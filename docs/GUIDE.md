@@ -135,5 +135,6 @@ flushes a lot). `"none"` ignores flushes: scratch disks only.
 - x86_64 hosts: not implemented.
 - Bridged / host-only: needs `bulwark-netd` running as root; not tested
   with real vmnet/tap yet.
-- No vTPM; Windows 11 is installed with its hardware checks bypassed.
+- Windows 11 is installed with its hardware checks bypassed; add
+  `tpm = true` (needs `brew install swtpm`) for a real TPM 2.0.
 - 3D snapshots, GL (virgl) path, Windows 3D: not supported.

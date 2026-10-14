@@ -13,6 +13,7 @@ mod machine;
 pub mod psci;
 mod ramfb;
 mod snapshot;
+mod tpm;
 mod vcpu;
 
 use std::io::Write;
@@ -140,7 +141,12 @@ impl Vmm {
         };
         let disks = disks::DiskSet::open(&config, &opts.state_dir, &layers)?;
         let uuid = machine_uuid(&opts.state_dir)?;
-        let m = machine::build(&config, hv.as_ref(), opts.serial_out, opts.clipboard, ui, &disks, ev_tx, uuid)?;
+        let env = machine::BuildEnv {
+            uuid,
+            state_dir: opts.state_dir.clone(),
+            resuming: matches!(opts.start, StartMode::Restore(_)),
+        };
+        let m = machine::build(&config, hv.as_ref(), opts.serial_out, opts.clipboard, ui, &disks, ev_tx, &env)?;
         let mut vmm = Vmm {
             config,
             hv,

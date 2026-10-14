@@ -26,6 +26,8 @@ pub enum FdtDevice {
     /// Two CFI flash banks (firmware code + variables).
     Flash { base0: u64, base1: u64, size: u64 },
     FwCfg { base: u64 },
+    /// TPM 2.0, TIS interface over MMIO.
+    Tpm { base: u64, size: u64 },
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +93,12 @@ fn build(cfg: &FdtConfig) -> FdtWriterResult<Vec<u8>> {
                 f.property_string("compatible", "qemu,fw-cfg-mmio")?;
                 f.property_array_u64("reg", &[base, 0x18])?;
                 f.property_null("dma-coherent")?;
+                f.end_node(n)?;
+            }
+            FdtDevice::Tpm { base, size } => {
+                let n = f.begin_node(&format!("tpm@{base:x}"))?;
+                f.property_string("compatible", "tcg,tpm-tis-mmio")?;
+                f.property_array_u64("reg", &[base, size])?;
                 f.end_node(n)?;
             }
         }

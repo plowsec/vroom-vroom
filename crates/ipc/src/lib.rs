@@ -23,8 +23,15 @@ impl std::error::Error for Error {}
 pub type Result<T> = std::result::Result<T, Error>;
 
 pub fn send_fd(sock: &UnixStream, fd: RawFd) -> Result<()> {
-    let mut byte = [0u8; 1];
-    let mut iov = libc::iovec { iov_base: byte.as_mut_ptr() as *mut _, iov_len: 1 };
+    send_fd_with(sock, &[0], fd)
+}
+
+/// Send `payload` (non-empty) with `fd` attached, in one message.
+pub fn send_fd_with(sock: &UnixStream, payload: &[u8], fd: RawFd) -> Result<()> {
+    if payload.is_empty() {
+        return Err(Error::Io(std::io::Error::other("empty payload")));
+    }
+    let mut iov = libc::iovec { iov_base: payload.as_ptr() as *mut _, iov_len: payload.len() };
     // SAFETY: CMSG_SPACE is a pure computation.
     let space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) } as usize;
     let mut cbuf = vec![0u8; space];
@@ -44,7 +51,7 @@ pub fn send_fd(sock: &UnixStream, fd: RawFd) -> Result<()> {
     }
     // SAFETY: msg describes valid buffers.
     let n = unsafe { libc::sendmsg(sock.as_raw_fd(), &msg, 0) };
-    if n != 1 {
+    if n != payload.len() as isize {
         return Err(Error::Io(std::io::Error::last_os_error()));
     }
     Ok(())

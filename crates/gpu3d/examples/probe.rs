@@ -4,6 +4,11 @@ use bulwark_virtio::devices::gpu3d::Renderer3d;
 
 fn main() {
     env_logger_lite();
+    if let Some(i) = std::env::args().position(|a| a == "--helper-profile") {
+        let a: Vec<String> = std::env::args().collect();
+        print!("{}", bulwark_sandbox::helper_profile(a[i + 1].as_ref(), a[i + 2].as_ref()).expect("profile"));
+        return;
+    }
     if std::env::args().any(|a| a == "--print-profile") {
         let p = bulwark_sandbox::Policy { gpu: true, ..Default::default() };
         print!("{}", bulwark_sandbox::profile_text(&p).expect("profile"));

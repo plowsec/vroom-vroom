@@ -73,6 +73,7 @@ impl Firmware {
         psci_smc: bool,
         virtio_mmio: Vec<(u64, u64, u32)>,
         screen: Option<Weak<FbSink>>,
+        tpm: Option<u64>,
         smbios: &bulwark_arch::smbios::SmbiosConfig,
     ) -> Result<()> {
         // Code: read-only, mapped straight into the guest.
@@ -109,6 +110,7 @@ impl Firmware {
             pci,
             virtio_mmio,
             psci_smc,
+            tpm,
         });
         fw.add_file(RSDP_FILE, tables.rsdp, None).map_err(Error::Setup)?;
         fw.add_file(TABLES_FILE, tables.tables, None).map_err(Error::Setup)?;

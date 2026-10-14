@@ -185,6 +185,15 @@ impl DeviceRegistry {
     }
 }
 
+/// Host-side facts the board needs.
+pub(crate) struct BuildEnv {
+    /// SMBIOS system UUID.
+    pub uuid: [u8; 16],
+    pub state_dir: std::path::PathBuf,
+    /// Restoring a snapshot / suspend image rather than cold booting.
+    pub resuming: bool,
+}
+
 /// What gets loaded into RAM at (re)boot. Kept so reset can reload it.
 pub(crate) enum BootImage {
     /// Direct Linux boot.
@@ -311,7 +320,7 @@ pub(crate) fn build(
     ui: Option<DisplayServer>,
     disks: &DiskSet,
     events: Sender<VmEvent>,
-    uuid: [u8; 16],
+    env: &BuildEnv,
 ) -> Result<Machine> {
     if hv.arch() != bulwark_hv::Arch::Aarch64 {
         return Err(Error::Setup("only the aarch64 board exists so far".into()));
@@ -449,6 +458,12 @@ pub(crate) fn build(
     }
     let need_pci = board.finish_pci()?;
     let Board { mut reg, fdt: mut fdt_devices, .. } = board;
+    if config.tpm {
+        let backend = crate::tpm::Swtpm::start(&env.state_dir.join("tpm"), !env.resuming)?;
+        let dev = bulwark_devices::tpm::Tpm::new(layout::TPM_BASE, Box::new(backend));
+        reg.add(layout::TPM_BASE, layout::TPM_SIZE, Arc::new(Mutex::new(dev)))?;
+        fdt_devices.push(board::FdtDevice::Tpm { base: layout::TPM_BASE, size: layout::TPM_SIZE });
+    }
 
     let mpidrs: Vec<u64> = (0..config.cpus).map(mpidr_for).collect();
     let fdt_base = |devices: Vec<board::FdtDevice>, cmdline: String| board::FdtConfig {
@@ -496,9 +511,10 @@ pub(crate) fn build(
                     })
                     .collect(),
                 screen.as_ref().map(Arc::downgrade),
+                config.tpm.then_some(layout::TPM_BASE),
                 &bulwark_arch::smbios::SmbiosConfig {
                     vm_name: config.name.clone(),
-                    uuid,
+                    uuid: env.uuid,
                     cpus: config.cpus,
                     memory_bytes: ram_size,
                     ram_base: layout::RAM_BASE,

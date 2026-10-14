@@ -34,6 +34,9 @@ pub const FW_CFG_BASE: u64 = 0x0902_0000;
 pub const GPIO_BASE: u64 = 0x0903_0000;
 pub const MMIO_DEV_SIZE: u64 = 0x1000;
 
+/// TPM TIS registers (same spot as QEMU's platform bus TPM).
+pub const TPM_BASE: u64 = 0x0c00_0000;
+pub const TPM_SIZE: u64 = 0x5000;
 pub const VIRTIO_MMIO_BASE: u64 = 0x0a00_0000;
 pub const VIRTIO_MMIO_SIZE: u64 = 0x200;
 pub const VIRTIO_MMIO_SLOTS: u32 = 32;

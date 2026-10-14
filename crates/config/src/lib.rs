@@ -53,6 +53,10 @@ pub struct VmConfig {
     /// M3 or newer Mac on macOS 15+. Snapshots are not supported then.
     #[serde(default)]
     pub nested: bool,
+    /// A TPM 2.0 (swtpm in its own process; state in the state dir).
+    /// Windows 11 wants one; Linux uses it for measured boot.
+    #[serde(default)]
+    pub tpm: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

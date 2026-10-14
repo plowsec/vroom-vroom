@@ -69,6 +69,15 @@ Snapshots contain guest RAM (keys, passwords). They're written 0600 in 0700
 directories, every blob is SHA-256 checked on load, and restore parses them
 with the same validation as live input.
 
+## vTPM
+
+`tpm = true` attaches a TPM 2.0. The TPM itself (libtpms) runs in a
+separate `swtpm` process, not in the VMM: on macOS under its own Seatbelt
+profile (its install, system libraries, its state directory, nothing
+else; no network). The VMM only frames commands for it, with size limits.
+State is in `<state>/tpm` (0700); snapshots include it, so reverting a VM
+reverts its TPM too.
+
 ## What 3D costs
 
 `gpu = "virtio3d"` loads virglrenderer and MoltenVK into the VMM. Guest
@@ -82,8 +91,6 @@ that need it. A future step is moving the renderer into its own process
 
 ## Known gaps
 
-- No vTPM yet: Windows 11 installs with its TPM check bypassed, so no
-  measured boot or TPM-sealed BitLocker in the guest.
 - The Windows agent runs elevated (the VirtIO serial port only admits
   Administrators); a service + unprivileged session helper split is planned.
 - x86_64 isn't implemented, so none of this is tested there.

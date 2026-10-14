@@ -67,6 +67,33 @@ pub fn profile(p: &Policy) -> Result<String> {
     Ok(s)
 }
 
+/// Profile for a helper we exec (swtpm): may read its own install and
+/// system libraries, read/write `rw_dir`, nothing else (no network, no
+/// home directory, no further exec).
+pub fn helper_profile(exe: &Path, rw_dir: &Path) -> Result<String> {
+    let exe_real = exe.canonicalize().unwrap_or_else(|_| exe.to_path_buf());
+    let prefix = exe_real.ancestors().nth(3).unwrap_or(Path::new("/opt/homebrew"));
+    Ok(format!(
+        r#"(version 1)
+(deny default)
+(allow process-exec (literal {exe}))
+(allow file-read* (subpath {prefix}) (subpath "/opt/homebrew") (subpath "/usr/lib") (subpath "/System")
+  (subpath "/Library/Apple") (literal "/dev/urandom") (literal "/dev/random") (literal "/dev/null")
+  (literal "/private/etc/localtime") (subpath "/private/var/db/timezone"))
+(allow file-write* (literal "/dev/null"))
+(allow file-read-metadata)
+(allow file-read-data (literal "/"))
+(allow file-read* file-write* (subpath {dir}))
+(allow sysctl-read)
+(allow signal (target self))
+(allow mach-task-name (target self))
+"#,
+        exe = q(&exe_real)?,
+        prefix = q(prefix)?,
+        dir = q(rw_dir)?,
+    ))
+}
+
 /// Metal through MoltenVK: driver bundles, the GPU's IOKit user clients
 /// (only those), and the shader compiler service. This is the attack
 /// surface 3D adds; without `gpu` none of it is reachable.

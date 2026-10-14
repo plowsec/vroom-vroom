@@ -19,6 +19,20 @@ pub struct AcpiConfig {
     pub virtio_mmio: Vec<(u64, u64, u32)>,
     /// PSCI via SMC (guest at EL2) instead of HVC.
     pub psci_smc: bool,
+    /// TPM TIS registers, if a vTPM is attached.
+    pub tpm: Option<u64>,
+}
+
+/// TPM2 table, rev 4: FIFO/TIS interface (start method 6), event log
+/// comes from the firmware (EFI_TCG2), so no log area here.
+fn tpm2() -> Vec<u8> {
+    let mut t = Table::new(b"TPM2", 4);
+    t.u16(0).u16(0); // client platform, reserved
+    t.u64(0); // control area: none for TIS
+    t.u32(6); // start method: memory mapped (TIS/FIFO)
+    t.zeros(12); // start method parameters
+    t.u32(0).u64(0); // LAML, LASA
+    t.finish()
 }
 
 /// FADT, HW-reduced, PSCI over HVC. X_DSDT lives at offset 140.
@@ -154,6 +168,16 @@ fn dsdt(c: &AcpiConfig) -> Vec<u8> {
     if c.pci {
         sb.push(pci_root());
     }
+    if let Some(base) = c.tpm {
+        sb.push(aml::device(
+            "TPM0",
+            vec![
+                aml::name("_HID", aml::string("MSFT0101")),
+                aml::name("_UID", aml::int(0)),
+                aml::name("_CRS", aml::resource_template(vec![res::memory32_fixed(base as u32, TPM_SIZE as u32, true)])),
+            ],
+        ));
+    }
     let mut t = Table::new(b"DSDT", 2);
     t.raw(&aml::scope("\\_SB", sb));
     t.finish()
@@ -228,6 +252,9 @@ pub fn build(c: &AcpiConfig) -> AcpiBlobs {
     if c.pci {
         others.push(mcfg());
     }
+    if c.tpm.is_some() {
+        others.push(tpm2());
+    }
     assemble(fadt(c.psci_smc), 140, dsdt(c), others)
 }
 
@@ -245,9 +272,10 @@ mod tests {
             pci: true,
             virtio_mmio: vec![(VIRTIO_MMIO_BASE, 0x200, 16)],
             psci_smc: false,
+            tpm: Some(TPM_BASE),
         });
         assert_eq!(b.loader.len() % 128, 0);
-        for sig in [&b"FACP"[..], b"APIC", b"GTDT", b"SPCR", b"DBG2", b"MCFG", b"DSDT", b"XSDT"] {
+        for sig in [&b"FACP"[..], b"APIC", b"GTDT", b"SPCR", b"DBG2", b"MCFG", b"DSDT", b"XSDT", b"TPM2"] {
             assert!(b.tables.windows(4).any(|w| w == sig), "{}", String::from_utf8_lossy(sig));
         }
         // Table lengths are self-consistent.
@@ -259,6 +287,7 @@ mod tests {
             pci: false,
             virtio_mmio: vec![],
             psci_smc: false,
+            tpm: None,
         });
         assert_eq!(madt.len(), 36 + 8 + 80 + 24 + 16);
         assert_eq!(dbg2().len(), 44 + 22 + 12 + 4 + 10);

@@ -48,6 +48,13 @@ pub fn profile_text(p: &Policy) -> Result<String> {
     macos::profile(p)
 }
 
+/// Seatbelt profile for a helper process (macOS); run it with
+/// `sandbox-exec -p`.
+#[cfg(target_os = "macos")]
+pub fn helper_profile(exe: &std::path::Path, rw_dir: &std::path::Path) -> Result<String> {
+    macos::helper_profile(exe, rw_dir)
+}
+
 /// Apply the sandbox to the whole process. Irreversible.
 pub fn apply(p: &Policy) -> Result<()> {
     #[cfg(target_os = "macos")]

@@ -25,7 +25,7 @@ What has been run end to end on an M3 Max, macOS 15:
 | Nested virtualization (KVM inside an Ubuntu guest, M3+) | works |
 | KVM backend (arm64), incl. snapshots | works (tested nested on HVF) |
 | x86_64 hosts | not done: KVM x86 backend is a stub |
-| vTPM | not done (Windows 11 installs with the TPM check bypassed) |
+| vTPM 2.0 (swtpm in its own sandboxed process; TIS, ACPI TPM2, measured boot) | works (EDK2, Linux; state survives suspend) |
 
 Honest caveats live in [docs/SECURITY.md](docs/SECURITY.md) and at the end of
 [docs/GUIDE.md](docs/GUIDE.md).
@@ -77,6 +77,7 @@ name = "dev"
 cpus = 4
 memory_mib = 4096
 nested = false                 # KVM inside the guest (M3+, macOS 15+)
+tpm = false                    # TPM 2.0 via swtpm (brew install swtpm); Windows 11 wants it
 virtio_transport = "auto"      # auto (mmio for kernel boot, pci for uefi) | mmio | pci
 
 [boot]
