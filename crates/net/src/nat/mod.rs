@@ -9,6 +9,8 @@
 //! Every table is capped so a hostile guest can't exhaust host memory.
 
 mod dhcp;
+mod fragment;
+mod ping;
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
@@ -36,6 +38,7 @@ const MAX_UDP: usize = 256;
 const MAX_TO_GUEST: usize = 4096;
 const TCP_BUF: usize = 64 << 10;
 const UDP_IDLE: Duration = Duration::from_secs(60);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Default)]
 pub struct NatPolicy {
@@ -149,6 +152,7 @@ struct TcpConn {
     host_readable: bool,
     host_eof: bool,
     host_wr_closed: bool,
+    created: Instant,
 }
 
 struct UdpFlow {
@@ -159,6 +163,7 @@ struct UdpFlow {
 
 enum Owner {
     Tcp,
+    Ping,
     Udp(FlowKey),
     Listener(usize),
 }
@@ -179,6 +184,9 @@ pub struct Nat {
     udp: HashMap<FlowKey, (usize, UdpFlow)>,
     listeners: Vec<(TcpListener, u16)>,
     next_local_port: u16,
+    fragments: fragment::Reassembly,
+    next_ip_id: u16,
+    pings: HashMap<usize, ping::Pending>,
 }
 
 impl std::fmt::Debug for Nat {
@@ -227,6 +235,9 @@ impl Nat {
             udp: HashMap::new(),
             listeners,
             next_local_port: 40000,
+            fragments: fragment::Reassembly::default(),
+            next_ip_id: u16::from_le_bytes([seed[0], seed[1]]),
+            pings: HashMap::new(),
         })
     }
 
@@ -270,8 +281,15 @@ impl Nat {
     }
 
     fn push_guest(&mut self, f: Vec<u8>) {
-        if self.to_guest.len() < MAX_TO_GUEST {
-            self.to_guest.push_back(f);
+        let frames = if f.len() > 1514 {
+            self.next_ip_id = self.next_ip_id.wrapping_add(1);
+            fragment_ipv4(f, 1500, self.next_ip_id)
+        } else {
+            vec![f]
+        };
+        // Queue the whole datagram or none of it.
+        if self.to_guest.len() + frames.len() <= MAX_TO_GUEST {
+            self.to_guest.extend(frames);
         }
     }
 
@@ -326,8 +344,7 @@ impl Nat {
                 match flow.sock.recv(&mut buf) {
                     Ok(n) => {
                         flow.last = Instant::now();
-                        // Max payload that fits a 1500 MTU without IP fragments.
-                        if n <= 1472 {
+                        if n <= 65507 {
                             out.push(build_udp(
                                 self.guest_mac,
                                 GATEWAY_MAC,
@@ -372,10 +389,7 @@ impl Nat {
         if let Some(&tok) = self.tcp_by_key.get(&key) {
             let stale = self.tcp.get(&tok).is_some_and(|c| {
                 c.handle.is_some_and(|h| {
-                    matches!(
-                        self.sockets.get::<tcp::Socket>(h).state(),
-                        tcp::State::Closed | tcp::State::TimeWait
-                    )
+                    matches!(self.sockets.get::<tcp::Socket>(h).state(), tcp::State::Closed | tcp::State::TimeWait)
                 })
             });
             if !(is_syn && stale) {
@@ -398,7 +412,13 @@ impl Nat {
             return;
         }
         let refuse = |nat: &mut Nat| {
-            let rst = build_tcp_rst(nat.guest_mac, GATEWAY_MAC, (ip.dst, t.dst_port), (ip.src, t.src_port), t.seq.wrapping_add(1));
+            let rst = build_tcp_rst(
+                nat.guest_mac,
+                GATEWAY_MAC,
+                (ip.dst, t.dst_port),
+                (ip.src, t.src_port),
+                t.seq.wrapping_add(1),
+            );
             nat.push_guest(rst);
         };
         if self.tcp.len() >= MAX_TCP {
@@ -423,16 +443,15 @@ impl Nat {
                 host_readable: false,
                 host_eof: false,
                 host_wr_closed: false,
+                created: Instant::now(),
             },
         );
         self.tcp_by_key.insert(key, tok);
     }
 
     fn new_tcp_socket() -> tcp::Socket<'static> {
-        let mut s = tcp::Socket::new(
-            tcp::SocketBuffer::new(vec![0u8; TCP_BUF]),
-            tcp::SocketBuffer::new(vec![0u8; TCP_BUF]),
-        );
+        let mut s =
+            tcp::Socket::new(tcp::SocketBuffer::new(vec![0u8; TCP_BUF]), tcp::SocketBuffer::new(vec![0u8; TCP_BUF]));
         s.set_nagle_enabled(false);
         s
     }
@@ -512,6 +531,7 @@ impl Nat {
                     host_readable: true,
                     host_eof: false,
                     host_wr_closed: false,
+                    created: Instant::now(),
                 },
             );
         }
@@ -566,7 +586,8 @@ impl Nat {
                     }
                 }
             }
-            let established_once = !matches!(s.state(), tcp::State::Listen | tcp::State::SynReceived | tcp::State::SynSent);
+            let established_once =
+                !matches!(s.state(), tcp::State::Listen | tcp::State::SynReceived | tcp::State::SynSent);
             if established_once && !s.may_recv() && c.to_host.is_empty() && !c.host_wr_closed {
                 let _ = c.stream.shutdown(Shutdown::Write);
                 c.host_wr_closed = true;
@@ -598,6 +619,29 @@ impl Nat {
             }
         }
         for t in dead {
+            self.drop_tcp(t);
+        }
+    }
+
+    fn expire_connects(&mut self) {
+        let dead: Vec<_> = self
+            .tcp
+            .iter()
+            .filter(|(_, c)| c.pending_syn.is_some() && c.created.elapsed() >= CONNECT_TIMEOUT)
+            .map(|(&t, _)| t)
+            .collect();
+        for t in dead {
+            if let Some(c) = self.tcp.get(&t) {
+                if let (Some(k), Some((_, seq))) = (c.key, &c.pending_syn) {
+                    self.push_guest(build_tcp_rst(
+                        self.guest_mac,
+                        GATEWAY_MAC,
+                        (*k.dst.ip(), k.dst.port()),
+                        (GUEST, k.guest_port),
+                        seq.wrapping_add(1),
+                    ));
+                }
+            }
             self.drop_tcp(t);
         }
     }
@@ -635,21 +679,34 @@ fn arp_reply(req: &Arp, ip: Ipv4Addr) -> Vec<u8> {
 impl NetBackend for Nat {
     fn send_frame(&mut self, frame: &[u8]) {
         let Some(eth) = parse_eth(frame) else { return };
-        if eth.src[0] & 1 != 0 {
-            return; // multicast source MAC: bogus
+        if eth.src != self.guest_mac {
+            return; // one configured guest per backend
         }
-        self.guest_mac = eth.src;
         match eth.ethertype {
             ETHERTYPE_ARP => self.handle_arp(frame),
             ETHERTYPE_IPV4 => {
                 let Some(ip) = parse_ipv4(frame) else { return };
                 if ip.fragmented {
+                    if eth.src == self.guest_mac && ip.src == GUEST {
+                        if let Some(complete) = self.fragments.push(frame) {
+                            self.send_frame(&complete);
+                        }
+                    }
+                    return;
+                }
+                let dhcp = ip.proto == PROTO_UDP
+                    && parse_udp(ip.payload).is_some_and(|u| u.src_port == 68 && u.dst_port == 67);
+                if eth.src != self.guest_mac || (!dhcp && ip.src != GUEST) {
+                    return;
+                }
+                if !dhcp && ip.ttl <= 1 && ip.dst != GATEWAY && ip.dst != DNS {
+                    self.error_to_guest(frame, 11, 0);
                     return;
                 }
                 match ip.proto {
                     PROTO_UDP => {
                         if let Some(u) = parse_udp(ip.payload) {
-                            if u.dst_port == 67 {
+                            if dhcp {
                                 self.handle_dhcp(&eth, u.payload);
                             } else {
                                 self.handle_udp(&ip, &u);
@@ -661,8 +718,8 @@ impl NetBackend for Nat {
                             self.handle_tcp(frame, &ip, &t);
                         }
                     }
-                    // Ping the gateway works; other ICMP is not relayed (yet).
                     PROTO_ICMP if ip.dst == GATEWAY => self.pipe.rx.push_back(frame.to_vec()),
+                    PROTO_ICMP => self.handle_ping(frame, &ip),
                     _ => {}
                 }
             }
@@ -693,12 +750,17 @@ impl NetBackend for Nat {
             for k in keys {
                 self.udp_readable(k);
             }
+            let tokens: Vec<_> = self.pings.keys().copied().collect();
+            for t in tokens {
+                self.ping_readable(t);
+            }
             for i in 0..self.listeners.len() {
                 self.accept_forward(i);
             }
         } else {
             match self.owners.get(&token) {
                 Some(Owner::Tcp) => self.tcp_event(token),
+                Some(Owner::Ping) => self.ping_readable(token),
                 Some(Owner::Udp(k)) => {
                     let k = *k;
                     self.udp_readable(k)
@@ -721,6 +783,9 @@ impl NetBackend for Nat {
     }
 
     fn tick(&mut self) {
+        self.fragments.expire();
+        self.expire_pings();
+        self.expire_connects();
         self.expire_udp(false);
         self.poll_stack();
     }
@@ -847,3 +912,7 @@ mod live {
         panic!("no DNS answer in 3s");
     }
 }
+
+#[cfg(test)]
+#[path = "tests.rs"]
+mod integration_tests;

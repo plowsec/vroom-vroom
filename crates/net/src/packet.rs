@@ -85,7 +85,7 @@ pub fn parse_ipv4(f: &[u8]) -> Option<Ipv4<'_>> {
     }
     let ihl = (p[0] & 0xf) as usize * 4;
     let total = be16(p, 2)? as usize;
-    if ihl < 20 || total < ihl || total > p.len() {
+    if ihl < 20 || total < ihl || total > p.len() || checksum(0, &p[..ihl]) != 0 {
         return None;
     }
     let frag = be16(p, 6)?;
@@ -186,6 +186,72 @@ fn eth_ipv4_header(out: &mut Vec<u8>, dst: Mac, src: Mac, sip: Ipv4Addr, dip: Ip
     let c = checksum(0, &ip);
     ip[10..12].copy_from_slice(&c.to_be_bytes());
     out.extend_from_slice(&ip);
+}
+
+/// Build an ICMP packet, calculating its checksum (including odd payloads).
+pub fn build_icmp(dst_mac: Mac, src_mac: Mac, src: Ipv4Addr, dst: Ipv4Addr, payload: &[u8]) -> Vec<u8> {
+    if payload.len() < 8 || payload.len() > 65515 {
+        return Vec::new();
+    }
+    let mut f = Vec::with_capacity(ETH_HLEN + 20 + payload.len());
+    eth_ipv4_header(&mut f, dst_mac, src_mac, src, dst, PROTO_ICMP, payload.len());
+    let mut p = payload.to_vec();
+    p[2..4].fill(0);
+    let c = checksum(0, &p);
+    p[2..4].copy_from_slice(&c.to_be_bytes());
+    f.extend_from_slice(&p);
+    f
+}
+
+/// Quote the original IPv4 header and eight payload bytes in an ICMP error.
+/// Never answer errors, noninitial fragments, or broadcast/multicast traffic.
+pub fn icmp_error(frame: &[u8], gateway_mac: Mac, gateway: Ipv4Addr, kind: u8, code: u8) -> Option<Vec<u8>> {
+    let eth = parse_eth(frame)?;
+    let ip = parse_ipv4(frame)?;
+    let p = &frame[ETH_HLEN..];
+    if eth.dst[0] & 1 != 0
+        || ip.src.is_unspecified()
+        || ip.src.is_multicast()
+        || ip.src.is_broadcast()
+        || ip.dst.is_multicast()
+        || ip.dst.is_broadcast()
+        || be16(p, 6)? & 0x1fff != 0
+        || (ip.proto == PROTO_ICMP && !matches!(ip.payload.first(), Some(8)))
+    {
+        return None;
+    }
+    let ihl = (p[0] & 15) as usize * 4;
+    let mut payload = vec![kind, code, 0, 0, 0, 0, 0, 0];
+    payload.extend_from_slice(&p[..ihl + ip.payload.len().min(8)]);
+    Some(build_icmp(eth.src, gateway_mac, gateway, ip.src, &payload))
+}
+
+/// Fragment a locally generated IPv4 packet into Ethernet frames at `mtu`.
+/// Local builders emit no IP options; guest packets are never passed here.
+pub fn fragment_ipv4(frame: Vec<u8>, mtu: usize, id: u16) -> Vec<Vec<u8>> {
+    if frame.len() <= ETH_HLEN + mtu {
+        return vec![frame];
+    }
+    let Some(ip) = parse_ipv4(&frame) else { return Vec::new() };
+    if frame[ETH_HLEN] != 0x45 || mtu < 28 || ip.fragmented {
+        return Vec::new();
+    }
+    let chunk = (mtu - 20) / 8 * 8;
+    let mut out = Vec::new();
+    for (i, part) in ip.payload.chunks(chunk).enumerate() {
+        let mut f = frame[..ETH_HLEN + 20].to_vec();
+        let h = &mut f[ETH_HLEN..];
+        h[2..4].copy_from_slice(&((20 + part.len()) as u16).to_be_bytes());
+        h[4..6].copy_from_slice(&id.to_be_bytes());
+        let flags = (i * chunk / 8) as u16 | if (i + 1) * chunk < ip.payload.len() { 0x2000 } else { 0 };
+        h[6..8].copy_from_slice(&flags.to_be_bytes());
+        h[10..12].fill(0);
+        let c = checksum(0, h);
+        h[10..12].copy_from_slice(&c.to_be_bytes());
+        f.extend_from_slice(part);
+        out.push(f);
+    }
+    out
 }
 
 /// Build Ethernet + IPv4 + UDP around `payload`.

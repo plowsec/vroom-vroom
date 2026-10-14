@@ -317,6 +317,7 @@ dependencies = [
 name = "bulwark-net"
 version = "0.1.0"
 dependencies = [
+ "bulwark-sandbox",
  "getrandom 0.2.17",
  "libc",
  "log",

@@ -14,5 +14,8 @@ getrandom = "0.2"
 socket2 = "0.5"
 smoltcp = { version = "0.14", default-features = false, features = ["std", "log", "medium-ethernet", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "socket-icmp", "socket-raw", "proto-dhcpv4"] }
 
+[dev-dependencies]
+bulwark-sandbox.workspace = true
+
 [lints]
 workspace = true
