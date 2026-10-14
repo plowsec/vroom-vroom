@@ -1,0 +1,19 @@
+[package]
+name = "bulwark-snapshot"
+description = "Snapshot trait and on-disk snapshot format."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

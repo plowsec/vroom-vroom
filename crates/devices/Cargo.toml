@@ -1,0 +1,15 @@
+[package]
+name = "bulwark-devices"
+description = "Device model core (bus, irq) and platform devices."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+log.workspace = true
+serde.workspace = true
+bulwark-snapshot.workspace = true
+
+[lints]
+workspace = true
