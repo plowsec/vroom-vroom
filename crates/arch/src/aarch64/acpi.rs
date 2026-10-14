@@ -311,6 +311,7 @@ mod dump {
             pci: true,
             virtio_mmio: vec![(super::VIRTIO_MMIO_BASE, 0x200, 16)],
             psci_smc: false,
+            tpm: Some(super::TPM_BASE),
         });
         let t = &b.tables;
         let mut off = 0;
