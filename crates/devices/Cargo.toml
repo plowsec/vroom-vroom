@@ -11,6 +11,10 @@ log.workspace = true
 serde.workspace = true
 bulwark-snapshot.workspace = true
 bulwark-memory.workspace = true
+bulwark-block.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true

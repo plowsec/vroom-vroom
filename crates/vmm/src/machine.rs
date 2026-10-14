@@ -6,7 +6,7 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use bulwark_arch::aarch64::{self as board, layout};
-use bulwark_config::{Boot, DiskFormat, Gpu, VmConfig};
+use bulwark_config::{Boot, DiskBus, DiskFormat, Gpu, VmConfig};
 use bulwark_devices::{pl011::Pl011, pl031::Pl031, BusBuilder, BusDevice};
 use bulwark_hv::{
     aarch64::mpidr_for, BootRegs, GicMsiConfig, Hypervisor, IrqChipConfig, IrqChipInfo, Vm, VmParams,
@@ -20,6 +20,7 @@ use bulwark_proto::AGENT_PORT;
 use bulwark_virtio::devices::gpu::{DisplaySink, Gpu as GpuDev};
 use bulwark_virtio::devices::input::{Input, InputKind};
 use bulwark_virtio::devices::{block::Block, console::Console, net::Net, rng::Rng};
+use bulwark_devices::nvme::{Namespace, Nvme};
 use bulwark_devices::pci::{IntxRouter, PciRoot, SharedPciDevice};
 use bulwark_devices::IrqLine;
 use bulwark_virtio::{mmio::VirtioMmio, pci::VirtioPci, VirtioDevice};
@@ -232,6 +233,7 @@ pub(crate) fn build(
         Ok(())
     };
     add_virtio(Box::new(Rng::new()))?;
+    let mut nvme_ns = Vec::new();
     for (i, d) in config.disks.iter().enumerate() {
         let fmt = match d.format {
             DiskFormat::Auto => None,
@@ -240,8 +242,13 @@ pub(crate) fn build(
         };
         let img = bulwark_block::open(&d.path, fmt, d.readonly)
             .map_err(|e| Error::Setup(format!("disk {}: {e}", d.path.display())))?;
-        let id = format!("vd{}", (b'a' + i as u8) as char);
-        add_virtio(Box::new(Block::new(&id, img)))?;
+        match d.bus {
+            DiskBus::Virtio => {
+                let id = format!("vd{}", (b'a' + i as u8) as char);
+                add_virtio(Box::new(Block::new(&id, img)))?;
+            }
+            DiskBus::Nvme => nvme_ns.push(Namespace { disk: img, read_only: d.readonly }),
+        }
     }
     // Display. UEFI always gets ramfb (firmware / installer screen);
     // virtio-gpu takes over once a guest driver drives it.
@@ -292,7 +299,15 @@ pub(crate) fn build(
         add_virtio(Box::new(Net::new(&format!("eth{i}"), mac, backend)))?;
     }
 
-    if use_pci {
+    if !nvme_ns.is_empty() {
+        let slot = next_pci_slot;
+        next_pci_slot += 1;
+        let n = Nvme::new(slot, nvme_ns, mem.clone(), intx.pin(slot, 1), msi.clone());
+        pci_devices.push((slot, Arc::new(Mutex::new(n))));
+    }
+    let _ = next_pci_slot;
+    let need_pci = !pci_devices.is_empty() || use_pci;
+    if need_pci {
         let root = PciRoot::new(pci_devices);
         reg.add(layout::PCI_ECAM_BASE, layout::PCI_ECAM_SIZE, Arc::new(Mutex::new(root.ecam_port())))?;
         reg.add_bus_only(layout::PCI_MMIO_BASE, layout::PCI_MMIO_SIZE, root.window_port(layout::PCI_MMIO_BASE))?;
@@ -339,7 +354,7 @@ pub(crate) fn build(
                 config.cpus,
                 &mpidrs,
                 &info,
-                use_pci,
+                need_pci,
                 fdt_devices
                     .iter()
                     .filter_map(|d| match *d {

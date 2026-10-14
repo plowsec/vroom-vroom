@@ -8,6 +8,7 @@
 mod bus;
 mod irq;
 pub mod fw_cfg;
+pub mod nvme;
 pub mod pci;
 pub mod pflash;
 pub mod pl011;

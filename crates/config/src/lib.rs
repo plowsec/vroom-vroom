@@ -118,6 +118,18 @@ pub struct Disk {
     /// Present as a CD-ROM style read-only device (installer ISOs).
     #[serde(default)]
     pub cdrom: bool,
+    /// virtio-blk (fast, needs a driver) or NVMe (every OS has a driver,
+    /// including Windows setup).
+    #[serde(default)]
+    pub bus: DiskBus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DiskBus {
+    #[default]
+    Virtio,
+    Nvme,
 }
 
 /// Typed network mode, derived from a validated [`Net`].

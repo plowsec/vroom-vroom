@@ -259,10 +259,12 @@ dependencies = [
 name = "bulwark-devices"
 version = "0.1.0"
 dependencies = [
+ "bulwark-block",
  "bulwark-memory",
  "bulwark-snapshot",
  "log",
  "serde",
+ "tempfile",
  "thiserror 2.0.21",
 ]
 
