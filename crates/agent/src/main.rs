@@ -91,8 +91,7 @@ fn session(args: &Args) -> std::io::Result<()> {
         clip::system()
     };
 
-    let feats = features::CLIPBOARD_TEXT | features::TIME_SYNC | features::SHUTDOWN;
-    writer.write_all(&Message::Hello { features: feats, agent: format!("bulwark-agent {}", env!("CARGO_PKG_VERSION")) }.encode())?;
+    writer.write_all(&hello().encode())?;
     log::info!("connected to {}", args.port);
 
     // Blocking reads on their own thread; main loop polls the clipboard.
@@ -138,9 +137,19 @@ fn session(args: &Args) -> std::io::Result<()> {
     }
 }
 
+fn hello() -> Message {
+    let features = features::CLIPBOARD_TEXT | features::TIME_SYNC | features::SHUTDOWN;
+    Message::Hello { features, agent: format!("bulwark-agent {}", env!("CARGO_PKG_VERSION")) }
+}
+
 fn handle(m: Message, w: &mut port::Writer, clip: &mut dyn clip::Clip, last: &mut Option<String>) -> std::io::Result<()> {
     match m {
-        Message::Hello { agent, .. } => log::info!("host: {agent}"),
+        // The host says hello when it (re)starts, e.g. resuming a
+        // suspended VM in a new process: introduce ourselves again.
+        Message::Hello { agent, .. } => {
+            log::info!("host: {agent}");
+            w.write_all(&hello().encode())?;
+        }
         Message::ClipboardText(t) => {
             clip.set(&t);
             // Don't bounce it straight back.

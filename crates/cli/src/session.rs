@@ -101,12 +101,23 @@ fn selftest() {
 struct Session {
     vmm: Vmm,
     state_dir: PathBuf,
+    /// Agent connections already announced.
+    agent_sessions: u32,
 }
 
 impl Session {
     fn note(&self, msg: &str) {
         eprint!("\r\n[bulwark] {msg}\r\n");
         self.vmm.viewer_status(msg);
+    }
+
+    /// Say so when the guest agent (clipboard, resize, shutdown) comes up.
+    fn check_agent(&mut self) {
+        let st = self.vmm.agent().status();
+        if st.sessions != self.agent_sessions {
+            self.agent_sessions = st.sessions;
+            self.note(&format!("guest agent connected ({})", st.agent));
+        }
     }
 
     fn act(&mut self, a: Action) -> Flow {
@@ -250,7 +261,7 @@ pub fn run(o: RunOpts) -> Result<(), String> {
     } else {
         eprintln!("bulwark: WARNING: running without sandbox");
     }
-    let mut s = Session { vmm, state_dir: o.state_dir };
+    let mut s = Session { vmm, state_dir: o.state_dir, agent_sessions: 0 };
     s.vmm.viewer_status("running");
 
     let _raw = if gui { None } else { Some(term::RawTerminal::enable()) };
@@ -299,5 +310,6 @@ pub fn run(o: RunOpts) -> Result<(), String> {
                 return Ok(());
             }
         }
+        s.check_agent();
     }
 }

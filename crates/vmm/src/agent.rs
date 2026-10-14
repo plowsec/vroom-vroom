@@ -41,8 +41,11 @@ pub enum AgentCmd {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentStatus {
     pub connected: bool,
+    /// Guest-supplied, sanitized: printable ASCII, 64 chars at most.
     pub agent: String,
     pub features: u64,
+    /// Hellos seen: goes up on every (re)connect, e.g. after a guest reboot.
+    pub sessions: u32,
 }
 
 const POLL: Duration = Duration::from_millis(250);
@@ -147,9 +150,11 @@ impl Service {
     fn on_message(&mut self, m: Message) {
         match m {
             Message::Hello { features, agent } => {
+                let agent: String = agent.chars().filter(|c| c.is_ascii_graphic() || *c == ' ').take(64).collect();
                 log::info!("guest agent connected: {agent}");
                 let mut s = self.status.lock().unwrap_or_else(|e| e.into_inner());
-                *s = AgentStatus { connected: true, agent, features };
+                let sessions = s.sessions.wrapping_add(1);
+                *s = AgentStatus { connected: true, agent, features, sessions };
             }
             Message::ClipboardText(t) => self.from_guest(t),
             Message::Ping(v) => self.send(&Message::Pong(v)),
