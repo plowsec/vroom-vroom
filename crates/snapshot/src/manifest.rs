@@ -143,7 +143,11 @@ impl SnapshotDir {
     /// For big streams (RAM). Call [`finish_stream`] to record the hash.
     pub fn stream_writer(&self, name: &str) -> Result<HashingWriter<BufWriter<File>>> {
         check_name(name)?;
-        let f = fs::OpenOptions::new().write(true).create_new(true).open(self.root.join(name))?;
+        let mut o = fs::OpenOptions::new();
+        o.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+        let f = o.open(self.root.join(name))?;
         Ok(HashingWriter { inner: BufWriter::new(f), hasher: Sha256::new(), written: 0 })
     }
 
@@ -175,7 +179,11 @@ impl SnapshotDir {
     /// Write the manifest atomically. Snapshot is complete after this.
     pub fn commit(&self) -> Result<()> {
         let tmp = self.root.join(".manifest.tmp");
-        let mut f = File::create(&tmp)?;
+        let mut o = fs::OpenOptions::new();
+        o.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+        let mut f = o.open(&tmp)?;
         serde_json::to_writer_pretty(&mut f, &self.manifest)
             .map_err(|e| Error::Encode(e.to_string()))?;
         f.sync_all()?;

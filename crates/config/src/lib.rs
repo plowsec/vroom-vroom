@@ -280,6 +280,35 @@ impl VmConfig {
         Ok(c)
     }
 
+    /// Make relative paths absolute against `base` (the config's directory).
+    pub fn rebase_paths(&mut self, base: &std::path::Path) {
+        let fix = |p: &mut PathBuf| {
+            if p.is_relative() {
+                *p = base.join(&*p);
+            }
+        };
+        match &mut self.boot {
+            Boot::Kernel { kernel, initrd, .. } => {
+                fix(kernel);
+                if let Some(i) = initrd {
+                    fix(i);
+                }
+            }
+            Boot::Uefi { firmware, vars } => {
+                if let Some(f) = firmware {
+                    fix(f);
+                }
+                fix(vars);
+            }
+        }
+        for d in &mut self.disks {
+            fix(&mut d.path);
+        }
+        if let Serial::File { path } = &mut self.serial {
+            fix(path);
+        }
+    }
+
     pub fn to_toml(&self) -> Result<String> {
         toml::to_string_pretty(self).map_err(|e| Error::Parse(e.to_string()))
     }

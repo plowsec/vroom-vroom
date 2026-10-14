@@ -1,0 +1,21 @@
+[package]
+name = "bulwark-vmm"
+description = "VM orchestration: builds the machine, runs vCPUs, snapshots."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bulwark-memory.workspace = true
+bulwark-hv.workspace = true
+bulwark-devices.workspace = true
+bulwark-arch.workspace = true
+bulwark-config.workspace = true
+bulwark-snapshot.workspace = true
+
+[lints]
+workspace = true

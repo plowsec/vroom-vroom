@@ -10,8 +10,6 @@ pub struct VcpuState {
     pub regs: Vec<(u32, u64)>,
     /// 128-bit SIMD/FP registers.
     pub vregs: Vec<(u32, [u8; 16])>,
-    /// Guest-visible virtual counter value at save time.
-    pub vcounter: u64,
     /// Extra opaque per-vcpu blob (e.g. per-cpu GIC regs).
     pub extra: Vec<(u32, u64)>,
     pub powered_on: bool,

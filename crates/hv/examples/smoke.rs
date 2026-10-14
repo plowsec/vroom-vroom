@@ -34,7 +34,7 @@ fn main() {
     let e = cpu.run().expect("run3");
     assert_eq!(e, VcpuExit::Hypercall { func: 0x8400_0008, args: [0x0900_0000, 7, 0] });
     let st = cpu.save_state().expect("save");
-    println!("saved {} regs, vcounter {}", st.regs.len(), st.vcounter);
+    println!("saved {} regs, clock {}", st.regs.len(), vm.clock());
     let gic = vm.save_irqchip().expect("gic save");
     println!("gic state {} bytes", gic.blob.len());
     vm.restore_irqchip(&gic).expect("gic restore");

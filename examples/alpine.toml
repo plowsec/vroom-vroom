@@ -1,0 +1,10 @@
+# Alpine netboot kernel, serial console only. Fetch with scripts/fetch-alpine.sh.
+name = "alpine"
+cpus = 2
+memory_mib = 1024
+
+[boot]
+type = "kernel"
+kernel = "../images/alpine/vmlinuz-virt"
+initrd = "../images/alpine/initramfs-virt"
+cmdline = "console=ttyAMA0 earlycon=pl011,mmio32,0x9000000"

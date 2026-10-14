@@ -107,6 +107,12 @@ pub trait Vm: Send + Sync {
     /// Deliver a message-signalled interrupt.
     fn signal_msi(&self, addr: u64, data: u32) -> Result<()>;
 
+    /// Guest-visible counter (CNTVCT on ARM). One clock for the whole VM.
+    fn clock(&self) -> u64;
+    /// Make the guest counter continue from `value` (snapshot restore).
+    /// Takes effect on each vCPU at its next state restore.
+    fn set_clock(&self, value: u64);
+
     /// Save / restore the interrupt controller (VM must be paused).
     fn save_irqchip(&self) -> Result<IrqChipState>;
     fn restore_irqchip(&self, s: &IrqChipState) -> Result<()>;

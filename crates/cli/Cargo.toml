@@ -1,0 +1,22 @@
+[package]
+name = "bulwark-cli"
+description = "bulwark command line."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "bulwark"
+path = "src/main.rs"
+
+[dependencies]
+log.workspace = true
+env_logger.workspace = true
+clap.workspace = true
+libc.workspace = true
+bulwark-config.workspace = true
+bulwark-hv.workspace = true
+bulwark-vmm.workspace = true
+
+[lints]
+workspace = true

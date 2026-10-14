@@ -11,6 +11,7 @@ log.workspace = true
 vm-fdt.workspace = true
 flate2.workspace = true
 getrandom = "0.2"
+ruzstd = "0.8"
 bulwark-memory.workspace = true
 
 [lints]

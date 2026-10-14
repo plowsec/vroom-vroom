@@ -11,7 +11,7 @@ mod ffi;
 mod vcpu;
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bulwark_memory::{GuestMemory, MmapRegion};
@@ -92,6 +92,8 @@ pub struct HvfVm {
     memory: Mutex<Vec<GuestMemory>>,
     roms: Mutex<Vec<Arc<MmapRegion>>>,
     kickers: Mutex<Vec<Arc<HvfKicker>>>,
+    /// Host ticks minus guest counter. Shared by all vCPUs.
+    vtimer_offset: Arc<AtomicU64>,
     spi_base: u32,
     spi_count: u32,
     msi: Option<crate::GicMsiConfig>,
@@ -164,6 +166,9 @@ impl HvfVm {
             memory: Mutex::new(Vec::new()),
             roms: Mutex::new(Vec::new()),
             kickers: Mutex::new(Vec::new()),
+            // Guest counter starts at 0 when the VM is created.
+            // SAFETY: no preconditions.
+            vtimer_offset: Arc::new(AtomicU64::new(unsafe { ffi::mach_absolute_time() })),
             spi_base: info.spi_base,
             spi_count: info.spi_count,
             msi,
@@ -218,7 +223,7 @@ impl Vm for HvfVm {
     }
 
     fn create_vcpu(&self, index: u32) -> Result<Box<dyn Vcpu>> {
-        let v = HvfVcpu::new(index)?;
+        let v = HvfVcpu::new(index, self.vtimer_offset.clone())?;
         self.kickers.lock().unwrap_or_else(|e| e.into_inner()).push(v.hvf_kicker());
         Ok(Box::new(v))
     }
@@ -246,6 +251,17 @@ impl Vm for HvfVm {
         check("hv_gic_send_msi", unsafe { ffi::hv_gic_send_msi(addr, data) })?;
         self.wake_all();
         Ok(())
+    }
+
+    fn clock(&self) -> u64 {
+        // SAFETY: no preconditions.
+        unsafe { ffi::mach_absolute_time() }.wrapping_sub(self.vtimer_offset.load(Ordering::SeqCst))
+    }
+
+    fn set_clock(&self, value: u64) {
+        // SAFETY: no preconditions.
+        let now = unsafe { ffi::mach_absolute_time() };
+        self.vtimer_offset.store(now.wrapping_sub(value), Ordering::SeqCst);
     }
 
     fn save_irqchip(&self) -> Result<IrqChipState> {

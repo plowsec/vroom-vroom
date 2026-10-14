@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -49,10 +49,11 @@ pub struct HvfVcpu {
     kicker: Arc<HvfKicker>,
     pending_read: Option<DataAbort>,
     vtimer_masked: bool,
+    vtimer_offset: Arc<AtomicU64>,
 }
 
 impl HvfVcpu {
-    pub(super) fn new(index: u32) -> Result<Self> {
+    pub(super) fn new(index: u32, vtimer_offset: Arc<AtomicU64>) -> Result<Self> {
         let mut id = 0u64;
         let mut exit: *const ffi::hv_vcpu_exit_t = std::ptr::null();
         // SAFETY: out pointers valid; default config.
@@ -73,8 +74,10 @@ impl HvfVcpu {
             }),
             pending_read: None,
             vtimer_masked: false,
+            vtimer_offset,
         };
         v.set_sys(ffi::HV_SYS_REG_MPIDR_EL1, mpidr)?;
+        v.apply_vm_clock()?;
         Ok(v)
     }
 
@@ -142,6 +145,13 @@ impl HvfVcpu {
         check("hv_gic_set_redistributor_reg", unsafe {
             ffi::hv_gic_set_redistributor_reg(self.id, reg, v)
         })
+    }
+
+    /// Use the VM-wide counter offset on this vCPU.
+    fn apply_vm_clock(&self) -> Result<()> {
+        let off = self.vtimer_offset.load(Ordering::SeqCst);
+        // SAFETY: owning thread.
+        check("hv_vcpu_set_vtimer_offset", unsafe { ffi::hv_vcpu_set_vtimer_offset(self.id, off) })
     }
 
     /// Guest virtual counter now.
@@ -385,7 +395,6 @@ impl Vcpu for HvfVcpu {
             check("hv_gic_get_icc_reg", unsafe { ffi::hv_gic_get_icc_reg(self.id, r, &mut v) })?;
             s.extra.push((r as u32, v));
         }
-        s.vcounter = self.vcounter()?;
         s.powered_on = true;
         Ok(s)
     }
@@ -422,11 +431,8 @@ impl Vcpu for HvfVcpu {
             // SAFETY: owning thread.
             check("hv_gic_set_icc_reg", unsafe { ffi::hv_gic_set_icc_reg(self.id, r, v) })?;
         }
-        // Keep guest time continuous: counter resumes from the saved value.
-        // SAFETY: no preconditions.
-        let off = unsafe { ffi::mach_absolute_time() }.wrapping_sub(s.vcounter);
-        // SAFETY: owning thread.
-        check("hv_vcpu_set_vtimer_offset", unsafe { ffi::hv_vcpu_set_vtimer_offset(self.id, off) })?;
+        // Counter is VM-wide; the VMM sets it via Vm::set_clock before this.
+        self.apply_vm_clock()?;
         self.mpidr = self.get_sys(ffi::HV_SYS_REG_MPIDR_EL1)?;
         self.pending_read = None;
         Ok(())
