@@ -80,7 +80,7 @@ pub trait QueueHandler: Send + 'static {
         Ok(())
     }
     /// Optional periodic tick (e.g. rate limiting, retries).
-    fn tick_interval(&self) -> Option<Duration> {
+    fn tick_interval(&mut self) -> Option<Duration> {
         None
     }
     fn tick(&mut self, _ctx: &mut QueueCtx) {}

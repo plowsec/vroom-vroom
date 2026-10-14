@@ -19,3 +19,8 @@ format = "qcow2"
 path = "../images/ubuntu/seed.iso"
 readonly = true
 format = "raw"
+
+# NAT: internet access, no access to host loopback. SSH via localhost:2222.
+[[net]]
+mode = "nat"
+port_forwards = [{ host_port = 2222, guest_port = 22 }]

@@ -1,0 +1,17 @@
+[package]
+name = "bulwark-net"
+description = "Network backends: userspace NAT, frame sockets to the privileged helper."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+log.workspace = true
+mio.workspace = true
+libc.workspace = true
+getrandom = "0.2"
+smoltcp = { version = "0.14", default-features = false, features = ["std", "log", "medium-ethernet", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "socket-icmp", "socket-raw", "proto-dhcpv4"] }
+
+[lints]
+workspace = true

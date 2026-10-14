@@ -149,6 +149,13 @@ pub struct Net {
     /// NAT: forwarded ports.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub port_forwards: Vec<PortForward>,
+    /// NAT: let the guest reach host loopback services via the gateway IP.
+    /// Off by default: localhost services often have no auth.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_host_loopback: bool,
+    /// NAT: block private (LAN) destinations; internet only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub block_private: bool,
     /// "52:54:00:12:34:56". Generated if absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mac: Option<String>,
@@ -163,7 +170,13 @@ impl Net {
                 if self.interface.is_some() || self.network.is_some() {
                     return bad("nat takes no interface/network");
                 }
+                if self.port_forwards.iter().any(|p| p.proto != "tcp") {
+                    return bad("only tcp port forwards are supported for now");
+                }
                 Ok(NetMode::Nat { port_forwards: self.port_forwards.clone() })
+            }
+            NetKind::Bridged | NetKind::HostOnly if self.allow_host_loopback || self.block_private => {
+                bad("allow_host_loopback / block_private only apply to nat")
             }
             NetKind::Bridged => {
                 if self.network.is_some() || !self.port_forwards.is_empty() {

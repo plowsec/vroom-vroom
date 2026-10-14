@@ -12,7 +12,10 @@ use bulwark_hv::{
 };
 use bulwark_memory::{GuestAddress, GuestMemory};
 use bulwark_snapshot::Snapshottable;
-use bulwark_virtio::devices::{block::Block, rng::Rng};
+use bulwark_config::NetMode;
+use bulwark_net::nat::{Nat, NatConfig, NatPolicy, TcpForward};
+use bulwark_net::NetBackend;
+use bulwark_virtio::devices::{block::Block, net::Net, rng::Rng};
 use bulwark_virtio::{mmio::VirtioMmio, VirtioDevice};
 
 use crate::irq::SpiLine;
@@ -93,6 +96,37 @@ impl BootImage {
     }
 }
 
+/// Deterministic, locally administered MAC per (VM, NIC index), so the guest
+/// keeps the same DHCP identity across boots without storing state.
+fn stable_mac(name: &str, idx: usize) -> [u8; 6] {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in name.bytes().chain([0, idx as u8]) {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    let b = h.to_le_bytes();
+    [0x02, b[0], b[1], b[2], b[3], b[4]]
+}
+
+fn net_backend(n: &bulwark_config::Net, mac: [u8; 6]) -> Result<Box<dyn NetBackend>> {
+    match n.mode()? {
+        NetMode::Nat { port_forwards } => {
+            let mut cfg = NatConfig::new(mac);
+            cfg.policy = NatPolicy { allow_host_loopback: n.allow_host_loopback, block_private: n.block_private };
+            for p in port_forwards {
+                let ip: std::net::IpAddr =
+                    p.host_addr.parse().map_err(|_| Error::Setup(format!("bad host_addr {}", p.host_addr)))?;
+                cfg.forwards.push(TcpForward { host: (ip, p.host_port).into(), guest_port: p.guest_port });
+            }
+            let nat = Nat::new(cfg).map_err(|e| Error::Setup(format!("nat: {e}")))?;
+            Ok(Box::new(nat))
+        }
+        NetMode::Bridged { .. } | NetMode::HostOnly { .. } => Err(Error::Setup(
+            "bridged / host-only need bulwark-netd (not wired up yet)".into(),
+        )),
+    }
+}
+
 fn read_file(p: &std::path::Path, what: &str, max: u64) -> Result<Vec<u8>> {
     let meta = std::fs::metadata(p).map_err(|e| Error::Setup(format!("{what} {}: {e}", p.display())))?;
     if meta.len() > max {
@@ -167,6 +201,14 @@ pub(crate) fn build(
             .map_err(|e| Error::Setup(format!("disk {}: {e}", d.path.display())))?;
         let id = format!("vd{}", (b'a' + i as u8) as char);
         add_virtio(Box::new(Block::new(&id, img)))?;
+    }
+    for (i, n) in config.nets.iter().enumerate() {
+        let mac = match &n.mac {
+            Some(m) => bulwark_config::parse_mac(m)?,
+            None => stable_mac(&config.name, i),
+        };
+        let backend = net_backend(n, mac)?;
+        add_virtio(Box::new(Net::new(&format!("eth{i}"), mac, backend)))?;
     }
 
     let mpidrs: Vec<u64> = (0..config.cpus).map(mpidr_for).collect();

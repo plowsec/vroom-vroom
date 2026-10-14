@@ -15,6 +15,7 @@ bulwark-memory.workspace = true
 bulwark-devices.workspace = true
 bulwark-snapshot.workspace = true
 bulwark-block.workspace = true
+bulwark-net.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
