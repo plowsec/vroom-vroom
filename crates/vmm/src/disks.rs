@@ -72,7 +72,9 @@ impl DiskSet {
     /// Open all disks. `restore`: disk index -> frozen layer to start a
     /// fresh overlay on (reverting to a snapshot).
     pub fn open(cfg: &VmConfig, state_dir: &Path, restore: &BTreeMap<usize, PathBuf>) -> Result<DiskSet> {
-        let dir = state_dir.join("disks");
+        // Absolute now, while we may still look up the cwd: overlays made
+        // later (under the sandbox) record these paths as backing names.
+        let dir = std::path::absolute(state_dir.join("disks"))?;
         std::fs::create_dir_all(&dir)?;
         let mut disks = Vec::new();
         for (i, d) in cfg.disks.iter().enumerate() {
@@ -102,7 +104,9 @@ impl DiskSet {
                     // written with paths relative to wherever we ran from).
                     Some(p) => match p.active.file_name().map(|n| dir.join(n)) {
                         Some(f) if f.is_file() => (f, Format::Qcow2),
-                        _ if p.active.file_name() == d.path.file_name() => (d.path.clone(), fmt_of(d.format).unwrap_or(Format::Raw)),
+                        _ if p.active.file_name() == d.path.file_name() => {
+                            (std::path::absolute(&d.path)?, fmt_of(d.format).unwrap_or(Format::Raw))
+                        }
                         _ => {
                             return Err(Error::Setup(format!(
                                 "disk {}: state points at {} which is missing; refusing to fall back to the base image",
@@ -111,10 +115,10 @@ impl DiskSet {
                             )))
                         }
                     },
-                    None => (d.path.clone(), fmt_of(d.format).unwrap_or(Format::Raw)),
+                    None => (std::path::absolute(&d.path)?, fmt_of(d.format).unwrap_or(Format::Raw)),
                 }
             };
-            let fmt = if active == d.path { fmt_of(d.format) } else { Some(fmt) };
+            let fmt = if active == std::path::absolute(&d.path)? { fmt_of(d.format) } else { Some(fmt) };
             let img = bulwark_block::open_with(&active, fmt, false, &policy)
                 .map_err(|e| Error::Setup(format!("disk {}: {e}", active.display())))?;
             let active_fmt = fmt.unwrap_or(Format::Raw);

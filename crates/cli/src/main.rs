@@ -56,6 +56,8 @@ fn main() -> ExitCode {
         Cmd::Run { config, restore, fresh, state_dir, host_clipboard_file, no_sandbox, ui_fd } => {
             load(&config).and_then(|cfg| {
                 let state_dir = state_dir.unwrap_or_else(|| default_state_dir(&config, &cfg));
+                // Absolute before the sandbox: no cwd lookups after that.
+                let state_dir = std::path::absolute(&state_dir).unwrap_or(state_dir);
                 session::run(session::RunOpts {
                     clipboard: if ui_fd.is_some() { None } else { clip::provider(host_clipboard_file) },
                     config: cfg,
