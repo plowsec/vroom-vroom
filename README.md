@@ -19,13 +19,13 @@ What has been run end to end on an M3 Max, macOS 15:
 | virtio: blk, net, console, rng, gpu 2D, input; NVMe; xHCI USB HID | works |
 | virtio-gpu 3D (Venus/Vulkan → MoltenVK → Metal), sandboxed | works, ~92% of native compute |
 | Dynamic resolution (Linux natively, Windows via agent) | works |
-| Clipboard both ways (Linux and Windows agent) | works |
+| Clipboard both ways (Linux agent; Windows service + unprivileged helper) | works |
 | NAT networking (DHCP, DNS, TCP/UDP, ICMP, port forwards) | works |
 | Bridged / host-only (privileged `bulwark-netd`) | plumbing tested; real vmnet/tap needs root, not yet run |
 | Nested virtualization (KVM inside an Ubuntu guest, M3+) | works |
 | KVM backend (arm64), incl. snapshots | works (tested nested on HVF) |
 | x86_64 hosts | builds (VMM on Linux, agents for x64 Windows/Linux); no x86 board yet, so VMs don't start |
-| vTPM 2.0 (swtpm in its own sandboxed process; TIS, ACPI TPM2, measured boot) | works (EDK2, Linux; state survives suspend) |
+| vTPM 2.0 (swtpm in its own sandboxed process; TIS, ACPI TPM2, measured boot) | works (EDK2, Linux, Windows 11 sees TPM 2.0; state survives suspend) |
 
 Honest caveats live in [docs/SECURITY.md](docs/SECURITY.md) and at the end of
 [docs/GUIDE.md](docs/GUIDE.md).

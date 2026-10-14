@@ -16,9 +16,12 @@ rem  - "--session" helper, unprivileged, started in each user session:
 rem    clipboard and resolution, through a pipe only the service serves.
 if exist "%~dp0bulwark-agent.exe" (
   sc stop BulwarkAgent >nul 2>&1
+  schtasks /end /tn "Bulwark Agent" >nul 2>&1
   taskkill /f /im bulwark-agent.exe >nul 2>&1
+  rem taskkill doesn't wait for the process to go: the copy would fail.
+  timeout /t 3 /nobreak >nul
   mkdir "%ProgramFiles%\Bulwark" 2>nul
-  copy /y "%~dp0bulwark-agent.exe" "%ProgramFiles%\Bulwark\"
+  copy /y "%~dp0bulwark-agent.exe" "%ProgramFiles%\Bulwark\" || (echo bulwark: could not copy the agent & exit /b 1)
   sc query BulwarkAgent >nul 2>&1 || sc create BulwarkAgent binPath= "\"%ProgramFiles%\Bulwark\bulwark-agent.exe\" --service" start= auto obj= LocalSystem DisplayName= "Bulwark guest agent"
   sc description BulwarkAgent "Host channel for the bulwark VMM: clock sync, clean shutdown, relays clipboard and resolution to the session helper."
   sc failure BulwarkAgent reset= 86400 actions= restart/5000/restart/5000/restart/30000

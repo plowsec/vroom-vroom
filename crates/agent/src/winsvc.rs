@@ -20,10 +20,10 @@ use windows_sys::Win32::Security::Authorization::{ConvertStringSecurityDescripto
 use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX};
 use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientSessionId, GetNamedPipeServerProcessId, PIPE_READMODE_BYTE,
+    ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientSessionId, GetNamedPipeServerSessionId, PIPE_READMODE_BYTE,
     PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
 };
-use windows_sys::Win32::System::RemoteDesktop::{ProcessIdToSessionId, WTSGetActiveConsoleSessionId};
+use windows_sys::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId;
 use windows_sys::Win32::System::Services::{
     RegisterServiceCtrlHandlerExW, SetServiceStatus, StartServiceCtrlDispatcherW, SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP,
     SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP, SERVICE_RUNNING, SERVICE_STATUS,
@@ -231,13 +231,16 @@ fn accept_helpers(tx: Sender<Ev>) {
 }
 
 /// Session helper side: is the pipe served by a service (session 0)?
+/// Asks the pipe, not the process: an unprivileged helper may not query
+/// a SYSTEM process.
 pub fn check_server(h: HANDLE) -> std::io::Result<()> {
-    let mut pid = 0u32;
     let mut sess = u32::MAX;
-    // SAFETY: valid pipe handle and out pointers.
-    let ok = unsafe { GetNamedPipeServerProcessId(h, &mut pid) != 0 && ProcessIdToSessionId(pid, &mut sess) != 0 };
-    if !ok || sess != 0 {
-        return Err(std::io::Error::other(format!("pipe server pid {pid} is not a service (session {sess})")));
+    // SAFETY: valid pipe handle and out pointer.
+    if unsafe { GetNamedPipeServerSessionId(h, &mut sess) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if sess != 0 {
+        return Err(std::io::Error::other(format!("pipe server runs in session {sess}, not as a service")));
     }
     Ok(())
 }
