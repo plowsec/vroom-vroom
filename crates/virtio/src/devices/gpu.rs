@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use bulwark_memory::{GuestAddress, GuestMemory};
+use serde::{Deserialize, Serialize};
 
 use crate::devices::gpu3d::{Blob, Box3d, Create3d, Renderer3d, ShmMapper, Transfer3d};
 use crate::worker::{QueueCtx, QueueHandler, WorkerSlot, BACKEND_TOKEN_BASE};
@@ -224,6 +225,24 @@ enum Scanout {
     Cpu { id: u32, view: Rect },
     /// A blob, read straight from its memory.
     Blob { id: u32, view: Rect, format: u32, stride: u32, offset: u32 },
+}
+
+/// 2D state for snapshots. Pixels are not saved: they are re-read from
+/// the guest backing (restored with RAM), like a full-frame transfer.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct Snap2d {
+    resources: Vec<SnapRes>,
+    /// (resource id, visible rect x, y, w, h) on scanout 0.
+    scanout: Option<(u32, u32, u32, u32, u32)>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SnapRes {
+    id: u32,
+    format: u32,
+    width: u32,
+    height: u32,
+    backing: Vec<(u64, u32)>,
 }
 
 /// A fenced command waiting for the GPU before it's returned to the guest.
@@ -810,6 +829,10 @@ impl GpuHandler {
         let Some(rect) = Rect::read(r) else { return ERR_INVALID_PARAMETER };
         let Some(id) = rd32(r) else { return ERR_INVALID_PARAMETER };
         log::trace!("gpu: flush res {id} {rect:?}");
+        self.flush_rect(mem, rect, id)
+    }
+
+    fn flush_rect(&mut self, mem: &GuestMemory, rect: Rect, id: u32) -> u32 {
         let Some(sc) = self.scanout else { return OK_NODATA };
         let (sid, view) = match sc {
             Scanout::Cpu { id, view } | Scanout::Blob { id, view, .. } => (id, view),
@@ -916,6 +939,59 @@ impl GpuHandler {
                 }
                 !hit
             });
+        }
+    }
+
+    fn save_2d(&self) -> Snap2d {
+        let mut resources: Vec<SnapRes> = self
+            .resources
+            .iter()
+            .map(|(&id, r)| SnapRes { id, format: r.format, width: r.width, height: r.height, backing: r.backing.clone() })
+            .collect();
+        resources.sort_by_key(|r| r.id);
+        let scanout = match self.scanout {
+            Some(Scanout::Cpu { id, view }) => Some((id, view.x, view.y, view.w, view.h)),
+            _ => None,
+        };
+        Snap2d { resources, scanout }
+    }
+
+    /// Rebuild from a snapshot (untrusted input: same checks as commands).
+    fn restore_2d(&mut self, mem: &GuestMemory, s: &Snap2d) -> Result<()> {
+        let bad = |m: &str| Error::Device(format!("gpu snapshot: {m}"));
+        for r in &s.resources {
+            if self.create_cpu(r.id, r.format, r.width, r.height) != OK_NODATA {
+                return Err(bad("bad resource"));
+            }
+            if r.backing.len() > MAX_BACKING_ENTRIES as usize || r.backing.iter().any(|&(a, l)| !mem.check_range(GuestAddress(a), l as u64)) {
+                return Err(bad("bad backing"));
+            }
+            if let Some(res) = self.resources.get_mut(&r.id) {
+                res.backing = r.backing.clone();
+            }
+            if !r.backing.is_empty() {
+                let full = Rect { x: 0, y: 0, w: r.width, h: r.height };
+                // Best effort: a partly unmapped backing just stays black.
+                let _ = self.transfer(mem, r.id, full, 0, None);
+            }
+        }
+        if let Some((id, x, y, w, h)) = s.scanout {
+            let view = Rect { x, y, w, h };
+            let ok = self.resources.get(&id).is_some_and(|r| view.inside(r.width, r.height) && w > 0 && h > 0);
+            if !ok {
+                return Err(bad("bad scanout"));
+            }
+            self.scanout = Some(Scanout::Cpu { id, view });
+            self.set_mode(w, h);
+            self.flush_all(mem);
+        }
+        Ok(())
+    }
+
+    /// Push the whole visible scanout to the sink.
+    fn flush_all(&mut self, mem: &GuestMemory) {
+        if let Some(Scanout::Cpu { id, view }) = self.scanout {
+            let _ = self.flush_rect(mem, view, id);
         }
     }
 
@@ -1056,11 +1132,13 @@ impl VirtioDevice for Gpu {
         if self.worker.with(|_, h| h.has_3d_state()).unwrap_or(false) {
             return Err(Error::Device("snapshots of a VM using 3D are not supported (GPU state lives on the host GPU)".into()));
         }
-        // Resources are host-side copies of guest memory; the guest driver
-        // re-uploads on the next frame. We only keep the queues.
-        Ok(DeviceState { queues: self.worker.queues(), data: Vec::new() })
+        // Drivers (Linux, viogpudo) never re-create resources on their own:
+        // keep the 2D layout; pixels come back from guest RAM.
+        let snap = self.worker.with(|_, h| h.save_2d()).unwrap_or_default();
+        let data = serde_json::to_vec(&snap).map_err(|e| Error::Device(e.to_string()))?;
+        Ok(DeviceState { queues: self.worker.queues(), data })
     }
-    fn restore_active(&mut self, ctx: ActivateContext, _data: &[u8]) -> Result<()> {
+    fn restore_active(&mut self, ctx: ActivateContext, data: &[u8]) -> Result<()> {
         {
             let mut s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
             s.irq = Some(ctx.irq.clone());
@@ -1068,7 +1146,11 @@ impl VirtioDevice for Gpu {
             s.events_read |= EVENT_DISPLAY;
         }
         let irq = ctx.irq.clone();
-        let h = self.handler();
+        let mut h = self.handler();
+        if !data.is_empty() {
+            let snap: Snap2d = serde_json::from_slice(data).map_err(|e| Error::Device(e.to_string()))?;
+            h.restore_2d(&ctx.mem, &snap)?;
+        }
         self.worker.start("gpu", ctx, h, true)?;
         irq.signal_config_changed();
         Ok(())

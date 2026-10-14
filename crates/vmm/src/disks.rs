@@ -97,9 +97,21 @@ impl DiskSet {
                 (top, Format::Qcow2)
             } else {
                 match std::fs::read(&ptr_path).ok().and_then(|b| serde_json::from_slice::<Pointer>(&b).ok()) {
-                    // Only trust pointers into our own disks dir.
-                    Some(p) if p.active.parent() == Some(dir.as_path()) && p.active.is_file() => (p.active, Format::Qcow2),
-                    _ => (d.path.clone(), fmt_of(d.format).unwrap_or(Format::Raw)),
+                    // Only trust pointers into our own disks dir: take the
+                    // file name and look for it there (older pointers were
+                    // written with paths relative to wherever we ran from).
+                    Some(p) => match p.active.file_name().map(|n| dir.join(n)) {
+                        Some(f) if f.is_file() => (f, Format::Qcow2),
+                        _ if p.active.file_name() == d.path.file_name() => (d.path.clone(), fmt_of(d.format).unwrap_or(Format::Raw)),
+                        _ => {
+                            return Err(Error::Setup(format!(
+                                "disk {}: state points at {} which is missing; refusing to fall back to the base image",
+                                d.path.display(),
+                                p.active.display()
+                            )))
+                        }
+                    },
+                    None => (d.path.clone(), fmt_of(d.format).unwrap_or(Format::Raw)),
                 }
             };
             let fmt = if active == d.path { fmt_of(d.format) } else { Some(fmt) };

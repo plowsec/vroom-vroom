@@ -363,6 +363,10 @@ impl Qcow2Image {
     /// Create a new empty v3 image, optionally on top of a backing file.
     /// `backing` is stored relative if it sits in the same directory.
     pub fn create(path: &Path, size: u64, backing: Option<(&Path, Format)>) -> Result<()> {
+        // Backing names resolve against the overlay's own directory: a path
+        // relative to our cwd would break the chain. Store it absolute.
+        let abs = backing.map(|(b, f)| std::path::absolute(b).map(|a| (a, f))).transpose()?;
+        let backing = abs.as_ref().map(|(b, f)| (b.as_path(), *f));
         if size == 0 || size > MAX_SIZE {
             return Err(bad("bad virtual size"));
         }

@@ -84,6 +84,7 @@ fn main() -> ExitCode {
 
 fn default_state_dir(config: &Path, cfg: &VmConfig) -> PathBuf {
     let dir = config.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     dir.join(format!("{}.state", cfg.name))
 }
 
@@ -91,7 +92,10 @@ fn load(p: &Path) -> Result<VmConfig, String> {
     let s = std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?;
     let mut c = VmConfig::from_toml(&s).map_err(|e| e.to_string())?;
     // Relative paths in the config are relative to the config file.
+    // Absolute, so nothing derived from them (qcow2 backing names in
+    // snapshot overlays) depends on the current directory.
     let base = p.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    c.rebase_paths(base);
+    let base = std::fs::canonicalize(base).map_err(|e| format!("{}: {e}", base.display()))?;
+    c.rebase_paths(&base);
     Ok(c)
 }
