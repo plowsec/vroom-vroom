@@ -19,7 +19,7 @@ use crate::{Error, Result};
 
 /// Held for as long as a VMM (or a housekeeping command) uses a state dir.
 #[derive(Debug)]
-pub struct StateLock(#[allow(dead_code)] File);
+pub struct StateLock(File);
 
 impl StateLock {
     pub fn acquire(dir: &Path) -> Result<StateLock> {
@@ -38,6 +38,18 @@ impl StateLock {
             });
         }
         Ok(StateLock(f))
+    }
+
+    /// Bytes free for us on the state dir's filesystem (disk layers grow
+    /// there). Works under the sandbox: no path lookup.
+    pub fn free_bytes(&self) -> std::io::Result<u64> {
+        // SAFETY: zeroed statfs is valid; fd is ours.
+        let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+        // SAFETY: valid fd and out pointer.
+        if unsafe { libc::fstatfs(self.0.as_raw_fd(), &mut st) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(st.f_bavail as u64 * st.f_bsize as u64)
     }
 }
 

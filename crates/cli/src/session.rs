@@ -103,12 +103,36 @@ struct Session {
     state_dir: PathBuf,
     /// Agent connections already announced.
     agent_sessions: u32,
+    next_space_check: std::time::Instant,
+    low_space: u64,
 }
+
+/// Below this, guest writes could fail half-way: pause first.
+/// `BULWARK_LOW_SPACE_MIB` overrides it.
+const LOW_SPACE: u64 = 2 << 30;
+const SPACE_CHECK: Duration = Duration::from_secs(2);
 
 impl Session {
     fn note(&self, msg: &str) {
         eprint!("\r\n[bulwark] {msg}\r\n");
         self.vmm.viewer_status(msg);
+    }
+
+    /// Host disk nearly full: pause before guest writes start failing
+    /// (a guest that sees I/O errors may corrupt its file systems).
+    fn check_space(&mut self) {
+        let now = std::time::Instant::now();
+        if now < self.next_space_check || self.vmm.state() != RunState::Running {
+            return;
+        }
+        self.next_space_check = now + SPACE_CHECK;
+        let Ok(free) = self.vmm.host_free_bytes() else { return };
+        if free < self.low_space && self.vmm.pause().is_ok() {
+            self.note(&format!(
+                "host disk almost full ({} MiB free): VM paused. Free some space, then resume.",
+                free >> 20
+            ));
+        }
     }
 
     /// Say so when the guest agent (clipboard, resize, shutdown) comes up.
@@ -261,7 +285,10 @@ pub fn run(o: RunOpts) -> Result<(), String> {
     } else {
         eprintln!("bulwark: WARNING: running without sandbox");
     }
-    let mut s = Session { vmm, state_dir: o.state_dir, agent_sessions: 0 };
+    let mut s = Session { vmm, state_dir: o.state_dir, agent_sessions: 0,
+        next_space_check: std::time::Instant::now(),
+        low_space: std::env::var("BULWARK_LOW_SPACE_MIB").ok().and_then(|v| v.parse::<u64>().ok()).map_or(LOW_SPACE, |m| m << 20),
+    };
     s.vmm.viewer_status("running");
 
     let _raw = if gui { None } else { Some(term::RawTerminal::enable()) };
@@ -311,5 +338,6 @@ pub fn run(o: RunOpts) -> Result<(), String> {
             }
         }
         s.check_agent();
+        s.check_space();
     }
 }

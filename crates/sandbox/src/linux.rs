@@ -47,7 +47,7 @@ fn allowed(p: &Policy) -> Vec<i64> {
     use libc::*;
     let mut v: Vec<i64> = vec![
         SYS_read, SYS_write, SYS_pread64, SYS_pwrite64, SYS_readv, SYS_writev, SYS_preadv,
-        SYS_pwritev, SYS_close, SYS_fstat, SYS_newfstatat, SYS_statx, SYS_lseek, SYS_mmap,
+        SYS_pwritev, SYS_close, SYS_fstat, SYS_fstatfs, SYS_newfstatat, SYS_statx, SYS_lseek, SYS_mmap,
         SYS_munmap, SYS_mprotect, SYS_madvise, SYS_mremap, SYS_brk, SYS_futex, SYS_ioctl,
         SYS_epoll_pwait, SYS_epoll_ctl, SYS_epoll_create1, SYS_eventfd2, SYS_ppoll,
         SYS_clock_gettime, SYS_clock_nanosleep, SYS_nanosleep, SYS_sched_yield,
