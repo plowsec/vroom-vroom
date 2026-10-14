@@ -4,13 +4,14 @@ use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
-use crate::{check_range, open_file, DiskImage, Error, Result};
+use crate::{check_range, open_file, DiskImage, Error, Result, SyncMode};
 
 #[derive(Debug)]
 pub struct RawImage {
     file: File,
     size: u64,
     read_only: bool,
+    sync: SyncMode,
 }
 
 impl RawImage {
@@ -21,7 +22,12 @@ impl RawImage {
 
     pub fn from_file(file: File, read_only: bool) -> Result<Self> {
         let size = file.metadata()?.len();
-        Ok(RawImage { file, size, read_only })
+        Ok(RawImage { file, size, read_only, sync: SyncMode::default() })
+    }
+
+    pub fn with_sync(mut self, sync: SyncMode) -> Self {
+        self.sync = sync;
+        self
     }
 }
 
@@ -51,7 +57,7 @@ impl DiskImage for RawImage {
 
     fn flush(&self) -> Result<()> {
         if !self.read_only {
-            self.file.sync_data()?;
+            crate::sync_file(&self.file, self.sync)?;
         }
         Ok(())
     }

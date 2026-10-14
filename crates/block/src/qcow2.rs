@@ -15,7 +15,7 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::{check_range, open_file, DiskImage, Error, Format, Result};
+use crate::{check_range, open_file, DiskImage, Error, Format, Result, SyncMode};
 
 pub const MAGIC: u32 = 0x5146_49fb; // "QFI\xfb"
 const L1_COPIED: u64 = 1 << 63;
@@ -46,6 +46,8 @@ const L2_CACHE: usize = 128;
 pub struct OpenPolicy {
     /// Extra directories backing files may live in (besides the image's own).
     pub allowed_dirs: Vec<PathBuf>,
+    /// Flush behaviour of the opened (writable) image.
+    pub sync: SyncMode,
 }
 
 #[derive(Debug, Clone)]
@@ -251,6 +253,7 @@ pub struct Qcow2Image {
     hdr: Header,
     cluster_size: u64,
     read_only: bool,
+    sync: SyncMode,
     backing: Option<Arc<dyn DiskImage>>,
     state: Mutex<State>,
 }
@@ -277,6 +280,11 @@ impl Qcow2Image {
     /// New writable overlay at `path` on top of an image that is already
     /// open (the running VM's disk). The header records `backing_name`
     /// for future opens; in-process we reuse `backing` directly.
+    pub fn with_sync(mut self, sync: SyncMode) -> Self {
+        self.sync = sync;
+        self
+    }
+
     pub fn create_overlay(path: &Path, backing_name: &Path, backing_fmt: Format, backing: Arc<dyn DiskImage>) -> Result<Self> {
         Self::create(path, backing.size(), Some((backing_name, backing_fmt)))?;
         Self::open_inner(path, false, &OpenPolicy::default(), 0, Some(backing))
@@ -339,6 +347,7 @@ impl Qcow2Image {
             path: path.to_path_buf(),
             cluster_size: cs,
             read_only,
+            sync: policy.sync,
             backing,
             state: Mutex::new(State {
                 l1,
@@ -671,7 +680,7 @@ impl DiskImage for Qcow2Image {
 
     fn flush(&self) -> Result<()> {
         if !self.read_only {
-            self.file.sync_all()?;
+            crate::sync_file(&self.file, self.sync)?;
         }
         Ok(())
     }
@@ -758,7 +767,7 @@ mod tests {
         Qcow2Image::create(&ov, 1 << 20, Some((&secret, Format::Raw))).unwrap();
         let e = Qcow2Image::open(&ov, true).unwrap_err().to_string();
         assert!(e.contains("outside the allowed"), "{e}");
-        let pol = OpenPolicy { allowed_dirs: vec![other.path().to_path_buf()] };
+        let pol = OpenPolicy { allowed_dirs: vec![other.path().to_path_buf()], ..Default::default() };
         assert!(Qcow2Image::open_with(&ov, true, &pol, 0).is_ok());
     }
 

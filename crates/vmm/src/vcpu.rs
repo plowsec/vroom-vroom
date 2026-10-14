@@ -215,7 +215,8 @@ impl VcpuLoop {
             VcpuCmd::Restore(state, on, reply) => {
                 let r = self.vcpu.restore_state(&state).map_err(Error::Hv);
                 if r.is_ok() {
-                    self.running = on;
+                    // In-kernel PSCI: off CPUs wait inside KVM_RUN.
+                    self.running = on || self.vcpu.in_kernel_psci();
                 }
                 let _ = reply.send(r);
             }

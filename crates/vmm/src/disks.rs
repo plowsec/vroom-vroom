@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
 use bulwark_block::qcow2::{OpenPolicy, Qcow2Image};
-use bulwark_block::{DiskImage, Format, SwapDisk};
-use bulwark_config::{DiskFormat, VmConfig};
+use bulwark_block::{DiskImage, Format, SwapDisk, SyncMode};
+use bulwark_config::{DiskFormat, DiskSync, VmConfig};
 use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};
@@ -31,12 +31,21 @@ pub(crate) struct VmDisk {
     /// Current top layer on disk (None for read-only disks).
     active: Option<PathBuf>,
     active_fmt: Format,
+    sync: SyncMode,
 }
 
 #[derive(Debug)]
 pub(crate) struct DiskSet {
     dir: PathBuf,
     pub disks: Vec<VmDisk>,
+}
+
+fn sync_of(s: DiskSync) -> SyncMode {
+    match s {
+        DiskSync::Full => SyncMode::Full,
+        DiskSync::Fsync => SyncMode::Fsync,
+        DiskSync::None => SyncMode::None,
+    }
 }
 
 fn fmt_of(f: DiskFormat) -> Option<Format> {
@@ -69,11 +78,12 @@ impl DiskSet {
         for (i, d) in cfg.disks.iter().enumerate() {
             let policy = OpenPolicy {
                 allowed_dirs: vec![dir.clone(), d.path.parent().map(Path::to_path_buf).unwrap_or_default()],
+                sync: sync_of(d.sync),
             };
             if d.readonly {
                 let img = bulwark_block::open_with(&d.path, fmt_of(d.format), true, &policy)
                     .map_err(|e| Error::Setup(format!("disk {}: {e}", d.path.display())))?;
-                disks.push(VmDisk { index: i, image: SwapDisk::new(img), active: None, active_fmt: Format::Raw });
+                disks.push(VmDisk { index: i, image: SwapDisk::new(img), active: None, active_fmt: Format::Raw, sync: policy.sync });
                 continue;
             }
             let ptr_path = dir.join(format!("disk{i}.json"));
@@ -97,7 +107,7 @@ impl DiskSet {
                 .map_err(|e| Error::Setup(format!("disk {}: {e}", active.display())))?;
             let active_fmt = fmt.unwrap_or(Format::Raw);
             write_pointer(&ptr_path, &active)?;
-            disks.push(VmDisk { index: i, image: SwapDisk::new(img), active: Some(active), active_fmt });
+            disks.push(VmDisk { index: i, image: SwapDisk::new(img), active: Some(active), active_fmt, sync: policy.sync });
         }
         Ok(DiskSet { dir, disks })
     }
@@ -113,7 +123,8 @@ impl DiskSet {
             let top_path = self.dir.join(format!("disk{}-{}.qcow2", d.index, stamp()));
             let lower = d.image.current();
             let top = Qcow2Image::create_overlay(&top_path, &frozen, d.active_fmt, lower)
-                .map_err(|e| Error::Setup(format!("overlay: {e}")))?;
+                .map_err(|e| Error::Setup(format!("overlay: {e}")))?
+                .with_sync(d.sync);
             d.image.swap(Arc::new(top)).map_err(|e| Error::Setup(e.to_string()))?;
             write_pointer(&self.dir.join(format!("disk{}.json", d.index)), &top_path)?;
             d.active = Some(top_path);

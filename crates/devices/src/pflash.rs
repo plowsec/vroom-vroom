@@ -220,25 +220,77 @@ struct Snap {
     data: Vec<u8>,
 }
 
+const MAGIC: &[u8; 8] = b"BWPFL\x001\0";
+const PAGE: usize = 4096;
+const PAGE_ZERO: u8 = 0;
+const PAGE_ERASED: u8 = 1;
+const PAGE_RAW: u8 = 2;
+
 impl Snapshottable for PFlash {
     fn snapshot_id(&self) -> String {
         format!("pflash@{:x}", self.base)
     }
 
     fn save(&mut self) -> bulwark_snapshot::Result<Vec<u8>> {
-        let end = self.data.iter().rposition(|&b| b != 0xff).map(|p| p + 1).unwrap_or(0);
-        encode(&Snap { st: self.st.clone(), data: self.data[..end].to_vec() })
+        // Binary: magic, state JSON, then 4 KiB pages tagged all-0x00 /
+        // all-0xff / raw. A 64 MiB variable store is mostly one or the other.
+        let st = encode(&self.st)?;
+        let mut out = Vec::with_capacity(64 << 10);
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&(st.len() as u32).to_le_bytes());
+        out.extend_from_slice(&st);
+        out.extend_from_slice(&(self.data.len() as u64).to_le_bytes());
+        for page in self.data.chunks(PAGE) {
+            match page {
+                p if p.iter().all(|&b| b == 0) => out.push(PAGE_ZERO),
+                p if p.iter().all(|&b| b == 0xff) => out.push(PAGE_ERASED),
+                p => {
+                    out.push(PAGE_RAW);
+                    out.extend_from_slice(p);
+                }
+            }
+        }
+        Ok(out)
     }
 
     fn restore(&mut self, d: &[u8]) -> bulwark_snapshot::Result<()> {
-        let s: Snap = decode(d)?;
-        if s.data.len() > self.data.len() || s.st.buf.len() > MAX_BUF_WORDS as usize {
-            return Err(bulwark_snapshot::Error::Invalid("pflash snapshot too large".into()));
+        let bad = |m: &str| bulwark_snapshot::Error::Invalid(format!("pflash snapshot: {m}"));
+        let (st, data) = if d.starts_with(MAGIC) {
+            let mut r = &d[MAGIC.len()..];
+            let mut take = |n: usize| -> bulwark_snapshot::Result<&[u8]> {
+                let (h, t) = r.split_at_checked(n).ok_or_else(|| bad("truncated"))?;
+                r = t;
+                Ok(h)
+            };
+            let st_len = u32::from_le_bytes(take(4)?.try_into().unwrap_or_default()) as usize;
+            let st: State = decode(take(st_len)?)?;
+            let len = u64::from_le_bytes(take(8)?.try_into().unwrap_or_default());
+            if len > self.data.len() as u64 {
+                return Err(bad("too large"));
+            }
+            let mut data = Vec::with_capacity(len as usize);
+            while data.len() < len as usize {
+                let n = PAGE.min(len as usize - data.len());
+                match take(1)?[0] {
+                    PAGE_ZERO => data.resize(data.len() + n, 0),
+                    PAGE_ERASED => data.resize(data.len() + n, 0xff),
+                    PAGE_RAW => data.extend_from_slice(take(n)?),
+                    _ => return Err(bad("bad page tag")),
+                }
+            }
+            (st, data)
+        } else {
+            // Older snapshots: JSON with the trimmed contents.
+            let s: Snap = decode(d)?;
+            (s.st, s.data)
+        };
+        if data.len() > self.data.len() || st.buf.len() > MAX_BUF_WORDS as usize {
+            return Err(bad("too large"));
         }
         self.data.fill(0xff);
-        self.data[..s.data.len()].copy_from_slice(&s.data);
+        self.data[..data.len()].copy_from_slice(&data);
         self.persist(0, self.data.len());
-        self.st = s.st;
+        self.st = st;
         Ok(())
     }
 
@@ -302,5 +354,21 @@ mod tests {
         w(&mut f, 0, 0x0070_0070); // left in status mode
         f.reset(&pristine).unwrap();
         assert_eq!(r(&mut f, 0x100), 0x1234_5678);
+    }
+
+    #[test]
+    fn snapshot_roundtrip_is_compact() {
+        let mut f = PFlash::new(0, 4 * BLOCK_SIZE, vec![0; 2 * BLOCK_SIZE as usize], None).unwrap();
+        w(&mut f, 0x100, 0x0040_0040);
+        w(&mut f, 0x100, 0x1234_5678);
+        let blob = f.save().unwrap();
+        assert!(blob.len() < 16 << 10, "blob is {} bytes", blob.len());
+        let mut g = PFlash::new(0, 4 * BLOCK_SIZE, vec![], None).unwrap();
+        g.restore(&blob).unwrap();
+        w(&mut g, 0, 0x00ff_00ff);
+        assert_eq!(r(&mut g, 0x100), 0x1234_5678);
+        assert_eq!(r(&mut g, 0x200), 0);
+        assert_eq!(r(&mut g, 3 * BLOCK_SIZE), 0xffff_ffff);
+        assert!(g.restore(&blob[..blob.len() - 1]).is_err());
     }
 }

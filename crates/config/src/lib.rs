@@ -126,6 +126,19 @@ pub struct Disk {
     /// including Windows setup).
     #[serde(default)]
     pub bus: DiskBus,
+    /// What a guest flush costs: "full" (power-loss safe, slow on macOS),
+    /// "fsync" (default, survives a host crash) or "none" (scratch disks).
+    #[serde(default)]
+    pub sync: DiskSync,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DiskSync {
+    Full,
+    #[default]
+    Fsync,
+    None,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

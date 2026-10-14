@@ -17,7 +17,7 @@ use crate::{BootRegs, Error, IrqChipConfig, IrqChipInfo, Result, Vcpu, VcpuExit,
 const BACKEND: &str = "kvm";
 /// Interrupt ids the vGIC implements (SPIs 32..NR_IRQS). KVM caps this
 /// at 1023 and wants a multiple of 32.
-const NR_IRQS: u32 = 992;
+pub(super) const NR_IRQS: u32 = 992;
 const IPA_BITS: u32 = 40;
 
 const CORE_BASE: u64 = 0x6030_0000_0010_0000;

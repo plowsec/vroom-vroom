@@ -11,7 +11,8 @@ use crate::{Error, Result};
 pub const FORMAT_VERSION: u32 = 1;
 const MANIFEST: &str = "manifest.json";
 /// Refuse absurd blobs from a hostile snapshot dir (RAM goes through streams).
-const MAX_BLOB: u64 = 64 << 20;
+/// Device blobs are read into memory. Old flash snapshots (JSON) get big.
+const MAX_BLOB: u64 = 256 << 20;
 
 /// A RAM range stored in `memory.bin`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

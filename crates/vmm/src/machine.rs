@@ -464,9 +464,6 @@ pub(crate) fn build(
     }
     let _ = shared.peers.set(vcpus.iter().map(|v| v.peer.clone()).collect());
     vm.finalize()?;
-    for v in vcpus.iter().skip(1).filter(|v| v.in_kernel_psci) {
-        v.peer.send(vcpu::VcpuCmd::Start)?;
-    }
 
     Ok(Machine { vm, mem, shared, vcpus, devices: reg.stateful, uart, agent, viewer, screen, boot })
 }

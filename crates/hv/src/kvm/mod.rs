@@ -9,6 +9,8 @@
 
 #[cfg(target_arch = "aarch64")]
 mod aarch64;
+#[cfg(target_arch = "aarch64")]
+mod gic;
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
 
@@ -192,11 +194,28 @@ impl Vm for KvmVm {
     fn set_clock(&self, _value: u64) {}
 
     fn save_irqchip(&self) -> Result<crate::IrqChipState> {
-        Err(Error::Unsupported("snapshots on KVM need irqchip save (not done yet)"))
+        match &self.chip {
+            #[cfg(target_arch = "aarch64")]
+            Chip::Gic(dev) => {
+                Ok(crate::IrqChipState { backend: "kvm-vgicv3".into(), blob: gic::save(dev, self.vcpus, aarch64::NR_IRQS)? })
+            }
+            #[cfg(target_arch = "x86_64")]
+            Chip::Ioapic => Err(Error::Unsupported("x86 irqchip save")),
+        }
     }
 
-    fn restore_irqchip(&self, _s: &crate::IrqChipState) -> Result<()> {
-        Err(Error::Unsupported("snapshots on KVM need irqchip restore (not done yet)"))
+    fn restore_irqchip(&self, s: &crate::IrqChipState) -> Result<()> {
+        match &self.chip {
+            #[cfg(target_arch = "aarch64")]
+            Chip::Gic(dev) => {
+                if s.backend != "kvm-vgicv3" {
+                    return Err(Error::Invalid(format!("irqchip state from {}", s.backend)));
+                }
+                gic::restore(dev, &s.blob)
+            }
+            #[cfg(target_arch = "x86_64")]
+            Chip::Ioapic => Err(Error::Unsupported("x86 irqchip restore")),
+        }
     }
 }
 

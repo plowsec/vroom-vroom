@@ -175,6 +175,11 @@ impl Vmm {
             StartMode::Boot => {
                 let regs = vmm.boot.load(&vmm.mem)?;
                 vmm.vcpus[0].peer.send(VcpuCmd::PowerOn(regs))?;
+                // In-kernel PSCI: secondaries wait inside KVM_RUN for CPU_ON.
+                // Only now: irqchip state access needs them out of KVM_RUN.
+                for v in vmm.vcpus.iter().skip(1).filter(|v| v.in_kernel_psci) {
+                    v.peer.send(VcpuCmd::Start)?;
+                }
             }
             StartMode::Restore(dir) => {
                 snapshot::restore(&mut vmm, &dir)?;

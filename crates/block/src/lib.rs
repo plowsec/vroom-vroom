@@ -4,7 +4,8 @@
 //! - [`raw::RawImage`]: plain file.
 //! - [`qcow2::Qcow2Image`]: sparse, copy-on-write over a backing image.
 //!   Disk snapshots = freeze current image, write to a new overlay.
-#![forbid(unsafe_code)]
+// One audited exception: plain fsync(2) in `sync_file`.
+#![deny(unsafe_code)]
 
 pub mod qcow2;
 pub mod raw;
@@ -83,6 +84,38 @@ pub fn detect(path: &Path) -> Result<Format> {
 /// qcow2 header into a raw disk, then on next boot points the "backing
 /// file" at host files). So: auto-detect only for read-only opens, or when
 /// the caller already pinned the format.
+/// What a guest flush does on the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SyncMode {
+    /// Through the drive's own cache (F_FULLFSYNC on macOS). Survives
+    /// power loss. Slow on macOS: milliseconds per flush.
+    Full,
+    /// fsync(2). Survives a host crash; on macOS maybe not a power cut.
+    #[default]
+    Fsync,
+    /// Ignore guest flushes. Scratch disks only.
+    None,
+}
+
+pub(crate) fn sync_file(f: &std::fs::File, mode: SyncMode) -> std::io::Result<()> {
+    match mode {
+        SyncMode::Full => f.sync_all(),
+        SyncMode::Fsync => fsync(f),
+        SyncMode::None => Ok(()),
+    }
+}
+
+#[allow(unsafe_code)]
+fn fsync(f: &std::fs::File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: fsync on an fd we own for the duration of the call.
+    if unsafe { libc::fsync(f.as_raw_fd()) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 pub fn open(path: &Path, format: Option<Format>, read_only: bool) -> Result<Arc<dyn DiskImage>> {
     open_with(path, format, read_only, &qcow2::OpenPolicy::default())
 }
@@ -104,7 +137,7 @@ pub fn open_with(path: &Path, format: Option<Format>, read_only: bool, policy: &
         }
     };
     Ok(match fmt {
-        Format::Raw => Arc::new(raw::RawImage::open(path, read_only)?),
+        Format::Raw => Arc::new(raw::RawImage::open(path, read_only)?.with_sync(policy.sync)),
         Format::Qcow2 => Arc::new(qcow2::Qcow2Image::open_with(path, read_only, policy, 0)?),
     })
 }
