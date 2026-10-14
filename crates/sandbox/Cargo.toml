@@ -1,0 +1,18 @@
+[package]
+name = "bulwark-sandbox"
+description = "Lock down the VMM process after setup (seatbelt on macOS, seccomp+landlock on Linux)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+log.workspace = true
+libc.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+seccompiler = "0.4"
+landlock = "0.4"
+
+[lints]
+workspace = true

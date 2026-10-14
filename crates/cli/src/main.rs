@@ -35,6 +35,9 @@ enum Cmd {
         /// Use a file instead of the system clipboard (headless hosts, tests).
         #[arg(long)]
         host_clipboard_file: Option<PathBuf>,
+        /// Don't sandbox the VMM process (debugging only).
+        #[arg(long)]
+        no_sandbox: bool,
     },
     /// Check a VM definition and print it back normalized.
     Check { config: PathBuf },
@@ -98,12 +101,12 @@ fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     let cli = Cli::parse();
     let r = match cli.cmd {
-        Cmd::Run { config, restore, snapshot_dir, host_clipboard_file } => {
+        Cmd::Run { config, restore, snapshot_dir, host_clipboard_file, no_sandbox } => {
             let clip = match host_clipboard_file {
                 Some(p) => Some(Box::new(FileClipboard(p)) as Box<dyn bulwark_vmm::agent::ClipboardProvider>),
                 None => host_clipboard(),
             };
-            run(&config, restore, &snapshot_dir, clip)
+            run(&config, restore, &snapshot_dir, clip, !no_sandbox)
         }
         Cmd::Disk(d) => disk(d),
         Cmd::Check { config } => load(&config).and_then(|c| {
@@ -183,11 +186,51 @@ fn timestamp() -> u64 {
         .unwrap_or(0)
 }
 
+/// Sandbox the process now that everything is open.
+fn lock_down(cfg: &VmConfig, snap_dir: &Path, clipboard: bool) -> Result<(), String> {
+    use bulwark_config::NetKind;
+    std::fs::create_dir_all(snap_dir).map_err(|e| format!("{}: {e}", snap_dir.display()))?;
+    let mut p = bulwark_sandbox::Policy { write_dirs: vec![snap_dir.to_path_buf()], clipboard, ..Default::default() };
+    for d in &cfg.disks {
+        if d.readonly {
+            p.ro_files.push(d.path.clone());
+        } else {
+            p.rw_files.push(d.path.clone());
+        }
+    }
+    for n in &cfg.nets {
+        if n.mode == NetKind::Nat {
+            p.network_outbound = true;
+            p.listen_ports.extend(n.port_forwards.iter().map(|f| f.host_port));
+        }
+    }
+    bulwark_sandbox::apply(&p).map_err(|e| e.to_string())?;
+    log::info!("sandbox applied");
+    if std::env::var_os("BULWARK_SANDBOX_SELFTEST").is_some() {
+        let probe = |path: &str| match std::fs::read(path) {
+            Ok(_) => eprintln!("sandbox selftest: {path} READABLE (bad)"),
+            Err(e) => eprintln!("sandbox selftest: {path} blocked ({e})"),
+        };
+        probe("/etc/passwd");
+        probe(&format!("{}/.ssh/known_hosts", std::env::var("HOME").unwrap_or_default()));
+        match std::process::Command::new("/bin/echo").arg("x").output() {
+            Ok(_) => eprintln!("sandbox selftest: exec ALLOWED (bad)"),
+            Err(e) => eprintln!("sandbox selftest: exec blocked ({e})"),
+        }
+        match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(_) => eprintln!("sandbox selftest: new listener ALLOWED"),
+            Err(e) => eprintln!("sandbox selftest: new listener blocked ({e})"),
+        }
+    }
+    Ok(())
+}
+
 fn run(
     config: &Path,
     restore: Option<PathBuf>,
     snap_dir: &Path,
     clipboard: Option<Box<dyn bulwark_vmm::agent::ClipboardProvider>>,
+    sandbox: bool,
 ) -> Result<(), String> {
     let cfg = load(config)?;
     let hv = bulwark_hv::default_hypervisor().map_err(|e| e.to_string())?;
@@ -195,9 +238,16 @@ fn run(
         Some(p) => StartMode::Restore(p),
         None => StartMode::Boot,
     };
+    let has_clip = clipboard.is_some();
     let opts = VmmOptions { serial_out: Box::new(std::io::stdout()), start, clipboard };
     let mut vmm = Vmm::start(cfg, hv, opts)
         .map_err(|e| e.to_string())?;
+
+    if sandbox && vmm.config().security.sandbox {
+        lock_down(vmm.config(), snap_dir, has_clip)?;
+    } else {
+        eprintln!("bulwark: WARNING: running without sandbox");
+    }
 
     let _raw = term::RawTerminal::enable();
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
