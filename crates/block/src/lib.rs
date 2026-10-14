@@ -116,6 +116,44 @@ fn fsync(f: &std::fs::File) -> std::io::Result<()> {
     }
 }
 
+/// Unit for hole punching (host file system blocks).
+pub(crate) const HOLE_ALIGN: u64 = 4096;
+
+/// Free the host blocks under `[off, off+len)`; they read back as zeros.
+/// Both ends must be `HOLE_ALIGN`-aligned. Errors if the file system
+/// can't (callers fall back or ignore).
+#[allow(unsafe_code)]
+pub(crate) fn punch_hole(f: &std::fs::File, off: u64, len: u64) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    if len == 0 {
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let arg = libc::fpunchhole_t { fp_flags: 0, reserved: 0, fp_offset: off as libc::off_t, fp_length: len as libc::off_t };
+        // SAFETY: valid fd and argument struct for F_PUNCHHOLE.
+        if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_PUNCHHOLE, &arg) } == 0 {
+            return Ok(());
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mode = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
+        // SAFETY: valid fd; plain integer arguments.
+        if unsafe { libc::fallocate(f.as_raw_fd(), mode, off as libc::off_t, len as libc::off_t) } == 0 {
+            return Ok(());
+        }
+    }
+    Err(std::io::Error::last_os_error())
+}
+
+/// The `HOLE_ALIGN`-aligned middle of a range: (start, end), maybe empty.
+pub(crate) fn aligned_middle(off: u64, len: u64) -> (u64, u64) {
+    let start = off.div_ceil(HOLE_ALIGN) * HOLE_ALIGN;
+    let end = (off + len) / HOLE_ALIGN * HOLE_ALIGN;
+    (start, end.max(start))
+}
+
 pub fn open(path: &Path, format: Option<Format>, read_only: bool) -> Result<Arc<dyn DiskImage>> {
     open_with(path, format, read_only, &qcow2::OpenPolicy::default())
 }

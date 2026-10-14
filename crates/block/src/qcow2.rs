@@ -572,25 +572,95 @@ impl Qcow2Image {
 
     /// Host offset of the cluster for `guest`, allocating (with COW from the
     /// backing image / old cluster) if needed.
+    /// An L2 table we may modify for `guest` (allocated or copied).
+    fn l2_for_write(&self, st: &mut State, guest: u64) -> Result<u64> {
+        let l1_idx = (guest / self.cluster_size / self.l2_entries()) as usize;
+        let l1e = *st.l1.get(l1_idx).ok_or(Error::OutOfRange)?;
+        let l2_off = l1e & OFFSET_MASK;
+        if l2_off != 0 && l1e & L1_COPIED != 0 {
+            return Ok(l2_off);
+        }
+        let new = self.alloc_cluster(st)?;
+        let table = if l2_off == 0 { vec![0u64; self.l2_entries() as usize] } else { self.load_l2(st, l2_off)?.clone() };
+        write_be64s(&self.file, new, &table)?;
+        st.l2_cache.insert(new, table);
+        st.l1[l1_idx] = new | L1_COPIED;
+        self.file.write_all_at(&(new | L1_COPIED).to_be_bytes(), self.hdr.l1_offset + 8 * l1_idx as u64)?;
+        Ok(new)
+    }
+
+    fn set_l2(&self, st: &mut State, l2_off: u64, idx: usize, e: u64) -> Result<()> {
+        self.load_l2(st, l2_off)?[idx] = e;
+        self.file.write_all_at(&e.to_be_bytes(), l2_off + 8 * idx as u64)?;
+        Ok(())
+    }
+
+    /// Make the whole clusters in `[start, end)` read as zeros and give
+    /// their space back. L2 entries change first, then the old clusters
+    /// are freed: a crash in between leaks clusters, never exposes data.
+    /// Batched: one write per L2 table, one hole per run of host clusters
+    /// (a guest may trim its whole disk at once).
+    fn zero_clusters(&self, start: u64, end: u64) -> Result<()> {
+        let cs = self.cluster_size;
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut freed = Vec::new();
+        // The one L2 table with unwritten changes, as (L1 index, offset).
+        // Written before the walk touches another table, so loading that
+        // one can't evict it from the cache first.
+        let mut dirty: Option<(u64, u64)> = None;
+        let mut g = start;
+        while g < end {
+            let l1_idx = g / cs / self.l2_entries();
+            let l2_idx = (g / cs % self.l2_entries()) as usize;
+            if let Some((i, off)) = dirty {
+                if i != l1_idx {
+                    self.write_l2(&mut st, off)?;
+                    dirty = None;
+                }
+            }
+            let old = self.l2_entry(&mut st, g)?;
+            if old == L2_ZERO || (old == 0 && self.backing.is_none()) {
+                g += cs;
+                continue;
+            }
+            let l2_off = self.l2_for_write(&mut st, g)?;
+            self.load_l2(&mut st, l2_off)?[l2_idx] = L2_ZERO;
+            dirty = Some((l1_idx, l2_off));
+            let host = old & OFFSET_MASK;
+            if old & L2_COMPRESSED == 0 && old & L2_COPIED != 0 && host != 0 {
+                freed.push(host);
+            }
+            g += cs;
+        }
+        if let Some((_, off)) = dirty {
+            self.write_l2(&mut st, off)?;
+        }
+        freed.sort_unstable();
+        for &h in &freed {
+            self.set_refcount(&mut st, h, 0)?;
+        }
+        // Advisory: without hole support the space stays used.
+        let mut i = 0;
+        while i < freed.len() {
+            let mut j = i + 1;
+            while j < freed.len() && freed[j] == freed[j - 1] + cs {
+                j += 1;
+            }
+            let _ = crate::punch_hole(&self.file, freed[i], (j - i) as u64 * cs);
+            i = j;
+        }
+        Ok(())
+    }
+
+    fn write_l2(&self, st: &mut State, l2_off: u64) -> Result<()> {
+        let t = self.load_l2(st, l2_off)?.clone();
+        write_be64s(&self.file, l2_off, &t)
+    }
+
     fn cluster_for_write(&self, st: &mut State, guest: u64) -> Result<u64> {
         let cs = self.cluster_size;
-        let l1_idx = (guest / cs / self.l2_entries()) as usize;
         let l2_idx = (guest / cs % self.l2_entries()) as usize;
-        let l1e = *st.l1.get(l1_idx).ok_or(Error::OutOfRange)?;
-        let mut l2_off = l1e & OFFSET_MASK;
-        if l2_off == 0 || l1e & L1_COPIED == 0 {
-            let new = self.alloc_cluster(st)?;
-            let table = if l2_off == 0 {
-                vec![0u64; self.l2_entries() as usize]
-            } else {
-                self.load_l2(st, l2_off)?.clone()
-            };
-            write_be64s(&self.file, new, &table)?;
-            st.l2_cache.insert(new, table);
-            st.l1[l1_idx] = new | L1_COPIED;
-            self.file.write_all_at(&(new | L1_COPIED).to_be_bytes(), self.hdr.l1_offset + 8 * l1_idx as u64)?;
-            l2_off = new;
-        }
+        let l2_off = self.l2_for_write(st, guest)?;
         let e = self.load_l2(st, l2_off)?[l2_idx];
         if e & L2_COPIED != 0 && e & L2_COMPRESSED == 0 && e & OFFSET_MASK != 0 {
             return Ok(e & OFFSET_MASK);
@@ -603,9 +673,7 @@ impl Qcow2Image {
         }
         let new = self.alloc_cluster(st)?;
         self.file.write_all_at(&buf, new)?;
-        let ne = new | L2_COPIED;
-        self.load_l2(st, l2_off)?[l2_idx] = ne;
-        self.file.write_all_at(&ne.to_be_bytes(), l2_off + 8 * l2_idx as u64)?;
+        self.set_l2(st, l2_off, l2_idx, new | L2_COPIED)?;
         Ok(new)
     }
 }
@@ -824,6 +892,45 @@ impl DiskImage for Qcow2Image {
         }
         Ok(())
     }
+
+    /// Whole clusters become zero clusters (space returned to the host);
+    /// partial ones are left alone (discard is advisory).
+    fn discard(&self, offset: u64, len: u64) -> Result<()> {
+        if self.read_only {
+            return Err(Error::ReadOnly);
+        }
+        check_range(self.hdr.size, offset, len)?;
+        let cs = self.cluster_size;
+        let (s, e) = (offset.div_ceil(cs) * cs, (offset + len) / cs * cs);
+        if e > s {
+            self.zero_clusters(s, e)?;
+        }
+        Ok(())
+    }
+
+    fn write_zeroes(&self, offset: u64, len: u64) -> Result<()> {
+        if self.read_only {
+            return Err(Error::ReadOnly);
+        }
+        check_range(self.hdr.size, offset, len)?;
+        let cs = self.cluster_size;
+        let (s, e) = (offset.div_ceil(cs) * cs, (offset + len) / cs * cs);
+        if e <= s {
+            return self.write_zero_bytes(offset, len);
+        }
+        self.write_zero_bytes(offset, s - offset)?;
+        self.zero_clusters(s, e)?;
+        self.write_zero_bytes(e, offset + len - e)
+    }
+}
+
+impl Qcow2Image {
+    fn write_zero_bytes(&self, off: u64, len: u64) -> Result<()> {
+        if len > 0 {
+            self.write_at(&vec![0u8; len as usize], off)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -896,6 +1003,98 @@ mod tests {
         set_backing(&top, None).unwrap();
         let t = Qcow2Image::open(&top, true).unwrap();
         assert!(t.hdr.backing_file.is_none());
+    }
+
+    #[test]
+    fn discard_zeroes_and_frees_even_over_a_backing_file() {
+        use std::os::unix::fs::MetadataExt;
+        const C: u64 = 64 << 10;
+        let td = tempfile::tempdir().unwrap();
+        let (base, top) = (td.path().join("base.raw"), td.path().join("top.qcow2"));
+        std::fs::write(&base, vec![7u8; 8 * C as usize]).unwrap();
+        Qcow2Image::create(&top, 8 * C, Some((&base, Format::Raw))).unwrap();
+        let q = Qcow2Image::open(&top, false).unwrap();
+        q.write_at(&vec![1u8; 4 * C as usize], 0).unwrap();
+        q.flush().unwrap();
+        let before = std::fs::metadata(&top).unwrap().blocks();
+        // Clusters 1 and 2 entirely, plus half of 0 and 3 (left alone).
+        q.discard(C / 2, 3 * C).unwrap();
+        let mut b = vec![0u8; 8 * C as usize];
+        q.read_at(&mut b, 0).unwrap();
+        assert!(b[..C as usize].iter().all(|&x| x == 1));
+        assert!(b[C as usize..3 * C as usize].iter().all(|&x| x == 0), "not the backing file's 7s");
+        assert!(b[3 * C as usize..4 * C as usize].iter().all(|&x| x == 1));
+        assert!(b[4 * C as usize..].iter().all(|&x| x == 7));
+        // Holes over never-written clusters hide the backing file too.
+        q.discard(5 * C, C).unwrap();
+        q.read_at(&mut b[..C as usize], 5 * C).unwrap();
+        assert!(b[..C as usize].iter().all(|&x| x == 0));
+        let after = std::fs::metadata(&top).unwrap().blocks();
+        assert!(after < before, "host blocks {before} -> {after}");
+        // Writing into a zero cluster: rest of it stays zero.
+        q.write_at(&[9, 9], C + 100).unwrap();
+        let mut c = vec![0u8; C as usize];
+        q.read_at(&mut c, C).unwrap();
+        assert_eq!((c[99], c[100], c[101], c[102]), (0, 9, 9, 0));
+        // Reopen: same picture.
+        drop(q);
+        let q = Qcow2Image::open(&top, true).unwrap();
+        q.read_at(&mut c, 2 * C).unwrap();
+        assert!(c.iter().all(|&x| x == 0));
+        // Metadata consistent for other tools too, when one is around.
+        if let Ok(out) = std::process::Command::new("qemu-img").args(["check", "-U"]).arg(&top).output() {
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+        }
+    }
+
+    #[test]
+    fn discard_across_many_l2_tables() {
+        // 512-byte clusters: an L2 table covers 32 KiB, so this walks far
+        // more tables than the cache holds.
+        let td = tempfile::tempdir().unwrap();
+        let p = td.path().join("small.qcow2");
+        let size = 16u64 << 20;
+        {
+            let f = std::process::Command::new("qemu-img")
+                .args(["create", "-q", "-f", "qcow2", "-o", "cluster_size=512"])
+                .arg(&p)
+                .arg(size.to_string())
+                .status();
+            if !f.is_ok_and(|s| s.success()) {
+                return; // no qemu-img here
+            }
+        }
+        let q = Qcow2Image::open(&p, false).unwrap();
+        let step = 32 << 10;
+        for off in (0..size).step_by(step) {
+            q.write_at(&[1u8; 512], off).unwrap();
+        }
+        q.discard(0, size).unwrap();
+        drop(q);
+        let q = Qcow2Image::open(&p, true).unwrap();
+        let mut b = [0u8; 512];
+        for off in (0..size).step_by(step) {
+            q.read_at(&mut b, off).unwrap();
+            assert!(b.iter().all(|&x| x == 0), "stale data at {off}");
+        }
+        let out = std::process::Command::new("qemu-img").args(["check", "-U"]).arg(&p).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+    }
+
+    #[test]
+    fn write_zeroes_handles_partial_clusters() {
+        const C: u64 = 64 << 10;
+        let td = tempfile::tempdir().unwrap();
+        let top = td.path().join("z.qcow2");
+        Qcow2Image::create(&top, 4 * C, None).unwrap();
+        let q = Qcow2Image::open(&top, false).unwrap();
+        q.write_at(&vec![5u8; 4 * C as usize], 0).unwrap();
+        q.write_zeroes(C / 2, 2 * C).unwrap();
+        let mut b = vec![0u8; 4 * C as usize];
+        q.read_at(&mut b, 0).unwrap();
+        let z = |r: std::ops::Range<u64>| b[r.start as usize..r.end as usize].iter().all(|&x| x == 0);
+        let f = |r: std::ops::Range<u64>| b[r.start as usize..r.end as usize].iter().all(|&x| x == 5);
+        assert!(f(0..C / 2) && z(C / 2..C / 2 + 2 * C) && f(C / 2 + 2 * C..4 * C));
     }
 
     #[test]

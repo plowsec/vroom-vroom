@@ -61,11 +61,67 @@ impl DiskImage for RawImage {
         }
         Ok(())
     }
+
+    /// Give the blocks back to the host (sparse file).
+    fn discard(&self, offset: u64, len: u64) -> Result<()> {
+        if self.read_only {
+            return Err(Error::ReadOnly);
+        }
+        check_range(self.size, offset, len)?;
+        let (s, e) = crate::aligned_middle(offset, len);
+        // Advisory: a file system without hole support keeps the data.
+        let _ = crate::punch_hole(&self.file, s, e - s);
+        Ok(())
+    }
+
+    fn write_zeroes(&self, offset: u64, len: u64) -> Result<()> {
+        if self.read_only {
+            return Err(Error::ReadOnly);
+        }
+        check_range(self.size, offset, len)?;
+        let (s, e) = crate::aligned_middle(offset, len);
+        if e > s && crate::punch_hole(&self.file, s, e - s).is_ok() {
+            self.zero_fill(offset, s - offset)?;
+            return self.zero_fill(e, offset + len - e);
+        }
+        self.zero_fill(offset, len)
+    }
+}
+
+impl RawImage {
+    fn zero_fill(&self, mut off: u64, mut len: u64) -> Result<()> {
+        let z = vec![0u8; len.min(1 << 20) as usize];
+        while len > 0 {
+            let n = len.min(z.len() as u64) as usize;
+            self.file.write_all_at(&z[..n], off)?;
+            off += n as u64;
+            len -= n as u64;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discard_punches_holes() {
+        use std::os::unix::fs::MetadataExt;
+        let td = tempfile::tempdir().unwrap();
+        let p = td.path().join("r.raw");
+        std::fs::write(&p, vec![3u8; 1 << 20]).unwrap();
+        let d = RawImage::open(&p, false).unwrap();
+        let before = std::fs::metadata(&p).unwrap().blocks();
+        d.discard(100, (1 << 20) - 200).unwrap();
+        d.write_zeroes(0, 50).unwrap();
+        let mut b = vec![0u8; 1 << 20];
+        d.read_at(&mut b, 0).unwrap();
+        assert!(b[..50].iter().all(|&x| x == 0));
+        assert!(b[50..100].iter().all(|&x| x == 3)); // partial block kept
+        assert!(b[4096..(1 << 20) - 4096].iter().all(|&x| x == 0));
+        assert!(std::fs::metadata(&p).unwrap().blocks() < before);
+    }
 
     #[test]
     fn rw_and_bounds() {
