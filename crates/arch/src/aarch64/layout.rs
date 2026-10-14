@@ -88,8 +88,8 @@ mod tests {
         let (last, irq) = virtio_mmio_slot(VIRTIO_MMIO_SLOTS - 1);
         assert!(last + VIRTIO_MMIO_SIZE <= PCI_MMIO_BASE);
         assert!(irq < MSI_INTID_BASE - 32);
-        assert!(PCI_ECAM_BASE + PCI_ECAM_SIZE <= RAM_BASE);
-        assert!(PCI_PIO_BASE + PCI_PIO_SIZE <= PCI_ECAM_BASE);
-        assert!(PCI_MMIO_BASE + PCI_MMIO_SIZE <= PCI_PIO_BASE);
+        const { assert!(PCI_ECAM_BASE + PCI_ECAM_SIZE <= RAM_BASE) };
+        const { assert!(PCI_PIO_BASE + PCI_PIO_SIZE <= PCI_ECAM_BASE) };
+        const { assert!(PCI_MMIO_BASE + PCI_MMIO_SIZE <= PCI_PIO_BASE) };
     }
 }

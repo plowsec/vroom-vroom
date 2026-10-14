@@ -232,7 +232,7 @@ impl Vm for HvfVm {
     unsafe fn map_host(&self, gpa: u64, ptr: *mut u8, size: u64) -> Result<()> {
         // HVF wants host pointer, IPA and size aligned to the host page.
         let ps = bulwark_memory::page_size() as u64;
-        if gpa % ps != 0 || ptr as u64 % ps != 0 || size % ps != 0 || size == 0 {
+        if !gpa.is_multiple_of(ps) || !(ptr as u64).is_multiple_of(ps) || !size.is_multiple_of(ps) || size == 0 {
             return Err(Error::Invalid(format!("unaligned host map {gpa:#x} {ptr:p} {size:#x}")));
         }
         self.map(ptr, gpa, size as usize, ffi::HV_MEMORY_READ | ffi::HV_MEMORY_WRITE)

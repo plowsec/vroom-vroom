@@ -229,11 +229,10 @@ impl BusDevice for Tpm {
                 }
             }
             o if (STS..STS + 4).contains(&o) => self.write_sts((v << (8 * (o - STS))) as u32),
-            o if (DATA_FIFO..DATA_FIFO + 4).contains(&o) || (XDATA_FIFO..XDATA_FIFO + 0x40).contains(&o) => {
-                if self.active {
+            o if ((DATA_FIFO..DATA_FIFO + 4).contains(&o) || (XDATA_FIFO..XDATA_FIFO + 0x40).contains(&o))
+                && self.active => {
                     self.write_fifo(data);
                 }
-            }
             _ => {}
         }
     }

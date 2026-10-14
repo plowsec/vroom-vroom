@@ -125,7 +125,7 @@ impl Device for Pipe {
     }
 
     fn transmit(&mut self, _t: smoltcp::time::Instant) -> Option<TxTok<'_>> {
-        (self.tx.len() < MAX_TO_GUEST).then(|| TxTok(&mut self.tx))
+        (self.tx.len() < MAX_TO_GUEST).then_some(TxTok(&mut self.tx))
     }
 
     fn capabilities(&self) -> DeviceCapabilities {

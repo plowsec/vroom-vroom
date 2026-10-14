@@ -414,7 +414,7 @@ impl Xhci {
     fn ctx_read(&self, addr: u64, dwords: usize) -> Option<Vec<u32>> {
         let mut b = vec![0u8; dwords * 4];
         self.mem.read(GuestAddress(addr), &mut b).ok()?;
-        Some(b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+        Some(b.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
     }
 
     fn ctx_write(&self, addr: u64, d: &[u32]) {
@@ -724,7 +724,7 @@ impl Xhci {
     }
 
     fn run_interrupt_in(&mut self, id: usize, dci: u8) {
-        if dci % 2 == 0 {
+        if dci.is_multiple_of(2) {
             // OUT endpoints: consume and complete (nothing to deliver).
             return self.drain_out(id, dci);
         }
@@ -982,7 +982,7 @@ impl PciDevice for Xhci {
     fn bar_read(&mut self, _bar: usize, off: u64, data: &mut [u8]) {
         let v: u64 = match off {
             o if o < OP => self.cap_read(o) as u64,
-            o if o >= XECP && o < XECP + 0x10 => self.cap_read(o) as u64,
+            o if (XECP..XECP + 0x10).contains(&o) => self.cap_read(o) as u64,
             o if o < RT => self.op_read(o - OP),
             o if o < DB => self.rt_read(o - RT),
             o if o >= MSIX_TABLE as u64 && o < MSIX_PBA as u64 => {
@@ -1001,7 +1001,7 @@ impl PciDevice for Xhci {
     fn bar_write(&mut self, _bar: usize, off: u64, data: &[u8]) {
         let v = get_le(data);
         match off {
-            o if o >= XECP && o < XECP + 0x10 => {}
+            o if (XECP..XECP + 0x10).contains(&o) => {}
             o if (OP..RT).contains(&o) => self.op_write(o - OP, v, data.len()),
             o if (RT..DB).contains(&o) => self.rt_write(o - RT, v, data.len()),
             o if (DB..MSIX_TABLE as u64).contains(&o) => {

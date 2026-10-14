@@ -301,7 +301,7 @@ impl VirtioPci {
                         0x28 => &mut q.avail_ring,
                         _ => &mut q.used_ring,
                     };
-                    set_half(field, v, off % 8 == 0, data.len());
+                    set_half(field, v, off.is_multiple_of(8), data.len());
                 }
             }
             _ => {}

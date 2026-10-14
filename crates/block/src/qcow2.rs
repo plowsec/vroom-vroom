@@ -141,7 +141,7 @@ fn parse_header(f: &File, file_len: u64) -> Result<Header> {
             return Err(bad("only 16-bit refcounts supported"));
         }
         header_len = be32(&b, 100) as u64;
-        if !(104..=4096).contains(&header_len) || header_len % 8 != 0 {
+        if !(104..=4096).contains(&header_len) || !header_len.is_multiple_of(8) {
             return Err(bad("header_length invalid"));
         }
         if incompat & INCOMPAT_COMPRESSION_TYPE != 0 {
@@ -318,7 +318,7 @@ impl Qcow2Image {
         read_be64s(&file, hdr.refcount_table_offset, &mut refcount_table)?;
         for e in l1.iter().chain(refcount_table.iter()) {
             let off = e & OFFSET_MASK;
-            if off % cs != 0 {
+            if !off.is_multiple_of(cs) {
                 return Err(bad("metadata offset not cluster aligned"));
             }
         }

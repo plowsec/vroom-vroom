@@ -138,7 +138,7 @@ impl BusDevice for Pl011 {
             RIS => r.ris,
             MIS => r.ris & r.imsc,
             DMACR => r.dmacr,
-            0xfe0..=0xffc if offset % 4 == 0 => ID[((offset - 0xfe0) / 4) as usize] as u32,
+            0xfe0..=0xffc if offset.is_multiple_of(4) => ID[((offset - 0xfe0) / 4) as usize] as u32,
             _ => 0,
         };
         put_le(data, v as u64);

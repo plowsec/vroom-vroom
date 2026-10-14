@@ -85,8 +85,7 @@ impl NetHandler {
 
     fn rx(&mut self, ctx: &mut QueueCtx) {
         let Some(be) = self.backend.as_mut() else { return };
-        loop {
-            let Some(frame) = self.pending.take().or_else(|| be.recv_frame()) else { break };
+        while let Some(frame) = self.pending.take().or_else(|| be.recv_frame()) {
             let chain = match ctx.queues[RX].pop(&ctx.mem) {
                 Ok(Some(c)) => c,
                 Ok(None) => {

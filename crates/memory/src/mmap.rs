@@ -21,7 +21,7 @@ impl MmapRegion {
     /// Map `size` bytes of zeroed RAM. `size` must be page aligned.
     pub fn new(size: usize) -> Result<Self> {
         let ps = page_size();
-        if size == 0 || size % ps != 0 {
+        if size == 0 || !size.is_multiple_of(ps) {
             return Err(Error::Unaligned(ps));
         }
         let guard = ps;
@@ -95,7 +95,7 @@ impl MmapRegion {
     /// Release physical pages back to the host (balloon, reset). Reads return 0 after.
     pub fn discard(&self, off: usize, len: usize) -> Result<()> {
         let ps = page_size();
-        if off % ps != 0 || len % ps != 0 || off.checked_add(len).is_none_or(|e| e > self.size) {
+        if !off.is_multiple_of(ps) || !len.is_multiple_of(ps) || off.checked_add(len).is_none_or(|e| e > self.size) {
             return Err(Error::Unaligned(ps));
         }
         // SAFETY: range is inside our mapping. Re-mapping anonymous memory

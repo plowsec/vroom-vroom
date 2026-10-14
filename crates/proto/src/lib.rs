@@ -256,7 +256,7 @@ mod tests {
                 x ^= x >> 9;
                 *b = x as u8;
             }
-            if buf.len() > 3 && x % 3 == 0 {
+            if buf.len() > 3 && x.is_multiple_of(3) {
                 buf[0] = b'B';
                 buf[1] = b'W';
                 buf[2] = VERSION;

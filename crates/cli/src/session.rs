@@ -232,12 +232,8 @@ pub fn run(o: RunOpts) -> Result<(), String> {
     };
     let resumed_suspend = matches!(&start, StartMode::Restore(p) if *p == suspend);
 
-    let ui = match o.ui_fd {
-        // SAFETY: the parent (bulwark-gui) passed us this fd and nothing
-        // else in this process uses it.
-        Some(fd) => Some(unsafe { UnixStream::from_raw_fd(fd) }),
-        None => None,
-    };
+    // SAFETY: --ui-fd is a socket the GUI passed to us and nobody else owns.
+    let ui = o.ui_fd.map(|fd| unsafe { UnixStream::from_raw_fd(fd) });
     let gui = ui.is_some();
     let clipboard = if gui { None } else { o.clipboard };
     let has_clip = clipboard.is_some();

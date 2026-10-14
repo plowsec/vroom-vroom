@@ -158,7 +158,10 @@ fn open_lib() -> Option<Lib> {
             }
             // SAFETY: the symbol has the C signature declared in `Lib`
             // (virglrenderer.h); the transmute just names it.
-            unsafe { std::mem::transmute::<*mut c_void, _>(f) }
+            #[allow(clippy::missing_transmute_annotations)]
+            unsafe {
+                std::mem::transmute::<*mut c_void, _>(f)
+            }
         }};
     }
     Some(Lib {

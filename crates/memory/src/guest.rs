@@ -187,7 +187,7 @@ impl GuestMemory {
 
     /// Host pointer for an aligned u16 in RAM (for atomics).
     fn aligned_u16_ptr(&self, addr: GuestAddress) -> Result<*mut u16> {
-        if addr.0 % 2 != 0 {
+        if !addr.0.is_multiple_of(2) {
             return Err(Error::InvalidRange(addr.0, 2));
         }
         let r = self.find(addr).ok_or(Error::InvalidRange(addr.0, 2))?;

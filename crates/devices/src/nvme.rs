@@ -191,8 +191,8 @@ impl Nvme {
         let acqs = ((self.regs.aqa >> 16) & 0xfff) as u16 + 1;
         let ok = asqs >= 2
             && acqs >= 2
-            && self.regs.asq % PAGE == 0
-            && self.regs.acq % PAGE == 0
+            && self.regs.asq.is_multiple_of(PAGE)
+            && self.regs.acq.is_multiple_of(PAGE)
             && self.mem.check_range(GuestAddress(self.regs.asq), asqs as u64 * 64)
             && self.mem.check_range(GuestAddress(self.regs.acq), acqs as u64 * 16);
         if !ok {
@@ -227,7 +227,7 @@ impl Nvme {
         }
         let idx = (off - DOORBELL) / 4;
         let qid = (idx / 2) as u16;
-        if idx % 2 == 0 {
+        if idx.is_multiple_of(2) {
             let Some(sq) = self.sqs.get_mut(&qid) else { return };
             if v >= sq.size as u32 {
                 return;
@@ -327,7 +327,7 @@ impl Nvme {
             return Ok(segs);
         }
         if left <= PAGE {
-            if prp2 % PAGE != 0 {
+            if !prp2.is_multiple_of(PAGE) {
                 return Err(SC_PRP_OFFSET);
             }
             segs.push((prp2, left));
@@ -335,7 +335,7 @@ impl Nvme {
         }
         // PRP list (may chain via its last entry).
         let mut list = prp2;
-        if list % 8 != 0 {
+        if !list.is_multiple_of(8) {
             return Err(SC_PRP_OFFSET);
         }
         let per_page = (PAGE - list % PAGE) / 8;
@@ -349,7 +349,7 @@ impl Nvme {
             let e = u64::from_le(e);
             if entries_left_on_page == 1 && left > PAGE {
                 // Last slot points at the next list page.
-                if e % PAGE != 0 {
+                if !e.is_multiple_of(PAGE) {
                     return Err(SC_PRP_OFFSET);
                 }
                 list = e;
@@ -357,7 +357,7 @@ impl Nvme {
                 entries_left_on_page = PAGE / 8;
                 continue;
             }
-            if e % PAGE != 0 {
+            if !e.is_multiple_of(PAGE) {
                 return Err(SC_PRP_OFFSET);
             }
             let n = left.min(PAGE);
@@ -423,7 +423,7 @@ impl Nvme {
         if iv as usize >= self.msix.vectors() {
             return err(SC_INVALID_VECTOR);
         }
-        if c.prp1 % PAGE != 0 || !self.mem.check_range(GuestAddress(c.prp1), size as u64 * 16) {
+        if !c.prp1.is_multiple_of(PAGE) || !self.mem.check_range(GuestAddress(c.prp1), size as u64 * 16) {
             return err(SC_INVALID_FIELD);
         }
         self.cqs.insert(qid, Cq { base: c.prp1, size: size as u16, head: 0, tail: 0, phase: true, ien, iv });
@@ -443,7 +443,7 @@ impl Nvme {
         if cqid == 0 || !self.cqs.contains_key(&cqid) {
             return err(SC_INVALID_CQ);
         }
-        if c.prp1 % PAGE != 0 || !self.mem.check_range(GuestAddress(c.prp1), size as u64 * 64) {
+        if !c.prp1.is_multiple_of(PAGE) || !self.mem.check_range(GuestAddress(c.prp1), size as u64 * 64) {
             return err(SC_INVALID_FIELD);
         }
         self.sqs.insert(qid, Sq { base: c.prp1, size: size as u16, head: 0, tail: 0, cqid });
@@ -636,7 +636,7 @@ impl Nvme {
         }
         let nr = (c.cdw[0] & 0xff) as u64 + 1;
         let ranges = self.from_guest(c.prp1, c.prp2, nr * 16)?;
-        for r in ranges.chunks_exact(16) {
+        for r in ranges.as_chunks::<16>().0 {
             let len = u32::from_le_bytes([r[4], r[5], r[6], r[7]]) as u64 * bs;
             let slba = u64::from_le_bytes(r[8..16].try_into().unwrap_or([0; 8]));
             let off = slba.checked_mul(bs).ok_or(SC_LBA_RANGE)?;

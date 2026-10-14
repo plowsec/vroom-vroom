@@ -97,7 +97,7 @@ impl BlockHandler {
         match ty {
             T_IN => {
                 let len = w.available();
-                if len % SECTOR_SIZE as usize != 0 || len > MAX_IO {
+                if !len.is_multiple_of(SECTOR_SIZE as usize) || len > MAX_IO {
                     return Err(S_IOERR);
                 }
                 let mut buf = vec![0u8; len];
@@ -109,7 +109,7 @@ impl BlockHandler {
                     return Err(S_IOERR);
                 }
                 let len = r.available();
-                if len % SECTOR_SIZE as usize != 0 || len > MAX_IO {
+                if !len.is_multiple_of(SECTOR_SIZE as usize) || len > MAX_IO {
                     return Err(S_IOERR);
                 }
                 let data = r.read_to_vec().map_err(|_| S_IOERR)?;

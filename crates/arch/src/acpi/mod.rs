@@ -142,7 +142,7 @@ pub fn assemble(fadt: Vec<u8>, fadt_dsdt_offset: usize, dsdt: Vec<u8>, others: V
     ld.allocate(TABLES_FILE, 64, 1);
 
     let place = |t: Vec<u8>, tables: &mut Vec<u8>| -> (u32, u32) {
-        while tables.len() % 8 != 0 {
+        while !tables.len().is_multiple_of(8) {
             tables.push(0);
         }
         let off = tables.len() as u32;
@@ -199,7 +199,7 @@ mod tests {
 
     /// Run the loader like firmware would, at a fake base address.
     pub(crate) fn link(b: &AcpiBlobs, base: u64, rsdp_base: u64) -> (Vec<u8>, Vec<u8>) {
-        let mut files = vec![(RSDP_FILE, b.rsdp.clone(), rsdp_base), (TABLES_FILE, b.tables.clone(), base)];
+        let mut files = [(RSDP_FILE, b.rsdp.clone(), rsdp_base), (TABLES_FILE, b.tables.clone(), base)];
         for c in b.loader.chunks(128) {
             let name = |o: usize| String::from_utf8_lossy(&c[o..o + 56]).trim_end_matches('\0').to_string();
             let u32_at = |o: usize| u32::from_le_bytes([c[o], c[o + 1], c[o + 2], c[o + 3]]);

@@ -83,6 +83,7 @@ impl SharedFb {
 
     /// Viewer side: map an fd received from the VMM.
     pub fn from_fd(fd: OwnedFd) -> Result<Self> {
+        // SAFETY: libc::stat is plain data; all-zero is a valid value.
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         // SAFETY: valid fd, valid out pointer.
         if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {

@@ -325,7 +325,7 @@ fn to_bgrx(sw: [usize; 4], src: &[u8], dst: &mut [u8]) {
         dst.copy_from_slice(src);
         return;
     }
-    for (d, p) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+    for (d, p) in dst.as_chunks_mut::<4>().0.iter_mut().zip(src.chunks_exact(4)) {
         d[0] = p[sw[0]];
         d[1] = p[sw[1]];
         d[2] = p[sw[2]];
@@ -512,7 +512,7 @@ impl GpuHandler {
             SUBMIT_3D => {
                 let (Some(size), Some(_pad)) = (rd32(r), rd32(r)) else { return bad };
                 let size = size as usize;
-                if size > MAX_SUBMIT || size % 4 != 0 || !self.contexts.contains(&hdr.ctx) {
+                if size > MAX_SUBMIT || !size.is_multiple_of(4) || !self.contexts.contains(&hdr.ctx) {
                     return bad;
                 }
                 let mut buf = vec![0u8; size];
@@ -673,7 +673,7 @@ impl GpuHandler {
         }
         let ps = bulwark_memory::page_size() as u64;
         let base = t.shm_base.load(Ordering::Acquire);
-        if base == 0 || offset % ps != 0 {
+        if base == 0 || !offset.is_multiple_of(ps) {
             return bad;
         }
         let mut rr = t.r();
@@ -685,7 +685,7 @@ impl GpuHandler {
         // The whole mapping must fit the window, in whole pages: rounding
         // up would hand the guest whatever sits next to it on the host.
         let fits = offset.checked_add(m.size).is_some_and(|e| e <= t.shm_size);
-        if !fits || m.size % ps != 0 || (m.ptr as u64) % ps != 0 {
+        if !fits || m.size % ps != 0 || !(m.ptr as u64).is_multiple_of(ps) {
             log::warn!("gpu: blob {id} map refused: offset {offset:#x} size {:#x} ptr {:p}", m.size, m.ptr);
             rr.unmap_blob(id);
             return bad;

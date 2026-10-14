@@ -59,9 +59,9 @@ impl Queue {
         let desc_len = 16 * n;
         let avail_len = 6 + 2 * n;
         let used_len = 6 + 8 * n;
-        self.desc_table % 16 == 0
-            && self.avail_ring % 2 == 0
-            && self.used_ring % 4 == 0
+        self.desc_table.is_multiple_of(16)
+            && self.avail_ring.is_multiple_of(2)
+            && self.used_ring.is_multiple_of(4)
             && mem.check_range(GuestAddress(self.desc_table), desc_len)
             && mem.check_range(GuestAddress(self.avail_ring), avail_len)
             && mem.check_range(GuestAddress(self.used_ring), used_len)

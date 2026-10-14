@@ -98,7 +98,7 @@ impl PFlash {
     /// `size` must be a multiple of BLOCK_SIZE. `contents` shorter than
     /// size is padded with 0xFF (erased).
     pub fn new(base: u64, size: u64, mut contents: Vec<u8>, file: Option<File>) -> Result<Self, String> {
-        if size == 0 || size % BLOCK_SIZE != 0 || contents.len() as u64 > size {
+        if size == 0 || !size.is_multiple_of(BLOCK_SIZE) || contents.len() as u64 > size {
             return Err("bad flash size".into());
         }
         contents.resize(size as usize, 0xff);

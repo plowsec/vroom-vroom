@@ -119,7 +119,7 @@ impl InputHandler {
     fn pull(&mut self) {
         let mut buf = [0u8; 4096];
         while let Ok(n) = self.sock.recv(&mut buf) {
-            for e in buf[..n - n % 8].chunks_exact(8) {
+            for e in buf[..n - n % 8].as_chunks::<8>().0 {
                 if self.pending.len() < MAX_PENDING {
                     let mut a = [0u8; 8];
                     a.copy_from_slice(e);
