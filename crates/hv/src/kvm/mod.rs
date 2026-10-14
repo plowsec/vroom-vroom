@@ -239,20 +239,16 @@ pub(crate) fn set_thread_run(p: *mut kvm_run) {
 
 #[derive(Debug)]
 pub(crate) struct KvmKicker {
-    thread: libc::pthread_t,
+    /// Kernel thread id of the vCPU thread (we signal it with tgkill on
+    /// our own pid, which is all the seccomp filter lets through).
+    tid: libc::pid_t,
     pub kicked: AtomicBool,
 }
 
-// SAFETY: pthread_t is an opaque thread id (a pointer on musl); we only
-// pass it to pthread_kill, which is thread-safe.
-unsafe impl Send for KvmKicker {}
-// SAFETY: see above.
-unsafe impl Sync for KvmKicker {}
-
 impl KvmKicker {
     pub fn current() -> Arc<Self> {
-        // SAFETY: pthread_self has no preconditions.
-        Arc::new(KvmKicker { thread: unsafe { libc::pthread_self() }, kicked: AtomicBool::new(false) })
+        // SAFETY: gettid has no preconditions.
+        Arc::new(KvmKicker { tid: unsafe { libc::gettid() }, kicked: AtomicBool::new(false) })
     }
 
     pub fn take(&self) -> bool {
@@ -263,8 +259,8 @@ impl KvmKicker {
 impl VcpuKicker for KvmKicker {
     fn kick(&self) {
         self.kicked.store(true, Ordering::Release);
-        // SAFETY: the vCPU thread lives as long as the vCPU (and kicker users).
-        unsafe { libc::pthread_kill(self.thread, kick_signal()) };
+        // SAFETY: plain syscall; the target is a thread of this process.
+        unsafe { libc::syscall(libc::SYS_tgkill, libc::getpid(), self.tid, kick_signal()) };
     }
 
     fn wake(&self) {

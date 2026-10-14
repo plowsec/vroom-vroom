@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use landlock::{Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, ABI};
-use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, SeccompRule, TargetArch};
+use seccompiler::{BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter, SeccompRule, TargetArch};
 
 use crate::{Error, Policy, Result};
 
@@ -42,7 +42,7 @@ fn allowed(p: &Policy) -> Vec<i64> {
         SYS_sched_getaffinity, SYS_rt_sigaction, SYS_rt_sigprocmask, SYS_rt_sigreturn,
         SYS_sigaltstack, SYS_exit, SYS_exit_group, SYS_getrandom, SYS_fcntl, SYS_openat,
         SYS_mkdirat, SYS_renameat2, SYS_fsync, SYS_fdatasync, SYS_ftruncate, SYS_fallocate,
-        SYS_getpid, SYS_gettid, SYS_tgkill, SYS_clone, SYS_clone3, SYS_set_robust_list,
+        SYS_getpid, SYS_gettid, SYS_clone, SYS_clone3, SYS_set_robust_list,
         SYS_rseq, SYS_prctl, SYS_getdents64, SYS_restart_syscall, SYS_socketpair,
         SYS_recvfrom, SYS_sendto, SYS_recvmsg, SYS_sendmsg, SYS_shutdown,
         SYS_getsockname, SYS_getpeername, SYS_getsockopt, SYS_setsockopt,
@@ -61,7 +61,12 @@ fn allowed(p: &Policy) -> Vec<i64> {
 
 fn seccomp(p: &Policy) -> Result<()> {
     let arch = if cfg!(target_arch = "x86_64") { TargetArch::x86_64 } else { TargetArch::aarch64 };
-    let rules: BTreeMap<i64, Vec<SeccompRule>> = allowed(p).into_iter().map(|n| (n, vec![])).collect();
+    let mut rules: BTreeMap<i64, Vec<SeccompRule>> = allowed(p).into_iter().map(|n| (n, vec![])).collect();
+    // Signals only to our own threads (vCPU kicks, abort). No tkill/kill.
+    // SAFETY: getpid has no preconditions.
+    let pid = unsafe { libc::getpid() } as u64;
+    let own = SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, pid).map_err(err)?;
+    rules.insert(libc::SYS_tgkill, vec![SeccompRule::new(vec![own]).map_err(err)?]);
     let filter = SeccompFilter::new(rules, SeccompAction::KillProcess, SeccompAction::Allow, arch).map_err(err)?;
     let prog: BpfProgram = filter.try_into().map_err(err)?;
     seccompiler::apply_filter_all_threads(&prog).map_err(err)
