@@ -1,0 +1,13 @@
+# /etc/bulwark/netd.toml — bulwark-netd (runs as root).
+# Only members of `group` can attach VMs.
+socket = "/var/run/bulwark/netd.sock"
+group = "staff"            # Linux default: "bulwark"
+
+# Interfaces VMs may bridge onto. macOS: physical interfaces (en0...).
+# Linux: an existing bridge (br0) you created with your NIC enslaved.
+bridge_interfaces = ["en0"]
+
+# Private host-only networks (VMs + host, no outside access).
+[[host_only]]
+name = "lab"
+gateway = "192.168.77.1/24"   # Linux bridge address; macOS vmnet picks its own

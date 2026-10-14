@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 pub mod nat;
+pub mod netd;
 pub mod packet;
 pub mod socket;
 

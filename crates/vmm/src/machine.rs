@@ -15,7 +15,8 @@ use bulwark_memory::{GuestAddress, GuestMemory};
 use bulwark_snapshot::Snapshottable;
 use bulwark_config::NetMode;
 use bulwark_net::nat::{Nat, NatConfig, NatPolicy, TcpForward};
-use bulwark_net::NetBackend;
+use bulwark_net::socket::FrameSocket;
+use bulwark_net::{netd, NetBackend};
 use bulwark_proto::AGENT_PORT;
 use bulwark_virtio::devices::gpu::{DisplaySink, Gpu as GpuDev};
 use bulwark_virtio::devices::input::{Input, InputKind};
@@ -214,7 +215,17 @@ fn stable_mac(name: &str, idx: usize) -> [u8; 6] {
     [0x02, b[0], b[1], b[2], b[3], b[4]]
 }
 
-fn net_backend(n: &bulwark_config::Net, mac: [u8; 6]) -> Result<Box<dyn NetBackend>> {
+/// Backend for one NIC, and the MAC the guest must use.
+fn net_backend(vm: &str, idx: usize, n: &bulwark_config::Net, mac: [u8; 6]) -> Result<(Box<dyn NetBackend>, [u8; 6])> {
+    let via_netd = |attach: netd::Attach| -> Result<(Box<dyn NetBackend>, [u8; 6])> {
+        let sock = std::env::var_os("BULWARK_NETD_SOCKET")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| netd::DEFAULT_SOCKET.into());
+        let req = netd::Request { version: netd::VERSION, vm: vm.to_string(), nic: idx as u32, attach, mac };
+        let (s, assigned) = netd::attach(&sock, &req).map_err(|e| Error::Setup(e.to_string()))?;
+        let fs = FrameSocket::new(s).map_err(|e| Error::Setup(format!("netd socket: {e}")))?;
+        Ok((Box::new(fs), assigned))
+    };
     match n.mode()? {
         NetMode::Nat { port_forwards } => {
             let mut cfg = NatConfig::new(mac);
@@ -225,11 +236,10 @@ fn net_backend(n: &bulwark_config::Net, mac: [u8; 6]) -> Result<Box<dyn NetBacke
                 cfg.forwards.push(TcpForward { host: (ip, p.host_port).into(), guest_port: p.guest_port });
             }
             let nat = Nat::new(cfg).map_err(|e| Error::Setup(format!("nat: {e}")))?;
-            Ok(Box::new(nat))
+            Ok((Box::new(nat), mac))
         }
-        NetMode::Bridged { .. } | NetMode::HostOnly { .. } => Err(Error::Setup(
-            "bridged / host-only need bulwark-netd (not wired up yet)".into(),
-        )),
+        NetMode::Bridged { interface } => via_netd(netd::Attach::Bridged { interface }),
+        NetMode::HostOnly { network } => via_netd(netd::Attach::HostOnly { network }),
     }
 }
 
@@ -368,7 +378,7 @@ pub(crate) fn build(
             Some(m) => bulwark_config::parse_mac(m)?,
             None => stable_mac(&config.name, i),
         };
-        let backend = net_backend(n, mac)?;
+        let (backend, mac) = net_backend(&config.name, i, n, mac)?;
         board.add_virtio(Box::new(Net::new(&format!("eth{i}"), mac, backend)))?;
     }
     let need_pci = board.finish_pci()?;

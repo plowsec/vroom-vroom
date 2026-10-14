@@ -42,3 +42,30 @@ pub fn shutdown(reboot: bool) {
         log::warn!("shutdown: {e}");
     }
 }
+
+/// Change the primary display mode (Windows). Linux guests follow the
+/// virtio-gpu hotplug event on their own, so nothing to do there.
+#[cfg(windows)]
+pub fn set_resolution(w: u32, h: u32) -> std::io::Result<()> {
+    use windows_sys::Win32::Graphics::Gdi::{
+        ChangeDisplaySettingsExW, DEVMODEW, CDS_UPDATEREGISTRY, DISP_CHANGE_SUCCESSFUL, DM_PELSHEIGHT, DM_PELSWIDTH,
+    };
+    // SAFETY: zeroed DEVMODEW is valid once dmSize is set.
+    let mut dm: DEVMODEW = unsafe { std::mem::zeroed() };
+    dm.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+    dm.dmPelsWidth = w;
+    dm.dmPelsHeight = h;
+    dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT;
+    // SAFETY: valid DEVMODEW; null device name = primary display.
+    let r = unsafe { ChangeDisplaySettingsExW(std::ptr::null(), &dm, std::ptr::null_mut(), CDS_UPDATEREGISTRY, std::ptr::null()) };
+    if r == DISP_CHANGE_SUCCESSFUL {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!("ChangeDisplaySettingsEx: {r}")))
+    }
+}
+
+#[cfg(not(windows))]
+pub fn set_resolution(_w: u32, _h: u32) -> std::io::Result<()> {
+    Ok(())
+}

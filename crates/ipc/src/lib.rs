@@ -3,7 +3,24 @@
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 
-use crate::{Error, Result};
+#[derive(Debug)]
+pub enum Error {
+    Io(std::io::Error),
+    Proto(&'static str),
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::Io(e) => write!(f, "i/o: {e}"),
+            Error::Proto(m) => write!(f, "protocol: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+pub type Result<T> = std::result::Result<T, Error>;
 
 pub fn send_fd(sock: &UnixStream, fd: RawFd) -> Result<()> {
     let mut byte = [0u8; 1];

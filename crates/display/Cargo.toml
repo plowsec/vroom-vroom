@@ -9,6 +9,7 @@ license.workspace = true
 thiserror.workspace = true
 libc.workspace = true
 getrandom = "0.2"
+bulwark-ipc.workspace = true
 
 [lints]
 workspace = true

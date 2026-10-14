@@ -1,0 +1,12 @@
+[package]
+name = "bulwark-ipc"
+description = "Small IPC helpers shared by bulwark processes (fd passing)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libc.workspace = true
+
+[lints]
+workspace = true

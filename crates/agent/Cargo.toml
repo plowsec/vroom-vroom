@@ -21,7 +21,7 @@ arboard = { version = "3", default-features = false }
 libc.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_System_SystemInformation", "Win32_Foundation"] }
+windows-sys = { version = "0.59", features = ["Win32_System_SystemInformation", "Win32_System_Time", "Win32_Foundation", "Win32_Graphics_Gdi"] }
 
 [lints]
 workspace = true

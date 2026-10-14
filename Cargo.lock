@@ -273,6 +273,7 @@ dependencies = [
 name = "bulwark-display"
 version = "0.1.0"
 dependencies = [
+ "bulwark-ipc",
  "getrandom 0.2.17",
  "libc",
  "thiserror 2.0.21",
@@ -306,6 +307,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "bulwark-ipc"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "bulwark-memory"
 version = "0.1.0"
 dependencies = [
@@ -317,14 +325,32 @@ dependencies = [
 name = "bulwark-net"
 version = "0.1.0"
 dependencies = [
+ "bulwark-ipc",
  "bulwark-sandbox",
  "getrandom 0.2.17",
  "libc",
  "log",
  "mio",
+ "serde",
+ "serde_json",
  "smoltcp",
  "socket2",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "bulwark-netd"
+version = "0.1.0"
+dependencies = [
+ "bulwark-ipc",
+ "bulwark-net",
+ "cc",
+ "env_logger",
+ "libc",
+ "log",
+ "serde",
+ "serde_json",
+ "toml",
 ]
 
 [[package]]

@@ -7,6 +7,9 @@ license.workspace = true
 
 [dependencies]
 thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bulwark-ipc.workspace = true
 log.workspace = true
 mio.workspace = true
 libc.workspace = true

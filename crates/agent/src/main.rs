@@ -139,7 +139,11 @@ fn handle(m: Message, w: &mut File, clip: &mut dyn clip::Clip, last: &mut Option
             }
         }
         Message::Shutdown { reboot } => sys::shutdown(reboot),
-        Message::SetResolution { width, height } => log::info!("resolution request {width}x{height} (not handled yet)"),
+        Message::SetResolution { width, height } => {
+            if let Err(e) = sys::set_resolution(width, height) {
+                log::debug!("resolution {width}x{height}: {e}");
+            }
+        }
         Message::Ping(v) => w.write_all(&Message::Pong(v).encode())?,
         Message::Pong(_) => {}
     }

@@ -23,6 +23,7 @@ bulwark-sandbox = { path = "crates/sandbox" }
 bulwark-block = { path = "crates/block" }
 bulwark-agent = { path = "crates/agent" }
 bulwark-display = { path = "crates/display" }
+bulwark-ipc = { path = "crates/ipc" }
 
 thiserror = "2"
 log = "0.4"
