@@ -83,6 +83,15 @@ impl MmapRegion {
         unsafe { std::ptr::write_bytes(self.base.add(off), val, len) }
     }
 
+    /// Fill the start of the mapping (firmware images).
+    pub fn load(&self, data: &[u8]) -> Result<()> {
+        if data.len() > self.size {
+            return Err(Error::InvalidRange(0, data.len() as u64));
+        }
+        self.write_at(0, data);
+        Ok(())
+    }
+
     /// Release physical pages back to the host (balloon, reset). Reads return 0 after.
     pub fn discard(&self, off: usize, len: usize) -> Result<()> {
         let ps = page_size();

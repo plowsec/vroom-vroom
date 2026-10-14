@@ -2,6 +2,7 @@
 //! firmware tables describe them, and how a kernel is put in RAM.
 #![forbid(unsafe_code)]
 
+pub mod acpi;
 pub mod aarch64;
 mod image;
 

@@ -64,6 +64,9 @@ impl ViewerTx {
 pub(crate) struct FbSink {
     fb: SharedFb,
     mode: Mutex<(u32, u32)>,
+    /// virtio-gpu owns the screen once its driver sets a mode; ramfb
+    /// (firmware / boot screen) only shows until then.
+    gpu_active: AtomicBool,
     /// None when headless: frames still land in the buffer (screendumps).
     tx: Option<ViewerTx>,
 }
@@ -71,7 +74,39 @@ pub(crate) struct FbSink {
 impl FbSink {
     pub fn headless() -> std::io::Result<Arc<Self>> {
         let fb = SharedFb::create().map_err(|e| std::io::Error::other(e.to_string()))?;
-        Ok(Arc::new(FbSink { fb, mode: Mutex::new((0, 0)), tx: None }))
+        Ok(Arc::new(FbSink { fb, mode: Mutex::new((0, 0)), gpu_active: AtomicBool::new(false), tx: None }))
+    }
+
+    /// A full frame from ramfb. Ignored while virtio-gpu is driving.
+    pub fn ramfb_frame(&self, w: u32, h: u32, rows: &[u8], stride: usize) {
+        if self.gpu_active.load(Ordering::Acquire) {
+            return;
+        }
+        self.apply_mode(w, h);
+        self.draw(0, 0, w, h, rows, stride);
+    }
+
+    fn apply_mode(&self, width: u32, height: u32) {
+        let mut m = self.mode.lock().unwrap_or_else(|e| e.into_inner());
+        if *m == (width, height) {
+            return;
+        }
+        *m = (width, height);
+        drop(m);
+        if let Some(tx) = &self.tx {
+            tx.send(&ToViewer::Mode { width, height });
+        }
+    }
+
+    fn draw(&self, x: u32, y: u32, w: u32, h: u32, rows: &[u8], stride: usize) {
+        let (mw, mh) = *self.mode.lock().unwrap_or_else(|e| e.into_inner());
+        if x.saturating_add(w) > mw || y.saturating_add(h) > mh {
+            return;
+        }
+        self.fb.write_rect(mw, x, y, w, h, rows, stride);
+        if let Some(tx) = &self.tx {
+            tx.send(&ToViewer::Damage { x, y, w, h });
+        }
     }
 
     /// Write the current screen as PNG.
@@ -99,20 +134,13 @@ impl DisplaySink for FbSink {
             log::warn!("display: mode {width}x{height} too large, ignored");
             return;
         }
-        *self.mode.lock().unwrap_or_else(|e| e.into_inner()) = (width, height);
-        if let Some(tx) = &self.tx {
-            tx.send(&ToViewer::Mode { width, height });
-        }
+        self.gpu_active.store(width != 0, Ordering::Release);
+        self.apply_mode(width, height);
     }
 
     fn flush(&self, x: u32, y: u32, w: u32, h: u32, rows: &[u8], stride: usize) {
-        let (mw, mh) = *self.mode.lock().unwrap_or_else(|e| e.into_inner());
-        if x.saturating_add(w) > mw || y.saturating_add(h) > mh {
-            return;
-        }
-        self.fb.write_rect(mw, x, y, w, h, rows, stride);
-        if let Some(tx) = &self.tx {
-            tx.send(&ToViewer::Damage { x, y, w, h });
+        if self.gpu_active.load(Ordering::Acquire) {
+            self.draw(x, y, w, h, rows, stride);
         }
     }
 }
@@ -140,8 +168,14 @@ pub(crate) struct DisplayServer {
 }
 
 pub(crate) struct InputPipes {
-    pub kbd: UnixDatagram,
-    pub tablet: UnixDatagram,
+    pub kbd: Option<UnixDatagram>,
+    pub tablet: Option<UnixDatagram>,
+}
+
+impl InputPipes {
+    fn none() -> Self {
+        InputPipes { kbd: None, tablet: None }
+    }
 }
 
 impl DisplayServer {
@@ -154,7 +188,12 @@ impl DisplayServer {
     pub fn sink(&self) -> std::io::Result<Arc<FbSink>> {
         let fb = SharedFb::create().map_err(|e| std::io::Error::other(e.to_string()))?;
         send_fd(&self.stream, fb.fd().as_raw_fd()).map_err(|e| std::io::Error::other(e.to_string()))?;
-        Ok(Arc::new(FbSink { fb, mode: Mutex::new((0, 0)), tx: Some(self.tx.clone()) }))
+        Ok(Arc::new(FbSink {
+            fb,
+            mode: Mutex::new((0, 0)),
+            gpu_active: AtomicBool::new(false),
+            tx: Some(self.tx.clone()),
+        }))
     }
 
     pub fn clipboard(&self) -> Box<dyn ClipboardProvider> {
@@ -166,7 +205,13 @@ impl DisplayServer {
     }
 
     /// Start reading viewer input.
-    pub fn run(self, gpu: GpuControl, input: InputPipes, agent: Agent, events: Sender<VmEvent>) -> std::io::Result<()> {
+    pub fn run(
+        self,
+        gpu: Option<GpuControl>,
+        input: Option<InputPipes>,
+        agent: Agent,
+        events: Sender<VmEvent>,
+    ) -> std::io::Result<()> {
         let mut stream = self.stream;
         let latest = self.clip_latest;
         std::thread::Builder::new().name("display".into()).spawn(move || {
@@ -180,7 +225,7 @@ impl DisplayServer {
                 dec.push(&buf[..n]);
                 loop {
                     match dec.next_to_vmm() {
-                        Ok(Some(m)) => handle(m, &gpu, &input, &agent, &events, &latest),
+                        Ok(Some(m)) => handle(m, gpu.as_ref(), input.as_ref(), &agent, &events, &latest),
                         Ok(None) => break,
                         Err(e) => {
                             log::warn!("display: {e}");
@@ -196,7 +241,8 @@ impl DisplayServer {
     }
 }
 
-fn send_events(sock: &UnixDatagram, evs: &[[u8; 8]]) {
+fn send_events(sock: &Option<UnixDatagram>, evs: &[[u8; 8]]) {
+    let Some(sock) = sock else { return };
     let mut b = Vec::with_capacity(evs.len() * 8);
     for e in evs {
         b.extend_from_slice(e);
@@ -206,13 +252,15 @@ fn send_events(sock: &UnixDatagram, evs: &[[u8; 8]]) {
 
 fn handle(
     m: ToVmm,
-    gpu: &GpuControl,
-    input: &InputPipes,
+    gpu: Option<&GpuControl>,
+    input: Option<&InputPipes>,
     agent: &Agent,
     events: &Sender<VmEvent>,
     latest: &Arc<Mutex<Option<String>>>,
 ) {
     let syn = event(ev::EV_SYN, 0, 0);
+    let none = InputPipes::none();
+    let input = input.unwrap_or(&none);
     match m {
         ToVmm::Key { code, down } => {
             if code < 249 {
@@ -240,7 +288,9 @@ fn handle(
             send_events(&input.tablet, &e);
         }
         ToVmm::Resize { width, height } => {
-            gpu.resize(width, height);
+            if let Some(g) = gpu {
+                g.resize(width, height);
+            }
             agent.send(AgentCmd::SetResolution(width, height));
         }
         ToVmm::Focus(f) => agent.send(AgentCmd::Focus(f)),

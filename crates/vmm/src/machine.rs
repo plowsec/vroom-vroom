@@ -61,13 +61,13 @@ pub(crate) struct Machine {
 
 /// Registers MMIO devices on the bus and in the snapshot list in one go,
 /// so nothing can be on the bus but missing from snapshots.
-struct DeviceRegistry {
+pub(crate) struct DeviceRegistry {
     bus: BusBuilder,
     stateful: Vec<StatefulDevice>,
 }
 
 impl DeviceRegistry {
-    fn add<T>(&mut self, base: u64, len: u64, dev: Arc<Mutex<T>>) -> Result<()>
+    pub fn add<T>(&mut self, base: u64, len: u64, dev: Arc<Mutex<T>>) -> Result<()>
     where
         T: BusDevice + Snapshottable + Send + 'static,
     {
@@ -78,30 +78,35 @@ impl DeviceRegistry {
 }
 
 /// What gets loaded into RAM at (re)boot. Kept so reset can reload it.
-pub(crate) struct BootImage {
-    kernel: Vec<u8>,
-    initrd: Option<Vec<u8>>,
-    ram: (u64, u64),
-    fdt_cfg: board::FdtConfig,
+pub(crate) enum BootImage {
+    /// Direct Linux boot.
+    Kernel { kernel: Vec<u8>, initrd: Option<Vec<u8>>, ram: (u64, u64), fdt_cfg: board::FdtConfig },
+    /// UEFI in flash; the FDT goes at the start of RAM for it to find.
+    Firmware { fdt_cfg: board::FdtConfig },
 }
 
 impl BootImage {
-    /// Copy kernel, initrd and a fresh FDT into RAM. Returns boot CPU regs.
+    /// Put boot blobs into RAM. Returns boot CPU regs.
     pub fn load(&self, mem: &GuestMemory) -> Result<BootRegs> {
-        let k = board::load_kernel(mem, self.ram.0, &self.kernel)?;
-        let plan = board::place_boot_blobs(
-            self.ram,
-            k.end,
-            self.initrd.as_ref().map(|i| i.len() as u64),
-        )?;
-        let mut fdt_cfg = self.fdt_cfg.clone();
-        if let (Some(addr), Some(data)) = (plan.initrd_addr, &self.initrd) {
-            board::load_initrd(mem, addr, data)?;
-            fdt_cfg.initrd = Some((addr, data.len() as u64));
+        match self {
+            BootImage::Kernel { kernel, initrd, ram, fdt_cfg } => {
+                let k = board::load_kernel(mem, ram.0, kernel)?;
+                let plan = board::place_boot_blobs(*ram, k.end, initrd.as_ref().map(|i| i.len() as u64))?;
+                let mut fdt_cfg = fdt_cfg.clone();
+                if let (Some(addr), Some(data)) = (plan.initrd_addr, initrd) {
+                    board::load_initrd(mem, addr, data)?;
+                    fdt_cfg.initrd = Some((addr, data.len() as u64));
+                }
+                let fdt = board::create_fdt(&fdt_cfg)?;
+                mem.write(GuestAddress(plan.fdt_addr), &fdt)?;
+                Ok(BootRegs::Aarch64 { pc: k.entry, x: [plan.fdt_addr, 0, 0, 0] })
+            }
+            BootImage::Firmware { fdt_cfg } => {
+                let fdt = board::create_fdt(fdt_cfg)?;
+                mem.write(GuestAddress(layout::RAM_BASE), &fdt)?;
+                Ok(BootRegs::Aarch64 { pc: layout::FLASH0_BASE, x: [layout::RAM_BASE, 0, 0, 0] })
+            }
         }
-        let fdt = board::create_fdt(&fdt_cfg)?;
-        mem.write(GuestAddress(plan.fdt_addr), &fdt)?;
-        Ok(BootRegs::Aarch64 { pc: k.entry, x: [plan.fdt_addr, 0, 0, 0] })
     }
 }
 
@@ -213,24 +218,29 @@ pub(crate) fn build(
         let id = format!("vd{}", (b'a' + i as u8) as char);
         add_virtio(Box::new(Block::new(&id, img)))?;
     }
-    // Display: virtio-gpu + keyboard + tablet. Without a viewer the GPU
-    // still exists (guest sees a monitor) and frames go nowhere.
-    let mut display_parts = None;
-    let mut screen = None;
-    if config.display.gpu != Gpu::None {
-        let fb = match &ui {
+    // Display. UEFI always gets ramfb (firmware / installer screen);
+    // virtio-gpu takes over once a guest driver drives it.
+    let uefi = matches!(config.boot, Boot::Uefi { .. });
+    let screen = if config.display.gpu != Gpu::None || uefi {
+        Some(match &ui {
             Some(ds) => ds.sink()?,
             None => FbSink::headless()?,
-        };
-        screen = Some(fb.clone());
-        let sink: Arc<dyn DisplaySink> = fb;
+        })
+    } else {
+        None
+    };
+    let mut gpu_ctl = None;
+    let mut input = None;
+    if let (Some(fb), true) = (&screen, config.display.gpu != Gpu::None) {
+        let sink: Arc<dyn DisplaySink> = fb.clone();
         let (gpu, ctl) = GpuDev::new(config.display.width, config.display.height, sink);
         add_virtio(Box::new(gpu))?;
         let (kbd_host, kbd_dev) = UnixDatagram::pair()?;
         let (tab_host, tab_dev) = UnixDatagram::pair()?;
         add_virtio(Box::new(Input::new(InputKind::Keyboard, kbd_dev)))?;
         add_virtio(Box::new(Input::new(InputKind::Tablet, tab_dev)))?;
-        display_parts = Some((ctl, InputPipes { kbd: kbd_host, tablet: tab_host }));
+        gpu_ctl = Some(ctl);
+        input = Some(InputPipes { kbd: Some(kbd_host), tablet: Some(tab_host) });
     }
 
     // Guest agent channel: /dev/virtio-ports/org.bulwark.agent.0 in the guest.
@@ -243,10 +253,10 @@ pub(crate) fn build(
     let agent = agent::spawn(host_end, config.clipboard.clone(), clipboard)?;
     let viewer = ui.as_ref().map(|d| d.tx());
     if let Some(ds) = ui {
-        match display_parts {
-            Some((ctl, pipes)) => ds.run(ctl, pipes, agent.clone(), events.clone())?,
-            None => return Err(Error::Setup("a viewer needs display.gpu set".into())),
+        if screen.is_none() {
+            return Err(Error::Setup("a viewer needs a display (display.gpu or UEFI boot)".into()));
         }
+        ds.run(gpu_ctl, input, agent.clone(), events.clone())?;
     }
     for (i, n) in config.nets.iter().enumerate() {
         let mac = match &n.mac {
@@ -258,6 +268,16 @@ pub(crate) fn build(
     }
 
     let mpidrs: Vec<u64> = (0..config.cpus).map(mpidr_for).collect();
+    let fdt_base = |devices: Vec<board::FdtDevice>, cmdline: String| board::FdtConfig {
+        cpu_mpidrs: mpidrs.clone(),
+        ram: vec![(layout::RAM_BASE, ram_size)],
+        cmdline,
+        initrd: None,
+        gic_dist_size: info.dist_size,
+        gic_redist_size: info.redist_size_per_cpu,
+        gic_msi: Some((layout::GIC_MSI_BASE, info.msi_size)),
+        devices,
+    };
     let boot = match &config.boot {
         Boot::Kernel { kernel, initrd, cmdline } => {
             let raw = read_file(kernel, "kernel", 1 << 30)?;
@@ -266,23 +286,39 @@ pub(crate) fn build(
                 Some(p) => Some(read_file(p, "initrd", ram_size / 2)?),
                 None => None,
             };
-            BootImage {
+            BootImage::Kernel {
                 kernel,
                 initrd,
                 ram: (layout::RAM_BASE, ram_size),
-                fdt_cfg: board::FdtConfig {
-                    cpu_mpidrs: mpidrs.clone(),
-                    ram: vec![(layout::RAM_BASE, ram_size)],
-                    cmdline: cmdline.clone(),
-                    initrd: None,
-                    gic_dist_size: info.dist_size,
-                    gic_redist_size: info.redist_size_per_cpu,
-                    gic_msi: Some((layout::GIC_MSI_BASE, info.msi_size)),
-                    devices: fdt_devices,
-                },
+                fdt_cfg: fdt_base(fdt_devices, cmdline.clone()),
             }
         }
-        Boot::Uefi { .. } => return Err(Error::Setup("UEFI boot not wired up yet".into())),
+        Boot::Uefi { firmware, vars } => {
+            let fw = crate::firmware::Firmware { code: firmware.clone(), vars: vars.clone() };
+            fw.setup(
+                &vm,
+                &mem,
+                &mut reg,
+                config.cpus,
+                &mpidrs,
+                &info,
+                fdt_devices
+                    .iter()
+                    .filter_map(|d| match *d {
+                        board::FdtDevice::VirtioMmio { base, size, spi } => Some((base, size, spi)),
+                        _ => None,
+                    })
+                    .collect(),
+                screen.as_ref().map(Arc::downgrade),
+            )?;
+            fdt_devices.push(board::FdtDevice::Flash {
+                base0: layout::FLASH0_BASE,
+                base1: layout::FLASH1_BASE,
+                size: layout::FLASH_SIZE,
+            });
+            fdt_devices.push(board::FdtDevice::FwCfg { base: layout::FW_CFG_BASE });
+            BootImage::Firmware { fdt_cfg: fdt_base(fdt_devices, String::new()) }
+        }
     };
 
     let shared = Arc::new(VcpuShared {

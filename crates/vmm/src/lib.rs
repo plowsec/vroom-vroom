@@ -6,9 +6,11 @@
 
 pub mod agent;
 mod display;
+mod firmware;
 mod irq;
 mod machine;
 pub mod psci;
+mod ramfb;
 mod snapshot;
 mod vcpu;
 

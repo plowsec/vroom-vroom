@@ -3,6 +3,7 @@
 //! Addresses match QEMU's `virt` machine where it matters, so unmodified
 //! EDK2 `ArmVirtQemu` firmware finds its devices.
 
+pub mod acpi;
 pub mod fdt;
 pub mod layout;
 pub mod loader;

@@ -259,6 +259,7 @@ dependencies = [
 name = "bulwark-devices"
 version = "0.1.0"
 dependencies = [
+ "bulwark-memory",
  "bulwark-snapshot",
  "log",
  "serde",

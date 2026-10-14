@@ -10,6 +10,7 @@ thiserror.workspace = true
 log.workspace = true
 serde.workspace = true
 bulwark-snapshot.workspace = true
+bulwark-memory.workspace = true
 
 [lints]
 workspace = true

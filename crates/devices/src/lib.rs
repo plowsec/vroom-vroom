@@ -7,6 +7,8 @@
 
 mod bus;
 mod irq;
+pub mod fw_cfg;
+pub mod pflash;
 pub mod pl011;
 pub mod pl031;
 

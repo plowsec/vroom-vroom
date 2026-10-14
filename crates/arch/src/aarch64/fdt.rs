@@ -23,6 +23,9 @@ pub enum FdtDevice {
     PciEcam { ecam_base: u64, ecam_size: u64, buses: u32 },
     /// PL061 with a power-button key wired to GPIO 3 (graceful shutdown).
     GpioPowerKey { base: u64, spi: u32 },
+    /// Two CFI flash banks (firmware code + variables).
+    Flash { base0: u64, base1: u64, size: u64 },
+    FwCfg { base: u64 },
 }
 
 #[derive(Debug, Clone)]
@@ -72,6 +75,20 @@ fn build(cfg: &FdtConfig) -> FdtWriterResult<Vec<u8>> {
                 pci(&mut f, ecam_base, ecam_size, buses, cfg.gic_msi.is_some())?
             }
             FdtDevice::GpioPowerKey { base, spi } => gpio_keys(&mut f, base, spi)?,
+            FdtDevice::Flash { base0, base1, size } => {
+                let n = f.begin_node(&format!("flash@{base0:x}"))?;
+                f.property_string("compatible", "cfi-flash")?;
+                f.property_array_u64("reg", &[base0, size, base1, size])?;
+                f.property_u32("bank-width", 4)?;
+                f.end_node(n)?;
+            }
+            FdtDevice::FwCfg { base } => {
+                let n = f.begin_node(&format!("fw-cfg@{base:x}"))?;
+                f.property_string("compatible", "qemu,fw-cfg-mmio")?;
+                f.property_array_u64("reg", &[base, 0x18])?;
+                f.property_null("dma-coherent")?;
+                f.end_node(n)?;
+            }
         }
     }
     f.end_node(root)?;
