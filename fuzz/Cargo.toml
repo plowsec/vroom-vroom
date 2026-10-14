@@ -1,0 +1,57 @@
+[package]
+name = "bulwark-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bulwark-proto = { path = "../crates/proto" }
+bulwark-net = { path = "../crates/net" }
+bulwark-virtio = { path = "../crates/virtio" }
+bulwark-devices = { path = "../crates/devices" }
+bulwark-memory = { path = "../crates/memory" }
+bulwark-block = { path = "../crates/block" }
+tempfile = "3"
+
+# Not part of the main workspace (needs nightly + sanitizers).
+[workspace]
+
+[[bin]]
+name = "proto_decoder"
+path = "fuzz_targets/proto_decoder.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "net_packets"
+path = "fuzz_targets/net_packets.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "virtqueue"
+path = "fuzz_targets/virtqueue.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "xhci"
+path = "fuzz_targets/xhci.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "nvme"
+path = "fuzz_targets/nvme.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "qcow2"
+path = "fuzz_targets/qcow2.rs"
+test = false
+doc = false
