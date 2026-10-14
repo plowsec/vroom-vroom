@@ -73,6 +73,7 @@ impl Firmware {
         psci_smc: bool,
         virtio_mmio: Vec<(u64, u64, u32)>,
         screen: Option<Weak<FbSink>>,
+        smbios: &bulwark_arch::smbios::SmbiosConfig,
     ) -> Result<()> {
         // Code: read-only, mapped straight into the guest.
         let code_path = match &self.code {
@@ -112,6 +113,9 @@ impl Firmware {
         fw.add_file(RSDP_FILE, tables.rsdp, None).map_err(Error::Setup)?;
         fw.add_file(TABLES_FILE, tables.tables, None).map_err(Error::Setup)?;
         fw.add_file(LOADER_FILE, tables.loader, None).map_err(Error::Setup)?;
+        let sm = bulwark_arch::smbios::build(smbios);
+        fw.add_file(bulwark_arch::smbios::TABLES_FILE, sm.tables, None).map_err(Error::Setup)?;
+        fw.add_file(bulwark_arch::smbios::ANCHOR_FILE, sm.anchor, None).map_err(Error::Setup)?;
         if let Some(fb) = screen {
             let cfg = Arc::new(Mutex::new(None));
             let c2 = cfg.clone();

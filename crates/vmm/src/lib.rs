@@ -139,7 +139,8 @@ impl Vmm {
             StartMode::Boot => Default::default(),
         };
         let disks = disks::DiskSet::open(&config, &opts.state_dir, &layers)?;
-        let m = machine::build(&config, hv.as_ref(), opts.serial_out, opts.clipboard, ui, &disks, ev_tx)?;
+        let uuid = machine_uuid(&opts.state_dir)?;
+        let m = machine::build(&config, hv.as_ref(), opts.serial_out, opts.clipboard, ui, &disks, ev_tx, uuid)?;
         let mut vmm = Vmm {
             config,
             hv,
@@ -347,4 +348,28 @@ impl Drop for Vmm {
             self.shutdown();
         }
     }
+}
+
+/// The VM's hardware UUID (SMBIOS): random once, then kept in the state
+/// dir. Guests key activation and hardware ids on it.
+fn machine_uuid(state_dir: &Path) -> Result<[u8; 16]> {
+    let path = state_dir.join("uuid");
+    if let Ok(s) = std::fs::read_to_string(&path) {
+        let hex: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+        if hex.len() == 32 {
+            let mut u = [0u8; 16];
+            for (i, b) in u.iter_mut().enumerate() {
+                *b = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap_or(0);
+            }
+            return Ok(u);
+        }
+    }
+    let mut u = [0u8; 16];
+    std::fs::File::open("/dev/urandom").and_then(|mut f| std::io::Read::read_exact(&mut f, &mut u))?;
+    u[6] = (u[6] & 0x0f) | 0x40; // version 4
+    u[8] = (u[8] & 0x3f) | 0x80; // variant 1
+    std::fs::create_dir_all(state_dir)?;
+    let hex: String = u.iter().map(|b| format!("{b:02x}")).collect();
+    std::fs::write(&path, format!("{}-{}-{}-{}-{}\n", &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..]))?;
+    Ok(u)
 }

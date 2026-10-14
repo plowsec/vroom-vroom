@@ -311,6 +311,7 @@ pub(crate) fn build(
     ui: Option<DisplayServer>,
     disks: &DiskSet,
     events: Sender<VmEvent>,
+    uuid: [u8; 16],
 ) -> Result<Machine> {
     if hv.arch() != bulwark_hv::Arch::Aarch64 {
         return Err(Error::Setup("only the aarch64 board exists so far".into()));
@@ -495,6 +496,13 @@ pub(crate) fn build(
                     })
                     .collect(),
                 screen.as_ref().map(Arc::downgrade),
+                &bulwark_arch::smbios::SmbiosConfig {
+                    vm_name: config.name.clone(),
+                    uuid,
+                    cpus: config.cpus,
+                    memory_bytes: ram_size,
+                    ram_base: layout::RAM_BASE,
+                },
             )?;
             fdt_devices.push(board::FdtDevice::Flash {
                 base0: layout::FLASH0_BASE,
