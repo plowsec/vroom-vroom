@@ -9,7 +9,12 @@
 
 mod clip;
 mod port;
+// Used by the Windows service; built everywhere so it's tested everywhere.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod relay;
 mod sys;
+#[cfg(windows)]
+mod winsvc;
 
 #[cfg(windows)]
 use std::fs::OpenOptions;
@@ -20,7 +25,7 @@ use std::time::Duration;
 use bulwark_proto::{features, Decoder, Message, AGENT_PORT};
 
 const POLL: Duration = Duration::from_millis(300);
-const MAX_CLIP: usize = 16 << 20;
+pub(crate) const MAX_CLIP: usize = 16 << 20;
 
 fn port_path() -> String {
     if cfg!(windows) {
@@ -30,22 +35,41 @@ fn port_path() -> String {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+enum Role {
+    /// Everything in one process (Linux; Windows run elevated).
+    Full,
+    /// Windows service: host port, clock, shutdown; desktop work relayed.
+    Service,
+    /// Windows, unprivileged, in the user's session: clipboard, resolution.
+    Session,
+}
+
 struct Args {
     port: String,
     clipboard_file: Option<String>,
     no_clipboard: bool,
+    role: Role,
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut a = Args { port: port_path(), clipboard_file: None, no_clipboard: false };
+    let mut a = Args { port: port_path(), clipboard_file: None, no_clipboard: false, role: Role::Full };
     let mut it = std::env::args().skip(1);
     while let Some(x) = it.next() {
         match x.as_str() {
             "--port" => a.port = it.next().ok_or("--port needs a value")?,
             "--clipboard-file" => a.clipboard_file = Some(it.next().ok_or("--clipboard-file needs a path")?),
             "--no-clipboard" => a.no_clipboard = true,
+            #[cfg(windows)]
+            "--service" => a.role = Role::Service,
+            #[cfg(windows)]
+            "--session" => {
+                a.role = Role::Session;
+                a.port = winsvc::PIPE.into();
+            }
             "-h" | "--help" => {
-                println!("bulwark-agent [--port PATH] [--clipboard-file PATH | --no-clipboard]");
+                println!("bulwark-agent [--port PATH] [--clipboard-file PATH | --no-clipboard] [--service | --session (Windows)]");
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument {other}")),
@@ -72,6 +96,14 @@ fn main() {
             std::process::exit(2);
         }
     };
+    #[cfg(windows)]
+    if args.role == Role::Service {
+        if let Err(e) = winsvc::run_service() {
+            log::error!("not started by the service manager: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     loop {
         if let Err(e) = session(&args) {
             log::warn!("session ended: {e}");
@@ -80,8 +112,17 @@ fn main() {
     }
 }
 
+fn open_link(args: &Args) -> std::io::Result<(port::Reader, port::Writer)> {
+    #[cfg(windows)]
+    if args.role == Role::Session {
+        return port::open_checked(&args.port, winsvc::check_server);
+    }
+    port::open(&args.port)
+}
+
 fn session(args: &Args) -> std::io::Result<()> {
-    let (mut reader, mut writer) = port::open(&args.port)?;
+    let (mut reader, mut writer) = open_link(args)?;
+    let system = args.role == Role::Full;
     sys::single_display();
     let mut clip: Box<dyn clip::Clip> = if args.no_clipboard {
         Box::new(clip::NoClip)
@@ -91,7 +132,9 @@ fn session(args: &Args) -> std::io::Result<()> {
         clip::system()
     };
 
-    writer.write_all(&hello().encode())?;
+    if system {
+        writer.write_all(&hello().encode())?;
+    }
     log::info!("connected to {}", args.port);
 
     // Blocking reads on their own thread; main loop polls the clipboard.
@@ -113,7 +156,7 @@ fn session(args: &Args) -> std::io::Result<()> {
                 dec.push(&bytes);
                 loop {
                     match dec.next() {
-                        Ok(Some(m)) => handle(m, &mut writer, clip.as_mut(), &mut last)?,
+                        Ok(Some(m)) => handle(m, system, &mut writer, clip.as_mut(), &mut last)?,
                         Ok(None) => break,
                         Err(e) => log::warn!("bad message from host: {e}"),
                     }
@@ -142,8 +185,13 @@ fn hello() -> Message {
     Message::Hello { features, agent: format!("bulwark-agent {}", env!("CARGO_PKG_VERSION")) }
 }
 
-fn handle(m: Message, w: &mut port::Writer, clip: &mut dyn clip::Clip, last: &mut Option<String>) -> std::io::Result<()> {
+/// `system`: we own the host link and may act on privileged requests.
+/// The session helper only ever gets clipboard and resolution messages.
+fn handle(m: Message, system: bool, w: &mut port::Writer, clip: &mut dyn clip::Clip, last: &mut Option<String>) -> std::io::Result<()> {
     match m {
+        Message::Hello { .. } | Message::TimeSync { .. } | Message::Shutdown { .. } | Message::Ping(_) if !system => {
+            log::debug!("ignoring a privileged message on the session link");
+        }
         // The host says hello when it (re)starts, e.g. resuming a
         // suspended VM in a new process: introduce ourselves again.
         Message::Hello { agent, .. } => {

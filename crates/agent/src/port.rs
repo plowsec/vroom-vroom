@@ -17,8 +17,11 @@ pub fn open(path: &str) -> std::io::Result<(Reader, Writer)> {
 
 #[cfg(windows)]
 pub fn open(path: &str) -> std::io::Result<(Reader, Writer)> {
-    win::open(path)
+    win::open(path, |_| Ok(()))
 }
+
+#[cfg(windows)]
+pub use win::{from_handle, open as open_checked, overlapped};
 
 #[cfg(windows)]
 mod win {
@@ -46,6 +49,50 @@ mod win {
         }
     }
 
+    fn new_event() -> io::Result<Handle> {
+        // SAFETY: anonymous manual-reset event.
+        let e = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        if e.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Handle(e))
+    }
+
+    /// Start an overlapped op on `h` with `f` and wait for it. `h` is
+    /// borrowed.
+    fn run_io(h: HANDLE, event: HANDLE, f: impl FnOnce(HANDLE, *mut OVERLAPPED) -> i32) -> io::Result<usize> {
+        // SAFETY: zeroed OVERLAPPED is valid; it outlives the op because
+        // we wait for completion below.
+        let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
+        ov.hEvent = event;
+        if f(h, &mut ov) == 0 {
+            // SAFETY: plain call.
+            let err = unsafe { GetLastError() };
+            if err != ERROR_IO_PENDING {
+                return Err(io::Error::from_raw_os_error(err as i32));
+            }
+        }
+        let mut n = 0u32;
+        // SAFETY: same handle and OVERLAPPED; wait = TRUE.
+        if unsafe { GetOverlappedResult(h, &ov, &mut n, 1) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(n as usize)
+    }
+
+    /// One overlapped operation on a handle we don't own.
+    pub fn overlapped(h: HANDLE, f: impl FnOnce(HANDLE, *mut OVERLAPPED) -> i32) -> io::Result<usize> {
+        let ev = new_event()?;
+        run_io(h, ev.0, f)
+    }
+
+    /// Reader and writer over a handle opened with FILE_FLAG_OVERLAPPED.
+    /// Takes ownership of the handle.
+    pub fn from_handle(h: HANDLE) -> io::Result<(Reader, Writer)> {
+        let port = Arc::new(Handle(h));
+        Ok((Box::new(Side::new(port.clone())?), Box::new(Side::new(port)?)))
+    }
+
     /// One direction: shared port handle, private event.
     struct Side {
         port: Arc<Handle>,
@@ -54,33 +101,11 @@ mod win {
 
     impl Side {
         fn new(port: Arc<Handle>) -> io::Result<Side> {
-            // SAFETY: anonymous manual-reset event.
-            let e = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
-            if e.is_null() {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(Side { port, event: Handle(e) })
+            Ok(Side { port, event: new_event()? })
         }
 
-        /// Start an overlapped op with `f` and wait for it.
         fn io(&self, f: impl FnOnce(HANDLE, *mut OVERLAPPED) -> i32) -> io::Result<usize> {
-            // SAFETY: zeroed OVERLAPPED is valid; it outlives the op because
-            // we wait for completion below.
-            let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
-            ov.hEvent = self.event.0;
-            if f(self.port.0, &mut ov) == 0 {
-                // SAFETY: plain call.
-                let err = unsafe { GetLastError() };
-                if err != ERROR_IO_PENDING {
-                    return Err(io::Error::from_raw_os_error(err as i32));
-                }
-            }
-            let mut n = 0u32;
-            // SAFETY: same handle and OVERLAPPED; wait = TRUE.
-            if unsafe { GetOverlappedResult(self.port.0, &ov, &mut n, 1) } == 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(n as usize)
+            run_io(self.port.0, self.event.0, f)
         }
     }
 
@@ -103,7 +128,8 @@ mod win {
         }
     }
 
-    pub fn open(path: &str) -> io::Result<(Reader, Writer)> {
+    /// Open `path` overlapped; `check` vets the handle before use.
+    pub fn open(path: &str, check: impl FnOnce(HANDLE) -> io::Result<()>) -> io::Result<(Reader, Writer)> {
         let wide: Vec<u16> = path.encode_utf16().chain([0]).collect();
         // SAFETY: valid NUL-terminated path; no sharing, no template.
         let h = unsafe {
@@ -121,6 +147,7 @@ mod win {
             return Err(io::Error::last_os_error());
         }
         let port = Arc::new(Handle(h));
+        check(h)?;
         Ok((Box::new(Side::new(port.clone())?), Box::new(Side::new(port)?)))
     }
 }

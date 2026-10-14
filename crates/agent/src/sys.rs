@@ -19,6 +19,7 @@ pub fn set_time(secs: u64, nanos: u32) -> std::io::Result<()> {
     // FILETIME: 100ns ticks since 1601-01-01.
     let ticks = (secs + 11_644_473_600) * 10_000_000 + (nanos / 100) as u64;
     let ft = FILETIME { dwLowDateTime: ticks as u32, dwHighDateTime: (ticks >> 32) as u32 };
+    // SAFETY: SYSTEMTIME is plain data; all-zero is valid.
     let mut st: SYSTEMTIME = unsafe { std::mem::zeroed() };
     // SAFETY: valid pointers.
     if unsafe { windows_sys::Win32::System::Time::FileTimeToSystemTime(&ft, &mut st) } == 0 {
