@@ -1,0 +1,53 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.80"
+
+[workspace.dependencies]
+bulwark-memory = { path = "crates/memory" }
+bulwark-hv = { path = "crates/hv" }
+bulwark-devices = { path = "crates/devices" }
+bulwark-virtio = { path = "crates/virtio" }
+bulwark-arch = { path = "crates/arch" }
+bulwark-vmm = { path = "crates/vmm" }
+bulwark-config = { path = "crates/config" }
+bulwark-snapshot = { path = "crates/snapshot" }
+bulwark-net = { path = "crates/net" }
+bulwark-proto = { path = "crates/proto" }
+bulwark-sandbox = { path = "crates/sandbox" }
+bulwark-block = { path = "crates/block" }
+
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+vm-fdt = "0.3"
+mio = { version = "1", features = ["os-poll", "os-ext", "net"] }
+flate2 = "1"
+clap = { version = "4", features = ["derive"] }
+crc32fast = "1"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+unwrap_used = "warn"
+
+[profile.release]
+panic = "abort"
+lto = "thin"
+codegen-units = 1
+overflow-checks = true
+
+[profile.dev]
+panic = "abort"
