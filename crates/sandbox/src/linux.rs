@@ -41,14 +41,14 @@ fn allowed(p: &Policy) -> Vec<i64> {
         SYS_clock_gettime, SYS_clock_nanosleep, SYS_nanosleep, SYS_sched_yield,
         SYS_sched_getaffinity, SYS_rt_sigaction, SYS_rt_sigprocmask, SYS_rt_sigreturn,
         SYS_sigaltstack, SYS_exit, SYS_exit_group, SYS_getrandom, SYS_fcntl, SYS_openat,
-        SYS_mkdirat, SYS_renameat2, SYS_fsync, SYS_fdatasync, SYS_ftruncate, SYS_fallocate,
+        SYS_mkdirat, SYS_renameat, SYS_renameat2, SYS_fchmod, SYS_fchmodat, SYS_fsync, SYS_fdatasync, SYS_ftruncate, SYS_fallocate,
         SYS_getpid, SYS_gettid, SYS_clone, SYS_clone3, SYS_set_robust_list,
         SYS_rseq, SYS_prctl, SYS_getdents64, SYS_restart_syscall, SYS_socketpair,
         SYS_recvfrom, SYS_sendto, SYS_recvmsg, SYS_sendmsg, SYS_shutdown,
         SYS_getsockname, SYS_getpeername, SYS_getsockopt, SYS_setsockopt,
     ];
     #[cfg(target_arch = "x86_64")]
-    v.extend_from_slice(&[SYS_epoll_wait, SYS_poll, SYS_rename, SYS_mkdir, SYS_arch_prctl]);
+    v.extend_from_slice(&[SYS_epoll_wait, SYS_poll, SYS_rename, SYS_mkdir, SYS_chmod, SYS_arch_prctl]);
     if p.network_outbound {
         // No bind: UDP flows use implicit binds via connect().
         v.extend_from_slice(&[SYS_socket, SYS_connect]);
