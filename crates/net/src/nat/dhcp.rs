@@ -32,6 +32,7 @@ pub fn handle(req: &[u8], lease: &Lease) -> Option<Vec<u8>> {
     let chaddr = &req[28..44];
     let mut msg_type = None;
     let mut requested = None;
+    let mut server = None;
     // Options: bounded walk.
     let mut i = 240;
     while i < req.len() {
@@ -48,9 +49,13 @@ pub fn handle(req: &[u8], lease: &Lease) -> Option<Vec<u8>> {
         match (code, len) {
             (53, 1) => msg_type = Some(val[0]),
             (50, 4) => requested = Some(Ipv4Addr::new(val[0], val[1], val[2], val[3])),
+            (54, 4) => server = Some(Ipv4Addr::new(val[0], val[1], val[2], val[3])),
             _ => {}
         }
         i += 2 + len;
+    }
+    if server.is_some_and(|s| s != lease.server) {
+        return None;
     }
     let reply_type = match msg_type? {
         DISCOVER => OFFER,
@@ -160,5 +165,19 @@ mod tests {
             let full = request(REQUEST, Some([10, 0, 2, 15]));
             let _ = handle(&full[..n.min(full.len())], &lease());
         }
+    }
+
+    #[test]
+    fn selected_server_and_renewal() {
+        let mut r = request(REQUEST, Some([10, 0, 2, 15]));
+        r.pop();
+        r.extend_from_slice(&[54, 4, 10, 0, 2, 99, 255]);
+        assert!(handle(&r, &lease()).is_none());
+        let n = r.len();
+        r[n - 2] = 2;
+        assert_eq!(msg_type(&handle(&r, &lease()).unwrap()), ACK);
+        let mut renewal = request(REQUEST, None);
+        renewal[12..16].copy_from_slice(&[10, 0, 2, 15]);
+        assert_eq!(msg_type(&handle(&renewal, &lease()).unwrap()), ACK);
     }
 }
