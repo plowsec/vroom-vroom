@@ -62,6 +62,14 @@ impl VirtioCore {
         self.dev.device_features() | VERSION_1
     }
 
+    pub fn shm_regions(&self) -> Vec<(u8, u64)> {
+        self.dev.shm_regions()
+    }
+
+    pub fn set_shm_base(&mut self, id: u8, gpa: u64) {
+        self.dev.set_shm_base(id, gpa);
+    }
+
     pub fn is_active(&self) -> bool {
         self.active
     }

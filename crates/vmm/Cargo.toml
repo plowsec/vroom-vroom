@@ -17,6 +17,7 @@ bulwark-arch.workspace = true
 bulwark-config.workspace = true
 bulwark-snapshot.workspace = true
 bulwark-virtio.workspace = true
+bulwark-gpu3d.workspace = true
 bulwark-block.workspace = true
 bulwark-net.workspace = true
 bulwark-proto.workspace = true

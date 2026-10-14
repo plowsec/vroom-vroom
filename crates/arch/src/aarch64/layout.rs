@@ -48,8 +48,12 @@ pub const PCI_MMIO64_BASE: u64 = 0x80_0000_0000;
 pub const PCI_MMIO64_SIZE: u64 = 0x80_0000_0000;
 
 pub const RAM_BASE: u64 = 0x4000_0000;
-/// RAM must end below the 64-bit PCI window.
-pub const RAM_MAX: u64 = PCI_MMIO64_BASE - RAM_BASE;
+/// Shared memory windows of virtio-mmio devices (GPU host-visible memory).
+/// Not RAM: the hypervisor maps host buffers in on demand.
+pub const SHM_BASE: u64 = 0x70_0000_0000;
+pub const SHM_SIZE: u64 = 0x10_0000_0000;
+/// RAM must end below the shared memory windows.
+pub const RAM_MAX: u64 = SHM_BASE - RAM_BASE;
 
 /// SPI assignments (0-based; GIC intid = 32 + n).
 pub const UART_SPI: u32 = 1;

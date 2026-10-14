@@ -51,7 +51,9 @@ fn build(cfg: &FdtConfig) -> FdtWriterResult<Vec<u8>> {
     let mut f = FdtWriter::new()?;
     let root = f.begin_node("")?;
     f.property_string("compatible", "linux,dummy-virt")?;
-    f.property_string("model", "bulwark-virt")?;
+    // Same as QEMU virt: distro tools (Ubuntu flash-kernel) match on it and
+    // fail kernel upgrades on boards they don't know.
+    f.property_string("model", "linux,dummy-virt")?;
     f.property_u32("#address-cells", 2)?;
     f.property_u32("#size-cells", 2)?;
     f.property_u32("interrupt-parent", PHANDLE_GIC)?;

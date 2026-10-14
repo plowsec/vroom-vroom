@@ -47,6 +47,13 @@ pub trait VirtioDevice: Send {
 
     /// Driver is ready: start processing. Queues are already validated.
     fn activate(&mut self, ctx: ActivateContext) -> Result<()>;
+    /// Shared memory regions `(id, length)` (virtio 1.2 §2.10), e.g. the
+    /// virtio-gpu host-visible window.
+    fn shm_regions(&self) -> Vec<(u8, u64)> {
+        Vec::new()
+    }
+    /// The transport placed region `id` at guest physical `gpa`.
+    fn set_shm_base(&mut self, _id: u8, _gpa: u64) {}
     /// Driver kicked `queue`. Called on a vCPU thread: keep it cheap.
     fn queue_notify(&mut self, queue: u16);
     /// Device reset by the driver: stop everything, forget queues.

@@ -24,6 +24,7 @@ bulwark-block = { path = "crates/block" }
 bulwark-agent = { path = "crates/agent" }
 bulwark-display = { path = "crates/display" }
 bulwark-ipc = { path = "crates/ipc" }
+bulwark-gpu3d = { path = "crates/gpu3d" }
 
 thiserror = "2"
 log = "0.4"

@@ -18,14 +18,16 @@ use bulwark_net::nat::{Nat, NatConfig, NatPolicy, TcpForward};
 use bulwark_net::socket::FrameSocket;
 use bulwark_net::{netd, NetBackend};
 use bulwark_proto::AGENT_PORT;
-use bulwark_virtio::devices::gpu::{DisplaySink, Gpu as GpuDev};
+use bulwark_virtio::devices::gpu::{DisplaySink, Gpu as GpuDev, ThreeD};
+use bulwark_virtio::devices::gpu3d::{Mapping, ShmMapper};
 use bulwark_virtio::devices::input::{Input, InputKind};
 use bulwark_virtio::devices::{block::Block, console::Console, net::Net, rng::Rng};
 use bulwark_devices::nvme::{Namespace, Nvme};
 use bulwark_devices::usb::xhci::Xhci;
 use bulwark_devices::pci::{Intx, IntxRouter, MsiSender, PciRoot, SharedPciDevice};
 use bulwark_devices::IrqLine;
-use bulwark_virtio::{mmio::VirtioMmio, pci::VirtioPci, VirtioDevice};
+use bulwark_virtio::mmio::{ShmRegion, VirtioMmio};
+use bulwark_virtio::{pci::VirtioPci, VirtioDevice};
 
 use crate::agent::{self, Agent, ClipboardProvider};
 use crate::disks::DiskSet;
@@ -60,6 +62,8 @@ struct Board {
     reg: DeviceRegistry,
     fdt: Vec<board::FdtDevice>,
     mmio_slots: VirtioSlots,
+    /// Next free spot in the shared memory window area.
+    shm_next: u64,
     use_pci: bool,
     pci: Vec<(u8, SharedPciDevice)>,
     next_pci_slot: u8,
@@ -79,6 +83,7 @@ impl Board {
             reg: DeviceRegistry { bus: BusBuilder::new(), stateful: Vec::new() },
             fdt: Vec::new(),
             mmio_slots: VirtioSlots::default(),
+            shm_next: layout::SHM_BASE,
             use_pci,
             pci: Vec::new(),
             next_pci_slot: 1,
@@ -111,6 +116,16 @@ impl Board {
         }
         let (base, spi) = self.mmio_slots.next()?;
         let t = VirtioMmio::new(base, dev, self.mem.clone(), SpiLine::new(self.vm.clone(), spi));
+        let mut regions = Vec::new();
+        for (id, len) in t.shm_wanted() {
+            // 1 GiB aligned windows, all inside the reserved area.
+            let at = self.shm_next.next_multiple_of(1 << 30);
+            let end = at.checked_add(len).filter(|&e| e <= layout::SHM_BASE + layout::SHM_SIZE);
+            let Some(end) = end else { return Err(Error::Setup(format!("no room for a {len:#x} shm window"))) };
+            regions.push(ShmRegion { id, base: at, len });
+            self.shm_next = end;
+        }
+        let t = t.with_shm(regions);
         self.reg.add(base, layout::VIRTIO_MMIO_SIZE, Arc::new(Mutex::new(t)))?;
         self.fdt.push(board::FdtDevice::VirtioMmio { base, size: layout::VIRTIO_MMIO_SIZE, spi });
         Ok(())
@@ -199,6 +214,43 @@ impl BootImage {
                 mem.write(GuestAddress(layout::RAM_BASE), &fdt)?;
                 Ok(BootRegs::Aarch64 { pc: layout::FLASH0_BASE, x: [layout::RAM_BASE, 0, 0, 0] })
             }
+        }
+    }
+}
+
+/// Host-visible window size for GPU buffers (address space, not memory).
+const GPU_SHM_SIZE: u64 = 8 << 30;
+
+/// Venus through virglrenderer, or a clear error.
+fn three_d(vm: &Arc<dyn Vm>) -> Result<ThreeD> {
+    if !bulwark_gpu3d::load() {
+        return Err(Error::Setup(
+            "gpu = \"virtio3d\" needs virglrenderer with Venus (macOS: brew install slp/krunkit/virglrenderer)".into(),
+        ));
+    }
+    let r = bulwark_gpu3d::Virgl::new().ok_or_else(|| Error::Setup("virglrenderer: Venus init failed (no Vulkan driver?)".into()))?;
+    Ok(ThreeD::new(Box::new(r), Arc::new(VmShm(vm.clone())), GPU_SHM_SIZE))
+}
+
+/// Maps GPU buffers into the guest with the hypervisor.
+struct VmShm(Arc<dyn Vm>);
+
+impl ShmMapper for VmShm {
+    fn map(&self, gpa: u64, m: &Mapping) -> bool {
+        // SAFETY: the renderer keeps the buffer mapped until unmap_blob,
+        // which the GPU device only calls after `unmap` below.
+        match unsafe { self.0.map_host(gpa, m.ptr, m.size) } {
+            Ok(()) => true,
+            Err(e) => {
+                log::warn!("gpu: map {gpa:#x}: {e}");
+                false
+            }
+        }
+    }
+
+    fn unmap(&self, gpa: u64, size: u64) {
+        if let Err(e) = self.0.unmap_host(gpa, size) {
+            log::warn!("gpu: unmap {gpa:#x}: {e}");
         }
     }
 }
@@ -342,7 +394,10 @@ pub(crate) fn build(
     let mut gpu_ctl = None;
     if let (Some(fb), true) = (&screen, config.display.gpu != Gpu::None) {
         let sink: Arc<dyn DisplaySink> = fb.clone();
-        let (gpu, ctl) = GpuDev::new(config.display.width, config.display.height, sink);
+        let (mut gpu, ctl) = GpuDev::new(config.display.width, config.display.height, sink);
+        if config.display.gpu == Gpu::Virtio3d {
+            gpu = gpu.with_3d(three_d(&vm)?);
+        }
         board.add_virtio(Box::new(gpu))?;
         gpu_ctl = Some(ctl);
     }

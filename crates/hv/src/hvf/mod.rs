@@ -229,6 +229,20 @@ impl Vm for HvfVm {
         Ok(())
     }
 
+    unsafe fn map_host(&self, gpa: u64, ptr: *mut u8, size: u64) -> Result<()> {
+        // HVF wants host pointer, IPA and size aligned to the host page.
+        let ps = bulwark_memory::page_size() as u64;
+        if gpa % ps != 0 || ptr as u64 % ps != 0 || size % ps != 0 || size == 0 {
+            return Err(Error::Invalid(format!("unaligned host map {gpa:#x} {ptr:p} {size:#x}")));
+        }
+        self.map(ptr, gpa, size as usize, ffi::HV_MEMORY_READ | ffi::HV_MEMORY_WRITE)
+    }
+
+    fn unmap_host(&self, gpa: u64, size: u64) -> Result<()> {
+        // SAFETY: removes a mapping we made; the guest just faults there now.
+        check("hv_vm_unmap", unsafe { ffi::hv_vm_unmap(gpa, size as usize) })
+    }
+
     fn zero_memory(&self, mem: &GuestMemory) -> Result<()> {
         // HVF keeps the pages it mapped: replacing them under it (discard
         // remaps) would leave the guest on the old contents. Unmap first.

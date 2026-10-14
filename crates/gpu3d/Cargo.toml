@@ -1,0 +1,15 @@
+[package]
+name = "bulwark-gpu3d"
+description = "virglrenderer (Venus) behind virtio-gpu, loaded at runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+log.workspace = true
+libc.workspace = true
+bulwark-virtio.workspace = true
+
+[lints]
+workspace = true

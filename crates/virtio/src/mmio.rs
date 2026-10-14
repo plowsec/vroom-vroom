@@ -148,8 +148,16 @@ impl VirtioMmio {
     }
 
     pub fn with_shm(mut self, shm: Vec<ShmRegion>) -> Self {
+        for r in &shm {
+            self.core.set_shm_base(r.id, r.base);
+        }
         self.shm = shm;
         self
+    }
+
+    /// Regions the device wants (id, len); the board picks the bases.
+    pub fn shm_wanted(&self) -> Vec<(u8, u64)> {
+        self.core.shm_regions()
     }
 
     fn irq_dyn(&self) -> Arc<dyn VirtioInterrupt> {

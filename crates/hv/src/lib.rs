@@ -101,6 +101,18 @@ pub trait Vm: Send + Sync {
     /// Map a read-only region (firmware flash). Guest writes trap as MMIO.
     fn map_readonly(&self, gpa: u64, region: Arc<bulwark_memory::MmapRegion>) -> Result<()>;
 
+    /// Map memory a native library owns (GPU buffers) at `gpa`, read/write.
+    ///
+    /// # Safety
+    /// `ptr..ptr+size` must stay mapped until `unmap_host(gpa, size)`.
+    unsafe fn map_host(&self, _gpa: u64, _ptr: *mut u8, _size: u64) -> Result<()> {
+        Err(Error::Unsupported("mapping host buffers into the guest"))
+    }
+
+    fn unmap_host(&self, _gpa: u64, _size: u64) -> Result<()> {
+        Err(Error::Unsupported("mapping host buffers into the guest"))
+    }
+
     /// Zero (and free) all of `mem`, already mapped with `map_memory`.
     /// vCPUs must be stopped. The default suits backends that follow host
     /// page table changes (KVM, via MMU notifiers).

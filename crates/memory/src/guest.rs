@@ -95,6 +95,20 @@ impl GuestMemory {
         self.walk(addr, len, |_, _, _| Ok(())).is_ok()
     }
 
+    /// Host pointers covering `[addr, addr+len)`, split where it crosses
+    /// regions (they are not contiguous on the host). For handing guest
+    /// buffers to native libraries (GPU renderer). None if any byte is not
+    /// guest RAM. Pointers stay valid for the life of this memory.
+    pub fn host_ranges(&self, addr: GuestAddress, len: u64) -> Option<Vec<(*mut u8, usize)>> {
+        let mut out = Vec::new();
+        self.walk(addr, len, |r, off, chunk| {
+            out.push((r.host_ptr().wrapping_add(off), chunk.len()));
+            Ok(())
+        })
+        .ok()?;
+        Some(out)
+    }
+
     /// Walk the range chunk by chunk (it may span adjacent regions).
     fn walk<F>(&self, addr: GuestAddress, len: u64, mut f: F) -> Result<()>
     where

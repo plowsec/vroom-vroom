@@ -80,6 +80,9 @@ struct Slots {
     next: u32,
     memory: Vec<GuestMemory>,
     roms: Vec<Arc<MmapRegion>>,
+    /// Host buffer mappings (GPU): gpa -> slot, and slots to reuse.
+    host: std::collections::HashMap<u64, u32>,
+    free: Vec<u32>,
 }
 
 /// Arch-specific irqchip handle (vGIC device fd on ARM).
@@ -105,20 +108,17 @@ impl std::fmt::Debug for KvmVm {
 }
 
 impl KvmVm {
-    fn add_slot(&self, gpa: u64, host: *mut u8, size: u64, flags: u32) -> Result<()> {
+    fn add_slot(&self, gpa: u64, host: *mut u8, size: u64, flags: u32) -> Result<u32> {
         let mut s = self.slots.lock().unwrap_or_else(|e| e.into_inner());
-        let region = kvm_userspace_memory_region {
-            slot: s.next,
-            flags,
-            guest_phys_addr: gpa,
-            memory_size: size,
-            userspace_addr: host as u64,
-        };
-        // SAFETY: host..host+size is a live mapping kept alive in `slots`
-        // for the VM's lifetime.
+        let slot = s.free.pop().unwrap_or(s.next);
+        let region = kvm_userspace_memory_region { slot, flags, guest_phys_addr: gpa, memory_size: size, userspace_addr: host as u64 };
+        // SAFETY: host..host+size is a live mapping: RAM/ROMs are kept in
+        // `slots` for the VM's lifetime, host buffers until unmap_host.
         unsafe { self.fd.set_user_memory_region(region) }.map_err(kerr("KVM_SET_USER_MEMORY_REGION"))?;
-        s.next += 1;
-        Ok(())
+        if slot == s.next {
+            s.next += 1;
+        }
+        Ok(slot)
     }
 }
 
@@ -134,6 +134,22 @@ impl Vm for KvmVm {
     fn map_readonly(&self, gpa: u64, region: Arc<MmapRegion>) -> Result<()> {
         self.add_slot(gpa, region.as_ptr(), region.size() as u64, KVM_MEM_READONLY)?;
         self.slots.lock().unwrap_or_else(|e| e.into_inner()).roms.push(region);
+        Ok(())
+    }
+
+    unsafe fn map_host(&self, gpa: u64, ptr: *mut u8, size: u64) -> Result<()> {
+        let slot = self.add_slot(gpa, ptr, size, 0)?;
+        self.slots.lock().unwrap_or_else(|e| e.into_inner()).host.insert(gpa, slot);
+        Ok(())
+    }
+
+    fn unmap_host(&self, gpa: u64, _size: u64) -> Result<()> {
+        let mut s = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = s.host.remove(&gpa).ok_or_else(|| Error::Invalid(format!("no host mapping at {gpa:#x}")))?;
+        let region = kvm_userspace_memory_region { slot, flags: 0, guest_phys_addr: gpa, memory_size: 0, userspace_addr: 0 };
+        // SAFETY: size 0 deletes the slot.
+        unsafe { self.fd.set_user_memory_region(region) }.map_err(kerr("KVM_SET_USER_MEMORY_REGION"))?;
+        s.free.push(slot);
         Ok(())
     }
 
