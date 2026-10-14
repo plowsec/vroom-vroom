@@ -1,7 +1,8 @@
 //! Save / restore a whole VM. The VM is paused by the caller.
 
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 use bulwark_hv::{IrqChipState, VcpuState};
@@ -25,8 +26,58 @@ fn dev_blob(id: &str) -> String {
     format!("dev.{id}")
 }
 
-pub(crate) fn save(vmm: &mut Vmm, dir: &Path, description: &str) -> Result<()> {
+/// Snapshots layer the disks; suspend images pin them instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Kind {
+    Snapshot,
+    Suspend,
+}
+
+/// What to do with the disks when starting from `dir`: for a snapshot,
+/// the frozen layers to revert to; for a suspend image, nothing (but the
+/// disks must not have changed since).
+pub(crate) fn disk_plan(dir: &Path) -> Result<BTreeMap<usize, PathBuf>> {
+    let snap = SnapshotDir::open(dir)?;
+    let m = &snap.manifest.meta;
+    let mut layers = BTreeMap::new();
+    if m.get("kind").map(String::as_str) == Some("suspend") {
+        for (k, v) in m.iter().filter(|(k, _)| k.starts_with("active.")) {
+            let (path, stamp) = v.split_once('|').ok_or_else(|| Error::Setup(format!("bad {k}")))?;
+            let now = crate::disks::file_stamp(Path::new(path)).unwrap_or_default();
+            if now != stamp {
+                return Err(Error::Setup(format!(
+                    "disk {path} changed since this VM was suspended; resuming would corrupt it (use --fresh)"
+                )));
+            }
+        }
+        return Ok(layers);
+    }
+    for (k, v) in m.iter() {
+        if let Some(i) = k.strip_prefix("disk.") {
+            let i: usize = i.parse().map_err(|_| Error::Setup(format!("bad {k}")))?;
+            layers.insert(i, PathBuf::from(v));
+        }
+    }
+    Ok(layers)
+}
+
+pub(crate) fn save(vmm: &mut Vmm, dir: &Path, description: &str, kind: Kind) -> Result<()> {
     let mut snap = SnapshotDir::create(dir)?;
+    match kind {
+        Kind::Snapshot => {
+            // Disk state at this instant becomes read-only; the VM goes on
+            // writing to a fresh overlay.
+            for (i, layer) in vmm.disks.freeze()? {
+                snap.manifest.meta.insert(format!("disk.{i}"), layer.display().to_string());
+            }
+        }
+        Kind::Suspend => {
+            snap.manifest.meta.insert("kind".into(), "suspend".into());
+            for (i, (path, stamp)) in vmm.disks.active_stamps()? {
+                snap.manifest.meta.insert(format!("active.{i}"), format!("{}|{stamp}", path.display()));
+            }
+        }
+    }
     let m = &mut snap.manifest;
     m.description = description.to_string();
     m.arch = "aarch64".into();

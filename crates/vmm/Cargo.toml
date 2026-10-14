@@ -23,5 +23,8 @@ bulwark-proto.workspace = true
 bulwark-display.workspace = true
 png = "0.17"
 
+[dev-dependencies]
+tempfile = "3"
+
 [lints]
 workspace = true

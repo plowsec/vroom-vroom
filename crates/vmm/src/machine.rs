@@ -6,7 +6,7 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use bulwark_arch::aarch64::{self as board, layout};
-use bulwark_config::{Boot, DiskBus, DiskFormat, Gpu, VmConfig};
+use bulwark_config::{Boot, DiskBus, Gpu, VmConfig};
 use bulwark_devices::{pl011::Pl011, pl031::Pl031, BusBuilder, BusDevice};
 use bulwark_hv::{
     aarch64::mpidr_for, BootRegs, GicMsiConfig, Hypervisor, IrqChipConfig, IrqChipInfo, Vm, VmParams,
@@ -27,6 +27,7 @@ use bulwark_devices::IrqLine;
 use bulwark_virtio::{mmio::VirtioMmio, pci::VirtioPci, VirtioDevice};
 
 use crate::agent::{self, Agent, ClipboardProvider};
+use crate::disks::DiskSet;
 use crate::display::{DisplayServer, FbSink, InputPipes, ViewerTx};
 use crate::irq::{GicMsi, SpiLine};
 use crate::psci::CpuTable;
@@ -246,6 +247,7 @@ pub(crate) fn build(
     serial_out: Box<dyn Write + Send>,
     clipboard: Option<Box<dyn ClipboardProvider>>,
     ui: Option<DisplayServer>,
+    disks: &DiskSet,
     events: Sender<VmEvent>,
 ) -> Result<Machine> {
     if hv.arch() != bulwark_hv::Arch::Aarch64 {
@@ -290,14 +292,9 @@ pub(crate) fn build(
 
     board.add_virtio(Box::new(Rng::new()))?;
     let mut nvme_ns = Vec::new();
-    for (i, d) in config.disks.iter().enumerate() {
-        let fmt = match d.format {
-            DiskFormat::Auto => None,
-            DiskFormat::Raw => Some(bulwark_block::Format::Raw),
-            DiskFormat::Qcow2 => Some(bulwark_block::Format::Qcow2),
-        };
-        let img = bulwark_block::open(&d.path, fmt, d.readonly)
-            .map_err(|e| Error::Setup(format!("disk {}: {e}", d.path.display())))?;
+    for (d, vd) in config.disks.iter().zip(&disks.disks) {
+        let i = vd.index;
+        let img: Arc<dyn bulwark_block::DiskImage> = vd.image.clone();
         match d.bus {
             DiskBus::Virtio => {
                 let id = format!("vd{}", (b'a' + i as u8) as char);

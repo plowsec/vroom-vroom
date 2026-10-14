@@ -84,6 +84,11 @@ pub fn detect(path: &Path) -> Result<Format> {
 /// file" at host files). So: auto-detect only for read-only opens, or when
 /// the caller already pinned the format.
 pub fn open(path: &Path, format: Option<Format>, read_only: bool) -> Result<Arc<dyn DiskImage>> {
+    open_with(path, format, read_only, &qcow2::OpenPolicy::default())
+}
+
+/// Like [`open`], with extra directories backing files may come from.
+pub fn open_with(path: &Path, format: Option<Format>, read_only: bool, policy: &qcow2::OpenPolicy) -> Result<Arc<dyn DiskImage>> {
     let fmt = match format {
         Some(f) => f,
         None if read_only => detect(path)?,
@@ -100,8 +105,59 @@ pub fn open(path: &Path, format: Option<Format>, read_only: bool) -> Result<Arc<
     };
     Ok(match fmt {
         Format::Raw => Arc::new(raw::RawImage::open(path, read_only)?),
-        Format::Qcow2 => Arc::new(qcow2::Qcow2Image::open(path, read_only)?),
+        Format::Qcow2 => Arc::new(qcow2::Qcow2Image::open_with(path, read_only, policy, 0)?),
     })
+}
+
+/// A disk whose backing image can be replaced while the VM is paused
+/// (snapshot layering). Devices hold this; size never changes.
+#[derive(Debug)]
+pub struct SwapDisk {
+    inner: std::sync::RwLock<Arc<dyn DiskImage>>,
+}
+
+impl SwapDisk {
+    pub fn new(d: Arc<dyn DiskImage>) -> Arc<Self> {
+        Arc::new(SwapDisk { inner: std::sync::RwLock::new(d) })
+    }
+
+    pub fn current(&self) -> Arc<dyn DiskImage> {
+        self.inner.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Swap in a new top layer of the same size.
+    pub fn swap(&self, d: Arc<dyn DiskImage>) -> Result<()> {
+        let mut g = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        if d.size() != g.size() {
+            return Err(Error::Format("replacement disk has a different size".into()));
+        }
+        *g = d;
+        Ok(())
+    }
+}
+
+impl DiskImage for SwapDisk {
+    fn size(&self) -> u64 {
+        self.current().size()
+    }
+    fn read_only(&self) -> bool {
+        self.current().read_only()
+    }
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<()> {
+        self.current().read_at(buf, offset)
+    }
+    fn write_at(&self, buf: &[u8], offset: u64) -> Result<()> {
+        self.current().write_at(buf, offset)
+    }
+    fn flush(&self) -> Result<()> {
+        self.current().flush()
+    }
+    fn discard(&self, offset: u64, len: u64) -> Result<()> {
+        self.current().discard(offset, len)
+    }
+    fn write_zeroes(&self, offset: u64, len: u64) -> Result<()> {
+        self.current().write_zeroes(offset, len)
+    }
 }
 
 pub(crate) fn open_file(path: &Path, read_only: bool) -> io::Result<File> {

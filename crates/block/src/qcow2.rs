@@ -36,7 +36,8 @@ const EXT_BACKING_FORMAT: u32 = 0xe279_2aca;
 /// Max virtual size we accept (64 TiB).
 const MAX_SIZE: u64 = 64 << 40;
 /// Max backing chain depth.
-const MAX_CHAIN: u32 = 16;
+/// Max backing chain depth (each snapshot adds a layer).
+const MAX_CHAIN: u32 = 64;
 /// L2 tables kept in memory.
 const L2_CACHE: usize = 128;
 
@@ -270,6 +271,24 @@ impl Qcow2Image {
     }
 
     pub fn open_with(path: &Path, read_only: bool, policy: &OpenPolicy, depth: u32) -> Result<Self> {
+        Self::open_inner(path, read_only, policy, depth, None)
+    }
+
+    /// New writable overlay at `path` on top of an image that is already
+    /// open (the running VM's disk). The header records `backing_name`
+    /// for future opens; in-process we reuse `backing` directly.
+    pub fn create_overlay(path: &Path, backing_name: &Path, backing_fmt: Format, backing: Arc<dyn DiskImage>) -> Result<Self> {
+        Self::create(path, backing.size(), Some((backing_name, backing_fmt)))?;
+        Self::open_inner(path, false, &OpenPolicy::default(), 0, Some(backing))
+    }
+
+    fn open_inner(
+        path: &Path,
+        read_only: bool,
+        policy: &OpenPolicy,
+        depth: u32,
+        backing_override: Option<Arc<dyn DiskImage>>,
+    ) -> Result<Self> {
         if depth > MAX_CHAIN {
             return Err(bad("backing chain too deep"));
         }
@@ -296,9 +315,10 @@ impl Qcow2Image {
             }
         }
 
-        let backing = match &hdr.backing_file {
-            None => None,
-            Some(name) => {
+        let backing = match (&hdr.backing_file, backing_override) {
+            (_, Some(b)) => Some(b),
+            (None, None) => None,
+            (Some(name), None) => {
                 let bp = resolve_backing(path, name, policy)?;
                 let fmt = match hdr.backing_format.as_deref() {
                     Some("qcow2") => Format::Qcow2,
@@ -703,6 +723,29 @@ mod tests {
         let r = RawImage::open(&base, true).unwrap();
         r.read_at(&mut b, 1000).unwrap();
         assert_eq!(b, [7; 4]);
+    }
+
+    #[test]
+    fn overlay_on_open_image_freezes_lower_layer() {
+        let td = tempfile::tempdir().unwrap();
+        let base = td.path().join("base.qcow2");
+        Qcow2Image::create(&base, 1 << 20, None).unwrap();
+        let lower: Arc<dyn DiskImage> = Arc::new(Qcow2Image::open(&base, false).unwrap());
+        lower.write_at(b"before", 0).unwrap();
+        let top_path = td.path().join("top.qcow2");
+        let top = Qcow2Image::create_overlay(&top_path, &base, Format::Qcow2, lower.clone()).unwrap();
+        top.write_at(b"after!", 0).unwrap();
+        let mut b = [0u8; 6];
+        lower.read_at(&mut b, 0).unwrap();
+        assert_eq!(&b, b"before"); // snapshot layer unchanged
+        top.read_at(&mut b, 0).unwrap();
+        assert_eq!(&b, b"after!");
+        drop(top);
+        // Reopen from disk: chain resolves through the header.
+        let again = Qcow2Image::open(&top_path, true).unwrap();
+        again.read_at(&mut b, 0).unwrap();
+        assert_eq!(&b, b"after!");
+        again.read_at(&mut b[..1], 100).unwrap();
     }
 
     #[test]

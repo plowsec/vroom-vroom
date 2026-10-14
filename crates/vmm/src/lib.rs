@@ -5,6 +5,7 @@
 //! through [`Vmm`] in-process or through the control socket.
 
 pub mod agent;
+mod disks;
 mod display;
 mod firmware;
 mod irq;
@@ -72,6 +73,8 @@ pub struct VmmOptions {
     pub clipboard: Option<Box<dyn agent::ClipboardProvider>>,
     /// Connection to a viewer process (GUI). Overrides `clipboard`.
     pub ui: Option<std::os::unix::net::UnixStream>,
+    /// Per-VM state directory (disk layers live in `disks/`).
+    pub state_dir: PathBuf,
 }
 
 impl std::fmt::Debug for VmmOptions {
@@ -102,6 +105,7 @@ pub struct Vmm {
     devices: Vec<StatefulDevice>,
     uart: Arc<Mutex<Pl011>>,
     agent: agent::Agent,
+    disks: disks::DiskSet,
     viewer: Option<display::ViewerTx>,
     screen: Option<Arc<display::FbSink>>,
     /// Captured right after build; reset = restore these.
@@ -129,7 +133,12 @@ impl Vmm {
             Some(s) => Some(display::DisplayServer::new(s)?),
             None => None,
         };
-        let m = machine::build(&config, hv.as_ref(), opts.serial_out, opts.clipboard, ui, ev_tx)?;
+        let layers = match &opts.start {
+            StartMode::Restore(dir) => snapshot::disk_plan(dir)?,
+            StartMode::Boot => Default::default(),
+        };
+        let disks = disks::DiskSet::open(&config, &opts.state_dir, &layers)?;
+        let m = machine::build(&config, hv.as_ref(), opts.serial_out, opts.clipboard, ui, &disks, ev_tx)?;
         let mut vmm = Vmm {
             config,
             hv,
@@ -141,6 +150,7 @@ impl Vmm {
             devices: m.devices,
             uart: m.uart,
             agent: m.agent,
+            disks,
             viewer: m.viewer,
             screen: m.screen,
             pristine_devices: Vec::new(),
@@ -277,7 +287,7 @@ impl Vmm {
     pub fn snapshot(&mut self, dir: &Path, description: &str) -> Result<()> {
         let was_running = self.state == RunState::Running;
         self.pause()?;
-        let r = snapshot::save(self, dir, description);
+        let r = snapshot::save(self, dir, description, snapshot::Kind::Snapshot);
         if was_running {
             self.resume()?;
         }
@@ -294,7 +304,7 @@ impl Vmm {
     /// VM is left paused, not stopped, so nothing is lost.
     pub fn suspend_in_place(&mut self, dir: &Path) -> Result<()> {
         self.pause()?;
-        snapshot::save(self, dir, "suspend")?;
+        snapshot::save(self, dir, "suspend", snapshot::Kind::Suspend)?;
         self.shutdown();
         Ok(())
     }
@@ -302,6 +312,7 @@ impl Vmm {
     /// Tear everything down. vCPUs are destroyed on their own threads.
     pub fn shutdown(&mut self) {
         self.agent.send(agent::AgentCmd::Stop);
+        self.disks.flush_all();
         if let Some(v) = &self.viewer {
             v.send(&bulwark_display::ToViewer::Closed);
         }
