@@ -1078,3 +1078,158 @@ impl PciDevice for Xhci {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pci::IntxRouter;
+    use crate::NoIrq;
+
+    struct NoMsi;
+    impl MsiSender for NoMsi {
+        fn send(&self, _a: u64, _d: u32) {}
+    }
+
+    const RAM: u64 = 0x4000_0000;
+    const DCBAA: u64 = RAM;
+    const CMD_RING: u64 = RAM + 0x1000;
+    const ERST: u64 = RAM + 0x2000;
+    const EVT: u64 = RAM + 0x3000;
+    const INPUT: u64 = RAM + 0x5000;
+    const OUTPUT: u64 = RAM + 0x6000;
+    const EP0: u64 = RAM + 0x7000;
+    const BUF: u64 = RAM + 0x8000;
+
+    struct Host {
+        x: Xhci,
+        mem: GuestMemory,
+        evt: u64,
+        cmd: u64,
+    }
+
+    impl Host {
+        fn new() -> Host {
+            let mem = GuestMemory::new(&[(GuestAddress(RAM), 1 << 20)]).unwrap();
+            let r = IntxRouter::new(vec![Arc::new(NoIrq); 4]);
+            let x = Xhci::new(6, mem.clone(), r.pin(6, 1), Arc::new(NoMsi));
+            let mut h = Host { x, mem, evt: 0, cmd: CMD_RING };
+            h.mem.write_obj(GuestAddress(ERST), &EVT.to_le()).unwrap();
+            h.mem.write_obj(GuestAddress(ERST + 8), &256u32.to_le()).unwrap();
+            h.mem.write_obj(GuestAddress(DCBAA + 8), &OUTPUT.to_le()).unwrap();
+            h.w(RT + 0x28, 1);
+            h.w(RT + 0x30, ERST);
+            h.w(RT + 0x38, EVT);
+            h.w(OP + 0x30, DCBAA);
+            h.w(OP + 0x18, CMD_RING | 1);
+            h.w(OP, (CMD_RUN | CMD_INTE) as u64);
+            h
+        }
+
+        fn w(&mut self, off: u64, v: u64) {
+            self.x.bar_write(0, off, &v.to_le_bytes());
+        }
+
+        fn put_trb(&self, at: u64, t: Trb) {
+            let b: Vec<u8> = t.iter().flat_map(|w| w.to_le_bytes()).collect();
+            self.mem.write(GuestAddress(at), &b).unwrap();
+        }
+
+        /// Events posted since the last call.
+        fn events(&mut self) -> Vec<Trb> {
+            let mut out = Vec::new();
+            while let Some(t) = self.x.read_trb(EVT + 16 * self.evt) {
+                if t[3] & 1 == 0 {
+                    break;
+                }
+                out.push(t);
+                self.evt += 1;
+            }
+            out
+        }
+
+        fn command(&mut self, mut t: Trb) -> Trb {
+            t[3] |= 1;
+            self.put_trb(self.cmd, t);
+            self.cmd += 16;
+            self.w(DB, 0);
+            let ev = self.events();
+            let c = ev.iter().find(|e| trb_type(e) == E_COMMAND).copied().expect("command completion");
+            assert_eq!(c[2] >> 24, CC_SUCCESS, "command {t:x?}");
+            c
+        }
+
+        /// Keyboard on port 1, addressed as slot 1.
+        fn keyboard() -> Host {
+            let mut h = Host::new();
+            let ports = h.events();
+            assert_eq!(ports.len(), NPORTS);
+            assert!(ports.iter().all(|e| trb_type(e) == E_PORT));
+            let c = h.command([0, 0, 0, C_ENABLE_SLOT << 10]);
+            assert_eq!(c[3] >> 24, 1);
+            let mut input = vec![0u32; 3 * 8];
+            input[1] = 3; // add slot + ep0
+            input[8 + 1] = 1 << 16; // root port 1
+            input[16 + 1] = 64 << 16; // max packet
+            input[16 + 2] = EP0 as u32 | 1;
+            input[16 + 3] = (EP0 >> 32) as u32;
+            let b: Vec<u8> = input.iter().flat_map(|w| w.to_le_bytes()).collect();
+            h.mem.write(GuestAddress(INPUT), &b).unwrap();
+            h.command([INPUT as u32, (INPUT >> 32) as u32, 0, C_ADDRESS << 10 | 1 << 24]);
+            h
+        }
+    }
+
+    #[test]
+    fn control_in_with_event_data() {
+        let mut h = Host::keyboard();
+        // GET_DESCRIPTOR(device), 64 byte buffer: the device returns 18.
+        let setup: u64 = 0x80 | 6 << 8 | 0x0100 << 16 | 64 << 48;
+        let c = 1; // cycle
+        h.put_trb(EP0, [setup as u32, (setup >> 32) as u32, 8, T_SETUP << 10 | TRB_IDT | 3 << 16 | c]);
+        h.put_trb(EP0 + 16, [BUF as u32, 0, 64, T_DATA << 10 | 1 << 16 | TRB_CH | TRB_ISP | c]);
+        h.put_trb(EP0 + 32, [0xbeef_0000, 0x12, 0, T_EVENT_DATA << 10 | TRB_IOC | c]);
+        h.put_trb(EP0 + 48, [0, 0, 0, T_STATUS << 10 | TRB_IOC | c]);
+        h.w(DB + 4, 1);
+        let ev = h.events();
+        assert_eq!(ev.len(), 3, "{ev:x?}");
+        // Short data stage (ISP): residual 46.
+        assert_eq!(param(&ev[0]), EP0 + 16);
+        assert_eq!((ev[0][2] >> 24, ev[0][2] & 0xff_ffff), (CC_SHORT, 46));
+        // Event Data: our pointer back, ED set, bytes moved.
+        assert_eq!(param(&ev[1]), 0x12_beef_0000);
+        assert_ne!(ev[1][3] & TRB_ED, 0);
+        assert_eq!((ev[1][2] >> 24, ev[1][2] & 0xff_ffff), (CC_SHORT, 18));
+        // Status stage.
+        assert_eq!(param(&ev[2]), EP0 + 48);
+        assert_eq!(ev[2][2] >> 24, CC_SUCCESS);
+        assert!(ev.iter().all(|e| trb_type(e) == E_TRANSFER && (e[3] >> 16) & 0x1f == 1 && e[3] >> 24 == 1));
+        let mut d = [0u8; 2];
+        h.mem.read(GuestAddress(BUF), &mut d).unwrap();
+        assert_eq!(d, [18, 1]); // bLength, DEVICE descriptor
+    }
+
+    #[test]
+    fn unfinished_td_waits_for_the_driver() {
+        let mut h = Host::keyboard();
+        let setup: u64 = 0x80 | 6 << 8 | 0x0100 << 16 | 18 << 48;
+        // Setup + Data queued, Status not yet: nothing may complete.
+        h.put_trb(EP0, [setup as u32, (setup >> 32) as u32, 8, T_SETUP << 10 | TRB_IDT | 3 << 16 | 1]);
+        h.put_trb(EP0 + 16, [BUF as u32, 0, 18, T_DATA << 10 | 1 << 16 | 1]);
+        h.w(DB + 4, 1);
+        assert!(h.events().is_empty());
+        h.put_trb(EP0 + 32, [0, 0, 0, T_STATUS << 10 | TRB_IOC | 1]);
+        h.w(DB + 4, 1);
+        let ev = h.events();
+        assert_eq!(ev.len(), 1);
+        assert_eq!(param(&ev[0]), EP0 + 32);
+    }
+
+    #[test]
+    fn link_loops_are_bounded() {
+        let mut h = Host::keyboard();
+        // A Link TRB pointing at itself: the walk must give up.
+        h.put_trb(EP0, [EP0 as u32, (EP0 >> 32) as u32, 0, T_LINK << 10 | 1]);
+        h.w(DB + 4, 1);
+        assert!(h.events().is_empty());
+    }
+}
