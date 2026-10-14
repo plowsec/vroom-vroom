@@ -94,9 +94,14 @@ mode = "nat"
    sees two monitors (firmware framebuffer + virtio-gpu); the agent keeps
    only the virtio-gpu one active, so windows open where you can see them.
 
-The agent runs elevated from a logon task (the VirtIO serial port only
-admits administrators), syncs the clipboard, follows window resizes, syncs
-the clock and handles clean shutdown requests (`Ctrl+Alt+Shift+D`).
+The agent is a Windows service (`BulwarkAgent`, clock sync and clean
+shutdown via `Ctrl+Alt+Shift+D`) plus an unprivileged helper started at
+each logon (clipboard, window resizes). The status line says when it
+connects. Upgrading an older install: run the new `bulwark-setup.cmd` as
+administrator.
+
+Until the agent runs, Windows may show two monitors (firmware framebuffer
+and virtio-gpu). The window shows whichever one Windows last drew on.
 
 ## 3D acceleration (Linux guests)
 
@@ -129,6 +134,12 @@ Venus driver.
   `bulwark snapshot prune vm.toml` does the cleanup alone (e.g. after
   reverting, the abandoned layers). These need the VM stopped: a state dir
   is locked by the VMM using it.
+
+## Disk space
+
+Disk layers grow in the state dir. When less than 2 GiB is left on that
+file system, the VM is paused with a message; free space and resume
+(`Ctrl-A p`, or the GUI shortcut).
 
 ## Disk sync
 

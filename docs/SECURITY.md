@@ -89,9 +89,38 @@ service, framework reads and the Metal shader cache. Use 3D only for guests
 that need it. A future step is moving the renderer into its own process
 (possible for most of Venus; host-visible memory needs shared mappings).
 
+## Guest agent (Windows)
+
+The VirtIO serial port only admits Administrators and SYSTEM, so the agent
+is split. A LocalSystem service owns the port and does clock sync and
+clean shutdown. An unprivileged helper in the console session does
+clipboard and resolution, and talks to the service over a named pipe:
+SYSTEM/Administrators/interactive users only, remote clients refused,
+only clients from the active console session served. The helper only
+talks to a pipe server in session 0, so a user process squatting the pipe
+name gets nothing. The service accepts nothing from the helper but
+clipboard text (size-capped).
+
+## Fuzzing
+
+`fuzz/` has cargo-fuzz targets for what a guest (or a downloaded image)
+controls: agent protocol, network frames, virtqueue chains over arbitrary
+guest memory, xHCI and NVMe driven by arbitrary register writes plus
+guest RAM, qcow2 images. Run with
+`cargo +nightly fuzz run -O <target>`. First runs found two qcow2 bugs
+(a crash on short v3 headers, multi-GB allocations from crafted table
+sizes); both fixed.
+
+## Host resources
+
+A guest can fill its disk layers, and so the host disk. The VMM pauses the
+VM when less than 2 GiB is left where its state lives, rather than letting
+guest writes fail half-way. A state dir is locked by the VMM using it, so
+two processes can't write the same disk layers.
+
 ## Known gaps
 
-- The Windows agent runs elevated (the VirtIO serial port only admits
-  Administrators); a service + unprivileged session helper split is planned.
+- The Windows agent split is new; installs from before it run the
+  all-in-one agent elevated (re-run `bulwark-setup.cmd` to upgrade).
 - x86_64 isn't implemented, so none of this is tested there.
-- No fuzzing harnesses yet for the device parsers (unit tests only).
+- Fuzzing doesn't cover virtio-gpu commands or the TPM interface yet.
