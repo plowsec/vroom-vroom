@@ -138,7 +138,13 @@ impl Vmm {
                 let regs = vmm.boot.load(&vmm.mem)?;
                 vmm.vcpus[0].peer.send(VcpuCmd::PowerOn(regs))?;
             }
-            StartMode::Restore(dir) => snapshot::restore(&mut vmm, &dir)?,
+            StartMode::Restore(dir) => {
+                snapshot::restore(&mut vmm, &dir)?;
+                // Restored workers start parked; let them go with the vCPUs.
+                for d in &vmm.devices {
+                    d.lock().unwrap_or_else(|e| e.into_inner()).resume();
+                }
+            }
         }
         vmm.state = RunState::Running;
         Ok(vmm)
@@ -180,6 +186,10 @@ impl Vmm {
         for rx in acks {
             rx.recv_timeout(PAUSE_TIMEOUT).map_err(|_| Error::Timeout)?;
         }
+        // vCPUs first (no new kicks), then device workers (no DMA).
+        for d in &self.devices {
+            d.lock().unwrap_or_else(|e| e.into_inner()).pause();
+        }
         self.state = RunState::Paused;
         Ok(())
     }
@@ -187,6 +197,9 @@ impl Vmm {
     pub fn resume(&mut self) -> Result<()> {
         if self.state != RunState::Paused {
             return Ok(());
+        }
+        for d in &self.devices {
+            d.lock().unwrap_or_else(|e| e.into_inner()).resume();
         }
         for v in &self.vcpus {
             v.peer.send(VcpuCmd::Resume)?;

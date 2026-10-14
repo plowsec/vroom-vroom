@@ -11,7 +11,6 @@ const PHANDLE_MSI: u32 = 3;
 
 const GIC_SPI: u32 = 0;
 const GIC_PPI: u32 = 1;
-const IRQ_EDGE_RISING: u32 = 1;
 const IRQ_LEVEL_HIGH: u32 = 4;
 
 /// Hard cap on FDT size (Linux requirement: < 2 MiB).
@@ -201,7 +200,8 @@ fn virtio_mmio(f: &mut FdtWriter, base: u64, size: u64, spi: u32) -> FdtWriterRe
     let n = f.begin_node(&format!("virtio_mmio@{base:x}"))?;
     f.property_string("compatible", "virtio,mmio")?;
     f.property_array_u64("reg", &[base, size])?;
-    f.property_array_u32("interrupts", &[GIC_SPI, spi, IRQ_EDGE_RISING])?;
+    // Level: line stays up while InterruptStatus != 0, drops on ACK.
+    f.property_array_u32("interrupts", &[GIC_SPI, spi, IRQ_LEVEL_HIGH])?;
     f.property_null("dma-coherent")?;
     f.end_node(n)
 }

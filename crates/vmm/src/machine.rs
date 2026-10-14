@@ -5,18 +5,37 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use bulwark_arch::aarch64::{self as board, layout};
-use bulwark_config::{Boot, VmConfig};
+use bulwark_config::{Boot, DiskFormat, VmConfig};
 use bulwark_devices::{pl011::Pl011, pl031::Pl031, BusBuilder, BusDevice};
 use bulwark_hv::{
     aarch64::mpidr_for, BootRegs, GicMsiConfig, Hypervisor, IrqChipConfig, IrqChipInfo, Vm, VmParams,
 };
 use bulwark_memory::{GuestAddress, GuestMemory};
 use bulwark_snapshot::Snapshottable;
+use bulwark_virtio::devices::{block::Block, rng::Rng};
+use bulwark_virtio::{mmio::VirtioMmio, VirtioDevice};
 
 use crate::irq::SpiLine;
 use crate::psci::CpuTable;
 use crate::vcpu::{self, VcpuHandle, VcpuShared, VmEvent};
 use crate::{Error, Result, StatefulDevice};
+
+/// Hands out virtio-mmio slots in order.
+#[derive(Default)]
+struct VirtioSlots {
+    next: u32,
+}
+
+impl VirtioSlots {
+    fn next(&mut self) -> Result<(u64, u32)> {
+        if self.next >= layout::VIRTIO_MMIO_SLOTS {
+            return Err(Error::Setup("out of virtio-mmio slots".into()));
+        }
+        let s = layout::virtio_mmio_slot(self.next);
+        self.next += 1;
+        Ok(s)
+    }
+}
 
 pub(crate) struct Machine {
     pub vm: Arc<dyn Vm>,
@@ -128,7 +147,27 @@ pub(crate) fn build(
     let rtc = Arc::new(Mutex::new(Pl031::new(layout::RTC_BASE, SpiLine::new(vm.clone(), layout::RTC_SPI))));
     reg.add(layout::RTC_BASE, layout::MMIO_DEV_SIZE, rtc)?;
 
-    let fdt_devices = Vec::new();
+    let mut fdt_devices = Vec::new();
+    let mut slots = VirtioSlots::default();
+    let mut add_virtio = |dev: Box<dyn VirtioDevice>| -> Result<()> {
+        let (base, spi) = slots.next()?;
+        let t = VirtioMmio::new(base, dev, mem.clone(), SpiLine::new(vm.clone(), spi));
+        reg.add(base, layout::VIRTIO_MMIO_SIZE, Arc::new(Mutex::new(t)))?;
+        fdt_devices.push(board::FdtDevice::VirtioMmio { base, size: layout::VIRTIO_MMIO_SIZE, spi });
+        Ok(())
+    };
+    add_virtio(Box::new(Rng::new()))?;
+    for (i, d) in config.disks.iter().enumerate() {
+        let fmt = match d.format {
+            DiskFormat::Auto => None,
+            DiskFormat::Raw => Some(bulwark_block::Format::Raw),
+            DiskFormat::Qcow2 => Some(bulwark_block::Format::Qcow2),
+        };
+        let img = bulwark_block::open(&d.path, fmt, d.readonly)
+            .map_err(|e| Error::Setup(format!("disk {}: {e}", d.path.display())))?;
+        let id = format!("vd{}", (b'a' + i as u8) as char);
+        add_virtio(Box::new(Block::new(&id, img)))?;
+    }
 
     let mpidrs: Vec<u64> = (0..config.cpus).map(mpidr_for).collect();
     let boot = match &config.boot {

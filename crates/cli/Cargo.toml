@@ -17,6 +17,7 @@ libc.workspace = true
 bulwark-config.workspace = true
 bulwark-hv.workspace = true
 bulwark-vmm.workspace = true
+bulwark-block.workspace = true
 
 [lints]
 workspace = true

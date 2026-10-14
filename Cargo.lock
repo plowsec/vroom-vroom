@@ -102,9 +102,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "bulwark-block"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "libc",
+ "log",
+ "ruzstd",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "bulwark-cli"
 version = "0.1.0"
 dependencies = [
+ "bulwark-block",
  "bulwark-config",
  "bulwark-hv",
  "bulwark-vmm",
@@ -168,15 +181,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "bulwark-virtio"
+version = "0.1.0"
+dependencies = [
+ "bulwark-block",
+ "bulwark-devices",
+ "bulwark-memory",
+ "bulwark-snapshot",
+ "getrandom 0.2.17",
+ "log",
+ "mio",
+ "serde",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "bulwark-vmm"
 version = "0.1.0"
 dependencies = [
  "bulwark-arch",
+ "bulwark-block",
  "bulwark-config",
  "bulwark-devices",
  "bulwark-hv",
  "bulwark-memory",
  "bulwark-snapshot",
+ "bulwark-virtio",
  "log",
  "serde",
  "serde_json",
@@ -538,6 +569,18 @@ checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
 dependencies = [
  "adler2",
  "simd-adler32",
+]
+
+[[package]]
+name = "mio"
+version = "1.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1788edb87fdc09c7e26304471e2f5be8cdefb1b6930d6e3985fc02ff53bf86ee"
+dependencies = [
+ "libc",
+ "log",
+ "wasi",
+ "windows-sys",
 ]
 
 [[package]]

@@ -34,6 +34,11 @@ pub trait Snapshottable {
     fn snapshot_id(&self) -> String;
     fn save(&mut self) -> Result<Vec<u8>>;
     fn restore(&mut self, data: &[u8]) -> Result<()>;
+
+    /// Stop touching guest memory (background workers park). Called when
+    /// the VM pauses and before `save`.
+    fn pause(&mut self) {}
+    fn resume(&mut self) {}
 }
 
 /// Serialize a state struct. JSON: small, debuggable, and serde is strict.

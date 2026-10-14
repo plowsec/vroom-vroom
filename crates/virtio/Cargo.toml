@@ -1,0 +1,23 @@
+[package]
+name = "bulwark-virtio"
+description = "Virtio: split virtqueues, MMIO/PCI transports, devices."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+log.workspace = true
+serde.workspace = true
+mio.workspace = true
+getrandom = "0.2"
+bulwark-memory.workspace = true
+bulwark-devices.workspace = true
+bulwark-snapshot.workspace = true
+bulwark-block.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

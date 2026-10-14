@@ -1,0 +1,19 @@
+[package]
+name = "bulwark-block"
+description = "Disk images: raw and qcow2 (with backing files for snapshots)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+log.workspace = true
+libc.workspace = true
+flate2.workspace = true
+ruzstd = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

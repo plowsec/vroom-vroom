@@ -16,6 +16,8 @@ bulwark-devices.workspace = true
 bulwark-arch.workspace = true
 bulwark-config.workspace = true
 bulwark-snapshot.workspace = true
+bulwark-virtio.workspace = true
+bulwark-block.workspace = true
 
 [lints]
 workspace = true

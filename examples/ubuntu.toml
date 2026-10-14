@@ -1,0 +1,21 @@
+# Ubuntu 24.04 arm64 cloud image. See docs/GUIDE.md for how to fetch it.
+name = "ubuntu"
+cpus = 4
+memory_mib = 4096
+
+[boot]
+type = "kernel"
+kernel = "../images/ubuntu/vmlinuz"
+initrd = "../images/ubuntu/initrd"
+cmdline = "console=ttyAMA0 root=LABEL=cloudimg-rootfs ro"
+
+# Writable overlay; noble.img below it is never modified.
+[[disk]]
+path = "../images/ubuntu/disk.qcow2"
+format = "qcow2"
+
+# cloud-init seed (user "ubuntu", password "bulwark").
+[[disk]]
+path = "../images/ubuntu/seed.iso"
+readonly = true
+format = "raw"
