@@ -6,7 +6,7 @@ pub(super) const MAX_PINGS: usize = 64;
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(super) struct Pending {
-    sock: UdpSocket,
+    pub(super) sock: UdpSocket,
     request: Vec<u8>,
     wire: Vec<u8>,
     destination: Ipv4Addr,

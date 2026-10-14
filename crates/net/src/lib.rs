@@ -29,6 +29,9 @@ pub trait NetBackend: Send + std::fmt::Debug {
     fn recv_frame(&mut self) -> Option<Vec<u8>>;
     /// Register host sources with tokens >= TOKEN_BASE.
     fn register(&mut self, reg: &Registry) -> io::Result<()>;
+    /// The worker is going away (device reset): undo `register` so the next
+    /// activation can register again.
+    fn deregister(&mut self, _reg: &Registry) {}
     /// A registered source is ready (or RESUME_TOKEN).
     fn ready(&mut self, token: usize);
     /// Next housekeeping deadline.

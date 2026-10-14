@@ -738,7 +738,35 @@ impl NetBackend for Nat {
             let t = self.alloc_token(Owner::Listener(i));
             reg.register(&mut self.listeners[i].0, Token(t), Interest::READABLE)?;
         }
+        // Flows that outlived a device reset (the guest re-activated the
+        // NIC): back on the new poller under their old tokens.
+        for (&t, c) in self.tcp.iter_mut() {
+            let _ = reg.register(&mut c.stream, Token(t), Interest::READABLE | Interest::WRITABLE);
+        }
+        for (t, f) in self.udp.values_mut() {
+            let _ = reg.register(&mut f.sock, Token(*t), Interest::READABLE);
+        }
+        for (&t, p) in self.pings.iter_mut() {
+            let _ = reg.register(&mut p.sock, Token(t), Interest::READABLE);
+        }
         Ok(())
+    }
+
+    fn deregister(&mut self, reg: &Registry) {
+        for (l, _) in self.listeners.iter_mut() {
+            let _ = reg.deregister(l);
+        }
+        self.owners.retain(|_, o| !matches!(o, Owner::Listener(_)));
+        for c in self.tcp.values_mut() {
+            let _ = reg.deregister(&mut c.stream);
+        }
+        for (_, f) in self.udp.values_mut() {
+            let _ = reg.deregister(&mut f.sock);
+        }
+        for p in self.pings.values_mut() {
+            let _ = reg.deregister(&mut p.sock);
+        }
+        self.registry = None;
     }
 
     fn ready(&mut self, token: usize) {

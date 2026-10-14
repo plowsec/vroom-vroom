@@ -39,11 +39,10 @@ impl Net {
         self.worker.start(&format!("net-{}", self.id), ctx, NetHandler { backend: Some(backend), pending: None }, paused)
     }
 
-    /// Get the backend back from a stopped worker. Workers are dropped with
-    /// their handler; the handler hands the backend over on stop.
+    /// Get the backend back from a stopped worker. The worker deregisters
+    /// the backend's sources on its way out, so take it only afterwards.
     fn stop(&mut self) {
-        let b = self.worker.with(|_, h| h.backend.take()).flatten();
-        self.worker.stop();
+        let b = self.worker.stop_with(|h| h.backend.take()).flatten();
         if b.is_some() {
             self.backend = b;
         }
@@ -135,6 +134,12 @@ impl QueueHandler for NetHandler {
         match self.backend.as_mut() {
             Some(be) => be.register(reg),
             None => Ok(()),
+        }
+    }
+
+    fn deregister(&mut self, reg: &mio::Registry) {
+        if let Some(be) = self.backend.as_mut() {
+            be.deregister(reg);
         }
     }
 

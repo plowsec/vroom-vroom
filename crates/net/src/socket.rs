@@ -56,6 +56,10 @@ impl NetBackend for FrameSocket {
         reg.register(&mut self.sock, Token(TOKEN_BASE), Interest::READABLE)
     }
 
+    fn deregister(&mut self, reg: &Registry) {
+        let _ = reg.deregister(&mut self.sock);
+    }
+
     fn ready(&mut self, token: usize) {
         if token == TOKEN_BASE || token == RESUME_TOKEN {
             self.drain();

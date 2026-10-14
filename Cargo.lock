@@ -283,6 +283,7 @@ dependencies = [
 name = "bulwark-gpu3d"
 version = "0.1.0"
 dependencies = [
+ "bulwark-sandbox",
  "bulwark-virtio",
  "libc",
  "log",
@@ -421,11 +422,14 @@ dependencies = [
  "bulwark-display",
  "bulwark-gpu3d",
  "bulwark-hv",
+ "bulwark-ipc",
  "bulwark-memory",
  "bulwark-net",
  "bulwark-proto",
+ "bulwark-sandbox",
  "bulwark-snapshot",
  "bulwark-virtio",
+ "libc",
  "log",
  "png",
  "serde",

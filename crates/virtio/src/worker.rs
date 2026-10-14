@@ -79,6 +79,9 @@ pub trait QueueHandler: Send + 'static {
     fn register(&mut self, _reg: &Registry) -> io::Result<()> {
         Ok(())
     }
+    /// The worker stops (device reset, VM teardown): undo `register`, or
+    /// the next activation can't register the same sources again.
+    fn deregister(&mut self, _reg: &Registry) {}
     /// Optional periodic tick (e.g. rate limiting, retries).
     fn tick_interval(&mut self) -> Option<Duration> {
         None
@@ -167,6 +170,12 @@ impl<H: QueueHandler> Worker<H> {
         self.lock().ctx.queues.clone()
     }
 
+    /// Stop the thread, then let `f` take what it needs from the handler.
+    pub fn stop_with<R>(mut self, f: impl FnOnce(&mut H) -> R) -> R {
+        self.shutdown();
+        f(&mut self.lock().handler)
+    }
+
     fn shutdown(&mut self) {
         self.shared.stop.store(true, Ordering::Release);
         let _ = self.waker.wake();
@@ -194,6 +203,8 @@ fn run<H: QueueHandler>(mut poll: Poll, s: Arc<Shared<H>>) {
             }
         }
         if s.stop.load(Ordering::Acquire) {
+            let mut g = s.inner.lock().unwrap_or_else(|e| e.into_inner());
+            g.handler.deregister(poll.registry());
             return;
         }
         let mut g = s.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -257,6 +268,10 @@ impl<H: QueueHandler> WorkerSlot<H> {
 
     pub fn stop(&mut self) -> Vec<Queue> {
         self.worker.take().map(|w| w.stop()).unwrap_or_default()
+    }
+
+    pub fn stop_with<R>(&mut self, f: impl FnOnce(&mut H) -> R) -> Option<R> {
+        self.worker.take().map(|w| w.stop_with(f))
     }
 
     pub fn pause(&self) {
