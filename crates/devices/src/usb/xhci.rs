@@ -41,7 +41,6 @@ const T_DATA: u32 = 3;
 const T_STATUS: u32 = 4;
 const T_LINK: u32 = 6;
 const T_EVENT_DATA: u32 = 7;
-const T_NOOP: u32 = 8;
 const C_ENABLE_SLOT: u32 = 9;
 const C_DISABLE_SLOT: u32 = 10;
 const C_ADDRESS: u32 = 11;
@@ -89,6 +88,13 @@ const PS_PLC: u32 = 1 << 22;
 const PS_CHANGE_MASK: u32 = 0x7f << 17;
 const PLS_U0: u32 = 0;
 const PLS_POLLING: u32 = 7;
+
+// TRB control bits (dword 3).
+const TRB_ED: u32 = 1 << 2; // in events: TRB pointer is Event Data
+const TRB_ISP: u32 = 1 << 2;
+const TRB_CH: u32 = 1 << 4;
+const TRB_IOC: u32 = 1 << 5;
+const TRB_IDT: u32 = 1 << 6;
 
 const EP_RUNNING: u32 = 1;
 const EP_HALTED: u32 = 2;
@@ -304,6 +310,7 @@ impl Xhci {
     }
 
     fn transfer_event(&mut self, ptr: u64, code: u32, residual: u32, slot: u8, dci: u8) {
+        log::debug!("xhci: transfer event slot {slot} dci {dci} ptr {ptr:#x} cc {code} residual {residual}");
         self.post_event([ptr as u32, (ptr >> 32) as u32, code << 24 | (residual & 0xff_ffff), E_TRANSFER << 10 | (dci as u32) << 16 | (slot as u32) << 24]);
     }
 
@@ -347,6 +354,7 @@ impl Xhci {
             r.deq = addr + 16;
             self.cmd = r;
             let (code, slot) = self.command(&t);
+            log::debug!("xhci: cmd type {} slot {} -> cc {code} slot {slot}", trb_type(&t), Self::slot_id(&t));
             self.post_event([addr as u32, (addr >> 32) as u32, code << 24, E_COMMAND << 10 | (slot as u32) << 24]);
         }
     }
@@ -581,29 +589,32 @@ impl Xhci {
         }
     }
 
+    /// Gather one TD from an endpoint ring: TRBs up to the first one with
+    /// the chain bit clear. Control TDs also run to (at least) the Status
+    /// stage. None if the driver hasn't finished queueing it.
+    fn gather_td(&self, ring: Ring, control: bool) -> Option<(Ring, Vec<(u64, Trb)>)> {
+        let mut r = ring;
+        let mut td = Vec::new();
+        let mut status = !control;
+        for _ in 0..64 {
+            let (addr, t) = self.ring_peek(&mut r)?;
+            r.deq = addr + 16;
+            td.push((addr, t));
+            status |= trb_type(&t) == T_STATUS;
+            if status && t[3] & TRB_CH == 0 {
+                return Some((r, td));
+            }
+        }
+        None
+    }
+
     fn run_control(&mut self, id: usize) {
         for _ in 0..WALK_LIMIT {
             let Some((port, mut ep)) = self.ep(id, 1) else { return };
             if ep.state != EP_RUNNING {
                 return;
             }
-            // Gather one TD: Setup [Data...] Status, all owned by us.
-            let mut r = ep.ring;
-            let mut td: Vec<(u64, Trb)> = Vec::new();
-            let mut complete = false;
-            for _ in 0..64 {
-                let Some((addr, t)) = self.ring_peek(&mut r) else { break };
-                r.deq = addr + 16;
-                let ty = trb_type(&t);
-                td.push((addr, t));
-                if ty == T_STATUS {
-                    complete = true;
-                    break;
-                }
-            }
-            if !complete {
-                return; // driver hasn't finished queueing this TD
-            }
+            let Some((r, td)) = self.gather_td(ep.ring, true) else { return };
             ep.ring = r;
             self.set_ep(id, 1, ep);
             self.control_td(id, port, &td);
@@ -612,11 +623,12 @@ impl Xhci {
 
     fn control_td(&mut self, id: usize, port: u8, td: &[(u64, Trb)]) {
         let Some(&(setup_addr, setup_trb)) = td.first() else { return };
-        if trb_type(&setup_trb) != T_SETUP || setup_trb[3] & (1 << 6) == 0 {
+        if trb_type(&setup_trb) != T_SETUP || setup_trb[3] & TRB_IDT == 0 {
             self.transfer_event(setup_addr, CC_TRB_ERROR, 0, id as u8, 1);
             return;
         }
         let setup = Setup::parse(param(&setup_trb));
+        log::debug!("xhci: slot {id} port {port} control {setup:x?} ({} trbs)", td.len());
         let data: Vec<&(u64, Trb)> = td.iter().filter(|(_, t)| trb_type(t) == T_DATA || trb_type(t) == T_NORMAL).collect();
         // OUT data stage.
         let mut out = Vec::new();
@@ -624,7 +636,7 @@ impl Xhci {
             for (_, t) in &data {
                 let len = (t[2] & 0x1ffff) as usize;
                 let mut b = vec![0u8; len.min(4096)];
-                if t[3] & (1 << 6) != 0 {
+                if t[3] & TRB_IDT != 0 {
                     let n = 8.min(len);
                     b.truncate(n);
                     b.copy_from_slice(&param(t).to_le_bytes()[..n]);
@@ -638,8 +650,11 @@ impl Xhci {
             Some(d) => d.control(setup, &out),
             None => Err(super::Stall),
         };
-        let reply = match result {
-            Ok(v) => v,
+        match result {
+            Ok(reply) => {
+                let input = setup.device_to_host().then_some(reply.as_slice());
+                self.complete_td(id, 1, td, input);
+            }
             Err(_) => {
                 // STALL on the data or status stage; endpoint halts.
                 let at = data.last().map(|(a, _)| *a).unwrap_or(td[td.len() - 1].0);
@@ -650,35 +665,60 @@ impl Xhci {
                     self.write_ep_ctx(ctx, 1, &ep);
                 }
                 self.transfer_event(at, CC_STALL, 0, id as u8, 1);
-                return;
-            }
-        };
-        // IN data stage: fill buffers in order.
-        let mut off = 0usize;
-        for (addr, t) in &data {
-            let len = (t[2] & 0x1ffff) as usize;
-            let n = if setup.device_to_host() {
-                let n = len.min(reply.len().saturating_sub(off));
-                if n > 0 && self.mem.write(GuestAddress(param(t)), &reply[off..off + n]).is_err() {
-                    return self.transfer_event(*addr, CC_TRB_ERROR, 0, id as u8, 1);
-                }
-                off += n;
-                n
-            } else {
-                len
-            };
-            let residual = (len - n) as u32;
-            let ioc = t[3] & (1 << 5) != 0;
-            let isp = t[3] & (1 << 2) != 0;
-            if residual > 0 && (isp || ioc) {
-                self.transfer_event(*addr, CC_SHORT, residual, id as u8, 1);
-            } else if ioc {
-                self.transfer_event(*addr, CC_SUCCESS, 0, id as u8, 1);
             }
         }
-        if let Some(&(addr, t)) = td.last() {
-            if t[3] & (1 << 5) != 0 {
-                self.transfer_event(addr, CC_SUCCESS, 0, id as u8, 1);
+    }
+
+    /// Walk a finished TD and post its events: every TRB with IOC gets
+    /// one (Setup included: EDK2 waits on the first and last TRB), short
+    /// data TRBs with ISP too, and Event Data TRBs report the bytes moved
+    /// since the previous one (Windows relies on these). `input` is the
+    /// data for an IN transfer, written into the data buffers in order.
+    fn complete_td(&mut self, id: usize, dci: u8, td: &[(u64, Trb)], input: Option<&[u8]>) {
+        let (slot, mut off, mut edtla, mut short) = (id as u8, 0usize, 0u32, false);
+        for &(addr, t) in td {
+            let ioc = t[3] & TRB_IOC != 0;
+            match trb_type(&t) {
+                T_DATA | T_NORMAL => {
+                    let len = (t[2] & 0x1ffff) as usize;
+                    let n = match input {
+                        Some(src) => {
+                            let n = len.min(src.len().saturating_sub(off));
+                            if n > 0 && self.mem.write(GuestAddress(param(&t)), &src[off..off + n]).is_err() {
+                                return self.transfer_event(addr, CC_TRB_ERROR, 0, slot, dci);
+                            }
+                            off += n;
+                            n
+                        }
+                        None => len,
+                    };
+                    edtla = edtla.wrapping_add(n as u32);
+                    let residual = (len - n) as u32;
+                    if residual > 0 {
+                        short = true;
+                        if ioc || t[3] & TRB_ISP != 0 {
+                            self.transfer_event(addr, CC_SHORT, residual, slot, dci);
+                        }
+                    } else if ioc {
+                        self.transfer_event(addr, CC_SUCCESS, 0, slot, dci);
+                    }
+                }
+                T_EVENT_DATA => {
+                    if ioc {
+                        let cc = if short { CC_SHORT } else { CC_SUCCESS };
+                        let p = param(&t);
+                        log::debug!("xhci: event data slot {slot} dci {dci} edtla {edtla} cc {cc}");
+                        self.post_event([p as u32, (p >> 32) as u32, cc << 24 | (edtla & 0xff_ffff), E_TRANSFER << 10 | TRB_ED | (dci as u32) << 16 | (slot as u32) << 24]);
+                    }
+                    edtla = 0;
+                    short = false;
+                }
+                _ => {
+                    // Setup, Status, No-op.
+                    if ioc {
+                        self.transfer_event(addr, CC_SUCCESS, 0, slot, dci);
+                    }
+                }
             }
         }
     }
@@ -694,48 +734,30 @@ impl Xhci {
             if ep.state != EP_RUNNING {
                 return;
             }
-            let mut r = ep.ring;
-            let Some((addr, t)) = self.ring_peek(&mut r) else {
-                ep.ring = r;
-                self.set_ep(id, dci, ep);
-                return;
-            };
-            if matches!(trb_type(&t), T_NOOP | T_EVENT_DATA) {
-                ep.ring = Ring { deq: addr + 16, cycle: r.cycle };
-                self.set_ep(id, dci, ep);
-                if t[3] & (1 << 5) != 0 {
-                    self.transfer_event(addr, CC_SUCCESS, 0, id as u8, dci);
+            let Some((r, td)) = self.gather_td(ep.ring, false) else { return };
+            // TDs with a data buffer wait for a report; pure No-op /
+            // Event Data TDs complete right away.
+            let report = if td.iter().any(|(_, t)| trb_type(t) == T_NORMAL) {
+                match self.dev(port).and_then(|d| d.poll_in(epnum)) {
+                    Some(r) => r,
+                    None => return,
                 }
-                continue;
-            }
-            let Some(report) = self.dev(port).and_then(|d| d.poll_in(epnum)) else { return };
-            let len = (t[2] & 0x1ffff) as usize;
-            let n = len.min(report.len());
-            if self.mem.write(GuestAddress(param(&t)), &report[..n]).is_err() {
-                return self.transfer_event(addr, CC_TRB_ERROR, 0, id as u8, dci);
-            }
-            ep.ring = Ring { deq: addr + 16, cycle: r.cycle };
+            } else {
+                Vec::new()
+            };
+            ep.ring = r;
             self.set_ep(id, dci, ep);
-            let residual = (len - n) as u32;
-            let (ioc, isp) = (t[3] & (1 << 5) != 0, t[3] & (1 << 2) != 0);
-            if residual > 0 && (isp || ioc) {
-                self.transfer_event(addr, CC_SHORT, residual, id as u8, dci);
-            } else if ioc {
-                self.transfer_event(addr, CC_SUCCESS, 0, id as u8, dci);
-            }
+            self.complete_td(id, dci, &td, Some(&report));
         }
     }
 
     fn drain_out(&mut self, id: usize, dci: u8) {
         for _ in 0..WALK_LIMIT {
             let Some((_, mut ep)) = self.ep(id, dci) else { return };
-            let mut r = ep.ring;
-            let Some((addr, t)) = self.ring_peek(&mut r) else { return };
-            ep.ring = Ring { deq: addr + 16, cycle: r.cycle };
+            let Some((r, td)) = self.gather_td(ep.ring, false) else { return };
+            ep.ring = r;
             self.set_ep(id, dci, ep);
-            if t[3] & (1 << 5) != 0 {
-                self.transfer_event(addr, CC_SUCCESS, 0, id as u8, dci);
-            }
+            self.complete_td(id, dci, &td, None);
         }
     }
 
@@ -864,6 +886,7 @@ impl Xhci {
 
     fn portsc_write(&mut self, p: usize, v: u32) {
         let old = self.ports[p];
+        log::debug!("xhci: portsc{p} {old:#x} <- {v:#x}");
         let mut s = old & !(v & PS_CHANGE_MASK);
         if v & PS_PED != 0 {
             s &= !PS_PED;
