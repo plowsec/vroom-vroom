@@ -11,6 +11,7 @@ use std::os::unix::net::{UnixDatagram, UnixStream};
 use std::sync::mpsc::Sender;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use bulwark_display::{send_fd, Decoder, SharedFb, ToViewer, ToVmm};
 use bulwark_devices::usb::hid::HidEvent;
@@ -63,12 +64,31 @@ impl ViewerTx {
     }
 }
 
+/// Two sources can feed the screen: ramfb (firmware, boot, Windows before
+/// its virtio-gpu driver) and virtio-gpu. Windows with both drivers shows
+/// two monitors and may well keep its desktop on the ramfb one, so neither
+/// source simply wins: the one that changed most recently does, once the
+/// one on screen has been quiet for `HOLD`. GPU updates are partial, so we
+/// keep a copy of its picture to redraw from when it takes over again.
+#[derive(Default)]
+struct Arbiter {
+    gpu_on_screen: bool,
+    gpu_mode: (u32, u32),
+    gpu_shadow: Vec<u8>,
+    last_gpu: Option<Instant>,
+    last_ramfb: Option<Instant>,
+}
+
+const HOLD: Duration = Duration::from_secs(3);
+
+fn quiet(t: Option<Instant>, now: Instant) -> bool {
+    t.is_none_or(|t| now.duration_since(t) >= HOLD)
+}
+
 pub(crate) struct FbSink {
     fb: SharedFb,
     mode: Mutex<(u32, u32)>,
-    /// virtio-gpu owns the screen once its driver sets a mode; ramfb
-    /// (firmware / boot screen) only shows until then.
-    gpu_active: AtomicBool,
+    arb: Mutex<Arbiter>,
     /// None when headless: frames still land in the buffer (screendumps).
     tx: Option<ViewerTx>,
 }
@@ -76,13 +96,23 @@ pub(crate) struct FbSink {
 impl FbSink {
     pub fn headless() -> std::io::Result<Arc<Self>> {
         let fb = SharedFb::create().map_err(|e| std::io::Error::other(e.to_string()))?;
-        Ok(Arc::new(FbSink { fb, mode: Mutex::new((0, 0)), gpu_active: AtomicBool::new(false), tx: None }))
+        Ok(Arc::new(FbSink { fb, mode: Mutex::new((0, 0)), arb: Mutex::default(), tx: None }))
     }
 
-    /// A full frame from ramfb. Ignored while virtio-gpu is driving.
+    /// A full frame from ramfb (sent only when it changed).
     pub fn ramfb_frame(&self, w: u32, h: u32, rows: &[u8], stride: usize) {
-        if self.gpu_active.load(Ordering::Acquire) {
-            return;
+        self.ramfb_frame_at(Instant::now(), w, h, rows, stride)
+    }
+
+    fn ramfb_frame_at(&self, now: Instant, w: u32, h: u32, rows: &[u8], stride: usize) {
+        let mut a = self.arb.lock().unwrap_or_else(|e| e.into_inner());
+        a.last_ramfb = Some(now);
+        if a.gpu_on_screen {
+            if !quiet(a.last_gpu, now) {
+                return;
+            }
+            log::info!("display: showing the firmware framebuffer (virtio-gpu is idle)");
+            a.gpu_on_screen = false;
         }
         self.apply_mode(w, h);
         self.draw(0, 0, w, h, rows, stride);
@@ -136,13 +166,41 @@ impl DisplaySink for FbSink {
             log::warn!("display: mode {width}x{height} too large, ignored");
             return;
         }
-        self.gpu_active.store(width != 0, Ordering::Release);
+        let mut a = self.arb.lock().unwrap_or_else(|e| e.into_inner());
+        a.gpu_mode = (width, height);
+        a.gpu_shadow = vec![0; width as usize * height as usize * 4];
+        a.gpu_on_screen = width != 0;
+        a.last_gpu = Some(Instant::now());
         self.apply_mode(width, height);
     }
 
     fn flush(&self, x: u32, y: u32, w: u32, h: u32, rows: &[u8], stride: usize) {
-        if self.gpu_active.load(Ordering::Acquire) {
+        self.flush_at(Instant::now(), x, y, w, h, rows, stride)
+    }
+}
+
+impl FbSink {
+    #[allow(clippy::too_many_arguments)]
+    fn flush_at(&self, now: Instant, x: u32, y: u32, w: u32, h: u32, rows: &[u8], stride: usize) {
+        let mut a = self.arb.lock().unwrap_or_else(|e| e.into_inner());
+        let (mw, mh) = a.gpu_mode;
+        if x.saturating_add(w) > mw || y.saturating_add(h) > mh {
+            return;
+        }
+        // Keep the GPU picture whether or not it is on screen.
+        let row = w as usize * 4;
+        for i in 0..h as usize {
+            let (Some(src), d) = (rows.get(i * stride..i * stride + row), ((y as usize + i) * mw as usize + x as usize) * 4) else { return };
+            a.gpu_shadow[d..d + row].copy_from_slice(src);
+        }
+        a.last_gpu = Some(now);
+        if a.gpu_on_screen {
             self.draw(x, y, w, h, rows, stride);
+        } else if quiet(a.last_ramfb, now) {
+            log::info!("display: showing virtio-gpu again");
+            a.gpu_on_screen = true;
+            self.apply_mode(mw, mh);
+            self.draw(0, 0, mw, mh, &a.gpu_shadow, mw as usize * 4);
         }
     }
 }
@@ -206,7 +264,7 @@ impl DisplayServer {
         Ok(Arc::new(FbSink {
             fb,
             mode: Mutex::new((0, 0)),
-            gpu_active: AtomicBool::new(false),
+            arb: Mutex::default(),
             tx: Some(self.tx.clone()),
         }))
     }
@@ -317,5 +375,42 @@ fn handle(
         ToVmm::Command(c) => {
             let _ = events.send(VmEvent::Ui(c));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn px(sink: &FbSink) -> u32 {
+        let (w, h) = *sink.mode.lock().unwrap();
+        let mut v = vec![0u32; (w * h) as usize];
+        sink.fb.read_into(w, h, &mut v);
+        v[0]
+    }
+
+    #[test]
+    fn the_source_that_changes_wins_after_a_quiet_spell() {
+        let s = FbSink::headless().unwrap();
+        let t0 = Instant::now();
+        let (ramfb, gpu) = ([0x11u8; 4 * 4 * 2], [0x22u8; 4 * 4 * 2]);
+        s.ramfb_frame_at(t0, 4, 2, &ramfb, 16);
+        assert_eq!(px(&s), 0x11111111);
+        // Driver comes up: GPU takes over at once.
+        s.set_mode(4, 2);
+        s.flush_at(t0, 0, 0, 4, 2, &gpu, 16);
+        assert_eq!(px(&s), 0x22222222);
+        // Firmware screen changes while the GPU is busy: stays on GPU.
+        s.ramfb_frame_at(t0 + Duration::from_secs(1), 4, 2, &ramfb, 16);
+        assert_eq!(px(&s), 0x22222222);
+        // GPU quiet for a while, ramfb changes: show ramfb.
+        s.ramfb_frame_at(t0 + Duration::from_secs(5), 4, 2, &ramfb, 16);
+        assert_eq!(px(&s), 0x11111111);
+        // A partial GPU update right after: ramfb is not quiet yet.
+        s.flush_at(t0 + Duration::from_secs(6), 0, 0, 1, 1, &[0x33; 4], 4);
+        assert_eq!(px(&s), 0x11111111);
+        // Later: GPU back, redrawn from its copy including that update.
+        s.flush_at(t0 + Duration::from_secs(10), 1, 0, 1, 1, &[0x44; 4], 4);
+        assert_eq!(px(&s), 0x33333333);
     }
 }
