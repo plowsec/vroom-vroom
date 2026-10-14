@@ -4,10 +4,15 @@
 //! The host is trusted more than the guest, but we still validate
 //! everything (sizes, UTF-8) via bulwark-proto.
 
+// Windows: a background app started at logon, no console window.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod clip;
+mod port;
 mod sys;
 
-use std::fs::{File, OpenOptions};
+#[cfg(windows)]
+use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -50,7 +55,16 @@ fn parse_args() -> Result<Args, String> {
 }
 
 fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    let mut logger = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
+    // No console on Windows: log to %LOCALAPPDATA%\Bulwark\agent.log.
+    #[cfg(windows)]
+    if let Some(dir) = std::env::var_os("LOCALAPPDATA").map(|d| std::path::PathBuf::from(d).join("Bulwark")) {
+        let _ = std::fs::create_dir_all(&dir);
+        if let Ok(f) = OpenOptions::new().create(true).append(true).open(dir.join("agent.log")) {
+            logger.target(env_logger::Target::Pipe(Box::new(f)));
+        }
+    }
+    logger.init();
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {
@@ -67,9 +81,8 @@ fn main() {
 }
 
 fn session(args: &Args) -> std::io::Result<()> {
-    let port = OpenOptions::new().read(true).write(true).open(&args.port)?;
-    let mut reader: File = port.try_clone()?;
-    let mut writer = port;
+    let (mut reader, mut writer) = port::open(&args.port)?;
+    sys::single_display();
     let mut clip: Box<dyn clip::Clip> = if args.no_clipboard {
         Box::new(clip::NoClip)
     } else if let Some(p) = &args.clipboard_file {
@@ -125,7 +138,7 @@ fn session(args: &Args) -> std::io::Result<()> {
     }
 }
 
-fn handle(m: Message, w: &mut File, clip: &mut dyn clip::Clip, last: &mut Option<String>) -> std::io::Result<()> {
+fn handle(m: Message, w: &mut port::Writer, clip: &mut dyn clip::Clip, last: &mut Option<String>) -> std::io::Result<()> {
     match m {
         Message::Hello { agent, .. } => log::info!("host: {agent}"),
         Message::ClipboardText(t) => {

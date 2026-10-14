@@ -595,8 +595,11 @@ impl GpuHandler {
             return None;
         }
         let mut entries = Vec::with_capacity(n as usize);
-        for _ in 0..n {
+        for i in 0..n {
             let (addr, len, _pad) = (rd64(r)?, rd32(r)?, rd32(r)?);
+            if i < 4 || i + 1 == n {
+                log::trace!("gpu: backing[{i}] {addr:#x}+{len:#x}");
+            }
             if !mem.check_range(GuestAddress(addr), len as u64) {
                 return None;
             }
@@ -725,6 +728,7 @@ impl GpuHandler {
     /// Copy a rect from guest backing into the host copy. `stride` is the
     /// guest's row pitch (None: tightly packed, like TRANSFER_TO_HOST_2D).
     fn transfer(&mut self, mem: &GuestMemory, id: u32, rect: Rect, offset: u64, stride: Option<u32>) -> u32 {
+        log::trace!("gpu: transfer res {id} {rect:?} offset {offset:#x} stride {stride:?}");
         let Some(res) = self.resources.get_mut(&id) else { return ERR_INVALID_RESOURCE_ID };
         if !rect.inside(res.width, res.height) || res.backing.is_empty() {
             return ERR_INVALID_PARAMETER;
@@ -805,6 +809,7 @@ impl GpuHandler {
     fn flush(&mut self, mem: &GuestMemory, r: &mut Reader) -> u32 {
         let Some(rect) = Rect::read(r) else { return ERR_INVALID_PARAMETER };
         let Some(id) = rd32(r) else { return ERR_INVALID_PARAMETER };
+        log::trace!("gpu: flush res {id} {rect:?}");
         let Some(sc) = self.scanout else { return OK_NODATA };
         let (sid, view) = match sc {
             Scanout::Cpu { id, view } | Scanout::Blob { id, view, .. } => (id, view),
@@ -872,6 +877,11 @@ impl GpuHandler {
                 })();
                 if let Some(hdr) = hdr {
                     let (ty, body) = self.command(&ctx.mem, &mut r, &hdr);
+                    if ty >= ERR_UNSPEC {
+                        log::debug!("gpu: command {:#x} -> {ty:#x}", hdr.ty);
+                    } else {
+                        log::trace!("gpu: command {:#x} ok", hdr.ty);
+                    }
                     Self::respond(&mut w, &hdr, ty, &body);
                     len = w.written() as u32;
                     if hdr.flags & FLAG_FENCE != 0 {

@@ -69,3 +69,24 @@ pub fn set_resolution(w: u32, h: u32) -> std::io::Result<()> {
 pub fn set_resolution(_w: u32, _h: u32) -> std::io::Result<()> {
     Ok(())
 }
+
+/// Windows: one display. With virtio-gpu next to the firmware framebuffer
+/// (ramfb), Windows extends the desktop over both, and windows open on a
+/// screen nobody sees. Keep only the virtio-gpu output ("internal").
+#[cfg(windows)]
+pub fn single_display() {
+    use windows_sys::Win32::Devices::Display::{
+        GetDisplayConfigBufferSizes, SetDisplayConfig, QDC_ONLY_ACTIVE_PATHS, SDC_APPLY, SDC_TOPOLOGY_INTERNAL,
+    };
+    let (mut paths, mut modes) = (0u32, 0u32);
+    // SAFETY: valid out pointers.
+    if unsafe { GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut paths, &mut modes) } != 0 || paths <= 1 {
+        return;
+    }
+    // SAFETY: no arrays: apply a stock topology.
+    let r = unsafe { SetDisplayConfig(0, std::ptr::null(), 0, std::ptr::null(), SDC_APPLY | SDC_TOPOLOGY_INTERNAL) };
+    log::info!("{paths} active displays; internal-only topology: {r}");
+}
+
+#[cfg(not(windows))]
+pub fn single_display() {}

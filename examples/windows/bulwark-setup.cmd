@@ -8,10 +8,14 @@ for %%d in (D E F G H I J K) do (
     )
   )
 )
-rem Agent (clipboard, time sync, resolution, shutdown), autostart at logon.
+rem Agent (clipboard, time sync, resolution, shutdown), started at logon in
+rem the user's session. Elevated: the VirtIO serial port only admits
+rem Administrators and SYSTEM. (Standard users need a service + session
+rem helper split; not done yet.)
 if exist "%~dp0bulwark-agent.exe" (
   mkdir "%ProgramFiles%\Bulwark" 2>nul
   copy /y "%~dp0bulwark-agent.exe" "%ProgramFiles%\Bulwark\"
-  reg add HKLM\Software\Microsoft\Windows\CurrentVersion\Run /v BulwarkAgent /t REG_SZ /d "\"%ProgramFiles%\Bulwark\bulwark-agent.exe\"" /f
+  schtasks /create /f /tn "Bulwark Agent" /tr "\"%ProgramFiles%\Bulwark\bulwark-agent.exe\"" /sc onlogon /rl highest /it
+  reg delete HKLM\Software\Microsoft\Windows\CurrentVersion\Run /v BulwarkAgent /f 2>nul
 )
 echo done > C:\bulwark-setup.done
