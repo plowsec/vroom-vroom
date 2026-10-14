@@ -1180,6 +1180,73 @@ mod tests {
         assert!(!Rect { x: u32::MAX, y: 0, w: 2, h: 1 }.inside(10, 10));
     }
 
+    #[derive(Default)]
+    struct Rec {
+        modes: Mutex<Vec<(u32, u32)>>,
+        frames: Mutex<Vec<(u32, u32, Vec<u8>)>>,
+    }
+    impl DisplaySink for Rec {
+        fn set_mode(&self, w: u32, h: u32) {
+            self.modes.lock().unwrap().push((w, h));
+        }
+        fn flush(&self, _x: u32, _y: u32, w: u32, h: u32, rows: &[u8], stride: usize) {
+            let px: Vec<u8> = (0..h as usize).flat_map(|i| rows[i * stride..i * stride + w as usize * 4].to_vec()).collect();
+            self.frames.lock().unwrap().push((w, h, px));
+        }
+    }
+
+    /// A 4x2 B8G8R8X8 resource, backing split over two guest pages, shown
+    /// on the scanout. Returns the snapshot of it.
+    fn snapshot_of_scene(gpu: &Gpu, mem: &GuestMemory) -> Snap2d {
+        let px: Vec<u8> = (0..32).collect();
+        mem.write(GuestAddress(0x1000), &px[..16]).unwrap();
+        mem.write(GuestAddress(0x3000), &px[16..]).unwrap();
+        let mut h = gpu.handler();
+        assert_eq!(h.create_cpu(7, 2, 4, 2), OK_NODATA);
+        h.resources.get_mut(&7).unwrap().backing = vec![(0x1000, 16), (0x3000, 16)];
+        let full = Rect { x: 0, y: 0, w: 4, h: 2 };
+        assert_eq!(h.transfer(mem, 7, full, 0, None), OK_NODATA);
+        h.scanout = Some(Scanout::Cpu { id: 7, view: full });
+        // Through JSON, like a real snapshot.
+        serde_json::from_slice(&serde_json::to_vec(&h.save_2d()).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn snapshot_2d_rebuilds_from_guest_ram() {
+        let mem = GuestMemory::new(&[(GuestAddress(0), 1 << 20)]).unwrap();
+        let sink = Arc::new(Rec::default());
+        let (gpu, _ctl) = Gpu::new(64, 64, sink.clone());
+        let snap = snapshot_of_scene(&gpu, &mem);
+        // Fresh handler (new process after resume): same picture, from RAM.
+        let mut h = gpu.handler();
+        h.restore_2d(&mem, &snap).unwrap();
+        assert_eq!(sink.modes.lock().unwrap().last(), Some(&(4, 2)));
+        let frames = sink.frames.lock().unwrap();
+        let (w, hh, px) = frames.last().unwrap();
+        assert_eq!((*w, *hh), (4, 2));
+        let bgr: Vec<u8> = px.chunks(4).flat_map(|p| p[..3].to_vec()).collect();
+        let want: Vec<u8> = (0..32u8).collect::<Vec<_>>().chunks(4).flat_map(|p| p[..3].to_vec()).collect();
+        assert_eq!(bgr, want);
+        // And the resource is usable by later commands.
+        assert!(h.resources.contains_key(&7));
+    }
+
+    #[test]
+    fn snapshot_2d_is_validated() {
+        let mem = GuestMemory::new(&[(GuestAddress(0), 1 << 20)]).unwrap();
+        let (gpu, _ctl) = Gpu::new(64, 64, Arc::new(Rec::default()));
+        let good = snapshot_of_scene(&gpu, &mem);
+        let mut s = serde_json::from_slice::<Snap2d>(&serde_json::to_vec(&good).unwrap()).unwrap();
+        s.resources[0].backing.push((0xffff_0000_0000, 4096)); // outside RAM
+        assert!(gpu.handler().restore_2d(&mem, &s).is_err());
+        let mut s = serde_json::from_slice::<Snap2d>(&serde_json::to_vec(&good).unwrap()).unwrap();
+        s.scanout = Some((7, 1, 0, 4, 2)); // runs off the resource
+        assert!(gpu.handler().restore_2d(&mem, &s).is_err());
+        let mut s = serde_json::from_slice::<Snap2d>(&serde_json::to_vec(&good).unwrap()).unwrap();
+        s.resources[0].width = 1 << 30; // over the memory cap
+        assert!(gpu.handler().restore_2d(&mem, &s).is_err());
+    }
+
     #[test]
     fn swizzles() {
         assert_eq!(swizzle(2), Some([0, 1, 2, 3]));
