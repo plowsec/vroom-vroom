@@ -1,12 +1,12 @@
 //! Assemble a machine from a config: memory, irqchip, devices, vCPUs.
 
 use std::io::Write;
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixDatagram, UnixStream};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use bulwark_arch::aarch64::{self as board, layout};
-use bulwark_config::{Boot, DiskFormat, VmConfig};
+use bulwark_config::{Boot, DiskFormat, Gpu, VmConfig};
 use bulwark_devices::{pl011::Pl011, pl031::Pl031, BusBuilder, BusDevice};
 use bulwark_hv::{
     aarch64::mpidr_for, BootRegs, GicMsiConfig, Hypervisor, IrqChipConfig, IrqChipInfo, Vm, VmParams,
@@ -17,10 +17,13 @@ use bulwark_config::NetMode;
 use bulwark_net::nat::{Nat, NatConfig, NatPolicy, TcpForward};
 use bulwark_net::NetBackend;
 use bulwark_proto::AGENT_PORT;
+use bulwark_virtio::devices::gpu::{DisplaySink, Gpu as GpuDev};
+use bulwark_virtio::devices::input::{Input, InputKind};
 use bulwark_virtio::devices::{block::Block, console::Console, net::Net, rng::Rng};
 use bulwark_virtio::{mmio::VirtioMmio, VirtioDevice};
 
 use crate::agent::{self, Agent, ClipboardProvider};
+use crate::display::{DisplayServer, FbSink, InputPipes, ViewerTx};
 use crate::irq::SpiLine;
 use crate::psci::CpuTable;
 use crate::vcpu::{self, VcpuHandle, VcpuShared, VmEvent};
@@ -51,6 +54,8 @@ pub(crate) struct Machine {
     pub devices: Vec<StatefulDevice>,
     pub uart: Arc<Mutex<Pl011>>,
     pub agent: Agent,
+    pub viewer: Option<ViewerTx>,
+    pub screen: Option<Arc<FbSink>>,
     pub boot: BootImage,
 }
 
@@ -144,6 +149,7 @@ pub(crate) fn build(
     hv: &dyn Hypervisor,
     serial_out: Box<dyn Write + Send>,
     clipboard: Option<Box<dyn ClipboardProvider>>,
+    ui: Option<DisplayServer>,
     events: Sender<VmEvent>,
 ) -> Result<Machine> {
     if hv.arch() != bulwark_hv::Arch::Aarch64 {
@@ -207,10 +213,41 @@ pub(crate) fn build(
         let id = format!("vd{}", (b'a' + i as u8) as char);
         add_virtio(Box::new(Block::new(&id, img)))?;
     }
+    // Display: virtio-gpu + keyboard + tablet. Without a viewer the GPU
+    // still exists (guest sees a monitor) and frames go nowhere.
+    let mut display_parts = None;
+    let mut screen = None;
+    if config.display.gpu != Gpu::None {
+        let fb = match &ui {
+            Some(ds) => ds.sink()?,
+            None => FbSink::headless()?,
+        };
+        screen = Some(fb.clone());
+        let sink: Arc<dyn DisplaySink> = fb;
+        let (gpu, ctl) = GpuDev::new(config.display.width, config.display.height, sink);
+        add_virtio(Box::new(gpu))?;
+        let (kbd_host, kbd_dev) = UnixDatagram::pair()?;
+        let (tab_host, tab_dev) = UnixDatagram::pair()?;
+        add_virtio(Box::new(Input::new(InputKind::Keyboard, kbd_dev)))?;
+        add_virtio(Box::new(Input::new(InputKind::Tablet, tab_dev)))?;
+        display_parts = Some((ctl, InputPipes { kbd: kbd_host, tablet: tab_host }));
+    }
+
     // Guest agent channel: /dev/virtio-ports/org.bulwark.agent.0 in the guest.
     let (host_end, dev_end) = UnixStream::pair()?;
     add_virtio(Box::new(Console::new(vec![(AGENT_PORT.to_string(), dev_end)])?))?;
+    let clipboard = match &ui {
+        Some(ds) => Some(ds.clipboard()),
+        None => clipboard,
+    };
     let agent = agent::spawn(host_end, config.clipboard.clone(), clipboard)?;
+    let viewer = ui.as_ref().map(|d| d.tx());
+    if let Some(ds) = ui {
+        match display_parts {
+            Some((ctl, pipes)) => ds.run(ctl, pipes, agent.clone(), events.clone())?,
+            None => return Err(Error::Setup("a viewer needs display.gpu set".into())),
+        }
+    }
     for (i, n) in config.nets.iter().enumerate() {
         let mac = match &n.mac {
             Some(m) => bulwark_config::parse_mac(m)?,
@@ -261,5 +298,5 @@ pub(crate) fn build(
     }
     let _ = shared.peers.set(vcpus.iter().map(|v| v.peer.clone()).collect());
 
-    Ok(Machine { vm, mem, shared, vcpus, devices: reg.stateful, uart, agent, boot })
+    Ok(Machine { vm, mem, shared, vcpus, devices: reg.stateful, uart, agent, viewer, screen, boot })
 }

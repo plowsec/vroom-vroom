@@ -5,6 +5,7 @@
 //! through [`Vmm`] in-process or through the control socket.
 
 pub mod agent;
+mod display;
 mod irq;
 mod machine;
 pub mod psci;
@@ -67,6 +68,8 @@ pub struct VmmOptions {
     pub start: StartMode,
     /// Host clipboard, if the frontend has one.
     pub clipboard: Option<Box<dyn agent::ClipboardProvider>>,
+    /// Connection to a viewer process (GUI). Overrides `clipboard`.
+    pub ui: Option<std::os::unix::net::UnixStream>,
 }
 
 impl std::fmt::Debug for VmmOptions {
@@ -97,6 +100,8 @@ pub struct Vmm {
     devices: Vec<StatefulDevice>,
     uart: Arc<Mutex<Pl011>>,
     agent: agent::Agent,
+    viewer: Option<display::ViewerTx>,
+    screen: Option<Arc<display::FbSink>>,
     /// Captured right after build; reset = restore these.
     pristine_devices: Vec<Vec<u8>>,
     pristine_irqchip: IrqChipState,
@@ -118,7 +123,11 @@ impl Vmm {
     pub fn start(config: VmConfig, hv: Arc<dyn Hypervisor>, opts: VmmOptions) -> Result<Vmm> {
         config.validate()?;
         let (ev_tx, ev_rx) = mpsc::channel();
-        let m = machine::build(&config, hv.as_ref(), opts.serial_out, opts.clipboard, ev_tx)?;
+        let ui = match opts.ui {
+            Some(s) => Some(display::DisplayServer::new(s)?),
+            None => None,
+        };
+        let m = machine::build(&config, hv.as_ref(), opts.serial_out, opts.clipboard, ui, ev_tx)?;
         let mut vmm = Vmm {
             config,
             hv,
@@ -130,6 +139,8 @@ impl Vmm {
             devices: m.devices,
             uart: m.uart,
             agent: m.agent,
+            viewer: m.viewer,
+            screen: m.screen,
             pristine_devices: Vec::new(),
             pristine_irqchip: IrqChipState::default(),
             boot: m.boot,
@@ -165,6 +176,21 @@ impl Vmm {
 
     pub fn state(&self) -> RunState {
         self.state
+    }
+
+    /// Save the guest screen as PNG. Returns the mode.
+    pub fn screendump(&self, path: &Path) -> Result<(u32, u32)> {
+        match &self.screen {
+            Some(s) => Ok(s.screendump(path)?),
+            None => Err(Error::Setup("VM has no display".into())),
+        }
+    }
+
+    /// Tell the viewer something (status line).
+    pub fn viewer_status(&self, text: &str) {
+        if let Some(v) = &self.viewer {
+            v.send(&bulwark_display::ToViewer::Status(text.to_string()));
+        }
     }
 
     /// Guest agent channel (clipboard, time sync, clean shutdown).
@@ -259,8 +285,14 @@ impl Vmm {
     /// Snapshot then stop: the VM can be resumed later with
     /// [`StartMode::Restore`]. This is "suspend to disk".
     pub fn suspend(mut self, dir: &Path) -> Result<()> {
+        self.suspend_in_place(dir)
+    }
+
+    /// Like [`suspend`], for callers that keep the handle. On error the
+    /// VM is left paused, not stopped, so nothing is lost.
+    pub fn suspend_in_place(&mut self, dir: &Path) -> Result<()> {
         self.pause()?;
-        snapshot::save(&mut self, dir, "suspend")?;
+        snapshot::save(self, dir, "suspend")?;
         self.shutdown();
         Ok(())
     }
@@ -268,6 +300,9 @@ impl Vmm {
     /// Tear everything down. vCPUs are destroyed on their own threads.
     pub fn shutdown(&mut self) {
         self.agent.send(agent::AgentCmd::Stop);
+        if let Some(v) = &self.viewer {
+            v.send(&bulwark_display::ToViewer::Closed);
+        }
         for v in &self.vcpus {
             let _ = v.peer.send(VcpuCmd::Stop);
         }

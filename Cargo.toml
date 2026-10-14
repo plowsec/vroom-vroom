@@ -22,6 +22,7 @@ bulwark-proto = { path = "crates/proto" }
 bulwark-sandbox = { path = "crates/sandbox" }
 bulwark-block = { path = "crates/block" }
 bulwark-agent = { path = "crates/agent" }
+bulwark-display = { path = "crates/display" }
 
 thiserror = "2"
 log = "0.4"

@@ -51,6 +51,9 @@ pub enum VmEvent {
     Shutdown,
     Reset,
     Crashed(String),
+    /// Lifecycle request from the viewer window.
+    Ui(bulwark_display::Command),
+    ViewerClosed,
 }
 
 /// Shared by all vCPU threads.

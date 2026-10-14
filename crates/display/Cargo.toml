@@ -1,0 +1,14 @@
+[package]
+name = "bulwark-display"
+description = "VMM <-> viewer display channel: shared framebuffer, input, resize, clipboard."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+libc.workspace = true
+getrandom = "0.2"
+
+[lints]
+workspace = true
