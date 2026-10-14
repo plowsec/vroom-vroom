@@ -16,6 +16,10 @@ use crate::IrqLine;
 pub trait PciDevice: Send {
     fn config(&self) -> &ConfigSpace;
     fn config_mut(&mut self) -> &mut ConfigSpace;
+    /// Config read; override for side-effecting windows (virtio pci_cfg).
+    fn config_read(&mut self, off: usize, data: &mut [u8]) {
+        self.config().read(off, data);
+    }
     /// Called after a guest config write (enable bits, MSI-X control...).
     fn config_written(&mut self, _off: usize, _len: usize) {}
     fn bar_read(&mut self, bar: usize, off: u64, data: &mut [u8]);
@@ -29,19 +33,6 @@ pub trait PciDevice: Send {
 }
 
 pub type SharedPciDevice = Arc<Mutex<dyn PciDevice>>;
-
-/// Interrupt delivery for a device: MSI-X if the driver enabled it,
-/// otherwise the legacy INTx line.
-#[derive(Clone)]
-pub struct PciIrq {
-    pub intx: Arc<Intx>,
-}
-
-impl std::fmt::Debug for PciIrq {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("PciIrq")
-    }
-}
 
 impl IrqLine for Intx {
     fn set_level(&self, level: bool) {

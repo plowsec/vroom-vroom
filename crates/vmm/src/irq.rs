@@ -22,3 +22,22 @@ impl IrqLine for SpiLine {
         }
     }
 }
+
+/// MSI delivery through the irqchip (GICv2m frame on ARM).
+pub struct GicMsi {
+    vm: Arc<dyn Vm>,
+}
+
+impl GicMsi {
+    pub fn new(vm: Arc<dyn Vm>) -> Arc<Self> {
+        Arc::new(GicMsi { vm })
+    }
+}
+
+impl bulwark_devices::pci::MsiSender for GicMsi {
+    fn send(&self, addr: u64, data: u32) {
+        if let Err(e) = self.vm.signal_msi(addr, data) {
+            log::debug!("msi {addr:#x}/{data}: {e}");
+        }
+    }
+}

@@ -26,6 +26,9 @@ pub struct Msix {
     table: Vec<Entry>,
     pending: Vec<bool>,
     cap: usize,
+    /// Cached from the capability's message control (see `update`).
+    enabled: bool,
+    fmask: bool,
     #[serde(skip)]
     sender: Option<Arc<dyn MsiSender>>,
 }
@@ -53,8 +56,14 @@ impl Msix {
             table: vec![Entry { ctrl: 1, ..Default::default() }; vectors as usize],
             pending: vec![false; vectors as usize],
             cap,
+            enabled: false,
+            fmask: false,
             sender: Some(sender),
         }
+    }
+
+    pub fn sender(&self) -> Option<Arc<dyn MsiSender>> {
+        self.sender.clone()
     }
 
     pub fn set_sender(&mut self, s: Arc<dyn MsiSender>) {
@@ -65,12 +74,22 @@ impl Msix {
         u16::from_le_bytes([cfg.raw()[cap + 2], cfg.raw()[cap + 3]])
     }
 
-    pub fn enabled(&self, cfg: &ConfigSpace) -> bool {
-        Self::control(cfg, self.cap) & 0x8000 != 0
+    /// Re-read enable / function-mask after a config write; delivers
+    /// anything that became unmasked.
+    pub fn update(&mut self, cfg: &ConfigSpace) {
+        let c = Self::control(cfg, self.cap);
+        self.enabled = c & 0x8000 != 0;
+        self.fmask = c & 0x4000 != 0;
+        self.flush_pending();
     }
 
-    fn function_masked(&self, cfg: &ConfigSpace) -> bool {
-        Self::control(cfg, self.cap) & 0x4000 != 0
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Capability offset in config space.
+    pub fn cap_offset(&self) -> usize {
+        self.cap
     }
 
     pub fn vectors(&self) -> usize {
@@ -96,7 +115,7 @@ impl Msix {
         }
     }
 
-    pub fn table_write(&mut self, off: u64, data: &[u8], cfg: &ConfigSpace) {
+    pub fn table_write(&mut self, off: u64, data: &[u8]) {
         let (i, f) = (off as usize / ENTRY, off as usize % ENTRY);
         let Some(e) = self.table.get_mut(i) else { return };
         let mut raw = [0u8; ENTRY];
@@ -112,7 +131,7 @@ impl Msix {
         e.data = u32::from_le_bytes(raw[8..12].try_into().unwrap_or([0; 4]));
         e.ctrl = u32::from_le_bytes(raw[12..16].try_into().unwrap_or([0; 4])) & 1;
         // Unmasking delivers a pending message.
-        self.flush_pending(cfg);
+        self.flush_pending();
     }
 
     pub fn pba_read(&self, off: u64, data: &mut [u8]) {
@@ -129,10 +148,10 @@ impl Msix {
     }
 
     /// Fire vector `v`, or mark it pending if masked.
-    pub fn notify(&mut self, v: u16, cfg: &ConfigSpace) {
+    pub fn notify(&mut self, v: u16) {
         let v = v as usize;
         let Some(e) = self.table.get(v).copied() else { return };
-        if e.ctrl & 1 != 0 || self.function_masked(cfg) {
+        if e.ctrl & 1 != 0 || self.fmask {
             self.pending[v] = true;
             return;
         }
@@ -141,9 +160,9 @@ impl Msix {
         }
     }
 
-    /// Config space changed (enable / function mask): deliver what's due.
-    pub fn flush_pending(&mut self, cfg: &ConfigSpace) {
-        if !self.enabled(cfg) || self.function_masked(cfg) {
+    /// Deliver pending messages that are no longer masked.
+    fn flush_pending(&mut self) {
+        if !self.enabled || self.fmask {
             return;
         }
         for v in 0..self.table.len() {

@@ -13,6 +13,7 @@ pub mod core;
 mod device;
 pub mod devices;
 pub mod mmio;
+pub mod pci;
 pub mod queue;
 pub mod worker;
 

@@ -69,6 +69,7 @@ impl Firmware {
         cpus: u32,
         mpidrs: &[u64],
         info: &IrqChipInfo,
+        pci: bool,
         virtio_mmio: Vec<(u64, u64, u32)>,
         screen: Option<Weak<FbSink>>,
     ) -> Result<()> {
@@ -103,7 +104,7 @@ impl Firmware {
             gic_dist_size: info.dist_size,
             gic_redist_size: info.redist_size_per_cpu,
             gic_msi: Some((layout::GIC_MSI_BASE, info.msi_size)),
-            pci: false,
+            pci,
             virtio_mmio,
         });
         fw.add_file(RSDP_FILE, tables.rsdp, None).map_err(Error::Setup)?;

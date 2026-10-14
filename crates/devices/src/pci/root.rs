@@ -136,7 +136,7 @@ impl PciRoot {
                 d.config_mut().write(reg, w);
                 d.config_written(reg, w.len());
             }
-            None => d.config().read(reg, data),
+            None => d.config_read(reg, data),
         }
         drop(d);
         if write.is_some() {

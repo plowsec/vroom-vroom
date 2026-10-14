@@ -45,6 +45,30 @@ pub struct VmConfig {
     pub serial: Serial,
     #[serde(default)]
     pub security: Security,
+    /// How virtio devices attach. Auto: MMIO for direct kernel boot, PCI
+    /// for UEFI (Windows drivers only speak PCI).
+    #[serde(default)]
+    pub virtio_transport: Transport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Transport {
+    #[default]
+    Auto,
+    Mmio,
+    Pci,
+}
+
+impl VmConfig {
+    /// Resolved transport.
+    pub fn use_pci(&self) -> bool {
+        match self.virtio_transport {
+            Transport::Pci => true,
+            Transport::Mmio => false,
+            Transport::Auto => matches!(self.boot, Boot::Uefi { .. }),
+        }
+    }
 }
 
 fn default_cpus() -> u32 {
