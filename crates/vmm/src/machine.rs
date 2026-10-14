@@ -1,6 +1,7 @@
 //! Assemble a machine from a config: memory, irqchip, devices, vCPUs.
 
 use std::io::Write;
+use std::os::unix::net::UnixStream;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -15,9 +16,11 @@ use bulwark_snapshot::Snapshottable;
 use bulwark_config::NetMode;
 use bulwark_net::nat::{Nat, NatConfig, NatPolicy, TcpForward};
 use bulwark_net::NetBackend;
-use bulwark_virtio::devices::{block::Block, net::Net, rng::Rng};
+use bulwark_proto::AGENT_PORT;
+use bulwark_virtio::devices::{block::Block, console::Console, net::Net, rng::Rng};
 use bulwark_virtio::{mmio::VirtioMmio, VirtioDevice};
 
+use crate::agent::{self, Agent, ClipboardProvider};
 use crate::irq::SpiLine;
 use crate::psci::CpuTable;
 use crate::vcpu::{self, VcpuHandle, VcpuShared, VmEvent};
@@ -47,6 +50,7 @@ pub(crate) struct Machine {
     pub vcpus: Vec<VcpuHandle>,
     pub devices: Vec<StatefulDevice>,
     pub uart: Arc<Mutex<Pl011>>,
+    pub agent: Agent,
     pub boot: BootImage,
 }
 
@@ -139,6 +143,7 @@ pub(crate) fn build(
     config: &VmConfig,
     hv: &dyn Hypervisor,
     serial_out: Box<dyn Write + Send>,
+    clipboard: Option<Box<dyn ClipboardProvider>>,
     events: Sender<VmEvent>,
 ) -> Result<Machine> {
     if hv.arch() != bulwark_hv::Arch::Aarch64 {
@@ -202,6 +207,10 @@ pub(crate) fn build(
         let id = format!("vd{}", (b'a' + i as u8) as char);
         add_virtio(Box::new(Block::new(&id, img)))?;
     }
+    // Guest agent channel: /dev/virtio-ports/org.bulwark.agent.0 in the guest.
+    let (host_end, dev_end) = UnixStream::pair()?;
+    add_virtio(Box::new(Console::new(vec![(AGENT_PORT.to_string(), dev_end)])?))?;
+    let agent = agent::spawn(host_end, config.clipboard.clone(), clipboard)?;
     for (i, n) in config.nets.iter().enumerate() {
         let mac = match &n.mac {
             Some(m) => bulwark_config::parse_mac(m)?,
@@ -252,5 +261,5 @@ pub(crate) fn build(
     }
     let _ = shared.peers.set(vcpus.iter().map(|v| v.peer.clone()).collect());
 
-    Ok(Machine { vm, mem, shared, vcpus, devices: reg.stateful, uart, boot })
+    Ok(Machine { vm, mem, shared, vcpus, devices: reg.stateful, uart, agent, boot })
 }

@@ -4,6 +4,7 @@
 //! One VMM process runs exactly one VM. Frontends (CLI, GUI) talk to it
 //! through [`Vmm`] in-process or through the control socket.
 
+pub mod agent;
 mod irq;
 mod machine;
 pub mod psci;
@@ -45,6 +46,8 @@ pub enum Error {
     VcpuGone,
     #[error("timed out waiting for vCPUs")]
     Timeout,
+    #[error("virtio: {0}")]
+    Virtio(#[from] bulwark_virtio::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -62,6 +65,8 @@ pub enum StartMode {
 pub struct VmmOptions {
     pub serial_out: Box<dyn Write + Send>,
     pub start: StartMode,
+    /// Host clipboard, if the frontend has one.
+    pub clipboard: Option<Box<dyn agent::ClipboardProvider>>,
 }
 
 impl std::fmt::Debug for VmmOptions {
@@ -91,6 +96,7 @@ pub struct Vmm {
     events: Receiver<VmEvent>,
     devices: Vec<StatefulDevice>,
     uart: Arc<Mutex<Pl011>>,
+    agent: agent::Agent,
     /// Captured right after build; reset = restore these.
     pristine_devices: Vec<Vec<u8>>,
     pristine_irqchip: IrqChipState,
@@ -112,7 +118,7 @@ impl Vmm {
     pub fn start(config: VmConfig, hv: Arc<dyn Hypervisor>, opts: VmmOptions) -> Result<Vmm> {
         config.validate()?;
         let (ev_tx, ev_rx) = mpsc::channel();
-        let m = machine::build(&config, hv.as_ref(), opts.serial_out, ev_tx)?;
+        let m = machine::build(&config, hv.as_ref(), opts.serial_out, opts.clipboard, ev_tx)?;
         let mut vmm = Vmm {
             config,
             hv,
@@ -123,6 +129,7 @@ impl Vmm {
             events: ev_rx,
             devices: m.devices,
             uart: m.uart,
+            agent: m.agent,
             pristine_devices: Vec::new(),
             pristine_irqchip: IrqChipState::default(),
             boot: m.boot,
@@ -144,6 +151,8 @@ impl Vmm {
                 for d in &vmm.devices {
                     d.lock().unwrap_or_else(|e| e.into_inner()).resume();
                 }
+                // Guest wall clock is stuck at snapshot time; fix it.
+                vmm.agent.send(agent::AgentCmd::SyncTime);
             }
         }
         vmm.state = RunState::Running;
@@ -156,6 +165,11 @@ impl Vmm {
 
     pub fn state(&self) -> RunState {
         self.state
+    }
+
+    /// Guest agent channel (clipboard, time sync, clean shutdown).
+    pub fn agent(&self) -> &agent::Agent {
+        &self.agent
     }
 
     /// Keyboard input for the serial console.
@@ -253,6 +267,7 @@ impl Vmm {
 
     /// Tear everything down. vCPUs are destroyed on their own threads.
     pub fn shutdown(&mut self) {
+        self.agent.send(agent::AgentCmd::Stop);
         for v in &self.vcpus {
             let _ = v.peer.send(VcpuCmd::Stop);
         }

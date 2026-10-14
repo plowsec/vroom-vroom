@@ -19,6 +19,7 @@ bulwark-snapshot.workspace = true
 bulwark-virtio.workspace = true
 bulwark-block.workspace = true
 bulwark-net.workspace = true
+bulwark-proto.workspace = true
 
 [lints]
 workspace = true

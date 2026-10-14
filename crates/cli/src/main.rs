@@ -9,6 +9,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use bulwark_config::VmConfig;
+use bulwark_vmm::agent::AgentCmd;
 use bulwark_vmm::{StartMode, VmEvent, Vmm, VmmOptions};
 use clap::{Parser, Subcommand};
 
@@ -31,6 +32,9 @@ enum Cmd {
         /// Where Ctrl-A s / Ctrl-A z write snapshots.
         #[arg(long, default_value = "snapshots")]
         snapshot_dir: PathBuf,
+        /// Use a file instead of the system clipboard (headless hosts, tests).
+        #[arg(long)]
+        host_clipboard_file: Option<PathBuf>,
     },
     /// Check a VM definition and print it back normalized.
     Check { config: PathBuf },
@@ -55,13 +59,52 @@ enum DiskCmd {
     Info { path: PathBuf },
 }
 
-const HELP: &str = "\r\n[bulwark] Ctrl-A x: quit | s: snapshot | z: suspend | p: pause/resume | r: reset | h: help\r\n";
+const HELP: &str = "\r\n[bulwark] Ctrl-A x: quit | s: snapshot | z: suspend | p: pause/resume | r: reset\r\n          c: host clipboard -> guest | v: guest clipboard -> host | h: help\r\n";
+
+/// Host clipboard through arboard.
+struct HostClipboard(arboard::Clipboard);
+
+impl bulwark_vmm::agent::ClipboardProvider for HostClipboard {
+    fn get_text(&mut self) -> Option<String> {
+        self.0.get_text().ok()
+    }
+    fn set_text(&mut self, text: &str) {
+        let _ = self.0.set_text(text.to_string());
+    }
+}
+
+struct FileClipboard(PathBuf);
+
+impl bulwark_vmm::agent::ClipboardProvider for FileClipboard {
+    fn get_text(&mut self) -> Option<String> {
+        std::fs::read_to_string(&self.0).ok()
+    }
+    fn set_text(&mut self, text: &str) {
+        let _ = std::fs::write(&self.0, text);
+    }
+}
+
+fn host_clipboard() -> Option<Box<dyn bulwark_vmm::agent::ClipboardProvider>> {
+    match arboard::Clipboard::new() {
+        Ok(c) => Some(Box::new(HostClipboard(c))),
+        Err(e) => {
+            log::info!("no host clipboard: {e}");
+            None
+        }
+    }
+}
 
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     let cli = Cli::parse();
     let r = match cli.cmd {
-        Cmd::Run { config, restore, snapshot_dir } => run(&config, restore, &snapshot_dir),
+        Cmd::Run { config, restore, snapshot_dir, host_clipboard_file } => {
+            let clip = match host_clipboard_file {
+                Some(p) => Some(Box::new(FileClipboard(p)) as Box<dyn bulwark_vmm::agent::ClipboardProvider>),
+                None => host_clipboard(),
+            };
+            run(&config, restore, &snapshot_dir, clip)
+        }
         Cmd::Disk(d) => disk(d),
         Cmd::Check { config } => load(&config).and_then(|c| {
             print!("{}", c.to_toml().map_err(|e| e.to_string())?);
@@ -140,14 +183,20 @@ fn timestamp() -> u64 {
         .unwrap_or(0)
 }
 
-fn run(config: &Path, restore: Option<PathBuf>, snap_dir: &Path) -> Result<(), String> {
+fn run(
+    config: &Path,
+    restore: Option<PathBuf>,
+    snap_dir: &Path,
+    clipboard: Option<Box<dyn bulwark_vmm::agent::ClipboardProvider>>,
+) -> Result<(), String> {
     let cfg = load(config)?;
     let hv = bulwark_hv::default_hypervisor().map_err(|e| e.to_string())?;
     let start = match restore {
         Some(p) => StartMode::Restore(p),
         None => StartMode::Boot,
     };
-    let mut vmm = Vmm::start(cfg, hv, VmmOptions { serial_out: Box::new(std::io::stdout()), start })
+    let opts = VmmOptions { serial_out: Box::new(std::io::stdout()), start, clipboard };
+    let mut vmm = Vmm::start(cfg, hv, opts)
         .map_err(|e| e.to_string())?;
 
     let _raw = term::RawTerminal::enable();
@@ -205,6 +254,14 @@ fn run(config: &Path, restore: Option<PathBuf>, snap_dir: &Path) -> Result<(), S
                                 Ok(s) => eprint!("\r\n[bulwark] {s}\r\n"),
                                 Err(e) => eprint!("\r\n[bulwark] {e}\r\n"),
                             }
+                        }
+                        b'c' => {
+                            vmm.agent().send(AgentCmd::PushClipboard);
+                            eprint!("\r\n[bulwark] host clipboard sent to guest\r\n");
+                        }
+                        b'v' => {
+                            vmm.agent().send(AgentCmd::PullClipboard);
+                            eprint!("\r\n[bulwark] guest clipboard copied to host\r\n");
                         }
                         b'r' => {
                             if let Err(e) = vmm.reset() {

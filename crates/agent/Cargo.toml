@@ -1,0 +1,27 @@
+[package]
+name = "bulwark-agent"
+description = "Guest agent: clipboard, time sync, clean shutdown. Runs inside the VM."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "bulwark-agent"
+path = "src/main.rs"
+
+[dependencies]
+bulwark-proto.workspace = true
+log.workspace = true
+env_logger.workspace = true
+
+[target.'cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))'.dependencies]
+arboard = { version = "3", default-features = false }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_SystemInformation", "Win32_Foundation"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,6 @@
+# Static guest agent builds without a cross toolchain.
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+
+[target.x86_64-unknown-linux-musl]
+linker = "rust-lld"
