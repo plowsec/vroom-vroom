@@ -123,6 +123,12 @@ Venus driver.
 - `Ctrl-A z` / `Ctrl+Alt+Shift+Z` / closing the GUI window: suspend; the
   next `run` resumes. `--fresh` ignores the suspend image.
 - Not possible while 3D contexts are active.
+- `bulwark snapshot list vm.toml`, `bulwark snapshot delete vm.toml snap-…`:
+  deleting a snapshot also removes the disk layers only it used, and merges
+  layers that became pass-through, so disk chains stay short.
+  `bulwark snapshot prune vm.toml` does the cleanup alone (e.g. after
+  reverting, the abandoned layers). These need the VM stopped: a state dir
+  is locked by the VMM using it.
 
 ## Disk sync
 

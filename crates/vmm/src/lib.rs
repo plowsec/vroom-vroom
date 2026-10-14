@@ -6,6 +6,7 @@
 
 pub mod agent;
 mod disks;
+pub mod state;
 mod display;
 mod firmware;
 mod irq;
@@ -96,6 +97,8 @@ pub(crate) type StatefulDevice = Arc<Mutex<dyn Snapshottable + Send>>;
 
 /// A running VM.
 pub struct Vmm {
+    /// One VMM per state dir: two would write the same disk layers.
+    _lock: state::StateLock,
     config: VmConfig,
     hv: Arc<dyn Hypervisor>,
     vm: Arc<dyn Vm>,
@@ -135,6 +138,7 @@ impl Vmm {
             Some(s) => Some(display::DisplayServer::new(s)?),
             None => None,
         };
+        let lock = state::StateLock::acquire(&opts.state_dir)?;
         let layers = match &opts.start {
             StartMode::Restore(dir) => snapshot::disk_plan(dir)?,
             StartMode::Boot => Default::default(),
@@ -148,6 +152,7 @@ impl Vmm {
         };
         let m = machine::build(&config, hv.as_ref(), opts.serial_out, opts.clipboard, ui, &disks, ev_tx, &env)?;
         let mut vmm = Vmm {
+            _lock: lock,
             config,
             hv,
             vm: m.vm,

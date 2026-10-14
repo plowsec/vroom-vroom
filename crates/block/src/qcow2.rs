@@ -255,6 +255,8 @@ pub struct Qcow2Image {
     read_only: bool,
     sync: SyncMode,
     backing: Option<Arc<dyn DiskImage>>,
+    /// Resolved backing file (None for in-process overlays and bases).
+    backing_path: Option<PathBuf>,
     state: Mutex<State>,
 }
 
@@ -323,11 +325,13 @@ impl Qcow2Image {
             }
         }
 
+        let mut backing_path = None;
         let backing = match (&hdr.backing_file, backing_override) {
             (_, Some(b)) => Some(b),
             (None, None) => None,
             (Some(name), None) => {
                 let bp = resolve_backing(path, name, policy)?;
+                backing_path = Some(bp.clone());
                 let fmt = match hdr.backing_format.as_deref() {
                     Some("qcow2") => Format::Qcow2,
                     Some("raw") => Format::Raw,
@@ -349,6 +353,7 @@ impl Qcow2Image {
             read_only,
             sync: policy.sync,
             backing,
+            backing_path,
             state: Mutex::new(State {
                 l1,
                 l2_cache: HashMap::new(),
@@ -394,29 +399,7 @@ impl Qcow2Image {
         put32(&mut hdr, 56, 1);
         put32(&mut hdr, 96, 4);
         put32(&mut hdr, 100, 104);
-        let mut off = 104usize;
-        if let Some((bp, fmt)) = backing {
-            let fmt_name: &[u8] = if fmt == Format::Qcow2 { b"qcow2" } else { b"raw" };
-            put32(&mut hdr, off, EXT_BACKING_FORMAT);
-            put32(&mut hdr, off + 4, fmt_name.len() as u32);
-            hdr[off + 8..off + 8 + fmt_name.len()].copy_from_slice(fmt_name);
-            off += 8 + fmt_name.len().div_ceil(8) * 8;
-            put32(&mut hdr, off, EXT_END);
-            put32(&mut hdr, off + 4, 0);
-            off += 8;
-            let same_dir = dir_of(bp).canonicalize().ok() == dir_of(path).canonicalize().ok();
-            let name = if same_dir {
-                bp.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
-            } else {
-                bp.to_string_lossy().into_owned()
-            };
-            if name.len() > 1023 || off + name.len() > cs as usize {
-                return Err(bad("backing path too long"));
-            }
-            hdr[off..off + name.len()].copy_from_slice(name.as_bytes());
-            put64(&mut hdr, 8, off as u64);
-            put32(&mut hdr, 16, name.len() as u32);
-        }
+        write_backing_area(&mut hdr, path, backing)?;
 
         let mut o = std::fs::OpenOptions::new();
         o.write(true).create_new(true);
@@ -438,6 +421,10 @@ impl Qcow2Image {
 
     pub fn backing(&self) -> Option<&Arc<dyn DiskImage>> {
         self.backing.as_ref()
+    }
+
+    pub fn backing_path(&self) -> Option<&Path> {
+        self.backing_path.as_deref()
     }
 
     fn l2_entries(&self) -> u64 {
@@ -608,6 +595,140 @@ impl Qcow2Image {
     }
 }
 
+/// Fill the part of a v3 header (first 4 KiB of cluster 0) that names
+/// the backing file: bytes 8..20 and everything from 104 on. Layout as
+/// we create it: backing-format extension, end marker, then the name.
+fn write_backing_area(hdr: &mut [u8], image: &Path, backing: Option<(&Path, Format)>) -> Result<()> {
+    let put32 = |b: &mut [u8], o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_be_bytes());
+    let put64 = |b: &mut [u8], o: usize, v: u64| b[o..o + 8].copy_from_slice(&v.to_be_bytes());
+    hdr[104..HEADER_AREA].fill(0);
+    put64(hdr, 8, 0);
+    put32(hdr, 16, 0);
+    let mut off = 104usize;
+    let Some((bp, fmt)) = backing else { return Ok(()) };
+    let fmt_name: &[u8] = if fmt == Format::Qcow2 { b"qcow2" } else { b"raw" };
+    put32(hdr, off, EXT_BACKING_FORMAT);
+    put32(hdr, off + 4, fmt_name.len() as u32);
+    hdr[off + 8..off + 8 + fmt_name.len()].copy_from_slice(fmt_name);
+    off += 8 + fmt_name.len().div_ceil(8) * 8;
+    put32(hdr, off, EXT_END);
+    put32(hdr, off + 4, 0);
+    off += 8;
+    let same_dir = dir_of(bp).canonicalize().ok() == dir_of(image).canonicalize().ok();
+    let name = if same_dir {
+        bp.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+    } else {
+        bp.to_string_lossy().into_owned()
+    };
+    if name.len() > 1023 || off + name.len() > HEADER_AREA {
+        return Err(bad("backing path too long"));
+    }
+    hdr[off..off + name.len()].copy_from_slice(name.as_bytes());
+    put64(hdr, 8, off as u64);
+    put32(hdr, 16, name.len() as u32);
+    Ok(())
+}
+
+/// Bytes of cluster 0 we rewrite when changing the backing file.
+const HEADER_AREA: usize = 4096;
+
+/// Point `image` at a different backing file (or none), without touching
+/// data. Only for images laid out like ours (v3, 104-byte header, at most
+/// the backing-format extension): anything else is refused. The caller
+/// guarantees the new backing shows the same data where `image` has holes.
+pub fn set_backing(image: &Path, backing: Option<(&Path, Format)>) -> Result<()> {
+    let f = open_file(image, false)?;
+    let len = f.metadata()?.len();
+    let h = parse_header(&f, len)?;
+    let mut hdr = vec![0u8; HEADER_AREA];
+    f.read_exact_at(&mut hdr, 0)?;
+    let mut ext = Vec::new();
+    let mut off = 104usize;
+    while off + 8 <= HEADER_AREA {
+        let (ty, l) = (be32(&hdr, off), be32(&hdr, off + 4) as usize);
+        if ty == EXT_END {
+            break;
+        }
+        ext.push(ty);
+        off += 8 + l.div_ceil(8) * 8;
+    }
+    if h.version != 3 || be32(&hdr, 100) != 104 || h.nb_snapshots != 0 || ext.iter().any(|&t| t != EXT_BACKING_FORMAT) || be64(&hdr, 72) != 0 {
+        return Err(bad("can only re-point images bulwark created"));
+    }
+    let abs = backing.map(|(b, fm)| std::path::absolute(b).map(|a| (a, fm))).transpose()?;
+    write_backing_area(&mut hdr, image, abs.as_ref().map(|(b, fm)| (b.as_path(), *fm)))?;
+    f.write_all_at(&hdr, 0)?;
+    f.sync_all()?;
+    Ok(())
+}
+
+/// Fold `child`'s backing layer into it: every cluster the backing layer
+/// defines and the child doesn't is copied up, then the child is pointed
+/// at the backing layer's own backing. Guest-visible data never changes,
+/// at any step, so a crash halfway leaves a valid chain. Returns the
+/// folded layer, which the child no longer needs (the caller deletes it if
+/// nothing else uses it).
+pub fn fold_backing(child: &Path, policy: &OpenPolicy) -> Result<PathBuf> {
+    let c = Qcow2Image::open_with(child, false, policy, 0)?.with_sync(SyncMode::Fsync);
+    let name = c.hdr.backing_file.clone().ok_or_else(|| bad("image has no backing file"))?;
+    let parent = resolve_backing(child, &name, policy)?;
+    if crate::detect(&parent)? != Format::Qcow2 {
+        return Err(bad("backing layer is not qcow2"));
+    }
+    let p = Qcow2Image::open_with(&parent, true, policy, 0)?;
+    if p.hdr.size != c.hdr.size {
+        return Err(bad("layers differ in size"));
+    }
+    let (pcs, ccs) = (p.cluster_size, c.cluster_size);
+    let size = c.hdr.size;
+    let mut buf = vec![0u8; ccs as usize];
+    let mut last_done = u64::MAX;
+    {
+        let mut pst = p.state.lock().unwrap_or_else(|e| e.into_inner());
+        let span = pcs * p.l2_entries();
+        for l1i in 0..pst.l1.len() as u64 {
+            if pst.l1[l1i as usize] & OFFSET_MASK == 0 {
+                continue;
+            }
+            let mut g = l1i * span;
+            while g < size.min((l1i + 1) * span) {
+                if p.l2_entry(&mut pst, g)? != 0 {
+                    // Child clusters overlapping this parent cluster.
+                    let mut cg = g - g % ccs;
+                    while cg < (g + pcs).min(size) {
+                        if cg != last_done && c.l2_entry(&mut c.state.lock().unwrap_or_else(|e| e.into_inner()), cg)? == 0 {
+                            let n = ccs.min(size - cg) as usize;
+                            drop(pst);
+                            p.read_at(&mut buf[..n], cg)?;
+                            c.write_at(&buf[..n], cg)?;
+                            pst = p.state.lock().unwrap_or_else(|e| e.into_inner());
+                        }
+                        last_done = cg;
+                        cg += ccs;
+                    }
+                }
+                g += pcs;
+            }
+        }
+    }
+    c.flush()?;
+    drop(c);
+    let up = match &p.hdr.backing_file {
+        None => None,
+        Some(n) => {
+            let bp = resolve_backing(&parent, n, policy)?;
+            let fmt = match p.hdr.backing_format.as_deref() {
+                Some("raw") => Format::Raw,
+                Some("qcow2") => Format::Qcow2,
+                _ => crate::detect(&bp)?,
+            };
+            Some((bp, fmt))
+        }
+    };
+    set_backing(child, up.as_ref().map(|(b, f)| (b.as_path(), *f)))?;
+    Ok(parent)
+}
+
 fn ruzstd_decoder(b: &[u8]) -> Result<impl Read + '_> {
     ruzstd::decoding::StreamingDecoder::new(b).map_err(|e| bad(format!("zstd: {e}")))
 }
@@ -717,6 +838,60 @@ mod tests {
         q.read_at(&mut b, (1 << 30) - 8).unwrap();
         assert_eq!(&b, b"far away");
         assert!(q.read_at(&mut b, 1 << 30).is_err());
+    }
+
+    #[test]
+    fn fold_keeps_data_and_shortens_chain() {
+        const C: u64 = 64 << 10;
+        let td = tempfile::tempdir().unwrap();
+        let (base, mid, top) = (td.path().join("base.raw"), td.path().join("mid.qcow2"), td.path().join("top.qcow2"));
+        std::fs::write(&base, vec![1u8; 8 * C as usize]).unwrap();
+        Qcow2Image::create(&mid, 8 * C, Some((&base, Format::Raw))).unwrap();
+        {
+            let m = Qcow2Image::open(&mid, false).unwrap();
+            m.write_at(&[2; 100], C + 10).unwrap(); // cluster 1: only in mid
+            m.write_at(&[2; 100], 3 * C).unwrap(); // cluster 3: mid, then top
+            m.write_at(&vec![0; C as usize], 5 * C).unwrap(); // cluster 5: zeros hide base
+        }
+        Qcow2Image::create(&top, 8 * C, Some((&mid, Format::Qcow2))).unwrap();
+        {
+            let t = Qcow2Image::open(&top, false).unwrap();
+            t.write_at(&[3; 100], 3 * C).unwrap();
+            t.write_at(&[3; 100], 6 * C).unwrap();
+        }
+        let read_all = |p: &Path| {
+            let q = Qcow2Image::open(p, true).unwrap();
+            let mut v = vec![0u8; 8 * C as usize];
+            q.read_at(&mut v, 0).unwrap();
+            v
+        };
+        let before = read_all(&top);
+        assert_eq!(before[(C + 10) as usize], 2);
+        assert_eq!(before[(5 * C) as usize], 0);
+
+        let folded = fold_backing(&top, &OpenPolicy::default()).unwrap();
+        assert_eq!(folded.canonicalize().unwrap(), mid.canonicalize().unwrap());
+        std::fs::remove_file(&mid).unwrap();
+        assert_eq!(read_all(&top), before);
+        let t = Qcow2Image::open(&top, true).unwrap();
+        assert_eq!(t.hdr.backing_file.as_deref(), Some("base.raw"));
+        assert_eq!(t.hdr.backing_format.as_deref(), Some("raw"));
+
+        // And once more down to no backing at all.
+        set_backing(&top, None).unwrap();
+        let t = Qcow2Image::open(&top, true).unwrap();
+        assert!(t.hdr.backing_file.is_none());
+    }
+
+    #[test]
+    fn set_backing_refuses_foreign_layouts() {
+        let td = tempfile::tempdir().unwrap();
+        let img = td.path().join("x.qcow2");
+        Qcow2Image::create(&img, 1 << 20, None).unwrap();
+        // Pretend another tool wrote a longer header.
+        let f = std::fs::OpenOptions::new().write(true).open(&img).unwrap();
+        f.write_all_at(&112u32.to_be_bytes(), 100).unwrap();
+        assert!(set_backing(&img, None).is_err());
     }
 
     #[test]
