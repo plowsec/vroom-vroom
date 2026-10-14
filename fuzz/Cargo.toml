@@ -55,3 +55,15 @@ name = "qcow2"
 path = "fuzz_targets/qcow2.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "virtio_gpu"
+path = "fuzz_targets/virtio_gpu.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "tpm_tis"
+path = "fuzz_targets/tpm_tis.rs"
+test = false
+doc = false

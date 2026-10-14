@@ -14,11 +14,12 @@ fuzz_target!(|data: &[u8]| {
     let mem = GuestMemory::new(&[(GuestAddress(0), MEM)]).unwrap();
     let n = (data.len() - 4).min(MEM as usize);
     mem.write(GuestAddress(0), &data[4..4 + n]).unwrap();
-    let mut q = Queue::new(256);
-    q.size = 1 << (data[0] % 9); // 1..256
-    q.desc_table = 0;
-    q.avail_ring = 0x1000;
-    q.used_ring = 0x2000;
+    // Avail ring first, descriptors after: short inputs reach both.
+    let mut q = Queue::new(64);
+    q.size = 1 << (data[0] % 7); // 1..64
+    q.avail_ring = 0;
+    q.desc_table = 0x100;
+    q.used_ring = 0xc000;
     q.ready = true;
     q.indirect = data[1] & 1 != 0;
     q.event_idx = data[1] & 2 != 0;

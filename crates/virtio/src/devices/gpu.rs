@@ -184,6 +184,17 @@ impl Gpu {
         self
     }
 
+    /// Fuzzing: run both queues over guest memory once, synchronously,
+    /// the way the worker does. Not for anything else.
+    #[doc(hidden)]
+    pub fn fuzz_queues(&self, ctx: ActivateContext) {
+        let mut h = self.handler();
+        let mut c = QueueCtx::new(ctx);
+        h.process(&mut c, 0);
+        h.process(&mut c, 1);
+        let _ = h.save_2d();
+    }
+
     fn handler(&self) -> GpuHandler {
         GpuHandler {
             shared: self.shared.clone(),
