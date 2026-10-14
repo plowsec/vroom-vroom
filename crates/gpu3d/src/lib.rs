@@ -118,6 +118,12 @@ fn candidates() -> Vec<String> {
     if let Ok(p) = std::env::var("BULWARK_VIRGLRENDERER") {
         v.push(p);
     }
+    // Our patched build (scripts/build-virglrenderer.sh) ships next to the
+    // binary; whoever can write there can replace the binary anyway.
+    let lib = if cfg!(target_os = "macos") { "libvirglrenderer.1.dylib" } else { "libvirglrenderer.so.1" };
+    if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.to_path_buf())) {
+        v.push(dir.join(lib).to_string_lossy().into_owned());
+    }
     if cfg!(target_os = "macos") {
         v.extend(
             ["/opt/homebrew/lib/libvirglrenderer.1.dylib", "/usr/local/lib/libvirglrenderer.1.dylib", "libvirglrenderer.1.dylib"]

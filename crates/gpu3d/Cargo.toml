@@ -13,3 +13,6 @@ bulwark-virtio.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+bulwark-sandbox.workspace = true

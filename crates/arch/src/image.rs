@@ -25,7 +25,8 @@ pub fn decompress_if_needed(raw: Vec<u8>) -> Result<Vec<u8>> {
         let payload = &raw[off..end];
         return match comp.split(|&b| b == 0).next().unwrap_or(&[]) {
             b"gzip" => gunzip(payload),
-            b"zstd" => unzstd(payload),
+            // "zstd22" is the max-level variant (Ubuntu configs); same stream format.
+            b"zstd" | b"zstd22" => unzstd(payload),
             other => Err(Error::Kernel(format!(
                 "zboot compression {:?} not supported",
                 String::from_utf8_lossy(other)

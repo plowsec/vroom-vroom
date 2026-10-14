@@ -1,0 +1,78 @@
+diff --color -ru a/src/venus/vkr_device.c b/src/venus/vkr_device.c
+--- a/src/venus/vkr_device.c	2026-10-14 22:56:03
++++ b/src/venus/vkr_device.c	2026-10-14 22:56:04
+@@ -84,6 +84,21 @@
+    struct vkr_physical_device *physical_dev =
+       vkr_physical_device_from_handle(args->physicalDevice);
+ 
++#ifdef __APPLE__
++   /* VK_KHR_external_memory_fd is only advertised (see
++    * vkr_physical_device.c); MoltenVK would refuse it. Drop it in place. */
++   {
++      VkDeviceCreateInfo *info = (VkDeviceCreateInfo *)args->pCreateInfo;
++      const char **names = (const char **)info->ppEnabledExtensionNames;
++      uint32_t kept = 0;
++      for (uint32_t i = 0; i < info->enabledExtensionCount; i++) {
++         if (strcmp(names[i], "VK_KHR_external_memory_fd"))
++            names[kept++] = names[i];
++      }
++      info->enabledExtensionCount = kept;
++   }
++#endif
++
+    /* append extensions for our own use */
+    const char **exts = NULL;
+    uint32_t ext_count = args->pCreateInfo->enabledExtensionCount;
+diff --color -ru a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
+--- a/src/venus/vkr_device_memory.c	2026-10-14 22:56:03
++++ b/src/venus/vkr_device_memory.c	2026-10-14 22:56:04
+@@ -235,6 +235,18 @@
+       }
+    }
+ 
++#ifdef __APPLE__
++   /* No fd export on macOS: host-visible memory is shared by pointer (see
++    * the export path below). Drop the export request the guest made. */
++   if (export_info) {
++      VkBaseInStructure *prev_of_export_info = vkr_find_prev_struct(
++         alloc_info, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
++      if (prev_of_export_info)
++         prev_of_export_info->pNext = export_info->pNext;
++      export_info = NULL;
++   }
++#endif
++
+    if (export_info) {
+       if (export_info->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT)
+          valid_fd_types |= 1 << VIRGL_RESOURCE_FD_OPAQUE;
+diff --color -ru a/src/venus/vkr_physical_device.c b/src/venus/vkr_physical_device.c
+--- a/src/venus/vkr_physical_device.c	2026-10-14 22:56:03
++++ b/src/venus/vkr_physical_device.c	2026-10-14 22:56:04
+@@ -253,6 +253,27 @@
+          physical_dev->KHR_external_fence_fd = false;
+    }
+ 
++#ifdef __APPLE__
++   /* Mesa's venus refuses renderers without VK_KHR_external_memory_fd: it
++    * uses it to map device memory. MoltenVK has no fd export, but on macOS
++    * mappings are shared by pointer instead (vkr_device_memory.c), so
++    * advertise it to the guest and strip it from what reaches MoltenVK.
++    */
++   if (!physical_dev->KHR_external_memory_fd) {
++      const uint32_t spec = vkr_extension_get_spec_version("VK_KHR_external_memory_fd");
++      VkExtensionProperties *more = realloc(exts, sizeof(*exts) * (advertised_count + 1));
++      if (more) {
++         exts = more;
++         if (spec) {
++            VkExtensionProperties *p = &exts[advertised_count++];
++            memset(p, 0, sizeof(*p));
++            snprintf(p->extensionName, sizeof(p->extensionName), "%s", "VK_KHR_external_memory_fd");
++            p->specVersion = spec;
++         }
++      }
++   }
++#endif
++
+    physical_dev->extensions = exts;
+    physical_dev->extension_count = advertised_count;
+ }

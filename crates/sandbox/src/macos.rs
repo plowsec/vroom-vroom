@@ -72,7 +72,8 @@ pub fn profile(p: &Policy) -> Result<String> {
 /// surface 3D adds; without `gpu` none of it is reachable.
 const GPU_RULES: &str = r#"(allow file-read* (subpath "/System/Library/Extensions") (subpath "/System/Library/Frameworks")
   (subpath "/System/Library/PrivateFrameworks") (subpath "/usr/lib") (subpath "/Library/Apple/System/Library"))
-(allow iokit-open (iokit-user-client-class #"^(AGX|IOAccel|IOGPU|IOSurface)"))
+(allow file-read* (literal "/System/Library/CoreServices/SystemVersion.plist"))
+(allow iokit-open (iokit-user-client-class "AGXDeviceUserClient" "AGXSharedUserClient" "IOSurfaceRootUserClient"))
 (allow iokit-get-properties)
 (allow mach-lookup (global-name "com.apple.MTLCompilerService") (xpc-service-name "com.apple.MTLCompilerService")
   (global-name "com.apple.gpumemd.source") (global-name "com.apple.PowerManagement.control"))

@@ -42,6 +42,12 @@ pub struct Policy {
     pub gpu: bool,
 }
 
+/// The Seatbelt profile `apply` would install (macOS), for debugging.
+#[cfg(target_os = "macos")]
+pub fn profile_text(p: &Policy) -> Result<String> {
+    macos::profile(p)
+}
+
 /// Apply the sandbox to the whole process. Irreversible.
 pub fn apply(p: &Policy) -> Result<()> {
     #[cfg(target_os = "macos")]

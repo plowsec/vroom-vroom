@@ -4,6 +4,11 @@ use bulwark_virtio::devices::gpu3d::Renderer3d;
 
 fn main() {
     env_logger_lite();
+    if std::env::args().any(|a| a == "--print-profile") {
+        let p = bulwark_sandbox::Policy { gpu: true, ..Default::default() };
+        print!("{}", bulwark_sandbox::profile_text(&p).expect("profile"));
+        return;
+    }
     if !bulwark_gpu3d::load() {
         eprintln!("virglrenderer not found");
         std::process::exit(1);
@@ -12,6 +17,12 @@ fn main() {
         eprintln!("init failed");
         std::process::exit(1);
     };
+    // Same order as the VMM: load + init, then lock down, then use.
+    if std::env::args().any(|a| a == "--sandbox") {
+        let p = bulwark_sandbox::Policy { gpu: true, ..Default::default() };
+        bulwark_sandbox::apply(&p).expect("sandbox");
+        eprintln!("sandboxed");
+    }
     for (id, ver, size) in r.capsets() {
         let caps = r.capset(id, ver).unwrap_or_default();
         println!("capset {id} v{ver} {size} bytes, head {:02x?}", &caps[..caps.len().min(16)]);
