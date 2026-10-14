@@ -32,6 +32,10 @@ pub fn provider(file: Option<PathBuf>) -> Option<Box<dyn ClipboardProvider>> {
     if let Some(p) = file {
         return Some(Box::new(FileClipboard(p)));
     }
+    // Headless Linux: don't stall probing for an X server.
+    if cfg!(target_os = "linux") && std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        return None;
+    }
     match arboard::Clipboard::new() {
         Ok(c) => Some(Box::new(HostClipboard(c))),
         Err(e) => {

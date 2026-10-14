@@ -20,6 +20,9 @@ use crate::{Error, Result};
 pub enum VcpuCmd {
     /// Start executing (boot CPU, or PSCI CPU_ON target).
     PowerOn(BootRegs),
+    /// Enter the run loop without touching registers (secondaries when
+    /// the kernel does PSCI: it keeps them parked until CPU_ON).
+    Start,
     Pause(Sender<()>),
     Resume,
     Save(Sender<Result<VcpuState>>),
@@ -34,6 +37,7 @@ impl std::fmt::Debug for VcpuCmd {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
             VcpuCmd::PowerOn(_) => "PowerOn",
+            VcpuCmd::Start => "Start",
             VcpuCmd::Pause(_) => "Pause",
             VcpuCmd::Resume => "Resume",
             VcpuCmd::Save(_) => "Save",
@@ -96,6 +100,8 @@ impl Peer {
 pub struct VcpuHandle {
     pub peer: Peer,
     thread: Option<JoinHandle<()>>,
+    /// The kernel handles PSCI: secondaries just need a Start.
+    pub in_kernel_psci: bool,
 }
 
 impl VcpuHandle {
@@ -124,7 +130,7 @@ pub fn spawn(index: u32, shared: Arc<VcpuShared>) -> Result<VcpuHandle> {
                 let mut v = vcpu;
                 match v.save_state() {
                     Ok(s) => {
-                        let _ = ready_tx.send(Ok(v.kicker()));
+                        let _ = ready_tx.send(Ok((v.kicker(), v.in_kernel_psci())));
                         (v, s)
                     }
                     Err(e) => {
@@ -133,12 +139,13 @@ pub fn spawn(index: u32, shared: Arc<VcpuShared>) -> Result<VcpuHandle> {
                     }
                 }
             };
-            VcpuLoop { vcpu: pristine.0, pristine: pristine.1, shared, rx, running: false, paused: false }
-                .run();
+            // Everyone waits for PowerOn / Start: with KVM the irqchip must
+            // be initialised before any vCPU enters KVM_RUN.
+            VcpuLoop { vcpu: pristine.0, pristine: pristine.1, shared, rx, running: false, paused: false }.run();
         })
         .map_err(|e| Error::Setup(format!("spawn vcpu thread: {e}")))?;
-    let kicker = ready_rx.recv().map_err(|_| Error::VcpuGone)??;
-    Ok(VcpuHandle { peer: Peer { tx, kicker }, thread: Some(thread) })
+    let (kicker, in_kernel_psci) = ready_rx.recv().map_err(|_| Error::VcpuGone)??;
+    Ok(VcpuHandle { peer: Peer { tx, kicker }, thread: Some(thread), in_kernel_psci })
 }
 
 struct VcpuLoop {
@@ -192,6 +199,7 @@ impl VcpuLoop {
                 Ok(()) => self.running = true,
                 Err(e) => log::error!("vcpu{}: power on: {e}", self.index()),
             },
+            VcpuCmd::Start => self.running = true,
             VcpuCmd::Pause(ack) => {
                 self.paused = true;
                 let _ = ack.send(());
@@ -229,7 +237,7 @@ impl VcpuLoop {
 
     fn reset(&mut self, regs: Option<&BootRegs>) -> Result<()> {
         self.vcpu.restore_state(&self.pristine)?;
-        self.running = false;
+        self.running = self.vcpu.in_kernel_psci() && self.index() != 0;
         if let Some(r) = regs {
             self.vcpu.set_boot_regs(r)?;
             self.running = true;

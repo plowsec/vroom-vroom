@@ -285,6 +285,7 @@ pub(crate) fn build(
             redist_base: layout::GIC_REDIST_BASE,
             msi: Some(msi),
         },
+        nested: config.nested,
     })?;
 
     let mem = GuestMemory::new(&[(GuestAddress(layout::RAM_BASE), ram_size)])?;
@@ -300,6 +301,11 @@ pub(crate) fn build(
     let rtc = Arc::new(Mutex::new(Pl031::new(layout::RTC_BASE, SpiLine::new(vm.clone(), layout::RTC_SPI))));
     board.reg.add(layout::RTC_BASE, layout::MMIO_DEV_SIZE, rtc)?;
 
+    if !info.msi_frame_in_kernel {
+        // Backend has no MSI frame (KVM): emulate the GICv2m doorbell.
+        let frame = crate::irq::V2mFrame::new(vm.clone());
+        board.reg.add_bus_only(layout::GIC_MSI_BASE, info.msi_size, frame)?;
+    }
     board.add_virtio(Box::new(Rng::new()))?;
     let mut nvme_ns = Vec::new();
     for (d, vd) in config.disks.iter().zip(&disks.disks) {
@@ -310,7 +316,11 @@ pub(crate) fn build(
                 let id = format!("vd{}", (b'a' + i as u8) as char);
                 board.add_virtio(Box::new(Block::new(&id, img)))?;
             }
-            DiskBus::Nvme => nvme_ns.push(Namespace { disk: img, read_only: d.readonly }),
+            DiskBus::Nvme => nvme_ns.push(Namespace {
+                disk: img,
+                read_only: d.readonly,
+                block_size: if d.cdrom { 2048 } else { 512 },
+            }),
         }
     }
     if !nvme_ns.is_empty() {
@@ -394,6 +404,7 @@ pub(crate) fn build(
         gic_redist_size: info.redist_size_per_cpu,
         gic_msi: Some((layout::GIC_MSI_BASE, info.msi_size)),
         devices,
+        psci_smc: config.nested,
     };
     let boot = match &config.boot {
         Boot::Kernel { kernel, initrd, cmdline } => {
@@ -420,6 +431,7 @@ pub(crate) fn build(
                 &mpidrs,
                 &info,
                 need_pci,
+                config.nested,
                 fdt_devices
                     .iter()
                     .filter_map(|d| match *d {
@@ -451,6 +463,10 @@ pub(crate) fn build(
         vcpus.push(vcpu::spawn(i, shared.clone())?);
     }
     let _ = shared.peers.set(vcpus.iter().map(|v| v.peer.clone()).collect());
+    vm.finalize()?;
+    for v in vcpus.iter().skip(1).filter(|v| v.in_kernel_psci) {
+        v.peer.send(vcpu::VcpuCmd::Start)?;
+    }
 
     Ok(Machine { vm, mem, shared, vcpus, devices: reg.stateful, uart, agent, viewer, screen, boot })
 }

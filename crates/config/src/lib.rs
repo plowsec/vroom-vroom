@@ -49,6 +49,10 @@ pub struct VmConfig {
     /// for UEFI (Windows drivers only speak PCI).
     #[serde(default)]
     pub virtio_transport: Transport,
+    /// Let the guest run its own VMs (KVM inside the guest). ARM: needs an
+    /// M3 or newer Mac on macOS 15+. Snapshots are not supported then.
+    #[serde(default)]
+    pub nested: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

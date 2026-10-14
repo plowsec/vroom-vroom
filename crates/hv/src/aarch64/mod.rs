@@ -120,6 +120,8 @@ impl SysRegAccess {
 
 /// PSTATE for "EL1h, all of DAIF masked" (Linux boot requirement).
 pub const PSTATE_EL1H_DAIF: u64 = 0x3c5;
+/// Same, at EL2h (nested virtualization).
+pub const PSTATE_EL2H_DAIF: u64 = 0x3c9;
 
 /// PSCI / SMCCC function ids.
 pub mod psci {

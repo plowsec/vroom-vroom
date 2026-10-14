@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use bulwark_block::{DiskImage, SECTOR_SIZE};
+use bulwark_block::DiskImage;
 use bulwark_memory::{GuestAddress, GuestMemory};
 use bulwark_snapshot::{decode, encode};
 use serde::{Deserialize, Serialize};
@@ -85,6 +85,8 @@ impl Cq {
 pub struct Namespace {
     pub disk: Arc<dyn DiskImage>,
     pub read_only: bool,
+    /// 512, or 2048 for CD/DVD images (UDF expects 2 KiB sectors).
+    pub block_size: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -514,7 +516,7 @@ impl Nvme {
                 let Some(n) = c.nsid.checked_sub(1).and_then(|i| self.ns.get(i as usize)) else {
                     return err(SC_INVALID_NS);
                 };
-                let blocks = n.disk.size() / SECTOR_SIZE;
+                let blocks = n.disk.size() / n.block_size;
                 d[0..8].copy_from_slice(&blocks.to_le_bytes());
                 d[8..16].copy_from_slice(&blocks.to_le_bytes());
                 d[16..24].copy_from_slice(&blocks.to_le_bytes());
@@ -522,7 +524,7 @@ impl Nvme {
                 d[25] = 0; // one LBA format
                 d[26] = 0;
                 d[99] = n.read_only as u8; // write protected
-                d[128 + 2] = 9; // LBAF0: 512-byte blocks
+                d[128 + 2] = n.block_size.trailing_zeros() as u8; // LBAF0: block size
             }
             0x01 => {
                 d[0..2].copy_from_slice(&0x1b36u16.to_le_bytes());
@@ -587,12 +589,13 @@ impl Nvme {
             return (SC_INVALID_NS, 0);
         };
         let disk = n.disk.clone();
+        let bs = n.block_size;
         let ro = n.read_only || disk.read_only();
         let slba = c.cdw[0] as u64 | (c.cdw[1] as u64) << 32;
         let nlb = (c.cdw[2] & 0xffff) as u64 + 1;
         let range = || -> Result<(u64, u64), u16> {
-            let off = slba.checked_mul(SECTOR_SIZE).ok_or(SC_LBA_RANGE)?;
-            let len = nlb * SECTOR_SIZE;
+            let off = slba.checked_mul(bs).ok_or(SC_LBA_RANGE)?;
+            let len = nlb * bs;
             bulwark_block::check_range(disk.size(), off, len).map_err(|_| SC_LBA_RANGE)?;
             Ok((off, len))
         };
@@ -617,7 +620,7 @@ impl Nvme {
             0x08 if ro => Err(SC_WRITE_PROTECTED),
             0x08 => range().and_then(|(off, len)| disk.write_zeroes(off, len).map_err(|_| SC_DATA_XFER_ERROR)),
             0x09 if ro => Err(SC_WRITE_PROTECTED),
-            0x09 => self.dsm(c, &disk),
+            0x09 => self.dsm(c, &disk, bs),
             _ => Err(SC_INVALID_OPCODE),
         };
         match r {
@@ -627,16 +630,16 @@ impl Nvme {
     }
 
     /// Dataset management: only "deallocate" does anything.
-    fn dsm(&self, c: &Cmd, disk: &Arc<dyn DiskImage>) -> Result<(), u16> {
+    fn dsm(&self, c: &Cmd, disk: &Arc<dyn DiskImage>, bs: u64) -> Result<(), u16> {
         if c.cdw[1] & 4 == 0 {
             return Ok(());
         }
         let nr = (c.cdw[0] & 0xff) as u64 + 1;
         let ranges = self.from_guest(c.prp1, c.prp2, nr * 16)?;
         for r in ranges.chunks_exact(16) {
-            let len = u32::from_le_bytes([r[4], r[5], r[6], r[7]]) as u64 * SECTOR_SIZE;
+            let len = u32::from_le_bytes([r[4], r[5], r[6], r[7]]) as u64 * bs;
             let slba = u64::from_le_bytes(r[8..16].try_into().unwrap_or([0; 8]));
-            let off = slba.checked_mul(SECTOR_SIZE).ok_or(SC_LBA_RANGE)?;
+            let off = slba.checked_mul(bs).ok_or(SC_LBA_RANGE)?;
             bulwark_block::check_range(disk.size(), off, len).map_err(|_| SC_LBA_RANGE)?;
             let _ = disk.discard(off, len);
         }
@@ -783,6 +786,7 @@ mod tests {
     use crate::pci::IntxRouter;
     use crate::NoIrq;
     use bulwark_block::raw::RawImage;
+    use bulwark_block::SECTOR_SIZE;
 
     struct NoMsi;
     impl MsiSender for NoMsi {
@@ -800,7 +804,7 @@ mod tests {
         f.set_len(1 << 20).unwrap();
         let disk: Arc<dyn DiskImage> = Arc::new(RawImage::from_file(f, false).unwrap());
         let r = IntxRouter::new(vec![Arc::new(NoIrq); 4]);
-        let mut n = Nvme::new(3, vec![Namespace { disk, read_only: false }], mem.clone(), r.pin(3, 1), Arc::new(NoMsi));
+        let mut n = Nvme::new(3, vec![Namespace { disk, read_only: false, block_size: SECTOR_SIZE }], mem.clone(), r.pin(3, 1), Arc::new(NoMsi));
         n.reg_write(0x24, (3 << 16) | 3, 4); // 4-entry admin queues
         n.reg_write(0x28, ASQ, 8);
         n.reg_write(0x30, ACQ, 8);

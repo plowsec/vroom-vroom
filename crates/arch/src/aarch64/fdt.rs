@@ -39,6 +39,8 @@ pub struct FdtConfig {
     pub gic_redist_size: u64,
     pub gic_msi: Option<(u64, u64)>,
     pub devices: Vec<FdtDevice>,
+    /// PSCI via SMC (guest at EL2) instead of HVC.
+    pub psci_smc: bool,
 }
 
 pub fn create_fdt(cfg: &FdtConfig) -> Result<Vec<u8>> {
@@ -62,7 +64,7 @@ fn build(cfg: &FdtConfig) -> FdtWriterResult<Vec<u8>> {
         f.end_node(n)?;
     }
     cpus(&mut f, cfg)?;
-    psci(&mut f)?;
+    psci(&mut f, cfg.psci_smc)?;
     gic(&mut f, cfg)?;
     timer(&mut f)?;
     clock(&mut f)?;
@@ -134,10 +136,10 @@ fn cpus(f: &mut FdtWriter, cfg: &FdtConfig) -> FdtWriterResult<()> {
     f.end_node(n)
 }
 
-fn psci(f: &mut FdtWriter) -> FdtWriterResult<()> {
+fn psci(f: &mut FdtWriter, smc: bool) -> FdtWriterResult<()> {
     let n = f.begin_node("psci")?;
     f.property_string_list("compatible", vec!["arm,psci-1.0".into(), "arm,psci-0.2".into()])?;
-    f.property_string("method", "hvc")?;
+    f.property_string("method", if smc { "smc" } else { "hvc" })?;
     f.end_node(n)
 }
 
@@ -302,6 +304,7 @@ mod tests {
                 FdtDevice::PciEcam { ecam_base: PCI_ECAM_BASE, ecam_size: PCI_ECAM_SIZE, buses: 16 },
                 FdtDevice::GpioPowerKey { base: GPIO_BASE, spi: GPIO_SPI },
             ],
+            psci_smc: false,
         }
     }
 

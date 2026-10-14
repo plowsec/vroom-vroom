@@ -50,10 +50,12 @@ pub struct HvfVcpu {
     pending_read: Option<DataAbort>,
     vtimer_masked: bool,
     vtimer_offset: Arc<AtomicU64>,
+    /// Guest runs at EL2 (nested virtualization).
+    el2: bool,
 }
 
 impl HvfVcpu {
-    pub(super) fn new(index: u32, vtimer_offset: Arc<AtomicU64>) -> Result<Self> {
+    pub(super) fn new(index: u32, vtimer_offset: Arc<AtomicU64>, el2: bool) -> Result<Self> {
         let mut id = 0u64;
         let mut exit: *const ffi::hv_vcpu_exit_t = std::ptr::null();
         // SAFETY: out pointers valid; default config.
@@ -75,9 +77,17 @@ impl HvfVcpu {
             pending_read: None,
             vtimer_masked: false,
             vtimer_offset,
+            el2,
         };
         v.set_sys(ffi::HV_SYS_REG_MPIDR_EL1, mpidr)?;
         v.apply_vm_clock()?;
+        // Advertise PMUv3. HVF hides the PMU by default and then UNDEFs
+        // PMU accesses; Windows requires a PMU (its boot manager reads
+        // PMCR_EL0 unconditionally). Once advertised, HVF virtualizes it.
+        let dfr0 = v.get_sys(ffi::HV_SYS_REG_ID_AA64DFR0_EL1)?;
+        if (dfr0 >> 8) & 0xf == 0 {
+            v.set_sys(ffi::HV_SYS_REG_ID_AA64DFR0_EL1, dfr0 | (1 << 8))?;
+        }
         Ok(v)
     }
 
@@ -223,6 +233,11 @@ impl HvfVcpu {
             if std::mem::take(&mut *f) {
                 return Ok(self.kicker.kicked.load(Ordering::Acquire));
             }
+            if self.el2 {
+                // EL2 timers live inside HVF and we can't read their
+                // deadlines; re-enter the guest so HVF can fire them.
+                return Ok(false);
+            }
         }
     }
 
@@ -266,10 +281,27 @@ impl HvfVcpu {
             }
             ExceptionClass::SysReg => {
                 let s = aarch64::decode_sysreg(esr);
-                // Debug/PMU/OS-lock registers HVF doesn't handle: RAZ/WI.
-                log::debug!("vcpu{}: sysreg {:#x} {} RAZ/WI", self.index, s.key(), if s.read { "read" } else { "write" });
-                if s.read {
-                    self.set_x(s.reg, 0)?;
+                let key = s.key() as u16;
+                // Registers HVF can hold but doesn't handle on trap (EL2
+                // state of nested guests, e.g. CNTHCTL_EL2): forward.
+                // Everything else (debug/PMU/OS lock...): RAZ/WI.
+                let forwarded = if s.read {
+                    match self.get_sys(key) {
+                        Ok(v) => {
+                            self.set_x(s.reg, v)?;
+                            true
+                        }
+                        Err(_) => false,
+                    }
+                } else {
+                    let v = self.get_x(s.reg)?;
+                    self.set_sys(key, v).is_ok()
+                };
+                if !forwarded {
+                    log::debug!("vcpu{}: sysreg {:#x} {} RAZ/WI", self.index, key, if s.read { "read" } else { "write" });
+                    if s.read {
+                        self.set_x(s.reg, 0)?;
+                    }
                 }
                 self.advance_pc()?;
                 Ok(None)
@@ -289,6 +321,13 @@ impl HvfVcpu {
         Ok(Some(VcpuExit::Hypercall { func, args }))
     }
 }
+
+/// EL2 system registers (op0=3, op1=4/5): HCR, SCTLR, TCR, TTBR0/1, VBAR,
+/// ELR, SPSR, ESR, FAR, MAIR, CNTHCTL, CNTVOFF, CNTHP_CTL/CVAL, VTCR, VTTBR.
+const EL2_REGS: &[u16] = &[
+    0xe088, 0xe080, 0xe102, 0xe100, 0xe101, 0xe600, 0xe201, 0xe200, 0xe290, 0xe300, 0xe510, 0xe708, 0xe703, 0xe711,
+    0xe712, 0xe10a, 0xe108, 0xe208,
+];
 
 impl Drop for HvfVcpu {
     fn drop(&mut self) {
@@ -365,7 +404,8 @@ impl Vcpu for HvfVcpu {
             self.set_x(i, if (i as usize) < x.len() { x[i as usize] } else { 0 })?;
         }
         self.set(ffi::HV_REG_PC, *pc)?;
-        self.set(ffi::HV_REG_CPSR, aarch64::PSTATE_EL1H_DAIF)?;
+        let pstate = if self.el2 { aarch64::PSTATE_EL2H_DAIF } else { aarch64::PSTATE_EL1H_DAIF };
+        self.set(ffi::HV_REG_CPSR, pstate)?;
         Ok(())
     }
 
@@ -394,6 +434,15 @@ impl Vcpu for HvfVcpu {
             // SAFETY: owning thread, valid out pointer.
             check("hv_gic_get_icc_reg", unsafe { ffi::hv_gic_get_icc_reg(self.id, r, &mut v) })?;
             s.extra.push((r as u32, v));
+        }
+        if self.el2 {
+            // EL2 state of a nested guest. Not in the SDK enum; HVF accepts
+            // the architectural encodings when EL2 is on. Best effort.
+            for &r in EL2_REGS {
+                if let Ok(v) = self.get_sys(r) {
+                    s.raw.push((r as u64, v.to_le_bytes().to_vec()));
+                }
+            }
         }
         s.powered_on = true;
         Ok(s)

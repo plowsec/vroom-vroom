@@ -110,7 +110,8 @@ pub struct Vmm {
     screen: Option<Arc<display::FbSink>>,
     /// Captured right after build; reset = restore these.
     pristine_devices: Vec<Vec<u8>>,
-    pristine_irqchip: IrqChipState,
+    /// None when the backend can't save its irqchip (KVM for now).
+    pristine_irqchip: Option<IrqChipState>,
     boot: machine::BootImage,
     state: RunState,
 }
@@ -154,11 +155,18 @@ impl Vmm {
             viewer: m.viewer,
             screen: m.screen,
             pristine_devices: Vec::new(),
-            pristine_irqchip: IrqChipState::default(),
+            pristine_irqchip: None,
             boot: m.boot,
             state: RunState::Paused,
         };
-        vmm.pristine_irqchip = vmm.vm.save_irqchip()?;
+        vmm.pristine_irqchip = match vmm.vm.save_irqchip() {
+            Ok(s) => Some(s),
+            Err(bulwark_hv::Error::Unsupported(why)) => {
+                log::info!("irqchip state not saveable ({why}); reset won't restore it");
+                None
+            }
+            Err(e) => return Err(e.into()),
+        };
         for d in &vmm.devices {
             let s = d.lock().unwrap_or_else(|e| e.into_inner()).save()?;
             vmm.pristine_devices.push(s);
@@ -265,10 +273,12 @@ impl Vmm {
         let was_running = self.state == RunState::Running;
         self.pause()?;
         for (d, s) in self.devices.iter().zip(&self.pristine_devices) {
-            d.lock().unwrap_or_else(|e| e.into_inner()).restore(s)?;
+            d.lock().unwrap_or_else(|e| e.into_inner()).reset(s)?;
         }
-        self.mem.discard_all()?;
-        self.vm.restore_irqchip(&self.pristine_irqchip)?;
+        self.vm.zero_memory(&self.mem)?;
+        if let Some(s) = &self.pristine_irqchip {
+            self.vm.restore_irqchip(s)?;
+        }
         self.shared.cpus.lock().unwrap_or_else(|e| e.into_inner()).reset();
         let regs = self.boot.load(&self.mem)?;
         for (i, v) in self.vcpus.iter().enumerate() {

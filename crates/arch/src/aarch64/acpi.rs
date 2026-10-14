@@ -17,10 +17,12 @@ pub struct AcpiConfig {
     pub pci: bool,
     /// virtio-mmio slots in use: (base, size, spi). Linux reads these from ACPI.
     pub virtio_mmio: Vec<(u64, u64, u32)>,
+    /// PSCI via SMC (guest at EL2) instead of HVC.
+    pub psci_smc: bool,
 }
 
 /// FADT, HW-reduced, PSCI over HVC. X_DSDT lives at offset 140.
-fn fadt() -> Vec<u8> {
+fn fadt(smc: bool) -> Vec<u8> {
     let mut t = Table::new(b"FACP", 6);
     t.zeros(276 - 36);
     let mut b = t.finish();
@@ -29,7 +31,7 @@ fn fadt() -> Vec<u8> {
     // Flags: HW_REDUCED_ACPI
     b[112..116].copy_from_slice(&(1u32 << 20).to_le_bytes());
     // ARM boot arch: PSCI compliant, use HVC.
-    b[129..131].copy_from_slice(&3u16.to_le_bytes());
+    b[129..131].copy_from_slice(&(if smc { 1u16 } else { 3u16 }).to_le_bytes());
     b[268..276].copy_from_slice(b"BULWARK\0");
     b
 }
@@ -226,7 +228,7 @@ pub fn build(c: &AcpiConfig) -> AcpiBlobs {
     if c.pci {
         others.push(mcfg());
     }
-    assemble(fadt(), 140, dsdt(c), others)
+    assemble(fadt(c.psci_smc), 140, dsdt(c), others)
 }
 
 #[cfg(test)]
@@ -242,6 +244,7 @@ mod tests {
             gic_msi: Some((GIC_MSI_BASE, 0x10000)),
             pci: true,
             virtio_mmio: vec![(VIRTIO_MMIO_BASE, 0x200, 16)],
+            psci_smc: false,
         });
         assert_eq!(b.loader.len() % 128, 0);
         for sig in [&b"FACP"[..], b"APIC", b"GTDT", b"SPCR", b"DBG2", b"MCFG", b"DSDT", b"XSDT"] {
@@ -255,6 +258,7 @@ mod tests {
             gic_msi: None,
             pci: false,
             virtio_mmio: vec![],
+            psci_smc: false,
         });
         assert_eq!(madt.len(), 36 + 8 + 80 + 24 + 16);
         assert_eq!(dbg2().len(), 44 + 22 + 12 + 4 + 10);
@@ -277,6 +281,7 @@ mod dump {
             gic_msi: Some((super::GIC_MSI_BASE, 0x10000)),
             pci: true,
             virtio_mmio: vec![(super::VIRTIO_MMIO_BASE, 0x200, 16)],
+            psci_smc: false,
         });
         let t = &b.tables;
         let mut off = 0;

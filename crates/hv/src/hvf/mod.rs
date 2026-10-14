@@ -70,6 +70,7 @@ impl Hypervisor for Hvf {
             msi_size: query("hv_gic_get_msi_region_size", ffi::hv_gic_get_msi_region_size)?,
             spi_base: base,
             spi_count: count,
+            msi_frame_in_kernel: true,
         })
     }
 
@@ -97,6 +98,7 @@ pub struct HvfVm {
     spi_base: u32,
     spi_count: u32,
     msi: Option<crate::GicMsiConfig>,
+    el2: bool,
 }
 
 impl std::fmt::Debug for HvfVm {
@@ -121,6 +123,16 @@ impl HvfVm {
         let ipa = max_ipa.min(40);
         // SAFETY: cfg is a valid config object.
         check("hv_vm_config_set_ipa_size", unsafe { ffi::hv_vm_config_set_ipa_size(cfg.0, ipa) })?;
+        if params.nested {
+            let mut ok = false;
+            // SAFETY: valid out pointer.
+            check("hv_vm_config_get_el2_supported", unsafe { ffi::hv_vm_config_get_el2_supported(&mut ok) })?;
+            if !ok {
+                return Err(Error::Unsupported("nested virtualization needs an M3+ Mac with macOS 15+"));
+            }
+            // SAFETY: cfg is a valid config object.
+            check("hv_vm_config_set_el2_enabled", unsafe { ffi::hv_vm_config_set_el2_enabled(cfg.0, true) })?;
+        }
         // SAFETY: cfg valid; one VM per process enforced by caller.
         check("hv_vm_create", unsafe { ffi::hv_vm_create(cfg.0) })?;
 
@@ -172,6 +184,7 @@ impl HvfVm {
             spi_base: info.spi_base,
             spi_count: info.spi_count,
             msi,
+            el2: params.nested,
         })
     }
 
@@ -216,6 +229,21 @@ impl Vm for HvfVm {
         Ok(())
     }
 
+    fn zero_memory(&self, mem: &GuestMemory) -> Result<()> {
+        // HVF keeps the pages it mapped: replacing them under it (discard
+        // remaps) would leave the guest on the old contents. Unmap first.
+        let flags = ffi::HV_MEMORY_READ | ffi::HV_MEMORY_WRITE | ffi::HV_MEMORY_EXEC;
+        for r in mem.regions() {
+            // SAFETY: unmapping a range we mapped; vCPUs are stopped.
+            check("hv_vm_unmap", unsafe { ffi::hv_vm_unmap(r.start().raw(), r.len() as usize) })?;
+        }
+        mem.discard_all().map_err(|e| Error::Invalid(format!("discard: {e}")))?;
+        for r in mem.regions() {
+            self.map(r.host_ptr(), r.start().raw(), r.len() as usize, flags)?;
+        }
+        Ok(())
+    }
+
     fn map_readonly(&self, gpa: u64, region: Arc<MmapRegion>) -> Result<()> {
         self.map(region.as_ptr(), gpa, region.size(), ffi::HV_MEMORY_READ | ffi::HV_MEMORY_EXEC)?;
         self.roms.lock().unwrap_or_else(|e| e.into_inner()).push(region);
@@ -223,7 +251,7 @@ impl Vm for HvfVm {
     }
 
     fn create_vcpu(&self, index: u32) -> Result<Box<dyn Vcpu>> {
-        let v = HvfVcpu::new(index, self.vtimer_offset.clone())?;
+        let v = HvfVcpu::new(index, self.vtimer_offset.clone(), self.el2)?;
         self.kickers.lock().unwrap_or_else(|e| e.into_inner()).push(v.hvf_kicker());
         Ok(Box::new(v))
     }

@@ -42,6 +42,7 @@ pub const HV_REG_FPSR: u32 = 33;
 pub const HV_REG_CPSR: u32 = 34;
 
 pub const HV_SYS_REG_MPIDR_EL1: u16 = 0xc005;
+pub const HV_SYS_REG_ID_AA64DFR0_EL1: u16 = 0xc028;
 pub const HV_SYS_REG_SP_EL1: u16 = 0xe208;
 pub const HV_SYS_REG_CNTV_CTL_EL0: u16 = 0xdf19;
 pub const HV_SYS_REG_CNTV_CVAL_EL0: u16 = 0xdf1a;
@@ -85,6 +86,8 @@ extern "C" {
     pub fn hv_vm_config_get_max_ipa_size(bits: *mut u32) -> hv_return_t;
     pub fn hv_vm_config_set_ipa_size(cfg: os_object_t, bits: u32) -> hv_return_t;
     pub fn hv_vm_create(cfg: os_object_t) -> hv_return_t;
+    pub fn hv_vm_config_get_el2_supported(supported: *mut bool) -> hv_return_t;
+    pub fn hv_vm_config_set_el2_enabled(cfg: os_object_t, enabled: bool) -> hv_return_t;
     pub fn hv_vm_destroy() -> hv_return_t;
     pub fn hv_vm_map(addr: *mut c_void, ipa: hv_ipa_t, size: usize, flags: hv_memory_flags_t) -> hv_return_t;
     pub fn hv_vm_unmap(ipa: hv_ipa_t, size: usize) -> hv_return_t;
@@ -93,6 +96,8 @@ extern "C" {
     pub fn hv_vcpu_create(vcpu: *mut hv_vcpu_t, exit: *mut *const hv_vcpu_exit_t, cfg: os_object_t) -> hv_return_t;
     pub fn hv_vcpu_destroy(vcpu: hv_vcpu_t) -> hv_return_t;
     pub fn hv_vcpu_run(vcpu: hv_vcpu_t) -> hv_return_t;
+    pub fn hv_vcpu_set_trap_debug_reg_accesses(vcpu: hv_vcpu_t, value: bool) -> hv_return_t;
+    pub fn hv_vcpu_set_trap_debug_exceptions(vcpu: hv_vcpu_t, value: bool) -> hv_return_t;
     pub fn hv_vcpus_exit(vcpus: *const hv_vcpu_t, count: u32) -> hv_return_t;
     pub fn hv_vcpu_get_reg(vcpu: hv_vcpu_t, reg: u32, value: *mut u64) -> hv_return_t;
     pub fn hv_vcpu_set_reg(vcpu: hv_vcpu_t, reg: u32, value: u64) -> hv_return_t;

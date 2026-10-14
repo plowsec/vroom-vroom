@@ -70,6 +70,7 @@ impl Firmware {
         mpidrs: &[u64],
         info: &IrqChipInfo,
         pci: bool,
+        psci_smc: bool,
         virtio_mmio: Vec<(u64, u64, u32)>,
         screen: Option<Weak<FbSink>>,
     ) -> Result<()> {
@@ -106,6 +107,7 @@ impl Firmware {
             gic_msi: Some((layout::GIC_MSI_BASE, info.msi_size)),
             pci,
             virtio_mmio,
+            psci_smc,
         });
         fw.add_file(RSDP_FILE, tables.rsdp, None).map_err(Error::Setup)?;
         fw.add_file(TABLES_FILE, tables.tables, None).map_err(Error::Setup)?;
@@ -116,8 +118,8 @@ impl Firmware {
             let m2 = mem.clone();
             let hook = Box::new(move |d: &[u8]| {
                 let parsed = ramfb::parse(d, &m2);
-                if parsed.is_none() {
-                    log::warn!("ramfb: guest config rejected");
+                if parsed.is_none() && d.iter().any(|&b| b != 0) {
+                    log::warn!("ramfb: guest config rejected: {:02x?}", d);
                 }
                 *c2.lock().unwrap_or_else(|e| e.into_inner()) = parsed;
             });

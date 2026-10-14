@@ -71,12 +71,17 @@ pub struct IrqChipInfo {
     /// SPI intids the backend lets us drive: [base, base+count).
     pub spi_base: u32,
     pub spi_count: u32,
+    /// The backend emulates the MSI frame itself (HVF). If false, the VMM
+    /// provides an MMIO frame that turns writes into SPIs (KVM).
+    pub msi_frame_in_kernel: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct VmParams {
     pub vcpus: u32,
     pub irqchip: IrqChipConfig,
+    /// Run the guest at EL2 so it can host its own VMs (ARM nested virt).
+    pub nested: bool,
 }
 
 /// Entry point to a hypervisor backend.
@@ -96,6 +101,13 @@ pub trait Vm: Send + Sync {
     /// Map a read-only region (firmware flash). Guest writes trap as MMIO.
     fn map_readonly(&self, gpa: u64, region: Arc<bulwark_memory::MmapRegion>) -> Result<()>;
 
+    /// Zero (and free) all of `mem`, already mapped with `map_memory`.
+    /// vCPUs must be stopped. The default suits backends that follow host
+    /// page table changes (KVM, via MMU notifiers).
+    fn zero_memory(&self, mem: &GuestMemory) -> Result<()> {
+        mem.discard_all().map_err(|e| Error::Invalid(format!("discard: {e}")))
+    }
+
     /// Create the vCPU `index`. On HVF this MUST run on the thread that will
     /// drive the vCPU forever; the returned object is deliberately `!Send`.
     fn create_vcpu(&self, index: u32) -> Result<Box<dyn Vcpu>>;
@@ -112,6 +124,11 @@ pub trait Vm: Send + Sync {
     /// Make the guest counter continue from `value` (snapshot restore).
     /// Takes effect on each vCPU at its next state restore.
     fn set_clock(&self, value: u64);
+
+    /// Called once every vCPU exists (KVM initialises its vGIC here).
+    fn finalize(&self) -> Result<()> {
+        Ok(())
+    }
 
     /// Save / restore the interrupt controller (VM must be paused).
     fn save_irqchip(&self) -> Result<IrqChipState>;
@@ -163,6 +180,11 @@ pub trait Vcpu {
     fn complete_pio_in(&mut self, data: &[u8]) -> Result<()>;
     fn complete_hypercall(&mut self, ret: [u64; 4]) -> Result<()>;
     fn kicker(&self) -> Arc<dyn VcpuKicker>;
+    /// PSCI / power state handled by the kernel (KVM): every vCPU thread
+    /// just runs; secondaries stay parked in the kernel until CPU_ON.
+    fn in_kernel_psci(&self) -> bool {
+        false
+    }
     fn set_boot_regs(&mut self, regs: &BootRegs) -> Result<()>;
     /// Arch identity (MPIDR on ARM, APIC id on x86).
     fn arch_id(&self) -> u64;

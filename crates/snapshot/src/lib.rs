@@ -35,6 +35,12 @@ pub trait Snapshottable {
     fn save(&mut self) -> Result<Vec<u8>>;
     fn restore(&mut self, data: &[u8]) -> Result<()>;
 
+    /// Hard reset, given the state saved at power-on. Devices with
+    /// non-volatile state (flash) override this to keep it.
+    fn reset(&mut self, pristine: &[u8]) -> Result<()> {
+        self.restore(pristine)
+    }
+
     /// Stop touching guest memory (background workers park). Called when
     /// the VM pauses and before `save`.
     fn pause(&mut self) {}

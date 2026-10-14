@@ -241,6 +241,12 @@ impl Snapshottable for PFlash {
         self.st = s.st;
         Ok(())
     }
+
+    fn reset(&mut self, _pristine: &[u8]) -> bulwark_snapshot::Result<()> {
+        // Flash is non-volatile: keep the data, drop any half-done command.
+        self.st = State { mode: Mode::ReadArray, buf: Vec::new() };
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -285,5 +291,16 @@ mod tests {
         // out of range is harmless
         w(&mut f, 0, 0x0040_0040);
         w(&mut f, 1 << 40, 1);
+    }
+
+    #[test]
+    fn reset_keeps_data_and_leaves_command_mode() {
+        let mut f = PFlash::new(0, 4 * BLOCK_SIZE, vec![], None).unwrap();
+        let pristine = f.save().unwrap();
+        w(&mut f, 0x100, 0x0040_0040);
+        w(&mut f, 0x100, 0x1234_5678);
+        w(&mut f, 0, 0x0070_0070); // left in status mode
+        f.reset(&pristine).unwrap();
+        assert_eq!(r(&mut f, 0x100), 0x1234_5678);
     }
 }

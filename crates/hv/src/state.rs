@@ -13,6 +13,9 @@ pub struct VcpuState {
     /// Extra opaque per-vcpu blob (e.g. per-cpu GIC regs).
     pub extra: Vec<(u32, u64)>,
     pub powered_on: bool,
+    /// Backends with variable-width registers (KVM ONE_REG): id -> bytes.
+    #[serde(default)]
+    pub raw: Vec<(u64, Vec<u8>)>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
