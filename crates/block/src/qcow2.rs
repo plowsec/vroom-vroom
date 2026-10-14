@@ -38,6 +38,10 @@ const MAX_SIZE: u64 = 64 << 40;
 /// Max backing chain depth.
 /// Max backing chain depth (each snapshot adds a layer).
 const MAX_CHAIN: u32 = 64;
+/// Largest L1 table we load (QEMU: 32 MiB).
+const MAX_L1_BYTES: u64 = 32 << 20;
+/// Largest refcount table we load (QEMU: 8 MiB).
+const MAX_REFTABLE_BYTES: u64 = 8 << 20;
 /// L2 tables kept in memory.
 const L2_CACHE: usize = 128;
 
@@ -79,7 +83,9 @@ fn bad(m: impl Into<String>) -> Error {
 }
 
 fn parse_header(f: &File, file_len: u64) -> Result<Header> {
-    let mut b = vec![0u8; 4096.min(file_len as usize).max(72)];
+    // Room for the full v3 header even when the file is shorter: reads
+    // fail cleanly instead of slicing past the buffer.
+    let mut b = vec![0u8; 4096.min(file_len as usize).max(104)];
     f.read_exact_at(&mut b[..72], 0).map_err(|_| bad("file too small for qcow2 header"))?;
     if be32(&b, 0) != MAGIC {
         return Err(bad("not qcow2"));
@@ -117,6 +123,15 @@ fn parse_header(f: &File, file_len: u64) -> Result<Header> {
     }
     if refcount_table_clusters == 0 || refcount_table_clusters > 1 << 16 {
         return Err(bad("refcount table size invalid"));
+    }
+    // Both tables are read into memory: cap them (QEMU's limits) and make
+    // sure they are really in the file before allocating anything.
+    let (l1_bytes, rt_bytes) = (l1_size as u64 * 8, refcount_table_clusters as u64 * cs);
+    if l1_bytes > MAX_L1_BYTES || rt_bytes > MAX_REFTABLE_BYTES {
+        return Err(bad("metadata tables too large"));
+    }
+    if l1_offset + l1_bytes > file_len || refcount_table_offset + rt_bytes > file_len {
+        return Err(bad("metadata tables run past the end of the file"));
     }
 
     let mut zstd = false;
@@ -881,6 +896,20 @@ mod tests {
         set_backing(&top, None).unwrap();
         let t = Qcow2Image::open(&top, true).unwrap();
         assert!(t.hdr.backing_file.is_none());
+    }
+
+    #[test]
+    fn short_v3_header_is_an_error_not_a_panic() {
+        // Found by fuzzing: v3 magic in a file shorter than the v3 header.
+        let td = tempfile::tempdir().unwrap();
+        let p = td.path().join("short.qcow2");
+        let mut b = vec![0u8; 80];
+        b[..4].copy_from_slice(&MAGIC.to_be_bytes());
+        b[4..8].copy_from_slice(&3u32.to_be_bytes());
+        b[20..24].copy_from_slice(&16u32.to_be_bytes());
+        b[56..60].copy_from_slice(&1u32.to_be_bytes());
+        std::fs::write(&p, b).unwrap();
+        assert!(Qcow2Image::open(&p, true).is_err());
     }
 
     #[test]
