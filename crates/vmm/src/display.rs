@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bulwark_display::{send_fd, Decoder, SharedFb, ToViewer, ToVmm};
+use bulwark_devices::usb::hid::HidEvent;
+use bulwark_devices::usb::xhci::Xhci;
 use bulwark_virtio::devices::gpu::{DisplaySink, GpuControl};
 use bulwark_virtio::devices::input::{self as ev, event};
 
@@ -170,12 +172,25 @@ pub(crate) struct DisplayServer {
 pub(crate) struct InputPipes {
     pub kbd: Option<UnixDatagram>,
     pub tablet: Option<UnixDatagram>,
+    /// USB HID (xHCI) instead of virtio-input. Exactly one path is used
+    /// so guests never see doubled keystrokes.
+    pub usb: Option<Arc<Mutex<Xhci>>>,
 }
 
 impl InputPipes {
     fn none() -> Self {
-        InputPipes { kbd: None, tablet: None }
+        InputPipes { kbd: None, tablet: None, usb: None }
     }
+}
+
+fn to_hid(m: &ToVmm) -> Option<HidEvent> {
+    Some(match *m {
+        ToVmm::Key { code, down } => HidEvent::Key { code, down },
+        ToVmm::Pointer { x, y } => HidEvent::Pointer { x, y },
+        ToVmm::Button { code, down } => HidEvent::Button { code, down },
+        ToVmm::Wheel { dy, .. } => HidEvent::Wheel { dy: dy.clamp(-127, 127) as i8 },
+        _ => return None,
+    })
 }
 
 impl DisplayServer {
@@ -261,6 +276,10 @@ fn handle(
     let syn = event(ev::EV_SYN, 0, 0);
     let none = InputPipes::none();
     let input = input.unwrap_or(&none);
+    if let (Some(usb), Some(ev)) = (&input.usb, to_hid(&m)) {
+        usb.lock().unwrap_or_else(|e| e.into_inner()).input(ev);
+        return;
+    }
     match m {
         ToVmm::Key { code, down } => {
             if code < 249 {

@@ -21,7 +21,8 @@ use bulwark_virtio::devices::gpu::{DisplaySink, Gpu as GpuDev};
 use bulwark_virtio::devices::input::{Input, InputKind};
 use bulwark_virtio::devices::{block::Block, console::Console, net::Net, rng::Rng};
 use bulwark_devices::nvme::{Namespace, Nvme};
-use bulwark_devices::pci::{IntxRouter, PciRoot, SharedPciDevice};
+use bulwark_devices::usb::xhci::Xhci;
+use bulwark_devices::pci::{Intx, IntxRouter, MsiSender, PciRoot, SharedPciDevice};
 use bulwark_devices::IrqLine;
 use bulwark_virtio::{mmio::VirtioMmio, pci::VirtioPci, VirtioDevice};
 
@@ -46,6 +47,88 @@ impl VirtioSlots {
         let s = layout::virtio_mmio_slot(self.next);
         self.next += 1;
         Ok(s)
+    }
+}
+
+/// Device attachment: owns the bus registry, virtio-mmio and PCI slot
+/// allocation, and interrupt wiring, so callers just say "add this".
+struct Board {
+    vm: Arc<dyn Vm>,
+    mem: GuestMemory,
+    reg: DeviceRegistry,
+    fdt: Vec<board::FdtDevice>,
+    mmio_slots: VirtioSlots,
+    use_pci: bool,
+    pci: Vec<(u8, SharedPciDevice)>,
+    next_pci_slot: u8,
+    intx: Arc<IntxRouter>,
+    msi: Arc<GicMsi>,
+}
+
+impl Board {
+    fn new(vm: Arc<dyn Vm>, mem: GuestMemory, use_pci: bool) -> Self {
+        let intx = IntxRouter::new(
+            (0..4).map(|i| SpiLine::new(vm.clone(), layout::PCI_INTX_SPI + i) as Arc<dyn IrqLine>).collect(),
+        );
+        let msi = GicMsi::new(vm.clone());
+        Board {
+            vm,
+            mem,
+            reg: DeviceRegistry { bus: BusBuilder::new(), stateful: Vec::new() },
+            fdt: Vec::new(),
+            mmio_slots: VirtioSlots::default(),
+            use_pci,
+            pci: Vec::new(),
+            next_pci_slot: 1,
+            intx,
+            msi,
+        }
+    }
+
+    /// Add a PCI function; `make` gets its slot and interrupt wiring.
+    fn add_pci(
+        &mut self,
+        make: impl FnOnce(u8, Arc<Intx>, Arc<dyn MsiSender>) -> SharedPciDevice,
+    ) -> Result<u8> {
+        let slot = self.next_pci_slot;
+        if slot > 31 {
+            return Err(Error::Setup("out of PCI slots".into()));
+        }
+        self.next_pci_slot += 1;
+        let dev = make(slot, self.intx.pin(slot, 1), self.msi.clone());
+        self.pci.push((slot, dev));
+        Ok(slot)
+    }
+
+    /// virtio device on whichever transport this machine uses.
+    fn add_virtio(&mut self, dev: Box<dyn VirtioDevice>) -> Result<()> {
+        if self.use_pci {
+            let mem = self.mem.clone();
+            self.add_pci(move |slot, intx, msi| Arc::new(Mutex::new(VirtioPci::new(slot, dev, mem, intx, msi))))?;
+            return Ok(());
+        }
+        let (base, spi) = self.mmio_slots.next()?;
+        let t = VirtioMmio::new(base, dev, self.mem.clone(), SpiLine::new(self.vm.clone(), spi));
+        self.reg.add(base, layout::VIRTIO_MMIO_SIZE, Arc::new(Mutex::new(t)))?;
+        self.fdt.push(board::FdtDevice::VirtioMmio { base, size: layout::VIRTIO_MMIO_SIZE, spi });
+        Ok(())
+    }
+
+    /// Put the root complex on the bus if anything needs it.
+    fn finish_pci(&mut self) -> Result<bool> {
+        if self.pci.is_empty() && !self.use_pci {
+            return Ok(false);
+        }
+        let root = PciRoot::new(std::mem::take(&mut self.pci));
+        self.reg.add(layout::PCI_ECAM_BASE, layout::PCI_ECAM_SIZE, Arc::new(Mutex::new(root.ecam_port())))?;
+        self.reg.add_bus_only(layout::PCI_MMIO_BASE, layout::PCI_MMIO_SIZE, root.window_port(layout::PCI_MMIO_BASE))?;
+        self.reg.add_bus_only(layout::PCI_MMIO64_BASE, layout::PCI_MMIO64_SIZE, root.window_port(layout::PCI_MMIO64_BASE))?;
+        self.fdt.push(board::FdtDevice::PciEcam {
+            ecam_base: layout::PCI_ECAM_BASE,
+            ecam_size: layout::PCI_ECAM_SIZE,
+            buses: (layout::PCI_ECAM_SIZE >> 20) as u32,
+        });
+        Ok(true)
     }
 }
 
@@ -195,44 +278,17 @@ pub(crate) fn build(
     let mem = GuestMemory::new(&[(GuestAddress(layout::RAM_BASE), ram_size)])?;
     vm.map_memory(&mem)?;
 
-    let mut reg = DeviceRegistry { bus: BusBuilder::new(), stateful: Vec::new() };
+    let mut board = Board::new(vm.clone(), mem.clone(), config.use_pci());
     let uart = Arc::new(Mutex::new(Pl011::new(
         layout::UART_BASE,
         serial_out,
         SpiLine::new(vm.clone(), layout::UART_SPI),
     )));
-    reg.add(layout::UART_BASE, layout::MMIO_DEV_SIZE, uart.clone())?;
+    board.reg.add(layout::UART_BASE, layout::MMIO_DEV_SIZE, uart.clone())?;
     let rtc = Arc::new(Mutex::new(Pl031::new(layout::RTC_BASE, SpiLine::new(vm.clone(), layout::RTC_SPI))));
-    reg.add(layout::RTC_BASE, layout::MMIO_DEV_SIZE, rtc)?;
+    board.reg.add(layout::RTC_BASE, layout::MMIO_DEV_SIZE, rtc)?;
 
-    let mut fdt_devices = Vec::new();
-    let mut slots = VirtioSlots::default();
-    let use_pci = config.use_pci();
-    // PCI functions collected here, attached to the root at the end.
-    let mut pci_devices: Vec<(u8, SharedPciDevice)> = Vec::new();
-    let intx = IntxRouter::new(
-        (0..4).map(|i| SpiLine::new(vm.clone(), layout::PCI_INTX_SPI + i) as Arc<dyn IrqLine>).collect(),
-    );
-    let msi = GicMsi::new(vm.clone());
-    let mut next_pci_slot = 1u8;
-    let mut add_virtio = |dev: Box<dyn VirtioDevice>| -> Result<()> {
-        if use_pci {
-            let slot = next_pci_slot;
-            if slot > 31 {
-                return Err(Error::Setup("out of PCI slots".into()));
-            }
-            next_pci_slot += 1;
-            let d = VirtioPci::new(slot, dev, mem.clone(), intx.pin(slot, 1), msi.clone());
-            pci_devices.push((slot, Arc::new(Mutex::new(d))));
-            return Ok(());
-        }
-        let (base, spi) = slots.next()?;
-        let t = VirtioMmio::new(base, dev, mem.clone(), SpiLine::new(vm.clone(), spi));
-        reg.add(base, layout::VIRTIO_MMIO_SIZE, Arc::new(Mutex::new(t)))?;
-        fdt_devices.push(board::FdtDevice::VirtioMmio { base, size: layout::VIRTIO_MMIO_SIZE, spi });
-        Ok(())
-    };
-    add_virtio(Box::new(Rng::new()))?;
+    board.add_virtio(Box::new(Rng::new()))?;
     let mut nvme_ns = Vec::new();
     for (i, d) in config.disks.iter().enumerate() {
         let fmt = match d.format {
@@ -245,11 +301,16 @@ pub(crate) fn build(
         match d.bus {
             DiskBus::Virtio => {
                 let id = format!("vd{}", (b'a' + i as u8) as char);
-                add_virtio(Box::new(Block::new(&id, img)))?;
+                board.add_virtio(Box::new(Block::new(&id, img)))?;
             }
             DiskBus::Nvme => nvme_ns.push(Namespace { disk: img, read_only: d.readonly }),
         }
     }
+    if !nvme_ns.is_empty() {
+        let mem2 = mem.clone();
+        board.add_pci(move |slot, intx, msi| Arc::new(Mutex::new(Nvme::new(slot, nvme_ns, mem2, intx, msi))))?;
+    }
+
     // Display. UEFI always gets ramfb (firmware / installer screen);
     // virtio-gpu takes over once a guest driver drives it.
     let uefi = matches!(config.boot, Boot::Uefi { .. });
@@ -262,22 +323,37 @@ pub(crate) fn build(
         None
     };
     let mut gpu_ctl = None;
-    let mut input = None;
     if let (Some(fb), true) = (&screen, config.display.gpu != Gpu::None) {
         let sink: Arc<dyn DisplaySink> = fb.clone();
         let (gpu, ctl) = GpuDev::new(config.display.width, config.display.height, sink);
-        add_virtio(Box::new(gpu))?;
-        let (kbd_host, kbd_dev) = UnixDatagram::pair()?;
-        let (tab_host, tab_dev) = UnixDatagram::pair()?;
-        add_virtio(Box::new(Input::new(InputKind::Keyboard, kbd_dev)))?;
-        add_virtio(Box::new(Input::new(InputKind::Tablet, tab_dev)))?;
+        board.add_virtio(Box::new(gpu))?;
         gpu_ctl = Some(ctl);
-        input = Some(InputPipes { kbd: Some(kbd_host), tablet: Some(tab_host) });
+    }
+    // Input: virtio-input for direct-boot Linux, USB HID otherwise (UEFI,
+    // Windows setup: works with zero drivers). Never both: no doubled keys.
+    let mut input = None;
+    if screen.is_some() {
+        if board.use_pci {
+            let mem2 = mem.clone();
+            let mut keep = None;
+            board.add_pci(|slot, intx, msi| {
+                let x = Arc::new(Mutex::new(Xhci::new(slot, mem2, intx, msi)));
+                keep = Some(x.clone());
+                x
+            })?;
+            input = Some(InputPipes { kbd: None, tablet: None, usb: keep });
+        } else {
+            let (kbd_host, kbd_dev) = UnixDatagram::pair()?;
+            let (tab_host, tab_dev) = UnixDatagram::pair()?;
+            board.add_virtio(Box::new(Input::new(InputKind::Keyboard, kbd_dev)))?;
+            board.add_virtio(Box::new(Input::new(InputKind::Tablet, tab_dev)))?;
+            input = Some(InputPipes { kbd: Some(kbd_host), tablet: Some(tab_host), usb: None });
+        }
     }
 
     // Guest agent channel: /dev/virtio-ports/org.bulwark.agent.0 in the guest.
     let (host_end, dev_end) = UnixStream::pair()?;
-    add_virtio(Box::new(Console::new(vec![(AGENT_PORT.to_string(), dev_end)])?))?;
+    board.add_virtio(Box::new(Console::new(vec![(AGENT_PORT.to_string(), dev_end)])?))?;
     let clipboard = match &ui {
         Some(ds) => Some(ds.clipboard()),
         None => clipboard,
@@ -296,28 +372,10 @@ pub(crate) fn build(
             None => stable_mac(&config.name, i),
         };
         let backend = net_backend(n, mac)?;
-        add_virtio(Box::new(Net::new(&format!("eth{i}"), mac, backend)))?;
+        board.add_virtio(Box::new(Net::new(&format!("eth{i}"), mac, backend)))?;
     }
-
-    if !nvme_ns.is_empty() {
-        let slot = next_pci_slot;
-        next_pci_slot += 1;
-        let n = Nvme::new(slot, nvme_ns, mem.clone(), intx.pin(slot, 1), msi.clone());
-        pci_devices.push((slot, Arc::new(Mutex::new(n))));
-    }
-    let _ = next_pci_slot;
-    let need_pci = !pci_devices.is_empty() || use_pci;
-    if need_pci {
-        let root = PciRoot::new(pci_devices);
-        reg.add(layout::PCI_ECAM_BASE, layout::PCI_ECAM_SIZE, Arc::new(Mutex::new(root.ecam_port())))?;
-        reg.add_bus_only(layout::PCI_MMIO_BASE, layout::PCI_MMIO_SIZE, root.window_port(layout::PCI_MMIO_BASE))?;
-        reg.add_bus_only(layout::PCI_MMIO64_BASE, layout::PCI_MMIO64_SIZE, root.window_port(layout::PCI_MMIO64_BASE))?;
-        fdt_devices.push(board::FdtDevice::PciEcam {
-            ecam_base: layout::PCI_ECAM_BASE,
-            ecam_size: layout::PCI_ECAM_SIZE,
-            buses: (layout::PCI_ECAM_SIZE >> 20) as u32,
-        });
-    }
+    let need_pci = board.finish_pci()?;
+    let Board { mut reg, fdt: mut fdt_devices, .. } = board;
 
     let mpidrs: Vec<u64> = (0..config.cpus).map(mpidr_for).collect();
     let fdt_base = |devices: Vec<board::FdtDevice>, cmdline: String| board::FdtConfig {

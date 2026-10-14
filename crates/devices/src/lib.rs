@@ -13,6 +13,7 @@ pub mod pci;
 pub mod pflash;
 pub mod pl011;
 pub mod pl031;
+pub mod usb;
 
 pub use bus::{Bus, BusBuilder, BusDevice, BusRange, SharedDevice};
 pub use irq::{IrqLine, NoIrq};
