@@ -7,6 +7,9 @@
 //! handler sets `immediate_exit` so a kick racing with KVM_RUN entry is
 //! never lost.
 
+// The x86 board is a stub for now: the shared vCPU plumbing goes unused.
+#![cfg_attr(target_arch = "x86_64", allow(dead_code))]
+
 #[cfg(target_arch = "aarch64")]
 mod aarch64;
 #[cfg(target_arch = "aarch64")]
@@ -221,6 +224,8 @@ impl Vm for KvmVm {
     }
 
     fn restore_irqchip(&self, s: &crate::IrqChipState) -> Result<()> {
+        #[cfg(target_arch = "x86_64")]
+        let _ = s;
         match &self.chip {
             #[cfg(target_arch = "aarch64")]
             Chip::Gic(dev) => {
