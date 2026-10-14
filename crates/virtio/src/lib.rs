@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 pub mod chain;
+pub mod core;
 mod device;
 pub mod devices;
 pub mod mmio;

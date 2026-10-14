@@ -76,6 +76,17 @@ pub fn host_dns() -> Option<SocketAddr> {
         .next()
 }
 
+/// A UDP socket connected to `dst`, without an explicit bind: connect()
+/// picks the ephemeral port. Keeps the sandbox free of "bind" rights, so a
+/// compromised VMM can't open listening UDP ports.
+fn connected_udp(dst: SocketAddr) -> io::Result<UdpSocket> {
+    let domain = if dst.is_ipv4() { socket2::Domain::IPV4 } else { socket2::Domain::IPV6 };
+    let s = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+    s.set_nonblocking(true)?;
+    s.connect(&dst.into())?;
+    Ok(UdpSocket::from_std(s.into()))
+}
+
 /// smoltcp <-> frame queues.
 #[derive(Default)]
 struct Pipe {
@@ -293,11 +304,7 @@ impl Nat {
                 self.expire_udp(true);
             }
             let Some(reg) = self.registry.as_ref().and_then(|r| r.try_clone().ok()) else { return };
-            let bind: SocketAddr = if real.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }.parse().unwrap_or(real);
-            let Ok(mut sock) = UdpSocket::bind(bind) else { return };
-            if sock.connect(real).is_err() {
-                return;
-            }
+            let Ok(mut sock) = connected_udp(real) else { return };
             let t = self.alloc_token(Owner::Udp(key));
             if reg.register(&mut sock, Token(t), Interest::READABLE).is_err() {
                 self.owners.remove(&t);
@@ -798,5 +805,45 @@ mod tests {
             }
             n.send_frame(&f);
         }
+    }
+}
+
+#[cfg(test)]
+mod live {
+    use super::*;
+    use mio::{Events, Poll};
+
+    /// Needs network: `cargo test -p bulwark-net live -- --ignored`
+    #[test]
+    #[ignore]
+    fn first_dns_query_answers() {
+        let mut n = Nat::new(NatConfig::new([2, 0, 0, 0, 0, 9])).unwrap();
+        let mut poll = Poll::new().unwrap();
+        n.register(poll.registry()).unwrap();
+        // DNS query for example.com A, id 0x1234.
+        let mut q = vec![0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+        for l in ["example", "com"] {
+            q.push(l.len() as u8);
+            q.extend_from_slice(l.as_bytes());
+        }
+        q.extend_from_slice(&[0, 0, 1, 0, 1]);
+        let f = build_udp(GATEWAY_MAC, [2, 0, 0, 0, 0, 9], (GUEST, 5555), (DNS, 53), &q);
+        let t0 = Instant::now();
+        n.send_frame(&f);
+        let mut events = Events::with_capacity(8);
+        while t0.elapsed() < Duration::from_secs(3) {
+            poll.poll(&mut events, Some(Duration::from_millis(50))).unwrap();
+            for e in events.iter() {
+                n.ready(e.token().0);
+            }
+            if let Some(r) = n.recv_frame() {
+                let ip = parse_ipv4(&r).unwrap();
+                let u = parse_udp(ip.payload).unwrap();
+                assert_eq!(&u.payload[..2], &[0x12, 0x34]);
+                eprintln!("answer after {:?}", t0.elapsed());
+                return;
+            }
+        }
+        panic!("no DNS answer in 3s");
     }
 }

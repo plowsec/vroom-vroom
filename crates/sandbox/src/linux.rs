@@ -50,7 +50,8 @@ fn allowed(p: &Policy) -> Vec<i64> {
     #[cfg(target_arch = "x86_64")]
     v.extend_from_slice(&[SYS_epoll_wait, SYS_poll, SYS_rename, SYS_mkdir, SYS_arch_prctl]);
     if p.network_outbound {
-        v.extend_from_slice(&[SYS_socket, SYS_connect, SYS_bind]);
+        // No bind: UDP flows use implicit binds via connect().
+        v.extend_from_slice(&[SYS_socket, SYS_connect]);
     }
     if !p.listen_ports.is_empty() {
         v.extend_from_slice(&[SYS_accept4, SYS_accept]);

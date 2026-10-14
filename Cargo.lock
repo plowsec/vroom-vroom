@@ -319,6 +319,7 @@ dependencies = [
  "log",
  "mio",
  "smoltcp",
+ "socket2",
  "thiserror 2.0.21",
 ]
 
@@ -2129,6 +2130,16 @@ dependencies = [
  "heapless",
  "log",
  "managed",
+]
+
+[[package]]
+name = "socket2"
+version = "0.5.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e22376abed350d73dd1cd119b57ffccad95b4e585a7cda43e286245ce23c0678"
+dependencies = [
+ "libc",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
