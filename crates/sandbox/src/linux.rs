@@ -22,6 +22,18 @@ fn landlock(p: &Policy) -> Result<()> {
     for f in &p.ro_files {
         rs = rs.add_rule(PathBeneath::new(PathFd::new(f).map_err(err)?, file_ro)).map_err(err)?;
     }
+    if p.gpu {
+        // Vulkan loader + driver files (read), the render node (read-write).
+        let read_dir = AccessFs::ReadFile | AccessFs::ReadDir;
+        for d in ["/usr/share/vulkan", "/etc/vulkan", "/usr/lib", "/sys/dev/char", "/sys/devices"] {
+            if let Ok(fd) = PathFd::new(d) {
+                rs = rs.add_rule(PathBeneath::new(fd, read_dir)).map_err(err)?;
+            }
+        }
+        if let Ok(fd) = PathFd::new("/dev/dri") {
+            rs = rs.add_rule(PathBeneath::new(fd, file_rw | AccessFs::ReadDir)).map_err(err)?;
+        }
+    }
     for d in &p.write_dirs {
         rs = rs.add_rule(PathBeneath::new(PathFd::new(d).map_err(err)?, AccessFs::from_all(abi))).map_err(err)?;
     }

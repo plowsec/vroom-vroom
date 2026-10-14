@@ -305,6 +305,7 @@ fn safe_map_size(_ptr: *mut u8, size: u64) -> u64 {
     size
 }
 
+#[cfg(target_os = "macos")]
 fn page_size() -> u64 {
     // SAFETY: sysconf has no preconditions.
     unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }

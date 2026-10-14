@@ -57,7 +57,39 @@ pub fn profile(p: &Policy) -> Result<String> {
         s += "(allow mach-lookup (global-name \"com.apple.pasteboard.1\") (global-name \"com.apple.distributed_notifications@Uv3\"))\n";
         s += "(allow ipc-posix-shm-read-data ipc-posix-shm-write-data)\n";
     }
+    if p.gpu {
+        s += GPU_RULES;
+        if let Some(cache) = user_cache_dir() {
+            // Metal's shader cache.
+            s += &format!("(allow file-read* file-write* (subpath {}))\n", q(&cache.join("com.apple.metal"))?);
+        }
+    }
     Ok(s)
+}
+
+/// Metal through MoltenVK: driver bundles, the GPU's IOKit user clients
+/// (only those), and the shader compiler service. This is the attack
+/// surface 3D adds; without `gpu` none of it is reachable.
+const GPU_RULES: &str = r#"(allow file-read* (subpath "/System/Library/Extensions") (subpath "/System/Library/Frameworks")
+  (subpath "/System/Library/PrivateFrameworks") (subpath "/usr/lib") (subpath "/Library/Apple/System/Library"))
+(allow iokit-open (iokit-user-client-class #"^(AGX|IOAccel|IOGPU|IOSurface)"))
+(allow iokit-get-properties)
+(allow mach-lookup (global-name "com.apple.MTLCompilerService") (xpc-service-name "com.apple.MTLCompilerService")
+  (global-name "com.apple.gpumemd.source") (global-name "com.apple.PowerManagement.control"))
+(allow ipc-posix-shm-read-data ipc-posix-shm-write-data)
+"#;
+
+/// confstr(_CS_DARWIN_USER_CACHE_DIR), e.g. /var/folders/xx/yyy/C/.
+fn user_cache_dir() -> Option<std::path::PathBuf> {
+    const CS_DARWIN_USER_CACHE_DIR: i32 = 65538;
+    let mut buf = vec![0u8; 1024];
+    // SAFETY: buf is valid for its length.
+    let n = unsafe { libc::confstr(CS_DARWIN_USER_CACHE_DIR, buf.as_mut_ptr() as *mut c_char, buf.len()) };
+    if n == 0 || n > buf.len() {
+        return None;
+    }
+    let s = CStr::from_bytes_until_nul(&buf).ok()?.to_str().ok()?;
+    Some(std::path::PathBuf::from(s))
 }
 
 pub fn apply(p: &Policy) -> Result<()> {

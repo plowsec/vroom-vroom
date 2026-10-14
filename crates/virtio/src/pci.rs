@@ -33,6 +33,9 @@ const CFG_NOTIFY: u8 = 2;
 const CFG_ISR: u8 = 3;
 const CFG_DEVICE: u8 = 4;
 const CFG_PCI: u8 = 5;
+const CFG_SHARED_MEMORY: u8 = 8;
+/// Shared memory regions (GPU host-visible memory) live in BAR 2.
+const SHM_BAR: usize = 2;
 
 fn class_for(device_type: u32) -> u32 {
     match device_type {
@@ -109,6 +112,8 @@ pub struct VirtioPci {
     irq: Arc<PciInterrupt>,
     /// Offset of the VIRTIO_PCI_CAP_PCI_CFG capability.
     pci_cfg_cap: usize,
+    /// Shared memory region in BAR 2 (id) and where the guest put it.
+    shm: Option<(u8, u64)>,
 }
 
 impl std::fmt::Debug for VirtioPci {
@@ -169,12 +174,34 @@ impl VirtioPci {
             *b = 0xff; // offset, length, data
         }
         let pci_cfg_cap = cfg.add_capability(CAP_VENDOR, &c, &w);
+        // One shared memory region at most (virtio-gpu), at offset 0 of BAR 2.
+        let shm_id = dev.shm_regions().first().map(|&(id, len)| {
+            let size = len.next_power_of_two().max(1 << 20);
+            cfg.add_bar(SHM_BAR, BarSpec { size, is64: true, prefetch: true });
+            // virtio_pci_cap64: cap + offset_hi + length_hi.
+            let mut c = vec![24, CFG_SHARED_MEMORY, SHM_BAR as u8, id, 0, 0];
+            c.extend_from_slice(&0u32.to_le_bytes());
+            c.extend_from_slice(&(len as u32).to_le_bytes());
+            c.extend_from_slice(&0u32.to_le_bytes());
+            c.extend_from_slice(&((len >> 32) as u32).to_le_bytes());
+            cfg.add_capability(CAP_VENDOR, &c, &ro(c.len()));
+            id
+        });
         let vectors = (nq + 1) as u16;
         let msix = Msix::new(&mut cfg, vectors, 0, MSIX_TABLE as u32, MSIX_PBA as u32, msi);
         let irq_state = Arc::new(Mutex::new(IrqState { msix, isr: 0, queue_vec: vec![NO_VECTOR; nq], config_vec: NO_VECTOR }));
         let irq = Arc::new(PciInterrupt { st: irq_state.clone(), intx });
         let id = format!("virtio-{}@{slot:02x}", dev.name());
-        VirtioPci { id, core: VirtioCore::new(dev, mem), cfg, sel: Sel::default(), irq_state, irq, pci_cfg_cap }
+        VirtioPci {
+            id,
+            core: VirtioCore::new(dev, mem),
+            cfg,
+            sel: Sel::default(),
+            irq_state,
+            irq,
+            pci_cfg_cap,
+            shm: shm_id.map(|id| (id, 0)),
+        }
     }
 
     fn irq_dyn(&self) -> Arc<dyn VirtioInterrupt> {
@@ -359,6 +386,13 @@ impl PciDevice for VirtioPci {
                 self.bar0_write(boff, &d[..l.min(len.max(1))]);
             }
         }
+        if let Some((id, base)) = self.shm {
+            let now = self.cfg.bar_addr(SHM_BAR).unwrap_or(0);
+            if now != base && now != 0 {
+                self.shm = Some((id, now));
+                self.core.set_shm_base(id, now);
+            }
+        }
         let cfg = self.cfg.clone();
         self.st().msix.update(&cfg);
         if self.cfg.intx_disabled() {
@@ -417,6 +451,10 @@ impl PciDevice for VirtioPci {
             }
         }
         self.cfg = cfg;
+        if let (Some((id, _)), Some(addr)) = (self.shm, self.cfg.bar_addr(SHM_BAR)) {
+            self.shm = Some((id, addr));
+            self.core.set_shm_base(id, addr);
+        }
         let irq = self.irq_dyn();
         self.core.restore(s.core, &irq).map_err(|e| bulwark_snapshot::Error::Invalid(e.to_string()))?;
         self.sel = s.sel;

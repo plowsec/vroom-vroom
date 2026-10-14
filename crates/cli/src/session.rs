@@ -54,7 +54,12 @@ fn timestamp() -> u64 {
 
 /// Sandbox the process now that everything is open.
 fn lock_down(cfg: &VmConfig, state_dir: &Path, clipboard: bool) -> Result<(), String> {
-    let mut p = bulwark_sandbox::Policy { write_dirs: vec![state_dir.to_path_buf()], clipboard, ..Default::default() };
+    let mut p = bulwark_sandbox::Policy {
+        write_dirs: vec![state_dir.to_path_buf()],
+        clipboard,
+        gpu: cfg.display.gpu == bulwark_config::Gpu::Virtio3d,
+        ..Default::default()
+    };
     for d in &cfg.disks {
         if d.readonly {
             p.ro_files.push(d.path.clone());

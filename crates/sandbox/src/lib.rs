@@ -38,6 +38,8 @@ pub struct Policy {
     pub listen_ports: Vec<u16>,
     /// Talk to the system pasteboard (macOS) in-process.
     pub clipboard: bool,
+    /// Use the host GPU (virtio-gpu 3D through virglrenderer/Vulkan).
+    pub gpu: bool,
 }
 
 /// Apply the sandbox to the whole process. Irreversible.
