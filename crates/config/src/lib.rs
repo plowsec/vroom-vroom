@@ -265,10 +265,10 @@ pub enum NetKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PortForward {
-    #[serde(default = "default_proto")]
+    #[serde(default = "default_proto", skip_serializing_if = "is_default_proto")]
     pub proto: String,
     /// Binds to 127.0.0.1 unless set; exposing to the LAN is explicit.
-    #[serde(default = "default_bind")]
+    #[serde(default = "default_bind", skip_serializing_if = "is_default_bind")]
     pub host_addr: String,
     pub host_port: u16,
     pub guest_port: u16,
@@ -279,6 +279,12 @@ fn default_proto() -> String {
 }
 fn default_bind() -> String {
     "127.0.0.1".into()
+}
+fn is_default_proto(p: &str) -> bool {
+    p == "tcp"
+}
+fn is_default_bind(a: &str) -> bool {
+    a == "127.0.0.1"
 }
 
 /// One network adapter, as written in TOML.

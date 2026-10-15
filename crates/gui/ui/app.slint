@@ -48,29 +48,6 @@ export component AppWindow inherits Window {
     min-height: 660px;
     default-font-size: 13px;
 
-    // Background glow.
-    Rectangle {
-        x: -260px;
-        y: -320px;
-        width: 900px;
-        height: 900px;
-        background: @radial-gradient(circle, Theme.accent.with-alpha(Theme.dark ? 0.16 : 0.10) 0%, transparent 65%);
-    }
-    Rectangle {
-        x: root.width - 560px;
-        y: root.height - 520px;
-        width: 1000px;
-        height: 1000px;
-        background: @radial-gradient(circle, Theme.accent-2.with-alpha(Theme.dark ? 0.09 : 0.07) 0%, transparent 65%);
-    }
-    if root.current >= 0 && root.current < root.vms.length && root.vms[root.current].state == VmState.running: Rectangle {
-        x: root.width * 0.35;
-        y: -380px;
-        width: 800px;
-        height: 700px;
-        background: @radial-gradient(circle, Theme.green.with-alpha(Theme.dark ? 0.06 : 0.04) 0%, transparent 65%);
-    }
-
     HorizontalLayout {
         Sidebar {
             vms: root.vms;
@@ -97,26 +74,24 @@ export component AppWindow inherits Window {
     }
 
     if root.drop-hover: Rectangle {
-        background: Theme.accent.with-alpha(0.12);
+        background: Theme.scrim;
         border-width: 2px;
         border-color: Theme.accent;
-        border-radius: 14px;
+        border-radius: Theme.r-xl;
         Rectangle {
             width: 300px;
             height: 64px;
-            border-radius: 18px;
+            border-radius: Theme.r-xl;
             background: Theme.popup;
             border-width: 1px;
             border-color: Theme.border-strong;
-            drop-shadow-blur: 30px;
-            drop-shadow-color: #00000080;
             HorizontalLayout {
                 alignment: center;
                 spacing: 10px;
                 Icon {
                     source: Icons.upload;
                     y: (parent.height - self.height) / 2;
-                    tint: Theme.accent-text;
+                    tint: Theme.text;
                 }
                 Text {
                     text: "Drop to make a VM from it";

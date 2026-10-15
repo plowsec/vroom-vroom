@@ -1,101 +1,72 @@
-// Design tokens. Every color, radius and timing comes from here, so the
-// light and dark themes are one switch.
+// Design tokens. Every color, radius and size comes from here, so the
+// light and dark themes are one switch. Flat and neutral on purpose:
+// color means something (running, warning, danger, the one main action).
 
 export global Theme {
     // Set from Rust: follows the system unless the user picked one.
     in-out property <bool> dark: true;
 
     // Surfaces
-    out property <color> bg: dark ? #07080c : #eef0f5;
-    out property <color> bg-raised: dark ? #0d0f15 : #f7f8fb;
-    out property <color> sidebar: dark ? #0b0d13e6 : #ffffffb3;
-    out property <color> card: dark ? #ffffff0a : #ffffffd9;
-    out property <color> card-hover: dark ? #ffffff10 : #ffffff;
-    out property <color> card-strong: dark ? #151821 : #ffffff;
-    out property <color> well: dark ? #00000040 : #0000000a;
-    out property <color> field: dark ? #ffffff0d : #00000008;
-    out property <color> field-focus: dark ? #ffffff14 : #ffffff;
-    out property <color> scrim: dark ? #000000a6 : #1a1d2959;
-    out property <color> popup: dark ? #161922f7 : #fffffff7;
+    out property <color> bg: dark ? #18181a : #f6f6f5;
+    out property <color> bg-raised: dark ? #1e1e21 : #ffffff;
+    out property <color> sidebar: dark ? #141416 : #ededec;
+    out property <color> card: dark ? #212124 : #ffffff;
+    out property <color> card-hover: dark ? #27272b : #fafafa;
+    out property <color> card-strong: dark ? #2b2b2f : #ffffff;
+    out property <color> well: dark ? #19191b : #f1f1f0;
+    out property <color> field: dark ? #19191b : #ffffff;
+    out property <color> field-focus: dark ? #1b1b1d : #ffffff;
+    out property <color> selected: dark ? #ffffff14 : #0000000f;
+    out property <color> scrim: dark ? #00000099 : #00000040;
+    out property <color> popup: dark ? #2a2a2e : #ffffff;
 
     // Lines
-    out property <color> border: dark ? #ffffff14 : #0000001a;
-    out property <color> border-strong: dark ? #ffffff24 : #0000002b;
-    out property <color> highlight: dark ? #ffffff0f : #ffffffcc;
+    out property <color> border: dark ? #ffffff14 : #00000017;
+    out property <color> border-strong: dark ? #ffffff24 : #00000026;
 
     // Text
-    out property <color> text: dark ? #f4f6fb : #11141c;
-    out property <color> text-2: dark ? #a3abbb : #4d5566;
-    out property <color> text-3: dark ? #6b7385 : #8a91a1;
+    out property <color> text: dark ? #ececec : #1c1c1e;
+    out property <color> text-2: dark ? #a1a1a6 : #5a5a5f;
+    out property <color> text-3: dark ? #707075 : #8e8e93;
     out property <color> on-accent: #ffffff;
 
-    // Accent: violet into cyan.
-    out property <color> accent: dark ? #8b6cff : #6d4dff;
-    out property <color> accent-2: dark ? #22d3ee : #0ea5c6;
-    out property <brush> accent-grad: @linear-gradient(120deg, accent 0%, accent-2 100%);
-    out property <color> accent-soft: dark ? #8b6cff26 : #6d4dff1a;
-    out property <color> accent-text: dark ? #b9a8ff : #5a3df0;
+    // The one accent: the main button, toggles, focus.
+    out property <color> accent: dark ? #3b82f6 : #2563eb;
+    out property <color> accent-text: dark ? #7aa7f7 : #1d4ed8;
 
     // Status
-    out property <color> green: dark ? #34d399 : #059669;
-    out property <color> amber: dark ? #fbbf24 : #d97706;
+    out property <color> green: dark ? #4ade80 : #16a34a;
+    out property <color> amber: dark ? #fbbf24 : #b45309;
     out property <color> red: dark ? #f87171 : #dc2626;
     out property <color> blue: dark ? #60a5fa : #2563eb;
-    out property <color> green-soft: dark ? #34d3991f : #05966914;
-    out property <color> amber-soft: dark ? #fbbf241a : #d9770614;
-    out property <color> red-soft: dark ? #f871711f : #dc262612;
-
-    // Section hues (settings cards)
-    out property <color> hue-cpu: #8b6cff;
-    out property <color> hue-display: #22d3ee;
-    out property <color> hue-storage: #f59e0b;
-    out property <color> hue-network: #3b82f6;
-    out property <color> hue-share: #10b981;
-    out property <color> hue-sound: #ec4899;
-    out property <color> hue-clip: #14b8a6;
-    out property <color> hue-security: #ef4444;
-    out property <color> hue-boot: #94a3b8;
+    out property <color> red-soft: dark ? #f8717124 : #dc262614;
 
     // Shape
-    out property <length> r-sm: 8px;
-    out property <length> r-md: 12px;
-    out property <length> r-lg: 16px;
-    out property <length> r-xl: 22px;
+    out property <length> r-sm: 6px;
+    out property <length> r-md: 8px;
+    out property <length> r-lg: 10px;
+    out property <length> r-xl: 12px;
 
     // Type
     out property <length> fs-xs: 11px;
     out property <length> fs-sm: 12px;
     out property <length> fs-md: 13px;
     out property <length> fs-lg: 15px;
-    out property <length> fs-xl: 20px;
-    out property <length> fs-hero: 26px;
+    out property <length> fs-xl: 18px;
+    out property <length> fs-hero: 22px;
     out property <string> mono: "Menlo";
-
-    // Motion
-    out property <duration> fast: 120ms;
-    out property <duration> med: 220ms;
-    out property <duration> slow: 380ms;
 }
 
-// One brand gradient per guest OS (badges, placeholders).
+// Each guest OS's own color, used on its icon only.
 export global OsLook {
-    public pure function grad(os: string) -> brush {
-        if os == "windows" { return @linear-gradient(135deg, #0ea5e9 0%, #2563eb 100%); }
-        if os == "ubuntu" { return @linear-gradient(135deg, #ff7a45 0%, #e0322b 100%); }
-        if os == "debian" { return @linear-gradient(135deg, #f43f5e 0%, #a21caf 100%); }
-        if os == "fedora" { return @linear-gradient(135deg, #60a5fa 0%, #1e3a8a 100%); }
-        if os == "alpine" { return @linear-gradient(135deg, #38bdf8 0%, #0e7490 100%); }
-        if os == "linux" { return @linear-gradient(135deg, #facc15 0%, #ea580c 100%); }
-        return @linear-gradient(135deg, #a78bfa 0%, #6366f1 100%);
-    }
-    public pure function glow(os: string) -> color {
-        if os == "windows" { return #2563eb; }
-        if os == "ubuntu" { return #e0322b; }
-        if os == "debian" { return #be185d; }
-        if os == "fedora" { return #2563eb; }
-        if os == "alpine" { return #0891b2; }
-        if os == "linux" { return #ea580c; }
-        return #6366f1;
+    public pure function color(os: string) -> color {
+        if os == "windows" { return #0078d4; }
+        if os == "ubuntu" { return #e95420; }
+        if os == "debian" { return #d70a53; }
+        if os == "fedora" { return #3c6eb4; }
+        if os == "alpine" { return #0d597f; }
+        if os == "linux" { return #c08a00; }
+        return #8e8e93;
     }
     public pure function label(os: string) -> string {
         if os == "windows" { return "Windows"; }

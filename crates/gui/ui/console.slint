@@ -86,7 +86,6 @@ export component ConsoleWindow inherits Window {
                 OsBadge {
                     os: root.os;
                     size: 64px;
-                    glow: true;
                 }
             }
             HorizontalLayout {
@@ -156,7 +155,7 @@ export component ConsoleWindow inherits Window {
         width: bl.preferred-width;
         height: 46px;
         border-radius: 23px;
-        background: #14161dd9;
+        background: #1c1c1ee6;
         border-width: 1px;
         border-color: #ffffff24;
         drop-shadow-blur: 30px;
@@ -263,7 +262,7 @@ export component ConsoleWindow inherits Window {
             close-policy: close-on-click-outside;
             changed visible => { if !self.visible { root.power-open = false; } }
             Rectangle {
-                background: #1a1d26f2;
+                background: #242427f2;
                 border-radius: 12px;
                 border-width: 1px;
                 border-color: #ffffff24;
@@ -316,7 +315,7 @@ export component ConsoleWindow inherits Window {
         width: min(root.width - 40px, tt.preferred-width + 32px);
         height: 36px;
         border-radius: 18px;
-        background: #14161de6;
+        background: #1c1c1ee6;
         border-width: 1px;
         border-color: #ffffff24;
         opacity: 0;

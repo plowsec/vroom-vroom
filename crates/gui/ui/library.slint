@@ -32,36 +32,13 @@ export global States {
     }
 }
 
-component Logo inherits Rectangle {
-    width: 30px;
-    height: 30px;
-    border-radius: 9px;
-    background: Theme.accent-grad;
-    drop-shadow-blur: 14px;
-    drop-shadow-color: Theme.accent.with-alpha(0.5);
-    drop-shadow-offset-y: 3px;
-    Text {
-        text: "v";
-        font-size: 19px;
-        font-weight: 800;
-        color: #ffffff;
-        y: 1px;
-        horizontal-alignment: center;
-        vertical-alignment: center;
-        width: parent.width;
-        height: parent.height - 4px;
-    }
-}
-
 component VmRow inherits Rectangle {
     in property <VmItem> vm;
     in property <bool> selected;
     callback clicked;
-    height: 58px;
-    border-radius: 12px;
-    background: selected ? Theme.accent-soft : ta.has-hover ? Theme.card : transparent;
-    border-width: selected ? 1px : 0px;
-    border-color: Theme.accent.with-alpha(0.35);
+    height: 54px;
+    border-radius: Theme.r-md;
+    background: selected ? Theme.selected : ta.has-hover ? Theme.selected.with-alpha(0.5) : transparent;
     animate background { duration: 120ms; }
     ta := TouchArea {
         mouse-cursor: pointer;
@@ -75,7 +52,6 @@ component VmRow inherits Rectangle {
             os: root.vm.os;
             size: 36px;
             y: (parent.height - self.height) / 2;
-            glow: root.selected;
         }
         VerticalLayout {
             horizontal-stretch: 1;
@@ -112,7 +88,6 @@ component VmRow inherits Rectangle {
         if !States.busy(root.vm.state) && root.vm.state != VmState.off: StatusDot {
             y: (parent.height - self.height) / 2;
             tint: States.color(root.vm.state);
-            glow: root.vm.state == VmState.running;
         }
     }
 }
@@ -137,12 +112,10 @@ export component Sidebar inherits Rectangle {
             height: 36px;
             spacing: 10px;
             padding-left: 4px;
-            Logo { y: (parent.height - self.height) / 2; }
             Text {
                 text: "vroom";
-                font-size: 18px;
-                font-weight: 800;
-                letter-spacing: -0.4px;
+                font-size: 17px;
+                font-weight: 700;
                 color: Theme.text;
                 vertical-alignment: center;
                 horizontal-stretch: 1;
@@ -157,8 +130,8 @@ export component Sidebar inherits Rectangle {
         }
         // Command palette opener.
         Rectangle {
-            height: 34px;
-            border-radius: 10px;
+            height: 32px;
+            border-radius: Theme.r-md;
             background: pta.has-hover ? Theme.card-hover : Theme.card;
             border-width: 1px;
             border-color: Theme.border;
@@ -232,7 +205,6 @@ export component Sidebar inherits Rectangle {
             }
         }
         Button {
-            kind: "primary";
             text: "New VM";
             icon: Icons.plus;
             has-icon: true;
@@ -260,18 +232,18 @@ component Menu inherits PopupWindow {
     width: 230px;
     Rectangle {
         background: Theme.popup;
-        border-radius: 12px;
+        border-radius: Theme.r-lg;
         border-width: 1px;
         border-color: Theme.border-strong;
-        drop-shadow-blur: 30px;
-        drop-shadow-color: #00000073;
-        drop-shadow-offset-y: 10px;
+        drop-shadow-blur: 16px;
+        drop-shadow-color: #00000040;
+        drop-shadow-offset-y: 4px;
         VerticalLayout {
             padding: 5px;
             for it in root.items: Rectangle {
-                height: 34px;
-                border-radius: 8px;
-                background: mta.has-hover ? (it.danger ? Theme.red-soft : Theme.accent-soft) : transparent;
+                height: 32px;
+                border-radius: Theme.r-sm;
+                background: mta.has-hover ? (it.danger ? Theme.red-soft : Theme.selected) : transparent;
                 HorizontalLayout {
                     padding-left: 10px;
                     spacing: 10px;
@@ -301,36 +273,29 @@ component Menu inherits PopupWindow {
 component Hero inherits Rectangle {
     in property <VmItem> vm;
     property <bool> live: States.live(vm.state);
-    border-radius: 18px;
+    border-radius: Theme.r-xl;
     background: Theme.bg-raised;
     border-width: 1px;
-    border-color: Theme.border-strong;
-    drop-shadow-blur: 48px;
-    drop-shadow-color: OsLook.glow(vm.os).with-alpha(Theme.dark ? 0.28 : 0.18);
-    drop-shadow-offset-y: 18px;
+    border-color: Theme.border;
     clip: true;
 
     // Placeholder: OS colors and a big glyph.
     if !root.vm.has-thumb: Rectangle {
-        background: @linear-gradient(155deg, OsLook.glow(root.vm.os).with-alpha(0.55) 0%, Theme.bg-raised 75%);
-        Image {
-            source: Icons.os(root.vm.os);
-            colorize: #ffffff;
-            opacity: 0.16;
-            width: parent.height * 0.42;
-            height: self.width;
-        }
+        background: Theme.well;
+    }
+    if root.vm.has-thumb: Rectangle {
+        background: #000000;
     }
     if root.vm.has-thumb: Image {
         width: parent.width;
         height: parent.height;
         source: root.vm.thumb;
-        image-fit: cover;
+        image-fit: contain;
         image-rendering: smooth;
     }
     // Dim what isn't running, so the button reads.
-    if !root.live: Rectangle {
-        background: @linear-gradient(180deg, #00000014 0%, #000000a0 100%);
+    if !root.live && root.vm.has-thumb: Rectangle {
+        background: #00000080;
     }
     ta := TouchArea {
         mouse-cursor: States.busy(root.vm.state) ? MouseCursor.default : MouseCursor.pointer;
@@ -348,26 +313,23 @@ component Hero inherits Rectangle {
         HorizontalLayout {
             alignment: center;
             Rectangle {
-                width: ta.has-hover ? 84px : 76px;
+                width: 64px;
                 height: self.width;
-                animate width { duration: 200ms; easing: ease-out; }
                 border-radius: self.width / 2;
-                background: #ffffff2e;
+                background: root.vm.has-thumb ? #000000b0 : ta.has-hover ? Theme.card-hover : Theme.card-strong;
                 border-width: 1px;
-                border-color: #ffffff59;
-                drop-shadow-blur: 30px;
-                drop-shadow-color: #00000080;
+                border-color: root.vm.has-thumb ? #ffffff40 : Theme.border-strong;
                 if States.busy(root.vm.state): Spinner {
                     width: 30px;
                     height: 30px;
-                    tint: #ffffff;
+                    tint: root.vm.has-thumb ? #ffffff : Theme.text;
                 }
                 if !States.busy(root.vm.state): Icon {
                     source: Icons.play;
                     x: (parent.width - self.width) / 2 + 3px;
                     width: parent.width * 0.38;
                     height: self.width;
-                    tint: #ffffff;
+                    tint: root.vm.has-thumb ? #ffffff : Theme.text;
                 }
             }
         }
@@ -377,7 +339,7 @@ component Hero inherits Rectangle {
             horizontal-alignment: center;
             font-size: Theme.fs-lg;
             font-weight: 600;
-            color: #ffffff;
+            color: root.vm.has-thumb ? #ffffff : Theme.text;
         }
     }
     if root.live && ta.has-hover: Rectangle {
@@ -389,10 +351,10 @@ component Hero inherits Rectangle {
                 Rectangle {
                     height: 40px;
                     width: wl.preferred-width;
-                    border-radius: 20px;
-                    background: #ffffff2e;
+                    border-radius: Theme.r-md;
+                    background: #000000b0;
                     border-width: 1px;
-                    border-color: #ffffff59;
+                    border-color: #ffffff30;
                     wl := HorizontalLayout {
                         padding-left: 16px;
                         padding-right: 18px;
@@ -431,7 +393,6 @@ component Hero inherits Rectangle {
             StatusDot {
                 y: (parent.height - self.height) / 2;
                 tint: States.color(root.vm.state);
-                glow: true;
             }
             Text {
                 text: root.vm.state == VmState.running ? "Live" : States.label(root.vm.state);
@@ -454,10 +415,10 @@ component SnapCard inherits Rectangle {
         spacing: 7px;
         Rectangle {
             height: 110px;
-            border-radius: 12px;
+            border-radius: Theme.r-lg;
             background: Theme.card;
             border-width: 1px;
-            border-color: ta.has-hover ? Theme.accent.with-alpha(0.5) : Theme.border;
+            border-color: ta.has-hover ? Theme.border-strong : Theme.border;
             clip: true;
             if root.snap.has-thumb: Image {
                 width: parent.width;
@@ -535,7 +496,6 @@ export component VmPage inherits Rectangle {
             OsBadge {
                 os: root.vm.os;
                 size: 48px;
-                glow: true;
                 y: (parent.height - self.height) / 2;
             }
             VerticalLayout {
@@ -545,8 +505,7 @@ export component VmPage inherits Rectangle {
                 Text {
                     text: root.vm.name;
                     font-size: Theme.fs-hero;
-                    font-weight: 750;
-                    letter-spacing: -0.6px;
+                    font-weight: 700;
                     color: Theme.text;
                     overflow: elide;
                 }
@@ -556,7 +515,6 @@ export component VmPage inherits Rectangle {
                     StatusDot {
                         y: (parent.height - self.height) / 2;
                         tint: States.color(root.vm.state);
-                        glow: root.vm.state == VmState.running;
                     }
                     Text {
                         text: States.label(root.vm.state);
@@ -638,32 +596,30 @@ export component VmPage inherits Rectangle {
                     Chip {
                         icon: Icons.cpu;
                         text: root.s.cpus + (root.s.cpus == 1 ? " CPU" : " CPUs");
-                        tint: Theme.hue-cpu;
+                        tint: Theme.text-2;
                     }
                     Chip {
                         icon: Icons.memory;
                         text: root.s.memory-gib + " GB";
-                        tint: Theme.hue-cpu;
+                        tint: Theme.text-2;
                     }
                     Chip {
                         icon: Icons.globe;
                         text: root.s.nets.length == 0 ? "Offline" : root.s.nets.length == 1 ? root.s.nets[0].summary : root.s.nets.length + " adapters";
-                        tint: Theme.hue-network;
+                        tint: Theme.text-2;
                     }
                     if root.s.gpu == 2: Chip {
                         icon: Icons.sparkles;
                         text: "3D";
-                        tint: Theme.hue-display;
+                        tint: Theme.text-2;
                     }
                     if root.s.tpm: Chip {
                         icon: Icons.lock;
                         text: "TPM";
-                        tint: Theme.green;
                     }
                     if root.s.sandbox: Chip {
                         icon: Icons.shield;
                         text: "Sandboxed";
-                        tint: Theme.green;
                     }
                 }
                 // Snapshots.
@@ -694,8 +650,8 @@ export component VmPage inherits Rectangle {
                     }
                 }
                 if root.snaps.length == 0: Rectangle {
-                    height: 74px;
-                    border-radius: 14px;
+                    height: 64px;
+                    border-radius: Theme.r-lg;
                     border-width: 1px;
                     border-color: Theme.border;
                     background: Theme.well;
@@ -771,46 +727,17 @@ export component EmptyState inherits Rectangle {
         spacing: 18px;
         HorizontalLayout {
             alignment: center;
-            // A little stack of VM windows.
-            Rectangle {
-                width: 260px;
-                height: 170px;
-                Rectangle {
-                    x: 40px;
-                    y: 0px;
-                    width: 200px;
-                    height: 125px;
-                    border-radius: 14px;
-                    background: OsLook.grad("windows");
-                    opacity: 0.55;
-                    transform-rotation: 8deg;
-                }
-                Rectangle {
-                    x: 10px;
-                    y: 22px;
-                    width: 200px;
-                    height: 125px;
-                    border-radius: 14px;
-                    background: OsLook.grad("ubuntu");
-                    drop-shadow-blur: 40px;
-                    drop-shadow-color: #e0322b66;
-                    drop-shadow-offset-y: 14px;
-                    border-width: 1px;
-                    border-color: #ffffff40;
-                    Image {
-                        source: Icons.os-ubuntu;
-                        colorize: #ffffff;
-                        width: 48px;
-                        height: 48px;
-                    }
-                }
+            Icon {
+                source: Icons.display;
+                width: 44px;
+                height: 44px;
+                tint: Theme.text-3;
             }
         }
         Text {
             text: "No VMs yet";
-            font-size: 28px;
-            font-weight: 750;
-            letter-spacing: -0.6px;
+            font-size: 22px;
+            font-weight: 700;
             color: Theme.text;
             horizontal-alignment: center;
         }

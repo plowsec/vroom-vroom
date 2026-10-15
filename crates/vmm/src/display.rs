@@ -125,6 +125,7 @@ impl FbSink {
         }
         *m = (width, height);
         drop(m);
+        log::debug!("display: mode {width}x{height}");
         if let Some(tx) = &self.tx {
             tx.send(&ToViewer::Mode { width, height });
         }
@@ -365,6 +366,7 @@ fn handle(
             send_events(&input.tablet, &e);
         }
         ToVmm::Resize { width, height } => {
+            log::debug!("display: viewer asks for {width}x{height}");
             if let Some(g) = gpu {
                 g.resize(width, height);
             }

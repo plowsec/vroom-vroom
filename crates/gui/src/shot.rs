@@ -1,6 +1,6 @@
 //! `VROOM_SHOT=out.png vroom-gui`: render the library window to a PNG and
 //! quit. `VROOM_SHOT_DO="act;act"` runs UI actions first ("newvm",
-//! "palette", "search:net", "select:1"). Used for the README pictures and
+//! "palette", "search:net", "select:1", "set:cpus=2"). Used for the README pictures and
 //! to check the UI without a person at the screen.
 
 use std::path::PathBuf;
@@ -22,6 +22,8 @@ pub fn schedule(out: PathBuf) {
         for a in acts.split(';').map(str::trim).filter(|a| !a.is_empty()) {
             if let Some(i) = a.strip_prefix("select:") {
                 msg::send(Msg::Select(i.parse().unwrap_or(0)));
+            } else if let Some((k, v)) = a.strip_prefix("set:").and_then(|kv| kv.split_once('=')) {
+                msg::send(Msg::Set(k.to_string(), v.to_string()));
             } else if let Some(q) = a.strip_prefix("type:") {
                 msg::send(Msg::Search(format!("palette:{q}")));
             } else {

@@ -17,21 +17,14 @@ component Scrim inherits Rectangle {
 
 component Panel inherits Rectangle {
     border-radius: Theme.r-xl;
-    background: Theme.card-strong;
+    background: Theme.bg-raised;
     border-width: 1px;
     border-color: Theme.border-strong;
-    drop-shadow-blur: 60px;
-    drop-shadow-color: #00000099;
-    drop-shadow-offset-y: 24px;
+    drop-shadow-blur: 30px;
+    drop-shadow-color: #00000059;
+    drop-shadow-offset-y: 8px;
     // Swallow clicks so they don't reach the scrim.
     TouchArea { }
-    // Soft accent glow along the top edge.
-    Rectangle {
-        y: 0;
-        height: 120px;
-        border-radius: root.border-radius;
-        background: @linear-gradient(180deg, Theme.accent.with-alpha(0.10) 0%, transparent 100%);
-    }
 }
 
 component OsTile inherits Rectangle {
@@ -39,9 +32,9 @@ component OsTile inherits Rectangle {
     in property <string> label;
     in property <bool> selected;
     callback clicked;
-    height: 96px;
-    border-radius: 14px;
-    background: selected ? Theme.accent-soft : ta.has-hover ? Theme.card-hover : Theme.card;
+    height: 88px;
+    border-radius: Theme.r-lg;
+    background: selected ? Theme.selected : ta.has-hover ? Theme.card-hover : Theme.card;
     border-width: selected ? 2px : 1px;
     border-color: selected ? Theme.accent : Theme.border;
     animate background, border-color { duration: 150ms; }
@@ -57,7 +50,6 @@ component OsTile inherits Rectangle {
             OsBadge {
                 os: root.os;
                 size: 38px;
-                glow: root.selected;
             }
         }
         Text {
@@ -101,9 +93,8 @@ export component NewVmSheet inherits Rectangle {
                     spacing: 4px;
                     Text {
                         text: "New VM";
-                        font-size: 24px;
-                        font-weight: 750;
-                        letter-spacing: -0.5px;
+                        font-size: 20px;
+                        font-weight: 700;
                         color: Theme.text;
                     }
                     Text {
@@ -131,11 +122,11 @@ export component NewVmSheet inherits Rectangle {
             }
             // Installer.
             Rectangle {
-                height: 74px;
-                border-radius: 14px;
-                background: ita.has-hover ? Theme.card-hover : Theme.well;
+                height: 66px;
+                border-radius: Theme.r-lg;
+                background: ita.has-hover ? Theme.card-hover : Theme.card;
                 border-width: 1px;
-                border-color: root.draft.installer != "" ? Theme.accent.with-alpha(0.5) : Theme.border-strong;
+                border-color: Theme.border-strong;
                 ita := TouchArea {
                     mouse-cursor: pointer;
                     clicked => { Bus.act("newvm.pick"); }
@@ -148,11 +139,11 @@ export component NewVmSheet inherits Rectangle {
                         width: 40px;
                         height: 40px;
                         y: (parent.height - self.height) / 2;
-                        border-radius: 12px;
-                        background: Theme.accent-soft;
+                        border-radius: Theme.r-md;
+                        background: Theme.well;
                         Icon {
                             source: root.draft.installer != "" ? Icons.disc : Icons.upload;
-                            tint: Theme.accent-text;
+                            tint: Theme.text-2;
                         }
                     }
                     VerticalLayout {
@@ -343,8 +334,6 @@ export component NewVmSheet inherits Rectangle {
                 Button {
                     text: "Create";
                     kind: "primary";
-                    icon: Icons.sparkles;
-                    has-icon: true;
                     busy: root.creating;
                     enabled: root.draft.name != "";
                     clicked => { Bus.act("newvm.create"); }
@@ -374,9 +363,9 @@ export component CommandPalette inherits Rectangle {
                 padding-left: 8px;
                 spacing: 8px;
                 Icon {
-                    source: Icons.command;
+                    source: Icons.search;
                     y: (parent.height - self.height) / 2;
-                    tint: Theme.accent-text;
+                    tint: Theme.text-3;
                 }
                 input := Field {
                     horizontal-stretch: 1;
@@ -388,9 +377,9 @@ export component CommandPalette inherits Rectangle {
                 }
             }
             for it[i] in root.items: Rectangle {
-                height: 44px;
-                border-radius: 10px;
-                background: i == root.selected ? Theme.accent-soft : ita.has-hover ? Theme.card : transparent;
+                height: 38px;
+                border-radius: Theme.r-md;
+                background: i == root.selected ? Theme.selected : transparent;
                 ita := TouchArea {
                     mouse-cursor: pointer;
                     clicked => { Bus.act("palette.run:" + i); }
@@ -402,7 +391,7 @@ export component CommandPalette inherits Rectangle {
                     Icon {
                         source: Icons.by-name(it.icon);
                         y: (parent.height - self.height) / 2;
-                        tint: i == root.selected ? Theme.accent-text : Theme.text-2;
+                        tint: i == root.selected ? Theme.text : Theme.text-2;
                     }
                     Text {
                         text: it.title;
@@ -495,16 +484,16 @@ export component ConfirmDialog inherits Rectangle {
 
 component ToastView inherits Rectangle {
     in property <Toast> t;
-    property <color> c: t.kind == 3 ? Theme.red : t.kind == 2 ? Theme.amber : t.kind == 1 ? Theme.green : Theme.accent-text;
+    property <color> c: t.kind == 3 ? Theme.red : t.kind == 2 ? Theme.amber : t.kind == 1 ? Theme.green : Theme.text-2;
     height: max(44px, tl.preferred-height);
     width: min(420px, tl.preferred-width);
-    border-radius: 12px;
+    border-radius: Theme.r-lg;
     background: Theme.popup;
     border-width: 1px;
     border-color: Theme.border-strong;
-    drop-shadow-blur: 24px;
-    drop-shadow-color: #00000066;
-    drop-shadow-offset-y: 8px;
+    drop-shadow-blur: 16px;
+    drop-shadow-color: #00000040;
+    drop-shadow-offset-y: 4px;
     opacity: 0;
     init => { self.opacity = 1; }
     animate opacity { duration: 220ms; }

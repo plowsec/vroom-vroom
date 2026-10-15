@@ -32,7 +32,7 @@ export component Spinner inherits Rectangle {
     }
 }
 
-// Buttons. kind: "primary" (gradient), "secondary", "ghost", "danger".
+// Buttons. kind: "primary" (the one main action), "secondary", "ghost", "danger".
 export component Button inherits Rectangle {
     in property <string> text;
     in property <image> icon;
@@ -43,30 +43,16 @@ export component Button inherits Rectangle {
     in property <bool> busy: false;
     callback clicked;
 
-    height: small ? 28px : 36px;
+    height: small ? 28px : 32px;
     min-width: layout.preferred-width;
-    border-radius: small ? 8px : 10px;
+    border-radius: Theme.r-md;
     opacity: enabled ? 1 : 0.45;
-    background: kind == "primary" ? Theme.accent-grad
+    background: kind == "primary" ? (ta.has-hover ? Theme.accent.brighter(0.08) : Theme.accent)
         : kind == "danger" ? (ta.has-hover ? Theme.red.with-alpha(0.28) : Theme.red-soft)
         : kind == "ghost" ? (ta.has-hover ? Theme.card-hover : transparent)
         : (ta.has-hover ? Theme.card-hover : Theme.card);
     border-width: kind == "primary" || kind == "ghost" ? 0px : 1px;
     border-color: kind == "danger" ? Theme.red.with-alpha(0.3) : Theme.border;
-    drop-shadow-blur: kind == "primary" && enabled ? (ta.has-hover ? 22px : 14px) : 0px;
-    drop-shadow-color: kind == "primary" ? Theme.accent.with-alpha(0.45) : transparent;
-    drop-shadow-offset-y: kind == "primary" ? 4px : 0px;
-    animate drop-shadow-blur { duration: 180ms; }
-
-    // Glossy top edge on the primary button.
-    if kind == "primary": Rectangle {
-        x: 1px;
-        y: 1px;
-        width: parent.width - 2px;
-        height: parent.height / 2;
-        border-radius: root.border-radius - 1px;
-        background: @linear-gradient(180deg, #ffffff38 0%, #ffffff00 100%);
-    }
     layout := HorizontalLayout {
         padding-left: root.small ? 10px : 14px;
         padding-right: root.small ? 10px : 16px;
@@ -111,15 +97,15 @@ export component IconButton inherits Rectangle {
     callback clicked;
     width: size;
     height: size;
-    border-radius: size / 3.4;
-    background: active ? Theme.accent-soft : ta.has-hover ? Theme.card-hover : transparent;
+    border-radius: Theme.r-md;
+    background: active || ta.has-hover ? Theme.selected : transparent;
     animate background { duration: 120ms; }
     opacity: enabled ? 1 : 0.35;
     Icon {
         source: root.icon;
         width: root.size * 0.5;
         height: self.width;
-        tint: root.active ? Theme.accent-text : ta.has-hover ? Theme.text : root.tint;
+        tint: root.active || ta.has-hover ? Theme.text : root.tint;
     }
     ta := TouchArea {
         enabled: root.enabled;
@@ -185,7 +171,7 @@ export component Segmented inherits Rectangle {
     callback changed(int);
     height: 32px;
     min-width: 60px * options.length;
-    border-radius: 9px;
+    border-radius: Theme.r-md;
     background: Theme.well;
     border-width: 1px;
     border-color: Theme.border;
@@ -196,13 +182,11 @@ export component Segmented inherits Rectangle {
         y: 2px;
         width: root.seg;
         height: root.height - 4px;
-        border-radius: 7px;
+        border-radius: Theme.r-sm;
         background: Theme.card-strong;
         border-width: 1px;
         border-color: Theme.border;
-        drop-shadow-blur: 6px;
-        drop-shadow-color: #00000030;
-        animate x { duration: 220ms; easing: ease-out; }
+        animate x { duration: 180ms; easing: ease-out; }
     }
     for o[i] in root.options: Rectangle {
         x: 2px + i * root.seg;
@@ -261,7 +245,7 @@ export component Slider inherits Rectangle {
         height: 6px;
         width: root.width - self.x;
         border-radius: 3px;
-        background: Theme.amber.with-alpha(0.22);
+        background: Theme.amber.with-alpha(0.25);
     }
     Rectangle {
         x: 0;
@@ -269,7 +253,7 @@ export component Slider inherits Rectangle {
         height: 6px;
         width: root.knob-x + 9px;
         border-radius: 3px;
-        background: Theme.accent-grad;
+        background: Theme.accent;
     }
     Rectangle {
         x: root.knob-x;
@@ -278,9 +262,10 @@ export component Slider inherits Rectangle {
         height: 18px;
         border-radius: 9px;
         background: #ffffff;
-        drop-shadow-blur: ta.has-hover || ta.pressed ? 10px : 4px;
-        drop-shadow-color: ta.pressed ? Theme.accent.with-alpha(0.7) : #00000059;
-        animate drop-shadow-blur { duration: 150ms; }
+        border-width: 1px;
+        border-color: #00000033;
+        drop-shadow-blur: 2px;
+        drop-shadow-color: #00000040;
     }
     if ta.pressed: Rectangle {
         x: root.knob-x + 9px - self.width / 2;
@@ -336,8 +321,8 @@ export component Field inherits Rectangle {
     callback committed(string);
     callback edited(string);
     callback key-pressed(KeyEvent) -> EventResult;
-    height: 34px;
-    border-radius: 9px;
+    height: 32px;
+    border-radius: Theme.r-md;
     background: input.has-focus ? Theme.field-focus : Theme.field;
     border-width: 1px;
     border-color: input.has-focus ? Theme.accent : Theme.border;
@@ -371,7 +356,7 @@ export component Field inherits Rectangle {
                 font-size: Theme.fs-md;
                 font-family: root.mono ? Theme.mono : "";
                 color: Theme.text;
-                selection-background-color: Theme.accent.with-alpha(0.4);
+                selection-background-color: Theme.accent.with-alpha(0.35);
                 selection-foreground-color: Theme.text;
                 single-line: true;
                 enabled: root.enabled;
@@ -411,9 +396,9 @@ export component Select inherits Rectangle {
     in property <bool> enabled: true;
     in property <string> empty-text: "None";
     callback selected(int);
-    height: 34px;
+    height: 32px;
     min-width: 120px;
-    border-radius: 9px;
+    border-radius: Theme.r-md;
     background: ta.has-hover ? Theme.card-hover : Theme.field;
     border-width: 1px;
     border-color: Theme.border;
@@ -449,18 +434,18 @@ export component Select inherits Rectangle {
         width: max(root.width, 160px);
         Rectangle {
             background: Theme.popup;
-            border-radius: 10px;
+            border-radius: Theme.r-lg;
             border-width: 1px;
             border-color: Theme.border-strong;
-            drop-shadow-blur: 24px;
-            drop-shadow-color: #00000066;
-            drop-shadow-offset-y: 8px;
+            drop-shadow-blur: 16px;
+            drop-shadow-color: #00000040;
+            drop-shadow-offset-y: 4px;
             VerticalLayout {
                 padding: 4px;
                 for o[i] in root.options: Rectangle {
                     height: 30px;
-                    border-radius: 7px;
-                    background: ita.has-hover ? Theme.accent-soft : transparent;
+                    border-radius: Theme.r-sm;
+                    background: ita.has-hover ? Theme.selected : transparent;
                     HorizontalLayout {
                         padding-left: 10px;
                         padding-right: 10px;
@@ -469,7 +454,7 @@ export component Select inherits Rectangle {
                             text: o;
                             vertical-alignment: center;
                             font-size: Theme.fs-md;
-                            color: i == root.current ? Theme.accent-text : Theme.text;
+                            color: Theme.text;
                             font-weight: i == root.current ? 600 : 400;
                         }
                         if i == root.current: Icon {
@@ -477,7 +462,7 @@ export component Select inherits Rectangle {
                             width: 14px;
                             height: 14px;
                             y: (parent.height - self.height) / 2;
-                            tint: Theme.accent-text;
+                            tint: Theme.text;
                         }
                     }
                     ita := TouchArea {
@@ -497,9 +482,9 @@ export component Chip inherits Rectangle {
     in property <image> icon;
     in property <string> text;
     in property <color> tint: Theme.text-2;
-    height: 30px;
+    height: 28px;
     min-width: l.preferred-width;
-    border-radius: 15px;
+    border-radius: Theme.r-md;
     background: Theme.card;
     border-width: 1px;
     border-color: Theme.border;
@@ -526,39 +511,28 @@ export component Chip inherits Rectangle {
 
 export component StatusDot inherits Rectangle {
     in property <color> tint;
-    in property <bool> glow: false;
     width: 8px;
     height: 8px;
     border-radius: 4px;
     background: tint;
-    drop-shadow-blur: glow ? 8px : 0px;
-    drop-shadow-color: tint;
+
 }
 
+// The guest's icon: a plain tile with the OS glyph in the OS's color.
 export component OsBadge inherits Rectangle {
     in property <string> os;
     in property <length> size: 32px;
-    in property <bool> glow: false;
     width: size;
     height: size;
-    border-radius: size * 0.3;
-    background: OsLook.grad(os);
-    drop-shadow-blur: glow ? size * 0.5 : 0px;
-    drop-shadow-color: OsLook.glow(os).with-alpha(0.55);
-    drop-shadow-offset-y: glow ? size * 0.12 : 0px;
-    Rectangle {
-        x: 1px;
-        y: 1px;
-        width: parent.width - 2px;
-        height: parent.height * 0.5;
-        border-radius: root.border-radius - 1px;
-        background: @linear-gradient(180deg, #ffffff40 0%, #ffffff00 100%);
-    }
+    border-radius: size * 0.24;
+    background: Theme.card-strong;
+    border-width: 1px;
+    border-color: Theme.border;
     Icon {
         source: Icons.os(root.os);
-        width: root.size * 0.56;
+        width: root.size * 0.58;
         height: self.width;
-        tint: #ffffff;
+        tint: OsLook.color(root.os);
     }
 }
 
@@ -609,7 +583,8 @@ export component Row inherits Rectangle {
 // Collapsible settings card.
 export component SectionCard inherits Rectangle {
     in property <image> icon;
-    in property <color> hue;
+    // Gray unless the color means something (security on/off).
+    in property <color> hue: Theme.text-2;
     in property <string> title;
     in property <string> summary;
     in property <bool> warn: false;
@@ -625,7 +600,7 @@ export component SectionCard inherits Rectangle {
     clip: true;
     VerticalLayout {
         header := Rectangle {
-            height: 62px;
+            height: 56px;
             header-ta := TouchArea {
                 mouse-cursor: pointer;
                 clicked => { root.expanded = !root.expanded; }
@@ -638,10 +613,10 @@ export component SectionCard inherits Rectangle {
                     width: 34px;
                     height: 34px;
                     y: (parent.height - self.height) / 2;
-                    border-radius: 10px;
-                    background: root.hue.with-alpha(0.16);
+                    border-radius: Theme.r-md;
+                    background: Theme.well;
                     border-width: 1px;
-                    border-color: root.hue.with-alpha(0.22);
+                    border-color: Theme.border;
                     Icon {
                         source: root.icon;
                         tint: root.hue;
@@ -732,12 +707,12 @@ export component Banner inherits Rectangle {
     in property <string> text;
     in property <int> kind: 2; // 1 ok, 2 warning, 3 error, 0 info
     in property <image> icon: kind == 3 ? Icons.warning : kind == 2 ? Icons.warning : kind == 1 ? Icons.check : Icons.info;
-    property <color> c: kind == 3 ? Theme.red : kind == 2 ? Theme.amber : kind == 1 ? Theme.green : Theme.blue;
+    property <color> c: kind == 3 ? Theme.red : kind == 2 ? Theme.amber : kind == 1 ? Theme.green : Theme.text-2;
     min-height: l.preferred-height;
-    border-radius: 12px;
-    background: c.with-alpha(0.10);
+    border-radius: Theme.r-lg;
+    background: kind == 0 ? Theme.well : c.with-alpha(0.10);
     border-width: 1px;
-    border-color: c.with-alpha(0.25);
+    border-color: kind == 0 ? Theme.border : c.with-alpha(0.28);
     l := HorizontalLayout {
         padding: 10px;
         padding-left: 12px;

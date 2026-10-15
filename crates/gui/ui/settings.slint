@@ -10,7 +10,7 @@ import { VmSettings, CardVis, HostInfo, NetRow } from "types.slint";
 import { Button, IconButton, Toggle, Segmented, Slider, Field, Select, Row, SectionCard, Divider, Banner, Icon } from "controls.slint";
 
 component SubCard inherits Rectangle {
-    border-radius: 12px;
+    border-radius: Theme.r-md;
     background: Theme.well;
     border-width: 1px;
     border-color: Theme.border;
@@ -246,7 +246,6 @@ export component SettingsPanel inherits Rectangle {
 
                 if root.vis.hw: SectionCard {
                     icon: Icons.cpu;
-                    hue: Theme.hue-cpu;
                     title: "Processor and memory";
                     summary: root.s.sum-hw;
                     force-open: root.open-all;
@@ -306,7 +305,6 @@ export component SettingsPanel inherits Rectangle {
 
                 if root.vis.display: SectionCard {
                     icon: Icons.display;
-                    hue: Theme.hue-display;
                     title: "Display";
                     summary: root.s.sum-display;
                     force-open: root.open-all;
@@ -358,7 +356,6 @@ export component SettingsPanel inherits Rectangle {
 
                 if root.vis.storage: SectionCard {
                     icon: Icons.disk;
-                    hue: Theme.hue-storage;
                     title: "Storage";
                     summary: root.s.sum-storage;
                     force-open: root.open-all;
@@ -368,7 +365,7 @@ export component SettingsPanel inherits Rectangle {
                             Icon {
                                 source: d.cdrom ? Icons.disc : Icons.disk;
                                 y: (parent.height - self.height) / 2;
-                                tint: d.missing ? Theme.red : Theme.hue-storage;
+                                tint: d.missing ? Theme.red : Theme.text-2;
                             }
                             VerticalLayout {
                                 horizontal-stretch: 1;
@@ -484,7 +481,6 @@ export component SettingsPanel inherits Rectangle {
 
                 if root.vis.net: SectionCard {
                     icon: Icons.globe;
-                    hue: Theme.hue-network;
                     title: "Network";
                     summary: root.s.sum-net;
                     force-open: root.open-all;
@@ -510,7 +506,6 @@ export component SettingsPanel inherits Rectangle {
 
                 if root.vis.share: SectionCard {
                     icon: Icons.folder;
-                    hue: Theme.hue-share;
                     title: "Shared folders";
                     summary: root.s.sum-share;
                     force-open: root.open-all;
@@ -520,7 +515,7 @@ export component SettingsPanel inherits Rectangle {
                             Icon {
                                 source: Icons.folder;
                                 y: (parent.height - self.height) / 2;
-                                tint: Theme.hue-share;
+                                tint: Theme.text-2;
                             }
                             Text {
                                 horizontal-stretch: 1;
@@ -602,7 +597,6 @@ export component SettingsPanel inherits Rectangle {
 
                 if root.vis.sound: SectionCard {
                     icon: Icons.speaker;
-                    hue: Theme.hue-sound;
                     title: "Sound";
                     summary: root.s.sum-sound;
                     force-open: root.open-all;
@@ -621,7 +615,6 @@ export component SettingsPanel inherits Rectangle {
 
                 if root.vis.clip: SectionCard {
                     icon: Icons.clipboard;
-                    hue: Theme.hue-clip;
                     title: "Clipboard";
                     summary: root.s.sum-clip;
                     force-open: root.open-all;
@@ -719,7 +712,6 @@ export component SettingsPanel inherits Rectangle {
 
                 if root.vis.boot: SectionCard {
                     icon: Icons.rocket;
-                    hue: Theme.hue-boot;
                     title: "Boot";
                     summary: root.s.sum-boot;
                     force-open: root.open-all;

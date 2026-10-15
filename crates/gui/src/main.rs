@@ -15,7 +15,7 @@ mod paths;
 mod shot;
 mod vm;
 
-#[allow(missing_debug_implementations)]
+#[allow(missing_debug_implementations, clippy::all, clippy::unwrap_used, clippy::undocumented_unsafe_blocks)]
 mod ui {
     slint::include_modules!();
 }
