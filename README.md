@@ -106,7 +106,7 @@ width = 1280
 height = 800
 
 [[share]]                      # host folder, Linux guest: mount -t virtiofs host /mnt
-path = "~/shared"              # (absolute or relative to this file)
+path = "/Users/me/shared"      # absolute, or relative to this file
 tag = "host"
 readonly = true                # default; false lets the guest change files
 
