@@ -155,12 +155,23 @@ impl Service {
                 let mut s = self.status.lock().unwrap_or_else(|e| e.into_inner());
                 let sessions = s.sessions.wrapping_add(1);
                 *s = AgentStatus { connected: true, agent, features, sessions };
+                drop(s);
+                // A fresh agent: boot, or a guest that slept. Set its clock
+                // (Windows also reads the RTC as local time until told).
+                if features & bulwark_proto::features::TIME_SYNC != 0 {
+                    self.sync_time();
+                }
             }
             Message::ClipboardText(t) => self.from_guest(t),
             Message::Ping(v) => self.send(&Message::Pong(v)),
             // Host-bound only; a guest sending these is ignored.
             _ => {}
         }
+    }
+
+    fn sync_time(&mut self) {
+        let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+        self.send(&Message::TimeSync { unix_secs: d.as_secs(), nanos: d.subsec_nanos() });
     }
 
     fn from_guest(&mut self, t: String) {
@@ -222,10 +233,7 @@ impl Service {
                     }
                 }
             }
-            AgentCmd::SyncTime => {
-                let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-                self.send(&Message::TimeSync { unix_secs: d.as_secs(), nanos: d.subsec_nanos() });
-            }
+            AgentCmd::SyncTime => self.sync_time(),
             AgentCmd::SetResolution(w, h) => self.send(&Message::SetResolution { width: w, height: h }),
             AgentCmd::Shutdown { reboot } => self.send(&Message::Shutdown { reboot }),
             AgentCmd::Stop => {}

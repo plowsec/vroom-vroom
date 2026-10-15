@@ -9,6 +9,8 @@ for %%d in (D E F G H I J K) do (
     )
   )
 )
+rem Our RTC runs in UTC (like every hypervisor's); Windows assumes local.
+reg add HKLM\SYSTEM\CurrentControlSet\Control\TimeZoneInformation /v RealTimeIsUniversal /t REG_DWORD /d 1 /f
 rem Agent, split in two:
 rem  - service "BulwarkAgent" (LocalSystem): owns the VirtIO port (only
 rem    admins / SYSTEM may open it), clock sync, clean shutdown;
