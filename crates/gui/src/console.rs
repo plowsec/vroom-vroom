@@ -28,6 +28,7 @@ use slint::{ComponentHandle, Rgba8Pixel, SharedPixelBuffer};
 use vroom_config::{GuestOs, VmConfig};
 use vroom_display::{recv_fd, Command, Decoder, SharedFb, ToViewer, ToVmm, POINTER_MAX};
 
+use crate::frame::{FrameBufs, Rect};
 use crate::msg::{self, Msg};
 use crate::{ConsoleWindow, VmState};
 
@@ -52,6 +53,8 @@ const LOG_TAIL: u64 = 16 << 10;
 struct Shared {
     mode: (u32, u32),
     frame: bool,
+    /// What changed since the UI last looked (clipped there).
+    dirty: Option<Rect>,
     status: VecDeque<String>,
     clipboard: Option<String>,
     posted: bool,
@@ -67,8 +70,17 @@ impl Shared {
                 }
                 self.mode = (width, height);
                 self.frame = true;
+                self.dirty = Some(Rect::full(width, height));
             }
-            ToViewer::Damage { .. } => self.frame = true,
+            ToViewer::Damage { x, y, w, h } => {
+                // 0 x 0 means "everything" (what older VMMs send).
+                let r = if w == 0 || h == 0 { Rect::full(u32::MAX, u32::MAX) } else { Rect { x, y, w, h } };
+                // Clipped first: then adding rects can't overflow.
+                if let Some(c) = r.clip(u32::MAX, u32::MAX) {
+                    self.dirty = crate::frame::add(self.dirty, Some(c));
+                }
+                self.frame = true;
+            }
             ToViewer::ClipboardSet(t) => self.clipboard = Some(t),
             ToViewer::Status(mut t) => {
                 if self.status.len() >= MAX_STATUS {
@@ -145,7 +157,7 @@ pub struct Console {
     fb: Option<SharedFb>,
     shared: Arc<Mutex<Shared>>,
     child: Child,
-    pixels: Vec<u32>,
+    bufs: FrameBufs,
     mode: (u32, u32),
     last_thumb: Instant,
     last_save: Instant,
@@ -348,7 +360,7 @@ pub fn start(path: &Path, cfg: &VmConfig, extra: &[String]) -> Result<String, St
         fb: None,
         shared,
         child,
-        pixels: Vec::new(),
+        bufs: FrameBufs::default(),
         mode: (0, 0),
         last_thumb: Instant::now(),
         last_save: Instant::now(),
@@ -749,7 +761,10 @@ impl Console {
     }
 
     fn frame(&mut self) {
-        let mode = self.shared.lock().unwrap_or_else(|e| e.into_inner()).mode;
+        let (mode, dirty) = {
+            let mut s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+            (s.mode, s.dirty.take())
+        };
         let Some(fb) = &self.fb else { return };
         let (w, h) = mode;
         if w == 0 || h == 0 {
@@ -758,13 +773,7 @@ impl Console {
             self.win.set_mode_h(0);
             return;
         }
-        let n = w as usize * h as usize;
-        self.pixels.resize(n, 0);
-        fb.read_into(w, h, &mut self.pixels);
-        let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(w, h);
-        for (o, p) in buf.make_mut_slice().iter_mut().zip(&self.pixels) {
-            *o = Rgba8Pixel { r: (p >> 16) as u8, g: (p >> 8) as u8, b: *p as u8, a: 255 };
-        }
+        let Some(buf) = self.bufs.update(fb, w, h, dirty) else { return };
         self.win.set_frame(slint::Image::from_rgba8(buf));
         if self.mode != mode {
             // Ask the guest to match the window on the first frame.
@@ -793,9 +802,8 @@ impl Console {
     /// The screen, at most `max_w` wide.
     fn scaled(&self, max_w: u32) -> Option<(SharedPixelBuffer<Rgba8Pixel>, u32, u32)> {
         let (w, h) = self.mode;
-        if w == 0 || h == 0 || self.pixels.len() < w as usize * h as usize {
-            return None;
-        }
+        let src = self.bufs.current().filter(|b| (b.width(), b.height()) == (w, h))?;
+        let src = src.as_slice();
         let tw = w.min(max_w);
         let th = (h as u64 * tw as u64 / w as u64).max(1) as u32;
         let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(tw, th);
@@ -804,8 +812,7 @@ impl Console {
             let sy = y * h as usize / th as usize;
             for x in 0..tw as usize {
                 let sx = x * w as usize / tw as usize;
-                let p = self.pixels[sy * w as usize + sx];
-                out[y * tw as usize + x] = Rgba8Pixel { r: (p >> 16) as u8, g: (p >> 8) as u8, b: p as u8, a: 255 };
+                out[y * tw as usize + x] = src[sy * w as usize + sx];
             }
         }
         Some((buf, tw, th))

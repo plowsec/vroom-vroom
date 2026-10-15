@@ -7,6 +7,7 @@ mod app;
 mod console;
 mod edit;
 mod fmt;
+mod frame;
 mod host;
 mod keymap;
 mod library;

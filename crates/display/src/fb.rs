@@ -144,6 +144,21 @@ impl SharedFb {
         }
     }
 
+    /// Copy `dst.len()` pixels of row `y`, from column `x`, of a
+    /// `fb_width`-wide image into `dst` (one u32 per pixel, 0RGB). False
+    /// (nothing copied) if that's outside the image or the buffer.
+    pub fn read_row(&self, fb_width: u32, x: u32, y: u32, dst: &mut [u32]) -> bool {
+        let (x, y, w) = (x as usize, y as usize, dst.len());
+        let fw = fb_width as usize;
+        let ok = x.checked_add(w).is_some_and(|e| e <= fw)
+            && y.checked_mul(fw).and_then(|o| o.checked_add(x + w)).and_then(|e| e.checked_mul(BPP)).is_some_and(|e| e <= self.len);
+        if ok {
+            // SAFETY: (y*fw + x + w) * 4 <= len, checked above; dst has w u32s.
+            unsafe { std::ptr::copy_nonoverlapping((self.ptr as *const u32).add(y * fw + x), dst.as_mut_ptr(), w) };
+        }
+        ok
+    }
+
     /// Copy the visible w x h image into `dst` (one u32 per pixel, 0RGB).
     pub fn read_into(&self, width: u32, height: u32, dst: &mut [u32]) {
         let n = (width as usize * height as usize).min(dst.len());
