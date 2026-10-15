@@ -19,7 +19,7 @@ and every virtual device treats the guest as hostile.
 - Nested VMs (M3 or newer)
 - Import from VMware Fusion (ARM64 VMs)
 - USB devices from the host (those macOS has no driver for; needs libusb)
-- Fast disk and network I/O: on par with or ahead of QEMU ([numbers](docs/PERFORMANCE.md))
+- Fast disk and network I/O, measured against QEMU ([numbers](docs/PERFORMANCE.md))
 
 Not yet: x86_64 hosts (it builds, can't run VMs yet), Secure Boot, and
 3D in Windows guests.
