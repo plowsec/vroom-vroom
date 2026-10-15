@@ -220,14 +220,23 @@ struct Pool {
     jobs: Option<Sender<Job>>,
     threads: Vec<JoinHandle<()>>,
     /// What a new thread needs.
-    spawn: (Arc<Exec>, Arc<PoolShared>, Poker, Arc<Mutex<Receiver<Job>>>),
+    spawn: Spawn,
+}
+
+#[derive(Debug, Clone)]
+struct Spawn {
+    exec: Arc<Exec>,
+    shared: Arc<PoolShared>,
+    poker: Poker,
+    rx: Arc<Mutex<Receiver<Job>>>,
 }
 
 impl Pool {
     fn start(exec: &Arc<Exec>, shared: &Arc<PoolShared>, poker: &Poker) -> std::io::Result<Pool> {
         let (tx, rx) = mpsc::channel::<Job>();
         let rx = Arc::new(Mutex::new(rx));
-        let mut pool = Pool { jobs: Some(tx), threads: Vec::new(), spawn: (exec.clone(), shared.clone(), poker.clone(), rx) };
+        let spawn = Spawn { exec: exec.clone(), shared: shared.clone(), poker: poker.clone(), rx };
+        let mut pool = Pool { jobs: Some(tx), threads: Vec::new(), spawn };
         pool.grow_to(IO_THREADS)?;
         Ok(pool)
     }
@@ -235,9 +244,9 @@ impl Pool {
     /// At least `n` threads (capped), so `n` requests can be in flight.
     fn grow_to(&mut self, n: usize) -> std::io::Result<()> {
         while self.threads.len() < n.min(MAX_IO_THREADS) {
-            let (exec, shared, poker, rx) = (self.spawn.0.clone(), self.spawn.1.clone(), self.spawn.2.clone(), self.spawn.3.clone());
+            let sp = self.spawn.clone();
             let name = format!("blk-io{}", self.threads.len());
-            self.threads.push(std::thread::Builder::new().name(name).spawn(move || io_thread(&exec, &shared, &poker, &rx))?);
+            self.threads.push(std::thread::Builder::new().name(name).spawn(move || io_thread(&sp.exec, &sp.shared, &sp.poker, &sp.rx))?);
         }
         Ok(())
     }
