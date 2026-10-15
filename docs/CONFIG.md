@@ -95,7 +95,14 @@ Linux guests only for now.
 
 | Key | Default | What it does |
 |---|---|---|
-| `output` | false | Guest sound out through the host speakers. There is no microphone path. Linux guests only. |
+| `output` | false | Guest sound out through the host speakers. |
+| `input` | false | The host microphone, for the guest to record from (video calls). It only flows while the VM's window is open, the VM runs and the guest records; the window shows when. Headless runs (`vroom run`) never get it. |
+| `device` | `auto` | The sound card: `hda` (Intel HD Audio: Windows and Linux have a driver built in), `virtio` (virtio-snd: Linux only). `auto` is `hda` for Windows guests (`os`, or guessed from the name), `virtio` otherwise. |
+
+The card is there when `output` or `input` is on. With `output` off the
+guest still sees speakers but they play nowhere; with `input` off the
+guest has no microphone at all. See [GUIDE.md](GUIDE.md#sound) for the
+macOS microphone permission.
 
 ## `[clipboard]`
 
@@ -144,6 +151,8 @@ defaults below. New VMs get random serials, so two VMs never match.
 | `pci_bridge_id` | `1b36:0008` | PCI IDs of the host bridge |
 | `nvme_pci_id` | `1b36:0010` | PCI IDs of the NVMe controller; Identify reports the same vendor |
 | `usb_pci_id` | `1b36:000d` | PCI IDs of the USB (xHCI) controller |
+| `hda_pci_id` | `8086:2668:1af4:1100` | PCI IDs of the HD Audio sound card (QEMU's `intel-hda`: an Intel ICH6) |
+| `hda_codec_id` | `1af4:0022:1af4:0022` | HD Audio codec vendor:device and subsystem (QEMU's `hda-duplex`); Windows shows it as `HDAUDIO\FUNC_01&VEN_..&DEV_..&SUBSYS_..` |
 | `usb_vendor_id` | `0x1209` | USB keyboard and tablet vendor ID, also the virtio input vendor |
 | `usb_manufacturer` | `vroom` | USB and virtio input device names |
 | `mac_prefix` | `02` | first 1-3 bytes of generated NIC MACs, e.g. `00:1b:21` |
@@ -157,6 +166,10 @@ PCI IDs are `vendor:device` or `vendor:device:subvendor:subdevice`, 4 hex
 digits each (`lspci -nn` shows them). Without the subsystem part it is
 `vendor:0000`. The default `1b36` is QEMU's vendor ID. A real chip's IDs
 make Linux apply that chip's driver quirks; class and revision don't change.
+The same goes for `hda_codec_id`: a real codec's IDs (say Realtek
+`10ec:0887`) make Linux load that codec's driver, which expects the real
+chip's layout, so keep a codec vendor Linux treats as generic unless the
+guest is Windows.
 
 The three NAT addresses share one private /24 (10/8, 172.16/12,
 192.168/16). Adapter N adds N to the third number, so `192.168.1.100`
