@@ -146,11 +146,11 @@ pub fn parse_tcp(p: &[u8]) -> Option<Tcp> {
 /// RFC 1071 checksum over `data`, starting from `init`.
 pub fn checksum(init: u32, data: &[u8]) -> u16 {
     let mut sum = init;
-    let mut chunks = data.chunks_exact(2);
-    for c in &mut chunks {
-        sum += u16::from_be_bytes([c[0], c[1]]) as u32;
+    let (pairs, rest) = data.as_chunks::<2>();
+    for c in pairs {
+        sum += u16::from_be_bytes(*c) as u32;
     }
-    if let [b] = chunks.remainder() {
+    if let [b] = rest {
         sum += (*b as u32) << 8;
     }
     while sum >> 16 != 0 {

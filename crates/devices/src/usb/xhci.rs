@@ -1110,7 +1110,7 @@ mod tests {
     impl Host {
         fn new() -> Host {
             let mem = GuestMemory::new(&[(GuestAddress(RAM), 1 << 20)]).unwrap();
-            let r = IntxRouter::new(vec![Arc::new(NoIrq); 4]);
+            let r = IntxRouter::new((0..4).map(|_| Arc::new(NoIrq) as Arc<dyn crate::IrqLine>).collect());
             let x = Xhci::new(6, mem.clone(), r.pin(6, 1), Arc::new(NoMsi));
             let mut h = Host { x, mem, evt: 0, cmd: CMD_RING };
             h.mem.write_obj(GuestAddress(ERST), &EVT.to_le()).unwrap();
@@ -1166,7 +1166,7 @@ mod tests {
             assert!(ports.iter().all(|e| trb_type(e) == E_PORT));
             let c = h.command([0, 0, 0, C_ENABLE_SLOT << 10]);
             assert_eq!(c[3] >> 24, 1);
-            let mut input = vec![0u32; 3 * 8];
+            let mut input = [0u32; 3 * 8];
             input[1] = 3; // add slot + ep0
             input[8 + 1] = 1 << 16; // root port 1
             input[16 + 1] = 64 << 16; // max packet

@@ -129,6 +129,7 @@ impl SharedFb {
     }
 
     /// Write rows of a rect. `src` holds `h` rows of `w*4` bytes with `src_stride`.
+    #[allow(clippy::too_many_arguments)]
     pub fn write_rect(&self, fb_width: u32, x: u32, y: u32, w: u32, h: u32, src: &[u8], src_stride: usize) {
         let stride = Self::stride(fb_width);
         let row = w as usize * BPP;

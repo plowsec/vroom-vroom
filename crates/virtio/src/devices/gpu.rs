@@ -336,7 +336,7 @@ fn to_bgrx(sw: [usize; 4], src: &[u8], dst: &mut [u8]) {
         dst.copy_from_slice(src);
         return;
     }
-    for (d, p) in dst.as_chunks_mut::<4>().0.iter_mut().zip(src.chunks_exact(4)) {
+    for (d, p) in dst.as_chunks_mut::<4>().0.iter_mut().zip(src.as_chunks::<4>().0) {
         d[0] = p[sw[0]];
         d[1] = p[sw[1]];
         d[2] = p[sw[2]];

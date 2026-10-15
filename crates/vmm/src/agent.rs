@@ -162,7 +162,7 @@ impl Service {
                     self.sync_time();
                 }
             }
-            Message::ClipboardText(t) => self.from_guest(t),
+            Message::ClipboardText(t) => self.guest_clipboard(t),
             Message::Ping(v) => self.send(&Message::Pong(v)),
             // Host-bound only; a guest sending these is ignored.
             _ => {}
@@ -174,7 +174,7 @@ impl Service {
         self.send(&Message::TimeSync { unix_secs: d.as_secs(), nanos: d.subsec_nanos() });
     }
 
-    fn from_guest(&mut self, t: String) {
+    fn guest_clipboard(&mut self, t: String) {
         if !self.policy.guest_to_host || t.len() > self.policy.max_bytes as usize {
             return;
         }

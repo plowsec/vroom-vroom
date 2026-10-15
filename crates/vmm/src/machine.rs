@@ -315,6 +315,7 @@ fn read_file(p: &std::path::Path, what: &str, max: u64) -> Result<Vec<u8>> {
     std::fs::read(p).map_err(|e| Error::Setup(format!("{what} {}: {e}", p.display())))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build(
     config: &VmConfig,
     hv: &dyn Hypervisor,

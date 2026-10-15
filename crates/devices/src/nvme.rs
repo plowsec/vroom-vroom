@@ -378,7 +378,7 @@ impl Nvme {
         Ok(())
     }
 
-    fn from_guest(&self, prp1: u64, prp2: u64, len: u64) -> Result<Vec<u8>, u16> {
+    fn read_prps(&self, prp1: u64, prp2: u64, len: u64) -> Result<Vec<u8>, u16> {
         let mut v = vec![0u8; len as usize];
         let mut off = 0usize;
         for (a, n) in self.prps(prp1, prp2, len)? {
@@ -614,7 +614,7 @@ impl Nvme {
                 if len > MAX_XFER {
                     return Err(SC_INVALID_FIELD);
                 }
-                let buf = self.from_guest(c.prp1, c.prp2, len)?;
+                let buf = self.read_prps(c.prp1, c.prp2, len)?;
                 disk.write_at(&buf, off).map_err(|_| SC_DATA_XFER_ERROR)
             }),
             0x08 if ro => Err(SC_WRITE_PROTECTED),
@@ -635,7 +635,7 @@ impl Nvme {
             return Ok(());
         }
         let nr = (c.cdw[0] & 0xff) as u64 + 1;
-        let ranges = self.from_guest(c.prp1, c.prp2, nr * 16)?;
+        let ranges = self.read_prps(c.prp1, c.prp2, nr * 16)?;
         for r in ranges.as_chunks::<16>().0 {
             let len = u32::from_le_bytes([r[4], r[5], r[6], r[7]]) as u64 * bs;
             let slba = u64::from_le_bytes(r[8..16].try_into().unwrap_or([0; 8]));
@@ -803,7 +803,7 @@ mod tests {
         let f = tempfile::tempfile().unwrap();
         f.set_len(1 << 20).unwrap();
         let disk: Arc<dyn DiskImage> = Arc::new(RawImage::from_file(f, false).unwrap());
-        let r = IntxRouter::new(vec![Arc::new(NoIrq); 4]);
+        let r = IntxRouter::new((0..4).map(|_| Arc::new(NoIrq) as Arc<dyn crate::IrqLine>).collect());
         let mut n = Nvme::new(3, vec![Namespace { disk, read_only: false, block_size: SECTOR_SIZE }], mem.clone(), r.pin(3, 1), Arc::new(NoMsi));
         n.reg_write(0x24, (3 << 16) | 3, 4); // 4-entry admin queues
         n.reg_write(0x28, ASQ, 8);

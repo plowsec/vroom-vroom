@@ -151,6 +151,8 @@ impl Decoder {
 
     /// Next complete message. `Ok(None)` = need more bytes. On `Err`, the
     /// offending bytes are skipped; calling again continues with the rest.
+    // Not an Iterator: errors are recoverable and Ok(None) means "later".
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<Option<Message>, Error> {
         if self.buf.len() < HDR {
             return Ok(None);
