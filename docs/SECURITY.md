@@ -27,7 +27,10 @@ service by a guest against its own VM.
   network packets, agent messages (size caps, UTF-8).
 - Hard limits on everything a guest can make us allocate: GPU resource
   memory, pending fences, queue sizes, NAT connections, fragment memory.
-- Config parsing is strict: unknown keys are errors.
+- Config parsing is strict: unknown keys are errors. `bulwark check` (and
+  every start) also names risky but valid choices: sandbox off, writable or
+  home-wide shares, port forwards reachable from the LAN, host loopback
+  open to the guest, bridged networking.
 - Logging is capped (50 lines a second, errors excepted): a guest that
   keeps tripping warnings can't flood the terminal or fill a log disk.
 - qcow2 backing files: only from the image's own directory or allow-listed
