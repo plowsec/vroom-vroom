@@ -1150,20 +1150,29 @@ impl VirtioDevice for Gpu {
         Ok(DeviceState { queues: self.worker.queues(), data })
     }
     fn restore_active(&mut self, ctx: ActivateContext, data: &[u8]) -> Result<()> {
-        {
-            let mut s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-            s.irq = Some(ctx.irq.clone());
-            // Make the driver re-query and re-setup the display.
-            s.events_read |= EVENT_DISPLAY;
-        }
+        self.shared.lock().unwrap_or_else(|e| e.into_inner()).irq = Some(ctx.irq.clone());
         let irq = ctx.irq.clone();
         let mut h = self.handler();
+        let mut shown = None;
         if !data.is_empty() {
             let snap: Snap2d = serde_json::from_slice(data).map_err(|e| Error::Device(e.to_string()))?;
             h.restore_2d(&ctx.mem, &snap)?;
+            shown = snap.scanout.map(|(_, _, _, w, h)| (w, h));
         }
         self.worker.start("gpu", ctx, h, true)?;
-        irq.signal_config_changed();
+        // A display event makes drivers rebuild their surfaces; Windows then
+        // repaints only what it thinks changed (a mostly black screen). With
+        // a picture restored, keep its mode: a viewer that wants another
+        // size asks, which raises the event the normal way.
+        let mut s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        match shown {
+            Some((w, h)) => (s.width, s.height) = (w, h),
+            None => {
+                s.events_read |= EVENT_DISPLAY;
+                drop(s);
+                irq.signal_config_changed();
+            }
+        }
         Ok(())
     }
 }
