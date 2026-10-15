@@ -49,6 +49,9 @@ const SC_INVALID_VECTOR: u16 = 0x108;
 
 /// I/O threads per controller, started on first use.
 const IO_THREADS: usize = 4;
+/// More while commands wait for a thread, up to this: a real SSD needs
+/// many reads in flight (with 4, queue depth 32 got a third of QEMU's).
+const MAX_IO_THREADS: usize = 32;
 /// Commands on the I/O threads at most; past that they run inline.
 const MAX_INFLIGHT: usize = 256;
 /// Reads and writes this big always go to the I/O threads.
@@ -169,6 +172,20 @@ struct IoShared {
 struct Pool {
     jobs: Option<Sender<Job>>,
     threads: Vec<JoinHandle<()>>,
+    /// Cloned for each new thread.
+    template: IoThread,
+}
+
+impl Pool {
+    /// At least `n` threads (capped), so `n` commands can be in flight.
+    fn grow_to(&mut self, n: usize) -> std::io::Result<()> {
+        while self.threads.len() < n.min(MAX_IO_THREADS) {
+            let t = self.template.clone();
+            let name = format!("nvme-io{}", self.threads.len());
+            self.threads.push(std::thread::Builder::new().name(name).spawn(move || t.run())?);
+        }
+        Ok(())
+    }
 }
 
 impl Drop for Pool {
@@ -429,7 +446,16 @@ impl Nvme {
         let Some(tx) = self.pool.as_ref().and_then(|p| p.jobs.clone()) else { return false };
         let Some(cq) = self.cqs.get_mut(&job.cqid) else { return false };
         cq.reserved += 1;
-        self.io.done.lock().unwrap_or_else(|e| e.into_inner()).running += 1;
+        let running = {
+            let mut d = self.io.done.lock().unwrap_or_else(|e| e.into_inner());
+            d.running += 1;
+            d.running
+        };
+        if let Some(pool) = self.pool.as_mut() {
+            if let Err(e) = pool.grow_to(running) {
+                log::debug!("{}: no more I/O threads ({e})", self.id);
+            }
+        }
         if tx.send(job).is_err() {
             // Can't happen while we hold the pool; undo and run inline.
             self.io.done.lock().unwrap_or_else(|e| e.into_inner()).running -= 1;
@@ -445,18 +471,9 @@ impl Nvme {
         let (tx, rx) = mpsc::channel::<Job>();
         let (posted, posted_rx) = mpsc::channel::<()>();
         let rx = Arc::new(Mutex::new(rx));
-        let mut threads = Vec::new();
-        for i in 0..IO_THREADS {
-            let t = IoThread {
-                rx: rx.clone(),
-                io: self.io.clone(),
-                mem: self.mem.clone(),
-                ns: self.ns.clone(),
-                me: self.me.clone(),
-                posted: posted.clone(),
-            };
-            threads.push(std::thread::Builder::new().name(format!("nvme-io{i}")).spawn(move || t.run())?);
-        }
+        let template = IoThread { rx, io: self.io.clone(), mem: self.mem.clone(), ns: self.ns.clone(), me: self.me.clone(), posted };
+        let mut pool = Pool { jobs: Some(tx), threads: Vec::new(), template };
+        pool.grow_to(IO_THREADS)?;
         let me = self.me.clone();
         std::thread::Builder::new().name("nvme-done".into()).spawn(move || {
             while posted_rx.recv().is_ok() {
@@ -465,8 +482,7 @@ impl Nvme {
                 n.lock().unwrap_or_else(|e| e.into_inner()).post_done();
             }
         })?;
-        drop(posted);
-        Ok(Pool { jobs: Some(tx), threads })
+        Ok(pool)
     }
 
     /// Post the results the I/O threads finished.
@@ -866,6 +882,7 @@ fn read_prps(mem: &GuestMemory, prp1: u64, prp2: u64, len: u64) -> Result<Vec<u8
     Ok(v)
 }
 
+#[derive(Clone)]
 struct IoThread {
     rx: Arc<Mutex<Receiver<Job>>>,
     io: Arc<IoShared>,

@@ -113,7 +113,8 @@ guest's submit call returns, so fio's own latency figure would say
 
 - **Disk requests run in parallel.** virtio-blk handed one request at a
   time to the disk image from a single thread. Now several requests in
-  flight go to four I/O threads per disk. NVMe ran every command on the
+  flight go to I/O threads: four per disk, more (up to 32) while requests
+  wait for one. NVMe ran every command on the
   vCPU that rang the doorbell; now big transfers, flushes and commands
   queued behind others go to I/O threads too. Pausing (snapshots,
   suspend), resets and queue deletion wait for them, so a paused VM still
@@ -167,14 +168,35 @@ guest's submit call returns, so fio's own latency figure would say
   screen is still, and once a second with no window at all. UEFI guests
   idle at 0.8 % of a core instead of 2.9 %.
 
+**Disk from the SSD (virtio raw, 60 GB of random data, host cache can't
+hold it, `scripts/bench-cold.sh`)**
+
+| | vroom | QEMU |
+|---|---|---|
+| 4k random read qd1 (IOPS) | 9.1k | 7.9k |
+|   mean / p99 latency (µs) | 109 / 126 | 125 / 191 |
+| 4k random read qd32 (IOPS) | 136k | 121k |
+|   mean / p99 latency (µs) | 234 / 448 | 265 / 485 |
+| 64k random read qd1 (IOPS) | 5.2k | 4.7k |
+
+These are the numbers a real workload with a cold cache sees; the tables
+above mostly measure the VMM's own cost. fio's latency for vroom at queue
+depth 1 in the tables above (well under a microsecond) is not real: the
+request finishes before fio's submit call returns, so fio times nothing.
+The per-request time in the "µs per 4k read" rows is the real one.
+
 ## Trade-offs
 
 - 4 KiB random I/O at queue depth 32 on virtio-blk is about 10 % below
   where it was (the guest now sends each request to its own vCPU's queue
   and kicks more often), still about twice QEMU's. NVMe at that depth is
   unchanged.
-- Eight I/O threads per disk instead of four would read 1 MiB blocks at
-  42 GB/s (QEMU: 37) but cost 15-20 % at 4 KiB queue depth 32; four it is.
+- A fixed four I/O threads looked best with the data in the host cache,
+  but from the SSD it allowed only four reads at once: 4 KiB random reads
+  at queue depth 32 ran at 43k IOPS, against QEMU's 121k. The pool now
+  grows to the number of requests in flight (up to 32): 136k from the
+  SSD. From the cache, 4 KiB at queue depth 32 drops from 251k to 205k
+  IOPS (QEMU: 120k) and 1 MiB reads go from 25 to 35 GB/s.
 - The virtio-blk device now has one queue per vCPU (up to 16), so a
   suspend image made by an older vroom of a VM with virtio disks no
   longer resumes ("queue layout mismatch"): start it with `--fresh`.

@@ -42,8 +42,12 @@ const SEG_MAX: u32 = 126;
 /// Biggest single read/write we accept (Linux default max is far below).
 const MAX_IO: usize = 4 << 20;
 const MAX_DISCARD_SECTORS: u32 = (1 << 30) / 512;
-/// I/O threads per disk, started on first use.
+/// I/O threads per disk, started on first use...
 const IO_THREADS: usize = 4;
+/// ...and more while requests wait for one, up to this. A real SSD only
+/// gets busy with many requests in flight: with 4 threads, 4k random
+/// reads at queue depth 32 ran at a third of QEMU's speed.
+const MAX_IO_THREADS: usize = 32;
 /// Requests handed to the I/O threads and not back yet. Bounded anyway
 /// by the queue size; this keeps the backlog short.
 const MAX_INFLIGHT: usize = 64;
@@ -215,18 +219,27 @@ struct PoolShared {
 struct Pool {
     jobs: Option<Sender<Job>>,
     threads: Vec<JoinHandle<()>>,
+    /// What a new thread needs.
+    spawn: (Arc<Exec>, Arc<PoolShared>, Poker, Arc<Mutex<Receiver<Job>>>),
 }
 
 impl Pool {
     fn start(exec: &Arc<Exec>, shared: &Arc<PoolShared>, poker: &Poker) -> std::io::Result<Pool> {
         let (tx, rx) = mpsc::channel::<Job>();
         let rx = Arc::new(Mutex::new(rx));
-        let mut threads = Vec::new();
-        for i in 0..IO_THREADS {
-            let (exec, shared, poker, rx) = (exec.clone(), shared.clone(), poker.clone(), rx.clone());
-            threads.push(std::thread::Builder::new().name(format!("blk-io{i}")).spawn(move || io_thread(&exec, &shared, &poker, &rx))?);
+        let mut pool = Pool { jobs: Some(tx), threads: Vec::new(), spawn: (exec.clone(), shared.clone(), poker.clone(), rx) };
+        pool.grow_to(IO_THREADS)?;
+        Ok(pool)
+    }
+
+    /// At least `n` threads (capped), so `n` requests can be in flight.
+    fn grow_to(&mut self, n: usize) -> std::io::Result<()> {
+        while self.threads.len() < n.min(MAX_IO_THREADS) {
+            let (exec, shared, poker, rx) = (self.spawn.0.clone(), self.spawn.1.clone(), self.spawn.2.clone(), self.spawn.3.clone());
+            let name = format!("blk-io{}", self.threads.len());
+            self.threads.push(std::thread::Builder::new().name(name).spawn(move || io_thread(&exec, &shared, &poker, &rx))?);
         }
-        Ok(Pool { jobs: Some(tx), threads })
+        Ok(())
     }
 }
 
@@ -292,8 +305,17 @@ impl BlockHandler {
                 }
             }
         }
+        let running = {
+            let mut d = self.shared.done.lock().unwrap_or_else(|e| e.into_inner());
+            d.running += chains.len();
+            d.running
+        };
+        if let Some(pool) = self.pool.as_mut() {
+            if let Err(e) = pool.grow_to(running) {
+                log::debug!("blk: no more I/O threads ({e})");
+            }
+        }
         let Some(tx) = self.pool.as_ref().and_then(|p| p.jobs.as_ref()) else { return false };
-        self.shared.done.lock().unwrap_or_else(|e| e.into_inner()).running += chains.len();
         self.inflight.fetch_add(chains.len(), Ordering::Relaxed);
         for c in chains.drain(..) {
             if let Err(mpsc::SendError((q, c))) = tx.send((q, c)) {
