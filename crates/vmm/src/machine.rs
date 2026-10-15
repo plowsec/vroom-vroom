@@ -202,7 +202,8 @@ pub(crate) struct BuildEnv {
 
 /// What gets loaded into RAM at (re)boot. Kept so reset can reload it.
 pub(crate) enum BootImage {
-    /// Direct Linux boot.
+    /// Direct Linux boot. The kernel stays as read from its file (often
+    /// compressed, a third of its size) and is unpacked at each load.
     Kernel { kernel: Vec<u8>, initrd: Option<Vec<u8>>, ram: (u64, u64), fdt_cfg: board::FdtConfig },
     /// UEFI in flash; the FDT goes at the start of RAM for it to find.
     Firmware { fdt_cfg: board::FdtConfig },
@@ -213,7 +214,8 @@ impl BootImage {
     pub fn load(&self, mem: &GuestMemory) -> Result<BootRegs> {
         match self {
             BootImage::Kernel { kernel, initrd, ram, fdt_cfg } => {
-                let k = board::load_kernel(mem, ram.0, kernel)?;
+                let kernel = vroom_arch::decompress_if_needed(kernel.clone())?;
+                let k = board::load_kernel(mem, ram.0, &kernel)?;
                 let plan = board::place_boot_blobs(*ram, k.end, initrd.as_ref().map(|i| i.len() as u64))?;
                 let mut fdt_cfg = fdt_cfg.clone();
                 if let (Some(addr), Some(data)) = (plan.initrd_addr, initrd) {
@@ -529,8 +531,7 @@ pub(crate) fn build(
     };
     let boot = match &config.boot {
         Boot::Kernel { kernel, initrd, cmdline } => {
-            let raw = read_file(kernel, "kernel", 1 << 30)?;
-            let kernel = vroom_arch::decompress_if_needed(raw)?;
+            let kernel = read_file(kernel, "kernel", 1 << 30)?;
             let initrd = match initrd {
                 Some(p) => Some(read_file(p, "initrd", ram_size / 2)?),
                 None => None,
