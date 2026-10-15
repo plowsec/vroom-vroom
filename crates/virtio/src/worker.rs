@@ -20,6 +20,8 @@ const WAKE: Token = Token(usize::MAX);
 pub const BACKEND_TOKEN_BASE: usize = 64;
 /// Passed to `backend_ready` after a resume: re-check every backend source.
 pub const RESUME_TOKEN: usize = usize::MAX - 1;
+/// Passed to `backend_ready` after a [`Poker::poke`].
+pub const POKE_TOKEN: usize = usize::MAX - 2;
 
 /// Queues + memory + interrupt, as seen by a handler.
 pub struct QueueCtx {
@@ -87,6 +89,13 @@ pub trait QueueHandler: Send + 'static {
         None
     }
     fn tick(&mut self, _ctx: &mut QueueCtx) {}
+    /// Called once before the worker starts: keep the poker to wake the
+    /// worker from other threads (`backend_ready(POKE_TOKEN)` follows).
+    fn attach(&mut self, _poker: Poker) {}
+    /// The worker is being paused: finish whatever runs on other threads
+    /// and hand back its buffers, so nothing touches guest memory until
+    /// the resume. Runs on the pausing thread, with the worker idle.
+    fn quiesce(&mut self, _ctx: &mut QueueCtx) {}
 }
 
 struct Inner<H> {
@@ -95,10 +104,36 @@ struct Inner<H> {
     handler: H,
 }
 
+/// What other threads set to get the worker's attention.
+struct Signals {
+    kicks: AtomicU64,
+    poked: AtomicBool,
+    stop: AtomicBool,
+}
+
 struct Shared<H> {
     inner: Mutex<Inner<H>>,
-    kicks: AtomicU64,
-    stop: AtomicBool,
+    sig: Arc<Signals>,
+}
+
+/// Wakes a worker from another thread (a device's I/O helpers).
+#[derive(Clone)]
+pub struct Poker {
+    sig: Arc<Signals>,
+    waker: Arc<Waker>,
+}
+
+impl std::fmt::Debug for Poker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Poker")
+    }
+}
+
+impl Poker {
+    pub fn poke(&self) {
+        self.sig.poked.store(true, Ordering::Release);
+        let _ = self.waker.wake();
+    }
 }
 
 /// Handle to a running worker.
@@ -120,13 +155,15 @@ impl<H: QueueHandler> Worker<H> {
         let waker = Arc::new(Waker::new(poll.registry(), WAKE)?);
         handler.register(poll.registry())?;
         let nq = ctx.queues.len();
-        let shared = Arc::new(Shared {
-            inner: Mutex::new(Inner { paused, ctx, handler }),
+        let sig = Arc::new(Signals {
             // Process everything once at start: the driver may have queued
             // buffers before we came up (or before a snapshot).
             kicks: AtomicU64::new(if nq >= 64 { u64::MAX } else { (1u64 << nq) - 1 }),
+            poked: AtomicBool::new(false),
             stop: AtomicBool::new(false),
         });
+        handler.attach(Poker { sig: sig.clone(), waker: waker.clone() });
+        let shared = Arc::new(Shared { inner: Mutex::new(Inner { paused, ctx, handler }), sig });
         let s = shared.clone();
         let thread = std::thread::Builder::new()
             .name(format!("virtio-{name}"))
@@ -137,7 +174,7 @@ impl<H: QueueHandler> Worker<H> {
 
     pub fn kick(&self, q: u16) {
         if q < 64 {
-            self.shared.kicks.fetch_or(1 << q, Ordering::AcqRel);
+            self.shared.sig.kicks.fetch_or(1 << q, Ordering::AcqRel);
             let _ = self.waker.wake();
         }
     }
@@ -148,12 +185,16 @@ impl<H: QueueHandler> Worker<H> {
 
     /// When this returns, the worker is idle and won't touch guest memory.
     pub fn pause(&self) {
-        self.lock().paused = true;
+        let mut g = self.lock();
+        g.paused = true;
+        let inner = &mut *g;
+        inner.handler.quiesce(&mut inner.ctx);
+        inner.ctx.flush();
     }
 
     pub fn resume(&self) {
         self.lock().paused = false;
-        self.shared.kicks.fetch_or(u64::MAX, Ordering::AcqRel);
+        self.shared.sig.kicks.fetch_or(u64::MAX, Ordering::AcqRel);
         let _ = self.waker.wake();
     }
 
@@ -177,7 +218,7 @@ impl<H: QueueHandler> Worker<H> {
     }
 
     fn shutdown(&mut self) {
-        self.shared.stop.store(true, Ordering::Release);
+        self.shared.sig.stop.store(true, Ordering::Release);
         let _ = self.waker.wake();
         if let Some(t) = self.thread.take() {
             let _ = t.join();
@@ -202,7 +243,7 @@ fn run<H: QueueHandler>(mut poll: Poll, s: Arc<Shared<H>>) {
                 return;
             }
         }
-        if s.stop.load(Ordering::Acquire) {
+        if s.sig.stop.load(Ordering::Acquire) {
             let mut g = s.inner.lock().unwrap_or_else(|e| e.into_inner());
             g.handler.deregister(poll.registry());
             return;
@@ -213,7 +254,10 @@ fn run<H: QueueHandler>(mut poll: Poll, s: Arc<Shared<H>>) {
             was_paused = true;
             continue;
         }
-        let kicks = s.kicks.swap(0, Ordering::AcqRel);
+        if s.sig.poked.swap(false, Ordering::AcqRel) {
+            inner.handler.backend_ready(&mut inner.ctx, POKE_TOKEN);
+        }
+        let kicks = s.sig.kicks.swap(0, Ordering::AcqRel);
         let nq = inner.ctx.queues.len();
         for q in 0..nq.min(64) {
             if kicks & (1 << q) != 0 {

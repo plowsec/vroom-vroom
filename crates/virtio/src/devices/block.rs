@@ -1,10 +1,21 @@
 //! virtio-blk.
+//!
+//! The device worker pops requests. A lone request runs right there; when
+//! the guest has several in flight they go to a few I/O threads and run
+//! in parallel, and completions come back to the worker, which alone
+//! touches the rings. Data moves between the image and guest RAM without
+//! a bounce buffer where the format allows (raw, plain qcow2 clusters).
+//! Pausing waits for the I/O threads, so a paused device never has I/O in
+//! flight (snapshots stay consistent).
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
 
 use vroom_block::{DiskImage, SECTOR_SIZE};
 
-use crate::worker::{QueueCtx, QueueHandler, WorkerSlot};
+use crate::worker::{Poker, QueueCtx, QueueHandler, WorkerSlot, POKE_TOKEN};
 use crate::{chain::DescriptorChain, types, ActivateContext, DeviceState, Result, VirtioDevice};
 
 const F_SEG_MAX: u64 = 1 << 2;
@@ -30,6 +41,11 @@ const SEG_MAX: u32 = 126;
 /// Biggest single read/write we accept (Linux default max is far below).
 const MAX_IO: usize = 4 << 20;
 const MAX_DISCARD_SECTORS: u32 = (1 << 30) / 512;
+/// I/O threads per disk, started on first use.
+const IO_THREADS: usize = 4;
+/// Requests handed to the I/O threads and not back yet. Bounded anyway
+/// by the queue size; this keeps the backlog short.
+const MAX_INFLIGHT: usize = 64;
 
 #[derive(Debug)]
 pub struct Block {
@@ -54,7 +70,7 @@ impl Block {
     }
 
     fn handler(&self) -> BlockHandler {
-        BlockHandler { disk: self.disk.clone(), serial: self.serial }
+        BlockHandler::new(Arc::new(Exec { disk: self.disk.clone(), serial: self.serial }))
     }
 
     fn config(&self) -> [u8; 60] {
@@ -73,18 +89,20 @@ impl Block {
     }
 }
 
+/// Runs requests; shared by the worker and the I/O threads.
 #[derive(Debug)]
-pub struct BlockHandler {
+struct Exec {
     disk: Arc<dyn DiskImage>,
     serial: [u8; 20],
 }
 
-impl BlockHandler {
+impl Exec {
     /// Run one request; returns bytes written to the guest (incl. status).
     fn request(&self, chain: DescriptorChain) -> u32 {
+        let mem = chain.memory().clone();
         let Ok((mut r, mut w)) = chain.into_rw() else { return 0 };
         let Ok(mut status) = w.split_tail(1) else { return 0 };
-        let st = match self.execute(&mut r, &mut w) {
+        let st = match self.execute(&mem, &mut r, &mut w) {
             Ok(()) => S_OK,
             Err(s) => s,
         };
@@ -92,7 +110,7 @@ impl BlockHandler {
         (w.written() + 1) as u32
     }
 
-    fn execute(&self, r: &mut crate::Reader, w: &mut crate::Writer) -> std::result::Result<(), u8> {
+    fn execute(&self, mem: &vroom_block::GuestMemory, r: &mut crate::Reader, w: &mut crate::Writer) -> std::result::Result<(), u8> {
         let ty: u32 = u32::from_le(r.read_obj().map_err(|_| S_IOERR)?);
         let _reserved: u32 = r.read_obj().map_err(|_| S_IOERR)?;
         let sector: u64 = u64::from_le(r.read_obj().map_err(|_| S_IOERR)?);
@@ -104,9 +122,8 @@ impl BlockHandler {
                 if !len.is_multiple_of(SECTOR_SIZE as usize) || len > MAX_IO {
                     return Err(S_IOERR);
                 }
-                let mut buf = vec![0u8; len];
-                self.disk.read_at(&mut buf, offset).map_err(|_| S_IOERR)?;
-                w.write_all(&buf).map_err(|_| S_IOERR)
+                let segs = w.take_segments();
+                self.disk.read_to_guest(mem, offset, &segs).map_err(|_| S_IOERR)
             }
             T_OUT => {
                 if ro {
@@ -116,8 +133,8 @@ impl BlockHandler {
                 if !len.is_multiple_of(SECTOR_SIZE as usize) || len > MAX_IO {
                     return Err(S_IOERR);
                 }
-                let data = r.read_to_vec().map_err(|_| S_IOERR)?;
-                self.disk.write_at(&data, offset).map_err(|_| S_IOERR)
+                let segs = r.take_segments();
+                self.disk.write_from_guest(mem, offset, &segs).map_err(|_| S_IOERR)
             }
             T_FLUSH => self.disk.flush().map_err(|_| S_IOERR),
             T_GET_ID => {
@@ -149,21 +166,174 @@ impl BlockHandler {
     }
 }
 
+/// Finished requests waiting for the worker: (head, used length).
+#[derive(Debug, Default)]
+struct Done {
+    list: Vec<(u16, u32)>,
+    /// Handed to the threads and not finished yet.
+    running: usize,
+}
+
+#[derive(Debug, Default)]
+struct PoolShared {
+    done: Mutex<Done>,
+    /// Signalled when `running` drops to 0 (pause waits on it).
+    idle: Condvar,
+}
+
+/// The I/O threads of one disk.
+#[derive(Debug)]
+struct Pool {
+    jobs: Option<Sender<DescriptorChain>>,
+    threads: Vec<JoinHandle<()>>,
+}
+
+impl Pool {
+    fn start(exec: &Arc<Exec>, shared: &Arc<PoolShared>, poker: &Poker) -> std::io::Result<Pool> {
+        let (tx, rx) = mpsc::channel::<DescriptorChain>();
+        let rx = Arc::new(Mutex::new(rx));
+        let mut threads = Vec::new();
+        for i in 0..IO_THREADS {
+            let (exec, shared, poker, rx) = (exec.clone(), shared.clone(), poker.clone(), rx.clone());
+            threads.push(std::thread::Builder::new().name(format!("blk-io{i}")).spawn(move || io_thread(&exec, &shared, &poker, &rx))?);
+        }
+        Ok(Pool { jobs: Some(tx), threads })
+    }
+}
+
+impl Drop for Pool {
+    /// Requests already handed out still finish (they write guest RAM):
+    /// after this, nothing does.
+    fn drop(&mut self) {
+        self.jobs = None;
+        for t in self.threads.drain(..) {
+            let _ = t.join();
+        }
+    }
+}
+
+fn io_thread(exec: &Exec, shared: &PoolShared, poker: &Poker, rx: &Mutex<Receiver<DescriptorChain>>) {
+    loop {
+        let job = rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
+        let Ok(chain) = job else { return };
+        let head = chain.head();
+        let len = exec.request(chain);
+        let mut d = shared.done.lock().unwrap_or_else(|e| e.into_inner());
+        d.list.push((head, len));
+        d.running -= 1;
+        if d.running == 0 {
+            shared.idle.notify_all();
+        }
+        drop(d);
+        poker.poke();
+    }
+}
+
+#[derive(Debug)]
+pub struct BlockHandler {
+    exec: Arc<Exec>,
+    shared: Arc<PoolShared>,
+    pool: Option<Pool>,
+    poker: Option<Poker>,
+    /// Requests handed out (worker's count; the threads keep their own).
+    inflight: Arc<AtomicUsize>,
+}
+
+impl BlockHandler {
+    fn new(exec: Arc<Exec>) -> Self {
+        BlockHandler { exec, shared: Arc::default(), pool: None, poker: None, inflight: Arc::default() }
+    }
+
+    /// Run one request; returns bytes written to the guest (incl. status).
+    #[cfg(test)]
+    fn request(&self, chain: DescriptorChain) -> u32 {
+        self.exec.request(chain)
+    }
+
+    /// Hand requests to the I/O threads. False if they can't run there.
+    fn dispatch(&mut self, chains: &mut Vec<DescriptorChain>) -> bool {
+        if self.pool.is_none() {
+            let Some(p) = &self.poker else { return false };
+            match Pool::start(&self.exec, &self.shared, p) {
+                Ok(pool) => self.pool = Some(pool),
+                Err(e) => {
+                    log::warn!("blk: no I/O threads ({e}), running requests inline");
+                    return false;
+                }
+            }
+        }
+        let Some(tx) = self.pool.as_ref().and_then(|p| p.jobs.as_ref()) else { return false };
+        self.shared.done.lock().unwrap_or_else(|e| e.into_inner()).running += chains.len();
+        self.inflight.fetch_add(chains.len(), Ordering::Relaxed);
+        for c in chains.drain(..) {
+            if let Err(mpsc::SendError(c)) = tx.send(c) {
+                // Threads gone (can't happen while we hold the pool): finish here.
+                let head = c.head();
+                let len = self.exec.request(c);
+                let mut d = self.shared.done.lock().unwrap_or_else(|e| e.into_inner());
+                d.list.push((head, len));
+                d.running -= 1;
+            }
+        }
+        true
+    }
+
+    /// Give finished requests back to the driver.
+    fn reap(&mut self, ctx: &mut QueueCtx) {
+        let list = std::mem::take(&mut self.shared.done.lock().unwrap_or_else(|e| e.into_inner()).list);
+        self.inflight.fetch_sub(list.len(), Ordering::Relaxed);
+        for (head, len) in list {
+            ctx.add_used(0, head, len);
+        }
+    }
+}
+
 impl QueueHandler for BlockHandler {
     fn process_queue(&mut self, ctx: &mut QueueCtx, q: usize) {
-        loop {
-            let chain = match ctx.queues[q].pop(&ctx.mem) {
-                Ok(Some(c)) => c,
+        self.reap(ctx);
+        let mut batch = Vec::new();
+        while self.inflight.load(Ordering::Relaxed) + batch.len() < MAX_INFLIGHT {
+            match ctx.queues[q].pop(&ctx.mem) {
+                Ok(Some(c)) => batch.push(c),
                 Ok(None) => break,
                 Err(e) => {
                     log::warn!("blk: {e}");
                     break;
                 }
-            };
-            let head = chain.head();
-            let len = self.request(chain);
+            }
+        }
+        // One request and nothing else running: no thread hop.
+        if batch.len() > 1 || self.inflight.load(Ordering::Relaxed) > 0 {
+            self.dispatch(&mut batch);
+        }
+        for c in batch {
+            let head = c.head();
+            let len = self.exec.request(c);
             ctx.add_used(q, head, len);
         }
+    }
+
+    fn backend_ready(&mut self, ctx: &mut QueueCtx, token: usize) {
+        if token == POKE_TOKEN {
+            self.reap(ctx);
+            // Room again: requests the cap held back.
+            if self.inflight.load(Ordering::Relaxed) < MAX_INFLIGHT {
+                self.process_queue(ctx, 0);
+            }
+        }
+    }
+
+    fn attach(&mut self, poker: Poker) {
+        self.poker = Some(poker);
+    }
+
+    fn quiesce(&mut self, ctx: &mut QueueCtx) {
+        let mut d = self.shared.done.lock().unwrap_or_else(|e| e.into_inner());
+        while d.running > 0 {
+            d = self.shared.idle.wait(d).unwrap_or_else(|e| e.into_inner());
+        }
+        drop(d);
+        self.reap(ctx);
     }
 }
 
@@ -247,7 +417,7 @@ mod tests {
     #[test]
     fn write_then_read() {
         let d = disk();
-        let h = BlockHandler { disk: d.clone(), serial: [0; 20] };
+        let h = BlockHandler::new(Arc::new(Exec { disk: d.clone(), serial: [0; 20] }));
         let mut ring = TestRing::new(8);
         // write: hdr(16, ro) data(512, ro) status(1, w)
         let head = ring.add_chain(&[(16, false), (512, false), (1, true)]);
@@ -273,7 +443,7 @@ mod tests {
 
     #[test]
     fn out_of_range_and_overflow() {
-        let h = BlockHandler { disk: disk(), serial: [0; 20] };
+        let h = BlockHandler::new(Arc::new(Exec { disk: disk(), serial: [0; 20] }));
         for sector in [(1u64 << 20) / 512, u64::MAX / 256] {
             let mut ring = TestRing::new(8);
             ring.add_chain(&[(16, false), (512, true), (1, true)]);
@@ -281,6 +451,73 @@ mod tests {
             let c = ring.q.clone().pop(&ring.mem).unwrap().unwrap();
             h.request(c);
             assert_eq!(ring.mem.read_obj::<u8>(GuestAddress(DATA + 0x2000)).unwrap(), S_IOERR);
+        }
+    }
+
+    struct NoIrq;
+    impl crate::VirtioInterrupt for NoIrq {
+        fn signal_used_queue(&self, _q: u16) {}
+        fn signal_config_changed(&self) {}
+    }
+
+    fn wait_used(ring: &TestRing, n: u16) {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while ring.used_idx() != n {
+            assert!(std::time::Instant::now() < end, "only {} of {n} requests done", ring.used_idx());
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// Many requests at once go through the I/O threads; pausing waits
+    /// for them, so a paused device has nothing in flight.
+    #[test]
+    fn parallel_requests_and_pause() {
+        const N: u16 = 40;
+        let d = disk();
+        let mut ring = TestRing::new(128);
+        for i in 0..N {
+            ring.add_chain(&[(16, false), (512, false), (1, true)]);
+            let base = DATA + 0x1000 * (3 * i as u64);
+            header(&ring, base, T_OUT, 8 * i as u64);
+            ring.mem.write(GuestAddress(base + 0x1000), &[i as u8 + 1; 512]).unwrap();
+        }
+        let ctx = crate::ActivateContext { mem: ring.mem.clone(), queues: vec![ring.q.clone()], irq: Arc::new(NoIrq), features: 0 };
+        let h = BlockHandler::new(Arc::new(Exec { disk: d.clone(), serial: [0; 20] }));
+        let w = crate::worker::Worker::spawn("blk-test", QueueCtx::new(ctx), h, false).unwrap();
+        wait_used(&ring, N);
+        for i in 0..N {
+            let mut b = [0u8; 512];
+            d.read_at(&mut b, 8 * 512 * i as u64).unwrap();
+            assert_eq!(b, [i as u8 + 1; 512]);
+            let status = DATA + 0x1000 * (3 * i as u64 + 2);
+            assert_eq!(ring.mem.read_obj::<u8>(GuestAddress(status)).unwrap(), S_OK);
+        }
+        // Reads this time; pause right after the start.
+        let mut ring2 = TestRing::new(128);
+        for i in 0..N {
+            ring2.add_chain(&[(16, false), (512, true), (1, true)]);
+            header(&ring2, DATA + 0x1000 * (3 * i as u64), T_IN, 8 * i as u64);
+        }
+        drop(w);
+        let ctx = crate::ActivateContext { mem: ring2.mem.clone(), queues: vec![ring2.q.clone()], irq: Arc::new(NoIrq), features: 0 };
+        let h = BlockHandler::new(Arc::new(Exec { disk: d, serial: [0; 20] }));
+        let w = crate::worker::Worker::spawn("blk-test", QueueCtx::new(ctx), h, false).unwrap();
+        // Pause and resume while the requests run: every pause must find
+        // everything taken from the ring already given back.
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while ring2.used_idx() != N {
+            assert!(std::time::Instant::now() < end);
+            w.pause();
+            w.with(|ctx, h| {
+                assert_eq!(ctx.queues[0].next_avail, ctx.queues[0].next_used, "requests in flight while paused");
+                assert_eq!(h.inflight.load(Ordering::Relaxed), 0);
+            });
+            w.resume();
+            std::thread::yield_now();
+        }
+        for i in 0..N {
+            let data = DATA + 0x1000 * (3 * i as u64 + 1);
+            assert_eq!(ring2.mem.read_obj::<u8>(GuestAddress(data + 511)).unwrap(), i as u8 + 1);
         }
     }
 }
