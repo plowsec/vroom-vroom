@@ -4,3 +4,4 @@
 /images
 .DS_Store
 *.state/
+.claude/worktrees/
