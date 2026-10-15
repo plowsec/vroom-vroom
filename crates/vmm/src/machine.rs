@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use vroom_arch::aarch64::{self as board, layout};
 use vroom_config::{Boot, DiskBus, Gpu, Identity, VmConfig};
-use vroom_devices::{pl011::Pl011, pl031::Pl031, BusBuilder, BusDevice};
+use vroom_devices::{pl011::Pl011, pl031::Pl031, BusBuilder, BusDevice, ConcurrentBusDevice};
 use vroom_hv::{
     aarch64::mpidr_for, BootRegs, GicMsiConfig, Hypervisor, IrqChipConfig, IrqChipInfo, Vm, VmParams,
 };
@@ -138,8 +138,8 @@ impl Board {
         }
         let root = PciRoot::with_host_ids(std::mem::take(&mut self.pci), host_ids);
         self.reg.add(layout::PCI_ECAM_BASE, layout::PCI_ECAM_SIZE, Arc::new(Mutex::new(root.ecam_port())))?;
-        self.reg.add_bus_only(layout::PCI_MMIO_BASE, layout::PCI_MMIO_SIZE, root.window_port(layout::PCI_MMIO_BASE))?;
-        self.reg.add_bus_only(layout::PCI_MMIO64_BASE, layout::PCI_MMIO64_SIZE, root.window_port(layout::PCI_MMIO64_BASE))?;
+        self.reg.add_concurrent(layout::PCI_MMIO_BASE, layout::PCI_MMIO_SIZE, Arc::new(root.window_port(layout::PCI_MMIO_BASE)))?;
+        self.reg.add_concurrent(layout::PCI_MMIO64_BASE, layout::PCI_MMIO64_SIZE, Arc::new(root.window_port(layout::PCI_MMIO64_BASE)))?;
         self.fdt.push(board::FdtDevice::PciEcam {
             ecam_base: layout::PCI_ECAM_BASE,
             ecam_size: layout::PCI_ECAM_SIZE,
@@ -179,9 +179,15 @@ impl DeviceRegistry {
         Ok(())
     }
 
-    /// On the bus, but its state lives elsewhere (PCI windows).
+    /// On the bus, but its state lives elsewhere (the emulated MSI frame).
     pub fn add_bus_only<T: BusDevice + 'static>(&mut self, base: u64, len: u64, dev: T) -> Result<()> {
         self.bus.insert(base, len, Arc::new(Mutex::new(dev))).map_err(Error::Setup)
+    }
+
+    /// On the bus without a lock of its own; its state lives elsewhere
+    /// (PCI windows: the devices behind them are snapshotted by the root).
+    pub fn add_concurrent(&mut self, base: u64, len: u64, dev: Arc<dyn ConcurrentBusDevice>) -> Result<()> {
+        self.bus.insert_concurrent(base, len, dev).map_err(Error::Setup)
     }
 }
 

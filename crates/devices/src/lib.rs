@@ -16,7 +16,7 @@ pub mod pl011;
 pub mod pl031;
 pub mod usb;
 
-pub use bus::{Bus, BusBuilder, BusDevice, BusRange, SharedDevice};
+pub use bus::{Bus, BusBuilder, BusDevice, BusRange, ConcurrentBusDevice, SharedDevice};
 pub use irq::{IrqLine, NoIrq};
 
 /// A device that sits on the bus and can be snapshotted.

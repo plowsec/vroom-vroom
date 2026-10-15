@@ -9,6 +9,37 @@ pub trait BusDevice: Send {
 
 pub type SharedDevice = Arc<Mutex<dyn BusDevice>>;
 
+/// A bus device that does its own locking (or needs none), so accesses
+/// from several vCPUs can run at the same time. The PCI windows are like
+/// this: each device behind them has its own lock, and one lock around
+/// the whole window would make every vCPU wait for every PCI device.
+pub trait ConcurrentBusDevice: Send + Sync {
+    fn read(&self, offset: u64, data: &mut [u8]);
+    fn write(&self, offset: u64, data: &[u8]);
+}
+
+#[derive(Clone)]
+enum Entry {
+    Locked(SharedDevice),
+    Concurrent(Arc<dyn ConcurrentBusDevice>),
+}
+
+impl Entry {
+    fn read(&self, off: u64, data: &mut [u8]) {
+        match self {
+            Entry::Locked(d) => d.lock().unwrap_or_else(|e| e.into_inner()).read(off, data),
+            Entry::Concurrent(d) => d.read(off, data),
+        }
+    }
+
+    fn write(&self, off: u64, data: &[u8]) {
+        match self {
+            Entry::Locked(d) => d.lock().unwrap_or_else(|e| e.into_inner()).write(off, data),
+            Entry::Concurrent(d) => d.write(off, data),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct BusRange {
     pub base: u64,
@@ -27,7 +58,7 @@ impl BusRange {
 /// Collects devices, then freezes into an immutable [`Bus`].
 #[derive(Default)]
 pub struct BusBuilder {
-    entries: Vec<(BusRange, SharedDevice)>,
+    entries: Vec<(BusRange, Entry)>,
 }
 
 impl std::fmt::Debug for BusBuilder {
@@ -42,6 +73,14 @@ impl BusBuilder {
     }
 
     pub fn insert(&mut self, base: u64, len: u64, dev: SharedDevice) -> Result<(), String> {
+        self.insert_entry(base, len, Entry::Locked(dev))
+    }
+
+    pub fn insert_concurrent(&mut self, base: u64, len: u64, dev: Arc<dyn ConcurrentBusDevice>) -> Result<(), String> {
+        self.insert_entry(base, len, Entry::Concurrent(dev))
+    }
+
+    fn insert_entry(&mut self, base: u64, len: u64, dev: Entry) -> Result<(), String> {
         if len == 0 || base.checked_add(len).is_none() {
             return Err(format!("bad bus range {base:#x}+{len:#x}"));
         }
@@ -63,7 +102,7 @@ impl BusBuilder {
 /// own lock so vCPUs touching different devices don't contend.
 #[derive(Clone, Default)]
 pub struct Bus {
-    entries: Arc<Vec<(BusRange, SharedDevice)>>,
+    entries: Arc<Vec<(BusRange, Entry)>>,
 }
 
 impl std::fmt::Debug for Bus {
@@ -73,7 +112,7 @@ impl std::fmt::Debug for Bus {
 }
 
 impl Bus {
-    fn find(&self, addr: u64) -> Option<(u64, &SharedDevice)> {
+    fn find(&self, addr: u64) -> Option<(u64, &Entry)> {
         let i = self.entries.partition_point(|(r, _)| r.base <= addr);
         if i == 0 {
             return None;
@@ -86,7 +125,7 @@ impl Bus {
     pub fn read(&self, addr: u64, data: &mut [u8]) -> bool {
         match self.find(addr) {
             Some((off, d)) => {
-                d.lock().unwrap_or_else(|e| e.into_inner()).read(off, data);
+                d.read(off, data);
                 true
             }
             None => false,
@@ -96,7 +135,7 @@ impl Bus {
     pub fn write(&self, addr: u64, data: &[u8]) -> bool {
         match self.find(addr) {
             Some((off, d)) => {
-                d.lock().unwrap_or_else(|e| e.into_inner()).write(off, data);
+                d.write(off, data);
                 true
             }
             None => false,
@@ -134,5 +173,26 @@ mod tests {
         assert_eq!(u32::from_le_bytes(d), 6);
         assert!(!bus.read(0x1100, &mut d));
         assert!(!bus.read(0x0fff, &mut d));
+    }
+
+    struct Echo;
+    impl ConcurrentBusDevice for Echo {
+        fn read(&self, off: u64, data: &mut [u8]) {
+            crate::put_le(data, off);
+        }
+        fn write(&self, _off: u64, _data: &[u8]) {}
+    }
+
+    #[test]
+    fn concurrent_entries() {
+        let mut b = BusBuilder::new();
+        b.insert(0x1000, 0x100, Arc::new(Mutex::new(Reg(10)))).unwrap();
+        assert!(b.insert_concurrent(0x10f0, 0x100, Arc::new(Echo)).is_err());
+        b.insert_concurrent(0x3000, 0x100, Arc::new(Echo)).unwrap();
+        let bus = b.build();
+        let mut d = [0u8; 4];
+        assert!(bus.read(0x3008, &mut d));
+        assert_eq!(u32::from_le_bytes(d), 8);
+        assert!(!bus.read(0x3100, &mut d));
     }
 }

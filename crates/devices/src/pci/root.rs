@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use vroom_snapshot::{decode, encode, Snapshottable};
 
 use super::{ConfigSpace, PciId, SharedPciDevice, VendorIds};
-use crate::{BusDevice, IrqLine};
+use crate::{BusDevice, ConcurrentBusDevice, IrqLine};
 
 /// Four shared level-triggered lines; a line is high while any device
 /// on it asserts.
@@ -204,13 +204,13 @@ pub struct WindowPort {
     base: u64,
 }
 
-impl BusDevice for WindowPort {
-    fn read(&mut self, offset: u64, data: &mut [u8]) {
+impl ConcurrentBusDevice for WindowPort {
+    fn read(&self, offset: u64, data: &mut [u8]) {
         if !self.root.mmio(self.base + offset, data, None) {
             data.fill(0xff);
         }
     }
-    fn write(&mut self, offset: u64, data: &[u8]) {
+    fn write(&self, offset: u64, data: &[u8]) {
         let mut scratch = [0u8; 8];
         self.root.mmio(self.base + offset, &mut scratch[..data.len().min(8)], Some(data));
     }
