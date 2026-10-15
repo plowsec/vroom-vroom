@@ -237,3 +237,31 @@ fn sandboxed_external_echo() {
     }
     panic!("no echo reply under sandbox");
 }
+
+#[test]
+fn gateway_answers_ping() {
+    let mut n = Nat::new(NatConfig::new(MAC)).unwrap();
+    // The guest asks for the gateway's MAC first, as a real one does.
+    let mut arp = Vec::new();
+    arp.extend_from_slice(&[0xff; 6]);
+    arp.extend_from_slice(&MAC);
+    arp.extend_from_slice(&[0x08, 0x06, 0, 1, 8, 0, 6, 4, 0, 1]);
+    arp.extend_from_slice(&MAC);
+    arp.extend_from_slice(&GUEST.octets());
+    arp.extend_from_slice(&[0; 6]);
+    arp.extend_from_slice(&GATEWAY.octets());
+    n.send_frame(&arp);
+    while n.recv_frame().is_some() {}
+    let mut echo = vec![8, 0, 0, 0, 0x12, 0x34, 0, 1];
+    echo.extend_from_slice(b"ping payload");
+    let c = checksum(0, &echo);
+    echo[2..4].copy_from_slice(&c.to_be_bytes());
+    n.send_frame(&build_icmp(GATEWAY_MAC, MAC, GUEST, GATEWAY, &echo));
+    let reply = std::iter::from_fn(|| n.recv_frame())
+        .find(|f| parse_ipv4(f).is_some_and(|ip| ip.proto == PROTO_ICMP))
+        .expect("echo reply");
+    let ip = parse_ipv4(&reply).unwrap();
+    assert_eq!((ip.src, ip.dst), (GATEWAY, GUEST));
+    assert_eq!(ip.payload[0], 0);
+    assert_eq!(&ip.payload[8..], b"ping payload");
+}

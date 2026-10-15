@@ -15,7 +15,7 @@ mio.workspace = true
 libc.workspace = true
 getrandom = "0.2"
 socket2 = "0.5"
-smoltcp = { version = "0.14", default-features = false, features = ["std", "log", "medium-ethernet", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "socket-icmp", "socket-raw", "proto-dhcpv4"] }
+smoltcp = { version = "0.14", default-features = false, features = ["std", "log", "medium-ethernet", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "socket-icmp", "socket-raw", "proto-dhcpv4", "auto-icmp-echo-reply"] }
 
 [dev-dependencies]
 vroom-sandbox.workspace = true
