@@ -25,6 +25,9 @@ use port::Port;
 use serde::Deserialize;
 
 const MAX_PORTS_PER_USER: usize = 32;
+/// Connections handled at once (each holds a thread): a local user can't
+/// starve the daemon by opening sockets and saying nothing.
+const MAX_CONNS: usize = 64;
 const MAX_FRAME: usize = 65536;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -203,8 +206,13 @@ fn handle(st: Arc<State>, mut s: UnixStream) {
         Ok(r) => r,
         Err(e) => return refuse(&mut s, &format!("bad request: {e}")),
     };
-    if req.version != VERSION || !valid_name(&req.vm) || req.nic >= 16 || req.mac[0] & 1 != 0 {
+    if req.version != VERSION || !valid_name(&req.vm) || req.nic >= 16 {
         return refuse(&mut s, "invalid request");
+    }
+    // Unicast and locally administered only: a VM (or a compromised VMM)
+    // can't take the MAC of a real device on the LAN, e.g. the router's.
+    if req.mac[0] & 0x03 != 0x02 {
+        return refuse(&mut s, "mac must be a locally administered unicast address (x2:..., x6:..., xA:..., xE:...)");
     }
     {
         let mut pu = st.per_user.lock().unwrap_or_else(|e| e.into_inner());
@@ -290,11 +298,20 @@ fn main() {
     }
     log::info!("listening on {} (group {})", cfg.socket.display(), cfg.group);
     let st = Arc::new(State { cfg, per_user: Mutex::new(HashMap::new()) });
+    let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     for conn in listener.incoming() {
         match conn {
-            Ok(s) => {
-                let st = st.clone();
-                std::thread::spawn(move || handle(st, s));
+            Ok(mut s) => {
+                if live.load(Ordering::Acquire) >= MAX_CONNS {
+                    refuse(&mut s, "busy");
+                    continue;
+                }
+                live.fetch_add(1, Ordering::AcqRel);
+                let (st, live) = (st.clone(), live.clone());
+                std::thread::spawn(move || {
+                    handle(st, s);
+                    live.fetch_sub(1, Ordering::AcqRel);
+                });
             }
             Err(e) => log::warn!("accept: {e}"),
         }

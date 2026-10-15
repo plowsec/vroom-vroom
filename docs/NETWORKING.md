@@ -40,8 +40,13 @@ and [Darwin ICMP implementation](https://github.com/apple-oss-distributions/xnu/
 ## Limits and unfinished work
 
 - IPv6, router advertisements, DHCPv6 and NAT64 are not implemented.
-- Bridged and host-only modes are defined in the config but the machine builder
-  rejects them; the privileged network helper is not wired up.
+- Bridged and host-only go through `bulwark-netd` (root): vmnet on macOS,
+  tap + bridge on Linux. The plumbing is tested, but not yet against a real
+  vmnet/tap (needs root). netd only accepts locally administered unicast
+  MACs (`x2:`, `x6:`, `xA:`, `xE:`...), so a VM can't take a real device's
+  address on the LAN; the default per-VM MACs (`02:...`) are such. It
+  refuses frames from any other source MAC, and serves at most 64
+  connections at once and 32 ports per user.
 - Port forwarding supports TCP only. UDP inbound forwarding is not implemented.
 - This is an echo relay, not general ICMP forwarding. Remote ICMP errors,
   end-to-end traceroute, and guest-visible path MTU discovery remain incomplete.
