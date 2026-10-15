@@ -32,7 +32,7 @@ fuzz_target!(|data: &[u8]| {
     let r = IntxRouter::new(vec![Arc::new(NoIrq); 4]);
     let dev: SharedPciDevice = Arc::new(Mutex::new(VirtioPci::new(1, Box::new(Rng::new()), mem, r.pin(1, 1), Arc::new(NoMsi))));
     let root = PciRoot::new(vec![(1, dev)]);
-    let (mut ecam, mut win) = (root.ecam_port(), root.window_port(WIN));
+    let (mut ecam, win) = (root.ecam_port(), root.window_port(WIN));
     // BAR0 (64-bit) at WIN, memory decoding + bus mastering on.
     ecam.write(DEV + 0x10, &(WIN as u32).to_le_bytes());
     ecam.write(DEV + 0x14, &0u32.to_le_bytes());
