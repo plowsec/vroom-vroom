@@ -222,7 +222,7 @@ picks the right one by itself:
   where virglrenderer replays it on OpenGL ES, which ANGLE turns into
   Metal. Stock Ubuntu works as it is (any kernel, Mesa from the archive).
   `glxinfo -B` shows `virgl (ANGLE (Apple, ANGLE Metal Renderer: Apple M…))`
-  and GNOME draws with the Mac's GPU.
+  and GNOME draws with the Mac's GPU, in Wayland and X11 sessions.
 - **Vulkan** (Venus): needs `mesa-vulkan-drivers` (Mesa ≥ 24), the user
   in the `render` group, and on macOS hosts a kernel with **16 KiB pages**
   (HVF maps guest memory at 16 KiB granularity). Ubuntu ships no such
@@ -267,8 +267,9 @@ macOS, and it works with any guest kernel.
 
 Snapshots and suspend: GPU state lives on the host GPU and can't be
 saved, so snapshots and suspend are refused while 3D contexts exist.
-With OpenGL on, the GNOME desktop itself is one, so in practice: shut the
-guest down instead of suspending it. Closing the window then leaves the
+With OpenGL on there always is one, even at a text console: Ubuntu's
+udev opens a GL context at boot and keeps it. So shut the guest down
+instead of suspending it. Closing the window then leaves the
 VM paused with "suspend failed"; resume it and shut down from the guest,
 or power it off. With `opengl = false` this only happens while a Vulkan
 app runs. Windows guests are not covered: Windows has no virgl or Venus
@@ -464,8 +465,8 @@ instead of the microphone. The window gate still applies.
   (the disks too).
 - `Ctrl-A z` / `Ctrl+Alt+Shift+Z` / closing the GUI window: suspend; the
   next `run` resumes. `--fresh` ignores the suspend image.
-- Not possible while 3D contexts are active. With OpenGL on, the GNOME
-  desktop is one (see 3D acceleration).
+- Not possible while 3D contexts are active. With OpenGL on there always
+  is one (see 3D acceleration).
 - `vroom snapshot list vm.toml`, `vroom snapshot delete vm.toml snap-…`:
   deleting a snapshot also removes the disk layers only it used, and merges
   layers that became pass-through, so disk chains stay short.

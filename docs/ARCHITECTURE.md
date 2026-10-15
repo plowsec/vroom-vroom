@@ -116,6 +116,11 @@ is pending. A GL scanout is copied back on flush: from a context of our
 own, into a pixel buffer on the GPU, and shown when the copy lands while
 the worker goes on.
 
+With GL on, 2D resources (dumb buffers) live in virglrenderer too, as in
+QEMU: Xorg's glamor draws into them with GL, and a context that touches
+a resource virglrenderer doesn't know is marked broken for good (every
+window turns black). Without GL they stay plain CPU buffers.
+
 macOS constraints: HVF maps at 16 KiB granularity, so guests need a 16 KiB
 page kernel (or blob sizes that are 16 KiB multiples), and MoltenVK lacks
 `VK_KHR_external_memory_fd`, which Mesa requires; our virglrenderer patch

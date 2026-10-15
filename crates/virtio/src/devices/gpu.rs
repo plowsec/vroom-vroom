@@ -79,6 +79,8 @@ const BLOB_MEM_GUEST: u32 = 1;
 const BLOB_MEM_HOST3D: u32 = 2;
 const BLOB_MEM_HOST3D_GUEST: u32 = 3;
 const PIPE_TEXTURE_2D: u32 = 2;
+const BIND_RENDER_TARGET: u32 = 1 << 1;
+const RESOURCE_FLAG_Y_0_TOP: u32 = 1;
 /// virgl's GL capset: a context made with capset 0 (classic virgl) uses it.
 const CAPSET_VIRGL2: u32 = 2;
 
@@ -405,7 +407,10 @@ impl GpuHandler {
                 b[16..20].copy_from_slice(&1u32.to_le_bytes()); // enabled
                 (OK_DISPLAY_INFO, b)
             }
-            RESOURCE_CREATE_2D => (self.create(r), vec![]),
+            RESOURCE_CREATE_2D => match self.three_d.clone() {
+                Some(t) if t.gl => (self.create_2d_gl(r, &t), vec![]),
+                _ => (self.create(r), vec![]),
+            },
             RESOURCE_UNREF => {
                 let Some(id) = rd32(r) else { return (ERR_INVALID_PARAMETER, vec![]) };
                 (self.unref(id), vec![])
@@ -415,6 +420,11 @@ impl GpuHandler {
             TRANSFER_TO_HOST_2D => {
                 let Some(rect) = Rect::read(r) else { return (ERR_INVALID_PARAMETER, vec![]) };
                 let (Some(offset), Some(id)) = (rd64(r), rd32(r)) else { return (ERR_INVALID_PARAMETER, vec![]) };
+                if let (true, Some(t)) = (self.res3d.contains_key(&id), &self.three_d) {
+                    let bx = Box3d { x: rect.x, y: rect.y, z: 0, w: rect.w, h: rect.h, d: 1 };
+                    let tr = Transfer3d { resource: id, level: 0, stride: 0, layer_stride: 0, bx, offset };
+                    return (if t.r().transfer(true, 0, &tr) { OK_NODATA } else { ERR_INVALID_PARAMETER }, vec![]);
+                }
                 (self.transfer(mem, id, rect, offset, None), vec![])
             }
             RESOURCE_ATTACH_BACKING => (self.attach(mem, r), vec![]),
@@ -597,6 +607,31 @@ impl GpuHandler {
         self.create_cpu(id, format, w, h)
     }
 
+    /// With GL, a 2D resource (a dumb buffer) lives in virglrenderer, like
+    /// in QEMU: guest GL draws into them too (Xorg's glamor does), and a
+    /// context that touches one virglrenderer doesn't know is dead for good.
+    fn create_2d_gl(&mut self, r: &mut Reader, t: &ThreeD) -> u32 {
+        let (Some(id), Some(format), Some(w), Some(h)) = (rd32(r), rd32(r), rd32(r), rd32(r)) else {
+            return ERR_INVALID_PARAMETER;
+        };
+        if swizzle(format).is_none() || w == 0 || h == 0 || w > MAX_DIM || h > MAX_DIM {
+            return ERR_INVALID_PARAMETER;
+        }
+        let a = Create3d {
+            target: PIPE_TEXTURE_2D,
+            format,
+            bind: BIND_RENDER_TARGET,
+            width: w,
+            height: h,
+            depth: 1,
+            array_size: 1,
+            last_level: 0,
+            nr_samples: 0,
+            flags: RESOURCE_FLAG_Y_0_TOP,
+        };
+        self.create_tex(id, &a, t)
+    }
+
     fn create_cpu(&mut self, id: u32, format: u32, w: u32, h: u32) -> u32 {
         if !self.id_free(id) || swizzle(format).is_none() {
             return ERR_INVALID_PARAMETER;
@@ -640,14 +675,18 @@ impl GpuHandler {
         if !t.gl && a.target == PIPE_TEXTURE_2D && a.depth <= 1 && a.array_size <= 1 && a.last_level == 0 && a.nr_samples <= 1 && swizzle(a.format).is_some() {
             return (self.create_cpu(id, a.format, a.width, a.height), vec![]);
         }
+        (self.create_tex(id, &a, t), vec![])
+    }
+
+    fn create_tex(&mut self, id: u32, a: &Create3d, t: &ThreeD) -> u32 {
         if !self.id_free(id) || self.resource_count() >= MAX_RESOURCES {
-            return (ERR_INVALID_PARAMETER, vec![]);
+            return ERR_INVALID_PARAMETER;
         }
-        if !t.r().create_3d(id, &a) {
-            return (ERR_UNSPEC, vec![]);
+        if !t.r().create_3d(id, a) {
+            return ERR_UNSPEC;
         }
         self.res3d.insert(id, Res3d { tex: Some((a.format, a.width, a.height)), ..Default::default() });
-        (OK_NODATA, vec![])
+        OK_NODATA
     }
 
     /// Read `n` (addr, len) entries; each must be guest RAM.
@@ -1282,6 +1321,113 @@ mod tests {
         assert!(read_backing(&mem, &b, 1, &mut out));
         assert_eq!(out, [2, 3, 4, 5]);
         assert!(!read_backing(&mem, &b, 4, &mut out)); // runs past the end
+    }
+
+    /// A GL renderer that only records what reaches it.
+    struct FakeGl(Arc<Mutex<Vec<String>>>);
+    impl Renderer3d for FakeGl {
+        fn capsets(&self) -> Vec<(u32, u32, u32)> {
+            vec![(CAPSET_VIRGL2, 2, 0)]
+        }
+        fn capset(&mut self, _: u32, _: u32) -> Option<Vec<u8>> {
+            None
+        }
+        fn context_create(&mut self, _: u32, _: u32, _: &[u8]) -> bool {
+            true
+        }
+        fn context_destroy(&mut self, _: u32) {}
+        fn context_attach(&mut self, ctx: u32, res: u32) {
+            self.0.lock().unwrap().push(format!("attach {ctx} {res}"));
+        }
+        fn context_detach(&mut self, _: u32, _: u32) {}
+        fn submit(&mut self, _: u32, _: &mut [u8]) -> bool {
+            true
+        }
+        fn create_3d(&mut self, res: u32, a: &Create3d) -> bool {
+            self.0.lock().unwrap().push(format!("create {res} {}x{} fmt {} target {}", a.width, a.height, a.format, a.target));
+            true
+        }
+        fn attach_backing(&mut self, _: u32, _: crate::devices::gpu3d::HostIov) -> bool {
+            true
+        }
+        fn detach_backing(&mut self, _: u32) {}
+        fn transfer(&mut self, to_host: bool, ctx: u32, t: &Transfer3d) -> bool {
+            self.0.lock().unwrap().push(format!("transfer {to_host} ctx {ctx} res {} {}x{}", t.resource, t.bx.w, t.bx.h));
+            true
+        }
+        fn create_blob(&mut self, _: &Blob, _: crate::devices::gpu3d::HostIov) -> bool {
+            false
+        }
+        fn map_blob(&mut self, _: u32) -> Option<crate::devices::gpu3d::Mapping> {
+            None
+        }
+        fn unmap_blob(&mut self, _: u32) {}
+        fn read_mapped(&mut self, _: u32, _: u64, _: &mut [u8]) -> bool {
+            false
+        }
+        fn read_back(&mut self, _: u32, _: Box3d, _: u32, _: &mut [u8]) -> bool {
+            false
+        }
+        fn unref(&mut self, _: u32) {}
+        fn create_fence(&mut self, _: u32, _: Option<u8>, _: u64) -> bool {
+            true
+        }
+        fn poll_fd(&self) -> Option<std::os::fd::RawFd> {
+            None
+        }
+        fn poll(&mut self) -> Vec<crate::devices::gpu3d::FenceDone> {
+            vec![]
+        }
+        fn reset(&mut self) {}
+    }
+    struct NoMap;
+    impl ShmMapper for NoMap {
+        fn map(&self, _: u64, _: &crate::devices::gpu3d::Mapping) -> bool {
+            false
+        }
+        fn unmap(&self, _: u64, _: u64) {}
+    }
+
+    /// Run one command (header + body) through the handler.
+    fn run(h: &mut GpuHandler, ty: u32, ctx: u32, body: &[u32]) -> u32 {
+        use crate::queue::tests::*;
+        let mut ring = TestRing::new(4);
+        let hdr = Hdr { ty, flags: 0, fence: 0, ctx, ring: 0 };
+        let b: Vec<u8> = body.iter().flat_map(|v| v.to_le_bytes()).collect();
+        ring.add_chain(&[(b.len() as u32, false)]);
+        ring.mem.write(GuestAddress(DATA), &b).unwrap();
+        let mem = ring.mem.clone();
+        let (mut r, _) = ring.q.clone().pop(&mem).unwrap().unwrap().into_rw().unwrap();
+        h.command(&mem, &mut r, &hdr).0
+    }
+
+    #[test]
+    fn gl_dumb_buffers_live_in_the_renderer() {
+        // Xorg's glamor draws into dumb buffers (RESOURCE_CREATE_2D). With
+        // GL they must exist in the renderer, or the first GL use of one
+        // kills the guest's context and every window turns black.
+        let log = Arc::new(Mutex::new(vec![]));
+        let t = ThreeD::new(Box::new(FakeGl(log.clone())), Arc::new(NoMap), 0);
+        let (gpu, _ctl) = Gpu::new(64, 64, Arc::new(Rec::default()));
+        let gpu = gpu.with_3d(t);
+        let mut h = gpu.handler();
+        assert_eq!(run(&mut h, RESOURCE_CREATE_2D, 0, &[5, 2, 64, 32]), OK_NODATA);
+        assert!(h.resources.is_empty() && h.res3d.contains_key(&5));
+        assert_eq!(run(&mut h, TRANSFER_TO_HOST_2D, 0, &[0, 0, 64, 32, 0, 0, 5, 0]), OK_NODATA);
+        let mut name = [0u32; 18];
+        name[0] = 4;
+        name[1] = CAPSET_VIRGL2;
+        assert_eq!(run(&mut h, CTX_CREATE, 1, &name), OK_NODATA);
+        assert_eq!(run(&mut h, CTX_ATTACH_RESOURCE, 1, &[5, 0]), OK_NODATA);
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["create 5 64x32 fmt 2 target 2", "transfer true ctx 0 res 5 64x32", "attach 1 5"]
+        );
+        // Without GL nothing changes: the CPU keeps them.
+        let (gpu, _ctl) = Gpu::new(64, 64, Arc::new(Rec::default()));
+        let mut h = gpu.handler();
+        assert_eq!(run(&mut h, RESOURCE_CREATE_2D, 0, &[5, 2, 64, 32]), OK_NODATA);
+        assert!(h.resources.contains_key(&5));
     }
 
     #[test]
