@@ -6,7 +6,7 @@ mod root;
 
 use std::sync::{Arc, Mutex};
 
-pub use config::{BarSpec, ConfigSpace, PciId, CFG_SIZE};
+pub use config::{BarSpec, ConfigSpace, PciId, VendorIds, CFG_SIZE};
 pub use msix::{Msix, MsiSender};
 pub use root::{Intx, IntxRouter, PciRoot};
 

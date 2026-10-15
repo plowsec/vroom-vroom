@@ -60,17 +60,20 @@ pub struct Input {
     worker: WorkerSlot<InputHandler>,
     /// What the guest reads as the device name.
     name: String,
+    /// Vendor in the device IDs (product: 1 keyboard, 2 tablet).
+    vendor: u16,
 }
 
 impl Input {
     pub fn new(kind: InputKind, events: StdUnixDatagram) -> Self {
         let name = if kind == InputKind::Keyboard { "vroom Keyboard" } else { "vroom Tablet" };
-        Input { kind, events, select: 0, subsel: 0, worker: WorkerSlot::default(), name: name.into() }
+        Input { kind, events, select: 0, subsel: 0, worker: WorkerSlot::default(), name: name.into(), vendor: 0x1209 }
     }
 
-    /// Device name the guest sees (from the VM's `[identity]`).
-    pub fn with_name(mut self, name: &str) -> Self {
+    /// Device name and vendor ID the guest sees (from the VM's `[identity]`).
+    pub fn with_ids(mut self, name: &str, vendor: u16) -> Self {
         self.name = name.to_string();
+        self.vendor = vendor;
         self
     }
 
@@ -95,7 +98,8 @@ impl Input {
             (CFG_ID_SERIAL, _) => b"0".to_vec(),
             (CFG_ID_DEVIDS, k) => {
                 let product: u16 = if k == InputKind::Keyboard { 1 } else { 2 };
-                [0x06u16, 0x627b, product, 1].iter().flat_map(|v| v.to_le_bytes()).collect()
+                // BUS_VIRTUAL: it is a virtio device whatever it says.
+                [0x06u16, self.vendor, product, 1].iter().flat_map(|v| v.to_le_bytes()).collect()
             }
             (CFG_EV_BITS, InputKind::Keyboard) => match self.subsel as u16 {
                 EV_KEY => bits(&(1u16..=248).collect::<Vec<_>>()),
@@ -262,5 +266,19 @@ mod tests {
         t.read_config(0, &mut d);
         // BTN_LEFT = 0x110 -> byte 34, bit 0
         assert_eq!(d[8 + 34] & 1, 1);
+    }
+
+    #[test]
+    fn ids_from_config() {
+        let (a, _b) = StdUnixDatagram::pair().unwrap();
+        let mut k = Input::new(InputKind::Keyboard, a).with_ids("Logitech K120", 0x046d);
+        k.write_config(0, &[CFG_ID_NAME, 0]);
+        let mut d = [0u8; 21];
+        k.read_config(0, &mut d);
+        assert_eq!((d[2], &d[8..21]), (13, &b"Logitech K120"[..]));
+        k.write_config(0, &[CFG_ID_DEVIDS, 0]);
+        let mut d = [0u8; 16];
+        k.read_config(0, &mut d);
+        assert_eq!(&d[8..16], &[0x06, 0, 0x6d, 0x04, 1, 0, 1, 0]);
     }
 }

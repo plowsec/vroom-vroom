@@ -213,8 +213,8 @@ pub fn act(c: &mut VmConfig, key: &str) -> Result<(), String> {
         }
         ["net", i, "mac", "random"] => {
             let i = idx(&mut c.nets, i, "adapter")?;
-            let r = random_bytes::<3>();
-            c.nets[i].mac = Some(format!("52:54:00:{:02x}:{:02x}:{:02x}", r[0], r[1], r[2]));
+            // identity.mac_prefix, not QEMU's 52:54:00.
+            c.nets[i].mac = Some(vroom_config::format_mac(&c.identity.mac(random_bytes())));
         }
         ["identity", "random"] => c.identity.randomize_serials(random_bytes()),
         ["identity", "reset"] => c.identity = vroom_config::Identity::default(),

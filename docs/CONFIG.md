@@ -68,7 +68,7 @@ port_forwards = [{ host_port = 2222, guest_port = 22 }]
 | `block_private` | nat | Guest can only reach the internet, not your LAN. |
 | `interface` | bridged | Host interface, e.g. `en0`. |
 | `network` | host-only | Network name. VMs with the same name see each other. |
-| `mac` | generated | `52:54:00:12:34:56`. |
+| `mac` | generated | `02:12:34:56:78:9a`. Generated ones start with `identity.mac_prefix`. |
 
 Bridged and host-only need the `vroom-netd` helper running as root. See
 [NETWORKING.md](NETWORKING.md).
@@ -126,31 +126,62 @@ defaults below. New VMs get random serials, so two VMs never match.
 | `vendor` | `vroom` | SMBIOS: BIOS vendor, system/chassis/CPU/memory maker |
 | `product` | `vroom VM` | SMBIOS system product |
 | `family` | `Virtual Machine` | SMBIOS system family |
+| `sku` | the VM's name | SMBIOS system SKU |
 | `version` | `1.0` | SMBIOS BIOS/system/chassis version |
 | `bios_date` | `10/14/2026` | SMBIOS BIOS date |
 | `serial` | from the VM's UUID | SMBIOS system and chassis serial |
+| `chassis_type` | 1 (other) | SMBIOS chassis type, 1-36: 3 desktop, 10 notebook, 35 mini PC |
+| `cpu_name` | `CPU` | SMBIOS processor version: the CPU name Windows and `dmidecode` show |
 | `announce_vm` | true | SMBIOS "virtual machine" BIOS flag and the ACPI hypervisor vendor field |
 | `acpi_oem_id` | `VROOM` | every ACPI table header and the RSDP (up to 6 chars) |
 | `acpi_table_id` | `VROOMVM` | every ACPI table header (up to 8) |
 | `acpi_creator_id` | `VRM` | every ACPI table header (up to 4) |
 | `hypervisor_id` | `VROOM` | ACPI FADT hypervisor vendor, if `announce_vm` |
+| `dt_model` | `linux,dummy-virt` | device tree `model` and `compatible` (direct kernel boot) |
 | `disk_model` | `vroom NVMe` | NVMe controller model |
 | `disk_serial` | `VRM` | disk serial prefix (NVMe and virtio), a number is added |
-| `usb_vendor_id` | `0x1209` | USB keyboard and tablet vendor ID |
+| `disk_firmware` | `1.0` | NVMe firmware revision (up to 8) |
+| `pci_bridge_id` | `1b36:0008` | PCI IDs of the host bridge |
+| `nvme_pci_id` | `1b36:0010` | PCI IDs of the NVMe controller; Identify reports the same vendor |
+| `usb_pci_id` | `1b36:000d` | PCI IDs of the USB (xHCI) controller |
+| `usb_vendor_id` | `0x1209` | USB keyboard and tablet vendor ID, also the virtio input vendor |
 | `usb_manufacturer` | `vroom` | USB and virtio input device names |
+| `mac_prefix` | `02` | first 1-3 bytes of generated NIC MACs, e.g. `00:1b:21` |
+| `nat_guest` | `10.0.2.15` | guest address on NAT |
+| `nat_gateway` | `10.0.2.2` | NAT gateway (DHCP server, default route) |
+| `nat_dns` | `10.0.2.3` | NAT DNS relay; may be the gateway's address |
+| `nat_gateway_mac` | `02:42:57:4b:00:01` | the gateway's MAC in the guest's ARP table |
 | `agent_port` | `org.vroom.agent.0` | guest agent port name. The agent finds a renamed port by itself if it's the only one; else start it with `--port` |
+
+PCI IDs are `vendor:device` or `vendor:device:subvendor:subdevice`, 4 hex
+digits each (`lspci -nn` shows them). Without the subsystem part it is
+`vendor:0000`. The default `1b36` is QEMU's vendor ID. A real chip's IDs
+make Linux apply that chip's driver quirks; class and revision don't change.
+
+The three NAT addresses share one private /24 (10/8, 172.16/12,
+192.168/16). Adapter N adds N to the third number, so `192.168.1.100`
+gives the second adapter `192.168.2.100`. The guest can't reach that /24
+on your LAN, so pick one your LAN doesn't use.
 
 ```toml
 [identity]
 vendor = "LENOVO"
 product = "ThinkStation P360"
+sku = "30FA"
+chassis_type = 3
 announce_vm = false
 acpi_oem_id = "LENOVO"
+nvme_pci_id = "144d:a808:144d:a801"
+mac_prefix = "00:1b:21"
+nat_guest = "192.168.1.100"
+nat_gateway = "192.168.1.1"
+nat_dns = "192.168.1.1"
 ```
 
 What it can't hide is in [SECURITY.md](SECURITY.md#what-the-guest-can-tell).
 Changing these on an installed Windows guest looks like new hardware to
-it (drivers re-install, activation may ask again).
+it (drivers re-install, activation may ask again). A new `mac_prefix` or
+NAT address shows up as a new network.
 
 ## State directory
 

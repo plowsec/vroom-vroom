@@ -5,6 +5,8 @@ Vroom currently provides an unprivileged IPv4 NAT backend. The guest sees
 address, route, DNS server and 1500-byte MTU. Each adapter has its own NAT
 instance on its own network: the second NAT adapter is `10.0.3.0/24`
 (guest `.15`, gateway `.2`, DNS `.3`), the third `10.0.4.0/24`, and so on.
+These are the defaults; `nat_guest`, `nat_gateway`, `nat_dns` and
+`nat_gateway_mac` in `[identity]` change them (see [CONFIG.md](CONFIG.md#identity)).
 
 The backend uses smoltcp for guest-facing TCP and normal host sockets for
 outbound traffic. It is a proxy, not a transparent IP router: host routing and

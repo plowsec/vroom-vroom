@@ -6,7 +6,7 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use vroom_arch::aarch64::{self as board, layout};
-use vroom_config::{Boot, DiskBus, Gpu, VmConfig};
+use vroom_config::{Boot, DiskBus, Gpu, Identity, VmConfig};
 use vroom_devices::{pl011::Pl011, pl031::Pl031, BusBuilder, BusDevice};
 use vroom_hv::{
     aarch64::mpidr_for, BootRegs, GicMsiConfig, Hypervisor, IrqChipConfig, IrqChipInfo, Vm, VmParams,
@@ -24,7 +24,7 @@ use vroom_virtio::devices::{block::Block, console::Console, fs::Fs, net::Net, rn
 use vroom_devices::nvme::{Namespace, Nvme};
 use vroom_devices::usb::hid::UsbIds;
 use vroom_devices::usb::xhci::Xhci;
-use vroom_devices::pci::{Intx, IntxRouter, MsiSender, PciRoot, SharedPciDevice};
+use vroom_devices::pci::{Intx, IntxRouter, MsiSender, PciRoot, SharedPciDevice, VendorIds};
 use vroom_devices::IrqLine;
 use vroom_virtio::mmio::{ShmRegion, VirtioMmio};
 use vroom_virtio::{pci::VirtioPci, VirtioDevice};
@@ -132,11 +132,11 @@ impl Board {
     }
 
     /// Put the root complex on the bus if anything needs it.
-    fn finish_pci(&mut self) -> Result<bool> {
+    fn finish_pci(&mut self, host_ids: VendorIds) -> Result<bool> {
         if self.pci.is_empty() && !self.use_pci {
             return Ok(false);
         }
-        let root = PciRoot::new(std::mem::take(&mut self.pci));
+        let root = PciRoot::with_host_ids(std::mem::take(&mut self.pci), host_ids);
         self.reg.add(layout::PCI_ECAM_BASE, layout::PCI_ECAM_SIZE, Arc::new(Mutex::new(root.ecam_port())))?;
         self.reg.add_bus_only(layout::PCI_MMIO_BASE, layout::PCI_MMIO_SIZE, root.window_port(layout::PCI_MMIO_BASE))?;
         self.reg.add_bus_only(layout::PCI_MMIO64_BASE, layout::PCI_MMIO64_SIZE, root.window_port(layout::PCI_MMIO64_BASE))?;
@@ -264,20 +264,34 @@ impl ShmMapper for VmShm {
     }
 }
 
-/// Deterministic, locally administered MAC per (VM, NIC index), so the guest
-/// keeps the same DHCP identity across boots without storing state.
-fn stable_mac(name: &str, idx: usize) -> [u8; 6] {
+/// Deterministic MAC per (VM, NIC index), so the guest keeps the same DHCP
+/// identity across boots without storing state. Starts with
+/// `identity.mac_prefix` (default 02: locally administered).
+fn stable_mac(ident: &Identity, name: &str, idx: usize) -> [u8; 6] {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in name.bytes().chain([0, idx as u8]) {
         h ^= b as u64;
         h = h.wrapping_mul(0x100_0000_01b3);
     }
     let b = h.to_le_bytes();
-    [0x02, b[0], b[1], b[2], b[3], b[4]]
+    ident.mac([b[0], b[1], b[2], b[3], b[4], b[5]])
+}
+
+/// A `*_pci_id` from `[identity]` (the config checked it already).
+fn vendor_ids(s: &str) -> Result<VendorIds> {
+    let [vendor, device, subsys_vendor, subsys] =
+        vroom_config::pci_ids(s).ok_or_else(|| Error::Setup(format!("bad PCI id {s:?}")))?;
+    Ok(VendorIds { vendor, device, subsys_vendor, subsys })
 }
 
 /// Backend for one NIC, and the MAC the guest must use.
-fn net_backend(vm: &str, idx: usize, n: &vroom_config::Net, mac: [u8; 6]) -> Result<(Box<dyn NetBackend>, [u8; 6])> {
+fn net_backend(
+    vm: &str,
+    ident: &Identity,
+    idx: usize,
+    n: &vroom_config::Net,
+    mac: [u8; 6],
+) -> Result<(Box<dyn NetBackend>, [u8; 6])> {
     let via_netd = |attach: netd::Attach| -> Result<(Box<dyn NetBackend>, [u8; 6])> {
         let sock = std::env::var_os("VROOM_NETD_SOCKET")
             .map(std::path::PathBuf::from)
@@ -290,9 +304,11 @@ fn net_backend(vm: &str, idx: usize, n: &vroom_config::Net, mac: [u8; 6]) -> Res
     match n.mode()? {
         NetMode::Nat { port_forwards } => {
             let mut cfg = NatConfig::new(mac);
-            // Adapter N: 10.0.(2+N).0/24, like VirtualBox: two NICs never
-            // share a subnet in the guest's routing table.
-            cfg.subnet = 2 + idx as u8;
+            // Adapter N: the first adapter's /24 plus N (10.0.(2+N).0/24 by
+            // default): two NICs never share a subnet in the guest's
+            // routing table.
+            (cfg.guest, cfg.gateway, cfg.dns) = ident.nat_addrs(idx);
+            cfg.gateway_mac = vroom_config::parse_mac(&ident.nat_gateway_mac)?;
             cfg.policy = NatPolicy { allow_host_loopback: n.allow_host_loopback, block_private: n.block_private };
             for p in port_forwards {
                 let ip: std::net::IpAddr =
@@ -404,10 +420,11 @@ pub(crate) fn build(
     }
     if !nvme_ns.is_empty() {
         let mem2 = mem.clone();
-        let (model, prefix) = (ident.disk_model.clone(), ident.disk_serial.clone());
+        let (model, prefix, fw) = (ident.disk_model.clone(), ident.disk_serial.clone(), ident.disk_firmware.clone());
+        let ids = vendor_ids(&ident.nvme_pci_id)?;
         board.add_pci(move |slot, intx, msi| {
             let serial = format!("{prefix}{slot:04}");
-            Arc::new(Mutex::new(Nvme::new(slot, nvme_ns, mem2, intx, msi).with_ids(&model, &serial)))
+            Arc::new(Mutex::new(Nvme::new(slot, nvme_ns, mem2, intx, msi).with_ids(&model, &serial, &fw).with_pci_ids(ids)))
         })?;
     }
 
@@ -439,9 +456,10 @@ pub(crate) fn build(
         if board.use_pci {
             let mem2 = mem.clone();
             let mut keep = None;
+            let pci_ids = vendor_ids(&ident.usb_pci_id)?;
             board.add_pci(|slot, intx, msi| {
                 let ids = UsbIds { vendor_id: ident.usb_vendor_id, manufacturer: ident.usb_manufacturer.clone() };
-                let x = Arc::new(Mutex::new(Xhci::new(slot, mem2, intx, msi).with_ids(&ids)));
+                let x = Arc::new(Mutex::new(Xhci::new(slot, mem2, intx, msi).with_ids(&ids).with_pci_ids(pci_ids)));
                 keep = Some(x.clone());
                 x
             })?;
@@ -449,9 +467,9 @@ pub(crate) fn build(
         } else {
             let (kbd_host, kbd_dev) = UnixDatagram::pair()?;
             let (tab_host, tab_dev) = UnixDatagram::pair()?;
-            let m = &ident.usb_manufacturer;
-            board.add_virtio(Box::new(Input::new(InputKind::Keyboard, kbd_dev).with_name(&format!("{m} Keyboard"))))?;
-            board.add_virtio(Box::new(Input::new(InputKind::Tablet, tab_dev).with_name(&format!("{m} Tablet"))))?;
+            let (m, v) = (&ident.usb_manufacturer, ident.usb_vendor_id);
+            board.add_virtio(Box::new(Input::new(InputKind::Keyboard, kbd_dev).with_ids(&format!("{m} Keyboard"), v)))?;
+            board.add_virtio(Box::new(Input::new(InputKind::Tablet, tab_dev).with_ids(&format!("{m} Tablet"), v)))?;
             input = Some(InputPipes { kbd: Some(kbd_host), tablet: Some(tab_host), usb: None });
         }
     }
@@ -474,12 +492,12 @@ pub(crate) fn build(
     for (i, n) in config.nets.iter().enumerate() {
         let mac = match &n.mac {
             Some(m) => vroom_config::parse_mac(m)?,
-            None => stable_mac(&config.name, i),
+            None => stable_mac(ident, &config.name, i),
         };
-        let (backend, mac) = net_backend(&config.name, i, n, mac)?;
+        let (backend, mac) = net_backend(&config.name, ident, i, n, mac)?;
         board.add_virtio(Box::new(Net::new(&format!("eth{i}"), mac, backend)))?;
     }
-    let need_pci = board.finish_pci()?;
+    let need_pci = board.finish_pci(vendor_ids(&ident.pci_bridge_id)?)?;
     let Board { mut reg, fdt: mut fdt_devices, .. } = board;
     if config.tpm {
         let backend = crate::tpm::Swtpm::start(&env.state_dir.join("tpm"), !env.resuming)?;
@@ -499,6 +517,7 @@ pub(crate) fn build(
         gic_msi: Some((layout::GIC_MSI_BASE, info.msi_size)),
         devices,
         psci_smc: config.nested,
+        model: ident.dt_model.clone(),
     };
     let boot = match &config.boot {
         Boot::Kernel { kernel, initrd, cmdline } => {
@@ -536,13 +555,15 @@ pub(crate) fn build(
                 screen.as_ref().map(Arc::downgrade),
                 config.tpm.then_some(layout::TPM_BASE),
                 &vroom_arch::smbios::SmbiosConfig {
-                    vm_name: config.name.clone(),
+                    sku: ident.sku_or(&config.name).to_string(),
                     vendor: ident.vendor.clone(),
                     product: ident.product.clone(),
                     family: ident.family.clone(),
                     version: ident.version.clone(),
                     bios_date: ident.bios_date.clone(),
                     serial: ident.serial.clone(),
+                    chassis_type: ident.chassis_type,
+                    cpu_name: ident.cpu_name.clone(),
                     announce_vm: ident.announce_vm,
                     uuid: env.uuid,
                     cpus: config.cpus,
@@ -581,4 +602,26 @@ pub(crate) fn build(
     vm.finalize()?;
 
     Ok(Machine { vm, mem, shared, vcpus, devices: reg.stateful, uart, agent, viewer, screen, boot })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn macs_and_pci_ids_from_identity() {
+        let mut ident = Identity::default();
+        // Same MAC as before mac_prefix existed: 02 then five hash bytes.
+        let m = stable_mac(&ident, "dev", 0);
+        assert_eq!(m[0], 0x02);
+        assert_ne!(stable_mac(&ident, "dev", 1), m);
+        ident.mac_prefix = "00:1b:21".into();
+        let v = stable_mac(&ident, "dev", 0);
+        assert_eq!((&v[..3], &v[3..]), (&[0x00, 0x1b, 0x21][..], &m[1..4]));
+        let ids = vendor_ids(&ident.nvme_pci_id).unwrap();
+        assert_eq!(ids, VendorIds { vendor: 0x1b36, device: 0x0010, subsys_vendor: 0x1b36, subsys: 0 });
+        let ids = vendor_ids("144d:a808:144d:a801").unwrap();
+        assert_eq!((ids.device, ids.subsys), (0xa808, 0xa801));
+        assert!(vendor_ids("144d").is_err());
+    }
 }

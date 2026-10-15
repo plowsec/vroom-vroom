@@ -43,6 +43,8 @@ pub struct FdtConfig {
     pub devices: Vec<FdtDevice>,
     /// PSCI via SMC (guest at EL2) instead of HVC.
     pub psci_smc: bool,
+    /// Root "model" and "compatible" (`identity.dt_model`).
+    pub model: String,
 }
 
 pub fn create_fdt(cfg: &FdtConfig) -> Result<Vec<u8>> {
@@ -52,10 +54,11 @@ pub fn create_fdt(cfg: &FdtConfig) -> Result<Vec<u8>> {
 fn build(cfg: &FdtConfig) -> FdtWriterResult<Vec<u8>> {
     let mut f = FdtWriter::new()?;
     let root = f.begin_node("")?;
-    f.property_string("compatible", "linux,dummy-virt")?;
-    // Same as QEMU virt: distro tools (Ubuntu flash-kernel) match on it and
-    // fail kernel upgrades on boards they don't know.
-    f.property_string("model", "linux,dummy-virt")?;
+    // Default "linux,dummy-virt", as on QEMU virt: distro tools (Ubuntu
+    // flash-kernel) match on it and fail kernel upgrades on boards they
+    // don't know.
+    f.property_string("compatible", &cfg.model)?;
+    f.property_string("model", &cfg.model)?;
     f.property_u32("#address-cells", 2)?;
     f.property_u32("#size-cells", 2)?;
     f.property_u32("interrupt-parent", PHANDLE_GIC)?;
@@ -315,6 +318,7 @@ mod tests {
                 FdtDevice::GpioPowerKey { base: GPIO_BASE, spi: GPIO_SPI },
             ],
             psci_smc: false,
+            model: "linux,dummy-virt".into(),
         }
     }
 
@@ -323,6 +327,15 @@ mod tests {
         let b = create_fdt(&cfg()).unwrap();
         assert_eq!(&b[..4], &[0xd0, 0x0d, 0xfe, 0xed]);
         assert!(b.len() < FDT_MAX_SIZE);
+    }
+
+    #[test]
+    fn model_from_config() {
+        let mut c = cfg();
+        c.model = "raspberrypi,4-model-b".into();
+        let b = create_fdt(&c).unwrap();
+        assert!(b.windows(22).any(|w| w == b"raspberrypi,4-model-b\0"));
+        assert!(!b.windows(5).any(|w| w == b"dummy"));
     }
 
     #[test]

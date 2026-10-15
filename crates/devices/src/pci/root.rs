@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use vroom_snapshot::{decode, encode, Snapshottable};
 
-use super::{ConfigSpace, PciId, SharedPciDevice};
+use super::{ConfigSpace, PciId, SharedPciDevice, VendorIds};
 use crate::{BusDevice, IrqLine};
 
 /// Four shared level-triggered lines; a line is high while any device
@@ -81,8 +81,20 @@ impl std::fmt::Debug for PciRoot {
 impl PciRoot {
     /// `devices`: (slot 1..=31, device). Slot 0 is the host bridge.
     pub fn new(devices: Vec<(u8, SharedPciDevice)>) -> Arc<Self> {
+        Self::with_host_ids(devices, VendorIds { vendor: 0x1b36, device: 0x0008, subsys_vendor: 0x1b36, subsys: 0 })
+    }
+
+    /// Same, with the host bridge's IDs (from the VM's `[identity]`).
+    pub fn with_host_ids(devices: Vec<(u8, SharedPciDevice)>, ids: VendorIds) -> Arc<Self> {
         let host = ConfigSpace::new(
-            PciId { vendor: 0x1b36, device: 0x0008, class: 0x06_00_00, revision: 0, subsys_vendor: 0x1b36, subsys: 0 },
+            PciId {
+                vendor: ids.vendor,
+                device: ids.device,
+                class: 0x06_00_00,
+                revision: 0,
+                subsys_vendor: ids.subsys_vendor,
+                subsys: ids.subsys,
+            },
             0,
         );
         Arc::new(PciRoot { host: Mutex::new(host), devices, map: RwLock::new(Vec::new()) })
@@ -321,5 +333,18 @@ mod tests {
         ecam.restore(&s).unwrap();
         win.read(0x8020, &mut q);
         assert_eq!(u64::from_le_bytes(q), 0x20);
+    }
+
+    #[test]
+    fn host_bridge_ids() {
+        let mut d = [0u8; 4];
+        PciRoot::new(vec![]).ecam_port().read(0, &mut d);
+        assert_eq!(u32::from_le_bytes(d), 0x0008_1b36);
+        let ids = VendorIds { vendor: 0x8086, device: 0x9a14, subsys_vendor: 0x17aa, subsys: 0x22d8 };
+        let mut ecam = PciRoot::with_host_ids(vec![], ids).ecam_port();
+        ecam.read(0, &mut d);
+        assert_eq!(u32::from_le_bytes(d), 0x9a14_8086);
+        ecam.read(0x2c, &mut d);
+        assert_eq!(u32::from_le_bytes(d), 0x22d8_17aa);
     }
 }

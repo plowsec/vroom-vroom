@@ -9,7 +9,7 @@ pub const ANCHOR_FILE: &str = "etc/smbios/smbios-anchor";
 
 #[derive(Debug, Clone)]
 pub struct SmbiosConfig {
-    pub vm_name: String,
+    pub sku: String,
     /// BIOS vendor and the system, chassis, CPU and memory maker.
     pub vendor: String,
     pub product: String,
@@ -18,6 +18,10 @@ pub struct SmbiosConfig {
     pub bios_date: String,
     /// System and chassis serial; None: from the UUID.
     pub serial: Option<String>,
+    /// SMBIOS chassis type (1 other, 3 desktop, ...).
+    pub chassis_type: u8,
+    /// Processor version string.
+    pub cpu_name: String,
     /// Set the BIOS "virtual machine" characteristic.
     pub announce_vm: bool,
     /// Stable per VM (activation, licensing and hardware ids key on it).
@@ -86,10 +90,10 @@ pub fn build(c: &SmbiosConfig) -> Smbios {
     t1.extend_from_slice(&smbios_uuid(&c.uuid));
     t1.extend_from_slice(&[6, 5, 6]); // wake-up: power switch; sku; family
     let serial: String = c.serial.clone().unwrap_or_else(|| c.uuid.iter().map(|x| format!("{x:02X}")).collect());
-    b.add(1, &t1, &[vendor, &c.product, version, &serial, &c.vm_name, &c.family]);
+    b.add(1, &t1, &[vendor, &c.product, version, &serial, &c.sku, &c.family]);
 
     // Type 3, chassis. 1 manufacturer, 2 version, 3 serial, 4 asset tag.
-    let t3 = vec![1, 0x01, 2, 3, 4, 0x03, 0x03, 0x03, 0x02, 0, 0, 0, 0, 0, 0, 0, 0];
+    let t3 = vec![1, c.chassis_type, 2, 3, 4, 0x03, 0x03, 0x03, 0x02, 0, 0, 0, 0, 0, 0, 0, 0];
     b.add(3, &t3, &[vendor, version, &serial, "none"]);
 
     // Type 4, processor. 1 socket, 2 manufacturer, 3 version.
@@ -106,7 +110,7 @@ pub fn build(c: &SmbiosConfig) -> Smbios {
     t4.extend_from_slice(&[cores, cores, cores]);
     t4.extend_from_slice(&0x04u16.to_le_bytes()); // characteristics: 64-bit
     t4.extend_from_slice(&0x0101u16.to_le_bytes()); // family 2: ARMv8
-    b.add(4, &t4, &["CPU0", vendor, "CPU"]);
+    b.add(4, &t4, &["CPU0", vendor, &c.cpu_name]);
 
     // Type 16, physical memory array (handle referenced by 17 and 19).
     let array_handle = b.handle;
@@ -166,7 +170,7 @@ mod tests {
     use super::*;
 
     /// Walk structures the way a parser would.
-    fn structures(t: &[u8]) -> Vec<(u8, usize)> {
+    fn structures(t: &[u8]) -> Vec<(u8, usize, usize)> {
         let mut out = Vec::new();
         let mut i = 0;
         while i < t.len() {
@@ -175,7 +179,7 @@ mod tests {
             while !(t[j] == 0 && t[j + 1] == 0) {
                 j += 1;
             }
-            out.push((ty, len));
+            out.push((ty, len, i));
             i = j + 2;
         }
         out
@@ -184,13 +188,15 @@ mod tests {
     #[test]
     fn tables_parse_and_checksum() {
         let mut c = SmbiosConfig {
-            vm_name: "win11".into(),
+            sku: "win11".into(),
             vendor: "vroom".into(),
             product: "vroom VM".into(),
             family: "Virtual Machine".into(),
             version: "1.0".into(),
             bios_date: "10/14/2026".into(),
             serial: None,
+            chassis_type: 1,
+            cpu_name: "CPU".into(),
             announce_vm: true,
             uuid: [7; 16],
             cpus: 4,
@@ -211,9 +217,18 @@ mod tests {
         c.announce_vm = false;
         c.vendor = "LENOVO".into();
         c.product = "ThinkStation".into();
+        c.sku = "30FA".into();
+        c.chassis_type = 3;
+        c.cpu_name = "Snapdragon X Elite".into();
         let s = build(&c);
         assert_eq!(s.tables[0x13] & 0x10, 0);
         assert!(s.tables.windows(6).any(|w| w == b"LENOVO"));
         assert!(!s.tables.windows(5).any(|w| w == b"vroom"));
+        assert!(!s.tables.windows(5).any(|w| w == b"win11"), "sku replaces the VM name");
+        assert!(s.tables.windows(5).any(|w| w == b"30FA\0"));
+        assert!(s.tables.windows(19).any(|w| w == b"Snapdragon X Elite\0"));
+        // Chassis type: byte 5 of the type 3 structure.
+        let chassis = structures(&s.tables).into_iter().find(|x| x.0 == 3).unwrap().2;
+        assert_eq!(s.tables[chassis + 5], 3);
     }
 }
