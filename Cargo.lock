@@ -313,6 +313,7 @@ name = "bulwark-gui"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "bulwark-config",
  "bulwark-display",
  "env_logger",
  "libc",

@@ -30,8 +30,9 @@ fn max_len() -> usize {
 
 #[cfg(target_os = "linux")]
 fn anon_shm() -> std::io::Result<OwnedFd> {
-    // SAFETY: memfd_create with a static name.
-    let fd = unsafe { libc::memfd_create(c"bulwark-fb".as_ptr(), libc::MFD_CLOEXEC) };
+    // SAFETY: memfd_create with a static name. Sealable: the viewer
+    // insists the size can't change under its mapping.
+    let fd = unsafe { libc::memfd_create(c"bulwark-fb".as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -77,6 +78,11 @@ impl SharedFb {
         if unsafe { libc::ftruncate(fd.as_raw_fd(), len as libc::off_t) } != 0 {
             return Err(Error::Io(std::io::Error::last_os_error()));
         }
+        #[cfg(target_os = "linux")]
+        // SAFETY: valid memfd; seals are plain flags.
+        unsafe {
+            libc::fcntl(fd.as_raw_fd(), libc::F_ADD_SEALS, libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL);
+        }
         let ptr = map(&fd, len)?;
         Ok(SharedFb { fd, ptr, len })
     }
@@ -92,6 +98,17 @@ impl SharedFb {
         let len = max_len();
         if (st.st_size as u64) < len as u64 {
             return Err(Error::Proto("framebuffer too small"));
+        }
+        // A VMM that shrinks the memory under our mapping would crash us
+        // (SIGBUS): Linux memfds must be sealed against that. (macOS POSIX
+        // shm can't be resized once sized.)
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: valid fd.
+            let seals = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GET_SEALS) };
+            if seals < 0 || seals & libc::F_SEAL_SHRINK == 0 {
+                return Err(Error::Proto("framebuffer not sealed"));
+            }
         }
         let ptr = map(&fd, len)?;
         Ok(SharedFb { fd, ptr, len })

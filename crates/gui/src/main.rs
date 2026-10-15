@@ -68,6 +68,9 @@ struct App {
     focused: bool,
     pending_resize: Option<(Instant, u32, u32)>,
     clipboard: Option<arboard::Clipboard>,
+    /// From the VM's config, enforced here too: the VMM is the process a
+    /// guest exploit would own, so it doesn't get to decide alone.
+    clip_policy: bulwark_config::Clipboard,
     clip_seen: Option<String>,
     next_clip_poll: Instant,
     status: String,
@@ -169,14 +172,16 @@ impl App {
     }
 
     fn poll_clipboard(&mut self) {
-        if !self.focused {
+        if !self.focused || !self.clip_policy.host_to_guest {
             return;
         }
         let Some(cb) = self.clipboard.as_mut() else { return };
         if let Ok(t) = cb.get_text() {
             if self.clip_seen.as_deref() != Some(t.as_str()) {
                 self.clip_seen = Some(t.clone());
-                self.tx.send(ToVmm::Clipboard(t));
+                if t.len() <= self.clip_policy.max_bytes as usize {
+                    self.tx.send(ToVmm::Clipboard(t));
+                }
             }
         }
     }
@@ -279,13 +284,15 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::Clipboard(t) => {
-                if let Some(cb) = self.clipboard.as_mut() {
+                let allowed = self.focused && self.clip_policy.guest_to_host && t.len() <= self.clip_policy.max_bytes as usize;
+                if let (true, Some(cb)) = (allowed, self.clipboard.as_mut()) {
                     let _ = cb.set_text(t.clone());
                     self.clip_seen = Some(t);
                 }
             }
             UserEvent::Status(s) => {
-                self.status = s;
+                // Shown in the title bar: printable, short.
+                self.status = s.chars().filter(|c| !c.is_control()).take(120).collect();
                 if let Some(w) = &self.window {
                     w.set_title(&self.title());
                 }
@@ -375,6 +382,12 @@ fn main() {
 }
 
 fn run(config: PathBuf, extra: Vec<String>) -> Result<(), String> {
+    // Clipboard policy straight from the file (unreadable: no clipboard).
+    let clip_policy = std::fs::read_to_string(&config)
+        .ok()
+        .and_then(|s| bulwark_config::VmConfig::from_toml(&s).ok())
+        .map(|c| c.clipboard)
+        .unwrap_or(bulwark_config::Clipboard { host_to_guest: false, guest_to_host: false, max_bytes: 0 });
     let (ours, theirs) = UnixStream::pair().map_err(|e| e.to_string())?;
     // The child must inherit its end: clear close-on-exec.
     // SAFETY: fcntl on an fd we own.
@@ -415,6 +428,7 @@ fn run(config: PathBuf, extra: Vec<String>) -> Result<(), String> {
         focused: false,
         pending_resize: None,
         clipboard: arboard::Clipboard::new().ok(),
+        clip_policy,
         clip_seen: None,
         next_clip_poll: Instant::now(),
         status: String::new(),

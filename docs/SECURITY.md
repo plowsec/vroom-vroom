@@ -62,6 +62,14 @@ Text only, size capped, and sync happens only while the VM window has focus.
 A background guest can't read what you copy on the host, and can't push to
 your clipboard behind your back. Headless runs need explicit push/pull.
 
+The GUI (`bulwark-gui`) is not sandboxed, so it treats the VMM like the
+guest-exposed process it is: it applies the clipboard policy from the VM's
+config itself (never sends the host clipboard if `host_to_guest` is off,
+never sets it if `guest_to_host` is off, focus and size limits too),
+caps and cleans status text, checks every mode and rectangle against the
+shared framebuffer, and on Linux only maps a framebuffer memfd that is
+sealed against shrinking (a VMM shrinking it would crash the GUI).
+
 ## Networking
 
 NAT is a userspace proxy: the guest never gets raw access to the host
