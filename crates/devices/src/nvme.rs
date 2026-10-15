@@ -275,6 +275,9 @@ impl Nvme {
     }
 
     fn process(&mut self, qid: u16) {
+        // Completion queues that got entries: one interrupt each at the
+        // end, not one per command (the driver reaps them all at once).
+        let mut posted = 0u64;
         // Bounded: at most one pass over the queue per doorbell.
         for _ in 0..MQES as usize + 1 {
             let Some(sq) = self.sqs.get(&qid) else { return };
@@ -301,10 +304,31 @@ impl Nvme {
             };
             if let Some((sc, dw0)) = out {
                 self.complete(cqid, qid, head, cmd.cid, sc, dw0);
+                // Queue ids are below MAX_QUEUES (64).
+                posted |= 1 << (cqid % 64);
+            }
+        }
+        while posted != 0 {
+            let cqid = posted.trailing_zeros() as u16;
+            posted &= posted - 1;
+            self.interrupt(cqid);
+        }
+    }
+
+    /// Signal that completion queue `cqid` has new entries.
+    fn interrupt(&mut self, cqid: u16) {
+        let Some(cq) = self.cqs.get(&cqid) else { return };
+        let (ien, iv) = (cq.ien, cq.iv);
+        if ien {
+            if self.msix.enabled() {
+                self.msix.notify(iv);
+            } else {
+                self.update_intx();
             }
         }
     }
 
+    /// Post a completion entry (the interrupt comes separately).
     fn complete(&mut self, cqid: u16, sqid: u16, sq_head: u16, cid: u16, sc: u16, dw0: u32) {
         let Some(cq) = self.cqs.get_mut(&cqid) else { return };
         let mut e = [0u8; 16];
@@ -319,14 +343,6 @@ impl Nvme {
         cq.tail = (cq.tail + 1) % cq.size;
         if cq.tail == 0 {
             cq.phase = !cq.phase;
-        }
-        let (ien, iv) = (cq.ien, cq.iv);
-        if ien {
-            if self.msix.enabled() {
-                self.msix.notify(iv);
-            } else {
-                self.update_intx();
-            }
         }
     }
 
@@ -392,6 +408,19 @@ impl Nvme {
             entries_left_on_page -= 1;
         }
         Ok(segs)
+    }
+
+    /// The PRPs as guest buffers for the disk (adjacent pages merged).
+    /// `prps` caps `len` at MAX_XFER.
+    fn guest_segs(&self, prp1: u64, prp2: u64, len: u64) -> Result<Vec<(GuestAddress, usize)>, u16> {
+        let mut out: Vec<(GuestAddress, usize)> = Vec::new();
+        for (a, n) in self.prps(prp1, prp2, len)? {
+            match out.last_mut() {
+                Some((last, l)) if last.0 + *l as u64 == a => *l += n as usize,
+                _ => out.push((GuestAddress(a), n as usize)),
+            }
+        }
+        Ok(out)
     }
 
     fn to_guest(&self, prp1: u64, prp2: u64, data: &[u8]) -> Result<(), u16> {
@@ -623,20 +652,13 @@ impl Nvme {
         let r: Result<(), u16> = match c.opc {
             0x00 => disk.flush().map_err(|_| SC_DATA_XFER_ERROR),
             0x02 => range().and_then(|(off, len)| {
-                if len > MAX_XFER {
-                    return Err(SC_INVALID_FIELD);
-                }
-                let mut buf = vec![0u8; len as usize];
-                disk.read_at(&mut buf, off).map_err(|_| SC_DATA_XFER_ERROR)?;
-                self.to_guest(c.prp1, c.prp2, &buf)
+                let segs = self.guest_segs(c.prp1, c.prp2, len)?;
+                disk.read_to_guest(&self.mem, off, &segs).map_err(|_| SC_DATA_XFER_ERROR)
             }),
             0x01 if ro => Err(SC_WRITE_PROTECTED),
             0x01 => range().and_then(|(off, len)| {
-                if len > MAX_XFER {
-                    return Err(SC_INVALID_FIELD);
-                }
-                let buf = self.read_prps(c.prp1, c.prp2, len)?;
-                disk.write_at(&buf, off).map_err(|_| SC_DATA_XFER_ERROR)
+                let segs = self.guest_segs(c.prp1, c.prp2, len)?;
+                disk.write_from_guest(&self.mem, off, &segs).map_err(|_| SC_DATA_XFER_ERROR)
             }),
             0x08 if ro => Err(SC_WRITE_PROTECTED),
             0x08 => range().and_then(|(off, len)| disk.write_zeroes(off, len).map_err(|_| SC_DATA_XFER_ERROR)),

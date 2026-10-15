@@ -311,7 +311,7 @@ mod tests {
         let dev: SharedPciDevice = Arc::new(Mutex::new(Dummy { cfg, last: 0 }));
         let root = PciRoot::new(vec![(1, dev)]);
         let mut ecam = root.ecam_port();
-        let mut win = root.window_port(0x1000_0000);
+        let win = root.window_port(0x1000_0000);
         let slot1 = 1u64 << 15;
         let mut d = [0u8; 4];
         ecam.read(slot1, &mut d);
