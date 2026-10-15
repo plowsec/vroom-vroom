@@ -9,7 +9,7 @@ and every virtual device treats the guest as hostile.
 ## What works
 
 - Ubuntu, Debian, Alpine, Windows 11 ARM64
-- Window with clipboard both ways and auto resolution
+- Window with clipboard both ways and auto resolution, sharp on Retina
 - 3D for Linux guests: Vulkan (about 90% of native speed) and OpenGL
 - Snapshots, suspend/resume, reset
 - NAT with port forwards, several network adapters. Bridged and host-only need a root helper.
@@ -19,6 +19,7 @@ and every virtual device treats the guest as hostile.
 - Nested VMs (M3 or newer)
 - Import from VMware Fusion (ARM64 VMs)
 - USB devices from the host (those macOS has no driver for; needs libusb)
+- Fast disk and network I/O: on par with or ahead of QEMU ([numbers](docs/PERFORMANCE.md))
 
 Not yet: x86_64 hosts (it builds, can't run VMs yet), Secure Boot, and
 3D in Windows guests.
