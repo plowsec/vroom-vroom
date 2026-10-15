@@ -2,14 +2,14 @@
 //!
 //! Byte stream (virtio-console port), framed:
 //! ```text
-//! "BW" | version u8 | type u8 | len u32 LE | payload[len]
+//! "VR" | version u8 | type u8 | len u32 LE | payload[len]
 //! ```
 //! Both sides treat the other as hostile: lengths are capped, strings are
 //! validated UTF-8, unknown types are errors. On any error the receiver
 //! drops its buffer and resyncs on the next magic.
 #![forbid(unsafe_code)]
 
-pub const MAGIC: [u8; 2] = *b"BW";
+pub const MAGIC: [u8; 2] = *b"VR";
 pub const VERSION: u8 = 1;
 const HDR: usize = 8;
 /// Absolute payload cap. Clipboard policy caps lower.

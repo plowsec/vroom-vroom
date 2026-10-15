@@ -62,7 +62,7 @@ pub trait UsbDevice: Send {
 pub struct Descriptors {
     pub device: Vec<u8>,
     pub config: Vec<u8>,
-    pub strings: Vec<&'static str>,
+    pub strings: Vec<String>,
     pub hid_report: Vec<u8>,
 }
 

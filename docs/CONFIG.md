@@ -116,6 +116,42 @@ Linux guests only for now.
 |---|---|---|
 | `sandbox` | true | Lock the VMM process down (Seatbelt on macOS, seccomp + Landlock on Linux) before the guest runs. Turn off only to debug. |
 
+## `[identity]`
+
+Everything the guest can read about its "hardware". Missing keys keep the
+defaults below. New VMs get random serials, so two VMs never match.
+
+| Key | Default | Where the guest sees it |
+|---|---|---|
+| `vendor` | `vroom` | SMBIOS: BIOS vendor, system/chassis/CPU/memory maker |
+| `product` | `vroom VM` | SMBIOS system product |
+| `family` | `Virtual Machine` | SMBIOS system family |
+| `version` | `1.0` | SMBIOS BIOS/system/chassis version |
+| `bios_date` | `10/14/2026` | SMBIOS BIOS date |
+| `serial` | from the VM's UUID | SMBIOS system and chassis serial |
+| `announce_vm` | true | SMBIOS "virtual machine" BIOS flag and the ACPI hypervisor vendor field |
+| `acpi_oem_id` | `VROOM` | every ACPI table header and the RSDP (up to 6 chars) |
+| `acpi_table_id` | `VROOMVM` | every ACPI table header (up to 8) |
+| `acpi_creator_id` | `VRM` | every ACPI table header (up to 4) |
+| `hypervisor_id` | `VROOM` | ACPI FADT hypervisor vendor, if `announce_vm` |
+| `disk_model` | `vroom NVMe` | NVMe controller model |
+| `disk_serial` | `VRM` | disk serial prefix (NVMe and virtio), a number is added |
+| `usb_vendor_id` | `0x1209` | USB keyboard and tablet vendor ID |
+| `usb_manufacturer` | `vroom` | USB and virtio input device names |
+| `agent_port` | `org.vroom.agent.0` | guest agent port name; start the agent with `--port` if you change it |
+
+```toml
+[identity]
+vendor = "LENOVO"
+product = "ThinkStation P360"
+announce_vm = false
+acpi_oem_id = "LENOVO"
+```
+
+What it can't hide is in [SECURITY.md](SECURITY.md#what-the-guest-can-tell).
+Changing these on an installed Windows guest looks like new hardware to
+it (drivers re-install, activation may ask again).
+
 ## State directory
 
 Next to the config: `<name>.state/`. Holds NVRAM, snapshots, the suspend

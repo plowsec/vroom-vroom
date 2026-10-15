@@ -17,12 +17,12 @@ use vroom_config::NetMode;
 use vroom_net::nat::{Nat, NatConfig, NatPolicy, TcpForward};
 use vroom_net::socket::FrameSocket;
 use vroom_net::{netd, NetBackend};
-use vroom_proto::AGENT_PORT;
 use vroom_virtio::devices::gpu::{DisplaySink, Gpu as GpuDev, ThreeD};
 use vroom_virtio::devices::gpu3d::{Mapping, ShmMapper};
 use vroom_virtio::devices::input::{Input, InputKind};
 use vroom_virtio::devices::{block::Block, console::Console, fs::Fs, net::Net, rng::Rng};
 use vroom_devices::nvme::{Namespace, Nvme};
+use vroom_devices::usb::hid::UsbIds;
 use vroom_devices::usb::xhci::Xhci;
 use vroom_devices::pci::{Intx, IntxRouter, MsiSender, PciRoot, SharedPciDevice};
 use vroom_devices::IrqLine;
@@ -329,6 +329,8 @@ pub(crate) fn build(
     if hv.arch() != vroom_hv::Arch::Aarch64 {
         return Err(Error::Setup("only the aarch64 board exists so far".into()));
     }
+    // Names and numbers the guest can read about its hardware.
+    let ident = &config.identity;
     let info: IrqChipInfo = hv.irqchip_info()?;
     let max = layout::max_vcpus(info.redist_size_per_cpu);
     if config.cpus > max {
@@ -390,7 +392,8 @@ pub(crate) fn build(
         match d.bus {
             DiskBus::Virtio => {
                 let id = format!("vd{}", (b'a' + i as u8) as char);
-                board.add_virtio(Box::new(Block::new(&id, img)))?;
+                let serial = format!("{}{i:04}", ident.disk_serial);
+                board.add_virtio(Box::new(Block::new(&id, img).with_serial(&serial)))?;
             }
             DiskBus::Nvme => nvme_ns.push(Namespace {
                 disk: img,
@@ -401,7 +404,11 @@ pub(crate) fn build(
     }
     if !nvme_ns.is_empty() {
         let mem2 = mem.clone();
-        board.add_pci(move |slot, intx, msi| Arc::new(Mutex::new(Nvme::new(slot, nvme_ns, mem2, intx, msi))))?;
+        let (model, prefix) = (ident.disk_model.clone(), ident.disk_serial.clone());
+        board.add_pci(move |slot, intx, msi| {
+            let serial = format!("{prefix}{slot:04}");
+            Arc::new(Mutex::new(Nvme::new(slot, nvme_ns, mem2, intx, msi).with_ids(&model, &serial)))
+        })?;
     }
 
     // Display. UEFI always gets ramfb (firmware / installer screen);
@@ -433,7 +440,8 @@ pub(crate) fn build(
             let mem2 = mem.clone();
             let mut keep = None;
             board.add_pci(|slot, intx, msi| {
-                let x = Arc::new(Mutex::new(Xhci::new(slot, mem2, intx, msi)));
+                let ids = UsbIds { vendor_id: ident.usb_vendor_id, manufacturer: ident.usb_manufacturer.clone() };
+                let x = Arc::new(Mutex::new(Xhci::new(slot, mem2, intx, msi).with_ids(&ids)));
                 keep = Some(x.clone());
                 x
             })?;
@@ -441,15 +449,16 @@ pub(crate) fn build(
         } else {
             let (kbd_host, kbd_dev) = UnixDatagram::pair()?;
             let (tab_host, tab_dev) = UnixDatagram::pair()?;
-            board.add_virtio(Box::new(Input::new(InputKind::Keyboard, kbd_dev)))?;
-            board.add_virtio(Box::new(Input::new(InputKind::Tablet, tab_dev)))?;
+            let m = &ident.usb_manufacturer;
+            board.add_virtio(Box::new(Input::new(InputKind::Keyboard, kbd_dev).with_name(&format!("{m} Keyboard"))))?;
+            board.add_virtio(Box::new(Input::new(InputKind::Tablet, tab_dev).with_name(&format!("{m} Tablet"))))?;
             input = Some(InputPipes { kbd: Some(kbd_host), tablet: Some(tab_host), usb: None });
         }
     }
 
-    // Guest agent channel: /dev/virtio-ports/org.vroom.agent.0 in the guest.
+    // Guest agent channel: /dev/virtio-ports/<agent_port> in the guest.
     let (host_end, dev_end) = UnixStream::pair()?;
-    board.add_virtio(Box::new(Console::new(vec![(AGENT_PORT.to_string(), dev_end)])?))?;
+    board.add_virtio(Box::new(Console::new(vec![(ident.agent_port.clone(), dev_end)])?))?;
     let clipboard = match &ui {
         Some(ds) => Some(ds.clipboard()),
         None => clipboard,
@@ -528,11 +537,24 @@ pub(crate) fn build(
                 config.tpm.then_some(layout::TPM_BASE),
                 &vroom_arch::smbios::SmbiosConfig {
                     vm_name: config.name.clone(),
+                    vendor: ident.vendor.clone(),
+                    product: ident.product.clone(),
+                    family: ident.family.clone(),
+                    version: ident.version.clone(),
+                    bios_date: ident.bios_date.clone(),
+                    serial: ident.serial.clone(),
+                    announce_vm: ident.announce_vm,
                     uuid: env.uuid,
                     cpus: config.cpus,
                     memory_bytes: ram_size,
                     ram_base: layout::RAM_BASE,
                 },
+                &vroom_arch::acpi::AcpiIds::new(
+                    &ident.acpi_oem_id,
+                    &ident.acpi_table_id,
+                    &ident.acpi_creator_id,
+                    Some(ident.hypervisor_id.as_str()).filter(|h| ident.announce_vm && !h.is_empty()),
+                ),
             )?;
             fdt_devices.push(board::FdtDevice::Flash {
                 base0: layout::FLASH0_BASE,

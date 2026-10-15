@@ -17,6 +17,19 @@ pub struct NewVm<'a> {
     pub cpus: u32,
     pub memory_mib: u64,
     pub gpu: Gpu,
+    /// Seed for this VM's serials (system and disks), so VMs differ.
+    pub serials: [u8; 8],
+}
+
+/// Random bytes, or something unique enough if there's no /dev/urandom.
+pub fn random8() -> [u8; 8] {
+    use std::io::Read;
+    let mut b = [0u8; 8];
+    if std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).is_err() {
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        b = ((t as u64) ^ ((std::process::id() as u64) << 32)).to_le_bytes();
+    }
+    b
 }
 
 impl<'a> NewVm<'a> {
@@ -31,6 +44,7 @@ impl<'a> NewVm<'a> {
             cpus: host.clamp(1, 4),
             memory_mib: if windows { 8192 } else { 4096 },
             gpu: Gpu::Virtio2d,
+            serials: random8(),
         }
     }
 
@@ -85,6 +99,14 @@ impl<'a> NewVm<'a> {
                 format!("\n# Installer. Remove this block once installed.\n[[disk]]\npath = {p}\nreadonly = true\ncdrom = true\n")
             };
         }
+        let mut ident = crate::Identity::default();
+        ident.randomize_serials(self.serials);
+        s += &format!(
+            "\n# What the guest can read about its hardware. Every key: docs/CONFIG.md.\n\
+             [identity]\nserial = {}\ndisk_serial = {}\n",
+            toml_str(ident.serial.as_deref().unwrap_or_default()),
+            toml_str(&ident.disk_serial)
+        );
         s += &format!(
             "\n[[net]]\nmode = \"nat\"\n# port_forwards = [{{ host_port = 2222, guest_port = 22 }}]\n\
              \n[display]\ngpu = \"{gpu}\"\nwidth = 1280\nheight = 800\n\
@@ -127,6 +149,8 @@ mod tests {
             assert_eq!(c.guest_os(), os);
             assert_eq!(c.disks.len(), 2);
             assert_eq!(c.disks[1].path, iso);
+            assert_eq!(c.identity.serial.as_ref().map(String::len), Some(12));
+            assert_ne!(c.identity.disk_serial, crate::Identity::default().disk_serial);
         }
     }
 }

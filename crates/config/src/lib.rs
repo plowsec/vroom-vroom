@@ -70,6 +70,117 @@ pub struct VmConfig {
     /// VM is the same either way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub os: Option<GuestOs>,
+    /// What the guest can read about its "hardware".
+    #[serde(default, skip_serializing_if = "Identity::is_default")]
+    pub identity: Identity,
+}
+
+/// Every name and number the guest can read about the machine it runs on
+/// (firmware tables, disk and USB descriptors, the agent's port). Defaults
+/// say "vroom" and set the "this is a VM" flags; change them to look like
+/// something else, e.g. for malware analysis. The guest can still tell it
+/// is virtualized from other things (virtio devices, CPU registers): see
+/// docs/SECURITY.md.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Identity {
+    /// SMBIOS: BIOS vendor and the system, chassis, CPU and memory maker.
+    pub vendor: String,
+    /// SMBIOS system product name.
+    pub product: String,
+    /// SMBIOS system family.
+    pub family: String,
+    /// SMBIOS BIOS, system and chassis version.
+    pub version: String,
+    /// SMBIOS BIOS date, MM/DD/YYYY.
+    pub bios_date: String,
+    /// SMBIOS system and chassis serial. Default: from the VM's UUID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serial: Option<String>,
+    /// Set the SMBIOS "virtual machine" BIOS flag and the ACPI hypervisor
+    /// vendor field.
+    pub announce_vm: bool,
+    /// ACPI OEM ID (up to 6 chars), table ID (8), creator ID (4).
+    pub acpi_oem_id: String,
+    pub acpi_table_id: String,
+    pub acpi_creator_id: String,
+    /// ACPI FADT hypervisor vendor (up to 8 chars), when `announce_vm`.
+    pub hypervisor_id: String,
+    /// NVMe controller model (up to 40 chars).
+    pub disk_model: String,
+    /// Disk serial prefix (up to 16 chars): NVMe and virtio disks append
+    /// a number.
+    pub disk_serial: String,
+    /// USB keyboard and tablet: vendor ID and manufacturer string.
+    pub usb_vendor_id: u16,
+    pub usb_manufacturer: String,
+    /// The guest agent's virtio-console port. The agent must be told if
+    /// this changes (`vroom-agent --port`).
+    pub agent_port: String,
+}
+
+impl Default for Identity {
+    fn default() -> Self {
+        Identity {
+            vendor: "vroom".into(),
+            product: "vroom VM".into(),
+            family: "Virtual Machine".into(),
+            version: "1.0".into(),
+            bios_date: "10/14/2026".into(),
+            serial: None,
+            announce_vm: true,
+            acpi_oem_id: "VROOM".into(),
+            acpi_table_id: "VROOMVM".into(),
+            acpi_creator_id: "VRM".into(),
+            hypervisor_id: "VROOM".into(),
+            disk_model: "vroom NVMe".into(),
+            disk_serial: "VRM".into(),
+            usb_vendor_id: 0x1209,
+            usb_manufacturer: "vroom".into(),
+            agent_port: "org.vroom.agent.0".into(),
+        }
+    }
+}
+
+impl Identity {
+    pub fn is_default(&self) -> bool {
+        *self == Identity::default()
+    }
+
+    fn validate(&self) -> Result<()> {
+        let text = |what: &str, v: &str, max: usize, empty_ok: bool| -> Result<()> {
+            if (!empty_ok && v.is_empty()) || v.len() > max || !v.bytes().all(|b| (0x20..0x7f).contains(&b)) {
+                return Err(Error::Invalid(format!("identity.{what}: {} printable ASCII chars", if empty_ok { format!("up to {max}") } else { format!("1-{max}") })));
+            }
+            Ok(())
+        };
+        text("vendor", &self.vendor, 64, false)?;
+        text("product", &self.product, 64, false)?;
+        text("family", &self.family, 64, false)?;
+        text("version", &self.version, 64, false)?;
+        text("bios_date", &self.bios_date, 10, false)?;
+        if let Some(s) = &self.serial {
+            text("serial", s, 64, false)?;
+        }
+        text("acpi_oem_id", &self.acpi_oem_id, 6, false)?;
+        text("acpi_table_id", &self.acpi_table_id, 8, false)?;
+        text("acpi_creator_id", &self.acpi_creator_id, 4, false)?;
+        text("hypervisor_id", &self.hypervisor_id, 8, true)?;
+        text("disk_model", &self.disk_model, 40, false)?;
+        text("disk_serial", &self.disk_serial, 16, false)?;
+        text("usb_manufacturer", &self.usb_manufacturer, 64, false)?;
+        if !valid_name(&self.agent_port) {
+            return Err(Error::Invalid("identity.agent_port: 1-64 chars of [A-Za-z0-9._-]".into()));
+        }
+        Ok(())
+    }
+
+    /// New random serials (system and disks), so two VMs never match.
+    pub fn randomize_serials(&mut self, random: [u8; 8]) {
+        let hex: String = random.iter().map(|b| format!("{b:02X}")).collect();
+        self.serial = Some(hex[..12].to_string());
+        self.disk_serial = hex[12..].to_string();
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -575,6 +686,7 @@ impl VmConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
+        self.identity.validate()?;
         let bad = |m: String| Err(Error::Invalid(m));
         if !valid_name(&self.name) {
             return bad(format!("name {:?}: use 1-64 chars of [A-Za-z0-9._-]", self.name));
@@ -763,6 +875,23 @@ gpu = "virtio3d"
 [clipboard]
 guest_to_host = false
 "#;
+
+    #[test]
+    fn identity_defaults_and_checks() {
+        let c = VmConfig::from_toml(SAMPLE).unwrap();
+        assert!(c.identity.is_default());
+        assert!(!c.to_toml().unwrap().contains("[identity]"), "defaults stay out of the file");
+        let custom = format!("{SAMPLE}\n[identity]\nvendor = \"Dell Inc.\"\nannounce_vm = false\nacpi_oem_id = \"DELL\"\n");
+        let c = VmConfig::from_toml(&custom).unwrap();
+        assert_eq!(c.identity.vendor, "Dell Inc.");
+        assert_eq!(c.identity.acpi_table_id, "VROOMVM", "unset keys keep defaults");
+        assert!(VmConfig::from_toml(&custom.replace("DELL", "TOOLONGID")).is_err());
+        assert!(VmConfig::from_toml(&custom.replace("Dell Inc.", "Dell\\u0007")).is_err());
+        let mut i = Identity::default();
+        i.randomize_serials([1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(i.serial.as_deref(), Some("010203040506"));
+        assert_eq!(i.disk_serial, "0708");
+    }
 
     #[test]
     fn parses_sample() {

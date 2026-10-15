@@ -220,7 +220,7 @@ struct Snap {
     data: Vec<u8>,
 }
 
-const MAGIC: &[u8; 8] = b"BWPFL\x001\0";
+const MAGIC: &[u8; 8] = b"VRPFL\x001\0";
 const PAGE: usize = 4096;
 const PAGE_ZERO: u8 = 0;
 const PAGE_ERASED: u8 = 1;

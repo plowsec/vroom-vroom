@@ -13,7 +13,7 @@ use vroom_memory::{GuestAddress, GuestMemory};
 use vroom_snapshot::{decode, encode};
 use serde::{Deserialize, Serialize};
 
-use super::hid::{HidEvent, Keyboard, Tablet};
+use super::hid::{HidEvent, Keyboard, Tablet, UsbIds};
 use super::{Setup, UsbDevice};
 use crate::pci::{BarSpec, ConfigSpace, Intx, MsiSender, Msix, PciDevice, PciId};
 use crate::{get_le, put_le};
@@ -215,6 +215,13 @@ impl Xhci {
         };
         x.hc_reset();
         x
+    }
+
+    /// USB names the guest sees (from the VM's `[identity]`).
+    pub fn with_ids(mut self, ids: &UsbIds) -> Self {
+        self.kbd = Keyboard::new(ids);
+        self.tablet = Tablet::new(ids);
+        self
     }
 
     fn dev(&mut self, port: u8) -> Option<&mut dyn UsbDevice> {

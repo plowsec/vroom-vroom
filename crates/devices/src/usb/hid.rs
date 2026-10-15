@@ -9,7 +9,18 @@ use super::{ControlResult, Descriptors, Setup, StdState, UsbDevice};
 
 const MAX_QUEUED: usize = 64;
 /// pid.codes test vendor; fine for virtual hardware.
-const VENDOR: u16 = 0x1209;
+/// What the guest reads from the USB descriptors (VM's `[identity]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsbIds {
+    pub vendor_id: u16,
+    pub manufacturer: String,
+}
+
+impl Default for UsbIds {
+    fn default() -> Self {
+        UsbIds { vendor_id: 0x1209, manufacturer: "vroom".into() }
+    }
+}
 
 const KBD_REPORT: &[u8] = &[
     0x05, 0x01, 0x09, 0x06, 0xa1, 0x01, 0x05, 0x07, 0x19, 0xe0, 0x29, 0xe7, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01,
@@ -35,9 +46,9 @@ pub enum HidEvent {
     Wheel { dy: i8 },
 }
 
-fn descriptors(product: u16, name: &'static str, protocol: u8, report: &[u8], report_len: usize) -> Descriptors {
+fn descriptors(ids: &UsbIds, product: u16, name: &str, protocol: u8, report: &[u8], report_len: usize) -> Descriptors {
     let mut device = vec![18, 1, 0x00, 0x02, 0, 0, 0, 64];
-    device.extend_from_slice(&VENDOR.to_le_bytes());
+    device.extend_from_slice(&ids.vendor_id.to_le_bytes());
     device.extend_from_slice(&product.to_le_bytes());
     device.extend_from_slice(&[0x00, 0x01, 1, 2, 3, 1]);
     let subclass = if protocol == 0 { 0 } else { 1 };
@@ -46,7 +57,7 @@ fn descriptors(product: u16, name: &'static str, protocol: u8, report: &[u8], re
     config.extend_from_slice(&[9, 0x21, 0x11, 0x01, 0, 1, 0x22]);
     config.extend_from_slice(&(report_len as u16).to_le_bytes());
     config.extend_from_slice(&[7, 5, 0x81, 3, 8, 0, 10]);
-    Descriptors { device, config, strings: vec!["Vroom", name, "1"], hid_report: report.to_vec() }
+    Descriptors { device, config, strings: vec![ids.manufacturer.clone(), name.to_string(), "1".to_string()], hid_report: report.to_vec() }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -65,11 +76,15 @@ pub struct Keyboard {
 
 impl Default for Keyboard {
     fn default() -> Self {
-        Keyboard { desc: descriptors(0x0001, "Vroom USB Keyboard", 1, KBD_REPORT, KBD_REPORT.len()), st: KbdState::default(), queue: VecDeque::new() }
+        Keyboard::new(&UsbIds::default())
     }
 }
 
 impl Keyboard {
+    pub fn new(ids: &UsbIds) -> Self {
+        Keyboard { desc: descriptors(ids, 0x0001, "USB Keyboard", 1, KBD_REPORT, KBD_REPORT.len()), st: KbdState::default(), queue: VecDeque::new() }
+    }
+
     fn report(&self) -> Vec<u8> {
         let mut r = vec![self.st.modifiers, 0, 0, 0, 0, 0, 0, 0];
         if self.st.keys.len() > 6 {
@@ -156,15 +171,15 @@ pub struct Tablet {
 
 impl Default for Tablet {
     fn default() -> Self {
-        Tablet {
-            desc: descriptors(0x0002, "Vroom USB Tablet", 0, TABLET_REPORT, TABLET_REPORT.len()),
-            st: TabletState::default(),
-            queue: VecDeque::new(),
-        }
+        Tablet::new(&UsbIds::default())
     }
 }
 
 impl Tablet {
+    pub fn new(ids: &UsbIds) -> Self {
+        Tablet { desc: descriptors(ids, 0x0002, "USB Tablet", 0, TABLET_REPORT, TABLET_REPORT.len()), st: TabletState::default(), queue: VecDeque::new() }
+    }
+
     fn report(&self, wheel: i8) -> Vec<u8> {
         let mut r = vec![self.st.buttons];
         r.extend_from_slice(&self.st.x.to_le_bytes());

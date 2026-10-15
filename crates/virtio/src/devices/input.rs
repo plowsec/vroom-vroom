@@ -58,11 +58,20 @@ pub struct Input {
     select: u8,
     subsel: u8,
     worker: WorkerSlot<InputHandler>,
+    /// What the guest reads as the device name.
+    name: String,
 }
 
 impl Input {
     pub fn new(kind: InputKind, events: StdUnixDatagram) -> Self {
-        Input { kind, events, select: 0, subsel: 0, worker: WorkerSlot::default() }
+        let name = if kind == InputKind::Keyboard { "vroom Keyboard" } else { "vroom Tablet" };
+        Input { kind, events, select: 0, subsel: 0, worker: WorkerSlot::default(), name: name.into() }
+    }
+
+    /// Device name the guest sees (from the VM's `[identity]`).
+    pub fn with_name(mut self, name: &str) -> Self {
+        self.name = name.to_string();
+        self
     }
 
     fn handler(&self) -> Result<InputHandler> {
@@ -82,8 +91,7 @@ impl Input {
             b
         };
         match (self.select, self.kind) {
-            (CFG_ID_NAME, InputKind::Keyboard) => b"Vroom Keyboard".to_vec(),
-            (CFG_ID_NAME, InputKind::Tablet) => b"Vroom Tablet".to_vec(),
+            (CFG_ID_NAME, _) => self.name.as_bytes().to_vec(),
             (CFG_ID_SERIAL, _) => b"0".to_vec(),
             (CFG_ID_DEVIDS, k) => {
                 let product: u16 = if k == InputKind::Keyboard { 1 } else { 2 };

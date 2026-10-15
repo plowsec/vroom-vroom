@@ -697,6 +697,58 @@ export component SettingsPanel inherits Rectangle {
                         }
                     }
                     Row {
+                        label: "Hardware maker";
+                        hint: "What firmware tables and devices tell the guest.";
+                        key: "identity.vendor";
+                        Field {
+                            width: 150px;
+                            text: root.s.id-vendor;
+                            enabled: !root.lk;
+                            committed(t) => { Bus.set("identity.vendor", t); }
+                        }
+                    }
+                    Row {
+                        label: "Model";
+                        key: "identity.product";
+                        Field {
+                            width: 150px;
+                            text: root.s.id-product;
+                            enabled: !root.lk;
+                            committed(t) => { Bus.set("identity.product", t); }
+                        }
+                    }
+                    Row {
+                        label: "Tell the guest it's a VM";
+                        hint: "Off hides the VM flags in the firmware tables. Other signs stay (virtio devices, CPU).";
+                        key: "identity.announce_vm";
+                        Toggle {
+                            y: (parent.height - self.height) / 2;
+                            checked: root.s.id-announce;
+                            enabled: !root.lk;
+                            toggled(v) => { Bus.set("identity.announce", v ? "true" : "false"); }
+                        }
+                    }
+                    Row {
+                        label: "Serial numbers";
+                        hint: root.s.id-serials;
+                        key: "identity.serial, disk_serial";
+                        Button {
+                            small: true;
+                            text: "New random";
+                            icon: Icons.dice;
+                            has-icon: true;
+                            y: (parent.height - self.height) / 2;
+                            enabled: !root.lk;
+                            clicked => { Bus.act("identity.random"); }
+                        }
+                    }
+                    Text {
+                        text: "ACPI, disk, USB and agent names: [identity] in the config file.";
+                        font-size: Theme.fs-xs;
+                        color: Theme.text-3;
+                        wrap: word-wrap;
+                    }
+                    Row {
                         label: "Serial console";
                         hint: "Terminal: the VM log when started from here.";
                         key: "serial.type";

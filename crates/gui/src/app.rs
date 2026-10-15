@@ -541,6 +541,14 @@ impl App {
             clip_out: c.clipboard.guest_to_host,
             clip_max_kib: s((c.clipboard.max_bytes / 1024).to_string()),
             sandbox: c.security.sandbox,
+            id_vendor: s(&c.identity.vendor),
+            id_product: s(&c.identity.product),
+            id_announce: c.identity.announce_vm,
+            id_serials: s(format!(
+                "System {}, disks {}…",
+                c.identity.serial.clone().unwrap_or_else(|| "from the VM's UUID".into()),
+                c.identity.disk_serial
+            )),
             transport: match c.virtio_transport {
                 Transport::Auto => 0,
                 Transport::Mmio => 1,
@@ -602,11 +610,12 @@ impl App {
                 (false, true) => "From the guest only",
                 (false, false) => "Off",
             }),
-            sum_security: s(match (c.security.sandbox, c.tpm) {
-                (true, true) => "Sandboxed · TPM 2.0",
-                (true, false) => "Sandboxed",
-                (false, _) => "Sandbox is off",
-            }),
+            sum_security: s(format!(
+                "{}{}{}",
+                if c.security.sandbox { "Sandboxed" } else { "Sandbox is off" },
+                if c.tpm { " · TPM 2.0" } else { "" },
+                if !c.identity.announce_vm { " · hides VM flags" } else if !c.identity.is_default() { " · custom identity" } else { "" }
+            )),
             sum_boot: s(match &c.boot {
                 Boot::Uefi { firmware: None, .. } => "UEFI".to_string(),
                 Boot::Uefi { .. } => "UEFI, custom firmware".to_string(),
@@ -632,7 +641,7 @@ impl App {
             share: any || hit("shared folders share folder virtiofs mount files tag"),
             sound: any || hit("sound audio speakers music output"),
             clip: any || hit("clipboard copy paste"),
-            security: any || hit("security sandbox tpm transport mmio pci serial console"),
+            security: any || hit("security sandbox tpm transport mmio pci serial console identity fingerprint hardware maker vendor model product smbios acpi hide vm detection"),
             boot: any || hit("boot uefi firmware kernel initrd cmdline command line nvram efi"),
         });
     }

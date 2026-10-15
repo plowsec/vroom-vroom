@@ -10,6 +10,16 @@ pub const ANCHOR_FILE: &str = "etc/smbios/smbios-anchor";
 #[derive(Debug, Clone)]
 pub struct SmbiosConfig {
     pub vm_name: String,
+    /// BIOS vendor and the system, chassis, CPU and memory maker.
+    pub vendor: String,
+    pub product: String,
+    pub family: String,
+    pub version: String,
+    pub bios_date: String,
+    /// System and chassis serial; None: from the UUID.
+    pub serial: Option<String>,
+    /// Set the BIOS "virtual machine" characteristic.
+    pub announce_vm: bool,
     /// Stable per VM (activation, licensing and hardware ids key on it).
     pub uuid: [u8; 16],
     pub cpus: u32,
@@ -59,26 +69,28 @@ fn smbios_uuid(u: &[u8; 16]) -> [u8; 16] {
 
 pub fn build(c: &SmbiosConfig) -> Smbios {
     let mut b = Builder { out: Vec::new(), handle: 0 };
-    let version = env!("CARGO_PKG_VERSION");
+    let version = c.version.as_str();
+    let vendor = c.vendor.as_str();
 
     // Type 0, BIOS. Strings: 1 vendor, 2 version, 3 date.
     let mut t0 = vec![1, 2, 0x00, 0xe8, 3, 0xff];
     t0.extend_from_slice(&(1u64 << 3).to_le_bytes()); // characteristics not supported
-    t0.extend_from_slice(&[0x03, 0x18]); // ext1: ACPI, USB legacy; ext2: UEFI (bit 3) + VM (bit 4)
+    // ext1: ACPI, USB legacy; ext2: UEFI (bit 3), VM (bit 4) if we say so.
+    t0.extend_from_slice(&[0x03, if c.announce_vm { 0x18 } else { 0x08 }]);
     t0.extend_from_slice(&[0, 0, 0xff, 0xff]); // BIOS / EC release
     t0.extend_from_slice(&16u16.to_le_bytes()); // extended ROM size: 16 MiB (ROM size 0xff)
-    b.add(0, &t0, &["vroom", version, "10/14/2026"]);
+    b.add(0, &t0, &[vendor, version, &c.bios_date]);
 
     // Type 1, system. 1 manufacturer, 2 product, 3 version, 4 serial, 5 sku, 6 family.
     let mut t1 = vec![1, 2, 3, 4];
     t1.extend_from_slice(&smbios_uuid(&c.uuid));
     t1.extend_from_slice(&[6, 5, 6]); // wake-up: power switch; sku; family
-    let serial: String = c.uuid.iter().map(|x| format!("{x:02X}")).collect();
-    b.add(1, &t1, &["Vroom", "Vroom Virtual Machine", version, &serial, &c.vm_name, "Virtual Machine"]);
+    let serial: String = c.serial.clone().unwrap_or_else(|| c.uuid.iter().map(|x| format!("{x:02X}")).collect());
+    b.add(1, &t1, &[vendor, &c.product, version, &serial, &c.vm_name, &c.family]);
 
     // Type 3, chassis. 1 manufacturer, 2 version, 3 serial, 4 asset tag.
     let t3 = vec![1, 0x01, 2, 3, 4, 0x03, 0x03, 0x03, 0x02, 0, 0, 0, 0, 0, 0, 0, 0];
-    b.add(3, &t3, &["Vroom", version, &serial, "none"]);
+    b.add(3, &t3, &[vendor, version, &serial, "none"]);
 
     // Type 4, processor. 1 socket, 2 manufacturer, 3 version.
     let cores = c.cpus.min(255) as u8;
@@ -94,7 +106,7 @@ pub fn build(c: &SmbiosConfig) -> Smbios {
     t4.extend_from_slice(&[cores, cores, cores]);
     t4.extend_from_slice(&0x04u16.to_le_bytes()); // characteristics: 64-bit
     t4.extend_from_slice(&0x0101u16.to_le_bytes()); // family 2: ARMv8
-    b.add(4, &t4, &["CPU0", "Vroom", "Virtual CPU"]);
+    b.add(4, &t4, &["CPU0", vendor, "CPU"]);
 
     // Type 16, physical memory array (handle referenced by 17 and 19).
     let array_handle = b.handle;
@@ -119,7 +131,7 @@ pub fn build(c: &SmbiosConfig) -> Smbios {
     t17.extend_from_slice(&0u16.to_le_bytes()); // speed
     t17.extend_from_slice(&[2, 0, 0, 0, 0]); // manufacturer, serial, asset, part, attributes
     t17.extend_from_slice(&(if mib >= 0x7fff { mib as u32 } else { 0 }).to_le_bytes()); // extended size
-    b.add(17, &t17, &["DIMM 0", "Vroom"]);
+    b.add(17, &t17, &["DIMM 0", vendor]);
 
     // Type 19, memory array mapped address (extended form, bytes).
     let mut t19 = Vec::new();
@@ -171,7 +183,21 @@ mod tests {
 
     #[test]
     fn tables_parse_and_checksum() {
-        let s = build(&SmbiosConfig { vm_name: "win11".into(), uuid: [7; 16], cpus: 4, memory_bytes: 6 << 30, ram_base: 0x4000_0000 });
+        let mut c = SmbiosConfig {
+            vm_name: "win11".into(),
+            vendor: "vroom".into(),
+            product: "vroom VM".into(),
+            family: "Virtual Machine".into(),
+            version: "1.0".into(),
+            bios_date: "10/14/2026".into(),
+            serial: None,
+            announce_vm: true,
+            uuid: [7; 16],
+            cpus: 4,
+            memory_bytes: 6 << 30,
+            ram_base: 0x4000_0000,
+        };
+        let s = build(&c);
         let types: Vec<u8> = structures(&s.tables).iter().map(|x| x.0).collect();
         assert_eq!(types, [0, 1, 3, 4, 16, 17, 19, 32, 127]);
         // Spec minimum lengths for the 3.0 layouts we emit.
@@ -180,5 +206,14 @@ mod tests {
         assert_eq!(lens[3], 0x2a);
         assert_eq!(s.anchor.len(), 24);
         assert_eq!(s.anchor.iter().fold(0u8, |a, &b| a.wrapping_add(b)), 0);
+        // The VM flag (BIOS characteristics ext2 bit 4) follows the config.
+        assert_eq!(s.tables[0x13] & 0x10, 0x10);
+        c.announce_vm = false;
+        c.vendor = "LENOVO".into();
+        c.product = "ThinkStation".into();
+        let s = build(&c);
+        assert_eq!(s.tables[0x13] & 0x10, 0);
+        assert!(s.tables.windows(6).any(|w| w == b"LENOVO"));
+        assert!(!s.tables.windows(5).any(|w| w == b"vroom"));
     }
 }

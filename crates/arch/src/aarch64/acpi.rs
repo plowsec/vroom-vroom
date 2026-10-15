@@ -21,6 +21,8 @@ pub struct AcpiConfig {
     pub psci_smc: bool,
     /// TPM TIS registers, if a vTPM is attached.
     pub tpm: Option<u64>,
+    /// Header names, from the VM's `[identity]`.
+    pub ids: crate::acpi::AcpiIds,
 }
 
 /// TPM2 table, rev 4: FIFO/TIS interface (start method 6), event log
@@ -36,7 +38,7 @@ fn tpm2() -> Vec<u8> {
 }
 
 /// FADT, HW-reduced, PSCI over HVC. X_DSDT lives at offset 140.
-fn fadt(smc: bool) -> Vec<u8> {
+fn fadt(smc: bool, hypervisor_id: [u8; 8]) -> Vec<u8> {
     let mut t = Table::new(b"FACP", 6);
     t.zeros(276 - 36);
     let mut b = t.finish();
@@ -46,7 +48,7 @@ fn fadt(smc: bool) -> Vec<u8> {
     b[112..116].copy_from_slice(&(1u32 << 20).to_le_bytes());
     // ARM boot arch: PSCI compliant, use HVC.
     b[129..131].copy_from_slice(&(if smc { 1u16 } else { 3u16 }).to_le_bytes());
-    b[268..276].copy_from_slice(b"VROOM\0\0\0");
+    b[268..276].copy_from_slice(&hypervisor_id);
     b
 }
 
@@ -255,7 +257,7 @@ pub fn build(c: &AcpiConfig) -> AcpiBlobs {
     if c.tpm.is_some() {
         others.push(tpm2());
     }
-    assemble(fadt(c.psci_smc), 140, dsdt(c), others)
+    assemble(&c.ids, fadt(c.psci_smc, c.ids.hypervisor_id), 140, dsdt(c), others)
 }
 
 #[cfg(test)]
@@ -273,6 +275,7 @@ mod tests {
             virtio_mmio: vec![(VIRTIO_MMIO_BASE, 0x200, 16)],
             psci_smc: false,
             tpm: Some(TPM_BASE),
+            ids: Default::default(),
         });
         assert_eq!(b.loader.len() % 128, 0);
         for sig in [&b"FACP"[..], b"APIC", b"GTDT", b"SPCR", b"DBG2", b"MCFG", b"DSDT", b"XSDT", b"TPM2"] {
@@ -288,6 +291,7 @@ mod tests {
             virtio_mmio: vec![],
             psci_smc: false,
             tpm: None,
+            ids: Default::default(),
         });
         assert_eq!(madt.len(), 36 + 8 + 80 + 24 + 16);
         assert_eq!(dbg2().len(), 44 + 22 + 12 + 4 + 10);
@@ -312,6 +316,7 @@ mod dump {
             virtio_mmio: vec![(super::VIRTIO_MMIO_BASE, 0x200, 16)],
             psci_smc: false,
             tpm: Some(super::TPM_BASE),
+            ids: Default::default(),
         });
         let t = &b.tables;
         let mut off = 0;

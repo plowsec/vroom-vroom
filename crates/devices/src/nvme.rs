@@ -107,6 +107,7 @@ pub struct Nvme {
     mem: GuestMemory,
     ns: Vec<Namespace>,
     serial: String,
+    model: String,
     regs: Regs,
     sqs: BTreeMap<u16, Sq>,
     cqs: BTreeMap<u16, Cq>,
@@ -166,12 +167,20 @@ impl Nvme {
             intx,
             mem,
             ns,
-            serial: format!("BWRK{slot:04}"),
+            serial: format!("VRM{slot:04}"),
+            model: "vroom NVMe".into(),
             regs: Regs::default(),
             sqs: BTreeMap::new(),
             cqs: BTreeMap::new(),
             aer: Vec::new(),
         }
+    }
+
+    /// Names the guest sees (from the VM's `[identity]`).
+    pub fn with_ids(mut self, model: &str, serial: &str) -> Self {
+        self.model = model.to_string();
+        self.serial = serial.to_string();
+        self
     }
 
     fn cap(&self) -> u64 {
@@ -535,7 +544,7 @@ impl Nvme {
                     v
                 };
                 d[4..24].copy_from_slice(&pad(&self.serial, 20));
-                d[24..64].copy_from_slice(&pad("Vroom NVMe", 40));
+                d[24..64].copy_from_slice(&pad(&self.model, 40));
                 d[64..72].copy_from_slice(&pad("1.0", 8));
                 d[72] = 6;
                 d[77] = MDTS;
@@ -549,7 +558,7 @@ impl Nvme {
                 d[516..520].copy_from_slice(&(self.ns.len() as u32).to_le_bytes());
                 d[520..522].copy_from_slice(&0x000cu16.to_le_bytes()); // DSM + write zeroes
                 d[525] = 1; // volatile write cache
-                let nqn = format!("nqn.2026-10.org.vroom:nvme:{}", self.serial);
+                let nqn = format!("nqn.2014-08.org.nvmexpress:{}", self.serial);
                 d[768..768 + nqn.len()].copy_from_slice(nqn.as_bytes());
             }
             0x02 => {
@@ -835,7 +844,7 @@ mod tests {
         assert_eq!(status(&mem, ACQ, 0), 0);
         let mut mn = [0u8; 10];
         mem.read(GuestAddress(BUF + 24), &mut mn).unwrap();
-        assert_eq!(&mn, b"Vroom NVMe");
+        assert_eq!(&mn, b"vroom NVMe");
         // Create CQ 1 and SQ 1 (4 entries each).
         let (cq1, sq1) = (RAM + 0x2000, RAM + 0x3000);
         submit(&mut n, &mem, (0, ASQ, 4), 1, [5 | 2 << 16, 0, 0, 0, 0, 0, cq1 as u32, 0, 0, 0, 1 | 3 << 16, 1, 0, 0, 0, 0]);

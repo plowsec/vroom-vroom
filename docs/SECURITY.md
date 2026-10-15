@@ -200,3 +200,23 @@ running VM's images, even with `-U`.
 - x86_64 isn't implemented, so none of this is tested there.
 - Fuzzing doesn't cover Venus (3D) command streams: that is
   virglrenderer's C code, which runs in the VMM process when 3D is on.
+
+## What the guest can tell
+
+Names and serials the guest reads from firmware tables, disks and USB
+devices come from the VM's `[identity]` (see [CONFIG.md](CONFIG.md#identity)).
+`announce_vm = false` drops the SMBIOS and ACPI "this is a VM" markers.
+
+Still visible, whatever the config says:
+
+- virtio devices (PCI vendor 0x1AF4) and the fw_cfg device: Linux and the
+  Windows drivers need them.
+- The firmware itself: EDK2 reports its own vendor in UEFI tables.
+- CPU ID registers come from the host CPU (an Apple core on a Mac), and
+  timing differs from bare metal.
+- The vTPM is swtpm (its manufacturer ID is IBM's).
+- The guest agent, if installed.
+
+So this makes casual checks fail. It doesn't make a VM look like real
+hardware to software that tries hard.
+

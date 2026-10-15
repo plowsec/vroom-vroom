@@ -75,6 +75,7 @@ impl Firmware {
         screen: Option<Weak<FbSink>>,
         tpm: Option<u64>,
         smbios: &vroom_arch::smbios::SmbiosConfig,
+        acpi_ids: &vroom_arch::acpi::AcpiIds,
     ) -> Result<()> {
         // Code: read-only, mapped straight into the guest.
         let code_path = match &self.code {
@@ -111,6 +112,7 @@ impl Firmware {
             virtio_mmio,
             psci_smc,
             tpm,
+            ids: acpi_ids.clone(),
         });
         fw.add_file(RSDP_FILE, tables.rsdp, None).map_err(Error::Setup)?;
         fw.add_file(TABLES_FILE, tables.tables, None).map_err(Error::Setup)?;

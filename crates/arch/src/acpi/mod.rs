@@ -3,9 +3,49 @@
 
 pub mod aml;
 
-pub const OEM_ID: &[u8; 6] = b"BULWRK";
-pub const OEM_TABLE_ID: &[u8; 8] = b"VROOM   ";
-const CREATOR_ID: &[u8; 4] = b"BWRK";
+/// The names in every table header (from the VM's `[identity]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcpiIds {
+    pub oem_id: [u8; 6],
+    pub table_id: [u8; 8],
+    pub creator_id: [u8; 4],
+    /// FADT hypervisor vendor; zeros: don't say.
+    pub hypervisor_id: [u8; 8],
+}
+
+impl AcpiIds {
+    /// Space padded, as ACPI wants (hypervisor id: zero padded).
+    pub fn new(oem: &str, table: &str, creator: &str, hypervisor: Option<&str>) -> Self {
+        fn pad<const N: usize>(s: &str, fill: u8) -> [u8; N] {
+            let mut o = [fill; N];
+            for (d, b) in o.iter_mut().zip(s.bytes()) {
+                *d = b;
+            }
+            o
+        }
+        AcpiIds {
+            oem_id: pad(oem, b' '),
+            table_id: pad(table, b' '),
+            creator_id: pad(creator, b' '),
+            hypervisor_id: hypervisor.map_or([0; 8], |h| pad(h, 0)),
+        }
+    }
+
+    /// Stamp the header of a finished table.
+    fn stamp(&self, t: &mut [u8]) {
+        if t.len() >= 36 {
+            t[10..16].copy_from_slice(&self.oem_id);
+            t[16..24].copy_from_slice(&self.table_id);
+            t[28..32].copy_from_slice(&self.creator_id);
+        }
+    }
+}
+
+impl Default for AcpiIds {
+    fn default() -> Self {
+        AcpiIds::new("VROOM", "VROOMVM", "VRM", Some("VROOM"))
+    }
+}
 
 pub const RSDP_FILE: &str = "etc/acpi/rsdp";
 pub const TABLES_FILE: &str = "etc/acpi/tables";
@@ -24,10 +64,10 @@ impl Table {
         b.extend_from_slice(&[0; 4]); // length, fixed in finish()
         b.push(revision);
         b.push(0); // checksum, filled by the loader
-        b.extend_from_slice(OEM_ID);
-        b.extend_from_slice(OEM_TABLE_ID);
+        // OEM, table and creator IDs: stamped by `assemble`.
+        b.extend_from_slice(&[b' '; 14]);
         b.extend_from_slice(&1u32.to_le_bytes());
-        b.extend_from_slice(CREATOR_ID);
+        b.extend_from_slice(&[b' '; 4]);
         b.extend_from_slice(&1u32.to_le_bytes());
         Table { bytes: b }
     }
@@ -135,13 +175,14 @@ pub struct AcpiBlobs {
 
 /// Lay out tables, build XSDT + RSDP and the loader script.
 /// `dsdt` is pointed to by the FADT (`fadt_dsdt_offset` = X_DSDT field).
-pub fn assemble(fadt: Vec<u8>, fadt_dsdt_offset: usize, dsdt: Vec<u8>, others: Vec<Vec<u8>>) -> AcpiBlobs {
+pub fn assemble(ids: &AcpiIds, fadt: Vec<u8>, fadt_dsdt_offset: usize, dsdt: Vec<u8>, others: Vec<Vec<u8>>) -> AcpiBlobs {
     let mut tables = Vec::new();
     let mut ld = Loader::default();
     ld.allocate(RSDP_FILE, 16, 2);
     ld.allocate(TABLES_FILE, 64, 1);
 
-    let place = |t: Vec<u8>, tables: &mut Vec<u8>| -> (u32, u32) {
+    let place = |mut t: Vec<u8>, tables: &mut Vec<u8>| -> (u32, u32) {
+        ids.stamp(&mut t);
         while !tables.len().is_multiple_of(8) {
             tables.push(0);
         }
@@ -179,7 +220,7 @@ pub fn assemble(fadt: Vec<u8>, fadt_dsdt_offset: usize, dsdt: Vec<u8>, others: V
     let mut rsdp = Vec::with_capacity(36);
     rsdp.extend_from_slice(b"RSD PTR ");
     rsdp.push(0); // checksum (first 20 bytes)
-    rsdp.extend_from_slice(OEM_ID);
+    rsdp.extend_from_slice(&ids.oem_id);
     rsdp.push(2); // revision: ACPI 2.0+
     rsdp.extend_from_slice(&0u32.to_le_bytes()); // RSDT: none
     rsdp.extend_from_slice(&36u32.to_le_bytes());
@@ -232,7 +273,12 @@ mod tests {
         let dsdt = Table::new(b"DSDT", 2).finish();
         let mut madt = Table::new(b"APIC", 4);
         madt.u32(0).u32(0);
-        let b = assemble(fadt.finish(), 140, dsdt, vec![madt.finish()]);
+        let ids = AcpiIds::new("DELL", "PE_SC3", "INTL", None);
+        let b = assemble(&ids, fadt.finish(), 140, dsdt, vec![madt.finish()]);
+        // Every header carries the configured names.
+        let hdrs = b.tables.windows(10).filter(|w| w[..4] == *b"DELL" && w[4..] == *b"  PE_S").count();
+        assert_eq!(hdrs, 4, "dsdt, fadt, madt, xsdt");
+        assert_eq!(&b.rsdp[9..15], b"DELL  ");
         let base = 0x7000_0000u64;
         let (rsdp, tables) = link(&b, base, 0x6000_0000);
         assert_eq!(checksum(&rsdp[..20]), 0);

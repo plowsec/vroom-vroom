@@ -42,11 +42,15 @@ pub struct Block {
 impl Block {
     /// `id` must be unique per VM ("vda", "vdb"...); used in snapshots.
     pub fn new(id: &str, disk: Arc<dyn DiskImage>) -> Self {
-        let mut serial = [0u8; 20];
-        let s = format!("vroom-{id}");
+        Block { disk, id: id.to_string(), serial: [0u8; 20], worker: WorkerSlot::default() }.with_serial(&format!("VRM-{id}"))
+    }
+
+    /// Serial the guest reads (GET_ID, up to 20 bytes; from `[identity]`).
+    pub fn with_serial(mut self, s: &str) -> Self {
+        self.serial = [0u8; 20];
         let n = s.len().min(20);
-        serial[..n].copy_from_slice(&s.as_bytes()[..n]);
-        Block { disk, id: id.to_string(), serial, worker: WorkerSlot::default() }
+        self.serial[..n].copy_from_slice(&s.as_bytes()[..n]);
+        self
     }
 
     fn handler(&self) -> BlockHandler {
