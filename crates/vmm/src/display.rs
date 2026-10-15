@@ -112,12 +112,13 @@ impl FbSink {
         Ok(Arc::new(FbSink { fb, mode: Mutex::new((0, 0)), arb: Mutex::default(), tx: None }))
     }
 
-    /// A full frame from ramfb (sent only when it changed).
-    pub fn ramfb_frame(&self, w: u32, h: u32, rows: &[u8], stride: usize) {
-        self.ramfb_frame_at(Instant::now(), w, h, rows, stride)
+    /// A full frame from ramfb (sent only when it changed); rows
+    /// `changed.0..changed.1` differ from the last one.
+    pub fn ramfb_frame(&self, w: u32, h: u32, rows: &[u8], stride: usize, changed: (u32, u32)) {
+        self.ramfb_frame_at(Instant::now(), w, h, rows, stride, changed)
     }
 
-    fn ramfb_frame_at(&self, now: Instant, w: u32, h: u32, rows: &[u8], stride: usize) {
+    fn ramfb_frame_at(&self, now: Instant, w: u32, h: u32, rows: &[u8], stride: usize, changed: (u32, u32)) {
         let mut a = self.arb.lock().unwrap_or_else(|e| e.into_inner());
         a.last_ramfb = Some(now);
         if a.gpu_on_screen {
@@ -126,9 +127,18 @@ impl FbSink {
             }
             log::info!("display: showing the firmware framebuffer (virtio-gpu is idle)");
             a.gpu_on_screen = false;
+            // Taking over the screen: all of it.
+            self.apply_mode(w, h);
+            self.draw(0, 0, w, h, rows, stride);
+            return;
         }
+        let new_mode = *self.mode.lock().unwrap_or_else(|e| e.into_inner()) != (w, h);
         self.apply_mode(w, h);
-        self.draw(0, 0, w, h, rows, stride);
+        let (y0, y1) = if new_mode { (0, h) } else { (changed.0.min(h), changed.1.min(h)) };
+        if y1 > y0 {
+            let start = y0 as usize * stride;
+            self.draw(0, y0, w, y1 - y0, rows.get(start..).unwrap_or(&[]), stride);
+        }
     }
 
     fn apply_mode(&self, width: u32, height: u32) {
@@ -433,17 +443,17 @@ mod tests {
         let s = FbSink::headless().unwrap();
         let t0 = Instant::now();
         let (ramfb, gpu) = ([0x11u8; 4 * 4 * 2], [0x22u8; 4 * 4 * 2]);
-        s.ramfb_frame_at(t0, 4, 2, &ramfb, 16);
+        s.ramfb_frame_at(t0, 4, 2, &ramfb, 16, (0, 2));
         assert_eq!(px(&s), 0x11111111);
         // Driver comes up: GPU takes over at once.
         s.set_mode(4, 2);
         s.flush_at(t0, 0, 0, 4, 2, &gpu, 16);
         assert_eq!(px(&s), 0x22222222);
         // Firmware screen changes while the GPU is busy: stays on GPU.
-        s.ramfb_frame_at(t0 + Duration::from_secs(1), 4, 2, &ramfb, 16);
+        s.ramfb_frame_at(t0 + Duration::from_secs(1), 4, 2, &ramfb, 16, (0, 2));
         assert_eq!(px(&s), 0x22222222);
         // GPU quiet for a while, ramfb changes: show ramfb.
-        s.ramfb_frame_at(t0 + Duration::from_secs(5), 4, 2, &ramfb, 16);
+        s.ramfb_frame_at(t0 + Duration::from_secs(5), 4, 2, &ramfb, 16, (0, 2));
         assert_eq!(px(&s), 0x11111111);
         // A partial GPU update right after: ramfb is not quiet yet.
         s.flush_at(t0 + Duration::from_secs(6), 0, 0, 1, 1, &[0x33; 4], 4);
