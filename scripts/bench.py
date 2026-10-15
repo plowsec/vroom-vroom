@@ -219,11 +219,15 @@ def run_fio(vm, runtime, only=None):
 
 
 def iperf_guest(vm, args):
-    out = vm.ssh(f"iperf3 -J {args}", check=False)
-    j = json.loads(out[out.index("{"):])
-    if "error" in j:
-        raise RuntimeError(f"iperf3 {args}: {j['error']}")
-    return j
+    for attempt in range(2):
+        out = vm.ssh(f"iperf3 -J {args}", check=False)
+        j = json.loads(out[out.index("{"):])
+        if "error" not in j:
+            return j
+        # The host's iperf3 server sometimes isn't back to listening yet.
+        print(f"iperf3 {args}: {j['error']} (attempt {attempt + 1})", file=sys.stderr)
+        time.sleep(1)
+    raise RuntimeError(f"iperf3 {args}: {j['error']}")
 
 
 ECHO_SERVER = ("python3 -c 'import socket\n"
