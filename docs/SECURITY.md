@@ -83,6 +83,13 @@ caps and cleans status text, checks every mode and rectangle against the
 shared framebuffer, and on Linux only maps a framebuffer memfd that is
 sealed against shrinking (a VMM shrinking it would crash the GUI).
 
+The app (same binary, no arguments) also reads VM state dirs, which the
+sandboxed VMM can write: it only parses snapshot manifests (JSON, size
+checked) and checks for the lock and the suspend marker there. Pictures
+it shows come from its own data dir, taken from the shared framebuffer,
+never from image files a VMM could have planted. Snapshot names from VMM
+status messages must be valid names before they become file names.
+
 ## Networking
 
 NAT is a userspace proxy: the guest never gets raw access to the host

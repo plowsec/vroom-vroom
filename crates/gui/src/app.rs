@@ -92,6 +92,9 @@ pub fn launch() -> Result<(), String> {
     app.apply_theme();
     app.push_host();
     app.push_all();
+    // An explicit size: left alone, the window follows its layout's
+    // preferred size, which changes with what's on screen.
+    app.ui.window().set_size(slint::LogicalSize::new(1320.0, 840.0));
     app.ui.show().map_err(|e| e.to_string())?;
     crate::shot::TARGET.with(|t| *t.borrow_mut() = Some(app.ui.clone_strong()));
     // Follow the system look unless the user picked one.

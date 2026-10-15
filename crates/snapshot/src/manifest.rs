@@ -13,6 +13,9 @@ const MANIFEST: &str = "manifest.json";
 /// Refuse absurd blobs from a hostile snapshot dir (RAM goes through streams).
 /// Device blobs are read into memory. Old flash snapshots (JSON) get big.
 const MAX_BLOB: u64 = 256 << 20;
+/// A manifest is a config and a list of files: small. The app reads them
+/// from dirs a (possibly compromised) VMM can write.
+const MAX_MANIFEST: u64 = 16 << 20;
 
 /// A RAM range stored in `memory.bin`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,7 +100,7 @@ impl SnapshotDir {
     /// Open an existing, complete snapshot.
     pub fn open(root: &Path) -> Result<Self> {
         let f = File::open(root.join(MANIFEST))?;
-        if f.metadata()?.len() > MAX_BLOB {
+        if f.metadata()?.len() > MAX_MANIFEST {
             return Err(Error::Invalid("manifest too large".into()));
         }
         let manifest: Manifest =

@@ -4,6 +4,8 @@ Run Linux and Windows VMs on your Mac (Apple Silicon) or on arm64 Linux.
 Written in Rust. The VM process locks itself down before the guest starts,
 and every virtual device treats the guest as hostile.
 
+![The app](docs/img/app.png)
+
 ## What works
 
 - Ubuntu, Debian, Alpine, Windows 11 ARM64
@@ -23,6 +25,12 @@ sound, 3D or shared folders in Windows guests.
 ```bash
 brew install qemu            # only for its UEFI firmware file
 scripts/build.sh --release   # builds and signs vroom + vroom-gui
+target/release/vroom-gui     # the app: New VM, pick the ISO, Start
+```
+
+Or from the terminal:
+
+```bash
 target/release/vroom new dev --os linux --disk 32G --iso ubuntu-24.04-desktop-arm64.iso
 target/release/vroom-gui dev.toml
 ```
@@ -33,7 +41,8 @@ Ubuntu installs like on a real machine. Windows needs a few more steps:
 ## Cheat sheet
 
 ```bash
-vroom-gui dev.toml                # open a VM in a window
+vroom-gui                         # the app: VM list, settings, snapshots
+vroom-gui dev.toml                # open one VM in a window
 vroom run dev.toml                # no window: serial console in this terminal
 vroom check dev.toml              # validate a config, print it with defaults
 vroom new NAME --os linux|windows --disk 64G --iso FILE
@@ -46,6 +55,7 @@ vroom disk compact x.qcow2        # give freed space back to the host
 |---|---|
 | snapshot / suspend / pause | `Ctrl+Alt+Shift` + `S` / `Z` / `P` |
 | reset / shut down / power off | `Ctrl+Alt+Shift` + `R` / `D` / `Q` |
+| toolbar | move the mouse to the top edge |
 | close the window | suspends the VM, next start resumes it |
 
 | In `vroom run` | `Ctrl-A` then |
@@ -54,7 +64,11 @@ vroom disk compact x.qcow2        # give freed space back to the host
 | snapshot / pause / reset | `s` / `p` / `r` |
 | clipboard to / from guest, screenshot | `c` / `v` / `g` |
 
-A VM is one TOML file:
+In the app: `⌘K` finds VMs, actions and settings. Drop an ISO on the
+window to make a VM from it.
+
+A VM is one TOML file. The app edits the same file and keeps your
+comments:
 
 ```toml
 name = "dev"

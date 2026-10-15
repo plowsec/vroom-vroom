@@ -10,6 +10,29 @@ scripts/build.sh
 `qemu` is not used to run anything: vroom only reads
 `/opt/homebrew/share/qemu/edk2-aarch64-code.fd` (UEFI) from it.
 
+## The app
+
+`vroom-gui` with no arguments opens the app.
+
+![New VM](img/new-vm.png)
+
+- New VMs go in `~/Library/Application Support/vroom/VMs/<name>/` (Linux:
+  `~/.local/share/vroom/VMs/`). "Add existing" takes any VM file; it stays
+  where it is.
+- Settings are saved to the VM file right away. Comments and layout in the
+  file are kept. Hand edits show up in the app within a couple of seconds.
+- A running or suspended VM's hardware is locked. Clipboard rules apply
+  right away.
+- Hover a setting to see its key in the file. Every option is in
+  [CONFIG.md](CONFIG.md); the rare ones are under "Advanced" in each card.
+- `⌘K` (Ctrl+K on Linux): start, suspend, snapshot, jump to a setting.
+- Each VM's last run log: `⋯` → Show log.
+- The app only reads pictures it saved itself (VM screens, snapshot
+  thumbnails, under `.../vroom/thumbs/`), never files from a state dir:
+  the sandboxed VMM can write there.
+- `VROOM_HOME=dir` uses another data dir. `VROOM_SHOT=out.png` saves a
+  picture of the window and quits (that's how the README pictures are made).
+
 ## Ubuntu 24.04 (cloud image, direct kernel boot)
 
 ```bash
