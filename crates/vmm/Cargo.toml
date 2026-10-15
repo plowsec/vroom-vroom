@@ -23,6 +23,7 @@ bulwark-ipc.workspace = true
 bulwark-sandbox.workspace = true
 bulwark-block.workspace = true
 bulwark-net.workspace = true
+bulwark-audio.workspace = true
 bulwark-proto.workspace = true
 bulwark-display.workspace = true
 png = "0.17"

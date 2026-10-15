@@ -218,6 +218,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bulwark-audio"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "log",
+ "tempfile",
+]
+
+[[package]]
 name = "bulwark-block"
 version = "0.1.0"
 dependencies = [
@@ -234,6 +243,7 @@ name = "bulwark-cli"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "bulwark-audio",
  "bulwark-block",
  "bulwark-config",
  "bulwark-display",
@@ -426,6 +436,7 @@ name = "bulwark-vmm"
 version = "0.1.0"
 dependencies = [
  "bulwark-arch",
+ "bulwark-audio",
  "bulwark-block",
  "bulwark-config",
  "bulwark-devices",

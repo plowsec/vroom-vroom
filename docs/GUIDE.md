@@ -138,6 +138,13 @@ the share, and symlinks already there are shown but never followed on the
 host. Windows guests need virtio-win's virtiofs service and WinFsp (not
 tested yet).
 
+## Sound
+
+`[audio] output = true` gives Linux guests a sound card (virtio-snd; the
+`virtio_snd` module, in stock Ubuntu kernels). 44.1/48 kHz, 16-bit,
+mono/stereo. There is no input: the guest can't reach the microphone.
+Windows has no virtio-snd driver, so Windows guests stay silent.
+
 ## Snapshots, suspend
 
 - `Ctrl-A s` / `Ctrl+Alt+Shift+S`: snapshot to `<state>/snapshots/snap-<time>`.

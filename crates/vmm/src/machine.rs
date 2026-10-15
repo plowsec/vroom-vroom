@@ -369,6 +369,13 @@ pub(crate) fn build(
         board.reg.add_bus_only(layout::GIC_MSI_BASE, info.msi_size, frame)?;
     }
     board.add_virtio(Box::new(Rng::new()))?;
+    if config.audio.output {
+        // BULWARK_AUDIO_WAV_DIR: test mode, record instead of playing.
+        let wav = std::env::var_os("BULWARK_AUDIO_WAV_DIR").map(std::path::PathBuf::from);
+        let helper = crate::audio::AudioHelper::spawn(wav.as_deref())?;
+        let make = move || -> Box<dyn bulwark_virtio::devices::sound::AudioSink> { Box::new(crate::audio::HelperSink(helper.clone())) };
+        board.add_virtio(Box::new(bulwark_virtio::devices::sound::Sound::new(Box::new(make))))?;
+    }
     for s in &config.shares {
         board.add_virtio(Box::new(Fs::new(&s.tag, s.path.clone(), s.readonly).map_err(|e| Error::Setup(e.to_string()))?))?;
     }

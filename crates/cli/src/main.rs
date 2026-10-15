@@ -50,6 +50,9 @@ enum Cmd {
     /// Disk image tools.
     #[command(subcommand)]
     Disk(disk::DiskCmd),
+    /// Audio helper started by the VMM (internal).
+    #[command(hide = true)]
+    AudioOut,
     /// Create a VM: write <name>.toml and its disk.
     New(new::NewArgs),
     /// Snapshot housekeeping (list, delete, prune disk layers).
@@ -79,6 +82,7 @@ fn main() -> ExitCode {
         Cmd::Disk(d) => disk::run(d),
         Cmd::Snapshot(s) => snap::run(s, load, default_state_dir),
         Cmd::New(a) => new::run(a, load),
+        Cmd::AudioOut => audio_out(),
         Cmd::Check { config } => load(&config).and_then(|c| {
             print!("{}", c.to_toml().map_err(|e| e.to_string())?);
             Ok(())
@@ -109,4 +113,14 @@ fn load(p: &Path) -> Result<VmConfig, String> {
     let base = std::fs::canonicalize(base).map_err(|e| format!("{}: {e}", base.display()))?;
     c.rebase_paths(&base);
     Ok(c)
+}
+
+/// The VMM hands us a datagram socket as stdin.
+fn audio_out() -> Result<(), String> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: fd 0 is the socket our parent set up for us; nobody else
+    // in this process uses stdin.
+    let sock = unsafe { std::os::unix::net::UnixDatagram::from_raw_fd(0) };
+    let wav = std::env::var_os("BULWARK_AUDIO_WAV").map(std::path::PathBuf::from);
+    bulwark_audio::helper_main(sock, wav).map_err(|e| e.to_string())
 }

@@ -82,6 +82,16 @@ the guest can't create links or device nodes. Node, handle and directory
 listing counts are capped. The sandbox only grants the share's own
 subtree (read-only shares: read access only). The FUSE server is fuzzed.
 
+## Sound
+
+Off unless `[audio] output = true`, and output only: the device has no
+capture stream and nothing in the VMM can read the microphone. PCM goes
+over a datagram socket to a helper process (`bulwark audio-out`) that
+plays it, so CoreAudio and the plug-ins it loads never run in the VMM. The
+helper runs under its own Seatbelt profile: system libraries, the
+CoreAudio services and the audio user client only; no user files, no
+network, no exec. The VMM never blocks on it (it drops audio instead).
+
 ## Snapshots
 
 Snapshots contain guest RAM (keys, passwords). They're written 0600 in 0700

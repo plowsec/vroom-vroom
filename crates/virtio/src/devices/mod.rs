@@ -1,6 +1,7 @@
 //! Virtio device implementations.
 
 pub mod rng;
+pub mod sound;
 pub mod block;
 pub mod net;
 pub mod console;

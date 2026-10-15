@@ -83,6 +83,36 @@ pub fn profile(p: &Policy) -> Result<String> {
 /// Profile for a helper we exec (swtpm): may read its own install and
 /// system libraries, read/write `rw_dir`, nothing else (no network, no
 /// home directory, no further exec).
+/// Profile for the audio helper: CoreAudio's client side and nothing
+/// else (no files beyond the system, no network, no exec). `wav_dir`: a
+/// test mode writing WAV files instead of playing.
+pub fn audio_profile(exe: &Path, wav_dir: Option<&Path>) -> Result<String> {
+    let exe_real = exe.canonicalize().unwrap_or_else(|_| exe.to_path_buf());
+    let mut s = format!(
+        r#"(version 1)
+(deny default)
+(allow process-exec (literal {exe}))
+(allow file-read* (literal {exe}) (subpath "/usr/lib") (subpath "/System") (subpath "/Library/Apple")
+  (subpath "/Library/Audio/Plug-Ins") (literal "/dev/urandom") (literal "/dev/null")
+  (literal "/private/etc/localtime") (subpath "/private/var/db/timezone"))
+(allow file-read-metadata)
+(allow file-read-data (literal "/"))
+(allow sysctl-read)
+(allow signal (target self))
+(allow mach-task-name (target self))
+(allow mach-lookup (global-name "com.apple.audio.audiohald") (global-name "com.apple.audio.AudioComponentRegistrar")
+  (global-name "com.apple.audio.AudioSession") (global-name "com.apple.coreaudio.components.server"))
+(allow ipc-posix-shm-read-data ipc-posix-shm-write-data ipc-posix-shm-read-metadata)
+(allow iokit-open (iokit-user-client-class "IOAudioEngineUserClient"))
+"#,
+        exe = q(&exe_real)?,
+    );
+    if let Some(d) = wav_dir {
+        s += &format!("(allow file-read* file-write* (subpath {}))\n", q(d)?);
+    }
+    Ok(s)
+}
+
 pub fn helper_profile(exe: &Path, rw_dir: &Path) -> Result<String> {
     let exe_real = exe.canonicalize().unwrap_or_else(|_| exe.to_path_buf());
     let prefix = exe_real.ancestors().nth(3).unwrap_or(Path::new("/opt/homebrew"));

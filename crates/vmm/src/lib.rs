@@ -5,6 +5,7 @@
 //! through [`Vmm`] in-process or through the control socket.
 
 pub mod agent;
+mod audio;
 mod disks;
 pub mod state;
 mod display;

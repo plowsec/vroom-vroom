@@ -53,6 +53,8 @@ pub struct VmConfig {
     /// M3 or newer Mac on macOS 15+. Snapshots are not supported then.
     #[serde(default)]
     pub nested: bool,
+    #[serde(default)]
+    pub audio: Audio,
     /// Host folders the guest can mount (virtio-fs).
     #[serde(default, rename = "share")]
     pub shares: Vec<Share>,
@@ -116,6 +118,15 @@ pub enum DiskFormat {
     Auto,
     Raw,
     Qcow2,
+}
+
+/// Sound. Output only: there is no microphone path at all.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Audio {
+    /// Guest playback through the host's speakers (virtio-snd; Linux guests).
+    #[serde(default)]
+    pub output: bool,
 }
 
 /// A host folder shared with the guest. Linux: `mount -t virtiofs <tag> /mnt`.

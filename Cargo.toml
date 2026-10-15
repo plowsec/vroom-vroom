@@ -26,6 +26,7 @@ bulwark-display = { path = "crates/display" }
 bulwark-ipc = { path = "crates/ipc" }
 bulwark-gpu3d = { path = "crates/gpu3d" }
 bulwark-fs = { path = "crates/fs" }
+bulwark-audio = { path = "crates/audio" }
 
 thiserror = "2"
 log = "0.4"

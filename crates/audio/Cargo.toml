@@ -1,0 +1,16 @@
+[package]
+name = "bulwark-audio"
+description = "Guest audio out of the VMM: framing, and the sandboxed helper that plays it."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libc.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
