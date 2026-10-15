@@ -1,6 +1,6 @@
 [package]
 name = "vroom-gui"
-description = "VM window. Runs unsandboxed but never touches guest memory: it only sees pixels and sends input."
+description = "The vroom app: VM library, settings, snapshots, and the VM windows. Runs unsandboxed but never touches guest memory: it only sees pixels and sends input."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,11 +13,24 @@ path = "src/main.rs"
 log.workspace = true
 env_logger.workspace = true
 libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
 vroom-display.workspace = true
 vroom-config.workspace = true
-winit = "0.30"
-softbuffer = "0.4"
+vroom-state.workspace = true
+vroom-block.workspace = true
+slint = { version = "1.18", features = ["unstable-winit-030"] }
 arboard = { version = "3", default-features = false }
+rfd = "0.15"
+toml_edit = "0.22"
+png = "0.17"
+
+[build-dependencies]
+slint-build = "1.18"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile = "3"

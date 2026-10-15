@@ -108,9 +108,10 @@ impl GuestOs {
     pub fn guess(name: &str) -> Option<GuestOs> {
         let n = name.to_ascii_lowercase();
         let has = |k: &str| n.contains(k);
-        Some(if has("win") {
+        let windows = has("windows") || n.starts_with("win") || ["win1", "-win", "_win", " win"].iter().any(|k| has(k));
+        Some(if windows {
             GuestOs::Windows
-        } else if has("ubuntu") || has("kubuntu") || has("xubuntu") {
+        } else if ["ubuntu", "noble", "jammy", "focal", "oracular", "plucky", "questing"].iter().any(|k| has(k)) {
             GuestOs::Ubuntu
         } else if has("debian") {
             GuestOs::Debian
@@ -439,6 +440,17 @@ impl VmConfig {
         }
         if let Some(o) = GuestOs::guess(&self.name) {
             return o;
+        }
+        // Installer and image names usually say ("noble.img", "Win11.iso").
+        for d in &self.disks {
+            let file = d.path.file_name();
+            let dir = d.path.parent().and_then(Path::file_name);
+            if let Some(o) = [file, dir].into_iter().flatten().find_map(|n| GuestOs::guess(&n.to_string_lossy())) {
+                return o;
+            }
+        }
+        if matches!(self.boot, Boot::Kernel { .. }) {
+            return GuestOs::Linux;
         }
         // Windows setups here use NVMe + TPM; Linux ones virtio.
         if self.tpm && self.disks.iter().any(|d| d.bus == DiskBus::Nvme) {

@@ -292,6 +292,12 @@ fn escape_action(b: u8) -> Option<Action> {
 pub fn run(o: RunOpts) -> Result<(), String> {
     std::fs::create_dir_all(&o.state_dir).map_err(|e| format!("{}: {e}", o.state_dir.display()))?;
     let suspend = o.state_dir.join("suspend");
+    if suspend.is_dir() && !suspend.join("manifest.json").exists() {
+        // Killed while suspending: the image is incomplete. The disks are
+        // as the guest left them, like after a power cut.
+        eprintln!("vroom: the last suspend didn't finish (the VM was killed while saving); booting fresh");
+        let _ = std::fs::remove_dir_all(&suspend);
+    }
     let start = match (&o.restore, o.fresh) {
         (Some(p), _) => StartMode::Restore(p.clone()),
         (None, false) if suspend.join("manifest.json").exists() => {

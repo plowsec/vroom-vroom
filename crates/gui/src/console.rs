@@ -1,0 +1,745 @@
+//! A VM window: starts `vroom run --ui-fd`, shows its screen, sends input.
+//!
+//! ```text
+//! vroom-gui (this: window, host clipboard; never touches guest memory)
+//!    └── vroom run --ui-fd N   (sandboxed VMM, owns the guest)
+//! ```
+//! We get pixels (shared memory) and small messages from the VMM and send
+//! input back. The VMM is treated as untrusted: its messages are size
+//! checked by the decoder, its strings are cleaned before display, and the
+//! clipboard rules from the VM file are enforced here too.
+
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap};
+use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::net::UnixStream;
+use std::path::Path;
+use std::process::{Child, Command as Proc, Stdio};
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use slint::winit_030::winit::event::{ElementState, WindowEvent};
+use slint::winit_030::winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
+use slint::winit_030::{EventResult, WinitWindowAccessor};
+use slint::{ComponentHandle, Rgba8Pixel, SharedPixelBuffer};
+use vroom_config::{GuestOs, VmConfig};
+use vroom_display::{recv_fd, Command, Decoder, SharedFb, ToViewer, ToVmm, POINTER_MAX};
+
+use crate::msg::{self, Msg};
+use crate::{ConsoleWindow, VmState};
+
+const CLIP_POLL: Duration = Duration::from_millis(500);
+const RESIZE_DEBOUNCE: Duration = Duration::from_millis(300);
+const THUMB_EVERY: Duration = Duration::from_secs(2);
+const THUMB_SAVE_EVERY: Duration = Duration::from_secs(60);
+/// Scroll distance (logical px) per wheel click sent to the guest.
+const WHEEL_STEP: f32 = 30.0;
+
+/// Shared with the socket reader thread.
+#[derive(Default)]
+struct Shared {
+    mode: (u32, u32),
+    frame_pending: bool,
+}
+
+/// Input side: everything the window callbacks need, without the rest.
+struct Io {
+    tx: Option<UnixStream>,
+    mods: ModifiersState,
+    /// Keys the guest thinks are down (released if we lose focus).
+    down: BTreeSet<u16>,
+    wheel: (f32, f32),
+    focused: bool,
+}
+
+impl Io {
+    fn send(&mut self, m: ToVmm) {
+        if let Some(t) = &mut self.tx {
+            let _ = t.write_all(&m.encode());
+        }
+    }
+
+    fn key(&mut self, code: u16, down: bool) {
+        if down {
+            self.down.insert(code);
+        } else {
+            self.down.remove(&code);
+        }
+        self.send(ToVmm::Key { code, down });
+    }
+
+    fn release_all(&mut self) {
+        for code in std::mem::take(&mut self.down) {
+            self.send(ToVmm::Key { code, down: false });
+        }
+    }
+}
+
+pub struct Console {
+    pub key: String,
+    pub state: VmState,
+    name: String,
+    win: ConsoleWindow,
+    io: Rc<RefCell<Io>>,
+    fb: Option<SharedFb>,
+    shared: Arc<Mutex<Shared>>,
+    child: Child,
+    pixels: Vec<u32>,
+    mode: (u32, u32),
+    last_thumb: Instant,
+    last_save: Instant,
+    clip_policy: vroom_config::Clipboard,
+    clipboard: Option<arboard::Clipboard>,
+    clip_seen: Option<String>,
+    pending_resize: Option<(Instant, u32, u32)>,
+    toast_id: u64,
+    ever_ran: bool,
+    gone: Arc<AtomicBool>,
+}
+
+thread_local! {
+    static CONSOLES: RefCell<HashMap<String, Console>> = RefCell::new(HashMap::new());
+    static TIMER: slint::Timer = slint::Timer::default();
+}
+
+fn with<R>(key: &str, f: impl FnOnce(&mut Console) -> R) -> Option<R> {
+    CONSOLES.with(|c| c.borrow_mut().get_mut(key).map(f))
+}
+
+pub fn is_running(key: &str) -> bool {
+    CONSOLES.with(|c| c.borrow().contains_key(key))
+}
+
+pub fn count() -> usize {
+    CONSOLES.with(|c| c.borrow().len())
+}
+
+pub fn state(key: &str) -> Option<VmState> {
+    with(key, |c| c.state)
+}
+
+/// Bring a VM's window to the front.
+pub fn show(key: &str) {
+    with(key, |c| {
+        let _ = c.win.show();
+        c.win.window().with_winit_window(|w| w.focus_window());
+    });
+}
+
+/// The VM file's clipboard rules changed: apply them now (we enforce them).
+pub fn set_clip_policy(key: &str, p: vroom_config::Clipboard) {
+    with(key, |c| c.clip_policy = p);
+}
+
+pub fn command(key: &str, cmd: &str) {
+    with(key, |c| c.command(cmd));
+}
+
+/// A picture of some VM window (for `VROOM_SHOT`).
+pub fn snapshot_any() -> Option<Result<SharedPixelBuffer<Rgba8Pixel>, slint::PlatformError>> {
+    CONSOLES.with(|c| c.borrow().values().next().map(|c| c.win.window().take_snapshot()))
+}
+
+/// Ask every running VM to suspend (app quitting).
+pub fn suspend_all() {
+    CONSOLES.with(|c| {
+        for con in c.borrow_mut().values_mut() {
+            con.command("suspend");
+        }
+    });
+}
+
+fn clean(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).take(160).collect()
+}
+
+fn tail(p: &Path, lines: usize) -> String {
+    let s = std::fs::read_to_string(p).unwrap_or_default();
+    let v: Vec<&str> = s.lines().filter(|l| !l.trim().is_empty()).collect();
+    v[v.len().saturating_sub(lines)..].join("\n")
+}
+
+/// Start a VM in a new window. `extra` goes to `vroom run` (`--fresh`,
+/// `--restore DIR`).
+pub fn start(path: &Path, cfg: &VmConfig, extra: &[String]) -> Result<String, String> {
+    let key = crate::paths::key(path);
+    if is_running(&key) {
+        show(&key);
+        return Ok(key);
+    }
+    let log = crate::paths::log_file(&key);
+    if let Some(d) = log.parent() {
+        std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
+    }
+    // Keep the last run only: logs are for "why did it stop".
+    let logf = std::fs::File::create(&log).map_err(|e| format!("{}: {e}", log.display()))?;
+    let (ours, theirs) = UnixStream::pair().map_err(|e| e.to_string())?;
+    // The child must inherit its end: clear close-on-exec.
+    // SAFETY: fcntl on an fd we own.
+    #[allow(unsafe_code)]
+    unsafe {
+        libc::fcntl(theirs.as_raw_fd(), libc::F_SETFD, 0)
+    };
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let vmm = exe.with_file_name("vroom");
+    let child = Proc::new(&vmm)
+        .arg("run")
+        .arg(path)
+        .arg("--ui-fd")
+        .arg(theirs.as_raw_fd().to_string())
+        .args(extra)
+        .stdin(Stdio::null())
+        .stdout(logf.try_clone().map_err(|e| e.to_string())?)
+        .stderr(logf)
+        .spawn()
+        .map_err(|e| format!("start {}: {e}", vmm.display()))?;
+    drop(theirs);
+
+    let os = cfg.guest_os();
+    let win = ConsoleWindow::new().map_err(|e| e.to_string())?;
+    win.set_vm_name(cfg.name.clone().into());
+    win.set_os(crate::os_id(os).into());
+    win.set_state(VmState::Starting);
+    win.set_has_display(cfg.display.gpu != vroom_config::Gpu::None);
+    win.set_windows_guest(os == GuestOs::Windows);
+    win.set_bar_pinned(true);
+    let io = Rc::new(RefCell::new(Io {
+        tx: ours.try_clone().ok(),
+        mods: ModifiersState::empty(),
+        down: BTreeSet::new(),
+        wheel: (0.0, 0.0),
+        focused: false,
+    }));
+    wire(&win, &key, &io);
+    win.show().map_err(|e| e.to_string())?;
+    // Keep the toolbar out for a few seconds so people see it exists.
+    {
+        let k = key.clone();
+        slint::Timer::single_shot(Duration::from_secs(4), move || {
+            with(&k, |c| c.win.set_bar_pinned(false));
+        });
+    }
+
+    let shared = Arc::new(Mutex::new(Shared::default()));
+    let gone = Arc::new(AtomicBool::new(false));
+    {
+        let (key, shared, gone) = (key.clone(), shared.clone(), gone.clone());
+        std::thread::Builder::new()
+            .name("vmm-reader".into())
+            .spawn(move || reader(ours, key, shared, gone))
+            .map_err(|e| e.to_string())?;
+    }
+    let c = Console {
+        key: key.clone(),
+        state: VmState::Starting,
+        name: cfg.name.clone(),
+        win,
+        io,
+        fb: None,
+        shared,
+        child,
+        pixels: Vec::new(),
+        mode: (0, 0),
+        last_thumb: Instant::now(),
+        last_save: Instant::now(),
+        clip_policy: cfg.clipboard.clone(),
+        clipboard: arboard::Clipboard::new().ok(),
+        clip_seen: None,
+        pending_resize: None,
+        toast_id: 0,
+        ever_ran: false,
+        gone,
+    };
+    CONSOLES.with(|m| m.borrow_mut().insert(key.clone(), c));
+    ensure_timer();
+    msg::send(Msg::ConsoleState { key: key.clone(), state: VmState::Starting });
+    Ok(key)
+}
+
+fn wire(win: &ConsoleWindow, key: &str, io: &Rc<RefCell<Io>>) {
+    {
+        let io = io.clone();
+        win.on_mouse_move(move |fx, fy| {
+            let x = (fx.clamp(0.0, 1.0) * POINTER_MAX as f32) as u16;
+            let y = (fy.clamp(0.0, 1.0) * POINTER_MAX as f32) as u16;
+            io.borrow_mut().send(ToVmm::Pointer { x, y });
+        });
+    }
+    {
+        let io = io.clone();
+        win.on_button(move |code, down| io.borrow_mut().send(ToVmm::Button { code: code as u16, down }));
+    }
+    {
+        let io = io.clone();
+        win.on_wheel(move |dx, dy| {
+            let mut io = io.borrow_mut();
+            io.wheel.0 += dx;
+            io.wheel.1 += dy;
+            let sx = (io.wheel.0 / WHEEL_STEP).trunc();
+            let sy = (io.wheel.1 / WHEEL_STEP).trunc();
+            if sx != 0.0 || sy != 0.0 {
+                io.wheel.0 -= sx * WHEEL_STEP;
+                io.wheel.1 -= sy * WHEEL_STEP;
+                io.send(ToVmm::Wheel { dx: sx as i16, dy: sy as i16 });
+            }
+        });
+    }
+    {
+        let k = key.to_string();
+        win.on_act(move |a| {
+            let (k, a) = (k.clone(), a.to_string());
+            // Not from inside the callback: the command may hide this window.
+            slint::Timer::single_shot(Duration::ZERO, move || command(&k, &a));
+        });
+    }
+    {
+        let k = key.to_string();
+        win.window().on_close_requested(move || {
+            let k = k.clone();
+            slint::Timer::single_shot(Duration::ZERO, move || command(&k, "close"));
+            slint::CloseRequestResponse::KeepWindowShown
+        });
+    }
+    let (k, io) = (key.to_string(), io.clone());
+    win.window().on_winit_window_event(move |_w, ev| winit_event(&k, &io, ev));
+}
+
+/// Keys as physical key codes (what the guest's keyboard sends), focus,
+/// resizes. Text input never goes through here.
+fn winit_event(key: &str, io: &Rc<RefCell<Io>>, ev: &WindowEvent) -> EventResult {
+    match ev {
+        WindowEvent::ModifiersChanged(m) => {
+            io.borrow_mut().mods = m.state();
+            EventResult::Propagate
+        }
+        WindowEvent::Focused(f) => {
+            let mut i = io.borrow_mut();
+            i.focused = *f;
+            if !*f {
+                i.release_all();
+            }
+            i.send(ToVmm::Focus(*f));
+            drop(i);
+            if *f {
+                // Can arrive from inside show(): don't touch the registry now.
+                let key = key.to_string();
+                slint::Timer::single_shot(Duration::ZERO, move || {
+                    with(&key, |c| c.clip_seen = None);
+                });
+            }
+            EventResult::Propagate
+        }
+        WindowEvent::KeyboardInput { event, .. } => {
+            let PhysicalKey::Code(k) = event.physical_key else { return EventResult::PreventDefault };
+            let down = event.state == ElementState::Pressed;
+            let m = io.borrow().mods;
+            if down && m.control_key() && m.alt_key() && m.shift_key() {
+                if let Some(cmd) = host_shortcut(k) {
+                    let key = key.to_string();
+                    slint::Timer::single_shot(Duration::ZERO, move || command(&key, cmd));
+                    return EventResult::PreventDefault;
+                }
+            }
+            if event.repeat {
+                return EventResult::PreventDefault; // the guest repeats on its own
+            }
+            if let Some(code) = crate::keymap::evdev(k) {
+                io.borrow_mut().key(code, down);
+            }
+            EventResult::PreventDefault
+        }
+        WindowEvent::Resized(sz) => {
+            let key = key.to_string();
+            let (w, h) = (sz.width, sz.height);
+            slint::Timer::single_shot(Duration::ZERO, move || {
+                with(&key, |c| {
+                    let sf = c.win.window().scale_factor().max(0.5);
+                    let (lw, lh) = ((w as f32 / sf) as u32, (h as f32 / sf) as u32);
+                    c.pending_resize = Some((Instant::now() + RESIZE_DEBOUNCE, lw, lh));
+                });
+            });
+            EventResult::Propagate
+        }
+        _ => EventResult::Propagate,
+    }
+}
+
+/// Ctrl+Alt+Shift+<key>: never sent to the guest.
+fn host_shortcut(k: KeyCode) -> Option<&'static str> {
+    Some(match k {
+        KeyCode::KeyS => "snapshot",
+        KeyCode::KeyP => "toggle-pause",
+        KeyCode::KeyR => "reset",
+        KeyCode::KeyD => "shutdown",
+        KeyCode::KeyQ => "poweroff",
+        KeyCode::KeyZ => "suspend",
+        KeyCode::KeyF => "fullscreen",
+        KeyCode::KeyL => "library",
+        _ => return None,
+    })
+}
+
+fn reader(mut s: UnixStream, key: String, shared: Arc<Mutex<Shared>>, gone: Arc<AtomicBool>) {
+    // The VMM sends the framebuffer first.
+    match recv_fd(&s) {
+        Ok(fd) => {
+            let k = key.clone();
+            let _ = slint::invoke_from_event_loop(move || ready(&k, fd));
+        }
+        Err(_) => {
+            gone.store(true, Ordering::Release);
+            let _ = slint::invoke_from_event_loop(move || closed(&key));
+            return;
+        }
+    }
+    let mut dec = Decoder::default();
+    let mut buf = vec![0u8; 64 << 10];
+    loop {
+        let n = match s.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        dec.push(&buf[..n]);
+        loop {
+            match dec.next_to_viewer() {
+                Ok(Some(ToViewer::Mode { width, height })) => {
+                    if width == 0 || SharedFb::mode_ok(width, height) {
+                        shared.lock().unwrap_or_else(|e| e.into_inner()).mode = (width, height);
+                        post_frame(&key, &shared, true);
+                    }
+                }
+                Ok(Some(ToViewer::Damage { .. })) => post_frame(&key, &shared, false),
+                Ok(Some(ToViewer::ClipboardSet(t))) => {
+                    let k = key.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        with(&k, |c| c.guest_clipboard(t));
+                    });
+                }
+                Ok(Some(ToViewer::Status(t))) => {
+                    let k = key.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        with(&k, |c| c.status(&t));
+                    });
+                }
+                Ok(Some(ToViewer::Closed)) => {
+                    gone.store(true, Ordering::Release);
+                    let _ = slint::invoke_from_event_loop(move || closed(&key));
+                    return;
+                }
+                Ok(None) => break,
+                Err(e) => log::warn!("from vmm: {e}"),
+            }
+        }
+    }
+    gone.store(true, Ordering::Release);
+    let _ = slint::invoke_from_event_loop(move || closed(&key));
+}
+
+fn post_frame(key: &str, shared: &Mutex<Shared>, force: bool) {
+    let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+    if sh.frame_pending && !force {
+        return;
+    }
+    sh.frame_pending = true;
+    drop(sh);
+    let k = key.to_string();
+    let _ = slint::invoke_from_event_loop(move || {
+        with(&k, |c| c.frame());
+    });
+}
+
+fn ready(key: &str, fd: OwnedFd) {
+    with(key, |c| match SharedFb::from_fd(fd) {
+        Ok(fb) => c.fb = Some(fb),
+        Err(e) => {
+            c.toast(&format!("display: {e}"));
+        }
+    });
+}
+
+fn closed(key: &str) {
+    let Some(mut c) = CONSOLES.with(|m| m.borrow_mut().remove(key)) else { return };
+    c.save_thumb(None);
+    let _ = c.win.hide();
+    // The VMM exits right after saying goodbye; don't block the UI on it.
+    let status = match c.child.try_wait() {
+        Ok(Some(s)) => Some(s),
+        _ => {
+            std::thread::sleep(Duration::from_millis(50));
+            c.child.try_wait().ok().flatten()
+        }
+    };
+    let failed = status.is_some_and(|s| !s.success());
+    if status.is_none() {
+        let mut child = c.child;
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
+    let error = if failed || !c.ever_ran {
+        let t = tail(&crate::paths::log_file(key), 4);
+        let t = t.lines().rev().find(|l| l.contains("vroom:") || l.contains("error")).unwrap_or(t.lines().last().unwrap_or("")).to_string();
+        Some(if t.is_empty() { format!("{} stopped", c.name) } else { clean(&t) })
+    } else {
+        None
+    };
+    msg::send(Msg::ConsoleGone { key: key.to_string(), error });
+}
+
+fn ensure_timer() {
+    TIMER.with(|t| {
+        if !t.running() {
+            t.start(slint::TimerMode::Repeated, CLIP_POLL / 2, tick);
+        }
+    });
+}
+
+fn tick() {
+    let keys: Vec<String> = CONSOLES.with(|m| m.borrow().keys().cloned().collect());
+    for k in keys {
+        with(&k, |c| c.tick());
+    }
+}
+
+impl Console {
+    fn set_state(&mut self, s: VmState) {
+        if self.state != s {
+            self.state = s;
+            self.win.set_state(s);
+            msg::send(Msg::ConsoleState { key: self.key.clone(), state: s });
+        }
+    }
+
+    fn toast(&mut self, text: &str) {
+        self.toast_id += 1;
+        let id = self.toast_id;
+        self.win.set_toast(text.into());
+        let k = self.key.clone();
+        slint::Timer::single_shot(Duration::from_millis(3500), move || {
+            with(&k, |c| {
+                if c.toast_id == id {
+                    c.win.set_toast("".into());
+                }
+            });
+        });
+    }
+
+    pub fn command(&mut self, cmd: &str) {
+        let send = |c: &mut Console, m: Command| c.io.borrow_mut().send(ToVmm::Command(m));
+        match cmd {
+            "pause" => send(self, Command::Pause),
+            "resume" => send(self, Command::Resume),
+            "toggle-pause" => {
+                let m = if self.state == VmState::Paused { Command::Resume } else { Command::Pause };
+                send(self, m);
+            }
+            "snapshot" => {
+                send(self, Command::Snapshot);
+                self.toast("Taking a snapshot...");
+            }
+            "reset" => send(self, Command::Reset),
+            "shutdown" => {
+                send(self, Command::Shutdown);
+                self.toast("Asked the guest to shut down");
+            }
+            "poweroff" => {
+                self.set_state(VmState::Stopping);
+                send(self, Command::PowerOff);
+            }
+            "suspend" | "close" => {
+                if self.gone.load(Ordering::Acquire) {
+                    let _ = self.win.hide();
+                    return;
+                }
+                if self.state != VmState::Suspending {
+                    self.save_thumb(None);
+                    self.set_state(VmState::Suspending);
+                    send(self, Command::Suspend);
+                }
+            }
+            "cad" => {
+                let mut io = self.io.borrow_mut();
+                for code in [29u16, 56, 111] {
+                    io.send(ToVmm::Key { code, down: true });
+                }
+                for code in [111u16, 56, 29] {
+                    io.send(ToVmm::Key { code, down: false });
+                }
+            }
+            "fullscreen" => {
+                let w = self.win.window();
+                let fs = !w.is_fullscreen();
+                w.set_fullscreen(fs);
+                self.win.set_fullscreen(fs);
+            }
+            "library" => msg::send(Msg::ShowLibrary),
+            _ => {}
+        }
+    }
+
+    fn status(&mut self, raw: &str) {
+        let t = clean(raw);
+        match t.as_str() {
+            "running" => {
+                self.ever_ran = true;
+                self.set_state(VmState::Running);
+            }
+            "paused" => self.set_state(VmState::Paused),
+            _ if t.starts_with("snapshot: ") => {
+                let name = Path::new(&t["snapshot: ".len()..]).file_name().map(|n| n.to_string_lossy().into_owned());
+                if let Some(n) = name.filter(|n| vroom_config::valid_name(n)) {
+                    self.save_thumb(Some(&n));
+                }
+                self.toast("Snapshot saved");
+                msg::send(Msg::SnapshotTaken { key: self.key.clone() });
+            }
+            _ if t.starts_with("guest agent connected") => self.toast("Guest tools connected: clipboard and resizing work"),
+            _ if t.starts_with("host disk almost full") => {
+                self.set_state(VmState::Paused);
+                self.toast(&t);
+                msg::send(Msg::Toast { text: format!("{}: {t}", self.name), kind: 2, action: String::new() });
+            }
+            _ => self.toast(&t),
+        }
+    }
+
+    fn guest_clipboard(&mut self, t: String) {
+        let focused = self.io.borrow().focused;
+        let ok = focused && self.clip_policy.guest_to_host && t.len() <= self.clip_policy.max_bytes as usize;
+        if let (true, Some(cb)) = (ok, self.clipboard.as_mut()) {
+            let _ = cb.set_text(t.clone());
+            self.clip_seen = Some(t);
+        }
+    }
+
+    fn tick(&mut self) {
+        let now = Instant::now();
+        if let Some((at, w, h)) = self.pending_resize {
+            if now >= at {
+                self.pending_resize = None;
+                self.io.borrow_mut().send(ToVmm::Resize { width: w, height: h });
+            }
+        }
+        // Host clipboard -> guest, only while this window has focus.
+        if self.io.borrow().focused && self.clip_policy.host_to_guest {
+            if let Some(Ok(t)) = self.clipboard.as_mut().map(|c| c.get_text()) {
+                if self.clip_seen.as_deref() != Some(t.as_str()) {
+                    self.clip_seen = Some(t.clone());
+                    if t.len() <= self.clip_policy.max_bytes as usize {
+                        self.io.borrow_mut().send(ToVmm::Clipboard(t));
+                    }
+                }
+            }
+        }
+        if self.state == VmState::Running && now.duration_since(self.last_save) > THUMB_SAVE_EVERY {
+            self.last_save = now;
+            self.save_thumb(None);
+        }
+        // A VMM that died without a goodbye.
+        if let Ok(Some(_)) = self.child.try_wait() {
+            if !self.gone.swap(true, Ordering::AcqRel) {
+                let k = self.key.clone();
+                slint::Timer::single_shot(Duration::ZERO, move || closed(&k));
+            }
+        }
+        self.win.set_captured(self.io.borrow().focused && self.state == VmState::Running);
+    }
+
+    fn frame(&mut self) {
+        let mode = {
+            let mut s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+            s.frame_pending = false;
+            s.mode
+        };
+        let Some(fb) = &self.fb else { return };
+        let (w, h) = mode;
+        if w == 0 || h == 0 {
+            self.mode = (0, 0);
+            self.win.set_mode_w(0);
+            self.win.set_mode_h(0);
+            return;
+        }
+        let n = w as usize * h as usize;
+        self.pixels.resize(n, 0);
+        fb.read_into(w, h, &mut self.pixels);
+        let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(w, h);
+        for (o, p) in buf.make_mut_slice().iter_mut().zip(&self.pixels) {
+            *o = Rgba8Pixel { r: (p >> 16) as u8, g: (p >> 8) as u8, b: *p as u8, a: 255 };
+        }
+        self.win.set_frame(slint::Image::from_rgba8(buf));
+        if self.mode != mode {
+            // Ask the guest to match the window on the first frame.
+            if self.mode == (0, 0) {
+                let sz = self.win.window().size();
+                let sf = self.win.window().scale_factor().max(0.5);
+                self.pending_resize = Some((Instant::now(), (sz.width as f32 / sf) as u32, (sz.height as f32 / sf) as u32));
+            }
+            self.mode = mode;
+            self.win.set_mode_w(w as i32);
+            self.win.set_mode_h(h as i32);
+        }
+        if self.state == VmState::Starting {
+            self.ever_ran = true;
+            self.set_state(VmState::Running);
+        }
+        let now = Instant::now();
+        if now.duration_since(self.last_thumb) > THUMB_EVERY {
+            self.last_thumb = now;
+            if let Some(img) = self.scaled(640).map(|(b, _, _)| slint::Image::from_rgba8(b)) {
+                msg::send(Msg::Thumb { key: self.key.clone(), image: img });
+            }
+        }
+    }
+
+    /// The screen, at most `max_w` wide.
+    fn scaled(&self, max_w: u32) -> Option<(SharedPixelBuffer<Rgba8Pixel>, u32, u32)> {
+        let (w, h) = self.mode;
+        if w == 0 || h == 0 || self.pixels.len() < w as usize * h as usize {
+            return None;
+        }
+        let tw = w.min(max_w);
+        let th = (h as u64 * tw as u64 / w as u64).max(1) as u32;
+        let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(tw, th);
+        let out = buf.make_mut_slice();
+        for y in 0..th as usize {
+            let sy = y * h as usize / th as usize;
+            for x in 0..tw as usize {
+                let sx = x * w as usize / tw as usize;
+                let p = self.pixels[sy * w as usize + sx];
+                out[y * tw as usize + x] = Rgba8Pixel { r: (p >> 16) as u8, g: (p >> 8) as u8, b: p as u8, a: 255 };
+            }
+        }
+        Some((buf, tw, th))
+    }
+
+    /// Save the screen as the VM's picture, or as a snapshot's.
+    fn save_thumb(&self, snapshot: Option<&str>) {
+        let Some((buf, w, h)) = self.scaled(960) else { return };
+        let dir = crate::paths::thumbs_dir(&self.key);
+        let p = match snapshot {
+            Some(n) => dir.join(format!("snap-{n}.png")),
+            None => dir.join("screen.png"),
+        };
+        if let Err(e) = write_png(&p, &buf, w, h) {
+            log::warn!("thumbnail {}: {e}", p.display());
+        }
+    }
+}
+
+pub fn write_png(p: &Path, buf: &SharedPixelBuffer<Rgba8Pixel>, w: u32, h: u32) -> Result<(), String> {
+    if let Some(d) = p.parent() {
+        std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
+    }
+    let tmp = p.with_extension("tmp~");
+    let f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+    let mut enc = png::Encoder::new(std::io::BufWriter::new(f), w, h);
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    let mut wr = enc.write_header().map_err(|e| e.to_string())?;
+    wr.write_image_data(buf.as_bytes()).map_err(|e| e.to_string())?;
+    wr.finish().map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, p).map_err(|e| e.to_string())
+}

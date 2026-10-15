@@ -1,0 +1,332 @@
+// A running VM's window. The guest screen fills it; a toolbar slides in
+// when the mouse touches the top edge. Keys go to the guest from Rust
+// (raw key codes, not text), so nothing here handles the keyboard.
+
+import { Theme } from "theme.slint";
+import { Icons } from "icons.slint";
+import { VmState } from "types.slint";
+import { IconButton, Icon, Spinner, OsBadge, StatusDot, Button } from "controls.slint";
+
+component BarButton inherits IconButton {
+    tint: #ffffffd0;
+    size: 32px;
+}
+
+export component ConsoleWindow inherits Window {
+    in property <string> vm-name;
+    in property <string> os;
+    in property <image> frame;
+    in property <int> mode-w;
+    in property <int> mode-h;
+    in property <VmState> state;
+    in property <bool> has-display: true;
+    in property <bool> windows-guest;
+    in property <string> toast;
+    in property <bool> captured;
+    in property <bool> fullscreen;
+    // Rust keeps the bar out for a moment after start.
+    in property <bool> bar-pinned;
+    callback mouse-move(float, float);
+    callback button(int, bool);
+    callback wheel(length, length);
+    callback act(string);
+
+    title: vm-name + " — vroom";
+    icon: Icons.logo;
+    background: #000000;
+    preferred-width: 1280px;
+    preferred-height: 800px;
+    min-width: 480px;
+    min-height: 320px;
+
+    property <float> ar: mode-w > 0 && mode-h > 0 ? mode-w / mode-h : 1.6;
+    property <bool> near-top: screen-ta.has-hover && screen-ta.mouse-y + screen.y < 8px;
+    property <bool> bar-out: bar-pinned || near-top || bar-ta.has-hover || power-open || state != VmState.running;
+    property <bool> power-open: false;
+
+    screen := Rectangle {
+        width: min(root.width, root.height * root.ar);
+        height: self.width / root.ar;
+        x: (root.width - self.width) / 2;
+        y: (root.height - self.height) / 2;
+        Image {
+            width: 100%;
+            height: 100%;
+            source: root.frame;
+            image-fit: fill;
+            image-rendering: smooth;
+        }
+        screen-ta := TouchArea {
+            changed mouse-x => { root.mouse-move(self.mouse-x / self.width, self.mouse-y / self.height); }
+            changed mouse-y => { root.mouse-move(self.mouse-x / self.width, self.mouse-y / self.height); }
+            pointer-event(ev) => {
+                let code = ev.button == PointerEventButton.left ? 272 : ev.button == PointerEventButton.right ? 273 : ev.button == PointerEventButton.middle ? 274 : 0;
+                if code != 0 && ev.kind == PointerEventKind.down {
+                    root.button(code, true);
+                }
+                if code != 0 && ev.kind == PointerEventKind.up {
+                    root.button(code, false);
+                }
+            }
+            scroll-event(ev) => {
+                root.wheel(ev.delta-x, ev.delta-y);
+                accept
+            }
+        }
+    }
+
+    // Center messages.
+    if root.state == VmState.starting || root.state == VmState.suspending || root.state == VmState.stopping || (root.mode-w == 0 && root.state == VmState.running): Rectangle {
+        background: root.mode-w == 0 ? #000000 : #000000a0;
+        VerticalLayout {
+            alignment: center;
+            spacing: 16px;
+            HorizontalLayout {
+                alignment: center;
+                OsBadge {
+                    os: root.os;
+                    size: 64px;
+                    glow: true;
+                }
+            }
+            HorizontalLayout {
+                alignment: center;
+                spacing: 10px;
+                Spinner {
+                    tint: #ffffffb0;
+                    y: (parent.height - self.height) / 2;
+                }
+                Text {
+                    text: root.state == VmState.suspending ? "Saving state..." : root.state == VmState.stopping ? "Shutting down..."
+                        : root.has-display ? "Starting " + root.vm-name + "..." : "Running. This VM has no screen: see its log.";
+                    color: #ffffffd0;
+                    font-size: Theme.fs-lg;
+                    font-weight: 600;
+                }
+            }
+        }
+    }
+    if root.state == VmState.paused: Rectangle {
+        background: #00000099;
+        VerticalLayout {
+            alignment: center;
+            spacing: 14px;
+            HorizontalLayout {
+                alignment: center;
+                Rectangle {
+                    width: 72px;
+                    height: 72px;
+                    border-radius: 36px;
+                    background: #ffffff26;
+                    border-width: 1px;
+                    border-color: #ffffff4d;
+                    Icon {
+                        source: Icons.pause;
+                        width: 28px;
+                        height: 28px;
+                        tint: #ffffff;
+                    }
+                }
+            }
+            Text {
+                text: "Paused";
+                color: #ffffff;
+                font-size: 20px;
+                font-weight: 700;
+                horizontal-alignment: center;
+            }
+            HorizontalLayout {
+                alignment: center;
+                Button {
+                    kind: "primary";
+                    text: "Continue";
+                    icon: Icons.play;
+                    has-icon: true;
+                    clicked => { root.act("resume"); }
+                }
+            }
+        }
+    }
+
+    // Toolbar.
+    bar := Rectangle {
+        x: (root.width - self.width) / 2;
+        y: root.bar-out ? 10px : -self.height - 12px;
+        animate y { duration: 240ms; easing: ease-out; }
+        width: bl.preferred-width;
+        height: 46px;
+        border-radius: 23px;
+        background: #14161dd9;
+        border-width: 1px;
+        border-color: #ffffff24;
+        drop-shadow-blur: 30px;
+        drop-shadow-color: #00000099;
+        drop-shadow-offset-y: 8px;
+        bar-ta := TouchArea { }
+        bl := HorizontalLayout {
+            padding-left: 8px;
+            padding-right: 8px;
+            spacing: 2px;
+            OsBadge {
+                os: root.os;
+                size: 28px;
+                y: (parent.height - self.height) / 2;
+            }
+            VerticalLayout {
+                alignment: center;
+                padding-left: 6px;
+                padding-right: 10px;
+                Text {
+                    text: root.vm-name;
+                    color: #ffffff;
+                    font-size: Theme.fs-md;
+                    font-weight: 650;
+                }
+                HorizontalLayout {
+                    spacing: 5px;
+                    StatusDot {
+                        width: 6px;
+                        height: 6px;
+                        y: (parent.height - self.height) / 2;
+                        tint: root.state == VmState.running ? #34d399 : #fbbf24;
+                    }
+                    Text {
+                        text: root.captured ? "Keyboard goes to the VM" : root.state == VmState.paused ? "Paused" : "Running";
+                        color: #ffffff99;
+                        font-size: 10px;
+                    }
+                }
+            }
+            Rectangle {
+                width: 1px;
+                height: 22px;
+                y: (parent.height - self.height) / 2;
+                background: #ffffff24;
+            }
+            BarButton {
+                icon: root.state == VmState.paused ? Icons.play : Icons.pause;
+                tip: root.state == VmState.paused ? "Continue" : "Pause";
+                y: (parent.height - self.height) / 2;
+                clicked => { root.act(root.state == VmState.paused ? "resume" : "pause"); }
+            }
+            BarButton {
+                icon: Icons.camera;
+                tip: "Snapshot";
+                y: (parent.height - self.height) / 2;
+                clicked => { root.act("snapshot"); }
+            }
+            BarButton {
+                icon: Icons.moon;
+                tip: "Suspend and close";
+                y: (parent.height - self.height) / 2;
+                clicked => { root.act("suspend"); }
+            }
+            BarButton {
+                icon: Icons.power;
+                tip: "Shut down...";
+                active: root.power-open;
+                y: (parent.height - self.height) / 2;
+                clicked => {
+                    root.power-open = true;
+                    power.show();
+                }
+            }
+            if root.windows-guest: BarButton {
+                icon: Icons.keyboard;
+                tip: "Send Ctrl+Alt+Del";
+                y: (parent.height - self.height) / 2;
+                clicked => { root.act("cad"); }
+            }
+            Rectangle {
+                width: 1px;
+                height: 22px;
+                y: (parent.height - self.height) / 2;
+                background: #ffffff24;
+            }
+            BarButton {
+                icon: Icons.maximize;
+                tip: root.fullscreen ? "Leave full screen" : "Full screen";
+                y: (parent.height - self.height) / 2;
+                clicked => { root.act("fullscreen"); }
+            }
+            BarButton {
+                icon: Icons.logo;
+                tip: "VM library";
+                y: (parent.height - self.height) / 2;
+                clicked => { root.act("library"); }
+            }
+        }
+        power := PopupWindow {
+            x: bar.width - 250px;
+            y: bar.height + 6px;
+            width: 200px;
+            close-policy: close-on-click-outside;
+            changed visible => { if !self.visible { root.power-open = false; } }
+            Rectangle {
+                background: #1a1d26f2;
+                border-radius: 12px;
+                border-width: 1px;
+                border-color: #ffffff24;
+                drop-shadow-blur: 24px;
+                drop-shadow-color: #00000099;
+                VerticalLayout {
+                    padding: 5px;
+                    for it in [
+                        { icon: Icons.power, text: "Shut down", action: "shutdown", danger: false },
+                        { icon: Icons.restart, text: "Restart", action: "reset", danger: false },
+                        { icon: Icons.x, text: "Force power off", action: "poweroff", danger: true },
+                    ]: Rectangle {
+                        height: 34px;
+                        border-radius: 8px;
+                        background: pta.has-hover ? (it.danger ? #f8717133 : #ffffff14) : transparent;
+                        HorizontalLayout {
+                            padding-left: 10px;
+                            spacing: 10px;
+                            Icon {
+                                source: it.icon;
+                                width: 16px;
+                                height: 16px;
+                                y: (parent.height - self.height) / 2;
+                                tint: it.danger ? #f87171 : #ffffffb0;
+                            }
+                            Text {
+                                text: it.text;
+                                color: it.danger ? #f87171 : #ffffff;
+                                font-size: Theme.fs-md;
+                                vertical-alignment: center;
+                            }
+                        }
+                        pta := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                root.power-open = false;
+                                root.act(it.action);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Status pill from the VMM ("guest agent connected", "snapshot saved").
+    if root.toast != "": Rectangle {
+        x: (root.width - self.width) / 2;
+        y: root.height - self.height - 22px;
+        width: min(root.width - 40px, tt.preferred-width + 32px);
+        height: 36px;
+        border-radius: 18px;
+        background: #14161de6;
+        border-width: 1px;
+        border-color: #ffffff24;
+        opacity: 0;
+        init => { self.opacity = 1; }
+        animate opacity { duration: 200ms; }
+        tt := Text {
+            text: root.toast;
+            color: #ffffff;
+            font-size: Theme.fs-md;
+            overflow: elide;
+        }
+    }
+}

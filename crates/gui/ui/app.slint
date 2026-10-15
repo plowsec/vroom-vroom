@@ -1,0 +1,147 @@
+// The library window.
+
+import { Theme } from "theme.slint";
+import { Icons } from "icons.slint";
+import { Bus } from "bus.slint";
+import { VmItem, VmState, VmSettings, SnapRow, CardVis, HostInfo, Toast, PaletteItem, NewVm } from "types.slint";
+import { Sidebar, VmPage, EmptyState, States } from "library.slint";
+import { NewVmSheet, CommandPalette, ConfirmDialog, ConfirmInfo, Toasts } from "sheets.slint";
+import { Icon } from "controls.slint";
+import { ConsoleWindow } from "console.slint";
+
+export { Theme, Bus, VmState, ConsoleWindow }
+
+export component AppWindow inherits Window {
+    in property <[VmItem]> vms;
+    in-out property <int> current: -1;
+    in property <VmSettings> settings;
+    in property <[SnapRow]> snaps;
+    in property <CardVis> vis;
+    in property <HostInfo> host;
+    in-out property <string> query;
+
+    in-out property <bool> newvm-open;
+    in-out property <NewVm> draft;
+    in property <string> newvm-dest;
+    in property <string> newvm-error;
+    in property <bool> newvm-creating;
+
+    in-out property <bool> palette-open;
+    in-out property <string> palette-query;
+    in property <[PaletteItem]> palette-items;
+    in property <int> palette-selected;
+
+    in-out property <bool> confirm-open;
+    in property <ConfirmInfo> confirm;
+
+    in property <[Toast]> toasts;
+    in property <bool> drop-hover;
+
+    callback select(int);
+
+    title: "vroom";
+    icon: Icons.logo;
+    background: Theme.bg;
+    preferred-width: 1320px;
+    preferred-height: 840px;
+    min-width: 1000px;
+    min-height: 660px;
+    default-font-size: 13px;
+
+    // Background glow.
+    Rectangle {
+        x: -260px;
+        y: -320px;
+        width: 900px;
+        height: 900px;
+        background: @radial-gradient(circle, Theme.accent.with-alpha(Theme.dark ? 0.16 : 0.10) 0%, transparent 65%);
+    }
+    Rectangle {
+        x: root.width - 560px;
+        y: root.height - 520px;
+        width: 1000px;
+        height: 1000px;
+        background: @radial-gradient(circle, Theme.accent-2.with-alpha(Theme.dark ? 0.09 : 0.07) 0%, transparent 65%);
+    }
+    if root.current >= 0 && root.current < root.vms.length && root.vms[root.current].state == VmState.running: Rectangle {
+        x: root.width * 0.35;
+        y: -380px;
+        width: 800px;
+        height: 700px;
+        background: @radial-gradient(circle, Theme.green.with-alpha(Theme.dark ? 0.06 : 0.04) 0%, transparent 65%);
+    }
+
+    HorizontalLayout {
+        Sidebar {
+            vms: root.vms;
+            current: root.current;
+            host: root.host;
+            select(i) => { root.select(i); }
+        }
+        if root.vms.length == 0: EmptyState {
+            horizontal-stretch: 1;
+        }
+        if root.vms.length > 0 && root.current >= 0 && root.current < root.vms.length: VmPage {
+            horizontal-stretch: 1;
+            vm: root.vms[root.current];
+            s: root.settings;
+            snaps: root.snaps;
+            vis: root.vis;
+            host: root.host;
+            query <=> root.query;
+        }
+    }
+
+    Toasts {
+        items: root.toasts;
+    }
+
+    if root.drop-hover: Rectangle {
+        background: Theme.accent.with-alpha(0.12);
+        border-width: 2px;
+        border-color: Theme.accent;
+        border-radius: 14px;
+        Rectangle {
+            width: 300px;
+            height: 64px;
+            border-radius: 18px;
+            background: Theme.popup;
+            border-width: 1px;
+            border-color: Theme.border-strong;
+            drop-shadow-blur: 30px;
+            drop-shadow-color: #00000080;
+            HorizontalLayout {
+                alignment: center;
+                spacing: 10px;
+                Icon {
+                    source: Icons.upload;
+                    y: (parent.height - self.height) / 2;
+                    tint: Theme.accent-text;
+                }
+                Text {
+                    text: "Drop to make a VM from it";
+                    font-size: Theme.fs-lg;
+                    font-weight: 600;
+                    color: Theme.text;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+
+    if root.newvm-open: NewVmSheet {
+        draft <=> root.draft;
+        host: root.host;
+        dest: root.newvm-dest;
+        error: root.newvm-error;
+        creating: root.newvm-creating;
+    }
+    if root.palette-open: CommandPalette {
+        items: root.palette-items;
+        selected: root.palette-selected;
+        query <=> root.palette-query;
+    }
+    if root.confirm-open: ConfirmDialog {
+        info: root.confirm;
+    }
+}

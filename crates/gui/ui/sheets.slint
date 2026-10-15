@@ -1,0 +1,558 @@
+// Things that float over the library: New VM, command palette, confirm
+// dialog, toasts.
+
+import { Theme, OsLook } from "theme.slint";
+import { Icons } from "icons.slint";
+import { Bus } from "bus.slint";
+import { NewVm, HostInfo, Toast, PaletteItem } from "types.slint";
+import { Button, IconButton, Toggle, Slider, Field, Icon, OsBadge, Banner, Row } from "controls.slint";
+
+component Scrim inherits Rectangle {
+    callback dismiss;
+    background: Theme.scrim;
+    TouchArea {
+        clicked => { root.dismiss(); }
+    }
+}
+
+component Panel inherits Rectangle {
+    border-radius: Theme.r-xl;
+    background: Theme.card-strong;
+    border-width: 1px;
+    border-color: Theme.border-strong;
+    drop-shadow-blur: 60px;
+    drop-shadow-color: #00000099;
+    drop-shadow-offset-y: 24px;
+    // Swallow clicks so they don't reach the scrim.
+    TouchArea { }
+    // Soft accent glow along the top edge.
+    Rectangle {
+        y: 0;
+        height: 120px;
+        border-radius: root.border-radius;
+        background: @linear-gradient(180deg, Theme.accent.with-alpha(0.10) 0%, transparent 100%);
+    }
+}
+
+component OsTile inherits Rectangle {
+    in property <string> os;
+    in property <string> label;
+    in property <bool> selected;
+    callback clicked;
+    height: 96px;
+    border-radius: 14px;
+    background: selected ? Theme.accent-soft : ta.has-hover ? Theme.card-hover : Theme.card;
+    border-width: selected ? 2px : 1px;
+    border-color: selected ? Theme.accent : Theme.border;
+    animate background, border-color { duration: 150ms; }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+    VerticalLayout {
+        alignment: center;
+        spacing: 9px;
+        HorizontalLayout {
+            alignment: center;
+            OsBadge {
+                os: root.os;
+                size: 38px;
+                glow: root.selected;
+            }
+        }
+        Text {
+            text: root.label;
+            font-size: Theme.fs-sm;
+            font-weight: 600;
+            color: Theme.text;
+            horizontal-alignment: center;
+        }
+    }
+}
+
+export component NewVmSheet inherits Rectangle {
+    in-out property <NewVm> draft;
+    in property <HostInfo> host;
+    in property <string> dest;
+    in property <string> error;
+    in property <bool> creating;
+    property <bool> windows: draft.os-index == 1;
+    property <[{os: string, label: string, index: int}]> tiles: [
+        { os: "ubuntu", label: "Ubuntu", index: 0 },
+        { os: "windows", label: "Windows 11", index: 1 },
+        { os: "debian", label: "Debian", index: 2 },
+        { os: "fedora", label: "Fedora", index: 3 },
+        { os: "linux", label: "Other Linux", index: 5 },
+    ];
+
+    Scrim {
+        dismiss => { Bus.act("newvm.cancel"); }
+    }
+    Panel {
+        width: min(780px, root.width - 60px);
+        height: min(l.preferred-height, root.height - 40px);
+        l := VerticalLayout {
+            padding: 28px;
+            spacing: 18px;
+            HorizontalLayout {
+                spacing: 12px;
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    spacing: 4px;
+                    Text {
+                        text: "New VM";
+                        font-size: 24px;
+                        font-weight: 750;
+                        letter-spacing: -0.5px;
+                        color: Theme.text;
+                    }
+                    Text {
+                        text: "Pick a system and an installer. Everything can change later.";
+                        font-size: Theme.fs-md;
+                        color: Theme.text-2;
+                    }
+                }
+                IconButton {
+                    icon: Icons.x;
+                    clicked => { Bus.act("newvm.cancel"); }
+                }
+            }
+            HorizontalLayout {
+                spacing: 10px;
+                for t in root.tiles: OsTile {
+                    horizontal-stretch: 1;
+                    preferred-width: 100px;
+                    min-width: 90px;
+                    os: t.os;
+                    label: t.label;
+                    selected: root.draft.os-index == t.index;
+                    clicked => { Bus.set("newvm.os", t.index); }
+                }
+            }
+            // Installer.
+            Rectangle {
+                height: 74px;
+                border-radius: 14px;
+                background: ita.has-hover ? Theme.card-hover : Theme.well;
+                border-width: 1px;
+                border-color: root.draft.installer != "" ? Theme.accent.with-alpha(0.5) : Theme.border-strong;
+                ita := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { Bus.act("newvm.pick"); }
+                }
+                HorizontalLayout {
+                    padding-left: 18px;
+                    padding-right: 14px;
+                    spacing: 14px;
+                    Rectangle {
+                        width: 40px;
+                        height: 40px;
+                        y: (parent.height - self.height) / 2;
+                        border-radius: 12px;
+                        background: Theme.accent-soft;
+                        Icon {
+                            source: root.draft.installer != "" ? Icons.disc : Icons.upload;
+                            tint: Theme.accent-text;
+                        }
+                    }
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        alignment: center;
+                        spacing: 3px;
+                        Text {
+                            text: root.draft.installer != "" ? root.draft.installer
+                                : root.windows ? "Choose the install stick image" : "Choose an installer ISO, or drop it here";
+                            font-size: Theme.fs-md;
+                            font-weight: 600;
+                            color: Theme.text;
+                            overflow: elide;
+                        }
+                        Text {
+                            text: root.windows ? "Made from the Windows ISO with scripts/make-windows-stick.sh (see the guide)."
+                                : "ARM64 images. Optional: you can attach one later.";
+                            font-size: Theme.fs-xs;
+                            color: Theme.text-3;
+                            overflow: elide;
+                        }
+                    }
+                    if root.draft.installer != "": IconButton {
+                        icon: Icons.x;
+                        tip: "No installer";
+                        y: (parent.height - self.height) / 2;
+                        clicked => { Bus.act("newvm.clear-installer"); }
+                    }
+                }
+            }
+            HorizontalLayout {
+                spacing: 18px;
+                VerticalLayout {
+                    width: 220px;
+                    spacing: 6px;
+                    alignment: start;
+                    Text {
+                        text: "Name";
+                        font-size: Theme.fs-sm;
+                        font-weight: 600;
+                        color: Theme.text-2;
+                    }
+                    Field {
+                        text: root.draft.name;
+                        mono: true;
+                        edited(t) => { root.draft.name = t; }
+                    }
+                    Text {
+                        text: "Letters, digits, . _ -";
+                        font-size: Theme.fs-xs;
+                        color: Theme.text-3;
+                    }
+                }
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    spacing: 2px;
+                    HorizontalLayout {
+                        Text {
+                            text: "CPUs";
+                            font-size: Theme.fs-sm;
+                            font-weight: 600;
+                            color: Theme.text-2;
+                            horizontal-stretch: 1;
+                        }
+                        Text {
+                            text: round(cpu.value);
+                            font-size: Theme.fs-sm;
+                            font-weight: 700;
+                            color: Theme.text;
+                        }
+                    }
+                    cpu := Slider {
+                        minimum: 1;
+                        maximum: root.host.cpus;
+                        sweet-max: max(1, root.host.cpus - 2);
+                        value: root.draft.cpus;
+                        unit: "CPUs";
+                        released(v) => { root.draft.cpus = round(v); }
+                    }
+                    HorizontalLayout {
+                        Text {
+                            text: "Memory";
+                            font-size: Theme.fs-sm;
+                            font-weight: 600;
+                            color: Theme.text-2;
+                            horizontal-stretch: 1;
+                        }
+                        Text {
+                            text: round(mem.value) + " GB";
+                            font-size: Theme.fs-sm;
+                            font-weight: 700;
+                            color: Theme.text;
+                        }
+                    }
+                    mem := Slider {
+                        minimum: 1;
+                        maximum: max(2, root.host.memory-gib);
+                        sweet-max: max(1, root.host.memory-gib * 0.6);
+                        value: root.draft.memory-gib;
+                        unit: "GB";
+                        released(v) => { root.draft.memory-gib = round(v); }
+                    }
+                    HorizontalLayout {
+                        Text {
+                            text: "Disk";
+                            font-size: Theme.fs-sm;
+                            font-weight: 600;
+                            color: Theme.text-2;
+                            horizontal-stretch: 1;
+                        }
+                        Text {
+                            text: round(disk.value) + " GB, uses space as it fills";
+                            font-size: Theme.fs-sm;
+                            font-weight: 700;
+                            color: Theme.text;
+                        }
+                    }
+                    disk := Slider {
+                        minimum: 8;
+                        maximum: 1024;
+                        step: 8;
+                        value: root.draft.disk-gib;
+                        unit: "GB";
+                        released(v) => { root.draft.disk-gib = round(v); }
+                    }
+                }
+            }
+            HorizontalLayout {
+                spacing: 24px;
+                if !root.windows: HorizontalLayout {
+                    spacing: 10px;
+                    Toggle {
+                        y: (parent.height - self.height) / 2;
+                        checked: root.draft.gpu3d;
+                        toggled(v) => { root.draft.gpu3d = v; }
+                    }
+                    Text {
+                        text: "3D graphics";
+                        font-size: Theme.fs-md;
+                        color: Theme.text;
+                        vertical-alignment: center;
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 10px;
+                    Toggle {
+                        y: (parent.height - self.height) / 2;
+                        checked: root.draft.start;
+                        toggled(v) => { root.draft.start = v; }
+                    }
+                    Text {
+                        text: "Start it right away";
+                        font-size: Theme.fs-md;
+                        color: Theme.text;
+                        vertical-alignment: center;
+                    }
+                }
+                Rectangle { horizontal-stretch: 1; }
+            }
+            if root.windows: Banner {
+                kind: 0;
+                text: "Windows 11 gets NVMe disks, a TPM and 8 GB of memory. Setup runs on its own and installs the guest tools.";
+            }
+            if root.error != "": Banner {
+                kind: 3;
+                text: root.error;
+            }
+            Rectangle {
+                height: 1px;
+                background: Theme.border;
+            }
+            HorizontalLayout {
+                spacing: 10px;
+                Text {
+                    horizontal-stretch: 1;
+                    text: root.dest;
+                    font-size: Theme.fs-xs;
+                    font-family: Theme.mono;
+                    color: Theme.text-3;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+                Button {
+                    text: "Cancel";
+                    kind: "ghost";
+                    clicked => { Bus.act("newvm.cancel"); }
+                }
+                Button {
+                    text: "Create";
+                    kind: "primary";
+                    icon: Icons.sparkles;
+                    has-icon: true;
+                    busy: root.creating;
+                    enabled: root.draft.name != "";
+                    clicked => { Bus.act("newvm.create"); }
+                }
+            }
+        }
+    }
+}
+
+export component CommandPalette inherits Rectangle {
+    in property <[PaletteItem]> items;
+    in property <int> selected;
+    in-out property <string> query;
+    callback opened;
+    Scrim {
+        dismiss => { Bus.act("palette.close"); }
+    }
+    Panel {
+        x: (root.width - self.width) / 2;
+        y: max(40px, root.height * 0.14);
+        width: min(620px, root.width - 60px);
+        height: pl.preferred-height;
+        pl := VerticalLayout {
+            padding: 10px;
+            spacing: 6px;
+            HorizontalLayout {
+                padding-left: 8px;
+                spacing: 8px;
+                Icon {
+                    source: Icons.command;
+                    y: (parent.height - self.height) / 2;
+                    tint: Theme.accent-text;
+                }
+                input := Field {
+                    horizontal-stretch: 1;
+                    height: 42px;
+                    text <=> root.query;
+                    placeholder: "Start a VM, open a setting, take a snapshot...";
+                    edited(t) => { Bus.search("palette:" + t); }
+                    init => { self.focus-input(); }
+                }
+            }
+            for it[i] in root.items: Rectangle {
+                height: 44px;
+                border-radius: 10px;
+                background: i == root.selected ? Theme.accent-soft : ita.has-hover ? Theme.card : transparent;
+                ita := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { Bus.act("palette.run:" + i); }
+                }
+                HorizontalLayout {
+                    padding-left: 12px;
+                    padding-right: 12px;
+                    spacing: 12px;
+                    Icon {
+                        source: Icons.by-name(it.icon);
+                        y: (parent.height - self.height) / 2;
+                        tint: i == root.selected ? Theme.accent-text : Theme.text-2;
+                    }
+                    Text {
+                        text: it.title;
+                        font-size: Theme.fs-md;
+                        font-weight: i == root.selected ? 600 : 500;
+                        color: Theme.text;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        overflow: elide;
+                    }
+                    Text {
+                        text: it.hint;
+                        font-size: Theme.fs-xs;
+                        color: Theme.text-3;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+            if root.items.length == 0: Text {
+                text: "Nothing found.";
+                font-size: Theme.fs-md;
+                color: Theme.text-3;
+                horizontal-alignment: center;
+                height: 44px;
+                vertical-alignment: center;
+            }
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-top: 2px;
+                spacing: 14px;
+                Text {
+                    text: "↑ ↓ choose    enter run    esc close";
+                    font-size: Theme.fs-xs;
+                    color: Theme.text-3;
+                }
+            }
+        }
+    }
+}
+
+export struct ConfirmInfo {
+    title: string,
+    text: string,
+    ok: string,
+    danger: bool,
+    action: string,
+}
+
+export component ConfirmDialog inherits Rectangle {
+    in property <ConfirmInfo> info;
+    Scrim {
+        dismiss => { Bus.act("confirm.cancel"); }
+    }
+    Panel {
+        width: min(440px, root.width - 60px);
+        height: cl.preferred-height;
+        cl := VerticalLayout {
+            padding: 24px;
+            spacing: 14px;
+            Text {
+                text: root.info.title;
+                font-size: Theme.fs-xl;
+                font-weight: 700;
+                color: Theme.text;
+                wrap: word-wrap;
+            }
+            Text {
+                text: root.info.text;
+                font-size: Theme.fs-md;
+                color: Theme.text-2;
+                wrap: word-wrap;
+            }
+            HorizontalLayout {
+                spacing: 10px;
+                alignment: end;
+                Button {
+                    text: "Cancel";
+                    kind: "ghost";
+                    clicked => { Bus.act("confirm.cancel"); }
+                }
+                Button {
+                    text: root.info.ok;
+                    kind: root.info.danger ? "danger" : "primary";
+                    clicked => { Bus.act("confirm.ok"); }
+                }
+            }
+        }
+    }
+}
+
+component ToastView inherits Rectangle {
+    in property <Toast> t;
+    property <color> c: t.kind == 3 ? Theme.red : t.kind == 2 ? Theme.amber : t.kind == 1 ? Theme.green : Theme.accent-text;
+    height: max(44px, tl.preferred-height);
+    width: min(420px, tl.preferred-width);
+    border-radius: 12px;
+    background: Theme.popup;
+    border-width: 1px;
+    border-color: Theme.border-strong;
+    drop-shadow-blur: 24px;
+    drop-shadow-color: #00000066;
+    drop-shadow-offset-y: 8px;
+    opacity: 0;
+    init => { self.opacity = 1; }
+    animate opacity { duration: 220ms; }
+    tl := HorizontalLayout {
+        padding: 10px;
+        padding-left: 12px;
+        padding-right: 8px;
+        spacing: 10px;
+        Icon {
+            source: root.t.kind == 1 ? Icons.check : root.t.kind == 0 ? Icons.info : Icons.warning;
+            width: 16px;
+            height: 16px;
+            y: (parent.height - self.height) / 2;
+            tint: root.c;
+        }
+        Text {
+            text: root.t.text;
+            font-size: Theme.fs-md;
+            color: Theme.text;
+            vertical-alignment: center;
+            wrap: word-wrap;
+            max-width: 320px;
+        }
+        if root.t.action != "": Button {
+            small: true;
+            kind: "ghost";
+            text: "Show log";
+            y: (parent.height - self.height) / 2;
+            clicked => { Bus.act(root.t.action); }
+        }
+        IconButton {
+            icon: Icons.x;
+            size: 24px;
+            y: (parent.height - self.height) / 2;
+            clicked => { Bus.act("toast.close:" + root.t.id); }
+        }
+    }
+}
+
+export component Toasts inherits Rectangle {
+    in property <[Toast]> items;
+    VerticalLayout {
+        alignment: end;
+        spacing: 8px;
+        padding: 18px;
+        for t in root.items: HorizontalLayout {
+            alignment: end;
+            ToastView { t: t; }
+        }
+    }
+}

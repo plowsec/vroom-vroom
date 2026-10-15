@@ -3,6 +3,12 @@
 # Usage: scripts/build.sh [--release]
 set -e
 cd "$(dirname "$0")/.."
+# macOS kills a process whose binary is rewritten: a VM started from
+# target/ would die mid-run (or mid-suspend).
+if pgrep -f "target/(debug|release)/vroom run" >/dev/null 2>&1; then
+  echo "a VM is running from target/: stop or suspend it first (or set CARGO_TARGET_DIR)" >&2
+  exit 1
+fi
 cargo build "$@" -p vroom-cli -p vroom-gui
 dir=target/debug
 case " $* " in *" --release "*) dir=target/release ;; esac

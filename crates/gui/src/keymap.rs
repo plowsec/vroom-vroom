@@ -1,6 +1,6 @@
 //! winit physical keys -> Linux evdev codes (what virtio-input carries).
 
-use winit::keyboard::KeyCode as K;
+use slint::winit_030::winit::keyboard::KeyCode as K;
 
 pub fn evdev(k: K) -> Option<u16> {
     Some(match k {

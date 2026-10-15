@@ -1,0 +1,817 @@
+// The settings column. One card per area; a closed card says in one line
+// what is set, an open card shows every option, the rare ones under
+// "Advanced". There is no separate expert mode.
+
+import { ScrollView } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+import { Icons } from "icons.slint";
+import { Bus } from "bus.slint";
+import { VmSettings, CardVis, HostInfo, NetRow } from "types.slint";
+import { Button, IconButton, Toggle, Segmented, Slider, Field, Select, Row, SectionCard, Divider, Banner, Icon } from "controls.slint";
+
+component SubCard inherits Rectangle {
+    border-radius: 12px;
+    background: Theme.well;
+    border-width: 1px;
+    border-color: Theme.border;
+    VerticalLayout {
+        padding: 10px;
+        padding-left: 12px;
+        padding-right: 12px;
+        spacing: 4px;
+        @children
+    }
+}
+
+component Value inherits Text {
+    font-size: Theme.fs-md;
+    font-weight: 600;
+    color: Theme.text;
+    vertical-alignment: center;
+    horizontal-alignment: right;
+    min-width: 54px;
+}
+
+component NetCard inherits SubCard {
+    in property <NetRow> net;
+    in property <int> index;
+    in property <HostInfo> host;
+    in property <bool> locked;
+    property <string> k: "net." + index;
+    HorizontalLayout {
+        spacing: 8px;
+        Text {
+            text: "Adapter " + (root.index + 1);
+            font-size: Theme.fs-sm;
+            font-weight: 600;
+            color: Theme.text-2;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+        IconButton {
+            icon: Icons.trash;
+            tip: "Remove adapter";
+            size: 28px;
+            enabled: !root.locked;
+            clicked => { Bus.act(root.k + ".remove"); }
+        }
+    }
+    Segmented {
+        options: ["NAT", "Bridged", "Host-only"];
+        selected: root.net.mode;
+        enabled: !root.locked;
+        changed(i) => { Bus.set(root.k + ".mode", i); }
+    }
+    Text {
+        text: root.net.mode == 0 ? "The guest reaches the internet through this Mac. Nothing reaches the guest unless you forward a port."
+            : root.net.mode == 1 ? "The guest sits on your network like a real machine. Needs vroom-netd (root)."
+            : "A private network for VMs and this Mac. No internet. Needs vroom-netd (root).";
+        font-size: Theme.fs-xs;
+        color: Theme.text-3;
+        wrap: word-wrap;
+    }
+    if root.net.mode == 0: VerticalLayout {
+        spacing: 4px;
+        Divider { text: "PORT FORWARDS"; }
+        for f[j] in root.net.forwards: HorizontalLayout {
+            spacing: 6px;
+            Field {
+                width: 84px;
+                text: f.host;
+                prefix: "host";
+                mono: true;
+                input-type: number;
+                enabled: !root.locked;
+                committed(t) => { Bus.set(root.k + ".fwd." + j + ".host", t); }
+            }
+            Icon {
+                source: Icons.arrow-right;
+                width: 14px;
+                y: (parent.height - self.height) / 2;
+                tint: Theme.text-3;
+            }
+            Field {
+                width: 88px;
+                text: f.guest;
+                prefix: "guest";
+                mono: true;
+                input-type: number;
+                enabled: !root.locked;
+                committed(t) => { Bus.set(root.k + ".fwd." + j + ".guest", t); }
+            }
+            Rectangle { horizontal-stretch: 1; }
+            Text {
+                text: "LAN";
+                font-size: Theme.fs-xs;
+                color: f.lan ? Theme.amber : Theme.text-3;
+                vertical-alignment: center;
+            }
+            Toggle {
+                y: (parent.height - self.height) / 2;
+                checked: f.lan;
+                danger: true;
+                enabled: !root.locked;
+                toggled(v) => { Bus.set(root.k + ".fwd." + j + ".lan", v ? "true" : "false"); }
+            }
+            IconButton {
+                icon: Icons.x;
+                size: 28px;
+                y: (parent.height - self.height) / 2;
+                enabled: !root.locked;
+                clicked => { Bus.act(root.k + ".fwd." + j + ".remove"); }
+            }
+        }
+        HorizontalLayout {
+            alignment: start;
+            Button {
+                small: true;
+                kind: "ghost";
+                text: "Add port forward";
+                icon: Icons.plus;
+                has-icon: true;
+                enabled: !root.locked;
+                clicked => { Bus.act(root.k + ".fwd.add"); }
+            }
+        }
+        Row {
+            label: "Reach this Mac's localhost";
+            hint: "Services on 127.0.0.1 often have no password.";
+            key: "allow_host_loopback";
+            warn: root.net.loopback;
+            Toggle {
+                y: (parent.height - self.height) / 2;
+                checked: root.net.loopback;
+                danger: true;
+                enabled: !root.locked;
+                toggled(v) => { Bus.set(root.k + ".loopback", v ? "true" : "false"); }
+            }
+        }
+        Row {
+            label: "Internet only";
+            hint: "Block your local network.";
+            key: "block_private";
+            Toggle {
+                y: (parent.height - self.height) / 2;
+                checked: root.net.block-private;
+                enabled: !root.locked;
+                toggled(v) => { Bus.set(root.k + ".block", v ? "true" : "false"); }
+            }
+        }
+    }
+    if root.net.mode == 1: Row {
+        label: "Host interface";
+        key: "interface";
+        Select {
+            width: 150px;
+            options: root.host.interfaces;
+            current: root.net.iface-index;
+            empty-text: root.net.interface != "" ? root.net.interface : "Pick one";
+            enabled: !root.locked;
+            selected(i) => { Bus.set(root.k + ".iface", root.host.interfaces[i]); }
+        }
+    }
+    if root.net.mode == 2: Row {
+        label: "Network name";
+        hint: "VMs with the same name see each other.";
+        key: "network";
+        Field {
+            width: 150px;
+            text: root.net.network;
+            placeholder: "lab";
+            enabled: !root.locked;
+            committed(t) => { Bus.set(root.k + ".network", t); }
+        }
+    }
+    Divider { text: "ADVANCED"; }
+    Row {
+        label: "MAC address";
+        key: "mac";
+        HorizontalLayout {
+            spacing: 4px;
+            Field {
+                width: 150px;
+                text: root.net.mac;
+                placeholder: "automatic";
+                mono: true;
+                enabled: !root.locked;
+                committed(t) => { Bus.set(root.k + ".mac", t); }
+            }
+            IconButton {
+                icon: Icons.dice;
+                tip: "New random MAC";
+                size: 30px;
+                y: (parent.height - self.height) / 2;
+                enabled: !root.locked;
+                clicked => { Bus.act(root.k + ".mac.random"); }
+            }
+        }
+    }
+}
+
+export component SettingsPanel inherits Rectangle {
+    in property <VmSettings> s;
+    in property <CardVis> vis;
+    in property <HostInfo> host;
+    in-out property <string> query;
+    property <bool> lk: s.locked;
+    property <bool> open-all: vis.searching;
+
+    VerticalLayout {
+        spacing: 12px;
+        HorizontalLayout {
+            spacing: 8px;
+            search := Field {
+                horizontal-stretch: 1;
+                text <=> root.query;
+                placeholder: "Search settings: port, 3d, mac, tpm...";
+                edited(t) => { Bus.search(t); }
+            }
+        }
+        if root.s.locked: Banner {
+            kind: 0;
+            icon: Icons.lock;
+            text: root.s.lock-reason;
+        }
+        for w in root.s.warnings: Banner {
+            kind: 2;
+            text: w;
+        }
+        ScrollView {
+            vertical-stretch: 1;
+            VerticalLayout {
+                alignment: start;
+                spacing: 10px;
+                padding-right: 10px;
+                padding-bottom: 20px;
+
+                if root.vis.hw: SectionCard {
+                    icon: Icons.cpu;
+                    hue: Theme.hue-cpu;
+                    title: "Processor and memory";
+                    summary: root.s.sum-hw;
+                    force-open: root.open-all;
+                    Row {
+                        label: "CPUs";
+                        key: "cpus";
+                        hint: root.s.snapshots-cpu-mem;
+                        Value { text: cpus.value; }
+                    }
+                    cpus := Slider {
+                        minimum: 1;
+                        maximum: root.host.cpus;
+                        value: root.s.cpus;
+                        sweet-max: max(1, root.host.cpus - 2);
+                        unit: "CPUs";
+                        enabled: !root.lk;
+                        released(v) => { Bus.set("cpus", round(v)); }
+                    }
+                    Row {
+                        label: "Memory";
+                        key: "memory_mib";
+                        Value { text: mem.value + " GB"; }
+                    }
+                    mem := Slider {
+                        minimum: 1;
+                        maximum: max(2, root.host.memory-gib);
+                        value: root.s.memory-gib;
+                        sweet-max: max(1, root.host.memory-gib * 0.6);
+                        unit: "GB";
+                        enabled: !root.lk;
+                        released(v) => { Bus.set("memory", round(v)); }
+                    }
+                    Divider { text: "ADVANCED"; }
+                    Row {
+                        label: "Nested virtualization";
+                        hint: "Run VMs inside this VM. M3 or newer. No snapshots then.";
+                        key: "nested";
+                        Toggle {
+                            y: (parent.height - self.height) / 2;
+                            checked: root.s.nested;
+                            enabled: !root.lk;
+                            toggled(v) => { Bus.set("nested", v ? "true" : "false"); }
+                        }
+                    }
+                    Row {
+                        label: "Guest system";
+                        hint: "Only changes the icon and defaults.";
+                        key: "os";
+                        Select {
+                            width: 130px;
+                            options: ["Ubuntu", "Windows", "Debian", "Fedora", "Alpine", "Linux", "Other"];
+                            current: root.s.os-index;
+                            selected(i) => { Bus.set("os", i); }
+                        }
+                    }
+                }
+
+                if root.vis.display: SectionCard {
+                    icon: Icons.display;
+                    hue: Theme.hue-display;
+                    title: "Display";
+                    summary: root.s.sum-display;
+                    force-open: root.open-all;
+                    Segmented {
+                        options: ["None", "2D", "3D"];
+                        selected: root.s.gpu;
+                        enabled: !root.lk;
+                        changed(i) => { Bus.set("gpu", i); }
+                    }
+                    Text {
+                        text: root.s.gpu == 2 ? "Vulkan in Linux guests, drawn by your Mac's GPU. Needs the 3D library (see guide)."
+                            : root.s.gpu == 1 ? "Works everywhere. The guest follows the window size."
+                            : "No screen. Use the serial console (vroom run).";
+                        font-size: Theme.fs-xs;
+                        color: Theme.text-3;
+                        wrap: word-wrap;
+                    }
+                    Row {
+                        label: "Starting size";
+                        key: "width, height";
+                        HorizontalLayout {
+                            spacing: 6px;
+                            Field {
+                                width: 70px;
+                                text: root.s.width;
+                                mono: true;
+                                align: center;
+                                input-type: number;
+                                enabled: !root.lk;
+                                committed(t) => { Bus.set("width", t); }
+                            }
+                            Text {
+                                text: "×";
+                                color: Theme.text-3;
+                                vertical-alignment: center;
+                            }
+                            Field {
+                                width: 70px;
+                                text: root.s.height;
+                                mono: true;
+                                align: center;
+                                input-type: number;
+                                enabled: !root.lk;
+                                committed(t) => { Bus.set("height", t); }
+                            }
+                        }
+                    }
+                }
+
+                if root.vis.storage: SectionCard {
+                    icon: Icons.disk;
+                    hue: Theme.hue-storage;
+                    title: "Storage";
+                    summary: root.s.sum-storage;
+                    force-open: root.open-all;
+                    for d[i] in root.s.disks: SubCard {
+                        HorizontalLayout {
+                            spacing: 10px;
+                            Icon {
+                                source: d.cdrom ? Icons.disc : Icons.disk;
+                                y: (parent.height - self.height) / 2;
+                                tint: d.missing ? Theme.red : Theme.hue-storage;
+                            }
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                alignment: center;
+                                Text {
+                                    text: d.file;
+                                    font-size: Theme.fs-md;
+                                    font-weight: 600;
+                                    color: Theme.text;
+                                    overflow: elide;
+                                }
+                                Text {
+                                    text: d.missing ? "File not found" : d.size + (d.used != "" ? "  ·  " + d.used + " on disk" : "");
+                                    font-size: Theme.fs-xs;
+                                    color: d.missing ? Theme.red : Theme.text-3;
+                                }
+                            }
+                            IconButton {
+                                icon: Icons.reveal;
+                                tip: "Show in Finder";
+                                size: 28px;
+                                y: (parent.height - self.height) / 2;
+                                clicked => { Bus.act("disk." + i + ".reveal"); }
+                            }
+                            IconButton {
+                                icon: d.cdrom ? Icons.x : Icons.trash;
+                                tip: d.cdrom ? "Eject" : "Detach (keeps the file)";
+                                size: 28px;
+                                y: (parent.height - self.height) / 2;
+                                enabled: !root.lk;
+                                clicked => { Bus.act("disk." + i + ".remove"); }
+                            }
+                        }
+                        if !d.cdrom: Row {
+                            label: "Bus";
+                            key: "bus";
+                            Segmented {
+                                width: 150px;
+                                options: ["VirtIO", "NVMe"];
+                                selected: d.bus;
+                                enabled: !root.lk;
+                                changed(v) => { Bus.set("disk." + i + ".bus", v); }
+                            }
+                        }
+                        if !d.cdrom: Row {
+                            label: "Read-only";
+                            key: "readonly";
+                            Toggle {
+                                y: (parent.height - self.height) / 2;
+                                checked: d.readonly;
+                                enabled: !root.lk;
+                                toggled(v) => { Bus.set("disk." + i + ".readonly", v ? "true" : "false"); }
+                            }
+                        }
+                        if !d.cdrom && !d.readonly: Row {
+                            label: "Write safety";
+                            hint: d.sync == 0 ? "Survives a power cut. Slow on macOS." : d.sync == 1 ? "Survives a Mac crash." : "Fast, for scratch disks only.";
+                            key: "sync";
+                            Select {
+                                width: 130px;
+                                options: ["Power cut", "Mac crash", "None"];
+                                current: d.sync;
+                                enabled: !root.lk;
+                                selected(v) => { Bus.set("disk." + i + ".sync", v); }
+                            }
+                        }
+                        if d.qcow2 && !d.readonly: Row {
+                            label: "Free unused space";
+                            hint: "Shrinks the file to what the guest uses. VM must be off.";
+                            Button {
+                                small: true;
+                                text: "Compact";
+                                icon: Icons.broom;
+                                has-icon: true;
+                                y: (parent.height - self.height) / 2;
+                                enabled: !root.lk;
+                                clicked => { Bus.act("disk." + i + ".compact"); }
+                            }
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 6px;
+                        alignment: start;
+                        Button {
+                            small: true;
+                            kind: "ghost";
+                            text: "New disk";
+                            icon: Icons.plus;
+                            has-icon: true;
+                            enabled: !root.lk;
+                            clicked => { Bus.act("disk.add-new"); }
+                        }
+                        Button {
+                            small: true;
+                            kind: "ghost";
+                            text: "Existing image";
+                            icon: Icons.disk;
+                            has-icon: true;
+                            enabled: !root.lk;
+                            clicked => { Bus.act("disk.add-existing"); }
+                        }
+                        Button {
+                            small: true;
+                            kind: "ghost";
+                            text: "ISO";
+                            icon: Icons.disc;
+                            has-icon: true;
+                            enabled: !root.lk;
+                            clicked => { Bus.act("disk.add-iso"); }
+                        }
+                    }
+                }
+
+                if root.vis.net: SectionCard {
+                    icon: Icons.globe;
+                    hue: Theme.hue-network;
+                    title: "Network";
+                    summary: root.s.sum-net;
+                    force-open: root.open-all;
+                    for n[i] in root.s.nets: NetCard {
+                        net: n;
+                        index: i;
+                        host: root.host;
+                        locked: root.lk;
+                    }
+                    HorizontalLayout {
+                        alignment: start;
+                        Button {
+                            small: true;
+                            kind: "ghost";
+                            text: "Add adapter";
+                            icon: Icons.plus;
+                            has-icon: true;
+                            enabled: !root.lk;
+                            clicked => { Bus.act("net.add"); }
+                        }
+                    }
+                }
+
+                if root.vis.share: SectionCard {
+                    icon: Icons.folder;
+                    hue: Theme.hue-share;
+                    title: "Shared folders";
+                    summary: root.s.sum-share;
+                    force-open: root.open-all;
+                    for sh[i] in root.s.shares: SubCard {
+                        HorizontalLayout {
+                            spacing: 10px;
+                            Icon {
+                                source: Icons.folder;
+                                y: (parent.height - self.height) / 2;
+                                tint: Theme.hue-share;
+                            }
+                            Text {
+                                horizontal-stretch: 1;
+                                text: sh.short;
+                                font-size: Theme.fs-md;
+                                font-weight: 600;
+                                color: Theme.text;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                            IconButton {
+                                icon: Icons.trash;
+                                tip: "Stop sharing";
+                                size: 28px;
+                                enabled: !root.lk;
+                                clicked => { Bus.act("share." + i + ".remove"); }
+                            }
+                        }
+                        Row {
+                            label: "Name in the guest";
+                            key: "tag";
+                            Field {
+                                width: 120px;
+                                text: sh.tag;
+                                mono: true;
+                                enabled: !root.lk;
+                                committed(t) => { Bus.set("share." + i + ".tag", t); }
+                            }
+                        }
+                        Row {
+                            label: "Guest can change files";
+                            key: "readonly = false";
+                            warn: !sh.readonly;
+                            Toggle {
+                                y: (parent.height - self.height) / 2;
+                                checked: !sh.readonly;
+                                danger: true;
+                                enabled: !root.lk;
+                                toggled(v) => { Bus.set("share." + i + ".writable", v ? "true" : "false"); }
+                            }
+                        }
+                        HorizontalLayout {
+                            spacing: 6px;
+                            Text {
+                                horizontal-stretch: 1;
+                                text: "sudo mount -t virtiofs " + sh.tag + " /mnt";
+                                font-family: Theme.mono;
+                                font-size: Theme.fs-xs;
+                                color: Theme.text-2;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                            IconButton {
+                                icon: Icons.copy;
+                                tip: "Copy";
+                                size: 26px;
+                                clicked => { Bus.copy("sudo mount -t virtiofs " + sh.tag + " /mnt"); }
+                            }
+                        }
+                    }
+                    Text {
+                        text: "Linux guests. Read-only unless you allow changes.";
+                        font-size: Theme.fs-xs;
+                        color: Theme.text-3;
+                    }
+                    HorizontalLayout {
+                        alignment: start;
+                        Button {
+                            small: true;
+                            kind: "ghost";
+                            text: "Share a folder";
+                            icon: Icons.plus;
+                            has-icon: true;
+                            enabled: !root.lk;
+                            clicked => { Bus.act("share.add"); }
+                        }
+                    }
+                }
+
+                if root.vis.sound: SectionCard {
+                    icon: Icons.speaker;
+                    hue: Theme.hue-sound;
+                    title: "Sound";
+                    summary: root.s.sum-sound;
+                    force-open: root.open-all;
+                    Row {
+                        label: "Play guest sound";
+                        hint: "Through this Mac's speakers. Linux guests. There is no microphone.";
+                        key: "audio.output";
+                        Toggle {
+                            y: (parent.height - self.height) / 2;
+                            checked: root.s.audio;
+                            enabled: !root.lk;
+                            toggled(v) => { Bus.set("audio", v ? "true" : "false"); }
+                        }
+                    }
+                }
+
+                if root.vis.clip: SectionCard {
+                    icon: Icons.clipboard;
+                    hue: Theme.hue-clip;
+                    title: "Clipboard";
+                    summary: root.s.sum-clip;
+                    force-open: root.open-all;
+                    Row {
+                        label: "Mac to guest";
+                        hint: "Only while the VM window has focus.";
+                        key: "clipboard.host_to_guest";
+                        Toggle {
+                            y: (parent.height - self.height) / 2;
+                            checked: root.s.clip-in;
+                            toggled(v) => { Bus.set("clip.in", v ? "true" : "false"); }
+                        }
+                    }
+                    Row {
+                        label: "Guest to Mac";
+                        key: "clipboard.guest_to_host";
+                        Toggle {
+                            y: (parent.height - self.height) / 2;
+                            checked: root.s.clip-out;
+                            toggled(v) => { Bus.set("clip.out", v ? "true" : "false"); }
+                        }
+                    }
+                    Divider { text: "ADVANCED"; }
+                    Row {
+                        label: "Size limit";
+                        hint: "Text only. Bigger copies are dropped.";
+                        key: "clipboard.max_bytes";
+                        Field {
+                            width: 100px;
+                            text: root.s.clip-max-kib;
+                            suffix: "KB";
+                            mono: true;
+                            input-type: number;
+                            committed(t) => { Bus.set("clip.max", t); }
+                        }
+                    }
+                }
+
+                if root.vis.security: SectionCard {
+                    icon: root.s.sandbox ? Icons.shield : Icons.shield-off;
+                    hue: root.s.sandbox ? Theme.green : Theme.red;
+                    title: "Security";
+                    summary: root.s.sum-security;
+                    warn: !root.s.sandbox;
+                    force-open: root.open-all;
+                    Row {
+                        label: "Sandbox";
+                        hint: root.s.sandbox ? "The VM process can only touch its own files." : "Off: a guest that breaks out gets your user's access.";
+                        key: "security.sandbox";
+                        warn: !root.s.sandbox;
+                        Toggle {
+                            y: (parent.height - self.height) / 2;
+                            checked: root.s.sandbox;
+                            enabled: !root.lk;
+                            toggled(v) => { Bus.set("sandbox", v ? "true" : "false"); }
+                        }
+                    }
+                    Row {
+                        label: "TPM 2.0";
+                        hint: "Windows 11 needs it. Needs swtpm (brew install swtpm).";
+                        key: "tpm";
+                        Toggle {
+                            y: (parent.height - self.height) / 2;
+                            checked: root.s.tpm;
+                            enabled: !root.lk;
+                            toggled(v) => { Bus.set("tpm", v ? "true" : "false"); }
+                        }
+                    }
+                    Divider { text: "ADVANCED"; }
+                    Row {
+                        label: "Device transport";
+                        hint: "Auto: PCI with UEFI, MMIO with kernel boot.";
+                        key: "virtio_transport";
+                        Segmented {
+                            width: 170px;
+                            options: ["Auto", "MMIO", "PCI"];
+                            selected: root.s.transport;
+                            enabled: !root.lk;
+                            changed(v) => { Bus.set("transport", v); }
+                        }
+                    }
+                    Row {
+                        label: "Serial console";
+                        hint: "Terminal: the VM log when started from here.";
+                        key: "serial.type";
+                        Select {
+                            width: 130px;
+                            options: ["Terminal", "File", "Off"];
+                            current: root.s.serial;
+                            enabled: !root.lk;
+                            selected(v) => { Bus.set("serial", v); }
+                        }
+                    }
+                }
+
+                if root.vis.boot: SectionCard {
+                    icon: Icons.rocket;
+                    hue: Theme.hue-boot;
+                    title: "Boot";
+                    summary: root.s.sum-boot;
+                    force-open: root.open-all;
+                    Segmented {
+                        options: ["UEFI firmware", "Linux kernel"];
+                        selected: root.s.boot-kernel ? 1 : 0;
+                        enabled: !root.lk;
+                        changed(v) => { Bus.set("boot.kind", v); }
+                    }
+                    if !root.s.boot-kernel: Row {
+                        label: "Firmware";
+                        hint: root.s.firmware == "" ? "Found automatically (Homebrew qemu)." : "";
+                        key: "boot.firmware";
+                        Field {
+                            width: 180px;
+                            text: root.s.firmware;
+                            placeholder: "automatic";
+                            mono: true;
+                            enabled: !root.lk;
+                            committed(t) => { Bus.set("boot.firmware", t); }
+                        }
+                    }
+                    if !root.s.boot-kernel: Row {
+                        label: "NVRAM";
+                        hint: root.s.vars;
+                        key: "boot.vars";
+                    }
+                    if root.s.boot-kernel: Row {
+                        label: "Kernel";
+                        key: "boot.kernel";
+                        Field {
+                            width: 180px;
+                            text: root.s.kernel;
+                            mono: true;
+                            enabled: !root.lk;
+                            committed(t) => { Bus.set("boot.kernel", t); }
+                        }
+                    }
+                    if root.s.boot-kernel: Row {
+                        label: "Initrd";
+                        key: "boot.initrd";
+                        Field {
+                            width: 180px;
+                            text: root.s.initrd;
+                            placeholder: "none";
+                            mono: true;
+                            enabled: !root.lk;
+                            committed(t) => { Bus.set("boot.initrd", t); }
+                        }
+                    }
+                    if root.s.boot-kernel: VerticalLayout {
+                        spacing: 4px;
+                        Row {
+                            label: "Command line";
+                            key: "boot.cmdline";
+                        }
+                        Field {
+                            text: root.s.cmdline;
+                            mono: true;
+                            enabled: !root.lk;
+                            committed(t) => { Bus.set("boot.cmdline", t); }
+                        }
+                    }
+                }
+
+                if root.vis.searching && !(root.vis.hw || root.vis.display || root.vis.storage || root.vis.net || root.vis.share || root.vis.sound || root.vis.clip || root.vis.security || root.vis.boot): Text {
+                    text: "Nothing matches. The config file has every option: ⋯ → Open config file.";
+                    font-size: Theme.fs-sm;
+                    color: Theme.text-3;
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    alignment: start;
+                    spacing: 6px;
+                    Button {
+                        small: true;
+                        kind: "ghost";
+                        text: "Open config file";
+                        icon: Icons.file;
+                        has-icon: true;
+                        clicked => { Bus.act("edit-file"); }
+                    }
+                    Text {
+                        text: root.s.config-path;
+                        font-family: Theme.mono;
+                        font-size: 10px;
+                        color: Theme.text-3;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
+            }
+        }
+    }
+}

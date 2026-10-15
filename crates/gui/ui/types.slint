@@ -1,0 +1,160 @@
+// Data the Rust side hands to the UI. The UI never changes these
+// directly: it calls back with what the user wants, Rust applies it,
+// saves the VM file, and pushes the new state.
+
+export enum VmState { off, starting, running, paused, suspending, stopping, suspended }
+
+export struct VmItem {
+    id: int,
+    name: string,
+    os: string,
+    state: VmState,
+    // "4 CPUs · 8 GB"
+    specs: string,
+    thumb: image,
+    has-thumb: bool,
+    // The window is open in this app (we can show it, send commands).
+    ours: bool,
+    warnings: int,
+}
+
+export struct DiskRow {
+    file: string,
+    path: string,
+    // "64 GB" virtual size, and what it takes on the host.
+    size: string,
+    used: string,
+    bus: int,        // 0 virtio, 1 nvme
+    sync: int,       // 0 full, 1 fsync, 2 none
+    readonly: bool,
+    cdrom: bool,
+    missing: bool,
+    qcow2: bool,
+}
+
+export struct ForwardRow {
+    host: string,
+    guest: string,
+    lan: bool,
+}
+
+export struct NetRow {
+    mode: int,       // 0 nat, 1 bridged, 2 host-only
+    interface: string,
+    iface-index: int,
+    network: string,
+    forwards: [ForwardRow],
+    loopback: bool,
+    block-private: bool,
+    mac: string,
+    summary: string,
+}
+
+export struct ShareRow {
+    path: string,
+    short: string,
+    tag: string,
+    readonly: bool,
+}
+
+export struct SnapRow {
+    name: string,
+    when: string,
+    size: string,
+    thumb: image,
+    has-thumb: bool,
+}
+
+export struct VmSettings {
+    loaded: bool,
+    name: string,
+    os-index: int,
+    cpus: int,
+    memory-gib: int,
+    nested: bool,
+    tpm: bool,
+    gpu: int,        // 0 none, 1 2d, 2 3d
+    width: string,
+    height: string,
+    disks: [DiskRow],
+    nets: [NetRow],
+    shares: [ShareRow],
+    audio: bool,
+    clip-in: bool,
+    clip-out: bool,
+    clip-max-kib: string,
+    sandbox: bool,
+    transport: int,  // 0 auto, 1 mmio, 2 pci
+    serial: int,     // 0 terminal, 1 file, 2 none
+    serial-path: string,
+    boot-kernel: bool,
+    firmware: string,
+    vars: string,
+    kernel: string,
+    initrd: string,
+    cmdline: string,
+    warnings: [string],
+    // Running or suspended: hardware can't change.
+    locked: bool,
+    lock-reason: string,
+    config-path: string,
+    state-path: string,
+    snapshots-cpu-mem: string,
+    // One-line summaries for the collapsed cards.
+    sum-hw: string,
+    sum-display: string,
+    sum-storage: string,
+    sum-net: string,
+    sum-share: string,
+    sum-sound: string,
+    sum-clip: string,
+    sum-security: string,
+    sum-boot: string,
+}
+
+// Which settings cards match the search box.
+export struct CardVis {
+    searching: bool,
+    hw: bool,
+    display: bool,
+    storage: bool,
+    net: bool,
+    share: bool,
+    sound: bool,
+    clip: bool,
+    security: bool,
+    boot: bool,
+}
+
+export struct HostInfo {
+    cpus: int,
+    memory-gib: int,
+    interfaces: [string],
+    free: string,
+}
+
+export struct Toast {
+    id: int,
+    text: string,
+    // 0 info, 1 ok, 2 warning, 3 error
+    kind: int,
+    action: string,
+}
+
+export struct PaletteItem {
+    title: string,
+    hint: string,
+    icon: string,
+    action: string,
+}
+
+export struct NewVm {
+    os-index: int,
+    name: string,
+    installer: string,
+    cpus: int,
+    memory-gib: int,
+    disk-gib: int,
+    gpu3d: bool,
+    start: bool,
+}

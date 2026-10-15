@@ -1,0 +1,132 @@
+// Icon set (24 px line icons, tinted with `colorize`).
+
+export global Icons {
+    out property <image> arrow-right: @image-url("icons/arrow-right.svg");
+    out property <image> broom: @image-url("icons/broom.svg");
+    out property <image> camera: @image-url("icons/camera.svg");
+    out property <image> check: @image-url("icons/check.svg");
+    out property <image> chevron-down: @image-url("icons/chevron-down.svg");
+    out property <image> chevron-right: @image-url("icons/chevron-right.svg");
+    out property <image> clipboard: @image-url("icons/clipboard.svg");
+    out property <image> command: @image-url("icons/command.svg");
+    out property <image> copy: @image-url("icons/copy.svg");
+    out property <image> cpu: @image-url("icons/cpu.svg");
+    out property <image> dice: @image-url("icons/dice.svg");
+    out property <image> disc: @image-url("icons/disc.svg");
+    out property <image> disk: @image-url("icons/disk.svg");
+    out property <image> display: @image-url("icons/display.svg");
+    out property <image> eye: @image-url("icons/eye.svg");
+    out property <image> file: @image-url("icons/file.svg");
+    out property <image> folder: @image-url("icons/folder.svg");
+    out property <image> gauge: @image-url("icons/gauge.svg");
+    out property <image> globe: @image-url("icons/globe.svg");
+    out property <image> history: @image-url("icons/history.svg");
+    out property <image> info: @image-url("icons/info.svg");
+    out property <image> keyboard: @image-url("icons/keyboard.svg");
+    out property <image> link: @image-url("icons/link.svg");
+    out property <image> lock: @image-url("icons/lock.svg");
+    out property <image> logo: @image-url("icons/logo.svg");
+    out property <image> maximize: @image-url("icons/maximize.svg");
+    out property <image> memory: @image-url("icons/memory.svg");
+    out property <image> minus: @image-url("icons/minus.svg");
+    out property <image> moon: @image-url("icons/moon.svg");
+    out property <image> more: @image-url("icons/more.svg");
+    out property <image> network: @image-url("icons/network.svg");
+    out property <image> os-alpine: @image-url("icons/os-alpine.svg");
+    out property <image> os-debian: @image-url("icons/os-debian.svg");
+    out property <image> os-fedora: @image-url("icons/os-fedora.svg");
+    out property <image> os-linux: @image-url("icons/os-linux.svg");
+    out property <image> os-other: @image-url("icons/os-other.svg");
+    out property <image> os-ubuntu: @image-url("icons/os-ubuntu.svg");
+    out property <image> os-windows: @image-url("icons/os-windows.svg");
+    out property <image> pause: @image-url("icons/pause.svg");
+    out property <image> play: @image-url("icons/play.svg");
+    out property <image> plus: @image-url("icons/plus.svg");
+    out property <image> power: @image-url("icons/power.svg");
+    out property <image> restart: @image-url("icons/restart.svg");
+    out property <image> reveal: @image-url("icons/reveal.svg");
+    out property <image> rocket: @image-url("icons/rocket.svg");
+    out property <image> search: @image-url("icons/search.svg");
+    out property <image> shield: @image-url("icons/shield.svg");
+    out property <image> shield-off: @image-url("icons/shield-off.svg");
+    out property <image> sparkles: @image-url("icons/sparkles.svg");
+    out property <image> speaker: @image-url("icons/speaker.svg");
+    out property <image> sun: @image-url("icons/sun.svg");
+    out property <image> terminal: @image-url("icons/terminal.svg");
+    out property <image> trash: @image-url("icons/trash.svg");
+    out property <image> upload: @image-url("icons/upload.svg");
+    out property <image> warning: @image-url("icons/warning.svg");
+    out property <image> window: @image-url("icons/window.svg");
+    out property <image> x: @image-url("icons/x.svg");
+
+    public pure function os(name: string) -> image {
+        if name == "windows" { return os-windows; }
+        if name == "ubuntu" { return os-ubuntu; }
+        if name == "debian" { return os-debian; }
+        if name == "fedora" { return os-fedora; }
+        if name == "alpine" { return os-alpine; }
+        if name == "linux" { return os-linux; }
+        return os-other;
+    }
+
+    public pure function by-name(name: string) -> image {
+        if name == "arrow-right" { return arrow-right; }
+        if name == "broom" { return broom; }
+        if name == "camera" { return camera; }
+        if name == "check" { return check; }
+        if name == "chevron-down" { return chevron-down; }
+        if name == "chevron-right" { return chevron-right; }
+        if name == "clipboard" { return clipboard; }
+        if name == "command" { return command; }
+        if name == "copy" { return copy; }
+        if name == "cpu" { return cpu; }
+        if name == "dice" { return dice; }
+        if name == "disc" { return disc; }
+        if name == "disk" { return disk; }
+        if name == "display" { return display; }
+        if name == "eye" { return eye; }
+        if name == "file" { return file; }
+        if name == "folder" { return folder; }
+        if name == "gauge" { return gauge; }
+        if name == "globe" { return globe; }
+        if name == "history" { return history; }
+        if name == "info" { return info; }
+        if name == "keyboard" { return keyboard; }
+        if name == "link" { return link; }
+        if name == "lock" { return lock; }
+        if name == "logo" { return logo; }
+        if name == "maximize" { return maximize; }
+        if name == "memory" { return memory; }
+        if name == "minus" { return minus; }
+        if name == "moon" { return moon; }
+        if name == "more" { return more; }
+        if name == "network" { return network; }
+        if name == "os-alpine" { return os-alpine; }
+        if name == "os-debian" { return os-debian; }
+        if name == "os-fedora" { return os-fedora; }
+        if name == "os-linux" { return os-linux; }
+        if name == "os-other" { return os-other; }
+        if name == "os-ubuntu" { return os-ubuntu; }
+        if name == "os-windows" { return os-windows; }
+        if name == "pause" { return pause; }
+        if name == "play" { return play; }
+        if name == "plus" { return plus; }
+        if name == "power" { return power; }
+        if name == "restart" { return restart; }
+        if name == "reveal" { return reveal; }
+        if name == "rocket" { return rocket; }
+        if name == "search" { return search; }
+        if name == "shield" { return shield; }
+        if name == "shield-off" { return shield-off; }
+        if name == "sparkles" { return sparkles; }
+        if name == "speaker" { return speaker; }
+        if name == "sun" { return sun; }
+        if name == "terminal" { return terminal; }
+        if name == "trash" { return trash; }
+        if name == "upload" { return upload; }
+        if name == "warning" { return warning; }
+        if name == "window" { return window; }
+        if name == "x" { return x; }
+        return info;
+    }
+}

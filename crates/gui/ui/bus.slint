@@ -1,0 +1,12 @@
+// Everything the UI asks for goes through here. Keys follow the VM file
+// ("cpus", "net.0.mode", "net.0.fwd.1.host"), so the Rust side has one
+// place that maps intents to config changes.
+
+export global Bus {
+    // Change a setting of the selected VM.
+    callback set(string, string);
+    // Do something: "start", "net.add", "share.add", "pick-installer"...
+    callback act(string);
+    callback search(string);
+    callback copy(string);
+}

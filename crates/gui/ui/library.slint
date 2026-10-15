@@ -1,0 +1,841 @@
+// Library window parts: sidebar, the selected VM's page, empty state.
+
+import { ScrollView } from "std-widgets.slint";
+import { Theme, OsLook } from "theme.slint";
+import { Icons } from "icons.slint";
+import { Bus } from "bus.slint";
+import { VmItem, VmState, VmSettings, SnapRow, CardVis, HostInfo } from "types.slint";
+import { Button, IconButton, Chip, StatusDot, OsBadge, Icon, Spinner } from "controls.slint";
+import { SettingsPanel } from "settings.slint";
+
+export global States {
+    public pure function label(s: VmState) -> string {
+        if s == VmState.running { return "Running"; }
+        if s == VmState.starting { return "Starting"; }
+        if s == VmState.paused { return "Paused"; }
+        if s == VmState.suspending { return "Saving state"; }
+        if s == VmState.stopping { return "Shutting down"; }
+        if s == VmState.suspended { return "Suspended"; }
+        return "Off";
+    }
+    public pure function color(s: VmState) -> color {
+        if s == VmState.running { return Theme.green; }
+        if s == VmState.paused || s == VmState.suspended { return Theme.amber; }
+        if s == VmState.starting || s == VmState.suspending || s == VmState.stopping { return Theme.blue; }
+        return Theme.text-3;
+    }
+    public pure function busy(s: VmState) -> bool {
+        return s == VmState.starting || s == VmState.suspending || s == VmState.stopping;
+    }
+    public pure function live(s: VmState) -> bool {
+        return s == VmState.running || s == VmState.paused;
+    }
+}
+
+component Logo inherits Rectangle {
+    width: 30px;
+    height: 30px;
+    border-radius: 9px;
+    background: Theme.accent-grad;
+    drop-shadow-blur: 14px;
+    drop-shadow-color: Theme.accent.with-alpha(0.5);
+    drop-shadow-offset-y: 3px;
+    Text {
+        text: "v";
+        font-size: 19px;
+        font-weight: 800;
+        color: #ffffff;
+        y: 1px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        width: parent.width;
+        height: parent.height - 4px;
+    }
+}
+
+component VmRow inherits Rectangle {
+    in property <VmItem> vm;
+    in property <bool> selected;
+    callback clicked;
+    height: 58px;
+    border-radius: 12px;
+    background: selected ? Theme.accent-soft : ta.has-hover ? Theme.card : transparent;
+    border-width: selected ? 1px : 0px;
+    border-color: Theme.accent.with-alpha(0.35);
+    animate background { duration: 120ms; }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 12px;
+        spacing: 11px;
+        OsBadge {
+            os: root.vm.os;
+            size: 36px;
+            y: (parent.height - self.height) / 2;
+            glow: root.selected;
+        }
+        VerticalLayout {
+            horizontal-stretch: 1;
+            alignment: center;
+            spacing: 2px;
+            Text {
+                text: root.vm.name;
+                font-size: Theme.fs-md;
+                font-weight: 600;
+                color: Theme.text;
+                overflow: elide;
+            }
+            HorizontalLayout {
+                spacing: 5px;
+                alignment: start;
+                Text {
+                    text: States.label(root.vm.state);
+                    font-size: Theme.fs-xs;
+                    font-weight: 600;
+                    color: States.color(root.vm.state);
+                }
+                Text {
+                    text: "· " + root.vm.specs;
+                    font-size: Theme.fs-xs;
+                    color: Theme.text-3;
+                    overflow: elide;
+                }
+            }
+        }
+        if States.busy(root.vm.state): Spinner {
+            y: (parent.height - self.height) / 2;
+            tint: Theme.blue;
+        }
+        if !States.busy(root.vm.state) && root.vm.state != VmState.off: StatusDot {
+            y: (parent.height - self.height) / 2;
+            tint: States.color(root.vm.state);
+            glow: root.vm.state == VmState.running;
+        }
+    }
+}
+
+export component Sidebar inherits Rectangle {
+    in property <[VmItem]> vms;
+    in property <int> current;
+    in property <HostInfo> host;
+    callback select(int);
+    width: 268px;
+    background: Theme.sidebar;
+    Rectangle {
+        x: parent.width - 1px;
+        width: 1px;
+        background: Theme.border;
+    }
+    VerticalLayout {
+        padding: 14px;
+        padding-top: 16px;
+        spacing: 10px;
+        HorizontalLayout {
+            height: 36px;
+            spacing: 10px;
+            padding-left: 4px;
+            Logo { y: (parent.height - self.height) / 2; }
+            Text {
+                text: "vroom";
+                font-size: 18px;
+                font-weight: 800;
+                letter-spacing: -0.4px;
+                color: Theme.text;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+            IconButton {
+                icon: Theme.dark ? Icons.sun : Icons.moon;
+                tip: "Light / dark";
+                size: 30px;
+                y: (parent.height - self.height) / 2;
+                clicked => { Bus.act("theme"); }
+            }
+        }
+        // Command palette opener.
+        Rectangle {
+            height: 34px;
+            border-radius: 10px;
+            background: pta.has-hover ? Theme.card-hover : Theme.card;
+            border-width: 1px;
+            border-color: Theme.border;
+            pta := TouchArea {
+                mouse-cursor: pointer;
+                clicked => { Bus.act("palette"); }
+            }
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-right: 8px;
+                spacing: 8px;
+                Icon {
+                    source: Icons.search;
+                    width: 15px;
+                    height: 15px;
+                    y: (parent.height - self.height) / 2;
+                    tint: Theme.text-3;
+                }
+                Text {
+                    text: "Search, run, jump to...";
+                    font-size: Theme.fs-sm;
+                    color: Theme.text-3;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                Rectangle {
+                    width: 32px;
+                    height: 20px;
+                    y: (parent.height - self.height) / 2;
+                    border-radius: 5px;
+                    background: Theme.well;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    Text {
+                        text: "⌘K";
+                        font-size: 10px;
+                        font-weight: 600;
+                        color: Theme.text-3;
+                    }
+                }
+            }
+        }
+        HorizontalLayout {
+            padding-left: 6px;
+            padding-top: 6px;
+            Text {
+                text: "VIRTUAL MACHINES";
+                font-size: 10px;
+                font-weight: 700;
+                letter-spacing: 0.9px;
+                color: Theme.text-3;
+                horizontal-stretch: 1;
+            }
+            Text {
+                text: root.vms.length;
+                font-size: 10px;
+                font-weight: 700;
+                color: Theme.text-3;
+            }
+        }
+        Flickable {
+            vertical-stretch: 1;
+            VerticalLayout {
+                alignment: start;
+                spacing: 3px;
+                for vm[i] in root.vms: VmRow {
+                    vm: vm;
+                    selected: i == root.current;
+                    clicked => { root.select(i); }
+                }
+            }
+        }
+        Button {
+            kind: "primary";
+            text: "New VM";
+            icon: Icons.plus;
+            has-icon: true;
+            clicked => { Bus.act("newvm"); }
+        }
+        Text {
+            text: root.host.free;
+            font-size: Theme.fs-xs;
+            color: Theme.text-3;
+            horizontal-alignment: center;
+        }
+    }
+}
+
+// Menu popup items.
+export struct MenuItem {
+    icon: image,
+    text: string,
+    action: string,
+    danger: bool,
+}
+
+component Menu inherits PopupWindow {
+    in property <[MenuItem]> items;
+    width: 230px;
+    Rectangle {
+        background: Theme.popup;
+        border-radius: 12px;
+        border-width: 1px;
+        border-color: Theme.border-strong;
+        drop-shadow-blur: 30px;
+        drop-shadow-color: #00000073;
+        drop-shadow-offset-y: 10px;
+        VerticalLayout {
+            padding: 5px;
+            for it in root.items: Rectangle {
+                height: 34px;
+                border-radius: 8px;
+                background: mta.has-hover ? (it.danger ? Theme.red-soft : Theme.accent-soft) : transparent;
+                HorizontalLayout {
+                    padding-left: 10px;
+                    spacing: 10px;
+                    Icon {
+                        source: it.icon;
+                        width: 16px;
+                        height: 16px;
+                        y: (parent.height - self.height) / 2;
+                        tint: it.danger ? Theme.red : Theme.text-2;
+                    }
+                    Text {
+                        text: it.text;
+                        font-size: Theme.fs-md;
+                        color: it.danger ? Theme.red : Theme.text;
+                        vertical-alignment: center;
+                    }
+                }
+                mta := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { Bus.act(it.action); }
+                }
+            }
+        }
+    }
+}
+
+component Hero inherits Rectangle {
+    in property <VmItem> vm;
+    property <bool> live: States.live(vm.state);
+    border-radius: 18px;
+    background: Theme.bg-raised;
+    border-width: 1px;
+    border-color: Theme.border-strong;
+    drop-shadow-blur: 48px;
+    drop-shadow-color: OsLook.glow(vm.os).with-alpha(Theme.dark ? 0.28 : 0.18);
+    drop-shadow-offset-y: 18px;
+    clip: true;
+
+    // Placeholder: OS colors and a big glyph.
+    if !root.vm.has-thumb: Rectangle {
+        background: @linear-gradient(155deg, OsLook.glow(root.vm.os).with-alpha(0.55) 0%, Theme.bg-raised 75%);
+        Image {
+            source: Icons.os(root.vm.os);
+            colorize: #ffffff;
+            opacity: 0.16;
+            width: parent.height * 0.42;
+            height: self.width;
+        }
+    }
+    if root.vm.has-thumb: Image {
+        width: parent.width;
+        height: parent.height;
+        source: root.vm.thumb;
+        image-fit: cover;
+        image-rendering: smooth;
+    }
+    // Dim what isn't running, so the button reads.
+    if !root.live: Rectangle {
+        background: @linear-gradient(180deg, #00000014 0%, #000000a0 100%);
+    }
+    ta := TouchArea {
+        mouse-cursor: States.busy(root.vm.state) ? MouseCursor.default : MouseCursor.pointer;
+        clicked => {
+            if root.live {
+                Bus.act("show");
+            } else if !States.busy(root.vm.state) {
+                Bus.act("start");
+            }
+        }
+    }
+    if !root.live: VerticalLayout {
+        alignment: center;
+        spacing: 12px;
+        HorizontalLayout {
+            alignment: center;
+            Rectangle {
+                width: ta.has-hover ? 84px : 76px;
+                height: self.width;
+                animate width { duration: 200ms; easing: ease-out; }
+                border-radius: self.width / 2;
+                background: #ffffff2e;
+                border-width: 1px;
+                border-color: #ffffff59;
+                drop-shadow-blur: 30px;
+                drop-shadow-color: #00000080;
+                if States.busy(root.vm.state): Spinner {
+                    width: 30px;
+                    height: 30px;
+                    tint: #ffffff;
+                }
+                if !States.busy(root.vm.state): Icon {
+                    source: Icons.play;
+                    x: (parent.width - self.width) / 2 + 3px;
+                    width: parent.width * 0.38;
+                    height: self.width;
+                    tint: #ffffff;
+                }
+            }
+        }
+        Text {
+            text: States.busy(root.vm.state) ? States.label(root.vm.state) + "..."
+                : root.vm.state == VmState.suspended ? "Resume where you left off" : "Start " + root.vm.name;
+            horizontal-alignment: center;
+            font-size: Theme.fs-lg;
+            font-weight: 600;
+            color: #ffffff;
+        }
+    }
+    if root.live && ta.has-hover: Rectangle {
+        background: #00000059;
+        HorizontalLayout {
+            alignment: center;
+            VerticalLayout {
+                alignment: center;
+                Rectangle {
+                    height: 40px;
+                    width: wl.preferred-width;
+                    border-radius: 20px;
+                    background: #ffffff2e;
+                    border-width: 1px;
+                    border-color: #ffffff59;
+                    wl := HorizontalLayout {
+                        padding-left: 16px;
+                        padding-right: 18px;
+                        spacing: 8px;
+                        Icon {
+                            source: Icons.window;
+                            y: (parent.height - self.height) / 2;
+                            tint: #ffffff;
+                        }
+                        Text {
+                            text: root.vm.ours ? "Show window" : "Running from the terminal";
+                            color: #ffffff;
+                            font-size: Theme.fs-md;
+                            font-weight: 600;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Corner pill.
+    if root.vm.state != VmState.off: Rectangle {
+        x: 14px;
+        y: 14px;
+        height: 26px;
+        width: pl.preferred-width;
+        border-radius: 13px;
+        background: #0000008c;
+        border-width: 1px;
+        border-color: #ffffff1f;
+        pl := HorizontalLayout {
+            padding-left: 10px;
+            padding-right: 11px;
+            spacing: 7px;
+            StatusDot {
+                y: (parent.height - self.height) / 2;
+                tint: States.color(root.vm.state);
+                glow: true;
+            }
+            Text {
+                text: root.vm.state == VmState.running ? "Live" : States.label(root.vm.state);
+                color: #ffffff;
+                font-size: Theme.fs-xs;
+                font-weight: 700;
+                vertical-alignment: center;
+            }
+        }
+    }
+}
+
+component SnapCard inherits Rectangle {
+    in property <SnapRow> snap;
+    in property <bool> can-restore;
+    width: 176px;
+    height: 150px;
+    ta := TouchArea { }
+    VerticalLayout {
+        spacing: 7px;
+        Rectangle {
+            height: 110px;
+            border-radius: 12px;
+            background: Theme.card;
+            border-width: 1px;
+            border-color: ta.has-hover ? Theme.accent.with-alpha(0.5) : Theme.border;
+            clip: true;
+            if root.snap.has-thumb: Image {
+                width: parent.width;
+                height: parent.height;
+                source: root.snap.thumb;
+                image-fit: cover;
+            }
+            if !root.snap.has-thumb: Icon {
+                source: Icons.camera;
+                width: 26px;
+                height: 26px;
+                tint: Theme.text-3;
+            }
+            if ta.has-hover: Rectangle {
+                background: #0000008c;
+                HorizontalLayout {
+                    alignment: center;
+                    spacing: 8px;
+                    padding-top: 37px;
+                    padding-bottom: 37px;
+                    Button {
+                        small: true;
+                        kind: "primary";
+                        text: "Restore";
+                        icon: Icons.history;
+                        has-icon: true;
+                        enabled: root.can-restore;
+                        clicked => { Bus.act("snap.restore:" + root.snap.name); }
+                    }
+                    IconButton {
+                        icon: Icons.trash;
+                        tint: #ffffff;
+                        size: 30px;
+                        clicked => { Bus.act("snap.delete:" + root.snap.name); }
+                    }
+                }
+            }
+        }
+        VerticalLayout {
+            spacing: 1px;
+            Text {
+                text: root.snap.when;
+                font-size: Theme.fs-sm;
+                font-weight: 600;
+                color: Theme.text;
+                overflow: elide;
+            }
+            Text {
+                text: root.snap.size;
+                font-size: Theme.fs-xs;
+                color: Theme.text-3;
+            }
+        }
+    }
+}
+
+export component VmPage inherits Rectangle {
+    in property <VmItem> vm;
+    in property <VmSettings> s;
+    in property <[SnapRow]> snaps;
+    in property <CardVis> vis;
+    in property <HostInfo> host;
+    in-out property <string> query;
+    property <bool> live: States.live(vm.state);
+
+    VerticalLayout {
+        padding: 26px;
+        padding-top: 18px;
+        padding-bottom: 0px;
+        spacing: 18px;
+        // Header.
+        HorizontalLayout {
+            height: 56px;
+            spacing: 14px;
+            OsBadge {
+                os: root.vm.os;
+                size: 48px;
+                glow: true;
+                y: (parent.height - self.height) / 2;
+            }
+            VerticalLayout {
+                alignment: center;
+                spacing: 3px;
+                horizontal-stretch: 1;
+                Text {
+                    text: root.vm.name;
+                    font-size: Theme.fs-hero;
+                    font-weight: 750;
+                    letter-spacing: -0.6px;
+                    color: Theme.text;
+                    overflow: elide;
+                }
+                HorizontalLayout {
+                    spacing: 7px;
+                    alignment: start;
+                    StatusDot {
+                        y: (parent.height - self.height) / 2;
+                        tint: States.color(root.vm.state);
+                        glow: root.vm.state == VmState.running;
+                    }
+                    Text {
+                        text: States.label(root.vm.state);
+                        font-size: Theme.fs-sm;
+                        font-weight: 600;
+                        color: States.color(root.vm.state);
+                    }
+                    Text {
+                        text: "·  " + OsLook.label(root.vm.os) + "  ·  " + root.vm.specs;
+                        font-size: Theme.fs-sm;
+                        color: Theme.text-3;
+                        overflow: elide;
+                    }
+                }
+            }
+            if root.live && root.vm.ours: HorizontalLayout {
+                spacing: 2px;
+                IconButton {
+                    icon: root.vm.state == VmState.paused ? Icons.play : Icons.pause;
+                    tip: root.vm.state == VmState.paused ? "Continue" : "Pause";
+                    y: (parent.height - self.height) / 2;
+                    clicked => { Bus.act(root.vm.state == VmState.paused ? "resume" : "pause"); }
+                }
+                IconButton {
+                    icon: Icons.camera;
+                    tip: "Take snapshot";
+                    y: (parent.height - self.height) / 2;
+                    clicked => { Bus.act("snapshot"); }
+                }
+                IconButton {
+                    icon: Icons.moon;
+                    tip: "Suspend";
+                    y: (parent.height - self.height) / 2;
+                    clicked => { Bus.act("suspend"); }
+                }
+                power := IconButton {
+                    icon: Icons.power;
+                    tip: "Shut down...";
+                    y: (parent.height - self.height) / 2;
+                    clicked => { power-menu.show(); }
+                }
+            }
+            if root.live && root.vm.ours: Button {
+                kind: "primary";
+                text: "Show window";
+                icon: Icons.window;
+                has-icon: true;
+                y: (parent.height - self.height) / 2;
+                clicked => { Bus.act("show"); }
+            }
+            if !root.live: Button {
+                kind: "primary";
+                text: root.vm.state == VmState.suspended ? "Resume" : "Start";
+                icon: Icons.play;
+                has-icon: true;
+                busy: States.busy(root.vm.state);
+                y: (parent.height - self.height) / 2;
+                clicked => { Bus.act("start"); }
+            }
+            more := IconButton {
+                icon: Icons.more;
+                tip: "More";
+                y: (parent.height - self.height) / 2;
+                clicked => { more-menu.show(); }
+            }
+        }
+        HorizontalLayout {
+            spacing: 26px;
+            VerticalLayout {
+                horizontal-stretch: 1;
+                spacing: 18px;
+                hero := Hero {
+                    vm: root.vm;
+                    height: min(self.width * 0.625, 470px);
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: start;
+                    Chip {
+                        icon: Icons.cpu;
+                        text: root.s.cpus + (root.s.cpus == 1 ? " CPU" : " CPUs");
+                        tint: Theme.hue-cpu;
+                    }
+                    Chip {
+                        icon: Icons.memory;
+                        text: root.s.memory-gib + " GB";
+                        tint: Theme.hue-cpu;
+                    }
+                    Chip {
+                        icon: Icons.globe;
+                        text: root.s.nets.length == 0 ? "Offline" : root.s.nets.length == 1 ? root.s.nets[0].summary : root.s.nets.length + " adapters";
+                        tint: Theme.hue-network;
+                    }
+                    if root.s.gpu == 2: Chip {
+                        icon: Icons.sparkles;
+                        text: "3D";
+                        tint: Theme.hue-display;
+                    }
+                    if root.s.tpm: Chip {
+                        icon: Icons.lock;
+                        text: "TPM";
+                        tint: Theme.green;
+                    }
+                    if root.s.sandbox: Chip {
+                        icon: Icons.shield;
+                        text: "Sandboxed";
+                        tint: Theme.green;
+                    }
+                }
+                // Snapshots.
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: "Snapshots";
+                        font-size: Theme.fs-lg;
+                        font-weight: 700;
+                        color: Theme.text;
+                        vertical-alignment: center;
+                    }
+                    Text {
+                        text: root.snaps.length > 0 ? root.snaps.length : "";
+                        font-size: Theme.fs-sm;
+                        color: Theme.text-3;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    Button {
+                        small: true;
+                        kind: "ghost";
+                        text: "Take snapshot";
+                        icon: Icons.camera;
+                        has-icon: true;
+                        enabled: root.live && root.vm.ours;
+                        clicked => { Bus.act("snapshot"); }
+                    }
+                }
+                if root.snaps.length == 0: Rectangle {
+                    height: 74px;
+                    border-radius: 14px;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    background: Theme.well;
+                    HorizontalLayout {
+                        padding-left: 18px;
+                        spacing: 12px;
+                        Icon {
+                            source: Icons.camera;
+                            y: (parent.height - self.height) / 2;
+                            tint: Theme.text-3;
+                        }
+                        Text {
+                            text: root.live ? "No snapshots yet. Take one before you try something risky." : "No snapshots yet. Start the VM to take one.";
+                            font-size: Theme.fs-sm;
+                            color: Theme.text-2;
+                            vertical-alignment: center;
+                            wrap: word-wrap;
+                            horizontal-stretch: 1;
+                        }
+                    }
+                }
+                if root.snaps.length > 0: Flickable {
+                    height: 152px;
+                    content-width: snaprow.preferred-width;
+                    interactive: true;
+                    snaprow := HorizontalLayout {
+                        spacing: 12px;
+                        for sn in root.snaps: SnapCard {
+                            snap: sn;
+                            can-restore: !root.live;
+                        }
+                    }
+                }
+                Rectangle { vertical-stretch: 1; }
+            }
+            SettingsPanel {
+                min-width: 360px;
+                max-width: 450px;
+                horizontal-stretch: 0.7;
+                s: root.s;
+                vis: root.vis;
+                host: root.host;
+                query <=> root.query;
+            }
+        }
+    }
+    more-menu := Menu {
+        x: root.width - 260px;
+        y: 70px;
+        items: [
+            { icon: Icons.file, text: "Open config file", action: "edit-file" },
+            { icon: Icons.reveal, text: "Show in Finder", action: "reveal" },
+            { icon: Icons.terminal, text: "Show log", action: "log" },
+            { icon: Icons.broom, text: "Clean up snapshot layers", action: "prune" },
+            { icon: Icons.history, text: "Discard saved state", action: "discard", danger: true },
+            { icon: Icons.trash, text: "Remove from list", action: "remove", danger: true },
+        ];
+    }
+    power-menu := Menu {
+        x: root.width - 380px;
+        y: 70px;
+        items: [
+            { icon: Icons.power, text: "Shut down", action: "shutdown" },
+            { icon: Icons.restart, text: "Restart", action: "reset" },
+            { icon: Icons.x, text: "Force power off", action: "poweroff", danger: true },
+        ];
+    }
+}
+
+export component EmptyState inherits Rectangle {
+    VerticalLayout {
+        alignment: center;
+        spacing: 18px;
+        HorizontalLayout {
+            alignment: center;
+            // A little stack of VM windows.
+            Rectangle {
+                width: 260px;
+                height: 170px;
+                Rectangle {
+                    x: 40px;
+                    y: 0px;
+                    width: 200px;
+                    height: 125px;
+                    border-radius: 14px;
+                    background: OsLook.grad("windows");
+                    opacity: 0.55;
+                    transform-rotation: 8deg;
+                }
+                Rectangle {
+                    x: 10px;
+                    y: 22px;
+                    width: 200px;
+                    height: 125px;
+                    border-radius: 14px;
+                    background: OsLook.grad("ubuntu");
+                    drop-shadow-blur: 40px;
+                    drop-shadow-color: #e0322b66;
+                    drop-shadow-offset-y: 14px;
+                    border-width: 1px;
+                    border-color: #ffffff40;
+                    Image {
+                        source: Icons.os-ubuntu;
+                        colorize: #ffffff;
+                        width: 48px;
+                        height: 48px;
+                    }
+                }
+            }
+        }
+        Text {
+            text: "No VMs yet";
+            font-size: 28px;
+            font-weight: 750;
+            letter-spacing: -0.6px;
+            color: Theme.text;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: "Make one from an installer ISO, or add a VM file you already have.\nYou can also drop an ISO or a .toml file on this window.";
+            font-size: Theme.fs-lg;
+            color: Theme.text-2;
+            horizontal-alignment: center;
+        }
+        HorizontalLayout {
+            alignment: center;
+            spacing: 10px;
+            Button {
+                kind: "primary";
+                text: "New VM";
+                icon: Icons.plus;
+                has-icon: true;
+                clicked => { Bus.act("newvm"); }
+            }
+            Button {
+                text: "Add existing...";
+                icon: Icons.file;
+                has-icon: true;
+                clicked => { Bus.act("import"); }
+            }
+        }
+    }
+}
