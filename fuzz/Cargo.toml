@@ -15,6 +15,7 @@ bulwark-virtio = { path = "../crates/virtio" }
 bulwark-devices = { path = "../crates/devices" }
 bulwark-memory = { path = "../crates/memory" }
 bulwark-block = { path = "../crates/block" }
+bulwark-fs = { path = "../crates/fs" }
 tempfile = "3"
 
 # Not part of the main workspace (needs nightly + sanitizers).
@@ -89,5 +90,11 @@ doc = false
 [[bin]]
 name = "nat_dhcp_frag"
 path = "fuzz_targets/nat_dhcp_frag.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "virtio_fs"
+path = "fuzz_targets/virtio_fs.rs"
 test = false
 doc = false

@@ -122,6 +122,22 @@ OpenGL on top of it (Mesa's Zink) doesn't work yet: Zink needs Vulkan's
 apps fall back to llvmpipe. Windows guests are not covered: Windows has no
 Venus driver.
 
+## Shared folders
+
+```toml
+[[share]]
+path = "/Users/me/shared"
+tag = "host"
+readonly = false     # default true
+```
+
+Linux guest: `sudo mount -t virtiofs host /mnt` (or in `/etc/fstab`:
+`host /mnt virtiofs defaults 0 0`). Files show up owned by whoever looks
+at them; the guest can't create symlinks, hard links or device nodes in
+the share, and symlinks already there are shown but never followed on the
+host. Windows guests need virtio-win's virtiofs service and WinFsp (not
+tested yet).
+
 ## Snapshots, suspend
 
 - `Ctrl-A s` / `Ctrl+Alt+Shift+S`: snapshot to `<state>/snapshots/snap-<time>`.

@@ -21,6 +21,7 @@ What has been run end to end on an M3 Max, macOS 15:
 | Dynamic resolution (Linux natively, Windows via agent) | works |
 | Clipboard both ways (Linux agent; Windows service + unprivileged helper) | works |
 | NAT networking (DHCP, DNS, TCP/UDP, ICMP, port forwards) | works |
+| Shared folders (virtio-fs; read-only by default) | works (Linux guests) |
 | Bridged / host-only (privileged `bulwark-netd`) | plumbing tested; real vmnet/tap needs root, not yet run |
 | Nested virtualization (KVM inside an Ubuntu guest, M3+) | works |
 | KVM backend (arm64), incl. snapshots | works (tested nested on HVF) |
@@ -103,6 +104,11 @@ port_forwards = [{ host_port = 2222, guest_port = 22 }]
 gpu = "virtio2d"               # none | virtio2d | virtio3d
 width = 1280
 height = 800
+
+[[share]]                      # host folder, Linux guest: mount -t virtiofs host /mnt
+path = "~/shared"              # (absolute or relative to this file)
+tag = "host"
+readonly = true                # default; false lets the guest change files
 
 [clipboard]
 host_to_guest = true

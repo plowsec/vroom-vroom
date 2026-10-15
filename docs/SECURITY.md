@@ -70,6 +70,18 @@ network stack. Host loopback is unreachable unless `allow_host_loopback`;
 through `bulwark-netd`, which enforces allow-listed interfaces and source
 MAC anti-spoofing.
 
+## Shared folders
+
+Off unless configured, read-only unless `readonly = false`. The host side
+(`bulwark-fs`) walks every guest path one component at a time with
+`openat(O_NOFOLLOW)` from an fd on the share root: a symlink anywhere ends
+the walk, so neither a guest-planted link nor one swapped in on the host
+mid-walk leads outside. Names with `/`, NUL, `.` or `..` are refused; only
+regular files and directories are opened (no FIFOs, devices, sockets);
+the guest can't create links or device nodes. Node, handle and directory
+listing counts are capped. The sandbox only grants the share's own
+subtree (read-only shares: read access only). The FUSE server is fuzzed.
+
 ## Snapshots
 
 Snapshots contain guest RAM (keys, passwords). They're written 0600 in 0700

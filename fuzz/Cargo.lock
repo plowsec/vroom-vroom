@@ -60,11 +60,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "bulwark-fs"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "bulwark-fuzz"
 version = "0.0.0"
 dependencies = [
  "bulwark-block",
  "bulwark-devices",
+ "bulwark-fs",
  "bulwark-memory",
  "bulwark-net",
  "bulwark-proto",
@@ -128,6 +136,7 @@ version = "0.1.0"
 dependencies = [
  "bulwark-block",
  "bulwark-devices",
+ "bulwark-fs",
  "bulwark-memory",
  "bulwark-net",
  "bulwark-snapshot",
