@@ -244,14 +244,22 @@ pub(crate) fn open_file(path: &Path, read_only: bool) -> io::Result<File> {
     let mut o = OpenOptions::new();
     o.read(true).write(!read_only);
     let f = o.open(path)?;
-    lock_file(&f, !read_only).map_err(|e| {
-        if e.kind() == io::ErrorKind::WouldBlock {
-            io::Error::new(e.kind(), format!("{} is in use by another VM", path.display()))
-        } else {
-            e
+    // A lock can outlive its owner by a moment: a child forked by another
+    // thread holds copies of our fds until it execs. Retry briefly.
+    let mut tries = 0;
+    loop {
+        match lock_file(&f, !read_only) {
+            Ok(()) => return Ok(f),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock && tries < 20 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                return Err(io::Error::new(e.kind(), format!("{} is in use by another VM", path.display())))
+            }
+            Err(e) => return Err(e),
         }
-    })?;
-    Ok(f)
+    }
 }
 
 /// Take, or convert to, a shared or exclusive lock on the whole file.

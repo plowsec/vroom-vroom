@@ -38,6 +38,56 @@ const MAX_SIZE: u64 = 64 << 40;
 /// Max backing chain depth.
 /// Max backing chain depth (each snapshot adds a layer).
 const MAX_CHAIN: u32 = 64;
+/// Free-cluster runs we track (beyond that, space is just not reused).
+const MAX_FREE_RUNS: usize = 1 << 20;
+
+/// Clusters with refcount 0 below the end of the file. A free run that
+/// reaches the end is cut off the file instead (`next_free` moves down).
+fn scan_free(f: &File, cs: u64, table: &[u64], next_free: &mut u64) -> Result<std::collections::BTreeMap<u64, u64>> {
+    let per_block = cs / 2;
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    let push = |host: u64, runs: &mut Vec<(u64, u64)>| {
+        if let Some((s, n)) = runs.last_mut() {
+            if *s + *n * cs == host {
+                *n += 1;
+                return;
+            }
+        }
+        if runs.len() < MAX_FREE_RUNS {
+            runs.push((host, 1));
+        }
+    };
+    let mut block = vec![0u8; cs as usize];
+    for (b, &e) in table.iter().enumerate() {
+        let first = b as u64 * per_block * cs;
+        if first >= *next_free {
+            break;
+        }
+        let rb = e & OFFSET_MASK;
+        if rb != 0 {
+            f.read_exact_at(&mut block, rb).map_err(|_| bad("refcount block truncated"))?;
+        }
+        for i in 0..per_block {
+            let host = first + i * cs;
+            if host >= *next_free {
+                break;
+            }
+            let rc = if rb == 0 { 0 } else { u16::from_be_bytes([block[2 * i as usize], block[2 * i as usize + 1]]) };
+            if rc == 0 {
+                push(host, &mut runs);
+            }
+        }
+    }
+    if let Some(&(s, n)) = runs.last() {
+        if s + n * cs == *next_free {
+            *next_free = s;
+            runs.pop();
+            f.set_len(*next_free)?;
+        }
+    }
+    Ok(runs.into_iter().collect())
+}
+
 /// Largest L1 table we load (QEMU: 32 MiB).
 const MAX_L1_BYTES: u64 = 32 << 20;
 /// Largest refcount table we load (QEMU: 8 MiB).
@@ -258,6 +308,10 @@ struct State {
     refcount_table: Vec<u64>,
     /// Next free host offset (end of file, cluster aligned).
     next_free: u64,
+    /// Clusters below `next_free` with refcount 0 (discarded), as runs
+    /// start -> count. Reused lowest first, so free space gathers at the
+    /// end of the file, where the next open cuts it off.
+    free: std::collections::BTreeMap<u64, u64>,
     /// Last decompressed cluster (host offset, data).
     zcache: Option<(u64, Vec<u8>)>,
 }
@@ -361,6 +415,8 @@ impl Qcow2Image {
             }
         };
 
+        let mut next_free = file_len.div_ceil(cs) * cs;
+        let free = if read_only { Default::default() } else { scan_free(&file, cs, &refcount_table, &mut next_free)? };
         Ok(Qcow2Image {
             file,
             path: path.to_path_buf(),
@@ -369,13 +425,7 @@ impl Qcow2Image {
             sync: policy.sync,
             backing,
             backing_path,
-            state: Mutex::new(State {
-                l1,
-                l2_cache: HashMap::new(),
-                refcount_table,
-                next_free: file_len.div_ceil(cs) * cs,
-                zcache: None,
-            }),
+            state: Mutex::new(State { l1, l2_cache: HashMap::new(), refcount_table, next_free, free, zcache: None }),
             hdr,
         })
     }
@@ -542,8 +592,21 @@ impl Qcow2Image {
     }
 
     fn alloc_cluster(&self, st: &mut State) -> Result<u64> {
-        let off = st.next_free;
-        st.next_free += self.cluster_size;
+        let cs = self.cluster_size;
+        let off = match st.free.first_key_value().map(|(&s, &n)| (s, n)) {
+            Some((s, n)) => {
+                st.free.remove(&s);
+                if n > 1 {
+                    st.free.insert(s + cs, n - 1);
+                }
+                s
+            }
+            None => {
+                let o = st.next_free;
+                st.next_free += cs;
+                o
+            }
+        };
         self.set_refcount(st, off, 1)?;
         Ok(off)
     }
@@ -647,6 +710,9 @@ impl Qcow2Image {
                 j += 1;
             }
             let _ = crate::punch_hole(&self.file, freed[i], (j - i) as u64 * cs);
+            if st.free.len() < MAX_FREE_RUNS {
+                st.free.insert(freed[i], (j - i) as u64);
+            }
             i = j;
         }
         Ok(())
@@ -1086,6 +1152,40 @@ mod tests {
         drop(q); // our lock keeps qemu-img out, even with -U, on macOS
         let out = std::process::Command::new("qemu-img").args(["check", "-U"]).arg(&p).output().unwrap();
         assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[test]
+    fn discarded_space_is_reused_and_tail_trimmed() {
+        const C: u64 = 64 << 10;
+        let td = tempfile::tempdir().unwrap();
+        let p = td.path().join("r.qcow2");
+        Qcow2Image::create(&p, 64 * C, None).unwrap();
+        let len = || std::fs::metadata(&p).unwrap().len();
+        let q = Qcow2Image::open(&p, false).unwrap();
+        q.write_at(&vec![1u8; 16 * C as usize], 0).unwrap();
+        let full = len();
+        // Guest deletes most of it, then writes elsewhere: no growth.
+        q.discard(4 * C, 12 * C).unwrap();
+        q.write_at(&vec![2u8; 8 * C as usize], 32 * C).unwrap();
+        assert_eq!(len(), full, "freed clusters reused");
+        q.discard(32 * C, 8 * C).unwrap();
+        drop(q);
+        // Reopen: free clusters at the end are cut off the file.
+        let q = Qcow2Image::open(&p, false).unwrap();
+        assert!(len() < full, "{} !< {full}", len());
+        let mut b = vec![0u8; 16 * C as usize];
+        q.read_at(&mut b, 0).unwrap();
+        assert!(b[..4 * C as usize].iter().all(|&x| x == 1));
+        assert!(b[4 * C as usize..].iter().all(|&x| x == 0));
+        q.write_at(&vec![3u8; 4 * C as usize], 50 * C).unwrap();
+        drop(q);
+        let q = Qcow2Image::open(&p, true).unwrap();
+        q.read_at(&mut b[..4 * C as usize], 50 * C).unwrap();
+        assert!(b[..4 * C as usize].iter().all(|&x| x == 3));
+        drop(q);
+        if let Ok(out) = std::process::Command::new("qemu-img").args(["check"]).arg(&p).output() {
+            assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        }
     }
 
     #[test]
