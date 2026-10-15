@@ -2,6 +2,7 @@
 
 mod clip;
 mod disk;
+mod log_limit;
 mod new;
 mod session;
 mod snap;
@@ -61,7 +62,7 @@ enum Cmd {
 }
 
 fn main() -> ExitCode {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    log_limit::Limited::install(env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).build());
     let r = match Cli::parse().cmd {
         Cmd::Run { config, restore, fresh, state_dir, host_clipboard_file, no_sandbox, ui_fd } => {
             load(&config).and_then(|cfg| {

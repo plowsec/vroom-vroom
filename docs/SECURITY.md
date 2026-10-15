@@ -28,6 +28,8 @@ service by a guest against its own VM.
 - Hard limits on everything a guest can make us allocate: GPU resource
   memory, pending fences, queue sizes, NAT connections, fragment memory.
 - Config parsing is strict: unknown keys are errors.
+- Logging is capped (50 lines a second, errors excepted): a guest that
+  keeps tripping warnings can't flood the terminal or fill a log disk.
 - qcow2 backing files: only from the image's own directory or allow-listed
   ones, no protocol prefixes, chain depth capped.
 
