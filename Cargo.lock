@@ -5432,6 +5432,7 @@ dependencies = [
  "vroom-display",
  "vroom-import",
  "vroom-state",
+ "vroom-usb",
 ]
 
 [[package]]

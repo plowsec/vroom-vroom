@@ -598,6 +598,55 @@ export component SettingsPanel inherits Rectangle {
                     }
                 }
 
+                if root.vis.usb: SectionCard {
+                    icon: Icons.link;
+                    title: "USB devices";
+                    summary: root.s.sum-usb;
+                    force-open: root.open-all || root.s.usb-picking;
+                    for u[i] in root.s.usb: Row {
+                        label: u.label;
+                        hint: u.note;
+                        key: "usb";
+                        warn: u.warn;
+                        IconButton {
+                            icon: Icons.trash;
+                            tip: "Remove";
+                            size: 28px;
+                            y: (parent.height - self.height) / 2;
+                            enabled: !root.lk;
+                            clicked => { Bus.act("usb." + i + ".remove"); }
+                        }
+                    }
+                    // What's plugged in, while "Add device" is open (a
+                    // repeater: an `if` here wouldn't grow the card).
+                    for h[j] in root.s.usb-host: Row {
+                        label: h.label;
+                        hint: h.note;
+                        Button {
+                            small: true;
+                            text: h.taken ? "Added" : "Add";
+                            y: (parent.height - self.height) / 2;
+                            enabled: !h.taken && !root.lk;
+                            clicked => { Bus.act("usb.pick." + j); }
+                        }
+                    }
+                    Row {
+                        label: "Host devices";
+                        hint: root.s.usb-picking && root.s.usb-host.length == 0 ? "Nothing plugged in." : "Taken from this Mac while the VM runs.";
+                        key: "[[usb]]";
+                        Button {
+                            small: true;
+                            kind: "ghost";
+                            text: root.s.usb-picking ? "Done" : "Add device";
+                            icon: root.s.usb-picking ? Icons.check : Icons.plus;
+                            has-icon: true;
+                            y: (parent.height - self.height) / 2;
+                            enabled: !root.lk;
+                            clicked => { Bus.act("usb.add"); }
+                        }
+                    }
+                }
+
                 if root.vis.sound: SectionCard {
                     icon: Icons.speaker;
                     title: "Sound";
@@ -832,7 +881,7 @@ export component SettingsPanel inherits Rectangle {
                     }
                 }
 
-                if root.vis.searching && !(root.vis.hw || root.vis.display || root.vis.storage || root.vis.net || root.vis.share || root.vis.sound || root.vis.clip || root.vis.security || root.vis.boot): Text {
+                if root.vis.searching && !(root.vis.hw || root.vis.display || root.vis.storage || root.vis.net || root.vis.share || root.vis.usb || root.vis.sound || root.vis.clip || root.vis.security || root.vis.boot): Text {
                     text: "Nothing matches. The config file has every option: ⋯ → Open config file.";
                     font-size: Theme.fs-sm;
                     color: Theme.text-3;

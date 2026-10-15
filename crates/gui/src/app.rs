@@ -61,6 +61,10 @@ pub struct App {
     /// The progress toast of the import that's running.
     import_toast: Option<i32>,
     last_settings: Option<VmSettings>,
+    /// Host USB devices as listed when "Add device" was pressed, and
+    /// whether that list is open.
+    usb_host: Vec<vroom_usb::list::HostDevice>,
+    usb_picking: bool,
     _timer: slint::Timer,
 }
 
@@ -192,6 +196,8 @@ impl App {
             vmware: None,
             import_toast: None,
             last_settings: None,
+            usb_host: Vec::new(),
+            usb_picking: false,
             _timer: timer,
             lib,
         };
@@ -531,6 +537,41 @@ impl App {
                 readonly: sh.readonly,
             })
             .collect();
+        let host_usb = if c.usb.is_empty() { Vec::new() } else { vroom_usb::list::list() };
+        let usb: Vec<UsbRow> = c
+            .usb
+            .iter()
+            .map(|u| {
+                let ids = u.ids();
+                let here = host_usb.iter().find(|d| Some((d.vendor, d.product)) == ids && (u.serial.is_none() || d.serial == u.serial));
+                let held = here.is_some_and(|d| !d.claimed_by.is_empty());
+                let state = match here {
+                    None => "not plugged in".to_string(),
+                    Some(d) if held => format!("held by {} (a VM can't take it without root)", d.claimed_by.join(", ")),
+                    Some(_) => "plugged in".to_string(),
+                };
+                let label = u.name.clone().or_else(|| here.map(|d| d.label())).unwrap_or_else(|| u.id.clone());
+                let serial = u.serial.as_ref().map(|sn| format!(" · serial {sn}")).unwrap_or_default();
+                UsbRow { label: s(label), note: s(format!("{}{serial} · {state}", u.id)), warn: held }
+            })
+            .collect();
+        let usb_host: Vec<UsbHostRow> = self
+            .usb_host
+            .iter()
+            .map(|d| {
+                let mut note = d.id();
+                if let Some(sn) = &d.serial {
+                    note += &format!(" · serial {sn}");
+                }
+                if !d.claimed_by.is_empty() {
+                    note += &format!(" · held by {}", d.claimed_by.join(", "));
+                } else if d.is_host_essential() {
+                    note += " · keyboard, mouse, disk or hub";
+                }
+                let taken = c.usb.iter().any(|u| u.ids() == Some((d.vendor, d.product)) && (u.serial.is_none() || u.serial == d.serial));
+                UsbHostRow { label: s(d.label()), note: s(note), taken }
+            })
+            .collect();
         let warnings: Vec<SharedString> = r.warnings().into_iter().map(|w| s(capitalize(&w))).collect();
 
         let (boot_kernel, firmware, vars, kernel, initrd, cmdline) = match &c.boot {
@@ -574,6 +615,14 @@ impl App {
             disks: model(disks),
             nets: model(nets),
             shares: model(shares),
+            usb_picking: self.usb_picking,
+            sum_usb: s(match c.usb.len() {
+                0 => "None".to_string(),
+                1 => usb[0].label.to_string(),
+                n => format!("{n} devices"),
+            }),
+            usb: model(usb),
+            usb_host: model(usb_host),
             audio: c.audio.output,
             clip_in: c.clipboard.host_to_guest,
             clip_out: c.clipboard.guest_to_host,
@@ -677,6 +726,7 @@ impl App {
             storage: any || hit("storage disk disks iso cdrom installer drive nvme virtio bus sync write safety readonly read-only compact image qcow2 space"),
             net: any || hit("network net nat bridged host-only hostonly port forward forwarding ssh mac address interface internet lan localhost loopback adapter"),
             share: any || hit("shared folders share folder virtiofs mount files tag"),
+            usb: any || hit("usb devices device passthrough serial adapter security key phone dongle"),
             sound: any || hit("sound audio speakers music output"),
             clip: any || hit("clipboard copy paste"),
             security: any || hit("security sandbox tpm transport mmio pci serial console identity fingerprint hardware maker vendor model product smbios acpi hide vm detection"),
@@ -999,7 +1049,22 @@ impl App {
                     self.push_all();
                 }
             }
-            "share.add" | "disk.add-iso" | "disk.add-existing" | "disk.add-new" if self.hw_locked() => {}
+            "share.add" | "disk.add-iso" | "disk.add-existing" | "disk.add-new" | "usb.add" if self.hw_locked() => {}
+            "usb.add" => {
+                // Open or close the list of what's plugged in.
+                self.usb_picking = !self.usb_picking;
+                self.usb_host = if self.usb_picking { vroom_usb::list::list() } else { Vec::new() };
+                self.push_all();
+            }
+            _ if a.starts_with("usb.pick.") => {
+                let j: usize = a["usb.pick.".len()..].parse().unwrap_or(usize::MAX);
+                if self.hw_locked() {
+                    return;
+                }
+                if let Some(d) = self.usb_host.get(j).cloned() {
+                    self.change(|c| edit::add_usb(c, &d.id(), d.serial.as_deref(), Some(&d.label())));
+                }
+            }
             "share.add" => {
                 if let Some(p) = rfd::FileDialog::new().set_title("Share a folder").pick_folder() {
                     self.change(|c| {
