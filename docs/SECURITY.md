@@ -26,7 +26,8 @@ service by a guest against its own VM.
   (sizes, counts, rects, backing entries), qcow2 headers and L1/L2 tables,
   network packets, agent messages (size caps, UTF-8).
 - Hard limits on everything a guest can make us allocate: GPU resource
-  memory, pending fences, queue sizes, NAT connections, fragment memory.
+  memory, pending fences, queue sizes, NAT connections and their buffers
+  (about 80 MiB at most), fragment memory, disk requests in flight.
 - Config parsing is strict: unknown keys are errors. `vroom check` (and
   every start) also names risky but valid choices: sandbox off, writable or
   home-wide shares, port forwards reachable from the LAN, host loopback
