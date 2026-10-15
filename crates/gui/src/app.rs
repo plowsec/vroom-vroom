@@ -1111,12 +1111,20 @@ impl App {
     }
 
     fn newvm_set(&mut self, k: &str, v: &str) {
-        if k != "os" {
-            return;
+        match k {
+            "installer" => return self.set_installer(Some(PathBuf::from(v))),
+            "start" => {
+                let mut d = self.ui.get_draft();
+                d.start = v == "true";
+                return self.ui.set_draft(d);
+            }
+            "os" => {}
+            _ => return,
         }
         let os = GuestOs::ALL.get(v.parse::<usize>().unwrap_or(0)).copied().unwrap_or(GuestOs::Ubuntu);
         let base = match os {
             GuestOs::Other | GuestOs::Linux => "linux",
+            GuestOs::Windows => "win11",
             o => os_id(o),
         };
         let name = self.unique_name(base);

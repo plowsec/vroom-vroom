@@ -51,7 +51,7 @@ hdiutil detach -quiet "$tmp/usb"
 hdiutil convert -quiet "$tmp/usb.dmg" -format UDTO -o "$tmp/usb"
 # Non-zero disk signature (Windows ignores MBR disks without one) and
 # the partition marked active.
-printf 'BWRK' | dd of="$tmp/usb.cdr" bs=1 seek=440 conv=notrunc 2>/dev/null
+printf 'VRMK' | dd of="$tmp/usb.cdr" bs=1 seek=440 conv=notrunc 2>/dev/null
 printf '\200' | dd of="$tmp/usb.cdr" bs=1 seek=446 conv=notrunc 2>/dev/null
 case "$out" in /*) ;; *) out="$root/$out" ;; esac
 mv "$tmp/usb.cdr" "$out"
