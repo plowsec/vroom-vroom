@@ -141,14 +141,28 @@ reverts its TPM too.
 
 ## What 3D costs
 
-`gpu = "virtio3d"` loads virglrenderer and MoltenVK into the VMM. Guest
-command streams are then parsed by C code (virglrenderer's Venus decoder)
-and reach the Apple GPU driver. The sandbox keeps working but has to allow
-the GPU: three IOKit user clients (`AGXDeviceUserClient`,
-`AGXSharedUserClient`, `IOSurfaceRootUserClient`), the Metal compiler
-service, framework reads and the Metal shader cache. Use 3D only for guests
-that need it. A future step is moving the renderer into its own process
-(possible for most of Venus; host-visible memory needs shared mappings).
+`gpu = "virtio3d"` loads virglrenderer and MoltenVK into the VMM, and
+with `opengl` (the default) ANGLE too. Guest command streams are then
+parsed by C code and reach the Apple GPU driver: Venus (Vulkan) commands
+by virglrenderer's Venus decoder, virgl (OpenGL) commands by its GL
+decoder (vrend), which has the longer history of bugs. vrend's GL calls go
+to ANGLE, which checks every call the way a browser checks WebGL before
+anything reaches Metal, so a vrend mistake meets a second check. The GL
+contexts ask for robust buffer access (out-of-bounds reads give zeros).
+`opengl = false` leaves vrend and ANGLE out entirely.
+
+The sandbox keeps working but has to allow the GPU: three IOKit user
+clients (`AGXDeviceUserClient`, `AGXSharedUserClient`,
+`IOSurfaceRootUserClient`), the Metal compiler service, framework reads
+and the Metal shader cache. OpenGL needed nothing more: ANGLE uses the
+same Metal device, and is loaded (with the display and a first context)
+before the sandbox goes up. libepoxy is built to load ANGLE only from
+virglrenderer's own directory, never Apple's OpenGL or a search path.
+
+Use 3D only for guests that need it. A future step is moving the renderer
+into its own process (possible for most of Venus and for virgl, whose
+frames already come back by copy; host-visible memory needs shared
+mappings).
 
 ## Guest agent (Windows)
 
@@ -203,7 +217,7 @@ running VM's images, even with `-U`.
 - The Windows agent split is new; installs from before it run the
   all-in-one agent elevated (re-run `vroom-setup.cmd` to upgrade).
 - x86_64 isn't implemented, so none of this is tested there.
-- Fuzzing doesn't cover Venus (3D) command streams: that is
+- Fuzzing doesn't cover Venus or virgl (3D) command streams: that is
   virglrenderer's C code, which runs in the VMM process when 3D is on.
 
 ## What the guest can tell
@@ -239,7 +253,9 @@ Still visible, whatever the config says:
   kernel's PSCI also answers the KVM vendor-hypervisor UID call.
 - The firmware itself: EDK2 reports its own vendor in UEFI tables.
 - The display: ramfb, then virtio-gpu with no EDID. With 3D, Vulkan shows
-  the host GPU (MoltenVK on Apple).
+  the host GPU (MoltenVK on Apple). OpenGL's renderer name follows
+  `gl_renderer`, but its limits (GL 2.1, ES 3.0, texture sizes, formats)
+  still look like ANGLE on Metal.
 - CPU ID registers come from the host CPU (an Apple core on a Mac), and
   timing differs from bare metal.
 - The vTPM is swtpm: its manufacturer is IBM, and the TIS DID/VID register

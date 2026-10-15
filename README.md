@@ -10,7 +10,7 @@ and every virtual device treats the guest as hostile.
 
 - Ubuntu, Debian, Alpine, Windows 11 ARM64
 - Window with clipboard both ways and auto resolution
-- 3D for Linux guests (Vulkan, about 90% of native speed)
+- 3D for Linux guests: Vulkan (about 90% of native speed) and OpenGL
 - Snapshots, suspend/resume, reset
 - NAT with port forwards, several network adapters. Bridged and host-only need a root helper.
 - Shared folders and sound (Linux guests)

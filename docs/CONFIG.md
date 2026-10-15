@@ -77,7 +77,8 @@ Bridged and host-only need the `vroom-netd` helper running as root. See
 
 | Key | Default | What it does |
 |---|---|---|
-| `gpu` | `none` | `none` (serial console only), `virtio2d`, `virtio3d` (Vulkan through MoltenVK, Linux guests). |
+| `gpu` | `none` | `none` (serial console only), `virtio2d`, `virtio3d` (Vulkan and OpenGL drawn by the host GPU, Linux guests; see the [guide](GUIDE.md#3d-acceleration-linux-guests)). |
+| `opengl` | true | With `virtio3d`: OpenGL too (virgl on ANGLE). `false` keeps Vulkan only: less host code facing the guest, and suspend keeps working on desktops. |
 | `width`, `height` | 1280, 800 | Starting resolution. The guest follows the window size once its agent or driver runs. |
 
 ## `[[share]]` (host folders, up to 8)
@@ -151,6 +152,7 @@ defaults below. New VMs get random serials, so two VMs never match.
 | `nat_gateway` | `10.0.2.2` | NAT gateway (DHCP server, default route) |
 | `nat_dns` | `10.0.2.3` | NAT DNS relay; may be the gateway's address |
 | `nat_gateway_mac` | `02:42:57:4b:00:01` | the gateway's MAC in the guest's ARP table |
+| `gl_renderer` | the host's | OpenGL renderer name with `virtio3d`: `glxinfo` shows `virgl (<this>)`. The host's names its GPU and macOS version. Up to 63 chars |
 | `agent_port` | `org.vroom.agent.0` | guest agent port name. The agent finds a renamed port by itself if it's the only one; else start it with `--port` |
 
 PCI IDs are `vendor:device` or `vendor:device:subvendor:subdevice`, 4 hex
