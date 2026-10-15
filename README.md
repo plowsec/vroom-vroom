@@ -51,6 +51,7 @@ Optional pieces:
 ## Run
 
 ```bash
+target/debug/bulwark new dev --os linux --disk 32G --iso ubuntu.iso   # dev.toml + dev.qcow2
 target/debug/bulwark run examples/ubuntu.toml      # serial console in this terminal
 target/debug/bulwark-gui examples/ubuntu.toml      # window (display, mouse, clipboard)
 target/debug/bulwark check examples/ubuntu.toml    # validate a config

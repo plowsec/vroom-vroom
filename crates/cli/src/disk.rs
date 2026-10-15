@@ -20,7 +20,7 @@ pub enum DiskCmd {
     Info { path: PathBuf },
 }
 
-fn parse_size(s: &str) -> Result<u64, String> {
+pub(crate) fn parse_size(s: &str) -> Result<u64, String> {
     let s = s.trim();
     let (num, mul) = match s.chars().last() {
         Some('K' | 'k') => (&s[..s.len() - 1], 1u64 << 10),

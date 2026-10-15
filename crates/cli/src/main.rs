@@ -2,6 +2,7 @@
 
 mod clip;
 mod disk;
+mod new;
 mod session;
 mod snap;
 mod term;
@@ -49,6 +50,8 @@ enum Cmd {
     /// Disk image tools.
     #[command(subcommand)]
     Disk(disk::DiskCmd),
+    /// Create a VM: write <name>.toml and its disk.
+    New(new::NewArgs),
     /// Snapshot housekeeping (list, delete, prune disk layers).
     #[command(subcommand)]
     Snapshot(snap::SnapCmd),
@@ -75,6 +78,7 @@ fn main() -> ExitCode {
         }
         Cmd::Disk(d) => disk::run(d),
         Cmd::Snapshot(s) => snap::run(s, load, default_state_dir),
+        Cmd::New(a) => new::run(a, load),
         Cmd::Check { config } => load(&config).and_then(|c| {
             print!("{}", c.to_toml().map_err(|e| e.to_string())?);
             Ok(())
