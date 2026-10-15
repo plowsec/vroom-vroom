@@ -203,19 +203,45 @@ running VM's images, even with `-U`.
 
 ## What the guest can tell
 
-Names and serials the guest reads from firmware tables, disks and USB
-devices come from the VM's `[identity]` (see [CONFIG.md](CONFIG.md#identity)).
+These come from the VM's `[identity]` (see [CONFIG.md](CONFIG.md#identity)):
+
+- SMBIOS: vendor, product, family, SKU (the VM's name unless set),
+  version, date, serials, chassis type, CPU name, the "VM" BIOS flag.
+- ACPI table header IDs and the FADT hypervisor vendor.
+- The device tree model (direct kernel boot).
+- Disks: NVMe model, serial, firmware revision; virtio disk serials.
+- PCI IDs of the host bridge, NVMe and USB controllers. The defaults are
+  QEMU's (vendor 0x1B36).
+- USB keyboard/tablet vendor ID and names, virtio input names and vendor.
+- Generated MACs (prefix), and the NAT network: guest, gateway and DNS
+  addresses and the gateway's MAC. The defaults (10.0.2.15, .2, .3) are
+  the classic QEMU/VirtualBox layout.
+- The agent's port name.
+
 `announce_vm = false` drops the SMBIOS and ACPI "this is a VM" markers.
 
 Still visible, whatever the config says:
 
-- virtio devices (PCI vendor 0x1AF4) and the fw_cfg device: Linux and the
-  Windows drivers need them.
+- virtio devices: PCI vendor 0x1AF4, subsystem 0x1AF4:1100, revision 1.
+  Linux and the Windows drivers match on these (virtio-win INFs list
+  `SUBSYS_11001AF4&REV_01`).
+- fw_cfg: the "QEMU" signature, its DMA signature and file names
+  (`etc/acpi/tables`, `etc/smbios/...`, `etc/ramfb`). EDK2 looks for them.
+- The board: QEMU virt memory map, PL011/PL031 PrimeCell IDs, CFI flash
+  (Intel 0x89/0x18), GICv3, ACPI device names (`COM0`, `PCI0`, `VR00`...)
+  and _HIDs. Stock EDK2 and the OS drivers expect this layout.
+- PSCI 1.0 / SMCCC 1.1 answers. They name no vendor. On KVM hosts the
+  kernel's PSCI also answers the KVM vendor-hypervisor UID call.
 - The firmware itself: EDK2 reports its own vendor in UEFI tables.
+- The display: ramfb, then virtio-gpu with no EDID. With 3D, Vulkan shows
+  the host GPU (MoltenVK on Apple).
 - CPU ID registers come from the host CPU (an Apple core on a Mac), and
   timing differs from bare metal.
-- The vTPM is swtpm (its manufacturer ID is IBM's).
-- The guest agent, if installed.
+- The vTPM is swtpm: its manufacturer is IBM, and the TIS DID/VID register
+  says the same (1014:0001) so the two agree.
+- NAT's TCP/IP stack (smoltcp) and the absolute-pointer tablet behave like
+  no physical router or mouse.
+- The guest agent, if installed (its protocol says "vroom").
 
 So this makes casual checks fail. It doesn't make a VM look like real
 hardware to software that tries hard.
