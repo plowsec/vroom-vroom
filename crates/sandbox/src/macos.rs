@@ -46,9 +46,16 @@ pub fn profile(p: &Policy) -> Result<String> {
         s += &format!("(allow file-read* file-write* (subpath {}))\n", q(d)?);
     }
     if p.network_outbound {
-        s += "(allow network-outbound (remote ip) (remote unix-socket))\n";
+        // IP only: no Unix sockets (ssh-agent, docker.sock...). netd is
+        // connected before we lock down. Later rules win in SBPL.
+        s += "(allow network-outbound (remote ip))\n";
         s += "(allow system-socket)\n";
-        // DNS relay only needs the resolver address it already parsed.
+        if !p.loopback {
+            s += "(deny network-outbound (remote ip \"localhost:*\"))\n";
+            if p.loopback_dns {
+                s += "(allow network-outbound (remote ip \"localhost:53\"))\n";
+            }
+        }
     }
     for port in &p.listen_ports {
         s += &format!("(allow network-inbound (local tcp \"*:{port}\"))\n");

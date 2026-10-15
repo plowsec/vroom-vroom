@@ -45,7 +45,14 @@ files (tested: `/etc/passwd`, `~/.ssh`, `exec` and `bind` all fail).
 **Linux (Landlock + seccomp)**: Landlock limits the filesystem to the same
 files and directories; seccomp allows only the syscalls the VMM uses (no
 `bind`, `execve`, `ptrace`...). Signals go only to our own threads
-(`tgkill` with our pid). Anything else kills the process.
+(`tgkill` with our pid); new sockets only for IPv4/IPv6 (no Unix,
+netlink or packet sockets). Anything else kills the process.
+
+Network reach of the VMM process itself: on macOS the profile allows IP
+only (no Unix sockets, so no ssh-agent or docker.sock) and denies the host's
+loopback unless `allow_host_loopback` (port 53 stays open if the host's
+resolver is local). On Linux, seccomp can't see addresses: loopback is
+refused by the NAT code only.
 
 `--no-sandbox` exists for debugging and prints a warning.
 
@@ -116,8 +123,12 @@ sizes); both fixed.
 
 A guest can fill its disk layers, and so the host disk. The VMM pauses the
 VM when less than 2 GiB is left where its state lives, rather than letting
-guest writes fail half-way. A state dir is locked by the VMM using it, so
-two processes can't write the same disk layers.
+guest writes fail half-way. A state dir is locked by the VMM using it,
+and every disk image is locked too: exclusive while a VM writes it, shared
+while it is a read-only layer. A second VM can't write an image another
+uses, or build on a base image another is still writing (that silently
+corrupts the overlay). On macOS these locks also keep `qemu-img` out of a
+running VM's images, even with `-U`.
 
 ## Known gaps
 

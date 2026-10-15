@@ -138,6 +138,7 @@ impl DiskSet {
             d.image.flush().map_err(|e| Error::Setup(e.to_string()))?;
             let top_path = self.dir.join(format!("disk{}-{}.qcow2", d.index, stamp()));
             let lower = d.image.current();
+            lower.freeze();
             let top = Qcow2Image::create_overlay(&top_path, &frozen, d.active_fmt, lower)
                 .map_err(|e| Error::Setup(format!("overlay: {e}")))?
                 .with_sync(d.sync);

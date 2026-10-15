@@ -34,6 +34,11 @@ pub struct Policy {
     pub write_dirs: Vec<PathBuf>,
     /// Outbound TCP/UDP (userspace NAT).
     pub network_outbound: bool,
+    /// ... including to the host's loopback (NAT `allow_host_loopback`).
+    /// Otherwise the sandbox refuses it too, not only the NAT code.
+    pub loopback: bool,
+    /// Host resolver is on loopback: allow port 53 there for the DNS relay.
+    pub loopback_dns: bool,
     /// Accept on these already-bound local TCP ports (port forwards).
     pub listen_ports: Vec<u16>,
     /// Talk to the system pasteboard (macOS) in-process.

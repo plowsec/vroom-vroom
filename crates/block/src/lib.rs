@@ -42,6 +42,9 @@ pub trait DiskImage: Send + Sync + std::fmt::Debug {
     fn discard(&self, _offset: u64, _len: u64) -> Result<()> {
         Ok(())
     }
+    /// This image just became a read-only layer under a new overlay
+    /// (snapshot): let others open it for reading.
+    fn freeze(&self) {}
     /// Write zeroes (default: plain writes).
     fn write_zeroes(&self, offset: u64, len: u64) -> Result<()> {
         let zero = vec![0u8; 64 << 10];
@@ -226,13 +229,40 @@ impl DiskImage for SwapDisk {
     fn discard(&self, offset: u64, len: u64) -> Result<()> {
         self.current().discard(offset, len)
     }
+    fn freeze(&self) {
+        self.current().freeze()
+    }
     fn write_zeroes(&self, offset: u64, len: u64) -> Result<()> {
         self.current().write_zeroes(offset, len)
     }
 }
 
+/// Open an image file and lock it: exclusive for writing, shared for
+/// reading. Two VMs writing one image, or one writing a file another uses
+/// as a backing layer, corrupt it; the second open fails instead.
 pub(crate) fn open_file(path: &Path, read_only: bool) -> io::Result<File> {
     let mut o = OpenOptions::new();
     o.read(true).write(!read_only);
-    o.open(path)
+    let f = o.open(path)?;
+    lock_file(&f, !read_only).map_err(|e| {
+        if e.kind() == io::ErrorKind::WouldBlock {
+            io::Error::new(e.kind(), format!("{} is in use by another VM", path.display()))
+        } else {
+            e
+        }
+    })?;
+    Ok(f)
+}
+
+/// Take, or convert to, a shared or exclusive lock on the whole file.
+#[allow(unsafe_code)]
+pub(crate) fn lock_file(f: &File, exclusive: bool) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let op = if exclusive { libc::LOCK_EX } else { libc::LOCK_SH };
+    // SAFETY: flock on an fd we own; no memory involved.
+    if unsafe { libc::flock(f.as_raw_fd(), op | libc::LOCK_NB) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }

@@ -893,6 +893,10 @@ impl DiskImage for Qcow2Image {
         Ok(())
     }
 
+    fn freeze(&self) {
+        let _ = crate::lock_file(&self.file, false);
+    }
+
     /// Whole clusters become zero clusters (space returned to the host);
     /// partial ones are left alone (discard is advisory).
     fn discard(&self, offset: u64, len: u64) -> Result<()> {
@@ -999,6 +1003,7 @@ mod tests {
         assert_eq!(t.hdr.backing_file.as_deref(), Some("base.raw"));
         assert_eq!(t.hdr.backing_format.as_deref(), Some("raw"));
 
+        drop(t);
         // And once more down to no backing at all.
         set_backing(&top, None).unwrap();
         let t = Qcow2Image::open(&top, true).unwrap();
@@ -1041,9 +1046,10 @@ mod tests {
         let q = Qcow2Image::open(&top, true).unwrap();
         q.read_at(&mut c, 2 * C).unwrap();
         assert!(c.iter().all(|&x| x == 0));
+        drop(q); // our lock keeps qemu-img out, even with -U, on macOS
         // Metadata consistent for other tools too, when one is around.
         if let Ok(out) = std::process::Command::new("qemu-img").args(["check", "-U"]).arg(&top).output() {
-            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+            assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
         }
     }
 
@@ -1077,8 +1083,9 @@ mod tests {
             q.read_at(&mut b, off).unwrap();
             assert!(b.iter().all(|&x| x == 0), "stale data at {off}");
         }
+        drop(q); // our lock keeps qemu-img out, even with -U, on macOS
         let out = std::process::Command::new("qemu-img").args(["check", "-U"]).arg(&p).output().unwrap();
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+        assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     }
 
     #[test]
@@ -1095,6 +1102,28 @@ mod tests {
         let z = |r: std::ops::Range<u64>| b[r.start as usize..r.end as usize].iter().all(|&x| x == 0);
         let f = |r: std::ops::Range<u64>| b[r.start as usize..r.end as usize].iter().all(|&x| x == 5);
         assert!(f(0..C / 2) && z(C / 2..C / 2 + 2 * C) && f(C / 2 + 2 * C..4 * C));
+    }
+
+    #[test]
+    fn images_are_locked_against_other_writers() {
+        let td = tempfile::tempdir().unwrap();
+        let (base, top) = (td.path().join("base.qcow2"), td.path().join("top.qcow2"));
+        Qcow2Image::create(&base, 1 << 20, None).unwrap();
+        let w = Qcow2Image::open(&base, false).unwrap();
+        let e = Qcow2Image::open(&base, false).unwrap_err().to_string();
+        assert!(e.contains("in use by another VM"), "{e}");
+        assert!(Qcow2Image::open(&base, true).is_err(), "readers wait for the writer");
+        // Snapshot: the writer becomes a layer, others may read it.
+        w.freeze();
+        let r1 = Qcow2Image::open(&base, true).unwrap();
+        Qcow2Image::create(&top, 1 << 20, Some((&base, Format::Qcow2))).unwrap();
+        let _t = Qcow2Image::open(&top, false).unwrap();
+        // Nobody may write a layer others are reading.
+        drop(w);
+        assert!(Qcow2Image::open(&base, false).is_err());
+        drop(r1);
+        drop(_t);
+        assert!(Qcow2Image::open(&base, false).is_ok());
     }
 
     #[test]
@@ -1149,6 +1178,7 @@ mod tests {
         let lower: Arc<dyn DiskImage> = Arc::new(Qcow2Image::open(&base, false).unwrap());
         lower.write_at(b"before", 0).unwrap();
         let top_path = td.path().join("top.qcow2");
+        lower.freeze(); // as a snapshot does
         let top = Qcow2Image::create_overlay(&top_path, &base, Format::Qcow2, lower.clone()).unwrap();
         top.write_at(b"after!", 0).unwrap();
         let mut b = [0u8; 6];

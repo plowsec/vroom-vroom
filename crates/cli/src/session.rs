@@ -70,6 +70,8 @@ fn lock_down(cfg: &VmConfig, state_dir: &Path, clipboard: bool) -> Result<(), St
     for n in &cfg.nets {
         if n.mode == NetKind::Nat {
             p.network_outbound = true;
+            p.loopback |= n.allow_host_loopback;
+            p.loopback_dns |= bulwark_net::nat::host_dns().is_some_and(|a| a.ip().is_loopback());
             p.listen_ports.extend(n.port_forwards.iter().map(|f| f.host_port));
         }
     }
@@ -95,6 +97,24 @@ fn selftest() {
     match std::net::TcpListener::bind("127.0.0.1:0") {
         Ok(_) => eprintln!("sandbox selftest: new listener ALLOWED (bad)"),
         Err(e) => eprintln!("sandbox selftest: new listener blocked ({e})"),
+    }
+    // Host services: loopback TCP and Unix sockets (ssh-agent...).
+    let t = Duration::from_secs(2);
+    if let Some(port) = std::env::var("BULWARK_SELFTEST_LOOPBACK_PORT").ok().and_then(|p| p.parse::<u16>().ok()) {
+        match std::net::TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), t) {
+            Ok(_) => eprintln!("sandbox selftest: host loopback ALLOWED (bad unless allow_host_loopback)"),
+            Err(e) => eprintln!("sandbox selftest: host loopback blocked ({e})"),
+        }
+    }
+    if let Some(sock) = std::env::var_os("SSH_AUTH_SOCK") {
+        match std::os::unix::net::UnixStream::connect(&sock) {
+            Ok(_) => eprintln!("sandbox selftest: unix socket {} ALLOWED (bad)", sock.to_string_lossy()),
+            Err(e) => eprintln!("sandbox selftest: unix sockets blocked ({e})"),
+        }
+    }
+    match std::net::TcpStream::connect_timeout(&([1, 1, 1, 1], 53).into(), t) {
+        Ok(_) => eprintln!("sandbox selftest: internet reachable (NAT works)"),
+        Err(e) => eprintln!("sandbox selftest: internet: {e}"),
     }
 }
 

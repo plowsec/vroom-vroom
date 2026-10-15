@@ -62,6 +62,10 @@ impl DiskImage for RawImage {
         Ok(())
     }
 
+    fn freeze(&self) {
+        let _ = crate::lock_file(&self.file, false);
+    }
+
     /// Give the blocks back to the host (sparse file).
     fn discard(&self, offset: u64, len: u64) -> Result<()> {
         if self.read_only {

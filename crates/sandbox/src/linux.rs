@@ -53,7 +53,7 @@ fn allowed(p: &Policy) -> Vec<i64> {
         SYS_clock_gettime, SYS_clock_nanosleep, SYS_nanosleep, SYS_sched_yield,
         SYS_sched_getaffinity, SYS_rt_sigaction, SYS_rt_sigprocmask, SYS_rt_sigreturn,
         SYS_sigaltstack, SYS_exit, SYS_exit_group, SYS_getrandom, SYS_fcntl, SYS_openat,
-        SYS_mkdirat, SYS_renameat, SYS_renameat2, SYS_fchmod, SYS_fchmodat, SYS_fsync, SYS_fdatasync, SYS_ftruncate, SYS_fallocate,
+        SYS_mkdirat, SYS_renameat, SYS_renameat2, SYS_fchmod, SYS_fchmodat, SYS_fsync, SYS_fdatasync, SYS_ftruncate, SYS_fallocate, SYS_flock,
         SYS_getpid, SYS_gettid, SYS_clone, SYS_clone3, SYS_set_robust_list,
         SYS_rseq, SYS_prctl, SYS_getdents64, SYS_restart_syscall, SYS_socketpair,
         SYS_recvfrom, SYS_sendto, SYS_recvmsg, SYS_sendmsg, SYS_shutdown,
@@ -62,8 +62,9 @@ fn allowed(p: &Policy) -> Vec<i64> {
     #[cfg(target_arch = "x86_64")]
     v.extend_from_slice(&[SYS_epoll_wait, SYS_poll, SYS_rename, SYS_mkdir, SYS_chmod, SYS_arch_prctl]);
     if p.network_outbound {
-        // No bind: UDP flows use implicit binds via connect().
-        v.extend_from_slice(&[SYS_socket, SYS_connect]);
+        // No bind: UDP flows use implicit binds via connect(). socket()
+        // gets an argument rule in `seccomp` (IP families only).
+        v.extend_from_slice(&[SYS_connect]);
     }
     if !p.listen_ports.is_empty() {
         v.extend_from_slice(&[SYS_accept4, SYS_accept]);
@@ -79,6 +80,15 @@ fn seccomp(p: &Policy) -> Result<()> {
     let pid = unsafe { libc::getpid() } as u64;
     let own = SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, pid).map_err(err)?;
     rules.insert(libc::SYS_tgkill, vec![SeccompRule::new(vec![own]).map_err(err)?]);
+    if p.network_outbound {
+        // New sockets: IPv4/IPv6 only. No AF_UNIX (ssh-agent, docker.sock,
+        // D-Bus...), no netlink, no packet sockets.
+        let fam = |f: i32| -> Result<SeccompRule> {
+            let c = SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, f as u64).map_err(err)?;
+            SeccompRule::new(vec![c]).map_err(err)
+        };
+        rules.insert(libc::SYS_socket, vec![fam(libc::AF_INET)?, fam(libc::AF_INET6)?]);
+    }
     let filter = SeccompFilter::new(rules, SeccompAction::KillProcess, SeccompAction::Allow, arch).map_err(err)?;
     let prog: BpfProgram = filter.try_into().map_err(err)?;
     seccompiler::apply_filter_all_threads(&prog).map_err(err)

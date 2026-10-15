@@ -18,6 +18,7 @@ bulwark-config.workspace = true
 bulwark-hv.workspace = true
 bulwark-vmm.workspace = true
 bulwark-block.workspace = true
+bulwark-net.workspace = true
 bulwark-sandbox.workspace = true
 bulwark-display.workspace = true
 arboard = { version = "3", default-features = false }
