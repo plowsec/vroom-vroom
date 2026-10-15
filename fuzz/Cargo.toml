@@ -16,6 +16,7 @@ bulwark-devices = { path = "../crates/devices" }
 bulwark-memory = { path = "../crates/memory" }
 bulwark-block = { path = "../crates/block" }
 bulwark-fs = { path = "../crates/fs" }
+bulwark-display = { path = "../crates/display" }
 tempfile = "3"
 
 # Not part of the main workspace (needs nightly + sanitizers).
@@ -102,5 +103,11 @@ doc = false
 [[bin]]
 name = "virtio_snd"
 path = "fuzz_targets/virtio_snd.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "display_proto"
+path = "fuzz_targets/display_proto.rs"
 test = false
 doc = false

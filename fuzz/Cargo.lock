@@ -60,6 +60,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bulwark-display"
+version = "0.1.0"
+dependencies = [
+ "bulwark-ipc",
+ "getrandom 0.2.17",
+ "libc",
+ "thiserror",
+]
+
+[[package]]
 name = "bulwark-fs"
 version = "0.1.0"
 dependencies = [
@@ -72,6 +82,7 @@ version = "0.0.0"
 dependencies = [
  "bulwark-block",
  "bulwark-devices",
+ "bulwark-display",
  "bulwark-fs",
  "bulwark-memory",
  "bulwark-net",

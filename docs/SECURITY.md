@@ -141,7 +141,7 @@ clipboard text (size-capped).
 ## Fuzzing
 
 `fuzz/` has cargo-fuzz targets for what a guest (or a downloaded image)
-controls: agent protocol, network frames, virtqueue chains over arbitrary
+controls: agent protocol, the viewer protocol (both directions), network frames, virtqueue chains over arbitrary
 guest memory, virtio-gpu 2D commands, virtio-fs (FUSE) requests, virtio-snd control
 and PCM transfers, the virtio-pci transport and PCI
 config space, xHCI, NVMe, TPM TIS, fw_cfg (DMA included) and flash, each
