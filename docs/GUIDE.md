@@ -172,12 +172,33 @@ mode = "nat"
 
 The agent is a Windows service (`VroomAgent`, clock sync and clean
 shutdown via `Ctrl+Alt+Shift+D`) plus an unprivileged helper started at
-each logon (clipboard, window resizes). The status line says when it
+each logon (clipboard, window resizes, UI scale). The status line says when it
 connects. Upgrading an older install: run the new `vroom-setup.cmd` as
 administrator.
 
 Until the agent runs, Windows may show two monitors (firmware framebuffer
 and virtio-gpu). The window shows whichever one Windows last drew on.
+
+## Retina screens
+
+With `[display] hidpi = true` (the default; "Full resolution on Retina"
+in the Display settings) a window on a Retina screen gives the guest its
+real pixels, 2560x1600 for a window that looks 1280x800, and the guest
+agent sets the guest's UI scale to 200% so things keep their size. The
+picture is shown 1:1, without the blur of scaling it up. It can be
+switched while the VM runs.
+
+- Needs the current guest agent. Older agents, or a guest without one,
+  get the old behavior: half the pixels, scaled up.
+- Linux: GNOME (X11 and Wayland). Other desktops don't get the scale yet:
+  set it in the guest yourself, or turn `hidpi` off.
+- Windows: the scale changes right away, without logging off. The shell
+  and most apps redraw sharp; a few older apps look blurry until they are
+  restarted.
+- Windows' display driver (viogpudo) has a 16 MiB framebuffer: modes up
+  to about 4 million pixels (2560x1600). A bigger window gets the largest
+  mode of the same shape that fits, scaled up a little.
+- Turning `hidpi` off puts the guest's own scale back.
 
 ## 3D acceleration (Linux guests)
 

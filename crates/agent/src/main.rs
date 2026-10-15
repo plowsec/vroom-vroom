@@ -15,6 +15,7 @@ mod port;
 // tested everywhere.
 #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 mod relay;
+mod scale;
 mod sys;
 #[cfg(windows)]
 mod winsvc;
@@ -214,12 +215,12 @@ fn session(args: &Args) -> std::io::Result<()> {
 }
 
 fn hello() -> Message {
-    let features = features::CLIPBOARD_TEXT | features::TIME_SYNC | features::SHUTDOWN;
+    let features = features::CLIPBOARD_TEXT | features::TIME_SYNC | features::SHUTDOWN | features::SCALE;
     Message::Hello { features, agent: format!("vroom-agent {}", env!("CARGO_PKG_VERSION")) }
 }
 
 /// `system`: we own the host link and may act on privileged requests.
-/// The session helper only ever gets clipboard and resolution messages.
+/// The session helper only ever gets clipboard, resolution and scale messages.
 fn handle(m: Message, system: bool, w: &mut port::Writer, clip: &mut dyn clip::Clip, last: &mut Option<String>) -> std::io::Result<()> {
     match m {
         Message::Hello { .. } | Message::TimeSync { .. } | Message::Shutdown { .. } | Message::Ping(_) if !system => {
@@ -243,10 +244,12 @@ fn handle(m: Message, system: bool, w: &mut port::Writer, clip: &mut dyn clip::C
         }
         Message::Shutdown { reboot } => sys::shutdown(reboot),
         Message::SetResolution { width, height } => {
+            scale::note_resolution(width, height);
             if let Err(e) = sys::set_resolution(width, height) {
                 log::debug!("resolution {width}x{height}: {e}");
             }
         }
+        Message::SetScale { percent } => scale::set(percent),
         Message::Ping(v) => w.write_all(&Message::Pong(v).encode())?,
         Message::Pong(_) => {}
     }

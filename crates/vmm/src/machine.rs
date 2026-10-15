@@ -6,7 +6,7 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use vroom_arch::aarch64::{self as board, layout};
-use vroom_config::{Boot, DiskBus, Gpu, Identity, SoundDevice, VmConfig};
+use vroom_config::{Boot, DiskBus, Gpu, GuestOs, Identity, SoundDevice, VmConfig};
 use vroom_devices::audio::{AudioSink, AudioSource, NullSink, Silence};
 use vroom_devices::hda::{codec::CodecIds, Hda, HdaIds};
 use vroom_virtio::devices::sound::Sound;
@@ -541,7 +541,8 @@ pub(crate) fn build(
         Some(ds) => Some(ds.clipboard()),
         None => clipboard,
     };
-    let agent = agent::spawn(host_end, config.clipboard.clone(), clipboard)?;
+    let max_pixels = if config.guest_os() == GuestOs::Windows { agent::WINDOWS_MAX_PIXELS } else { 0 };
+    let agent = agent::spawn(host_end, config.clipboard.clone(), clipboard, agent::Screen { gpu: gpu_ctl, max_pixels })?;
     let viewer = ui.as_ref().map(|d| d.tx());
     if let Some(ds) = ui {
         if screen.is_none() {
@@ -549,7 +550,7 @@ pub(crate) fn build(
         }
         // The microphone gate closes with the window.
         let on_close = audio.map(|a| Box::new(move || a.set_window(false)) as Box<dyn FnOnce() + Send>);
-        ds.run(gpu_ctl, input, agent.clone(), events.clone(), on_close)?;
+        ds.run(input, agent.clone(), events.clone(), on_close)?;
     }
     for (i, n) in config.nets.iter().enumerate() {
         let mac = match &n.mac {

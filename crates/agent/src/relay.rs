@@ -1,6 +1,6 @@
 //! Service side of the split agent (Windows): the privileged service owns
 //! the host port and does what needs privileges (clock, shutdown); what
-//! needs the user's desktop (clipboard, resolution) goes to an
+//! needs the user's desktop (clipboard, resolution, scale) goes to an
 //! unprivileged helper in the console session, over a local pipe.
 //!
 //! The helper is less trusted than the service: it may only send
@@ -47,11 +47,14 @@ pub struct Relay<S: System> {
     sys: S,
     helper: Option<(u64, Writer, Decoder)>,
     max: usize,
+    /// The host's last resolution and scale: a helper that starts later
+    /// (logon) gets them, so the desktop matches the window right away.
+    display: (Option<Message>, Option<Message>),
 }
 
 impl<S: System> Relay<S> {
     pub fn new(sys: S, max: usize) -> Self {
-        Relay { sys, helper: None, max }
+        Relay { sys, helper: None, max, display: (None, None) }
     }
 
     /// Serve one host connection until it goes away. Helper state
@@ -75,6 +78,9 @@ impl<S: System> Relay<S> {
                 Ev::HelperUp(id, w) => {
                     log::info!("session helper {id} connected");
                     self.helper = Some((id, w, Decoder::new(self.max + 64)));
+                    for m in [self.display.0.clone(), self.display.1.clone()].into_iter().flatten() {
+                        self.send_helper(&m);
+                    }
                 }
                 Ev::Helper(id, b) => self.on_helper(id, &b, host)?,
                 Ev::HelperGone(id) => {
@@ -96,17 +102,27 @@ impl<S: System> Relay<S> {
             Message::Ping(v) => host.write_all(&Message::Pong(v).encode())?,
             Message::TimeSync { unix_secs, nanos } => self.sys.set_time(unix_secs, nanos),
             Message::Shutdown { reboot } => self.sys.shutdown(reboot),
-            m @ (Message::ClipboardText(_) | Message::SetResolution { .. }) => {
-                if let Some((id, w, _)) = self.helper.as_mut() {
-                    if let Err(e) = w.write_all(&m.encode()) {
-                        log::info!("session helper {id}: {e}");
-                        self.helper = None;
-                    }
-                }
+            Message::SetResolution { .. } => {
+                self.display.0 = Some(m.clone());
+                self.send_helper(&m);
             }
+            Message::SetScale { .. } => {
+                self.display.1 = Some(m.clone());
+                self.send_helper(&m);
+            }
+            m @ Message::ClipboardText(_) => self.send_helper(&m),
             Message::Pong(_) => {}
         }
         Ok(())
+    }
+
+    fn send_helper(&mut self, m: &Message) {
+        if let Some((id, w, _)) = self.helper.as_mut() {
+            if let Err(e) = w.write_all(&m.encode()) {
+                log::info!("session helper {id}: {e}");
+                self.helper = None;
+            }
+        }
     }
 
     fn on_helper(&mut self, id: u64, b: &[u8], host: &mut Writer) -> io::Result<()> {
@@ -218,6 +234,20 @@ mod tests {
         let m = helper.msgs();
         assert!(matches!(&m[0], Message::ClipboardText(t) if t == "hi"));
         assert!(matches!(m[1], Message::SetResolution { width: 800, height: 600 }));
+    }
+
+    #[test]
+    fn a_late_helper_gets_the_current_display() {
+        let helper = Sink::default();
+        run(vec![
+            host(Message::SetResolution { width: 800, height: 600 }),
+            host(Message::SetScale { percent: 150 }),
+            host(Message::SetResolution { width: 1600, height: 1200 }),
+            host(Message::SetScale { percent: 200 }),
+            host(Message::ClipboardText("old".into())),
+            Ev::HelperUp(1, Box::new(helper.clone())),
+        ]);
+        assert_eq!(helper.msgs(), vec![Message::SetResolution { width: 1600, height: 1200 }, Message::SetScale { percent: 200 }]);
     }
 
     #[test]

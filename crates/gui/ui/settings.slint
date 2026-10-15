@@ -325,6 +325,16 @@ export component SettingsPanel inherits Rectangle {
                         color: Theme.text-3;
                         wrap: word-wrap;
                     }
+                    if root.s.gpu != 0: Row {
+                        label: "Full resolution on Retina";
+                        hint: "The guest gets every pixel of the window and its tools scale its UI, so text is sharp. Guests without the tools get half and are scaled up.";
+                        key: "hidpi";
+                        Toggle {
+                            y: (parent.height - self.height) / 2;
+                            checked: root.s.hidpi;
+                            toggled(v) => { Bus.set("hidpi", v ? "true" : "false"); }
+                        }
+                    }
                     Row {
                         label: "Starting size";
                         key: "width, height";

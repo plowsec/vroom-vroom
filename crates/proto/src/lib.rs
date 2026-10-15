@@ -23,7 +23,14 @@ pub mod features {
     pub const TIME_SYNC: u64 = 2;
     pub const RESOLUTION: u64 = 4;
     pub const SHUTDOWN: u64 = 8;
+    /// The agent can change the desktop's UI scale (HiDPI host windows).
+    pub const SCALE: u64 = 16;
 }
+
+/// UI scales a host may ask for, in percent. 0 = "the host no longer
+/// manages the scale": the agent puts back what the guest had before.
+pub const SCALE_MIN: u32 = 100;
+pub const SCALE_MAX: u32 = 500;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
@@ -34,6 +41,9 @@ pub enum Message {
     TimeSync { unix_secs: u64, nanos: u32 },
     /// Host -> guest: window resized; change the display mode.
     SetResolution { width: u32, height: u32 },
+    /// Host -> guest: UI scale in percent (100 = 1x, 200 = 2x), or 0 to
+    /// undo ours. Sent after SetResolution.
+    SetScale { percent: u32 },
     /// Host -> guest: please shut down / reboot cleanly.
     Shutdown { reboot: bool },
     Ping(u64),
@@ -61,6 +71,7 @@ const T_RES: u8 = 4;
 const T_SHUTDOWN: u8 = 5;
 const T_PING: u8 = 6;
 const T_PONG: u8 = 7;
+const T_SCALE: u8 = 8;
 
 impl Message {
     pub fn encode(&self) -> Vec<u8> {
@@ -81,6 +92,7 @@ impl Message {
                 p.extend_from_slice(&height.to_le_bytes());
                 (T_RES, p)
             }
+            Message::SetScale { percent } => (T_SCALE, percent.to_le_bytes().to_vec()),
             Message::Shutdown { reboot } => (T_SHUTDOWN, vec![*reboot as u8]),
             Message::Ping(v) => (T_PING, v.to_le_bytes().to_vec()),
             Message::Pong(v) => (T_PONG, v.to_le_bytes().to_vec()),
@@ -124,10 +136,17 @@ impl Message {
                 }
                 Message::SetResolution { width: w, height: h }
             }
+            T_SCALE if p.len() == 4 => {
+                let percent = u32_at(0)?;
+                if percent != 0 && !(SCALE_MIN..=SCALE_MAX).contains(&percent) {
+                    return Err(Error::Malformed);
+                }
+                Message::SetScale { percent }
+            }
             T_SHUTDOWN if p.len() == 1 => Message::Shutdown { reboot: p[0] != 0 },
             T_PING if p.len() == 8 => Message::Ping(u64_at(0)?),
             T_PONG if p.len() == 8 => Message::Pong(u64_at(0)?),
-            T_TIME | T_RES | T_SHUTDOWN | T_PING | T_PONG => return Err(Error::Malformed),
+            T_TIME | T_RES | T_SCALE | T_SHUTDOWN | T_PING | T_PONG => return Err(Error::Malformed),
             t => return Err(Error::Type(t)),
         })
     }
@@ -198,6 +217,8 @@ mod tests {
             Message::ClipboardText(String::new()),
             Message::TimeSync { unix_secs: 1_800_000_000, nanos: 5 },
             Message::SetResolution { width: 1920, height: 1080 },
+            Message::SetScale { percent: 200 },
+            Message::SetScale { percent: 0 },
             Message::Shutdown { reboot: true },
             Message::Ping(42),
             Message::Pong(42),
@@ -245,6 +266,14 @@ mod tests {
         let mut d = Decoder::new(1024);
         d.push(&Message::ClipboardText("a\0b".into()).encode());
         assert_eq!(d.next(), Ok(Some(Message::ClipboardText("ab".into()))));
+        // scales out of range
+        for bad in [1u32, 99, 501, u32::MAX] {
+            let mut f = Message::SetScale { percent: 200 }.encode();
+            f[8..12].copy_from_slice(&bad.to_le_bytes());
+            let mut d = Decoder::new(1024);
+            d.push(&f);
+            assert_eq!(d.next(), Err(Error::Malformed), "{bad}");
+        }
     }
 
     #[test]

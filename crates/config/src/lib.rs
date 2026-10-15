@@ -631,6 +631,12 @@ pub struct Display {
     pub width: u32,
     #[serde(default = "default_h")]
     pub height: u32,
+    /// Full resolution on HiDPI (Retina) screens: the window gives the
+    /// guest its size in physical pixels and has the guest agent scale
+    /// the guest's UI to match. Without an agent that can, or off: the
+    /// guest gets logical pixels and the window scales the picture up.
+    #[serde(default = "yes")]
+    pub hidpi: bool,
 }
 
 fn default_w() -> u32 {
@@ -642,7 +648,7 @@ fn default_h() -> u32 {
 
 impl Default for Display {
     fn default() -> Self {
-        Display { gpu: Gpu::None, width: default_w(), height: default_h() }
+        Display { gpu: Gpu::None, width: default_w(), height: default_h(), hidpi: true }
     }
 }
 
