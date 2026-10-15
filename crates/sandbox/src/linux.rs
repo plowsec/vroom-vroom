@@ -123,6 +123,36 @@ fn seccomp(p: &Policy) -> Result<()> {
     seccompiler::apply_filter_all_threads(&prog).map_err(err)
 }
 
+/// The USB helper: libusb needs the usbfs nodes (read-write) and sysfs
+/// and udev's database (read) to find devices; nothing else on disk.
+pub fn apply_usb_helper() -> Result<()> {
+    // SAFETY: prctl with constant arguments.
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        return Err(Error::Apply("no_new_privs failed".into()));
+    }
+    let abi = ABI::V2;
+    let mut rs = Ruleset::default().handle_access(AccessFs::from_all(abi)).map_err(err)?.create().map_err(err)?;
+    let read = AccessFs::ReadFile | AccessFs::ReadDir;
+    for d in ["/sys/bus/usb", "/sys/devices", "/sys/class", "/run/udev"] {
+        if let Ok(fd) = PathFd::new(d) {
+            rs = rs.add_rule(PathBeneath::new(fd, read)).map_err(err)?;
+        }
+    }
+    for f in ["/dev/null", "/dev/urandom"] {
+        if let Ok(fd) = PathFd::new(f) {
+            rs = rs.add_rule(PathBeneath::new(fd, AccessFs::ReadFile)).map_err(err)?;
+        }
+    }
+    if let Ok(fd) = PathFd::new("/dev/bus/usb") {
+        rs = rs.add_rule(PathBeneath::new(fd, read | AccessFs::WriteFile)).map_err(err)?;
+    }
+    match rs.restrict_self() {
+        Ok(st) => log::info!("usb helper landlock: {:?}", st.ruleset),
+        Err(e) => log::warn!("landlock unavailable: {e}"),
+    }
+    Ok(())
+}
+
 pub fn apply(p: &Policy) -> Result<()> {
     // SAFETY: prctl with constant arguments.
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {

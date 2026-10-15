@@ -24,6 +24,7 @@ pub mod psci;
 mod ramfb;
 mod snapshot;
 mod tpm;
+mod usb;
 mod vcpu;
 
 use std::io::Write;

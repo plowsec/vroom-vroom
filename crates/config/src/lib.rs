@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 pub const MAX_CPUS: u32 = 64;
 pub const MAX_DISKS: usize = 16;
 pub const MAX_NICS: usize = 8;
+pub const MAX_USB: usize = 8;
 pub const MIN_MEMORY_MIB: u64 = 64;
 pub const MAX_MEMORY_MIB: u64 = 512 * 1024;
 
@@ -71,9 +72,44 @@ pub struct VmConfig {
     /// VM is the same either way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub os: Option<GuestOs>,
+    /// Host USB devices handed to the guest (passthrough).
+    #[serde(default, rename = "usb", skip_serializing_if = "Vec::is_empty")]
+    pub usb: Vec<Usb>,
     /// What the guest can read about its "hardware".
     #[serde(default, skip_serializing_if = "Identity::is_default")]
     pub identity: Identity,
+}
+
+/// A host USB device the guest gets to use. The VM takes the first
+/// device that matches `id` (and `serial`, if set) while it runs; a
+/// device that is unplugged and plugged back in comes back to the guest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Usb {
+    /// "vendor:product", 4 hex digits each, as `vroom usb list` and
+    /// `lsusb` print them.
+    pub id: String,
+    /// Only the device with this serial number (two of the same kind).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial: Option<String>,
+    /// A label for the app; the guest never sees it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+impl Usb {
+    /// (vendor, product) from `id`.
+    pub fn ids(&self) -> Option<(u16, u16)> {
+        usb_id(&self.id)
+    }
+}
+
+/// "vendor:product" in hex, e.g. "1050:0407". Vendor 0 isn't a device.
+pub fn usb_id(s: &str) -> Option<(u16, u16)> {
+    let hex = |x: &str| (x.len() == 4 && x.bytes().all(|b| b.is_ascii_hexdigit())).then(|| u16::from_str_radix(x, 16).ok()).flatten();
+    let (v, p) = s.split_once(':')?;
+    let (v, p) = (hex(v)?, hex(p)?);
+    (v != 0).then_some((v, p))
 }
 
 /// Every name and number the guest can read about the machine it runs on
@@ -816,6 +852,24 @@ impl VmConfig {
         }
         if self.nets.len() > MAX_NICS {
             return bad(format!("at most {MAX_NICS} network adapters"));
+        }
+        if self.usb.len() > MAX_USB {
+            return bad(format!("at most {MAX_USB} USB devices"));
+        }
+        let printable = |v: &str, max: usize| !v.is_empty() && v.len() <= max && v.bytes().all(|b| (0x20..0x7f).contains(&b));
+        for (i, u) in self.usb.iter().enumerate() {
+            if u.ids().is_none() {
+                return bad(format!("usb id {:?}: \"vendor:product\", 4 hex digits each (vroom usb list shows them)", u.id));
+            }
+            if u.serial.as_deref().is_some_and(|s| !printable(s, 126)) {
+                return bad(format!("usb {}: serial must be 1-126 printable ASCII chars", u.id));
+            }
+            if u.name.as_deref().is_some_and(|s| !printable(s, 64)) {
+                return bad(format!("usb {}: name must be 1-64 printable ASCII chars", u.id));
+            }
+            if self.usb[..i].iter().any(|o| o.ids() == u.ids() && o.serial == u.serial) {
+                return bad(format!("usb {} listed twice", u.id));
+            }
         }
         if let Boot::Kernel { cmdline, .. } = &self.boot {
             if cmdline.len() > 2048 {

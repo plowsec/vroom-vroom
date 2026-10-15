@@ -27,6 +27,7 @@ vroom-audio.workspace = true
 vroom-proto.workspace = true
 vroom-display.workspace = true
 vroom-state.workspace = true
+vroom-usb.workspace = true
 png = "0.17"
 
 [dev-dependencies]

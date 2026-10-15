@@ -66,6 +66,20 @@ pub fn audio_profile(exe: &std::path::Path, wav_dir: Option<&std::path::Path>) -
     macos::audio_profile(exe, wav_dir)
 }
 
+/// Seatbelt profile for the USB passthrough helper (macOS).
+#[cfg(target_os = "macos")]
+pub fn usb_profile(exe: &std::path::Path) -> Result<String> {
+    macos::usb_profile(exe)
+}
+
+/// Lock down the USB passthrough helper (Linux), once libusb is loaded:
+/// no new privileges, and Landlock leaves it the USB device nodes and
+/// sysfs (read-only) only. Its seccomp filter is still to come.
+#[cfg(target_os = "linux")]
+pub fn apply_usb_helper() -> Result<()> {
+    linux::apply_usb_helper()
+}
+
 /// Seatbelt profile for a helper process (macOS); run it with
 /// `sandbox-exec -p`.
 #[cfg(target_os = "macos")]

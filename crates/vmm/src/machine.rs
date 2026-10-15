@@ -451,19 +451,36 @@ pub(crate) fn build(
     }
     // Input: virtio-input for direct-boot Linux, USB HID otherwise (UEFI,
     // Windows setup: works with zero drivers). Never both: no doubled keys.
+    // The xHCI also carries passthrough devices, each behind its own
+    // helper process (started here, before the sandbox).
     let mut input = None;
+    let mut xhci = None;
+    if (screen.is_some() && board.use_pci) || !config.usb.is_empty() {
+        let mut helpers = Vec::new();
+        let mut links = Vec::new();
+        for u in &config.usb {
+            let (h, link) = crate::usb::spawn(u)?;
+            helpers.push(h);
+            links.push(link);
+        }
+        let mem2 = mem.clone();
+        let pci_ids = vendor_ids(&ident.usb_pci_id)?;
+        board.add_pci(|slot, intx, msi| {
+            let ids = UsbIds { vendor_id: ident.usb_vendor_id, manufacturer: ident.usb_manufacturer.clone() };
+            let x = Xhci::new(slot, mem2, intx, msi).with_ids(&ids).with_pci_ids(pci_ids).with_passthrough(links);
+            let x = Arc::new(Mutex::new(x));
+            xhci = Some(x.clone());
+            x
+        })?;
+        if let Some(x) = &xhci {
+            for (i, h) in helpers.into_iter().enumerate() {
+                h.run(i, x.clone())?;
+            }
+        }
+    }
     if screen.is_some() {
         if board.use_pci {
-            let mem2 = mem.clone();
-            let mut keep = None;
-            let pci_ids = vendor_ids(&ident.usb_pci_id)?;
-            board.add_pci(|slot, intx, msi| {
-                let ids = UsbIds { vendor_id: ident.usb_vendor_id, manufacturer: ident.usb_manufacturer.clone() };
-                let x = Arc::new(Mutex::new(Xhci::new(slot, mem2, intx, msi).with_ids(&ids).with_pci_ids(pci_ids)));
-                keep = Some(x.clone());
-                x
-            })?;
-            input = Some(InputPipes { kbd: None, tablet: None, usb: keep });
+            input = Some(InputPipes { kbd: None, tablet: None, usb: xhci });
         } else {
             let (kbd_host, kbd_dev) = UnixDatagram::pair()?;
             let (tab_host, tab_dev) = UnixDatagram::pair()?;

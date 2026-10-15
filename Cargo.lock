@@ -5353,6 +5353,7 @@ dependencies = [
  "vroom-import",
  "vroom-net",
  "vroom-sandbox",
+ "vroom-usb",
  "vroom-vmm",
 ]
 
@@ -5377,6 +5378,7 @@ dependencies = [
  "vroom-block",
  "vroom-memory",
  "vroom-snapshot",
+ "vroom-usb",
 ]
 
 [[package]]
@@ -5547,6 +5549,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "vroom-usb"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "log",
+]
+
+[[package]]
 name = "vroom-virtio"
 version = "0.1.0"
 dependencies = [
@@ -5591,6 +5601,7 @@ dependencies = [
  "vroom-sandbox",
  "vroom-snapshot",
  "vroom-state",
+ "vroom-usb",
  "vroom-virtio",
 ]
 

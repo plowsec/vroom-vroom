@@ -113,6 +113,35 @@ pub fn audio_profile(exe: &Path, wav_dir: Option<&Path>) -> Result<String> {
     Ok(s)
 }
 
+/// Profile for the USB helper: libusb (from Homebrew or /usr/local), the
+/// IOKit registry, and the USB device and interface user clients. No
+/// files beyond the system and libusb, no network, no exec, no other
+/// IOKit drivers. Which device it opens is up to the helper (the one its
+/// command line names); the sandbox can't tell USB devices apart.
+pub fn usb_profile(exe: &Path) -> Result<String> {
+    let exe_real = exe.canonicalize().unwrap_or_else(|_| exe.to_path_buf());
+    Ok(format!(
+        r#"(version 1)
+(deny default)
+(allow process-exec (literal {exe}))
+(allow file-read* (literal {exe}) (subpath "/usr/lib") (subpath "/System") (subpath "/Library/Apple")
+  (subpath "/opt/homebrew/lib") (subpath "/opt/homebrew/Cellar/libusb") (subpath "/opt/homebrew/opt/libusb")
+  (subpath "/usr/local/lib") (subpath "/usr/local/Cellar/libusb") (subpath "/usr/local/opt/libusb")
+  (literal "/dev/urandom") (literal "/dev/null") (literal "/private/etc/localtime") (subpath "/private/var/db/timezone"))
+(allow file-write* (literal "/dev/null"))
+(allow file-read-metadata)
+(allow file-read-data (literal "/"))
+(allow sysctl-read)
+(allow signal (target self))
+(allow mach-task-name (target self))
+(allow iokit-get-properties)
+(allow iokit-open (iokit-user-client-class "AppleUSBHostDeviceUserClient" "AppleUSBHostInterfaceUserClient"
+  "AppleUSBLegacyDeviceUserClient" "AppleUSBLegacyInterfaceUserClient" "IOUSBDeviceUserClientV2" "IOUSBInterfaceUserClientV3"))
+"#,
+        exe = q(&exe_real)?,
+    ))
+}
+
 pub fn helper_profile(exe: &Path, rw_dir: &Path) -> Result<String> {
     let exe_real = exe.canonicalize().unwrap_or_else(|_| exe.to_path_buf());
     let prefix = exe_real.ancestors().nth(3).unwrap_or(Path::new("/opt/homebrew"));
