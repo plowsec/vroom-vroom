@@ -86,6 +86,8 @@ pub struct SoundHandler {
     pending: VecDeque<Pending>,
     queued: u64,
     started: Option<Instant>,
+    /// PCM queued before START (drivers pre-fill): sent on START.
+    prefill: Vec<u8>,
 }
 
 impl std::fmt::Debug for SoundHandler {
@@ -102,7 +104,7 @@ impl SoundHandler {
     fn new(sink: Box<dyn AudioSink>, snap: Snap) -> Self {
         // Running streams come back prepared: the guest restarts them.
         let state = if snap.state == State::Running { State::Prepared } else { snap.state };
-        SoundHandler { sink, params: snap.params, state, pending: VecDeque::new(), queued: 0, started: None }
+        SoundHandler { sink, params: snap.params, state, pending: VecDeque::new(), queued: 0, started: None, prefill: Vec::new() }
     }
 
     fn frame_bytes(&self) -> u64 {
@@ -199,6 +201,10 @@ impl SoundHandler {
                 // (the usual pre-fill) play first.
                 self.started = Some(Instant::now());
                 self.sink.start(p.rate, p.channels);
+                let pre = std::mem::take(&mut self.prefill);
+                if !pre.is_empty() {
+                    self.sink.write(&pre);
+                }
                 S_OK
             }
             R_PCM_STOP => {
@@ -208,6 +214,7 @@ impl SoundHandler {
                 self.state = State::Prepared;
                 self.started = None;
                 self.sink.stop();
+                self.prefill.clear();
                 self.complete(ctx, true);
                 self.queued = 0;
                 S_OK
@@ -218,6 +225,7 @@ impl SoundHandler {
                 }
                 self.state = State::Idle;
                 self.started = None;
+                self.prefill.clear();
                 self.complete(ctx, true);
                 self.queued = 0;
                 S_OK
@@ -255,7 +263,11 @@ impl SoundHandler {
             // Whole frames only.
             let fb = self.frame_bytes() as usize;
             pcm.truncate(pcm.len() / fb * fb);
-            self.sink.write(&pcm);
+            if self.state == State::Running {
+                self.sink.write(&pcm);
+            } else if self.prefill.len() + pcm.len() <= self.params.map_or(0, |p| p.buffer_bytes as usize) {
+                self.prefill.extend_from_slice(&pcm);
+            }
             self.queued += pcm.len() as u64;
             // Keep only the 8-byte status part for later.
             let status = match w.split_tail(8) {

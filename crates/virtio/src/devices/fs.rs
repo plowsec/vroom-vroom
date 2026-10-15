@@ -32,6 +32,8 @@ const ROOT: u64 = 1;
 const MAX_NODES: usize = 1 << 18;
 const MAX_HANDLES: usize = 1024;
 const MAX_DIR_ENTRIES: usize = 1 << 17;
+/// Entries held by all open directory handles together.
+const MAX_DIR_BUDGET: usize = 1 << 20;
 /// Largest read/write (FUSE max_write, and max_pages * 4K).
 pub const MAX_IO: usize = 1 << 20;
 const MAX_REQUEST: usize = MAX_IO + 4096;
@@ -523,7 +525,12 @@ impl FuseServer {
             }
             OPENDIR => {
                 let p = os_path(&self.path(node)?);
-                let entries = self.share.read_dir(&p, MAX_DIR_ENTRIES).map_err(|e| linux_errno(&e))?;
+                let held: usize = self.handles.values().map(|h| if let Handle::Dir { entries } = h { entries.len() } else { 0 }).sum();
+                let room = MAX_DIR_BUDGET.saturating_sub(held).min(MAX_DIR_ENTRIES);
+                if room == 0 {
+                    return Err(EMFILE);
+                }
+                let entries = self.share.read_dir(&p, room).map_err(|e| linux_errno(&e))?;
                 let fh = self.add_handle(Handle::Dir { entries })?;
                 let mut o = Out::default();
                 o.u64(fh).u32(0).u32(0);
