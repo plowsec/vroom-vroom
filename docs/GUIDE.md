@@ -117,7 +117,9 @@ Ubuntu ships no such kernel; build one from Ubuntu's config with
 `CONFIG_ARM64_16K_PAGES=y` (see `examples/ubuntu/kernel-16k.sh`).
 `vulkaninfo --summary` should show `Virtio-GPU Venus (Apple M…)`.
 
-OpenGL on top (Zink) and Windows guests are not covered: Windows has no
+OpenGL on top of it (Mesa's Zink) doesn't work yet: Zink needs Vulkan's
+`nullDescriptor` (robustness2), which MoltenVK can't offer on Metal, so GL
+apps fall back to llvmpipe. Windows guests are not covered: Windows has no
 Venus driver.
 
 ## Snapshots, suspend
