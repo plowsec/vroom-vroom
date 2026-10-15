@@ -129,6 +129,10 @@ pub struct Identity {
     pub pci_bridge_id: String,
     pub nvme_pci_id: String,
     pub usb_pci_id: String,
+    /// Sound card (HD Audio controller), when `[audio]` uses one.
+    pub hda_pci_id: String,
+    /// HD Audio codec: vendor:device, then its subsystem ID (same format).
+    pub hda_codec_id: String,
     /// USB keyboard and tablet (and virtio input): vendor ID and
     /// manufacturer string.
     pub usb_vendor_id: u16,
@@ -173,6 +177,8 @@ impl Default for Identity {
             pci_bridge_id: "1b36:0008".into(),
             nvme_pci_id: "1b36:0010".into(),
             usb_pci_id: "1b36:000d".into(),
+            hda_pci_id: "8086:2668:1af4:1100".into(),
+            hda_codec_id: "1af4:0022:1af4:0022".into(),
             usb_vendor_id: 0x1209,
             usb_manufacturer: "vroom".into(),
             mac_prefix: "02".into(),
@@ -221,7 +227,13 @@ impl Identity {
         if !(1..=0x24).contains(&self.chassis_type) {
             return Err(Error::Invalid("identity.chassis_type: 1-36 (SMBIOS chassis type)".into()));
         }
-        for (what, v) in [("pci_bridge_id", &self.pci_bridge_id), ("nvme_pci_id", &self.nvme_pci_id), ("usb_pci_id", &self.usb_pci_id)] {
+        for (what, v) in [
+            ("pci_bridge_id", &self.pci_bridge_id),
+            ("nvme_pci_id", &self.nvme_pci_id),
+            ("usb_pci_id", &self.usb_pci_id),
+            ("hda_pci_id", &self.hda_pci_id),
+            ("hda_codec_id", &self.hda_codec_id),
+        ] {
             // Vendor 0xffff reads as "no device here".
             if !pci_ids(v).is_some_and(|[vendor, ..]| vendor != 0 && vendor != 0xffff) {
                 return Err(Error::Invalid(format!(
@@ -351,6 +363,18 @@ pub enum Transport {
 }
 
 impl VmConfig {
+    /// The sound card to build, if any (`auto` resolved).
+    pub fn sound_device(&self) -> Option<SoundDevice> {
+        if !self.audio.output && !self.audio.input {
+            return None;
+        }
+        Some(match self.audio.device {
+            SoundDevice::Auto if self.guest_os() == GuestOs::Windows => SoundDevice::Hda,
+            SoundDevice::Auto => SoundDevice::Virtio,
+            d => d,
+        })
+    }
+
     /// Resolved transport.
     pub fn use_pci(&self) -> bool {
         match self.virtio_transport {
@@ -397,13 +421,33 @@ pub enum DiskFormat {
     Qcow2,
 }
 
-/// Sound. Output only: there is no microphone path at all.
+/// Sound. The microphone is a separate opt-in (`input`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Audio {
-    /// Guest playback through the host's speakers (virtio-snd; Linux guests).
+    /// Guest playback through the host's speakers.
     #[serde(default)]
     pub output: bool,
+    /// The host microphone, for the guest to record from. Flows only while
+    /// the VM's window is open, the VM runs and the guest records.
+    #[serde(default)]
+    pub input: bool,
+    /// Which sound card the guest gets.
+    #[serde(default)]
+    pub device: SoundDevice,
+}
+
+/// The emulated sound card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SoundDevice {
+    /// HD Audio for Windows guests, virtio-snd for the others.
+    #[default]
+    Auto,
+    /// Intel HD Audio: Windows and Linux have a driver built in.
+    Hda,
+    /// virtio-snd: Linux (`virtio_snd`); Windows has no driver.
+    Virtio,
 }
 
 /// A host folder shared with the guest. Linux: `mount -t virtiofs <tag> /mnt`.
@@ -778,6 +822,9 @@ impl VmConfig {
                 w.push(format!("share {:?} is writable: the guest can change or delete files in {}", s.tag, p.display()));
             }
         }
+        if self.audio.input {
+            w.push("audio.input: the guest hears your microphone while its window is open and it records".into());
+        }
         if self.clipboard.guest_to_host && self.clipboard.host_to_guest {
             // The default, and gated on window focus: worth a mention only
             // together with a disabled sandbox.
@@ -1060,6 +1107,22 @@ guest_to_host = false
         i.randomize_serials([1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(i.serial.as_deref(), Some("010203040506"));
         assert_eq!(i.disk_serial, "0708");
+    }
+
+    #[test]
+    fn sound_device_follows_the_guest() {
+        let base = "name = \"x\"\n[boot]\ntype = \"uefi\"\nvars = \"v.fd\"\n";
+        let c = |extra: &str| VmConfig::from_toml(&format!("{base}{extra}")).unwrap();
+        assert_eq!(c("").sound_device(), None);
+        assert_eq!(c("[audio]\noutput = true\n").sound_device(), Some(SoundDevice::Virtio));
+        let win = VmConfig::from_toml(&format!("os = \"windows\"\n{base}[audio]\ninput = true\n")).unwrap();
+        assert_eq!(win.sound_device(), Some(SoundDevice::Hda));
+        assert_eq!(c("[audio]\noutput = true\ndevice = \"hda\"\n").sound_device(), Some(SoundDevice::Hda));
+        assert!(c("[audio]\ninput = true\n").warnings().iter().any(|w| w.contains("microphone")));
+        assert!(VmConfig::from_toml(&format!("{base}[audio]\ndevice = \"ac97\"\n")).is_err());
+        let ids = c("[identity]\nhda_pci_id = \"8086:a0c8:17aa:22d8\"\nhda_codec_id = \"10ec:0287:17aa:22d8\"\n");
+        assert_eq!(pci_ids(&ids.identity.hda_codec_id), Some([0x10ec, 0x0287, 0x17aa, 0x22d8]));
+        assert!(VmConfig::from_toml(&format!("{base}[identity]\nhda_codec_id = \"0000:0287\"\n")).is_err());
     }
 
     #[test]

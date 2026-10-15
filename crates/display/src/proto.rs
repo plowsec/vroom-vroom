@@ -19,6 +19,8 @@ pub enum ToViewer {
     Status(String),
     /// VM is gone; viewer should close.
     Closed,
+    /// The guest is recording from the host microphone (true) or stopped.
+    Mic(bool),
 }
 
 /// Lifecycle requests from the viewer.
@@ -82,6 +84,7 @@ impl ToViewer {
             ToViewer::ClipboardSet(s) => frame(3, s.as_bytes()),
             ToViewer::Status(s) => frame(4, s.as_bytes()),
             ToViewer::Closed => frame(5, &[]),
+            ToViewer::Mic(on) => frame(6, &[*on as u8]),
         }
     }
 
@@ -92,6 +95,7 @@ impl ToViewer {
             3 => ToViewer::ClipboardSet(text(p)?),
             4 => ToViewer::Status(text(p)?),
             5 => ToViewer::Closed,
+            6 => ToViewer::Mic(*p.first().ok_or(Error::Proto("short"))? != 0),
             _ => return Err(Error::Proto("unknown viewer message")),
         })
     }
@@ -207,7 +211,12 @@ mod tests {
         for m in &vm {
             assert_eq!(d.next_to_vmm().unwrap().as_ref(), Some(m));
         }
-        let v = [ToViewer::Mode { width: 800, height: 600 }, ToViewer::Damage { x: 1, y: 2, w: 3, h: 4 }, ToViewer::Closed];
+        let v = [
+            ToViewer::Mode { width: 800, height: 600 },
+            ToViewer::Damage { x: 1, y: 2, w: 3, h: 4 },
+            ToViewer::Closed,
+            ToViewer::Mic(true),
+        ];
         for m in &v {
             d.push(&m.encode());
         }

@@ -6,7 +6,10 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use vroom_arch::aarch64::{self as board, layout};
-use vroom_config::{Boot, DiskBus, Gpu, Identity, VmConfig};
+use vroom_config::{Boot, DiskBus, Gpu, Identity, SoundDevice, VmConfig};
+use vroom_devices::audio::{AudioSink, AudioSource, NullSink, Silence};
+use vroom_devices::hda::{codec::CodecIds, Hda, HdaIds};
+use vroom_virtio::devices::sound::Sound;
 use vroom_devices::{pl011::Pl011, pl031::Pl031, BusBuilder, BusDevice};
 use vroom_hv::{
     aarch64::mpidr_for, BootRegs, GicMsiConfig, Hypervisor, IrqChipConfig, IrqChipInfo, Vm, VmParams,
@@ -284,6 +287,66 @@ fn vendor_ids(s: &str) -> Result<VendorIds> {
     Ok(VendorIds { vendor, device, subsys_vendor, subsys })
 }
 
+/// The sound card `[audio]` asks for, fed by the audio helper. Returns
+/// the helper (its microphone gate follows the VM window).
+fn sound_card(
+    board: &mut Board,
+    config: &VmConfig,
+    dev: SoundDevice,
+    ui: Option<&DisplayServer>,
+) -> Result<Arc<crate::audio::AudioHelper>> {
+    use crate::audio::{AudioHelper, HelperSink, HelperSource};
+    // VROOM_AUDIO_WAV_DIR: test mode, record to / from WAV files instead
+    // of the speakers and the microphone.
+    let wav = std::env::var_os("VROOM_AUDIO_WAV_DIR").map(std::path::PathBuf::from);
+    let (output, input) = (config.audio.output, config.audio.input);
+    let helper = AudioHelper::spawn(wav.as_deref(), input)?;
+    if let Some(ds) = ui {
+        helper.set_viewer(ds.tx());
+        helper.set_window(true);
+    }
+    let h = helper.clone();
+    let make_sink = move || -> Box<dyn AudioSink> {
+        if output {
+            Box::new(HelperSink(h.clone()))
+        } else {
+            Box::new(NullSink)
+        }
+    };
+    let h = helper.clone();
+    let make_source = move || -> Box<dyn AudioSource> { Box::new(HelperSource(h.clone())) };
+    match dev {
+        SoundDevice::Hda => {
+            let ident = &config.identity;
+            let [vendor, device, sv, sd] = vroom_config::pci_ids(&ident.hda_codec_id)
+                .ok_or_else(|| Error::Setup(format!("bad HD Audio codec id {:?}", ident.hda_codec_id)))?;
+            let ids = HdaIds {
+                pci: vendor_ids(&ident.hda_pci_id)?,
+                codec: CodecIds { vendor, device, subsys: (sv as u32) << 16 | sd as u32 },
+            };
+            let mem = board.mem.clone();
+            let mut keep = None;
+            board.add_pci(|slot, intx, msi| {
+                let source: Box<dyn AudioSource> = if input { make_source() } else { Box::new(Silence) };
+                let d = Arc::new(Mutex::new(Hda::new(slot, mem, intx, msi, ids, input, make_sink(), source)));
+                keep = Some(d.clone());
+                d
+            })?;
+            if let Some(d) = keep {
+                vroom_devices::hda::spawn_timer(&d)?;
+            }
+        }
+        SoundDevice::Virtio | SoundDevice::Auto => {
+            let mut s = Sound::new(Box::new(make_sink));
+            if input {
+                s = s.with_capture(Box::new(make_source));
+            }
+            board.add_virtio(Box::new(s))?;
+        }
+    }
+    Ok(helper)
+}
+
 /// Backend for one NIC, and the MAC the guest must use.
 fn net_backend(
     vm: &str,
@@ -391,13 +454,10 @@ pub(crate) fn build(
         board.reg.add_bus_only(layout::GIC_MSI_BASE, info.msi_size, frame)?;
     }
     board.add_virtio(Box::new(Rng::new()))?;
-    if config.audio.output {
-        // VROOM_AUDIO_WAV_DIR: test mode, record instead of playing.
-        let wav = std::env::var_os("VROOM_AUDIO_WAV_DIR").map(std::path::PathBuf::from);
-        let helper = crate::audio::AudioHelper::spawn(wav.as_deref())?;
-        let make = move || -> Box<dyn vroom_virtio::devices::sound::AudioSink> { Box::new(crate::audio::HelperSink(helper.clone())) };
-        board.add_virtio(Box::new(vroom_virtio::devices::sound::Sound::new(Box::new(make))))?;
-    }
+    let audio = match config.sound_device() {
+        Some(dev) => Some(sound_card(&mut board, config, dev, ui.as_ref())?),
+        None => None,
+    };
     for s in &config.shares {
         board.add_virtio(Box::new(Fs::new(&s.tag, s.path.clone(), s.readonly).map_err(|e| Error::Setup(e.to_string()))?))?;
     }
@@ -487,7 +547,9 @@ pub(crate) fn build(
         if screen.is_none() {
             return Err(Error::Setup("a viewer needs a display (display.gpu or UEFI boot)".into()));
         }
-        ds.run(gpu_ctl, input, agent.clone(), events.clone())?;
+        // The microphone gate closes with the window.
+        let on_close = audio.map(|a| Box::new(move || a.set_window(false)) as Box<dyn FnOnce() + Send>);
+        ds.run(gpu_ctl, input, agent.clone(), events.clone(), on_close)?;
     }
     for (i, n) in config.nets.iter().enumerate() {
         let mac = match &n.mac {

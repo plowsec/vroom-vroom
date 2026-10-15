@@ -285,6 +285,7 @@ impl DisplayServer {
         input: Option<InputPipes>,
         agent: Agent,
         events: Sender<VmEvent>,
+        on_close: Option<Box<dyn FnOnce() + Send>>,
     ) -> std::io::Result<()> {
         let mut stream = self.stream;
         let latest = self.clip_latest;
@@ -309,6 +310,9 @@ impl DisplayServer {
                 }
             }
             log::info!("viewer disconnected");
+            if let Some(f) = on_close {
+                f();
+            }
             let _ = events.send(VmEvent::ViewerClosed);
         })?;
         Ok(())
