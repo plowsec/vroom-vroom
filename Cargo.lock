@@ -238,6 +238,7 @@ dependencies = [
  "bulwark-config",
  "bulwark-display",
  "bulwark-hv",
+ "bulwark-net",
  "bulwark-sandbox",
  "bulwark-vmm",
  "clap",
@@ -277,6 +278,14 @@ dependencies = [
  "getrandom 0.2.17",
  "libc",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "bulwark-fs"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tempfile",
 ]
 
 [[package]]
@@ -399,6 +408,7 @@ version = "0.1.0"
 dependencies = [
  "bulwark-block",
  "bulwark-devices",
+ "bulwark-fs",
  "bulwark-memory",
  "bulwark-net",
  "bulwark-snapshot",

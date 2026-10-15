@@ -53,6 +53,9 @@ pub struct VmConfig {
     /// M3 or newer Mac on macOS 15+. Snapshots are not supported then.
     #[serde(default)]
     pub nested: bool,
+    /// Host folders the guest can mount (virtio-fs).
+    #[serde(default, rename = "share")]
+    pub shares: Vec<Share>,
     /// A TPM 2.0 (swtpm in its own process; state in the state dir).
     /// Windows 11 wants one; Linux uses it for measured boot.
     #[serde(default)]
@@ -113,6 +116,18 @@ pub enum DiskFormat {
     Auto,
     Raw,
     Qcow2,
+}
+
+/// A host folder shared with the guest. Linux: `mount -t virtiofs <tag> /mnt`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Share {
+    pub path: PathBuf,
+    /// Name the guest mounts it by.
+    pub tag: String,
+    /// The guest can't change anything (default). Set false to allow it.
+    #[serde(default = "yes")]
+    pub readonly: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -374,6 +389,9 @@ impl VmConfig {
         for d in &mut self.disks {
             fix(&mut d.path);
         }
+        for s in &mut self.shares {
+            fix(&mut s.path);
+        }
         if let Serial::File { path } = &mut self.serial {
             fix(path);
         }
@@ -396,6 +414,17 @@ impl VmConfig {
         }
         if self.disks.len() > MAX_DISKS {
             return bad(format!("at most {MAX_DISKS} disks"));
+        }
+        for (i, s) in self.shares.iter().enumerate() {
+            if s.tag.is_empty() || s.tag.len() > 36 || !s.tag.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)) {
+                return bad(format!("share tag {:?}: 1-36 chars of [A-Za-z0-9._-]", s.tag));
+            }
+            if self.shares[..i].iter().any(|o| o.tag == s.tag) {
+                return bad(format!("share tag {:?} used twice", s.tag));
+            }
+        }
+        if self.shares.len() > 8 {
+            return bad("at most 8 shares".into());
         }
         if self.nets.len() > MAX_NICS {
             return bad(format!("at most {MAX_NICS} network adapters"));

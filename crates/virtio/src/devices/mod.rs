@@ -4,6 +4,7 @@ pub mod rng;
 pub mod block;
 pub mod net;
 pub mod console;
+pub mod fs;
 pub mod gpu;
 pub mod gpu3d;
 pub mod input;

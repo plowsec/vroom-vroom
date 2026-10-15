@@ -37,6 +37,21 @@ fn landlock(p: &Policy) -> Result<()> {
     for d in &p.write_dirs {
         rs = rs.add_rule(PathBeneath::new(PathFd::new(d).map_err(err)?, AccessFs::from_all(abi))).map_err(err)?;
     }
+    for d in &p.share_ro {
+        rs = rs.add_rule(PathBeneath::new(PathFd::new(d).map_err(err)?, AccessFs::ReadFile | AccessFs::ReadDir)).map_err(err)?;
+    }
+    // What virtio-fs does: no device nodes, sockets, FIFOs or symlinks.
+    let share = AccessFs::ReadFile
+        | AccessFs::ReadDir
+        | AccessFs::WriteFile
+        | AccessFs::RemoveFile
+        | AccessFs::RemoveDir
+        | AccessFs::MakeDir
+        | AccessFs::MakeReg
+        | AccessFs::Refer;
+    for d in &p.share_rw {
+        rs = rs.add_rule(PathBeneath::new(PathFd::new(d).map_err(err)?, share)).map_err(err)?;
+    }
     let st = rs.restrict_self().map_err(err)?;
     log::info!("landlock: {:?}", st.ruleset);
     Ok(())

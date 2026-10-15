@@ -21,7 +21,7 @@ use bulwark_proto::AGENT_PORT;
 use bulwark_virtio::devices::gpu::{DisplaySink, Gpu as GpuDev, ThreeD};
 use bulwark_virtio::devices::gpu3d::{Mapping, ShmMapper};
 use bulwark_virtio::devices::input::{Input, InputKind};
-use bulwark_virtio::devices::{block::Block, console::Console, net::Net, rng::Rng};
+use bulwark_virtio::devices::{block::Block, console::Console, fs::Fs, net::Net, rng::Rng};
 use bulwark_devices::nvme::{Namespace, Nvme};
 use bulwark_devices::usb::xhci::Xhci;
 use bulwark_devices::pci::{Intx, IntxRouter, MsiSender, PciRoot, SharedPciDevice};
@@ -369,6 +369,9 @@ pub(crate) fn build(
         board.reg.add_bus_only(layout::GIC_MSI_BASE, info.msi_size, frame)?;
     }
     board.add_virtio(Box::new(Rng::new()))?;
+    for s in &config.shares {
+        board.add_virtio(Box::new(Fs::new(&s.tag, s.path.clone(), s.readonly).map_err(|e| Error::Setup(e.to_string()))?))?;
+    }
     let mut nvme_ns = Vec::new();
     for (d, vd) in config.disks.iter().zip(&disks.disks) {
         let i = vd.index;

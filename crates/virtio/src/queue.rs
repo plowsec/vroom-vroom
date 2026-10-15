@@ -84,7 +84,9 @@ impl Queue {
 
     /// Take the next available descriptor chain.
     pub fn pop(&mut self, mem: &GuestMemory) -> Result<Option<DescriptorChain>, Error> {
-        if self.pending(mem)? == 0 {
+        // A queue the driver never enabled holds no requests (and its
+        // addresses mean nothing).
+        if !self.ready || self.pending(mem)? == 0 {
             return Ok(None);
         }
         let slot = self.next_avail % self.size;

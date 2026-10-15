@@ -32,6 +32,10 @@ pub struct Policy {
     pub ro_files: Vec<PathBuf>,
     /// Directories where new files may be created (snapshots, overlays).
     pub write_dirs: Vec<PathBuf>,
+    /// Shared folders the guest may read.
+    pub share_ro: Vec<PathBuf>,
+    /// Shared folders the guest may change (files and directories only).
+    pub share_rw: Vec<PathBuf>,
     /// Outbound TCP/UDP (userspace NAT).
     pub network_outbound: bool,
     /// ... including to the host's loopback (NAT `allow_host_loopback`).

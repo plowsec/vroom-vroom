@@ -67,6 +67,15 @@ fn lock_down(cfg: &VmConfig, state_dir: &Path, clipboard: bool) -> Result<(), St
             p.rw_files.push(d.path.clone());
         }
     }
+    for s in &cfg.shares {
+        // Rules name real paths: the share root may be a symlink.
+        let real = std::fs::canonicalize(&s.path).unwrap_or_else(|_| s.path.clone());
+        if s.readonly {
+            p.share_ro.push(real);
+        } else {
+            p.share_rw.push(real);
+        }
+    }
     for n in &cfg.nets {
         if n.mode == NetKind::Nat {
             p.network_outbound = true;

@@ -45,6 +45,12 @@ pub fn profile(p: &Policy) -> Result<String> {
     for d in &p.write_dirs {
         s += &format!("(allow file-read* file-write* (subpath {}))\n", q(d)?);
     }
+    for d in &p.share_ro {
+        s += &format!("(allow file-read* (subpath {}))\n", q(d)?);
+    }
+    for d in &p.share_rw {
+        s += &format!("(allow file-read* file-write-data file-write-create file-write-unlink file-write-mode file-write-times (subpath {}))\n", q(d)?);
+    }
     if p.network_outbound {
         // IP only: no Unix sockets (ssh-agent, docker.sock...). netd is
         // connected before we lock down. Later rules win in SBPL.
