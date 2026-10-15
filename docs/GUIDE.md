@@ -106,6 +106,11 @@ installs a systemd service (root, hardened unit: the host channel, clock,
 shutdown) and a desktop autostart entry for the unprivileged session
 helper (clipboard); the service only serves the user on screen.
 
+The cloud image has no driver for the hardware clock (`rtc-pl031`, in
+`linux-modules-extra-$(uname -r)`), so it boots with a wrong date until
+NTP or the vroom agent sets it. Install that package if the guest has no
+network.
+
 ## Ubuntu desktop (live ISO, UEFI)
 
 ```toml
