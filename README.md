@@ -13,13 +13,13 @@ and every virtual device treats the guest as hostile.
 - 3D for Linux guests (Vulkan, about 90% of native speed)
 - Snapshots, suspend/resume, reset
 - NAT with port forwards, several network adapters. Bridged and host-only need a root helper.
-- Shared folders and sound (Linux guests)
+- Shared folders (Linux and Windows guests), sound (Linux guests)
 - TPM 2.0 (Windows 11 needs it)
 - Nested VMs (M3 or newer)
 - Import from VMware Fusion (ARM64 VMs)
 
 Not yet: x86_64 hosts (it builds, can't run VMs yet), Secure Boot, and
-sound, 3D or shared folders in Windows guests.
+sound or 3D in Windows guests.
 
 ## Try it
 

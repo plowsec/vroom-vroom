@@ -70,8 +70,10 @@ After the import:
 
 - Linux guests boot as they are. Remove `open-vm-tools` if you like.
 - Windows guests boot from NVMe, but need the virtio-win drivers and the
-  vroom tools for network, clipboard and resizing: attach `tools.raw` and
-  the virtio-win ISO, run `vroom-setup.cmd` as administrator. Fusion puts
+  vroom tools for network, clipboard and resizing: build the tools disk
+  with the drivers on it (`scripts/make-windows-tools.sh tools.raw
+  virtio-win.iso`; Windows can't read the ISO itself from an NVMe disk),
+  attach it and run `vroom-setup.cmd` as administrator. Fusion puts
   Windows on NVMe; a Windows installed on a SATA disk may not boot from
   NVMe (INACCESSIBLE_BOOT_DEVICE). That case isn't handled yet.
 - Until the tools are in, Windows' clock is off by your time zone (it
@@ -211,8 +213,56 @@ Linux guest: `sudo mount -t virtiofs host /mnt` (or in `/etc/fstab`:
 `host /mnt virtiofs defaults 0 0`). Files show up owned by whoever looks
 at them; the guest can't create symlinks, hard links or device nodes in
 the share, and symlinks already there are shown but never followed on the
-host. Windows guests need virtio-win's virtiofs service and WinFsp (not
-tested yet).
+host.
+
+### Windows guests
+
+Each share becomes a drive letter: the first gets Z:, the next Y:, and so
+on. It takes three pieces, all set up by `vroom-setup.cmd` (run it as
+administrator, again after adding your first share is fine):
+
+- the viofs driver from virtio-win;
+- [WinFsp](https://winfsp.dev), a file system library virtio-win's
+  `virtiofs.exe` runs on. It isn't ours to ship (GPLv3), so setup takes
+  `winfsp-2.1.25156.msi` from next to the script if it's there, or
+  downloads that version from WinFsp's GitHub releases. Either way it
+  checks the SHA-256 before installing. No internet in the guest: put the
+  MSI on the tools disk (`WINFSP_MSI=path/to.msi
+  scripts/make-windows-tools.sh tools.raw virtio-win.iso`);
+- one service per share, `VroomShare_<tag>`, running
+  `virtiofs.exe -t <tag> -m Z:`. The agent service checks at every boot
+  and adds services for new shares, so shares added later show up after
+  a reboot.
+
+The drivers come from the tools disk: build it with the virtio-win ISO
+(`scripts/make-windows-tools.sh tools.raw virtio-win.iso`); Windows can't
+read the ISO itself from an NVMe disk.
+
+A folder instead of a drive letter (the folder must not exist yet):
+
+```bat
+sc config VroomShare_host binPath= "\"C:\Program Files\Vroom\virtiofs.exe\" -t host -m C:\Shares\host"
+sc stop VroomShare_host & sc start VroomShare_host
+```
+
+Setup only adds services, it never changes yours. A share you removed
+from the config leaves its service behind, failing to start; delete it
+with `sc delete VroomShare_<tag>`.
+
+What to expect:
+
+- Read-only shares refuse changes with "Access denied". Their files look
+  read-only to Windows, so copies of them come out read-only, like files
+  copied from a CD.
+- Whether case matters is up to the host: on a Mac `README.txt` and
+  `readme.txt` are one file, as Windows expects; on a Linux host, two.
+- No symlinks, junctions or hard links can be made in a share. Symlinks
+  already there show up but don't lead anywhere outside it.
+- Paths are limited to 259 characters (virtiofs.exe's limit).
+- Free space shown is the host disk's.
+- `virtiofs.exe` never tells us when it is done with a file, so a share
+  with more than about 260,000 files and folders opened makes us drop the
+  ones it doesn't have open; it looks them up again by name.
 
 ## Sound
 
@@ -268,7 +318,7 @@ flushes a lot). `"none"` ignores flushes: scratch disks only.
 - Windows 11 is installed with its hardware checks bypassed (no Secure
   Boot); `tpm = true` (needs `brew install swtpm`) gives it a real TPM 2.0,
   which Windows sees and uses.
-- Windows guests: no shared folders without WinFsp (untested), no sound
-  (no virtio-snd driver), no 3D (no Venus driver).
+- Windows guests: no sound (no virtio-snd driver), no 3D (no Venus
+  driver). Shared folders need WinFsp (see above).
 - 3D snapshots, OpenGL on Venus (Zink, see above): not supported.
 - NAT connections don't survive suspend/resume (the guest reconnects).
