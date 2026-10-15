@@ -42,6 +42,9 @@ scripts/build.sh --release
 Every rebuild of `target/*/bulwark` must be re-signed (`scripts/sign.sh`),
 otherwise Hypervisor.framework refuses to create the VM.
 
+`scripts/dist.sh` makes a release tarball (signed binaries, guest agents,
+the 3D library if built, docs) in `target/dist/`.
+
 Optional pieces:
 
 - 3D (macOS): `scripts/build-virglrenderer.sh` builds the patched
