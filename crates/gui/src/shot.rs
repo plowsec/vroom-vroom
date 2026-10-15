@@ -24,6 +24,8 @@ pub fn schedule(out: PathBuf) {
                 msg::send(Msg::Select(i.parse().unwrap_or(0)));
             } else if let Some((k, v)) = a.strip_prefix("set:").and_then(|kv| kv.split_once('=')) {
                 msg::send(Msg::Set(k.to_string(), v.to_string()));
+            } else if let Some(p) = a.strip_prefix("drop:") {
+                msg::send(Msg::Drop(PathBuf::from(p)));
             } else if let Some(q) = a.strip_prefix("type:") {
                 msg::send(Msg::Search(format!("palette:{q}")));
             } else {

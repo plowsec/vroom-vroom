@@ -401,6 +401,8 @@ fn file_name(p: &Path) -> String {
 /// Copy a disk to a new qcow2, skipping what's all zeros.
 pub fn copy_disk(src: &dyn DiskImage, dst: &Path, mut progress: impl FnMut(u64, u64)) -> Result<()> {
     const CHUNK: usize = 1 << 20;
+    // One memcmp per chunk: most of a disk is zeros.
+    static ZEROS: [u8; CHUNK] = [0; CHUNK];
     let size = src.size();
     vroom_block::qcow2::Qcow2Image::create(dst, size, None).map_err(|e| Error::Disk(format!("{}: {e}", dst.display())))?;
     let out = vroom_block::open(dst, Some(vroom_block::Format::Qcow2), false).map_err(|e| Error::Disk(format!("{}: {e}", dst.display())))?;
@@ -409,7 +411,7 @@ pub fn copy_disk(src: &dyn DiskImage, dst: &Path, mut progress: impl FnMut(u64, 
     while off < size {
         let n = (size - off).min(CHUNK as u64) as usize;
         src.read_at(&mut buf[..n], off).map_err(|e| Error::Disk(format!("read at {off}: {e}")))?;
-        if buf[..n].iter().any(|&b| b != 0) {
+        if buf[..n] != ZEROS[..n] {
             out.write_at(&buf[..n], off).map_err(|e| Error::Disk(format!("{}: {e}", dst.display())))?;
         }
         off += n as u64;

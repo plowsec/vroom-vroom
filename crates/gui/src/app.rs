@@ -56,6 +56,10 @@ pub struct App {
     /// The action a confirm dialog runs, and the VM (key) it was asked for.
     confirm: Option<(String, String)>,
     installer: Option<PathBuf>,
+    /// A VMware VM read and waiting for "Import".
+    vmware: Option<vroom_import::Plan>,
+    /// The progress toast of the import that's running.
+    import_toast: Option<i32>,
     last_settings: Option<VmSettings>,
     _timer: slint::Timer,
 }
@@ -185,6 +189,8 @@ impl App {
             palette_sel: 0,
             confirm: None,
             installer: None,
+            vmware: None,
+            import_toast: None,
             last_settings: None,
             _timer: timer,
             lib,
@@ -273,6 +279,25 @@ impl App {
                 }
                 self.last_settings = None;
                 self.push_all();
+            }
+            Msg::ImportProgress(pct) => {
+                if let Some(t) = self.toasts.iter_mut().find(|t| Some(t.toast.id) == self.import_toast) {
+                    t.toast.text = s(format!("Importing from VMware: {pct}%"));
+                    t.until = Instant::now() + ERROR_TOAST_FOR;
+                    self.push_toasts();
+                }
+            }
+            Msg::Imported(r) => {
+                let id = self.import_toast.take();
+                self.toasts.retain(|t| Some(t.toast.id) != id);
+                self.push_toasts();
+                match r {
+                    Ok(p) => {
+                        self.add_vm(&p);
+                        self.toast("Imported. Check the notes in the guide before the first start (Windows needs the tools).", 1);
+                    }
+                    Err(e) => self.toast(format!("Import failed: {e}"), 3),
+                }
             }
             Msg::Created(r, start) => {
                 self.ui.set_newvm_creating(false);
@@ -627,7 +652,7 @@ impl App {
                 "{}{}{}",
                 if c.security.sandbox { "Sandboxed" } else { "Sandbox is off" },
                 if c.tpm { " · TPM 2.0" } else { "" },
-                if !c.identity.announce_vm { " · hides VM flags" } else if !c.identity.is_default() { " · custom identity" } else { "" }
+                if !c.identity.announce_vm { " · hides VM flags" } else if !same_names(&c.identity) { " · custom identity" } else { "" }
             )),
             sum_boot: s(match &c.boot {
                 Boot::Uefi { firmware: None, .. } => "UEFI".to_string(),
@@ -868,6 +893,19 @@ impl App {
             }
             "newvm.clear-installer" => self.set_installer(None),
             "newvm.create" => self.newvm_create(),
+            "vmware" => {
+                let mut d = rfd::FileDialog::new().set_title("Import from VMware").add_filter("VMware VM", &["vmwarevm", "vmx"]);
+                if let Some(h) = std::env::var_os("HOME") {
+                    let lib = PathBuf::from(h).join("Virtual Machines.localized");
+                    if lib.is_dir() {
+                        d = d.set_directory(lib);
+                    }
+                }
+                if let Some(p) = d.pick_file() {
+                    self.vmware_plan(&p);
+                }
+            }
+            "do.vmware" => self.vmware_run(),
             "import" => {
                 if let Some(p) = rfd::FileDialog::new().set_title("Add a VM file").add_filter("VM file", &["toml"]).pick_file() {
                     self.import(&p);
@@ -1012,6 +1050,59 @@ impl App {
                 self.change(|c| edit::act(c, &a));
             }
         }
+    }
+
+    /// Read a VMware VM and ask before copying anything.
+    fn vmware_plan(&mut self, p: &Path) {
+        if self.import_toast.is_some() {
+            return self.toast("An import is already running.", 0);
+        }
+        match vroom_import::plan(p) {
+            Err(e) => self.toast(e.to_string(), 3),
+            Ok(plan) => {
+                let disks = plan.disks.iter().filter(|d| !d.cdrom).count();
+                let mut text = format!(
+                    "{} CPUs, {} GB, {} disk{} to copy into {}. VMware's copy is only read.",
+                    plan.cpus,
+                    plan.memory_mib.div_ceil(1024),
+                    disks,
+                    if disks == 1 { "" } else { "s" },
+                    paths::tilde(&paths::vms_dir())
+                );
+                for n in &plan.notes {
+                    text += "\n\n";
+                    text += n;
+                }
+                let title = format!("Import {}?", plan.name);
+                let (ok, danger) = if plan.suspended { ("Import anyway", true) } else { ("Import", false) };
+                self.vmware = Some(plan);
+                self.confirm = Some((String::new(), "do.vmware".into()));
+                self.ui.set_confirm(ConfirmInfo { title: s(title), text: s(text), ok: s(ok), danger, action: s("do.vmware") });
+                self.ui.set_confirm_open(true);
+            }
+        }
+    }
+
+    fn vmware_run(&mut self) {
+        let Some(plan) = self.vmware.take() else { return };
+        let opts = vroom_import::Options { name: Some(self.unique_name(&plan.name)), keep_hardware_ids: false, accept_suspended: true };
+        self.update(Msg::Toast { text: "Importing from VMware: 0%".into(), kind: 0, action: String::new() });
+        self.import_toast = self.toasts.last().map(|t| t.toast.id);
+        let dir = paths::vms_dir();
+        std::thread::spawn(move || {
+            let _ = std::fs::create_dir_all(&dir);
+            let mut last = 0u32;
+            let r = vroom_import::run(&plan, &dir, &opts, |p| {
+                // Several disks count as one bar.
+                let per = 100.0 / p.disks.max(1) as f64;
+                let pct = (per * p.disk as f64 + per * p.done as f64 / p.total.max(1) as f64) as u32;
+                if pct != last {
+                    last = pct;
+                    msg::post(move || Msg::ImportProgress(pct));
+                }
+            });
+            msg::post(move || Msg::Imported(r.map_err(|e| e.to_string())));
+        });
     }
 
     fn ask(&mut self, title: &str, text: &str, ok: &str, danger: bool, action: &str) {
@@ -1165,8 +1256,9 @@ impl App {
         let ext = p.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
         match ext.as_str() {
             "toml" => self.import(p),
+            "vmwarevm" | "vmx" => self.vmware_plan(p),
             "iso" | "img" | "raw" => self.newvm_open(Some(p.to_path_buf())),
-            _ => self.toast("Drop an ISO to make a VM, or a .toml VM file to add it.", 0),
+            _ => self.toast("Drop an ISO to make a VM, a .toml VM file to add it, or a VMware VM to import it.", 0),
         }
     }
 
@@ -1276,6 +1368,7 @@ impl App {
         }
         all.push(e("New VM".into(), "⌘N", "plus", "newvm".into()));
         all.push(e("Add a VM file".into(), "", "file", "import".into()));
+        all.push(e("Import from VMware".into(), "", "upload", "vmware".into()));
         for (i, v) in self.vms.iter().enumerate() {
             all.push(e(format!("Go to {}", v.name()), "", "arrow-right", format!("vm:{i}:select")));
         }
@@ -1339,6 +1432,15 @@ impl App {
         }
         self.push_palette();
     }
+}
+
+/// Identity changed by hand? Random serials (every new VM has them) don't count.
+fn same_names(id: &vroom_config::Identity) -> bool {
+    let mut id = id.clone();
+    let d = vroom_config::Identity::default();
+    id.serial = d.serial.clone();
+    id.disk_serial = d.disk_serial.clone();
+    id == d
 }
 
 fn is_qcow2(p: &Path) -> bool {

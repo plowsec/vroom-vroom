@@ -5428,6 +5428,7 @@ dependencies = [
  "vroom-block",
  "vroom-config",
  "vroom-display",
+ "vroom-import",
  "vroom-state",
 ]
 

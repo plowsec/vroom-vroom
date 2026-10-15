@@ -20,6 +20,7 @@ vroom-display.workspace = true
 vroom-config.workspace = true
 vroom-state.workspace = true
 vroom-block.workspace = true
+vroom-import.workspace = true
 slint = { version = "1.18", features = ["unstable-winit-030"] }
 arboard = { version = "3", default-features = false }
 rfd = "0.15"

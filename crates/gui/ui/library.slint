@@ -210,6 +210,12 @@ export component Sidebar inherits Rectangle {
             has-icon: true;
             clicked => { Bus.act("newvm"); }
         }
+        Button {
+            text: "Import from VMware...";
+            kind: "ghost";
+            small: true;
+            clicked => { Bus.act("vmware"); }
+        }
         Text {
             text: root.host.free;
             font-size: Theme.fs-xs;
@@ -742,7 +748,7 @@ export component EmptyState inherits Rectangle {
             horizontal-alignment: center;
         }
         Text {
-            text: "Make one from an installer ISO, or add a VM file you already have.\nYou can also drop an ISO or a .toml file on this window.";
+            text: "Make one from an installer ISO, add a VM file you already have,\nor bring one over from VMware. You can also drop any of those on this window.";
             font-size: Theme.fs-lg;
             color: Theme.text-2;
             horizontal-alignment: center;
@@ -762,6 +768,12 @@ export component EmptyState inherits Rectangle {
                 icon: Icons.file;
                 has-icon: true;
                 clicked => { Bus.act("import"); }
+            }
+            Button {
+                text: "Import from VMware...";
+                icon: Icons.upload;
+                has-icon: true;
+                clicked => { Bus.act("vmware"); }
             }
         }
     }
