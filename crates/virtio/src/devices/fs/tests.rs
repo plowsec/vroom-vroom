@@ -358,11 +358,12 @@ fn windows_read_only() {
     let mut t = T::windows(true);
     let sub = t.lookup(ROOT, "sub").unwrap();
     let f = t.lookup(sub, "hello.txt").unwrap();
-    // Modes are the host's (copies out of the share don't come out
-    // read-only); changes are "access denied", not "unexpected error".
+    // No write bits: Windows refuses before asking (deletes happen at
+    // close, where an error can't reach the user). Asking anyway is
+    // "access denied", not "unexpected error".
     let (e, attr) = t.call(GETATTR, f, &[0; 16]);
     assert_eq!(e, 0);
-    assert_eq!(u32::from_le_bytes(attr[16 + 60..16 + 64].try_into().unwrap()) & 0o777, 0o644);
+    assert_eq!(u32::from_le_bytes(attr[16 + 60..16 + 64].try_into().unwrap()) & 0o777, 0o444);
     assert_eq!(t.open(f, 1), Err(EACCES));
     assert_eq!(t.call(UNLINK, sub, &name("hello.txt")).0, -EACCES);
     assert_eq!(t.setattr(f, FATTR_MODE, 0o664).0, -EACCES);
@@ -370,9 +371,12 @@ fn windows_read_only() {
     let fh = t.open(f, 0).unwrap();
     assert_eq!(t.fallocate(fh, 0, 100, 0), -EACCES);
     assert_eq!(std::fs::read(t.root.join("sub/hello.txt")).unwrap(), b"hello world");
-    // Linux gets EROFS for the same thing.
+    // Linux sees the host's modes and gets EROFS.
     let mut l = T::new(true);
     let sub = l.lookup(ROOT, "sub").unwrap();
+    let f = l.lookup(sub, "hello.txt").unwrap();
+    let (_, attr) = l.call(GETATTR, f, &[0; 16]);
+    assert_eq!(u32::from_le_bytes(attr[16 + 60..16 + 64].try_into().unwrap()) & 0o777, 0o644);
     assert_eq!(l.call(UNLINK, sub, &name("hello.txt")).0, -EROFS);
 }
 

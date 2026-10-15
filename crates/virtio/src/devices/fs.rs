@@ -5,7 +5,7 @@
 //! The FUSE server here only parses and answers; every host access goes
 //! through `vroom_fs::Share`, which never leaves the shared directory and
 //! never follows a symlink. On top of that, from the guest's side:
-//! - read-only shares refuse every change (EROFS);
+//! - read-only shares refuse every change (EROFS; Windows sees no write bits);
 //! - no symlinks, hard links or device nodes can be created;
 //! - nodes, open handles, directory listings and path lengths are capped;
 //! - every length and name in a request is checked before use.
@@ -317,8 +317,19 @@ impl FuseServer {
         Ok(p)
     }
 
+    /// Attributes as the guest sees them. Windows on a read-only share:
+    /// no write bits, so it refuses changes up front, like on a CD.
+    /// Otherwise it "deletes" a file at close, can't tell us, and the
+    /// file comes back on the next listing.
+    fn shown(&self, mut st: Stat) -> Stat {
+        if self.windows && self.share.readonly() {
+            st.mode &= !0o222;
+        }
+        st
+    }
+
     fn stat(&self, p: &[Vec<u8>]) -> std::result::Result<Stat, i32> {
-        self.share.stat(&os_path(p)).map_err(|e| linux_errno(&e))
+        self.share.stat(&os_path(p)).map(|s| self.shown(s)).map_err(|e| linux_errno(&e))
     }
 
     /// Count a lookup of `p` and return its node.
@@ -528,7 +539,7 @@ impl FuseServer {
             let st = match e.name.as_bytes() {
                 b"." => self.stat(&dir).ok(),
                 b".." => self.stat(dir.split_last().map_or(&dir[..], |(_, up)| up)).ok(),
-                _ => st,
+                _ => st.map(|s| self.shown(s)),
             };
             // Gone since the listing: skip it.
             let Some(st) = st else { continue };
@@ -851,7 +862,7 @@ impl FuseServer {
             self.share.set_times(&p, a, m).map_err(|e| linux_errno(&e))?;
         }
         // uid/gid changes: accepted and ignored (files are the host user's).
-        let st = self.share.stat(&p).map_err(|e| linux_errno(&e))?;
+        let st = self.share.stat(&p).map(|s| self.shown(s)).map_err(|e| linux_errno(&e))?;
         let mut o = Out::default();
         o.u64(TTL_SECS).u32(0).u32(0).attr(&st, uid, gid);
         Ok(o.0)
