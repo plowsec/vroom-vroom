@@ -185,6 +185,34 @@ impl GuestMemory {
         Ok(())
     }
 
+    /// Host iovecs for guest buffers, after checking every byte is RAM.
+    fn iovecs(&self, segs: &[(GuestAddress, usize)]) -> std::io::Result<Vec<libc::iovec>> {
+        let mut v = Vec::with_capacity(segs.len());
+        for &(a, len) in segs {
+            self.walk(a, len as u64, |r, off, span| {
+                v.push(libc::iovec { iov_base: r.host_ptr().wrapping_add(off).cast(), iov_len: span.len() });
+                Ok(())
+            })
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+        }
+        Ok(v)
+    }
+
+    /// Read `file` at `offset` straight into the guest buffers `segs`, in
+    /// order (disk reads without a bounce buffer: the kernel copies into
+    /// guest RAM). All of it or an error; reading past the end of the file
+    /// is an error.
+    pub fn read_file(&self, file: &std::fs::File, offset: u64, segs: &[(GuestAddress, usize)]) -> std::io::Result<()> {
+        let mut iov = self.iovecs(segs)?;
+        file_io(file, offset, &mut iov, false)
+    }
+
+    /// Write the guest buffers `segs`, in order, to `file` at `offset`.
+    pub fn write_file(&self, file: &std::fs::File, offset: u64, segs: &[(GuestAddress, usize)]) -> std::io::Result<()> {
+        let mut iov = self.iovecs(segs)?;
+        file_io(file, offset, &mut iov, true)
+    }
+
     /// Host pointer for an aligned u16 in RAM (for atomics).
     fn aligned_u16_ptr(&self, addr: GuestAddress) -> Result<*mut u16> {
         if !addr.0.is_multiple_of(2) {
@@ -231,9 +259,94 @@ impl GuestMemory {
     }
 }
 
+/// preadv/pwritev until every iovec is done. The iovecs point into guest
+/// RAM (checked by the caller); no Rust reference to it is ever made.
+fn file_io(file: &std::fs::File, mut offset: u64, iov: &mut [libc::iovec], write: bool) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    const IOV_MAX: usize = 1024;
+    let mut i = 0;
+    while i < iov.len() {
+        if iov[i].iov_len == 0 {
+            i += 1;
+            continue;
+        }
+        let n = (iov.len() - i).min(IOV_MAX);
+        let off = libc::off_t::try_from(offset).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        // SAFETY: iov[i..i+n] describe live guest RAM (bounds-checked in
+        // iovecs(), mappings live as long as self); the kernel accesses
+        // them, not Rust code. n <= IOV_MAX fits a c_int.
+        let r = unsafe {
+            if write {
+                libc::pwritev(file.as_raw_fd(), iov[i..].as_ptr(), n as libc::c_int, off)
+            } else {
+                libc::preadv(file.as_raw_fd(), iov[i..].as_ptr(), n as libc::c_int, off)
+            }
+        };
+        if r < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        if r == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        let mut done = r as usize;
+        offset += done as u64;
+        while done > 0 {
+            let v = &mut iov[i];
+            let k = done.min(v.iov_len);
+            v.iov_base = v.iov_base.cast::<u8>().wrapping_add(k).cast();
+            v.iov_len -= k;
+            done -= k;
+            if v.iov_len == 0 {
+                i += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_io_across_regions_and_bounds() {
+        use std::io::{Seek, Write};
+        let m = mem();
+        let boundary = m.regions().next().unwrap().end();
+        let mut f = tempfile_in_tmp();
+        let data: Vec<u8> = (0..10000u32).map(|i| (i % 251) as u8).collect();
+        f.write_all(&data).unwrap();
+        f.rewind().unwrap();
+        // Two segments, the first crossing the region boundary.
+        let segs = [(GuestAddress(boundary.0 - 100), 300), (GuestAddress(boundary.0 + 1000), 5000)];
+        m.read_file(&f, 7, &segs).unwrap();
+        let mut b = vec![0u8; 300];
+        m.read(segs[0].0, &mut b).unwrap();
+        assert_eq!(b, data[7..307]);
+        let mut b = vec![0u8; 5000];
+        m.read(segs[1].0, &mut b).unwrap();
+        assert_eq!(b, data[307..5307]);
+        // And back out, somewhere else in the file.
+        m.write_file(&f, 20000, &segs).unwrap();
+        let mut back = vec![0u8; 5300];
+        std::os::unix::fs::FileExt::read_exact_at(&f, &mut back, 20000).unwrap();
+        assert_eq!(back, data[7..5307]);
+        // Past the end of the file, outside RAM: errors, not crashes.
+        assert!(m.read_file(&f, 30000, &segs).is_err());
+        assert!(m.read_file(&f, 0, &[(m.end_addr(), 1)]).is_err());
+        assert!(m.write_file(&f, 0, &[(GuestAddress(boundary.0 - 1), usize::MAX)]).is_err());
+    }
+
+    fn tempfile_in_tmp() -> std::fs::File {
+        let p = std::env::temp_dir().join(format!("vroom-mem-test-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&p).unwrap();
+        let _ = std::fs::remove_file(&p);
+        f
+    }
 
     fn mem() -> GuestMemory {
         let ps = page_size() as u64;
