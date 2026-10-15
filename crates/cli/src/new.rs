@@ -2,6 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
+use bulwark_config::template::NewVm;
+use bulwark_config::GuestOs;
 use clap::{Args, ValueEnum};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -34,52 +36,13 @@ pub struct NewArgs {
     pub dir: PathBuf,
 }
 
-fn installer(os: Os, iso: &Path) -> String {
-    let p = iso.display().to_string().replace('\\', "\\\\").replace('"', "\\\"");
-    match os {
-        Os::Linux => format!(
-            "\n# Installer. Remove this block once installed.\n[[disk]]\npath = \"{p}\"\nreadonly = true\ncdrom = true\n"
-        ),
-        Os::Windows => format!(
-            "\n# Install stick (FAT32/MBR image, see docs/GUIDE.md). Remove this block\n\
-             # once Windows is installed: left in, a failed boot can fall back to\n\
-             # it and reinstall over disk 0.\n[[disk]]\npath = \"{p}\"\nreadonly = true\nformat = \"raw\"\nbus = \"nvme\"\n"
-        ),
+impl Os {
+    fn guest(self) -> GuestOs {
+        match self {
+            Os::Linux => GuestOs::Linux,
+            Os::Windows => GuestOs::Windows,
+        }
     }
-}
-
-pub fn template(a: &NewArgs, disk_file: &str) -> String {
-    let host_cpus = std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(4);
-    let cpus = a.cpus.unwrap_or_else(|| host_cpus.clamp(1, 4));
-    let (mem, bus, tpm, extra) = match a.os {
-        Os::Linux => (a.memory_mib.unwrap_or(4096), "virtio", false, ""),
-        Os::Windows => (a.memory_mib.unwrap_or(8192), "nvme", true, "# Windows setup only has an NVMe driver.\n"),
-    };
-    let mut s = format!(
-        "# Created by `bulwark new`. Reference: README.md, docs/GUIDE.md.\n\
-         name = \"{name}\"\n\
-         cpus = {cpus}\n\
-         memory_mib = {mem}\n\
-         tpm = {tpm}\n\
-         \n\
-         [boot]\n\
-         type = \"uefi\"\n\
-         vars = \"{name}.state/efivars.fd\"\n\
-         \n\
-         {extra}[[disk]]\n\
-         path = \"{disk_file}\"\n\
-         format = \"qcow2\"\n\
-         bus = \"{bus}\"\n",
-        name = a.name,
-    );
-    if let Some(iso) = &a.iso {
-        s += &installer(a.os, iso);
-    }
-    s += "\n[[net]]\nmode = \"nat\"\n# port_forwards = [{ host_port = 2222, guest_port = 22 }]\n\
-          \n[display]\ngpu = \"virtio2d\"\nwidth = 1280\nheight = 800\n\
-          \n# Shared folder (Linux guest: mount -t virtiofs host /mnt).\n\
-          # [[share]]\n# path = \"/Users/me/shared\"\n# tag = \"host\"\n# readonly = true\n";
-    s
 }
 
 pub fn run(a: NewArgs, load: impl Fn(&Path) -> Result<bulwark_config::VmConfig, String>) -> Result<(), String> {
@@ -101,7 +64,11 @@ pub fn run(a: NewArgs, load: impl Fn(&Path) -> Result<bulwark_config::VmConfig, 
         }
     }
     let size = crate::disk::parse_size(&a.disk)?;
-    let text = template(&a, &disk_file);
+    let mut n = NewVm::defaults(&a.name, a.os.guest(), &disk_file);
+    n.installer = a.iso.as_deref();
+    n.cpus = a.cpus.unwrap_or(n.cpus);
+    n.memory_mib = a.memory_mib.unwrap_or(n.memory_mib);
+    let text = n.render();
     std::fs::write(&cfg_path, &text).map_err(|e| format!("{}: {e}", cfg_path.display()))?;
     // Check it the way `run` will read it, before creating the disk.
     if let Err(e) = load(&cfg_path) {
@@ -112,28 +79,4 @@ pub fn run(a: NewArgs, load: impl Fn(&Path) -> Result<bulwark_config::VmConfig, 
     println!("created {} and {} ({} bytes)", cfg_path.display(), disk_path.display(), size);
     println!("start it: bulwark-gui {}", cfg_path.display());
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn templates_parse() {
-        for os in [Os::Linux, Os::Windows] {
-            let a = NewArgs {
-                name: "t".into(),
-                os,
-                disk: "8G".into(),
-                iso: Some("/tmp/x \"quoted\".iso".into()),
-                cpus: None,
-                memory_mib: None,
-                dir: ".".into(),
-            };
-            let c = bulwark_config::VmConfig::from_toml(&template(&a, "t.qcow2")).unwrap();
-            c.validate().unwrap();
-            assert_eq!(c.tpm, os == Os::Windows);
-            assert_eq!(c.disks.len(), 2);
-        }
-    }
 }

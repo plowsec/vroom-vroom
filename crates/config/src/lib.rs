@@ -4,7 +4,9 @@
 //! disable a security setting). Everything is validated before use.
 #![forbid(unsafe_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+pub mod template;
 
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +22,8 @@ pub enum Error {
     Parse(String),
     #[error("invalid config: {0}")]
     Invalid(String),
+    #[error("{0}")]
+    Io(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -62,6 +66,64 @@ pub struct VmConfig {
     /// Windows 11 wants one; Linux uses it for measured boot.
     #[serde(default)]
     pub tpm: bool,
+    /// What the guest runs. Only picks icons and sensible defaults; the
+    /// VM is the same either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os: Option<GuestOs>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GuestOs {
+    Windows,
+    Ubuntu,
+    Debian,
+    Fedora,
+    Alpine,
+    Linux,
+    Other,
+}
+
+impl GuestOs {
+    pub const ALL: [GuestOs; 7] =
+        [GuestOs::Ubuntu, GuestOs::Windows, GuestOs::Debian, GuestOs::Fedora, GuestOs::Alpine, GuestOs::Linux, GuestOs::Other];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            GuestOs::Windows => "Windows",
+            GuestOs::Ubuntu => "Ubuntu",
+            GuestOs::Debian => "Debian",
+            GuestOs::Fedora => "Fedora",
+            GuestOs::Alpine => "Alpine",
+            GuestOs::Linux => "Linux",
+            GuestOs::Other => "Other",
+        }
+    }
+
+    pub fn is_linux(self) -> bool {
+        !matches!(self, GuestOs::Windows | GuestOs::Other)
+    }
+
+    /// Best guess from a file name ("ubuntu-24.04-arm64.iso", "Win11_ARM64.iso").
+    pub fn guess(name: &str) -> Option<GuestOs> {
+        let n = name.to_ascii_lowercase();
+        let has = |k: &str| n.contains(k);
+        Some(if has("win") {
+            GuestOs::Windows
+        } else if has("ubuntu") || has("kubuntu") || has("xubuntu") {
+            GuestOs::Ubuntu
+        } else if has("debian") {
+            GuestOs::Debian
+        } else if has("fedora") {
+            GuestOs::Fedora
+        } else if has("alpine") {
+            GuestOs::Alpine
+        } else if has("linux") || has("arch") || has("mint") || has("kali") || has("suse") || has("rocky") || has("alma") {
+            GuestOs::Linux
+        } else {
+            return None;
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -370,6 +432,44 @@ impl Default for Security {
 }
 
 impl VmConfig {
+    /// The guest OS, said or guessed (old files don't say).
+    pub fn guest_os(&self) -> GuestOs {
+        if let Some(o) = self.os {
+            return o;
+        }
+        if let Some(o) = GuestOs::guess(&self.name) {
+            return o;
+        }
+        // Windows setups here use NVMe + TPM; Linux ones virtio.
+        if self.tpm && self.disks.iter().any(|d| d.bus == DiskBus::Nvme) {
+            GuestOs::Windows
+        } else {
+            GuestOs::Linux
+        }
+    }
+
+    /// Read and check a VM file, then make its relative paths absolute
+    /// against the file's directory, so nothing derived from them (qcow2
+    /// backing names in snapshot overlays) depends on the current dir.
+    pub fn load(p: &Path) -> Result<Self> {
+        let mut c = Self::load_raw(p)?;
+        c.rebase_paths(&config_dir(p)?);
+        Ok(c)
+    }
+
+    /// Read and check a VM file, paths as written (for editing it).
+    pub fn load_raw(p: &Path) -> Result<Self> {
+        let s = std::fs::read_to_string(p).map_err(|e| Error::Io(format!("{}: {e}", p.display())))?;
+        Self::from_toml(&s)
+    }
+
+    /// `<config dir>/<name>.state`: snapshots, suspend image, NVRAM, overlays.
+    pub fn default_state_dir(&self, config: &Path) -> PathBuf {
+        let dir = config.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        dir.join(format!("{}.state", self.name))
+    }
+
     pub fn from_toml(s: &str) -> Result<Self> {
         let c: VmConfig = toml::from_str(s).map_err(|e| Error::Parse(e.to_string()))?;
         c.validate()?;
@@ -537,7 +637,14 @@ impl VmConfig {
     }
 }
 
-fn valid_name(s: &str) -> bool {
+/// The directory a config's relative paths are relative to, canonical.
+pub fn config_dir(config: &Path) -> Result<PathBuf> {
+    let base = config.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    std::fs::canonicalize(base).map_err(|e| Error::Io(format!("{}: {e}", base.display())))
+}
+
+/// VM, network and share names: 1-64 of `[A-Za-z0-9._-]`, no leading dot.
+pub fn valid_name(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
         && !s.starts_with('.')

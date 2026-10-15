@@ -15,7 +15,18 @@ use std::path::{Path, PathBuf};
 use bulwark_block::qcow2::{fold_backing, OpenPolicy};
 use bulwark_snapshot::SnapshotDir;
 
-use crate::{Error, Result};
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// Another bulwark process (a running VM) holds the state dir.
+    #[error("{0} is in use by another bulwark process")]
+    Busy(String),
+    #[error("{0}")]
+    Setup(String),
+    #[error("i/o: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
 
 /// Held for as long as a VMM (or a housekeeping command) uses a state dir.
 #[derive(Debug)]
@@ -28,16 +39,29 @@ impl StateLock {
         o.read(true).write(true).create(true).truncate(false);
         std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
         let f = o.open(dir.join("lock"))?;
-        // SAFETY: valid fd we own; flock has no memory effects.
-        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        // A probe (`in_use`) or a forked child that hasn't exec'd yet can
+        // hold it for a moment: retry briefly.
+        for _ in 0..20 {
+            // SAFETY: valid fd we own; flock has no memory effects.
+            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(StateLock(f));
+            }
             let e = std::io::Error::last_os_error();
-            return Err(if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
-                Error::Setup(format!("{} is in use by another bulwark process", dir.display()))
-            } else {
-                Error::Io(e)
-            });
+            if e.raw_os_error() != Some(libc::EWOULDBLOCK) {
+                return Err(Error::Io(e));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        Ok(StateLock(f))
+        Err(Error::Busy(dir.display().to_string()))
+    }
+
+    /// Is a VMM running on this state dir? Takes a shared lock for an
+    /// instant; never creates anything.
+    pub fn in_use(dir: &Path) -> bool {
+        let Ok(f) = File::open(dir.join("lock")) else { return false };
+        // SAFETY: valid fd we own; the lock goes away with `f`.
+        let r = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
+        r != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EWOULDBLOCK)
     }
 
     /// Bytes free for us on the state dir's filesystem (disk layers grow
@@ -61,6 +85,7 @@ pub fn free_bytes(f: &File) -> std::io::Result<u64> {
 #[derive(Debug, Clone)]
 pub struct SnapshotInfo {
     pub name: String,
+    pub path: PathBuf,
     pub created_unix: u64,
     pub description: String,
     /// Bytes on disk for the snapshot itself (not its disk layers).
@@ -85,6 +110,7 @@ pub fn list(state: &Path) -> Result<Vec<SnapshotInfo>> {
         let Ok(s) = SnapshotDir::open(&e.path()) else { continue };
         out.push(SnapshotInfo {
             name: e.file_name().to_string_lossy().into_owned(),
+            path: e.path(),
             created_unix: s.manifest.created_unix,
             description: s.manifest.description.clone(),
             bytes: dir_bytes(&e.path()),
@@ -212,4 +238,37 @@ pub fn prune(state: &Path, base_dirs: &[PathBuf]) -> Result<PruneReport> {
         report.folded.push(gone);
     }
     Ok(report)
+}
+
+/// A suspend image is waiting: the next start resumes it.
+pub fn is_suspended(state: &Path) -> bool {
+    state.join("suspend").join("manifest.json").is_file()
+}
+
+/// Throw the suspend image away: the next start boots fresh. The caller
+/// holds the lock. Its disk layers go with the next prune.
+pub fn discard_suspend(state: &Path, base_dirs: &[PathBuf]) -> Result<PruneReport> {
+    let d = state.join("suspend");
+    if d.exists() {
+        std::fs::remove_dir_all(&d)?;
+    }
+    prune(state, base_dirs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lock_and_probe() {
+        let t = tempfile::tempdir().unwrap();
+        assert!(!StateLock::in_use(t.path()));
+        let l = StateLock::acquire(t.path()).unwrap();
+        assert!(StateLock::in_use(t.path()));
+        assert!(matches!(StateLock::acquire(t.path()), Err(Error::Busy(_))));
+        drop(l);
+        assert!(!StateLock::in_use(t.path()));
+        // The probe itself doesn't block a VMM from starting.
+        let _l = StateLock::acquire(t.path()).unwrap();
+    }
 }

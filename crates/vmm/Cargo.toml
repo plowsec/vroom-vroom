@@ -26,6 +26,7 @@ bulwark-net.workspace = true
 bulwark-audio.workspace = true
 bulwark-proto.workspace = true
 bulwark-display.workspace = true
+bulwark-state.workspace = true
 png = "0.17"
 
 [dev-dependencies]

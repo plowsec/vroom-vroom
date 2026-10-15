@@ -15,7 +15,7 @@ static HELPERS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
 pub(crate) fn note_helper(pid: u32) {
     HELPERS.lock().unwrap_or_else(|e| e.into_inner()).push(pid);
 }
-pub mod state;
+pub use bulwark_state as state;
 mod display;
 mod firmware;
 mod irq;
@@ -55,6 +55,8 @@ pub enum Error {
     Snapshot(#[from] bulwark_snapshot::Error),
     #[error("setup: {0}")]
     Setup(String),
+    #[error("{0}")]
+    State(#[from] bulwark_state::Error),
     #[error("i/o: {0}")]
     Io(#[from] std::io::Error),
     #[error("a vCPU thread is gone")]
