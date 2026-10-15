@@ -105,8 +105,9 @@ clipboard text (size-capped).
 
 `fuzz/` has cargo-fuzz targets for what a guest (or a downloaded image)
 controls: agent protocol, network frames, virtqueue chains over arbitrary
-guest memory, xHCI and NVMe driven by arbitrary register writes plus
-guest RAM, qcow2 images. Run with
+guest memory, virtio-gpu 2D commands, the virtio-pci transport and PCI
+config space, xHCI, NVMe, TPM TIS, fw_cfg (DMA included) and flash, each
+driven by arbitrary register writes plus guest RAM; and qcow2 images. Run with
 `cargo +nightly fuzz run -O <target>`. First runs found two qcow2 bugs
 (a crash on short v3 headers, multi-GB allocations from crafted table
 sizes); both fixed.
@@ -123,4 +124,5 @@ two processes can't write the same disk layers.
 - The Windows agent split is new; installs from before it run the
   all-in-one agent elevated (re-run `bulwark-setup.cmd` to upgrade).
 - x86_64 isn't implemented, so none of this is tested there.
-- Fuzzing doesn't cover virtio-gpu commands or the TPM interface yet.
+- Fuzzing doesn't cover Venus (3D) command streams: that is
+  virglrenderer's C code, which runs in the VMM process when 3D is on.

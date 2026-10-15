@@ -67,3 +67,21 @@ name = "tpm_tis"
 path = "fuzz_targets/tpm_tis.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "fw_cfg"
+path = "fuzz_targets/fw_cfg.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "pflash"
+path = "fuzz_targets/pflash.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "pci_virtio"
+path = "fuzz_targets/pci_virtio.rs"
+test = false
+doc = false
