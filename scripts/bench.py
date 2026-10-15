@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Boot a Linux guest under vroom (or QEMU, for comparison) and measure it.
 
-usage: bench.py WORKDIR [--vmm vroom|qemu] [--bin PATH] [--boot kernel|uefi]
+usage: bench.py --table RESULTS.jsonl   (medians per tag, Markdown)
+       bench.py WORKDIR [--vmm vroom|qemu] [--bin PATH] [--boot kernel|uefi]
                 [--bus virtio|nvme] [--fmt raw|qcow2] [--tests boot,idle,exit,fio,net]
                 [--runs N] [--tag NAME]
 
@@ -361,7 +362,43 @@ def one_run(a, i):
     return r
 
 
+def table(path):
+    """Medians per tag of a results.jsonl, as a Markdown table: one column
+    per tag (in the order they first appear), one row per number."""
+    runs = {}
+    for line in open(path):
+        r = json.loads(line)
+        if "error" in r:
+            continue
+        flat = {k: v for k, v in r.items() if isinstance(v, (int, float)) and k != "run"}
+        for k, v in r.get("fio", {}).items():
+            flat[f"fio {k} " + ("MB/s" if "1m" in k else "IOPS")] = v["mbs"] if "1m" in k else v["iops"]
+            if "4k-qd1" in k:
+                flat[f"fio {k} latency us"] = v["lat_us"]
+        for k, v in (r.get("net") or {}).items():
+            if v is not None:
+                flat[f"net {k}"] = v
+        runs.setdefault(r["tag"], []).append(flat)
+    tags = list(runs)
+    keys = []
+    for t in tags:
+        for f in runs[t]:
+            keys += [k for k in f if k not in keys]
+    def med(t, k):
+        v = sorted(f[k] for f in runs[t] if k in f)
+        if not v:
+            return ""
+        m = v[len(v) // 2] if len(v) % 2 else (v[len(v) // 2 - 1] + v[len(v) // 2]) / 2
+        return f"{m:.3g}" if m < 100 else f"{m:.0f}"
+    print("| | " + " | ".join(f"{t} (n={len(runs[t])})" for t in tags) + " |")
+    print("|---" * (len(tags) + 1) + "|")
+    for k in keys:
+        print(f"| {k} | " + " | ".join(med(t, k) for t in tags) + " |")
+
+
 def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "--table":
+        return table(sys.argv[2])
     ap = argparse.ArgumentParser()
     ap.add_argument("workdir")
     ap.add_argument("--vmm", default="vroom", choices=["vroom", "qemu"])
