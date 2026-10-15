@@ -1,12 +1,12 @@
-# bulwark guest agent, system part: owns the host channel (root only),
+# vroom guest agent, system part: owns the host channel (root only),
 # syncs the clock, handles clean shutdown, relays clipboard/resolution to
 # the session helper of the user on screen.
 [Unit]
-Description=bulwark guest agent
+Description=vroom guest agent
 After=systemd-udevd.service
 
 [Service]
-ExecStart=/usr/local/bin/bulwark-agent --service
+ExecStart=/usr/local/bin/vroom-agent --service
 Restart=always
 RestartSec=2
 NoNewPrivileges=yes

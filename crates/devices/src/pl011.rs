@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::Arc;
 
-use bulwark_snapshot::{decode, encode, Snapshottable};
+use vroom_snapshot::{decode, encode, Snapshottable};
 use serde::{Deserialize, Serialize};
 
 use crate::{put_le, BusDevice, IrqLine};
@@ -176,11 +176,11 @@ impl Snapshottable for Pl011 {
         format!("pl011@{:x}", self.base)
     }
 
-    fn save(&mut self) -> bulwark_snapshot::Result<Vec<u8>> {
+    fn save(&mut self) -> vroom_snapshot::Result<Vec<u8>> {
         encode(&self.regs)
     }
 
-    fn restore(&mut self, data: &[u8]) -> bulwark_snapshot::Result<()> {
+    fn restore(&mut self, data: &[u8]) -> vroom_snapshot::Result<()> {
         let mut regs: Regs = decode(data)?;
         regs.rx.truncate(RX_CAP);
         self.regs = regs;

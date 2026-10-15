@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use bulwark_block::{DiskImage, SECTOR_SIZE};
+use vroom_block::{DiskImage, SECTOR_SIZE};
 
 use crate::worker::{QueueCtx, QueueHandler, WorkerSlot};
 use crate::{chain::DescriptorChain, types, ActivateContext, DeviceState, Result, VirtioDevice};
@@ -43,7 +43,7 @@ impl Block {
     /// `id` must be unique per VM ("vda", "vdb"...); used in snapshots.
     pub fn new(id: &str, disk: Arc<dyn DiskImage>) -> Self {
         let mut serial = [0u8; 20];
-        let s = format!("bulwark-{id}");
+        let s = format!("vroom-{id}");
         let n = s.len().min(20);
         serial[..n].copy_from_slice(&s.as_bytes()[..n]);
         Block { disk, id: id.to_string(), serial, worker: WorkerSlot::default() }
@@ -133,7 +133,7 @@ impl BlockHandler {
                 }
                 let off = s.checked_mul(SECTOR_SIZE).ok_or(S_IOERR)?;
                 let len = n as u64 * SECTOR_SIZE;
-                bulwark_block::check_range(self.disk.size(), off, len).map_err(|_| S_IOERR)?;
+                vroom_block::check_range(self.disk.size(), off, len).map_err(|_| S_IOERR)?;
                 if ty == T_DISCARD {
                     self.disk.discard(off, len).map_err(|_| S_IOERR)
                 } else {
@@ -226,8 +226,8 @@ impl VirtioDevice for Block {
 mod tests {
     use super::*;
     use crate::queue::tests::*;
-    use bulwark_block::raw::RawImage;
-    use bulwark_memory::GuestAddress;
+    use vroom_block::raw::RawImage;
+    use vroom_memory::GuestAddress;
 
     fn disk() -> Arc<dyn DiskImage> {
         let f = tempfile::tempfile().unwrap();

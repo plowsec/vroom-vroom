@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use bulwark_devices::Bus;
-use bulwark_hv::{BootRegs, Vcpu, VcpuExit, VcpuKicker, VcpuState, Vm};
+use vroom_devices::Bus;
+use vroom_hv::{BootRegs, Vcpu, VcpuExit, VcpuKicker, VcpuState, Vm};
 
 use crate::psci::{self, CpuTable, PsciOutcome};
 use crate::{Error, Result};
@@ -56,7 +56,7 @@ pub enum VmEvent {
     Reset,
     Crashed(String),
     /// Lifecycle request from the viewer window.
-    Ui(bulwark_display::Command),
+    Ui(vroom_display::Command),
     ViewerClosed,
 }
 
@@ -293,7 +293,7 @@ impl VcpuLoop {
                     Some(peer) if peer.send(VcpuCmd::PowerOn(regs)).is_ok() => 0,
                     _ => {
                         self.shared.cpus.lock().unwrap_or_else(|e| e.into_inner()).set_on(target, false);
-                        bulwark_hv::aarch64::psci::INTERNAL_FAILURE
+                        vroom_hv::aarch64::psci::INTERNAL_FAILURE
                     }
                 }
             }

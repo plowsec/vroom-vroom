@@ -2,9 +2,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use bulwark_devices::{get_le, put_le, BusDevice, IrqLine};
-use bulwark_memory::GuestMemory;
-use bulwark_snapshot::{decode, encode, Snapshottable};
+use vroom_devices::{get_le, put_le, BusDevice, IrqLine};
+use vroom_memory::GuestMemory;
+use vroom_snapshot::{decode, encode, Snapshottable};
 use serde::{Deserialize, Serialize};
 
 use crate::core::{CoreState, VirtioCore};
@@ -263,15 +263,15 @@ impl Snapshottable for VirtioMmio {
         self.core.resume();
     }
 
-    fn save(&mut self) -> bulwark_snapshot::Result<Vec<u8>> {
-        let core = self.core.save().map_err(|e| bulwark_snapshot::Error::Encode(e.to_string()))?;
+    fn save(&mut self) -> vroom_snapshot::Result<Vec<u8>> {
+        let core = self.core.save().map_err(|e| vroom_snapshot::Error::Encode(e.to_string()))?;
         encode(&MmioSnapshot { sel: self.sel.clone(), interrupt_status: self.irq.get(), core })
     }
 
-    fn restore(&mut self, data: &[u8]) -> bulwark_snapshot::Result<()> {
+    fn restore(&mut self, data: &[u8]) -> vroom_snapshot::Result<()> {
         let s: MmioSnapshot = decode(data)?;
         let irq = self.irq_dyn();
-        self.core.restore(s.core, &irq).map_err(|e| bulwark_snapshot::Error::Invalid(e.to_string()))?;
+        self.core.restore(s.core, &irq).map_err(|e| vroom_snapshot::Error::Invalid(e.to_string()))?;
         self.sel = s.sel;
         self.irq.set(s.interrupt_status);
         Ok(())

@@ -5,8 +5,8 @@
 #![no_main]
 use std::path::Path;
 
-use bulwark_block::qcow2::Qcow2Image;
-use bulwark_block::{DiskImage, Format};
+use vroom_block::qcow2::Qcow2Image;
+use vroom_block::{DiskImage, Format};
 use libfuzzer_sys::fuzz_target;
 
 const C: u64 = 64 << 10;
@@ -50,7 +50,7 @@ fuzz_target!(|data: &[u8]| {
             }
             _ => {
                 drop(q);
-                bulwark_block::qcow2::compact(&top, &Default::default()).unwrap();
+                vroom_block::qcow2::compact(&top, &Default::default()).unwrap();
                 q = open(&top);
             }
         }

@@ -4,11 +4,11 @@
 #![no_main]
 use std::sync::{Arc, Mutex};
 
-use bulwark_devices::pci::{IntxRouter, MsiSender, PciRoot, SharedPciDevice};
-use bulwark_devices::{BusDevice, NoIrq};
-use bulwark_memory::{GuestAddress, GuestMemory};
-use bulwark_virtio::devices::rng::Rng;
-use bulwark_virtio::pci::VirtioPci;
+use vroom_devices::pci::{IntxRouter, MsiSender, PciRoot, SharedPciDevice};
+use vroom_devices::{BusDevice, NoIrq};
+use vroom_memory::{GuestAddress, GuestMemory};
+use vroom_virtio::devices::rng::Rng;
+use vroom_virtio::pci::VirtioPci;
 use libfuzzer_sys::fuzz_target;
 
 struct NoMsi;

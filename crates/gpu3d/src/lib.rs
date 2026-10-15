@@ -17,7 +17,7 @@ use std::ffi::{c_char, c_int, c_void, CString};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::{Mutex, OnceLock};
 
-use bulwark_virtio::devices::gpu3d::{Blob, Create3d, FenceDone, HostIov, Mapping, Renderer3d, Transfer3d};
+use vroom_virtio::devices::gpu3d::{Blob, Create3d, FenceDone, HostIov, Mapping, Renderer3d, Transfer3d};
 
 const CAPSET_VENUS: u32 = 4;
 // Venus only: GL (virgl) is off, its capsets would be empty.
@@ -115,7 +115,7 @@ static LIB: OnceLock<Option<Lib>> = OnceLock::new();
 
 fn candidates() -> Vec<String> {
     let mut v = Vec::new();
-    if let Ok(p) = std::env::var("BULWARK_VIRGLRENDERER") {
+    if let Ok(p) = std::env::var("VROOM_VIRGLRENDERER") {
         v.push(p);
     }
     // Our patched build (scripts/build-virglrenderer.sh) ships next to the

@@ -2,7 +2,7 @@
 //! session helper (`--session`, in the user's desktop) talks to.
 //!
 //! Socket rules:
-//! - `/run/bulwark-agent.sock`: /run is root's, nobody can squat the name;
+//! - `/run/vroom-agent.sock`: /run is root's, nobody can squat the name;
 //!   the helper also checks its peer is root.
 //! - The service only serves the user logind says is active on seat0, so
 //!   another local user can't listen in on the clipboard.
@@ -18,7 +18,7 @@ use std::time::Duration;
 use crate::port::{self, Reader, Writer};
 use crate::relay::{Ev, RealSystem, Relay};
 
-pub const SOCKET: &str = "/run/bulwark-agent.sock";
+pub const SOCKET: &str = "/run/vroom-agent.sock";
 
 #[allow(unsafe_code)]
 fn peer_uid(s: &UnixStream) -> std::io::Result<u32> {

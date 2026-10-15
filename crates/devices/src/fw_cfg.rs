@@ -6,8 +6,8 @@
 
 use std::collections::BTreeMap;
 
-use bulwark_memory::{GuestAddress, GuestMemory};
-use bulwark_snapshot::{decode, encode, Snapshottable};
+use vroom_memory::{GuestAddress, GuestMemory};
+use vroom_snapshot::{decode, encode, Snapshottable};
 use serde::{Deserialize, Serialize};
 
 use crate::BusDevice;
@@ -208,14 +208,14 @@ impl Snapshottable for FwCfg {
         format!("fwcfg@{:x}", self.base)
     }
 
-    fn save(&mut self) -> bulwark_snapshot::Result<Vec<u8>> {
+    fn save(&mut self) -> vroom_snapshot::Result<Vec<u8>> {
         // Writable items (ramfb config) are part of the state.
         let writable: Vec<(u16, Vec<u8>)> =
             self.items.iter().filter(|(_, i)| i.on_write.is_some()).map(|(k, i)| (*k, i.data.clone())).collect();
         encode(&(self.st.clone(), writable))
     }
 
-    fn restore(&mut self, data: &[u8]) -> bulwark_snapshot::Result<()> {
+    fn restore(&mut self, data: &[u8]) -> vroom_snapshot::Result<()> {
         let (st, writable): (State, Vec<(u16, Vec<u8>)>) = decode(data)?;
         self.st = st;
         for (k, v) in writable {

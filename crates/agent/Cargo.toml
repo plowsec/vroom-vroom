@@ -1,16 +1,16 @@
 [package]
-name = "bulwark-agent"
+name = "vroom-agent"
 description = "Guest agent: clipboard, time sync, clean shutdown. Runs inside the VM."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "bulwark-agent"
+name = "vroom-agent"
 path = "src/main.rs"
 
 [dependencies]
-bulwark-proto.workspace = true
+vroom-proto.workspace = true
 log.workspace = true
 env_logger.workspace = true
 

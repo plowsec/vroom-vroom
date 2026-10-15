@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use bulwark_memory::{GuestAddress, GuestMemory};
+use vroom_memory::{GuestAddress, GuestMemory};
 use serde::{Deserialize, Serialize};
 
 use crate::devices::gpu3d::{Blob, Box3d, Create3d, Renderer3d, ShmMapper, Transfer3d};
@@ -682,7 +682,7 @@ impl GpuHandler {
         if res.mapped.is_some() {
             return bad;
         }
-        let ps = bulwark_memory::page_size() as u64;
+        let ps = vroom_memory::page_size() as u64;
         let base = t.shm_base.load(Ordering::Acquire);
         if base == 0 || !offset.is_multiple_of(ps) {
             return bad;

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use bulwark_memory::GuestMemory;
+use vroom_memory::GuestMemory;
 use serde::{Deserialize, Serialize};
 
 use crate::{Queue, Result};

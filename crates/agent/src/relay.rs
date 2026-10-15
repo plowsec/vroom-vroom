@@ -9,7 +9,7 @@
 use std::io::{self, Write};
 use std::sync::mpsc::Receiver;
 
-use bulwark_proto::{Decoder, Message};
+use vroom_proto::{Decoder, Message};
 
 use crate::port::Writer;
 

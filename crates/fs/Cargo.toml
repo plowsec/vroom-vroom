@@ -1,5 +1,5 @@
 [package]
-name = "bulwark-fs"
+name = "vroom-fs"
 description = "Host side of shared folders: a directory the guest may use, and nothing outside it."
 version.workspace = true
 edition.workspace = true

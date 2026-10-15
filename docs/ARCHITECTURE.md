@@ -3,21 +3,21 @@
 ## Processes
 
 ```
-bulwark-gui ──(socketpair: display protocol + shared framebuffer fd)──┐
+vroom-gui ──(socketpair: display protocol + shared framebuffer fd)──┐
                                                                       │
-bulwark run <vm.toml>   one process per VM, sandboxed after setup ◄───┘
+vroom run <vm.toml>   one process per VM, sandboxed after setup ◄───┘
    │
    ├─ vCPU threads (one per vCPU, own the hv vCPU handle)
    ├─ device workers (virtio queues, NAT, display, agent, ramfb)
-   ├─ optional: unix socket to bulwark-netd (root) for bridged/host-only
+   ├─ optional: unix socket to vroom-netd (root) for bridged/host-only
    ├─ optional: swtpm (vTPM), own sandbox, control + data socketpairs
-   └─ optional: bulwark audio-out (sound), own sandbox, datagram socket
+   └─ optional: vroom audio-out (sound), own sandbox, datagram socket
 ```
 
 The GUI never touches the guest: it shows a framebuffer the VMM shares
 with it and forwards input. Closing it makes the VMM suspend the VM.
 
-`bulwark-netd` is the only privileged piece. It owns vmnet (macOS) or
+`vroom-netd` is the only privileged piece. It owns vmnet (macOS) or
 tap+bridge (Linux) and hands each VMM an `AF_UNIX` datagram socket carrying
 Ethernet frames, after policy checks (allow-listed interfaces, per-user
 limits, source-MAC anti-spoofing). The VMM never holds an interface.
@@ -37,6 +37,7 @@ limits, source-MAC anti-spoofing). The VMM never holds an interface.
 | `block` | raw and qcow2 (COW, compressed reads, backing chains with an allow-list, discard/zero clusters with hole punching, folding a layer into its child), sync modes, swappable layers, flock-based image locks. |
 | `net` | Userspace NAT (smoltcp for the guest side, host sockets outward), DHCP/DNS, ICMP echo, fragments; netd wire protocol. |
 | `snapshot` | `Snapshottable` trait, snapshot directories with per-blob SHA-256 and an atomic manifest. |
+| `state` | A VM's state dir: one-VMM lock, snapshot list/delete, pruning disk layers nothing needs. Shared by the CLI and the app. |
 | `vmm` | Builds the board from the config, runs vCPUs, PSCI, the agent channel, display arbitration (ramfb vs virtio-gpu), snapshots and suspend, disk layering. |
 | `sandbox` | Seatbelt profile (macOS), seccomp + Landlock (Linux). |
 | `agent` / `proto` | Guest agent (Linux, Windows) and its framed protocol over a virtio-serial port. |
@@ -74,7 +75,7 @@ the disks didn't change in between.
 Things a snapshot can't hold: host GPU objects (snapshots refuse while 3D
 contexts exist), and nested-virtualization EL2 state is best effort.
 
-Layers form a tree under `<state>/disks`. `bulwark snapshot delete/prune`
+Layers form a tree under `<state>/disks`. `vroom snapshot delete/prune`
 (VM stopped) removes layers nothing references and folds a layer that only
 one child still needs into that child (copying up the clusters the child
 lacks, then re-pointing its header), so chains stay short. A state dir is

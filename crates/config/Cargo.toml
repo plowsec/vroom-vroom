@@ -1,5 +1,5 @@
 [package]
-name = "bulwark-config"
+name = "vroom-config"
 description = "VM definition (TOML) and validation."
 version.workspace = true
 edition.workspace = true

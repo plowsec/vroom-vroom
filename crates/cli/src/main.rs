@@ -1,4 +1,4 @@
-//! `bulwark` command line.
+//! `vroom` command line.
 
 mod clip;
 mod disk;
@@ -11,11 +11,11 @@ mod term;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use bulwark_config::VmConfig;
+use vroom_config::VmConfig;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
-#[command(name = "bulwark", version, about = "Secure, modern virtual machines")]
+#[command(name = "vroom", version, about = "Secure, modern virtual machines")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -23,7 +23,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// Run a VM. Serial console on this terminal; use `bulwark-gui` for a window.
+    /// Run a VM. Serial console on this terminal; use `vroom-gui` for a window.
     Run {
         /// VM definition (TOML).
         config: PathBuf,
@@ -42,7 +42,7 @@ enum Cmd {
         /// Don't sandbox the VMM process (debugging only).
         #[arg(long)]
         no_sandbox: bool,
-        /// Display channel fd from bulwark-gui (internal).
+        /// Display channel fd from vroom-gui (internal).
         #[arg(long, hide = true)]
         ui_fd: Option<i32>,
     },
@@ -67,7 +67,7 @@ fn main() -> ExitCode {
         Cmd::Run { config, restore, fresh, state_dir, host_clipboard_file, no_sandbox, ui_fd } => {
             load(&config).and_then(|cfg| {
                 for w in cfg.warnings() {
-                    eprintln!("bulwark: warning: {w}");
+                    eprintln!("vroom: warning: {w}");
                 }
                 let state_dir = state_dir.unwrap_or_else(|| default_state_dir(&config, &cfg));
                 // Absolute before the sandbox: no cwd lookups after that.
@@ -98,7 +98,7 @@ fn main() -> ExitCode {
     match r {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("bulwark: {e}");
+            eprintln!("vroom: {e}");
             ExitCode::FAILURE
         }
     }
@@ -118,6 +118,6 @@ fn audio_out() -> Result<(), String> {
     // SAFETY: fd 0 is the socket our parent set up for us; nobody else
     // in this process uses stdin.
     let sock = unsafe { std::os::unix::net::UnixDatagram::from_raw_fd(0) };
-    let wav = std::env::var_os("BULWARK_AUDIO_WAV").map(std::path::PathBuf::from);
-    bulwark_audio::helper_main(sock, wav).map_err(|e| e.to_string())
+    let wav = std::env::var_os("VROOM_AUDIO_WAV").map(std::path::PathBuf::from);
+    vroom_audio::helper_main(sock, wav).map_err(|e| e.to_string())
 }

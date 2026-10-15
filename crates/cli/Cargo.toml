@@ -1,12 +1,12 @@
 [package]
-name = "bulwark-cli"
-description = "bulwark command line."
+name = "vroom-cli"
+description = "vroom command line."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "bulwark"
+name = "vroom"
 path = "src/main.rs"
 
 [dependencies]
@@ -14,14 +14,14 @@ log.workspace = true
 env_logger.workspace = true
 clap.workspace = true
 libc.workspace = true
-bulwark-config.workspace = true
-bulwark-hv.workspace = true
-bulwark-vmm.workspace = true
-bulwark-block.workspace = true
-bulwark-net.workspace = true
-bulwark-audio.workspace = true
-bulwark-sandbox.workspace = true
-bulwark-display.workspace = true
+vroom-config.workspace = true
+vroom-hv.workspace = true
+vroom-vmm.workspace = true
+vroom-block.workspace = true
+vroom-net.workspace = true
+vroom-audio.workspace = true
+vroom-sandbox.workspace = true
+vroom-display.workspace = true
 arboard = { version = "3", default-features = false }
 
 [lints]

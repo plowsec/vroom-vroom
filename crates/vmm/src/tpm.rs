@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use bulwark_devices::tpm::{TpmBackend, MAX_BUFFER};
+use vroom_devices::tpm::{TpmBackend, MAX_BUFFER};
 use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};
@@ -45,7 +45,7 @@ impl std::fmt::Debug for Swtpm {
 }
 
 fn find_swtpm() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("BULWARK_SWTPM") {
+    if let Some(p) = std::env::var_os("VROOM_SWTPM") {
         return Some(p.into());
     }
     ["/opt/homebrew/bin/swtpm", "/usr/local/bin/swtpm", "/usr/bin/swtpm"].iter().map(PathBuf::from).find(|p| p.is_file())
@@ -106,7 +106,7 @@ impl Swtpm {
             s.set_write_timeout(Some(TIMEOUT))?;
         }
         let mut t = Swtpm { ctrl, data, child, dir: dir.to_path_buf() };
-        bulwark_ipc::send_fd_with(&t.ctrl, &CMD_SET_DATAFD.to_be_bytes(), data_child.as_raw_fd())
+        vroom_ipc::send_fd_with(&t.ctrl, &CMD_SET_DATAFD.to_be_bytes(), data_child.as_raw_fd())
             .map_err(|e| Error::Setup(format!("vtpm: set data fd: {e}")))?;
         t.result("set data fd")?;
         drop(data_child);
@@ -130,7 +130,7 @@ impl Swtpm {
     fn command(exe: &Path, dir: &Path, args: &[String]) -> Result<Command> {
         #[cfg(target_os = "macos")]
         {
-            let prof = bulwark_sandbox::helper_profile(exe, dir).map_err(|e| Error::Setup(format!("vtpm sandbox: {e}")))?;
+            let prof = vroom_sandbox::helper_profile(exe, dir).map_err(|e| Error::Setup(format!("vtpm sandbox: {e}")))?;
             let mut c = Command::new("/usr/bin/sandbox-exec");
             c.arg("-p").arg(prof).arg(exe).args(args);
             Ok(c)

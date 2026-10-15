@@ -9,8 +9,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
-use bulwark_memory::{GuestAddress, GuestMemory};
-use bulwark_snapshot::{decode, encode};
+use vroom_memory::{GuestAddress, GuestMemory};
+use vroom_snapshot::{decode, encode};
 use serde::{Deserialize, Serialize};
 
 use super::hid::{HidEvent, Keyboard, Tablet};
@@ -1036,7 +1036,7 @@ impl PciDevice for Xhci {
         }
     }
 
-    fn save(&mut self) -> bulwark_snapshot::Result<Vec<u8>> {
+    fn save(&mut self) -> vroom_snapshot::Result<Vec<u8>> {
         encode(&Snap {
             cfg: self.cfg.clone(),
             msix: self.msix.clone(),
@@ -1050,14 +1050,14 @@ impl PciDevice for Xhci {
         })
     }
 
-    fn restore(&mut self, data: &[u8]) -> bulwark_snapshot::Result<()> {
+    fn restore(&mut self, data: &[u8]) -> vroom_snapshot::Result<()> {
         let s: Snap = decode(data)?;
         let mut cfg = s.cfg;
         if !cfg.rebuild_masks(&self.cfg) || s.msix.vectors() != self.msix.vectors() || s.slots.len() != MAX_SLOTS + 1 {
-            return Err(bulwark_snapshot::Error::Invalid("xhci layout".into()));
+            return Err(vroom_snapshot::Error::Invalid("xhci layout".into()));
         }
         if s.slots.iter().flatten().any(|sl| sl.port as usize > NPORTS || sl.eps.keys().any(|&d| d == 0 || d > 31)) {
-            return Err(bulwark_snapshot::Error::Invalid("xhci slots".into()));
+            return Err(vroom_snapshot::Error::Invalid("xhci slots".into()));
         }
         let sender = self.msix.sender();
         self.cfg = cfg;

@@ -5,7 +5,7 @@
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 
-use bulwark_snapshot::{decode, encode, Snapshottable};
+use vroom_snapshot::{decode, encode, Snapshottable};
 use serde::{Deserialize, Serialize};
 
 use crate::{get_le, put_le, BusDevice};
@@ -231,7 +231,7 @@ impl Snapshottable for PFlash {
         format!("pflash@{:x}", self.base)
     }
 
-    fn save(&mut self) -> bulwark_snapshot::Result<Vec<u8>> {
+    fn save(&mut self) -> vroom_snapshot::Result<Vec<u8>> {
         // Binary: magic, state JSON, then 4 KiB pages tagged all-0x00 /
         // all-0xff / raw. A 64 MiB variable store is mostly one or the other.
         let st = encode(&self.st)?;
@@ -253,11 +253,11 @@ impl Snapshottable for PFlash {
         Ok(out)
     }
 
-    fn restore(&mut self, d: &[u8]) -> bulwark_snapshot::Result<()> {
-        let bad = |m: &str| bulwark_snapshot::Error::Invalid(format!("pflash snapshot: {m}"));
+    fn restore(&mut self, d: &[u8]) -> vroom_snapshot::Result<()> {
+        let bad = |m: &str| vroom_snapshot::Error::Invalid(format!("pflash snapshot: {m}"));
         let (st, data) = if d.starts_with(MAGIC) {
             let mut r = &d[MAGIC.len()..];
-            let mut take = |n: usize| -> bulwark_snapshot::Result<&[u8]> {
+            let mut take = |n: usize| -> vroom_snapshot::Result<&[u8]> {
                 let (h, t) = r.split_at_checked(n).ok_or_else(|| bad("truncated"))?;
                 r = t;
                 Ok(h)
@@ -294,7 +294,7 @@ impl Snapshottable for PFlash {
         Ok(())
     }
 
-    fn reset(&mut self, _pristine: &[u8]) -> bulwark_snapshot::Result<()> {
+    fn reset(&mut self, _pristine: &[u8]) -> vroom_snapshot::Result<()> {
         // Flash is non-volatile: keep the data, drop any half-done command.
         self.st = State { mode: Mode::ReadArray, buf: Vec::new() };
         Ok(())

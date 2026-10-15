@@ -1,4 +1,4 @@
-//! Guest audio out: a helper process (`bulwark audio-out`) plays what the
+//! Guest audio out: a helper process (`vroom audio-out`) plays what the
 //! virtio-snd device sends it. Started before the VMM's own sandbox, in
 //! its own (CoreAudio only) sandbox on macOS.
 
@@ -9,8 +9,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bulwark_audio::Msg;
-use bulwark_virtio::devices::sound::AudioSink;
+use vroom_audio::Msg;
+use vroom_virtio::devices::sound::AudioSink;
 
 use crate::{Error, Result};
 
@@ -42,11 +42,11 @@ impl AudioHelper {
     /// `wav`: test mode, write `<dir>/audio.wav` instead of playing.
     pub fn spawn(wav_dir: Option<&std::path::Path>) -> Result<Arc<AudioHelper>> {
         let exe = std::env::current_exe().map_err(|e| Error::Setup(format!("audio: {e}")))?;
-        let (ours, theirs) = bulwark_audio::pair()?;
+        let (ours, theirs) = vroom_audio::pair()?;
         let mut cmd = command(&exe, wav_dir)?;
         cmd.arg("audio-out");
         if let Some(d) = wav_dir {
-            cmd.env("BULWARK_AUDIO_WAV", d.join("audio.wav"));
+            cmd.env("VROOM_AUDIO_WAV", d.join("audio.wav"));
         }
         let child = cmd
             .stdin(Stdio::from(OwnedFd::from(theirs)))
@@ -76,7 +76,7 @@ impl AudioHelper {
 fn command(exe: &std::path::Path, wav_dir: Option<&std::path::Path>) -> Result<Command> {
     #[cfg(target_os = "macos")]
     {
-        let prof = bulwark_sandbox::audio_profile(exe, wav_dir).map_err(|e| Error::Setup(format!("audio sandbox: {e}")))?;
+        let prof = vroom_sandbox::audio_profile(exe, wav_dir).map_err(|e| Error::Setup(format!("audio sandbox: {e}")))?;
         let mut c = Command::new("/usr/bin/sandbox-exec");
         c.arg("-p").arg(prof).arg(exe);
         Ok(c)
@@ -97,7 +97,7 @@ impl AudioSink for HelperSink {
         self.0.send_ctl(&Msg::Start { rate, channels });
     }
     fn write(&mut self, pcm: &[u8]) {
-        if !bulwark_audio::send_pcm(&self.0.sock, pcm) {
+        if !vroom_audio::send_pcm(&self.0.sock, pcm) {
             log::trace!("audio: helper behind, dropped some audio");
         }
     }

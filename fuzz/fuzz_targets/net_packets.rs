@@ -1,6 +1,6 @@
 //! Frames a guest sends to the NAT: every parser layer.
 #![no_main]
-use bulwark_net::packet::*;
+use vroom_net::packet::*;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|f: &[u8]| {

@@ -1,5 +1,5 @@
 [package]
-name = "bulwark-virtio"
+name = "vroom-virtio"
 description = "Virtio: split virtqueues, MMIO/PCI transports, devices."
 version.workspace = true
 edition.workspace = true
@@ -12,12 +12,12 @@ serde.workspace = true
 serde_json.workspace = true
 mio.workspace = true
 getrandom = "0.2"
-bulwark-memory.workspace = true
-bulwark-fs.workspace = true
-bulwark-devices.workspace = true
-bulwark-snapshot.workspace = true
-bulwark-block.workspace = true
-bulwark-net.workspace = true
+vroom-memory.workspace = true
+vroom-fs.workspace = true
+vroom-devices.workspace = true
+vroom-snapshot.workspace = true
+vroom-block.workspace = true
+vroom-net.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

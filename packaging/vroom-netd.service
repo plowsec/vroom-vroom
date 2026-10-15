@@ -1,9 +1,9 @@
 [Unit]
-Description=bulwark network helper (bridged / host-only VM networking)
+Description=vroom network helper (bridged / host-only VM networking)
 After=network-online.target
 
 [Service]
-ExecStart=/usr/local/libexec/bulwark-netd /etc/bulwark/netd.toml
+ExecStart=/usr/local/libexec/vroom-netd /etc/vroom/netd.toml
 Restart=on-failure
 # Needs CAP_NET_ADMIN for tap/bridge; nothing else.
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_CHOWN
@@ -12,8 +12,8 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
-RuntimeDirectory=bulwark
-ReadWritePaths=/run/bulwark
+RuntimeDirectory=vroom
+ReadWritePaths=/run/vroom
 DeviceAllow=/dev/net/tun rw
 
 [Install]

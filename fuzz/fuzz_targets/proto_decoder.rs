@@ -1,6 +1,6 @@
 //! Agent messages from a hostile guest.
 #![no_main]
-use bulwark_proto::Decoder;
+use vroom_proto::Decoder;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

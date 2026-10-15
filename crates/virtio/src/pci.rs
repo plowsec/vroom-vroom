@@ -8,10 +8,10 @@
 
 use std::sync::{Arc, Mutex};
 
-use bulwark_devices::pci::{BarSpec, ConfigSpace, Intx, MsiSender, Msix, PciDevice, PciId};
-use bulwark_devices::{get_le, put_le};
-use bulwark_memory::GuestMemory;
-use bulwark_snapshot::{decode, encode};
+use vroom_devices::pci::{BarSpec, ConfigSpace, Intx, MsiSender, Msix, PciDevice, PciId};
+use vroom_devices::{get_le, put_le};
+use vroom_memory::GuestMemory;
+use vroom_snapshot::{decode, encode};
 use serde::{Deserialize, Serialize};
 
 use crate::core::{CoreState, VirtioCore};
@@ -426,22 +426,22 @@ impl PciDevice for VirtioPci {
         self.core.resume();
     }
 
-    fn save(&mut self) -> bulwark_snapshot::Result<Vec<u8>> {
-        let core = self.core.save().map_err(|e| bulwark_snapshot::Error::Encode(e.to_string()))?;
+    fn save(&mut self) -> vroom_snapshot::Result<Vec<u8>> {
+        let core = self.core.save().map_err(|e| vroom_snapshot::Error::Encode(e.to_string()))?;
         let irq = self.st().clone();
         encode(&Snap { cfg: self.cfg.clone(), sel: self.sel.clone(), irq, core })
     }
 
-    fn restore(&mut self, data: &[u8]) -> bulwark_snapshot::Result<()> {
+    fn restore(&mut self, data: &[u8]) -> vroom_snapshot::Result<()> {
         let s: Snap = decode(data)?;
         let mut cfg = s.cfg;
         if !cfg.rebuild_masks(&self.cfg) {
-            return Err(bulwark_snapshot::Error::Invalid(format!("{}: config layout", self.id)));
+            return Err(vroom_snapshot::Error::Invalid(format!("{}: config layout", self.id)));
         }
         {
             let mut st = self.st();
             if s.irq.queue_vec.len() != st.queue_vec.len() || s.irq.msix.vectors() != st.msix.vectors() {
-                return Err(bulwark_snapshot::Error::Invalid(format!("{}: irq layout", self.id)));
+                return Err(vroom_snapshot::Error::Invalid(format!("{}: irq layout", self.id)));
             }
             // The sender is runtime-only (not serialized): keep ours.
             let sender = st.msix.sender();
@@ -456,7 +456,7 @@ impl PciDevice for VirtioPci {
             self.core.set_shm_base(id, addr);
         }
         let irq = self.irq_dyn();
-        self.core.restore(s.core, &irq).map_err(|e| bulwark_snapshot::Error::Invalid(e.to_string()))?;
+        self.core.restore(s.core, &irq).map_err(|e| vroom_snapshot::Error::Invalid(e.to_string()))?;
         self.sel = s.sel;
         let c = self.cfg.clone();
         self.st().msix.update(&c);

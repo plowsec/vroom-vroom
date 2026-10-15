@@ -1,4 +1,4 @@
-//! Protocol between the VMM and the privileged `bulwark-netd` helper.
+//! Protocol between the VMM and the privileged `vroom-netd` helper.
 //!
 //! The VMM connects to the netd socket, sends one JSON line (a
 //! [`Request`]), and gets back one JSON line (a [`Response`]) followed by
@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-pub const DEFAULT_SOCKET: &str = "/var/run/bulwark/netd.sock";
+pub const DEFAULT_SOCKET: &str = "/var/run/vroom/netd.sock";
 pub const VERSION: u32 = 1;
 const MAX_LINE: usize = 4096;
 
@@ -50,7 +50,7 @@ pub struct Response {
 
 #[derive(Debug, thiserror::Error)]
 pub enum NetdError {
-    #[error("bulwark-netd not reachable at {0} ({1}); is it installed and running?")]
+    #[error("vroom-netd not reachable at {0} ({1}); is it installed and running?")]
     Connect(String, std::io::Error),
     #[error("netd: {0}")]
     Refused(String),
@@ -85,7 +85,7 @@ pub fn attach(socket: &Path, req: &Request) -> Result<(UnixDatagram, [u8; 6]), N
     if resp.mac[0] & 1 != 0 {
         return Err(NetdError::Proto("netd returned a multicast MAC".into()));
     }
-    let fd = bulwark_ipc::recv_fd(&s).map_err(|e| NetdError::Proto(e.to_string()))?;
+    let fd = vroom_ipc::recv_fd(&s).map_err(|e| NetdError::Proto(e.to_string()))?;
     Ok((UnixDatagram::from(fd), resp.mac))
 }
 

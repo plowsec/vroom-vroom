@@ -1,5 +1,5 @@
 [package]
-name = "bulwark-devices"
+name = "vroom-devices"
 description = "Device model core (bus, irq) and platform devices."
 version.workspace = true
 edition.workspace = true
@@ -10,9 +10,9 @@ thiserror.workspace = true
 log.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-bulwark-snapshot.workspace = true
-bulwark-memory.workspace = true
-bulwark-block.workspace = true
+vroom-snapshot.workspace = true
+vroom-memory.workspace = true
+vroom-block.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

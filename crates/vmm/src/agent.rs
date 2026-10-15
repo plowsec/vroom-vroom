@@ -14,8 +14,8 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use bulwark_config::Clipboard as ClipPolicy;
-use bulwark_proto::{features, Decoder, Message};
+use vroom_config::Clipboard as ClipPolicy;
+use vroom_proto::{features, Decoder, Message};
 
 /// Host clipboard access, provided by the frontend.
 pub trait ClipboardProvider: Send {
@@ -112,7 +112,7 @@ impl Service {
 
     fn hello(&mut self) {
         let f = features::CLIPBOARD_TEXT | features::TIME_SYNC | features::RESOLUTION | features::SHUTDOWN;
-        self.send(&Message::Hello { features: f, agent: format!("bulwark-host {}", env!("CARGO_PKG_VERSION")) });
+        self.send(&Message::Hello { features: f, agent: format!("vroom-host {}", env!("CARGO_PKG_VERSION")) });
     }
 
     fn run(mut self) {
@@ -158,7 +158,7 @@ impl Service {
                 drop(s);
                 // A fresh agent: boot, or a guest that slept. Set its clock
                 // (Windows also reads the RTC as local time until told).
-                if features & bulwark_proto::features::TIME_SYNC != 0 {
+                if features & vroom_proto::features::TIME_SYNC != 0 {
                     self.sync_time();
                 }
             }

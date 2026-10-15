@@ -1,7 +1,7 @@
 //! virtio-net. One RX/TX pair, no offloads (keeps the frame path simple:
 //! every frame is a plain, fully checksummed Ethernet frame).
 
-use bulwark_net::NetBackend;
+use vroom_net::NetBackend;
 
 use crate::worker::{QueueCtx, QueueHandler, WorkerSlot};
 use crate::{types, ActivateContext, DeviceState, Result, VirtioDevice};

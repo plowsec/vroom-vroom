@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use bulwark_snapshot::{decode, encode, Snapshottable};
+use vroom_snapshot::{decode, encode, Snapshottable};
 use serde::{Deserialize, Serialize};
 
 use crate::{get_le, put_le, BusDevice, IrqLine};
@@ -94,11 +94,11 @@ impl Snapshottable for Pl031 {
         format!("pl031@{:x}", self.base)
     }
 
-    fn save(&mut self) -> bulwark_snapshot::Result<Vec<u8>> {
+    fn save(&mut self) -> vroom_snapshot::Result<Vec<u8>> {
         encode(&self.regs)
     }
 
-    fn restore(&mut self, data: &[u8]) -> bulwark_snapshot::Result<()> {
+    fn restore(&mut self, data: &[u8]) -> vroom_snapshot::Result<()> {
         self.regs = decode(data)?;
         self.update_irq();
         Ok(())

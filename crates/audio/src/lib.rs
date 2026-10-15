@@ -1,7 +1,7 @@
 //! Guest audio, out of the VMM.
 //!
 //! The VMM's virtio-snd device sends PCM over a socket to a helper process
-//! (`bulwark audio-out`), which plays it. Audio frameworks (CoreAudio and
+//! (`vroom audio-out`), which plays it. Audio frameworks (CoreAudio and
 //! the plug-ins it loads) thus never run inside the VMM, and the helper
 //! runs in its own sandbox. Output only: there is no way to ask for input.
 //!

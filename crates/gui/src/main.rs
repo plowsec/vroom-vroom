@@ -1,9 +1,9 @@
-//! bulwark-gui: the VM window.
+//! vroom-gui: the VM window.
 //!
 //! Process model:
 //! ```text
-//! bulwark-gui (this, unsandboxed: window, host clipboard)
-//!    └── bulwark run --ui-fd N   (sandboxed VMM, owns the guest)
+//! vroom-gui (this, unsandboxed: window, host clipboard)
+//!    └── vroom run --ui-fd N   (sandboxed VMM, owns the guest)
 //! ```
 //! We only get pixels (shared memory) and small messages from the VMM, and
 //! send input back. The VMM is treated as untrusted.
@@ -20,7 +20,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use bulwark_display::{recv_fd, Command, Decoder, SharedFb, ToViewer, ToVmm, POINTER_MAX};
+use vroom_display::{recv_fd, Command, Decoder, SharedFb, ToViewer, ToVmm, POINTER_MAX};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -70,7 +70,7 @@ struct App {
     clipboard: Option<arboard::Clipboard>,
     /// From the VM's config, enforced here too: the VMM is the process a
     /// guest exploit would own, so it doesn't get to decide alone.
-    clip_policy: bulwark_config::Clipboard,
+    clip_policy: vroom_config::Clipboard,
     clip_seen: Option<String>,
     next_clip_poll: Instant,
     status: String,
@@ -79,7 +79,7 @@ struct App {
 
 impl App {
     fn title(&self) -> String {
-        format!("{} — Bulwark{}", self.name, if self.status.is_empty() { String::new() } else { format!(" ({})", self.status) })
+        format!("{} — Vroom{}", self.name, if self.status.is_empty() { String::new() } else { format!(" ({})", self.status) })
     }
 
     fn redraw(&mut self) {
@@ -196,7 +196,7 @@ impl ApplicationHandler<UserEvent> for App {
         let win = match el.create_window(attrs) {
             Ok(w) => Rc::new(w),
             Err(e) => {
-                eprintln!("bulwark-gui: window: {e}");
+                eprintln!("vroom-gui: window: {e}");
                 el.exit();
                 return;
             }
@@ -205,7 +205,7 @@ impl ApplicationHandler<UserEvent> for App {
         match surface {
             Ok(s) => self.surface = Some(s),
             Err(e) => {
-                eprintln!("bulwark-gui: surface: {e}");
+                eprintln!("vroom-gui: surface: {e}");
                 el.exit();
                 return;
             }
@@ -371,12 +371,12 @@ fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     let mut args = std::env::args().skip(1);
     let Some(config) = args.next() else {
-        eprintln!("usage: bulwark-gui <vm.toml> [extra args for `bulwark run`]");
+        eprintln!("usage: vroom-gui <vm.toml> [extra args for `vroom run`]");
         std::process::exit(2);
     };
     let extra: Vec<String> = args.collect();
     if let Err(e) = run(PathBuf::from(config), extra) {
-        eprintln!("bulwark-gui: {e}");
+        eprintln!("vroom-gui: {e}");
         std::process::exit(1);
     }
 }
@@ -385,15 +385,15 @@ fn run(config: PathBuf, extra: Vec<String>) -> Result<(), String> {
     // Clipboard policy straight from the file (unreadable: no clipboard).
     let clip_policy = std::fs::read_to_string(&config)
         .ok()
-        .and_then(|s| bulwark_config::VmConfig::from_toml(&s).ok())
+        .and_then(|s| vroom_config::VmConfig::from_toml(&s).ok())
         .map(|c| c.clipboard)
-        .unwrap_or(bulwark_config::Clipboard { host_to_guest: false, guest_to_host: false, max_bytes: 0 });
+        .unwrap_or(vroom_config::Clipboard { host_to_guest: false, guest_to_host: false, max_bytes: 0 });
     let (ours, theirs) = UnixStream::pair().map_err(|e| e.to_string())?;
     // The child must inherit its end: clear close-on-exec.
     // SAFETY: fcntl on an fd we own.
     unsafe { libc::fcntl(theirs.as_raw_fd(), libc::F_SETFD, 0) };
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let vmm = exe.with_file_name("bulwark");
+    let vmm = exe.with_file_name("vroom");
     let name = config.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let child = Proc::new(&vmm)
         .arg("run")

@@ -15,7 +15,7 @@ static HELPERS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
 pub(crate) fn note_helper(pid: u32) {
     HELPERS.lock().unwrap_or_else(|e| e.into_inner()).push(pid);
 }
-pub use bulwark_state as state;
+pub use vroom_state as state;
 mod display;
 mod firmware;
 mod irq;
@@ -32,11 +32,11 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bulwark_config::VmConfig;
-use bulwark_devices::pl011::Pl011;
-use bulwark_hv::{BootRegs, Hypervisor, IrqChipState, Vm};
-use bulwark_memory::GuestMemory;
-use bulwark_snapshot::Snapshottable;
+use vroom_config::VmConfig;
+use vroom_devices::pl011::Pl011;
+use vroom_hv::{BootRegs, Hypervisor, IrqChipState, Vm};
+use vroom_memory::GuestMemory;
+use vroom_snapshot::Snapshottable;
 
 pub use vcpu::VmEvent;
 use vcpu::{VcpuCmd, VcpuHandle, VcpuShared};
@@ -44,19 +44,19 @@ use vcpu::{VcpuCmd, VcpuHandle, VcpuShared};
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("hypervisor: {0}")]
-    Hv(#[from] bulwark_hv::Error),
+    Hv(#[from] vroom_hv::Error),
     #[error("memory: {0}")]
-    Memory(#[from] bulwark_memory::Error),
+    Memory(#[from] vroom_memory::Error),
     #[error("boot: {0}")]
-    Arch(#[from] bulwark_arch::Error),
+    Arch(#[from] vroom_arch::Error),
     #[error("config: {0}")]
-    Config(#[from] bulwark_config::Error),
+    Config(#[from] vroom_config::Error),
     #[error("snapshot: {0}")]
-    Snapshot(#[from] bulwark_snapshot::Error),
+    Snapshot(#[from] vroom_snapshot::Error),
     #[error("setup: {0}")]
     Setup(String),
     #[error("{0}")]
-    State(#[from] bulwark_state::Error),
+    State(#[from] vroom_state::Error),
     #[error("i/o: {0}")]
     Io(#[from] std::io::Error),
     #[error("a vCPU thread is gone")]
@@ -64,7 +64,7 @@ pub enum Error {
     #[error("timed out waiting for vCPUs")]
     Timeout,
     #[error("virtio: {0}")]
-    Virtio(#[from] bulwark_virtio::Error),
+    Virtio(#[from] vroom_virtio::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -184,7 +184,7 @@ impl Vmm {
         };
         vmm.pristine_irqchip = match vmm.vm.save_irqchip() {
             Ok(s) => Some(s),
-            Err(bulwark_hv::Error::Unsupported(why)) => {
+            Err(vroom_hv::Error::Unsupported(why)) => {
                 log::info!("irqchip state not saveable ({why}); reset won't restore it");
                 None
             }
@@ -237,7 +237,7 @@ impl Vmm {
     /// Tell the viewer something (status line).
     pub fn viewer_status(&self, text: &str) {
         if let Some(v) = &self.viewer {
-            v.send(&bulwark_display::ToViewer::Status(text.to_string()));
+            v.send(&vroom_display::ToViewer::Status(text.to_string()));
         }
     }
 
@@ -363,7 +363,7 @@ impl Vmm {
         self.agent.send(agent::AgentCmd::Stop);
         self.disks.flush_all();
         if let Some(v) = &self.viewer {
-            v.send(&bulwark_display::ToViewer::Closed);
+            v.send(&vroom_display::ToViewer::Closed);
         }
         for v in &self.vcpus {
             let _ = v.peer.send(VcpuCmd::Stop);

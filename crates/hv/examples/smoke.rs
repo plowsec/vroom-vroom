@@ -3,8 +3,8 @@
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn main() {
-    use bulwark_hv::*;
-    use bulwark_memory::{GuestAddress, GuestMemory};
+    use vroom_hv::*;
+    use vroom_memory::{GuestAddress, GuestMemory};
 
     let hv = default_hypervisor().expect("hypervisor");
     let info = hv.irqchip_info().expect("irqchip info");

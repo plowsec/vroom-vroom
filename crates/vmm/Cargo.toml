@@ -1,5 +1,5 @@
 [package]
-name = "bulwark-vmm"
+name = "vroom-vmm"
 description = "VM orchestration: builds the machine, runs vCPUs, snapshots."
 version.workspace = true
 edition.workspace = true
@@ -10,23 +10,23 @@ thiserror.workspace = true
 log.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-bulwark-memory.workspace = true
-bulwark-hv.workspace = true
-bulwark-devices.workspace = true
-bulwark-arch.workspace = true
-bulwark-config.workspace = true
-bulwark-snapshot.workspace = true
-bulwark-virtio.workspace = true
-bulwark-gpu3d.workspace = true
+vroom-memory.workspace = true
+vroom-hv.workspace = true
+vroom-devices.workspace = true
+vroom-arch.workspace = true
+vroom-config.workspace = true
+vroom-snapshot.workspace = true
+vroom-virtio.workspace = true
+vroom-gpu3d.workspace = true
 libc.workspace = true
-bulwark-ipc.workspace = true
-bulwark-sandbox.workspace = true
-bulwark-block.workspace = true
-bulwark-net.workspace = true
-bulwark-audio.workspace = true
-bulwark-proto.workspace = true
-bulwark-display.workspace = true
-bulwark-state.workspace = true
+vroom-ipc.workspace = true
+vroom-sandbox.workspace = true
+vroom-block.workspace = true
+vroom-net.workspace = true
+vroom-audio.workspace = true
+vroom-proto.workspace = true
+vroom-display.workspace = true
+vroom-state.workspace = true
 png = "0.17"
 
 [dev-dependencies]

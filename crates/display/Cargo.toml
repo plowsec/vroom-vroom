@@ -1,5 +1,5 @@
 [package]
-name = "bulwark-display"
+name = "vroom-display"
 description = "VMM <-> viewer display channel: shared framebuffer, input, resize, clipboard."
 version.workspace = true
 edition.workspace = true
@@ -9,7 +9,7 @@ license.workspace = true
 thiserror.workspace = true
 libc.workspace = true
 getrandom = "0.2"
-bulwark-ipc.workspace = true
+vroom-ipc.workspace = true
 
 [lints]
 workspace = true

@@ -1,5 +1,5 @@
 [package]
-name = "bulwark-arch"
+name = "vroom-arch"
 description = "Board layouts, firmware tables (FDT) and kernel loaders."
 version.workspace = true
 edition.workspace = true
@@ -12,7 +12,7 @@ vm-fdt.workspace = true
 flate2.workspace = true
 getrandom = "0.2"
 ruzstd = "0.8"
-bulwark-memory.workspace = true
+vroom-memory.workspace = true
 
 [lints]
 workspace = true

@@ -194,10 +194,10 @@ fn pending_connect_expires_and_refuses_guest() {
 #[test]
 #[ignore = "requires outbound ICMP and host permission for datagram ping sockets"]
 fn sandboxed_external_echo() {
-    if std::env::var_os("BULWARK_PING_SANDBOX_CHILD").is_none() {
+    if std::env::var_os("VROOM_PING_SANDBOX_CHILD").is_none() {
         let result = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "nat::integration_tests::sandboxed_external_echo", "--ignored", "--nocapture"])
-            .env("BULWARK_PING_SANDBOX_CHILD", "1")
+            .env("VROOM_PING_SANDBOX_CHILD", "1")
             .status()
             .unwrap();
         assert!(result.success());
@@ -206,7 +206,7 @@ fn sandboxed_external_echo() {
     let mut n = Nat::new(NatConfig::new(MAC)).unwrap();
     let mut poll = Poll::new().unwrap();
     n.register(poll.registry()).unwrap();
-    bulwark_sandbox::apply(&bulwark_sandbox::Policy { network_outbound: true, ..Default::default() }).unwrap();
+    vroom_sandbox::apply(&vroom_sandbox::Policy { network_outbound: true, ..Default::default() }).unwrap();
     let dst = Ipv4Addr::new(1, 1, 1, 1);
     // Large, odd-sized payload exercises fragmentation in both directions.
     let mut payload = vec![42; 4009];

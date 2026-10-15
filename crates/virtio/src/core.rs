@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use bulwark_memory::GuestMemory;
+use vroom_memory::GuestMemory;
 use serde::{Deserialize, Serialize};
 
 use crate::features::{RING_EVENT_IDX, RING_INDIRECT_DESC, VERSION_1};

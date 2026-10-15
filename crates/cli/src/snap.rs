@@ -1,9 +1,9 @@
-//! `bulwark snapshot ...`: housekeeping while the VM is off.
+//! `vroom snapshot ...`: housekeeping while the VM is off.
 
 use std::path::{Path, PathBuf};
 
-use bulwark_config::VmConfig;
-use bulwark_vmm::state::{self, PruneReport, StateLock};
+use vroom_config::VmConfig;
+use vroom_vmm::state::{self, PruneReport, StateLock};
 use clap::Subcommand;
 
 #[derive(Subcommand, Debug)]

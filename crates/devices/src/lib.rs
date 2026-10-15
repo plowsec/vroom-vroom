@@ -20,8 +20,8 @@ pub use bus::{Bus, BusBuilder, BusDevice, BusRange, SharedDevice};
 pub use irq::{IrqLine, NoIrq};
 
 /// A device that sits on the bus and can be snapshotted.
-pub trait Device: BusDevice + bulwark_snapshot::Snapshottable + Send {}
-impl<T: BusDevice + bulwark_snapshot::Snapshottable + Send> Device for T {}
+pub trait Device: BusDevice + vroom_snapshot::Snapshottable + Send {}
+impl<T: BusDevice + vroom_snapshot::Snapshottable + Send> Device for T {}
 
 /// Little-endian register read helper: copy `val` into `data` (len 1..8).
 pub fn put_le(data: &mut [u8], val: u64) {

@@ -2,7 +2,7 @@
 //!
 //! - [`nat::Nat`]: userspace NAT, unprivileged, in-process.
 //! - [`socket::FrameSocket`]: raw Ethernet frames over a unix datagram
-//!   socket, connected to the privileged `bulwark-netd` helper which owns
+//!   socket, connected to the privileged `vroom-netd` helper which owns
 //!   bridged / host-only interfaces. The VMM never needs root.
 #![forbid(unsafe_code)]
 

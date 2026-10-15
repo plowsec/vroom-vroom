@@ -1,12 +1,12 @@
 [package]
-name = "bulwark-netd"
+name = "vroom-netd"
 description = "Privileged network helper: bridged and host-only ports for sandboxed VMMs."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "bulwark-netd"
+name = "vroom-netd"
 path = "src/main.rs"
 
 [dependencies]
@@ -16,8 +16,8 @@ libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
-bulwark-net.workspace = true
-bulwark-ipc.workspace = true
+vroom-net.workspace = true
+vroom-ipc.workspace = true
 
 [build-dependencies]
 cc = "1"

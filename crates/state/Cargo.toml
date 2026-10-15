@@ -1,5 +1,5 @@
 [package]
-name = "bulwark-state"
+name = "vroom-state"
 description = "A VM's state directory: the one-VMM lock, snapshots, pruning disk layers."
 version.workspace = true
 edition.workspace = true
@@ -9,8 +9,8 @@ license.workspace = true
 thiserror.workspace = true
 libc.workspace = true
 serde_json.workspace = true
-bulwark-block.workspace = true
-bulwark-snapshot.workspace = true
+vroom-block.workspace = true
+vroom-snapshot.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

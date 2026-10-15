@@ -1,4 +1,4 @@
-//! `bulwark disk ...`
+//! `vroom disk ...`
 
 use std::path::PathBuf;
 
@@ -39,13 +39,13 @@ pub(crate) fn parse_size(s: &str) -> Result<u64, String> {
 }
 
 pub fn run(cmd: DiskCmd) -> Result<(), String> {
-    use bulwark_block::{qcow2::Qcow2Image, Format};
+    use vroom_block::{qcow2::Qcow2Image, Format};
     match cmd {
         DiskCmd::Create { path, size, backing } => {
             let b = match &backing {
                 Some(p) => {
-                    let fmt = bulwark_block::detect(p).map_err(|e| e.to_string())?;
-                    let img = bulwark_block::open(p, Some(fmt), true).map_err(|e| e.to_string())?;
+                    let fmt = vroom_block::detect(p).map_err(|e| e.to_string())?;
+                    let img = vroom_block::open(p, Some(fmt), true).map_err(|e| e.to_string())?;
                     Some((p.as_path(), fmt, img.size()))
                 }
                 None => None,
@@ -61,13 +61,13 @@ pub fn run(cmd: DiskCmd) -> Result<(), String> {
         }
         DiskCmd::Compact { path } => {
             let (before, after) =
-                bulwark_block::qcow2::compact(&path, &bulwark_block::qcow2::OpenPolicy::default()).map_err(|e| format!("{}: {e}", path.display()))?;
+                vroom_block::qcow2::compact(&path, &vroom_block::qcow2::OpenPolicy::default()).map_err(|e| format!("{}: {e}", path.display()))?;
             println!("{}: {} -> {} bytes", path.display(), before, after);
             Ok(())
         }
         DiskCmd::Info { path } => {
-            let fmt = bulwark_block::detect(&path).map_err(|e| e.to_string())?;
-            let img = bulwark_block::open(&path, Some(fmt), true).map_err(|e| e.to_string())?;
+            let fmt = vroom_block::detect(&path).map_err(|e| e.to_string())?;
+            let img = vroom_block::open(&path, Some(fmt), true).map_err(|e| e.to_string())?;
             println!("format: {}", if fmt == Format::Qcow2 { "qcow2" } else { "raw" });
             println!("virtual size: {} bytes", img.size());
             println!("{img:?}");

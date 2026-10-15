@@ -1,12 +1,12 @@
 #!/bin/sh
-# Build the virglrenderer bulwark uses for 3D (Venus) on macOS.
+# Build the virglrenderer vroom uses for 3D (Venus) on macOS.
 #
 # Base: slp's macOS fork (what krunkit ships), pinned by hash, plus our
 # patches in third_party/virglrenderer/. Needs: meson ninja pkg-config
 # libepoxy molten-vk (brew install meson ninja libepoxy molten-vk).
 #
 # Output: target/virglrenderer/lib/libvirglrenderer.1.dylib, also copied
-# next to target/{debug,release}/bulwark where the VMM looks first.
+# next to target/{debug,release}/vroom where the VMM looks first.
 set -eu
 cd "$(dirname "$0")/.."
 ROOT=$(pwd)

@@ -7,7 +7,7 @@ brew install qemu            # only for the EDK2 firmware files and qemu-img
 scripts/build.sh
 ```
 
-`qemu` is not used to run anything: bulwark only reads
+`qemu` is not used to run anything: vroom only reads
 `/opt/homebrew/share/qemu/edk2-aarch64-code.fd` (UEFI) from it.
 
 ## Ubuntu 24.04 (cloud image, direct kernel boot)
@@ -19,16 +19,16 @@ mv noble-server-cloudimg-arm64.img noble.img
 # kernel + initrd from the same release
 curl -L -o vmlinuz https://cloud-images.ubuntu.com/noble/current/unpacked/noble-server-cloudimg-arm64-vmlinuz-generic
 curl -L -o initrd https://cloud-images.ubuntu.com/noble/current/unpacked/noble-server-cloudimg-arm64-initrd-generic
-../../target/debug/bulwark disk create disk.qcow2 --backing noble.img --size 20G
+../../target/debug/vroom disk create disk.qcow2 --backing noble.img --size 20G
 ```
 
-Make a cloud-init seed (user `ubuntu`, password `bulwark`) as `seed.iso`
+Make a cloud-init seed (user `ubuntu`, password `vroom`) as `seed.iso`
 with `user-data` / `meta-data` (any NoCloud ISO tool works, e.g.
 `hdiutil makehybrid -iso -joliet -default-volume-name cidata -o seed.iso seeddir`),
-then `target/debug/bulwark run examples/ubuntu.toml`.
+then `target/debug/vroom run examples/ubuntu.toml`.
 
 Clipboard, time sync and clean shutdown need the agent in the guest:
-`cargo build --release --target aarch64-unknown-linux-musl -p bulwark-agent`,
+`cargo build --release --target aarch64-unknown-linux-musl -p vroom-agent`,
 copy it and `examples/linux/*` in, run `sudo ./install-agent.sh`. That
 installs a systemd service (root, hardened unit: the host channel, clock,
 shutdown) and a desktop autostart entry for the unprivileged session
@@ -53,7 +53,7 @@ gpu = "virtio2d"
 mode = "nat"
 ```
 
-`target/debug/bulwark-gui desktop.toml`. The guest follows window resizes.
+`target/debug/vroom-gui desktop.toml`. The guest follows window resizes.
 
 ## Windows 11 ARM64
 
@@ -63,7 +63,7 @@ mode = "nat"
    It's a FAT32 image with an **MBR** partition table and a non-zero disk
    signature, holding the ISO contents, the ARM64 virtio-win driver
    folders, `examples/windows/autounattend.xml`,
-   `examples/windows/bulwark-setup.cmd` and `bulwark-agent.exe` (an
+   `examples/windows/vroom-setup.cmd` and `vroom-agent.exe` (an
    `install.wim` over 4 GiB is split; needs `brew install wimlib`).
    (An ISO doesn't work: Windows Setup has no driver for 2 KiB-sector media
    on NVMe. A GPT image gets its EFI partition mistaken for the system
@@ -78,7 +78,7 @@ memory_mib = 6144
 type = "uefi"
 vars = "win11.state/efivars.fd"
 [[disk]]
-path = "win11.qcow2"        # bulwark disk create win11.qcow2 --size 64G
+path = "win11.qcow2"        # vroom disk create win11.qcow2 --size 64G
 format = "qcow2"
 bus = "nvme"
 [[disk]]
@@ -90,8 +90,8 @@ bus = "nvme"
 mode = "nat"
 ```
 
-4. `bulwark-gui win11.toml`. Setup runs unattended (the unattend file wipes
-   **disk 0**), reboots, and logs in as `bulwark` / `bulwark` (change it).
+4. `vroom-gui win11.toml`. Setup runs unattended (the unattend file wipes
+   **disk 0**), reboots, and logs in as `vroom` / `vroom` (change it).
    First logon installs the virtio drivers and the agent.
 5. **Remove the stick from the config afterwards.** If Windows ever fails to
    boot, the firmware falls back to the next boot entry: with the stick
@@ -100,10 +100,10 @@ mode = "nat"
    sees two monitors (firmware framebuffer + virtio-gpu); the agent keeps
    only the virtio-gpu one active, so windows open where you can see them.
 
-The agent is a Windows service (`BulwarkAgent`, clock sync and clean
+The agent is a Windows service (`VroomAgent`, clock sync and clean
 shutdown via `Ctrl+Alt+Shift+D`) plus an unprivileged helper started at
 each logon (clipboard, window resizes). The status line says when it
-connects. Upgrading an older install: run the new `bulwark-setup.cmd` as
+connects. Upgrading an older install: run the new `vroom-setup.cmd` as
 administrator.
 
 Until the agent runs, Windows may show two monitors (firmware framebuffer
@@ -157,15 +157,15 @@ and stays silent.
 ## Snapshots, suspend
 
 - `Ctrl-A s` / `Ctrl+Alt+Shift+S`: snapshot to `<state>/snapshots/snap-<time>`.
-- `bulwark run vm.toml --restore <state>/snapshots/snap-…`: go back to it
+- `vroom run vm.toml --restore <state>/snapshots/snap-…`: go back to it
   (the disks too).
 - `Ctrl-A z` / `Ctrl+Alt+Shift+Z` / closing the GUI window: suspend; the
   next `run` resumes. `--fresh` ignores the suspend image.
 - Not possible while 3D contexts are active.
-- `bulwark snapshot list vm.toml`, `bulwark snapshot delete vm.toml snap-…`:
+- `vroom snapshot list vm.toml`, `vroom snapshot delete vm.toml snap-…`:
   deleting a snapshot also removes the disk layers only it used, and merges
   layers that became pass-through, so disk chains stay short.
-  `bulwark snapshot prune vm.toml` does the cleanup alone (e.g. after
+  `vroom snapshot prune vm.toml` does the cleanup alone (e.g. after
   reverting, the abandoned layers). These need the VM stopped: a state dir
   is locked by the VMM using it.
 
@@ -180,7 +180,7 @@ file system, the VM is paused with a message; free space and resume
 Guests that TRIM (Ubuntu's cloud images mount with `discard`; Windows
 trims on its own) give space back: freed clusters become holes in the
 image and are reused. A qcow2 file can still keep a large apparent size
-(its real usage, `du`, is what counts); `bulwark disk compact vm.qcow2`
+(its real usage, `du`, is what counts); `vroom disk compact vm.qcow2`
 (VM off) rewrites it to its real size, keeping its backing file.
 
 ## Disk sync
@@ -193,7 +193,7 @@ flushes a lot). `"none"` ignores flushes: scratch disks only.
 
 - x86_64 hosts: everything builds, but there is no x86 board: VMs can't
   start there yet.
-- Bridged / host-only: needs `bulwark-netd` running as root; not tested
+- Bridged / host-only: needs `vroom-netd` running as root; not tested
   with real vmnet/tap yet.
 - Windows 11 is installed with its hardware checks bypassed (no Secure
   Boot); `tpm = true` (needs `brew install swtpm`) gives it a real TPM 2.0,

@@ -14,7 +14,7 @@ cmdline = "console=ttyAMA0 root=LABEL=cloudimg-rootfs ro"
 path = "../images/ubuntu/disk.qcow2"
 format = "qcow2"
 
-# cloud-init seed (user "ubuntu", password "bulwark").
+# cloud-init seed (user "ubuntu", password "vroom").
 [[disk]]
 path = "../images/ubuntu/seed.iso"
 readonly = true

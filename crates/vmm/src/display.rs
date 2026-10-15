@@ -13,11 +13,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use bulwark_display::{send_fd, Decoder, SharedFb, ToViewer, ToVmm};
-use bulwark_devices::usb::hid::HidEvent;
-use bulwark_devices::usb::xhci::Xhci;
-use bulwark_virtio::devices::gpu::{DisplaySink, GpuControl};
-use bulwark_virtio::devices::input::{self as ev, event};
+use vroom_display::{send_fd, Decoder, SharedFb, ToViewer, ToVmm};
+use vroom_devices::usb::hid::HidEvent;
+use vroom_devices::usb::xhci::Xhci;
+use vroom_virtio::devices::gpu::{DisplaySink, GpuControl};
+use vroom_virtio::devices::input::{self as ev, event};
 
 use crate::agent::{Agent, AgentCmd, ClipboardProvider};
 use crate::vcpu::VmEvent;

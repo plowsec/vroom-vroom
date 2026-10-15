@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use bulwark_vmm::agent::ClipboardProvider;
+use vroom_vmm::agent::ClipboardProvider;
 
 /// System clipboard through arboard.
 struct HostClipboard(arboard::Clipboard);

@@ -1,8 +1,8 @@
 //! A guest scribbling over its rings: walk every chain the avail ring
 //! offers, read and write through it, complete it.
 #![no_main]
-use bulwark_memory::{GuestAddress, GuestMemory};
-use bulwark_virtio::Queue;
+use vroom_memory::{GuestAddress, GuestMemory};
+use vroom_virtio::Queue;
 use libfuzzer_sys::fuzz_target;
 
 const MEM: u64 = 64 << 10;

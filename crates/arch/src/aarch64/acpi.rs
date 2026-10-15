@@ -46,7 +46,7 @@ fn fadt(smc: bool) -> Vec<u8> {
     b[112..116].copy_from_slice(&(1u32 << 20).to_le_bytes());
     // ARM boot arch: PSCI compliant, use HVC.
     b[129..131].copy_from_slice(&(if smc { 1u16 } else { 3u16 }).to_le_bytes());
-    b[268..276].copy_from_slice(b"BULWARK\0");
+    b[268..276].copy_from_slice(b"VROOM\0\0\0");
     b
 }
 
@@ -298,11 +298,11 @@ mod tests {
 
 #[cfg(test)]
 mod dump {
-    /// `BULWARK_ACPI_DUMP=dir cargo test -p bulwark-arch dump` writes each
+    /// `VROOM_ACPI_DUMP=dir cargo test -p vroom-arch dump` writes each
     /// table to dir/<SIG>.dat for `iasl -d`.
     #[test]
     fn dump() {
-        let Some(dir) = std::env::var_os("BULWARK_ACPI_DUMP") else { return };
+        let Some(dir) = std::env::var_os("VROOM_ACPI_DUMP") else { return };
         let b = super::build(&super::AcpiConfig {
             cpu_mpidrs: vec![0x8000_0000, 0x8000_0001],
             gic_dist_size: 0x10000,

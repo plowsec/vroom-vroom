@@ -1,7 +1,7 @@
 //! Flash (UEFI variable store) command state machine from a hostile guest.
 #![no_main]
-use bulwark_devices::pflash::PFlash;
-use bulwark_devices::BusDevice;
+use vroom_devices::pflash::PFlash;
+use vroom_devices::BusDevice;
 use libfuzzer_sys::fuzz_target;
 
 const SIZE: u64 = 256 << 10;

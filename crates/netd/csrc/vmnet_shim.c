@@ -29,7 +29,7 @@ bw_vmnet *bw_vmnet_start(int mode, const char *bridge_if, const unsigned char *i
         }
     }
     bw_vmnet *v = calloc(1, sizeof(*v));
-    v->queue = dispatch_queue_create("org.bulwark.vmnet", DISPATCH_QUEUE_SERIAL);
+    v->queue = dispatch_queue_create("org.vroom.vmnet", DISPATCH_QUEUE_SERIAL);
     v->avail = dispatch_semaphore_create(0);
     dispatch_semaphore_t done = dispatch_semaphore_create(0);
     __block vmnet_return_t st = VMNET_FAILURE;

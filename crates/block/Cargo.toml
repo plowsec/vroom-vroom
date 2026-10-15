@@ -1,5 +1,5 @@
 [package]
-name = "bulwark-block"
+name = "vroom-block"
 description = "Disk images: raw and qcow2 (with backing files for snapshots)."
 version.workspace = true
 edition.workspace = true

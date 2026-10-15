@@ -32,7 +32,7 @@ fn max_len() -> usize {
 fn anon_shm() -> std::io::Result<OwnedFd> {
     // SAFETY: memfd_create with a static name. Sealable: the viewer
     // insists the size can't change under its mapping.
-    let fd = unsafe { libc::memfd_create(c"bulwark-fb".as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
+    let fd = unsafe { libc::memfd_create(c"vroom-fb".as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
     }

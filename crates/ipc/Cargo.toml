@@ -1,6 +1,6 @@
 [package]
-name = "bulwark-ipc"
-description = "Small IPC helpers shared by bulwark processes (fd passing)."
+name = "vroom-ipc"
+description = "Small IPC helpers shared by vroom processes (fd passing)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

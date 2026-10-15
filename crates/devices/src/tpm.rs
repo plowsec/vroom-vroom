@@ -6,7 +6,7 @@
 //! all-ones. Commands are run by a [`TpmBackend`] (swtpm in its own
 //! process): this side just frames bytes and tracks the TIS state machine.
 
-use bulwark_snapshot::{decode, encode, Snapshottable};
+use vroom_snapshot::{decode, encode, Snapshottable};
 use serde::{Deserialize, Serialize};
 
 use crate::{get_le, put_le, BusDevice};
@@ -243,18 +243,18 @@ impl Snapshottable for Tpm {
         format!("tpm@{:x}", self.base)
     }
 
-    fn save(&mut self) -> bulwark_snapshot::Result<Vec<u8>> {
+    fn save(&mut self) -> vroom_snapshot::Result<Vec<u8>> {
         let backend = self.backend.save();
         encode(&Snap { state: self.state, active: self.active, buf: self.buf.clone(), pos: self.pos, backend })
     }
 
-    fn restore(&mut self, d: &[u8]) -> bulwark_snapshot::Result<()> {
+    fn restore(&mut self, d: &[u8]) -> vroom_snapshot::Result<()> {
         let s: Snap = decode(d)?;
         if s.buf.len() > MAX_BUFFER || s.pos > s.buf.len() {
-            return Err(bulwark_snapshot::Error::Invalid("tpm snapshot".into()));
+            return Err(vroom_snapshot::Error::Invalid("tpm snapshot".into()));
         }
         if !s.backend.is_empty() && !self.backend.load(&s.backend) {
-            return Err(bulwark_snapshot::Error::Invalid("tpm state could not be restored".into()));
+            return Err(vroom_snapshot::Error::Invalid("tpm state could not be restored".into()));
         }
         self.state = s.state;
         self.active = s.active;
@@ -263,7 +263,7 @@ impl Snapshottable for Tpm {
         Ok(())
     }
 
-    fn reset(&mut self, _pristine: &[u8]) -> bulwark_snapshot::Result<()> {
+    fn reset(&mut self, _pristine: &[u8]) -> vroom_snapshot::Result<()> {
         // Platform reset: the TPM restarts too (its NV state stays).
         self.backend.reset();
         self.state = State::Idle;

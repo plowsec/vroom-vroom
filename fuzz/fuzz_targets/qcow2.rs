@@ -2,8 +2,8 @@
 #![no_main]
 use std::io::Write;
 
-use bulwark_block::qcow2::Qcow2Image;
-use bulwark_block::DiskImage;
+use vroom_block::qcow2::Qcow2Image;
+use vroom_block::DiskImage;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

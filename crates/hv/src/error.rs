@@ -9,7 +9,7 @@ pub enum Error {
     #[error("guest fault: {0}")]
     GuestFault(String),
     #[error("memory: {0}")]
-    Memory(#[from] bulwark_memory::Error),
+    Memory(#[from] vroom_memory::Error),
     #[error("i/o: {0}")]
     Io(#[from] std::io::Error),
 }

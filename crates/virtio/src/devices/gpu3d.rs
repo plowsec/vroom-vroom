@@ -1,12 +1,12 @@
 //! What virtio-gpu needs from a host 3D renderer (virglrenderer / Venus).
 //!
 //! Kept as a trait so this crate stays free of unsafe code: the FFI lives
-//! in `bulwark-gpu3d`. Every call comes from the GPU worker thread.
+//! in `vroom-gpu3d`. Every call comes from the GPU worker thread.
 
 use std::os::fd::RawFd;
 
 /// Host copy of guest RAM ranges handed to the renderer. Built from
-/// [`bulwark_memory::GuestMemory::host_ranges`], so always inside guest RAM.
+/// [`vroom_memory::GuestMemory::host_ranges`], so always inside guest RAM.
 pub type HostIov = Vec<(*mut u8, usize)>;
 
 /// virtio_gpu_resource_create_3d, minus the id.

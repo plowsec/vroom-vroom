@@ -1,7 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=bulwark guest agent (session)
-Comment=Clipboard and resolution for the bulwark host; unprivileged
-Exec=/usr/local/bin/bulwark-agent --session
-NoDisplay=true
-X-GNOME-Autostart-enabled=true

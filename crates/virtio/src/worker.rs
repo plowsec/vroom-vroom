@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use bulwark_memory::GuestMemory;
+use vroom_memory::GuestMemory;
 use mio::{Events, Poll, Registry, Token, Waker};
 
 use crate::{ActivateContext, Queue, Result, VirtioInterrupt};

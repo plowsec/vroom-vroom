@@ -46,7 +46,7 @@ fn descriptors(product: u16, name: &'static str, protocol: u8, report: &[u8], re
     config.extend_from_slice(&[9, 0x21, 0x11, 0x01, 0, 1, 0x22]);
     config.extend_from_slice(&(report_len as u16).to_le_bytes());
     config.extend_from_slice(&[7, 5, 0x81, 3, 8, 0, 10]);
-    Descriptors { device, config, strings: vec!["Bulwark", name, "1"], hid_report: report.to_vec() }
+    Descriptors { device, config, strings: vec!["Vroom", name, "1"], hid_report: report.to_vec() }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -65,7 +65,7 @@ pub struct Keyboard {
 
 impl Default for Keyboard {
     fn default() -> Self {
-        Keyboard { desc: descriptors(0x0001, "Bulwark USB Keyboard", 1, KBD_REPORT, KBD_REPORT.len()), st: KbdState::default(), queue: VecDeque::new() }
+        Keyboard { desc: descriptors(0x0001, "Vroom USB Keyboard", 1, KBD_REPORT, KBD_REPORT.len()), st: KbdState::default(), queue: VecDeque::new() }
     }
 }
 
@@ -157,7 +157,7 @@ pub struct Tablet {
 impl Default for Tablet {
     fn default() -> Self {
         Tablet {
-            desc: descriptors(0x0002, "Bulwark USB Tablet", 0, TABLET_REPORT, TABLET_REPORT.len()),
+            desc: descriptors(0x0002, "Vroom USB Tablet", 0, TABLET_REPORT, TABLET_REPORT.len()),
             st: TabletState::default(),
             queue: VecDeque::new(),
         }

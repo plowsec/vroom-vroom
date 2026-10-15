@@ -1,5 +1,5 @@
 [package]
-name = "bulwark-memory"
+name = "vroom-memory"
 description = "Guest physical memory: mmap'd regions with bounds-checked access."
 version.workspace = true
 edition.workspace = true

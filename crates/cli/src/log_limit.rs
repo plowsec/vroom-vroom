@@ -38,7 +38,7 @@ impl Limited {
                 self.inner.log(
                     &Record::builder()
                         .level(Level::Warn)
-                        .target("bulwark")
+                        .target("vroom")
                         .args(format_args!("log flood: {dropped} lines dropped"))
                         .build(),
                 );

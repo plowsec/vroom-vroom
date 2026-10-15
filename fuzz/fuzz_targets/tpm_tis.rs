@@ -1,14 +1,14 @@
 //! TPM TIS registers from a hostile guest: locality, status, FIFO with
 //! any lengths; the backend echoes a well-formed reply.
 #![no_main]
-use bulwark_devices::tpm::{Tpm, TpmBackend};
-use bulwark_devices::BusDevice;
+use vroom_devices::tpm::{Tpm, TpmBackend};
+use vroom_devices::BusDevice;
 use libfuzzer_sys::fuzz_target;
 
 struct Echo;
 impl TpmBackend for Echo {
     fn execute(&mut self, cmd: &[u8]) -> Vec<u8> {
-        assert!(cmd.len() <= bulwark_devices::tpm::MAX_BUFFER);
+        assert!(cmd.len() <= vroom_devices::tpm::MAX_BUFFER);
         let mut r = vec![0x80, 0x01, 0, 0, 0, 10, 0, 0, 0, 0];
         r.extend_from_slice(&cmd[..cmd.len().min(64)]);
         let n = r.len() as u32;

@@ -1,7 +1,7 @@
-# /etc/bulwark/netd.toml — bulwark-netd (runs as root).
+# /etc/vroom/netd.toml — vroom-netd (runs as root).
 # Only members of `group` can attach VMs.
-socket = "/var/run/bulwark/netd.sock"
-group = "staff"            # Linux default: "bulwark"
+socket = "/var/run/vroom/netd.sock"
+group = "staff"            # Linux default: "vroom"
 
 # Interfaces VMs may bridge onto. macOS: physical interfaces (en0...).
 # Linux: an existing bridge (br0) you created with your NIC enslaved.

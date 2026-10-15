@@ -82,8 +82,8 @@ impl Input {
             b
         };
         match (self.select, self.kind) {
-            (CFG_ID_NAME, InputKind::Keyboard) => b"Bulwark Keyboard".to_vec(),
-            (CFG_ID_NAME, InputKind::Tablet) => b"Bulwark Tablet".to_vec(),
+            (CFG_ID_NAME, InputKind::Keyboard) => b"Vroom Keyboard".to_vec(),
+            (CFG_ID_NAME, InputKind::Tablet) => b"Vroom Tablet".to_vec(),
             (CFG_ID_SERIAL, _) => b"0".to_vec(),
             (CFG_ID_DEVIDS, k) => {
                 let product: u16 = if k == InputKind::Keyboard { 1 } else { 2 };

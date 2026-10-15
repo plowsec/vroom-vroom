@@ -1,7 +1,7 @@
 //! The viewer protocol in both directions. Viewer side matters most: the
 //! unsandboxed GUI decodes what the (guest-exposed) VMM sends.
 #![no_main]
-use bulwark_display::Decoder;
+use vroom_display::Decoder;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

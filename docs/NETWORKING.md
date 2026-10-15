@@ -1,6 +1,6 @@
 # Networking
 
-Bulwark currently provides an unprivileged IPv4 NAT backend. The guest sees
+Vroom currently provides an unprivileged IPv4 NAT backend. The guest sees
 `10.0.2.15/24`, gateway `10.0.2.2`, and DNS relay `10.0.2.3`. DHCP supplies the
 address, route, DNS server and 1500-byte MTU. Each adapter has its own NAT
 instance on its own network: the second NAT adapter is `10.0.3.0/24`
@@ -30,7 +30,7 @@ resolver is private. Echo forwarding does not use either alias.
 
 No raw sockets or new sandbox permissions are needed for echo forwarding. On
 Linux, the account must be allowed to create datagram ping sockets by the host's
-`net.ipv4.ping_group_range` policy. Bulwark does not change this setting or fall
+`net.ipv4.ping_group_range` policy. Vroom does not change this setting or fall
 back to privileged raw sockets. Darwin includes an IPv4 header in ping replies;
 Linux supplies the ICMP payload and rewrites the echo identifier. The relay
 handles both layouts and matches outstanding requests before returning replies.
@@ -40,7 +40,7 @@ and [Darwin ICMP implementation](https://github.com/apple-oss-distributions/xnu/
 ## Limits and unfinished work
 
 - IPv6, router advertisements, DHCPv6 and NAT64 are not implemented.
-- Bridged and host-only go through `bulwark-netd` (root): vmnet on macOS,
+- Bridged and host-only go through `vroom-netd` (root): vmnet on macOS,
   tap + bridge on Linux. The plumbing is tested, but not yet against a real
   vmnet/tap (needs root). netd only accepts locally administered unicast
   MACs (`x2:`, `x6:`, `xA:`, `xE:`...), so a VM can't take a real device's
@@ -66,7 +66,7 @@ and [Darwin ICMP implementation](https://github.com/apple-oss-distributions/xnu/
 Run deterministic packet and localhost socket tests:
 
 ```sh
-cargo test -p bulwark-net
+cargo test -p vroom-net
 ```
 
 The integration tests exercise an 8 KB fragmented UDP round trip, a 300 KB TCP
@@ -76,7 +76,7 @@ TTL handling, and connection/probe expiry.
 Opt-in tests require internet access:
 
 ```sh
-cargo test -p bulwark-net -- --ignored --nocapture
+cargo test -p vroom-net -- --ignored --nocapture
 ```
 
 The external echo test launches a separate process, applies the production

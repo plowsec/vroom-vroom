@@ -802,7 +802,7 @@ pub fn set_backing(image: &Path, backing: Option<(&Path, Format)>) -> Result<()>
         off += 8 + l.div_ceil(8) * 8;
     }
     if h.version != 3 || be32(&hdr, 100) != 104 || h.nb_snapshots != 0 || ext.iter().any(|&t| t != EXT_BACKING_FORMAT) || be64(&hdr, 72) != 0 {
-        return Err(bad("can only re-point images bulwark created"));
+        return Err(bad("can only re-point images vroom created"));
     }
     let abs = backing.map(|(b, fm)| std::path::absolute(b).map(|a| (a, fm))).transpose()?;
     write_backing_area(&mut hdr, image, abs.as_ref().map(|(b, fm)| (b.as_path(), *fm)))?;

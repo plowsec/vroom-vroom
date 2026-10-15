@@ -3,7 +3,7 @@
 #![no_main]
 use std::net::Ipv4Addr;
 
-use bulwark_net::nat::fuzzing::{dhcp, Lease, Reassembly};
+use vroom_net::nat::fuzzing::{dhcp, Lease, Reassembly};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

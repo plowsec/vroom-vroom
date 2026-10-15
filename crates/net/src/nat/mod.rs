@@ -939,7 +939,7 @@ mod live {
     use super::*;
     use mio::{Events, Poll};
 
-    /// Needs network: `cargo test -p bulwark-net live -- --ignored`
+    /// Needs network: `cargo test -p vroom-net live -- --ignored`
     #[test]
     #[ignore]
     fn first_dns_query_answers() {

@@ -17,7 +17,7 @@ mod state;
 
 use std::sync::Arc;
 
-use bulwark_memory::GuestMemory;
+use vroom_memory::GuestMemory;
 
 pub use error::{Error, Result};
 pub use state::{IrqChipState, VcpuState};
@@ -99,7 +99,7 @@ pub trait Vm: Send + Sync {
     fn map_memory(&self, mem: &GuestMemory) -> Result<()>;
 
     /// Map a read-only region (firmware flash). Guest writes trap as MMIO.
-    fn map_readonly(&self, gpa: u64, region: Arc<bulwark_memory::MmapRegion>) -> Result<()>;
+    fn map_readonly(&self, gpa: u64, region: Arc<vroom_memory::MmapRegion>) -> Result<()>;
 
     /// Map memory a native library owns (GPU buffers) at `gpa`, read/write.
     ///

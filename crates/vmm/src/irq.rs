@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use bulwark_devices::IrqLine;
-use bulwark_hv::Vm;
+use vroom_devices::IrqLine;
+use vroom_hv::Vm;
 
 /// A device interrupt wired to one irqchip input line.
 pub struct SpiLine {
@@ -34,7 +34,7 @@ impl GicMsi {
     }
 }
 
-impl bulwark_devices::pci::MsiSender for GicMsi {
+impl vroom_devices::pci::MsiSender for GicMsi {
     fn send(&self, addr: u64, data: u32) {
         if let Err(e) = self.vm.signal_msi(addr, data) {
             log::debug!("msi {addr:#x}/{data}: {e}");
@@ -58,21 +58,21 @@ const V2M_TYPER: u64 = 0x008;
 const V2M_SETSPI_NS: u64 = 0x040;
 const V2M_IIDR: u64 = 0xfcc;
 
-impl bulwark_devices::BusDevice for V2mFrame {
+impl vroom_devices::BusDevice for V2mFrame {
     fn read(&mut self, offset: u64, data: &mut [u8]) {
-        use bulwark_arch::aarch64::layout::{MSI_INTID_BASE, MSI_INTID_COUNT};
+        use vroom_arch::aarch64::layout::{MSI_INTID_BASE, MSI_INTID_COUNT};
         let v: u64 = match offset {
             V2M_TYPER => ((MSI_INTID_BASE as u64) << 16) | MSI_INTID_COUNT as u64,
             V2M_IIDR => 0x0000_043b,
             _ => 0,
         };
-        bulwark_devices::put_le(data, v);
+        vroom_devices::put_le(data, v);
     }
 
     fn write(&mut self, offset: u64, data: &[u8]) {
-        use bulwark_arch::aarch64::layout::{MSI_INTID_BASE, MSI_INTID_COUNT};
+        use vroom_arch::aarch64::layout::{MSI_INTID_BASE, MSI_INTID_COUNT};
         if offset == V2M_SETSPI_NS {
-            let intid = bulwark_devices::get_le(data) as u32;
+            let intid = vroom_devices::get_le(data) as u32;
             // Only the SPIs this frame owns.
             if (MSI_INTID_BASE..MSI_INTID_BASE + MSI_INTID_COUNT).contains(&intid) {
                 let _ = self.vm.signal_msi(offset, intid);

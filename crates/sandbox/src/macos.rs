@@ -21,7 +21,7 @@ fn q(p: &Path) -> Result<String> {
     Ok(format!("\"{s}\""))
 }
 
-/// Build the profile. Public for tests / `bulwark sandbox-profile`.
+/// Build the profile. Public for tests / `vroom sandbox-profile`.
 pub fn profile(p: &Policy) -> Result<String> {
     let mut s = String::from(
         r#"(version 1)

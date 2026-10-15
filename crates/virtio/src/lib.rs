@@ -47,13 +47,13 @@ pub enum Error {
     #[error("descriptor chain: {0}")]
     Chain(String),
     #[error("guest memory: {0}")]
-    Memory(#[from] bulwark_memory::Error),
+    Memory(#[from] vroom_memory::Error),
     #[error("device: {0}")]
     Device(String),
     #[error("i/o: {0}")]
     Io(#[from] std::io::Error),
     #[error("snapshot: {0}")]
-    Snapshot(#[from] bulwark_snapshot::Error),
+    Snapshot(#[from] vroom_snapshot::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

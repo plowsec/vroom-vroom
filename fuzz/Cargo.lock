@@ -36,7 +36,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "bulwark-block"
+name = "vroom-block"
 version = "0.1.0"
 dependencies = [
  "flate2",
@@ -47,12 +47,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "bulwark-devices"
+name = "vroom-devices"
 version = "0.1.0"
 dependencies = [
- "bulwark-block",
- "bulwark-memory",
- "bulwark-snapshot",
+ "vroom-block",
+ "vroom-memory",
+ "vroom-snapshot",
  "log",
  "serde",
  "serde_json",
@@ -60,47 +60,47 @@ dependencies = [
 ]
 
 [[package]]
-name = "bulwark-display"
+name = "vroom-display"
 version = "0.1.0"
 dependencies = [
- "bulwark-ipc",
+ "vroom-ipc",
  "getrandom 0.2.17",
  "libc",
  "thiserror",
 ]
 
 [[package]]
-name = "bulwark-fs"
+name = "vroom-fs"
 version = "0.1.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
-name = "bulwark-fuzz"
+name = "vroom-fuzz"
 version = "0.0.0"
 dependencies = [
- "bulwark-block",
- "bulwark-devices",
- "bulwark-display",
- "bulwark-fs",
- "bulwark-memory",
- "bulwark-net",
- "bulwark-proto",
- "bulwark-virtio",
+ "vroom-block",
+ "vroom-devices",
+ "vroom-display",
+ "vroom-fs",
+ "vroom-memory",
+ "vroom-net",
+ "vroom-proto",
+ "vroom-virtio",
  "libfuzzer-sys",
  "tempfile",
 ]
 
 [[package]]
-name = "bulwark-ipc"
+name = "vroom-ipc"
 version = "0.1.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
-name = "bulwark-memory"
+name = "vroom-memory"
 version = "0.1.0"
 dependencies = [
  "libc",
@@ -108,10 +108,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "bulwark-net"
+name = "vroom-net"
 version = "0.1.0"
 dependencies = [
- "bulwark-ipc",
+ "vroom-ipc",
  "getrandom 0.2.17",
  "libc",
  "log",
@@ -124,14 +124,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "bulwark-proto"
+name = "vroom-proto"
 version = "0.1.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
-name = "bulwark-snapshot"
+name = "vroom-snapshot"
 version = "0.1.0"
 dependencies = [
  "hex",
@@ -142,15 +142,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "bulwark-virtio"
+name = "vroom-virtio"
 version = "0.1.0"
 dependencies = [
- "bulwark-block",
- "bulwark-devices",
- "bulwark-fs",
- "bulwark-memory",
- "bulwark-net",
- "bulwark-snapshot",
+ "vroom-block",
+ "vroom-devices",
+ "vroom-fs",
+ "vroom-memory",
+ "vroom-net",
+ "vroom-snapshot",
  "getrandom 0.2.17",
  "log",
  "mio",

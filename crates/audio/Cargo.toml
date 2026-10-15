@@ -1,5 +1,5 @@
 [package]
-name = "bulwark-audio"
+name = "vroom-audio"
 description = "Guest audio out of the VMM: framing, and the sandboxed helper that plays it."
 version.workspace = true
 edition.workspace = true

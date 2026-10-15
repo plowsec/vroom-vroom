@@ -11,9 +11,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
-use bulwark_block::qcow2::{OpenPolicy, Qcow2Image};
-use bulwark_block::{DiskImage, Format, SwapDisk, SyncMode};
-use bulwark_config::{DiskFormat, DiskSync, VmConfig};
+use vroom_block::qcow2::{OpenPolicy, Qcow2Image};
+use vroom_block::{DiskImage, Format, SwapDisk, SyncMode};
+use vroom_config::{DiskFormat, DiskSync, VmConfig};
 use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};
@@ -86,7 +86,7 @@ impl DiskSet {
                 sync: sync_of(d.sync),
             };
             if d.readonly {
-                let img = bulwark_block::open_with(&d.path, fmt_of(d.format), true, &policy)
+                let img = vroom_block::open_with(&d.path, fmt_of(d.format), true, &policy)
                     .map_err(|e| Error::Setup(format!("disk {}: {e}", d.path.display())))?;
                 disks.push(VmDisk { index: i, image: SwapDisk::new(img), active: None, active_fmt: Format::Raw, sync: policy.sync });
                 continue;
@@ -94,9 +94,9 @@ impl DiskSet {
             let ptr_path = dir.join(format!("disk{i}.json"));
             let (active, fmt) = if let Some(layer) = restore.get(&i) {
                 // Revert: new overlay on the frozen layer.
-                let lower = bulwark_block::open_with(layer, None, true, &policy)
+                let lower = vroom_block::open_with(layer, None, true, &policy)
                     .map_err(|e| Error::Setup(format!("snapshot layer {}: {e}", layer.display())))?;
-                let lfmt = bulwark_block::detect(layer).map_err(|e| Error::Setup(e.to_string()))?;
+                let lfmt = vroom_block::detect(layer).map_err(|e| Error::Setup(e.to_string()))?;
                 let top = dir.join(format!("disk{i}-{}.qcow2", stamp()));
                 Qcow2Image::create(&top, lower.size(), Some((layer, lfmt))).map_err(|e| Error::Setup(e.to_string()))?;
                 (top, Format::Qcow2)
@@ -122,7 +122,7 @@ impl DiskSet {
                 }
             };
             let fmt = if active == std::path::absolute(&d.path)? { fmt_of(d.format) } else { Some(fmt) };
-            let img = bulwark_block::open_with(&active, fmt, false, &policy)
+            let img = vroom_block::open_with(&active, fmt, false, &policy)
                 .map_err(|e| Error::Setup(format!("disk {}: {e}", active.display())))?;
             let active_fmt = fmt.unwrap_or(Format::Raw);
             write_pointer(&ptr_path, &active)?;

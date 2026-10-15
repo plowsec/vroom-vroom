@@ -21,7 +21,7 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once};
 
-use bulwark_memory::{GuestMemory, MmapRegion};
+use vroom_memory::{GuestMemory, MmapRegion};
 use kvm_bindings::{kvm_run, kvm_userspace_memory_region, KVM_MEM_READONLY};
 use kvm_ioctls::{Kvm as KvmSys, VmFd};
 

@@ -3,9 +3,9 @@
 #![no_main]
 use std::sync::Arc;
 
-use bulwark_memory::{GuestAddress, GuestMemory};
-use bulwark_virtio::devices::sound::{AudioSink, Sound};
-use bulwark_virtio::{ActivateContext, Queue, VirtioInterrupt};
+use vroom_memory::{GuestAddress, GuestMemory};
+use vroom_virtio::devices::sound::{AudioSink, Sound};
+use vroom_virtio::{ActivateContext, Queue, VirtioInterrupt};
 use libfuzzer_sys::fuzz_target;
 
 struct Null;

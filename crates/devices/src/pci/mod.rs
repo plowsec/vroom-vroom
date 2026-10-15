@@ -26,8 +26,8 @@ pub trait PciDevice: Send {
     fn bar_write(&mut self, bar: usize, off: u64, data: &[u8]);
     /// Snapshot id (unique per VM).
     fn id(&self) -> String;
-    fn save(&mut self) -> bulwark_snapshot::Result<Vec<u8>>;
-    fn restore(&mut self, data: &[u8]) -> bulwark_snapshot::Result<()>;
+    fn save(&mut self) -> vroom_snapshot::Result<Vec<u8>>;
+    fn restore(&mut self, data: &[u8]) -> vroom_snapshot::Result<()>;
     fn pause(&mut self) {}
     fn resume(&mut self) {}
 }

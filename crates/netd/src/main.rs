@@ -1,4 +1,4 @@
-//! bulwark-netd: privileged network helper.
+//! vroom-netd: privileged network helper.
 //!
 //! Runs as root, owns the real network attachments (vmnet on macOS,
 //! tap+bridge on Linux) and hands each sandboxed VMM a socket that carries
@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bulwark_net::netd::{read_line, Attach, Request, Response, VERSION};
+use vroom_net::netd::{read_line, Attach, Request, Response, VERSION};
 use port::Port;
 use serde::Deserialize;
 
@@ -60,11 +60,11 @@ struct Config {
 }
 
 fn default_socket() -> PathBuf {
-    bulwark_net::netd::DEFAULT_SOCKET.into()
+    vroom_net::netd::DEFAULT_SOCKET.into()
 }
 
 fn default_group() -> String {
-    if cfg!(target_os = "macos") { "staff" } else { "bulwark" }.into()
+    if cfg!(target_os = "macos") { "staff" } else { "vroom" }.into()
 }
 
 fn valid_name(s: &str) -> bool {
@@ -244,7 +244,7 @@ fn handle(st: Arc<State>, mut s: UnixStream) {
     };
     log::info!("uid {uid}: {} nic{} {:?} mac {:02x?}", req.vm, req.nic, req.attach, port.mac());
     reply(&mut s, &Response { ok: true, error: String::new(), mac: port.mac(), mtu: port.mtu() });
-    if bulwark_ipc::send_fd(&s, vmm_end.as_raw_fd()).is_err() {
+    if vroom_ipc::send_fd(&s, vmm_end.as_raw_fd()).is_err() {
         release(&st);
         return;
     }
@@ -264,16 +264,16 @@ fn group_gid(name: &str) -> Option<u32> {
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    let path = std::env::args().nth(1).unwrap_or_else(|| "/etc/bulwark/netd.toml".into());
+    let path = std::env::args().nth(1).unwrap_or_else(|| "/etc/vroom/netd.toml".into());
     let cfg: Config = match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|s| toml::from_str(&s).map_err(|e| e.to_string())) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("bulwark-netd: {path}: {e}");
+            eprintln!("vroom-netd: {path}: {e}");
             std::process::exit(2);
         }
     };
     if cfg.host_only.iter().any(|n| !valid_name(&n.name)) || cfg.bridge_interfaces.iter().any(|i| !valid_name(i)) {
-        eprintln!("bulwark-netd: invalid names in config");
+        eprintln!("vroom-netd: invalid names in config");
         std::process::exit(2);
     }
     // SAFETY: geteuid has no preconditions.
@@ -287,7 +287,7 @@ fn main() {
     let listener = match UnixListener::bind(&cfg.socket) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("bulwark-netd: bind {}: {e}", cfg.socket.display());
+            eprintln!("vroom-netd: bind {}: {e}", cfg.socket.display());
             std::process::exit(1);
         }
     };

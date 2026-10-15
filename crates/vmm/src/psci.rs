@@ -1,6 +1,6 @@
 //! PSCI 1.0 over HVC. Pure logic: the vCPU threads apply the outcome.
 
-use bulwark_hv::aarch64::{mpidr_affinity, psci::*};
+use vroom_hv::aarch64::{mpidr_affinity, psci::*};
 
 /// Power state of every vCPU, indexed like the vCPU threads.
 #[derive(Debug, Clone)]
@@ -111,7 +111,7 @@ pub fn handle(func: u64, args: [u64; 3], caller: usize, t: &mut CpuTable) -> Psc
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bulwark_hv::aarch64::mpidr_for;
+    use vroom_hv::aarch64::mpidr_for;
 
     fn table(n: u32) -> CpuTable {
         CpuTable::new((0..n).map(mpidr_for).collect())

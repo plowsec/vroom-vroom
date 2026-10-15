@@ -5,29 +5,29 @@ use std::os::unix::net::{UnixDatagram, UnixStream};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use bulwark_arch::aarch64::{self as board, layout};
-use bulwark_config::{Boot, DiskBus, Gpu, VmConfig};
-use bulwark_devices::{pl011::Pl011, pl031::Pl031, BusBuilder, BusDevice};
-use bulwark_hv::{
+use vroom_arch::aarch64::{self as board, layout};
+use vroom_config::{Boot, DiskBus, Gpu, VmConfig};
+use vroom_devices::{pl011::Pl011, pl031::Pl031, BusBuilder, BusDevice};
+use vroom_hv::{
     aarch64::mpidr_for, BootRegs, GicMsiConfig, Hypervisor, IrqChipConfig, IrqChipInfo, Vm, VmParams,
 };
-use bulwark_memory::{GuestAddress, GuestMemory};
-use bulwark_snapshot::Snapshottable;
-use bulwark_config::NetMode;
-use bulwark_net::nat::{Nat, NatConfig, NatPolicy, TcpForward};
-use bulwark_net::socket::FrameSocket;
-use bulwark_net::{netd, NetBackend};
-use bulwark_proto::AGENT_PORT;
-use bulwark_virtio::devices::gpu::{DisplaySink, Gpu as GpuDev, ThreeD};
-use bulwark_virtio::devices::gpu3d::{Mapping, ShmMapper};
-use bulwark_virtio::devices::input::{Input, InputKind};
-use bulwark_virtio::devices::{block::Block, console::Console, fs::Fs, net::Net, rng::Rng};
-use bulwark_devices::nvme::{Namespace, Nvme};
-use bulwark_devices::usb::xhci::Xhci;
-use bulwark_devices::pci::{Intx, IntxRouter, MsiSender, PciRoot, SharedPciDevice};
-use bulwark_devices::IrqLine;
-use bulwark_virtio::mmio::{ShmRegion, VirtioMmio};
-use bulwark_virtio::{pci::VirtioPci, VirtioDevice};
+use vroom_memory::{GuestAddress, GuestMemory};
+use vroom_snapshot::Snapshottable;
+use vroom_config::NetMode;
+use vroom_net::nat::{Nat, NatConfig, NatPolicy, TcpForward};
+use vroom_net::socket::FrameSocket;
+use vroom_net::{netd, NetBackend};
+use vroom_proto::AGENT_PORT;
+use vroom_virtio::devices::gpu::{DisplaySink, Gpu as GpuDev, ThreeD};
+use vroom_virtio::devices::gpu3d::{Mapping, ShmMapper};
+use vroom_virtio::devices::input::{Input, InputKind};
+use vroom_virtio::devices::{block::Block, console::Console, fs::Fs, net::Net, rng::Rng};
+use vroom_devices::nvme::{Namespace, Nvme};
+use vroom_devices::usb::xhci::Xhci;
+use vroom_devices::pci::{Intx, IntxRouter, MsiSender, PciRoot, SharedPciDevice};
+use vroom_devices::IrqLine;
+use vroom_virtio::mmio::{ShmRegion, VirtioMmio};
+use vroom_virtio::{pci::VirtioPci, VirtioDevice};
 
 use crate::agent::{self, Agent, ClipboardProvider};
 use crate::disks::DiskSet;
@@ -232,12 +232,12 @@ const GPU_SHM_SIZE: u64 = 8 << 30;
 
 /// Venus through virglrenderer, or a clear error.
 fn three_d(vm: &Arc<dyn Vm>) -> Result<ThreeD> {
-    if !bulwark_gpu3d::load() {
+    if !vroom_gpu3d::load() {
         return Err(Error::Setup(
             "gpu = \"virtio3d\" needs virglrenderer with Venus (macOS: brew install slp/krunkit/virglrenderer)".into(),
         ));
     }
-    let r = bulwark_gpu3d::Virgl::new().ok_or_else(|| Error::Setup("virglrenderer: Venus init failed (no Vulkan driver?)".into()))?;
+    let r = vroom_gpu3d::Virgl::new().ok_or_else(|| Error::Setup("virglrenderer: Venus init failed (no Vulkan driver?)".into()))?;
     Ok(ThreeD::new(Box::new(r), Arc::new(VmShm(vm.clone())), GPU_SHM_SIZE))
 }
 
@@ -277,9 +277,9 @@ fn stable_mac(name: &str, idx: usize) -> [u8; 6] {
 }
 
 /// Backend for one NIC, and the MAC the guest must use.
-fn net_backend(vm: &str, idx: usize, n: &bulwark_config::Net, mac: [u8; 6]) -> Result<(Box<dyn NetBackend>, [u8; 6])> {
+fn net_backend(vm: &str, idx: usize, n: &vroom_config::Net, mac: [u8; 6]) -> Result<(Box<dyn NetBackend>, [u8; 6])> {
     let via_netd = |attach: netd::Attach| -> Result<(Box<dyn NetBackend>, [u8; 6])> {
-        let sock = std::env::var_os("BULWARK_NETD_SOCKET")
+        let sock = std::env::var_os("VROOM_NETD_SOCKET")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| netd::DEFAULT_SOCKET.into());
         let req = netd::Request { version: netd::VERSION, vm: vm.to_string(), nic: idx as u32, attach, mac };
@@ -326,7 +326,7 @@ pub(crate) fn build(
     events: Sender<VmEvent>,
     env: &BuildEnv,
 ) -> Result<Machine> {
-    if hv.arch() != bulwark_hv::Arch::Aarch64 {
+    if hv.arch() != vroom_hv::Arch::Aarch64 {
         return Err(Error::Setup("only the aarch64 board exists so far".into()));
     }
     let info: IrqChipInfo = hv.irqchip_info()?;
@@ -374,11 +374,11 @@ pub(crate) fn build(
     }
     board.add_virtio(Box::new(Rng::new()))?;
     if config.audio.output {
-        // BULWARK_AUDIO_WAV_DIR: test mode, record instead of playing.
-        let wav = std::env::var_os("BULWARK_AUDIO_WAV_DIR").map(std::path::PathBuf::from);
+        // VROOM_AUDIO_WAV_DIR: test mode, record instead of playing.
+        let wav = std::env::var_os("VROOM_AUDIO_WAV_DIR").map(std::path::PathBuf::from);
         let helper = crate::audio::AudioHelper::spawn(wav.as_deref())?;
-        let make = move || -> Box<dyn bulwark_virtio::devices::sound::AudioSink> { Box::new(crate::audio::HelperSink(helper.clone())) };
-        board.add_virtio(Box::new(bulwark_virtio::devices::sound::Sound::new(Box::new(make))))?;
+        let make = move || -> Box<dyn vroom_virtio::devices::sound::AudioSink> { Box::new(crate::audio::HelperSink(helper.clone())) };
+        board.add_virtio(Box::new(vroom_virtio::devices::sound::Sound::new(Box::new(make))))?;
     }
     for s in &config.shares {
         board.add_virtio(Box::new(Fs::new(&s.tag, s.path.clone(), s.readonly).map_err(|e| Error::Setup(e.to_string()))?))?;
@@ -386,7 +386,7 @@ pub(crate) fn build(
     let mut nvme_ns = Vec::new();
     for (d, vd) in config.disks.iter().zip(&disks.disks) {
         let i = vd.index;
-        let img: Arc<dyn bulwark_block::DiskImage> = vd.image.clone();
+        let img: Arc<dyn vroom_block::DiskImage> = vd.image.clone();
         match d.bus {
             DiskBus::Virtio => {
                 let id = format!("vd{}", (b'a' + i as u8) as char);
@@ -447,7 +447,7 @@ pub(crate) fn build(
         }
     }
 
-    // Guest agent channel: /dev/virtio-ports/org.bulwark.agent.0 in the guest.
+    // Guest agent channel: /dev/virtio-ports/org.vroom.agent.0 in the guest.
     let (host_end, dev_end) = UnixStream::pair()?;
     board.add_virtio(Box::new(Console::new(vec![(AGENT_PORT.to_string(), dev_end)])?))?;
     let clipboard = match &ui {
@@ -464,7 +464,7 @@ pub(crate) fn build(
     }
     for (i, n) in config.nets.iter().enumerate() {
         let mac = match &n.mac {
-            Some(m) => bulwark_config::parse_mac(m)?,
+            Some(m) => vroom_config::parse_mac(m)?,
             None => stable_mac(&config.name, i),
         };
         let (backend, mac) = net_backend(&config.name, i, n, mac)?;
@@ -474,7 +474,7 @@ pub(crate) fn build(
     let Board { mut reg, fdt: mut fdt_devices, .. } = board;
     if config.tpm {
         let backend = crate::tpm::Swtpm::start(&env.state_dir.join("tpm"), !env.resuming)?;
-        let dev = bulwark_devices::tpm::Tpm::new(layout::TPM_BASE, Box::new(backend));
+        let dev = vroom_devices::tpm::Tpm::new(layout::TPM_BASE, Box::new(backend));
         reg.add(layout::TPM_BASE, layout::TPM_SIZE, Arc::new(Mutex::new(dev)))?;
         fdt_devices.push(board::FdtDevice::Tpm { base: layout::TPM_BASE, size: layout::TPM_SIZE });
     }
@@ -494,7 +494,7 @@ pub(crate) fn build(
     let boot = match &config.boot {
         Boot::Kernel { kernel, initrd, cmdline } => {
             let raw = read_file(kernel, "kernel", 1 << 30)?;
-            let kernel = bulwark_arch::decompress_if_needed(raw)?;
+            let kernel = vroom_arch::decompress_if_needed(raw)?;
             let initrd = match initrd {
                 Some(p) => Some(read_file(p, "initrd", ram_size / 2)?),
                 None => None,
@@ -526,7 +526,7 @@ pub(crate) fn build(
                     .collect(),
                 screen.as_ref().map(Arc::downgrade),
                 config.tpm.then_some(layout::TPM_BASE),
-                &bulwark_arch::smbios::SmbiosConfig {
+                &vroom_arch::smbios::SmbiosConfig {
                     vm_name: config.name.clone(),
                     uuid: env.uuid,
                     cpus: config.cpus,

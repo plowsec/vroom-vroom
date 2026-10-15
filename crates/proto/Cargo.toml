@@ -1,5 +1,5 @@
 [package]
-name = "bulwark-proto"
+name = "vroom-proto"
 description = "Host <-> guest agent protocol. Shared by the VMM and the guest agent."
 version.workspace = true
 edition.workspace = true

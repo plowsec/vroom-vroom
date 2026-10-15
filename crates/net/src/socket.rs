@@ -1,7 +1,7 @@
 //! Frames over a unix datagram socket (one datagram = one Ethernet frame).
 //!
 //! Used for bridged and host-only networking: the other end is the
-//! privileged `bulwark-netd`, which owns the real interfaces.
+//! privileged `vroom-netd`, which owns the real interfaces.
 
 use std::collections::VecDeque;
 use std::io;

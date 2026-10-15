@@ -1,9 +1,9 @@
-//! `bulwark new`: write a VM definition and create its disk.
+//! `vroom new`: write a VM definition and create its disk.
 
 use std::path::{Path, PathBuf};
 
-use bulwark_config::template::NewVm;
-use bulwark_config::GuestOs;
+use vroom_config::template::NewVm;
+use vroom_config::GuestOs;
 use clap::{Args, ValueEnum};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -45,7 +45,7 @@ impl Os {
     }
 }
 
-pub fn run(a: NewArgs, load: impl Fn(&Path) -> Result<bulwark_config::VmConfig, String>) -> Result<(), String> {
+pub fn run(a: NewArgs, load: impl Fn(&Path) -> Result<vroom_config::VmConfig, String>) -> Result<(), String> {
     if !a.name.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)) || a.name.is_empty() {
         return Err(format!("name {:?}: use letters, digits, '.', '_' or '-'", a.name));
     }
@@ -75,8 +75,8 @@ pub fn run(a: NewArgs, load: impl Fn(&Path) -> Result<bulwark_config::VmConfig, 
         let _ = std::fs::remove_file(&cfg_path);
         return Err(format!("generated config is invalid: {e}"));
     }
-    bulwark_block::qcow2::Qcow2Image::create(&disk_path, size, None).map_err(|e| e.to_string())?;
+    vroom_block::qcow2::Qcow2Image::create(&disk_path, size, None).map_err(|e| e.to_string())?;
     println!("created {} and {} ({} bytes)", cfg_path.display(), disk_path.display(), size);
-    println!("start it: bulwark-gui {}", cfg_path.display());
+    println!("start it: vroom-gui {}", cfg_path.display());
     Ok(())
 }

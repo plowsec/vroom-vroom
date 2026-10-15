@@ -6,7 +6,7 @@
 
 use std::num::Wrapping;
 
-use bulwark_memory::{GuestAddress, GuestMemory};
+use vroom_memory::{GuestAddress, GuestMemory};
 use serde::{Deserialize, Serialize};
 
 use crate::chain::DescriptorChain;

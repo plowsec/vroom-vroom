@@ -14,7 +14,7 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use bulwark_memory::{GuestMemory, MmapRegion};
+use vroom_memory::{GuestMemory, MmapRegion};
 
 use crate::{
     Arch, Error, Hypervisor, IrqChipConfig, IrqChipInfo, IrqChipState, Result, Vcpu, VcpuKicker, Vm,
@@ -231,7 +231,7 @@ impl Vm for HvfVm {
 
     unsafe fn map_host(&self, gpa: u64, ptr: *mut u8, size: u64) -> Result<()> {
         // HVF wants host pointer, IPA and size aligned to the host page.
-        let ps = bulwark_memory::page_size() as u64;
+        let ps = vroom_memory::page_size() as u64;
         if !gpa.is_multiple_of(ps) || !(ptr as u64).is_multiple_of(ps) || !size.is_multiple_of(ps) || size == 0 {
             return Err(Error::Invalid(format!("unaligned host map {gpa:#x} {ptr:p} {size:#x}")));
         }

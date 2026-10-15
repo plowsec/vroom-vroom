@@ -1,4 +1,4 @@
-//! `bulwark run`: one VM, serial console and/or GUI viewer.
+//! `vroom run`: one VM, serial console and/or GUI viewer.
 
 use std::io::Read;
 use std::os::fd::FromRawFd;
@@ -7,14 +7,14 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use bulwark_config::{NetKind, VmConfig};
-use bulwark_display::Command;
-use bulwark_vmm::agent::{AgentCmd, ClipboardProvider};
-use bulwark_vmm::{RunState, StartMode, VmEvent, Vmm, VmmOptions};
+use vroom_config::{NetKind, VmConfig};
+use vroom_display::Command;
+use vroom_vmm::agent::{AgentCmd, ClipboardProvider};
+use vroom_vmm::{RunState, StartMode, VmEvent, Vmm, VmmOptions};
 
 use crate::term;
 
-const HELP: &str = "\r\n[bulwark] Ctrl-A x: power off | s: snapshot | z: suspend | p: pause/resume | r: reset\r\n          d: ask guest to shut down | c: host clipboard -> guest | v: guest clipboard -> host\r\n          g: screendump (png)\r\n";
+const HELP: &str = "\r\n[vroom] Ctrl-A x: power off | s: snapshot | z: suspend | p: pause/resume | r: reset\r\n          d: ask guest to shut down | c: host clipboard -> guest | v: guest clipboard -> host\r\n          g: screendump (png)\r\n";
 
 pub struct RunOpts {
     pub config: VmConfig,
@@ -54,10 +54,10 @@ fn timestamp() -> u64 {
 
 /// Sandbox the process now that everything is open.
 fn lock_down(cfg: &VmConfig, state_dir: &Path, clipboard: bool, helpers: Vec<u32>) -> Result<(), String> {
-    let mut p = bulwark_sandbox::Policy {
+    let mut p = vroom_sandbox::Policy {
         write_dirs: vec![state_dir.to_path_buf()],
         clipboard,
-        gpu: cfg.display.gpu == bulwark_config::Gpu::Virtio3d,
+        gpu: cfg.display.gpu == vroom_config::Gpu::Virtio3d,
         ..Default::default()
     };
     for d in &cfg.disks {
@@ -80,14 +80,14 @@ fn lock_down(cfg: &VmConfig, state_dir: &Path, clipboard: bool, helpers: Vec<u32
         if n.mode == NetKind::Nat {
             p.network_outbound = true;
             p.loopback |= n.allow_host_loopback;
-            p.loopback_dns |= bulwark_net::nat::host_dns().is_some_and(|a| a.ip().is_loopback());
+            p.loopback_dns |= vroom_net::nat::host_dns().is_some_and(|a| a.ip().is_loopback());
             p.listen_ports.extend(n.port_forwards.iter().map(|f| f.host_port));
         }
     }
     p.helper_pids = helpers;
-    bulwark_sandbox::apply(&p).map_err(|e| e.to_string())?;
+    vroom_sandbox::apply(&p).map_err(|e| e.to_string())?;
     log::info!("sandbox applied");
-    if std::env::var_os("BULWARK_SANDBOX_SELFTEST").is_some() {
+    if std::env::var_os("VROOM_SANDBOX_SELFTEST").is_some() {
         selftest();
     }
     Ok(())
@@ -114,7 +114,7 @@ fn selftest() {
     }
     // Host services: loopback TCP and Unix sockets (ssh-agent...).
     let t = Duration::from_secs(2);
-    if let Some(port) = std::env::var("BULWARK_SELFTEST_LOOPBACK_PORT").ok().and_then(|p| p.parse::<u16>().ok()) {
+    if let Some(port) = std::env::var("VROOM_SELFTEST_LOOPBACK_PORT").ok().and_then(|p| p.parse::<u16>().ok()) {
         match std::net::TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), t) {
             Ok(_) => eprintln!("sandbox selftest: host loopback ALLOWED (bad unless allow_host_loopback)"),
             Err(e) => eprintln!("sandbox selftest: host loopback blocked ({e})"),
@@ -143,13 +143,13 @@ struct Session {
 }
 
 /// Below this, guest writes could fail half-way: pause first.
-/// `BULWARK_LOW_SPACE_MIB` overrides it.
+/// `VROOM_LOW_SPACE_MIB` overrides it.
 const LOW_SPACE: u64 = 2 << 30;
 const SPACE_CHECK: Duration = Duration::from_secs(2);
 
 impl Session {
     fn note(&self, msg: &str) {
-        eprint!("\r\n[bulwark] {msg}\r\n");
+        eprint!("\r\n[vroom] {msg}\r\n");
         self.vmm.viewer_status(msg);
     }
 
@@ -183,7 +183,7 @@ impl Session {
         match a {
             Action::PowerOff => {
                 self.vmm.shutdown();
-                eprint!("\r\n[bulwark] stopped\r\n");
+                eprint!("\r\n[vroom] stopped\r\n");
                 return Flow::Exit;
             }
             Action::Snapshot => {
@@ -198,7 +198,7 @@ impl Session {
                 let _ = std::fs::remove_dir_all(&d);
                 match self.vmm.suspend_in_place(&d) {
                     Ok(()) => {
-                        eprint!("\r\n[bulwark] suspended to {}\r\n", d.display());
+                        eprint!("\r\n[vroom] suspended to {}\r\n", d.display());
                         return Flow::Exit;
                     }
                     Err(e) => self.note(&format!("suspend failed: {e}")),
@@ -248,7 +248,7 @@ impl Session {
         Ok(match ev {
             VmEvent::Shutdown => {
                 self.vmm.shutdown();
-                eprint!("\r\n[bulwark] guest powered off\r\n");
+                eprint!("\r\n[vroom] guest powered off\r\n");
                 Flow::Exit
             }
             VmEvent::Reset => {
@@ -295,7 +295,7 @@ pub fn run(o: RunOpts) -> Result<(), String> {
     let start = match (&o.restore, o.fresh) {
         (Some(p), _) => StartMode::Restore(p.clone()),
         (None, false) if suspend.join("manifest.json").exists() => {
-            eprintln!("bulwark: resuming suspended VM");
+            eprintln!("vroom: resuming suspended VM");
             StartMode::Restore(suspend.clone())
         }
         _ => StartMode::Boot,
@@ -307,7 +307,7 @@ pub fn run(o: RunOpts) -> Result<(), String> {
     let gui = ui.is_some();
     let clipboard = if gui { None } else { o.clipboard };
     let has_clip = clipboard.is_some();
-    let hv = bulwark_hv::default_hypervisor().map_err(|e| e.to_string())?;
+    let hv = vroom_hv::default_hypervisor().map_err(|e| e.to_string())?;
     let opts = VmmOptions { serial_out: Box::new(std::io::stdout()), start, clipboard, ui, state_dir: o.state_dir.clone() };
     let vmm = Vmm::start(o.config, hv, opts).map_err(|e| e.to_string())?;
     if resumed_suspend {
@@ -318,11 +318,11 @@ pub fn run(o: RunOpts) -> Result<(), String> {
     if o.sandbox && vmm.config().security.sandbox {
         lock_down(vmm.config(), &o.state_dir, has_clip, vmm.helper_pids())?;
     } else {
-        eprintln!("bulwark: WARNING: running without sandbox");
+        eprintln!("vroom: WARNING: running without sandbox");
     }
     let mut s = Session { vmm, state_dir: o.state_dir, agent_sessions: 0,
         next_space_check: std::time::Instant::now(),
-        low_space: std::env::var("BULWARK_LOW_SPACE_MIB").ok().and_then(|v| v.parse::<u64>().ok()).map_or(LOW_SPACE, |m| m << 20),
+        low_space: std::env::var("VROOM_LOW_SPACE_MIB").ok().and_then(|v| v.parse::<u64>().ok()).map_or(LOW_SPACE, |m| m << 20),
     };
     s.vmm.viewer_status("running");
 

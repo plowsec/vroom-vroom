@@ -5,14 +5,14 @@
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use bulwark_fs::Share;
-use bulwark_virtio::devices::fs::FuseServer;
+use vroom_fs::Share;
+use vroom_virtio::devices::fs::FuseServer;
 use libfuzzer_sys::fuzz_target;
 
 fn root() -> &'static PathBuf {
     static R: OnceLock<PathBuf> = OnceLock::new();
     R.get_or_init(|| {
-        let d = std::env::temp_dir().join(format!("bulwark-fuzz-fs-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("vroom-fuzz-fs-{}", std::process::id()));
         let _ = std::fs::create_dir_all(d.join("dir/deeper"));
         let _ = std::fs::write(d.join("file"), vec![7u8; 10000]);
         let _ = std::fs::write(d.join("dir/deeper/x"), b"x");

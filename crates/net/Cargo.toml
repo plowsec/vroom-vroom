@@ -1,5 +1,5 @@
 [package]
-name = "bulwark-net"
+name = "vroom-net"
 description = "Network backends: userspace NAT, frame sockets to the privileged helper."
 version.workspace = true
 edition.workspace = true
@@ -9,7 +9,7 @@ license.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-bulwark-ipc.workspace = true
+vroom-ipc.workspace = true
 log.workspace = true
 mio.workspace = true
 libc.workspace = true
@@ -18,7 +18,7 @@ socket2 = "0.5"
 smoltcp = { version = "0.14", default-features = false, features = ["std", "log", "medium-ethernet", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "socket-icmp", "socket-raw", "proto-dhcpv4"] }
 
 [dev-dependencies]
-bulwark-sandbox.workspace = true
+vroom-sandbox.workspace = true
 
 [lints]
 workspace = true

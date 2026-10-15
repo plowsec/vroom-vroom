@@ -1,5 +1,5 @@
 [package]
-name = "bulwark-snapshot"
+name = "vroom-snapshot"
 description = "Snapshot trait and on-disk snapshot format."
 version.workspace = true
 edition.workspace = true

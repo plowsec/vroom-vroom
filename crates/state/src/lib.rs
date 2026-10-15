@@ -12,13 +12,13 @@ use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
-use bulwark_block::qcow2::{fold_backing, OpenPolicy};
-use bulwark_snapshot::SnapshotDir;
+use vroom_block::qcow2::{fold_backing, OpenPolicy};
+use vroom_snapshot::SnapshotDir;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// Another bulwark process (a running VM) holds the state dir.
-    #[error("{0} is in use by another bulwark process")]
+    /// Another vroom process (a running VM) holds the state dir.
+    #[error("{0} is in use by another vroom process")]
     Busy(String),
     #[error("{0}")]
     Setup(String),
@@ -176,7 +176,7 @@ fn canon(p: &Path) -> PathBuf {
 /// Backing file of a layer. A layer we can't open stops everything: guessing
 /// would make its parent look unused and get it deleted.
 fn parent_of(layer: &Path, policy: &OpenPolicy) -> Result<Option<PathBuf>> {
-    let q = bulwark_block::qcow2::Qcow2Image::open_with(layer, true, policy, 0)
+    let q = vroom_block::qcow2::Qcow2Image::open_with(layer, true, policy, 0)
         .map_err(|e| Error::Setup(format!("layer {}: {e}; not pruning", layer.display())))?;
     Ok(q.backing_path().map(canon))
 }

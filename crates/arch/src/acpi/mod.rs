@@ -4,7 +4,7 @@
 pub mod aml;
 
 pub const OEM_ID: &[u8; 6] = b"BULWRK";
-pub const OEM_TABLE_ID: &[u8; 8] = b"BULWARK ";
+pub const OEM_TABLE_ID: &[u8; 8] = b"VROOM   ";
 const CREATOR_ID: &[u8; 4] = b"BWRK";
 
 pub const RSDP_FILE: &str = "etc/acpi/rsdp";

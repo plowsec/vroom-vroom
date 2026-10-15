@@ -1,6 +1,6 @@
 //! Direct kernel boot (arm64 `Image` protocol, Documentation/arm64/booting.rst).
 
-use bulwark_memory::{GuestAddress, GuestMemory};
+use vroom_memory::{GuestAddress, GuestMemory};
 
 use super::fdt::FDT_MAX_SIZE;
 use crate::{Error, Result};

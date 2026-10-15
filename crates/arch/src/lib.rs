@@ -20,7 +20,7 @@ pub enum Error {
     #[error("layout: {0}")]
     Layout(String),
     #[error("memory: {0}")]
-    Memory(#[from] bulwark_memory::Error),
+    Memory(#[from] vroom_memory::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

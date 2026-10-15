@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=vroom guest agent (session)
+Comment=Clipboard and resolution for the vroom host; unprivileged
+Exec=/usr/local/bin/vroom-agent --session
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

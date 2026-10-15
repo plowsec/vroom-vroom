@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Unattended Windows 11 ARM64 install for bulwark VMs.
+<!-- Unattended Windows 11 ARM64 install for vroom VMs.
      - Bypasses TPM / Secure Boot / CPU checks (no vTPM yet).
      - Wipes disk 0 (the first NVMe namespace) and installs there.
-     - Creates local admin "bulwark" / "bulwark" (change it!).
-     - On first logon installs virtio-win drivers + the bulwark agent if
+     - Creates local admin "vroom" / "vroom" (change it!).
+     - On first logon installs virtio-win drivers + the vroom agent if
        found on any attached disk. -->
 <unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
   <settings pass="windowsPE">
@@ -52,7 +52,7 @@
   </settings>
   <settings pass="specialize">
     <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
-      <ComputerName>BULWARK-WIN</ComputerName>
+      <ComputerName>VROOM-WIN</ComputerName>
     </component>
     <component name="Microsoft-Windows-Deployment" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
       <RunSynchronous>
@@ -79,23 +79,23 @@
       <UserAccounts>
         <LocalAccounts>
           <LocalAccount wcm:action="add">
-            <Name>bulwark</Name>
+            <Name>vroom</Name>
             <Group>Administrators</Group>
-            <Password><Value>bulwark</Value><PlainText>true</PlainText></Password>
+            <Password><Value>vroom</Value><PlainText>true</PlainText></Password>
           </LocalAccount>
         </LocalAccounts>
       </UserAccounts>
       <AutoLogon>
         <Enabled>true</Enabled>
-        <Username>bulwark</Username>
-        <Password><Value>bulwark</Value><PlainText>true</PlainText></Password>
+        <Username>vroom</Username>
+        <Password><Value>vroom</Value><PlainText>true</PlainText></Password>
         <LogonCount>3</LogonCount>
       </AutoLogon>
       <FirstLogonCommands>
         <SynchronousCommand wcm:action="add">
           <Order>1</Order>
-          <CommandLine>cmd /c for %d in (D E F G H I J K) do if exist %d:\bulwark-setup.cmd call %d:\bulwark-setup.cmd</CommandLine>
-          <Description>Install bulwark guest tools</Description>
+          <CommandLine>cmd /c for %d in (D E F G H I J K) do if exist %d:\vroom-setup.cmd call %d:\vroom-setup.cmd</CommandLine>
+          <Description>Install vroom guest tools</Description>
         </SynchronousCommand>
       </FirstLogonCommands>
     </component>

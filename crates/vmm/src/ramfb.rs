@@ -5,8 +5,8 @@
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use bulwark_display::SharedFb;
-use bulwark_memory::{GuestAddress, GuestMemory};
+use vroom_display::SharedFb;
+use vroom_memory::{GuestAddress, GuestMemory};
 
 use crate::display::FbSink;
 

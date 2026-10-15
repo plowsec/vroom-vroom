@@ -5,9 +5,9 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
-use bulwark_hv::{IrqChipState, VcpuState};
-use bulwark_memory::GuestAddress;
-use bulwark_snapshot::{MemoryRange, SnapshotDir};
+use vroom_hv::{IrqChipState, VcpuState};
+use vroom_memory::GuestAddress;
+use vroom_snapshot::{MemoryRange, SnapshotDir};
 
 use crate::vcpu::VcpuCmd;
 use crate::{Error, Result, Vmm, PAUSE_TIMEOUT};
@@ -141,7 +141,7 @@ pub(crate) fn restore(vmm: &mut Vmm, dir: &Path) -> Result<()> {
     if m.backend != vmm.hv.name() {
         return Err(Error::Setup(format!("snapshot is for backend {}, host is {}", m.backend, vmm.hv.name())));
     }
-    let saved: bulwark_config::VmConfig =
+    let saved: vroom_config::VmConfig =
         serde_json::from_value(m.config.clone()).map_err(|e| Error::Setup(format!("snapshot config: {e}")))?;
     if saved.cpus != vmm.config.cpus || saved.memory_mib != vmm.config.memory_mib {
         return Err(Error::Setup("snapshot was taken with a different cpu/memory config".into()));

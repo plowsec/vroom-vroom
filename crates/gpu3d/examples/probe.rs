@@ -1,31 +1,31 @@
 //! Can this host do Venus? Loads virglrenderer, prints capsets, makes a
 //! context.
-use bulwark_virtio::devices::gpu3d::Renderer3d;
+use vroom_virtio::devices::gpu3d::Renderer3d;
 
 fn main() {
     env_logger_lite();
     if let Some(i) = std::env::args().position(|a| a == "--helper-profile") {
         let a: Vec<String> = std::env::args().collect();
-        print!("{}", bulwark_sandbox::helper_profile(a[i + 1].as_ref(), a[i + 2].as_ref()).expect("profile"));
+        print!("{}", vroom_sandbox::helper_profile(a[i + 1].as_ref(), a[i + 2].as_ref()).expect("profile"));
         return;
     }
     if std::env::args().any(|a| a == "--print-profile") {
-        let p = bulwark_sandbox::Policy { gpu: true, ..Default::default() };
-        print!("{}", bulwark_sandbox::profile_text(&p).expect("profile"));
+        let p = vroom_sandbox::Policy { gpu: true, ..Default::default() };
+        print!("{}", vroom_sandbox::profile_text(&p).expect("profile"));
         return;
     }
-    if !bulwark_gpu3d::load() {
+    if !vroom_gpu3d::load() {
         eprintln!("virglrenderer not found");
         std::process::exit(1);
     }
-    let Some(mut r) = bulwark_gpu3d::Virgl::new() else {
+    let Some(mut r) = vroom_gpu3d::Virgl::new() else {
         eprintln!("init failed");
         std::process::exit(1);
     };
     // Same order as the VMM: load + init, then lock down, then use.
     if std::env::args().any(|a| a == "--sandbox") {
-        let p = bulwark_sandbox::Policy { gpu: true, ..Default::default() };
-        bulwark_sandbox::apply(&p).expect("sandbox");
+        let p = vroom_sandbox::Policy { gpu: true, ..Default::default() };
+        vroom_sandbox::apply(&p).expect("sandbox");
         eprintln!("sandboxed");
     }
     for (id, ver, size) in r.capsets() {

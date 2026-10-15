@@ -1,9 +1,9 @@
 //! fw_cfg from a hostile guest: selector, data port and the DMA interface
 //! (descriptors in guest RAM), including a guest-writable file.
 #![no_main]
-use bulwark_devices::fw_cfg::FwCfg;
-use bulwark_devices::BusDevice;
-use bulwark_memory::{GuestAddress, GuestMemory};
+use vroom_devices::fw_cfg::FwCfg;
+use vroom_devices::BusDevice;
+use vroom_memory::{GuestAddress, GuestMemory};
 use libfuzzer_sys::fuzz_target;
 
 const RAM: u64 = 0x4000_0000;

@@ -15,7 +15,7 @@ const HDR: usize = 8;
 /// Absolute payload cap. Clipboard policy caps lower.
 pub const MAX_PAYLOAD: usize = 64 << 20;
 /// Port name the guest agent opens.
-pub const AGENT_PORT: &str = "org.bulwark.agent.0";
+pub const AGENT_PORT: &str = "org.vroom.agent.0";
 
 /// Feature bits for Hello.
 pub mod features {
@@ -193,7 +193,7 @@ mod tests {
 
     fn all() -> Vec<Message> {
         vec![
-            Message::Hello { features: 3, agent: "bulwark-agent 0.1".into() },
+            Message::Hello { features: 3, agent: "vroom-agent 0.1".into() },
             Message::ClipboardText("héllo 🦀".into()),
             Message::ClipboardText(String::new()),
             Message::TimeSync { unix_secs: 1_800_000_000, nanos: 5 },

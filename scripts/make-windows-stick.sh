@@ -1,5 +1,5 @@
 #!/bin/sh
-# Windows 11 ARM64 install "stick" for bulwark (macOS): a raw FAT32 image
+# Windows 11 ARM64 install "stick" for vroom (macOS): a raw FAT32 image
 # with an MBR (Windows Setup on NVMe can't read 2 KiB-sector ISOs, and a
 # GPT image's EFI partition confuses it), holding the ISO's files, the
 # virtio-win ARM64 drivers, the unattend file, setup script and agent.
@@ -14,8 +14,8 @@ iso=$1; vw=$2; out=${3:-winusb.raw}
 cd "$(dirname "$0")/.."
 root=$(pwd)
 [ -f "$iso" ] && [ -f "$vw" ] || { echo "missing ISO" >&2; exit 1; }
-exe=target/aarch64-pc-windows-msvc/release/bulwark-agent.exe
-[ -f "$exe" ] || cargo xwin build --release -p bulwark-agent --target aarch64-pc-windows-msvc
+exe=target/aarch64-pc-windows-msvc/release/vroom-agent.exe
+[ -f "$exe" ] || cargo xwin build --release -p vroom-agent --target aarch64-pc-windows-msvc
 tmp=$(mktemp -d)
 cleanup() {
   for m in "$tmp/iso" "$tmp/vw" "$tmp/usb"; do hdiutil detach -quiet "$m" 2>/dev/null || true; done
@@ -45,7 +45,7 @@ for d in viogpudo NetKVM vioserial vioinput viorng viostor Balloon; do
     cp -R "$tmp/vw/$d/w11/ARM64" "$tmp/usb/$d/w11/"
   fi
 done
-cp examples/windows/autounattend.xml examples/windows/bulwark-setup.cmd "$exe" "$tmp/usb/"
+cp examples/windows/autounattend.xml examples/windows/vroom-setup.cmd "$exe" "$tmp/usb/"
 rm -f "$tmp/usb/._"*
 hdiutil detach -quiet "$tmp/usb"
 hdiutil convert -quiet "$tmp/usb.dmg" -format UDTO -o "$tmp/usb"

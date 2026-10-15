@@ -4,12 +4,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 
-use bulwark_arch::aarch64::{acpi, layout};
-use bulwark_arch::acpi::{LOADER_FILE, RSDP_FILE, TABLES_FILE};
-use bulwark_devices::fw_cfg::FwCfg;
-use bulwark_devices::pflash::PFlash;
-use bulwark_hv::{IrqChipInfo, Vm};
-use bulwark_memory::{GuestMemory, MmapRegion};
+use vroom_arch::aarch64::{acpi, layout};
+use vroom_arch::acpi::{LOADER_FILE, RSDP_FILE, TABLES_FILE};
+use vroom_devices::fw_cfg::FwCfg;
+use vroom_devices::pflash::PFlash;
+use vroom_hv::{IrqChipInfo, Vm};
+use vroom_memory::{GuestMemory, MmapRegion};
 
 use crate::display::FbSink;
 use crate::machine::DeviceRegistry;
@@ -74,7 +74,7 @@ impl Firmware {
         virtio_mmio: Vec<(u64, u64, u32)>,
         screen: Option<Weak<FbSink>>,
         tpm: Option<u64>,
-        smbios: &bulwark_arch::smbios::SmbiosConfig,
+        smbios: &vroom_arch::smbios::SmbiosConfig,
     ) -> Result<()> {
         // Code: read-only, mapped straight into the guest.
         let code_path = match &self.code {
@@ -115,9 +115,9 @@ impl Firmware {
         fw.add_file(RSDP_FILE, tables.rsdp, None).map_err(Error::Setup)?;
         fw.add_file(TABLES_FILE, tables.tables, None).map_err(Error::Setup)?;
         fw.add_file(LOADER_FILE, tables.loader, None).map_err(Error::Setup)?;
-        let sm = bulwark_arch::smbios::build(smbios);
-        fw.add_file(bulwark_arch::smbios::TABLES_FILE, sm.tables, None).map_err(Error::Setup)?;
-        fw.add_file(bulwark_arch::smbios::ANCHOR_FILE, sm.anchor, None).map_err(Error::Setup)?;
+        let sm = vroom_arch::smbios::build(smbios);
+        fw.add_file(vroom_arch::smbios::TABLES_FILE, sm.tables, None).map_err(Error::Setup)?;
+        fw.add_file(vroom_arch::smbios::ANCHOR_FILE, sm.anchor, None).map_err(Error::Setup)?;
         if let Some(fb) = screen {
             let cfg = Arc::new(Mutex::new(None));
             let c2 = cfg.clone();

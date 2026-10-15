@@ -7,9 +7,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use bulwark_block::DiskImage;
-use bulwark_memory::{GuestAddress, GuestMemory};
-use bulwark_snapshot::{decode, encode};
+use vroom_block::DiskImage;
+use vroom_memory::{GuestAddress, GuestMemory};
+use vroom_snapshot::{decode, encode};
 use serde::{Deserialize, Serialize};
 
 use crate::pci::{BarSpec, ConfigSpace, Intx, MsiSender, Msix, PciDevice, PciId};
@@ -535,7 +535,7 @@ impl Nvme {
                     v
                 };
                 d[4..24].copy_from_slice(&pad(&self.serial, 20));
-                d[24..64].copy_from_slice(&pad("Bulwark NVMe", 40));
+                d[24..64].copy_from_slice(&pad("Vroom NVMe", 40));
                 d[64..72].copy_from_slice(&pad("1.0", 8));
                 d[72] = 6;
                 d[77] = MDTS;
@@ -549,7 +549,7 @@ impl Nvme {
                 d[516..520].copy_from_slice(&(self.ns.len() as u32).to_le_bytes());
                 d[520..522].copy_from_slice(&0x000cu16.to_le_bytes()); // DSM + write zeroes
                 d[525] = 1; // volatile write cache
-                let nqn = format!("nqn.2026-10.org.bulwark:nvme:{}", self.serial);
+                let nqn = format!("nqn.2026-10.org.vroom:nvme:{}", self.serial);
                 d[768..768 + nqn.len()].copy_from_slice(nqn.as_bytes());
             }
             0x02 => {
@@ -596,7 +596,7 @@ impl Nvme {
         let range = || -> Result<(u64, u64), u16> {
             let off = slba.checked_mul(bs).ok_or(SC_LBA_RANGE)?;
             let len = nlb * bs;
-            bulwark_block::check_range(disk.size(), off, len).map_err(|_| SC_LBA_RANGE)?;
+            vroom_block::check_range(disk.size(), off, len).map_err(|_| SC_LBA_RANGE)?;
             Ok((off, len))
         };
         let r: Result<(), u16> = match c.opc {
@@ -640,7 +640,7 @@ impl Nvme {
             let len = u32::from_le_bytes([r[4], r[5], r[6], r[7]]) as u64 * bs;
             let slba = u64::from_le_bytes(r[8..16].try_into().unwrap_or([0; 8]));
             let off = slba.checked_mul(bs).ok_or(SC_LBA_RANGE)?;
-            bulwark_block::check_range(disk.size(), off, len).map_err(|_| SC_LBA_RANGE)?;
+            vroom_block::check_range(disk.size(), off, len).map_err(|_| SC_LBA_RANGE)?;
             let _ = disk.discard(off, len);
         }
         Ok(())
@@ -733,7 +733,7 @@ impl PciDevice for Nvme {
         self.id.clone()
     }
 
-    fn save(&mut self) -> bulwark_snapshot::Result<Vec<u8>> {
+    fn save(&mut self) -> vroom_snapshot::Result<Vec<u8>> {
         for n in &self.ns {
             let _ = n.disk.flush();
         }
@@ -747,9 +747,9 @@ impl PciDevice for Nvme {
         })
     }
 
-    fn restore(&mut self, data: &[u8]) -> bulwark_snapshot::Result<()> {
+    fn restore(&mut self, data: &[u8]) -> vroom_snapshot::Result<()> {
         let s: Snap = decode(data)?;
-        let bad = |m: &str| bulwark_snapshot::Error::Invalid(format!("nvme: {m}"));
+        let bad = |m: &str| vroom_snapshot::Error::Invalid(format!("nvme: {m}"));
         let mut cfg = s.cfg;
         if !cfg.rebuild_masks(&self.cfg) || s.msix.vectors() != self.msix.vectors() {
             return Err(bad("layout"));
@@ -785,8 +785,8 @@ mod tests {
     use super::*;
     use crate::pci::IntxRouter;
     use crate::NoIrq;
-    use bulwark_block::raw::RawImage;
-    use bulwark_block::SECTOR_SIZE;
+    use vroom_block::raw::RawImage;
+    use vroom_block::SECTOR_SIZE;
 
     struct NoMsi;
     impl MsiSender for NoMsi {
@@ -833,9 +833,9 @@ mod tests {
         // Identify controller (cid 1, opc 6, cns 1).
         submit(&mut n, &mem, (0, ASQ, 4), 0, [6 | 1 << 16, 0, 0, 0, 0, 0, BUF as u32, 0, 0, 0, 1, 0, 0, 0, 0, 0]);
         assert_eq!(status(&mem, ACQ, 0), 0);
-        let mut mn = [0u8; 12];
+        let mut mn = [0u8; 10];
         mem.read(GuestAddress(BUF + 24), &mut mn).unwrap();
-        assert_eq!(&mn, b"Bulwark NVMe");
+        assert_eq!(&mn, b"Vroom NVMe");
         // Create CQ 1 and SQ 1 (4 entries each).
         let (cq1, sq1) = (RAM + 0x2000, RAM + 0x3000);
         submit(&mut n, &mem, (0, ASQ, 4), 1, [5 | 2 << 16, 0, 0, 0, 0, 0, cq1 as u32, 0, 0, 0, 1 | 3 << 16, 1, 0, 0, 0, 0]);

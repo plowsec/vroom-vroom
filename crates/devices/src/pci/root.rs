@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, RwLock};
 
-use bulwark_snapshot::{decode, encode, Snapshottable};
+use vroom_snapshot::{decode, encode, Snapshottable};
 
 use super::{ConfigSpace, PciId, SharedPciDevice};
 use crate::{BusDevice, IrqLine};
@@ -221,7 +221,7 @@ impl Snapshottable for EcamPort {
         }
     }
 
-    fn save(&mut self) -> bulwark_snapshot::Result<Vec<u8>> {
+    fn save(&mut self) -> vroom_snapshot::Result<Vec<u8>> {
         let host = self.0.host.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let mut devs = BTreeMap::new();
         for (_, d) in &self.0.devices {
@@ -231,20 +231,20 @@ impl Snapshottable for EcamPort {
         encode(&(host, devs))
     }
 
-    fn restore(&mut self, data: &[u8]) -> bulwark_snapshot::Result<()> {
+    fn restore(&mut self, data: &[u8]) -> vroom_snapshot::Result<()> {
         let (host, mut devs): (ConfigSpace, BTreeMap<String, Vec<u8>>) = decode(data)?;
         {
             let mut h = self.0.host.lock().unwrap_or_else(|e| e.into_inner());
             let mut host = host;
             if !host.rebuild_masks(&h) {
-                return Err(bulwark_snapshot::Error::Invalid("host bridge layout".into()));
+                return Err(vroom_snapshot::Error::Invalid("host bridge layout".into()));
             }
             *h = host;
         }
         for (_, d) in &self.0.devices {
             let mut d = d.lock().unwrap_or_else(|e| e.into_inner());
             let id = d.id();
-            let blob = devs.remove(&id).ok_or_else(|| bulwark_snapshot::Error::Invalid(format!("missing {id}")))?;
+            let blob = devs.remove(&id).ok_or_else(|| vroom_snapshot::Error::Invalid(format!("missing {id}")))?;
             d.restore(&blob)?;
         }
         self.0.remap();
@@ -278,10 +278,10 @@ mod tests {
         fn id(&self) -> String {
             "dummy".into()
         }
-        fn save(&mut self) -> bulwark_snapshot::Result<Vec<u8>> {
+        fn save(&mut self) -> vroom_snapshot::Result<Vec<u8>> {
             encode(&self.cfg)
         }
-        fn restore(&mut self, d: &[u8]) -> bulwark_snapshot::Result<()> {
+        fn restore(&mut self, d: &[u8]) -> vroom_snapshot::Result<()> {
             let mut c: ConfigSpace = decode(d)?;
             c.rebuild_masks(&self.cfg);
             self.cfg = c;

@@ -3,8 +3,8 @@
 # Usage: scripts/build.sh [--release]
 set -e
 cd "$(dirname "$0")/.."
-cargo build "$@" -p bulwark-cli -p bulwark-gui
+cargo build "$@" -p vroom-cli -p vroom-gui
 dir=target/debug
 case " $* " in *" --release "*) dir=target/release ;; esac
-scripts/sign.sh "$dir/bulwark"
-echo "built: $dir/bulwark $dir/bulwark-gui"
+scripts/sign.sh "$dir/vroom"
+echo "built: $dir/vroom $dir/vroom-gui"

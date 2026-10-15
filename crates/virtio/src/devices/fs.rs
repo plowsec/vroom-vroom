@@ -2,7 +2,7 @@
 //! virtqueue). Linux: `mount -t virtiofs <tag> /mnt`.
 //!
 //! The FUSE server here only parses and answers; every host access goes
-//! through `bulwark_fs::Share`, which never leaves the shared directory and
+//! through `vroom_fs::Share`, which never leaves the shared directory and
 //! never follows a symlink. On top of that, from the guest's side:
 //! - read-only shares refuse every change (EROFS);
 //! - no symlinks, hard links or device nodes can be created;
@@ -20,7 +20,7 @@ use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use bulwark_fs::{linux_errno, Share, Stat};
+use vroom_fs::{linux_errno, Share, Stat};
 use serde::{Deserialize, Serialize};
 
 use crate::worker::{QueueCtx, QueueHandler, WorkerSlot};
@@ -125,7 +125,7 @@ impl<'a> In<'a> {
         let end = self.b.iter().position(|&c| c == 0).ok_or(EINVAL)?;
         let n = OsStr::from_bytes(&self.b[..end]).to_os_string();
         self.b = &self.b[end + 1..];
-        if !bulwark_fs::valid_name(&n) {
+        if !vroom_fs::valid_name(&n) {
             return Err(EINVAL);
         }
         Ok(n)
@@ -170,7 +170,7 @@ struct Node {
 
 enum Handle {
     File { node: u64, file: File, write: bool, append: bool },
-    Dir { entries: Vec<bulwark_fs::DirEntry> },
+    Dir { entries: Vec<vroom_fs::DirEntry> },
 }
 
 /// What survives a snapshot (the guest kernel holds node ids and file
@@ -557,7 +557,7 @@ impl FuseServer {
                 let s = self.share.statfs().map_err(|e| linux_errno(&e))?;
                 let mut o = Out::default();
                 o.u64(s.blocks).u64(s.bfree).u64(s.bavail).u64(s.files).u64(s.ffree);
-                o.u32(s.bsize).u32(bulwark_fs::NAME_MAX as u32).u32(s.bsize).u32(0);
+                o.u32(s.bsize).u32(vroom_fs::NAME_MAX as u32).u32(s.bsize).u32(0);
                 o.0.resize(80, 0);
                 Ok(o.0)
             }
@@ -635,7 +635,7 @@ impl FuseServer {
         self.reset();
         for (id, mut n) in s.nodes.into_iter().take(MAX_NODES) {
             // Snapshot data is input like any other: names must be names.
-            if n.path.as_ref().is_some_and(|p| !p.iter().all(|c| bulwark_fs::valid_name(OsStr::from_bytes(c)))) {
+            if n.path.as_ref().is_some_and(|p| !p.iter().all(|c| vroom_fs::valid_name(OsStr::from_bytes(c)))) {
                 n.path = None;
             }
             if id == ROOT {

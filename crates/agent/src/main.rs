@@ -1,8 +1,8 @@
-//! bulwark guest agent.
+//! vroom guest agent.
 //!
-//! Talks to the host over the virtio-console port `org.bulwark.agent.0`.
+//! Talks to the host over the virtio-console port `org.vroom.agent.0`.
 //! The host is trusted more than the guest, but we still validate
-//! everything (sizes, UTF-8) via bulwark-proto.
+//! everything (sizes, UTF-8) via vroom-proto.
 
 // Windows: a background app started at logon, no console window.
 #![cfg_attr(windows, windows_subsystem = "windows")]
@@ -25,7 +25,7 @@ use std::io::{Read, Write};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use bulwark_proto::{features, Decoder, Message, AGENT_PORT};
+use vroom_proto::{features, Decoder, Message, AGENT_PORT};
 
 const POLL: Duration = Duration::from_millis(300);
 pub(crate) const MAX_CLIP: usize = 16 << 20;
@@ -77,7 +77,7 @@ fn parse_args() -> Result<Args, String> {
                 a.port = linsvc::SOCKET.into();
             }
             "-h" | "--help" => {
-                println!("bulwark-agent [--port PATH] [--clipboard-file PATH | --no-clipboard] [--service | --session]");
+                println!("vroom-agent [--port PATH] [--clipboard-file PATH | --no-clipboard] [--service | --session]");
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument {other}")),
@@ -88,9 +88,9 @@ fn parse_args() -> Result<Args, String> {
 
 fn main() {
     let mut logger = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
-    // No console on Windows: log to %LOCALAPPDATA%\Bulwark\agent.log.
+    // No console on Windows: log to %LOCALAPPDATA%\Vroom\agent.log.
     #[cfg(windows)]
-    if let Some(dir) = std::env::var_os("LOCALAPPDATA").map(|d| std::path::PathBuf::from(d).join("Bulwark")) {
+    if let Some(dir) = std::env::var_os("LOCALAPPDATA").map(|d| std::path::PathBuf::from(d).join("Vroom")) {
         let _ = std::fs::create_dir_all(&dir);
         if let Ok(f) = OpenOptions::new().create(true).append(true).open(dir.join("agent.log")) {
             logger.target(env_logger::Target::Pipe(Box::new(f)));
@@ -100,7 +100,7 @@ fn main() {
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("bulwark-agent: {e}");
+            eprintln!("vroom-agent: {e}");
             std::process::exit(2);
         }
     };
@@ -202,7 +202,7 @@ fn session(args: &Args) -> std::io::Result<()> {
 
 fn hello() -> Message {
     let features = features::CLIPBOARD_TEXT | features::TIME_SYNC | features::SHUTDOWN;
-    Message::Hello { features, agent: format!("bulwark-agent {}", env!("CARGO_PKG_VERSION")) }
+    Message::Hello { features, agent: format!("vroom-agent {}", env!("CARGO_PKG_VERSION")) }
 }
 
 /// `system`: we own the host link and may act on privileged requests.

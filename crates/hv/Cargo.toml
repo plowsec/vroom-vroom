@@ -1,5 +1,5 @@
 [package]
-name = "bulwark-hv"
+name = "vroom-hv"
 description = "Hypervisor abstraction with HVF (macOS) and KVM (Linux) backends."
 version.workspace = true
 edition.workspace = true
@@ -10,7 +10,7 @@ thiserror.workspace = true
 log.workspace = true
 libc.workspace = true
 serde.workspace = true
-bulwark-memory.workspace = true
+vroom-memory.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 kvm-ioctls = "0.19"

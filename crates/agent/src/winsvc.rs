@@ -34,8 +34,8 @@ use windows_sys::Win32::System::IO::OVERLAPPED;
 use crate::port::{self, Reader};
 use crate::relay::{Ev, RealSystem, Relay};
 
-pub const PIPE: &str = r"\\.\pipe\bulwark-agent";
-const SERVICE_NAME: &str = "BulwarkAgent";
+pub const PIPE: &str = r"\\.\pipe\vroom-agent";
+const SERVICE_NAME: &str = "VroomAgent";
 /// SYSTEM, Administrators: all. Interactive users: read/write. Protected
 /// DACL (no inheritance).
 const PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)";

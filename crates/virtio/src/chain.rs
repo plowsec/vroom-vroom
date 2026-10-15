@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 
-use bulwark_memory::{ByteValued, GuestAddress, GuestMemory};
+use vroom_memory::{ByteValued, GuestAddress, GuestMemory};
 
 use crate::queue::{VIRTQ_DESC_F_INDIRECT, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
 use crate::Error;

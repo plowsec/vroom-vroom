@@ -27,7 +27,7 @@ service by a guest against its own VM.
   network packets, agent messages (size caps, UTF-8).
 - Hard limits on everything a guest can make us allocate: GPU resource
   memory, pending fences, queue sizes, NAT connections, fragment memory.
-- Config parsing is strict: unknown keys are errors. `bulwark check` (and
+- Config parsing is strict: unknown keys are errors. `vroom check` (and
   every start) also names risky but valid choices: sandbox off, writable or
   home-wide shares, port forwards reachable from the LAN, host loopback
   open to the guest, bridged networking.
@@ -61,10 +61,10 @@ refused by the NAT code only.
 
 `--no-sandbox` exists for debugging and prints a warning.
 
-Check it on your machine: `BULWARK_SANDBOX_SELFTEST=1 bulwark run vm.toml`
+Check it on your machine: `VROOM_SANDBOX_SELFTEST=1 vroom run vm.toml`
 makes the VMM, once locked down, try to read `/etc/passwd` and
 `~/.ssh`, exec a program, open a listener, reach host loopback
-(`BULWARK_SELFTEST_LOOPBACK_PORT=<a port you listen on>`), connect to
+(`VROOM_SELFTEST_LOOPBACK_PORT=<a port you listen on>`), connect to
 `$SSH_AUTH_SOCK` and reach the internet, and print what happened. On
 Linux the Unix-socket probe ends the process (seccomp kills it): that is
 the expected result.
@@ -75,7 +75,7 @@ Text only, size capped, and sync happens only while the VM window has focus.
 A background guest can't read what you copy on the host, and can't push to
 your clipboard behind your back. Headless runs need explicit push/pull.
 
-The GUI (`bulwark-gui`) is not sandboxed, so it treats the VMM like the
+The GUI (`vroom-gui`) is not sandboxed, so it treats the VMM like the
 guest-exposed process it is: it applies the clipboard policy from the VM's
 config itself (never sends the host clipboard if `host_to_guest` is off,
 never sets it if `guest_to_host` is off, focus and size limits too),
@@ -88,13 +88,13 @@ sealed against shrinking (a VMM shrinking it would crash the GUI).
 NAT is a userspace proxy: the guest never gets raw access to the host
 network stack. Host loopback is unreachable unless `allow_host_loopback`;
 `block_private` keeps the guest off your LAN. Bridged and host-only go
-through `bulwark-netd`, which enforces allow-listed interfaces and source
+through `vroom-netd`, which enforces allow-listed interfaces and source
 MAC anti-spoofing.
 
 ## Shared folders
 
 Off unless configured, read-only unless `readonly = false`. The host side
-(`bulwark-fs`) walks every guest path one component at a time with
+(`vroom-fs`) walks every guest path one component at a time with
 `openat(O_NOFOLLOW)` from an fd on the share root: a symlink anywhere ends
 the walk, so neither a guest-planted link nor one swapped in on the host
 mid-walk leads outside. Names with `/`, NUL, `.` or `..` are refused; only
@@ -107,7 +107,7 @@ subtree (read-only shares: read access only). The FUSE server is fuzzed.
 
 Off unless `[audio] output = true`, and output only: the device has no
 capture stream and nothing in the VMM can read the microphone. PCM goes
-over a datagram socket to a helper process (`bulwark audio-out`) that
+over a datagram socket to a helper process (`vroom audio-out`) that
 plays it, so CoreAudio and the plug-ins it loads never run in the VMM. The
 helper runs under its own Seatbelt profile: system libraries, the
 CoreAudio services and the audio user client only; no user files, no
@@ -154,7 +154,7 @@ clipboard text (size-capped).
 The Linux agent has the same split: a hardened systemd service
 (`CAP_SYS_TIME` only, read-only file system, Unix sockets only) and a
 session helper started with the desktop. They meet on
-`/run/bulwark-agent.sock`; the service serves only the user logind reports
+`/run/vroom-agent.sock`; the service serves only the user logind reports
 active on seat0, and the helper only talks to a root-owned peer.
 
 ## Fuzzing
@@ -189,7 +189,7 @@ running VM's images, even with `-U`.
   rewrite the keys anyway. Windows 11 is installed with that check
   bypassed.
 - The Windows agent split is new; installs from before it run the
-  all-in-one agent elevated (re-run `bulwark-setup.cmd` to upgrade).
+  all-in-one agent elevated (re-run `vroom-setup.cmd` to upgrade).
 - x86_64 isn't implemented, so none of this is tested there.
 - Fuzzing doesn't cover Venus (3D) command streams: that is
   virglrenderer's C code, which runs in the VMM process when 3D is on.

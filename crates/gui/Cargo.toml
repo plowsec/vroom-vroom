@@ -1,20 +1,20 @@
 [package]
-name = "bulwark-gui"
+name = "vroom-gui"
 description = "VM window. Runs unsandboxed but never touches guest memory: it only sees pixels and sends input."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "bulwark-gui"
+name = "vroom-gui"
 path = "src/main.rs"
 
 [dependencies]
 log.workspace = true
 env_logger.workspace = true
 libc.workspace = true
-bulwark-display.workspace = true
-bulwark-config.workspace = true
+vroom-display.workspace = true
+vroom-config.workspace = true
 winit = "0.30"
 softbuffer = "0.4"
 arboard = { version = "3", default-features = false }

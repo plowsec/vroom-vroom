@@ -9,25 +9,25 @@ license = "Apache-2.0"
 rust-version = "1.80"
 
 [workspace.dependencies]
-bulwark-memory = { path = "crates/memory" }
-bulwark-hv = { path = "crates/hv" }
-bulwark-devices = { path = "crates/devices" }
-bulwark-virtio = { path = "crates/virtio" }
-bulwark-arch = { path = "crates/arch" }
-bulwark-vmm = { path = "crates/vmm" }
-bulwark-config = { path = "crates/config" }
-bulwark-snapshot = { path = "crates/snapshot" }
-bulwark-net = { path = "crates/net" }
-bulwark-proto = { path = "crates/proto" }
-bulwark-sandbox = { path = "crates/sandbox" }
-bulwark-block = { path = "crates/block" }
-bulwark-agent = { path = "crates/agent" }
-bulwark-display = { path = "crates/display" }
-bulwark-ipc = { path = "crates/ipc" }
-bulwark-gpu3d = { path = "crates/gpu3d" }
-bulwark-fs = { path = "crates/fs" }
-bulwark-audio = { path = "crates/audio" }
-bulwark-state = { path = "crates/state" }
+vroom-memory = { path = "crates/memory" }
+vroom-hv = { path = "crates/hv" }
+vroom-devices = { path = "crates/devices" }
+vroom-virtio = { path = "crates/virtio" }
+vroom-arch = { path = "crates/arch" }
+vroom-vmm = { path = "crates/vmm" }
+vroom-config = { path = "crates/config" }
+vroom-snapshot = { path = "crates/snapshot" }
+vroom-net = { path = "crates/net" }
+vroom-proto = { path = "crates/proto" }
+vroom-sandbox = { path = "crates/sandbox" }
+vroom-block = { path = "crates/block" }
+vroom-agent = { path = "crates/agent" }
+vroom-display = { path = "crates/display" }
+vroom-ipc = { path = "crates/ipc" }
+vroom-gpu3d = { path = "crates/gpu3d" }
+vroom-fs = { path = "crates/fs" }
+vroom-audio = { path = "crates/audio" }
+vroom-state = { path = "crates/state" }
 
 thiserror = "2"
 log = "0.4"
