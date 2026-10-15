@@ -5334,6 +5334,7 @@ dependencies = [
  "ruzstd",
  "tempfile",
  "thiserror 2.0.21",
+ "vroom-memory",
 ]
 
 [[package]]

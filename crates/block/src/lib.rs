@@ -17,7 +17,68 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
+pub use vroom_memory::{GuestAddress, GuestMemory};
+
 pub const SECTOR_SIZE: u64 = 512;
+
+/// Guest buffers of one request, in order: (address, length).
+pub type GuestSegs = [(GuestAddress, usize)];
+
+/// Biggest request the bounce-buffer fallbacks accept (devices cap
+/// requests lower than this already).
+pub const MAX_BOUNCE: usize = 16 << 20;
+
+fn segs_len(segs: &GuestSegs) -> Result<usize> {
+    segs.iter()
+        .try_fold(0usize, |a, &(_, l)| a.checked_add(l))
+        .filter(|&n| n <= MAX_BOUNCE)
+        .ok_or(Error::OutOfRange)
+}
+
+fn mem_err(e: vroom_memory::Error) -> Error {
+    Error::Io(io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))
+}
+
+/// The part `[start, start + len)` of the concatenated buffers.
+pub(crate) fn sub_segs(segs: &GuestSegs, mut start: usize, mut len: usize) -> Vec<(GuestAddress, usize)> {
+    let mut out = Vec::new();
+    for &(a, l) in segs {
+        if len == 0 {
+            break;
+        }
+        if start >= l {
+            start -= l;
+            continue;
+        }
+        let n = (l - start).min(len);
+        out.push((GuestAddress(a.0 + start as u64), n));
+        start = 0;
+        len -= n;
+    }
+    out
+}
+
+/// Copy guest buffers out (bounce-buffer fallback).
+pub(crate) fn gather(mem: &GuestMemory, segs: &GuestSegs) -> Result<Vec<u8>> {
+    let mut buf = vec![0u8; segs_len(segs)?];
+    let mut o = 0;
+    for &(a, l) in segs {
+        mem.read(a, &mut buf[o..o + l]).map_err(mem_err)?;
+        o += l;
+    }
+    Ok(buf)
+}
+
+/// Copy into guest buffers (bounce-buffer fallback).
+pub(crate) fn scatter(mem: &GuestMemory, segs: &GuestSegs, buf: &[u8]) -> Result<()> {
+    let mut o = 0;
+    for &(a, l) in segs {
+        let end = o + l;
+        mem.write(a, buf.get(o..end).ok_or(Error::OutOfRange)?).map_err(mem_err)?;
+        o = end;
+    }
+    Ok(())
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -40,6 +101,18 @@ pub trait DiskImage: Send + Sync + std::fmt::Debug {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<()>;
     fn write_at(&self, buf: &[u8], offset: u64) -> Result<()>;
     fn flush(&self) -> Result<()>;
+    /// Read `offset..` straight into guest buffers. Formats that can
+    /// override this to skip the bounce buffer (raw, plain qcow2 clusters).
+    fn read_to_guest(&self, mem: &GuestMemory, offset: u64, segs: &GuestSegs) -> Result<()> {
+        let mut buf = vec![0u8; segs_len(segs)?];
+        self.read_at(&mut buf, offset)?;
+        scatter(mem, segs, &buf)
+    }
+    /// Write guest buffers at `offset`.
+    fn write_from_guest(&self, mem: &GuestMemory, offset: u64, segs: &GuestSegs) -> Result<()> {
+        let buf = gather(mem, segs)?;
+        self.write_at(&buf, offset)
+    }
     /// Hint that a range is unused. May be a no-op.
     fn discard(&self, _offset: u64, _len: u64) -> Result<()> {
         Ok(())
@@ -227,6 +300,12 @@ impl DiskImage for SwapDisk {
     }
     fn flush(&self) -> Result<()> {
         self.current().flush()
+    }
+    fn read_to_guest(&self, mem: &GuestMemory, offset: u64, segs: &GuestSegs) -> Result<()> {
+        self.current().read_to_guest(mem, offset, segs)
+    }
+    fn write_from_guest(&self, mem: &GuestMemory, offset: u64, segs: &GuestSegs) -> Result<()> {
+        self.current().write_from_guest(mem, offset, segs)
     }
     fn discard(&self, offset: u64, len: u64) -> Result<()> {
         self.current().discard(offset, len)

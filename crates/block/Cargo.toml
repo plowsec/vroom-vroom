@@ -11,6 +11,7 @@ log.workspace = true
 libc.workspace = true
 flate2.workspace = true
 ruzstd = "0.8"
+vroom-memory.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

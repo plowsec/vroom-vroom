@@ -4,7 +4,7 @@ use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
-use crate::{check_range, open_file, DiskImage, Error, Result, SyncMode};
+use crate::{check_range, open_file, segs_len, DiskImage, Error, GuestMemory, GuestSegs, Result, SyncMode};
 
 #[derive(Debug)]
 pub struct RawImage {
@@ -53,6 +53,19 @@ impl DiskImage for RawImage {
         check_range(self.size, offset, buf.len() as u64)?;
         self.file.write_all_at(buf, offset)?;
         Ok(())
+    }
+
+    fn read_to_guest(&self, mem: &GuestMemory, offset: u64, segs: &GuestSegs) -> Result<()> {
+        check_range(self.size, offset, segs_len(segs)? as u64)?;
+        Ok(mem.read_file(&self.file, offset, segs)?)
+    }
+
+    fn write_from_guest(&self, mem: &GuestMemory, offset: u64, segs: &GuestSegs) -> Result<()> {
+        if self.read_only {
+            return Err(Error::ReadOnly);
+        }
+        check_range(self.size, offset, segs_len(segs)? as u64)?;
+        Ok(mem.write_file(&self.file, offset, segs)?)
     }
 
     fn flush(&self) -> Result<()> {

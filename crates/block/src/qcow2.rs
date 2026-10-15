@@ -13,9 +13,9 @@ use std::fs::File;
 use std::io::Read;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
-use crate::{check_range, open_file, DiskImage, Error, Format, Result, SyncMode};
+use crate::{check_range, open_file, segs_len, sub_segs, DiskImage, Error, Format, GuestMemory, GuestSegs, Result, SyncMode};
 
 pub const MAGIC: u32 = 0x5146_49fb; // "QFI\xfb"
 const L1_COPIED: u64 = 1 << 63;
@@ -327,6 +327,12 @@ pub struct Qcow2Image {
     /// Resolved backing file (None for in-process overlays and bases).
     backing_path: Option<PathBuf>,
     state: Mutex<State>,
+    /// Guest data I/O runs outside `state`, holding this for reading:
+    /// whatever frees clusters (discard, write zeroes) takes it for
+    /// writing, so a cluster can't be freed and reused (say, as an L2
+    /// table) while a read or write that looked it up is still going.
+    /// Lock order: `io_gate`, then `state`.
+    io_gate: RwLock<()>,
 }
 
 impl std::fmt::Debug for Qcow2Image {
@@ -426,6 +432,7 @@ impl Qcow2Image {
             backing,
             backing_path,
             state: Mutex::new(State { l1, l2_cache: HashMap::new(), refcount_table, next_free, free, zcache: None }),
+            io_gate: RwLock::new(()),
             hdr,
         })
     }
@@ -665,6 +672,7 @@ impl Qcow2Image {
     /// (a guest may trim its whole disk at once).
     fn zero_clusters(&self, start: u64, end: u64) -> Result<()> {
         let cs = self.cluster_size;
+        let _gate = self.io_gate.write().unwrap_or_else(|e| e.into_inner());
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut freed = Vec::new();
         // The one L2 table with unwritten changes, as (L1 index, offset).
@@ -724,23 +732,60 @@ impl Qcow2Image {
     }
 
     fn cluster_for_write(&self, st: &mut State, guest: u64) -> Result<u64> {
+        self.cluster_for_write_with(st, guest, None).map(|(h, _)| h)
+    }
+
+    /// Like `cluster_for_write`; if the cluster has to be allocated and
+    /// `fill` is given (`fill.1` lands at the guest offset), it goes into
+    /// the same write as the copied-up old contents, and the old contents
+    /// aren't read at all when `fill` covers the whole cluster. Returns
+    /// (host offset of the cluster, whether `fill` was written).
+    fn cluster_for_write_with(&self, st: &mut State, guest: u64, fill: Option<&[u8]>) -> Result<(u64, bool)> {
         let cs = self.cluster_size;
         let l2_idx = (guest / cs % self.l2_entries()) as usize;
         let l2_off = self.l2_for_write(st, guest)?;
         let e = self.load_l2(st, l2_off)?[l2_idx];
         if e & L2_COPIED != 0 && e & L2_COMPRESSED == 0 && e & OFFSET_MASK != 0 {
-            return Ok(e & OFFSET_MASK);
+            return Ok((e & OFFSET_MASK, false));
         }
         // Copy-on-write: fill a fresh cluster with the current contents.
         let base = guest - guest % cs;
+        let in_cluster = (guest - base) as usize;
         let mut buf = vec![0u8; cs as usize];
-        if e & L2_ZERO == 0 {
+        let covered = fill.is_some_and(|f| f.len() as u64 == cs);
+        if e & L2_ZERO == 0 && !covered {
             self.read_chunk(st, &mut buf, base)?;
+        }
+        if let Some(f) = fill {
+            buf.get_mut(in_cluster..in_cluster + f.len()).ok_or(Error::OutOfRange)?.copy_from_slice(f);
         }
         let new = self.alloc_cluster(st)?;
         self.file.write_all_at(&buf, new)?;
         self.set_l2(st, l2_off, l2_idx, new | L2_COPIED)?;
-        Ok(new)
+        Ok((new, fill.is_some()))
+    }
+
+    /// Plain data cluster for `guest`: host offset of that byte.
+    fn plain_host(entry: u64, guest: u64, cs: u64) -> Option<u64> {
+        let host = entry & OFFSET_MASK;
+        (entry & (L2_COMPRESSED | L2_ZERO) == 0 && host != 0).then(|| host + guest % cs)
+    }
+}
+
+/// Runs of guest bytes that sit back to back in the image file: one
+/// preadv/pwritev each. (start in the request, length, host offset)
+#[derive(Default)]
+struct Runs(Vec<(usize, usize, u64)>);
+
+impl Runs {
+    fn push(&mut self, start: usize, len: usize, host: u64) {
+        if let Some(r) = self.0.last_mut() {
+            if r.0 + r.1 == start && r.2 + r.1 as u64 == host {
+                r.1 += len;
+                return;
+            }
+        }
+        self.0.push((start, len, host));
     }
 }
 
@@ -1006,6 +1051,79 @@ impl DiskImage for Qcow2Image {
     fn flush(&self) -> Result<()> {
         if !self.read_only {
             crate::sync_file(&self.file, self.sync)?;
+        }
+        Ok(())
+    }
+
+    /// Mapping lookups under the lock; plain clusters are then read with
+    /// one preadv per run of back-to-back clusters, straight into guest
+    /// RAM and without the lock, so requests run in parallel.
+    fn read_to_guest(&self, mem: &GuestMemory, offset: u64, segs: &GuestSegs) -> Result<()> {
+        let total = segs_len(segs)?;
+        check_range(self.hdr.size, offset, total as u64)?;
+        let _gate = self.io_gate.read().unwrap_or_else(|e| e.into_inner());
+        let cs = self.cluster_size;
+        let mut runs = Runs::default();
+        {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut done = 0usize;
+            while done < total {
+                let g = offset + done as u64;
+                let n = ((cs - g % cs) as usize).min(total - done);
+                let e = self.l2_entry(&mut st, g)?;
+                match Self::plain_host(e, g, cs) {
+                    Some(host) => runs.push(done, n, host),
+                    None => {
+                        // Zero, compressed or backing: small, rare, bounced.
+                        let mut buf = vec![0u8; n];
+                        self.read_chunk(&mut st, &mut buf, g)?;
+                        crate::scatter(mem, &sub_segs(segs, done, n), &buf)?;
+                    }
+                }
+                done += n;
+            }
+        }
+        for (start, len, host) in runs.0 {
+            mem.read_file(&self.file, host, &sub_segs(segs, start, len))?;
+        }
+        Ok(())
+    }
+
+    /// Allocation (with its copy-up) under the lock; data to clusters
+    /// that already exist goes straight from guest RAM, without the lock.
+    fn write_from_guest(&self, mem: &GuestMemory, offset: u64, segs: &GuestSegs) -> Result<()> {
+        if self.read_only {
+            return Err(Error::ReadOnly);
+        }
+        let total = segs_len(segs)?;
+        check_range(self.hdr.size, offset, total as u64)?;
+        let _gate = self.io_gate.read().unwrap_or_else(|e| e.into_inner());
+        let cs = self.cluster_size;
+        let mut runs = Runs::default();
+        {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut done = 0usize;
+            while done < total {
+                let g = offset + done as u64;
+                let n = ((cs - g % cs) as usize).min(total - done);
+                let e = self.l2_entry(&mut st, g)?;
+                let l1_idx = (g / cs / self.l2_entries()) as usize;
+                let l2_ours = st.l1.get(l1_idx).is_some_and(|l1e| l1e & L1_COPIED != 0);
+                let ready = l2_ours && e & L2_COPIED != 0 && Self::plain_host(e, g, cs).is_some();
+                if ready {
+                    runs.push(done, n, (e & OFFSET_MASK) + g % cs);
+                } else {
+                    let data = crate::gather(mem, &sub_segs(segs, done, n))?;
+                    let (host, wrote) = self.cluster_for_write_with(&mut st, g, Some(&data))?;
+                    if !wrote {
+                        self.file.write_all_at(&data, host + g % cs)?;
+                    }
+                }
+                done += n;
+            }
+        }
+        for (start, len, host) in runs.0 {
+            mem.write_file(&self.file, host, &sub_segs(segs, start, len))?;
         }
         Ok(())
     }
@@ -1335,6 +1453,125 @@ mod tests {
         let f = std::fs::OpenOptions::new().write(true).open(&img).unwrap();
         f.write_all_at(&112u32.to_be_bytes(), 100).unwrap();
         assert!(set_backing(&img, None).is_err());
+    }
+
+    /// Guest RAM in two regions, so buffers can straddle a boundary.
+    fn guest_mem() -> GuestMemory {
+        let ps = vroom_memory::page_size() as u64;
+        let a = 64 * ps;
+        GuestMemory::new(&[(crate::GuestAddress(0), a), (crate::GuestAddress(a), a)]).unwrap()
+    }
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self, n: u64) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (self.0 >> 33) % n
+        }
+    }
+
+    /// Random list of non-overlapping guest buffers, `len` bytes in all.
+    fn segs(rng: &mut Lcg, mem: &GuestMemory, len: usize) -> Vec<(crate::GuestAddress, usize)> {
+        let mut out = Vec::new();
+        let mut left = len;
+        let mut at = rng.next(mem.total_size() - len as u64 - 8 * 4096);
+        while left > 0 {
+            let n = if left > 512 && rng.next(3) == 0 { 1 + rng.next(left as u64 - 1) as usize } else { left };
+            out.push((crate::GuestAddress(at), n));
+            at += n as u64 + rng.next(4096);
+            left -= n;
+        }
+        out
+    }
+
+    #[test]
+    fn guest_io_matches_a_model() {
+        const C: u64 = 64 << 10;
+        const SIZE: u64 = 32 * C;
+        let td = tempfile::tempdir().unwrap();
+        let base = td.path().join("base.raw");
+        let base_data: Vec<u8> = (0..SIZE).map(|i| (i * 7 % 251) as u8).collect();
+        std::fs::write(&base, &base_data).unwrap();
+        let ov = td.path().join("ov.qcow2");
+        Qcow2Image::create(&ov, SIZE, Some((&base, Format::Raw))).unwrap();
+        let q = Qcow2Image::open(&ov, false).unwrap();
+        let mem = guest_mem();
+        let mut model = base_data;
+        let mut rng = Lcg(42);
+        for step in 0..600u32 {
+            let len = 1 + rng.next(3 * C) as usize;
+            let off = rng.next(SIZE - len as u64);
+            let (o, l) = (off as usize, len);
+            match rng.next(5) {
+                0 | 1 => {
+                    let sg = segs(&mut rng, &mem, len);
+                    let fill: Vec<u8> = (0..len).map(|i| (i as u32 ^ step) as u8).collect();
+                    crate::scatter(&mem, &sg, &fill).unwrap();
+                    q.write_from_guest(&mem, off, &sg).unwrap();
+                    model[o..o + l].copy_from_slice(&fill);
+                }
+                2 => {
+                    q.discard(off, len as u64).unwrap();
+                    let (s, e) = (off.div_ceil(C) * C, (off + len as u64) / C * C);
+                    if e > s {
+                        model[s as usize..e as usize].fill(0);
+                    }
+                }
+                3 => {
+                    let sg = segs(&mut rng, &mem, len);
+                    q.read_to_guest(&mem, off, &sg).unwrap();
+                    assert_eq!(crate::gather(&mem, &sg).unwrap(), model[o..o + l], "step {step}");
+                }
+                _ => {
+                    let mut b = vec![0u8; len];
+                    q.read_at(&mut b, off).unwrap();
+                    assert_eq!(b, model[o..o + l], "step {step}");
+                }
+            }
+        }
+        // Out of range and outside RAM: errors.
+        let sg = vec![(crate::GuestAddress(0), 512)];
+        assert!(q.read_to_guest(&mem, SIZE, &sg).is_err());
+        assert!(q.write_from_guest(&mem, 0, &[(mem.end_addr(), 512)]).is_err());
+    }
+
+    #[test]
+    fn parallel_guest_io_and_discards() {
+        const C: u64 = 64 << 10;
+        const SIZE: u64 = 64 * C;
+        let td = tempfile::tempdir().unwrap();
+        let p = td.path().join("p.qcow2");
+        Qcow2Image::create(&p, SIZE, None).unwrap();
+        let q = Arc::new(Qcow2Image::open(&p, false).unwrap());
+        let mem = guest_mem();
+        // Thread t owns clusters t, t+4, ...: writes, reads back, discards.
+        let threads: Vec<_> = (0..4u64)
+            .map(|t| {
+                let (q, mem) = (q.clone(), mem.clone());
+                std::thread::spawn(move || {
+                    let buf = crate::GuestAddress(t * 2 * C);
+                    for round in 0..40u64 {
+                        let cl = (t + 4 * (round % 16)) * C;
+                        let v = (t * 50 + round) as u8;
+                        mem.fill(buf, C, v).unwrap();
+                        q.write_from_guest(&mem, cl, &[(buf, C as usize)]).unwrap();
+                        let back = crate::GuestAddress(buf.0 + C);
+                        q.read_to_guest(&mem, cl, &[(back, C as usize)]).unwrap();
+                        let mut b = vec![0u8; C as usize];
+                        mem.read(back, &mut b).unwrap();
+                        assert!(b.iter().all(|&x| x == v));
+                        if round % 3 == 0 {
+                            q.discard(cl, C).unwrap();
+                            q.read_at(&mut b, cl).unwrap();
+                            assert!(b.iter().all(|&x| x == 0));
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
     }
 
     #[test]
