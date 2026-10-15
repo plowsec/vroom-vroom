@@ -244,7 +244,14 @@ const GPU_SHM_SIZE: u64 = 8 << 30;
 /// Venus (and GL, if asked and ANGLE is there) through virglrenderer, or
 /// a clear error.
 fn three_d(vm: &Arc<dyn Vm>, config: &VmConfig) -> Result<ThreeD> {
-    if !vroom_gpu3d::load(config.display.opengl) {
+    #[cfg(target_os = "macos")]
+    let gl = config.display.opengl.then_some(match config.display.opengl_host {
+        vroom_config::OpenglHost::Angle => vroom_gpu3d::GlHost::Angle,
+        vroom_config::OpenglHost::Apple => vroom_gpu3d::GlHost::Apple,
+    });
+    #[cfg(not(target_os = "macos"))]
+    let gl = config.display.opengl;
+    if !vroom_gpu3d::load(gl) {
         return Err(Error::Setup(
             "gpu = \"virtio3d\" needs virglrenderer with Venus (scripts/build-virglrenderer.sh, or brew install slp/krunkit/virglrenderer)".into(),
         ));
@@ -252,7 +259,7 @@ fn three_d(vm: &Arc<dyn Vm>, config: &VmConfig) -> Result<ThreeD> {
     let r = vroom_gpu3d::Virgl::new(config.identity.gl_renderer.clone())
         .ok_or_else(|| Error::Setup("virglrenderer: Venus init failed (no Vulkan driver?)".into()))?;
     if config.display.opengl && !r.capsets().iter().any(|c| c.0 == 2) {
-        log::warn!("gpu: no OpenGL for the guest (needs ANGLE next to virglrenderer: scripts/build-angle.sh); Vulkan only");
+        log::warn!("gpu: no OpenGL for the guest (opengl_host = \"angle\" needs ANGLE next to virglrenderer: scripts/build-angle.sh); Vulkan only");
     }
     Ok(ThreeD::new(Box::new(r), Arc::new(VmShm(vm.clone())), GPU_SHM_SIZE))
 }

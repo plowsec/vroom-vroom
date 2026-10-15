@@ -14,7 +14,7 @@ use slint::winit_030::winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use slint::winit_030::{EventResult, WinitWindowAccessor};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use vroom_config::template::NewVm as Template;
-use vroom_config::{Boot, DiskBus, DiskSync, GuestOs, Gpu, NetKind, Serial, Transport, VmConfig};
+use vroom_config::{Boot, DiskBus, DiskSync, GuestOs, Gpu, NetKind, OpenglHost, Serial, Transport, VmConfig};
 
 use crate::edit;
 use crate::library::Library;
@@ -611,6 +611,10 @@ impl App {
             tpm: c.tpm,
             gpu,
             opengl: c.display.opengl,
+            opengl_host: match c.display.opengl_host {
+                OpenglHost::Apple => 0,
+                OpenglHost::Angle => 1,
+            },
             width: s(c.display.width.to_string()),
             height: s(c.display.height.to_string()),
             hidpi: c.display.hidpi,
@@ -676,9 +680,10 @@ impl App {
                 0 => "No screen".to_string(),
                 g => format!(
                     "{} · starts at {}×{}{}",
-                    match (g, c.display.opengl) {
-                        (1, _) => "2D",
-                        (_, true) => "3D (Vulkan, OpenGL)",
+                    match (g, c.display.opengl, c.display.opengl_host) {
+                        (1, ..) => "2D",
+                        (_, true, OpenglHost::Apple) => "3D (Vulkan, OpenGL 4.1)",
+                        (_, true, OpenglHost::Angle) => "3D (Vulkan, OpenGL 2.1)",
                         _ => "3D (Vulkan)",
                     },
                     c.display.width,
@@ -739,7 +744,7 @@ impl App {
         self.ui.set_vis(CardVis {
             searching: !any,
             hw: any || hit(&format!("processor cpu cpus core memory ram nested virtualization guest system os {}", st.sum_hw.to_lowercase())),
-            display: any || hit("display screen gpu 3d 2d graphics vulkan opengl resolution width height size monitor retina hidpi scale scaling sharp blurry"),
+            display: any || hit("display screen gpu 3d 2d graphics vulkan opengl angle apple driver resolution width height size monitor retina hidpi scale scaling sharp blurry"),
             storage: any || hit("storage disk disks iso cdrom installer drive nvme virtio bus sync write safety readonly read-only compact image qcow2 space"),
             net: any || hit("network net nat bridged host-only hostonly port forward forwarding ssh mac address interface internet lan localhost loopback adapter"),
             share: any || hit("shared folders share folder virtiofs mount files tag"),

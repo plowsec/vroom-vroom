@@ -1,0 +1,86 @@
+--- a/src/vrend_shader.c	2025-10-28 11:45:33
++++ b/src/vrend_shader.c	2026-10-15 23:28:15
+@@ -6139,7 +6139,71 @@
+ {
+    emit_ver_extf(glsl_strbufs, "#extension GL_%s : %s\n", name, verb);
+ }
++
++/* Extensions a GLSL version has built in. */
++static const struct {
++   const char *name;
++   int core;
++} glsl_core_exts[] = {
++   { "ARB_texture_rectangle", 140 }, { "ARB_uniform_buffer_object", 140 },
++   { "ARB_draw_instanced", 140 }, { "ARB_fragment_coord_conventions", 150 },
++   { "ARB_texture_multisample", 150 }, { "ARB_shader_bit_encoding", 330 },
++   { "ARB_explicit_attrib_location", 330 }, { "ARB_texture_cube_map_array", 400 },
++   { "ARB_texture_query_lod", 400 }, { "ARB_texture_gather", 400 },
++   { "ARB_sample_shading", 400 }, { "ARB_gpu_shader5", 400 },
++   { "ARB_gpu_shader_fp64", 400 }, { "ARB_tessellation_shader", 400 },
++   { "ARB_separate_shader_objects", 410 }, { "ARB_viewport_array", 410 },
++   { "ARB_conservative_depth", 420 }, { "ARB_shader_image_load_store", 420 },
++   { "ARB_shader_atomic_counters", 420 }, { "ARB_shading_language_packing", 420 },
++   { "ARB_texture_query_levels", 430 }, { "ARB_explicit_uniform_location", 430 },
++   { "ARB_arrays_of_arrays", 430 }, { "ARB_shader_image_size", 430 },
++   { "ARB_shader_storage_buffer_object", 430 }, { "ARB_fragment_layer_viewport", 430 },
++   { "ARB_enhanced_layouts", 440 }, { "ARB_cull_distance", 450 },
++   { "ARB_derivative_control", 450 }, { "ARB_shader_texture_image_samples", 450 },
++   { "ARB_ES3_1_compatibility", 450 }, { "ARB_shader_draw_parameters", 460 },
++   { "ARB_shader_group_vote", 460 }, { "ARB_shader_atomic_counter_ops", 460 },
++};
+ 
++/* macOS's GLSL compiler (OpenGL 4.1) rejects #extension lines it doesn't
++ * list, even for what its own version has built in. Rewrite the header
++ * at the host's version, without those extensions. */
++static void use_host_glsl_version(struct vrend_strbuf *sb, int host_ver)
++{
++   char *out = malloc(sb->size + 1);
++   size_t n = 0;
++   const char *p = sb->buf;
++   int ver;
++
++   if (!out)
++      return;
++   while (*p) {
++      const char *eol = strchr(p, '\n');
++      size_t len = eol ? (size_t)(eol - p + 1) : strlen(p);
++      bool keep = true;
++
++      if (sscanf(p, "#version %d", &ver) == 1 && ver < host_ver && len == 13) {
++         n += snprintf(out + n, 14, "#version %d\n", host_ver);
++         keep = false;
++      } else if (!strncmp(p, "#extension GL_", 14)) {
++         for (unsigned i = 0; i < ARRAY_SIZE(glsl_core_exts); i++) {
++            size_t l = strlen(glsl_core_exts[i].name);
++            if (glsl_core_exts[i].core <= host_ver &&
++                !strncmp(p + 14, glsl_core_exts[i].name, l) && p[14 + l] == ' ')
++               keep = false;
++         }
++      }
++      if (keep) {
++         memcpy(out + n, p, len);
++         n += len;
++      }
++      p += len;
++   }
++   out[n] = 0;
++   memcpy(sb->buf, out, n + 1);
++   sb->size = n;
++   free(out);
++}
++
+ static void emit_header(const struct dump_ctx *ctx, struct vrend_glsl_strbufs *glsl_strbufs)
+ {
+    if (ctx->cfg->use_gles) {
+@@ -6290,6 +6354,11 @@
+             emit_ext(glsl_strbufs, shader_req_table[i].string, "require");
+          }
+       }
++
++      /* Desktop core host with GLSL 3.30+ (macOS: 4.10). */
++      if (ctx->cfg->use_core_profile && ctx->cfg->glsl_version >= 330 &&
++          ctx->prog_type != TGSI_PROCESSOR_COMPUTE)
++         use_host_glsl_version(&glsl_strbufs->glsl_ver_ext, ctx->cfg->glsl_version);
+    }
+ }
+ 

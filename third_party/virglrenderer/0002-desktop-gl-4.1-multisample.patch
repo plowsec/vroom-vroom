@@ -1,0 +1,37 @@
+--- a/src/vrend_formats.c	2025-10-28 11:45:33
++++ b/src/vrend_formats.c	2026-10-15 23:00:19
+@@ -652,8 +652,10 @@
+ {
+    bool is_desktop_gl = epoxy_is_desktop_gl();
+    for (int i = 0; i < VIRGL_FORMAT_MAX_EXTENDED; i++) {
+-      bool function_available =
+-         (table[i].flags & VIRGL_TEXTURE_CAN_TEXTURE_STORAGE) ? enable_storage : is_desktop_gl;
++      /* Desktop GL has glTexImage2DMultisample since 3.2: without
++       * glTexStorage2DMultisample (4.3; macOS stops at 4.1) use that. */
++      bool use_storage = (table[i].flags & VIRGL_TEXTURE_CAN_TEXTURE_STORAGE) && enable_storage;
++      bool function_available = use_storage || is_desktop_gl;
+ 
+       if (table[i].internalformat != 0 &&
+           !(table[i].flags & VIRGL_TEXTURE_CAN_MULTISAMPLE) &&
+@@ -661,7 +663,7 @@
+          GLuint tex_id;
+          glGenTextures(1, &tex_id);
+          glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, tex_id);
+-         if (table[i].flags & VIRGL_TEXTURE_CAN_TEXTURE_STORAGE) {
++         if (use_storage) {
+             glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 2,
+                                       table[i].internalformat, 32, 32, GL_TRUE);
+          } else {
+--- a/src/vrend_renderer.c	2025-10-28 11:45:33
++++ b/src/vrend_renderer.c	2026-10-15 23:00:19
+@@ -8438,7 +8438,9 @@
+       }
+ 
+       if (pr->nr_samples > 1) {
+-         if (format_can_texture_storage) {
++         /* See vrend_check_texture_multisample: GL 4.1 has no
++          * glTexStorage*Multisample. */
++         if (format_can_texture_storage && has_feature(feat_storage_multisample)) {
+             if (gr->target == GL_TEXTURE_2D_MULTISAMPLE) {
+                glTexStorage2DMultisample(gr->target, pr->nr_samples,
+                                          internalformat, pr->width0, pr->height0,

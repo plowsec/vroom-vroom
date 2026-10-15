@@ -533,6 +533,7 @@ dependencies = [
  "log",
  "ruzstd",
  "thiserror",
+ "vroom-memory",
 ]
 
 [[package]]

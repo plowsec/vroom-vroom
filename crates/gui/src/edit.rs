@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table};
-use vroom_config::{
+use vroom_config::{OpenglHost, 
     Boot, Disk, DiskBus, DiskFormat, DiskSync, GuestOs, Gpu, Net, NetKind, PortForward, Serial, Share, Transport, Usb, VmConfig,
 };
 
@@ -60,6 +60,7 @@ pub fn set(c: &mut VmConfig, key: &str, v: &str, default_iface: Option<&str>) ->
         ["os"] => c.os = Some(GuestOs::ALL[choice(v, GuestOs::ALL.len(), "system")?]),
         ["gpu"] => c.display.gpu = [Gpu::None, Gpu::Virtio2d, Gpu::Virtio3d][choice(v, 3, "display")?],
         ["opengl"] => c.display.opengl = bool_of(v)?,
+        ["opengl_host"] => c.display.opengl_host = [OpenglHost::Apple, OpenglHost::Angle][choice(v, 2, "OpenGL driver")?],
         ["width"] => c.display.width = num(v, "width")?,
         ["height"] => c.display.height = num(v, "height")?,
         ["hidpi"] => c.display.hidpi = bool_of(v)?,
@@ -662,6 +663,7 @@ gpu = "virtio2d"
         ("os", "1"),
         ("gpu", "2"),
         ("opengl", "false"),
+        ("opengl_host", "1"),
         ("width", "1600"),
         ("height", "900"),
         ("hidpi", "false"),

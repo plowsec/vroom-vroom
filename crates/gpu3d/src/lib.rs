@@ -23,7 +23,10 @@ use std::sync::{Mutex, OnceLock};
 use vroom_virtio::devices::gpu3d::{Blob, Box3d, Create3d, FenceDone, HostIov, Mapping, Renderer3d, Transfer3d};
 
 #[cfg(target_os = "macos")]
-mod egl;
+mod gl;
+
+#[cfg(target_os = "macos")]
+pub use gl::Host as GlHost;
 
 const CAPSET_VIRGL: u32 = 1;
 const CAPSET_VIRGL2: u32 = 2;
@@ -89,7 +92,7 @@ struct Callbacks {
 }
 
 #[cfg(target_os = "macos")]
-use egl::GlCtxParam;
+use gl::GlCtxParam;
 #[cfg(not(target_os = "macos"))]
 enum GlCtxParam {}
 
@@ -182,6 +185,17 @@ fn open_lib() -> Option<Lib> {
             }
         }};
     }
+    // Its messages into ours (its default writes to stderr, and its
+    // errors got lost there). Older libraries lack this: then they don't.
+    let c = CString::new("virgl_set_log_callback").ok()?;
+    // SAFETY: valid handle and name.
+    let set_log = unsafe { libc::dlsym(handle, c.as_ptr()) };
+    if !set_log.is_null() {
+        type SetLog = unsafe extern "C" fn(extern "C" fn(c_int, *const c_char, *mut c_void), *mut c_void, *mut c_void);
+        // SAFETY: virglrenderer.h's virgl_set_log_callback; our callback
+        // only reads the message, and needs no user data or free hook.
+        unsafe { std::mem::transmute::<*mut c_void, SetLog>(set_log)(on_log, std::ptr::null_mut(), std::ptr::null_mut()) };
+    }
     // Bare names were found through the search path: ask dyld where.
     let dir = std::path::Path::new(&path).is_absolute().then(|| PathBuf::from(&path)).and_then(|p| p.parent().map(PathBuf::from));
     Some(Lib {
@@ -219,34 +233,41 @@ fn open_lib() -> Option<Lib> {
     })
 }
 
-/// Load the library, and with `gl` ANGLE next to it. Call before the
-/// sandbox. Returns whether 3D is usable (GL or not).
-pub fn load(gl: bool) -> bool {
+/// Load the library, and with `gl` that host's GL (ANGLE from next to
+/// it, or Apple's). Call before the sandbox, once per process. Returns
+/// whether 3D is usable (GL or not).
+#[cfg(target_os = "macos")]
+pub fn load(gl: Option<GlHost>) -> bool {
     let Some(lib) = LIB.get_or_init(open_lib) else { return false };
-    if gl {
-        GL.get_or_init(|| load_gl(lib));
+    if let Some(host) = gl {
+        GL.get_or_init(|| load_gl(lib, host));
     }
     true
 }
 
-/// Whether OpenGL (virgl on ANGLE) came up in [`load`].
+/// Load the library (no GL off macOS). See the macOS one.
+#[cfg(not(target_os = "macos"))]
+pub fn load(gl: bool) -> bool {
+    let Some(_lib) = LIB.get_or_init(open_lib) else { return false };
+    if gl {
+        log::info!("gpu3d: OpenGL (virgl) is only wired up on macOS for now");
+    }
+    true
+}
+
+/// Whether OpenGL (virgl) came up in [`load`].
 static GL: OnceLock<bool> = OnceLock::new();
 
 #[cfg(target_os = "macos")]
-fn load_gl(lib: &Lib) -> bool {
-    match &lib.dir {
-        Some(dir) => egl::load(dir),
-        None => {
+fn load_gl(lib: &Lib, host: GlHost) -> bool {
+    match (&lib.dir, host) {
+        (Some(dir), _) => gl::load(dir, host),
+        (None, GlHost::Apple) => gl::load(std::path::Path::new(""), host),
+        (None, GlHost::Angle) => {
             log::info!("gpu3d: virglrenderer from the search path: no ANGLE, OpenGL off");
             false
         }
     }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn load_gl(_lib: &Lib) -> bool {
-    log::info!("gpu3d: OpenGL (virgl) is only wired up on macOS for now");
-    false
 }
 
 fn lib() -> Option<&'static Lib> {
@@ -287,6 +308,21 @@ fn signal(f: FenceDone) {
     // SAFETY: write one byte to our own non-blocking pipe; a full pipe
     // already means "wake up".
     unsafe { libc::write(s.wake_tx.as_raw_fd(), [1u8].as_ptr() as *const c_void, 1) };
+}
+
+/// virglrenderer's log, by its level (debug, info, warning, error).
+extern "C" fn on_log(level: c_int, msg: *const c_char, _user: *mut c_void) {
+    if msg.is_null() {
+        return;
+    }
+    // SAFETY: a NUL-terminated message, valid for this call.
+    let m = unsafe { std::ffi::CStr::from_ptr(msg) }.to_string_lossy();
+    let m = m.trim_end();
+    match level {
+        0 => log::debug!("virgl: {m}"),
+        1 => log::info!("virgl: {m}"),
+        _ => log::warn!("virgl: {m}"),
+    }
 }
 
 extern "C" fn on_fence(_cookie: *mut c_void, fence: u32) {
@@ -370,13 +406,13 @@ fn page_size() -> u64 {
 /// Bind the GL context to the calling thread (see egl.rs). No-op without GL.
 fn enter() {
     #[cfg(target_os = "macos")]
-    egl::bind();
+    gl::bind();
 }
 
 /// The calling thread won't make renderer calls for a while.
 fn leave() {
     #[cfg(target_os = "macos")]
-    egl::release();
+    gl::release();
 }
 
 /// Set once virglrenderer is up: whether with GL.
@@ -389,7 +425,7 @@ fn init(lib: &Lib, gl: bool) -> c_int {
     type Current = extern "C" fn(*mut c_void, c_int, *mut c_void) -> c_int;
     #[cfg(target_os = "macos")]
     let (create, destroy, current): (Option<Create>, Option<Destroy>, Option<Current>) =
-        if gl { (Some(egl::create_gl_context), Some(egl::destroy_gl_context), Some(egl::make_current)) } else { (None, None, None) };
+        if gl { (Some(gl::create_gl_context), Some(gl::destroy_gl_context), Some(gl::make_current)) } else { (None, None, None) };
     #[cfg(not(target_os = "macos"))]
     let (create, destroy, current): (Option<Create>, Option<Destroy>, Option<Current>) = (None, None, None);
     // virglrenderer keeps the callbacks pointer: make it 'static.
@@ -505,6 +541,8 @@ impl Renderer3d for Virgl {
             return None;
         }
         let mut buf = vec![0u8; size as usize];
+        // Filling the virgl sets queries GL.
+        enter();
         // SAFETY: buf is exactly the size the library reported for this set.
         unsafe { (self.lib.fill_caps)(id, version, buf.as_mut_ptr() as *mut c_void) };
         if let (CAPSET_VIRGL2, Some(name), Some(field)) = (id, &self.gl_renderer, buf.get_mut(CAPS_V2_RENDERER)) {
@@ -716,7 +754,7 @@ impl Renderer3d for Virgl {
         const Y_0_TOP: u32 = 1;
         let flip = (info[5] & Y_0_TOP != 0).then_some(info[3]);
         #[cfg(target_os = "macos")]
-        return egl::read_start(info[6], flip, (bx.x, bx.y, bx.w, bx.h));
+        return gl::read_start(info[6], flip, (bx.x, bx.y, bx.w, bx.h));
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (flip, bx);
@@ -727,7 +765,7 @@ impl Renderer3d for Virgl {
     fn scanout_poll(&mut self, out: &mut [u8], wait: bool) -> Option<bool> {
         enter();
         #[cfg(target_os = "macos")]
-        return egl::read_poll(out, wait);
+        return gl::read_poll(out, wait);
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (out, wait);

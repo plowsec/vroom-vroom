@@ -682,10 +682,26 @@ pub struct Display {
     /// guest gets logical pixels and the window scales the picture up.
     #[serde(default = "yes")]
     pub hidpi: bool,
-    /// With `virtio3d`: OpenGL (virgl, on ANGLE/Metal) next to Vulkan.
+    /// With `virtio3d`: OpenGL (virgl) next to Vulkan.
     /// Off keeps Venus only: less host code parsing guest commands.
     #[serde(default = "yes")]
     pub opengl: bool,
+    /// What runs the guest's OpenGL on the host (see [`OpenglHost`]).
+    #[serde(default)]
+    pub opengl_host: OpenglHost,
+}
+
+/// What runs guest OpenGL on the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OpenglHost {
+    /// macOS's own OpenGL 4.1: the guest gets OpenGL 4.1 (GL 3.3 apps
+    /// run), with fewer checks between the guest and Apple's driver.
+    #[default]
+    Apple,
+    /// ANGLE on Metal: OpenGL ES 3.0, so the guest gets OpenGL 2.1. ANGLE
+    /// checks every call before the driver sees it.
+    Angle,
 }
 
 fn default_w() -> u32 {
@@ -697,7 +713,7 @@ fn default_h() -> u32 {
 
 impl Default for Display {
     fn default() -> Self {
-        Display { gpu: Gpu::None, width: default_w(), height: default_h(), hidpi: true, opengl: true }
+        Display { gpu: Gpu::None, width: default_w(), height: default_h(), hidpi: true, opengl: true, opengl_host: OpenglHost::Apple }
     }
 }
 
@@ -1202,6 +1218,16 @@ guest_to_host = false
         i.randomize_serials([1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(i.serial.as_deref(), Some("010203040506"));
         assert_eq!(i.disk_serial, "0708");
+    }
+
+    #[test]
+    fn opengl_host() {
+        let base = "name = \"x\"\n[boot]\ntype = \"uefi\"\nvars = \"v.fd\"\n[display]\ngpu = \"virtio3d\"\n";
+        let c = |extra: &str| VmConfig::from_toml(&format!("{base}{extra}")).map(|c| c.display.opengl_host);
+        assert_eq!(c("").unwrap(), OpenglHost::Apple);
+        assert_eq!(c("opengl_host = \"angle\"\n").unwrap(), OpenglHost::Angle);
+        assert_eq!(c("opengl_host = \"apple\"\n").unwrap(), OpenglHost::Apple);
+        assert!(c("opengl_host = \"metal\"\n").is_err());
     }
 
     #[test]

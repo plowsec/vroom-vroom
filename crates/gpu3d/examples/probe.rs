@@ -14,7 +14,9 @@ fn main() {
         print!("{}", vroom_sandbox::profile_text(&p).expect("profile"));
         return;
     }
-    if !vroom_gpu3d::load(true) {
+    // `--apple`: Apple's OpenGL instead of ANGLE.
+    let host = if std::env::args().any(|a| a == "--apple") { vroom_gpu3d::GlHost::Apple } else { vroom_gpu3d::GlHost::Angle };
+    if !vroom_gpu3d::load(Some(host)) {
         eprintln!("virglrenderer not found");
         std::process::exit(1);
     }

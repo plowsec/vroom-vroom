@@ -211,18 +211,16 @@ switched while the VM runs.
 
 ```bash
 brew install meson ninja molten-vk
-scripts/build-angle.sh            # OpenGL: ANGLE on Metal (about 10 minutes)
 scripts/build-virglrenderer.sh    # virglrenderer, for Vulkan and OpenGL
+scripts/build-angle.sh            # only for opengl_host = "angle" (about 10 minutes)
 ```
 
 Set `[display] gpu = "virtio3d"`. The guest gets two drivers, and Mesa
 picks the right one by itself:
 
 - **OpenGL** (virgl): Mesa's virgl driver sends GL work to the host,
-  where virglrenderer replays it on OpenGL ES, which ANGLE turns into
-  Metal. Stock Ubuntu works as it is (any kernel, Mesa from the archive).
-  `glxinfo -B` shows `virgl (ANGLE (Apple, ANGLE Metal Renderer: Apple M…))`
-  and GNOME draws with the Mac's GPU, in Wayland and X11 sessions.
+  where virglrenderer replays it on the Mac's GPU. Stock Ubuntu works as
+  it is (any kernel, Mesa from the archive), in Wayland and X11 sessions.
 - **Vulkan** (Venus): needs `mesa-vulkan-drivers` (Mesa ≥ 24), the user
   in the `render` group, and on macOS hosts a kernel with **16 KiB pages**
   (HVF maps guest memory at 16 KiB granularity). Ubuntu ships no such
@@ -232,38 +230,46 @@ picks the right one by itself:
   (`VK_KHR_swapchain` is missing, with or without OpenGL): Vulkan apps
   can compute and render off screen, not show a window.
 
-What OpenGL apps get: OpenGL 2.1 and OpenGL ES 3.0. ANGLE's Metal
-backend stops at ES 3.0, and virgl can't offer more than its host has.
-That covers desktops and apps written for GL 2 or GLES; apps that need
-GL 3.3 core (Blender, recent games) won't start. `LIBGL_ALWAYS_SOFTWARE=1`
+Two ways to run the guest's OpenGL, `[display] opengl_host`:
+
+| | `apple` (default) | `angle` |
+|---|---|---|
+| Runs on | macOS's own OpenGL 4.1 | ANGLE (OpenGL ES 3.0) on Metal |
+| The guest gets | OpenGL 4.1, core and compatibility | OpenGL 2.1, OpenGL ES 3.0 |
+| `glxinfo -B` | `virgl (Apple M…)` | `virgl (ANGLE (Apple, ANGLE Metal Renderer: Apple M…))` |
+| Checks | virglrenderer's | virglrenderer's, then ANGLE checks every call (built for WebGL) |
+
+With `angle`, apps that need GL 3 won't start, and some that assume it
+crash (glmark2 does, on its framebuffer scenes). Most desktop Linux apps
+want GL 3.3 now, so `apple` is the default; see SECURITY.md for what
+the extra ANGLE checks buy. Neither gets past GL 4.1 (no compute
+shaders: that's GL 4.3, which macOS never had). `LIBGL_ALWAYS_SOFTWARE=1`
 runs one app on llvmpipe instead, which has GL 4.5.
 
 `[display] opengl = false` keeps Vulkan only (the guest's GL then runs on
 llvmpipe). That keeps less host code in reach of the guest, and keeps
 suspend working (see below).
 
-Speed, Ubuntu 24.04 GNOME (Wayland), 1280×800, 6 vCPUs, M3 Max,
-glmark2 2023.01 at its default 800×600 window:
+Speed, Ubuntu 22.04 live desktop (X11), 1280×800, 4 vCPUs, M3 Max,
+glmark2 2021.02 at its default 800×600 window, `opengl_host = "apple"`
+against llvmpipe in the same guest:
 
-| | `virtio2d` (llvmpipe) | `virtio3d` (virgl on Metal) |
+| | llvmpipe (CPU) | `apple` |
 |---|---|---|
-| glmark2 score | 463, 478 | 806 to 925 (four runs) |
-| glmark2 terrain | 16 to 22 fps | 520 to 530 fps |
-| glmark2 refract | 42 to 47 fps | 770 to 850 fps |
-| glxgears (vsync off) | about 2,700 fps | 400 to 1,600 fps |
-| guest CPU busy during terrain | 59% | 3% |
+| glmark2 score (full run) | 676 | 1059 |
+| terrain | 13 fps | 388 to 448 fps |
+| refract | 40 fps | 981 to 1071 fps |
+| desktop (blur) | 159 fps | 892 to 1006 fps |
 
-Numbers move with the host's load (these were taken next to other VMs).
-glxgears is the one test llvmpipe wins: its frames are tiny, and with
-virgl each one makes a round trip to the host GPU, and the window shows
-a copy of the guest's screen read back from it. Anything with real work
-is many times faster, and the guest's CPUs stay free.
+Small scenes stop near 1,100 fps either way: each frame makes a round
+trip to the host, and the window shows a copy read back from the GPU.
+Anything with real work is many times faster, and the guest's CPUs stay
+free.
 
 Why virgl and not OpenGL on top of Vulkan (Zink): Zink needs Vulkan's
 `nullDescriptor` (robustness2), which MoltenVK can't offer on Metal.
 Faking it on the host would mean rewriting descriptor sets in
-virglrenderer's Venus decoder. virgl on ANGLE is the route UTM takes on
-macOS, and it works with any guest kernel.
+virglrenderer's Venus decoder. virgl works with any guest kernel.
 
 Snapshots and suspend: GPU state lives on the host GPU and can't be
 saved, so snapshots and suspend are refused while 3D contexts exist.
@@ -279,9 +285,12 @@ The build: `build-angle.sh` fetches ANGLE at the commit Chrome's stable
 release uses, with Google's depot_tools, about 3 GB while it builds
 (removed afterwards), and leaves `libEGL.dylib` and `libGLESv2.dylib`
 (6 MB) in `target/angle`. `build-virglrenderer.sh` builds libepoxy 1.5.10
-(EGL on, patched to load ANGLE from its own directory) into
-virglrenderer (3.4 MB). Both copy their results next to `target/*/vroom`,
-where the VMM looks; ship the three dylibs with the binary.
+(EGL on, patched to load ANGLE from its own directory, or Apple's OpenGL
+when the VMM asks for it) into virglrenderer (3.4 MB), with our patches
+from `third_party/virglrenderer/` (two of them make it work on macOS's
+OpenGL 4.1). Both copy their results next to `target/*/vroom`, where the
+VMM looks; ship the dylibs with the binary (ANGLE's two only for
+`opengl_host = "angle"`).
 
 ## Shared folders
 

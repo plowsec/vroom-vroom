@@ -101,15 +101,16 @@ in-flight buffers before saving.
 `gpu = "virtio3d"` adds two protocols to virtio-gpu. Venus: guest Vulkan
 (Mesa's venus driver) serializes commands, virglrenderer replays them on
 MoltenVK. virgl: guest OpenGL (Mesa's virgl driver) sends Gallium
-commands, virglrenderer's vrend replays them on OpenGL ES from ANGLE's
-Metal backend. Both capsets are offered; Mesa picks per API. Guest memory
-a renderer may touch is passed as host iovecs; host-visible buffers are
+commands, virglrenderer's vrend replays them on macOS's OpenGL 4.1 (CGL),
+or with `opengl_host = "angle"` on OpenGL ES from ANGLE's Metal backend.
+Both capsets are offered; Mesa picks per API. Guest memory a renderer may
+touch is passed as host iovecs; host-visible buffers are
 mapped into the guest's shared memory window with the hypervisor.
 
-GL details (`gpu3d/src/egl.rs`): we create the EGL contexts virglrenderer
-asks for (one share group, no surfaces) and keep the right one bound on
-whichever thread calls in (setup thread, then the GPU worker, which
-changes on device reset). GL fences have no completion thread (ANGLE
+GL details (`gpu3d/src/gl.rs`): we create the CGL or EGL contexts
+virglrenderer asks for (one share group, no surfaces) and keep the right
+one bound on whichever thread calls in (setup thread, then the GPU
+worker, which changes on device reset). GL fences have no completion thread (ANGLE
 serializes a share group's contexts, so a thread blocked on a fence
 would stall submits): the worker polls them every millisecond while any
 is pending. A GL scanout is copied back on flush: from a context of our
@@ -125,4 +126,8 @@ macOS constraints: HVF maps at 16 KiB granularity, so guests need a 16 KiB
 page kernel (or blob sizes that are 16 KiB multiples), and MoltenVK lacks
 `VK_KHR_external_memory_fd`, which Mesa requires; our virglrenderer patch
 advertises it and shares mappings by pointer instead
-(`third_party/virglrenderer/`).
+(`third_party/virglrenderer/`). Two more patches there make vrend work on
+macOS's OpenGL 4.1: multisample textures without `glTexStorage*Multisample`
+(GL 4.3), and shaders written at the host's GLSL version (4.10) instead of
+an older one plus `#extension` lines macOS's compiler rejects. virglrenderer
+logs through our logger (`virgl:` lines).

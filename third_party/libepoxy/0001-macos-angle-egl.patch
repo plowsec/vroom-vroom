@@ -1,7 +1,7 @@
 diff -ru a/src/dispatch_common.c b/src/dispatch_common.c
---- a/src/dispatch_common.c	2022-02-17 13:56:12
-+++ b/src/dispatch_common.c	2026-10-15 12:13:26
-@@ -174,10 +174,15 @@
+--- a/src/dispatch_common.c	2026-10-15 22:49:12
++++ b/src/dispatch_common.c	2026-10-15 22:49:12
+@@ -174,10 +174,18 @@
  #include "dispatch_common.h"
  
  #if defined(__APPLE__)
@@ -15,24 +15,84 @@ diff -ru a/src/dispatch_common.c b/src/dispatch_common.c
 -#define GLES2_LIB "libGLESv2.so"
 +#define EGL_LIB "@loader_path/libEGL.dylib"
 +#define OPENGL_LIB "@loader_path/libGLESv2.dylib"
++/* Apple's desktop GL, only for a process whose first GL call runs with a
++ * CGL context current (vroom's `opengl_host = "apple"`). */
++#define APPLE_OPENGL_LIB "/System/Library/Frameworks/OpenGL.framework/Versions/Current/OpenGL"
 +#define GLES1_LIB "@loader_path/libGLESv1_CM.dylib"
 +#define GLES2_LIB "@loader_path/libGLESv2.dylib"
  #elif defined(__ANDROID__)
  #define GLX_LIB "libGLESv2.so"
  #define EGL_LIB "libEGL.so"
-@@ -782,6 +787,9 @@
- epoxy_egl_get_current_gl_context_api(void)
+@@ -660,13 +668,33 @@
+     return epoxy_conservative_glx_dlsym(name, true);
+ }
+ 
++#if defined(__APPLE__)
++/* A CGL context is current on this thread. CGLGetCurrentContext is only
++ * there if the caller loaded OpenGL.framework itself: otherwise this is
++ * false and everything stays on ANGLE. */
++static bool
++epoxy_cgl_current(void)
++{
++    static void *(*cgl_current)(void);
++    if (!cgl_current)
++        cgl_current = (void *(*)(void))dlsym(RTLD_DEFAULT, "CGLGetCurrentContext");
++    return cgl_current && cgl_current();
++}
++#endif
++
+ static void
+ epoxy_load_gl(void)
+ {
+     if (api.gl_handle)
+ 	return;
+ 
+-#if defined(_WIN32) || defined(__APPLE__)
++#if defined(__APPLE__)
++    /* Decided once: epoxy resolves each function once per process. */
++    if (epoxy_cgl_current())
++        get_dlopen_handle(&api.gl_handle, APPLE_OPENGL_LIB, true, true);
++    else
++        get_dlopen_handle(&api.gl_handle, OPENGL_LIB, true, true);
++#elif defined(_WIN32)
+     get_dlopen_handle(&api.gl_handle, OPENGL_LIB, true, true);
+ #else
+ 
+@@ -783,6 +811,9 @@
  {
      EGLint curapi;
-+
+ 
 +    if (!api.egl_handle)
 +        return EGL_NONE;
- 
++
      if (eglQueryContext(eglGetCurrentDisplay(), eglGetCurrentContext(),
  			EGL_CONTEXT_CLIENT_TYPE, &curapi) == EGL_FALSE) {
+ 	(void)eglGetError();
+@@ -819,6 +850,10 @@
+      * since future calls will also use that API (this prevents a
+      * non-X11 ES2 context from loading a bunch of X11 junk).
+      */
++#if defined(__APPLE__)
++    if (epoxy_cgl_current())
++        return epoxy_gl_dlsym(name);
++#endif
+ #if PLATFORM_HAS_EGL
+     get_dlopen_handle(&api.egl_handle, EGL_LIB, false, true);
+     if (api.egl_handle) {
+@@ -847,6 +882,10 @@
+ void *
+ epoxy_get_proc_address(const char *name)
+ {
++#if defined(__APPLE__)
++    if (epoxy_cgl_current())
++        return epoxy_gl_dlsym(name);
++#endif
+ #if PLATFORM_HAS_EGL
+     GLenum egl_api = EGL_NONE;
+ 
 diff -ru a/src/dispatch_common.h b/src/dispatch_common.h
---- a/src/dispatch_common.h	2022-02-17 13:56:12
-+++ b/src/dispatch_common.h	2026-10-15 12:04:26
+--- a/src/dispatch_common.h	2026-10-15 22:49:12
++++ b/src/dispatch_common.h	2026-10-15 22:49:12
 @@ -28,7 +28,7 @@
  #define PLATFORM_HAS_GLX ENABLE_GLX
  #define PLATFORM_HAS_WGL 1

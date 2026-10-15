@@ -346,6 +346,21 @@ export component SettingsPanel inherits Rectangle {
                             toggled(v) => { Bus.set("opengl", v ? "true" : "false"); }
                         }
                     }
+                    if root.s.gpu == 2 && root.s.opengl: Row {
+                        label: "OpenGL driver";
+                        hint: root.s.opengl-host == 0
+                            ? "Your Mac's own OpenGL. The guest gets OpenGL 4.1, enough for most Linux apps."
+                            : "ANGLE checks every call before your Mac's GPU sees it, but the guest only gets OpenGL 2.1: many apps won't start.";
+                        key: "display.opengl_host";
+                        Segmented {
+                            y: (parent.height - self.height) / 2;
+                            width: 170px;
+                            options: ["Apple", "ANGLE"];
+                            selected: root.s.opengl-host;
+                            enabled: !root.lk;
+                            changed(i) => { Bus.set("opengl_host", i); }
+                        }
+                    }
                     Row {
                         label: "Starting size";
                         key: "width, height";

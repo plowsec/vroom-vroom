@@ -1,15 +1,20 @@
-//! OpenGL ES contexts for virglrenderer's GL side (virgl), from ANGLE's
-//! EGL on its Metal backend.
+//! GL contexts for virglrenderer's GL side (virgl), from one of two hosts:
+//!
+//! - ANGLE (`opengl_host = "angle"`): OpenGL ES 3.0 from ANGLE's EGL on
+//!   its Metal backend. ANGLE's libEGL must sit next to virglrenderer: the
+//!   libepoxy built into it loads libEGL and libGLESv2 from there, and the
+//!   two must be the same library instance. ANGLE validates every GL call
+//!   it gets (it was made for WebGL), so guest commands that slip past
+//!   virglrenderer still meet a second check before the Metal driver. The
+//!   guest gets OpenGL 2.1.
+//! - Apple (`opengl_host = "apple"`): macOS's own OpenGL 4.1 core profile
+//!   through CGL. The guest gets OpenGL 4.1, but calls reach Apple's driver
+//!   with virglrenderer's checks only. Our libepoxy uses Apple's OpenGL
+//!   when a CGL context is current at the first GL call, which ours is.
 //!
 //! virglrenderer asks for contexts through callbacks; these create them
-//! on one ANGLE display, all in one share group, without surfaces (it
-//! only renders to its own framebuffer objects). ANGLE's libEGL must sit
-//! next to virglrenderer: the libepoxy built into it loads libEGL and
-//! libGLESv2 from there, and the two must be the same library instance.
-//!
-//! ANGLE validates every GL call it gets (it was made for WebGL), so guest
-//! commands that slip past virglrenderer still meet a second check before
-//! the Metal driver.
+//! all in one share group, without surfaces (it only renders to its own
+//! framebuffer objects).
 
 use std::cell::Cell;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
@@ -29,6 +34,13 @@ const EGL_PLATFORM_ANGLE_ANGLE: u32 = 0x3202;
 const EGL_PLATFORM_ANGLE_TYPE_ANGLE: isize = 0x3203;
 const EGL_PLATFORM_ANGLE_TYPE_METAL_ANGLE: isize = 0x3489;
 
+/// Which GL the host runs guest GL on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Host {
+    Angle,
+    Apple,
+}
+
 /// The virglrenderer.h context request.
 #[repr(C)]
 pub(crate) struct GlCtxParam {
@@ -39,36 +51,109 @@ pub(crate) struct GlCtxParam {
     compat_ctx: c_int,
 }
 
+/// How contexts are made, per host.
+enum Api {
+    Angle {
+        get_error: unsafe extern "C" fn() -> i32,
+        create_context: unsafe extern "C" fn(Ptr, Ptr, Ptr, *const i32) -> Ptr,
+        destroy_context: unsafe extern "C" fn(Ptr, Ptr) -> u32,
+        make_current: unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr) -> u32,
+        display: Ptr,
+        robust: bool,
+    },
+    Apple {
+        pixel_format: Ptr,
+        create_context: unsafe extern "C" fn(Ptr, Ptr, *mut Ptr) -> c_int,
+        destroy_context: unsafe extern "C" fn(Ptr) -> c_int,
+        set_current: unsafe extern "C" fn(Ptr) -> c_int,
+    },
+}
+
 struct Egl {
-    get_error: unsafe extern "C" fn() -> i32,
-    create_context: unsafe extern "C" fn(Ptr, Ptr, Ptr, *const i32) -> Ptr,
-    destroy_context: unsafe extern "C" fn(Ptr, Ptr) -> u32,
-    make_current: unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr) -> u32,
-    display: Ptr,
+    api: Api,
     /// Never destroyed: every context shares with it, so the share group
     /// outlives any one guest context.
     root: Ptr,
-    robust: bool,
     /// Scanout readback (None: read through virglrenderer instead).
     reader: Option<Mutex<Reader>>,
 }
 
-// SAFETY: EGL handles are process-wide and EGL calls are thread-safe; the
-// struct is only read after init.
+// SAFETY: EGL and CGL handles are process-wide and their calls are
+// thread-safe; the struct is only read after init.
 unsafe impl Send for Egl {}
 // SAFETY: see above.
 unsafe impl Sync for Egl {}
 
 static EGL: OnceLock<Option<Egl>> = OnceLock::new();
 
-/// Open ANGLE's libEGL in `dir`, bring up a Metal display and a first
-/// context. Call before the sandbox. Returns whether GL is usable.
-pub(crate) fn load(dir: &Path) -> bool {
-    EGL.get_or_init(|| open(dir)).is_some()
+/// Bring up `host`'s GL and a first context (ANGLE from `dir`). Call
+/// before the sandbox, once per process. Returns whether GL is usable.
+pub(crate) fn load(dir: &Path, host: Host) -> bool {
+    EGL.get_or_init(|| match host {
+        Host::Angle => open(dir),
+        Host::Apple => open_apple(),
+    })
+    .is_some()
 }
 
 fn egl() -> Option<&'static Egl> {
     EGL.get().and_then(|e| e.as_ref())
+}
+
+const APPLE_OPENGL: &str = "/System/Library/Frameworks/OpenGL.framework/Versions/Current/OpenGL";
+// CGL pixel format attributes.
+const CGL_PFA_ACCELERATED: c_int = 73;
+const CGL_PFA_ALLOW_OFFLINE_RENDERERS: c_int = 96;
+const CGL_PFA_OPENGL_PROFILE: c_int = 99;
+const CGL_OGL_PVERSION_GL4_CORE: c_int = 0x4100;
+
+/// macOS's OpenGL 4.1 core profile, through CGL.
+fn open_apple() -> Option<Egl> {
+    let c = CString::new(APPLE_OPENGL).ok()?;
+    // SAFETY: dlopen with a valid C string. Global: our libepoxy finds
+    // CGLGetCurrentContext with dlsym(RTLD_DEFAULT).
+    let h = unsafe { libc::dlopen(c.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
+    if h.is_null() {
+        log::warn!("gpu3d: can't load Apple's OpenGL");
+        return None;
+    }
+    let sym = |name: &str| -> Option<Ptr> {
+        let c = CString::new(name).ok()?;
+        // SAFETY: valid handle and name.
+        let f = unsafe { libc::dlsym(h, c.as_ptr()) };
+        if f.is_null() {
+            log::warn!("gpu3d: {name} missing");
+        }
+        (!f.is_null()).then_some(f)
+    };
+    // SAFETY: the CGL signature it is cast to.
+    let choose: unsafe extern "C" fn(*const c_int, *mut Ptr, *mut c_int) -> c_int = unsafe { std::mem::transmute(sym("CGLChoosePixelFormat")?) };
+    // SAFETY: as above.
+    let create_context: unsafe extern "C" fn(Ptr, Ptr, *mut Ptr) -> c_int = unsafe { std::mem::transmute(sym("CGLCreateContext")?) };
+    // SAFETY: as above.
+    let destroy_context: unsafe extern "C" fn(Ptr) -> c_int = unsafe { std::mem::transmute(sym("CGLDestroyContext")?) };
+    // SAFETY: as above.
+    let set_current: unsafe extern "C" fn(Ptr) -> c_int = unsafe { std::mem::transmute(sym("CGLSetCurrentContext")?) };
+    let attrs = [CGL_PFA_OPENGL_PROFILE, CGL_OGL_PVERSION_GL4_CORE, CGL_PFA_ACCELERATED, CGL_PFA_ALLOW_OFFLINE_RENDERERS, 0];
+    let (mut pixel_format, mut n) = (std::ptr::null_mut(), 0);
+    // SAFETY: zero-terminated attributes, valid out pointers.
+    let r = unsafe { choose(attrs.as_ptr(), &mut pixel_format, &mut n) };
+    if r != 0 || pixel_format.is_null() {
+        log::warn!("gpu3d: no OpenGL 4.1 pixel format ({r})");
+        return None;
+    }
+    let mut e = Egl { api: Api::Apple { pixel_format, create_context, destroy_context, set_current }, root: std::ptr::null_mut(), reader: None };
+    e.root = e.context(4, 1)?;
+    let get_proc = move |name: &CStr| -> Ptr {
+        // SAFETY: valid handle and name.
+        unsafe { libc::dlsym(h, name.as_ptr()) }
+    };
+    e.reader = Gl::load(&get_proc).and_then(|gl| {
+        // Desktop GL reads BGRA without an extension.
+        Some(Mutex::new(Reader { gl, ctx: e.context(4, 1)?, fbo: 0, pbo: 0, pbo_size: 0, bgra: Some(true), pending: None }))
+    });
+    log::info!("gpu3d: Apple OpenGL 4.1 (CGL)");
+    Some(e)
 }
 
 fn open(dir: &Path) -> Option<Egl> {
@@ -104,16 +189,8 @@ fn open(dir: &Path) -> Option<Egl> {
     let initialize: unsafe extern "C" fn(Ptr, *mut i32, *mut i32) -> u32 = sym!("eglInitialize");
     let bind_api: unsafe extern "C" fn(u32) -> u32 = sym!("eglBindAPI");
     let query_string: unsafe extern "C" fn(Ptr, i32) -> *const c_char = sym!("eglQueryString");
-    let mut e = Egl {
-        get_error: sym!("eglGetError"),
-        create_context: sym!("eglCreateContext"),
-        destroy_context: sym!("eglDestroyContext"),
-        make_current: sym!("eglMakeCurrent"),
-        display: std::ptr::null_mut(),
-        root: std::ptr::null_mut(),
-        robust: false,
-        reader: None,
-    };
+    let get_error: unsafe extern "C" fn() -> i32 = sym!("eglGetError");
+    let (create_context, destroy_context, make_current) = (sym!("eglCreateContext"), sym!("eglDestroyContext"), sym!("eglMakeCurrent"));
     let attrs = [EGL_PLATFORM_ANGLE_TYPE_ANGLE, EGL_PLATFORM_ANGLE_TYPE_METAL_ANGLE, EGL_NONE as isize];
     // SAFETY: EGL_DEFAULT_DISPLAY (null) and a NONE-terminated list.
     let d = unsafe { get_platform_display(EGL_PLATFORM_ANGLE_ANGLE, std::ptr::null_mut(), attrs.as_ptr()) };
@@ -121,7 +198,7 @@ fn open(dir: &Path) -> Option<Egl> {
     // SAFETY: d is a display handle (or null, which fails cleanly).
     if d.is_null() || unsafe { initialize(d, &mut major, &mut minor) } == 0 {
         // SAFETY: plain call.
-        log::warn!("gpu3d: ANGLE (Metal) display failed: {:#x}", unsafe { (e.get_error)() });
+        log::warn!("gpu3d: ANGLE (Metal) display failed: {:#x}", unsafe { get_error() });
         return None;
     }
     // SAFETY: plain calls on an initialized display.
@@ -136,12 +213,15 @@ fn open(dir: &Path) -> Option<Egl> {
         log::warn!("gpu3d: ANGLE lacks surfaceless contexts: OpenGL off");
         return None;
     }
-    e.display = d;
-    e.robust = has("EGL_EXT_create_context_robustness");
+    let robust = has("EGL_EXT_create_context_robustness");
+    let api = Api::Angle { get_error, create_context, destroy_context, make_current, display: d, robust };
+    let mut e = Egl { api, root: std::ptr::null_mut(), reader: None };
     e.root = e.context(3, 0)?;
-    log::info!("gpu3d: ANGLE EGL {major}.{minor} on Metal{}", if e.robust { ", robust access" } else { "" });
-    let get_proc: unsafe extern "C" fn(*const c_char) -> Ptr = sym!("eglGetProcAddress");
-    e.reader = Gl::load(get_proc).and_then(|gl| Some(Mutex::new(Reader { gl, ctx: e.context(3, 0)?, fbo: 0, pbo: 0, pbo_size: 0, bgra: None, pending: None })));
+    log::info!("gpu3d: ANGLE EGL {major}.{minor} on Metal{}", if robust { ", robust access" } else { "" });
+    let egl_get_proc: unsafe extern "C" fn(*const c_char) -> Ptr = sym!("eglGetProcAddress");
+    // SAFETY: valid C string; ANGLE returns core entry points too.
+    let get_proc = move |name: &CStr| unsafe { egl_get_proc(name.as_ptr()) };
+    e.reader = Gl::load(&get_proc).and_then(|gl| Some(Mutex::new(Reader { gl, ctx: e.context(3, 0)?, fbo: 0, pbo: 0, pbo_size: 0, bgra: None, pending: None })));
     Some(e)
 }
 
@@ -163,7 +243,7 @@ const GL_CONDITION_SATISFIED: u32 = 0x911C;
 /// Longest wait for a readback the caller insists on (a stuck GPU).
 const READ_WAIT_NS: u64 = 1_000_000_000;
 
-/// The few GL ES 3.0 calls scanout readback needs.
+/// The few GL ES 3.0 / GL 4.1 calls scanout readback needs.
 struct Gl {
     get_error: unsafe extern "C" fn() -> u32,
     get_string: unsafe extern "C" fn(u32) -> *const c_char,
@@ -184,17 +264,17 @@ struct Gl {
 }
 
 impl Gl {
-    fn load(get_proc: unsafe extern "C" fn(*const c_char) -> Ptr) -> Option<Gl> {
+    fn load(get_proc: &dyn Fn(&CStr) -> Ptr) -> Option<Gl> {
         macro_rules! gl {
             ($name:literal) => {{
                 let c = CString::new($name).ok()?;
-                // SAFETY: valid C string; ANGLE returns core entry points too.
-                let f = unsafe { get_proc(c.as_ptr()) };
+                let f = get_proc(&c);
                 if f.is_null() {
                     log::warn!("gpu3d: {} missing", $name);
                     return None;
                 }
-                // SAFETY: the GL ES 3.0 signature it is cast to.
+                // SAFETY: the GL signature it is cast to (same in ES 3.0
+                // and GL 4.1).
                 #[allow(clippy::missing_transmute_annotations)]
                 unsafe {
                     std::mem::transmute::<Ptr, _>(f)
@@ -417,17 +497,64 @@ pub(crate) fn read_poll(out: &mut [u8], wait: bool) -> Option<bool> {
 
 impl Egl {
     fn context(&self, major: c_int, minor: c_int) -> Option<Ptr> {
-        let mut attrs = vec![EGL_CONTEXT_MAJOR_VERSION, major, EGL_CONTEXT_MINOR_VERSION, minor];
-        if self.robust {
-            // Out-of-bounds buffer reads return zeros instead of whatever
-            // memory follows.
-            attrs.extend([EGL_CONTEXT_OPENGL_ROBUST_ACCESS, 1]);
+        match &self.api {
+            Api::Angle { create_context, display, robust, .. } => {
+                let mut attrs = vec![EGL_CONTEXT_MAJOR_VERSION, major, EGL_CONTEXT_MINOR_VERSION, minor];
+                if *robust {
+                    // Out-of-bounds buffer reads return zeros instead of
+                    // whatever memory follows.
+                    attrs.extend([EGL_CONTEXT_OPENGL_ROBUST_ACCESS, 1]);
+                }
+                attrs.push(EGL_NONE);
+                // SAFETY: valid display; EGL_NO_CONFIG_KHR (null); share
+                // with the root (null for the root itself); NONE-terminated.
+                let c = unsafe { create_context(*display, std::ptr::null_mut(), self.root, attrs.as_ptr()) };
+                (!c.is_null()).then_some(c)
+            }
+            Api::Apple { pixel_format, create_context, .. } => {
+                // A 4.1 core context is all macOS has: say no to more, so
+                // virglrenderer walks down to what it gets.
+                if (major, minor) > (4, 1) {
+                    return None;
+                }
+                let mut c = std::ptr::null_mut();
+                // SAFETY: valid pixel format; share with the root (null for
+                // the root itself); valid out pointer.
+                let r = unsafe { create_context(*pixel_format, self.root, &mut c) };
+                (r == 0 && !c.is_null()).then_some(c)
+            }
         }
-        attrs.push(EGL_NONE);
-        // SAFETY: valid display; EGL_NO_CONFIG_KHR (null); share with the
-        // root (null for the root itself); NONE-terminated attributes.
-        let c = unsafe { (self.create_context)(self.display, std::ptr::null_mut(), self.root, attrs.as_ptr()) };
-        (!c.is_null()).then_some(c)
+    }
+
+    fn destroy(&self, ctx: Ptr) {
+        match &self.api {
+            // SAFETY: a context we created on this display (EGL defers the
+            // delete while it is still bound somewhere).
+            Api::Angle { destroy_context, display, .. } => unsafe {
+                destroy_context(*display, ctx);
+            },
+            // SAFETY: a context we created and nobody uses any more.
+            Api::Apple { destroy_context, .. } => unsafe {
+                destroy_context(ctx);
+            },
+        }
+    }
+
+    fn make_current(&self, ctx: Ptr) -> bool {
+        match &self.api {
+            // SAFETY: a context of ours (or null to release); no surfaces.
+            Api::Angle { make_current, display, .. } => unsafe { make_current(*display, std::ptr::null_mut(), std::ptr::null_mut(), ctx) != 0 },
+            // SAFETY: a context of ours, or null to release.
+            Api::Apple { set_current, .. } => unsafe { set_current(ctx) == 0 },
+        }
+    }
+
+    fn error(&self) -> i32 {
+        match &self.api {
+            // SAFETY: plain call.
+            Api::Angle { get_error, .. } => unsafe { get_error() },
+            Api::Apple { .. } => 0,
+        }
     }
 }
 
@@ -446,8 +573,7 @@ thread_local! {
 static LAST: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
 fn set_current(e: &Egl, ctx: Ptr) -> bool {
-    // SAFETY: a context of ours (or null to release); no surfaces.
-    let ok = unsafe { (e.make_current)(e.display, std::ptr::null_mut(), std::ptr::null_mut(), ctx) } != 0;
+    let ok = e.make_current(ctx);
     if ok {
         CURRENT.with(|c| c.set(ctx));
     }
@@ -460,8 +586,7 @@ pub(crate) fn bind() {
     RENDERER.with(|r| r.set(true));
     let want = LAST.load(Ordering::Acquire);
     if !want.is_null() && CURRENT.with(|c| c.get()) != want && !set_current(e, want) {
-        // SAFETY: plain call.
-        log::warn!("gpu3d: can't bind the GL context on this thread: {:#x}", unsafe { (e.get_error)() });
+        log::warn!("gpu3d: can't bind the GL context on this thread: {:#x}", e.error());
     }
 }
 
@@ -481,7 +606,11 @@ pub(crate) extern "C" fn create_gl_context(_cookie: Ptr, _scanout: c_int, param:
     }
     // SAFETY: virglrenderer passes a valid parameter block.
     let p = unsafe { &*param };
-    // virglrenderer walks down from GL 4.6; ANGLE answers for ES 3.x.
+    // virglrenderer walks down from GL 4.6; ANGLE answers for ES 3.x,
+    // Apple for 4.1 and below. Apple has no compatibility profile.
+    if p.compat_ctx != 0 && matches!(e.api, Api::Apple { .. }) {
+        return std::ptr::null_mut();
+    }
     e.context(p.major_ver, p.minor_ver).unwrap_or(std::ptr::null_mut())
 }
 
@@ -489,9 +618,7 @@ pub(crate) extern "C" fn destroy_gl_context(_cookie: Ptr, ctx: Ptr) {
     if let Some(e) = egl() {
         if !ctx.is_null() && ctx != e.root {
             let _ = LAST.compare_exchange(ctx, std::ptr::null_mut(), Ordering::AcqRel, Ordering::Acquire);
-            // SAFETY: a context we created on this display (EGL defers the
-            // delete while it is still bound somewhere).
-            unsafe { (e.destroy_context)(e.display, ctx) };
+            e.destroy(ctx);
         }
     }
 }

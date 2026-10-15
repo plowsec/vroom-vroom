@@ -229,22 +229,33 @@ reverts its TPM too.
 ## What 3D costs
 
 `gpu = "virtio3d"` loads virglrenderer and MoltenVK into the VMM, and
-with `opengl` (the default) ANGLE too. Guest command streams are then
-parsed by C code and reach the Apple GPU driver: Venus (Vulkan) commands
-by virglrenderer's Venus decoder, virgl (OpenGL) commands by its GL
-decoder (vrend), which has the longer history of bugs. vrend's GL calls go
-to ANGLE, which checks every call the way a browser checks WebGL before
-anything reaches Metal, so a vrend mistake meets a second check. The GL
-contexts ask for robust buffer access (out-of-bounds reads give zeros).
-`opengl = false` leaves vrend and ANGLE out entirely.
+with `opengl` (the default) a GL driver too. Guest command streams are
+then parsed by C code and reach the Apple GPU driver: Venus (Vulkan)
+commands by virglrenderer's Venus decoder, virgl (OpenGL) commands by its
+GL decoder (vrend), which has the longer history of bugs. Where vrend's
+GL calls go depends on `opengl_host`:
+
+- `"apple"` (the default): macOS's own OpenGL 4.1. vrend's checks are the
+  only ones before Apple's driver, and macOS's GL has no robust buffer
+  access, so a shader reading out of bounds reads whatever GPU memory of
+  the VMM follows (its own guest's data; each VM is its own process) or
+  crashes the VMM. In exchange the guest gets OpenGL 4.1, which most
+  Linux apps need.
+- `"angle"`: ANGLE on Metal, which checks every call the way a browser
+  checks WebGL before anything reaches Metal, so a vrend mistake meets a
+  second check. Its contexts ask for robust buffer access (out-of-bounds
+  reads give zeros). The guest gets OpenGL 2.1 only.
+
+`opengl = false` leaves vrend and both GL drivers out entirely.
 
 The sandbox keeps working but has to allow the GPU: three IOKit user
 clients (`AGXDeviceUserClient`, `AGXSharedUserClient`,
 `IOSurfaceRootUserClient`), the Metal compiler service, framework reads
-and the Metal shader cache. OpenGL needed nothing more: ANGLE uses the
-same Metal device, and is loaded (with the display and a first context)
-before the sandbox goes up. libepoxy is built to load ANGLE only from
-virglrenderer's own directory, never Apple's OpenGL or a search path.
+and the Metal shader cache. OpenGL needed nothing more: ANGLE and Apple's
+OpenGL (on Apple Silicon it runs on Metal too) are loaded, with a first
+context, before the sandbox goes up. libepoxy is built to load ANGLE only
+from virglrenderer's own directory, and Apple's OpenGL only by its system
+path, when the VMM made a CGL context current first; never a search path.
 
 Use 3D only for guests that need it. A future step is moving the renderer
 into its own process (possible for most of Venus and for virgl, whose
@@ -350,8 +361,8 @@ Still visible, whatever the config says:
   (the scale its agent is asked for).
 - The display: ramfb, then virtio-gpu with no EDID. With 3D, Vulkan shows
   the host GPU (MoltenVK on Apple). OpenGL's renderer name follows
-  `gl_renderer`, but its limits (GL 2.1, ES 3.0, texture sizes, formats)
-  still look like ANGLE on Metal.
+  `gl_renderer`, but its limits (GL 4.1 with `apple`, GL 2.1 and ES 3.0
+  with `angle`, texture sizes, formats) still give the host driver away.
 - CPU ID registers come from the host CPU (an Apple core on a Mac), and
   timing differs from bare metal.
 - The vTPM is swtpm: its manufacturer is IBM, and the TIS DID/VID register
