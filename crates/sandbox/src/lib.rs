@@ -49,6 +49,9 @@ pub struct Policy {
     pub clipboard: bool,
     /// Use the host GPU (virtio-gpu 3D through virglrenderer/Vulkan).
     pub gpu: bool,
+    /// Our helper processes: the only ones we may signal (Linux; macOS's
+    /// profile allows no signals but to ourselves, and we cope).
+    pub helper_pids: Vec<u32>,
 }
 
 /// The Seatbelt profile `apply` would install (macOS), for debugging.

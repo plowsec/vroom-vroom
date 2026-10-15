@@ -7,6 +7,14 @@
 pub mod agent;
 mod audio;
 mod disks;
+
+/// Helper processes we started (swtpm, audio): the only processes the
+/// sandboxed VMM may still signal (to stop them on exit).
+static HELPERS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+pub(crate) fn note_helper(pid: u32) {
+    HELPERS.lock().unwrap_or_else(|e| e.into_inner()).push(pid);
+}
 pub mod state;
 mod display;
 mod firmware;
@@ -229,6 +237,11 @@ impl Vmm {
         if let Some(v) = &self.viewer {
             v.send(&bulwark_display::ToViewer::Status(text.to_string()));
         }
+    }
+
+    /// Pids of the helper processes this VM started.
+    pub fn helper_pids(&self) -> Vec<u32> {
+        HELPERS.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Free space where this VM's disk layers live.

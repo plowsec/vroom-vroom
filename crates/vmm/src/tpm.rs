@@ -115,6 +115,7 @@ impl Swtpm {
             std::thread::sleep(Duration::from_millis(200));
         }
         log::info!("vtpm: swtpm {} on {}", t.child.id(), dir.display());
+        crate::note_helper(t.child.id());
         Ok(t)
     }
 

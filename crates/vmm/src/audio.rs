@@ -56,6 +56,7 @@ impl AudioHelper {
             .map_err(|e| Error::Setup(format!("audio helper: {e}")))?;
         ours.set_nonblocking(true)?;
         log::info!("audio: helper {}", child.id());
+        crate::note_helper(child.id());
         Ok(Arc::new(AudioHelper { sock: ours, child: std::sync::Mutex::new(child) }))
     }
 

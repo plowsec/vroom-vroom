@@ -95,6 +95,20 @@ fn seccomp(p: &Policy) -> Result<()> {
     let pid = unsafe { libc::getpid() } as u64;
     let own = SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, pid).map_err(err)?;
     rules.insert(libc::SYS_tgkill, vec![SeccompRule::new(vec![own]).map_err(err)?]);
+    // Stopping our helpers on exit, and reaping them (own children only).
+    let kill_rules = p
+        .helper_pids
+        .iter()
+        .map(|&pid| {
+            let c = SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, pid as u64).map_err(err)?;
+            SeccompRule::new(vec![c]).map_err(err)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if !kill_rules.is_empty() {
+        rules.insert(libc::SYS_kill, kill_rules);
+    }
+    rules.insert(libc::SYS_wait4, vec![]);
+    rules.insert(libc::SYS_waitid, vec![]);
     if p.network_outbound {
         // New sockets: IPv4/IPv6 only. No AF_UNIX (ssh-agent, docker.sock,
         // D-Bus...), no netlink, no packet sockets.

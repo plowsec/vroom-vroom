@@ -53,7 +53,7 @@ fn timestamp() -> u64 {
 }
 
 /// Sandbox the process now that everything is open.
-fn lock_down(cfg: &VmConfig, state_dir: &Path, clipboard: bool) -> Result<(), String> {
+fn lock_down(cfg: &VmConfig, state_dir: &Path, clipboard: bool, helpers: Vec<u32>) -> Result<(), String> {
     let mut p = bulwark_sandbox::Policy {
         write_dirs: vec![state_dir.to_path_buf()],
         clipboard,
@@ -84,6 +84,7 @@ fn lock_down(cfg: &VmConfig, state_dir: &Path, clipboard: bool) -> Result<(), St
             p.listen_ports.extend(n.port_forwards.iter().map(|f| f.host_port));
         }
     }
+    p.helper_pids = helpers;
     bulwark_sandbox::apply(&p).map_err(|e| e.to_string())?;
     log::info!("sandbox applied");
     if std::env::var_os("BULWARK_SANDBOX_SELFTEST").is_some() {
@@ -315,7 +316,7 @@ pub fn run(o: RunOpts) -> Result<(), String> {
     }
 
     if o.sandbox && vmm.config().security.sandbox {
-        lock_down(vmm.config(), &o.state_dir, has_clip)?;
+        lock_down(vmm.config(), &o.state_dir, has_clip, vmm.helper_pids())?;
     } else {
         eprintln!("bulwark: WARNING: running without sandbox");
     }
