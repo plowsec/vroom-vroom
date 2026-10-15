@@ -217,6 +217,8 @@ impl Gpu {
             contexts: Vec::new(),
             cpu_contexts: Vec::new(),
             pending: Vec::new(),
+            reading: None,
+            read_buf: Vec::new(),
         }
     }
 }
@@ -293,6 +295,21 @@ pub struct GpuHandler {
     /// Contexts with no renderer side (capset 0).
     cpu_contexts: Vec<u32>,
     pending: Vec<Pending>,
+    /// A GL scanout on its way back from the GPU, and where it lands.
+    reading: Option<Reading>,
+    read_buf: Vec<u8>,
+}
+
+/// Where a GL frame being read back goes.
+#[derive(Debug, Clone, Copy)]
+struct Reading {
+    id: u32,
+    view: Rect,
+    /// Position in the visible view, and size.
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
 }
 
 impl std::fmt::Debug for GpuHandler {
@@ -725,6 +742,9 @@ impl GpuHandler {
     }
 
     fn unref(&mut self, id: u32) -> u32 {
+        if self.reading.is_some_and(|r| r.id == id) {
+            self.finish_read(true);
+        }
         if matches!(self.scanout, Some(Scanout::Cpu { id: s, .. } | Scanout::Blob { id: s, .. } | Scanout::Gl { id: s, .. }) if s == id) {
             self.scanout = None;
         }
@@ -794,6 +814,7 @@ impl GpuHandler {
     }
 
     fn set_scanout(&mut self, r: &mut Reader) -> u32 {
+        self.finish_read(true);
         let Some(rect) = Rect::read(r) else { return ERR_INVALID_PARAMETER };
         let (Some(sid), Some(id)) = (rd32(r), rd32(r)) else { return ERR_INVALID_PARAMETER };
         if sid != 0 {
@@ -818,6 +839,7 @@ impl GpuHandler {
     }
 
     fn set_scanout_blob(&mut self, r: &mut Reader) -> u32 {
+        self.finish_read(true);
         let Some(rect) = Rect::read(r) else { return ERR_INVALID_PARAMETER };
         let mut v = [0u32; 14];
         for x in v.iter_mut() {
@@ -879,6 +901,16 @@ impl GpuHandler {
         }
         let (w, h) = (x1 - x0, y1 - y0);
         let row = w as usize * 4;
+        let bx = Box3d { x: x0, y: y0, z: 0, w, h, d: 1 };
+        if let (Scanout::Gl { .. }, Some(t)) = (sc, self.three_d.clone()) {
+            // Show the frame before, then let the GPU copy this one while
+            // we go on with other commands.
+            self.finish_read(true);
+            if t.r().scanout_start(id, bx) {
+                self.reading = Some(Reading { id, view, x: x0 - view.x, y: y0 - view.y, w, h });
+                return OK_NODATA;
+            }
+        }
         let mut out = vec![0u8; row * h as usize];
         match sc {
             Scanout::Cpu { .. } => {
@@ -910,11 +942,7 @@ impl GpuHandler {
             Scanout::Gl { format, .. } => {
                 let Some(sw) = swizzle(format) else { return ERR_UNSPEC };
                 let Some(t) = &self.three_d else { return ERR_UNSPEC };
-                let bx = Box3d { x: x0, y: y0, z: 0, w, h, d: 1 };
-                let mut r = t.r();
-                if r.read_scanout(id, bx, &mut out) {
-                    // Already BGRX.
-                } else if !r.read_back(id, bx, row as u32, &mut out) {
+                if !t.r().read_back(id, bx, row as u32, &mut out) {
                     return ERR_INVALID_PARAMETER;
                 } else if sw != [0, 1, 2, 3] {
                     for p in out.as_chunks_mut::<4>().0 {
@@ -925,6 +953,25 @@ impl GpuHandler {
         }
         self.sink.flush(x0 - view.x, y0 - view.y, w, h, &out, row);
         OK_NODATA
+    }
+
+    /// Show the GL frame being read back, once the GPU has it (or now,
+    /// with `wait`). Dropped if the scanout moved on meanwhile.
+    fn finish_read(&mut self, wait: bool) {
+        let (Some(rd), Some(t)) = (self.reading, &self.three_d) else { return };
+        let row = rd.w as usize * 4;
+        // Reused: frames come often and are large.
+        let mut out = std::mem::take(&mut self.read_buf);
+        out.resize(row * rd.h as usize, 0);
+        let got = t.r().scanout_poll(&mut out, wait);
+        if got.is_some() || wait {
+            self.reading = None;
+            let current = matches!(self.scanout, Some(Scanout::Gl { id, view, .. }) if id == rd.id && view == rd.view);
+            if got == Some(true) && current {
+                self.sink.flush(rd.x, rd.y, rd.w, rd.h, &out, row);
+            }
+        }
+        self.read_buf = out;
     }
 
     fn process(&mut self, ctx: &mut QueueCtx, q: usize) {
@@ -1103,14 +1150,16 @@ impl QueueHandler for GpuHandler {
 
     fn backend_ready(&mut self, ctx: &mut QueueCtx, _token: usize) {
         self.complete_fences(ctx);
+        self.finish_read(false);
     }
 
     fn tick_interval(&mut self) -> Option<Duration> {
-        (!self.pending.is_empty()).then_some(FENCE_POLL)
+        (!self.pending.is_empty() || self.reading.is_some()).then_some(FENCE_POLL)
     }
 
     fn tick(&mut self, ctx: &mut QueueCtx) {
         self.complete_fences(ctx);
+        self.finish_read(false);
     }
 }
 
@@ -1181,7 +1230,9 @@ impl VirtioDevice for Gpu {
     }
     fn save_active(&mut self) -> Result<DeviceState> {
         if self.worker.with(|_, h| h.has_3d_state()).unwrap_or(false) {
-            return Err(Error::Device("snapshots of a VM using 3D are not supported (GPU state lives on the host GPU)".into()));
+            // With GL the desktop itself draws through the host GPU.
+            let hint = if self.three_d.as_ref().is_some_and(|t| t.gl) { "; [display] opengl = false avoids it for desktops" } else { "" };
+            return Err(Error::Device(format!("snapshots of a VM using 3D are not supported (GPU state lives on the host GPU{hint})")));
         }
         // Drivers (Linux, viogpudo) never re-create resources on their own:
         // keep the 2D layout; pixels come back from guest RAM.

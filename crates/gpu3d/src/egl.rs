@@ -141,7 +141,7 @@ fn open(dir: &Path) -> Option<Egl> {
     e.root = e.context(3, 0)?;
     log::info!("gpu3d: ANGLE EGL {major}.{minor} on Metal{}", if e.robust { ", robust access" } else { "" });
     let get_proc: unsafe extern "C" fn(*const c_char) -> Ptr = sym!("eglGetProcAddress");
-    e.reader = Gl::load(get_proc).and_then(|gl| Some(Mutex::new(Reader { gl, ctx: e.context(3, 0)?, fbo: 0, pbo: 0, pbo_size: 0, bgra: None })));
+    e.reader = Gl::load(get_proc).and_then(|gl| Some(Mutex::new(Reader { gl, ctx: e.context(3, 0)?, fbo: 0, pbo: 0, pbo_size: 0, bgra: None, pending: None })));
     Some(e)
 }
 
@@ -156,6 +156,12 @@ const GL_READ_FRAMEBUFFER: u32 = 0x8CA8;
 const GL_COLOR_ATTACHMENT0: u32 = 0x8CE0;
 const GL_FRAMEBUFFER_COMPLETE: u32 = 0x8CD5;
 const GL_MAP_READ_BIT: u32 = 0x0001;
+const GL_SYNC_GPU_COMMANDS_COMPLETE: u32 = 0x9117;
+const GL_SYNC_FLUSH_COMMANDS_BIT: u32 = 0x0001;
+const GL_ALREADY_SIGNALED: u32 = 0x911A;
+const GL_CONDITION_SATISFIED: u32 = 0x911C;
+/// Longest wait for a readback the caller insists on (a stuck GPU).
+const READ_WAIT_NS: u64 = 1_000_000_000;
 
 /// The few GL ES 3.0 calls scanout readback needs.
 struct Gl {
@@ -172,6 +178,9 @@ struct Gl {
     read_pixels: unsafe extern "C" fn(i32, i32, i32, i32, u32, u32, Ptr),
     map_buffer_range: unsafe extern "C" fn(u32, isize, isize, u32) -> Ptr,
     unmap_buffer: unsafe extern "C" fn(u32) -> u8,
+    fence_sync: unsafe extern "C" fn(u32, u32) -> Ptr,
+    client_wait_sync: unsafe extern "C" fn(Ptr, u32, u64) -> u32,
+    delete_sync: unsafe extern "C" fn(Ptr),
 }
 
 impl Gl {
@@ -206,14 +215,26 @@ impl Gl {
             read_pixels: gl!("glReadPixels"),
             map_buffer_range: gl!("glMapBufferRange"),
             unmap_buffer: gl!("glUnmapBuffer"),
+            fence_sync: gl!("glFenceSync"),
+            client_wait_sync: gl!("glClientWaitSync"),
+            delete_sync: gl!("glDeleteSync"),
         })
     }
 }
 
+/// A copy on its way into the pixel buffer.
+struct Pending {
+    sync: Ptr,
+    size: usize,
+    row: usize,
+    flip: bool,
+}
+
 /// Reads scanout textures through a pixel buffer, in a context of its own
 /// so virglrenderer's GL state is never touched. ANGLE then copies on the
-/// GPU (which also untiles); a plain glReadPixels to memory untiles on
-/// the CPU, several times slower.
+/// GPU (which also untiles; a plain glReadPixels to memory untiles on the
+/// CPU, several times slower), and the GPU worker goes on with other
+/// commands until the copy is done.
 struct Reader {
     gl: Gl,
     ctx: Ptr,
@@ -222,22 +243,20 @@ struct Reader {
     pbo_size: usize,
     /// GL_EXT_read_format_bgra, checked on first use.
     bgra: Option<bool>,
+    pending: Option<Pending>,
 }
 
 impl Reader {
-    /// With our context current: copy `w` x `h` pixels at (`x`, `y`) of
-    /// texture `tex` into `out` as BGRX rows, top row first. `flip`: the
-    /// texture's height, when its rows are stored bottom-up.
+    /// Queue a copy of `w` x `h` pixels at (`x`, `y`) of texture `tex`
+    /// into the pixel buffer, as BGRX. `flip`: the texture's height, when
+    /// its rows are stored bottom-up.
     ///
     /// # Safety
     /// `self.ctx` must be current on this thread.
-    unsafe fn read(&mut self, tex: u32, flip: Option<u32>, (x, y, w, h): (u32, u32, u32, u32), out: &mut [u8]) -> bool {
+    unsafe fn start(&mut self, tex: u32, flip: Option<u32>, (x, y, w, h): (u32, u32, u32, u32)) -> bool {
         let gl = &self.gl;
         let row = w as usize * 4;
         let size = row * h as usize;
-        if out.len() < size || size == 0 {
-            return false;
-        }
         let gl_y = match flip {
             Some(height) => match height.checked_sub(y).and_then(|v| v.checked_sub(h)) {
                 Some(v) => v,
@@ -245,9 +264,16 @@ impl Reader {
             },
             None => y,
         };
+        if size == 0 {
+            return false;
+        }
         // SAFETY: GL calls on our current context (whole block), with
-        // names we generated; the mapping is read only within `size`.
+        // names we generated.
         unsafe {
+            // One copy at a time: an unclaimed one (device reset) goes.
+            if let Some(p) = self.pending.take() {
+                (gl.delete_sync)(p.sync);
+            }
             let bgra = *self.bgra.get_or_insert_with(|| {
                 let s = (gl.get_string)(GL_EXTENSIONS);
                 !s.is_null() && CStr::from_ptr(s).to_string_lossy().split(' ').any(|e| e == "GL_EXT_read_format_bgra")
@@ -272,21 +298,14 @@ impl Reader {
                 (gl.pixel_storei)(GL_PACK_ALIGNMENT, 4);
                 // Offset 0 in the bound pack buffer.
                 (gl.read_pixels)(x as i32, gl_y as i32, w as i32, h as i32, GL_BGRA_EXT, GL_UNSIGNED_BYTE, std::ptr::null_mut());
-                let p = (gl.map_buffer_range)(GL_PIXEL_PACK_BUFFER, 0, size as isize, GL_MAP_READ_BIT) as *const u8;
-                ok = !p.is_null();
-                if ok {
-                    let src = std::slice::from_raw_parts(p, size);
-                    if flip.is_some() {
-                        for (d, s) in out.chunks_exact_mut(row).zip(src.chunks_exact(row).rev()) {
-                            d.copy_from_slice(s);
-                        }
-                    } else {
-                        out[..size].copy_from_slice(src);
-                    }
-                    (gl.unmap_buffer)(GL_PIXEL_PACK_BUFFER);
-                }
                 (gl.bind_buffer)(GL_PIXEL_PACK_BUFFER, 0);
-                ok &= (gl.get_error)() == 0;
+                let sync = (gl.fence_sync)(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+                ok = !sync.is_null() && (gl.get_error)() == 0;
+                if ok {
+                    self.pending = Some(Pending { sync, size, row, flip: flip.is_some() });
+                } else if !sync.is_null() {
+                    (gl.delete_sync)(sync);
+                }
             }
             // Never keep a guest texture alive through our framebuffer.
             (gl.framebuffer_texture_2d)(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
@@ -294,24 +313,106 @@ impl Reader {
             ok
         }
     }
+
+    /// Is the pending copy done? Any context of the share group may be
+    /// current (sync objects are shared).
+    ///
+    /// # Safety
+    /// A context of ours must be current on this thread.
+    unsafe fn done(&self, wait: bool) -> bool {
+        let Some(p) = &self.pending else { return false };
+        let (flags, timeout) = if wait { (GL_SYNC_FLUSH_COMMANDS_BIT, READ_WAIT_NS) } else { (0, 0) };
+        // SAFETY: a live sync object of the share group.
+        let r = unsafe { (self.gl.client_wait_sync)(p.sync, flags, timeout) };
+        r == GL_ALREADY_SIGNALED || r == GL_CONDITION_SATISFIED
+    }
+
+    /// Copy the finished pixel buffer into `out`, top row first.
+    ///
+    /// # Safety
+    /// `self.ctx` must be current on this thread.
+    unsafe fn finish(&mut self, out: &mut [u8]) -> bool {
+        let Some(p) = self.pending.take() else { return false };
+        let gl = &self.gl;
+        // SAFETY: GL calls on our current context; the mapping is read only
+        // within `p.size`, which the buffer was sized for.
+        unsafe {
+            (gl.delete_sync)(p.sync);
+            if out.len() < p.size {
+                return false;
+            }
+            (gl.bind_buffer)(GL_PIXEL_PACK_BUFFER, self.pbo);
+            let m = (gl.map_buffer_range)(GL_PIXEL_PACK_BUFFER, 0, p.size as isize, GL_MAP_READ_BIT) as *const u8;
+            let ok = !m.is_null();
+            if ok {
+                let src = std::slice::from_raw_parts(m, p.size);
+                if p.flip {
+                    for (d, s) in out.chunks_exact_mut(p.row).zip(src.chunks_exact(p.row).rev()) {
+                        d.copy_from_slice(s);
+                    }
+                } else {
+                    out[..p.size].copy_from_slice(src);
+                }
+                (gl.unmap_buffer)(GL_PIXEL_PACK_BUFFER);
+            }
+            (gl.bind_buffer)(GL_PIXEL_PACK_BUFFER, 0);
+            ok
+        }
+    }
 }
 
-/// Copy a rect of GL texture `tex` (a scanout) into `out` as BGRX rows,
-/// top first. `flip`: see [`Reader::read`]. False if that isn't possible
-/// here (the caller then reads through virglrenderer).
-pub(crate) fn read_texture(tex: u32, flip: Option<u32>, rect: (u32, u32, u32, u32), out: &mut [u8]) -> bool {
-    let Some(e) = egl() else { return false };
-    let Some(reader) = &e.reader else { return false };
+/// Run `f` with the reader's context current, then put back what
+/// virglrenderer expects to find bound.
+fn with_reader<R>(f: impl FnOnce(&mut Reader) -> R) -> Option<R> {
+    let e = egl()?;
+    let reader = e.reader.as_ref()?;
     let mut r = reader.lock().unwrap_or_else(|p| p.into_inner());
     let prev = CURRENT.with(|c| c.get());
     if !set_current(e, r.ctx) {
-        return false;
+        return None;
     }
-    // SAFETY: r.ctx is current on this thread (just above).
-    let ok = unsafe { r.read(tex, flip, rect, out) };
-    // Back to what virglrenderer expects to find bound.
+    let out = f(&mut r);
     set_current(e, prev);
-    ok
+    Some(out)
+}
+
+/// Start copying a rect of GL texture `tex` (a scanout) out as BGRX rows;
+/// [`read_poll`] delivers it. `flip`: see [`Reader::start`]. False if that
+/// isn't possible here (the caller then reads through virglrenderer).
+pub(crate) fn read_start(tex: u32, flip: Option<u32>, rect: (u32, u32, u32, u32)) -> bool {
+    // SAFETY: with_reader makes r.ctx current.
+    with_reader(|r| unsafe { r.start(tex, flip, rect) }).unwrap_or(false)
+}
+
+/// The copy [`read_start`] queued: None while the GPU is still at it
+/// (unless `wait`), else whether `out` got it.
+pub(crate) fn read_poll(out: &mut [u8], wait: bool) -> Option<bool> {
+    let reader = egl()?.reader.as_ref()?;
+    {
+        let r = reader.lock().unwrap_or_else(|p| p.into_inner());
+        r.pending.as_ref()?;
+        // Poll in whatever context is bound: no switch (which flushes)
+        // until there is something to copy.
+        // SAFETY: one of our contexts is current on this thread.
+        if !wait && !CURRENT.with(|c| c.get()).is_null() && !unsafe { r.done(false) } {
+            return None;
+        }
+    }
+    // SAFETY: with_reader makes r.ctx current.
+    with_reader(|r| unsafe {
+        if !r.done(wait) {
+            if !wait {
+                return None;
+            }
+            // Give up on it: the GPU never got there.
+            if let Some(p) = r.pending.take() {
+                (r.gl.delete_sync)(p.sync);
+            }
+            return Some(false);
+        }
+        Some(r.finish(out))
+    })
+    .flatten()
 }
 
 impl Egl {

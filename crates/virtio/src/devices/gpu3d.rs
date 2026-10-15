@@ -95,10 +95,16 @@ pub trait Renderer3d: Send {
     /// rows `stride` bytes apart, top row first (scanout of GL frames).
     fn read_back(&mut self, resource: u32, bx: Box3d, stride: u32, out: &mut [u8]) -> bool;
     /// Like [`Renderer3d::read_back`], but as BGRX rows (`bx.w * 4` bytes
-    /// each) by a faster path. False if the renderer can't: then use
-    /// `read_back`.
-    fn read_scanout(&mut self, _resource: u32, _bx: Box3d, _out: &mut [u8]) -> bool {
+    /// each), by a faster path that doesn't wait for the GPU: collect it
+    /// with `scanout_poll`. One at a time. False if the renderer can't:
+    /// then use `read_back`.
+    fn scanout_start(&mut self, _resource: u32, _bx: Box3d) -> bool {
         false
+    }
+    /// The read `scanout_start` began: None while the GPU is at it (unless
+    /// `wait`) or if there is none, else whether `out` holds it.
+    fn scanout_poll(&mut self, _out: &mut [u8], _wait: bool) -> Option<bool> {
+        None
     }
     fn unref(&mut self, resource: u32);
 

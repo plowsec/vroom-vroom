@@ -704,7 +704,7 @@ impl Renderer3d for Virgl {
         unsafe { (self.lib.read_iov)(resource, 0, 0, stride, 0, &mut b, 0, &mut iov, 1) == 0 }
     }
 
-    fn read_scanout(&mut self, resource: u32, bx: Box3d, out: &mut [u8]) -> bool {
+    fn scanout_start(&mut self, resource: u32, bx: Box3d) -> bool {
         enter();
         // virgl_renderer_resource_info: handle, virgl_format, width,
         // height, depth, flags, tex_id, ... (room to spare for forks).
@@ -716,11 +716,22 @@ impl Renderer3d for Virgl {
         const Y_0_TOP: u32 = 1;
         let flip = (info[5] & Y_0_TOP != 0).then_some(info[3]);
         #[cfg(target_os = "macos")]
-        return egl::read_texture(info[6], flip, (bx.x, bx.y, bx.w, bx.h), out);
+        return egl::read_start(info[6], flip, (bx.x, bx.y, bx.w, bx.h));
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = (flip, bx, out);
+            let _ = (flip, bx);
             false
+        }
+    }
+
+    fn scanout_poll(&mut self, out: &mut [u8], wait: bool) -> Option<bool> {
+        enter();
+        #[cfg(target_os = "macos")]
+        return egl::read_poll(out, wait);
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (out, wait);
+            None
         }
     }
 
