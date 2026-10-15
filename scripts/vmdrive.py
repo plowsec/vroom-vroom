@@ -7,7 +7,8 @@ Commands, one per line, on <state-dir>.cmd (a fifo):
   type TEXT              US layout
   shot                   screendump (path shows in <state-dir>.log)
   resize W H | focus 0|1 | clip TEXT | cmd N | quit
-Viewer events (mode, clipboard, status) go to <state-dir>.events.
+  serial TEXT            to the serial console (\\n for Enter)
+Viewer events (mode, clipboard, status, mic) go to <state-dir>.events.
 """
 import os, socket, struct, subprocess, sys, threading, time
 
@@ -45,6 +46,8 @@ def reader():
                 ev.write("status " + pl.decode(errors="replace") + "\n")
             elif t == 5:
                 ev.write("closed\n")
+            elif t == 6:
+                ev.write(f"mic {pl[0]}\n")
 threading.Thread(target=reader, daemon=True).start()
 
 def send(t, payload):
@@ -119,6 +122,7 @@ if True:
                 elif c == "focus": send(6, bytes([int(arg)]))
                 elif c == "clip": send(7, arg.encode())
                 elif c == "cmd": send(8, bytes([int(arg)]))
+                elif c == "serial": p.stdin.write(arg.replace("\\n", "\r").encode()); p.stdin.flush()
                 elif c == "quit": p.stdin.write(b"\x01x"); p.stdin.flush()
             except Exception as e:
                 ev.write(f"error {line.strip()}: {e}\n")

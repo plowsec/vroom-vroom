@@ -30,6 +30,13 @@ const K_STOP: u8 = 3;
 const K_IN_START: u8 = 4;
 const K_IN_STOP: u8 = 5;
 const K_CAPTURED: u8 = 6;
+const K_MIC_NOTE: u8 = 7;
+/// `MicNote` codes: nothing arrives from the device, or only silence
+/// (what macOS gives an app it doesn't let use the microphone).
+pub const MIC_NO_DATA: u8 = 1;
+pub const MIC_SILENT: u8 = 2;
+/// How long after `InStart` the helper checks what the device gave.
+const MIC_CHECK: Duration = Duration::from_secs(2);
 /// Largest payload accepted.
 pub const MAX_MSG: usize = 1 << 20;
 /// PCM bytes per datagram: macOS caps Unix datagrams at 2048 bytes.
@@ -87,6 +94,8 @@ pub enum Msg {
     InStop,
     /// Helper to VMM: recorded S16LE frames.
     Captured { gen: u32, pcm: Vec<u8> },
+    /// Helper to VMM: the microphone seems blocked (`MIC_*`).
+    MicNote(u8),
 }
 
 impl Msg {
@@ -111,6 +120,7 @@ impl Msg {
                 p.extend_from_slice(pcm);
                 (K_CAPTURED, p)
             }
+            Msg::MicNote(c) => (K_MIC_NOTE, vec![*c]),
         };
         let mut v = vec![k];
         v.extend_from_slice(&(p.len() as u32).to_le_bytes());
@@ -157,6 +167,7 @@ pub fn read_msg(r: &mut impl Read) -> io::Result<Option<Msg>> {
         }
         K_IN_STOP => Msg::InStop,
         K_CAPTURED if len >= 4 => Msg::Captured { gen: le32(&p), pcm: p[4..].to_vec() },
+        K_MIC_NOTE if len == 1 => Msg::MicNote(p[0]),
         _ => return Err(io::Error::other("bad audio message")),
     }))
 }
@@ -206,15 +217,44 @@ pub trait Output {
 pub struct CaptureOut {
     sock: Arc<UnixDatagram>,
     gen: u32,
+    stats: Arc<CaptureStats>,
+}
+
+/// What a recorder delivered so far (to tell a blocked microphone).
+#[derive(Debug, Default)]
+pub struct CaptureStats {
+    chunks: std::sync::atomic::AtomicU64,
+    loud: AtomicBool,
+}
+
+impl CaptureStats {
+    /// None if all is well, else a `MIC_*` code.
+    pub fn problem(&self) -> Option<u8> {
+        if self.chunks.load(Ordering::Relaxed) == 0 {
+            Some(MIC_NO_DATA)
+        } else if !self.loud.load(Ordering::Relaxed) {
+            Some(MIC_SILENT)
+        } else {
+            None
+        }
+    }
 }
 
 impl CaptureOut {
     pub fn new(sock: Arc<UnixDatagram>, gen: u32) -> Self {
-        CaptureOut { sock, gen }
+        CaptureOut { sock, gen, stats: Arc::default() }
+    }
+
+    pub fn stats(&self) -> Arc<CaptureStats> {
+        self.stats.clone()
     }
 
     /// Send whole S16LE frames. False if some were dropped.
     pub fn send(&self, pcm: &[u8]) -> bool {
+        self.stats.chunks.fetch_add(1, Ordering::Relaxed);
+        if !self.stats.loud.load(Ordering::Relaxed) && pcm.iter().any(|&b| b != 0) {
+            self.stats.loud.store(true, Ordering::Relaxed);
+        }
         pcm.chunks(CAPTURE_CHUNK).all(|c| send_nowait(&self.sock, &Msg::Captured { gen: self.gen, pcm: c.to_vec() }.encode()))
     }
 }
@@ -442,7 +482,18 @@ pub fn helper_main(sock: UnixDatagram, opts: HelperOpts) -> io::Result<()> {
     // also notice being orphaned (the VMM killed) and leave.
     sock.set_read_timeout(Some(Duration::from_millis(500)))?;
     let parent = parent_pid();
+    // After a recording starts: when to look at what the device gave.
+    let mut check: Option<(Instant, Arc<CaptureStats>)> = None;
     loop {
+        if let Some((at, stats)) = &check {
+            if at.elapsed() >= MIC_CHECK {
+                if let Some(code) = stats.problem() {
+                    log::warn!("audio: the microphone gives {}", if code == MIC_NO_DATA { "nothing" } else { "only silence" });
+                    send_nowait(&sock, &Msg::MicNote(code).encode());
+                }
+                check = None;
+            }
+        }
         let n = match sock.recv(&mut buf) {
             Ok(0) => break,
             Ok(n) => n,
@@ -470,18 +521,21 @@ pub fn helper_main(sock: UnixDatagram, opts: HelperOpts) -> io::Result<()> {
             Msg::InStart { gen, rate, channels } => match input.as_mut() {
                 Some(i) => {
                     i.stop();
-                    if let Err(e) = i.start(rate, channels, CaptureOut::new(sock.clone(), gen)) {
+                    let out = CaptureOut::new(sock.clone(), gen);
+                    check = Some((Instant::now(), out.stats()));
+                    if let Err(e) = i.start(rate, channels, out) {
                         log::warn!("audio: microphone: {e}");
                     }
                 }
                 None => log::warn!("audio: the VM asked for the microphone, but input is off"),
             },
             Msg::InStop => {
+                check = None;
                 if let Some(i) = input.as_mut() {
                     i.stop();
                 }
             }
-            Msg::Captured { .. } => {}
+            Msg::Captured { .. } | Msg::MicNote(_) => {}
         }
     }
     if let Some(i) = input.as_mut() {
@@ -516,6 +570,7 @@ mod tests {
             Msg::InStart { gen: 7, rate: 44100, channels: 1 },
             Msg::InStop,
             Msg::Captured { gen: 7, pcm: vec![5, 6] },
+            Msg::MicNote(MIC_SILENT),
         ];
         for m in &all {
             v.extend(m.encode());
@@ -597,6 +652,7 @@ mod tests {
             while let Ok(n) = vmm.recv(&mut b) {
                 match read_msg(&mut &b[..n]).unwrap() {
                     Some(Msg::Captured { gen: 3, pcm }) => got.extend(pcm),
+                    Some(Msg::MicNote(_)) => {}
                     other => panic!("{other:?}"),
                 }
             }
@@ -611,5 +667,34 @@ mod tests {
                 assert!(got.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn a_silent_microphone_is_reported() {
+        let td = tempfile::tempdir().unwrap();
+        let p = td.path().join("mic.wav");
+        let mut w = wav_header(8000, 1, 1600);
+        w.extend_from_slice(&[0u8; 1600]);
+        std::fs::write(&p, w).unwrap();
+        let (vmm, helper) = pair().unwrap();
+        let opts = HelperOpts { wav_in: Some(p), input: true, ..Default::default() };
+        let t = std::thread::spawn(move || helper_main(helper, opts));
+        vmm.send(&Msg::InStart { gen: 1, rate: 8000, channels: 1 }.encode()).unwrap();
+        vmm.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        let t0 = Instant::now();
+        let mut note = None;
+        let mut b = [0u8; 4096];
+        while note.is_none() && t0.elapsed() < Duration::from_secs(4) {
+            if let Ok(n) = vmm.recv(&mut b) {
+                if let Ok(Some(Msg::MicNote(c))) = read_msg(&mut &b[..n]) {
+                    note = Some(c);
+                }
+            }
+        }
+        assert_eq!(note, Some(MIC_SILENT));
+        vmm.send(&Msg::InStop.encode()).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        drop(vmm);
+        t.join().unwrap().unwrap();
     }
 }

@@ -177,13 +177,24 @@ impl AudioHelper {
     /// from an earlier request (another generation) is dropped.
     fn capture_read(&self, out: &mut [u8]) {
         let mut m = self.mic();
+        // Sound cards read in their own chunks (HD Audio: a few ms;
+        // virtio-snd: a whole period, maybe 100 ms): keep a cushion on
+        // top of one read, so reads don't run dry between deliveries.
+        let ms = |rate: u32, ch: u8, t: u64| (rate as u64 * t / 1000) as usize * 2 * ch as usize;
         let mut b = [0u8; 4096];
         while let Ok(n) = self.sock.recv(&mut b) {
-            let Ok(Some(Msg::Captured { gen, pcm })) = vroom_audio::read_msg(&mut &b[..n]) else { continue };
+            let (gen, pcm) = match vroom_audio::read_msg(&mut &b[..n]) {
+                Ok(Some(Msg::Captured { gen, pcm })) => (gen, pcm),
+                Ok(Some(Msg::MicNote(code))) => {
+                    mic_note(&m, code);
+                    continue;
+                }
+                _ => continue,
+            };
             let Some((rate, ch)) = m.want.filter(|_| m.on && gen == m.gen) else { continue };
             let frame = 2 * ch as usize;
             m.buf.extend(&pcm[..pcm.len() / frame * frame]);
-            let max = (rate as u64 * MIC_MAX_MS / 1000) as usize * frame;
+            let max = ms(rate, ch, MIC_MAX_MS).max(2 * out.len() + ms(rate, ch, MIC_PRIME_MS));
             if m.buf.len() > max {
                 let drop = (m.buf.len() - max).next_multiple_of(frame).min(m.buf.len());
                 m.buf.drain(..drop);
@@ -192,7 +203,7 @@ impl AudioHelper {
         out.fill(0);
         let Some((rate, ch)) = m.want.filter(|_| m.on) else { return };
         if !m.primed {
-            if m.buf.len() < (rate as u64 * MIC_PRIME_MS / 1000) as usize * 2 * ch as usize {
+            if m.buf.len() < out.len() + ms(rate, ch, MIC_PRIME_MS) {
                 return;
             }
             m.primed = true;
@@ -205,6 +216,20 @@ impl AudioHelper {
             // Ran dry: build the cushion up again.
             m.primed = false;
         }
+    }
+}
+
+/// The helper says the microphone looks blocked: say what to do, in
+/// the log and in the VM window.
+fn mic_note(m: &Mic, code: u8) {
+    #[cfg(target_os = "macos")]
+    let fix = "Allow the app that started vroom (Terminal, iTerm...) in System Settings > Privacy & Security > Microphone.";
+    #[cfg(not(target_os = "macos"))]
+    let fix = "Check the host's default capture device (ALSA).";
+    let what = if code == vroom_audio::MIC_NO_DATA { "no sound arrives" } else { "only silence so far" };
+    log::warn!("audio: microphone: {what}. {fix}");
+    if let Some(v) = &m.viewer {
+        v.send(&ToViewer::Status(format!("Microphone: {what}. {fix}")));
     }
 }
 

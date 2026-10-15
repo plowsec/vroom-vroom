@@ -182,14 +182,13 @@ unsafe extern "C" fn recorded(
     }
 }
 
-/// The default input device (the Mac's microphone unless the user picked
-/// another one in System Settings).
-#[derive(Default)]
-pub struct CoreAudioIn {
+/// A running input queue and the sender its callback uses. Lives on the
+/// microphone thread.
+struct Recorder {
     queue: Option<(AudioQueueRef, Box<CaptureOut>)>,
 }
 
-impl Input for CoreAudioIn {
+impl Recorder {
     fn start(&mut self, rate: u32, channels: u8, out: CaptureOut) -> io::Result<()> {
         self.stop();
         let fmt = format(rate, channels);
@@ -211,8 +210,9 @@ impl Input for CoreAudioIn {
             // SAFETY: b is a fresh, empty buffer of q.
             check("AudioQueueEnqueueBuffer", unsafe { AudioQueueEnqueueBuffer(q, b, 0, std::ptr::null()) })?;
         }
-        // SAFETY: live queue; NULL = start now. This is where macOS asks
-        // for the microphone permission the first time.
+        // SAFETY: live queue; NULL = start now. The first time, this is
+        // where macOS asks for the microphone permission, and it waits
+        // for the answer.
         check("AudioQueueStart", unsafe { AudioQueueStart(q, std::ptr::null()) })
     }
 
@@ -226,8 +226,57 @@ impl Input for CoreAudioIn {
     }
 }
 
-impl Drop for CoreAudioIn {
-    fn drop(&mut self) {
-        self.stop();
+enum Cmd {
+    Start(u32, u8, CaptureOut),
+    Stop,
+}
+
+/// The default input device (the Mac's microphone unless the user picked
+/// another one in System Settings). Starting can block for as long as the
+/// permission prompt is up, so a thread of its own does it: the helper
+/// keeps playing and answering the VMM meanwhile.
+#[derive(Default)]
+pub struct CoreAudioIn {
+    tx: Option<std::sync::mpsc::Sender<Cmd>>,
+}
+
+impl CoreAudioIn {
+    fn send(&mut self, c: Cmd) -> io::Result<()> {
+        if self.tx.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel::<Cmd>();
+            std::thread::Builder::new().name("mic".into()).spawn(move || {
+                let mut r = Recorder { queue: None };
+                // Ends when the helper drops its sender.
+                while let Ok(c) = rx.recv() {
+                    match c {
+                        Cmd::Start(rate, ch, out) => {
+                            if let Err(e) = r.start(rate, ch, out) {
+                                log::warn!("audio: microphone: {e}");
+                                r.stop();
+                            }
+                        }
+                        Cmd::Stop => r.stop(),
+                    }
+                }
+                r.stop();
+            })?;
+            self.tx = Some(tx);
+        }
+        match &self.tx {
+            Some(t) => t.send(c).map_err(|_| io::Error::other("microphone thread gone")),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Input for CoreAudioIn {
+    fn start(&mut self, rate: u32, channels: u8, out: CaptureOut) -> io::Result<()> {
+        self.send(Cmd::Start(rate, channels, out))
+    }
+
+    fn stop(&mut self) {
+        if self.tx.is_some() {
+            let _ = self.send(Cmd::Stop);
+        }
     }
 }
