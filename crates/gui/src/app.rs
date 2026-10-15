@@ -569,6 +569,7 @@ impl App {
             nested: c.nested,
             tpm: c.tpm,
             gpu,
+            opengl: c.display.opengl,
             width: s(c.display.width.to_string()),
             height: s(c.display.height.to_string()),
             disks: model(disks),
@@ -623,7 +624,12 @@ impl App {
             sum_display: s(match gpu {
                 0 => "No screen".to_string(),
                 1 => format!("2D · starts at {}×{}", c.display.width, c.display.height),
-                _ => format!("3D (Vulkan) · starts at {}×{}", c.display.width, c.display.height),
+                _ => format!(
+                    "3D ({}) · starts at {}×{}",
+                    if c.display.opengl { "Vulkan, OpenGL" } else { "Vulkan" },
+                    c.display.width,
+                    c.display.height
+                ),
             }),
             sum_storage: s(format!(
                 "{} disk{}{}{}",
@@ -673,7 +679,7 @@ impl App {
         self.ui.set_vis(CardVis {
             searching: !any,
             hw: any || hit(&format!("processor cpu cpus core memory ram nested virtualization guest system os {}", st.sum_hw.to_lowercase())),
-            display: any || hit("display screen gpu 3d 2d graphics vulkan resolution width height size monitor"),
+            display: any || hit("display screen gpu 3d 2d graphics vulkan opengl resolution width height size monitor"),
             storage: any || hit("storage disk disks iso cdrom installer drive nvme virtio bus sync write safety readonly read-only compact image qcow2 space"),
             net: any || hit("network net nat bridged host-only hostonly port forward forwarding ssh mac address interface internet lan localhost loopback adapter"),
             share: any || hit("shared folders share folder virtiofs mount files tag"),

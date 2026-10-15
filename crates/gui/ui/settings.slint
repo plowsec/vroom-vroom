@@ -318,12 +318,23 @@ export component SettingsPanel inherits Rectangle {
                         changed(i) => { Bus.set("gpu", i); }
                     }
                     Text {
-                        text: root.s.gpu == 2 ? "Vulkan in Linux guests, drawn by your Mac's GPU. Needs the 3D library (see guide)."
+                        text: root.s.gpu == 2 ? "Vulkan and OpenGL in Linux guests, drawn by your Mac's GPU. Needs the 3D libraries (see guide)."
                             : root.s.gpu == 1 ? "Works everywhere. The guest follows the window size."
                             : "No screen. Use the serial console (vroom run).";
                         font-size: Theme.fs-xs;
                         color: Theme.text-3;
                         wrap: word-wrap;
+                    }
+                    if root.s.gpu == 2: Row {
+                        label: "OpenGL";
+                        hint: "Off: Vulkan only. Less host code faces the guest, and snapshots keep working when no 3D app runs.";
+                        key: "display.opengl";
+                        Toggle {
+                            y: (parent.height - self.height) / 2;
+                            checked: root.s.opengl;
+                            enabled: !root.lk;
+                            toggled(v) => { Bus.set("opengl", v ? "true" : "false"); }
+                        }
                     }
                     Row {
                         label: "Starting size";
