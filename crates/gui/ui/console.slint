@@ -24,6 +24,8 @@ export component ConsoleWindow inherits Window {
     in property <string> toast;
     in property <bool> captured;
     in property <bool> fullscreen;
+    // The guest is recording from the host microphone.
+    in property <bool> mic-on;
     // Rust keeps the bar out for a moment after start.
     in property <bool> bar-pinned;
     callback mouse-move(float, float);
@@ -193,6 +195,30 @@ export component ConsoleWindow inherits Window {
                         text: root.captured ? "Keyboard goes to the VM" : root.state == VmState.paused ? "Paused" : "Running";
                         color: #ffffff99;
                         font-size: 10px;
+                    }
+                }
+            }
+            if root.mic-on: Rectangle {
+                y: (parent.height - self.height) / 2;
+                height: 26px;
+                width: ml.preferred-width;
+                border-radius: 13px;
+                background: #ffffff14;
+                ml := HorizontalLayout {
+                    padding-left: 9px;
+                    padding-right: 10px;
+                    spacing: 6px;
+                    StatusDot {
+                        width: 8px;
+                        height: 8px;
+                        y: (parent.height - self.height) / 2;
+                        tint: #ef4444;
+                    }
+                    Text {
+                        text: "Microphone in use";
+                        color: #ffffffd0;
+                        font-size: 11px;
+                        vertical-alignment: center;
                     }
                 }
             }

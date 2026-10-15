@@ -605,13 +605,26 @@ export component SettingsPanel inherits Rectangle {
                     force-open: root.open-all;
                     Row {
                         label: "Play guest sound";
-                        hint: "Through this Mac's speakers. Linux guests. There is no microphone.";
+                        hint: "Through this Mac's speakers.";
                         key: "audio.output";
                         Toggle {
                             y: (parent.height - self.height) / 2;
                             checked: root.s.audio;
                             enabled: !root.lk;
                             toggled(v) => { Bus.set("audio", v ? "true" : "false"); }
+                        }
+                    }
+                    Row {
+                        label: "Microphone";
+                        hint: root.s.audio-in ? "The guest hears this Mac's microphone while its window is open and it records. The window shows when." : "For video calls. Off: the guest has no microphone.";
+                        key: "audio.input";
+                        warn: root.s.audio-in;
+                        Toggle {
+                            y: (parent.height - self.height) / 2;
+                            checked: root.s.audio-in;
+                            danger: true;
+                            enabled: !root.lk;
+                            toggled(v) => { Bus.set("audio.in", v ? "true" : "false"); }
                         }
                     }
                 }

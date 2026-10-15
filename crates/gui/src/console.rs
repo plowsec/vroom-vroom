@@ -54,6 +54,8 @@ struct Shared {
     frame: bool,
     status: VecDeque<String>,
     clipboard: Option<String>,
+    /// The guest records from the microphone (latest word from the VMM).
+    mic: Option<bool>,
     posted: bool,
 }
 
@@ -83,6 +85,7 @@ impl Shared {
                 }
                 self.status.push_back(t);
             }
+            ToViewer::Mic(on) => self.mic = Some(on),
             ToViewer::Closed => return false,
         }
         !std::mem::replace(&mut self.posted, true)
@@ -665,13 +668,16 @@ impl Console {
 
     /// What the reader thread collected since the last wakeup.
     fn inbox(&mut self) {
-        let (frame, status, clip) = {
+        let (frame, status, clip, mic) = {
             let mut s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
             s.posted = false;
-            (std::mem::take(&mut s.frame), std::mem::take(&mut s.status), s.clipboard.take())
+            (std::mem::take(&mut s.frame), std::mem::take(&mut s.status), s.clipboard.take(), s.mic.take())
         };
         for t in status {
             self.status(&t);
+        }
+        if let Some(on) = mic {
+            self.mic(on);
         }
         if let Some(t) = clip {
             self.guest_clipboard(t);
@@ -703,6 +709,22 @@ impl Console {
                 msg::send(Msg::Toast { text: format!("{}: {t}", self.name), kind: 2, action: String::new() });
             }
             _ => self.toast(&t),
+        }
+    }
+
+    /// Microphone indicator. Turning on also shows the toolbar for a
+    /// moment so it gets noticed.
+    fn mic(&mut self, on: bool) {
+        if on == self.win.get_mic_on() {
+            return;
+        }
+        self.win.set_mic_on(on);
+        if on {
+            self.win.set_bar_pinned(true);
+            let k = self.key.clone();
+            slint::Timer::single_shot(Duration::from_secs(3), move || {
+                with(&k, |c| c.win.set_bar_pinned(false));
+            });
         }
     }
 
