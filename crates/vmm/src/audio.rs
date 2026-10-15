@@ -22,9 +22,19 @@ pub struct AudioHelper {
 
 impl Drop for AudioHelper {
     fn drop(&mut self) {
+        // Inside the sandbox we may not signal other processes: tell the
+        // helper by closing its socket (it also watches for us dying),
+        // and never block on it.
+        let _ = self.sock.shutdown(std::net::Shutdown::Both);
         let mut c = self.child.lock().unwrap_or_else(|e| e.into_inner());
         let _ = c.kill();
-        let _ = c.wait();
+        for _ in 0..50 {
+            if !matches!(c.try_wait(), Ok(None)) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        log::warn!("audio: helper {} did not exit", c.id());
     }
 }
 

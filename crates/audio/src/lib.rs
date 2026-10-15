@@ -230,10 +230,21 @@ pub fn helper_main(sock: UnixDatagram, wav: Option<PathBuf>) -> io::Result<()> {
         None => return Err(io::Error::other("no audio output on this host yet")),
     };
     let mut buf = vec![0u8; 4096];
+    // A datagram socket doesn't report its peer's death on every system:
+    // also notice being orphaned (the VMM killed) and leave.
+    sock.set_read_timeout(Some(std::time::Duration::from_millis(500)))?;
+    let parent = parent_pid();
     loop {
         let n = match sock.recv(&mut buf) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
             Ok(n) => n,
+            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+                if parent_pid() != parent {
+                    break;
+                }
+                continue;
+            }
+            Err(_) => break,
         };
         let Some(m) = read_msg(&mut &buf[..n])? else { break };
         match m {
@@ -252,6 +263,12 @@ pub fn helper_main(sock: UnixDatagram, wav: Option<PathBuf>) -> io::Result<()> {
     }
     out.stop();
     Ok(())
+}
+
+#[allow(unsafe_code)]
+fn parent_pid() -> i32 {
+    // SAFETY: no preconditions.
+    unsafe { libc::getppid() }
 }
 
 #[cfg(target_os = "macos")]
