@@ -226,6 +226,11 @@ impl App {
             }
             Msg::SnapshotTaken { .. } => self.push_snaps(),
             Msg::ConsoleGone { key, error } => {
+                // Library closed earlier and that was the last VM window.
+                if console::count() == 0 && !self.ui.window().is_visible() {
+                    let _ = slint::quit_event_loop();
+                    return;
+                }
                 self.live_thumbs.remove(&key);
                 if let Some(v) = self.vms.iter_mut().find(|v| v.key == key) {
                     v.refresh_state();

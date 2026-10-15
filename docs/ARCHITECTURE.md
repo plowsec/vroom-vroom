@@ -40,6 +40,7 @@ limits, source-MAC anti-spoofing). The VMM never holds an interface.
 | `state` | A VM's state dir: one-VMM lock, snapshot list/delete, pruning disk layers nothing needs. Shared by the CLI and the app. |
 | `vmm` | Builds the board from the config, runs vCPUs, PSCI, the agent channel, display arbitration (ramfb vs virtio-gpu), snapshots and suspend, disk layering. |
 | `sandbox` | Seatbelt profile (macOS), seccomp + Landlock (Linux). |
+| `gui` | The app (Slint): VM list, settings that edit the VM file in place (toml_edit, comments kept), New VM, `⌘K` palette, VM windows. All state changes go through one message queue on the UI thread. VM windows only see pixels and send input. |
 | `agent` / `proto` | Guest agent (Linux, Windows) and its framed protocol over a virtio-serial port. |
 
 ## Board (aarch64)

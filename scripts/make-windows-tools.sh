@@ -7,13 +7,14 @@ set -e
 cd "$(dirname "$0")/.."
 out=${1:-windows-tools.raw}
 exe=target/aarch64-pc-windows-msvc/release/vroom-agent.exe
-[ -f "$exe" ] || cargo xwin build --release -p vroom-agent --target aarch64-pc-windows-msvc
+# Always rebuild: a stale agent on the disk is a confusing bug.
+cargo xwin build --release -p vroom-agent --target aarch64-pc-windows-msvc
 tmp=$(mktemp -d)
 trap 'hdiutil detach -quiet "$tmp/mnt" 2>/dev/null; rm -rf "$tmp"' EXIT
-hdiutil create -quiet -size 64m -layout MBRSPUD -fs "MS-DOS FAT32" -volname BWTOOLS "$tmp/t.dmg"
+hdiutil create -quiet -size 64m -layout MBRSPUD -fs "MS-DOS FAT32" -volname VRTOOLS "$tmp/t.dmg"
 hdiutil convert -quiet "$tmp/t.dmg" -format UDTO -o "$tmp/t"
 # Windows ignores MBR disks whose signature is zero.
-printf 'BWT1' | dd of="$tmp/t.cdr" bs=1 seek=440 conv=notrunc 2>/dev/null
+printf 'VRT1' | dd of="$tmp/t.cdr" bs=1 seek=440 conv=notrunc 2>/dev/null
 mkdir "$tmp/mnt"
 hdiutil attach -quiet -imagekey diskimage-class=CRawDiskImage "$tmp/t.cdr" -mountpoint "$tmp/mnt"
 cp "$exe" examples/windows/vroom-setup.cmd "$tmp/mnt/"
