@@ -27,9 +27,12 @@ with `user-data` / `meta-data` (any NoCloud ISO tool works, e.g.
 `hdiutil makehybrid -iso -joliet -default-volume-name cidata -o seed.iso seeddir`),
 then `target/debug/bulwark run examples/ubuntu.toml`.
 
-Clipboard and time sync need the agent in the guest:
+Clipboard, time sync and clean shutdown need the agent in the guest:
 `cargo build --release --target aarch64-unknown-linux-musl -p bulwark-agent`,
-copy it in, run it at login (it uses `/dev/virtio-ports/org.bulwark.agent.0`).
+copy it and `examples/linux/*` in, run `sudo ./install-agent.sh`. That
+installs a systemd service (root, hardened unit: the host channel, clock,
+shutdown) and a desktop autostart entry for the unprivileged session
+helper (clipboard); the service only serves the user on screen.
 
 ## Ubuntu desktop (live ISO, UEFI)
 

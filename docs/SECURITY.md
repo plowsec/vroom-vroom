@@ -146,6 +146,12 @@ talks to a pipe server in session 0, so a user process squatting the pipe
 name gets nothing. The service accepts nothing from the helper but
 clipboard text (size-capped).
 
+The Linux agent has the same split: a hardened systemd service
+(`CAP_SYS_TIME` only, read-only file system, Unix sockets only) and a
+session helper started with the desktop. They meet on
+`/run/bulwark-agent.sock`; the service serves only the user logind reports
+active on seat0, and the helper only talks to a root-owned peer.
+
 ## Fuzzing
 
 `fuzz/` has cargo-fuzz targets for what a guest (or a downloaded image)

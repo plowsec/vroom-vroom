@@ -1,0 +1,22 @@
+# bulwark guest agent, system part: owns the host channel (root only),
+# syncs the clock, handles clean shutdown, relays clipboard/resolution to
+# the session helper of the user on screen.
+[Unit]
+Description=bulwark guest agent
+After=systemd-udevd.service
+
+[Service]
+ExecStart=/usr/local/bin/bulwark-agent --service
+Restart=always
+RestartSec=2
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_SYS_TIME
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/run
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

@@ -9,12 +9,15 @@
 
 mod clip;
 mod port;
-// Used by the Windows service; built everywhere so it's tested everywhere.
-#[cfg_attr(not(windows), allow(dead_code))]
+// Used by the service mode (Windows, Linux); built everywhere so it's
+// tested everywhere.
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 mod relay;
 mod sys;
 #[cfg(windows)]
 mod winsvc;
+#[cfg(target_os = "linux")]
+mod linsvc;
 
 #[cfg(windows)]
 use std::fs::OpenOptions;
@@ -36,7 +39,7 @@ fn port_path() -> String {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 enum Role {
     /// Everything in one process (Linux; Windows run elevated).
     Full,
@@ -61,15 +64,20 @@ fn parse_args() -> Result<Args, String> {
             "--port" => a.port = it.next().ok_or("--port needs a value")?,
             "--clipboard-file" => a.clipboard_file = Some(it.next().ok_or("--clipboard-file needs a path")?),
             "--no-clipboard" => a.no_clipboard = true,
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             "--service" => a.role = Role::Service,
             #[cfg(windows)]
             "--session" => {
                 a.role = Role::Session;
                 a.port = winsvc::PIPE.into();
             }
+            #[cfg(target_os = "linux")]
+            "--session" => {
+                a.role = Role::Session;
+                a.port = linsvc::SOCKET.into();
+            }
             "-h" | "--help" => {
-                println!("bulwark-agent [--port PATH] [--clipboard-file PATH | --no-clipboard] [--service | --session (Windows)]");
+                println!("bulwark-agent [--port PATH] [--clipboard-file PATH | --no-clipboard] [--service | --session]");
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument {other}")),
@@ -104,6 +112,14 @@ fn main() {
         }
         return;
     }
+    #[cfg(target_os = "linux")]
+    if args.role == Role::Service {
+        if let Err(e) = linsvc::run_service(&args.port) {
+            log::error!("service: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     loop {
         if let Err(e) = session(&args) {
             log::warn!("session ended: {e}");
@@ -116,6 +132,10 @@ fn open_link(args: &Args) -> std::io::Result<(port::Reader, port::Writer)> {
     #[cfg(windows)]
     if args.role == Role::Session {
         return port::open_checked(&args.port, winsvc::check_server);
+    }
+    #[cfg(target_os = "linux")]
+    if args.role == Role::Session {
+        return linsvc::connect();
     }
     port::open(&args.port)
 }
