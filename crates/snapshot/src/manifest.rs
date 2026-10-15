@@ -13,7 +13,8 @@ pub const FORMAT_VERSION: u32 = 1;
 const MANIFEST: &str = "manifest.json";
 /// Refuse absurd blobs from a hostile snapshot dir (RAM goes through streams).
 /// Device blobs are read into memory. Old flash snapshots (JSON) get big.
-const MAX_BLOB: u64 = 256 << 20;
+/// Device state can hold a 3D desktop's GPU contents (textures read back).
+const MAX_BLOB: u64 = 4 << 30;
 /// A manifest is a config and a list of files: small. The app reads them
 /// from dirs a (possibly compromised) VMM can write.
 const MAX_MANIFEST: u64 = 16 << 20;

@@ -271,15 +271,19 @@ Why virgl and not OpenGL on top of Vulkan (Zink): Zink needs Vulkan's
 Faking it on the host would mean rewriting descriptor sets in
 virglrenderer's Venus decoder. virgl works with any guest kernel.
 
-Snapshots and suspend: GPU state lives on the host GPU and can't be
-saved, so snapshots and suspend are refused while 3D contexts exist.
-With OpenGL on there always is one, even at a text console: Ubuntu's
-udev opens a GL context at boot and keeps it. So shut the guest down
-instead of suspending it. Closing the window then leaves the
-VM paused with "suspend failed"; resume it and shut down from the guest,
-or power it off. With `opengl = false` this only happens while a Vulkan
-app runs. Windows guests are not covered: Windows has no virgl or Venus
-driver.
+Snapshots and suspend work with OpenGL. GL state lives on the host GPU,
+so vroom keeps track of what each GL app set up (its shaders, states and
+bindings) from what it sends, reads every texture back when saving, and
+builds it all again on resume. Measured on the 22.04 desktop with Settings
+and glxgears open: about 105 MiB of GPU contents, 16 s to suspend, 17 s to
+resume, glxgears still drawing afterwards. A few things come back empty:
+multisampled buffers, and depth buffers with `opengl_host = "angle"`
+(OpenGL ES can't read depth); apps redraw those every frame anyway.
+Refused, with the reason shown: a running Vulkan app (Vulkan state isn't
+tracked), and GPU memory shared with the guest (blobs). Closing the window
+then leaves the VM paused with "Can't save this VM's state"; keep it
+running, or shut it down from the guest. Windows guests are not covered:
+Windows has no virgl or Venus driver.
 
 The build: `build-angle.sh` fetches ANGLE at the commit Chrome's stable
 release uses, with Google's depot_tools, about 3 GB while it builds
@@ -473,8 +477,8 @@ instead of the microphone. The window gate still applies.
   (the disks too).
 - `Ctrl-A z` / `Ctrl+Alt+Shift+Z` / closing the GUI window: suspend; the
   next `run` resumes. `--fresh` ignores the suspend image.
-- Not possible while 3D contexts are active. With OpenGL on there always
-  is one (see 3D acceleration).
+- With 3D: works with OpenGL apps, not while a Vulkan app runs (see 3D
+  acceleration).
 - `vroom snapshot list vm.toml`, `vroom snapshot delete vm.toml snap-…`:
   deleting a snapshot also removes the disk layers only it used, and merges
   layers that became pass-through, so disk chains stay short.
@@ -513,7 +517,8 @@ flushes a lot). `"none"` ignores flushes: scratch disks only.
   which Windows sees and uses.
 - Windows guests: no 3D (no Venus or virgl driver). Shared folders need
   WinFsp (see above).
-- 3D snapshots: not supported. Guest OpenGL stops at 2.1 / ES 3.0.
+- 3D snapshots: not while a Vulkan app runs. Guest OpenGL stops at 4.1
+  (2.1 with `opengl_host = "angle"`).
 - NAT connections don't survive suspend/resume (the guest reconnects).
 - USB passthrough: not yet tried with a real device (none was at hand);
   tested with the pretend device behind the real helper and sandbox. No

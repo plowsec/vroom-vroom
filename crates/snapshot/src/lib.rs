@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 mod manifest;
+pub mod bytes;
 
 pub use manifest::{Manifest, MemoryRange, SnapshotDir, FORMAT_VERSION};
 

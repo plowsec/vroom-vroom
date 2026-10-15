@@ -238,13 +238,13 @@ impl Snapshottable for EcamPort {
         let mut devs = BTreeMap::new();
         for (_, d) in &self.0.devices {
             let mut d = d.lock().unwrap_or_else(|e| e.into_inner());
-            devs.insert(d.id(), d.save()?);
+            devs.insert(d.id(), vroom_snapshot::bytes::Bytes(d.save()?));
         }
         encode(&(host, devs))
     }
 
     fn restore(&mut self, data: &[u8]) -> vroom_snapshot::Result<()> {
-        let (host, mut devs): (ConfigSpace, BTreeMap<String, Vec<u8>>) = decode(data)?;
+        let (host, mut devs): (ConfigSpace, BTreeMap<String, vroom_snapshot::bytes::Bytes>) = decode(data)?;
         {
             let mut h = self.0.host.lock().unwrap_or_else(|e| e.into_inner());
             let mut host = host;
@@ -257,7 +257,7 @@ impl Snapshottable for EcamPort {
             let mut d = d.lock().unwrap_or_else(|e| e.into_inner());
             let id = d.id();
             let blob = devs.remove(&id).ok_or_else(|| vroom_snapshot::Error::Invalid(format!("missing {id}")))?;
-            d.restore(&blob)?;
+            d.restore(&blob.0)?;
         }
         self.0.remap();
         Ok(())

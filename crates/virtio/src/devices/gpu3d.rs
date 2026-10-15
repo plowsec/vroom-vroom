@@ -3,6 +3,7 @@
 //! Kept as a trait so this crate stays free of unsafe code: the FFI lives
 //! in `vroom-gpu3d`. Every call comes from the GPU worker thread.
 
+use serde::{Deserialize, Serialize};
 use std::os::fd::RawFd;
 
 /// Host copy of guest RAM ranges handed to the renderer. Built from
@@ -10,7 +11,7 @@ use std::os::fd::RawFd;
 pub type HostIov = Vec<(*mut u8, usize)>;
 
 /// virtio_gpu_resource_create_3d, minus the id.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Create3d {
     pub target: u32,
     pub format: u32,
@@ -94,6 +95,20 @@ pub trait Renderer3d: Send {
     /// Read a box of a GL resource (level 0) back from the GPU into `out`,
     /// rows `stride` bytes apart, top row first (scanout of GL frames).
     fn read_back(&mut self, resource: u32, bx: Box3d, stride: u32, out: &mut [u8]) -> bool;
+    /// Snapshots: bytes per row of a resource's level 0, as virgl lays
+    /// it out (None: unknown).
+    fn row_bytes(&mut self, _resource: u32) -> Option<u32> {
+        None
+    }
+    /// Snapshots: copy box `bx` of `level` into `out`, rows `stride` and
+    /// layers `layer_stride` bytes apart.
+    fn read_level(&mut self, _resource: u32, _level: u32, _bx: Box3d, _stride: u32, _layer_stride: u32, _out: &mut [u8]) -> bool {
+        false
+    }
+    /// Snapshots: the way back, from `data`.
+    fn write_level(&mut self, _resource: u32, _level: u32, _bx: Box3d, _stride: u32, _layer_stride: u32, _data: &[u8]) -> bool {
+        false
+    }
     /// Like [`Renderer3d::read_back`], but as BGRX rows (`bx.w * 4` bytes
     /// each), by a faster path that doesn't wait for the GPU: collect it
     /// with `scanout_poll`. One at a time. False if the renderer can't:

@@ -742,6 +742,32 @@ impl Renderer3d for Virgl {
         unsafe { (self.lib.read_iov)(resource, 0, 0, stride, 0, &mut b, 0, &mut iov, 1) == 0 }
     }
 
+    fn row_bytes(&mut self, resource: u32) -> Option<u32> {
+        enter();
+        // virgl_renderer_resource_info: ..., tex_id, stride, ...
+        let mut info = [0u32; 16];
+        // SAFETY: the buffer is larger than the struct the library fills.
+        (unsafe { (self.lib.get_info)(resource as c_int, info.as_mut_ptr() as *mut c_void) } == 0).then_some(info[7])
+    }
+
+    fn read_level(&mut self, resource: u32, level: u32, bx: Box3d, stride: u32, layer_stride: u32, out: &mut [u8]) -> bool {
+        enter();
+        let mut b = VirglBox { x: bx.x, y: bx.y, z: bx.z, w: bx.w, h: bx.h, d: bx.d };
+        let mut iov = libc::iovec { iov_base: out.as_mut_ptr() as *mut c_void, iov_len: out.len() };
+        // SAFETY: one iovec over `out`, which outlives the call; the library
+        // checks the box against the resource and the iovec's size.
+        unsafe { (self.lib.read_iov)(resource, 0, level, stride, layer_stride, &mut b, 0, &mut iov, 1) == 0 }
+    }
+
+    fn write_level(&mut self, resource: u32, level: u32, bx: Box3d, stride: u32, layer_stride: u32, data: &[u8]) -> bool {
+        enter();
+        let mut b = VirglBox { x: bx.x, y: bx.y, z: bx.z, w: bx.w, h: bx.h, d: bx.d };
+        // The library only reads through it.
+        let mut iov = libc::iovec { iov_base: data.as_ptr() as *mut c_void, iov_len: data.len() };
+        // SAFETY: as in read_level; `data` is only read.
+        unsafe { (self.lib.write_iov)(resource, 0, level as c_int, stride, layer_stride, &mut b, 0, &mut iov, 1) == 0 }
+    }
+
     fn scanout_start(&mut self, resource: u32, bx: Box3d) -> bool {
         enter();
         // virgl_renderer_resource_info: handle, virgl_format, width,

@@ -31,6 +31,7 @@ impl std::fmt::Debug for ActivateContext {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DeviceState {
     pub queues: Vec<Queue>,
+    #[serde(with = "vroom_snapshot::bytes")]
     pub data: Vec<u8>,
 }
 

@@ -101,6 +101,10 @@ pub trait QueueHandler: Send + 'static {
     /// and hand back its buffers, so nothing touches guest memory until
     /// the resume. Runs on the pausing thread, with the worker idle.
     fn quiesce(&mut self, _ctx: &mut QueueCtx) {}
+    /// On the worker thread, asked by [`WorkerSlot::release_thread`]:
+    /// let go of what is bound to this thread (a GL context), so another
+    /// thread can use it while the worker is paused.
+    fn release_thread(&mut self) {}
 }
 
 struct Inner<H> {
@@ -114,6 +118,9 @@ struct Signals {
     kicks: AtomicU64,
     poked: AtomicBool,
     stop: AtomicBool,
+    /// [`Worker::release_thread`] asks; the worker counts the times it did.
+    release: AtomicBool,
+    released: (Mutex<u64>, std::sync::Condvar),
 }
 
 struct Shared<H> {
@@ -166,6 +173,8 @@ impl<H: QueueHandler> Worker<H> {
             kicks: AtomicU64::new(if nq >= 64 { u64::MAX } else { (1u64 << nq) - 1 }),
             poked: AtomicBool::new(false),
             stop: AtomicBool::new(false),
+            release: AtomicBool::new(false),
+            released: (Mutex::new(0), std::sync::Condvar::new()),
         });
         handler.attach(Poker { sig: sig.clone(), waker: waker.clone() });
         let shared = Arc::new(Shared { inner: Mutex::new(Inner { paused, ctx, handler }), sig });
@@ -201,6 +210,18 @@ impl<H: QueueHandler> Worker<H> {
 
     fn lock(&self) -> MutexGuard<'_, Inner<H>> {
         self.shared.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Have the worker thread run `release_thread` (paused or not), and
+    /// wait for it. False if it didn't within a few seconds.
+    pub fn release_thread(&self) -> bool {
+        let (count, cv) = &self.shared.sig.released;
+        let before = *count.lock().unwrap_or_else(|e| e.into_inner());
+        self.shared.sig.release.store(true, Ordering::Release);
+        let _ = self.waker.wake();
+        let g = count.lock().unwrap_or_else(|e| e.into_inner());
+        let (g, _) = cv.wait_timeout_while(g, Duration::from_secs(5), |n| *n == before).unwrap_or_else(|e| e.into_inner());
+        *g != before
     }
 
     /// When this returns, the worker is idle and won't touch guest memory.
@@ -270,6 +291,12 @@ fn run<H: QueueHandler>(mut poll: Poll, s: Arc<Shared<H>>) {
         }
         let mut g = s.inner.lock().unwrap_or_else(|e| e.into_inner());
         let inner = &mut *g;
+        if s.sig.release.swap(false, Ordering::AcqRel) {
+            inner.handler.release_thread();
+            let (count, cv) = &s.sig.released;
+            *count.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+            cv.notify_all();
+        }
         if inner.paused {
             was_paused = true;
             continue;
@@ -357,6 +384,11 @@ impl<H: QueueHandler> WorkerSlot<H> {
         if let Some(w) = &self.worker {
             w.resume();
         }
+    }
+
+    /// See [`Worker::release_thread`]. True with no worker.
+    pub fn release_thread(&self) -> bool {
+        self.worker.as_ref().is_none_or(|w| w.release_thread())
     }
 
     pub fn queues(&self) -> Vec<Queue> {

@@ -302,18 +302,19 @@ fn status_state(t: &str) -> Option<VmState> {
 /// The snapshot a "snapshot: <dir>" status reports, if its name is one we
 /// can use in a file name.
 /// Why a suspend failed, for people: the VMM's line names its layers
-/// ("snapshot: encode: device: ...").
+/// ("snapshot: encode: device: the GPU can't be saved: <why>"); the last
+/// part is the reason, in words.
 fn suspend_why(raw: &str) -> String {
-    if raw.contains("using 3D") {
-        let gl = raw.contains("opengl = false");
-        return format!(
-            "It's using 3D, and that state lives on the Mac's GPU, where vroom can't save it.{}",
-            if gl { " With OpenGL off (Display settings), only Vulkan apps get in the way." } else { "" }
-        );
-    }
     let why = raw.trim().trim_start_matches("suspend failed").trim_start_matches([':', ' ']);
     let why = why.rsplit(": ").next().unwrap_or(why);
-    clean(why)
+    let mut s = clean(why);
+    if let Some(c) = s.get(..1) {
+        s.replace_range(..1, &c.to_uppercase());
+    }
+    if !s.ends_with('.') && !s.ends_with(')') {
+        s.push('.');
+    }
+    s
 }
 
 fn snapshot_name(raw: &str) -> Option<String> {
@@ -977,12 +978,10 @@ mod tests {
 
     #[test]
     fn suspend_reasons() {
-        let gl = "suspend failed: snapshot: encode: device: snapshots of a VM using 3D are not supported (GPU state lives on the host GPU; [display] opengl = false avoids it for desktops)";
-        assert!(suspend_why(gl).starts_with("It's using 3D") && suspend_why(gl).contains("OpenGL off"));
-        let vk = "suspend failed: snapshot: encode: device: snapshots of a VM using 3D are not supported (GPU state lives on the host GPU)";
-        assert!(!suspend_why(vk).contains("OpenGL"));
-        assert_eq!(suspend_why("suspend failed: snapshot: write: No space left on device"), "No space left on device");
-        assert_eq!(suspend_why("suspend failed: disk busy"), "disk busy");
+        let vk = "suspend failed: snapshot: encode: device: the GPU can't be saved: a Vulkan app is running, and Vulkan state can't be saved";
+        assert_eq!(suspend_why(vk), "A Vulkan app is running, and Vulkan state can't be saved.");
+        assert_eq!(suspend_why("suspend failed: snapshot: write: No space left on device"), "No space left on device.");
+        assert_eq!(suspend_why("suspend failed: disk busy"), "Disk busy.");
     }
 
     #[test]

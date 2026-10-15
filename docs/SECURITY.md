@@ -257,6 +257,13 @@ context, before the sandbox goes up. libepoxy is built to load ANGLE only
 from virglrenderer's own directory, and Apple's OpenGL only by its system
 path, when the VMM made a CGL context current first; never a search path.
 
+Snapshots with GL in them hold the guest's GPU contents (textures read
+back, so whatever was on screen) next to its RAM, in the state dir. On
+restore, the GL state goes back through virglrenderer's checks like any
+command the guest sends, and resource sizes, backing ranges and counts get
+the same limits as guest commands: a tampered snapshot can do what the
+guest could, no more.
+
 Use 3D only for guests that need it. A future step is moving the renderer
 into its own process (possible for most of Venus and for virgl, whose
 frames already come back by copy; host-visible memory needs shared

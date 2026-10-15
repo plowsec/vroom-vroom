@@ -8,4 +8,6 @@ pub mod console;
 pub mod fs;
 pub mod gpu;
 pub mod gpu3d;
+#[doc(hidden)]
+pub mod virgl_state;
 pub mod input;

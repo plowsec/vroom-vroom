@@ -82,8 +82,16 @@ a new qcow2 overlay starts on it. Reverting starts a fresh overlay on the
 frozen layer. Suspend is a snapshot that ends the process; resuming checks
 the disks didn't change in between.
 
-Things a snapshot can't hold: host GPU objects (snapshots refuse while 3D
-contexts exist), and nested-virtualization EL2 state is best effort.
+Host GPU objects can't be saved as they are. For GL (virgl) contexts the
+GPU device follows each submitted command stream (`virgl_state.rs`): live
+objects, and the latest of each setter, dropping a setter once a later one
+writes everything it wrote (vrend's own rules: sampler views clear the
+slots after them, sampler states don't). A snapshot reads every texture
+level and buffer back through virglrenderer; restore makes the resources
+again, writes the contents, makes the contexts and replays their state,
+then returns the fenced commands the GPU had finished. Vulkan (Venus)
+contexts and blob resources aren't tracked: snapshots refuse while they
+exist. Nested-virtualization EL2 state is best effort.
 
 Layers form a tree under `<state>/disks`. `vroom snapshot delete/prune`
 (VM stopped) removes layers nothing references and folds a layer that only

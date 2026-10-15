@@ -25,6 +25,7 @@ use vroom_memory::{GuestAddress, GuestMemory};
 use serde::{Deserialize, Serialize};
 
 use crate::devices::gpu3d::{Blob, Box3d, Create3d, Renderer3d, ShmMapper, Transfer3d};
+use crate::devices::virgl_state::GlState;
 use crate::worker::{QueueCtx, QueueHandler, WorkerSlot, BACKEND_TOKEN_BASE};
 use crate::{types, ActivateContext, DeviceState, Error, Reader, Result, VirtioDevice, VirtioInterrupt, Writer};
 
@@ -219,6 +220,7 @@ impl Gpu {
             contexts: Vec::new(),
             cpu_contexts: Vec::new(),
             pending: Vec::new(),
+            ctx_info: HashMap::new(),
             reading: None,
             read_buf: Vec::new(),
         }
@@ -243,6 +245,22 @@ struct Res3d {
     mapped: Option<(u64, u64)>,
     /// Format, width and height of a classic 3D resource (GL scanouts).
     tex: Option<(u32, u32, u32)>,
+    /// How a classic 3D resource was made (a snapshot makes it again).
+    create: Option<Create3d>,
+    /// Its guest backing, as last attached.
+    backing: Vec<(u64, u32)>,
+    /// A blob: memory the guest may map. Snapshots can't rebuild those.
+    blob: bool,
+}
+
+/// What a snapshot needs to know about a renderer context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CtxInfo {
+    capset: u32,
+    name: Vec<u8>,
+    attached: std::collections::BTreeSet<u32>,
+    /// GL (virgl) contexts: their state, followed from what they submit.
+    gl: Option<GlState>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -273,6 +291,112 @@ struct SnapRes {
     backing: Vec<(u64, u32)>,
 }
 
+/// A snapshot with 3D in it: `SNAP3D_MAGIC`, the length of the JSON, the
+/// JSON (this), then the contents of every resource level back to back.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct Snap3d {
+    /// The CPU (2D) side, as without 3D.
+    cpu: Snap2d,
+    resources: Vec<SnapRes3d>,
+    contexts: Vec<SnapCtx>,
+    /// A GL scanout: (resource, view x, y, w, h).
+    gl_scanout: Option<(u32, u32, u32, u32, u32)>,
+    /// Fenced commands not yet given back: (queue, head, len). The GPU is
+    /// done with them by the time we have read everything back.
+    pending: Vec<(usize, u16, u32)>,
+}
+
+const SNAP3D_MAGIC: &[u8; 4] = b"VG3D";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SnapRes3d {
+    id: u32,
+    create: Create3d,
+    backing: Vec<(u64, u32)>,
+    /// Where each level's contents are, after the JSON: (offset, length).
+    /// Empty: none kept (multisampled, or it couldn't be read).
+    levels: Vec<(u64, u64)>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SnapCtx {
+    id: u32,
+    info: CtxInfo,
+}
+
+/// How a level of a classic 3D resource is laid out for a transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Layout {
+    bx: Box3d,
+    stride: u32,
+    layer_stride: u32,
+    bytes: usize,
+}
+
+// gallium pipe_texture_target.
+const PIPE_BUFFER: u32 = 0;
+const PIPE_TEXTURE_1D: u32 = 1;
+const PIPE_TEXTURE_3D: u32 = 3;
+const PIPE_TEXTURE_1D_ARRAY: u32 = 6;
+/// No single resource level bigger than this in a snapshot.
+const MAX_LEVEL_BYTES: u64 = 4 << 30;
+
+/// Block width, height and bytes of virgl's compressed formats (virgl_hw.h).
+fn compressed_block(format: u32) -> Option<(u32, u32, u32)> {
+    Some(match format {
+        105 | 106 | 109 | 110 | 113 | 114 | 143 | 144 | 226 | 269..=272 | 275 | 276 => (4, 4, 8),
+        107 | 108 | 111 | 112 | 115 | 116 | 145 | 146 | 255..=258 | 273 | 274 | 277..=279 | 293 => (4, 4, 16),
+        280 | 294 => (5, 4, 16),
+        281 | 295 => (5, 5, 16),
+        282 | 296 => (6, 5, 16),
+        283 | 297 => (6, 6, 16),
+        284 | 298 => (8, 5, 16),
+        285 | 299 => (8, 6, 16),
+        286 | 300 => (8, 8, 16),
+        287 | 301 => (10, 5, 16),
+        288 | 302 => (10, 6, 16),
+        289 | 303 => (10, 8, 16),
+        290 | 304 => (10, 10, 16),
+        291 | 305 => (12, 10, 16),
+        292 | 306 => (12, 12, 16),
+        _ => return None,
+    })
+}
+
+/// Level `level` of a resource made with `a`, tightly packed. `row0`:
+/// virgl's bytes per row of level 0 (for the pixel size of uncompressed
+/// formats). None if it can't be worked out.
+fn level_layout(a: &Create3d, row0: Option<u32>, level: u32) -> Option<Layout> {
+    if a.target == PIPE_BUFFER {
+        let bx = Box3d { x: 0, y: 0, z: 0, w: a.width, h: 1, d: 1 };
+        return Some(Layout { bx, stride: 0, layer_stride: 0, bytes: a.width as usize });
+    }
+    if level > a.last_level || level >= 16 || a.width == 0 {
+        return None;
+    }
+    let mip = |v: u32| (v >> level).max(1);
+    let w = mip(a.width);
+    let h = if matches!(a.target, PIPE_TEXTURE_1D | PIPE_TEXTURE_1D_ARRAY) { 1 } else { mip(a.height) };
+    let d = if a.target == PIPE_TEXTURE_3D { mip(a.depth) } else { a.array_size.max(1) };
+    let (stride, rows) = match compressed_block(a.format) {
+        Some((bw, bh, bytes)) => (w.div_ceil(bw) as u64 * bytes as u64, h.div_ceil(bh) as u64),
+        None => {
+            let row0 = row0? as u64;
+            if row0 == 0 || !row0.is_multiple_of(a.width as u64) {
+                return None;
+            }
+            (w as u64 * (row0 / a.width as u64), h as u64)
+        }
+    };
+    let layer = stride.checked_mul(rows)?;
+    let bytes = layer.checked_mul(d as u64)?;
+    if bytes > MAX_LEVEL_BYTES || stride > u32::MAX as u64 || layer > u32::MAX as u64 {
+        return None;
+    }
+    let bx = Box3d { x: 0, y: 0, z: 0, w, h, d };
+    Some(Layout { bx, stride: stride as u32, layer_stride: layer as u32, bytes: bytes as usize })
+}
+
 /// A fenced command waiting for the GPU before it's returned to the guest.
 #[derive(Debug, Clone, Copy)]
 struct Pending {
@@ -297,6 +421,7 @@ pub struct GpuHandler {
     /// Contexts with no renderer side (capset 0).
     cpu_contexts: Vec<u32>,
     pending: Vec<Pending>,
+    ctx_info: HashMap<u32, CtxInfo>,
     /// A GL scanout on its way back from the GPU, and where it lands.
     reading: Option<Reading>,
     read_buf: Vec<u8>,
@@ -434,8 +559,9 @@ impl GpuHandler {
                     res.backing.clear();
                     return (OK_NODATA, vec![]);
                 }
-                match (self.res3d.contains_key(&id), &self.three_d) {
-                    (true, Some(t)) => {
+                match (self.res3d.get_mut(&id), &self.three_d) {
+                    (Some(res), Some(t)) => {
+                        res.backing.clear();
                         t.r().detach_backing(id);
                         (OK_NODATA, vec![])
                     }
@@ -489,6 +615,8 @@ impl GpuHandler {
                     return (ERR_UNSPEC, vec![]);
                 }
                 self.contexts.push(hdr.ctx);
+                let gl = (capset == 1 || capset == CAPSET_VIRGL2).then(GlState::default);
+                self.ctx_info.insert(hdr.ctx, CtxInfo { capset, name: name[..n].to_vec(), attached: Default::default(), gl });
                 (OK_NODATA, vec![])
             }
             CTX_DESTROY => {
@@ -499,6 +627,7 @@ impl GpuHandler {
                 match self.contexts.iter().position(|&c| c == hdr.ctx) {
                     Some(i) => {
                         self.contexts.swap_remove(i);
+                        self.ctx_info.remove(&hdr.ctx);
                         t.r().context_destroy(hdr.ctx);
                         (OK_NODATA, vec![])
                     }
@@ -514,10 +643,13 @@ impl GpuHandler {
                     return (ERR_INVALID_CONTEXT_ID, vec![]);
                 }
                 if self.res3d.contains_key(&id) {
+                    let attached = self.ctx_info.get_mut(&hdr.ctx).map(|c| &mut c.attached);
                     if hdr.ty == CTX_ATTACH_RESOURCE {
                         t.r().context_attach(hdr.ctx, id);
+                        attached.map(|a| a.insert(id));
                     } else {
                         t.r().context_detach(hdr.ctx, id);
+                        attached.map(|a| a.remove(&id));
                     }
                     (OK_NODATA, vec![])
                 } else if self.resources.contains_key(&id) {
@@ -571,7 +703,14 @@ impl GpuHandler {
                 if r.read_exact(&mut buf).is_err() {
                     return bad;
                 }
+                // What the renderer gets may change in its hands: keep a copy
+                // for the GL state, followed once the renderer took it.
+                let gl = self.ctx_info.get_mut(&hdr.ctx).and_then(|c| c.gl.as_mut()).filter(|g| g.broken().is_none());
+                let words: Option<Vec<u32>> = gl.is_some().then(|| buf.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect());
                 if t.r().submit(hdr.ctx, &mut buf) {
+                    if let (Some(w), Some(g)) = (words, self.ctx_info.get_mut(&hdr.ctx).and_then(|c| c.gl.as_mut())) {
+                        g.follow(&w);
+                    }
                     (OK_NODATA, vec![])
                 } else {
                     (ERR_UNSPEC, vec![])
@@ -685,7 +824,7 @@ impl GpuHandler {
         if !t.r().create_3d(id, a) {
             return ERR_UNSPEC;
         }
-        self.res3d.insert(id, Res3d { tex: Some((a.format, a.width, a.height)), ..Default::default() });
+        self.res3d.insert(id, Res3d { tex: Some((a.format, a.width, a.height)), create: Some(*a), ..Default::default() });
         OK_NODATA
     }
 
@@ -742,7 +881,7 @@ impl GpuHandler {
             return (ERR_UNSPEC, vec![]);
         }
         let guest = if blob_mem == BLOB_MEM_GUEST { entries } else { Vec::new() };
-        self.res3d.insert(id, Res3d { guest, mapped: None, tex: None });
+        self.res3d.insert(id, Res3d { guest, blob: true, ..Default::default() });
         (OK_NODATA, vec![])
     }
 
@@ -791,6 +930,9 @@ impl GpuHandler {
             self.used_bytes -= res.pixels.len();
             return OK_NODATA;
         }
+        for c in self.ctx_info.values_mut() {
+            c.attached.remove(&id);
+        }
         match (self.res3d.remove(&id), &self.three_d) {
             (Some(res), Some(t)) => {
                 if let Some((gpa, size)) = res.mapped {
@@ -813,14 +955,14 @@ impl GpuHandler {
             res.backing = entries;
             return OK_NODATA;
         }
-        match (self.res3d.contains_key(&id), &self.three_d) {
-            (true, Some(t)) => match Self::host_iov(mem, &entries) {
+        match (self.res3d.get_mut(&id), &self.three_d) {
+            (Some(res), Some(t)) => match Self::host_iov(mem, &entries) {
                 Some(iov) => {
-                    if t.r().attach_backing(id, iov) {
-                        OK_NODATA
-                    } else {
-                        ERR_UNSPEC
+                    if !t.r().attach_backing(id, iov) {
+                        return ERR_UNSPEC;
                     }
+                    res.backing = entries;
+                    OK_NODATA
                 }
                 None => ERR_INVALID_PARAMETER,
             },
@@ -1125,9 +1267,193 @@ impl GpuHandler {
         }
     }
 
-    /// Anything a snapshot can't capture (host GPU objects)?
+    /// Why a snapshot can't capture the GPU right now, if it can't.
+    fn snapshot_blocker(&self) -> Option<String> {
+        if self.ctx_info.values().any(|c| c.gl.is_none()) {
+            return Some("a Vulkan app is running, and Vulkan state can't be saved".into());
+        }
+        if self.res3d.values().any(|r| r.blob) {
+            return Some("an app shares GPU memory with the guest (a blob), and that can't be saved".into());
+        }
+        if let Some(why) = self.ctx_info.values().find_map(|c| c.gl.as_ref().and_then(GlState::broken)) {
+            return Some(format!("an OpenGL app did something vroom can't save ({why})"));
+        }
+        None
+    }
+
     fn has_3d_state(&self) -> bool {
         !self.contexts.is_empty() || !self.res3d.is_empty()
+    }
+
+    /// Everything on the GPU side, read back. Run with the GL context free
+    /// for this thread (see `WorkerSlot::release_thread`).
+    fn save_3d(&mut self) -> Result<Vec<u8>> {
+        let bad = |m: String| Error::Device(format!("gpu snapshot: {m}"));
+        let Some(t) = self.three_d.clone() else { return Err(bad("no 3D renderer".into())) };
+        // The guest may wait on the result of an ended query: have it
+        // written to its buffer now, before that buffer is read back.
+        for (&id, c) in &self.ctx_info {
+            let Some(gl) = &c.gl else { continue };
+            let mut cmds: Vec<u8> = gl.fetch_query_results().iter().flat_map(|w| w.to_le_bytes()).collect();
+            if !cmds.is_empty() && !t.r().submit(id, &mut cmds) {
+                log::warn!("gpu snapshot: context {id}: query results not fetched");
+            }
+        }
+        let mut blob: Vec<u8> = Vec::new();
+        let mut resources = Vec::new();
+        let mut ids: Vec<u32> = self.res3d.keys().copied().collect();
+        ids.sort_unstable();
+        for id in ids {
+            let r = &self.res3d[&id];
+            let Some(a) = r.create else { continue };
+            let start = blob.len();
+            let mut levels = Vec::new();
+            if a.nr_samples <= 1 {
+                let row0 = t.r().row_bytes(id);
+                for level in 0..=a.last_level {
+                    let read = level_layout(&a, row0, level).and_then(|l| {
+                        let at = blob.len();
+                        blob.resize(at + l.bytes, 0);
+                        t.r().read_level(id, level, l.bx, l.stride, l.layer_stride, &mut blob[at..]).then_some((at as u64, l.bytes as u64))
+                    });
+                    match read {
+                        Some(l) => levels.push(l),
+                        None => {
+                            // It comes back empty rather than not at all.
+                            log::warn!("gpu snapshot: resource {id} (format {}, target {}) level {level} can't be read back", a.format, a.target);
+                            blob.truncate(start);
+                            levels.clear();
+                            break;
+                        }
+                    }
+                }
+            }
+            resources.push(SnapRes3d { id, create: a, backing: r.backing.clone(), levels });
+        }
+        let mut contexts: Vec<SnapCtx> = self.ctx_info.iter().map(|(&id, info)| SnapCtx { id, info: info.clone() }).collect();
+        contexts.sort_unstable_by_key(|c| c.id);
+        let gl_scanout = match self.scanout {
+            Some(Scanout::Gl { id, view, .. }) => Some((id, view.x, view.y, view.w, view.h)),
+            _ => None,
+        };
+        let snap = Snap3d {
+            cpu: self.save_2d(),
+            resources,
+            contexts,
+            gl_scanout,
+            pending: self.pending.iter().map(|p| (p.q, p.head, p.len)).collect(),
+        };
+        // Hand GL back to the worker thread.
+        t.r().release_thread();
+        let json = serde_json::to_vec(&snap).map_err(|e| bad(e.to_string()))?;
+        let mut out = Vec::with_capacity(12 + json.len() + blob.len());
+        out.extend_from_slice(SNAP3D_MAGIC);
+        out.extend_from_slice(&(json.len() as u64).to_le_bytes());
+        out.extend_from_slice(&json);
+        out.extend_from_slice(&blob);
+        log::info!("gpu snapshot: {} resources, {} contexts, {} MiB of GPU contents", snap.resources.len(), snap.contexts.len(), blob.len() >> 20);
+        Ok(out)
+    }
+
+    /// Build the GPU side again from [`save_3d`]'s output (untrusted input:
+    /// checked like commands; GL state goes through virglrenderer's checks
+    /// like anything the guest submits).
+    fn restore_3d(&mut self, mem: &GuestMemory, data: &[u8]) -> Result<Vec<(usize, u16, u32)>> {
+        let bad = |m: &str| Error::Device(format!("gpu snapshot: {m}"));
+        let Some(t) = self.three_d.clone() else { return Err(bad("it has 3D state, but this VM has no 3D")) };
+        let n = data.get(4..12).and_then(|b| b.try_into().ok()).map(u64::from_le_bytes).ok_or_else(|| bad("truncated"))?;
+        let json_end = 12usize.checked_add(usize::try_from(n).map_err(|_| bad("bad length"))?).filter(|&e| e <= data.len()).ok_or_else(|| bad("truncated"))?;
+        let snap: Snap3d = serde_json::from_slice(&data[12..json_end]).map_err(|e| bad(&e.to_string()))?;
+        let blob = &data[json_end..];
+        self.restore_2d(mem, &snap.cpu)?;
+        if snap.resources.len() > MAX_RESOURCES || snap.contexts.len() > MAX_RESOURCES {
+            return Err(bad("too many objects"));
+        }
+        for r in &snap.resources {
+            let a = &r.create;
+            // A buffer's width is its size in bytes.
+            let max_w = if a.target == PIPE_BUFFER { u32::MAX >> 1 } else { MAX_DIM };
+            if !self.id_free(r.id) || a.width > max_w || a.height > MAX_DIM || a.depth > MAX_DIM || a.array_size > MAX_DIM {
+                return Err(bad("bad resource"));
+            }
+            if r.backing.len() > MAX_BACKING_ENTRIES as usize || r.backing.iter().any(|&(g, l)| !mem.check_range(GuestAddress(g), l as u64)) {
+                return Err(bad("bad backing"));
+            }
+            if !t.r().create_3d(r.id, a) {
+                return Err(bad("can't make a resource again"));
+            }
+            self.res3d.insert(r.id, Res3d { tex: Some((a.format, a.width, a.height)), create: Some(*a), backing: r.backing.clone(), ..Default::default() });
+            if !r.backing.is_empty() {
+                let Some(iov) = Self::host_iov(mem, &r.backing) else { return Err(bad("bad backing")) };
+                if !t.r().attach_backing(r.id, iov) {
+                    return Err(bad("can't attach backing"));
+                }
+            }
+            let row0 = t.r().row_bytes(r.id);
+            for (level, &(off, len)) in r.levels.iter().enumerate() {
+                let l = level_layout(a, row0, level as u32).filter(|l| l.bytes as u64 == len).ok_or_else(|| bad("bad level"))?;
+                let src = usize::try_from(off).ok().and_then(|o| blob.get(o..o.checked_add(l.bytes)?)).ok_or_else(|| bad("truncated contents"))?;
+                if !t.r().write_level(r.id, level as u32, l.bx, l.stride, l.layer_stride, src) {
+                    log::warn!("gpu snapshot: resource {} level {level}: contents not written back", r.id);
+                }
+            }
+        }
+        for c in &snap.contexts {
+            if c.id == 0 || self.contexts.contains(&c.id) || c.info.name.len() > 64 {
+                return Err(bad("bad context"));
+            }
+            if !t.r().context_create(c.id, c.info.capset, &c.info.name) {
+                return Err(bad("can't make a context again"));
+            }
+            self.contexts.push(c.id);
+            for &rid in c.info.attached.iter().filter(|r| self.res3d.contains_key(r)) {
+                t.r().context_attach(c.id, rid);
+            }
+            if let Some(gl) = &c.info.gl {
+                let words = gl.replay(&|r| self.res3d.contains_key(&r));
+                if !self.submit_words(&t, c.id, &words) {
+                    // That app's GL is gone; the rest of the desktop isn't.
+                    log::warn!("gpu snapshot: context {} ({}): GL state not rebuilt", c.id, String::from_utf8_lossy(&c.info.name));
+                }
+            }
+            self.ctx_info.insert(c.id, c.info.clone());
+        }
+        if let Some((id, x, y, w, h)) = snap.gl_scanout {
+            let view = Rect { x, y, w, h };
+            match self.res3d.get(&id).and_then(|r| r.tex) {
+                Some((format, rw, rh)) if view.inside(rw, rh) && w > 0 && h > 0 && swizzle(format).is_some() => {
+                    self.scanout = Some(Scanout::Gl { id, view, format });
+                    self.set_mode(w, h);
+                    self.flush_all(mem);
+                }
+                _ => return Err(bad("bad scanout")),
+            }
+        }
+        t.r().release_thread();
+        Ok(snap.pending)
+    }
+
+    /// Submit a command stream in pieces the renderer takes, split between
+    /// commands.
+    fn submit_words(&mut self, t: &ThreeD, ctx: u32, words: &[u32]) -> bool {
+        let max = MAX_SUBMIT / 4;
+        let mut i = 0;
+        while i < words.len() {
+            let mut end = i;
+            while end < words.len() {
+                let next = end + 1 + (words[end] >> 16) as usize;
+                if next - i > max && end > i {
+                    break;
+                }
+                end = next;
+            }
+            let mut bytes: Vec<u8> = words[i..end.min(words.len())].iter().flat_map(|w| w.to_le_bytes()).collect();
+            if !t.r().submit(ctx, &mut bytes) {
+                return false;
+            }
+            i = end;
+        }
+        true
     }
 }
 
@@ -1182,6 +1508,13 @@ impl QueueHandler for GpuHandler {
 
     fn deregister(&mut self, _reg: &mio::Registry) {
         // Runs on the worker thread as it stops: hand the GL context back.
+        if let Some(t) = &self.three_d {
+            t.r().release_thread();
+        }
+    }
+
+    fn release_thread(&mut self) {
+        // A snapshot wants GL on its own thread.
         if let Some(t) = &self.three_d {
             t.r().release_thread();
         }
@@ -1268,10 +1601,16 @@ impl VirtioDevice for Gpu {
         self.worker.resume();
     }
     fn save_active(&mut self) -> Result<DeviceState> {
+        if let Some(why) = self.worker.with(|_, h| h.snapshot_blocker()).flatten() {
+            return Err(Error::Device(format!("the GPU can't be saved: {why}")));
+        }
         if self.worker.with(|_, h| h.has_3d_state()).unwrap_or(false) {
-            // With GL the desktop itself draws through the host GPU.
-            let hint = if self.three_d.as_ref().is_some_and(|t| t.gl) { "; [display] opengl = false avoids it for desktops" } else { "" };
-            return Err(Error::Device(format!("snapshots of a VM using 3D are not supported (GPU state lives on the host GPU{hint})")));
+            // GL is bound to the worker's thread: have it let go first.
+            if !self.worker.release_thread() {
+                return Err(Error::Device("the GPU worker didn't answer".into()));
+            }
+            let data = self.worker.with(|_, h| h.save_3d()).unwrap_or_else(|| Err(Error::Device("no GPU worker".into())))?;
+            return Ok(DeviceState { queues: self.worker.queues(), data });
         }
         // Drivers (Linux, viogpudo) never re-create resources on their own:
         // keep the 2D layout; pixels come back from guest RAM.
@@ -1284,12 +1623,25 @@ impl VirtioDevice for Gpu {
         let irq = ctx.irq.clone();
         let mut h = self.handler();
         let mut shown = None;
-        if !data.is_empty() {
+        let mut pending = vec![];
+        if data.starts_with(SNAP3D_MAGIC) {
+            pending = h.restore_3d(&ctx.mem, data)?;
+            shown = (h.mode != (0, 0)).then_some(h.mode);
+        } else if !data.is_empty() {
             let snap: Snap2d = serde_json::from_slice(data).map_err(|e| Error::Device(e.to_string()))?;
             h.restore_2d(&ctx.mem, &snap)?;
             shown = snap.scanout.map(|(_, _, _, w, h)| (w, h));
         }
         self.worker.start("gpu", ctx, h, true)?;
+        // Fenced commands the GPU finished before the snapshot: return them.
+        if !pending.is_empty() {
+            self.worker.with(|q, _| {
+                for (qi, head, len) in pending {
+                    q.add_used(qi, head, len);
+                }
+                q.flush();
+            });
+        }
         // A display event makes drivers rebuild their surfaces; Windows then
         // repaints only what it thinks changed (a mostly black screen). With
         // a picture restored, keep its mode: a viewer that wants another
@@ -1340,7 +1692,9 @@ mod tests {
             self.0.lock().unwrap().push(format!("attach {ctx} {res}"));
         }
         fn context_detach(&mut self, _: u32, _: u32) {}
-        fn submit(&mut self, _: u32, _: &mut [u8]) -> bool {
+        fn submit(&mut self, ctx: u32, cmds: &mut [u8]) -> bool {
+            let words: Vec<u32> = cmds.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
+            self.0.lock().unwrap().push(format!("submit {ctx} {words:x?}"));
             true
         }
         fn create_3d(&mut self, res: u32, a: &Create3d) -> bool {
@@ -1367,6 +1721,17 @@ mod tests {
         }
         fn read_back(&mut self, _: u32, _: Box3d, _: u32, _: &mut [u8]) -> bool {
             false
+        }
+        fn row_bytes(&mut self, _: u32) -> Option<u32> {
+            Some(8 * 4) // the test's textures are 8 wide, 4 bytes a pixel
+        }
+        fn read_level(&mut self, res: u32, level: u32, _: Box3d, _: u32, _: u32, out: &mut [u8]) -> bool {
+            out.fill(res as u8 + level as u8);
+            true
+        }
+        fn write_level(&mut self, res: u32, level: u32, bx: Box3d, stride: u32, _: u32, data: &[u8]) -> bool {
+            self.0.lock().unwrap().push(format!("write {res} level {level} {}x{} stride {stride}: {} bytes of {}", bx.w, bx.h, data.len(), data[0]));
+            true
         }
         fn unref(&mut self, _: u32) {}
         fn create_fence(&mut self, _: u32, _: Option<u8>, _: u64) -> bool {
@@ -1428,6 +1793,71 @@ mod tests {
         let mut h = gpu.handler();
         assert_eq!(run(&mut h, RESOURCE_CREATE_2D, 0, &[5, 2, 64, 32]), OK_NODATA);
         assert!(h.resources.contains_key(&5));
+    }
+
+    #[test]
+    fn gl_state_survives_a_snapshot() {
+        let log = Arc::new(Mutex::new(vec![]));
+        let (gpu, _ctl) = Gpu::new(64, 64, Arc::new(Rec::default()));
+        let gpu = gpu.with_3d(ThreeD::new(Box::new(FakeGl(log.clone())), Arc::new(NoMap), 0));
+        let mut h = gpu.handler();
+        let mut name = [0u32; 18];
+        (name[0], name[1], name[2]) = (3, CAPSET_VIRGL2, u32::from_le_bytes(*b"app\0"));
+        assert_eq!(run(&mut h, CTX_CREATE, 1, &name), OK_NODATA);
+        // An 8x4 B8G8R8X8 texture with one more mip level.
+        assert_eq!(run(&mut h, RESOURCE_CREATE_3D, 0, &[9, 2, 2, 2, 8, 4, 1, 1, 1, 0, 0, 0]), OK_NODATA);
+        assert_eq!(run(&mut h, CTX_ATTACH_RESOURCE, 1, &[9, 0]), OK_NODATA);
+        // Create blend state 5 and bind it, draw.
+        let cmds = [1 | 1 << 8 | 4 << 16, 5, 0, 0, 0, 2 | 1 << 8 | 1 << 16, 5, 8 | 12 << 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut body = vec![(cmds.len() * 4) as u32, 0];
+        body.extend(cmds);
+        assert_eq!(run(&mut h, SUBMIT_3D, 1, &body), OK_NODATA);
+        assert!(h.snapshot_blocker().is_none());
+        let data = h.save_3d().unwrap();
+
+        log.lock().unwrap().clear();
+        let (gpu, _ctl) = Gpu::new(64, 64, Arc::new(Rec::default()));
+        let gpu = gpu.with_3d(ThreeD::new(Box::new(FakeGl(log.clone())), Arc::new(NoMap), 0));
+        let mut h = gpu.handler();
+        let mem = GuestMemory::new(&[(GuestAddress(0), 1 << 20)]).unwrap();
+        assert!(h.restore_3d(&mem, &data).unwrap().is_empty());
+        let log = log.lock().unwrap().clone();
+        assert_eq!(log[0], "create 9 8x4 fmt 2 target 2");
+        assert_eq!(log[1], "write 9 level 0 8x4 stride 32: 128 bytes of 9");
+        assert_eq!(log[2], "write 9 level 1 4x2 stride 16: 32 bytes of 10");
+        assert_eq!(log[3], "attach 1 9");
+        // Sub-context 0, the blend state and its binding; no draw.
+        assert_eq!(log[4], "submit 1 [1001c, 0, 40101, 5, 0, 0, 0, 10102, 5, 1001c, 0]");
+        assert_eq!(h.contexts, [1]);
+        // And it goes on following what the context does.
+        assert!(h.ctx_info[&1].gl.as_ref().is_some_and(|g| g.broken().is_none()));
+    }
+
+    #[test]
+    fn vulkan_blocks_snapshots() {
+        let log = Arc::new(Mutex::new(vec![]));
+        let (gpu, _ctl) = Gpu::new(64, 64, Arc::new(Rec::default()));
+        let gpu = gpu.with_3d(ThreeD::new(Box::new(FakeGl(log)), Arc::new(NoMap), 0));
+        let mut h = gpu.handler();
+        h.ctx_info.insert(2, CtxInfo { capset: 4, name: vec![], attached: Default::default(), gl: None });
+        assert!(h.snapshot_blocker().unwrap().contains("Vulkan"));
+    }
+
+    #[test]
+    fn level_layouts() {
+        let tex = Create3d { target: 2, format: 2, width: 10, height: 6, depth: 1, array_size: 1, last_level: 3, ..Default::default() };
+        let l = level_layout(&tex, Some(40), 2).unwrap();
+        assert_eq!((l.bx.w, l.bx.h, l.bx.d, l.stride, l.bytes), (2, 1, 1, 8, 8));
+        assert!(level_layout(&tex, Some(40), 4).is_none());
+        assert!(level_layout(&tex, Some(41), 0).is_none(), "row not a whole number of pixels");
+        // DXT5 (4x4 blocks of 16 bytes), a 2D array of 3.
+        let dxt = Create3d { target: 7, format: 108, width: 10, height: 6, depth: 1, array_size: 3, ..Default::default() };
+        let l = level_layout(&dxt, None, 0).unwrap();
+        assert_eq!((l.stride, l.layer_stride, l.bytes, l.bx.d), (48, 96, 288, 3));
+        let buf = Create3d { target: 0, width: 1000, ..Default::default() };
+        assert_eq!(level_layout(&buf, None, 0).unwrap().bytes, 1000);
+        let vol = Create3d { target: 3, format: 2, width: 4, height: 4, depth: 8, array_size: 1, last_level: 1, ..Default::default() };
+        assert_eq!(level_layout(&vol, Some(16), 1).unwrap().bx.d, 4);
     }
 
     #[test]

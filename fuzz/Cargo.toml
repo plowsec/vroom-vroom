@@ -136,3 +136,9 @@ name = "usb_proto"
 path = "fuzz_targets/usb_proto.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "virgl_state"
+path = "fuzz_targets/virgl_state.rs"
+test = false
+doc = false
