@@ -138,7 +138,7 @@ defaults below. New VMs get random serials, so two VMs never match.
 | `disk_serial` | `VRM` | disk serial prefix (NVMe and virtio), a number is added |
 | `usb_vendor_id` | `0x1209` | USB keyboard and tablet vendor ID |
 | `usb_manufacturer` | `vroom` | USB and virtio input device names |
-| `agent_port` | `org.vroom.agent.0` | guest agent port name; start the agent with `--port` if you change it |
+| `agent_port` | `org.vroom.agent.0` | guest agent port name. The agent finds a renamed port by itself if it's the only one; else start it with `--port` |
 
 ```toml
 [identity]

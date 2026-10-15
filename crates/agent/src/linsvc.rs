@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::time::Duration;
 
-use crate::port::{self, Reader, Writer};
+use crate::port::{Reader, Writer};
 use crate::relay::{Ev, RealSystem, Relay};
 
 pub const SOCKET: &str = "/run/vroom-agent.sock";
@@ -39,7 +39,8 @@ fn active_uid() -> Option<u32> {
     s.lines().find_map(|l| l.strip_prefix("ACTIVE_UID=")).and_then(|v| v.trim().parse().ok())
 }
 
-pub fn run_service(port_path: &str) -> std::io::Result<()> {
+/// `port`: from `--port`; None finds it on every try.
+pub fn run_service(port: Option<&str>) -> std::io::Result<()> {
     let _ = std::fs::remove_file(SOCKET);
     let l = UnixListener::bind(SOCKET)?;
     // Anyone may connect; who gets served is checked per connection.
@@ -51,15 +52,15 @@ pub fn run_service(port_path: &str) -> std::io::Result<()> {
     }
     let mut relay = Relay::new(RealSystem, crate::MAX_CLIP);
     loop {
-        match port::open(port_path) {
-            Ok((r, mut w)) => {
-                log::info!("service: connected to {port_path}");
+        match crate::open_port(port) {
+            Ok((path, r, mut w)) => {
+                log::info!("service: connected to {path}");
                 spawn_reader(r, tx.clone(), Ev::Host, || Ev::HostGone);
                 if let Err(e) = relay.run(&mut w, &rx) {
                     log::warn!("service: {e}");
                 }
             }
-            Err(e) => log::debug!("service: {port_path}: {e}"),
+            Err(e) => log::debug!("service: {e}"),
         }
         std::thread::sleep(Duration::from_secs(2));
     }

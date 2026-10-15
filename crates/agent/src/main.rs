@@ -1,6 +1,7 @@
 //! vroom guest agent.
 //!
-//! Talks to the host over the virtio-console port `org.vroom.agent.0`.
+//! Talks to the host over the virtio-console port `org.vroom.agent.0`
+//! (or the only port there is, see find.rs).
 //! The host is trusted more than the guest, but we still validate
 //! everything (sizes, UTF-8) via vroom-proto.
 
@@ -8,6 +9,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod clip;
+mod find;
 mod port;
 // Used by the service mode (Windows, Linux); built everywhere so it's
 // tested everywhere.
@@ -30,14 +32,6 @@ use vroom_proto::{features, Decoder, Message, AGENT_PORT};
 const POLL: Duration = Duration::from_millis(300);
 pub(crate) const MAX_CLIP: usize = 16 << 20;
 
-fn port_path() -> String {
-    if cfg!(windows) {
-        format!(r"\\.\Global\{AGENT_PORT}")
-    } else {
-        format!("/dev/virtio-ports/{AGENT_PORT}")
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 enum Role {
@@ -50,18 +44,19 @@ enum Role {
 }
 
 struct Args {
-    port: String,
+    /// None: find it (find.rs).
+    port: Option<String>,
     clipboard_file: Option<String>,
     no_clipboard: bool,
     role: Role,
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut a = Args { port: port_path(), clipboard_file: None, no_clipboard: false, role: Role::Full };
+    let mut a = Args { port: None, clipboard_file: None, no_clipboard: false, role: Role::Full };
     let mut it = std::env::args().skip(1);
     while let Some(x) = it.next() {
         match x.as_str() {
-            "--port" => a.port = it.next().ok_or("--port needs a value")?,
+            "--port" => a.port = Some(it.next().ok_or("--port needs a value")?),
             "--clipboard-file" => a.clipboard_file = Some(it.next().ok_or("--clipboard-file needs a path")?),
             "--no-clipboard" => a.no_clipboard = true,
             #[cfg(any(windows, target_os = "linux"))]
@@ -69,15 +64,19 @@ fn parse_args() -> Result<Args, String> {
             #[cfg(windows)]
             "--session" => {
                 a.role = Role::Session;
-                a.port = winsvc::PIPE.into();
+                a.port = Some(winsvc::PIPE.into());
             }
             #[cfg(target_os = "linux")]
             "--session" => {
                 a.role = Role::Session;
-                a.port = linsvc::SOCKET.into();
+                a.port = Some(linsvc::SOCKET.into());
             }
             "-h" | "--help" => {
                 println!("vroom-agent [--port PATH] [--clipboard-file PATH | --no-clipboard] [--service | --session]");
+                println!();
+                println!("--port PATH  host channel. Default: virtio-serial port {AGENT_PORT}.");
+                println!("             If it's missing ([identity].agent_port renamed it), the");
+                println!("             only port there is. Several ports: pass --port.");
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument {other}")),
@@ -106,7 +105,7 @@ fn main() {
     };
     #[cfg(windows)]
     if args.role == Role::Service {
-        if let Err(e) = winsvc::run_service() {
+        if let Err(e) = winsvc::run_service(args.port) {
             log::error!("not started by the service manager: {e}");
             std::process::exit(1);
         }
@@ -114,7 +113,7 @@ fn main() {
     }
     #[cfg(target_os = "linux")]
     if args.role == Role::Service {
-        if let Err(e) = linsvc::run_service(&args.port) {
+        if let Err(e) = linsvc::run_service(args.port.as_deref()) {
             log::error!("service: {e}");
             std::process::exit(1);
         }
@@ -128,20 +127,34 @@ fn main() {
     }
 }
 
-fn open_link(args: &Args) -> std::io::Result<(port::Reader, port::Writer)> {
+/// Find and open the host port: `--port`, else find.rs. Ok has the
+/// path, for logs.
+pub(crate) fn open_port(explicit: Option<&str>) -> std::io::Result<(String, port::Reader, port::Writer)> {
+    let path = match explicit {
+        Some(p) => p.to_string(),
+        None => find::port_path()?,
+    };
+    let (r, w) = port::open(&path).map_err(|e| std::io::Error::new(e.kind(), format!("{path}: {e}")))?;
+    Ok((path, r, w))
+}
+
+fn open_link(args: &Args) -> std::io::Result<(String, port::Reader, port::Writer)> {
     #[cfg(windows)]
     if args.role == Role::Session {
-        return port::open_checked(&args.port, winsvc::check_server);
+        let path = args.port.as_deref().unwrap_or(winsvc::PIPE);
+        let (r, w) = port::open_checked(path, winsvc::check_server)?;
+        return Ok((path.to_string(), r, w));
     }
     #[cfg(target_os = "linux")]
     if args.role == Role::Session {
-        return linsvc::connect();
+        let (r, w) = linsvc::connect()?;
+        return Ok((linsvc::SOCKET.to_string(), r, w));
     }
-    port::open(&args.port)
+    open_port(args.port.as_deref())
 }
 
 fn session(args: &Args) -> std::io::Result<()> {
-    let (mut reader, mut writer) = open_link(args)?;
+    let (path, mut reader, mut writer) = open_link(args)?;
     let system = args.role == Role::Full;
     sys::single_display();
     let mut clip: Box<dyn clip::Clip> = if args.no_clipboard {
@@ -155,7 +168,7 @@ fn session(args: &Args) -> std::io::Result<()> {
     if system {
         writer.write_all(&hello().encode())?;
     }
-    log::info!("connected to {}", args.port);
+    log::info!("connected to {path}");
 
     // Blocking reads on their own thread; main loop polls the clipboard.
     let (tx, rx) = mpsc::channel::<Vec<u8>>();

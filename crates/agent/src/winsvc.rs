@@ -10,6 +10,7 @@
 
 use std::io::Read;
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::sync::mpsc::{channel, Sender};
 use std::time::Duration;
 
@@ -45,6 +46,8 @@ fn wide(s: &str) -> Vec<u16> {
 }
 
 static STATUS: AtomicPtr<core::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
+/// `--port`, for service_main. None: find it on every try.
+static PORT: OnceLock<Option<String>> = OnceLock::new();
 
 fn set_state(state: SERVICE_STATUS_CURRENT_STATE) {
     let h = STATUS.load(Ordering::Acquire);
@@ -81,12 +84,13 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut windows_sys::core
     let h = unsafe { RegisterServiceCtrlHandlerExW(name.as_ptr(), Some(control), std::ptr::null()) };
     STATUS.store(h, Ordering::Release);
     set_state(SERVICE_RUNNING);
-    serve(&crate::port_path());
+    serve(PORT.get().and_then(|p| p.as_deref()));
     set_state(SERVICE_STOPPED);
 }
 
 /// Hand the process to the service control manager.
-pub fn run_service() -> std::io::Result<()> {
+pub fn run_service(port: Option<String>) -> std::io::Result<()> {
+    let _ = PORT.set(port);
     let mut name = wide(SERVICE_NAME);
     let table = [
         SERVICE_TABLE_ENTRYW { lpServiceName: name.as_mut_ptr(), lpServiceProc: Some(service_main) },
@@ -100,7 +104,7 @@ pub fn run_service() -> std::io::Result<()> {
 }
 
 /// The service's work: keep the host port open, accept helpers, relay.
-fn serve(port_path: &str) {
+fn serve(port: Option<&str>) {
     let (tx, rx) = channel::<Ev>();
     {
         let tx = tx.clone();
@@ -108,15 +112,15 @@ fn serve(port_path: &str) {
     }
     let mut relay = Relay::new(RealSystem, crate::MAX_CLIP);
     loop {
-        match port::open(port_path) {
-            Ok((r, mut w)) => {
-                log::info!("service: connected to {port_path}");
+        match crate::open_port(port) {
+            Ok((path, r, mut w)) => {
+                log::info!("service: connected to {path}");
                 spawn_reader(r, tx.clone(), Ev::Host, || Ev::HostGone);
                 if let Err(e) = relay.run(&mut w, &rx) {
                     log::warn!("service: {e}");
                 }
             }
-            Err(e) => log::debug!("service: {port_path}: {e}"),
+            Err(e) => log::debug!("service: {e}"),
         }
         std::thread::sleep(Duration::from_secs(2));
     }
