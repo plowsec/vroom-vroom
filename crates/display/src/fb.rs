@@ -4,10 +4,12 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use crate::{Error, Result};
 
-/// Largest scanout we support. The mapping is sized for this once (pages
-/// are only committed when touched), so mode changes never reallocate.
-pub const MAX_WIDTH: u32 = 5120;
-pub const MAX_HEIGHT: u32 = 2880;
+/// Largest scanout we support: 8K, so a full-screen window on a 5K or 6K
+/// display fits in physical pixels. The mapping is sized for this once
+/// (pages are only committed when touched), so mode changes never
+/// reallocate.
+pub const MAX_WIDTH: u32 = 7680;
+pub const MAX_HEIGHT: u32 = 4320;
 const BPP: usize = 4;
 
 /// A mapped framebuffer. Accesses are raw copies: the other process may
@@ -144,6 +146,27 @@ impl SharedFb {
         }
     }
 
+    /// Copy the `w` x `h` rect at `x`,`y` of a `fb_width` wide image into
+    /// `dst` (raw XRGB bytes, rows `dst_stride` apart). Rows that don't fit
+    /// either buffer are skipped.
+    #[allow(clippy::too_many_arguments)]
+    pub fn read_rect(&self, fb_width: u32, x: u32, y: u32, w: u32, h: u32, dst: &mut [u8], dst_stride: usize) {
+        let stride = Self::stride(fb_width);
+        let row = w as usize * BPP;
+        if x.saturating_add(w) > fb_width {
+            return;
+        }
+        for r in 0..h as usize {
+            let so = (y as usize + r) * stride + x as usize * BPP;
+            let d = r * dst_stride;
+            if so + row > self.len || d + row > dst.len() {
+                return;
+            }
+            // SAFETY: bounds checked against both buffers above.
+            unsafe { std::ptr::copy_nonoverlapping(self.ptr.add(so), dst.as_mut_ptr().add(d), row) };
+        }
+    }
+
     /// Copy the visible w x h image into `dst` (one u32 per pixel, 0RGB).
     pub fn read_into(&self, width: u32, height: u32, dst: &mut [u32]) {
         let n = (width as usize * height as usize).min(dst.len());
@@ -179,5 +202,20 @@ mod tests {
         assert_eq!(out[6], u32::from_le_bytes([4, 5, 6, 0]));
         // Out-of-bounds writes are ignored, not UB.
         a.write_rect(MAX_WIDTH, MAX_WIDTH - 1, MAX_HEIGHT - 1, 2, 2, &[0; 16], 8);
+        // A rect: row 1, pixels 1..3, into a 2-pixel-wide buffer.
+        let mut r = vec![0u8; 16];
+        b.read_rect(4, 1, 1, 2, 1, &mut r, 8);
+        assert_eq!(&r[..8], &px);
+        // Out of bounds: nothing read, nothing touched.
+        let mut r = vec![9u8; 16];
+        b.read_rect(4, 3, 0, 2, 1, &mut r, 8);
+        b.read_rect(MAX_WIDTH, 0, MAX_HEIGHT - 1, 1, 2, &mut r[..4], 4);
+        assert!(r[4..].iter().all(|v| *v == 9));
+        // The largest mode works end to end.
+        assert!(SharedFb::mode_ok(MAX_WIDTH, MAX_HEIGHT) && !SharedFb::mode_ok(MAX_WIDTH + 1, 1));
+        a.write_rect(MAX_WIDTH, MAX_WIDTH - 1, MAX_HEIGHT - 1, 1, 1, &[7; 4], 4);
+        let mut r = [0u8; 4];
+        b.read_rect(MAX_WIDTH, MAX_WIDTH - 1, MAX_HEIGHT - 1, 1, 1, &mut r, 4);
+        assert_eq!(r, [7; 4]);
     }
 }

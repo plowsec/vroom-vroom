@@ -110,6 +110,8 @@ impl<'a> NewVm<'a> {
         s += &format!(
             "\n[[net]]\nmode = \"nat\"\n# port_forwards = [{{ host_port = 2222, guest_port = 22 }}]\n\
              \n[display]\ngpu = \"{gpu}\"\nwidth = 1280\nheight = 800\n\
+             # Full resolution on Retina screens (the guest agent scales the UI).\n\
+             hidpi = true\n\
              \n# Shared folder (Linux guest: mount -t virtiofs host /mnt).\n\
              # [[share]]\n# path = \"/Users/me/shared\"\n# tag = \"host\"\n# readonly = true\n"
         );

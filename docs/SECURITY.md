@@ -155,7 +155,7 @@ that need it. A future step is moving the renderer into its own process
 The VirtIO serial port only admits Administrators and SYSTEM, so the agent
 is split. A LocalSystem service owns the port and does clock sync and
 clean shutdown. An unprivileged helper in the console session does
-clipboard and resolution, and talks to the service over a named pipe:
+clipboard, resolution and UI scale, and talks to the service over a named pipe:
 SYSTEM/Administrators/interactive users only, remote clients refused,
 only clients from the active console session served. The helper only
 talks to a pipe server in session 0, so a user process squatting the pipe
@@ -238,6 +238,9 @@ Still visible, whatever the config says:
 - PSCI 1.0 / SMCCC 1.1 answers. They name no vendor. On KVM hosts the
   kernel's PSCI also answers the KVM vendor-hypervisor UID call.
 - The firmware itself: EDK2 reports its own vendor in UEFI tables.
+- The display size follows the window, so it says something about your
+  screen; with `[display] hidpi` the guest also learns its pixel density
+  (the scale its agent is asked for).
 - The display: ramfb, then virtio-gpu with no EDID. With 3D, Vulkan shows
   the host GPU (MoltenVK on Apple).
 - CPU ID registers come from the host CPU (an Apple core on a Mac), and

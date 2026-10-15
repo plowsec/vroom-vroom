@@ -6,7 +6,7 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use vroom_arch::aarch64::{self as board, layout};
-use vroom_config::{Boot, DiskBus, Gpu, Identity, VmConfig};
+use vroom_config::{Boot, DiskBus, Gpu, GuestOs, Identity, VmConfig};
 use vroom_devices::{pl011::Pl011, pl031::Pl031, BusBuilder, BusDevice};
 use vroom_hv::{
     aarch64::mpidr_for, BootRegs, GicMsiConfig, Hypervisor, IrqChipConfig, IrqChipInfo, Vm, VmParams,
@@ -481,13 +481,14 @@ pub(crate) fn build(
         Some(ds) => Some(ds.clipboard()),
         None => clipboard,
     };
-    let agent = agent::spawn(host_end, config.clipboard.clone(), clipboard)?;
+    let max_pixels = if config.guest_os() == GuestOs::Windows { agent::WINDOWS_MAX_PIXELS } else { 0 };
+    let agent = agent::spawn(host_end, config.clipboard.clone(), clipboard, agent::Screen { gpu: gpu_ctl, max_pixels })?;
     let viewer = ui.as_ref().map(|d| d.tx());
     if let Some(ds) = ui {
         if screen.is_none() {
             return Err(Error::Setup("a viewer needs a display (display.gpu or UEFI boot)".into()));
         }
-        ds.run(gpu_ctl, input, agent.clone(), events.clone())?;
+        ds.run(input, agent.clone(), events.clone())?;
     }
     for (i, n) in config.nets.iter().enumerate() {
         let mac = match &n.mac {

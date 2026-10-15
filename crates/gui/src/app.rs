@@ -571,6 +571,7 @@ impl App {
             gpu,
             width: s(c.display.width.to_string()),
             height: s(c.display.height.to_string()),
+            hidpi: c.display.hidpi,
             disks: model(disks),
             nets: model(nets),
             shares: model(shares),
@@ -622,8 +623,13 @@ impl App {
             )),
             sum_display: s(match gpu {
                 0 => "No screen".to_string(),
-                1 => format!("2D · starts at {}×{}", c.display.width, c.display.height),
-                _ => format!("3D (Vulkan) · starts at {}×{}", c.display.width, c.display.height),
+                g => format!(
+                    "{} · starts at {}×{}{}",
+                    if g == 1 { "2D" } else { "3D (Vulkan)" },
+                    c.display.width,
+                    c.display.height,
+                    if c.display.hidpi { " · full resolution" } else { "" }
+                ),
             }),
             sum_storage: s(format!(
                 "{} disk{}{}{}",
@@ -673,7 +679,7 @@ impl App {
         self.ui.set_vis(CardVis {
             searching: !any,
             hw: any || hit(&format!("processor cpu cpus core memory ram nested virtualization guest system os {}", st.sum_hw.to_lowercase())),
-            display: any || hit("display screen gpu 3d 2d graphics vulkan resolution width height size monitor"),
+            display: any || hit("display screen gpu 3d 2d graphics vulkan resolution width height size monitor retina hidpi scale scaling sharp blurry"),
             storage: any || hit("storage disk disks iso cdrom installer drive nvme virtio bus sync write safety readonly read-only compact image qcow2 space"),
             net: any || hit("network net nat bridged host-only hostonly port forward forwarding ssh mac address interface internet lan localhost loopback adapter"),
             share: any || hit("shared folders share folder virtiofs mount files tag"),
@@ -703,9 +709,10 @@ impl App {
         for v in &mut self.vms {
             if v.changed_on_disk() {
                 v.reload();
-                // Clipboard rules edited by hand apply right away too.
+                // Clipboard rules and HiDPI edited by hand apply right away too.
                 if let Some(c) = &v.raw {
                     console::set_clip_policy(&v.key, c.clipboard.clone());
+                    console::set_hidpi(&v.key, c.display.hidpi);
                 }
                 changed = true;
             }
@@ -754,6 +761,7 @@ impl App {
                 Ok(()) => {
                     v.reload();
                     console::set_clip_policy(&v.key, after.clipboard.clone());
+                    console::set_hidpi(&v.key, after.display.hidpi);
                     true
                 }
                 Err(e) => {
@@ -789,7 +797,8 @@ impl App {
             return self.newvm_set(k, v);
         }
         let locked = self.cur().is_some_and(|vm| self.state_of(vm) != VmState::Off);
-        if locked && !key.starts_with("clip.") {
+        // Not hardware: these apply to a running VM's window.
+        if locked && !key.starts_with("clip.") && key != "hidpi" {
             return;
         }
         let iface = self.host_ifaces.first().cloned();
