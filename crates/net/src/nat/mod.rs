@@ -43,6 +43,8 @@ use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpo
 use crate::packet::*;
 use crate::NetBackend;
 
+/// Addresses on the default network (10.0.2.0/24); adapter N gets
+/// 10.0.(2+N).0/24 with the same host parts.
 pub const GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 2);
 pub const DNS: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 3);
 pub const GUEST: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 15);
@@ -77,11 +79,26 @@ pub struct NatConfig {
     /// Where DNS queries to 10.0.2.3 go. None = DNS disabled.
     pub dns_upstream: Option<SocketAddr>,
     pub forwards: Vec<TcpForward>,
+    /// Third octet of the guest network: 10.0.<subnet>.0/24 (2 by default;
+    /// one per adapter, so a guest with two NICs routes sanely).
+    pub subnet: u8,
 }
 
 impl NatConfig {
     pub fn new(guest_mac: Mac) -> Self {
-        NatConfig { guest_mac, policy: NatPolicy::default(), dns_upstream: host_dns(), forwards: Vec::new() }
+        NatConfig { guest_mac, policy: NatPolicy::default(), dns_upstream: host_dns(), forwards: Vec::new(), subnet: 2 }
+    }
+    fn host(&self, h: u8) -> Ipv4Addr {
+        Ipv4Addr::new(10, 0, self.subnet, h)
+    }
+    pub fn gateway(&self) -> Ipv4Addr {
+        self.host(2)
+    }
+    pub fn dns(&self) -> Ipv4Addr {
+        self.host(3)
+    }
+    pub fn guest(&self) -> Ipv4Addr {
+        self.host(15)
     }
 }
 
@@ -225,9 +242,9 @@ impl Nat {
         let epoch = Instant::now();
         let mut iface = Interface::new(icfg, &mut pipe, smol_now(epoch));
         iface.update_ip_addrs(|a| {
-            let _ = a.push(IpCidr::new(IpAddress::Ipv4(GATEWAY), 24));
+            let _ = a.push(IpCidr::new(IpAddress::Ipv4(cfg.gateway()), 24));
         });
-        let _ = iface.routes_mut().add_default_ipv4_route(GATEWAY);
+        let _ = iface.routes_mut().add_default_ipv4_route(cfg.gateway());
         // Accept TCP for any destination: that's how we proxy.
         iface.set_any_ip(true);
         let mut listeners = Vec::new();
@@ -259,10 +276,10 @@ impl Nat {
 
     /// Where a guest destination really goes, or None if policy says no.
     fn resolve(&self, dst: Ipv4Addr, port: u16) -> Option<SocketAddr> {
-        if dst == DNS {
+        if dst == self.cfg.dns() {
             return if port == 53 { self.cfg.dns_upstream } else { None };
         }
-        if dst == GATEWAY {
+        if dst == self.cfg.gateway() {
             return self
                 .cfg
                 .policy
@@ -270,7 +287,7 @@ impl Nat {
                 .then(|| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)));
         }
         let o = dst.octets();
-        let in_subnet = o[0] == 10 && o[1] == 0 && o[2] == 2;
+        let in_subnet = o[0] == 10 && o[1] == 0 && o[2] == self.cfg.subnet;
         let cgnat = o[0] == 100 && (64..128).contains(&o[1]);
         if dst.is_loopback()
             || dst.is_unspecified()
@@ -313,9 +330,9 @@ impl Nat {
         let Some(a) = parse_arp(frame) else { return };
         // Only speak for our own two addresses. Answering for everything
         // (smoltcp any_ip) would break the guest's duplicate address checks.
-        if a.target_ip == GATEWAY || a.target_ip == DNS {
-            if a.op == 1 && a.target_ip == DNS {
-                self.push_guest(arp_reply(&a, DNS));
+        if a.target_ip == self.cfg.gateway() || a.target_ip == self.cfg.dns() {
+            if a.op == 1 && a.target_ip == self.cfg.dns() {
+                self.push_guest(arp_reply(&a, self.cfg.dns()));
                 return;
             }
             self.pipe.rx.push_back(frame.to_vec());
@@ -323,9 +340,9 @@ impl Nat {
     }
 
     fn handle_dhcp(&mut self, eth: &Eth, payload: &[u8]) {
-        let lease = dhcp::Lease { client: GUEST, server: GATEWAY, mask: NETMASK, dns: DNS, seconds: 86400 };
+        let lease = dhcp::Lease { client: self.cfg.guest(), server: self.cfg.gateway(), mask: NETMASK, dns: self.cfg.dns(), seconds: 86400 };
         if let Some(reply) = dhcp::handle(payload, &lease) {
-            let f = build_udp(eth.src, GATEWAY_MAC, (GATEWAY, 67), (Ipv4Addr::BROADCAST, 68), &reply);
+            let f = build_udp(eth.src, GATEWAY_MAC, (self.cfg.gateway(), 67), (Ipv4Addr::BROADCAST, 68), &reply);
             self.push_guest(f);
         }
     }
@@ -365,7 +382,7 @@ impl Nat {
                                 self.guest_mac,
                                 GATEWAY_MAC,
                                 (*flow.key.dst.ip(), flow.key.dst.port()),
-                                (GUEST, flow.key.guest_port),
+                                (self.cfg.guest(), flow.key.guest_port),
                                 &buf[..n],
                             ));
                         }
@@ -491,7 +508,7 @@ impl Nat {
                 self.guest_mac,
                 GATEWAY_MAC,
                 (*key.dst.ip(), key.dst.port()),
-                (GUEST, key.guest_port),
+                (self.cfg.guest(), key.guest_port),
                 seq.wrapping_add(1),
             );
             self.push_guest(rst);
@@ -526,8 +543,8 @@ impl Nat {
             let mut s = Self::new_tcp_socket();
             let local = self.next_local_port;
             self.next_local_port = if local >= 60000 { 40000 } else { local + 1 };
-            let remote = IpEndpoint::new(IpAddress::Ipv4(GUEST), guest_port);
-            if s.connect(self.iface.context(), remote, (IpAddress::Ipv4(GATEWAY), local)).is_err() {
+            let remote = IpEndpoint::new(IpAddress::Ipv4(self.cfg.guest()), guest_port);
+            if s.connect(self.iface.context(), remote, (IpAddress::Ipv4(self.cfg.gateway()), local)).is_err() {
                 continue;
             }
             let tok = self.alloc_token(Owner::Tcp);
@@ -653,7 +670,7 @@ impl Nat {
                         self.guest_mac,
                         GATEWAY_MAC,
                         (*k.dst.ip(), k.dst.port()),
-                        (GUEST, k.guest_port),
+                        (self.cfg.guest(), k.guest_port),
                         seq.wrapping_add(1),
                     ));
                 }
@@ -703,7 +720,7 @@ impl NetBackend for Nat {
             ETHERTYPE_IPV4 => {
                 let Some(ip) = parse_ipv4(frame) else { return };
                 if ip.fragmented {
-                    if eth.src == self.guest_mac && ip.src == GUEST {
+                    if eth.src == self.guest_mac && ip.src == self.cfg.guest() {
                         if let Some(complete) = self.fragments.push(frame) {
                             self.send_frame(&complete);
                         }
@@ -712,10 +729,10 @@ impl NetBackend for Nat {
                 }
                 let dhcp = ip.proto == PROTO_UDP
                     && parse_udp(ip.payload).is_some_and(|u| u.src_port == 68 && u.dst_port == 67);
-                if eth.src != self.guest_mac || (!dhcp && ip.src != GUEST) {
+                if eth.src != self.guest_mac || (!dhcp && ip.src != self.cfg.guest()) {
                     return;
                 }
-                if !dhcp && ip.ttl <= 1 && ip.dst != GATEWAY && ip.dst != DNS {
+                if !dhcp && ip.ttl <= 1 && ip.dst != self.cfg.gateway() && ip.dst != self.cfg.dns() {
                     self.error_to_guest(frame, 11, 0);
                     return;
                 }
@@ -734,7 +751,7 @@ impl NetBackend for Nat {
                             self.handle_tcp(frame, &ip, &t);
                         }
                     }
-                    PROTO_ICMP if ip.dst == GATEWAY => self.pipe.rx.push_back(frame.to_vec()),
+                    PROTO_ICMP if ip.dst == self.cfg.gateway() => self.pipe.rx.push_back(frame.to_vec()),
                     PROTO_ICMP => self.handle_ping(frame, &ip),
                     _ => {}
                 }

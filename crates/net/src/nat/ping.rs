@@ -15,7 +15,7 @@ pub(super) struct Pending {
 
 impl Nat {
     pub(super) fn error_to_guest(&mut self, frame: &[u8], kind: u8, code: u8) {
-        if let Some(reply) = icmp_error(frame, GATEWAY_MAC, GATEWAY, kind, code) {
+        if let Some(reply) = icmp_error(frame, GATEWAY_MAC, self.cfg.gateway(), kind, code) {
             self.push_guest(reply);
         }
     }
@@ -26,7 +26,7 @@ impl Nat {
             return;
         }
         // Echo uses the same destination policy, but never the DNS/loopback aliases.
-        if ip.dst == DNS || ip.dst == GATEWAY || self.resolve(ip.dst, 1).is_none() {
+        if ip.dst == self.cfg.dns() || ip.dst == self.cfg.gateway() || self.resolve(ip.dst, 1).is_none() {
             self.error_to_guest(frame, 3, 13);
             return;
         }
@@ -94,7 +94,7 @@ impl Nat {
                     let Some(original) = parse_ipv4(&p.request) else { break };
                     let mut payload = body.to_vec();
                     payload[4..8].copy_from_slice(&original.payload[4..8]);
-                    reply = Some(build_icmp(self.guest_mac, GATEWAY_MAC, p.destination, GUEST, &payload));
+                    reply = Some(build_icmp(self.guest_mac, GATEWAY_MAC, p.destination, self.cfg.guest(), &payload));
                     break;
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,

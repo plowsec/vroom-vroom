@@ -2,7 +2,9 @@
 
 Bulwark currently provides an unprivileged IPv4 NAT backend. The guest sees
 `10.0.2.15/24`, gateway `10.0.2.2`, and DNS relay `10.0.2.3`. DHCP supplies the
-address, route, DNS server and 1500-byte MTU. Each adapter has its own NAT instance.
+address, route, DNS server and 1500-byte MTU. Each adapter has its own NAT
+instance on its own network: the second NAT adapter is `10.0.3.0/24`
+(guest `.15`, gateway `.2`, DNS `.3`), the third `10.0.4.0/24`, and so on.
 
 The backend uses smoltcp for guest-facing TCP and normal host sockets for
 outbound traffic. It is a proxy, not a transparent IP router: host routing and

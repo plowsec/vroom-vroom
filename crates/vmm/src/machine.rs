@@ -290,6 +290,9 @@ fn net_backend(vm: &str, idx: usize, n: &bulwark_config::Net, mac: [u8; 6]) -> R
     match n.mode()? {
         NetMode::Nat { port_forwards } => {
             let mut cfg = NatConfig::new(mac);
+            // Adapter N: 10.0.(2+N).0/24, like VirtualBox: two NICs never
+            // share a subnet in the guest's routing table.
+            cfg.subnet = 2 + idx as u8;
             cfg.policy = NatPolicy { allow_host_loopback: n.allow_host_loopback, block_private: n.block_private };
             for p in port_forwards {
                 let ip: std::net::IpAddr =
