@@ -224,7 +224,10 @@ export component SettingsPanel inherits Rectangle {
                 horizontal-stretch: 1;
                 text <=> root.query;
                 placeholder: "Search settings: port, 3d, mac, tpm...";
-                edited(t) => { Bus.search(t); }
+                edited(t) => {
+                    root.query = t;
+                    Bus.search(t);
+                }
             }
         }
         if root.s.locked: Banner {
@@ -253,7 +256,7 @@ export component SettingsPanel inherits Rectangle {
                         label: "CPUs";
                         key: "cpus";
                         hint: root.s.snapshots-cpu-mem;
-                        Value { text: cpus.value; }
+                        Value { text: cpus.shown; }
                     }
                     cpus := Slider {
                         minimum: 1;
@@ -267,7 +270,7 @@ export component SettingsPanel inherits Rectangle {
                     Row {
                         label: "Memory";
                         key: "memory_mib";
-                        Value { text: mem.value + " GB"; }
+                        Value { text: mem.shown + " GB"; }
                     }
                     mem := Slider {
                         minimum: 1;

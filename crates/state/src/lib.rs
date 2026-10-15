@@ -38,6 +38,9 @@ impl StateLock {
         let mut o = std::fs::OpenOptions::new();
         o.read(true).write(true).create(true).truncate(false);
         std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+        // The VMM can write this dir: a link or FIFO planted as `lock` must
+        // not make us create files elsewhere or hang.
+        std::os::unix::fs::OpenOptionsExt::custom_flags(&mut o, libc::O_NOFOLLOW | libc::O_NONBLOCK);
         let f = o.open(dir.join("lock"))?;
         // A probe (`in_use`) or a forked child that hasn't exec'd yet can
         // hold it for a moment: retry briefly.
@@ -58,7 +61,10 @@ impl StateLock {
     /// Is a VMM running on this state dir? Takes a shared lock for an
     /// instant; never creates anything.
     pub fn in_use(dir: &Path) -> bool {
-        let Ok(f) = File::open(dir.join("lock")) else { return false };
+        let mut o = std::fs::OpenOptions::new();
+        o.read(true);
+        std::os::unix::fs::OpenOptionsExt::custom_flags(&mut o, libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        let Ok(f) = o.open(dir.join("lock")) else { return false };
         // SAFETY: valid fd we own; the lock goes away with `f`.
         let r = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
         r != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EWOULDBLOCK)
@@ -131,6 +137,7 @@ pub fn delete(state: &Path, name: &str, base_dirs: &[PathBuf]) -> Result<PruneRe
     if name.is_empty() || name.contains('/') || name.starts_with('.') {
         return Err(Error::Setup(format!("bad snapshot name {name:?}")));
     }
+    real_dir(&snapshots_dir(state))?;
     let dir = snapshots_dir(state).join(name);
     SnapshotDir::open(&dir).map_err(|e| Error::Setup(format!("snapshot {name}: {e}")))?;
     std::fs::remove_dir_all(&dir)?;
@@ -146,7 +153,7 @@ fn roots(state: &Path) -> Result<(BTreeSet<PathBuf>, BTreeSet<PathBuf>)> {
     for e in std::fs::read_dir(&disks)?.flatten() {
         let p = e.path();
         if p.extension().is_some_and(|x| x == "json") {
-            let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&p)?).map_err(|e| Error::Setup(e.to_string()))?;
+            let v: serde_json::Value = serde_json::from_slice(&read_small(&p)?).map_err(|e| Error::Setup(e.to_string()))?;
             if let Some(a) = v.get("active").and_then(|a| a.as_str()) {
                 roots.insert(canon(Path::new(a)));
             }
@@ -169,6 +176,36 @@ fn roots(state: &Path) -> Result<(BTreeSet<PathBuf>, BTreeSet<PathBuf>)> {
     Ok((roots, pinned))
 }
 
+/// Disk pointers are a line of JSON. Refuses links, FIFOs and big files:
+/// a VMM writes these.
+fn read_small(p: &Path) -> Result<Vec<u8>> {
+    use std::io::Read;
+    const MAX: u64 = 1 << 20;
+    let mut o = std::fs::OpenOptions::new();
+    o.read(true);
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut o, libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let f = o.open(p)?;
+    if !f.metadata()?.is_file() {
+        return Err(Error::Setup(format!("{}: not a file", p.display())));
+    }
+    let mut v = Vec::new();
+    f.take(MAX + 1).read_to_end(&mut v)?;
+    if v.len() as u64 > MAX {
+        return Err(Error::Setup(format!("{}: too large", p.display())));
+    }
+    Ok(v)
+}
+
+/// A directory in the state dir, not a link to one somewhere else (we
+/// delete files in there).
+fn real_dir(p: &Path) -> Result<()> {
+    if std::fs::symlink_metadata(p)?.is_dir() {
+        Ok(())
+    } else {
+        Err(Error::Setup(format!("{} is not a directory", p.display())))
+    }
+}
+
 fn canon(p: &Path) -> PathBuf {
     p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
 }
@@ -183,6 +220,7 @@ fn parent_of(layer: &Path, policy: &OpenPolicy) -> Result<Option<PathBuf>> {
 
 /// Delete unneeded layers and fold single-child intermediates.
 pub fn prune(state: &Path, base_dirs: &[PathBuf]) -> Result<PruneReport> {
+    real_dir(&state.join("disks"))?;
     let disks = canon(&state.join("disks"));
     let mut allowed = vec![disks.clone()];
     allowed.extend(base_dirs.iter().cloned());
@@ -190,9 +228,12 @@ pub fn prune(state: &Path, base_dirs: &[PathBuf]) -> Result<PruneReport> {
     let mut report = PruneReport::default();
     loop {
         let (roots, pinned) = roots(state)?;
+        // Regular files only: following a link the VMM planted would make
+        // its target (anywhere) a layer we may delete.
         let layers: Vec<PathBuf> = std::fs::read_dir(&disks)?
             .flatten()
-            .map(|e| canon(&e.path()))
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+            .map(|e| e.path())
             .filter(|p| p.extension().is_some_and(|x| x == "qcow2"))
             .collect();
         let parent: BTreeMap<PathBuf, Option<PathBuf>> =
@@ -270,5 +311,53 @@ mod tests {
         assert!(!StateLock::in_use(t.path()));
         // The probe itself doesn't block a VMM from starting.
         let _l = StateLock::acquire(t.path()).unwrap();
+    }
+
+    fn mkfifo(p: &Path) {
+        let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: valid C string.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    }
+
+    #[test]
+    fn planted_lock_files() {
+        let t = tempfile::tempdir().unwrap();
+        let (state, victim) = (t.path().join("vm.state"), t.path().join("victim"));
+        std::fs::create_dir(&state).unwrap();
+        std::os::unix::fs::symlink(&victim, state.join("lock")).unwrap();
+        assert!(StateLock::acquire(&state).is_err());
+        assert!(!victim.exists(), "followed the link");
+        std::fs::remove_file(state.join("lock")).unwrap();
+        mkfifo(&state.join("lock"));
+        assert!(!StateLock::in_use(&state));
+    }
+
+    #[test]
+    fn prune_stays_in_the_state_dir() {
+        let t = tempfile::tempdir().unwrap();
+        let state = t.path().join("vm.state");
+        let disks = state.join("disks");
+        std::fs::create_dir_all(&disks).unwrap();
+        let outside = t.path().join("other");
+        std::fs::create_dir(&outside).unwrap();
+        let victim = outside.join("victim.qcow2");
+        vroom_block::qcow2::Qcow2Image::create(&victim, 1 << 20, None).unwrap();
+        vroom_block::qcow2::Qcow2Image::create(&disks.join("old.qcow2"), 1 << 20, None).unwrap();
+        std::os::unix::fs::symlink(&victim, disks.join("evil.qcow2")).unwrap();
+        let r = prune(&state, &[]).unwrap();
+        assert_eq!(r.deleted, vec![disks.canonicalize().unwrap().join("old.qcow2")]);
+        assert!(victim.exists(), "deleted a file outside the state dir");
+
+        // The whole disks dir swapped for a link.
+        std::fs::remove_dir_all(&disks).unwrap();
+        std::os::unix::fs::symlink(&outside, &disks).unwrap();
+        assert!(prune(&state, &[]).is_err());
+        assert!(victim.exists());
+
+        // A pointer file that never ends.
+        std::fs::remove_file(&disks).unwrap();
+        std::fs::create_dir(&disks).unwrap();
+        mkfifo(&disks.join("vda.json"));
+        assert!(prune(&state, &[]).is_err());
     }
 }

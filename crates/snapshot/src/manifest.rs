@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -99,12 +100,21 @@ impl SnapshotDir {
 
     /// Open an existing, complete snapshot.
     pub fn open(root: &Path) -> Result<Self> {
-        let f = File::open(root.join(MANIFEST))?;
-        if f.metadata()?.len() > MAX_MANIFEST {
+        // No links, and a FIFO planted there must not block the reader.
+        let f = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(root.join(MANIFEST))?;
+        let md = f.metadata()?;
+        if !md.is_file() {
+            return Err(Error::Invalid("manifest is not a file".into()));
+        }
+        if md.len() > MAX_MANIFEST {
             return Err(Error::Invalid("manifest too large".into()));
         }
+        // take(): the file can grow after the size check.
         let manifest: Manifest =
-            serde_json::from_reader(BufReader::new(f)).map_err(|e| Error::Decode(e.to_string()))?;
+            serde_json::from_reader(BufReader::new(f.take(MAX_MANIFEST))).map_err(|e| Error::Decode(e.to_string()))?;
         if manifest.format != FORMAT_VERSION {
             return Err(Error::Invalid(format!("unsupported format {}", manifest.format)));
         }
@@ -233,6 +243,22 @@ mod tests {
 
         fs::write(p.join("dev.pl011@9000000"), b"hellO").unwrap();
         assert!(r.get_blob("dev.pl011@9000000").is_err());
+    }
+
+    #[test]
+    fn hostile_manifest_files() {
+        let td = tempfile::tempdir().unwrap();
+        // A FIFO: opening it must not hang.
+        let fifo = td.path().join("fifo");
+        fs::create_dir(&fifo).unwrap();
+        assert!(std::process::Command::new("mkfifo").arg(fifo.join(MANIFEST)).status().unwrap().success());
+        assert!(SnapshotDir::open(&fifo).is_err());
+        // A link to some other file.
+        let link = td.path().join("link");
+        fs::create_dir(&link).unwrap();
+        fs::write(td.path().join("elsewhere.json"), "{}").unwrap();
+        std::os::unix::fs::symlink(td.path().join("elsewhere.json"), link.join(MANIFEST)).unwrap();
+        assert!(SnapshotDir::open(&link).is_err());
     }
 
     #[test]

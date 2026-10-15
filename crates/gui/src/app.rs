@@ -53,45 +53,15 @@ pub struct App {
     next_toast: i32,
     palette: Vec<PaletteEntry>,
     palette_sel: usize,
-    confirm: Option<String>,
+    /// The action a confirm dialog runs, and the VM (key) it was asked for.
+    confirm: Option<(String, String)>,
     installer: Option<PathBuf>,
     last_settings: Option<VmSettings>,
     _timer: slint::Timer,
 }
 
 pub fn launch() -> Result<(), String> {
-    let ui = AppWindow::new().map_err(|e| e.to_string())?;
-    let lib = Library::load(&paths::library_file());
-    let vms: Vec<Vm> = lib.vms.iter().map(|p| Vm::open(p)).collect();
-    let vm_model = Rc::new(VecModel::default());
-    let snap_model = Rc::new(VecModel::default());
-    ui.set_vms(ModelRc::from(vm_model.clone()));
-    ui.set_snaps(ModelRc::from(snap_model.clone()));
-    wire(&ui);
-    let timer = slint::Timer::default();
-    timer.start(slint::TimerMode::Repeated, TICK, || msg::send(Msg::Tick));
-    let mut app = App {
-        ui,
-        lib,
-        current: (!vms.is_empty()).then_some(0),
-        vms,
-        live_thumbs: HashMap::new(),
-        query: String::new(),
-        host_ifaces: host::interfaces(),
-        vm_model,
-        snap_model,
-        toasts: Vec::new(),
-        next_toast: 1,
-        palette: Vec::new(),
-        palette_sel: 0,
-        confirm: None,
-        installer: None,
-        last_settings: None,
-        _timer: timer,
-    };
-    app.apply_theme();
-    app.push_host();
-    app.push_all();
+    let mut app = App::new()?;
     // An explicit size: left alone, the window follows its layout's
     // preferred size, which changes with what's on screen.
     app.ui.window().set_size(slint::LogicalSize::new(1320.0, 840.0));
@@ -189,6 +159,45 @@ fn model<T: Clone + 'static>(v: Vec<T>) -> ModelRc<T> {
 }
 
 impl App {
+    fn new() -> Result<App, String> {
+        let ui = AppWindow::new().map_err(|e| e.to_string())?;
+        let lib = Library::load(&paths::library_file());
+        let vms: Vec<Vm> = lib.vms.iter().map(|p| Vm::open(p)).collect();
+        let vm_model = Rc::new(VecModel::default());
+        let snap_model = Rc::new(VecModel::default());
+        ui.set_vms(ModelRc::from(vm_model.clone()));
+        ui.set_snaps(ModelRc::from(snap_model.clone()));
+        wire(&ui);
+        let timer = slint::Timer::default();
+        timer.start(slint::TimerMode::Repeated, TICK, || msg::send(Msg::Tick));
+        let mut app = App {
+            ui,
+            current: (!vms.is_empty()).then_some(0),
+            vms,
+            live_thumbs: HashMap::new(),
+            query: String::new(),
+            host_ifaces: host::interfaces(),
+            vm_model,
+            snap_model,
+            toasts: Vec::new(),
+            next_toast: 1,
+            palette: Vec::new(),
+            palette_sel: 0,
+            confirm: None,
+            installer: None,
+            last_settings: None,
+            _timer: timer,
+            lib,
+        };
+        if let Some(e) = app.lib.error.clone() {
+            app.toast(format!("Couldn't read the VM list: {e}"), 3);
+        }
+        app.apply_theme();
+        app.push_host();
+        app.push_all();
+        Ok(app)
+    }
+
     fn update(&mut self, m: Msg) {
         match m {
             Msg::Select(i) => {
@@ -371,6 +380,8 @@ impl App {
                     .unwrap_or_default()
                     .into_iter()
                     .rev()
+                    // Dir names the VMM picked: only ones we'd use in a file name.
+                    .filter(|sn| vroom_config::valid_name(&sn.name))
                     .map(|sn| {
                         let tp = dir.join(format!("snap-{}.png", sn.name));
                         let thumb = tp.is_file().then(|| slint::Image::load_from_path(&tp).ok()).flatten();
@@ -416,7 +427,9 @@ impl App {
             };
         };
         let r = v.resolved().unwrap_or_else(|| c.clone());
-        let has_snaps = !vroom_state::list(&v.state_dir()).unwrap_or_default().is_empty();
+        // Not a full listing: this runs every tick, and each snapshot's
+        // manifest can be megabytes.
+        let has_snaps = std::fs::read_dir(v.state_dir().join("snapshots")).is_ok_and(|mut d| d.next().is_some());
         let (locked, lock_reason) = match state {
             VmState::Off => (false, ""),
             VmState::Suspended => (
@@ -665,6 +678,10 @@ impl App {
         for v in &mut self.vms {
             if v.changed_on_disk() {
                 v.reload();
+                // Clipboard rules edited by hand apply right away too.
+                if let Some(c) = &v.raw {
+                    console::set_clip_policy(&v.key, c.clipboard.clone());
+                }
                 changed = true;
             }
             if !console::is_running(&v.key) {
@@ -695,27 +712,51 @@ impl App {
 
     // ---- changes ----
 
-    /// Change the selected VM's file through `f`; validate and save.
-    fn change(&mut self, f: impl FnOnce(&mut VmConfig) -> Result<(), String>) {
-        let Some(i) = self.current else { return };
-        let Some(before) = self.vms[i].raw.clone() else { return };
+    /// Change the selected VM's file through `f`; validate and save. False
+    /// if nothing was saved.
+    fn change(&mut self, f: impl FnOnce(&mut VmConfig) -> Result<(), String>) -> bool {
+        let Some(v) = self.current.and_then(|i| self.vms.get_mut(i)) else { return false };
+        // Edited by hand since the last tick: change what's there now.
+        if v.changed_on_disk() {
+            v.reload();
+        }
+        let Some(before) = v.raw.clone() else { return false };
         let mut after = before.clone();
         let r = f(&mut after).and_then(|_| after.validate().map_err(|e| e.to_string()));
-        match r {
-            Ok(()) if after == before => {}
-            Ok(()) => match edit::save(&self.vms[i].path, &before, &after) {
+        let saved = match r {
+            Ok(()) if after == before => false,
+            Ok(()) => match edit::save(&v.path, &before, &after) {
                 Ok(()) => {
-                    let v = &mut self.vms[i];
                     v.reload();
                     console::set_clip_policy(&v.key, after.clipboard.clone());
+                    true
                 }
-                Err(e) => self.toast(format!("Couldn't save: {e}"), 3),
+                Err(e) => {
+                    v.reload();
+                    self.toast(format!("Couldn't save: {e}"), 3);
+                    false
+                }
             },
-            Err(e) => self.toast(plain_error(&e), 3),
-        }
+            Err(e) => {
+                self.toast(plain_error(&e), 3);
+                false
+            }
+        };
         // Push even on error: the UI shows the value that really applies.
         self.last_settings = None;
         self.push_all();
+        saved
+    }
+
+    /// Hardware is locked while the VM runs or is suspended (it resumes on
+    /// the hardware it was saved with). The UI greys those controls out,
+    /// but the palette and keys can still ask.
+    fn hw_locked(&mut self) -> bool {
+        let locked = self.cur().is_some_and(|v| self.state_of(v) != VmState::Off);
+        if locked {
+            self.toast("Shut the VM down first: its hardware can't change while it runs or is suspended.", 0);
+        }
+        locked
     }
 
     fn set(&mut self, key: &str, v: &str) {
@@ -747,6 +788,13 @@ impl App {
         if let Some(k) = a.strip_prefix("log:") {
             return open_text(&paths::log_file(k));
         }
+        if let Some((_, n)) = a.strip_prefix("do.").unwrap_or(a).strip_prefix("snap.").and_then(|r| r.split_once(':')) {
+            // Names come from the state dir (VMM-writable); the list only
+            // shows valid ones.
+            if !vroom_config::valid_name(n) {
+                return;
+            }
+        }
         if let Some(n) = a.strip_prefix("snap.restore:") {
             return self.ask(
                 "Restore this snapshot?",
@@ -775,9 +823,12 @@ impl App {
             // From the palette: "vm:<index>:<action>".
             let mut it = rest.splitn(2, ':');
             if let (Some(i), Some(what)) = (it.next().and_then(|i| i.parse::<usize>().ok()), it.next()) {
-                self.update(Msg::Select(i));
-                if what != "select" {
-                    self.act(what);
+                // Not some other VM if that one is gone meanwhile.
+                if i < self.vms.len() {
+                    self.update(Msg::Select(i));
+                    if what != "select" {
+                        self.act(what);
+                    }
                 }
             }
             return;
@@ -841,8 +892,18 @@ impl App {
             }
             "confirm.ok" => {
                 self.ui.set_confirm_open(false);
-                if let Some(a) = self.confirm.take() {
-                    self.act(&a);
+                // On the VM it was asked for, whatever is selected now.
+                if let Some((key, a)) = self.confirm.take() {
+                    match self.vms.iter().position(|v| v.key == key) {
+                        Some(i) => {
+                            if self.current != Some(i) {
+                                self.update(Msg::Select(i));
+                            }
+                            self.act(&a);
+                        }
+                        None if key.is_empty() => self.act(&a),
+                        None => {}
+                    }
                 }
             }
             "edit-file" => {
@@ -891,13 +952,16 @@ impl App {
                 if let Some(i) = self.current {
                     let p = self.vms[i].path.clone();
                     self.lib.remove(&p);
-                    let _ = self.lib.save();
+                    if let Err(e) = self.lib.save() {
+                        self.toast(format!("Couldn't save the list: {e}"), 3);
+                    }
                     self.vms.remove(i);
                     self.current = if self.vms.is_empty() { None } else { Some(i.min(self.vms.len() - 1)) };
                     self.last_settings = None;
                     self.push_all();
                 }
             }
+            "share.add" | "disk.add-iso" | "disk.add-existing" | "disk.add-new" if self.hw_locked() => {}
             "share.add" => {
                 if let Some(p) = rfd::FileDialog::new().set_title("Share a folder").pick_folder() {
                     self.change(|c| {
@@ -936,9 +1000,13 @@ impl App {
                             }
                             return;
                         }
-                        "compact" => return self.compact(i),
+                        "compact" if !self.hw_locked() => return self.compact(i),
+                        "compact" => return,
                         _ => {}
                     }
+                }
+                if self.hw_locked() {
+                    return;
                 }
                 let a = a.to_string();
                 self.change(|c| edit::act(c, &a));
@@ -947,7 +1015,8 @@ impl App {
     }
 
     fn ask(&mut self, title: &str, text: &str, ok: &str, danger: bool, action: &str) {
-        self.confirm = Some(action.to_string());
+        let key = self.cur().map(|v| v.key.clone()).unwrap_or_default();
+        self.confirm = Some((key, action.to_string()));
         self.ui.set_confirm(ConfirmInfo { title: s(title), text: s(text), ok: s(ok), danger, action: s(action) });
         self.ui.set_confirm_open(true);
     }
@@ -1057,11 +1126,16 @@ impl App {
             return self.toast(format!("Couldn't create the disk: {e}"), 3);
         }
         let f = PathBuf::from(&file);
-        self.change(|c| {
+        let saved = self.change(|c| {
             edit::add_disk(c, &f, edit::NewDisk::Image);
             Ok(())
         });
-        self.toast(format!("Added {file} (64 GB, takes space as it fills)"), 1);
+        if saved {
+            self.toast(format!("Added {file} (64 GB, takes space as it fills)"), 1);
+        } else {
+            // Not in the file (too many disks...): don't leave it lying around.
+            let _ = std::fs::remove_file(dir.join(&file));
+        }
     }
 
     fn add_vm(&mut self, p: &Path) {
@@ -1365,4 +1439,104 @@ fn create_vm(name: &str, os: GuestOs, installer: Option<&Path>, cpus: u32, mem_g
     std::fs::write(&cfg, text).map_err(|e| undo(e.to_string()))?;
     vroom_block::qcow2::Qcow2Image::create(&dir.join(&disk_file), disk_gib << 30, None).map_err(|e| undo(e.to_string()))?;
     Ok(cfg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const VM: &str = "name = \"NAME\"\n[boot]\ntype = \"uefi\"\nvars = \"NAME.state/efivars.fd\"\n\n[[net]]\nmode = \"nat\"\n";
+
+    /// The app over a fresh data dir, with VMs of these names in its list.
+    fn app(names: &[&str]) -> (tempfile::TempDir, App) {
+        i_slint_backend_testing::init_no_event_loop();
+        let t = tempfile::tempdir().unwrap();
+        paths::TEST_HOME.with(|h| *h.borrow_mut() = Some(t.path().join("home")));
+        let mut lib = Library::load(&paths::library_file());
+        for n in names {
+            let p = t.path().join(format!("{n}.toml"));
+            std::fs::write(&p, VM.replace("NAME", n)).unwrap();
+            lib.add(&p);
+        }
+        lib.save().unwrap();
+        (t, App::new().unwrap())
+    }
+
+    fn names(a: &App) -> Vec<String> {
+        a.vms.iter().map(Vm::name).collect()
+    }
+
+    fn act(a: &mut App, s: &str) {
+        a.update(Msg::Act(s.into()));
+    }
+
+    #[test]
+    fn confirm_acts_on_the_vm_it_was_asked_for() {
+        let (_t, mut a) = app(&["a", "b"]);
+        act(&mut a, "remove");
+        // Something else got selected while the dialog was up (the palette).
+        a.update(Msg::Select(1));
+        act(&mut a, "confirm.ok");
+        assert_eq!(names(&a), ["b"]);
+        assert_eq!(a.ui.get_settings().name, "b");
+    }
+
+    #[test]
+    fn palette_entry_of_a_removed_vm() {
+        let (_t, mut a) = app(&["a", "b", "c"]);
+        a.update(Msg::Select(2));
+        act(&mut a, "do.remove");
+        assert_eq!(a.current, Some(1));
+        assert_eq!(a.ui.get_settings().name, "b");
+        // Built while "c" was there: must not hit whatever is selected now.
+        act(&mut a, "vm:2:do.remove");
+        assert_eq!(names(&a), ["a", "b"]);
+    }
+
+    #[test]
+    fn suspended_hardware_is_locked() {
+        let (t, mut a) = app(&["a"]);
+        let file = t.path().join("a.toml");
+        let suspend = t.path().join("a.state/suspend");
+        std::fs::create_dir_all(&suspend).unwrap();
+        std::fs::write(suspend.join("manifest.json"), "{}").unwrap();
+        a.update(Msg::Refresh);
+        assert!(a.ui.get_settings().locked);
+        let before = std::fs::read_to_string(&file).unwrap();
+        for k in ["net.add", "net.0.remove", "net.0.fwd.add", "identity.random", "disk.add-new", "disk.0.compact"] {
+            act(&mut a, k);
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), before, "{k}");
+        }
+        a.update(Msg::Set("cpus".into(), "4".into()));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
+        // Clipboard rules aren't hardware.
+        a.update(Msg::Set("clip.out".into(), "false".into()));
+        assert!(std::fs::read_to_string(&file).unwrap().contains("guest_to_host = false"));
+    }
+
+    #[test]
+    fn hand_edits_between_ticks_are_kept() {
+        let (t, mut a) = app(&["a"]);
+        let file = t.path().join("a.toml");
+        let text = std::fs::read_to_string(&file).unwrap().replace("name = \"a\"", "name = \"a\"\nmemory_mib = 8192 # by hand");
+        std::fs::write(&file, text).unwrap();
+        a.update(Msg::Set("cpus".into(), "3".into()));
+        let now = std::fs::read_to_string(&file).unwrap();
+        assert!(now.contains("memory_mib = 8192 # by hand") && now.contains("cpus = 3"), "{now}");
+    }
+
+    #[test]
+    fn snapshot_list_only_has_usable_names() {
+        let (t, mut a) = app(&["a"]);
+        let m = r#"{"format":1,"created_unix":1,"description":"","arch":"","backend":"","config":null,"memory":[],"files":{},"meta":{}}"#;
+        for n in ["snap-1", "bad name", "x\u{202e}y", "-"] {
+            let d = t.path().join("a.state/snapshots").join(n);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("manifest.json"), m).unwrap();
+        }
+        a.update(Msg::Refresh);
+        let mut rows: Vec<String> = a.snap_model.iter().map(|r| r.name.to_string()).collect();
+        rows.sort();
+        assert_eq!(rows, ["-", "snap-1"]);
+    }
 }

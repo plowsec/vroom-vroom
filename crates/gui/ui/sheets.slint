@@ -209,7 +209,7 @@ export component NewVmSheet inherits Rectangle {
                             horizontal-stretch: 1;
                         }
                         Text {
-                            text: round(cpu.value);
+                            text: round(cpu.shown);
                             font-size: Theme.fs-sm;
                             font-weight: 700;
                             color: Theme.text;
@@ -232,7 +232,7 @@ export component NewVmSheet inherits Rectangle {
                             horizontal-stretch: 1;
                         }
                         Text {
-                            text: round(mem.value) + " GB";
+                            text: round(mem.shown) + " GB";
                             font-size: Theme.fs-sm;
                             font-weight: 700;
                             color: Theme.text;
@@ -255,7 +255,7 @@ export component NewVmSheet inherits Rectangle {
                             horizontal-stretch: 1;
                         }
                         Text {
-                            text: round(disk.value) + " GB, uses space as it fills";
+                            text: round(disk.shown) + " GB, uses space as it fills";
                             font-size: Theme.fs-sm;
                             font-weight: 700;
                             color: Theme.text;
@@ -372,7 +372,10 @@ export component CommandPalette inherits Rectangle {
                     height: 42px;
                     text <=> root.query;
                     placeholder: "Start a VM, open a setting, take a snapshot...";
-                    edited(t) => { Bus.search("palette:" + t); }
+                    edited(t) => {
+                        root.query = t;
+                        Bus.search("palette:" + t);
+                    }
                     init => { self.focus-input(); }
                 }
             }

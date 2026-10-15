@@ -10,8 +10,8 @@
 //! clipboard rules from the VM file are enforced here too.
 
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
-use std::io::{Read, Write};
+use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -38,19 +38,65 @@ const THUMB_SAVE_EVERY: Duration = Duration::from_secs(60);
 /// Scroll distance (logical px) per wheel click sent to the guest.
 const WHEEL_STEP: f32 = 30.0;
 
-/// Shared with the socket reader thread.
+/// Status lines waiting for the UI thread; more are dropped.
+const MAX_STATUS: usize = 16;
+/// Status lines are short; snapshot ones hold a path.
+const MAX_STATUS_LEN: usize = 4096;
+/// How much of the end of a VMM log we read for an error message.
+const LOG_TAIL: u64 = 16 << 10;
+
+/// What the socket reader thread hands the UI thread. Bounded whatever the
+/// VMM sends: frames and the clipboard keep only the latest, status lines
+/// past a few are dropped, and only one wakeup is ever in flight.
 #[derive(Default)]
 struct Shared {
     mode: (u32, u32),
-    frame_pending: bool,
+    frame: bool,
+    status: VecDeque<String>,
+    clipboard: Option<String>,
+    posted: bool,
+}
+
+impl Shared {
+    /// Take one message in. True if the UI thread needs waking up.
+    fn push(&mut self, m: ToViewer) -> bool {
+        match m {
+            ToViewer::Mode { width, height } => {
+                if width != 0 && !SharedFb::mode_ok(width, height) {
+                    return false;
+                }
+                self.mode = (width, height);
+                self.frame = true;
+            }
+            ToViewer::Damage { .. } => self.frame = true,
+            ToViewer::ClipboardSet(t) => self.clipboard = Some(t),
+            ToViewer::Status(mut t) => {
+                if self.status.len() >= MAX_STATUS {
+                    return false;
+                }
+                if t.len() > MAX_STATUS_LEN {
+                    let mut end = MAX_STATUS_LEN;
+                    while !t.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    t.truncate(end);
+                }
+                self.status.push_back(t);
+            }
+            ToViewer::Closed => return false,
+        }
+        !std::mem::replace(&mut self.posted, true)
+    }
 }
 
 /// Input side: everything the window callbacks need, without the rest.
 struct Io {
     tx: Option<UnixStream>,
     mods: ModifiersState,
-    /// Keys the guest thinks are down (released if we lose focus).
+    /// Keys and mouse buttons the guest thinks are down (released if we
+    /// lose focus).
     down: BTreeSet<u16>,
+    buttons: BTreeSet<u16>,
     wheel: (f32, f32),
     focused: bool,
 }
@@ -71,9 +117,21 @@ impl Io {
         self.send(ToVmm::Key { code, down });
     }
 
+    fn button(&mut self, code: u16, down: bool) {
+        if down {
+            self.buttons.insert(code);
+        } else {
+            self.buttons.remove(&code);
+        }
+        self.send(ToVmm::Button { code, down });
+    }
+
     fn release_all(&mut self) {
         for code in std::mem::take(&mut self.down) {
             self.send(ToVmm::Key { code, down: false });
+        }
+        for code in std::mem::take(&mut self.buttons) {
+            self.send(ToVmm::Button { code, down: false });
         }
     }
 }
@@ -152,14 +210,58 @@ pub fn suspend_all() {
     });
 }
 
+/// VMM text for display: at most 160 chars, no control characters and no
+/// invisible or direction-changing ones (they can make it read as
+/// something else).
 fn clean(s: &str) -> String {
-    s.chars().filter(|c| !c.is_control()).take(160).collect()
+    let hidden = |c: char| matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}' | '\u{fff9}'..='\u{fffb}');
+    s.chars().filter(|c| !c.is_control() && !hidden(*c)).take(160).collect()
 }
 
+/// The last `lines` non-empty lines of a log. Only its end is read: the
+/// VMM writes it and can make it any size.
 fn tail(p: &Path, lines: usize) -> String {
-    let s = std::fs::read_to_string(p).unwrap_or_default();
+    let mut b = Vec::new();
+    if let Ok(mut f) = std::fs::File::open(p) {
+        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        if f.seek(SeekFrom::Start(len.saturating_sub(LOG_TAIL))).is_ok() {
+            let _ = f.take(LOG_TAIL).read_to_end(&mut b);
+        }
+    }
+    let s = String::from_utf8_lossy(&b);
     let v: Vec<&str> = s.lines().filter(|l| !l.trim().is_empty()).collect();
     v[v.len().saturating_sub(lines)..].join("\n")
+}
+
+/// The state a status line from the VMM puts the VM in.
+fn status_state(t: &str) -> Option<VmState> {
+    if t == "running" {
+        Some(VmState::Running)
+    } else if t == "paused" || t.starts_with("host disk almost full") {
+        Some(VmState::Paused)
+    } else if t.starts_with("suspend failed") {
+        // The VMM paused the guest to save it and stays up.
+        Some(VmState::Paused)
+    } else {
+        None
+    }
+}
+
+/// The snapshot a "snapshot: <dir>" status reports, if its name is one we
+/// can use in a file name.
+fn snapshot_name(raw: &str) -> Option<String> {
+    let dir = raw.strip_prefix("snapshot: ")?;
+    let n = Path::new(dir.trim_end()).file_name()?.to_str()?;
+    vroom_config::valid_name(n).then(|| n.to_string())
+}
+
+/// A VMM whose window couldn't be set up: stop it, reap it elsewhere.
+fn abandon(mut child: Child, e: String) -> String {
+    let _ = child.kill();
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    e
 }
 
 /// Start a VM in a new window. `extra` goes to `vroom run` (`--fresh`,
@@ -177,6 +279,24 @@ pub fn start(path: &Path, cfg: &VmConfig, extra: &[String]) -> Result<String, St
     // Keep the last run only: logs are for "why did it stop".
     let logf = std::fs::File::create(&log).map_err(|e| format!("{}: {e}", log.display()))?;
     let (ours, theirs) = UnixStream::pair().map_err(|e| e.to_string())?;
+    let os = cfg.guest_os();
+    let win = ConsoleWindow::new().map_err(|e| e.to_string())?;
+    win.set_vm_name(cfg.name.clone().into());
+    win.set_os(crate::os_id(os).into());
+    win.set_state(VmState::Starting);
+    win.set_has_display(cfg.display.gpu != vroom_config::Gpu::None);
+    win.set_windows_guest(os == GuestOs::Windows);
+    win.set_bar_pinned(true);
+    let io = Rc::new(RefCell::new(Io {
+        tx: ours.try_clone().ok(),
+        mods: ModifiersState::empty(),
+        down: BTreeSet::new(),
+        buttons: BTreeSet::new(),
+        wheel: (0.0, 0.0),
+        focused: false,
+    }));
+    wire(&win, &key, &io);
+
     // The child must inherit its end: clear close-on-exec.
     // SAFETY: fcntl on an fd we own.
     #[allow(unsafe_code)]
@@ -198,23 +318,9 @@ pub fn start(path: &Path, cfg: &VmConfig, extra: &[String]) -> Result<String, St
         .map_err(|e| format!("start {}: {e}", vmm.display()))?;
     drop(theirs);
 
-    let os = cfg.guest_os();
-    let win = ConsoleWindow::new().map_err(|e| e.to_string())?;
-    win.set_vm_name(cfg.name.clone().into());
-    win.set_os(crate::os_id(os).into());
-    win.set_state(VmState::Starting);
-    win.set_has_display(cfg.display.gpu != vroom_config::Gpu::None);
-    win.set_windows_guest(os == GuestOs::Windows);
-    win.set_bar_pinned(true);
-    let io = Rc::new(RefCell::new(Io {
-        tx: ours.try_clone().ok(),
-        mods: ModifiersState::empty(),
-        down: BTreeSet::new(),
-        wheel: (0.0, 0.0),
-        focused: false,
-    }));
-    wire(&win, &key, &io);
-    win.show().map_err(|e| e.to_string())?;
+    if let Err(e) = win.show() {
+        return Err(abandon(child, e.to_string()));
+    }
     // Keep the toolbar out for a few seconds so people see it exists.
     {
         let k = key.clone();
@@ -227,10 +333,11 @@ pub fn start(path: &Path, cfg: &VmConfig, extra: &[String]) -> Result<String, St
     let gone = Arc::new(AtomicBool::new(false));
     {
         let (key, shared, gone) = (key.clone(), shared.clone(), gone.clone());
-        std::thread::Builder::new()
-            .name("vmm-reader".into())
-            .spawn(move || reader(ours, key, shared, gone))
-            .map_err(|e| e.to_string())?;
+        let r = std::thread::Builder::new().name("vmm-reader".into()).spawn(move || reader(ours, key, shared, gone));
+        if let Err(e) = r {
+            let _ = win.hide();
+            return Err(abandon(child, e.to_string()));
+        }
     }
     let c = Console {
         key: key.clone(),
@@ -270,7 +377,7 @@ fn wire(win: &ConsoleWindow, key: &str, io: &Rc<RefCell<Io>>) {
     }
     {
         let io = io.clone();
-        win.on_button(move |code, down| io.borrow_mut().send(ToVmm::Button { code: code as u16, down }));
+        win.on_button(move |code, down| io.borrow_mut().button(code as u16, down));
     }
     {
         let io = io.clone();
@@ -405,29 +512,18 @@ fn reader(mut s: UnixStream, key: String, shared: Arc<Mutex<Shared>>, gone: Arc<
         dec.push(&buf[..n]);
         loop {
             match dec.next_to_viewer() {
-                Ok(Some(ToViewer::Mode { width, height })) => {
-                    if width == 0 || SharedFb::mode_ok(width, height) {
-                        shared.lock().unwrap_or_else(|e| e.into_inner()).mode = (width, height);
-                        post_frame(&key, &shared, true);
-                    }
-                }
-                Ok(Some(ToViewer::Damage { .. })) => post_frame(&key, &shared, false),
-                Ok(Some(ToViewer::ClipboardSet(t))) => {
-                    let k = key.clone();
-                    let _ = slint::invoke_from_event_loop(move || {
-                        with(&k, |c| c.guest_clipboard(t));
-                    });
-                }
-                Ok(Some(ToViewer::Status(t))) => {
-                    let k = key.clone();
-                    let _ = slint::invoke_from_event_loop(move || {
-                        with(&k, |c| c.status(&t));
-                    });
-                }
                 Ok(Some(ToViewer::Closed)) => {
                     gone.store(true, Ordering::Release);
                     let _ = slint::invoke_from_event_loop(move || closed(&key));
                     return;
+                }
+                Ok(Some(m)) => {
+                    if shared.lock().unwrap_or_else(|e| e.into_inner()).push(m) {
+                        let k = key.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            with(&k, |c| c.inbox());
+                        });
+                    }
                 }
                 Ok(None) => break,
                 Err(e) => log::warn!("from vmm: {e}"),
@@ -436,19 +532,6 @@ fn reader(mut s: UnixStream, key: String, shared: Arc<Mutex<Shared>>, gone: Arc<
     }
     gone.store(true, Ordering::Release);
     let _ = slint::invoke_from_event_loop(move || closed(&key));
-}
-
-fn post_frame(key: &str, shared: &Mutex<Shared>, force: bool) {
-    let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
-    if sh.frame_pending && !force {
-        return;
-    }
-    sh.frame_pending = true;
-    drop(sh);
-    let k = key.to_string();
-    let _ = slint::invoke_from_event_loop(move || {
-        with(&k, |c| c.frame());
-    });
 }
 
 fn ready(key: &str, fd: OwnedFd) {
@@ -580,17 +663,35 @@ impl Console {
         }
     }
 
+    /// What the reader thread collected since the last wakeup.
+    fn inbox(&mut self) {
+        let (frame, status, clip) = {
+            let mut s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+            s.posted = false;
+            (std::mem::take(&mut s.frame), std::mem::take(&mut s.status), s.clipboard.take())
+        };
+        for t in status {
+            self.status(&t);
+        }
+        if let Some(t) = clip {
+            self.guest_clipboard(t);
+        }
+        if frame {
+            self.frame();
+        }
+    }
+
     fn status(&mut self, raw: &str) {
         let t = clean(raw);
+        if let Some(s) = status_state(&t) {
+            self.ever_ran |= s == VmState::Running;
+            self.set_state(s);
+        }
         match t.as_str() {
-            "running" => {
-                self.ever_ran = true;
-                self.set_state(VmState::Running);
-            }
-            "paused" => self.set_state(VmState::Paused),
+            "running" | "paused" => {}
             _ if t.starts_with("snapshot: ") => {
-                let name = Path::new(&t["snapshot: ".len()..]).file_name().map(|n| n.to_string_lossy().into_owned());
-                if let Some(n) = name.filter(|n| vroom_config::valid_name(n)) {
+                // From the raw line: the cleaned one may be cut short.
+                if let Some(n) = snapshot_name(raw) {
                     self.save_thumb(Some(&n));
                 }
                 self.toast("Snapshot saved");
@@ -598,7 +699,6 @@ impl Console {
             }
             _ if t.starts_with("guest agent connected") => self.toast("Guest tools connected: clipboard and resizing work"),
             _ if t.starts_with("host disk almost full") => {
-                self.set_state(VmState::Paused);
                 self.toast(&t);
                 msg::send(Msg::Toast { text: format!("{}: {t}", self.name), kind: 2, action: String::new() });
             }
@@ -649,11 +749,7 @@ impl Console {
     }
 
     fn frame(&mut self) {
-        let mode = {
-            let mut s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-            s.frame_pending = false;
-            s.mode
-        };
+        let mode = self.shared.lock().unwrap_or_else(|e| e.into_inner()).mode;
         let Some(fb) = &self.fb else { return };
         let (w, h) = mode;
         if w == 0 || h == 0 {
@@ -742,4 +838,95 @@ pub fn write_png(p: &Path, buf: &SharedPixelBuffer<Rgba8Pixel>, w: u32, h: u32) 
     wr.write_image_data(buf.as_bytes()).map_err(|e| e.to_string())?;
     wr.finish().map_err(|e| e.to_string())?;
     std::fs::rename(&tmp, p).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_flooding_vmm_stays_bounded() {
+        let mut s = Shared::default();
+        assert!(s.push(ToViewer::Damage { x: 0, y: 0, w: 1, h: 1 }), "first one wakes the UI");
+        for i in 0..100_000u32 {
+            assert!(!s.push(ToViewer::Mode { width: 640 + i % 8, height: 480 }));
+            assert!(!s.push(ToViewer::Status("x".repeat(100_000))));
+            assert!(!s.push(ToViewer::ClipboardSet(i.to_string())));
+        }
+        assert_eq!(s.status.len(), MAX_STATUS);
+        assert!(s.status.iter().all(|t| t.len() <= MAX_STATUS_LEN));
+        assert_eq!(s.clipboard.as_deref(), Some("99999"));
+        assert_eq!(s.mode, (640 + 99_999 % 8, 480));
+        // Bad modes are dropped.
+        assert!(!s.push(ToViewer::Mode { width: 1 << 20, height: 1 }));
+        assert_eq!(s.mode.1, 480);
+        // The UI took it all: the next message wakes it again.
+        s.posted = false;
+        s.status.clear();
+        assert!(s.push(ToViewer::Status("é".repeat(MAX_STATUS_LEN))));
+        assert!(s.status[0].len() <= MAX_STATUS_LEN);
+    }
+
+    #[test]
+    fn status_lines() {
+        assert_eq!(status_state("running"), Some(VmState::Running));
+        assert_eq!(status_state("paused"), Some(VmState::Paused));
+        // A suspend that failed leaves the VM paused, not "suspending" forever.
+        assert_eq!(status_state("suspend failed: disk full"), Some(VmState::Paused));
+        assert_eq!(status_state("snapshot: /x"), None);
+        assert_eq!(snapshot_name("snapshot: /a/b/vm.state/snapshots/snap-20261015-1200"), Some("snap-20261015-1200".into()));
+        let long = format!("snapshot: /{}/snap-1", "d".repeat(300));
+        assert_eq!(snapshot_name(&long), Some("snap-1".into()), "names come from the whole line");
+        for bad in ["snapshot: /x/..", "snapshot: /x/.hidden", "snapshot: /x/a b", "snapshot: ", "snapshot: /x/a\u{202e}gnp"] {
+            assert_eq!(snapshot_name(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn cleaning() {
+        assert_eq!(clean("a\x1b[31mb\nc\u{202e}d\u{200b}e"), "a[31mbcde");
+        assert_eq!(clean(&"x".repeat(1000)).len(), 160);
+    }
+
+    #[test]
+    fn log_tail_reads_only_the_end() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("vm.log");
+        let mut f = std::fs::File::create(&p).unwrap();
+        // Sparse: 8 GB that would take as much memory to read whole.
+        f.set_len(8 << 30).unwrap();
+        f.seek(SeekFrom::End(0)).unwrap();
+        f.write_all(b"\nvroom: one\n\nvroom: two\n").unwrap();
+        assert_eq!(tail(&p, 2), "vroom: one\nvroom: two");
+        assert_eq!(tail(&t.path().join("nope"), 2), "");
+    }
+
+    #[test]
+    fn focus_loss_releases_keys_and_buttons() {
+        let (a, mut b) = UnixStream::pair().unwrap();
+        let mut io = Io {
+            tx: Some(a),
+            mods: ModifiersState::empty(),
+            down: BTreeSet::new(),
+            buttons: BTreeSet::new(),
+            wheel: (0.0, 0.0),
+            focused: true,
+        };
+        io.key(30, true);
+        io.button(272, true);
+        io.button(273, true);
+        io.button(273, false);
+        io.release_all();
+        io.tx = None;
+        let mut buf = Vec::new();
+        b.set_nonblocking(true).unwrap();
+        let _ = b.read_to_end(&mut buf);
+        let mut d = Decoder::default();
+        d.push(&buf);
+        let mut got = Vec::new();
+        while let Some(m) = d.next_to_vmm().unwrap() {
+            got.push(m);
+        }
+        assert_eq!(&got[4..], &[ToVmm::Key { code: 30, down: false }, ToVmm::Button { code: 272, down: false }]);
+    }
 }

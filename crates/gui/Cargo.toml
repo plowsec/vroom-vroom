@@ -34,3 +34,5 @@ workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+# Runs the app window without a display (tests).
+i-slint-backend-testing = "=1.18.1"

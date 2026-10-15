@@ -157,10 +157,9 @@ export component Toggle inherits Rectangle {
     TouchArea {
         enabled: root.enabled;
         mouse-cursor: pointer;
-        clicked => {
-            root.checked = !root.checked;
-            root.toggled(root.checked);
-        }
+        // The owner sets `checked` from its state. Flipping it here would
+        // cut that binding for good (it would then show another VM's value).
+        clicked => { root.toggled(!root.checked); }
     }
 }
 
@@ -207,9 +206,9 @@ export component Segmented inherits Rectangle {
         TouchArea {
             enabled: root.enabled;
             mouse-cursor: pointer;
+            // The owner moves `selected` (see Toggle).
             clicked => {
                 if root.selected != i {
-                    root.selected = i;
                     root.changed(i);
                 }
             }
@@ -227,9 +226,13 @@ export component Slider inherits Rectangle {
     in property <float> sweet-max: maximum;
     in property <string> unit;
     callback released(float);
+    // The owner sets `value` (see Toggle); while dragging the knob follows
+    // the pointer instead.
+    property <float> drag;
+    out property <float> shown: ta.pressed ? drag : value;
     height: 26px;
     opacity: enabled ? 1 : 0.45;
-    property <float> ratio: (value - minimum) / max(0.0001, maximum - minimum);
+    property <float> ratio: (shown - minimum) / max(0.0001, maximum - minimum);
     property <length> knob-x: (root.width - 18px) * max(0, min(1, ratio));
     track := Rectangle {
         y: (root.height - 6px) / 2;
@@ -277,7 +280,7 @@ export component Slider inherits Rectangle {
         border-width: 1px;
         border-color: Theme.border;
         bubble := Text {
-            text: round(root.value) + " " + root.unit;
+            text: round(root.shown) + " " + root.unit;
             font-size: Theme.fs-xs;
             font-weight: 600;
             color: Theme.text;
@@ -291,7 +294,7 @@ export component Slider inherits Rectangle {
                 root.set-from(self.mouse-x);
             }
             if ev.kind == PointerEventKind.up {
-                root.released(root.value);
+                root.released(root.drag);
             }
         }
         moved => {
@@ -303,12 +306,16 @@ export component Slider inherits Rectangle {
     function set-from(x: length) {
         let r = max(0, min(1, (x - 9px) / max(1px, root.width - 18px)));
         let v = root.minimum + r * (root.maximum - root.minimum);
-        root.value = max(root.minimum, min(root.maximum, round(v / root.step) * root.step));
+        root.drag = max(root.minimum, min(root.maximum, round(v / root.step) * root.step));
     }
 }
 
 // Text box. `committed` fires on Enter and when focus leaves.
 export component Field inherits Rectangle {
+    // The owner's value. Typing doesn't write it (that goes out through
+    // `edited`/`committed`), so a binding to it stays live: when it changes
+    // (another VM selected, the file edited) the box shows it, even over a
+    // half-typed edit.
     in-out property <string> text;
     in property <string> placeholder;
     in property <bool> mono: false;
@@ -328,6 +335,7 @@ export component Field inherits Rectangle {
     border-color: input.has-focus ? Theme.accent : Theme.border;
     animate border-color { duration: 150ms; }
     opacity: enabled ? 1 : 0.55;
+    changed text => { input.text = root.text; }
     public function focus-input() {
         input.focus();
     }
@@ -350,7 +358,7 @@ export component Field inherits Rectangle {
             input := TextInput {
                 width: 100%;
                 height: 100%;
-                text <=> root.text;
+                text: root.text;
                 vertical-alignment: center;
                 horizontal-alignment: root.align;
                 font-size: Theme.fs-md;
@@ -369,7 +377,7 @@ export component Field inherits Rectangle {
                     }
                 }
             }
-            if root.text == "": Text {
+            if input.text == "": Text {
                 width: 100%;
                 height: 100%;
                 text: root.placeholder;
@@ -467,10 +475,8 @@ export component Select inherits Rectangle {
                     }
                     ita := TouchArea {
                         mouse-cursor: pointer;
-                        clicked => {
-                            root.current = i;
-                            root.selected(i);
-                        }
+                        // The owner moves `current` (see Toggle).
+                        clicked => { root.selected(i); }
                     }
                 }
             }
