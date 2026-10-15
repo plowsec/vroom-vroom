@@ -150,6 +150,9 @@ tested yet).
 `virtio_snd` module, in stock Ubuntu kernels). 44.1/48 kHz, 16-bit,
 mono/stereo. There is no input: the guest can't reach the microphone.
 Windows has no virtio-snd driver, so Windows guests stay silent.
+On Linux hosts the helper plays through ALSA (`libasound`, loaded at run
+time): use a normal (glibc) build there; a static musl build can't load it
+and stays silent.
 
 ## Snapshots, suspend
 
