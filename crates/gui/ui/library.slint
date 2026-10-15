@@ -596,36 +596,41 @@ export component VmPage inherits Rectangle {
                     vm: root.vm;
                     height: min(self.width * 0.625, 470px);
                 }
-                HorizontalLayout {
-                    spacing: 8px;
-                    alignment: start;
-                    Chip {
-                        icon: Icons.cpu;
-                        text: root.s.cpus + (root.s.cpus == 1 ? " CPU" : " CPUs");
-                        tint: Theme.text-2;
-                    }
-                    Chip {
-                        icon: Icons.memory;
-                        text: root.s.memory-gib + " GB";
-                        tint: Theme.text-2;
-                    }
-                    Chip {
-                        icon: Icons.globe;
-                        text: root.s.nets.length == 0 ? "Offline" : root.s.nets.length == 1 ? root.s.nets[0].summary : root.s.nets.length + " adapters";
-                        tint: Theme.text-2;
-                    }
-                    if root.s.gpu == 2: Chip {
-                        icon: Icons.sparkles;
-                        text: "3D";
-                        tint: Theme.text-2;
-                    }
-                    if root.s.tpm: Chip {
-                        icon: Icons.lock;
-                        text: "TPM";
-                    }
-                    if root.s.sandbox: Chip {
-                        icon: Icons.shield;
-                        text: "Sandboxed";
+                // Scrolls rather than widening the page when it doesn't fit.
+                Flickable {
+                    height: chiprow.preferred-height;
+                    content-width: chiprow.preferred-width;
+                    chiprow := HorizontalLayout {
+                        spacing: 8px;
+                        alignment: start;
+                        Chip {
+                            icon: Icons.cpu;
+                            text: root.s.cpus + (root.s.cpus == 1 ? " CPU" : " CPUs");
+                            tint: Theme.text-2;
+                        }
+                        Chip {
+                            icon: Icons.memory;
+                            text: root.s.memory-gib + " GB";
+                            tint: Theme.text-2;
+                        }
+                        Chip {
+                            icon: Icons.globe;
+                            text: root.s.nets.length == 0 ? "Offline" : root.s.nets.length == 1 ? root.s.nets[0].summary : root.s.nets.length + " adapters";
+                            tint: Theme.text-2;
+                        }
+                        if root.s.gpu == 2: Chip {
+                            icon: Icons.sparkles;
+                            text: "3D";
+                            tint: Theme.text-2;
+                        }
+                        if root.s.tpm: Chip {
+                            icon: Icons.lock;
+                            text: "TPM";
+                        }
+                        if root.s.sandbox: Chip {
+                            icon: Icons.shield;
+                            text: "Sandboxed";
+                        }
                     }
                 }
                 // Snapshots.

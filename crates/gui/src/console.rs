@@ -239,6 +239,15 @@ pub fn command(key: &str, cmd: &str) {
     with(key, |c| c.command(cmd));
 }
 
+/// `cmd` to every VM window (for `VROOM_SHOT`).
+pub fn command_any(cmd: &str) {
+    CONSOLES.with(|c| {
+        for con in c.borrow_mut().values_mut() {
+            con.command(cmd);
+        }
+    });
+}
+
 /// A picture of some VM window (for `VROOM_SHOT`).
 pub fn snapshot_any() -> Option<Result<SharedPixelBuffer<Rgba8Pixel>, slint::PlatformError>> {
     CONSOLES.with(|c| c.borrow().values().next().map(|c| c.win.window().take_snapshot()))
@@ -292,6 +301,21 @@ fn status_state(t: &str) -> Option<VmState> {
 
 /// The snapshot a "snapshot: <dir>" status reports, if its name is one we
 /// can use in a file name.
+/// Why a suspend failed, for people: the VMM's line names its layers
+/// ("snapshot: encode: device: ...").
+fn suspend_why(raw: &str) -> String {
+    if raw.contains("using 3D") {
+        let gl = raw.contains("opengl = false");
+        return format!(
+            "It's using 3D, and that state lives on the Mac's GPU, where vroom can't save it.{}",
+            if gl { " With OpenGL off (Display settings), only Vulkan apps get in the way." } else { "" }
+        );
+    }
+    let why = raw.trim().trim_start_matches("suspend failed").trim_start_matches([':', ' ']);
+    let why = why.rsplit(": ").next().unwrap_or(why);
+    clean(why)
+}
+
 fn snapshot_name(raw: &str) -> Option<String> {
     let dir = raw.strip_prefix("snapshot: ")?;
     let n = Path::new(dir.trim_end()).file_name()?.to_str()?;
@@ -754,8 +778,7 @@ impl Console {
             _ if t.starts_with("suspend failed") => {
                 // Usually 3D in use. Say why and offer the ways out,
                 // rather than leaving a paused window that won't close.
-                let why = t.trim_start_matches("suspend failed").trim_start_matches([':', ' ']);
-                self.win.set_suspend_error(why.into());
+                self.win.set_suspend_error(suspend_why(raw).into());
             }
             _ if t.starts_with("host disk almost full") => {
                 self.toast(&t);
@@ -951,6 +974,16 @@ pub fn write_png(p: &Path, buf: &SharedPixelBuffer<Rgba8Pixel>, w: u32, h: u32) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suspend_reasons() {
+        let gl = "suspend failed: snapshot: encode: device: snapshots of a VM using 3D are not supported (GPU state lives on the host GPU; [display] opengl = false avoids it for desktops)";
+        assert!(suspend_why(gl).starts_with("It's using 3D") && suspend_why(gl).contains("OpenGL off"));
+        let vk = "suspend failed: snapshot: encode: device: snapshots of a VM using 3D are not supported (GPU state lives on the host GPU)";
+        assert!(!suspend_why(vk).contains("OpenGL"));
+        assert_eq!(suspend_why("suspend failed: snapshot: write: No space left on device"), "No space left on device");
+        assert_eq!(suspend_why("suspend failed: disk busy"), "disk busy");
+    }
 
     #[test]
     fn a_flooding_vmm_stays_bounded() {
