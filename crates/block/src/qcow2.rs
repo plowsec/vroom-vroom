@@ -878,6 +878,57 @@ pub fn fold_backing(child: &Path, policy: &OpenPolicy) -> Result<PathBuf> {
     Ok(parent)
 }
 
+/// Rewrite `path` into a fresh file holding only its own clusters (data
+/// and zero markers; the backing file stays as it is), then swap it in.
+/// Undoes the apparent-size growth discard leaves behind. Takes the
+/// image's exclusive lock: refuses while a VM uses it. Returns the file
+/// length before and after.
+pub fn compact(path: &Path, policy: &OpenPolicy) -> Result<(u64, u64)> {
+    let src = Qcow2Image::open_with(path, false, policy, 0)?;
+    let before = src.file.metadata()?.len();
+    let up = match (&src.hdr.backing_file, &src.backing_path) {
+        (Some(_), Some(bp)) => {
+            let fmt = match src.hdr.backing_format.as_deref() {
+                Some("raw") => Format::Raw,
+                Some("qcow2") => Format::Qcow2,
+                _ => crate::detect(bp)?,
+            };
+            Some((bp.clone(), fmt))
+        }
+        _ => None,
+    };
+    let tmp = path.with_extension("compacting");
+    let _ = std::fs::remove_file(&tmp);
+    Qcow2Image::create(&tmp, src.hdr.size, up.as_ref().map(|(p, f)| (p.as_path(), *f)))?;
+    let result = (|| -> Result<()> {
+        let dst = Qcow2Image::open_inner(&tmp, false, policy, 0, src.backing.clone())?.with_sync(SyncMode::Fsync);
+        let cs = src.cluster_size;
+        let mut st = src.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut buf = vec![0u8; cs as usize];
+        let mut g = 0;
+        while g < src.hdr.size {
+            let e = src.l2_entry(&mut st, g)?;
+            let n = cs.min(src.hdr.size - g);
+            if e == L2_ZERO || (e & L2_ZERO != 0 && e & L2_COMPRESSED == 0) {
+                dst.write_zeroes(g, n)?;
+            } else if e != 0 {
+                // Our own data (plain or compressed), not the backing's.
+                src.read_chunk(&mut st, &mut buf[..n as usize], g)?;
+                dst.write_at(&buf[..n as usize], g)?;
+            }
+            g += cs;
+        }
+        dst.flush()
+    })();
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    std::fs::rename(&tmp, path)?;
+    let after = std::fs::metadata(path)?.len();
+    Ok((before, after))
+}
+
 fn ruzstd_decoder(b: &[u8]) -> Result<impl Read + '_> {
     ruzstd::decoding::StreamingDecoder::new(b).map_err(|e| bad(format!("zstd: {e}")))
 }
@@ -1185,6 +1236,41 @@ mod tests {
         drop(q);
         if let Ok(out) = std::process::Command::new("qemu-img").args(["check"]).arg(&p).output() {
             assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        }
+    }
+
+    #[test]
+    fn compact_keeps_data_and_shrinks() {
+        const C: u64 = 64 << 10;
+        let td = tempfile::tempdir().unwrap();
+        let (base, p) = (td.path().join("b.raw"), td.path().join("c.qcow2"));
+        std::fs::write(&base, vec![7u8; 64 * C as usize]).unwrap();
+        Qcow2Image::create(&p, 64 * C, Some((&base, Format::Raw))).unwrap();
+        {
+            let q = Qcow2Image::open(&p, false).unwrap();
+            for round in 0..8u8 {
+                q.write_at(&vec![round + 1; 8 * C as usize], 8 * C).unwrap();
+                q.discard(8 * C, 8 * C).unwrap();
+            }
+            q.write_at(&vec![9u8; 4 * C as usize], 20 * C).unwrap();
+            q.discard(30 * C, 2 * C).unwrap(); // zeros over the base's 7s
+        }
+        let read_all = |p: &Path| {
+            let q = Qcow2Image::open(p, true).unwrap();
+            let mut v = vec![0u8; 64 * C as usize];
+            q.read_at(&mut v, 0).unwrap();
+            v
+        };
+        let want = read_all(&p);
+        // Someone using it: refused.
+        let busy = Qcow2Image::open(&p, true).unwrap();
+        assert!(compact(&p, &OpenPolicy::default()).is_err());
+        drop(busy);
+        let (before, after) = compact(&p, &OpenPolicy::default()).unwrap();
+        assert!(after <= before, "{after} > {before}");
+        assert_eq!(read_all(&p), want);
+        if let Ok(out) = std::process::Command::new("qemu-img").args(["check"]).arg(&p).output() {
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
         }
     }
 

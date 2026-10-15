@@ -18,6 +18,9 @@ pub enum DiskCmd {
     },
     /// Show image info.
     Info { path: PathBuf },
+    /// Rewrite a qcow2 image without the space freed inside it (the VM
+    /// must be off).
+    Compact { path: PathBuf },
 }
 
 pub(crate) fn parse_size(s: &str) -> Result<u64, String> {
@@ -54,6 +57,12 @@ pub fn run(cmd: DiskCmd) -> Result<(), String> {
             };
             Qcow2Image::create(&path, size, b.map(|(p, f, _)| (p, f))).map_err(|e| e.to_string())?;
             println!("created {} ({} bytes)", path.display(), size);
+            Ok(())
+        }
+        DiskCmd::Compact { path } => {
+            let (before, after) =
+                bulwark_block::qcow2::compact(&path, &bulwark_block::qcow2::OpenPolicy::default()).map_err(|e| format!("{}: {e}", path.display()))?;
+            println!("{}: {} -> {} bytes", path.display(), before, after);
             Ok(())
         }
         DiskCmd::Info { path } => {

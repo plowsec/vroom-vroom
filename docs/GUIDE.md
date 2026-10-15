@@ -172,6 +172,14 @@ Disk layers grow in the state dir. When less than 2 GiB is left on that
 file system, the VM is paused with a message; free space and resume
 (`Ctrl-A p`, or the GUI shortcut).
 
+## Disk size
+
+Guests that TRIM (Ubuntu's cloud images mount with `discard`; Windows
+trims on its own) give space back: freed clusters become holes in the
+image and are reused. A qcow2 file can still keep a large apparent size
+(its real usage, `du`, is what counts); `bulwark disk compact vm.qcow2`
+(VM off) rewrites it to its real size, keeping its backing file.
+
 ## Disk sync
 
 `sync = "fsync"` (default) survives a host crash. `"full"` also survives a
