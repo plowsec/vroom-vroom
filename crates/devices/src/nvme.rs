@@ -1,11 +1,17 @@
 //! NVMe 1.4 controller (PCI). Windows boots from it with its inbox driver.
 //!
-//! Commands run synchronously on the vCPU that rings the doorbell, so a
-//! paused VM never has I/O in flight (snapshots are trivially consistent).
-//! Everything the guest hands us (queue addresses, PRPs, LBAs) is checked.
+//! Admin commands run on the vCPU that rings the doorbell. So does a lone
+//! I/O command (no thread hop: the lowest latency). When the guest keeps
+//! several in flight they go to a few I/O threads and run in parallel; a
+//! completion thread posts their results. Pausing, resetting and deleting
+//! queues first wait for those, so a paused VM never has I/O in flight
+//! (snapshots stay consistent). Everything the guest hands us (queue
+//! addresses, PRPs, LBAs) is checked.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::thread::JoinHandle;
 
 use vroom_block::DiskImage;
 use vroom_memory::{GuestAddress, GuestMemory};
@@ -41,6 +47,13 @@ const SC_INVALID_QSIZE: u16 = 0x102;
 const SC_INVALID_CQ: u16 = 0x100;
 const SC_INVALID_VECTOR: u16 = 0x108;
 
+/// I/O threads per controller, started on first use.
+const IO_THREADS: usize = 4;
+/// Commands on the I/O threads at most; past that they run inline.
+const MAX_INFLIGHT: usize = 256;
+/// Reads and writes this big always go to the I/O threads.
+const ASYNC_BYTES: u64 = 64 << 10;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Regs {
     cc: u32,
@@ -69,11 +82,16 @@ struct Cq {
     phase: bool,
     ien: bool,
     iv: u16,
+    /// Slots promised to commands still on the I/O threads (always 0
+    /// when paused, so never in a snapshot).
+    #[serde(skip)]
+    reserved: u16,
 }
 
 impl Cq {
     fn full(&self) -> bool {
-        (self.tail + 1) % self.size == self.head
+        let used = (self.tail + self.size - self.head) % self.size;
+        used + self.reserved + 1 >= self.size
     }
     fn pending(&self) -> bool {
         self.head != self.tail
@@ -105,7 +123,7 @@ pub struct Nvme {
     msix: Msix,
     intx: Arc<Intx>,
     mem: GuestMemory,
-    ns: Vec<Namespace>,
+    ns: Arc<[Namespace]>,
     serial: String,
     model: String,
     firmware: String,
@@ -114,6 +132,56 @@ pub struct Nvme {
     cqs: BTreeMap<u16, Cq>,
     /// Outstanding Asynchronous Event Request command ids.
     aer: Vec<u16>,
+    /// Ourselves, for the completion thread (set by `into_shared`;
+    /// without it every command runs inline).
+    me: Weak<Mutex<Nvme>>,
+    io: Arc<IoShared>,
+    pool: Option<Pool>,
+}
+
+/// A command handed to the I/O threads.
+#[derive(Clone, Copy)]
+struct Job {
+    cmd: Cmd,
+    sqid: u16,
+    cqid: u16,
+    sq_head: u16,
+}
+
+/// Results waiting to be posted, and how many are still running.
+#[derive(Default)]
+struct IoDone {
+    list: Vec<(Job, Outcome)>,
+    running: usize,
+}
+
+#[derive(Default)]
+struct IoShared {
+    done: Mutex<IoDone>,
+    /// Signalled when `running` drops to 0.
+    idle: Condvar,
+}
+
+/// The I/O threads. The completion thread isn't here: it holds only a
+/// weak reference to the controller, ends when the I/O threads do, and is
+/// never joined (it may be the one dropping the controller).
+struct Pool {
+    jobs: Option<Sender<Job>>,
+    threads: Vec<JoinHandle<()>>,
+}
+
+impl Drop for Pool {
+    /// Commands already handed out still finish (they write guest RAM).
+    fn drop(&mut self) {
+        self.jobs = None;
+        let me = std::thread::current().id();
+        for t in self.threads.drain(..) {
+            // An I/O thread may hold the last reference to the controller.
+            if t.thread().id() != me {
+                let _ = t.join();
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for Nvme {
@@ -122,6 +190,7 @@ impl std::fmt::Debug for Nvme {
     }
 }
 
+#[derive(Clone, Copy)]
 struct Cmd {
     opc: u8,
     cid: u16,
@@ -174,7 +243,7 @@ impl Nvme {
             msix,
             intx,
             mem,
-            ns,
+            ns: ns.into(),
             serial: format!("VRM{slot:04}"),
             model: "vroom NVMe".into(),
             firmware: "1.0".into(),
@@ -182,7 +251,19 @@ impl Nvme {
             sqs: BTreeMap::new(),
             cqs: BTreeMap::new(),
             aer: Vec::new(),
+            me: Weak::new(),
+            io: Arc::default(),
+            pool: None,
         }
+    }
+
+    /// Put it behind its lock, ready for I/O threads.
+    pub fn into_shared(self) -> Arc<Mutex<Nvme>> {
+        Arc::new_cyclic(|me| {
+            let mut n = self;
+            n.me = me.clone();
+            Mutex::new(n)
+        })
     }
 
     /// Names the guest sees (from the VM's `[identity]`).
@@ -204,6 +285,7 @@ impl Nvme {
     }
 
     fn reset(&mut self) {
+        self.drain_io();
         self.sqs.clear();
         self.cqs.clear();
         self.aer.clear();
@@ -224,7 +306,7 @@ impl Nvme {
             self.regs.csts = 2; // CFS: fatal
             return;
         }
-        self.cqs.insert(0, Cq { base: self.regs.acq, size: acqs, head: 0, tail: 0, phase: true, ien: true, iv: 0 });
+        self.cqs.insert(0, Cq { base: self.regs.acq, size: acqs, head: 0, tail: 0, phase: true, ien: true, iv: 0, reserved: 0 });
         self.sqs.insert(0, Sq { base: self.regs.asq, size: asqs, head: 0, tail: 0, cqid: 0 });
         self.regs.csts = 1;
     }
@@ -239,7 +321,8 @@ impl Nvme {
         }
         if (v >> 14) & 3 != 0 {
             // Shutdown notification: make data durable.
-            for n in &self.ns {
+            self.drain_io();
+            for n in self.ns.iter() {
                 let _ = n.disk.flush();
             }
             self.regs.csts = (self.regs.csts & !0xc) | (2 << 2);
@@ -294,11 +377,14 @@ impl Nvme {
             let sq = self.sqs.get_mut(&qid).expect("checked above");
             sq.head = (sq.head + 1) % sq.size;
             let head = sq.head;
+            let more = sq.head != sq.tail;
             let cmd = Cmd::parse(&raw);
             let out = if !read_ok {
                 Some((SC_DATA_XFER_ERROR, 0))
             } else if qid == 0 {
                 self.admin(&cmd)
+            } else if self.dispatch(Job { cmd, sqid: qid, cqid, sq_head: head }, more) {
+                None
             } else {
                 Some(self.io(&cmd))
             };
@@ -313,6 +399,101 @@ impl Nvme {
             posted &= posted - 1;
             self.interrupt(cqid);
         }
+    }
+
+    /// Hand an I/O command to the I/O threads if that pays: other
+    /// commands are queued behind it or running, it's big (the vCPU would
+    /// wait for it), or it's a flush (milliseconds). A small one alone
+    /// runs here: no thread wakeups, about three times the IOPS at queue
+    /// depth 1. False: run it here.
+    fn dispatch(&mut self, job: Job, more: bool) -> bool {
+        let running = self.io.done.lock().unwrap_or_else(|e| e.into_inner()).running;
+        let c = &job.cmd;
+        let bs = c.nsid.checked_sub(1).and_then(|i| self.ns.get(i as usize)).map_or(512, |n| n.block_size);
+        let big = matches!(c.opc, 0x01 | 0x02) && ((c.cdw[2] & 0xffff) as u64 + 1) * bs >= ASYNC_BYTES;
+        if !(more || running > 0 || big || c.opc == 0x00) || running >= MAX_INFLIGHT || self.me.strong_count() == 0 {
+            return false;
+        }
+        if self.pool.is_none() {
+            match self.start_pool() {
+                Ok(p) => self.pool = Some(p),
+                Err(e) => {
+                    log::warn!("{}: no I/O threads ({e}), running commands inline", self.id);
+                    return false;
+                }
+            }
+        }
+        let Some(tx) = self.pool.as_ref().and_then(|p| p.jobs.clone()) else { return false };
+        let Some(cq) = self.cqs.get_mut(&job.cqid) else { return false };
+        cq.reserved += 1;
+        self.io.done.lock().unwrap_or_else(|e| e.into_inner()).running += 1;
+        if tx.send(job).is_err() {
+            // Can't happen while we hold the pool; undo and run inline.
+            self.io.done.lock().unwrap_or_else(|e| e.into_inner()).running -= 1;
+            if let Some(cq) = self.cqs.get_mut(&job.cqid) {
+                cq.reserved -= 1;
+            }
+            return false;
+        }
+        true
+    }
+
+    fn start_pool(&self) -> std::io::Result<Pool> {
+        let (tx, rx) = mpsc::channel::<Job>();
+        let (posted, posted_rx) = mpsc::channel::<()>();
+        let rx = Arc::new(Mutex::new(rx));
+        let mut threads = Vec::new();
+        for i in 0..IO_THREADS {
+            let t = IoThread {
+                rx: rx.clone(),
+                io: self.io.clone(),
+                mem: self.mem.clone(),
+                ns: self.ns.clone(),
+                me: self.me.clone(),
+                posted: posted.clone(),
+            };
+            threads.push(std::thread::Builder::new().name(format!("nvme-io{i}")).spawn(move || t.run())?);
+        }
+        let me = self.me.clone();
+        std::thread::Builder::new().name("nvme-done".into()).spawn(move || {
+            while posted_rx.recv().is_ok() {
+                while posted_rx.try_recv().is_ok() {}
+                let Some(n) = me.upgrade() else { return };
+                n.lock().unwrap_or_else(|e| e.into_inner()).post_done();
+            }
+        })?;
+        drop(posted);
+        Ok(Pool { jobs: Some(tx), threads })
+    }
+
+    /// Post the results the I/O threads finished.
+    fn post_done(&mut self) {
+        let list = std::mem::take(&mut self.io.done.lock().unwrap_or_else(|e| e.into_inner()).list);
+        let mut posted = 0u64;
+        for (j, (sc, dw0)) in list {
+            let Some(cq) = self.cqs.get_mut(&j.cqid) else { continue };
+            cq.reserved = cq.reserved.saturating_sub(1);
+            self.complete(j.cqid, j.sqid, j.sq_head, j.cmd.cid, sc, dw0);
+            posted |= 1 << (j.cqid % 64);
+        }
+        while posted != 0 {
+            let cqid = posted.trailing_zeros() as u16;
+            posted &= posted - 1;
+            self.interrupt(cqid);
+        }
+    }
+
+    /// Wait for the I/O threads and post what they did.
+    fn drain_io(&mut self) {
+        if self.pool.is_none() {
+            return;
+        }
+        let mut d = self.io.done.lock().unwrap_or_else(|e| e.into_inner());
+        while d.running > 0 {
+            d = self.io.idle.wait(d).unwrap_or_else(|e| e.into_inner());
+        }
+        drop(d);
+        self.post_done();
     }
 
     /// Signal that completion queue `cqid` has new entries.
@@ -355,94 +536,25 @@ impl Nvme {
         self.intx.set(pending);
     }
 
-    /// Guest buffer described by PRP1/PRP2 for `len` bytes.
-    fn prps(&self, prp1: u64, prp2: u64, len: u64) -> Result<Vec<(u64, u64)>, u16> {
-        if len == 0 || len > MAX_XFER {
-            return Err(SC_INVALID_FIELD);
-        }
-        let mut segs = Vec::new();
-        let first = (PAGE - prp1 % PAGE).min(len);
-        segs.push((prp1, first));
-        let mut left = len - first;
-        if left == 0 {
-            return Ok(segs);
-        }
-        if left <= PAGE {
-            if !prp2.is_multiple_of(PAGE) {
-                return Err(SC_PRP_OFFSET);
-            }
-            segs.push((prp2, left));
-            return Ok(segs);
-        }
-        // PRP list (may chain via its last entry).
-        let mut list = prp2;
-        if !list.is_multiple_of(8) {
-            return Err(SC_PRP_OFFSET);
-        }
-        let per_page = (PAGE - list % PAGE) / 8;
-        let mut i = 0;
-        let mut entries_left_on_page = per_page;
-        while left > 0 {
-            if segs.len() > (MAX_XFER / PAGE) as usize + 2 {
-                return Err(SC_INVALID_FIELD);
-            }
-            let e: u64 = self.mem.read_obj(GuestAddress(list + i * 8)).map_err(|_| SC_DATA_XFER_ERROR)?;
-            let e = u64::from_le(e);
-            if entries_left_on_page == 1 && left > PAGE {
-                // Last slot points at the next list page.
-                if !e.is_multiple_of(PAGE) {
-                    return Err(SC_PRP_OFFSET);
-                }
-                list = e;
-                i = 0;
-                entries_left_on_page = PAGE / 8;
-                continue;
-            }
-            if !e.is_multiple_of(PAGE) {
-                return Err(SC_PRP_OFFSET);
-            }
-            let n = left.min(PAGE);
-            segs.push((e, n));
-            left -= n;
-            i += 1;
-            entries_left_on_page -= 1;
-        }
-        Ok(segs)
-    }
-
-    /// The PRPs as guest buffers for the disk (adjacent pages merged).
-    /// `prps` caps `len` at MAX_XFER.
-    fn guest_segs(&self, prp1: u64, prp2: u64, len: u64) -> Result<Vec<(GuestAddress, usize)>, u16> {
-        let mut out: Vec<(GuestAddress, usize)> = Vec::new();
-        for (a, n) in self.prps(prp1, prp2, len)? {
-            match out.last_mut() {
-                Some((last, l)) if last.0 + *l as u64 == a => *l += n as usize,
-                _ => out.push((GuestAddress(a), n as usize)),
-            }
-        }
-        Ok(out)
-    }
-
     fn to_guest(&self, prp1: u64, prp2: u64, data: &[u8]) -> Result<(), u16> {
         let mut off = 0usize;
-        for (a, n) in self.prps(prp1, prp2, data.len() as u64)? {
+        for (a, n) in prps(&self.mem, prp1, prp2, data.len() as u64)? {
             self.mem.write(GuestAddress(a), &data[off..off + n as usize]).map_err(|_| SC_DATA_XFER_ERROR)?;
             off += n as usize;
         }
         Ok(())
     }
 
-    fn read_prps(&self, prp1: u64, prp2: u64, len: u64) -> Result<Vec<u8>, u16> {
-        let mut v = vec![0u8; len as usize];
-        let mut off = 0usize;
-        for (a, n) in self.prps(prp1, prp2, len)? {
-            self.mem.read(GuestAddress(a), &mut v[off..off + n as usize]).map_err(|_| SC_DATA_XFER_ERROR)?;
-            off += n as usize;
+    fn admin(&mut self, c: &Cmd) -> Option<Outcome> {
+        match c.opc {
+            // Queue deletion: let commands still running finish first.
+            0x00 | 0x04 => self.drain_io(),
+            _ => {}
         }
-        Ok(v)
+        self.admin_cmd(c)
     }
 
-    fn admin(&mut self, c: &Cmd) -> Option<Outcome> {
+    fn admin_cmd(&mut self, c: &Cmd) -> Option<Outcome> {
         match c.opc {
             0x00 => self.delete_sq(c.cdw[0] as u16),
             0x04 => self.delete_cq(c.cdw[0] as u16),
@@ -480,7 +592,7 @@ impl Nvme {
         if !c.prp1.is_multiple_of(PAGE) || !self.mem.check_range(GuestAddress(c.prp1), size as u64 * 16) {
             return err(SC_INVALID_FIELD);
         }
-        self.cqs.insert(qid, Cq { base: c.prp1, size: size as u16, head: 0, tail: 0, phase: true, ien, iv });
+        self.cqs.insert(qid, Cq { base: c.prp1, size: size as u16, head: 0, tail: 0, phase: true, ien, iv, reserved: 0 });
         ok(0)
     }
 
@@ -635,58 +747,7 @@ impl Nvme {
     }
 
     fn io(&mut self, c: &Cmd) -> Outcome {
-        let Some(n) = c.nsid.checked_sub(1).and_then(|i| self.ns.get(i as usize)) else {
-            return (SC_INVALID_NS, 0);
-        };
-        let disk = n.disk.clone();
-        let bs = n.block_size;
-        let ro = n.read_only || disk.read_only();
-        let slba = c.cdw[0] as u64 | (c.cdw[1] as u64) << 32;
-        let nlb = (c.cdw[2] & 0xffff) as u64 + 1;
-        let range = || -> Result<(u64, u64), u16> {
-            let off = slba.checked_mul(bs).ok_or(SC_LBA_RANGE)?;
-            let len = nlb * bs;
-            vroom_block::check_range(disk.size(), off, len).map_err(|_| SC_LBA_RANGE)?;
-            Ok((off, len))
-        };
-        let r: Result<(), u16> = match c.opc {
-            0x00 => disk.flush().map_err(|_| SC_DATA_XFER_ERROR),
-            0x02 => range().and_then(|(off, len)| {
-                let segs = self.guest_segs(c.prp1, c.prp2, len)?;
-                disk.read_to_guest(&self.mem, off, &segs).map_err(|_| SC_DATA_XFER_ERROR)
-            }),
-            0x01 if ro => Err(SC_WRITE_PROTECTED),
-            0x01 => range().and_then(|(off, len)| {
-                let segs = self.guest_segs(c.prp1, c.prp2, len)?;
-                disk.write_from_guest(&self.mem, off, &segs).map_err(|_| SC_DATA_XFER_ERROR)
-            }),
-            0x08 if ro => Err(SC_WRITE_PROTECTED),
-            0x08 => range().and_then(|(off, len)| disk.write_zeroes(off, len).map_err(|_| SC_DATA_XFER_ERROR)),
-            0x09 if ro => Err(SC_WRITE_PROTECTED),
-            0x09 => self.dsm(c, &disk, bs),
-            _ => Err(SC_INVALID_OPCODE),
-        };
-        match r {
-            Ok(()) => (SC_SUCCESS, 0),
-            Err(sc) => (sc, 0),
-        }
-    }
-
-    /// Dataset management: only "deallocate" does anything.
-    fn dsm(&self, c: &Cmd, disk: &Arc<dyn DiskImage>, bs: u64) -> Result<(), u16> {
-        if c.cdw[1] & 4 == 0 {
-            return Ok(());
-        }
-        let nr = (c.cdw[0] & 0xff) as u64 + 1;
-        let ranges = self.read_prps(c.prp1, c.prp2, nr * 16)?;
-        for r in ranges.as_chunks::<16>().0 {
-            let len = u32::from_le_bytes([r[4], r[5], r[6], r[7]]) as u64 * bs;
-            let slba = u64::from_le_bytes(r[8..16].try_into().unwrap_or([0; 8]));
-            let off = slba.checked_mul(bs).ok_or(SC_LBA_RANGE)?;
-            vroom_block::check_range(disk.size(), off, len).map_err(|_| SC_LBA_RANGE)?;
-            let _ = disk.discard(off, len);
-        }
-        Ok(())
+        exec_io(&self.mem, &self.ns, c)
     }
 
     fn reg_read(&self, off: u64) -> u64 {
@@ -722,6 +783,176 @@ impl Nvme {
             _ => {}
         }
     }
+}
+
+/// Guest buffer described by PRP1/PRP2 for `len` bytes.
+fn prps(mem: &GuestMemory, prp1: u64, prp2: u64, len: u64) -> Result<Vec<(u64, u64)>, u16> {
+    if len == 0 || len > MAX_XFER {
+        return Err(SC_INVALID_FIELD);
+    }
+    let mut segs = Vec::new();
+    let first = (PAGE - prp1 % PAGE).min(len);
+    segs.push((prp1, first));
+    let mut left = len - first;
+    if left == 0 {
+        return Ok(segs);
+    }
+    if left <= PAGE {
+        if !prp2.is_multiple_of(PAGE) {
+            return Err(SC_PRP_OFFSET);
+        }
+        segs.push((prp2, left));
+        return Ok(segs);
+    }
+    // PRP list (may chain via its last entry).
+    let mut list = prp2;
+    if !list.is_multiple_of(8) {
+        return Err(SC_PRP_OFFSET);
+    }
+    let per_page = (PAGE - list % PAGE) / 8;
+    let mut i = 0;
+    let mut entries_left_on_page = per_page;
+    while left > 0 {
+        if segs.len() > (MAX_XFER / PAGE) as usize + 2 {
+            return Err(SC_INVALID_FIELD);
+        }
+        let e: u64 = mem.read_obj(GuestAddress(list + i * 8)).map_err(|_| SC_DATA_XFER_ERROR)?;
+        let e = u64::from_le(e);
+        if entries_left_on_page == 1 && left > PAGE {
+            // Last slot points at the next list page.
+            if !e.is_multiple_of(PAGE) {
+                return Err(SC_PRP_OFFSET);
+            }
+            list = e;
+            i = 0;
+            entries_left_on_page = PAGE / 8;
+            continue;
+        }
+        if !e.is_multiple_of(PAGE) {
+            return Err(SC_PRP_OFFSET);
+        }
+        let n = left.min(PAGE);
+        segs.push((e, n));
+        left -= n;
+        i += 1;
+        entries_left_on_page -= 1;
+    }
+    Ok(segs)
+}
+
+/// The PRPs as guest buffers for the disk (adjacent pages merged).
+/// `prps` caps `len` at MAX_XFER.
+fn guest_segs(mem: &GuestMemory, prp1: u64, prp2: u64, len: u64) -> Result<Vec<(GuestAddress, usize)>, u16> {
+    let mut out: Vec<(GuestAddress, usize)> = Vec::new();
+    for (a, n) in prps(mem, prp1, prp2, len)? {
+        match out.last_mut() {
+            Some((last, l)) if last.0 + *l as u64 == a => *l += n as usize,
+            _ => out.push((GuestAddress(a), n as usize)),
+        }
+    }
+    Ok(out)
+}
+
+fn read_prps(mem: &GuestMemory, prp1: u64, prp2: u64, len: u64) -> Result<Vec<u8>, u16> {
+    let mut v = vec![0u8; len as usize];
+    let mut off = 0usize;
+    for (a, n) in prps(mem, prp1, prp2, len)? {
+        mem.read(GuestAddress(a), &mut v[off..off + n as usize]).map_err(|_| SC_DATA_XFER_ERROR)?;
+        off += n as usize;
+    }
+    Ok(v)
+}
+
+struct IoThread {
+    rx: Arc<Mutex<Receiver<Job>>>,
+    io: Arc<IoShared>,
+    mem: GuestMemory,
+    ns: Arc<[Namespace]>,
+    me: Weak<Mutex<Nvme>>,
+    posted: Sender<()>,
+}
+
+impl IoThread {
+    fn run(self) {
+        loop {
+            let job = self.rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
+            let Ok(job) = job else { return };
+            let out = exec_io(&self.mem, &self.ns, &job.cmd);
+            let mut d = self.io.done.lock().unwrap_or_else(|e| e.into_inner());
+            d.list.push((job, out));
+            d.running -= 1;
+            if d.running == 0 {
+                self.io.idle.notify_all();
+            }
+            drop(d);
+            // Post it ourselves if the controller is free (saves a thread
+            // wakeup); else the completion thread does, once it's free.
+            if let Some(n) = self.me.upgrade() {
+                if let Ok(mut g) = n.try_lock() {
+                    g.post_done();
+                    continue;
+                }
+            }
+            let _ = self.posted.send(());
+        }
+    }
+}
+
+/// Run an NVM command set command (read, write, flush...).
+fn exec_io(mem: &GuestMemory, ns: &[Namespace], c: &Cmd) -> Outcome {
+
+    let Some(n) = c.nsid.checked_sub(1).and_then(|i| ns.get(i as usize)) else {
+        return (SC_INVALID_NS, 0);
+    };
+    let disk = n.disk.clone();
+    let bs = n.block_size;
+    let ro = n.read_only || disk.read_only();
+    let slba = c.cdw[0] as u64 | (c.cdw[1] as u64) << 32;
+    let nlb = (c.cdw[2] & 0xffff) as u64 + 1;
+    let range = || -> Result<(u64, u64), u16> {
+        let off = slba.checked_mul(bs).ok_or(SC_LBA_RANGE)?;
+        let len = nlb * bs;
+        vroom_block::check_range(disk.size(), off, len).map_err(|_| SC_LBA_RANGE)?;
+        Ok((off, len))
+    };
+    let r: Result<(), u16> = match c.opc {
+        0x00 => disk.flush().map_err(|_| SC_DATA_XFER_ERROR),
+        0x02 => range().and_then(|(off, len)| {
+            let segs = guest_segs(mem, c.prp1, c.prp2, len)?;
+            disk.read_to_guest(mem, off, &segs).map_err(|_| SC_DATA_XFER_ERROR)
+        }),
+        0x01 if ro => Err(SC_WRITE_PROTECTED),
+        0x01 => range().and_then(|(off, len)| {
+            let segs = guest_segs(mem, c.prp1, c.prp2, len)?;
+            disk.write_from_guest(mem, off, &segs).map_err(|_| SC_DATA_XFER_ERROR)
+        }),
+        0x08 if ro => Err(SC_WRITE_PROTECTED),
+        0x08 => range().and_then(|(off, len)| disk.write_zeroes(off, len).map_err(|_| SC_DATA_XFER_ERROR)),
+        0x09 if ro => Err(SC_WRITE_PROTECTED),
+        0x09 => dsm(mem, c, &disk, bs),
+        _ => Err(SC_INVALID_OPCODE),
+    };
+    match r {
+        Ok(()) => (SC_SUCCESS, 0),
+        Err(sc) => (sc, 0),
+    }
+}
+
+/// Dataset management: only "deallocate" does anything.
+fn dsm(mem: &GuestMemory, c: &Cmd, disk: &Arc<dyn DiskImage>, bs: u64) -> Result<(), u16> {
+    if c.cdw[1] & 4 == 0 {
+        return Ok(());
+    }
+    let nr = (c.cdw[0] & 0xff) as u64 + 1;
+    let ranges = read_prps(mem, c.prp1, c.prp2, nr * 16)?;
+    for r in ranges.as_chunks::<16>().0 {
+        let len = u32::from_le_bytes([r[4], r[5], r[6], r[7]]) as u64 * bs;
+        let slba = u64::from_le_bytes(r[8..16].try_into().unwrap_or([0; 8]));
+        let off = slba.checked_mul(bs).ok_or(SC_LBA_RANGE)?;
+        vroom_block::check_range(disk.size(), off, len).map_err(|_| SC_LBA_RANGE)?;
+        let _ = disk.discard(off, len);
+    }
+    Ok(())
 }
 
 fn set_part(field: &mut u64, v: u64, high: bool, len: usize) {
@@ -776,8 +1007,13 @@ impl PciDevice for Nvme {
         self.id.clone()
     }
 
+    fn pause(&mut self) {
+        self.drain_io();
+    }
+
     fn save(&mut self) -> vroom_snapshot::Result<Vec<u8>> {
-        for n in &self.ns {
+        self.drain_io();
+        for n in self.ns.iter() {
             let _ = n.disk.flush();
         }
         encode(&Snap {
@@ -928,6 +1164,55 @@ mod tests {
         assert_eq!(status(&mem, cq1, 3), SC_INVALID_NS);
     }
 
+    /// Several commands per doorbell run on the I/O threads; pausing
+    /// waits for them and posts every completion.
+    #[test]
+    fn parallel_io_then_pause() {
+        let (n, mem) = ctrl();
+        let n = n.into_shared();
+        let (cq1, sq1) = (RAM + 0x2000, RAM + 0x3000);
+        {
+            let mut g = n.lock().unwrap();
+            submit(&mut g, &mem, (0, ASQ, 4), 0, [5 | 2 << 16, 0, 0, 0, 0, 0, cq1 as u32, 0, 0, 0, 1 | 63 << 16, 1, 0, 0, 0, 0]);
+            submit(&mut g, &mem, (0, ASQ, 4), 1, [1 | 3 << 16, 0, 0, 0, 0, 0, sq1 as u32, 0, 0, 0, 1 | 63 << 16, 1 | 1 << 16, 0, 0, 0, 0]);
+            assert_eq!((status(&mem, ACQ, 0), status(&mem, ACQ, 1)), (0, 0));
+        }
+        let ring = |opc: u32, base: u16, data: u64| {
+            for i in 0..32u16 {
+                let slot = base + i;
+                let cmd = [opc | (100 + slot as u32) << 16, 1, 0, 0, 0, 0, (data + 0x1000 * i as u64) as u32, 0, 0, 0, 8 * i as u32, 0, 7, 0, 0, 0];
+                let mut b = [0u8; 64];
+                for (k, w) in cmd.iter().enumerate() {
+                    b[k * 4..k * 4 + 4].copy_from_slice(&w.to_le_bytes());
+                }
+                mem.write(GuestAddress(sq1 + slot as u64 * 64), &b).unwrap();
+            }
+            n.lock().unwrap().doorbell(DOORBELL + 8, ((base + 32) % 64) as u32);
+        };
+        let phase_set = |slot: u16| mem.read_obj::<u16>(GuestAddress(cq1 + slot as u64 * 16 + 14)).unwrap() & 1 == 1;
+        for i in 0..32u64 {
+            mem.write(GuestAddress(BUF + 0x1000 * i), &[i as u8 + 1; 4096]).unwrap();
+        }
+        ring(1, 0, BUF);
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !(0..32).all(phase_set) {
+            assert!(std::time::Instant::now() < end, "completions missing");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!((0..32).all(|s| status(&mem, cq1, s) == 0));
+        // Reads, paused right away: everything is posted by then.
+        n.lock().unwrap().doorbell(DOORBELL + 12, 32); // the guest consumed the CQ
+        ring(2, 32, BUF + 0x40000);
+        let mut g = n.lock().unwrap();
+        g.pause();
+        assert!((32..64).all(phase_set), "a paused controller has nothing in flight");
+        assert_eq!(g.cqs[&1].reserved, 0);
+        drop(g);
+        for i in 0..32u64 {
+            assert_eq!(mem.read_obj::<u8>(GuestAddress(BUF + 0x40000 + 0x1000 * i + 4095)).unwrap(), i as u8 + 1);
+        }
+    }
+
     #[test]
     fn prp_list_rules() {
         let (n, mem) = ctrl();
@@ -936,12 +1221,12 @@ mod tests {
         for (i, p) in [0x20000u64, 0x21000, 0x22000].iter().enumerate() {
             mem.write_obj(GuestAddress(list + 8 * i as u64), &(RAM + p)).unwrap();
         }
-        let segs = n.prps(RAM + 0x1f800, list, 3 * 4096).unwrap();
+        let segs = prps(&n.mem, RAM + 0x1f800, list, 3 * 4096).unwrap();
         assert_eq!(segs.len(), 4);
         assert_eq!(segs.iter().map(|s| s.1).sum::<u64>(), 3 * 4096);
         // Misaligned PRP2 data pointer rejected.
-        assert_eq!(n.prps(RAM, RAM + 0x10, 8192), Err(SC_PRP_OFFSET));
+        assert_eq!(prps(&n.mem, RAM, RAM + 0x10, 8192), Err(SC_PRP_OFFSET));
         // Oversized transfer rejected.
-        assert!(n.prps(RAM, list, MAX_XFER + 4096).is_err());
+        assert!(prps(&n.mem, RAM, list, MAX_XFER + 4096).is_err());
     }
 }

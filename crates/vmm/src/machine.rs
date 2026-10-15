@@ -430,7 +430,7 @@ pub(crate) fn build(
         let ids = vendor_ids(&ident.nvme_pci_id)?;
         board.add_pci(move |slot, intx, msi| {
             let serial = format!("{prefix}{slot:04}");
-            Arc::new(Mutex::new(Nvme::new(slot, nvme_ns, mem2, intx, msi).with_ids(&model, &serial, &fw).with_pci_ids(ids)))
+            Nvme::new(slot, nvme_ns, mem2, intx, msi).with_ids(&model, &serial, &fw).with_pci_ids(ids).into_shared()
         })?;
     }
 
