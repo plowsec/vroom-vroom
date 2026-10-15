@@ -11,7 +11,9 @@ vroom run <vm.toml>   one process per VM, sandboxed after setup ◄───┘
    ├─ device workers (virtio queues, NAT, display, agent, ramfb)
    ├─ optional: unix socket to vroom-netd (root) for bridged/host-only
    ├─ optional: swtpm (vTPM), own sandbox, control + data socketpairs
-   └─ optional: vroom audio-out (sound), own sandbox, datagram socket
+   ├─ optional: vroom audio-out (sound), own sandbox, datagram socket
+   └─ optional: vroom usb-host (one per [[usb]] device), own sandbox,
+      stream socket: transfer requests in, results and plug events out
 ```
 
 The GUI never touches the guest: it shows a framebuffer the VMM shares
@@ -29,7 +31,8 @@ limits, source-MAC anti-spoofing). The VMM never holds an interface.
 | `hv` | `Hypervisor` / `Vm` / `Vcpu` traits. HVF backend (in-kernel GICv3, vtimer, EL2 for nested), KVM arm64 backend (vGICv3 with save/restore, in-kernel PSCI). Exits are decoded into `VcpuExit` (MMIO, hypercall, PSCI events). |
 | `memory` | Guest RAM as guarded mmaps; every access bounds-checked (`GuestMemory`). |
 | `arch` | Board layout (QEMU-virt compatible), FDT, ACPI tables (own AML encoder), SMBIOS, kernel image loader (Image, gzip, EFI zboot). |
-| `devices` | Bus, PL011, PL031, fw_cfg (+DMA), CFI flash (NVRAM), PCI host (ECAM, MSI-X, INTx), NVMe, xHCI + USB HID. Parses hostile input only; `forbid(unsafe_code)`. |
+| `devices` | Bus, PL011, PL031, fw_cfg (+DMA), CFI flash (NVRAM), PCI host (ECAM, MSI-X, INTx), NVMe, xHCI + USB HID; passthrough devices get a USB 2 and a USB 3 root port each and asynchronous transfers. Parses hostile input only; `forbid(unsafe_code)`. |
+| `usb` | USB passthrough: the VMM/helper protocol, the helper's request checks, libusb (loaded with `dlopen`, helper only), host device listing (IOKit registry / sysfs), a pretend serial port for tests. |
 | `virtio` | Split-queue handling (hardened), MMIO and modern PCI transports, devices (blk, net, console, rng, gpu, input, fs, sound), a pausable worker per device. `forbid(unsafe_code)`. |
 | `fs` | Host side of shared folders: component-wise `openat(O_NOFOLLOW)` walks from a root fd, Linux errno mapping. The virtio-fs FUSE server lives in `virtio`. |
 | `audio` | Sound helper: datagram protocol, ring buffer, CoreAudio (macOS) / ALSA (Linux, `dlopen`) output, WAV test output. |
