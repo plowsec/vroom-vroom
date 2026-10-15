@@ -590,7 +590,8 @@ export component SettingsPanel inherits Rectangle {
                         }
                     }
                     Text {
-                        text: "Linux guests. Read-only unless you allow changes.";
+                        text: "Linux: the command above. Windows: each share is a drive letter (Z: first) once vroom-setup.cmd ran. Read-only unless you allow changes.";
+                        wrap: word-wrap;
                         font-size: Theme.fs-xs;
                         color: Theme.text-3;
                     }

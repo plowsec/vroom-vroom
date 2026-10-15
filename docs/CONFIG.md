@@ -90,7 +90,9 @@ tag = "host"                     # in the guest: mount -t virtiofs host /mnt
 readonly = true                  # default; false lets the guest change files
 ```
 
-Linux guests only for now.
+`tag`: 1-36 of `[A-Za-z0-9._-]`, different for each share. Windows guests
+see each share as a drive letter (Z:, Y:, ...) once `vroom-setup.cmd` ran;
+see [GUIDE.md](GUIDE.md#windows-guests).
 
 ## `[[usb]]` (host USB devices, up to 8)
 

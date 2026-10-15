@@ -14,14 +14,14 @@ and every virtual device treats the guest as hostile.
 - Snapshots, suspend/resume, reset
 - NAT with port forwards, several network adapters. Bridged and host-only need a root helper.
 - Sound in Linux and Windows guests; microphone if you turn it on
-- Shared folders (Linux guests)
+- Shared folders (Linux and Windows guests)
 - TPM 2.0 (Windows 11 needs it)
 - Nested VMs (M3 or newer)
 - Import from VMware Fusion (ARM64 VMs)
 - USB devices from the host (those macOS has no driver for; needs libusb)
 
 Not yet: x86_64 hosts (it builds, can't run VMs yet), Secure Boot, and
-3D or shared folders in Windows guests.
+3D in Windows guests.
 
 ## Try it
 

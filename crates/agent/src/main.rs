@@ -16,6 +16,9 @@ mod port;
 #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 mod relay;
 mod scale;
+// Windows only; the pure parts are tested everywhere.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod shares;
 mod sys;
 #[cfg(windows)]
 mod winsvc;
@@ -63,6 +66,17 @@ fn parse_args() -> Result<Args, String> {
             #[cfg(any(windows, target_os = "linux"))]
             "--service" => a.role = Role::Service,
             #[cfg(windows)]
+            "--mount-shares" => {
+                // Needs admin rights (it makes services): setup runs it.
+                match shares::mount_all() {
+                    Ok(()) => std::process::exit(0),
+                    Err(e) => {
+                        log::error!("shares: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            #[cfg(windows)]
             "--session" => {
                 a.role = Role::Session;
                 a.port = Some(winsvc::PIPE.into());
@@ -73,7 +87,7 @@ fn parse_args() -> Result<Args, String> {
                 a.port = Some(linsvc::SOCKET.into());
             }
             "-h" | "--help" => {
-                println!("vroom-agent [--port PATH] [--clipboard-file PATH | --no-clipboard] [--service | --session]");
+                println!("vroom-agent [--port PATH] [--clipboard-file PATH | --no-clipboard] [--service | --session | --mount-shares]");
                 println!();
                 println!("--port PATH  host channel. Default: virtio-serial port {AGENT_PORT}.");
                 println!("             If it's missing ([identity].agent_port renamed it), the");

@@ -112,8 +112,20 @@ the walk, so neither a guest-planted link nor one swapped in on the host
 mid-walk leads outside. Names with `/`, NUL, `.` or `..` are refused; only
 regular files and directories are opened (no FIFOs, devices, sockets);
 the guest can't create links or device nodes. Node, handle and directory
-listing counts are capped. The sandbox only grants the share's own
-subtree (read-only shares: read access only). The FUSE server is fuzzed.
+listing counts are capped, and so are path lengths (4096 bytes) and the
+memory all node paths take together. The sandbox only grants the share's
+own subtree (read-only shares: read access only; writable ones: no set-id
+bits, owner changes, ACLs, file flags or extended attributes). The FUSE
+server is fuzzed, as both clients and on both kinds of share.
+
+Windows guests (virtio-win's virtiofs.exe) get the same server. Names
+that mean something special to Windows (`name:stream`, `CON`, trailing
+dots) are plain names on a Mac or Linux host: they stay inside the share.
+So does a Mac's `file/..namedfork/rsrc`, since a file is never walked
+through. The only extra name accepted is `.` for "this directory", which
+the Windows client uses for the root; `..` is still refused. The guest
+side needs WinFsp: setup installs one pinned version and checks its
+SHA-256 first.
 
 ## Sound
 
@@ -330,6 +342,8 @@ Still visible, whatever the config says:
 - NAT's TCP/IP stack (smoltcp) and the absolute-pointer tablet behave like
   no physical router or mouse.
 - The guest agent, if installed (its protocol says "vroom").
+- Shared folders, if any: virtio-fs itself, the host disk's size and free
+  space, and on Windows the `VroomShare_<tag>` services.
 
 So this makes casual checks fail. It doesn't make a VM look like real
 hardware to software that tries hard.

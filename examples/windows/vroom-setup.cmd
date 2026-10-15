@@ -1,12 +1,15 @@
 @echo off
-rem vroom guest tools for Windows ARM64: virtio drivers + agent.
-rem Looks for the virtio-win media on any drive letter. Run as admin
-rem (first logon runs it elevated). Safe to run again to upgrade.
+rem vroom guest tools for Windows ARM64: virtio drivers, agent, shared
+rem folders. Looks for the virtio-win media on any drive letter. Run as
+rem admin (first logon runs it elevated). Safe to run again to upgrade.
+rem No labels or goto: cmd can miss labels in files with Unix line ends.
+set VIOFS=
 for %%d in (D E F G H I J K) do (
   if exist %%d:\viogpudo\w11\ARM64 (
-    for %%x in (viogpudo NetKVM vioserial vioinput viorng viostor) do (
+    for %%x in (viogpudo NetKVM vioserial vioinput viorng viostor viofs) do (
       pnputil /add-driver %%d:\%%x\w11\ARM64\*.inf /install
     )
+    if exist %%d:\viofs\w11\ARM64\virtiofs.exe set VIOFS=%%d:\viofs\w11\ARM64\virtiofs.exe
   )
 )
 rem Our RTC runs in UTC (like every hypervisor's); Windows assumes local.
@@ -35,6 +38,35 @@ if exist "%~dp0vroom-agent.exe" (
   sc query VroomAgent >nul 2>&1 || sc create VroomAgent binPath= "\"%ProgramFiles%\Vroom\vroom-agent.exe\" --service" start= auto obj= LocalSystem DisplayName= "Vroom guest agent"
   sc description VroomAgent "Host channel for the vroom VMM: clock sync, clean shutdown, relays clipboard and resolution to the session helper."
   sc failure VroomAgent reset= 86400 actions= restart/5000/restart/5000/restart/30000
+)
+rem Shared folders: virtio-win's virtiofs.exe on WinFsp. Each [[share]]
+rem becomes a service "VroomShare_<tag>" that mounts it on a drive letter
+rem (Z: first). The agent service does the same when it starts, so
+rem shares added later show up after a reboot.
+set SHARES=
+if defined VIOFS if exist "%ProgramFiles%\Vroom\vroom-agent.exe" set SHARES=1
+rem Running share services hold virtiofs.exe open.
+if defined SHARES for /f "tokens=2" %%s in ('sc query state^= all ^| findstr /b /c:"SERVICE_NAME: VroomShare_"') do sc stop %%s >nul 2>&1
+if defined SHARES timeout /t 2 /nobreak >nul
+if defined SHARES copy /y "%VIOFS%" "%ProgramFiles%\Vroom\" >nul || set SHARES=
+rem WinFsp (winfsp.dev, GPLv3 with a FLOSS exception) isn't ours to ship:
+rem take winfsp-*.msi from next to this script if it's there, else
+rem download that release from GitHub. Either way the SHA-256 must match.
+set WINFSP_MSI=winfsp-2.1.25156.msi
+set WINFSP_SHA256=073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a
+set WINFSP_TMP=%TEMP%\%WINFSP_MSI%
+set NEED=
+if defined SHARES if not exist "%ProgramFiles(x86)%\WinFsp\bin\winfsp-a64.dll" set NEED=1
+if defined NEED del "%WINFSP_TMP%" 2>nul
+if defined NEED if exist "%~dp0%WINFSP_MSI%" copy /y "%~dp0%WINFSP_MSI%" "%WINFSP_TMP%" >nul
+if defined NEED if not exist "%WINFSP_TMP%" curl.exe -fsSL --retry 5 --retry-delay 5 --retry-all-errors -o "%WINFSP_TMP%" https://github.com/winfsp/winfsp/releases/download/v2.1/%WINFSP_MSI%
+if defined NEED (
+  certutil -hashfile "%WINFSP_TMP%" SHA256 | findstr /i /x "%WINFSP_SHA256%" >nul || (echo vroom: no WinFsp ^(download failed or wrong hash^), no shared folders & set SHARES=)
+)
+if defined NEED if defined SHARES msiexec /i "%WINFSP_TMP%" /qn /norestart
+if defined NEED del "%WINFSP_TMP%" 2>nul
+if defined SHARES "%ProgramFiles%\Vroom\vroom-agent.exe" --mount-shares
+if exist "%~dp0vroom-agent.exe" (
   sc start VroomAgent
   reg add HKLM\Software\Microsoft\Windows\CurrentVersion\Run /v VroomSession /t REG_SZ /d "\"%ProgramFiles%\Vroom\vroom-agent.exe\" --session" /f
   rem This session: start the helper without our admin token.

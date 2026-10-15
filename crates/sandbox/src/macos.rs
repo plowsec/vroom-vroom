@@ -49,7 +49,14 @@ pub fn profile(p: &Policy) -> Result<String> {
         s += &format!("(allow file-read* (subpath {}))\n", q(d)?);
     }
     for d in &p.share_rw {
-        s += &format!("(allow file-read* file-write-data file-write-create file-write-unlink file-write-mode file-write-times (subpath {}))\n", q(d)?);
+        // Setting times (utimensat) isn't file-write-times on current
+        // macOS: allow the writes, then take back what the FUSE server
+        // never does (set-id bits, owner, ACLs, flags, xattrs).
+        s += &format!("(allow file-read* file-write* (subpath {}))\n", q(d)?);
+        s += &format!(
+            "(deny file-write-setugid file-write-owner file-write-acl file-write-flags file-write-xattr file-write-finderinfo (subpath {}))\n",
+            q(d)?
+        );
     }
     if p.network_outbound {
         // IP only: no Unix sockets (ssh-agent, docker.sock...). netd is
