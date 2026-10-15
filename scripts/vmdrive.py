@@ -1,6 +1,6 @@
 """Drive a vroom VM through its --ui-fd viewer socket.
 
-usage: vmdrive.py <bulwark> <cfg> <state-dir> [--fresh]
+usage: vmdrive.py <vroom binary> <cfg> <state-dir> [--fresh]
 Commands, one per line, on <state-dir>.cmd (a fifo):
   click X Y | rclick X Y | dclick X Y | move X Y   (guest pixels)
   key CODE[+CODE...]     press in order, release in reverse (evdev codes)
@@ -11,13 +11,13 @@ Viewer events (mode, clipboard, status) go to <state-dir>.events.
 """
 import os, socket, struct, subprocess, sys, threading, time
 
-bulwark, cfg, state = sys.argv[1:4]
+vroom, cfg, state = sys.argv[1:4]
 extra = sys.argv[4:]
 cmdp, evp = state + ".cmd", state + ".events"
 if not os.path.exists(cmdp):
     os.mkfifo(cmdp)
 a, b = socket.socketpair()
-p = subprocess.Popen([bulwark, "run", cfg, "--ui-fd", str(b.fileno()), "--state-dir", state] + extra,
+p = subprocess.Popen([vroom, "run", cfg, "--ui-fd", str(b.fileno()), "--state-dir", state] + extra,
                      pass_fds=[b.fileno()], stdin=subprocess.PIPE,
                      stdout=open(state + ".log", "ab"), stderr=subprocess.STDOUT)
 b.close()
