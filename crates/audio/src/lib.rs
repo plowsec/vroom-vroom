@@ -219,12 +219,14 @@ pub fn helper_main(sock: UnixDatagram, wav: Option<PathBuf>) -> io::Result<()> {
     let ring = Arc::new(Mutex::new(Ring::default()));
     let mut wav_out = wav.map(|p| WavOut::new(p, ring.clone()));
     #[cfg(target_os = "macos")]
-    let mut ca = coreaudio::CoreAudioOut::new(ring.clone());
+    let mut host = coreaudio::CoreAudioOut::new(ring.clone());
+    #[cfg(target_os = "linux")]
+    let mut host = alsa::AlsaOut::new(ring.clone());
     let out: &mut dyn Output = match wav_out.as_mut() {
         Some(w) => w,
-        #[cfg(target_os = "macos")]
-        None => &mut ca,
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        None => &mut host,
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         None => return Err(io::Error::other("no audio output on this host yet")),
     };
     let mut buf = vec![0u8; 4096];
@@ -254,6 +256,8 @@ pub fn helper_main(sock: UnixDatagram, wav: Option<PathBuf>) -> io::Result<()> {
 
 #[cfg(target_os = "macos")]
 mod coreaudio;
+#[cfg(target_os = "linux")]
+mod alsa;
 
 #[cfg(test)]
 mod tests {
