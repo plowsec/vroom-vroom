@@ -415,7 +415,9 @@ pub(crate) fn build(
             DiskBus::Virtio => {
                 let id = format!("vd{}", (b'a' + i as u8) as char);
                 let serial = format!("{}{i:04}", ident.disk_serial);
-                board.add_virtio(Box::new(Block::new(&id, img).with_serial(&serial)))?;
+                // A queue per vCPU: completions interrupt the vCPU that asked.
+                let queues = config.cpus.min(vroom_virtio::devices::block::MAX_QUEUES as u32) as u16;
+                board.add_virtio(Box::new(Block::new(&id, img).with_serial(&serial).with_queues(queues)))?;
             }
             DiskBus::Nvme => nvme_ns.push(Namespace {
                 disk: img,

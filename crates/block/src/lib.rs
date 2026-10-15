@@ -355,3 +355,68 @@ pub(crate) fn lock_file(f: &File, exclusive: bool) -> io::Result<()> {
         Err(io::Error::last_os_error())
     }
 }
+
+/// Whether a lone request runs on the vCPU that submitted it (no thread
+/// wakeups: the lowest latency at queue depth 1) or goes to I/O threads
+/// (several requests overlap: needed at higher depths). While requests
+/// run inline each one ends before the guest can submit the next, so the
+/// guest's depth can't be seen: every `PROBE_EVERY`th lone request goes
+/// to the threads anyway, and if the guest submits more while it runs, we
+/// stay on the threads until it goes back to one request at a time.
+#[derive(Debug, Default)]
+pub struct InlinePolicy {
+    threaded: bool,
+    count: u32,
+}
+
+impl InlinePolicy {
+    const PROBE_EVERY: u32 = 64;
+    const BACK_TO_INLINE: u32 = 32;
+
+    /// The guest keeps several requests in flight (for now).
+    pub fn threaded(&self) -> bool {
+        self.threaded
+    }
+
+    /// A request arrives. `others`: requests are running or came with it.
+    /// True: run it inline.
+    pub fn run_inline(&mut self, others: bool) -> bool {
+        if others {
+            self.threaded = true;
+            self.count = 0;
+            return false;
+        }
+        self.count += 1;
+        if self.threaded {
+            if self.count >= Self::BACK_TO_INLINE {
+                self.threaded = false;
+                self.count = 0;
+            }
+            return false;
+        }
+        if self.count >= Self::PROBE_EVERY {
+            self.count = 0;
+            return false;
+        }
+        true
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::InlinePolicy;
+
+    #[test]
+    fn inline_until_the_guest_overlaps_requests() {
+        let mut p = InlinePolicy::default();
+        // One at a time: inline, but for a probe now and then.
+        let inline = (0..128).filter(|_| p.run_inline(false)).count();
+        assert_eq!(inline, 126);
+        // The guest submitted more while one ran: threads from now on...
+        assert!(!p.run_inline(true));
+        assert!((0..31).all(|_| !p.run_inline(false)));
+        // ...until it has been one at a time for a while.
+        assert!(!p.run_inline(false));
+        assert!(p.run_inline(false));
+    }
+}

@@ -21,6 +21,7 @@ use crate::{chain::DescriptorChain, types, ActivateContext, DeviceState, Result,
 const F_SEG_MAX: u64 = 1 << 2;
 const F_RO: u64 = 1 << 5;
 const F_BLK_SIZE: u64 = 1 << 6;
+const F_MQ: u64 = 1 << 12;
 const F_FLUSH: u64 = 1 << 9;
 const F_DISCARD: u64 = 1 << 13;
 const F_WRITE_ZEROES: u64 = 1 << 14;
@@ -46,19 +47,32 @@ const IO_THREADS: usize = 4;
 /// Requests handed to the I/O threads and not back yet. Bounded anyway
 /// by the queue size; this keeps the backlog short.
 const MAX_INFLIGHT: usize = 64;
+/// A lone read or write up to this size runs on the vCPU that kicked.
+const INLINE_MAX: usize = 64 << 10;
+/// Most request queues we offer (one per vCPU up to this).
+pub const MAX_QUEUES: u16 = 16;
 
 #[derive(Debug)]
 pub struct Block {
     disk: Arc<dyn DiskImage>,
     id: String,
     serial: [u8; 20],
+    queues: u16,
     worker: WorkerSlot<BlockHandler>,
 }
 
 impl Block {
     /// `id` must be unique per VM ("vda", "vdb"...); used in snapshots.
     pub fn new(id: &str, disk: Arc<dyn DiskImage>) -> Self {
-        Block { disk, id: id.to_string(), serial: [0u8; 20], worker: WorkerSlot::default() }.with_serial(&format!("VRM-{id}"))
+        Block { disk, id: id.to_string(), serial: [0u8; 20], queues: 1, worker: WorkerSlot::default() }
+            .with_serial(&format!("VRM-{id}"))
+    }
+
+    /// Request queues (one per vCPU is best: each gets its own interrupt,
+    /// handled on the vCPU that asked). 1 to MAX_QUEUES.
+    pub fn with_queues(mut self, n: u16) -> Self {
+        self.queues = n.clamp(1, MAX_QUEUES);
+        self
     }
 
     /// Serial the guest reads (GET_ID, up to 20 bytes; from `[identity]`).
@@ -79,7 +93,7 @@ impl Block {
         c[0..8].copy_from_slice(&sectors.to_le_bytes());
         c[12..16].copy_from_slice(&SEG_MAX.to_le_bytes());
         c[20..24].copy_from_slice(&512u32.to_le_bytes());
-        c[34..36].copy_from_slice(&1u16.to_le_bytes()); // num_queues
+        c[34..36].copy_from_slice(&self.queues.to_le_bytes()); // num_queues
         c[36..40].copy_from_slice(&MAX_DISCARD_SECTORS.to_le_bytes());
         c[40..44].copy_from_slice(&1u32.to_le_bytes()); // max_discard_seg
         c[44..48].copy_from_slice(&8u32.to_le_bytes()); // discard alignment (sectors)
@@ -97,6 +111,18 @@ struct Exec {
 }
 
 impl Exec {
+    /// A quick read or write (or GET_ID)? Peeks at a copy of the chain.
+    fn is_quick(chain: &DescriptorChain) -> bool {
+        let Ok((mut r, w)) = chain.clone().into_rw() else { return true };
+        let Ok(ty) = r.read_obj::<u32>() else { return true };
+        match u32::from_le(ty) {
+            T_IN => w.available() <= INLINE_MAX + 1,
+            T_OUT => r.available() <= INLINE_MAX + 12,
+            T_GET_ID => true,
+            _ => false,
+        }
+    }
+
     /// Run one request; returns bytes written to the guest (incl. status).
     fn request(&self, chain: DescriptorChain) -> u32 {
         let mem = chain.memory().clone();
@@ -166,10 +192,13 @@ impl Exec {
     }
 }
 
-/// Finished requests waiting for the worker: (head, used length).
+/// A request for the I/O threads: its queue and its chain.
+type Job = (usize, DescriptorChain);
+
+/// Finished requests waiting for the worker: (queue, head, used length).
 #[derive(Debug, Default)]
 struct Done {
-    list: Vec<(u16, u32)>,
+    list: Vec<(usize, u16, u32)>,
     /// Handed to the threads and not finished yet.
     running: usize,
 }
@@ -184,13 +213,13 @@ struct PoolShared {
 /// The I/O threads of one disk.
 #[derive(Debug)]
 struct Pool {
-    jobs: Option<Sender<DescriptorChain>>,
+    jobs: Option<Sender<Job>>,
     threads: Vec<JoinHandle<()>>,
 }
 
 impl Pool {
     fn start(exec: &Arc<Exec>, shared: &Arc<PoolShared>, poker: &Poker) -> std::io::Result<Pool> {
-        let (tx, rx) = mpsc::channel::<DescriptorChain>();
+        let (tx, rx) = mpsc::channel::<Job>();
         let rx = Arc::new(Mutex::new(rx));
         let mut threads = Vec::new();
         for i in 0..IO_THREADS {
@@ -212,14 +241,14 @@ impl Drop for Pool {
     }
 }
 
-fn io_thread(exec: &Exec, shared: &PoolShared, poker: &Poker, rx: &Mutex<Receiver<DescriptorChain>>) {
+fn io_thread(exec: &Exec, shared: &PoolShared, poker: &Poker, rx: &Mutex<Receiver<Job>>) {
     loop {
         let job = rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
-        let Ok(chain) = job else { return };
+        let Ok((q, chain)) = job else { return };
         let head = chain.head();
         let len = exec.request(chain);
         let mut d = shared.done.lock().unwrap_or_else(|e| e.into_inner());
-        d.list.push((head, len));
+        d.list.push((q, head, len));
         d.running -= 1;
         if d.running == 0 {
             shared.idle.notify_all();
@@ -237,11 +266,12 @@ pub struct BlockHandler {
     poker: Option<Poker>,
     /// Requests handed out (worker's count; the threads keep their own).
     inflight: Arc<AtomicUsize>,
+    policy: vroom_block::InlinePolicy,
 }
 
 impl BlockHandler {
     fn new(exec: Arc<Exec>) -> Self {
-        BlockHandler { exec, shared: Arc::default(), pool: None, poker: None, inflight: Arc::default() }
+        BlockHandler { exec, shared: Arc::default(), pool: None, poker: None, inflight: Arc::default(), policy: Default::default() }
     }
 
     /// Run one request; returns bytes written to the guest (incl. status).
@@ -251,7 +281,7 @@ impl BlockHandler {
     }
 
     /// Hand requests to the I/O threads. False if they can't run there.
-    fn dispatch(&mut self, chains: &mut Vec<DescriptorChain>) -> bool {
+    fn dispatch(&mut self, q: usize, chains: &mut Vec<DescriptorChain>) -> bool {
         if self.pool.is_none() {
             let Some(p) = &self.poker else { return false };
             match Pool::start(&self.exec, &self.shared, p) {
@@ -266,12 +296,12 @@ impl BlockHandler {
         self.shared.done.lock().unwrap_or_else(|e| e.into_inner()).running += chains.len();
         self.inflight.fetch_add(chains.len(), Ordering::Relaxed);
         for c in chains.drain(..) {
-            if let Err(mpsc::SendError(c)) = tx.send(c) {
+            if let Err(mpsc::SendError((q, c))) = tx.send((q, c)) {
                 // Threads gone (can't happen while we hold the pool): finish here.
                 let head = c.head();
                 let len = self.exec.request(c);
                 let mut d = self.shared.done.lock().unwrap_or_else(|e| e.into_inner());
-                d.list.push((head, len));
+                d.list.push((q, head, len));
                 d.running -= 1;
             }
         }
@@ -282,8 +312,8 @@ impl BlockHandler {
     fn reap(&mut self, ctx: &mut QueueCtx) {
         let list = std::mem::take(&mut self.shared.done.lock().unwrap_or_else(|e| e.into_inner()).list);
         self.inflight.fetch_sub(list.len(), Ordering::Relaxed);
-        for (head, len) in list {
-            ctx.add_used(0, head, len);
+        for (q, head, len) in list {
+            ctx.add_used(q, head, len);
         }
     }
 }
@@ -303,8 +333,13 @@ impl QueueHandler for BlockHandler {
             }
         }
         // One request and nothing else running: no thread hop.
-        if batch.len() > 1 || self.inflight.load(Ordering::Relaxed) > 0 {
-            self.dispatch(&mut batch);
+        let others = batch.len() > 1 || self.inflight.load(Ordering::Relaxed) > 0;
+        if !batch.is_empty() {
+            // Only to follow the guest's depth here.
+            let _ = self.policy.run_inline(others);
+        }
+        if others {
+            self.dispatch(q, &mut batch);
         }
         for c in batch {
             let head = c.head();
@@ -313,12 +348,49 @@ impl QueueHandler for BlockHandler {
         }
     }
 
+    /// On the vCPU: a lone quick request runs right here (no thread
+    /// wakeups at all) while the guest sends one at a time; anything else
+    /// goes to the I/O threads, so the vCPU never waits for long.
+    fn process_queue_inline(&mut self, ctx: &mut QueueCtx, q: usize) -> bool {
+        // A guest with many in flight: the worker takes them in batches
+        // (and the guest skips kicks while it is busy).
+        if self.policy.threaded() {
+            return false;
+        }
+        self.reap(ctx);
+        let mut batch = Vec::new();
+        while self.inflight.load(Ordering::Relaxed) + batch.len() < MAX_INFLIGHT {
+            match ctx.queues[q].pop(&ctx.mem) {
+                Ok(Some(c)) => batch.push(c),
+                Ok(None) => break,
+                Err(e) => {
+                    log::warn!("blk: {e}");
+                    break;
+                }
+            }
+        }
+        let others = batch.len() > 1 || self.inflight.load(Ordering::Relaxed) > 0;
+        let inline = self.policy.run_inline(others) && batch.first().is_some_and(Exec::is_quick);
+        if !inline {
+            self.dispatch(q, &mut batch);
+        }
+        for c in batch {
+            let head = c.head();
+            let len = self.exec.request(c);
+            ctx.add_used(q, head, len);
+        }
+        true
+    }
+
     fn backend_ready(&mut self, ctx: &mut QueueCtx, token: usize) {
         if token == POKE_TOKEN {
             self.reap(ctx);
             // Room again: requests the cap held back.
-            if self.inflight.load(Ordering::Relaxed) < MAX_INFLIGHT {
-                self.process_queue(ctx, 0);
+            for q in 0..ctx.queues.len() {
+                if self.inflight.load(Ordering::Relaxed) >= MAX_INFLIGHT {
+                    break;
+                }
+                self.process_queue(ctx, q);
             }
         }
     }
@@ -345,11 +417,14 @@ impl VirtioDevice for Block {
         format!("blk-{}", self.id)
     }
     fn queue_max_sizes(&self) -> Vec<u16> {
-        vec![QUEUE_SIZE]
+        vec![QUEUE_SIZE; self.queues as usize]
     }
     fn device_features(&self) -> u64 {
         let mut f = F_SEG_MAX | F_BLK_SIZE | F_FLUSH | crate::features::RING_EVENT_IDX
             | crate::features::RING_INDIRECT_DESC;
+        if self.queues > 1 {
+            f |= F_MQ;
+        }
         if self.disk.read_only() {
             f |= F_RO;
         } else {
@@ -373,7 +448,7 @@ impl VirtioDevice for Block {
         self.worker.start(&self.name(), ctx, h, false)
     }
     fn queue_notify(&mut self, q: u16) {
-        self.worker.notify(q);
+        self.worker.notify_inline(q);
     }
     fn reset(&mut self) {
         self.worker.stop();
@@ -466,6 +541,37 @@ mod tests {
             assert!(std::time::Instant::now() < end, "only {} of {n} requests done", ring.used_idx());
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+    }
+
+    /// A lone small request kicked from a vCPU is done before the kick
+    /// returns; a big one goes to the I/O threads.
+    #[test]
+    fn lone_quick_request_runs_on_the_kicking_thread() {
+        let d = disk();
+        let mut ring = TestRing::new(16);
+        let ctx = crate::ActivateContext { mem: ring.mem.clone(), queues: vec![ring.q.clone()], irq: Arc::new(NoIrq), features: 0 };
+        let h = BlockHandler::new(Arc::new(Exec { disk: d, serial: [0; 20] }));
+        let w = crate::worker::Worker::spawn("blk-test", QueueCtx::new(ctx), h, false).unwrap();
+        // Let the worker's start-up pass finish first.
+        w.with(|_, _| ());
+        ring.add_chain(&[(16, false), (4096, true), (1, true)]);
+        header(&ring, DATA, T_IN, 0);
+        let mut done = false;
+        for _ in 0..1000 {
+            if w.try_inline(0) {
+                done = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(done);
+        assert_eq!(ring.used_idx(), 1, "done inline");
+        assert_eq!(ring.used(0).1, 4097);
+        // 512 KiB: handed to the I/O threads, completes a bit later.
+        ring.add_chain(&[(16, false), (512 << 10, true), (1, true)]);
+        header(&ring, DATA + 0x3000, T_IN, 0);
+        assert!(w.try_inline(0) || { w.kick(0); true });
+        wait_used(&ring, 2);
     }
 
     /// Many requests at once go through the I/O threads; pausing waits

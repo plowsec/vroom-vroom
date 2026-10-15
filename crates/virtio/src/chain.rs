@@ -20,7 +20,8 @@ pub struct Descriptor {
 }
 
 /// A chain of descriptors starting at `head`. Iterate to walk it.
-#[derive(Debug)]
+/// A clone walks the same chain again (the guest may have changed it).
+#[derive(Debug, Clone)]
 pub struct DescriptorChain {
     mem: GuestMemory,
     table: u64,

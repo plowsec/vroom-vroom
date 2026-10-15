@@ -137,6 +137,7 @@ pub struct Nvme {
     me: Weak<Mutex<Nvme>>,
     io: Arc<IoShared>,
     pool: Option<Pool>,
+    policy: vroom_block::InlinePolicy,
 }
 
 /// A command handed to the I/O threads.
@@ -254,6 +255,7 @@ impl Nvme {
             me: Weak::new(),
             io: Arc::default(),
             pool: None,
+            policy: Default::default(),
         }
     }
 
@@ -401,17 +403,18 @@ impl Nvme {
         }
     }
 
-    /// Hand an I/O command to the I/O threads if that pays: other
-    /// commands are queued behind it or running, it's big (the vCPU would
-    /// wait for it), or it's a flush (milliseconds). A small one alone
-    /// runs here: no thread wakeups, about three times the IOPS at queue
-    /// depth 1. False: run it here.
+    /// Hand an I/O command to the I/O threads if that pays: the guest
+    /// keeps several in flight, it's big (the vCPU would wait for it), or
+    /// it's a flush (milliseconds). A small one while the guest sends one
+    /// at a time runs here: no thread wakeups, about three times the IOPS
+    /// at queue depth 1. False: run it here.
     fn dispatch(&mut self, job: Job, more: bool) -> bool {
         let running = self.io.done.lock().unwrap_or_else(|e| e.into_inner()).running;
         let c = &job.cmd;
         let bs = c.nsid.checked_sub(1).and_then(|i| self.ns.get(i as usize)).map_or(512, |n| n.block_size);
         let big = matches!(c.opc, 0x01 | 0x02) && ((c.cdw[2] & 0xffff) as u64 + 1) * bs >= ASYNC_BYTES;
-        if !(more || running > 0 || big || c.opc == 0x00) || running >= MAX_INFLIGHT || self.me.strong_count() == 0 {
+        let inline = self.policy.run_inline(more || running > 0) && !big && c.opc != 0x00;
+        if inline || running >= MAX_INFLIGHT || self.me.strong_count() == 0 {
             return false;
         }
         if self.pool.is_none() {

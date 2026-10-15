@@ -92,6 +92,11 @@ pub trait QueueHandler: Send + 'static {
     /// Called once before the worker starts: keep the poker to wake the
     /// worker from other threads (`backend_ready(POKE_TOKEN)` follows).
     fn attach(&mut self, _poker: Poker) {}
+    /// Run queue `q` on the thread that kicked it (a vCPU), instead of
+    /// waking the worker. False if the handler doesn't do that.
+    fn process_queue_inline(&mut self, _ctx: &mut QueueCtx, _q: usize) -> bool {
+        false
+    }
     /// The worker is being paused: finish whatever runs on other threads
     /// and hand back its buffers, so nothing touches guest memory until
     /// the resume. Runs on the pausing thread, with the worker idle.
@@ -177,6 +182,21 @@ impl<H: QueueHandler> Worker<H> {
             self.shared.sig.kicks.fetch_or(1 << q, Ordering::AcqRel);
             let _ = self.waker.wake();
         }
+    }
+
+    /// Let the handler run queue `q` here and now if the worker is idle
+    /// (not busy, not paused). False: kick it instead.
+    pub fn try_inline(&self, q: u16) -> bool {
+        let Ok(mut g) = self.shared.inner.try_lock() else { return false };
+        let inner = &mut *g;
+        if inner.paused || (q as usize) >= inner.ctx.queues.len() {
+            return false;
+        }
+        if !inner.handler.process_queue_inline(&mut inner.ctx, q as usize) {
+            return false;
+        }
+        inner.ctx.flush();
+        true
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner<H>> {
@@ -307,6 +327,15 @@ impl<H: QueueHandler> WorkerSlot<H> {
     pub fn notify(&self, q: u16) {
         if let Some(w) = &self.worker {
             w.kick(q);
+        }
+    }
+
+    /// Run queue `q` on the calling thread if the handler can, else kick.
+    pub fn notify_inline(&self, q: u16) {
+        if let Some(w) = &self.worker {
+            if !w.try_inline(q) {
+                w.kick(q);
+            }
         }
     }
 
