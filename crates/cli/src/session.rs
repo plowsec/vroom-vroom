@@ -94,9 +94,13 @@ fn selftest() {
         Ok(_) => eprintln!("sandbox selftest: exec ALLOWED (bad)"),
         Err(e) => eprintln!("sandbox selftest: exec blocked ({e})"),
     }
-    match std::net::TcpListener::bind("127.0.0.1:0") {
-        Ok(_) => eprintln!("sandbox selftest: new listener ALLOWED (bad)"),
-        Err(e) => eprintln!("sandbox selftest: new listener blocked ({e})"),
+    // On Linux, seccomp kills the process on bind() or an AF_UNIX
+    // socket(): those probes go last there, and dying is the pass.
+    if cfg!(target_os = "macos") {
+        match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(_) => eprintln!("sandbox selftest: new listener ALLOWED (bad)"),
+            Err(e) => eprintln!("sandbox selftest: new listener blocked ({e})"),
+        }
     }
     // Host services: loopback TCP and Unix sockets (ssh-agent...).
     let t = Duration::from_secs(2);
@@ -106,15 +110,16 @@ fn selftest() {
             Err(e) => eprintln!("sandbox selftest: host loopback blocked ({e})"),
         }
     }
+    match std::net::TcpStream::connect_timeout(&([1, 1, 1, 1], 53).into(), t) {
+        Ok(_) => eprintln!("sandbox selftest: internet reachable (NAT works)"),
+        Err(e) => eprintln!("sandbox selftest: internet: {e}"),
+    }
     if let Some(sock) = std::env::var_os("SSH_AUTH_SOCK") {
+        eprintln!("sandbox selftest: unix socket probe (Linux: expect SIGSYS now)");
         match std::os::unix::net::UnixStream::connect(&sock) {
             Ok(_) => eprintln!("sandbox selftest: unix socket {} ALLOWED (bad)", sock.to_string_lossy()),
             Err(e) => eprintln!("sandbox selftest: unix sockets blocked ({e})"),
         }
-    }
-    match std::net::TcpStream::connect_timeout(&([1, 1, 1, 1], 53).into(), t) {
-        Ok(_) => eprintln!("sandbox selftest: internet reachable (NAT works)"),
-        Err(e) => eprintln!("sandbox selftest: internet: {e}"),
     }
 }
 
