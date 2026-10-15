@@ -92,10 +92,23 @@ in-flight buffers before saving.
 
 ## 3D
 
-`gpu = "virtio3d"` adds Venus to virtio-gpu: guest Vulkan (Mesa's venus
-driver) serializes commands, virglrenderer replays them on MoltenVK. Guest
-memory a renderer may touch is passed as host iovecs; host-visible buffers
-are mapped into the guest's shared memory window with the hypervisor.
+`gpu = "virtio3d"` adds two protocols to virtio-gpu. Venus: guest Vulkan
+(Mesa's venus driver) serializes commands, virglrenderer replays them on
+MoltenVK. virgl: guest OpenGL (Mesa's virgl driver) sends Gallium
+commands, virglrenderer's vrend replays them on OpenGL ES from ANGLE's
+Metal backend. Both capsets are offered; Mesa picks per API. Guest memory
+a renderer may touch is passed as host iovecs; host-visible buffers are
+mapped into the guest's shared memory window with the hypervisor.
+
+GL details (`gpu3d/src/egl.rs`): we create the EGL contexts virglrenderer
+asks for (one share group, no surfaces) and keep the right one bound on
+whichever thread calls in (setup thread, then the GPU worker, which
+changes on device reset). GL fences have no completion thread (ANGLE
+serializes a share group's contexts, so a thread blocked on a fence
+would stall submits): the worker polls them every millisecond while any
+is pending. A GL scanout is copied back on flush: from a context of our
+own, into a pixel buffer on the GPU, and shown when the copy lands while
+the worker goes on.
 
 macOS constraints: HVF maps at 16 KiB granularity, so guests need a 16 KiB
 page kernel (or blob sizes that are 16 KiB multiples), and MoltenVK lacks

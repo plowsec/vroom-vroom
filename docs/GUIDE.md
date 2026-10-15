@@ -205,21 +205,77 @@ switched while the VM runs.
 ## 3D acceleration (Linux guests)
 
 ```bash
-brew install meson ninja libepoxy molten-vk
-scripts/build-virglrenderer.sh
+brew install meson ninja molten-vk
+scripts/build-angle.sh            # OpenGL: ANGLE on Metal (about 10 minutes)
+scripts/build-virglrenderer.sh    # virglrenderer, for Vulkan and OpenGL
 ```
 
-Set `[display] gpu = "virtio3d"`. In the guest: `mesa-vulkan-drivers`
-(Mesa ≥ 24), the user in the `render` group, and on macOS hosts a kernel
-with **16 KiB pages** (HVF maps guest memory at 16 KiB granularity).
-Ubuntu ships no such kernel; build one from Ubuntu's config with
-`CONFIG_ARM64_16K_PAGES=y` (see `examples/ubuntu/kernel-16k.sh`).
-`vulkaninfo --summary` should show `Virtio-GPU Venus (Apple M…)`.
+Set `[display] gpu = "virtio3d"`. The guest gets two drivers, and Mesa
+picks the right one by itself:
 
-OpenGL on top of it (Mesa's Zink) doesn't work yet: Zink needs Vulkan's
-`nullDescriptor` (robustness2), which MoltenVK can't offer on Metal, so GL
-apps fall back to llvmpipe. Windows guests are not covered: Windows has no
-Venus driver.
+- **OpenGL** (virgl): Mesa's virgl driver sends GL work to the host,
+  where virglrenderer replays it on OpenGL ES, which ANGLE turns into
+  Metal. Stock Ubuntu works as it is (any kernel, Mesa from the archive).
+  `glxinfo -B` shows `virgl (ANGLE (Apple, ANGLE Metal Renderer: Apple M…))`
+  and GNOME draws with the Mac's GPU.
+- **Vulkan** (Venus): needs `mesa-vulkan-drivers` (Mesa ≥ 24), the user
+  in the `render` group, and on macOS hosts a kernel with **16 KiB pages**
+  (HVF maps guest memory at 16 KiB granularity). Ubuntu ships no such
+  kernel; build one from Ubuntu's config with `CONFIG_ARM64_16K_PAGES=y`
+  (see `examples/ubuntu/kernel-16k.sh`). `vulkaninfo --summary` should
+  show `Virtio-GPU Venus (Apple M…)`. There is no swapchain
+  (`VK_KHR_swapchain` is missing, with or without OpenGL): Vulkan apps
+  can compute and render off screen, not show a window.
+
+What OpenGL apps get: OpenGL 2.1 and OpenGL ES 3.0. ANGLE's Metal
+backend stops at ES 3.0, and virgl can't offer more than its host has.
+That covers desktops and apps written for GL 2 or GLES; apps that need
+GL 3.3 core (Blender, recent games) won't start. `LIBGL_ALWAYS_SOFTWARE=1`
+runs one app on llvmpipe instead, which has GL 4.5.
+
+`[display] opengl = false` keeps Vulkan only (the guest's GL then runs on
+llvmpipe). That keeps less host code in reach of the guest, and keeps
+suspend working (see below).
+
+Speed, Ubuntu 24.04 GNOME (Wayland), 1280×800, 6 vCPUs, M3 Max,
+glmark2 2023.01 at its default 800×600 window:
+
+| | `virtio2d` (llvmpipe) | `virtio3d` (virgl on Metal) |
+|---|---|---|
+| glmark2 score | 463, 478 | 806 to 925 (four runs) |
+| glmark2 terrain | 16 to 22 fps | 520 to 530 fps |
+| glmark2 refract | 42 to 47 fps | 770 to 850 fps |
+| glxgears (vsync off) | about 2,700 fps | 400 to 1,600 fps |
+| guest CPU busy during terrain | 59% | 3% |
+
+Numbers move with the host's load (these were taken next to other VMs).
+glxgears is the one test llvmpipe wins: its frames are tiny, and with
+virgl each one makes a round trip to the host GPU, and the window shows
+a copy of the guest's screen read back from it. Anything with real work
+is many times faster, and the guest's CPUs stay free.
+
+Why virgl and not OpenGL on top of Vulkan (Zink): Zink needs Vulkan's
+`nullDescriptor` (robustness2), which MoltenVK can't offer on Metal.
+Faking it on the host would mean rewriting descriptor sets in
+virglrenderer's Venus decoder. virgl on ANGLE is the route UTM takes on
+macOS, and it works with any guest kernel.
+
+Snapshots and suspend: GPU state lives on the host GPU and can't be
+saved, so snapshots and suspend are refused while 3D contexts exist.
+With OpenGL on, the GNOME desktop itself is one, so in practice: shut the
+guest down instead of suspending it. Closing the window then leaves the
+VM paused with "suspend failed"; resume it and shut down from the guest,
+or power it off. With `opengl = false` this only happens while a Vulkan
+app runs. Windows guests are not covered: Windows has no virgl or Venus
+driver.
+
+The build: `build-angle.sh` fetches ANGLE at the commit Chrome's stable
+release uses, with Google's depot_tools, about 3 GB while it builds
+(removed afterwards), and leaves `libEGL.dylib` and `libGLESv2.dylib`
+(6 MB) in `target/angle`. `build-virglrenderer.sh` builds libepoxy 1.5.10
+(EGL on, patched to load ANGLE from its own directory) into
+virglrenderer (3.4 MB). Both copy their results next to `target/*/vroom`,
+where the VMM looks; ship the three dylibs with the binary.
 
 ## Shared folders
 
@@ -403,7 +459,8 @@ instead of the microphone. The window gate still applies.
   (the disks too).
 - `Ctrl-A z` / `Ctrl+Alt+Shift+Z` / closing the GUI window: suspend; the
   next `run` resumes. `--fresh` ignores the suspend image.
-- Not possible while 3D contexts are active.
+- Not possible while 3D contexts are active. With OpenGL on, the GNOME
+  desktop is one (see 3D acceleration).
 - `vroom snapshot list vm.toml`, `vroom snapshot delete vm.toml snap-…`:
   deleting a snapshot also removes the disk layers only it used, and merges
   layers that became pass-through, so disk chains stay short.
@@ -440,9 +497,9 @@ flushes a lot). `"none"` ignores flushes: scratch disks only.
 - Windows 11 is installed with its hardware checks bypassed (no Secure
   Boot); `tpm = true` (needs `brew install swtpm`) gives it a real TPM 2.0,
   which Windows sees and uses.
-- Windows guests: no 3D (no Venus driver). Shared folders need WinFsp
-  (see above).
-- 3D snapshots, OpenGL on Venus (Zink, see above): not supported.
+- Windows guests: no 3D (no Venus or virgl driver). Shared folders need
+  WinFsp (see above).
+- 3D snapshots: not supported. Guest OpenGL stops at 2.1 / ES 3.0.
 - NAT connections don't survive suspend/resume (the guest reconnects).
 - USB passthrough: not yet tried with a real device (none was at hand);
   tested with the pretend device behind the real helper and sandbox. No

@@ -610,6 +610,7 @@ impl App {
             nested: c.nested,
             tpm: c.tpm,
             gpu,
+            opengl: c.display.opengl,
             width: s(c.display.width.to_string()),
             height: s(c.display.height.to_string()),
             hidpi: c.display.hidpi,
@@ -675,7 +676,11 @@ impl App {
                 0 => "No screen".to_string(),
                 g => format!(
                     "{} · starts at {}×{}{}",
-                    if g == 1 { "2D" } else { "3D (Vulkan)" },
+                    match (g, c.display.opengl) {
+                        (1, _) => "2D",
+                        (_, true) => "3D (Vulkan, OpenGL)",
+                        _ => "3D (Vulkan)",
+                    },
                     c.display.width,
                     c.display.height,
                     if c.display.hidpi { " · full resolution" } else { "" }
@@ -734,7 +739,7 @@ impl App {
         self.ui.set_vis(CardVis {
             searching: !any,
             hw: any || hit(&format!("processor cpu cpus core memory ram nested virtualization guest system os {}", st.sum_hw.to_lowercase())),
-            display: any || hit("display screen gpu 3d 2d graphics vulkan resolution width height size monitor retina hidpi scale scaling sharp blurry"),
+            display: any || hit("display screen gpu 3d 2d graphics vulkan opengl resolution width height size monitor retina hidpi scale scaling sharp blurry"),
             storage: any || hit("storage disk disks iso cdrom installer drive nvme virtio bus sync write safety readonly read-only compact image qcow2 space"),
             net: any || hit("network net nat bridged host-only hostonly port forward forwarding ssh mac address interface internet lan localhost loopback adapter"),
             share: any || hit("shared folders share folder virtiofs mount files tag"),

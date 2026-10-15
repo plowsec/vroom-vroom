@@ -187,6 +187,10 @@ pub struct Identity {
     /// The guest agent's virtio-console port. The agent must be told if
     /// this changes (`vroom-agent --port`).
     pub agent_port: String,
+    /// OpenGL renderer name (virtio3d): the guest shows "virgl (<this>)".
+    /// Default: the host's, which names its GPU and macOS version.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gl_renderer: Option<String>,
 }
 
 impl Default for Identity {
@@ -223,6 +227,7 @@ impl Default for Identity {
             nat_dns: Ipv4Addr::new(10, 0, 2, 3),
             nat_gateway_mac: "02:42:57:4b:00:01".into(),
             agent_port: "org.vroom.agent.0".into(),
+            gl_renderer: None,
         }
     }
 }
@@ -260,6 +265,10 @@ impl Identity {
         text("cpu_name", &self.cpu_name, 64, false)?;
         text("dt_model", &self.dt_model, 64, false)?;
         text("disk_firmware", &self.disk_firmware, 8, false)?;
+        if let Some(s) = &self.gl_renderer {
+            // 63 + NUL fill virgl's 64-byte field.
+            text("gl_renderer", s, 63, false)?;
+        }
         if !(1..=0x24).contains(&self.chassis_type) {
             return Err(Error::Invalid("identity.chassis_type: 1-36 (SMBIOS chassis type)".into()));
         }
@@ -673,6 +682,10 @@ pub struct Display {
     /// guest gets logical pixels and the window scales the picture up.
     #[serde(default = "yes")]
     pub hidpi: bool,
+    /// With `virtio3d`: OpenGL (virgl, on ANGLE/Metal) next to Vulkan.
+    /// Off keeps Venus only: less host code parsing guest commands.
+    #[serde(default = "yes")]
+    pub opengl: bool,
 }
 
 fn default_w() -> u32 {
@@ -684,7 +697,7 @@ fn default_h() -> u32 {
 
 impl Default for Display {
     fn default() -> Self {
-        Display { gpu: Gpu::None, width: default_w(), height: default_h(), hidpi: true }
+        Display { gpu: Gpu::None, width: default_w(), height: default_h(), hidpi: true, opengl: true }
     }
 }
 
@@ -1179,6 +1192,11 @@ guest_to_host = false
         // A [[net]] MAC can't be the gateway's.
         let clash = format!("{SAMPLE}\n[identity]\nnat_gateway_mac = \"52:54:00:aa:bb:cc\"\n");
         assert!(VmConfig::from_toml(&clash).is_err());
+        // The GL renderer name fills a 64-byte C string.
+        let gl = format!("{SAMPLE}\n[identity]\ngl_renderer = \"Mali-G78\"\n");
+        assert_eq!(VmConfig::from_toml(&gl).unwrap().identity.gl_renderer.as_deref(), Some("Mali-G78"));
+        assert!(VmConfig::from_toml(&gl.replace("Mali-G78", &"x".repeat(64))).is_err());
+        assert!(VmConfig::from_toml(&gl.replace("Mali-G78", "")).is_err());
 
         let mut i = Identity::default();
         i.randomize_serials([1, 2, 3, 4, 5, 6, 7, 8]);
@@ -1212,6 +1230,7 @@ guest_to_host = false
         assert_eq!(port_forwards[0].host_addr, "127.0.0.1");
         assert!(c.clipboard.host_to_guest && !c.clipboard.guest_to_host);
         assert!(c.security.sandbox);
+        assert!(c.display.opengl, "GL on by default with 3D");
         // Round trip.
         let again = VmConfig::from_toml(&c.to_toml().unwrap()).unwrap();
         assert_eq!(again, c);

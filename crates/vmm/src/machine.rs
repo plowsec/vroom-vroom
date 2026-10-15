@@ -21,7 +21,7 @@ use vroom_net::nat::{Nat, NatConfig, NatPolicy, TcpForward};
 use vroom_net::socket::FrameSocket;
 use vroom_net::{netd, NetBackend};
 use vroom_virtio::devices::gpu::{DisplaySink, Gpu as GpuDev, ThreeD};
-use vroom_virtio::devices::gpu3d::{Mapping, ShmMapper};
+use vroom_virtio::devices::gpu3d::{Mapping, Renderer3d, ShmMapper};
 use vroom_virtio::devices::input::{Input, InputKind};
 use vroom_virtio::devices::{block::Block, console::Console, fs::Fs, net::Net, rng::Rng};
 use vroom_devices::nvme::{Namespace, Nvme};
@@ -233,14 +233,19 @@ impl BootImage {
 /// Host-visible window size for GPU buffers (address space, not memory).
 const GPU_SHM_SIZE: u64 = 8 << 30;
 
-/// Venus through virglrenderer, or a clear error.
-fn three_d(vm: &Arc<dyn Vm>) -> Result<ThreeD> {
-    if !vroom_gpu3d::load() {
+/// Venus (and GL, if asked and ANGLE is there) through virglrenderer, or
+/// a clear error.
+fn three_d(vm: &Arc<dyn Vm>, config: &VmConfig) -> Result<ThreeD> {
+    if !vroom_gpu3d::load(config.display.opengl) {
         return Err(Error::Setup(
-            "gpu = \"virtio3d\" needs virglrenderer with Venus (macOS: brew install slp/krunkit/virglrenderer)".into(),
+            "gpu = \"virtio3d\" needs virglrenderer with Venus (scripts/build-virglrenderer.sh, or brew install slp/krunkit/virglrenderer)".into(),
         ));
     }
-    let r = vroom_gpu3d::Virgl::new().ok_or_else(|| Error::Setup("virglrenderer: Venus init failed (no Vulkan driver?)".into()))?;
+    let r = vroom_gpu3d::Virgl::new(config.identity.gl_renderer.clone())
+        .ok_or_else(|| Error::Setup("virglrenderer: Venus init failed (no Vulkan driver?)".into()))?;
+    if config.display.opengl && !r.capsets().iter().any(|c| c.0 == 2) {
+        log::warn!("gpu: no OpenGL for the guest (needs ANGLE next to virglrenderer: scripts/build-angle.sh); Vulkan only");
+    }
     Ok(ThreeD::new(Box::new(r), Arc::new(VmShm(vm.clone())), GPU_SHM_SIZE))
 }
 
@@ -504,7 +509,7 @@ pub(crate) fn build(
         let sink: Arc<dyn DisplaySink> = fb.clone();
         let (mut gpu, ctl) = GpuDev::new(config.display.width, config.display.height, sink);
         if config.display.gpu == Gpu::Virtio3d {
-            gpu = gpu.with_3d(three_d(&vm)?);
+            gpu = gpu.with_3d(three_d(&vm, config)?);
         }
         board.add_virtio(Box::new(gpu))?;
         gpu_ctl = Some(ctl);

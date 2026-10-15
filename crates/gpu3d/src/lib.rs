@@ -1,13 +1,15 @@
 //! Host 3D for virtio-gpu: virglrenderer, loaded with dlopen.
 //!
-//! Only Venus (Vulkan) is enabled: the guest's Vulkan driver talks to the
-//! host's (MoltenVK on macOS) through serialized command streams. OpenGL in
-//! the guest goes through Zink on top of that.
+//! Two protocols: Venus (Vulkan), where the guest's Vulkan driver talks to
+//! the host's (MoltenVK on macOS) through serialized command streams, and
+//! virgl (OpenGL), where Mesa's virgl driver sends Gallium commands that
+//! virglrenderer replays on OpenGL ES (ANGLE on Metal, see [`egl`]). The
+//! guest's Mesa picks virgl for GL and Venus for Vulkan.
 //!
 //! virglrenderer is native code that parses guest-controlled command
 //! streams, so it adds attack surface to the VMM process. It only loads
 //! when the VM asks for `gpu = "virtio3d"`; [`load`] must run before the
-//! sandbox goes up (it needs to open the library and the GPU driver).
+//! sandbox goes up (it needs to open the libraries and the GPU driver).
 //!
 //! The library is global state (one renderer per process), which matches
 //! one GPU per VMM process.
@@ -15,13 +17,21 @@
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void, CString};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
-use vroom_virtio::devices::gpu3d::{Blob, Create3d, FenceDone, HostIov, Mapping, Renderer3d, Transfer3d};
+use vroom_virtio::devices::gpu3d::{Blob, Box3d, Create3d, FenceDone, HostIov, Mapping, Renderer3d, Transfer3d};
 
+#[cfg(target_os = "macos")]
+mod egl;
+
+const CAPSET_VIRGL: u32 = 1;
+const CAPSET_VIRGL2: u32 = 2;
 const CAPSET_VENUS: u32 = 4;
-// Venus only: GL (virgl) is off, its capsets would be empty.
-const KNOWN_CAPSETS: [u32; 1] = [CAPSET_VENUS];
+const KNOWN_CAPSETS: [u32; 3] = [CAPSET_VIRGL, CAPSET_VIRGL2, CAPSET_VENUS];
+/// Where `char renderer[64]` sits in virgl caps v2 (virgl_hw.h; the
+/// layout is guest ABI, it only grows).
+const CAPS_V2_RENDERER: std::ops::Range<usize> = 696..760;
 
 // virglrenderer.h flags.
 const THREAD_SYNC: c_int = 2;
@@ -70,7 +80,7 @@ struct BlobArgs {
 struct Callbacks {
     version: c_int,
     write_fence: Option<extern "C" fn(*mut c_void, u32)>,
-    create_gl_context: Option<extern "C" fn(*mut c_void, c_int, *mut c_void) -> *mut c_void>,
+    create_gl_context: Option<extern "C" fn(*mut c_void, c_int, *mut GlCtxParam) -> *mut c_void>,
     destroy_gl_context: Option<extern "C" fn(*mut c_void, *mut c_void)>,
     make_current: Option<extern "C" fn(*mut c_void, c_int, *mut c_void) -> c_int>,
     get_drm_fd: Option<extern "C" fn(*mut c_void) -> c_int>,
@@ -78,8 +88,15 @@ struct Callbacks {
     get_server_fd: Option<extern "C" fn(*mut c_void, u32) -> c_int>,
 }
 
+#[cfg(target_os = "macos")]
+use egl::GlCtxParam;
+#[cfg(not(target_os = "macos"))]
+enum GlCtxParam {}
+
 /// Resolved entry points.
 struct Lib {
+    /// The directory it was loaded from (ANGLE must sit there too).
+    dir: Option<PathBuf>,
     init: unsafe extern "C" fn(*mut c_void, c_int, *mut Callbacks) -> c_int,
     poll: unsafe extern "C" fn(),
     reset: unsafe extern "C" fn(),
@@ -102,6 +119,7 @@ struct Lib {
     get_map_info: unsafe extern "C" fn(u32, *mut u32) -> c_int,
     create_fence: unsafe extern "C" fn(c_int, u32) -> c_int,
     ctx_create_fence: unsafe extern "C" fn(u32, u32, u32, u64) -> c_int,
+    get_info: unsafe extern "C" fn(c_int, *mut c_void) -> c_int,
     /// macOS fork (krunkit): blobs come with a host pointer already.
     get_map_ptr: Option<unsafe extern "C" fn(u32, *mut u64) -> c_int>,
 }
@@ -136,7 +154,7 @@ fn candidates() -> Vec<String> {
 }
 
 fn open_lib() -> Option<Lib> {
-    let handle = candidates().into_iter().find_map(|p| {
+    let (handle, path) = candidates().into_iter().find_map(|p| {
         let c = CString::new(p.clone()).ok()?;
         // SAFETY: dlopen with a valid C string.
         let h = unsafe { libc::dlopen(c.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
@@ -144,7 +162,7 @@ fn open_lib() -> Option<Lib> {
             None
         } else {
             log::info!("gpu3d: loaded {p}");
-            Some(h)
+            Some((h, p))
         }
     })?;
     macro_rules! sym {
@@ -164,7 +182,10 @@ fn open_lib() -> Option<Lib> {
             }
         }};
     }
+    // Bare names were found through the search path: ask dyld where.
+    let dir = std::path::Path::new(&path).is_absolute().then(|| PathBuf::from(&path)).and_then(|p| p.parent().map(PathBuf::from));
     Some(Lib {
+        dir,
         init: sym!("virgl_renderer_init"),
         poll: sym!("virgl_renderer_poll"),
         reset: sym!("virgl_renderer_reset"),
@@ -187,6 +208,7 @@ fn open_lib() -> Option<Lib> {
         get_map_info: sym!("virgl_renderer_resource_get_map_info"),
         create_fence: sym!("virgl_renderer_create_fence"),
         ctx_create_fence: sym!("virgl_renderer_context_create_fence"),
+        get_info: sym!("virgl_renderer_resource_get_info"),
         get_map_ptr: {
             let c = CString::new("virgl_renderer_resource_get_map_ptr").ok()?;
             // SAFETY: valid handle and name.
@@ -197,9 +219,34 @@ fn open_lib() -> Option<Lib> {
     })
 }
 
-/// Load the library. Call before the sandbox. Returns whether 3D is usable.
-pub fn load() -> bool {
-    LIB.get_or_init(open_lib).is_some()
+/// Load the library, and with `gl` ANGLE next to it. Call before the
+/// sandbox. Returns whether 3D is usable (GL or not).
+pub fn load(gl: bool) -> bool {
+    let Some(lib) = LIB.get_or_init(open_lib) else { return false };
+    if gl {
+        GL.get_or_init(|| load_gl(lib));
+    }
+    true
+}
+
+/// Whether OpenGL (virgl on ANGLE) came up in [`load`].
+static GL: OnceLock<bool> = OnceLock::new();
+
+#[cfg(target_os = "macos")]
+fn load_gl(lib: &Lib) -> bool {
+    match &lib.dir {
+        Some(dir) => egl::load(dir),
+        None => {
+            log::info!("gpu3d: virglrenderer from the search path: no ANGLE, OpenGL off");
+            false
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn load_gl(_lib: &Lib) -> bool {
+    log::info!("gpu3d: OpenGL (virgl) is only wired up on macOS for now");
+    false
 }
 
 fn lib() -> Option<&'static Lib> {
@@ -320,7 +367,52 @@ fn page_size() -> u64 {
     unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
 }
 
-static INIT: Mutex<bool> = Mutex::new(false);
+/// Bind the GL context to the calling thread (see egl.rs). No-op without GL.
+fn enter() {
+    #[cfg(target_os = "macos")]
+    egl::bind();
+}
+
+/// The calling thread won't make renderer calls for a while.
+fn leave() {
+    #[cfg(target_os = "macos")]
+    egl::release();
+}
+
+/// Set once virglrenderer is up: whether with GL.
+static INIT: Mutex<Option<bool>> = Mutex::new(None);
+
+/// virgl_renderer_init, with GL contexts from [`egl`] or without GL.
+fn init(lib: &Lib, gl: bool) -> c_int {
+    type Create = extern "C" fn(*mut c_void, c_int, *mut GlCtxParam) -> *mut c_void;
+    type Destroy = extern "C" fn(*mut c_void, *mut c_void);
+    type Current = extern "C" fn(*mut c_void, c_int, *mut c_void) -> c_int;
+    #[cfg(target_os = "macos")]
+    let (create, destroy, current): (Option<Create>, Option<Destroy>, Option<Current>) =
+        if gl { (Some(egl::create_gl_context), Some(egl::destroy_gl_context), Some(egl::make_current)) } else { (None, None, None) };
+    #[cfg(not(target_os = "macos"))]
+    let (create, destroy, current): (Option<Create>, Option<Destroy>, Option<Current>) = (None, None, None);
+    // virglrenderer keeps the callbacks pointer: make it 'static.
+    let cb: &'static mut Callbacks = Box::leak(Box::new(Callbacks {
+        version: 3,
+        write_fence: Some(on_fence),
+        create_gl_context: create,
+        destroy_gl_context: destroy,
+        make_current: current,
+        get_drm_fd: None,
+        write_context_fence: Some(on_context_fence),
+        get_server_fd: None,
+    }));
+    // With GL, no fence thread: ANGLE serializes the contexts of a share
+    // group, so a thread blocked on a GL fence would stall every submit.
+    // GL fences are polled by the GPU worker instead (`poll`).
+    let flags = VENUS | ASYNC_FENCE_CB | if gl { 0 } else { NO_VIRGL | THREAD_SYNC };
+    // virgl refuses a null cookie; ours is never used (callbacks reach statics).
+    static COOKIE: u8 = 0;
+    // SAFETY: valid callbacks for the process lifetime; the cookie is only
+    // passed back to us.
+    unsafe { (lib.init)(&COOKIE as *const u8 as *mut c_void, flags, cb) }
+}
 
 /// The renderer. Owns the iovec arrays virglrenderer points into.
 pub struct Virgl {
@@ -332,6 +424,8 @@ pub struct Virgl {
     maps: HashMap<u32, (*mut u8, u64, bool)>,
     /// Blob sizes, for pointer-only mappings.
     blob_sizes: HashMap<u32, u64>,
+    /// GL renderer name the guest sees instead of the host's.
+    gl_renderer: Option<String>,
 }
 
 // SAFETY: the raw pointers (iovecs into guest RAM) stay valid for the VM's
@@ -345,34 +439,40 @@ impl std::fmt::Debug for Virgl {
 }
 
 impl Virgl {
-    /// Initialise virglrenderer (once per process) for Venus.
-    pub fn new() -> Option<Virgl> {
+    /// Initialise virglrenderer (once per process): Venus, plus virgl if
+    /// [`load`] brought up GL. `gl_renderer` replaces the host's GL
+    /// renderer name in what the guest reads.
+    pub fn new(gl_renderer: Option<String>) -> Option<Virgl> {
         let lib = lib()?;
         let mut inited = INIT.lock().unwrap_or_else(|e| e.into_inner());
-        if !*inited {
-            // virglrenderer keeps the callbacks pointer: make it 'static.
-            let cb: &'static mut Callbacks = Box::leak(Box::new(Callbacks {
-                version: 3,
-                write_fence: Some(on_fence),
-                create_gl_context: None,
-                destroy_gl_context: None,
-                make_current: None,
-                get_drm_fd: None,
-                write_context_fence: Some(on_context_fence),
-                get_server_fd: None,
-            }));
-            let _ = sink();
-            let flags = VENUS | NO_VIRGL | THREAD_SYNC | ASYNC_FENCE_CB;
-            // SAFETY: valid callbacks for the process lifetime; cookie unused.
-            let r = unsafe { (lib.init)(std::ptr::null_mut(), flags, cb) };
-            if r != 0 {
-                log::warn!("gpu3d: virgl_renderer_init failed: {r}");
-                return None;
+        let gl = match *inited {
+            Some(gl) => gl,
+            None => {
+                let _ = sink();
+                enter();
+                let mut gl = GL.get().copied().unwrap_or(false);
+                let mut r = if gl { init(lib, true) } else { -1 };
+                if gl && r != 0 {
+                    log::warn!("gpu3d: OpenGL (virgl) init failed ({r}): Venus only");
+                    gl = false;
+                }
+                if r != 0 {
+                    r = init(lib, false);
+                }
+                if r != 0 {
+                    log::warn!("gpu3d: virgl_renderer_init failed: {r}");
+                    leave();
+                    return None;
+                }
+                *inited = Some(gl);
+                // The GPU worker thread takes over from here.
+                leave();
+                gl
             }
-            *inited = true;
-        }
+        };
         let mut capsets = Vec::new();
-        for id in KNOWN_CAPSETS {
+        // virglrenderer reports the GL sets even with GL off (then empty).
+        for id in KNOWN_CAPSETS.into_iter().filter(|&id| gl || id == CAPSET_VENUS) {
             let (mut ver, mut size) = (0u32, 0u32);
             // SAFETY: valid out pointers.
             unsafe { (lib.get_cap_set)(id, &mut ver, &mut size) };
@@ -384,7 +484,7 @@ impl Virgl {
         if capsets.is_empty() {
             return None;
         }
-        Some(Virgl { lib, capsets, iovs: HashMap::new(), contexts: Vec::new(), maps: HashMap::new(), blob_sizes: HashMap::new() })
+        Some(Virgl { lib, capsets, iovs: HashMap::new(), contexts: Vec::new(), maps: HashMap::new(), blob_sizes: HashMap::new(), gl_renderer })
     }
 
     fn iov(&mut self, resource: u32, iov: HostIov) -> (*mut libc::iovec, usize) {
@@ -407,10 +507,17 @@ impl Renderer3d for Virgl {
         let mut buf = vec![0u8; size as usize];
         // SAFETY: buf is exactly the size the library reported for this set.
         unsafe { (self.lib.fill_caps)(id, version, buf.as_mut_ptr() as *mut c_void) };
+        if let (CAPSET_VIRGL2, Some(name), Some(field)) = (id, &self.gl_renderer, buf.get_mut(CAPS_V2_RENDERER)) {
+            // NUL-terminated, the rest zeroed.
+            field.fill(0);
+            let n = name.len().min(field.len() - 1);
+            field[..n].copy_from_slice(&name.as_bytes()[..n]);
+        }
         Some(buf)
     }
 
     fn context_create(&mut self, ctx: u32, capset: u32, name: &[u8]) -> bool {
+        enter();
         if !self.capsets.iter().any(|c| c.0 == capset) {
             return false;
         }
@@ -424,6 +531,7 @@ impl Renderer3d for Virgl {
     }
 
     fn context_destroy(&mut self, ctx: u32) {
+        enter();
         if let Some(i) = self.contexts.iter().position(|&c| c == ctx) {
             self.contexts.swap_remove(i);
             // SAFETY: plain call with an id.
@@ -432,16 +540,19 @@ impl Renderer3d for Virgl {
     }
 
     fn context_attach(&mut self, ctx: u32, resource: u32) {
+        enter();
         // SAFETY: plain call with ids; the library validates them.
         unsafe { (self.lib.ctx_attach)(ctx as c_int, resource as c_int) };
     }
 
     fn context_detach(&mut self, ctx: u32, resource: u32) {
+        enter();
         // SAFETY: as above.
         unsafe { (self.lib.ctx_detach)(ctx as c_int, resource as c_int) };
     }
 
     fn submit(&mut self, ctx: u32, cmds: &mut [u8]) -> bool {
+        enter();
         if cmds.len() % 4 != 0 {
             return false;
         }
@@ -450,6 +561,7 @@ impl Renderer3d for Virgl {
     }
 
     fn create_3d(&mut self, resource: u32, a: &Create3d) -> bool {
+        enter();
         let mut args = CreateArgs {
             handle: resource,
             target: a.target,
@@ -468,6 +580,7 @@ impl Renderer3d for Virgl {
     }
 
     fn attach_backing(&mut self, resource: u32, iov: HostIov) -> bool {
+        enter();
         if self.iovs.contains_key(&resource) {
             return false;
         }
@@ -482,6 +595,7 @@ impl Renderer3d for Virgl {
     }
 
     fn detach_backing(&mut self, resource: u32) {
+        enter();
         if self.iovs.contains_key(&resource) {
             let (mut p, mut n) = (std::ptr::null_mut(), 0);
             // SAFETY: valid out pointers; the array stays ours.
@@ -491,6 +605,7 @@ impl Renderer3d for Virgl {
     }
 
     fn transfer(&mut self, to_host: bool, ctx: u32, t: &Transfer3d) -> bool {
+        enter();
         let mut b = VirglBox { x: t.bx.x, y: t.bx.y, z: t.bx.z, w: t.bx.w, h: t.bx.h, d: t.bx.d };
         // SAFETY: the library bounds-checks box/offset against the resource
         // and its attached backing (our arrays).
@@ -505,6 +620,7 @@ impl Renderer3d for Virgl {
     }
 
     fn create_blob(&mut self, blob: &Blob, iov: HostIov) -> bool {
+        enter();
         if self.iovs.contains_key(&blob.resource) {
             return false;
         }
@@ -530,6 +646,7 @@ impl Renderer3d for Virgl {
     }
 
     fn map_blob(&mut self, resource: u32) -> Option<Mapping> {
+        enter();
         if self.maps.contains_key(&resource) {
             return None;
         }
@@ -555,6 +672,7 @@ impl Renderer3d for Virgl {
     }
 
     fn unmap_blob(&mut self, resource: u32) {
+        enter();
         if let Some((_, _, true)) = self.maps.remove(&resource) {
             // SAFETY: plain call.
             unsafe { (self.lib.unmap)(resource) };
@@ -562,6 +680,7 @@ impl Renderer3d for Virgl {
     }
 
     fn read_mapped(&mut self, resource: u32, offset: u64, out: &mut [u8]) -> bool {
+        enter();
         let Some(&(p, size, _)) = self.maps.get(&resource) else { return false };
         let Some(end) = offset.checked_add(out.len() as u64) else { return false };
         if end > size {
@@ -572,7 +691,52 @@ impl Renderer3d for Virgl {
         true
     }
 
+    fn read_back(&mut self, resource: u32, bx: Box3d, stride: u32, out: &mut [u8]) -> bool {
+        enter();
+        let need = (bx.h as u64).saturating_sub(1) * stride as u64 + bx.w as u64 * 4;
+        if bx.w == 0 || bx.h == 0 || (stride as u64) < bx.w as u64 * 4 || need > out.len() as u64 {
+            return false;
+        }
+        let mut b = VirglBox { x: bx.x, y: bx.y, z: 0, w: bx.w, h: bx.h, d: 1 };
+        let mut iov = libc::iovec { iov_base: out.as_mut_ptr() as *mut c_void, iov_len: out.len() };
+        // SAFETY: one iovec over `out`, which outlives the call; the library
+        // checks the box against the resource and the iovec's size.
+        unsafe { (self.lib.read_iov)(resource, 0, 0, stride, 0, &mut b, 0, &mut iov, 1) == 0 }
+    }
+
+    fn scanout_start(&mut self, resource: u32, bx: Box3d) -> bool {
+        enter();
+        // virgl_renderer_resource_info: handle, virgl_format, width,
+        // height, depth, flags, tex_id, ... (room to spare for forks).
+        let mut info = [0u32; 16];
+        // SAFETY: the buffer is larger than the struct the library fills.
+        if unsafe { (self.lib.get_info)(resource as c_int, info.as_mut_ptr() as *mut c_void) } != 0 || info[6] == 0 {
+            return false;
+        }
+        const Y_0_TOP: u32 = 1;
+        let flip = (info[5] & Y_0_TOP != 0).then_some(info[3]);
+        #[cfg(target_os = "macos")]
+        return egl::read_start(info[6], flip, (bx.x, bx.y, bx.w, bx.h));
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (flip, bx);
+            false
+        }
+    }
+
+    fn scanout_poll(&mut self, out: &mut [u8], wait: bool) -> Option<bool> {
+        enter();
+        #[cfg(target_os = "macos")]
+        return egl::read_poll(out, wait);
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (out, wait);
+            None
+        }
+    }
+
     fn unref(&mut self, resource: u32) {
+        enter();
         self.unmap_blob(resource);
         self.detach_backing(resource);
         // SAFETY: plain call; unknown ids are ignored by the library.
@@ -582,6 +746,7 @@ impl Renderer3d for Virgl {
     }
 
     fn create_fence(&mut self, ctx: u32, ring: Option<u8>, fence: u64) -> bool {
+        enter();
         // SAFETY: plain calls.
         let r = unsafe {
             match ring {
@@ -597,6 +762,7 @@ impl Renderer3d for Virgl {
     }
 
     fn poll(&mut self) -> Vec<FenceDone> {
+        enter();
         let s = sink();
         let mut buf = [0u8; 64];
         // SAFETY: drain our non-blocking pipe into a local buffer.
@@ -607,6 +773,7 @@ impl Renderer3d for Virgl {
     }
 
     fn reset(&mut self) {
+        enter();
         // SAFETY: drops every context and resource inside the library.
         unsafe { (self.lib.reset)() };
         self.iovs.clear();
@@ -614,5 +781,10 @@ impl Renderer3d for Virgl {
         self.maps.clear();
         self.blob_sizes.clear();
         sink().done.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        leave();
+    }
+
+    fn release_thread(&mut self) {
+        leave();
     }
 }

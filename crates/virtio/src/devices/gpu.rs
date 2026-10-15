@@ -6,9 +6,10 @@
 //!
 //! 3D (optional, see [`ThreeD`]): contexts, command submission, blob
 //! resources and fences go to a [`Renderer3d`]. Host-visible blobs are
-//! mapped into a shared memory window the guest maps like VRAM. Simple 2D
-//! textures (what Linux uses for dumb buffers once 3D is negotiated) stay
-//! on the CPU path here: Venus has no GL to render them with.
+//! mapped into a shared memory window the guest maps like VRAM. With GL
+//! (virgl), every 3D resource lives in the renderer and a GL scanout is
+//! read back from the GPU on flush. Without it (Venus only), simple 2D
+//! textures stay on the CPU path here: there is no GL to render them with.
 //!
 //! Hostile-guest limits: total resource memory, resource count, backing
 //! entries, command sizes, pending fences, and every rect/offset/window
@@ -78,6 +79,8 @@ const BLOB_MEM_GUEST: u32 = 1;
 const BLOB_MEM_HOST3D: u32 = 2;
 const BLOB_MEM_HOST3D_GUEST: u32 = 3;
 const PIPE_TEXTURE_2D: u32 = 2;
+/// virgl's GL capset: a context made with capset 0 (classic virgl) uses it.
+const CAPSET_VIRGL2: u32 = 2;
 
 const MAX_RESOURCE_BYTES: usize = 512 << 20;
 const MAX_RESOURCES: usize = 4096;
@@ -85,7 +88,10 @@ const MAX_BACKING_ENTRIES: u32 = 16384;
 const MAX_DIM: u32 = 16384;
 const MAX_SUBMIT: usize = 16 << 20;
 const MAX_PENDING_FENCES: usize = 4096;
-const FENCE_POLL: Duration = Duration::from_millis(5);
+/// How often to look for finished fences while some are pending. GL
+/// fences have no completion callback (no fence thread, see vroom-gpu3d),
+/// so this bounds how long a guest waits after the GPU is done.
+const FENCE_POLL: Duration = Duration::from_millis(1);
 
 /// Where finished frames go.
 pub trait DisplaySink: Send + Sync {
@@ -140,6 +146,8 @@ pub struct ThreeD {
     mapper: Arc<dyn ShmMapper>,
     shm_size: u64,
     shm_base: Arc<AtomicU64>,
+    /// The renderer does GL (virgl), not just Venus.
+    gl: bool,
 }
 
 impl std::fmt::Debug for ThreeD {
@@ -151,7 +159,8 @@ impl std::fmt::Debug for ThreeD {
 impl ThreeD {
     pub fn new(renderer: Box<dyn Renderer3d>, mapper: Arc<dyn ShmMapper>, shm_size: u64) -> Self {
         let capsets = renderer.capsets();
-        ThreeD { renderer: Arc::new(Mutex::new(renderer)), capsets, mapper, shm_size, shm_base: Arc::new(AtomicU64::new(0)) }
+        let gl = capsets.iter().any(|c| c.0 == CAPSET_VIRGL2);
+        ThreeD { renderer: Arc::new(Mutex::new(renderer)), capsets, mapper, shm_size, shm_base: Arc::new(AtomicU64::new(0)), gl }
     }
 
     fn r(&self) -> MutexGuard<'_, Box<dyn Renderer3d>> {
@@ -178,7 +187,7 @@ impl Gpu {
         (Gpu { shared: shared.clone(), sink, three_d: None, worker: WorkerSlot::default() }, GpuControl(shared))
     }
 
-    /// Offer 3D (Venus) on top of 2D.
+    /// Offer 3D (Venus, and GL if the renderer has it) on top of 2D.
     pub fn with_3d(mut self, t: ThreeD) -> Self {
         self.three_d = Some(t);
         self
@@ -208,6 +217,8 @@ impl Gpu {
             contexts: Vec::new(),
             cpu_contexts: Vec::new(),
             pending: Vec::new(),
+            reading: None,
+            read_buf: Vec::new(),
         }
     }
 }
@@ -228,6 +239,8 @@ struct Res3d {
     guest: Vec<(u64, u32)>,
     /// Where it's mapped in the host-visible window: (gpa, size).
     mapped: Option<(u64, u64)>,
+    /// Format, width and height of a classic 3D resource (GL scanouts).
+    tex: Option<(u32, u32, u32)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -236,6 +249,8 @@ enum Scanout {
     Cpu { id: u32, view: Rect },
     /// A blob, read straight from its memory.
     Blob { id: u32, view: Rect, format: u32, stride: u32, offset: u32 },
+    /// A GL resource, read back from the GPU.
+    Gl { id: u32, view: Rect, format: u32 },
 }
 
 /// 2D state for snapshots. Pixels are not saved: they are re-read from
@@ -280,6 +295,21 @@ pub struct GpuHandler {
     /// Contexts with no renderer side (capset 0).
     cpu_contexts: Vec<u32>,
     pending: Vec<Pending>,
+    /// A GL scanout on its way back from the GPU, and where it lands.
+    reading: Option<Reading>,
+    read_buf: Vec<u8>,
+}
+
+/// Where a GL frame being read back goes.
+#[derive(Debug, Clone, Copy)]
+struct Reading {
+    id: u32,
+    view: Rect,
+    /// Position in the visible view, and size.
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
 }
 
 impl std::fmt::Debug for GpuHandler {
@@ -437,12 +467,13 @@ impl GpuHandler {
                 if hdr.ctx == 0 || self.contexts.contains(&hdr.ctx) || self.cpu_contexts.contains(&hdr.ctx) {
                     return bad;
                 }
-                if capset == 0 {
+                if capset == 0 && !t.gl {
                     // Classic virgl (Linux makes one for its own use). No GL
                     // here: a context that only ever touches CPU resources.
                     self.cpu_contexts.push(hdr.ctx);
                     return (OK_NODATA, vec![]);
                 }
+                let capset = if capset == 0 { CAPSET_VIRGL2 } else { capset };
                 let n = (nlen as usize).min(64);
                 if !t.r().context_create(hdr.ctx, capset, &name[..n]) {
                     return (ERR_UNSPEC, vec![]);
@@ -605,8 +636,8 @@ impl GpuHandler {
             nr_samples: v[9],
             flags: v[10],
         };
-        // Plain 2D textures (dumb buffers, fbcon) stay on the CPU.
-        if a.target == PIPE_TEXTURE_2D && a.depth <= 1 && a.array_size <= 1 && a.last_level == 0 && a.nr_samples <= 1 && swizzle(a.format).is_some() {
+        // Without GL, plain 2D textures (dumb buffers, fbcon) stay on the CPU.
+        if !t.gl && a.target == PIPE_TEXTURE_2D && a.depth <= 1 && a.array_size <= 1 && a.last_level == 0 && a.nr_samples <= 1 && swizzle(a.format).is_some() {
             return (self.create_cpu(id, a.format, a.width, a.height), vec![]);
         }
         if !self.id_free(id) || self.resource_count() >= MAX_RESOURCES {
@@ -615,7 +646,7 @@ impl GpuHandler {
         if !t.r().create_3d(id, &a) {
             return (ERR_UNSPEC, vec![]);
         }
-        self.res3d.insert(id, Res3d::default());
+        self.res3d.insert(id, Res3d { tex: Some((a.format, a.width, a.height)), ..Default::default() });
         (OK_NODATA, vec![])
     }
 
@@ -672,7 +703,7 @@ impl GpuHandler {
             return (ERR_UNSPEC, vec![]);
         }
         let guest = if blob_mem == BLOB_MEM_GUEST { entries } else { Vec::new() };
-        self.res3d.insert(id, Res3d { guest, mapped: None });
+        self.res3d.insert(id, Res3d { guest, mapped: None, tex: None });
         (OK_NODATA, vec![])
     }
 
@@ -711,7 +742,10 @@ impl GpuHandler {
     }
 
     fn unref(&mut self, id: u32) -> u32 {
-        if matches!(self.scanout, Some(Scanout::Cpu { id: s, .. } | Scanout::Blob { id: s, .. }) if s == id) {
+        if self.reading.is_some_and(|r| r.id == id) {
+            self.finish_read(true);
+        }
+        if matches!(self.scanout, Some(Scanout::Cpu { id: s, .. } | Scanout::Blob { id: s, .. } | Scanout::Gl { id: s, .. }) if s == id) {
             self.scanout = None;
         }
         if let Some(res) = self.resources.remove(&id) {
@@ -780,6 +814,7 @@ impl GpuHandler {
     }
 
     fn set_scanout(&mut self, r: &mut Reader) -> u32 {
+        self.finish_read(true);
         let Some(rect) = Rect::read(r) else { return ERR_INVALID_PARAMETER };
         let (Some(sid), Some(id)) = (rd32(r), rd32(r)) else { return ERR_INVALID_PARAMETER };
         if sid != 0 {
@@ -790,16 +825,21 @@ impl GpuHandler {
             self.set_mode(0, 0);
             return OK_NODATA;
         }
-        let Some(res) = self.resources.get(&id) else { return ERR_INVALID_RESOURCE_ID };
-        if !rect.inside(res.width, res.height) || rect.w == 0 || rect.h == 0 {
+        let (scanout, w, h) = match (self.resources.get(&id), self.res3d.get(&id).and_then(|r| r.tex)) {
+            (Some(res), _) => (Scanout::Cpu { id, view: rect }, res.width, res.height),
+            (None, Some((format, w, h))) if swizzle(format).is_some() => (Scanout::Gl { id, view: rect, format }, w, h),
+            _ => return ERR_INVALID_RESOURCE_ID,
+        };
+        if !rect.inside(w, h) || rect.w == 0 || rect.h == 0 {
             return ERR_INVALID_PARAMETER;
         }
-        self.scanout = Some(Scanout::Cpu { id, view: rect });
+        self.scanout = Some(scanout);
         self.set_mode(rect.w, rect.h);
         OK_NODATA
     }
 
     fn set_scanout_blob(&mut self, r: &mut Reader) -> u32 {
+        self.finish_read(true);
         let Some(rect) = Rect::read(r) else { return ERR_INVALID_PARAMETER };
         let mut v = [0u32; 14];
         for x in v.iter_mut() {
@@ -846,7 +886,7 @@ impl GpuHandler {
     fn flush_rect(&mut self, mem: &GuestMemory, rect: Rect, id: u32) -> u32 {
         let Some(sc) = self.scanout else { return OK_NODATA };
         let (sid, view) = match sc {
-            Scanout::Cpu { id, view } | Scanout::Blob { id, view, .. } => (id, view),
+            Scanout::Cpu { id, view } | Scanout::Blob { id, view, .. } | Scanout::Gl { id, view, .. } => (id, view),
         };
         if sid != id {
             return OK_NODATA;
@@ -861,6 +901,16 @@ impl GpuHandler {
         }
         let (w, h) = (x1 - x0, y1 - y0);
         let row = w as usize * 4;
+        let bx = Box3d { x: x0, y: y0, z: 0, w, h, d: 1 };
+        if let (Scanout::Gl { .. }, Some(t)) = (sc, self.three_d.clone()) {
+            // Show the frame before, then let the GPU copy this one while
+            // we go on with other commands.
+            self.finish_read(true);
+            if t.r().scanout_start(id, bx) {
+                self.reading = Some(Reading { id, view, x: x0 - view.x, y: y0 - view.y, w, h });
+                return OK_NODATA;
+            }
+        }
         let mut out = vec![0u8; row * h as usize];
         match sc {
             Scanout::Cpu { .. } => {
@@ -889,9 +939,39 @@ impl GpuHandler {
                     to_bgrx(sw, &line, &mut out[i * row..(i + 1) * row]);
                 }
             }
+            Scanout::Gl { format, .. } => {
+                let Some(sw) = swizzle(format) else { return ERR_UNSPEC };
+                let Some(t) = &self.three_d else { return ERR_UNSPEC };
+                if !t.r().read_back(id, bx, row as u32, &mut out) {
+                    return ERR_INVALID_PARAMETER;
+                } else if sw != [0, 1, 2, 3] {
+                    for p in out.as_chunks_mut::<4>().0 {
+                        *p = [p[sw[0]], p[sw[1]], p[sw[2]], 0];
+                    }
+                }
+            }
         }
         self.sink.flush(x0 - view.x, y0 - view.y, w, h, &out, row);
         OK_NODATA
+    }
+
+    /// Show the GL frame being read back, once the GPU has it (or now,
+    /// with `wait`). Dropped if the scanout moved on meanwhile.
+    fn finish_read(&mut self, wait: bool) {
+        let (Some(rd), Some(t)) = (self.reading, &self.three_d) else { return };
+        let row = rd.w as usize * 4;
+        // Reused: frames come often and are large.
+        let mut out = std::mem::take(&mut self.read_buf);
+        out.resize(row * rd.h as usize, 0);
+        let got = t.r().scanout_poll(&mut out, wait);
+        if got.is_some() || wait {
+            self.reading = None;
+            let current = matches!(self.scanout, Some(Scanout::Gl { id, view, .. }) if id == rd.id && view == rd.view);
+            if got == Some(true) && current {
+                self.sink.flush(rd.x, rd.y, rd.w, rd.h, &out, row);
+            }
+        }
+        self.read_buf = out;
     }
 
     fn process(&mut self, ctx: &mut QueueCtx, q: usize) {
@@ -1001,7 +1081,7 @@ impl GpuHandler {
 
     /// Push the whole visible scanout to the sink.
     fn flush_all(&mut self, mem: &GuestMemory) {
-        if let Some(Scanout::Cpu { id, view }) = self.scanout {
+        if let Some(Scanout::Cpu { id, view } | Scanout::Gl { id, view, .. }) = self.scanout {
             let _ = self.flush_rect(mem, view, id);
         }
     }
@@ -1061,16 +1141,25 @@ impl QueueHandler for GpuHandler {
         Ok(())
     }
 
+    fn deregister(&mut self, _reg: &mio::Registry) {
+        // Runs on the worker thread as it stops: hand the GL context back.
+        if let Some(t) = &self.three_d {
+            t.r().release_thread();
+        }
+    }
+
     fn backend_ready(&mut self, ctx: &mut QueueCtx, _token: usize) {
         self.complete_fences(ctx);
+        self.finish_read(false);
     }
 
     fn tick_interval(&mut self) -> Option<Duration> {
-        (!self.pending.is_empty()).then_some(FENCE_POLL)
+        (!self.pending.is_empty() || self.reading.is_some()).then_some(FENCE_POLL)
     }
 
     fn tick(&mut self, ctx: &mut QueueCtx) {
         self.complete_fences(ctx);
+        self.finish_read(false);
     }
 }
 
@@ -1141,7 +1230,9 @@ impl VirtioDevice for Gpu {
     }
     fn save_active(&mut self) -> Result<DeviceState> {
         if self.worker.with(|_, h| h.has_3d_state()).unwrap_or(false) {
-            return Err(Error::Device("snapshots of a VM using 3D are not supported (GPU state lives on the host GPU)".into()));
+            // With GL the desktop itself draws through the host GPU.
+            let hint = if self.three_d.as_ref().is_some_and(|t| t.gl) { "; [display] opengl = false avoids it for desktops" } else { "" };
+            return Err(Error::Device(format!("snapshots of a VM using 3D are not supported (GPU state lives on the host GPU{hint})")));
         }
         // Drivers (Linux, viogpudo) never re-create resources on their own:
         // keep the 2D layout; pixels come back from guest RAM.
