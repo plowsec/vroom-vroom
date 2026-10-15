@@ -149,6 +149,36 @@ export component ConsoleWindow inherits Window {
         }
     }
 
+    // Microphone in use, while the toolbar is away: a small pill where it
+    // would be, so it never goes unnoticed.
+    if root.mic-on && !root.bar-out: Rectangle {
+        x: (root.width - self.width) / 2;
+        y: 8px;
+        width: mpl.preferred-width;
+        height: 22px;
+        border-radius: 11px;
+        background: #1c1c1ee6;
+        border-width: 1px;
+        border-color: #ffffff24;
+        mpl := HorizontalLayout {
+            padding-left: 8px;
+            padding-right: 9px;
+            spacing: 5px;
+            StatusDot {
+                width: 7px;
+                height: 7px;
+                y: (parent.height - self.height) / 2;
+                tint: #ef4444;
+            }
+            Text {
+                text: "Mic";
+                color: #ffffffd0;
+                font-size: 10px;
+                vertical-alignment: center;
+            }
+        }
+    }
+
     // Toolbar.
     bar := Rectangle {
         x: (root.width - self.width) / 2;
