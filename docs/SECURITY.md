@@ -116,13 +116,46 @@ subtree (read-only shares: read access only). The FUSE server is fuzzed.
 
 ## Sound
 
-Off unless `[audio] output = true`, and output only: the device has no
-capture stream and nothing in the VMM can read the microphone. PCM goes
-over a datagram socket to a helper process (`vroom audio-out`) that
-plays it, so CoreAudio and the plug-ins it loads never run in the VMM. The
-helper runs under its own Seatbelt profile: system libraries, the
-CoreAudio services and the audio user client only; no user files, no
-network, no exec. The VMM never blocks on it (it drops audio instead).
+Off unless `[audio] output` or `input` is on. PCM goes over a datagram
+socket to a helper process (`vroom audio-out`) that plays it, so
+CoreAudio and the plug-ins it loads never run in the VMM. The helper
+runs under its own Seatbelt profile: system libraries, the CoreAudio
+services and the audio user client only; no user files, no network, no
+exec. The VMM never blocks on it (it drops audio instead).
+
+Both sound cards parse guest input with the same care as the rest:
+virtio-snd chains as virtqueues; HD Audio registers of any width and
+offset, CORB/RIRB rings (pointers masked to the ring size, one pass per
+doorbell), buffer descriptor lists (index masked, empty or unreachable
+entries stop the stream with an error), DMA amounts capped per tick.
+Both are fuzzed.
+
+### Microphone
+
+There is a microphone path now, off by default. How it works:
+
+- `[audio] input = false` (the default): the guest's sound card has no
+  input at all (no capture stream, no mic pin). The helper is started
+  without `--input`, so it refuses to record whatever the VMM asks, and
+  its Seatbelt profile has no `device-microphone`. Both are fixed before
+  the guest runs; a guest that took over the VMM can't change them.
+- `input = true`: the helper may record and its profile allows the
+  microphone. The VMM itself still has no microphone access: only the
+  helper talks to CoreAudio (or ALSA). The VMM asks for audio only
+  while a VM window is open (a viewer is connected; headless runs never),
+  the VM runs (pausing stops it) and the guest records. The window shows
+  "Microphone in use" whenever the VMM says it asked.
+- What that gate does not cover: with `input = true`, the gate and the
+  indicator are enforced by the VMM process. A guest that broke out into
+  the VMM could ask the helper for the microphone at any time while the
+  VM runs, and not tell the window. macOS's own indicator (the orange
+  dot in the menu bar) can't be faked by it. That's why it's opt-in.
+- macOS asks for the microphone permission on behalf of the app that
+  started vroom (Terminal, iTerm, VS Code...): a yes covers everything
+  started from that app, not just vroom. See [GUIDE.md](GUIDE.md#microphone).
+- What the helper sends back is parsed by the VMM like guest input
+  (sizes, whole frames, a generation number so audio from an earlier
+  request is dropped), and at most a quarter second is buffered.
 
 ## Snapshots
 
@@ -173,7 +206,8 @@ active on seat0, and the helper only talks to a root-owned peer.
 `fuzz/` has cargo-fuzz targets for what a guest (or a downloaded image)
 controls: agent protocol, the viewer protocol (both directions), network frames, virtqueue chains over arbitrary
 guest memory, virtio-gpu 2D commands, virtio-fs (FUSE) requests, virtio-snd control
-and PCM transfers, the virtio-pci transport and PCI
+and PCM transfers (playback and capture), the HD Audio controller (registers,
+CORB/RIRB, buffer descriptor lists, stream DMA, MSI), the virtio-pci transport and PCI
 config space, xHCI, NVMe, TPM TIS, fw_cfg (DMA included) and flash, each
 driven by arbitrary register writes plus guest RAM; and qcow2 images,
 both parsing and a differential target (random writes, discards, zero
@@ -215,8 +249,9 @@ These come from the VM's `[identity]` (see [CONFIG.md](CONFIG.md#identity)):
 - ACPI table header IDs and the FADT hypervisor vendor.
 - The device tree model (direct kernel boot).
 - Disks: NVMe model, serial, firmware revision; virtio disk serials.
-- PCI IDs of the host bridge, NVMe and USB controllers. The defaults are
-  QEMU's (vendor 0x1B36).
+- PCI IDs of the host bridge, NVMe, USB and HD Audio controllers, and
+  the HD Audio codec's IDs. The defaults are QEMU's (vendor 0x1B36; HD
+  Audio: QEMU's Intel ICH6 `intel-hda` and `hda-duplex` codec).
 - USB keyboard/tablet vendor ID and names, virtio input names and vendor.
 - Generated MACs (prefix), and the NAT network: guest, gateway and DNS
   addresses and the gateway's MAC. The defaults (10.0.2.15, .2, .3) are

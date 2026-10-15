@@ -216,13 +216,58 @@ tested yet).
 
 ## Sound
 
-`[audio] output = true` gives Linux guests a sound card (virtio-snd; the
-`virtio_snd` module, in stock Ubuntu kernels). 44.1/48 kHz, 16-bit,
-mono/stereo. There is no input: the guest can't reach the microphone.
-Windows has no virtio-snd driver, so Windows guests stay silent.
-On Linux hosts the helper plays through ALSA (`libasound`, loaded at run
-time): use a normal (glibc) build there; a static musl build can't load it
-and stays silent.
+```toml
+[audio]
+output = true    # guest sound through the Mac's speakers
+input = true     # the Mac's microphone, for video calls (off by default)
+```
+
+The guest gets a sound card with 44.1/48 kHz, 16-bit, mono/stereo:
+
+- Windows: an Intel HD Audio card. Windows' own driver picks it up
+  (Device Manager: "High Definition Audio Controller", then "Speakers"
+  and "Microphone (High Definition Audio Device)"). Nothing to install.
+- Linux: virtio-snd (`virtio_snd` module). Ubuntu's cloud images keep
+  it in `linux-modules-extra-$(uname -r)`; desktop installs have it.
+  `device = "hda"` gives Linux the HD Audio card too (`snd_hda_intel`).
+
+`vroom check` names the microphone as a risk when it's on.
+
+### Microphone
+
+The microphone is off unless `input = true` (app: Settings, Sound,
+Microphone). When on, sound from it reaches the guest only while all of
+these hold:
+
+- the VM's window is open (closing it suspends the VM anyway; `vroom run`
+  without a window never gets the microphone),
+- the VM runs (pausing it stops the microphone),
+- the guest records (an app in it opened the input).
+
+The window shows "Microphone in use" in its toolbar, and a small "Mic"
+pill at the top while the toolbar is hidden. macOS shows its own orange
+dot in the menu bar too. Focus doesn't matter: a call keeps going while
+you work in another window, the way a native app would.
+
+The first time a guest records, macOS asks for the microphone
+permission. It asks for the app that started vroom, not vroom itself:
+Terminal (or iTerm, VS Code...) for `vroom run` and for `vroom-gui`
+started from a terminal. Saying yes lets everything started from that
+app use the microphone. If you said no, or never saw the question, the
+guest records silence and the window says so after two seconds; turn
+the app on in System Settings, Privacy & Security, Microphone (or reset
+the question with `tccutil reset Microphone com.apple.Terminal`).
+Sound input in the guest follows the Mac's default input device (System
+Settings, Sound, Input).
+
+On Linux hosts the helper plays and records through ALSA (`libasound`,
+loaded at run time, "default" device): use a normal (glibc) build there;
+a static musl build can't load it and stays silent.
+
+Testing without speakers or a microphone: `VROOM_AUDIO_WAV_DIR=dir vroom
+run ...` writes what the guest plays to `dir/audio.wav` and, with
+`input = true`, feeds `dir/mic.wav` (16-bit PCM, looped) to the guest
+instead of the microphone. The window gate still applies.
 
 ## Snapshots, suspend
 
@@ -268,7 +313,7 @@ flushes a lot). `"none"` ignores flushes: scratch disks only.
 - Windows 11 is installed with its hardware checks bypassed (no Secure
   Boot); `tpm = true` (needs `brew install swtpm`) gives it a real TPM 2.0,
   which Windows sees and uses.
-- Windows guests: no shared folders without WinFsp (untested), no sound
-  (no virtio-snd driver), no 3D (no Venus driver).
+- Windows guests: no shared folders without WinFsp (untested), no 3D (no
+  Venus driver).
 - 3D snapshots, OpenGL on Venus (Zink, see above): not supported.
 - NAT connections don't survive suspend/resume (the guest reconnects).
