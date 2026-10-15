@@ -74,6 +74,8 @@ After the import:
   the virtio-win ISO, run `vroom-setup.cmd` as administrator. Fusion puts
   Windows on NVMe; a Windows installed on a SATA disk may not boot from
   NVMe (INACCESSIBLE_BOOT_DEVICE). That case isn't handled yet.
+- Until the tools are in, Windows' clock is off by your time zone (it
+  reads the hardware clock as local time; `vroom-setup.cmd` fixes that).
 - Windows may ask to reactivate (it sees new hardware).
   `--keep-hardware-ids` keeps VMware's BIOS UUID and SMBIOS names, which
   helps, but then the guest can tell it came from VMware.
