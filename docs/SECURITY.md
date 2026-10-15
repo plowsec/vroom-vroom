@@ -35,6 +35,10 @@ service by a guest against its own VM.
   keeps tripping warnings can't flood the terminal or fill a log disk.
 - qcow2 backing files: only from the image's own directory or allow-listed
   ones, no protocol prefixes, chain depth capped.
+- Imported VMware disks (VMDK, read-only): headers, grain tables and
+  descriptors are range-checked and capped like qcow2's; extent files must
+  be plain names next to their descriptor (no symlinks out); parents must
+  be `.vmdk` files, CIDs must match, chains are capped and loops refused.
 
 ## Layer 2: sandbox
 
@@ -173,7 +177,8 @@ and PCM transfers, the virtio-pci transport and PCI
 config space, xHCI, NVMe, TPM TIS, fw_cfg (DMA included) and flash, each
 driven by arbitrary register writes plus guest RAM; and qcow2 images,
 both parsing and a differential target (random writes, discards, zero
-writes, reopens and compactions checked byte for byte against a model). Run with
+writes, reopens and compactions checked byte for byte against a model),
+and VMDK (sparse headers, grain tables, compressed grains, descriptors). Run with
 `cargo +nightly fuzz run -O <target>`. First runs found two qcow2 bugs
 (a crash on short v3 headers, multi-GB allocations from crafted table
 sizes); both fixed.

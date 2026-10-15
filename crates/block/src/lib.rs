@@ -4,11 +4,13 @@
 //! - [`raw::RawImage`]: plain file.
 //! - [`qcow2::Qcow2Image`]: sparse, copy-on-write over a backing image.
 //!   Disk snapshots = freeze current image, write to a new overlay.
+//! - [`vmdk::VmdkImage`]: VMware disks, read-only (for importing).
 // One audited exception: plain fsync(2) in `sync_file`.
 #![deny(unsafe_code)]
 
 pub mod qcow2;
 pub mod raw;
+pub mod vmdk;
 
 use std::fs::{File, OpenOptions};
 use std::io;
