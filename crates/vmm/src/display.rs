@@ -9,7 +9,6 @@ use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixDatagram, UnixStream};
 use std::sync::mpsc::Sender;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -25,39 +24,53 @@ use crate::vcpu::VmEvent;
 /// Sends to the viewer without ever blocking the caller.
 ///
 /// A dedicated thread does the (blocking) socket writes. Damage is
-/// coalesced into one "something changed" flag, so a viewer that stops
-/// reading costs us at most a handful of queued messages, never a stall.
+/// coalesced into one rectangle covering everything that changed since
+/// the last one went out, so a viewer that stops reading costs us at most
+/// a handful of queued messages, never a stall, and a viewer that keeps
+/// up only converts what changed.
+/// Corners of a damaged area: (x0, y0, x1, y1).
+type Corners = (u32, u32, u32, u32);
+
 #[derive(Clone)]
 pub(crate) struct ViewerTx {
     q: std::sync::mpsc::Sender<ToViewer>,
-    damage_pending: Arc<AtomicBool>,
+    /// Union of the damage not sent yet.
+    damage: Arc<Mutex<Option<Corners>>>,
 }
 
 impl ViewerTx {
     fn spawn(mut sock: UnixStream) -> std::io::Result<Self> {
         let (q, rx) = std::sync::mpsc::channel::<ToViewer>();
-        let damage_pending = Arc::new(AtomicBool::new(false));
-        let dp = damage_pending.clone();
+        let damage = Arc::new(Mutex::new(None::<Corners>));
+        let dmg = damage.clone();
         std::thread::Builder::new().name("viewer-tx".into()).spawn(move || {
-            while let Ok(m) = rx.recv() {
+            while let Ok(mut m) = rx.recv() {
                 if matches!(m, ToViewer::Damage { .. }) {
-                    dp.store(false, Ordering::Release);
+                    // Whatever accumulated until now goes out as one rect.
+                    let Some((x0, y0, x1, y1)) = dmg.lock().unwrap_or_else(|e| e.into_inner()).take() else { continue };
+                    m = ToViewer::Damage { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
                 }
                 if sock.write_all(&m.encode()).is_err() {
                     break;
                 }
             }
         })?;
-        Ok(ViewerTx { q, damage_pending })
+        Ok(ViewerTx { q, damage })
     }
 
     pub fn send(&self, m: &ToViewer) {
-        if let ToViewer::Damage { .. } = m {
-            if self.damage_pending.swap(true, Ordering::AcqRel) {
-                return;
+        if let &ToViewer::Damage { x, y, w, h } = m {
+            let r = (x, y, x.saturating_add(w), y.saturating_add(h));
+            let mut d = self.damage.lock().unwrap_or_else(|e| e.into_inner());
+            match d.as_mut() {
+                // A message is already queued: it will carry this too.
+                Some(u) => *u = (u.0.min(r.0), u.1.min(r.1), u.2.max(r.2), u.3.max(r.3)),
+                None => {
+                    *d = Some(r);
+                    drop(d);
+                    let _ = self.q.send(ToViewer::Damage { x: 0, y: 0, w: 0, h: 0 });
+                }
             }
-            // The viewer redraws the whole frame anyway.
-            let _ = self.q.send(ToViewer::Damage { x: 0, y: 0, w: 0, h: 0 });
             return;
         }
         let _ = self.q.send(m.clone());
@@ -389,6 +402,30 @@ mod tests {
         let mut v = vec![0u32; (w * h) as usize];
         sink.fb.read_into(w, h, &mut v);
         v[0]
+    }
+
+    #[test]
+    fn damage_goes_out_as_one_rect() {
+        let (a, mut b) = UnixStream::pair().unwrap();
+        let tx = ViewerTx::spawn(a).unwrap();
+        // Queued behind a big message, these coalesce into one rect.
+        tx.send(&ToViewer::Status("x".repeat(1 << 20)));
+        tx.send(&ToViewer::Damage { x: 10, y: 20, w: 5, h: 5 });
+        tx.send(&ToViewer::Damage { x: 100, y: 2, w: 1, h: 1 });
+        tx.send(&ToViewer::Damage { x: u32::MAX, y: 0, w: 9, h: 1 });
+        let mut dec = Decoder::default();
+        let mut got = Vec::new();
+        let mut buf = vec![0u8; 1 << 16];
+        b.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        while got.len() < 2 {
+            let n = b.read(&mut buf).unwrap();
+            assert!(n > 0);
+            dec.push(&buf[..n]);
+            while let Some(m) = dec.next_to_viewer().unwrap() {
+                got.push(m);
+            }
+        }
+        assert_eq!(got[1], ToViewer::Damage { x: 10, y: 0, w: u32::MAX - 10, h: 25 });
     }
 
     #[test]
