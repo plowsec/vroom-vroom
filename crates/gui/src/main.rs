@@ -92,3 +92,98 @@ fn main() {
     // when this process goes away).
     console::suspend_all();
 }
+
+/// The controls show their owner's value, whatever the user did with them
+/// before (one settings page serves every VM).
+#[cfg(test)]
+#[allow(clippy::all, clippy::unwrap_used, missing_debug_implementations)]
+mod controls_tests {
+    use slint::platform::{PointerEventButton, WindowEvent};
+    use slint::{ComponentHandle, LogicalPosition};
+
+    slint::slint! {
+        import { Field, Toggle, Slider } from "ui/controls.slint";
+        export component Controls inherits Window {
+            width: 400px;
+            height: 200px;
+            in property <string> value: "1024";
+            in property <bool> on;
+            in property <float> amount: 4;
+            out property <string> last-edit;
+            out property <int> toggled;
+            out property <bool> toggle-shows: t.checked;
+            out property <float> slider-shows: sl.shown;
+            public function focus-field() { f.focus-input(); }
+            f := Field {
+                x: 0;
+                y: 0;
+                width: 200px;
+                text: root.value;
+                edited(s) => { root.last-edit = s; }
+            }
+            t := Toggle {
+                x: 0;
+                y: 50px;
+                checked: root.on;
+                toggled(v) => { root.toggled += 1; }
+            }
+            sl := Slider {
+                x: 0;
+                y: 100px;
+                width: 200px;
+                minimum: 0;
+                maximum: 10;
+                value: root.amount;
+            }
+        }
+    }
+
+    fn click(w: &Controls, x: f32, y: f32) {
+        let p = LogicalPosition::new(x, y);
+        let win = w.window();
+        win.dispatch_event(WindowEvent::PointerMoved { position: p });
+        win.dispatch_event(WindowEvent::PointerPressed { position: p, button: PointerEventButton::Left });
+        win.dispatch_event(WindowEvent::PointerReleased { position: p, button: PointerEventButton::Left });
+    }
+
+    /// Type a char; what the box holds then, without it.
+    fn typed(w: &Controls, c: &str) -> String {
+        w.window().dispatch_event(WindowEvent::KeyPressed { text: c.into() });
+        w.window().dispatch_event(WindowEvent::KeyReleased { text: c.into() });
+        slint::platform::update_timers_and_animations();
+        w.get_last_edit().replacen(c, "", 1)
+    }
+
+    #[test]
+    fn controls_follow_their_owner() {
+        i_slint_backend_testing::init_no_event_loop();
+        let w = Controls::new().unwrap();
+        w.show().unwrap();
+
+        w.invoke_focus_field();
+        assert_eq!(typed(&w, "9"), "1024");
+        // The owner's value changes (another VM): the box shows it, not
+        // what was typed for the old one.
+        w.set_value("800".into());
+        slint::platform::update_timers_and_animations();
+        assert_eq!(typed(&w, "7"), "800");
+
+        click(&w, 10.0, 60.0);
+        assert_eq!(w.get_toggled(), 1);
+        assert!(!w.get_toggle_shows(), "flipped itself instead of asking");
+        w.set_on(true);
+        assert!(w.get_toggle_shows());
+        click(&w, 10.0, 60.0);
+        w.set_on(false);
+        assert!(!w.get_toggle_shows());
+
+        // Drag the knob: it follows the pointer, then the owner's value.
+        let win = w.window();
+        win.dispatch_event(WindowEvent::PointerMoved { position: LogicalPosition::new(190.0, 110.0) });
+        win.dispatch_event(WindowEvent::PointerPressed { position: LogicalPosition::new(190.0, 110.0), button: PointerEventButton::Left });
+        assert_eq!(w.get_slider_shows(), 10.0);
+        win.dispatch_event(WindowEvent::PointerReleased { position: LogicalPosition::new(190.0, 110.0), button: PointerEventButton::Left });
+        w.set_amount(2.0);
+        assert_eq!(w.get_slider_shows(), 2.0);
+    }
+}
