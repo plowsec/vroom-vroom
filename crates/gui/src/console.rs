@@ -654,7 +654,10 @@ impl Console {
         let send = |c: &mut Console, m: Command| c.io.borrow_mut().send(ToVmm::Command(m));
         match cmd {
             "pause" => send(self, Command::Pause),
-            "resume" => send(self, Command::Resume),
+            "resume" => {
+                self.win.set_suspend_error("".into());
+                send(self, Command::Resume);
+            }
             "toggle-pause" => {
                 let m = if self.state == VmState::Paused { Command::Resume } else { Command::Pause };
                 send(self, m);
@@ -665,10 +668,16 @@ impl Console {
             }
             "reset" => send(self, Command::Reset),
             "shutdown" => {
+                self.win.set_suspend_error("".into());
+                // A paused guest can't hear the request.
+                if self.state == VmState::Paused {
+                    send(self, Command::Resume);
+                }
                 send(self, Command::Shutdown);
                 self.toast("Asked the guest to shut down");
             }
             "poweroff" => {
+                self.win.set_suspend_error("".into());
                 self.set_state(VmState::Stopping);
                 send(self, Command::PowerOff);
             }
@@ -742,6 +751,12 @@ impl Console {
                 msg::send(Msg::SnapshotTaken { key: self.key.clone() });
             }
             _ if t.starts_with("guest agent connected") => self.toast("Guest tools connected: clipboard and resizing work"),
+            _ if t.starts_with("suspend failed") => {
+                // Usually 3D in use. Say why and offer the ways out,
+                // rather than leaving a paused window that won't close.
+                let why = t.trim_start_matches("suspend failed").trim_start_matches([':', ' ']);
+                self.win.set_suspend_error(why.into());
+            }
             _ if t.starts_with("host disk almost full") => {
                 self.toast(&t);
                 msg::send(Msg::Toast { text: format!("{}: {t}", self.name), kind: 2, action: String::new() });

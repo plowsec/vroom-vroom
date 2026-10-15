@@ -28,6 +28,8 @@ export component ConsoleWindow inherits Window {
     in property <bool> mic-on;
     // Rust keeps the bar out for a moment after start.
     in property <bool> bar-pinned;
+    // Set when saving the VM's state failed (why, from the VMM).
+    in property <string> suspend-error;
     callback mouse-move(float, float);
     callback button(int, bool);
     callback wheel(length, length);
@@ -175,6 +177,54 @@ export component ConsoleWindow inherits Window {
                 color: #ffffffd0;
                 font-size: 10px;
                 vertical-alignment: center;
+            }
+        }
+    }
+
+    if root.suspend-error != "": Rectangle {
+        background: #000000a0;
+        TouchArea { }
+        Rectangle {
+            width: min(460px, root.width - 40px);
+            height: el.preferred-height;
+            border-radius: 12px;
+            background: #242427f2;
+            border-width: 1px;
+            border-color: #ffffff24;
+            el := VerticalLayout {
+                padding: 20px;
+                spacing: 12px;
+                Text {
+                    text: "Can't save this VM's state";
+                    color: #ffffff;
+                    font-size: Theme.fs-xl;
+                    font-weight: 700;
+                }
+                Text {
+                    text: root.suspend-error + "\n\nIt's paused. Shut it down, or keep it running.";
+                    color: #ffffffb0;
+                    font-size: Theme.fs-md;
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: end;
+                    Button {
+                        text: "Keep running";
+                        kind: "ghost";
+                        clicked => { root.act("resume"); }
+                    }
+                    Button {
+                        text: "Force off";
+                        kind: "danger";
+                        clicked => { root.act("poweroff"); }
+                    }
+                    Button {
+                        text: "Shut down";
+                        kind: "primary";
+                        clicked => { root.act("shutdown"); }
+                    }
+                }
             }
         }
     }
