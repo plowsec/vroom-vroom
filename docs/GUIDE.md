@@ -55,10 +55,13 @@ mode = "nat"
 ## Windows 11 ARM64
 
 1. Get a Windows 11 ARM64 ISO (e.g. via UUP dump) and the virtio-win ISO.
-2. Build an install "stick": a FAT32 image with an **MBR** partition table
-   and a non-zero disk signature, holding the ISO contents, the ARM64
-   virtio-win driver folders, `examples/windows/autounattend.xml`,
-   `examples/windows/bulwark-setup.cmd` and `bulwark-agent.exe`.
+2. Build the install "stick":
+   `scripts/make-windows-stick.sh win11-arm64.iso virtio-win.iso winusb.raw`.
+   It's a FAT32 image with an **MBR** partition table and a non-zero disk
+   signature, holding the ISO contents, the ARM64 virtio-win driver
+   folders, `examples/windows/autounattend.xml`,
+   `examples/windows/bulwark-setup.cmd` and `bulwark-agent.exe` (an
+   `install.wim` over 4 GiB is split; needs `brew install wimlib`).
    (An ISO doesn't work: Windows Setup has no driver for 2 KiB-sector media
    on NVMe. A GPT image gets its EFI partition mistaken for the system
    partition.)
