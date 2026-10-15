@@ -12,7 +12,7 @@ use vroom_memory::{GuestAddress, GuestMemory};
 use vroom_snapshot::{decode, encode};
 use serde::{Deserialize, Serialize};
 
-use crate::pci::{BarSpec, ConfigSpace, Intx, MsiSender, Msix, PciDevice, PciId};
+use crate::pci::{BarSpec, ConfigSpace, Intx, MsiSender, Msix, PciDevice, PciId, VendorIds};
 use crate::{get_le, put_le};
 
 const BAR_SIZE: u64 = 0x4000;
@@ -108,6 +108,7 @@ pub struct Nvme {
     ns: Vec<Namespace>,
     serial: String,
     model: String,
+    firmware: String,
     regs: Regs,
     sqs: BTreeMap<u16, Sq>,
     cqs: BTreeMap<u16, Cq>,
@@ -152,6 +153,13 @@ fn err(sc: u16) -> Option<Outcome> {
     Some((sc, 0))
 }
 
+/// ASCII field, space padded (cut to `n`).
+fn pad(s: &str, n: usize) -> Vec<u8> {
+    let mut v = s.as_bytes().to_vec();
+    v.resize(n, b' ');
+    v
+}
+
 impl Nvme {
     pub fn new(slot: u8, ns: Vec<Namespace>, mem: GuestMemory, intx: Arc<Intx>, msi: Arc<dyn MsiSender>) -> Self {
         let mut cfg = ConfigSpace::new(
@@ -169,6 +177,7 @@ impl Nvme {
             ns,
             serial: format!("VRM{slot:04}"),
             model: "vroom NVMe".into(),
+            firmware: "1.0".into(),
             regs: Regs::default(),
             sqs: BTreeMap::new(),
             cqs: BTreeMap::new(),
@@ -177,9 +186,16 @@ impl Nvme {
     }
 
     /// Names the guest sees (from the VM's `[identity]`).
-    pub fn with_ids(mut self, model: &str, serial: &str) -> Self {
+    pub fn with_ids(mut self, model: &str, serial: &str, firmware: &str) -> Self {
         self.model = model.to_string();
         self.serial = serial.to_string();
+        self.firmware = firmware.to_string();
+        self
+    }
+
+    /// PCI IDs; Identify reports the same vendor and subsystem vendor.
+    pub fn with_pci_ids(mut self, ids: VendorIds) -> Self {
+        self.cfg.set_vendor_ids(ids);
         self
     }
 
@@ -507,7 +523,7 @@ impl Nvme {
             }
             0x03 => {
                 page[0] = 1;
-                page[8..16].copy_from_slice(b"1.0     ");
+                page[8..16].copy_from_slice(&pad(&self.firmware, 8));
             }
             _ => return err(SC_INVALID_FIELD),
         }
@@ -536,16 +552,12 @@ impl Nvme {
                 d[128 + 2] = n.block_size.trailing_zeros() as u8; // LBAF0: block size
             }
             0x01 => {
-                d[0..2].copy_from_slice(&0x1b36u16.to_le_bytes());
-                d[2..4].copy_from_slice(&0x1b36u16.to_le_bytes());
-                let pad = |s: &str, n: usize| {
-                    let mut v = s.as_bytes().to_vec();
-                    v.resize(n, b' ');
-                    v
-                };
+                let ids = self.cfg.vendor_ids();
+                d[0..2].copy_from_slice(&ids.vendor.to_le_bytes());
+                d[2..4].copy_from_slice(&ids.subsys_vendor.to_le_bytes());
                 d[4..24].copy_from_slice(&pad(&self.serial, 20));
                 d[24..64].copy_from_slice(&pad(&self.model, 40));
-                d[64..72].copy_from_slice(&pad("1.0", 8));
+                d[64..72].copy_from_slice(&pad(&self.firmware, 8));
                 d[72] = 6;
                 d[77] = MDTS;
                 d[80..84].copy_from_slice(&0x0001_0400u32.to_le_bytes());
@@ -808,12 +820,16 @@ mod tests {
     const BUF: u64 = RAM + 0x10000;
 
     fn ctrl() -> (Nvme, GuestMemory) {
+        ctrl_with(|n| n)
+    }
+
+    fn ctrl_with(f: impl FnOnce(Nvme) -> Nvme) -> (Nvme, GuestMemory) {
         let mem = GuestMemory::new(&[(GuestAddress(RAM), 4 << 20)]).unwrap();
-        let f = tempfile::tempfile().unwrap();
-        f.set_len(1 << 20).unwrap();
-        let disk: Arc<dyn DiskImage> = Arc::new(RawImage::from_file(f, false).unwrap());
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(1 << 20).unwrap();
+        let disk: Arc<dyn DiskImage> = Arc::new(RawImage::from_file(file, false).unwrap());
         let r = IntxRouter::new((0..4).map(|_| Arc::new(NoIrq) as Arc<dyn crate::IrqLine>).collect());
-        let mut n = Nvme::new(3, vec![Namespace { disk, read_only: false, block_size: SECTOR_SIZE }], mem.clone(), r.pin(3, 1), Arc::new(NoMsi));
+        let mut n = f(Nvme::new(3, vec![Namespace { disk, read_only: false, block_size: SECTOR_SIZE }], mem.clone(), r.pin(3, 1), Arc::new(NoMsi)));
         n.reg_write(0x24, (3 << 16) | 3, 4); // 4-entry admin queues
         n.reg_write(0x28, ASQ, 8);
         n.reg_write(0x30, ACQ, 8);
@@ -834,6 +850,31 @@ mod tests {
     fn status(mem: &GuestMemory, cq: u64, slot: u16) -> u16 {
         let s: u16 = mem.read_obj(GuestAddress(cq + slot as u64 * 16 + 14)).unwrap();
         s >> 1
+    }
+
+    #[test]
+    fn identify_shows_configured_ids() {
+        let ids = VendorIds { vendor: 0x144d, device: 0xa808, subsys_vendor: 0x144d, subsys: 0xa801 };
+        let (mut n, mem) = ctrl_with(|n| n.with_ids("Samsung SSD 970 EVO Plus 1TB", "S4EWNX0R1234", "2B2QEXM7").with_pci_ids(ids));
+        let mut id = [0u8; 4];
+        n.config().read(0, &mut id);
+        assert_eq!(id, [0x4d, 0x14, 0x08, 0xa8]);
+        n.config().read(0x2c, &mut id);
+        assert_eq!(id, [0x4d, 0x14, 0x01, 0xa8]);
+        submit(&mut n, &mem, (0, ASQ, 4), 0, [6 | 1 << 16, 0, 0, 0, 0, 0, BUF as u32, 0, 0, 0, 1, 0, 0, 0, 0, 0]);
+        assert_eq!(status(&mem, ACQ, 0), 0);
+        let mut d = [0u8; 72];
+        mem.read(GuestAddress(BUF), &mut d).unwrap();
+        assert_eq!(&d[0..4], &[0x4d, 0x14, 0x4d, 0x14], "VID, SSVID");
+        assert_eq!(&d[4..24], b"S4EWNX0R1234        ");
+        assert!(d[24..64].starts_with(b"Samsung SSD 970 EVO Plus 1TB "));
+        assert_eq!(&d[64..72], b"2B2QEXM7");
+        // Firmware slot log (lid 3): slot 1 revision.
+        submit(&mut n, &mem, (0, ASQ, 4), 1, [2 | 2 << 16, 0, 0, 0, 0, 0, BUF as u32, 0, 0, 0, 3 | 127 << 16, 0, 0, 0, 0, 0]);
+        assert_eq!(status(&mem, ACQ, 1), 0);
+        let mut fr = [0u8; 8];
+        mem.read(GuestAddress(BUF + 8), &mut fr).unwrap();
+        assert_eq!(&fr, b"2B2QEXM7");
     }
 
     #[test]

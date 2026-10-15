@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use super::hid::{HidEvent, Keyboard, Tablet, UsbIds};
 use super::{Setup, UsbDevice};
-use crate::pci::{BarSpec, ConfigSpace, Intx, MsiSender, Msix, PciDevice, PciId};
+use crate::pci::{BarSpec, ConfigSpace, Intx, MsiSender, Msix, PciDevice, PciId, VendorIds};
 use crate::{get_le, put_le};
 
 const BAR_SIZE: u64 = 0x4000;
@@ -221,6 +221,12 @@ impl Xhci {
     pub fn with_ids(mut self, ids: &UsbIds) -> Self {
         self.kbd = Keyboard::new(ids);
         self.tablet = Tablet::new(ids);
+        self
+    }
+
+    /// The controller's own PCI IDs (from the VM's `[identity]`).
+    pub fn with_pci_ids(mut self, ids: VendorIds) -> Self {
+        self.cfg.set_vendor_ids(ids);
         self
     }
 
@@ -1238,5 +1244,19 @@ mod tests {
         h.put_trb(EP0, [EP0 as u32, (EP0 >> 32) as u32, 0, T_LINK << 10 | 1]);
         h.w(DB + 4, 1);
         assert!(h.events().is_empty());
+    }
+
+    #[test]
+    fn pci_ids_from_config() {
+        let mem = GuestMemory::new(&[(GuestAddress(RAM), 1 << 20)]).unwrap();
+        let r = IntxRouter::new((0..4).map(|_| Arc::new(NoIrq) as Arc<dyn crate::IrqLine>).collect());
+        let ids = VendorIds { vendor: 0x8086, device: 0xa0ed, subsys_vendor: 0x17aa, subsys: 0x22d8 };
+        let x = Xhci::new(6, mem, r.pin(6, 1), Arc::new(NoMsi)).with_pci_ids(ids);
+        let mut d = [0u8; 4];
+        x.config().read(0, &mut d);
+        assert_eq!(u32::from_le_bytes(d), 0xa0ed_8086);
+        x.config().read(0x2c, &mut d);
+        assert_eq!(u32::from_le_bytes(d), 0x22d8_17aa);
+        assert_eq!(x.config().raw()[0x0b], 0x0c, "class stays USB");
     }
 }

@@ -4,6 +4,7 @@
 //! disable a security setting). Everything is validated before use.
 #![forbid(unsafe_code)]
 
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 pub mod template;
@@ -76,8 +77,9 @@ pub struct VmConfig {
 }
 
 /// Every name and number the guest can read about the machine it runs on
-/// (firmware tables, disk and USB descriptors, the agent's port). Defaults
-/// say "vroom" and set the "this is a VM" flags; change them to look like
+/// (firmware tables, PCI IDs, disk and USB descriptors, MACs and NAT
+/// addresses, the agent's port). Defaults say "vroom" or match QEMU and set
+/// the "this is a VM" flags; change them to look like
 /// something else, e.g. for malware analysis. The guest can still tell it
 /// is virtualized from other things (virtio devices, CPU registers): see
 /// docs/SECURITY.md.
@@ -90,6 +92,9 @@ pub struct Identity {
     pub product: String,
     /// SMBIOS system family.
     pub family: String,
+    /// SMBIOS system SKU. Default: the VM's name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sku: Option<String>,
     /// SMBIOS BIOS, system and chassis version.
     pub version: String,
     /// SMBIOS BIOS date, MM/DD/YYYY.
@@ -97,6 +102,10 @@ pub struct Identity {
     /// SMBIOS system and chassis serial. Default: from the VM's UUID.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub serial: Option<String>,
+    /// SMBIOS chassis type (1 other, 3 desktop, 10 notebook, ...).
+    pub chassis_type: u8,
+    /// SMBIOS processor version: the CPU name Windows and `dmidecode` show.
+    pub cpu_name: String,
     /// Set the SMBIOS "virtual machine" BIOS flag and the ACPI hypervisor
     /// vendor field.
     pub announce_vm: bool,
@@ -106,14 +115,35 @@ pub struct Identity {
     pub acpi_creator_id: String,
     /// ACPI FADT hypervisor vendor (up to 8 chars), when `announce_vm`.
     pub hypervisor_id: String,
+    /// Device tree model and compatible (direct kernel boot only).
+    pub dt_model: String,
     /// NVMe controller model (up to 40 chars).
     pub disk_model: String,
     /// Disk serial prefix (up to 16 chars): NVMe and virtio disks append
     /// a number.
     pub disk_serial: String,
-    /// USB keyboard and tablet: vendor ID and manufacturer string.
+    /// NVMe firmware revision (up to 8 chars).
+    pub disk_firmware: String,
+    /// PCI IDs, "vendor:device" or "vendor:device:subvendor:subdevice" in
+    /// hex. Without the subsystem part it is vendor:0000.
+    pub pci_bridge_id: String,
+    pub nvme_pci_id: String,
+    pub usb_pci_id: String,
+    /// USB keyboard and tablet (and virtio input): vendor ID and
+    /// manufacturer string.
     pub usb_vendor_id: u16,
     pub usb_manufacturer: String,
+    /// First 1-3 bytes of generated NIC MACs ("02" or "00:1b:21"); the rest
+    /// comes from the VM name. `mac` in `[[net]]` still wins.
+    pub mac_prefix: String,
+    /// NAT network of the first adapter: guest, gateway and DNS addresses,
+    /// one private /24. Adapter N adds N to the third number. DNS may be
+    /// the gateway.
+    pub nat_guest: Ipv4Addr,
+    pub nat_gateway: Ipv4Addr,
+    pub nat_dns: Ipv4Addr,
+    /// MAC of the NAT gateway (the guest's ARP table).
+    pub nat_gateway_mac: String,
     /// The guest agent's virtio-console port. The agent must be told if
     /// this changes (`vroom-agent --port`).
     pub agent_port: String,
@@ -125,18 +155,31 @@ impl Default for Identity {
             vendor: "vroom".into(),
             product: "vroom VM".into(),
             family: "Virtual Machine".into(),
+            sku: None,
             version: "1.0".into(),
             bios_date: "10/14/2026".into(),
             serial: None,
+            chassis_type: 1,
+            cpu_name: "CPU".into(),
             announce_vm: true,
             acpi_oem_id: "VROOM".into(),
             acpi_table_id: "VROOMVM".into(),
             acpi_creator_id: "VRM".into(),
             hypervisor_id: "VROOM".into(),
+            dt_model: "linux,dummy-virt".into(),
             disk_model: "vroom NVMe".into(),
             disk_serial: "VRM".into(),
+            disk_firmware: "1.0".into(),
+            pci_bridge_id: "1b36:0008".into(),
+            nvme_pci_id: "1b36:0010".into(),
+            usb_pci_id: "1b36:000d".into(),
             usb_vendor_id: 0x1209,
             usb_manufacturer: "vroom".into(),
+            mac_prefix: "02".into(),
+            nat_guest: Ipv4Addr::new(10, 0, 2, 15),
+            nat_gateway: Ipv4Addr::new(10, 0, 2, 2),
+            nat_dns: Ipv4Addr::new(10, 0, 2, 3),
+            nat_gateway_mac: "02:42:57:4b:00:01".into(),
             agent_port: "org.vroom.agent.0".into(),
         }
     }
@@ -169,10 +212,70 @@ impl Identity {
         text("disk_model", &self.disk_model, 40, false)?;
         text("disk_serial", &self.disk_serial, 16, false)?;
         text("usb_manufacturer", &self.usb_manufacturer, 64, false)?;
+        if let Some(s) = &self.sku {
+            text("sku", s, 64, false)?;
+        }
+        text("cpu_name", &self.cpu_name, 64, false)?;
+        text("dt_model", &self.dt_model, 64, false)?;
+        text("disk_firmware", &self.disk_firmware, 8, false)?;
+        if !(1..=0x24).contains(&self.chassis_type) {
+            return Err(Error::Invalid("identity.chassis_type: 1-36 (SMBIOS chassis type)".into()));
+        }
+        for (what, v) in [("pci_bridge_id", &self.pci_bridge_id), ("nvme_pci_id", &self.nvme_pci_id), ("usb_pci_id", &self.usb_pci_id)] {
+            // Vendor 0xffff reads as "no device here".
+            if !pci_ids(v).is_some_and(|[vendor, ..]| vendor != 0 && vendor != 0xffff) {
+                return Err(Error::Invalid(format!(
+                    "identity.{what}: \"vendor:device\" or \"vendor:device:subvendor:subdevice\", 4 hex digits each"
+                )));
+            }
+        }
+        if mac_prefix(&self.mac_prefix).is_none() {
+            return Err(Error::Invalid("identity.mac_prefix: 1-3 bytes like \"02\" or \"00:1b:21\", not multicast".into()));
+        }
+        if !parse_mac(&self.nat_gateway_mac).is_ok_and(|m| m[0] & 1 == 0 && m != [0; 6]) {
+            return Err(Error::Invalid("identity.nat_gateway_mac: a unicast MAC like \"02:42:57:4b:00:01\"".into()));
+        }
+        let (g, gw, dns) = (self.nat_guest.octets(), self.nat_gateway.octets(), self.nat_dns.octets());
+        let host_ok = |o: [u8; 4]| o[3] != 0 && o[3] != 255;
+        if !self.nat_gateway.is_private()
+            || g[..3] != gw[..3]
+            || dns[..3] != gw[..3]
+            || ![g, gw, dns].into_iter().all(host_ok)
+            || g == gw
+            || g == dns
+        {
+            return Err(Error::Invalid(
+                "identity.nat_guest/nat_gateway/nat_dns: one private /24 (10/8, 172.16/12, 192.168/16), host parts 1-254, guest apart from the others".into(),
+            ));
+        }
         if !valid_name(&self.agent_port) {
             return Err(Error::Invalid("identity.agent_port: 1-64 chars of [A-Za-z0-9._-]".into()));
         }
         Ok(())
+    }
+
+    /// The SMBIOS SKU: `sku`, or the VM's name.
+    pub fn sku_or<'a>(&'a self, vm_name: &'a str) -> &'a str {
+        self.sku.as_deref().unwrap_or(vm_name)
+    }
+
+    /// A NIC MAC: `mac_prefix`, then bytes from `fill`.
+    pub fn mac(&self, fill: [u8; 6]) -> [u8; 6] {
+        let prefix = mac_prefix(&self.mac_prefix).unwrap_or_else(|| vec![0x02]);
+        let mut m = [0u8; 6];
+        m[..prefix.len()].copy_from_slice(&prefix);
+        m[prefix.len()..].copy_from_slice(&fill[..6 - prefix.len()]);
+        m
+    }
+
+    /// NAT addresses of adapter `nic`: (guest, gateway, DNS).
+    pub fn nat_addrs(&self, nic: usize) -> (Ipv4Addr, Ipv4Addr, Ipv4Addr) {
+        let shift = |a: Ipv4Addr| {
+            let mut o = a.octets();
+            o[2] = o[2].wrapping_add(nic as u8);
+            Ipv4Addr::from(o)
+        };
+        (shift(self.nat_guest), shift(self.nat_gateway), shift(self.nat_dns))
     }
 
     /// New random serials (system and disks), so two VMs never match.
@@ -419,7 +522,7 @@ pub struct Net {
     /// NAT: block private (LAN) destinations; internet only.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub block_private: bool,
-    /// "52:54:00:12:34:56". Generated if absent.
+    /// "02:12:34:56:78:9a". Generated if absent (`identity.mac_prefix`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mac: Option<String>,
 }
@@ -724,12 +827,20 @@ impl VmConfig {
                 return bad(format!("{}: cdrom must be readonly", d.path.display()));
             }
         }
+        // Adapter N's NAT network is the first one's plus N.
+        if usize::from(self.identity.nat_gateway.octets()[2]) + self.nets.len().saturating_sub(1) > 255 {
+            return bad("identity.nat_gateway: no room for the other adapters' networks (third number too high)".into());
+        }
+        let gateway_mac = parse_mac(&self.identity.nat_gateway_mac)?;
         let mut macs = Vec::new();
         for n in &self.nets {
             if let Some(m) = &n.mac {
                 let mac = parse_mac(m)?;
                 if mac[0] & 1 != 0 {
                     return bad(format!("mac {m} is multicast"));
+                }
+                if mac == gateway_mac {
+                    return bad(format!("mac {m} is the NAT gateway's (identity.nat_gateway_mac)"));
                 }
                 if macs.contains(&mac) {
                     return bad(format!("duplicate mac {m}"));
@@ -798,6 +909,25 @@ pub fn parse_mac(s: &str) -> Result<[u8; 6]> {
         *o = u8::from_str_radix(p, 16).map_err(|_| Error::Invalid(format!("bad mac {s:?}")))?;
     }
     Ok(out)
+}
+
+/// A `*_pci_id` value: [vendor, device, subsystem vendor, subsystem].
+/// "vendor:device" means subsystem vendor:0000.
+pub fn pci_ids(s: &str) -> Option<[u16; 4]> {
+    let hex = |x: &str| (x.len() == 4 && x.bytes().all(|b| b.is_ascii_hexdigit())).then(|| u16::from_str_radix(x, 16).ok()).flatten();
+    let p = s.split(':').map(hex).collect::<Option<Vec<u16>>>()?;
+    match p[..] {
+        [v, d] => Some([v, d, v, 0]),
+        [v, d, sv, sd] => Some([v, d, sv, sd]),
+        _ => None,
+    }
+}
+
+/// `mac_prefix`: 1-3 bytes, the first one unicast.
+fn mac_prefix(s: &str) -> Option<Vec<u8>> {
+    let hex = |x: &str| (x.len() == 2 && x.bytes().all(|b| b.is_ascii_hexdigit())).then(|| u8::from_str_radix(x, 16).ok()).flatten();
+    let p = s.split(':').map(hex).collect::<Option<Vec<u8>>>()?;
+    ((1..=3).contains(&p.len()) && p[0] & 1 == 0).then_some(p)
 }
 
 pub fn format_mac(m: &[u8; 6]) -> String {
@@ -887,6 +1017,45 @@ guest_to_host = false
         assert_eq!(c.identity.acpi_table_id, "VROOMVM", "unset keys keep defaults");
         assert!(VmConfig::from_toml(&custom.replace("DELL", "TOOLONGID")).is_err());
         assert!(VmConfig::from_toml(&custom.replace("Dell Inc.", "Dell\\u0007")).is_err());
+        let more = format!(
+            "{SAMPLE}\n[identity]\nsku = \"30FA\"\nchassis_type = 3\ncpu_name = \"Snapdragon X Elite\"\n\
+             nvme_pci_id = \"144d:a808:144d:a801\"\nusb_pci_id = \"8086:a0ed\"\nmac_prefix = \"00:1b:21\"\n\
+             nat_guest = \"192.168.1.100\"\nnat_gateway = \"192.168.1.1\"\nnat_dns = \"192.168.1.1\"\n"
+        );
+        let c = VmConfig::from_toml(&more).unwrap();
+        let i = &c.identity;
+        assert_eq!(i.sku_or(&c.name), "30FA");
+        assert_eq!(Identity::default().sku_or("dev"), "dev");
+        assert_eq!(pci_ids(&i.nvme_pci_id), Some([0x144d, 0xa808, 0x144d, 0xa801]));
+        assert_eq!(pci_ids(&i.usb_pci_id), Some([0x8086, 0xa0ed, 0x8086, 0]));
+        assert_eq!(i.mac([9, 8, 7, 6, 5, 4]), [0x00, 0x1b, 0x21, 9, 8, 7]);
+        assert_eq!(Identity::default().mac([9, 8, 7, 6, 5, 4]), [0x02, 9, 8, 7, 6, 5]);
+        let ip = |s: &str| s.parse::<Ipv4Addr>().unwrap();
+        assert_eq!(i.nat_addrs(2), (ip("192.168.3.100"), ip("192.168.3.1"), ip("192.168.3.1")));
+        assert_eq!(Identity::default().nat_addrs(0), (ip("10.0.2.15"), ip("10.0.2.2"), ip("10.0.2.3")));
+        assert_eq!(VmConfig::from_toml(&c.to_toml().unwrap()).unwrap(), c, "round trip");
+        for (from, to) in [
+            ("usb_pci_id = \"8086:a0ed\"", "usb_pci_id = \"ffff:a0ed\""),
+            ("usb_pci_id = \"8086:a0ed\"", "usb_pci_id = \"8086:a0e\""),
+            ("usb_pci_id = \"8086:a0ed\"", "usb_pci_id = \"8086:a0ed:1\""),
+            ("mac_prefix = \"00:1b:21\"", "mac_prefix = \"01\""),
+            ("mac_prefix = \"00:1b:21\"", "mac_prefix = \"00:1b:21:00\""),
+            ("chassis_type = 3", "chassis_type = 0"),
+            ("nat_dns = \"192.168.1.1\"", "nat_dns = \"192.168.2.1\""),
+            ("nat_guest = \"192.168.1.100\"", "nat_guest = \"192.168.1.1\""),
+            ("nat_guest = \"192.168.1.100\"", "nat_guest = \"192.168.1.255\""),
+            ("nat_gateway = \"192.168.1.1\"\nnat_dns = \"192.168.1.1\"", "nat_gateway = \"8.8.8.1\"\nnat_dns = \"8.8.8.8\""),
+        ] {
+            assert!(VmConfig::from_toml(&more.replace(from, to)).is_err(), "{to}");
+        }
+        // Three adapters need three /24s above the first one.
+        let high = more.replace("192.168.1.", "192.168.254.");
+        assert!(VmConfig::from_toml(&high).is_err());
+        assert!(VmConfig::from_toml(&high.replace("192.168.254.", "192.168.253.")).is_ok());
+        // A [[net]] MAC can't be the gateway's.
+        let clash = format!("{SAMPLE}\n[identity]\nnat_gateway_mac = \"52:54:00:aa:bb:cc\"\n");
+        assert!(VmConfig::from_toml(&clash).is_err());
+
         let mut i = Identity::default();
         i.randomize_serials([1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(i.serial.as_deref(), Some("010203040506"));

@@ -64,6 +64,16 @@ pub struct PciId {
     pub subsys: u16,
 }
 
+/// Vendor, device and subsystem IDs: what a guest names a function by
+/// (lspci, Device Manager). Class and revision stay with the device model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VendorIds {
+    pub vendor: u16,
+    pub device: u16,
+    pub subsys_vendor: u16,
+    pub subsys: u16,
+}
+
 impl ConfigSpace {
     /// `int_pin`: 0 none, 1..=4 INTA..INTD.
     pub fn new(id: PciId, int_pin: u8) -> Self {
@@ -84,6 +94,18 @@ impl ConfigSpace {
         c.wmask[0x0c] = 0xff; // cache line size
         c.wmask[0x0d] = 0xff; // latency timer
         c
+    }
+
+    /// Replace the vendor, device and subsystem IDs (VM's `[identity]`).
+    pub fn set_vendor_ids(&mut self, ids: VendorIds) {
+        self.put16(0x00, ids.vendor);
+        self.put16(0x02, ids.device);
+        self.put16(0x2c, ids.subsys_vendor);
+        self.put16(0x2e, ids.subsys);
+    }
+
+    pub fn vendor_ids(&self) -> VendorIds {
+        VendorIds { vendor: self.get16(0x00), device: self.get16(0x02), subsys_vendor: self.get16(0x2c), subsys: self.get16(0x2e) }
     }
 
     fn put16(&mut self, o: usize, v: u16) {
