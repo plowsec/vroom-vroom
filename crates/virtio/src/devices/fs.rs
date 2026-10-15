@@ -1,16 +1,23 @@
 //! virtio-fs: a host directory shared with the guest (FUSE over a
-//! virtqueue). Linux: `mount -t virtiofs <tag> /mnt`.
+//! virtqueue). Linux: `mount -t virtiofs <tag> /mnt`. Windows: virtio-win's
+//! viofs driver and virtiofs.exe (on WinFsp).
 //!
 //! The FUSE server here only parses and answers; every host access goes
 //! through `vroom_fs::Share`, which never leaves the shared directory and
 //! never follows a symlink. On top of that, from the guest's side:
-//! - read-only shares refuse every change (EROFS);
+//! - read-only shares refuse every change (EROFS) and show no write bits;
 //! - no symlinks, hard links or device nodes can be created;
-//! - nodes, open handles and directory listings are capped;
+//! - nodes, open handles, directory listings and path lengths are capped;
 //! - every length and name in a request is checked before use.
 //!
 //! Nodes are paths below the root, so they survive snapshots: open files
 //! are reopened by path on restore.
+//!
+//! The Windows client differs from Linux's: it looks the root up as ".",
+//! lists with READDIRPLUS (and counts "." and ".." to tell an empty
+//! directory), preallocates with FALLOCATE, never sends FORGET, and sets
+//! mode 0664 on what it closes after a change. We tell it apart by its
+//! INIT flags and adapt (see `windows`).
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
@@ -38,6 +45,11 @@ const MAX_DIR_BUDGET: usize = 1 << 20;
 pub const MAX_IO: usize = 1 << 20;
 const MAX_REQUEST: usize = MAX_IO + 4096;
 const TTL_SECS: u64 = 1;
+/// Longest path below the root, in bytes (Linux's PATH_MAX). The Windows
+/// client stops at 259.
+const MAX_PATH: usize = 4096;
+/// Path bytes all nodes may hold together.
+const MAX_PATH_BUDGET: usize = 32 << 20;
 
 // Opcodes.
 const LOOKUP: u32 = 1;
@@ -66,6 +78,8 @@ const CREATE: u32 = 35;
 const INTERRUPT: u32 = 36;
 const DESTROY: u32 = 38;
 const BATCH_FORGET: u32 = 42;
+const FALLOCATE: u32 = 43;
+const READDIRPLUS: u32 = 44;
 const RENAME2: u32 = 45;
 
 // Linux errno values (what the guest expects).
@@ -73,6 +87,11 @@ const EPERM: i32 = 1;
 const ENOENT: i32 = 2;
 const EIO: i32 = 5;
 const EBADF: i32 = 9;
+const EACCES: i32 = 13;
+const ENOTDIR: i32 = 20;
+const EFBIG: i32 = 27;
+const ENAMETOOLONG: i32 = 36;
+const EOPNOTSUPP: i32 = 95;
 const ENFILE: i32 = 23;
 const EMFILE: i32 = 24;
 const EINVAL: i32 = 22;
@@ -94,9 +113,14 @@ const FATTR_FH: u32 = 64;
 const FATTR_ATIME_NOW: u32 = 128;
 const FATTR_MTIME_NOW: u32 = 256;
 
+const FUSE_ASYNC_READ: u32 = 1;
 const FUSE_BIG_WRITES: u32 = 1 << 5;
 const FUSE_MAX_PAGES: u32 = 1 << 22;
 const RENAME_NOREPLACE: u32 = 1;
+const FALLOC_FL_KEEP_SIZE: u32 = 1;
+const DT_DIR: u32 = 4;
+const S_IFMT: u32 = 0o170000;
+const S_IFLNK: u32 = 0o120000;
 
 const IN_HEADER: usize = 40;
 
@@ -120,11 +144,16 @@ impl<'a> In<'a> {
     fn u64(&mut self) -> std::result::Result<u64, i32> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().map_err(|_| EINVAL)?))
     }
-    /// A NUL-terminated name.
-    fn name(&mut self) -> std::result::Result<OsString, i32> {
+    /// A NUL-terminated name, unchecked.
+    fn raw_name(&mut self) -> std::result::Result<OsString, i32> {
         let end = self.b.iter().position(|&c| c == 0).ok_or(EINVAL)?;
         let n = OsStr::from_bytes(&self.b[..end]).to_os_string();
         self.b = &self.b[end + 1..];
+        Ok(n)
+    }
+    /// A NUL-terminated name that is one path component.
+    fn name(&mut self) -> std::result::Result<OsString, i32> {
+        let n = self.raw_name()?;
         if !vroom_fs::valid_name(&n) {
             return Err(EINVAL);
         }
@@ -157,6 +186,22 @@ impl Out {
     fn entry(&mut self, node: u64, s: &Stat, uid: u32, gid: u32) -> &mut Self {
         self.u64(node).u64(0).u64(TTL_SECS).u64(TTL_SECS).u32(0).u32(0).attr(s, uid, gid)
     }
+    /// A READDIR record (`off`: where the next one starts).
+    fn dirent(&mut self, ino: u64, off: u64, kind: u32, name: &[u8]) -> &mut Self {
+        self.u64(ino).u64(off).u32(name.len() as u32).u32(kind);
+        self.0.extend_from_slice(name);
+        self.0.resize(self.0.len().div_ceil(8) * 8, 0);
+        self
+    }
+}
+
+fn dirent_len(name: &[u8]) -> usize {
+    (24 + name.len()).div_ceil(8) * 8
+}
+
+/// Bytes a node's path holds.
+fn plen(p: &[Vec<u8>]) -> usize {
+    p.iter().map(|c| c.len() + 1).sum()
 }
 
 type Reply = std::result::Result<Vec<u8>, i32>;
@@ -170,7 +215,23 @@ struct Node {
 
 enum Handle {
     File { node: u64, file: File, write: bool, append: bool },
-    Dir { entries: Vec<vroom_fs::DirEntry> },
+    /// A listing taken at open; READDIR at offset 0 takes a new one
+    /// (Windows reads a directory again through the handle it keeps).
+    Dir { node: u64, entries: Vec<vroom_fs::DirEntry>, fresh: bool },
+}
+
+impl Handle {
+    fn node(&self) -> u64 {
+        match self {
+            Handle::File { node, .. } | Handle::Dir { node, .. } => *node,
+        }
+    }
+    fn dir_len(&self) -> usize {
+        match self {
+            Handle::Dir { entries, .. } => entries.len(),
+            Handle::File { .. } => 0,
+        }
+    }
 }
 
 /// What survives a snapshot (the guest kernel holds node ids and file
@@ -182,16 +243,22 @@ struct Snap {
     next_node: u64,
     next_fh: u64,
     inited: bool,
+    #[serde(default)]
+    windows: bool,
 }
 
 pub struct FuseServer {
     share: Share,
     nodes: HashMap<u64, Node>,
     by_path: HashMap<Vec<Vec<u8>>, u64>,
+    /// Sum of `plen` over the paths in `nodes`.
+    path_bytes: usize,
     handles: HashMap<u64, Handle>,
     next_node: u64,
     next_fh: u64,
     inited: bool,
+    /// The client is virtio-win's virtiofs.exe.
+    windows: bool,
 }
 
 impl std::fmt::Debug for FuseServer {
@@ -215,10 +282,12 @@ impl FuseServer {
             share,
             nodes: HashMap::new(),
             by_path: HashMap::new(),
+            path_bytes: 0,
             handles: HashMap::new(),
             next_node: 2,
             next_fh: 1,
             inited: false,
+            windows: false,
         };
         s.reset();
         s
@@ -230,7 +299,9 @@ impl FuseServer {
         self.handles.clear();
         self.nodes.insert(ROOT, Node { path: Some(Vec::new()), lookups: 1 });
         self.by_path.insert(Vec::new(), ROOT);
+        self.path_bytes = 0;
         self.inited = false;
+        self.windows = false;
     }
 
     fn path(&self, node: u64) -> std::result::Result<Vec<Vec<u8>>, i32> {
@@ -239,12 +310,24 @@ impl FuseServer {
 
     fn child(&self, parent: u64, name: &OsStr) -> std::result::Result<Vec<Vec<u8>>, i32> {
         let mut p = self.path(parent)?;
+        if plen(&p) + name.len() + 1 > MAX_PATH {
+            return Err(ENAMETOOLONG);
+        }
         p.push(name.as_bytes().to_vec());
         Ok(p)
     }
 
+    /// Attributes as the guest sees them: a read-only share has no write
+    /// bits, so clients that check (Windows does) refuse up front.
+    fn shown(&self, mut st: Stat) -> Stat {
+        if self.share.readonly() {
+            st.mode &= !0o222;
+        }
+        st
+    }
+
     fn stat(&self, p: &[Vec<u8>]) -> std::result::Result<Stat, i32> {
-        self.share.stat(&os_path(p)).map_err(|e| linux_errno(&e))
+        self.share.stat(&os_path(p)).map(|s| self.shown(s)).map_err(|e| linux_errno(&e))
     }
 
     /// Count a lookup of `p` and return its node.
@@ -255,14 +338,51 @@ impl FuseServer {
             }
             return Ok(id);
         }
-        if self.nodes.len() >= MAX_NODES {
+        let full = |s: &Self| s.nodes.len() >= MAX_NODES || s.path_bytes + plen(&p) > MAX_PATH_BUDGET;
+        if full(self) && self.windows {
+            self.evict();
+        }
+        if full(self) {
             return Err(ENFILE);
         }
         let id = self.next_node;
         self.next_node += 1;
+        self.path_bytes += plen(&p);
         self.by_path.insert(p.clone(), id);
         self.nodes.insert(id, Node { path: Some(p), lookups: 1 });
         Ok(id)
+    }
+
+    /// Node `id` is gone: drop it and its path.
+    fn remove_node(&mut self, id: u64) {
+        if let Some(Node { path: Some(p), .. }) = self.nodes.remove(&id) {
+            self.path_bytes = self.path_bytes.saturating_sub(plen(&p));
+            if self.by_path.get(&p) == Some(&id) {
+                self.by_path.remove(&p);
+            }
+        }
+    }
+
+    /// Node `id` no longer has a path (removed or replaced).
+    fn unlink_node(&mut self, id: u64) {
+        if let Some(old) = self.nodes.get_mut(&id).and_then(|n| n.path.take()) {
+            self.path_bytes = self.path_bytes.saturating_sub(plen(&old));
+            if self.by_path.get(&old) == Some(&id) {
+                self.by_path.remove(&old);
+            }
+        }
+    }
+
+    /// The Windows client never forgets a node: when the table is full,
+    /// drop every node no open handle uses. It looks paths up again from
+    /// the root for each open, so only open handles hold node ids.
+    fn evict(&mut self) {
+        let held: std::collections::HashSet<u64> = self.handles.values().map(Handle::node).collect();
+        let gone: Vec<u64> = self.nodes.keys().copied().filter(|id| *id != ROOT && !held.contains(id)).collect();
+        log::debug!("fs: node table full, dropping {} unused nodes", gone.len());
+        for id in gone {
+            self.remove_node(id);
+        }
     }
 
     fn entry(&mut self, p: Vec<Vec<u8>>, uid: u32, gid: u32) -> Reply {
@@ -285,11 +405,7 @@ impl FuseServer {
             None => false,
         };
         if gone {
-            if let Some(Node { path: Some(p), .. }) = self.nodes.remove(&node) {
-                if self.by_path.get(&p) == Some(&node) {
-                    self.by_path.remove(&p);
-                }
-            }
+            self.remove_node(node);
         }
     }
 
@@ -297,25 +413,29 @@ impl FuseServer {
     fn drop_path(&mut self, p: &[Vec<u8>]) {
         let ids: Vec<u64> = self.by_path.iter().filter(|(k, _)| k.starts_with(p)).map(|(_, &v)| v).collect();
         for id in ids {
-            if let Some(n) = self.nodes.get_mut(&id) {
-                if let Some(old) = n.path.take() {
-                    self.by_path.remove(&old);
-                }
-            }
+            self.unlink_node(id);
         }
     }
 
-    /// Everything under `from` is now under `to`.
+    /// Everything under `from` is now under `to`. Nodes whose new path
+    /// would be too long lose their path (the guest gets ENOENT).
     fn moved(&mut self, from: &[Vec<u8>], to: &[Vec<u8>]) {
+        if from == to {
+            return;
+        }
         self.drop_path(to);
         let ids: Vec<(Vec<Vec<u8>>, u64)> =
             self.by_path.iter().filter(|(k, _)| k.starts_with(from)).map(|(k, &v)| (k.clone(), v)).collect();
         for (old, id) in ids {
-            self.by_path.remove(&old);
+            self.unlink_node(id);
             let mut new = to.to_vec();
             new.extend_from_slice(&old[from.len()..]);
-            self.by_path.insert(new.clone(), id);
+            if plen(&new) > MAX_PATH || self.path_bytes + plen(&new) > MAX_PATH_BUDGET {
+                continue;
+            }
             if let Some(n) = self.nodes.get_mut(&id) {
+                self.path_bytes += plen(&new);
+                self.by_path.insert(new.clone(), id);
                 n.path = Some(new);
             }
         }
@@ -337,6 +457,99 @@ impl FuseServer {
         } else {
             Ok(())
         }
+    }
+
+    /// List directory `node` for handle `fh` (None: a new handle), "."
+    /// and ".." first, within the budget all listings share.
+    fn list(&self, node: u64, fh: Option<u64>) -> std::result::Result<Vec<vroom_fs::DirEntry>, i32> {
+        let p = self.path(node)?;
+        let held: usize = self.handles.iter().filter(|(k, _)| Some(**k) != fh).map(|(_, h)| h.dir_len()).sum();
+        let room = MAX_DIR_BUDGET.saturating_sub(held).min(MAX_DIR_ENTRIES);
+        if room < 2 {
+            return Err(EMFILE);
+        }
+        let me = self.stat(&p)?;
+        if !me.is_dir() {
+            return Err(ENOTDIR);
+        }
+        let up = match p.split_last() {
+            Some((_, parent)) => self.stat(parent)?.ino,
+            None => me.ino,
+        };
+        let mut entries = vec![
+            vroom_fs::DirEntry { name: ".".into(), ino: me.ino, kind: DT_DIR },
+            vroom_fs::DirEntry { name: "..".into(), ino: up, kind: DT_DIR },
+        ];
+        entries.extend(self.share.read_dir(&os_path(&p), room - 2).map_err(|e| linux_errno(&e))?);
+        Ok(entries)
+    }
+
+    /// READDIR / READDIRPLUS on handle `fh` from entry `off`.
+    #[allow(clippy::too_many_arguments)]
+    fn readdir(&mut self, fh: u64, off: u64, size: u32, plus: bool, uid: u32, gid: u32, room: usize) -> Reply {
+        let (node, fresh) = match self.handles.get(&fh) {
+            Some(Handle::Dir { node, fresh, .. }) => (*node, *fresh),
+            _ => return Err(EBADF),
+        };
+        if off == 0 && !fresh {
+            let new = self.list(node, Some(fh))?;
+            if let Some(Handle::Dir { entries, .. }) = self.handles.get_mut(&fh) {
+                *entries = new;
+            }
+        }
+        let Some(Handle::Dir { entries, fresh, .. }) = self.handles.get_mut(&fh) else { return Err(EBADF) };
+        *fresh = false;
+        let cap = (size as usize).min(room);
+        let start = off.min(entries.len() as u64) as usize;
+        // What fits, by size alone.
+        let mut end = start;
+        let mut used = 0;
+        for e in &entries[start..] {
+            let rec = dirent_len(e.name.as_bytes()) + if plus { 128 } else { 0 };
+            if used + rec > cap {
+                break;
+            }
+            used += rec;
+            end += 1;
+        }
+        let batch: Vec<vroom_fs::DirEntry> = entries[start..end].to_vec();
+        let mut o = Out::default();
+        if !plus {
+            for (i, e) in batch.iter().enumerate() {
+                o.dirent(e.ino, (start + i + 1) as u64, e.kind, e.name.as_bytes());
+            }
+            return Ok(o.0);
+        }
+        let dir = self.path(node)?;
+        let names: Vec<&OsStr> = batch.iter().map(|e| e.name.as_os_str()).collect();
+        let stats = self.share.stat_children(&os_path(&dir), &names).map_err(|e| linux_errno(&e))?;
+        for (i, (e, st)) in batch.iter().zip(stats).enumerate() {
+            let dots = matches!(e.name.as_bytes(), b"." | b"..");
+            let st = match e.name.as_bytes() {
+                b"." => self.stat(&dir).ok(),
+                b".." => self.stat(dir.split_last().map_or(&dir[..], |(_, up)| up)).ok(),
+                _ => st.map(|s| self.shown(s)),
+            };
+            // Gone since the listing: skip it.
+            let Some(st) = st else { continue };
+            // A node id counts as a lookup. Only symlinks get one (the
+            // Windows client reads them through it); the rest get 0, "just
+            // attributes", so listings don't fill the node table.
+            let id = if st.mode & S_IFMT == S_IFLNK && !dots {
+                let mut p = dir.clone();
+                p.push(e.name.as_bytes().to_vec());
+                if plen(&p) <= MAX_PATH {
+                    self.remember(p).unwrap_or(0)
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+            o.entry(id, &st, uid, gid);
+            o.dirent(st.ino, (start + i + 1) as u64, e.kind, e.name.as_bytes());
+        }
+        Ok(o.0)
     }
 
     /// Handle one request. `room`: bytes the reply may take (without
@@ -371,6 +584,12 @@ impl FuseServer {
             _ => {}
         }
         let res = if op != INIT && !self.inited { Err(EIO) } else { self.op(op, node, &mut body, uid, gid, room) };
+        // virtiofs.exe turns EROFS into "unexpected error"; EACCES is
+        // "access denied", which is what Explorer should say.
+        let res = match res {
+            Err(EROFS) if self.windows => Err(EACCES),
+            r => r,
+        };
         Some(reply(unique, res))
     }
 
@@ -383,6 +602,9 @@ impl FuseServer {
                 }
                 self.reset();
                 self.inited = true;
+                // Linux always asks for async reads; virtiofs.exe asks
+                // for READDIRPLUS and max_pages only.
+                self.windows = flags & FUSE_ASYNC_READ == 0;
                 let mut o = Out::default();
                 o.u32(7).u32(minor.min(31)).u32(readahead).u32(flags & (FUSE_BIG_WRITES | FUSE_MAX_PAGES));
                 o.u16(64).u16(48).u32(MAX_IO as u32).u32(1).u16((MAX_IO / 4096) as u16).u16(0);
@@ -395,8 +617,15 @@ impl FuseServer {
                 Ok(Vec::new())
             }
             LOOKUP => {
-                let name = b.name()?;
-                let p = self.child(node, &name)?;
+                let name = b.raw_name()?;
+                // The Windows client looks the root up as ".".
+                let p = if name == "." {
+                    self.path(node)?
+                } else if vroom_fs::valid_name(&name) {
+                    self.child(node, &name)?
+                } else {
+                    return Err(EINVAL);
+                };
                 self.entry(p, uid, gid)
             }
             GETATTR => {
@@ -524,34 +753,38 @@ impl FuseServer {
                 Ok(Vec::new())
             }
             OPENDIR => {
-                let p = os_path(&self.path(node)?);
-                let held: usize = self.handles.values().map(|h| if let Handle::Dir { entries } = h { entries.len() } else { 0 }).sum();
-                let room = MAX_DIR_BUDGET.saturating_sub(held).min(MAX_DIR_ENTRIES);
-                if room == 0 {
-                    return Err(EMFILE);
-                }
-                let entries = self.share.read_dir(&p, room).map_err(|e| linux_errno(&e))?;
-                let fh = self.add_handle(Handle::Dir { entries })?;
+                let entries = self.list(node, None)?;
+                let fh = self.add_handle(Handle::Dir { node, entries, fresh: true })?;
                 let mut o = Out::default();
                 o.u64(fh).u32(0).u32(0);
                 Ok(o.0)
             }
-            READDIR => {
+            READDIR | READDIRPLUS => {
                 let (fh, off, size) = (b.u64()?, b.u64()?, b.u32()?);
-                let Some(Handle::Dir { entries }) = self.handles.get(&fh) else { return Err(EBADF) };
-                let cap = (size as usize).min(room);
-                let mut o = Out::default();
-                for (i, e) in entries.iter().enumerate().skip(off.min(usize::MAX as u64) as usize) {
-                    let name = e.name.as_bytes();
-                    let rec = (24 + name.len()).div_ceil(8) * 8;
-                    if o.0.len() + rec > cap {
-                        break;
-                    }
-                    o.u64(e.ino).u64(i as u64 + 1).u32(name.len() as u32).u32(e.kind);
-                    o.0.extend_from_slice(name);
-                    o.0.resize(o.0.len().div_ceil(8) * 8, 0);
+                self.readdir(fh, off, size, op == READDIRPLUS, uid, gid, room)
+            }
+            FALLOCATE => {
+                self.writable()?;
+                let (fh, off, len, mode) = (b.u64()?, b.u64()?, b.u64()?, b.u32()?);
+                let Some(Handle::File { file, write: true, .. }) = self.handles.get(&fh) else { return Err(EBADF) };
+                if len == 0 {
+                    return Err(EINVAL);
                 }
-                Ok(o.0)
+                let end = off.checked_add(len).filter(|e| *e <= i64::MAX as u64).ok_or(EFBIG)?;
+                match mode {
+                    // Grow to `end` (sparse: nothing is reserved).
+                    0 => {
+                        let size = file.metadata().map_err(|e| linux_errno(&e))?.len();
+                        if end > size {
+                            file.set_len(end).map_err(|e| linux_errno(&e))?;
+                        }
+                    }
+                    // Only a hint (Windows sends it with the allocation
+                    // size of a new file).
+                    FALLOC_FL_KEEP_SIZE => {}
+                    _ => return Err(EOPNOTSUPP),
+                }
+                Ok(Vec::new())
             }
             STATFS => {
                 let s = self.share.statfs().map_err(|e| linux_errno(&e))?;
@@ -591,7 +824,11 @@ impl FuseServer {
             }
         }
         if valid & FATTR_MODE != 0 {
-            self.share.set_mode(&p, mode).map_err(|e| linux_errno(&e))?;
+            let cur = self.share.stat(&p).map_err(|e| linux_errno(&e))?.mode;
+            let new = if self.windows { windows_mode(cur, mode) } else { mode };
+            if new & 0o7777 != cur & 0o7777 {
+                self.share.set_mode(&p, new).map_err(|e| linux_errno(&e))?;
+            }
         }
         let t = |set: u32, now_bit: u32, s: u64, ns: u32| {
             if valid & now_bit != 0 {
@@ -607,7 +844,7 @@ impl FuseServer {
             self.share.set_times(&p, a, m).map_err(|e| linux_errno(&e))?;
         }
         // uid/gid changes: accepted and ignored (files are the host user's).
-        let st = self.share.stat(&p).map_err(|e| linux_errno(&e))?;
+        let st = self.share.stat(&p).map(|s| self.shown(s)).map_err(|e| linux_errno(&e))?;
         let mut o = Out::default();
         o.u64(TTL_SECS).u32(0).u32(0).attr(&st, uid, gid);
         Ok(o.0)
@@ -628,6 +865,7 @@ impl FuseServer {
             next_node: self.next_node,
             next_fh: self.next_fh,
             inited: self.inited,
+            windows: self.windows,
         }
     }
 
@@ -638,10 +876,14 @@ impl FuseServer {
             if n.path.as_ref().is_some_and(|p| !p.iter().all(|c| vroom_fs::valid_name(OsStr::from_bytes(c)))) {
                 n.path = None;
             }
+            if n.path.as_ref().is_some_and(|p| plen(p) > MAX_PATH || self.path_bytes + plen(p) > MAX_PATH_BUDGET) {
+                n.path = None;
+            }
             if id == ROOT {
                 continue;
             }
             if let Some(p) = &n.path {
+                self.path_bytes += plen(p);
                 self.by_path.insert(p.clone(), id);
             }
             self.nodes.insert(id, n);
@@ -657,7 +899,23 @@ impl FuseServer {
         self.next_node = s.next_node.max(2);
         self.next_fh = s.next_fh.max(1);
         self.inited = s.inited;
+        self.windows = s.windows;
     }
+}
+
+/// Windows only has a read-only attribute, and virtiofs.exe sends 0664
+/// (or 0444) for it, directories included. Apply just that: read-only
+/// clears every write bit, writable gives the owner one back. Type and
+/// execute bits stay.
+fn windows_mode(cur: u32, req: u32) -> u32 {
+    let m = if req & 0o222 == 0 {
+        cur & !0o222
+    } else if cur & 0o200 == 0 {
+        cur | 0o200
+    } else {
+        cur
+    };
+    m & 0o7777
 }
 
 fn reply(unique: u64, res: Reply) -> Vec<u8> {
@@ -760,7 +1018,9 @@ impl VirtioDevice for Fs {
         vec![128, 128]
     }
     fn device_features(&self) -> u64 {
-        0
+        // Windows' driver sends a 1 MiB request (257 pages) as one chain:
+        // more than the queue holds without indirect descriptors.
+        crate::features::RING_INDIRECT_DESC
     }
     fn read_config(&self, offset: u64, data: &mut [u8]) {
         let mut c = [0u8; 40];
