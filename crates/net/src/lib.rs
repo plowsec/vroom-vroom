@@ -25,6 +25,14 @@ pub const RESUME_TOKEN: usize = usize::MAX - 1;
 pub trait NetBackend: Send + std::fmt::Debug {
     /// Guest -> outside.
     fn send_frame(&mut self, frame: &[u8]);
+    /// Several frames the guest sent at once. Backends that can, handle
+    /// them as one batch (NAT: one pass of its TCP/IP stack and one write
+    /// per connection, instead of one per frame).
+    fn send_frames(&mut self, frames: &[Vec<u8>]) {
+        for f in frames {
+            self.send_frame(f);
+        }
+    }
     /// Outside -> guest. None when nothing is queued.
     fn recv_frame(&mut self) -> Option<Vec<u8>>;
     /// Register host sources with tokens >= TOKEN_BASE.

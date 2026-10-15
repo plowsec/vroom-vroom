@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 use mio::net::{TcpListener, TcpStream, UdpSocket};
 use mio::{Interest, Registry, Token};
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
-use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use smoltcp::phy::{Checksum, Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::tcp;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint};
 
@@ -54,7 +54,15 @@ pub const GATEWAY_MAC: Mac = [0x02, 0x42, 0x57, 0x4b, 0x00, 0x01];
 const MAX_TCP: usize = 512;
 const MAX_UDP: usize = 256;
 const MAX_TO_GUEST: usize = 4096;
+/// smoltcp buffers per TCP connection (each way). Their size is the TCP
+/// window, and with the guest a few tens of microseconds away the window
+/// is what limits throughput: 64 KiB caps a stream near 6 Gbit/s, 512 KiB
+/// lets it run at 20. Only the first few connections get the big ones,
+/// so a guest opening MAX_TCP connections still can't make us allocate
+/// more than ~80 MiB.
 const TCP_BUF: usize = 64 << 10;
+const TCP_BUF_BIG: usize = 512 << 10;
+const MAX_BIG_BUFS: usize = 16;
 const UDP_IDLE: Duration = Duration::from_secs(60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -167,6 +175,13 @@ impl Device for Pipe {
         let mut c = DeviceCapabilities::default();
         c.medium = Medium::Ethernet;
         c.max_transmission_unit = 1514;
+        // Frames from the guest went through RAM, not a wire: checking
+        // their checksums catches nothing (and a guest can send any bytes
+        // with a right checksum anyway). Ours to the guest are computed.
+        c.checksum.ipv4 = Checksum::Tx;
+        c.checksum.tcp = Checksum::Tx;
+        c.checksum.udp = Checksum::Tx;
+        c.checksum.icmpv4 = Checksum::Tx;
         c
     }
 }
@@ -188,6 +203,8 @@ struct TcpConn {
     host_eof: bool,
     host_wr_closed: bool,
     created: Instant,
+    /// Size of its smoltcp buffers (0 before it has a socket).
+    buf: usize,
 }
 
 struct UdpFlow {
@@ -222,6 +239,10 @@ pub struct Nat {
     fragments: fragment::Reassembly,
     next_ip_id: u16,
     pings: HashMap<usize, ping::Pending>,
+    /// Reused buffer for reads from host sockets.
+    scratch: Vec<u8>,
+    /// Connections holding TCP_BUF_BIG buffers.
+    big_bufs: usize,
 }
 
 impl std::fmt::Debug for Nat {
@@ -273,6 +294,8 @@ impl Nat {
             fragments: fragment::Reassembly::default(),
             next_ip_id: u16::from_le_bytes([seed[0], seed[1]]),
             pings: HashMap::new(),
+            scratch: vec![0u8; 64 << 10],
+            big_bufs: 0,
         })
     }
 
@@ -376,7 +399,8 @@ impl Nat {
     }
 
     fn udp_readable(&mut self, key: FlowKey) {
-        let mut buf = vec![0u8; 65536];
+        let mut buf = std::mem::take(&mut self.scratch);
+        buf.resize(65536, 0);
         let mut out = Vec::new();
         if let Some((_, flow)) = self.udp.get_mut(&key) {
             loop {
@@ -398,6 +422,7 @@ impl Nat {
                 }
             }
         }
+        self.scratch = buf;
         for f in out {
             self.push_guest(f);
         }
@@ -483,16 +508,30 @@ impl Nat {
                 host_eof: false,
                 host_wr_closed: false,
                 created: Instant::now(),
+                buf: 0,
             },
         );
         self.tcp_by_key.insert(key, tok);
     }
 
-    fn new_tcp_socket() -> tcp::Socket<'static> {
-        let mut s =
-            tcp::Socket::new(tcp::SocketBuffer::new(vec![0u8; TCP_BUF]), tcp::SocketBuffer::new(vec![0u8; TCP_BUF]));
+    /// A socket and the size of its buffers. Hand the size to the
+    /// connection (or `release_buf` it), so big buffers are counted back.
+    fn new_tcp_socket(&mut self) -> (tcp::Socket<'static>, usize) {
+        let size = if self.big_bufs < MAX_BIG_BUFS {
+            self.big_bufs += 1;
+            TCP_BUF_BIG
+        } else {
+            TCP_BUF
+        };
+        let mut s = tcp::Socket::new(tcp::SocketBuffer::new(vec![0u8; size]), tcp::SocketBuffer::new(vec![0u8; size]));
         s.set_nagle_enabled(false);
-        s
+        (s, size)
+    }
+
+    fn release_buf(&mut self, size: usize) {
+        if size == TCP_BUF_BIG {
+            self.big_bufs -= 1;
+        }
     }
 
     /// Host side of an outbound connection became ready.
@@ -521,7 +560,10 @@ impl Nat {
             self.drop_tcp(tok);
             return;
         }
-        let mut s = Self::new_tcp_socket();
+        let (mut s, size) = self.new_tcp_socket();
+        if let Some(c) = self.tcp.get_mut(&tok) {
+            c.buf = size;
+        }
         if s.listen(IpListenEndpoint { addr: Some(IpAddress::Ipv4(*key.dst.ip())), port: key.dst.port() }).is_err() {
             self.drop_tcp(tok);
             return;
@@ -546,16 +588,18 @@ impl Nat {
                 continue;
             }
             let Some(reg) = self.registry.as_ref().and_then(|r| r.try_clone().ok()) else { return };
-            let mut s = Self::new_tcp_socket();
+            let (mut s, size) = self.new_tcp_socket();
             let local = self.next_local_port;
             self.next_local_port = if local >= 60000 { 40000 } else { local + 1 };
             let remote = IpEndpoint::new(IpAddress::Ipv4(self.cfg.guest), guest_port);
             if s.connect(self.iface.context(), remote, (IpAddress::Ipv4(self.cfg.gateway), local)).is_err() {
+                self.release_buf(size);
                 continue;
             }
             let tok = self.alloc_token(Owner::Tcp);
             if reg.register(&mut stream, Token(tok), Interest::READABLE | Interest::WRITABLE).is_err() {
                 self.owners.remove(&tok);
+                self.release_buf(size);
                 continue;
             }
             let h = self.sockets.add(s);
@@ -571,6 +615,7 @@ impl Nat {
                     host_eof: false,
                     host_wr_closed: false,
                     created: Instant::now(),
+                    buf: size,
                 },
             );
         }
@@ -589,19 +634,21 @@ impl Nat {
                 self.tcp_by_key.remove(&k);
             }
             self.owners.remove(&tok);
+            self.release_buf(c.buf);
         }
     }
 
     /// Move bytes between smoltcp sockets and host streams.
     fn pump_tcp(&mut self) {
         let mut dead = Vec::new();
-        let mut buf = vec![0u8; 16 << 10];
+        let mut buf = std::mem::take(&mut self.scratch);
+        buf.resize(64 << 10, 0);
         for (&tok, c) in self.tcp.iter_mut() {
             let Some(h) = c.handle else { continue };
             let s = self.sockets.get_mut::<tcp::Socket>(h);
             // guest -> host
-            while c.to_host.len() < TCP_BUF && s.can_recv() {
-                let room = TCP_BUF - c.to_host.len();
+            while c.to_host.len() < c.buf && s.can_recv() {
+                let room = c.buf - c.to_host.len();
                 let r = s.recv(|b| {
                     let n = b.len().min(room);
                     c.to_host.extend_from_slice(&b[..n]);
@@ -657,6 +704,7 @@ impl Nat {
                 dead.push(tok);
             }
         }
+        self.scratch = buf;
         for t in dead {
             self.drop_tcp(t);
         }
@@ -715,8 +763,9 @@ fn arp_reply(req: &Arp, ip: Ipv4Addr, mac: Mac) -> Vec<u8> {
     f
 }
 
-impl NetBackend for Nat {
-    fn send_frame(&mut self, frame: &[u8]) {
+impl Nat {
+    /// Take one guest frame in; the stack runs later (`poll_stack`).
+    fn take_frame(&mut self, frame: &[u8]) {
         let Some(eth) = parse_eth(frame) else { return };
         if eth.src != self.guest_mac {
             return; // one configured guest per backend
@@ -728,7 +777,7 @@ impl NetBackend for Nat {
                 if ip.fragmented {
                     if eth.src == self.guest_mac && ip.src == self.cfg.guest {
                         if let Some(complete) = self.fragments.push(frame) {
-                            self.send_frame(&complete);
+                            self.take_frame(&complete);
                         }
                     }
                     return;
@@ -763,6 +812,19 @@ impl NetBackend for Nat {
                 }
             }
             _ => {} // IPv6 etc: not offered on the NAT network.
+        }
+    }
+}
+
+impl NetBackend for Nat {
+    fn send_frame(&mut self, frame: &[u8]) {
+        self.take_frame(frame);
+        self.poll_stack();
+    }
+
+    fn send_frames(&mut self, frames: &[Vec<u8>]) {
+        for f in frames {
+            self.take_frame(f);
         }
         self.poll_stack();
     }

@@ -59,6 +59,8 @@ pub struct NetHandler {
 impl NetHandler {
     fn tx(&mut self, ctx: &mut QueueCtx) {
         let Some(be) = self.backend.as_mut() else { return };
+        // Everything the guest queued goes to the backend as one batch.
+        let mut batch = Vec::new();
         loop {
             let chain = match ctx.queues[TX].pop(&ctx.mem) {
                 Ok(Some(c)) => c,
@@ -75,11 +77,14 @@ impl NetHandler {
                     let mut hdr = [0u8; HDR_LEN];
                     let mut frame = vec![0u8; n - HDR_LEN];
                     if r.read_exact(&mut hdr).is_ok() && r.read_exact(&mut frame).is_ok() {
-                        be.send_frame(&frame);
+                        batch.push(frame);
                     }
                 }
             }
             ctx.add_used(TX, head, 0);
+        }
+        if !batch.is_empty() {
+            be.send_frames(&batch);
         }
     }
 

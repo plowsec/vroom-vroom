@@ -94,7 +94,8 @@ fn tcp_large_transfer_and_half_close() {
     });
     iface.routes_mut().add_default_ipv4_route(GATEWAY).unwrap();
     let mut sockets = SocketSet::new(Vec::new());
-    let mut socket = Nat::new_tcp_socket();
+    // The guest's end.
+    let mut socket = tcp::Socket::new(tcp::SocketBuffer::new(vec![0u8; TCP_BUF]), tcp::SocketBuffer::new(vec![0u8; TCP_BUF]));
     socket.connect(iface.context(), (IpAddress::Ipv4(DNS), 53), 3456).unwrap();
     let handle = sockets.add(socket);
     let mut sent = 0;
@@ -180,6 +181,7 @@ fn pending_connect_expires_and_refuses_guest() {
             host_eof: false,
             host_wr_closed: false,
             created: Instant::now() - CONNECT_TIMEOUT,
+            buf: 0,
         },
     );
     n.tick();
@@ -238,10 +240,7 @@ fn sandboxed_external_echo() {
     panic!("no echo reply under sandbox");
 }
 
-#[test]
-fn gateway_answers_ping() {
-    let mut n = Nat::new(NatConfig::new(MAC)).unwrap();
-    // The guest asks for the gateway's MAC first, as a real one does.
+fn arp_for_gateway() -> Vec<u8> {
     let mut arp = Vec::new();
     arp.extend_from_slice(&[0xff; 6]);
     arp.extend_from_slice(&MAC);
@@ -250,13 +249,34 @@ fn gateway_answers_ping() {
     arp.extend_from_slice(&GUEST.octets());
     arp.extend_from_slice(&[0; 6]);
     arp.extend_from_slice(&GATEWAY.octets());
-    n.send_frame(&arp);
-    while n.recv_frame().is_some() {}
-    let mut echo = vec![8, 0, 0, 0, 0x12, 0x34, 0, 1];
+    arp
+}
+
+fn echo_request(seq: u8) -> Vec<u8> {
+    let mut echo = vec![8, 0, 0, 0, 0x12, 0x34, 0, seq];
     echo.extend_from_slice(b"ping payload");
     let c = checksum(0, &echo);
     echo[2..4].copy_from_slice(&c.to_be_bytes());
-    n.send_frame(&build_icmp(GATEWAY_MAC, MAC, GUEST, GATEWAY, &echo));
+    build_icmp(GATEWAY_MAC, MAC, GUEST, GATEWAY, &echo)
+}
+
+#[test]
+fn a_batch_of_frames_is_handled_like_single_ones() {
+    let mut n = Nat::new(NatConfig::new(MAC)).unwrap();
+    n.send_frames(&[arp_for_gateway(), echo_request(1), echo_request(2), vec![0; 3]]);
+    let seqs: Vec<u8> = std::iter::from_fn(|| n.recv_frame())
+        .filter_map(|f| parse_ipv4(&f).filter(|ip| ip.proto == PROTO_ICMP).map(|ip| ip.payload[7]))
+        .collect();
+    assert_eq!(seqs, [1, 2]);
+}
+
+#[test]
+fn gateway_answers_ping() {
+    let mut n = Nat::new(NatConfig::new(MAC)).unwrap();
+    // The guest asks for the gateway's MAC first, as a real one does.
+    n.send_frame(&arp_for_gateway());
+    while n.recv_frame().is_some() {}
+    n.send_frame(&echo_request(1));
     let reply = std::iter::from_fn(|| n.recv_frame())
         .find(|f| parse_ipv4(f).is_some_and(|ip| ip.proto == PROTO_ICMP))
         .expect("echo reply");
@@ -264,4 +284,16 @@ fn gateway_answers_ping() {
     assert_eq!((ip.src, ip.dst), (GATEWAY, GUEST));
     assert_eq!(ip.payload[0], 0);
     assert_eq!(&ip.payload[8..], b"ping payload");
+}
+
+#[test]
+fn only_a_few_connections_get_big_buffers() {
+    let mut n = Nat::new(NatConfig::new(MAC)).unwrap();
+    let sizes: Vec<usize> = (0..MAX_BIG_BUFS + 4).map(|_| n.new_tcp_socket().1).collect();
+    assert!(sizes[..MAX_BIG_BUFS].iter().all(|&s| s == TCP_BUF_BIG));
+    assert!(sizes[MAX_BIG_BUFS..].iter().all(|&s| s == TCP_BUF));
+    n.release_buf(TCP_BUF_BIG);
+    n.release_buf(TCP_BUF);
+    assert_eq!(n.new_tcp_socket().1, TCP_BUF_BIG);
+    assert_eq!(n.new_tcp_socket().1, TCP_BUF);
 }
