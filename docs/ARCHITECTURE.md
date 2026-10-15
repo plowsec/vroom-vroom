@@ -9,7 +9,9 @@ bulwark run <vm.toml>   one process per VM, sandboxed after setup ◄───�
    │
    ├─ vCPU threads (one per vCPU, own the hv vCPU handle)
    ├─ device workers (virtio queues, NAT, display, agent, ramfb)
-   └─ optional: unix socket to bulwark-netd (root) for bridged/host-only
+   ├─ optional: unix socket to bulwark-netd (root) for bridged/host-only
+   ├─ optional: swtpm (vTPM), own sandbox, control + data socketpairs
+   └─ optional: bulwark audio-out (sound), own sandbox, datagram socket
 ```
 
 The GUI never touches the guest: it shows a framebuffer the VMM shares
@@ -28,9 +30,11 @@ limits, source-MAC anti-spoofing). The VMM never holds an interface.
 | `memory` | Guest RAM as guarded mmaps; every access bounds-checked (`GuestMemory`). |
 | `arch` | Board layout (QEMU-virt compatible), FDT, ACPI tables (own AML encoder), SMBIOS, kernel image loader (Image, gzip, EFI zboot). |
 | `devices` | Bus, PL011, PL031, fw_cfg (+DMA), CFI flash (NVRAM), PCI host (ECAM, MSI-X, INTx), NVMe, xHCI + USB HID. Parses hostile input only; `forbid(unsafe_code)`. |
-| `virtio` | Split-queue handling (hardened), MMIO and modern PCI transports, devices (blk, net, console, rng, gpu, input), a pausable worker per device. `forbid(unsafe_code)`. |
+| `virtio` | Split-queue handling (hardened), MMIO and modern PCI transports, devices (blk, net, console, rng, gpu, input, fs, sound), a pausable worker per device. `forbid(unsafe_code)`. |
+| `fs` | Host side of shared folders: component-wise `openat(O_NOFOLLOW)` walks from a root fd, Linux errno mapping. The virtio-fs FUSE server lives in `virtio`. |
+| `audio` | Sound helper: datagram protocol, ring buffer, CoreAudio (macOS) / ALSA (Linux, `dlopen`) output, WAV test output. |
 | `gpu3d` | virglrenderer loaded with `dlopen`, behind the `Renderer3d` trait the virtio crate defines. The one place with GPU FFI. |
-| `block` | raw and qcow2 (COW, compressed reads, backing chains with an allow-list), sync modes, swappable layers. |
+| `block` | raw and qcow2 (COW, compressed reads, backing chains with an allow-list, discard/zero clusters with hole punching, folding a layer into its child), sync modes, swappable layers, flock-based image locks. |
 | `net` | Userspace NAT (smoltcp for the guest side, host sockets outward), DHCP/DNS, ICMP echo, fragments; netd wire protocol. |
 | `snapshot` | `Snapshottable` trait, snapshot directories with per-blob SHA-256 and an atomic manifest. |
 | `vmm` | Builds the board from the config, runs vCPUs, PSCI, the agent channel, display arbitration (ramfb vs virtio-gpu), snapshots and suspend, disk layering. |
@@ -69,6 +73,17 @@ the disks didn't change in between.
 
 Things a snapshot can't hold: host GPU objects (snapshots refuse while 3D
 contexts exist), and nested-virtualization EL2 state is best effort.
+
+Layers form a tree under `<state>/disks`. `bulwark snapshot delete/prune`
+(VM stopped) removes layers nothing references and folds a layer that only
+one child still needs into that child (copying up the clusters the child
+lacks, then re-pointing its header), so chains stay short. A state dir is
+locked by its VMM; every image is locked exclusive (writer) or shared
+(read-only layer), and a snapshot downgrades the frozen layer to shared.
+
+Shared folders keep their FUSE node table as paths, so a snapshot carries
+it and open files are reopened by path on restore. Sound hands back
+in-flight buffers before saving.
 
 ## 3D
 
