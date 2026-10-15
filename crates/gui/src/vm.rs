@@ -20,9 +20,13 @@ pub enum DiskState {
 pub struct Vm {
     pub path: PathBuf,
     pub key: String,
-    /// As written: paths relative to the file. None if unreadable.
+    /// As written: paths relative to the file. None if unreadable (or
+    /// broken since: the app then shows the error, not a stale copy).
     pub raw: Option<VmConfig>,
     pub error: Option<String>,
+    /// From the last good read: a VM running on it keeps it while the file
+    /// is broken.
+    state: PathBuf,
     pub mtime: Option<SystemTime>,
     pub disk_state: DiskState,
     pub thumb: Option<slint::Image>,
@@ -40,6 +44,7 @@ impl Vm {
             key: crate::paths::key(path),
             raw: None,
             error: None,
+            state: path.with_extension("state"),
             mtime: None,
             disk_state: DiskState::Off,
             thumb: None,
@@ -55,10 +60,14 @@ impl Vm {
         self.mtime = mtime(&self.path);
         match VmConfig::load_raw(&self.path) {
             Ok(c) => {
+                self.state = c.default_state_dir(&self.path);
                 self.raw = Some(c);
                 self.error = None;
             }
-            Err(e) => self.error = Some(e.to_string()),
+            Err(e) => {
+                self.raw = None;
+                self.error = Some(e.to_string());
+            }
         }
     }
 
@@ -83,10 +92,7 @@ impl Vm {
     }
 
     pub fn state_dir(&self) -> PathBuf {
-        match &self.raw {
-            Some(c) => c.default_state_dir(&self.path),
-            None => self.path.with_extension("state"),
-        }
+        self.state.clone()
     }
 
     pub fn refresh_state(&mut self) {
@@ -138,4 +144,24 @@ pub fn virtual_size(p: &Path) -> Option<u64> {
 pub fn used_bytes(p: &Path) -> Option<u64> {
     use std::os::unix::fs::MetadataExt;
     std::fs::metadata(p).ok().map(|m| m.blocks() * 512)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_broken_file_shows_as_broken() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("dev.toml");
+        std::fs::write(&p, "name = \"dev\"\n[boot]\ntype = \"uefi\"\nvars = \"x.fd\"\n").unwrap();
+        let mut v = Vm::open(&p);
+        assert!(v.raw.is_some());
+        let state = v.state_dir();
+        assert!(state.ends_with("dev.state"));
+        std::fs::write(&p, "name = \"dev\"\ncpus = \"many\"\n").unwrap();
+        v.reload();
+        assert!(v.raw.is_none() && v.error.is_some(), "kept showing the old settings");
+        assert_eq!(v.state_dir(), state);
+    }
 }

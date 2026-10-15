@@ -5412,6 +5412,7 @@ version = "0.1.0"
 dependencies = [
  "arboard",
  "env_logger",
+ "i-slint-backend-testing",
  "libc",
  "log",
  "png 0.17.16",

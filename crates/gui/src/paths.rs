@@ -3,8 +3,18 @@
 
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+thread_local! {
+    /// Unit tests: a data dir per test (they run on their own threads).
+    pub static TEST_HOME: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
 /// `VROOM_HOME` if set (tests), else the platform's app data dir.
 pub fn data_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(h) = TEST_HOME.with(|h| h.borrow().clone()) {
+        return h;
+    }
     if let Some(h) = std::env::var_os("VROOM_HOME") {
         return PathBuf::from(h);
     }
