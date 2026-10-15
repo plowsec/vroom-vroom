@@ -358,11 +358,11 @@ fn windows_read_only() {
     let mut t = T::windows(true);
     let sub = t.lookup(ROOT, "sub").unwrap();
     let f = t.lookup(sub, "hello.txt").unwrap();
-    // No write bits shown: Windows refuses before asking.
+    // Modes are the host's (copies out of the share don't come out
+    // read-only); changes are "access denied", not "unexpected error".
     let (e, attr) = t.call(GETATTR, f, &[0; 16]);
     assert_eq!(e, 0);
-    assert_eq!(u32::from_le_bytes(attr[16 + 60..16 + 64].try_into().unwrap()) & 0o222, 0);
-    // Asking anyway is "access denied", not "unexpected error".
+    assert_eq!(u32::from_le_bytes(attr[16 + 60..16 + 64].try_into().unwrap()) & 0o777, 0o644);
     assert_eq!(t.open(f, 1), Err(EACCES));
     assert_eq!(t.call(UNLINK, sub, &name("hello.txt")).0, -EACCES);
     assert_eq!(t.setattr(f, FATTR_MODE, 0o664).0, -EACCES);
@@ -529,4 +529,24 @@ fn bookkeeping_survives_renames_and_removes() {
     assert!(t.raw(FORGET, c, &1u64.to_le_bytes()).is_none());
     t.consistent();
     assert!(!t.s.nodes.contains_key(&c));
+}
+
+#[test]
+fn made_again_after_the_host_removed_it_is_a_new_node() {
+    let mut t = T::windows(false);
+    let mkdir = |t: &mut T, n: &str| t.call(MKDIR, ROOT, &le(&[&0o755u32.to_le_bytes(), &[0; 4], &name(n)]));
+    let (e, b) = mkdir(&mut t, "d");
+    assert_eq!(e, 0);
+    let old = u64::from_le_bytes(b[0..8].try_into().unwrap());
+    // Gone on the host, made again from the guest: virtiofs.exe fails a
+    // create that hands back a node id it already knows.
+    std::fs::remove_dir(t.root.join("d")).unwrap();
+    let (e, b) = mkdir(&mut t, "d");
+    assert_eq!(e, 0);
+    assert_ne!(u64::from_le_bytes(b[0..8].try_into().unwrap()), old);
+    std::fs::write(t.root.join("f"), b"x").unwrap();
+    let f = t.lookup(ROOT, "f").unwrap();
+    std::fs::remove_file(t.root.join("f")).unwrap();
+    assert_ne!(t.create(ROOT, "f").0, f);
+    t.consistent();
 }

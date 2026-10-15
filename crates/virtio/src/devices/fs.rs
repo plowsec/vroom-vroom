@@ -5,7 +5,7 @@
 //! The FUSE server here only parses and answers; every host access goes
 //! through `vroom_fs::Share`, which never leaves the shared directory and
 //! never follows a symlink. On top of that, from the guest's side:
-//! - read-only shares refuse every change (EROFS) and show no write bits;
+//! - read-only shares refuse every change (EROFS);
 //! - no symlinks, hard links or device nodes can be created;
 //! - nodes, open handles, directory listings and path lengths are capped;
 //! - every length and name in a request is checked before use.
@@ -317,17 +317,8 @@ impl FuseServer {
         Ok(p)
     }
 
-    /// Attributes as the guest sees them: a read-only share has no write
-    /// bits, so clients that check (Windows does) refuse up front.
-    fn shown(&self, mut st: Stat) -> Stat {
-        if self.share.readonly() {
-            st.mode &= !0o222;
-        }
-        st
-    }
-
     fn stat(&self, p: &[Vec<u8>]) -> std::result::Result<Stat, i32> {
-        self.share.stat(&os_path(p)).map(|s| self.shown(s)).map_err(|e| linux_errno(&e))
+        self.share.stat(&os_path(p)).map_err(|e| linux_errno(&e))
     }
 
     /// Count a lookup of `p` and return its node.
@@ -406,6 +397,15 @@ impl FuseServer {
         };
         if gone {
             self.remove_node(node);
+        }
+    }
+
+    /// We just made a new file or directory at `p`. A node we still have
+    /// for that path was something the host removed behind our back: the
+    /// new one gets a new node (the Windows client insists on it).
+    fn created(&mut self, p: &[Vec<u8>]) {
+        if self.by_path.contains_key(p) {
+            self.drop_path(p);
         }
     }
 
@@ -528,7 +528,7 @@ impl FuseServer {
             let st = match e.name.as_bytes() {
                 b"." => self.stat(&dir).ok(),
                 b".." => self.stat(dir.split_last().map_or(&dir[..], |(_, up)| up)).ok(),
-                _ => st.map(|s| self.shown(s)),
+                _ => st,
             };
             // Gone since the listing: skip it.
             let Some(st) = st else { continue };
@@ -646,9 +646,10 @@ impl FuseServer {
                 self.writable()?;
                 let (mode, umask) = (b.u32()?, b.u32()?);
                 let name = b.name()?;
+                let p = self.child(node, &name)?;
                 let parent = os_path(&self.path(node)?);
                 self.share.mkdir(&parent, &name, mode & !umask).map_err(|e| linux_errno(&e))?;
-                let p = self.child(node, &name)?;
+                self.created(&p);
                 self.entry(p, uid, gid)
             }
             UNLINK | RMDIR => {
@@ -700,12 +701,15 @@ impl FuseServer {
                 self.writable()?;
                 let (flags, mode, umask, _) = (b.u32()?, b.u32()?, b.u32()?, b.u32()?);
                 let name = b.name()?;
+                let p = self.child(node, &name)?;
                 let parent = os_path(&self.path(node)?);
                 let file = self.share.create(&parent, &name, mode & !umask, flags & O_EXCL != 0).map_err(|e| linux_errno(&e))?;
                 if flags & O_TRUNC != 0 {
                     file.set_len(0).map_err(|e| linux_errno(&e))?;
                 }
-                let p = self.child(node, &name)?;
+                if flags & O_EXCL != 0 {
+                    self.created(&p);
+                }
                 let mut o = Out(self.entry(p.clone(), uid, gid)?);
                 let id = self.by_path.get(&p).copied().ok_or(EIO)?;
                 let fh = self.add_handle(Handle::File { node: id, file, write: true, append: flags & O_APPEND != 0 })?;
@@ -847,7 +851,7 @@ impl FuseServer {
             self.share.set_times(&p, a, m).map_err(|e| linux_errno(&e))?;
         }
         // uid/gid changes: accepted and ignored (files are the host user's).
-        let st = self.share.stat(&p).map(|s| self.shown(s)).map_err(|e| linux_errno(&e))?;
+        let st = self.share.stat(&p).map_err(|e| linux_errno(&e))?;
         let mut o = Out::default();
         o.u64(TTL_SECS).u32(0).u32(0).attr(&st, uid, gid);
         Ok(o.0)
