@@ -233,7 +233,8 @@ impl Vmm {
 
     /// Free space where this VM's disk layers live.
     pub fn host_free_bytes(&self) -> std::io::Result<u64> {
-        self._lock.free_bytes()
+        let state = self._lock.free_bytes()?;
+        Ok(self.disks.min_free().map_or(state, |d| d.min(state)))
     }
 
     /// Guest agent channel (clipboard, time sync, clean shutdown).

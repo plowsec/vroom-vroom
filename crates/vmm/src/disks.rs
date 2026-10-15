@@ -38,6 +38,9 @@ pub(crate) struct VmDisk {
 pub(crate) struct DiskSet {
     dir: PathBuf,
     pub disks: Vec<VmDisk>,
+    /// Directories of writable images outside the state dir (opened now,
+    /// before the sandbox): their file systems fill up too.
+    watch: Vec<std::fs::File>,
 }
 
 fn sync_of(s: DiskSync) -> SyncMode {
@@ -125,7 +128,13 @@ impl DiskSet {
             write_pointer(&ptr_path, &active)?;
             disks.push(VmDisk { index: i, image: SwapDisk::new(img), active: Some(active), active_fmt, sync: policy.sync });
         }
-        Ok(DiskSet { dir, disks })
+        let watch = disks
+            .iter()
+            .filter_map(|d| d.active.as_ref())
+            .filter(|a| !a.starts_with(&dir))
+            .filter_map(|a| a.parent().and_then(|p| std::fs::File::open(p).ok()))
+            .collect();
+        Ok(DiskSet { dir, disks, watch })
     }
 
     /// Freeze every writable disk at its current state and continue on a
@@ -161,6 +170,11 @@ impl DiskSet {
             }
         }
         Ok(m)
+    }
+
+    /// Least free space among the file systems writable images live on.
+    pub fn min_free(&self) -> Option<u64> {
+        self.watch.iter().filter_map(|f| crate::state::free_bytes(f).ok()).min()
     }
 
     pub fn flush_all(&self) {

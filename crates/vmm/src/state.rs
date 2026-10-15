@@ -43,14 +43,19 @@ impl StateLock {
     /// Bytes free for us on the state dir's filesystem (disk layers grow
     /// there). Works under the sandbox: no path lookup.
     pub fn free_bytes(&self) -> std::io::Result<u64> {
-        // SAFETY: zeroed statfs is valid; fd is ours.
-        let mut st: libc::statfs = unsafe { std::mem::zeroed() };
-        // SAFETY: valid fd and out pointer.
-        if unsafe { libc::fstatfs(self.0.as_raw_fd(), &mut st) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(st.f_bavail as u64 * st.f_bsize as u64)
+        free_bytes(&self.0)
     }
+}
+
+/// Bytes free for us on the file system holding `f`.
+pub fn free_bytes(f: &File) -> std::io::Result<u64> {
+    // SAFETY: zeroed statfs is valid plain data.
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: valid fd and out pointer.
+    if unsafe { libc::fstatfs(f.as_raw_fd(), &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(st.f_bavail as u64 * st.f_bsize as u64)
 }
 
 #[derive(Debug, Clone)]
