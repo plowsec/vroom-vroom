@@ -8,6 +8,7 @@ mod new;
 mod session;
 mod snap;
 mod term;
+mod usb;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -59,6 +60,12 @@ enum Cmd {
         #[arg(long)]
         input: bool,
     },
+    /// USB passthrough helper started by the VMM (internal).
+    #[command(hide = true)]
+    UsbHost(usb::HostArgs),
+    /// Host USB devices a VM can be given.
+    #[command(subcommand)]
+    Usb(usb::UsbCmd),
     /// Create a VM: write <name>.toml and its disk.
     New(new::NewArgs),
     /// Bring a VM over from VMware (copies its disks, VMware's copy stays).
@@ -95,6 +102,8 @@ fn main() -> ExitCode {
         Cmd::New(a) => new::run(a, load),
         Cmd::Import(a) => import::run(a),
         Cmd::AudioOut { input } => audio_out(input),
+        Cmd::UsbHost(a) => usb::host(a),
+        Cmd::Usb(c) => usb::run(c),
         Cmd::Check { config } => load(&config).and_then(|c| {
             print!("{}", c.to_toml().map_err(|e| e.to_string())?);
             for w in c.warnings() {

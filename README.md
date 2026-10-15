@@ -18,6 +18,7 @@ and every virtual device treats the guest as hostile.
 - TPM 2.0 (Windows 11 needs it)
 - Nested VMs (M3 or newer)
 - Import from VMware Fusion (ARM64 VMs)
+- USB devices from the host (those macOS has no driver for; needs libusb)
 
 Not yet: x86_64 hosts (it builds, can't run VMs yet), Secure Boot, and
 3D or shared folders in Windows guests.
@@ -52,6 +53,7 @@ vroom import ~/Virtual\ Machines.localized/X.vmwarevm   # from VMware Fusion
 vroom snapshot list|delete|prune dev.toml
 vroom disk create x.qcow2 --size 64G
 vroom disk compact x.qcow2        # give freed space back to the host
+vroom usb list                    # host USB devices, the id for [[usb]]
 ```
 
 | In the VM window | Keys |

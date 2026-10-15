@@ -17,7 +17,8 @@ service by a guest against its own VM.
 
 - One process per VM, written in Rust. `devices`, `virtio`, `arch`, `net`,
   `config`, `snapshot` and `proto` are `forbid(unsafe_code)`; unsafe code
-  is confined to `hv`, `memory`, `sandbox`, `gpu3d`, `ipc` and a few FFI
+  is confined to `hv`, `memory`, `sandbox`, `gpu3d`, `ipc`, `usb` (libusb,
+  loaded by the USB helper only, and IOKit device listing) and a few FFI
   shims, with `// SAFETY:` notes.
 - Guest memory goes through bounds-checked `GuestMemory`; there are no raw
   pointers into guest RAM in device code.
@@ -157,6 +158,46 @@ There is a microphone path now, off by default. How it works:
   (sizes, whole frames, a generation number so audio from an earlier
   request is dropped), and at most a quarter second is buffered.
 
+## USB devices
+
+Off unless the VM file lists `[[usb]]` devices. The VM process never
+touches the host's USB stack: each device gets a helper process
+(`vroom usb-host`), started before the VMM locks itself down, that opens
+that one device with libusb. The two talk over a socketpair with a small
+protocol: submit a transfer, cancel one, reset the device; back come
+attached/detached and transfer results.
+
+The helper treats the VMM as hostile, like the VMM treats the guest:
+
+- It only opens the device its command line names (vendor and product,
+  and serial number if given), chosen by the VMM's config before the
+  sandbox; the protocol has no way to name another device, list devices
+  or change the address.
+- Every request is checked: sizes (1 MiB per transfer), at most 64
+  transfers in flight, endpoints only those of the configuration and
+  alternate settings the guest selected, with the type the descriptors
+  give. Configuration, interface and halt changes go through libusb's own
+  calls; SET_ADDRESS is refused. Hubs are never opened.
+- Malformed messages end the connection.
+
+The VMM checks the helper the same way: answers must match a transfer it
+sent (size, direction), and never write past the guest's buffers. A dead
+or misbehaving helper looks like an unplugged device. The vCPUs never
+wait on a helper.
+
+The helper's own sandbox (macOS, Seatbelt): system libraries and libusb,
+the IOKit registry, and the USB device and interface user clients only;
+no files, no network, no exec, no other drivers. Seatbelt can't tell USB
+devices apart, so a compromised helper could open other USB devices macOS
+lets a normal user open (none that a macOS driver holds: not keyboards,
+mice or disks). On Linux the helper sets no_new_privs and Landlock
+(`/dev/bus/usb` and sysfs only); it has no seccomp filter yet, and can
+open whatever USB device nodes your user may open (udev rules decide).
+
+The guest gets full control of a device it is given (it can send it any
+request, including firmware updates). Give it only devices you'd plug
+into that machine.
+
 ## Snapshots
 
 Snapshots contain guest RAM (keys, passwords). They're written 0600 in 0700
@@ -212,10 +253,14 @@ config space, xHCI, NVMe, TPM TIS, fw_cfg (DMA included) and flash, each
 driven by arbitrary register writes plus guest RAM; and qcow2 images,
 both parsing and a differential target (random writes, discards, zero
 writes, reopens and compactions checked byte for byte against a model),
-and VMDK (sparse headers, grain tables, compressed grains, descriptors). Run with
+and VMDK (sparse headers, grain tables, compressed grains, descriptors),
+the USB passthrough protocol both ways with the helper's checks, and USB
+descriptors (the xHCI target also has a passthrough device whose answers
+come from the input). Run with
 `cargo +nightly fuzz run -O <target>`. First runs found two qcow2 bugs
 (a crash on short v3 headers, multi-GB allocations from crafted table
-sizes); both fixed.
+sizes); both fixed. The USB target found a short configuration descriptor
+read out of bounds (a panic, not memory corruption); fixed.
 
 ## Host resources
 

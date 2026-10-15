@@ -1,0 +1,13 @@
+[package]
+name = "vroom-usb"
+description = "USB passthrough: the VMM <-> helper protocol, and the sandboxed helper that owns the host device."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libc.workspace = true
+log.workspace = true
+
+[lints]
+workspace = true

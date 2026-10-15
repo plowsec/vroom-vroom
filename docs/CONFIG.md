@@ -92,6 +92,30 @@ readonly = true                  # default; false lets the guest change files
 
 Linux guests only for now.
 
+## `[[usb]]` (host USB devices, up to 8)
+
+```toml
+[[usb]]
+id = "1209:000a"                 # vendor:product, as `vroom usb list` shows it
+serial = "A1B2C3"                # optional: only this one of several alike
+name = "dev board"               # optional label for the app
+```
+
+| Key | Default | What it does |
+|---|---|---|
+| `id` | required | `vendor:product`, 4 hex digits each. |
+| `serial` | none | Pick one device by its serial number. Without it, the first device with that `id` is taken. |
+| `name` | none | Shown in the app. The guest never sees it. |
+
+The VM takes the device when it starts and gives it back when it stops.
+Unplug it and plug it back in while the VM runs: the guest sees that too.
+A device added while the VM runs is picked up at the next start.
+
+The guest sees the device's own descriptors. On macOS, a device that a
+macOS driver holds (keyboards, mice, disks, security keys, most USB
+serial chips) can't be taken without root: see
+[GUIDE.md](GUIDE.md#usb-devices). Needs libusb (`brew install libusb`).
+
 ## `[audio]`
 
 | Key | Default | What it does |

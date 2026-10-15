@@ -36,130 +36,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "vroom-block"
-version = "0.1.0"
-dependencies = [
- "flate2",
- "libc",
- "log",
- "ruzstd",
- "thiserror",
-]
-
-[[package]]
-name = "vroom-devices"
-version = "0.1.0"
-dependencies = [
- "vroom-block",
- "vroom-memory",
- "vroom-snapshot",
- "log",
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "vroom-display"
-version = "0.1.0"
-dependencies = [
- "vroom-ipc",
- "getrandom 0.2.17",
- "libc",
- "thiserror",
-]
-
-[[package]]
-name = "vroom-fs"
-version = "0.1.0"
-dependencies = [
- "libc",
-]
-
-[[package]]
-name = "vroom-fuzz"
-version = "0.0.0"
-dependencies = [
- "vroom-block",
- "vroom-devices",
- "vroom-display",
- "vroom-fs",
- "vroom-memory",
- "vroom-net",
- "vroom-proto",
- "vroom-virtio",
- "libfuzzer-sys",
- "tempfile",
-]
-
-[[package]]
-name = "vroom-ipc"
-version = "0.1.0"
-dependencies = [
- "libc",
-]
-
-[[package]]
-name = "vroom-memory"
-version = "0.1.0"
-dependencies = [
- "libc",
- "thiserror",
-]
-
-[[package]]
-name = "vroom-net"
-version = "0.1.0"
-dependencies = [
- "vroom-ipc",
- "getrandom 0.2.17",
- "libc",
- "log",
- "mio",
- "serde",
- "serde_json",
- "smoltcp",
- "socket2",
- "thiserror",
-]
-
-[[package]]
-name = "vroom-proto"
-version = "0.1.0"
-dependencies = [
- "thiserror",
-]
-
-[[package]]
-name = "vroom-snapshot"
-version = "0.1.0"
-dependencies = [
- "hex",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
-]
-
-[[package]]
-name = "vroom-virtio"
-version = "0.1.0"
-dependencies = [
- "vroom-block",
- "vroom-devices",
- "vroom-fs",
- "vroom-memory",
- "vroom-net",
- "vroom-snapshot",
- "getrandom 0.2.17",
- "log",
- "mio",
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
 name = "byteorder"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -647,6 +523,141 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "vroom-block"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "libc",
+ "log",
+ "ruzstd",
+ "thiserror",
+]
+
+[[package]]
+name = "vroom-devices"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "vroom-block",
+ "vroom-memory",
+ "vroom-snapshot",
+ "vroom-usb",
+]
+
+[[package]]
+name = "vroom-display"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.2.17",
+ "libc",
+ "thiserror",
+ "vroom-ipc",
+]
+
+[[package]]
+name = "vroom-fs"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "vroom-fuzz"
+version = "0.0.0"
+dependencies = [
+ "libfuzzer-sys",
+ "tempfile",
+ "vroom-block",
+ "vroom-devices",
+ "vroom-display",
+ "vroom-fs",
+ "vroom-memory",
+ "vroom-net",
+ "vroom-proto",
+ "vroom-usb",
+ "vroom-virtio",
+]
+
+[[package]]
+name = "vroom-ipc"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "vroom-memory"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "thiserror",
+]
+
+[[package]]
+name = "vroom-net"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.2.17",
+ "libc",
+ "log",
+ "mio",
+ "serde",
+ "serde_json",
+ "smoltcp",
+ "socket2",
+ "thiserror",
+ "vroom-ipc",
+]
+
+[[package]]
+name = "vroom-proto"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "vroom-snapshot"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
+name = "vroom-usb"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "log",
+]
+
+[[package]]
+name = "vroom-virtio"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.2.17",
+ "log",
+ "mio",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "vroom-block",
+ "vroom-devices",
+ "vroom-fs",
+ "vroom-memory",
+ "vroom-net",
+ "vroom-snapshot",
+]
 
 [[package]]
 name = "wasi"

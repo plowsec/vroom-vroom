@@ -235,6 +235,62 @@ the share, and symlinks already there are shown but never followed on the
 host. Windows guests need virtio-win's virtiofs service and WinFsp (not
 tested yet).
 
+## USB devices
+
+```bash
+brew install libusb          # the helper loads it at run time
+vroom usb list               # what's plugged in, with its id
+```
+
+```toml
+[[usb]]
+id = "1209:000a"
+```
+
+In the app: the "USB devices" card, "Add device" lists what's plugged in.
+The VM takes the device while it runs; unplugging and plugging it back
+in works while the VM runs, and the guest sees a new device after a
+suspend/resume or a snapshot revert (in-flight transfers can't be saved).
+
+The device goes to the guest through a helper process (`vroom usb-host`,
+one per device, in its own sandbox); the VM process itself never opens a
+host device. See [SECURITY.md](SECURITY.md#usb-devices).
+
+What works on macOS, as a normal user: devices no macOS driver holds.
+That's vendor-specific devices: many dev boards, flashing and DFU modes,
+debug probes, logic analyzers, SDR sticks, Android phones in adb or
+fastboot mode. `vroom usb list` says when a macOS driver holds a device.
+What doesn't:
+
+- Keyboards, mice, game pads and FIDO security keys (HID), disks and
+  card readers (mass storage), sound cards, webcams, USB Ethernet,
+  iPhones, and the common USB serial chips (FTDI, CP210x, CH34x, PL2303,
+  CDC-ACM): macOS has drivers for these and keeps them. Taking a device
+  away from a macOS driver needs root, or Apple's
+  `com.apple.vm.device-access` entitlement (Apple gives it to approved VM
+  vendors only; vroom can't ship it). With either, the same code takes
+  the device: libusb's "detach kernel driver" does it.
+- Isochronous transfers (webcams, sound cards) aren't passed through
+  yet: such a device shows up in the guest but doesn't stream.
+- A device composed of several functions works for the ones macOS
+  leaves alone; the guest sees the others but they fail.
+
+Control, bulk and interrupt transfers work, at USB 1.1, 2.0 and 3.x speeds
+(SuperSpeed devices show up on a USB 3 port). No USB 3 bulk streams (UAS
+disks fall back to the older protocol).
+
+On Linux hosts the helper uses usbfs: give your user access to the device
+with a udev rule, e.g.
+`SUBSYSTEM=="usb", ATTR{idVendor}=="1209", ATTR{idProduct}=="000a", MODE="0660", TAG+="uaccess"`.
+Linux drivers bound to the device's interfaces are detached while the VM
+has it.
+
+Testing without hardware: `VROOM_USB_FAKE=acm` makes every helper serve
+a pretend USB serial port that echoes what it's sent (CDC-ACM; Linux
+guests see `/dev/ttyACM0` if they have the `cdc_acm` module, or use it
+from userspace through `/dev/bus/usb`). `VROOM_USB_FAKE_UNPLUG=<secs>`
+pulls it out once, for three seconds.
+
 ## Sound
 
 ```toml
@@ -338,3 +394,6 @@ flushes a lot). `"none"` ignores flushes: scratch disks only.
   Venus driver).
 - 3D snapshots, OpenGL on Venus (Zink, see above): not supported.
 - NAT connections don't survive suspend/resume (the guest reconnects).
+- USB passthrough: not yet tried with a real device (none was at hand);
+  tested with the pretend device behind the real helper and sandbox. No
+  isochronous transfers. On macOS only devices macOS has no driver for.

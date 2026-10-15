@@ -1,16 +1,25 @@
-//! xHCI host controller (USB 2 root ports only) with a keyboard on port 1
-//! and a tablet on port 2. Enough for Windows setup, UEFI and Linux.
+//! xHCI host controller with a keyboard on port 1 and a tablet on port 2.
+//! Enough for Windows setup, UEFI and Linux.
+//!
+//! Host devices passed through (`with_passthrough`) get a USB 2 and a
+//! USB 3 root port each, after the HID ones; the device shows up on the
+//! one that fits its speed. Their transfers are asynchronous: a TD goes
+//! to the device's helper process as a request and completes when the
+//! answer comes back (`usb_event`).
 //!
 //! Rings live in guest memory and the guest controls them: walks are
 //! bounded, Link TRB chains are capped, and every address is checked by
 //! GuestMemory. A full event ring drops events instead of overwriting.
+//! What the helper sends back is checked against what was asked for.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::Instant;
 
 use vroom_memory::{GuestAddress, GuestMemory};
 use vroom_snapshot::{decode, encode};
+use vroom_usb::proto::{Done, Event, Request, Speed, Status, Submit, XferType, MAX_DATA};
 use serde::{Deserialize, Serialize};
 
 use super::hid::{HidEvent, Keyboard, Tablet, UsbIds};
@@ -28,11 +37,21 @@ const MSIX_PBA: u32 = 0x3800;
 const XECP: u64 = 0x100;
 
 const MAX_SLOTS: usize = 8;
-const NPORTS: usize = 2;
+/// Keyboard and tablet.
+const HID_PORTS: usize = 2;
 /// Most TRBs handled per doorbell / ring walk.
 const WALK_LIMIT: usize = 256;
 const LINK_LIMIT: usize = 8;
 const MAX_DEFERRED: usize = 256;
+/// Most TRBs in one TD: emulated devices, passthrough (1 MiB in pages).
+const TD_TRBS: usize = 64;
+const PASS_TD_TRBS: usize = 320;
+/// Passthrough transfers in flight: per endpoint, per device.
+const MAX_EP_INFLIGHT: usize = 8;
+const MAX_DEV_INFLIGHT: usize = 32;
+/// Helper events held while paused (completions are bounded by the
+/// above; the rest is attach/detach noise).
+const MAX_DEFERRED_USB: usize = 256;
 
 // TRB types
 const T_NORMAL: u32 = 1;
@@ -57,6 +76,8 @@ const E_PORT: u32 = 34;
 
 // Completion codes
 const CC_SUCCESS: u32 = 1;
+const CC_BABBLE: u32 = 3;
+const CC_TRANSACTION: u32 = 4;
 const CC_TRB_ERROR: u32 = 5;
 const CC_STALL: u32 = 6;
 const CC_NO_SLOTS: u32 = 9;
@@ -83,10 +104,13 @@ const PS_PP: u32 = 1 << 9;
 const PS_SPEED_SHIFT: u32 = 10;
 const PS_LWS: u32 = 1 << 16;
 const PS_CSC: u32 = 1 << 17;
+const PS_WRC: u32 = 1 << 19;
 const PS_PRC: u32 = 1 << 21;
 const PS_PLC: u32 = 1 << 22;
 const PS_CHANGE_MASK: u32 = 0x7f << 17;
+const PS_WPR: u32 = 1 << 31;
 const PLS_U0: u32 = 0;
+const PLS_RXDETECT: u32 = 5;
 const PLS_POLLING: u32 = 7;
 
 // TRB control bits (dword 3).
@@ -112,6 +136,78 @@ struct Ring {
 struct Ep {
     ring: Ring,
     state: u32,
+    /// Endpoint type from its context: 4 control, 2/6 bulk out/in,
+    /// 3/7 interrupt, 1/5 isochronous.
+    #[serde(default)]
+    kind: u8,
+}
+
+const EPT_ISO_OUT: u8 = 1;
+const EPT_BULK_OUT: u8 = 2;
+const EPT_INT_OUT: u8 = 3;
+const EPT_CONTROL: u8 = 4;
+const EPT_ISO_IN: u8 = 5;
+const EPT_BULK_IN: u8 = 6;
+const EPT_INT_IN: u8 = 7;
+
+/// A passthrough TD the helper is working on.
+#[derive(Debug)]
+struct Pending {
+    slot: usize,
+    dci: u8,
+    /// Ring position of the TD's first TRB (to stop or halt on it).
+    start: Ring,
+    td: Vec<(u64, Trb)>,
+    is_in: bool,
+    len: u32,
+    done: Option<Done>,
+}
+
+/// A host device behind a helper process.
+#[derive(Debug)]
+struct Passthrough {
+    link: Sender<Request>,
+    /// Attached, at this speed. Live state: never saved.
+    speed: Option<Speed>,
+    /// The guest gave it an address since the last reset.
+    addressed: bool,
+    /// Show it connected once the guest has seen the disconnect.
+    reconnect: bool,
+    next_id: u32,
+    pending: BTreeMap<u32, Pending>,
+    /// Transfers per (slot, dci), oldest first: completed in this order.
+    queues: BTreeMap<(usize, u8), VecDeque<u32>>,
+    warned_iso: bool,
+}
+
+impl Passthrough {
+    fn alloc_id(&mut self) -> u32 {
+        loop {
+            self.next_id = self.next_id.wrapping_add(1);
+            if self.next_id != 0 && !self.pending.contains_key(&self.next_id) {
+                return self.next_id;
+            }
+        }
+    }
+}
+
+/// What is behind a root port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PortKind {
+    Hid,
+    /// Passthrough device, on its USB 2 or USB 3 port.
+    Pass(usize, bool),
+}
+
+/// PORTSC speed ID for a host device's speed.
+fn speed_id(s: Speed) -> u32 {
+    match s {
+        Speed::Full => 1,
+        Speed::Low => 2,
+        Speed::High => 3,
+        Speed::Super => 4,
+        Speed::SuperPlus => 5,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,7 +246,7 @@ struct Snap {
     op: Op,
     intr: Intr,
     cmd: Ring,
-    ports: [u32; NPORTS],
+    ports: Vec<u32>,
     slots: Vec<Option<Slot>>,
     kbd: Vec<u8>,
     tablet: Vec<u8>,
@@ -165,12 +261,18 @@ pub struct Xhci {
     op: Op,
     intr: Intr,
     cmd: Ring,
-    ports: [u32; NPORTS],
+    /// PORTSC per root port: HID ports, then a USB 2 port per
+    /// passthrough device, then a USB 3 port per passthrough device.
+    ports: Vec<u32>,
     slots: Vec<Option<Slot>>,
     kbd: Keyboard,
     tablet: Tablet,
+    pass: Vec<Passthrough>,
     paused: bool,
     deferred: VecDeque<HidEvent>,
+    deferred_usb: VecDeque<(usize, Event)>,
+    /// Port changes to report once running again (after a restore).
+    port_events_due: bool,
     epoch: Instant,
 }
 
@@ -205,16 +307,73 @@ impl Xhci {
             op: Op::default(),
             intr: Intr::default(),
             cmd: Ring::default(),
-            ports: [0; NPORTS],
+            ports: vec![0; HID_PORTS],
             slots: vec![None; MAX_SLOTS + 1],
             kbd: Keyboard::default(),
             tablet: Tablet::default(),
+            pass: Vec::new(),
             paused: false,
             deferred: VecDeque::new(),
+            deferred_usb: VecDeque::new(),
+            port_events_due: false,
             epoch: Instant::now(),
         };
         x.hc_reset();
         x
+    }
+
+    /// Host devices behind helper processes: requests for device `i` go
+    /// to `links[i]`, its events come back through `usb_event(i, ..)`.
+    /// Each gets a USB 2 and a USB 3 root port, and a device slot.
+    pub fn with_passthrough(mut self, links: Vec<Sender<Request>>) -> Self {
+        let n = links.len();
+        self.pass = links
+            .into_iter()
+            .map(|link| Passthrough {
+                link,
+                speed: None,
+                addressed: false,
+                reconnect: false,
+                next_id: 0,
+                pending: BTreeMap::new(),
+                queues: BTreeMap::new(),
+                warned_iso: false,
+            })
+            .collect();
+        self.ports = vec![0; HID_PORTS + 2 * n];
+        self.slots = vec![None; MAX_SLOTS.max(HID_PORTS + n) + 1];
+        self.hc_reset();
+        self
+    }
+
+    fn max_slots(&self) -> usize {
+        self.slots.len() - 1
+    }
+
+    fn port_kind(&self, port: u8) -> Option<PortKind> {
+        let p = (port as usize).checked_sub(1)?;
+        let n = self.pass.len();
+        match p {
+            _ if p < HID_PORTS => Some(PortKind::Hid),
+            _ if p < HID_PORTS + n => Some(PortKind::Pass(p - HID_PORTS, false)),
+            _ if p < HID_PORTS + 2 * n => Some(PortKind::Pass(p - HID_PORTS - n, true)),
+            _ => None,
+        }
+    }
+
+    /// Index into `ports` of passthrough device `i`'s USB 2 / USB 3 port.
+    fn pass_port(&self, i: usize, usb3: bool) -> usize {
+        HID_PORTS + i + if usb3 { self.pass.len() } else { 0 }
+    }
+
+    /// PORTSC of a passthrough port with (Some) or without a device.
+    fn pass_portsc(speed: Option<Speed>, usb3: bool) -> u32 {
+        match speed {
+            // USB 3 links train by themselves: enabled, in U0.
+            Some(s) if usb3 => PS_CCS | PS_PP | PS_PED | PLS_U0 << PS_PLS_SHIFT | speed_id(s) << PS_SPEED_SHIFT,
+            Some(s) => PS_CCS | PS_PP | PLS_POLLING << PS_PLS_SHIFT | speed_id(s) << PS_SPEED_SHIFT,
+            None => PS_PP | PLS_RXDETECT << PS_PLS_SHIFT,
+        }
     }
 
     /// USB names the guest sees (from the VM's `[identity]`).
@@ -242,10 +401,25 @@ impl Xhci {
         self.op = Op { usbsts: STS_HCH, ..Default::default() };
         self.intr = Intr::default();
         self.cmd = Ring::default();
-        self.slots = vec![None; MAX_SLOTS + 1];
-        for p in 0..NPORTS {
+        self.slots = vec![None; self.max_slots() + 1];
+        for p in 0..HID_PORTS {
             // Device attached, powered, waiting for a port reset.
             self.ports[p] = PS_CCS | PS_PP | PS_CSC | PLS_POLLING << PS_PLS_SHIFT | (super::SPEED_FULL as u32) << PS_SPEED_SHIFT;
+        }
+        for i in 0..self.pass.len() {
+            self.pass_forget(i);
+            // A bus reset, as a real host does on reboot.
+            let p = &mut self.pass[i];
+            if std::mem::take(&mut p.addressed) {
+                let _ = p.link.send(Request::Reset);
+            }
+            p.reconnect = false;
+            let speed = p.speed;
+            for usb3 in [false, true] {
+                let here = speed.filter(|s| s.is_super() == usb3);
+                let at = self.pass_port(i, usb3);
+                self.ports[at] = Self::pass_portsc(here, usb3) | if here.is_some() { PS_CSC } else { 0 };
+            }
         }
         self.kbd.reset();
         self.tablet.reset();
@@ -377,7 +551,7 @@ impl Xhci {
     }
 
     fn slot_mut(&mut self, id: usize) -> Option<&mut Slot> {
-        if id == 0 || id > MAX_SLOTS {
+        if id == 0 || id > self.max_slots() {
             return None;
         }
         self.slots[id].as_mut()
@@ -386,7 +560,7 @@ impl Xhci {
     fn command(&mut self, t: &Trb) -> (u32, u8) {
         let id = Self::slot_id(t);
         match trb_type(t) {
-            C_ENABLE_SLOT => match (1..=MAX_SLOTS).find(|&i| self.slots[i].is_none()) {
+            C_ENABLE_SLOT => match (1..=self.max_slots()).find(|&i| self.slots[i].is_none()) {
                 Some(i) => {
                     self.slots[i] = Some(Slot { port: 0, ctx: 0, eps: BTreeMap::new() });
                     (CC_SUCCESS, i as u8)
@@ -397,6 +571,7 @@ impl Xhci {
                 if self.slot_mut(id).is_none() {
                     return (CC_SLOT_NOT_ENABLED, id as u8);
                 }
+                self.abandon_slot(id, |_| true);
                 self.slots[id] = None;
                 (CC_SUCCESS, id as u8)
             }
@@ -413,6 +588,10 @@ impl Xhci {
                 (self.set_deq(id, dci, param(t)), id as u8)
             }
             C_RESET_DEVICE => {
+                if self.slot_mut(id).is_none() {
+                    return (CC_SLOT_NOT_ENABLED, id as u8);
+                }
+                self.abandon_slot(id, |_| true);
                 let Some(s) = self.slot_mut(id) else { return (CC_SLOT_NOT_ENABLED, id as u8) };
                 s.eps.retain(|&d, _| d == 1);
                 let ctx = s.ctx;
@@ -471,20 +650,26 @@ impl Xhci {
             return CC_PARAMETER;
         }
         let port = ((slot_ctx[1] >> 16) & 0xff) as u8;
-        if port == 0 || port as usize > NPORTS {
+        if port == 0 || port as usize > self.ports.len() {
             return CC_CONTEXT_STATE;
         }
         let Some(out) = self.output_ctx(id) else { return CC_PARAMETER };
         let ring = Ring { deq: (ep0[2] as u64 | (ep0[3] as u64) << 32) & !0xf, cycle: ep0[2] & 1 == 1 };
-        let ep = Ep { ring, state: EP_RUNNING };
+        let ep = Ep { ring, state: EP_RUNNING, kind: EPT_CONTROL };
         let mut sc = slot_ctx.clone();
         sc[3] = if bsr { 1 << 27 } else { 2 << 27 | id as u32 };
         self.ctx_write(out, &sc);
         let mut e0 = ep0.clone();
         e0[0] = (e0[0] & !7) | EP_RUNNING;
         self.ctx_write(out + 0x20, &e0);
-        if let Some(d) = self.dev(port) {
-            d.reset();
+        self.abandon_slot(id, |_| true);
+        match self.port_kind(port) {
+            Some(PortKind::Pass(i, _)) => self.pass[i].addressed |= !bsr,
+            _ => {
+                if let Some(d) = self.dev(port) {
+                    d.reset();
+                }
+            }
         }
         let s = self.slot_mut(id).expect("checked above");
         s.port = port;
@@ -499,11 +684,14 @@ impl Xhci {
         let ctx = s.ctx;
         if deconfigure {
             s.eps.retain(|&d, _| d == 1);
+            self.abandon_slot(id, |d| d != 1);
             self.write_slot_state(ctx, 2, id as u32);
             return CC_SUCCESS;
         }
         let Some(icc) = self.ctx_read(input, 8) else { return CC_PARAMETER };
         let (drop, add) = (icc[0], icc[1]);
+        // Dropped or re-added endpoints lose what was in flight.
+        self.abandon_slot(id, |d| d > 1 && (drop | add) & (1 << d) != 0);
         let mut new_eps = Vec::new();
         for dci in 2..=31u8 {
             if add & (1 << dci) != 0 {
@@ -512,7 +700,7 @@ impl Xhci {
                 let mut out_e = e.clone();
                 out_e[0] = (out_e[0] & !7) | EP_RUNNING;
                 self.ctx_write(ctx + 0x20 * dci as u64, &out_e);
-                new_eps.push((dci, Ep { ring, state: EP_RUNNING }));
+                new_eps.push((dci, Ep { ring, state: EP_RUNNING, kind: ((e[1] >> 3) & 7) as u8 }));
             }
         }
         let s = self.slot_mut(id).expect("checked above");
@@ -549,11 +737,17 @@ impl Xhci {
 
     fn ep_state_cmd(&mut self, id: usize, dci: u8, stop: bool) -> u32 {
         let Some(s) = self.slot_mut(id) else { return CC_SLOT_NOT_ENABLED };
-        let ctx = s.ctx;
-        let Some(ep) = s.eps.get_mut(&dci) else { return CC_EP_NOT_ENABLED };
+        let Some(ep) = s.eps.get(&dci) else { return CC_EP_NOT_ENABLED };
         if !stop && ep.state != EP_HALTED {
             return CC_CONTEXT_STATE;
         }
+        // Stop: passthrough transfers in flight are cancelled, and the
+        // ring goes back to the first of them (the driver decides what
+        // to do with them, like with a TD a real controller stopped in).
+        self.abandon_slot(id, |d| d == dci);
+        let Some(s) = self.slot_mut(id) else { return CC_SLOT_NOT_ENABLED };
+        let ctx = s.ctx;
+        let Some(ep) = s.eps.get_mut(&dci) else { return CC_EP_NOT_ENABLED };
         ep.state = EP_STOPPED;
         let e = *ep;
         self.write_ep_ctx(ctx, dci, &e);
@@ -582,7 +776,10 @@ impl Xhci {
             return;
         }
         ep.state = EP_RUNNING;
-        if dci == 1 {
+        let port = s.port;
+        if let Some(PortKind::Pass(i, _)) = self.port_kind(port) {
+            self.run_pass(i, id, dci);
+        } else if dci == 1 {
             self.run_control(id);
         } else {
             self.run_interrupt_in(id, dci);
@@ -605,11 +802,11 @@ impl Xhci {
     /// Gather one TD from an endpoint ring: TRBs up to the first one with
     /// the chain bit clear. Control TDs also run to (at least) the Status
     /// stage. None if the driver hasn't finished queueing it.
-    fn gather_td(&self, ring: Ring, control: bool) -> Option<(Ring, Vec<(u64, Trb)>)> {
+    fn gather_td(&self, ring: Ring, control: bool, max: usize) -> Option<(Ring, Vec<(u64, Trb)>)> {
         let mut r = ring;
         let mut td = Vec::new();
         let mut status = !control;
-        for _ in 0..64 {
+        for _ in 0..max {
             let (addr, t) = self.ring_peek(&mut r)?;
             r.deq = addr + 16;
             td.push((addr, t));
@@ -627,7 +824,7 @@ impl Xhci {
             if ep.state != EP_RUNNING {
                 return;
             }
-            let Some((r, td)) = self.gather_td(ep.ring, true) else { return };
+            let Some((r, td)) = self.gather_td(ep.ring, true, TD_TRBS) else { return };
             ep.ring = r;
             self.set_ep(id, 1, ep);
             self.control_td(id, port, &td);
@@ -747,7 +944,7 @@ impl Xhci {
             if ep.state != EP_RUNNING {
                 return;
             }
-            let Some((r, td)) = self.gather_td(ep.ring, false) else { return };
+            let Some((r, td)) = self.gather_td(ep.ring, false, TD_TRBS) else { return };
             // TDs with a data buffer wait for a report; pure No-op /
             // Event Data TDs complete right away.
             let report = if td.iter().any(|(_, t)| trb_type(t) == T_NORMAL) {
@@ -767,10 +964,268 @@ impl Xhci {
     fn drain_out(&mut self, id: usize, dci: u8) {
         for _ in 0..WALK_LIMIT {
             let Some((_, mut ep)) = self.ep(id, dci) else { return };
-            let Some((r, td)) = self.gather_td(ep.ring, false) else { return };
+            let Some((r, td)) = self.gather_td(ep.ring, false, TD_TRBS) else { return };
             ep.ring = r;
             self.set_ep(id, dci, ep);
             self.complete_td(id, dci, &td, None);
+        }
+    }
+
+    // ---- passthrough ----
+
+    /// Hand TDs queued on a passthrough endpoint to the device's helper,
+    /// up to a few in flight.
+    fn run_pass(&mut self, i: usize, id: usize, dci: u8) {
+        for _ in 0..WALK_LIMIT {
+            let Some((_, mut ep)) = self.ep(id, dci) else { return };
+            if ep.state != EP_RUNNING || self.pass[i].speed.is_none() {
+                return;
+            }
+            if matches!(ep.kind, EPT_ISO_OUT | EPT_ISO_IN) {
+                // Not passed through yet: the TDs stay queued (an error
+                // per TD would just have the driver spin resubmitting).
+                if !std::mem::replace(&mut self.pass[i].warned_iso, true) {
+                    log::warn!("usb: isochronous endpoints (audio, video) aren't passed through yet");
+                }
+                return;
+            }
+            let p = &self.pass[i];
+            let queued = p.queues.get(&(id, dci)).map_or(0, |q| q.len());
+            if queued >= if dci == 1 { 1 } else { MAX_EP_INFLIGHT } || p.pending.len() >= MAX_DEV_INFLIGHT {
+                return;
+            }
+            let start = ep.ring;
+            let Some((r, td)) = self.gather_td(ep.ring, dci == 1, PASS_TD_TRBS) else { return };
+            ep.ring = r;
+            self.set_ep(id, dci, ep);
+            let mut sub = match self.pass_submit(dci, ep.kind, &td) {
+                Ok(s) => s,
+                Err((at, cc)) => {
+                    self.transfer_event(at, cc, 0, id as u8, dci);
+                    continue;
+                }
+            };
+            let p = &mut self.pass[i];
+            sub.id = p.alloc_id();
+            let (rid, is_in, len) = (sub.id, sub.is_in(), sub.len);
+            if p.link.send(Request::Submit(sub)).is_err() {
+                // The helper is gone: the device is as good as unplugged.
+                let at = td.last().map(|t| t.0).unwrap_or(0);
+                self.pass_halt(id, dci, start, at, CC_TRANSACTION);
+                return;
+            }
+            p.pending.insert(rid, Pending { slot: id, dci, start, td, is_in, len, done: None });
+            p.queues.entry((id, dci)).or_default().push_back(rid);
+        }
+    }
+
+    /// The request for one TD. Err: (TRB, completion code) to fail it with.
+    fn pass_submit(&self, dci: u8, kind: u8, td: &[(u64, Trb)]) -> Result<Submit, (u64, u32)> {
+        let first = td.first().map(|t| t.0).unwrap_or(0);
+        let trb_err = |at: u64| (at, CC_TRB_ERROR);
+        let data: Vec<&(u64, Trb)> = td.iter().filter(|(_, t)| matches!(trb_type(t), T_DATA | T_NORMAL)).collect();
+        let total: usize = data.iter().map(|(_, t)| (t[2] & 0x1ffff) as usize).sum();
+        if total > MAX_DATA {
+            return Err(trb_err(first));
+        }
+        let read_out = |this: &Self| -> Result<Vec<u8>, (u64, u32)> {
+            let mut out = Vec::with_capacity(total);
+            for (at, t) in &data {
+                let len = (t[2] & 0x1ffff) as usize;
+                if t[3] & TRB_IDT != 0 {
+                    out.extend_from_slice(&param(t).to_le_bytes()[..len.min(8)]);
+                } else {
+                    let mut b = vec![0u8; len];
+                    this.mem.read(GuestAddress(param(t)), &mut b).map_err(|_| trb_err(*at))?;
+                    out.extend_from_slice(&b);
+                }
+            }
+            Ok(out)
+        };
+        if dci == 1 {
+            let Some(&(at, t)) = td.first() else { return Err(trb_err(first)) };
+            if trb_type(&t) != T_SETUP || t[3] & TRB_IDT == 0 {
+                return Err(trb_err(at));
+            }
+            let setup = param(&t).to_le_bytes();
+            let wlen = u16::from_le_bytes([setup[6], setup[7]]) as usize;
+            if setup[0] & 0x80 != 0 {
+                return Ok(Submit::control(0, setup, Vec::new()));
+            }
+            let out = read_out(self)?;
+            if out.len() != wlen {
+                return Err(trb_err(at));
+            }
+            return Ok(Submit::control(0, setup, out));
+        }
+        let xfer = match kind {
+            EPT_BULK_OUT | EPT_BULK_IN => XferType::Bulk,
+            EPT_INT_OUT | EPT_INT_IN => XferType::Interrupt,
+            _ => return Err(trb_err(first)),
+        };
+        // DCI: endpoint number * 2, plus one for IN.
+        let ep = (dci / 2) | if dci % 2 == 1 { 0x80 } else { 0 };
+        let mut s = Submit { id: 0, ep, kind: xfer, setup: [0; 8], len: total as u32, data: Vec::new(), zero_packet: false };
+        if ep & 0x80 == 0 {
+            s.data = read_out(self)?;
+            // Linux ends a bulk OUT that fills its last packet with an
+            // empty TRB in the same TD: the device must see a ZLP.
+            s.zero_packet = xfer == XferType::Bulk && total > 0 && data.len() > 1 && data.last().is_some_and(|(_, t)| t[2] & 0x1ffff == 0);
+        }
+        Ok(s)
+    }
+
+    /// What a helper says: device `dev` attached, detached, or a
+    /// transfer done. Held while paused.
+    pub fn usb_event(&mut self, dev: usize, ev: Event) {
+        if dev >= self.pass.len() {
+            return;
+        }
+        if self.paused {
+            if self.deferred_usb.len() < MAX_DEFERRED_USB {
+                self.deferred_usb.push_back((dev, ev));
+            } else {
+                log::warn!("usb: too many events while paused, dropping one");
+            }
+            return;
+        }
+        match ev {
+            Event::Attached { speed, vendor, product } => {
+                log::info!("usb: {vendor:04x}:{product:04x} attached ({speed:?})");
+                self.pass_attach(dev, Some(speed));
+            }
+            Event::Detached => {
+                log::info!("usb: device {dev} detached");
+                self.pass_attach(dev, None);
+            }
+            Event::Done(d) => self.pass_done(dev, d),
+        }
+    }
+
+    fn running(&self) -> bool {
+        self.op.usbcmd & CMD_RUN != 0
+    }
+
+    /// Show the device on its port (or none). A device already shown
+    /// goes away first; the new one appears once the driver has seen
+    /// that (it clears the connect change), so a replug is never missed.
+    fn pass_attach(&mut self, i: usize, speed: Option<Speed>) {
+        self.pass_forget(i);
+        let p = &mut self.pass[i];
+        p.speed = speed;
+        p.addressed = false;
+        p.reconnect = false;
+        let mut shown = false;
+        for usb3 in [false, true] {
+            let at = self.pass_port(i, usb3);
+            let was = self.ports[at];
+            // Shown, or its unplug not yet seen by the driver.
+            if was & (PS_CCS | PS_CSC) != 0 {
+                self.ports[at] = Self::pass_portsc(None, usb3) | PS_CSC;
+                shown = true;
+                if was & PS_CCS != 0 && self.running() {
+                    self.port_event(at);
+                }
+            }
+        }
+        if shown {
+            self.pass[i].reconnect = speed.is_some();
+        } else {
+            self.pass_connect(i);
+        }
+    }
+
+    fn pass_connect(&mut self, i: usize) {
+        let Some(s) = self.pass[i].speed else { return };
+        self.pass[i].reconnect = false;
+        let at = self.pass_port(i, s.is_super());
+        self.ports[at] = Self::pass_portsc(Some(s), s.is_super()) | PS_CSC;
+        if self.running() {
+            self.port_event(at);
+        }
+    }
+
+    fn pass_done(&mut self, i: usize, d: Done) {
+        let Some(p) = self.pass[i].pending.get_mut(&d.id) else {
+            // Cancelled already, or made up.
+            return;
+        };
+        p.done = Some(d);
+        let key = (p.slot, p.dci);
+        // Complete in order: a TD finishes only after those before it.
+        loop {
+            let pass = &mut self.pass[i];
+            let Some(&front) = pass.queues.get(&key).and_then(|q| q.front()) else { break };
+            if pass.pending.get(&front).is_none_or(|p| p.done.is_none()) {
+                break;
+            }
+            if let Some(q) = pass.queues.get_mut(&key) {
+                q.pop_front();
+            }
+            let Some(p) = pass.pending.remove(&front) else { break };
+            self.pass_complete(p);
+        }
+        self.run_pass(i, key.0, key.1);
+    }
+
+    fn pass_complete(&mut self, p: Pending) {
+        let Some(d) = p.done else { return };
+        let (slot, dci) = (p.slot, p.dci);
+        // The helper must answer what was asked: never more data than
+        // the TD has room for, never data for an OUT transfer.
+        let sane = if p.is_in { d.data.len() == d.actual as usize && d.actual <= p.len } else { d.data.is_empty() && d.actual <= p.len };
+        let status = if sane { d.status } else { Status::Babble };
+        let last = p.td.iter().rev().find(|(_, t)| matches!(trb_type(t), T_DATA | T_NORMAL)).or(p.td.last()).map(|t| t.0).unwrap_or(0);
+        match status {
+            Status::Ok => self.complete_td(slot, dci, &p.td, p.is_in.then_some(d.data.as_slice())),
+            Status::Stall => self.pass_halt(slot, dci, p.start, last, CC_STALL),
+            Status::Babble => self.pass_halt(slot, dci, p.start, last, CC_BABBLE),
+            Status::Error | Status::Cancelled | Status::NoDevice => self.pass_halt(slot, dci, p.start, last, CC_TRANSACTION),
+        }
+    }
+
+    /// The endpoint halts on a failed TD: later transfers are cancelled
+    /// and the ring points back at the failed TD, as on real hardware.
+    fn pass_halt(&mut self, slot: usize, dci: u8, start: Ring, at: u64, cc: u32) {
+        self.abandon_slot(slot, |d| d == dci);
+        if let Some((_, mut ep)) = self.ep(slot, dci) {
+            ep.state = EP_HALTED;
+            ep.ring = start;
+            self.set_ep(slot, dci, ep);
+            let ctx = self.slots[slot].as_ref().map(|s| s.ctx).unwrap_or(0);
+            self.write_ep_ctx(ctx, dci, &ep);
+        }
+        self.transfer_event(at, cc, 0, slot as u8, dci);
+    }
+
+    /// Cancel passthrough transfers of `slot` on endpoints `which`, and
+    /// rewind each ring to its first unfinished TD.
+    fn abandon_slot(&mut self, slot: usize, which: impl Fn(u8) -> bool) {
+        for i in 0..self.pass.len() {
+            let keys: Vec<(usize, u8)> = self.pass[i].queues.keys().filter(|k| k.0 == slot && which(k.1)).copied().collect();
+            for key in keys {
+                let p = &mut self.pass[i];
+                let ids = p.queues.remove(&key).unwrap_or_default();
+                let mut first = None;
+                for id in ids {
+                    if let Some(x) = p.pending.remove(&id) {
+                        first = first.or(Some(x.start));
+                        let _ = p.link.send(Request::Cancel { id });
+                    }
+                }
+                if let (Some(start), Some((_, mut ep))) = (first, self.ep(key.0, key.1)) {
+                    ep.ring = start;
+                    self.set_ep(key.0, key.1, ep);
+                }
+            }
+        }
+    }
+
+    /// Drop everything in flight for device `i` (reset, unplug, restore).
+    fn pass_forget(&mut self, i: usize) {
+        let slots: Vec<usize> = self.pass[i].queues.keys().map(|k| k.0).collect();
+        for s in slots {
+            self.abandon_slot(s, |_| true);
         }
     }
 
@@ -793,7 +1248,7 @@ impl Xhci {
             }
         };
         // Deliver to the slot bound to that port, on EP1 IN (DCI 3).
-        let ids: Vec<usize> = (1..=MAX_SLOTS).filter(|&i| self.slots[i].as_ref().is_some_and(|s| s.port == port)).collect();
+        let ids: Vec<usize> = (1..=self.max_slots()).filter(|&i| self.slots[i].as_ref().is_some_and(|s| s.port == port)).collect();
         for id in ids {
             self.run_interrupt_in(id, 3);
         }
@@ -802,18 +1257,24 @@ impl Xhci {
     // ---- registers ----
 
     fn cap_read(&self, off: u64) -> u32 {
+        let n = self.pass.len() as u32;
         match off {
             0x00 => 0x0100_0000 | CAPLEN as u32,
-            0x04 => (NPORTS as u32) << 24 | 1 << 8 | MAX_SLOTS as u32,
+            0x04 => (self.ports.len() as u32) << 24 | 1 << 8 | self.max_slots() as u32,
             0x08 => 0,
             0x0c => 0,
             0x10 => 1 | ((XECP / 4) as u32) << 16, // AC64, xECP
             0x14 => DB as u32,
             0x18 => RT as u32,
             0x1c => 0,
-            o if o == XECP => 0x0200_0002,       // supported protocol: USB 2.0
-            o if o == XECP + 4 => 0x2042_5355,   // "USB "
-            o if o == XECP + 8 => (NPORTS as u32) << 8 | 1,
+            // Supported protocols: USB 2.0 (HID ports, then one per
+            // passthrough device), then USB 3.0 if there are any.
+            o if o == XECP => 0x0200_0002 | if n > 0 { 4 << 8 } else { 0 },
+            o if o == XECP + 4 => 0x2042_5355, // "USB "
+            o if o == XECP + 8 => (HID_PORTS as u32 + n) << 8 | 1,
+            o if o == XECP + 0x10 && n > 0 => 0x0300_0002,
+            o if o == XECP + 0x14 && n > 0 => 0x2042_5355,
+            o if o == XECP + 0x18 && n > 0 => n << 8 | (HID_PORTS as u32 + n + 1),
             _ => 0,
         }
     }
@@ -830,7 +1291,7 @@ impl Xhci {
             0x38 => self.op.config as u64,
             o if o >= 0x400 => {
                 let p = ((o - 0x400) / 0x10) as usize;
-                if p < NPORTS && (o - 0x400) % 0x10 == 0 {
+                if p < self.ports.len() && (o - 0x400) % 0x10 == 0 {
                     self.ports[p] as u64
                 } else {
                     0
@@ -852,7 +1313,7 @@ impl Xhci {
                 self.op.usbcmd = v & 0x3f0f;
                 if v & CMD_RUN != 0 && !was_running {
                     self.op.usbsts &= !STS_HCH;
-                    for p in 0..NPORTS {
+                    for p in 0..self.ports.len() {
                         if self.ports[p] & PS_CSC != 0 {
                             self.port_event(p);
                         }
@@ -889,7 +1350,7 @@ impl Xhci {
             0x38 => self.op.config = v as u32 & 0xff,
             o if o >= 0x400 => {
                 let p = ((o - 0x400) / 0x10) as usize;
-                if p < NPORTS && (o - 0x400) % 0x10 == 0 {
+                if p < self.ports.len() && (o - 0x400) % 0x10 == 0 {
                     self.portsc_write(p, v as u32);
                 }
             }
@@ -905,11 +1366,32 @@ impl Xhci {
             s &= !PS_PED;
         }
         let mut notify = false;
-        if v & PS_PR != 0 && s & PS_CCS != 0 {
+        let kind = self.port_kind((p + 1) as u8);
+        if v & (PS_PR | PS_WPR) != 0 && s & PS_CCS != 0 {
             // Reset completes instantly.
             s = (s & !(0xf << PS_PLS_SHIFT)) | PS_PED | PS_PRC | PLS_U0 << PS_PLS_SHIFT;
-            if let Some(d) = self.dev((p + 1) as u8) {
-                d.reset();
+            if v & PS_WPR != 0 {
+                s |= PS_WRC;
+            }
+            match kind {
+                Some(PortKind::Pass(i, _)) => {
+                    let slots: Vec<usize> =
+                        (1..=self.max_slots()).filter(|&id| self.slots[id].as_ref().is_some_and(|sl| sl.port as usize == p + 1)).collect();
+                    for id in slots {
+                        self.abandon_slot(id, |_| true);
+                    }
+                    // The device itself only needs a reset once it has
+                    // been set up (not on its first enumeration).
+                    let pass = &mut self.pass[i];
+                    if std::mem::take(&mut pass.addressed) {
+                        let _ = pass.link.send(Request::Reset);
+                    }
+                }
+                _ => {
+                    if let Some(d) = self.dev((p + 1) as u8) {
+                        d.reset();
+                    }
+                }
             }
             notify = true;
         }
@@ -926,6 +1408,12 @@ impl Xhci {
         self.ports[p] = s;
         if notify {
             self.port_event(p);
+        }
+        // The driver saw a passthrough device go: show the new one.
+        if let Some(PortKind::Pass(i, _)) = kind {
+            if v & PS_CSC != 0 && s & PS_CCS == 0 && self.pass[i].reconnect {
+                self.pass_connect(i);
+            }
         }
     }
 
@@ -995,7 +1483,7 @@ impl PciDevice for Xhci {
     fn bar_read(&mut self, _bar: usize, off: u64, data: &mut [u8]) {
         let v: u64 = match off {
             o if o < OP => self.cap_read(o) as u64,
-            o if (XECP..XECP + 0x10).contains(&o) => self.cap_read(o) as u64,
+            o if (XECP..XECP + 0x20).contains(&o) => self.cap_read(o) as u64,
             o if o < RT => self.op_read(o - OP),
             o if o < DB => self.rt_read(o - RT),
             o if o >= MSIX_TABLE as u64 && o < MSIX_PBA as u64 => {
@@ -1014,7 +1502,7 @@ impl PciDevice for Xhci {
     fn bar_write(&mut self, _bar: usize, off: u64, data: &[u8]) {
         let v = get_le(data);
         match off {
-            o if (XECP..XECP + 0x10).contains(&o) => {}
+            o if (XECP..XECP + 0x20).contains(&o) => {}
             o if (OP..RT).contains(&o) => self.op_write(o - OP, v, data.len()),
             o if (RT..DB).contains(&o) => self.rt_write(o - RT, v, data.len()),
             o if (DB..MSIX_TABLE as u64).contains(&o) => {
@@ -1044,8 +1532,18 @@ impl PciDevice for Xhci {
 
     fn resume(&mut self) {
         self.paused = false;
+        if std::mem::take(&mut self.port_events_due) && self.running() {
+            for p in 0..self.ports.len() {
+                if self.ports[p] & PS_CSC != 0 {
+                    self.port_event(p);
+                }
+            }
+        }
         while let Some(e) = self.deferred.pop_front() {
             self.input(e);
+        }
+        while let Some((i, e)) = self.deferred_usb.pop_front() {
+            self.usb_event(i, e);
         }
     }
 
@@ -1056,7 +1554,7 @@ impl PciDevice for Xhci {
             op: self.op.clone(),
             intr: self.intr.clone(),
             cmd: self.cmd,
-            ports: self.ports,
+            ports: self.ports.clone(),
             slots: self.slots.clone(),
             kbd: self.kbd.save(),
             tablet: self.tablet.save(),
@@ -1066,10 +1564,14 @@ impl PciDevice for Xhci {
     fn restore(&mut self, data: &[u8]) -> vroom_snapshot::Result<()> {
         let s: Snap = decode(data)?;
         let mut cfg = s.cfg;
-        if !cfg.rebuild_masks(&self.cfg) || s.msix.vectors() != self.msix.vectors() || s.slots.len() != MAX_SLOTS + 1 {
+        if !cfg.rebuild_masks(&self.cfg)
+            || s.msix.vectors() != self.msix.vectors()
+            || s.slots.len() != self.slots.len()
+            || s.ports.len() != self.ports.len()
+        {
             return Err(vroom_snapshot::Error::Invalid("xhci layout".into()));
         }
-        if s.slots.iter().flatten().any(|sl| sl.port as usize > NPORTS || sl.eps.keys().any(|&d| d == 0 || d > 31)) {
+        if s.slots.iter().flatten().any(|sl| sl.port as usize > self.ports.len() || sl.eps.keys().any(|&d| d == 0 || d > 31)) {
             return Err(vroom_snapshot::Error::Invalid("xhci slots".into()));
         }
         let sender = self.msix.sender();
@@ -1087,6 +1589,32 @@ impl PciDevice for Xhci {
         self.slots = s.slots;
         self.kbd.restore(&s.kbd);
         self.tablet.restore(&s.tablet);
+        // Passthrough devices can't be saved: what the guest had is
+        // gone. It sees the device leave, and come back if it is here.
+        for i in 0..self.pass.len() {
+            self.pass_forget(i);
+            let p = &mut self.pass[i];
+            p.addressed = false;
+            p.reconnect = false;
+            let speed = p.speed;
+            let mut shown = false;
+            for usb3 in [false, true] {
+                let at = self.pass_port(i, usb3);
+                if self.ports[at] & PS_CCS != 0 {
+                    self.ports[at] = Self::pass_portsc(None, usb3) | PS_CSC;
+                    shown = true;
+                } else {
+                    self.ports[at] = Self::pass_portsc(None, usb3) | (self.ports[at] & PS_CSC);
+                }
+            }
+            if shown {
+                self.pass[i].reconnect = speed.is_some();
+            } else if let Some(sp) = speed {
+                let at = self.pass_port(i, sp.is_super());
+                self.ports[at] = Self::pass_portsc(Some(sp), sp.is_super()) | PS_CSC;
+            }
+            self.port_events_due = true;
+        }
         self.update_irq();
         Ok(())
     }
@@ -1125,6 +1653,15 @@ mod tests {
             let mem = GuestMemory::new(&[(GuestAddress(RAM), 1 << 20)]).unwrap();
             let r = IntxRouter::new((0..4).map(|_| Arc::new(NoIrq) as Arc<dyn crate::IrqLine>).collect());
             let x = Xhci::new(6, mem.clone(), r.pin(6, 1), Arc::new(NoMsi));
+            Host::with(x, mem)
+        }
+
+        fn write_u32s(&self, at: u64, v: &[u32]) {
+            let b: Vec<u8> = v.iter().flat_map(|w| w.to_le_bytes()).collect();
+            self.mem.write(GuestAddress(at), &b).unwrap();
+        }
+
+        fn with(x: Xhci, mem: GuestMemory) -> Host {
             let mut h = Host { x, mem, evt: 0, cmd: CMD_RING };
             h.mem.write_obj(GuestAddress(ERST), &EVT.to_le()).unwrap();
             h.mem.write_obj(GuestAddress(ERST + 8), &256u32.to_le()).unwrap();
@@ -1175,7 +1712,7 @@ mod tests {
         fn keyboard() -> Host {
             let mut h = Host::new();
             let ports = h.events();
-            assert_eq!(ports.len(), NPORTS);
+            assert_eq!(ports.len(), HID_PORTS);
             assert!(ports.iter().all(|e| trb_type(e) == E_PORT));
             let c = h.command([0, 0, 0, C_ENABLE_SLOT << 10]);
             assert_eq!(c[3] >> 24, 1);
@@ -1258,5 +1795,209 @@ mod tests {
         x.config().read(0x2c, &mut d);
         assert_eq!(u32::from_le_bytes(d), 0x22d8_17aa);
         assert_eq!(x.config().raw()[0x0b], 0x0c, "class stays USB");
+    }
+
+    /// The helper side, in-process: the fake serial port behind a session.
+    struct FakeHelper {
+        rx: std::sync::mpsc::Receiver<Request>,
+        events: std::sync::mpsc::Receiver<Event>,
+        session: vroom_usb::helper::Session,
+        dev: vroom_usb::fake::Acm,
+    }
+
+    impl FakeHelper {
+        fn new() -> (FakeHelper, Sender<Request>) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (etx, events) = std::sync::mpsc::channel();
+            let dev = vroom_usb::fake::Acm::new(etx.clone(), 0x1209, 0x000a);
+            (FakeHelper { rx, events, session: vroom_usb::helper::Session::new(etx), dev }, tx)
+        }
+
+        /// Run requests and hand back completions until both are quiet.
+        fn pump(&mut self, x: &mut Xhci) {
+            loop {
+                let mut busy = false;
+                while let Ok(r) = self.rx.try_recv() {
+                    self.session.request(Some(&mut self.dev), r);
+                    busy = true;
+                }
+                while let Ok(e) = self.events.try_recv() {
+                    x.usb_event(0, e);
+                    busy = true;
+                }
+                if !busy {
+                    break;
+                }
+            }
+        }
+    }
+
+    const EP1: u64 = RAM + 0x9000;
+    const EP2: u64 = RAM + 0xa000;
+    const EP3: u64 = RAM + 0xb000;
+    const PASS_PORT: u64 = OP + 0x400 + 0x10 * HID_PORTS as u64;
+
+    fn portsc(h: &mut Host, at: u64) -> u32 {
+        let mut ps = [0u8; 4];
+        h.x.bar_read(0, at, &mut ps);
+        u32::from_le_bytes(ps)
+    }
+
+    /// The fake serial port attached on the first passthrough port,
+    /// addressed as slot 1, configured, with bulk OUT (DCI 4), bulk IN
+    /// (DCI 7) and interrupt IN (DCI 3) rings.
+    fn pass_host() -> (Host, FakeHelper) {
+        let mem = GuestMemory::new(&[(GuestAddress(RAM), 1 << 20)]).unwrap();
+        let r = IntxRouter::new((0..4).map(|_| Arc::new(NoIrq) as Arc<dyn crate::IrqLine>).collect());
+        let (mut helper, link) = FakeHelper::new();
+        let x = Xhci::new(6, mem.clone(), r.pin(6, 1), Arc::new(NoMsi)).with_passthrough(vec![link]);
+        let mut h = Host::with(x, mem);
+        assert_eq!(h.events().len(), HID_PORTS, "only the HID ports have devices");
+        h.x.usb_event(0, Event::Attached { speed: Speed::Full, vendor: 0x1209, product: 0x000a });
+        let ev = h.events();
+        assert_eq!((ev.len(), trb_type(&ev[0]), ev[0][0] >> 24), (1, E_PORT, HID_PORTS as u32 + 1));
+        let ps = portsc(&mut h, PASS_PORT);
+        assert_eq!((ps & PS_CCS, (ps >> PS_SPEED_SHIFT) & 0xf), (PS_CCS, 1));
+        h.w(PASS_PORT, (PS_PP | PS_PR | PS_CSC) as u64);
+        assert_eq!(trb_type(&h.events()[0]), E_PORT);
+        h.command([0, 0, 0, C_ENABLE_SLOT << 10]);
+        let mut input = [0u32; 3 * 8];
+        input[1] = 3;
+        input[8 + 1] = (HID_PORTS as u32 + 1) << 16;
+        input[16 + 1] = 64 << 16 | (EPT_CONTROL as u32) << 3;
+        input[16 + 2] = EP0 as u32 | 1;
+        h.write_u32s(INPUT, &input);
+        h.command([INPUT as u32, (INPUT >> 32) as u32, 0, C_ADDRESS << 10 | 1 << 24]);
+        // SET_CONFIGURATION(1): no data stage.
+        let set_cfg: u64 = 9 << 8 | 1 << 16;
+        h.put_trb(EP0, [set_cfg as u32, (set_cfg >> 32) as u32, 8, T_SETUP << 10 | TRB_IDT | 1]);
+        h.put_trb(EP0 + 16, [0, 0, 0, T_STATUS << 10 | TRB_IOC | 1]);
+        h.w(DB + 4, 1);
+        helper.pump(&mut h.x);
+        let ev = h.events();
+        assert_eq!((ev.len(), ev[0][2] >> 24), (1, CC_SUCCESS), "{ev:x?}");
+        let mut input = [0u32; 9 * 8];
+        input[1] = 1 | 1 << 3 | 1 << 4 | 1 << 7;
+        for (dci, ty, ring) in [(3usize, EPT_INT_IN, EP1), (4, EPT_BULK_OUT, EP2), (7, EPT_BULK_IN, EP3)] {
+            input[8 + 8 * dci + 1] = 64 << 16 | (ty as u32) << 3;
+            input[8 + 8 * dci + 2] = ring as u32 | 1;
+        }
+        h.write_u32s(INPUT, &input);
+        h.command([INPUT as u32, (INPUT >> 32) as u32, 0, C_CONFIGURE << 10 | 1 << 24]);
+        (h, helper)
+    }
+
+    #[test]
+    fn passthrough_control_and_bulk() {
+        let (mut h, mut helper) = pass_host();
+        // GET_DESCRIPTOR(device) goes to the device behind the helper.
+        let setup: u64 = 0x80 | 6 << 8 | 0x0100 << 16 | 18 << 48;
+        h.put_trb(EP0 + 32, [setup as u32, (setup >> 32) as u32, 8, T_SETUP << 10 | TRB_IDT | 3 << 16 | 1]);
+        h.put_trb(EP0 + 48, [BUF as u32, 0, 18, T_DATA << 10 | 1 << 16 | 1]);
+        h.put_trb(EP0 + 64, [0, 0, 0, T_STATUS << 10 | TRB_IOC | 1]);
+        h.w(DB + 4, 1);
+        assert!(h.events().is_empty(), "completes only when the helper answers");
+        helper.pump(&mut h.x);
+        assert_eq!(h.events()[0][2] >> 24, CC_SUCCESS);
+        let mut d = [0u8; 18];
+        h.mem.read(GuestAddress(BUF), &mut d).unwrap();
+        assert_eq!((d[4], u16::from_le_bytes([d[8], d[9]])), (2, 0x1209), "CDC class, the device's vendor");
+        // Bulk OUT "hello", then bulk IN 64: the loopback answers short.
+        h.mem.write(GuestAddress(BUF + 0x100), b"hello").unwrap();
+        h.put_trb(EP2, [(BUF + 0x100) as u32, 0, 5, T_NORMAL << 10 | TRB_IOC | 1]);
+        h.w(DB + 4, 4);
+        h.put_trb(EP3, [(BUF + 0x200) as u32, 0, 64, T_NORMAL << 10 | TRB_IOC | TRB_ISP | 1]);
+        h.w(DB + 4, 7);
+        helper.pump(&mut h.x);
+        let ev = h.events();
+        assert_eq!(ev.len(), 2, "{ev:x?}");
+        assert_eq!(((ev[0][3] >> 16) & 0x1f, ev[0][2] >> 24), (4, CC_SUCCESS));
+        assert_eq!(((ev[1][3] >> 16) & 0x1f, ev[1][2] >> 24, ev[1][2] & 0xff_ffff), (7, CC_SHORT, 59));
+        let mut b = [0u8; 5];
+        h.mem.read(GuestAddress(BUF + 0x200), &mut b).unwrap();
+        assert_eq!(&b, b"hello");
+        // A request the device refuses stalls and halts EP0.
+        let vendor: u64 = 0xc0 | 0x55 << 8 | 4 << 48;
+        h.put_trb(EP0 + 80, [vendor as u32, (vendor >> 32) as u32, 8, T_SETUP << 10 | TRB_IDT | 3 << 16 | 1]);
+        h.put_trb(EP0 + 96, [BUF as u32, 0, 4, T_DATA << 10 | 1 << 16 | 1]);
+        h.put_trb(EP0 + 112, [0, 0, 0, T_STATUS << 10 | TRB_IOC | 1]);
+        h.w(DB + 4, 1);
+        helper.pump(&mut h.x);
+        let ev = h.events();
+        assert_eq!((ev.len(), ev[0][2] >> 24, param(&ev[0])), (1, CC_STALL, EP0 + 96));
+        assert_eq!(h.x.ep(1, 1).unwrap().1.state, EP_HALTED);
+    }
+
+    #[test]
+    fn passthrough_stop_and_unplug() {
+        let (mut h, mut helper) = pass_host();
+        // Interrupt IN waits on the device; Stop Endpoint cancels it and
+        // leaves the ring at that TD.
+        h.put_trb(EP1, [BUF as u32, 0, 8, T_NORMAL << 10 | TRB_IOC | 1]);
+        h.w(DB + 4, 3);
+        helper.pump(&mut h.x);
+        assert!(h.events().is_empty());
+        assert_eq!(h.x.pass[0].pending.len(), 1);
+        h.command([0, 0, 0, C_STOP_EP << 10 | 3 << 16 | 1 << 24]);
+        assert!(h.x.pass[0].pending.is_empty());
+        let mut e = [0u8; 16];
+        h.mem.read(GuestAddress(OUTPUT + 0x20 * 3), &mut e).unwrap();
+        assert_eq!(u64::from_le_bytes(e[8..16].try_into().unwrap()) & !0xf, EP1);
+        // The late "cancelled" answer is ignored.
+        helper.pump(&mut h.x);
+        assert!(h.events().is_empty());
+        // Unplugged: the port says so.
+        h.x.usb_event(0, Event::Detached);
+        let ev = h.events();
+        assert_eq!((ev.len(), trb_type(&ev[0])), (1, E_PORT));
+        assert_eq!(portsc(&mut h, PASS_PORT) & (PS_CCS | PS_CSC), PS_CSC);
+        // Back again: it shows up once the driver acknowledged the unplug.
+        h.x.usb_event(0, Event::Attached { speed: Speed::High, vendor: 0x1209, product: 0x000a });
+        assert!(h.events().is_empty());
+        h.w(PASS_PORT, (PS_PP | PS_CSC) as u64);
+        assert_eq!(trb_type(&h.events()[0]), E_PORT);
+        let ps = portsc(&mut h, PASS_PORT);
+        assert_eq!((ps & PS_CCS, (ps >> PS_SPEED_SHIFT) & 0xf), (PS_CCS, 3));
+        // A SuperSpeed device goes on the USB 3 port.
+        h.x.usb_event(0, Event::Detached);
+        h.w(PASS_PORT, (PS_PP | PS_CSC) as u64);
+        h.x.usb_event(0, Event::Attached { speed: Speed::Super, vendor: 0x1209, product: 0x000a });
+        let usb3 = PASS_PORT + 0x10;
+        let ps = portsc(&mut h, usb3);
+        assert_eq!((ps & (PS_CCS | PS_PED), (ps >> PS_SPEED_SHIFT) & 0xf), (PS_CCS | PS_PED, 4));
+    }
+
+    #[test]
+    fn passthrough_restore_replugs() {
+        let (mut h, _helper) = pass_host();
+        h.x.pause();
+        let snap = h.x.save().unwrap();
+        h.x.restore(&snap).unwrap();
+        h.x.resume();
+        assert_eq!(portsc(&mut h, PASS_PORT) & (PS_CCS | PS_CSC), PS_CSC, "the old device left");
+        assert!(h.events().iter().any(|e| trb_type(e) == E_PORT));
+        h.w(PASS_PORT, (PS_PP | PS_CSC) as u64);
+        assert_eq!(portsc(&mut h, PASS_PORT) & (PS_CCS | PS_CSC), PS_CCS | PS_CSC, "and is back");
+    }
+
+    #[test]
+    fn passthrough_answers_are_checked() {
+        let (mut h, mut helper) = pass_host();
+        h.put_trb(EP3, [(BUF + 0x200) as u32, 0, 4, T_NORMAL << 10 | TRB_IOC | 1]);
+        h.w(DB + 4, 7);
+        helper.pump(&mut h.x);
+        let id = *h.x.pass[0].pending.keys().next().unwrap();
+        // More data than asked for: babble, nothing past the buffer.
+        h.mem.write(GuestAddress(BUF + 0x204), &[0xaa; 4]).unwrap();
+        h.x.usb_event(0, Event::Done(Done { id, status: Status::Ok, actual: 8, data: vec![1; 8] }));
+        let ev = h.events();
+        assert_eq!(ev[0][2] >> 24, CC_BABBLE);
+        let mut b = [0u8; 4];
+        h.mem.read(GuestAddress(BUF + 0x204), &mut b).unwrap();
+        assert_eq!(b, [0xaa; 4]);
+        // Unknown ids and other devices are ignored.
+        h.x.usb_event(0, Event::Done(Done { id: 999, status: Status::Ok, actual: 0, data: vec![] }));
+        h.x.usb_event(5, Event::Detached);
+        assert!(h.events().is_empty());
     }
 }
