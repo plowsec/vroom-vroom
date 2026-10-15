@@ -38,6 +38,9 @@ impl Config {
             return None;
         }
         let total = (u16::from_le_bytes([b[2], b[3]]) as usize).min(b.len());
+        if total < 9 {
+            return None;
+        }
         let b = &b[..total];
         let mut c = Config { value: b[5], alts: Vec::new() };
         let mut at = b[0] as usize;
@@ -126,6 +129,8 @@ mod tests {
         for n in 0..cfg.len() {
             let _ = Config::parse(&cfg[..n]);
         }
+        // wTotalLength shorter than the header (found by fuzzing).
+        assert!(Config::parse(&[9, 2, 3, 0, 1, 1, 0, 0x80, 50]).is_none());
         // Endpoint before any interface, endpoint 0 in a list.
         assert!(Config::parse(&[9, 2, 16, 0, 1, 1, 0, 0x80, 50, 7, 5, 0x81, 3, 8, 0, 10]).is_none());
         assert!(Config::parse(&[9, 2, 25, 0, 1, 1, 0, 0x80, 50, 9, 4, 0, 0, 1, 3, 0, 0, 0, 7, 5, 0x80, 3, 8, 0, 10]).is_none());
