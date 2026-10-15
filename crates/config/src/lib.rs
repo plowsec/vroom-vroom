@@ -991,6 +991,23 @@ pub fn format_mac(m: &[u8; 6]) -> String {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn usb_entries() {
+        let base = "name = \"u\"\n[boot]\ntype = \"kernel\"\nkernel = \"/k\"\n";
+        let ok = super::VmConfig::from_toml(&format!("{base}[[usb]]\nid = \"1050:0407\"\nserial = \"123\"\n[[usb]]\nid = \"1050:0407\"\n")).unwrap();
+        assert_eq!(ok.usb[0].ids(), Some((0x1050, 0x0407)));
+        for bad in [
+            "[[usb]]\nid = \"1050\"\n",
+            "[[usb]]\nid = \"0000:0001\"\n",
+            "[[usb]]\nid = \"1050:04079\"\n",
+            "[[usb]]\nid = \"1050:0407\"\nserial = \"\"\n",
+            "[[usb]]\nid = \"1050:0407\"\nbus = 1\n",
+            "[[usb]]\nid = \"1050:0407\"\n[[usb]]\nid = \"1050:0407\"\n",
+        ] {
+            assert!(super::VmConfig::from_toml(&format!("{base}{bad}")).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn risky_choices_are_named() {
         let c = super::VmConfig::from_toml(
             r#"
