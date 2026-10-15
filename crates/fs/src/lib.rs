@@ -418,7 +418,7 @@ mod sys {
 
     fn times(a: Option<(i64, u32)>, m: Option<(i64, u32)>) -> [libc::timespec; 2] {
         let t = |v: Option<(i64, u32)>| match v {
-            Some((s, ns)) => libc::timespec { tv_sec: s as libc::time_t, tv_nsec: ns.min(999_999_999) as _ },
+            Some((s, ns)) => libc::timespec { tv_sec: s as _, tv_nsec: ns.min(999_999_999) as _ },
             None => libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_OMIT as _ },
         };
         [t(a), t(m)]
