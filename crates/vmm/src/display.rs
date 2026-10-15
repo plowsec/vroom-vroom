@@ -112,6 +112,11 @@ impl FbSink {
         Ok(Arc::new(FbSink { fb, mode: Mutex::new((0, 0)), arb: Mutex::default(), tx: None }))
     }
 
+    /// A viewer window is attached.
+    pub fn has_viewer(&self) -> bool {
+        self.tx.is_some()
+    }
+
     /// A full frame from ramfb (sent only when it changed); rows
     /// `changed.0..changed.1` differ from the last one.
     pub fn ramfb_frame(&self, w: u32, h: u32, rows: &[u8], stride: usize, changed: (u32, u32)) {

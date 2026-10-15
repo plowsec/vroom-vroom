@@ -1,7 +1,8 @@
 //! ramfb: a dumb framebuffer in guest RAM, configured by firmware through
 //! fw_cfg ("etc/ramfb"). UEFI's GOP and Windows' basic display driver
 //! draw into it; we copy it to the screen up to 30 times per second, and
-//! 4 times once it has been still for a couple of seconds.
+//! 4 times once it has been still for a couple of seconds, once a second
+//! when no window shows it.
 
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -18,6 +19,7 @@ const PERIOD: Duration = Duration::from_millis(33);
 /// A screen unchanged for this many periods is looked at less often.
 const IDLE_AFTER: u32 = 60;
 const IDLE_PERIOD: Duration = Duration::from_millis(250);
+const HEADLESS_PERIOD: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RamfbConfig {
@@ -56,7 +58,17 @@ pub fn spawn(mem: GuestMemory, cfg: Arc<Mutex<Option<RamfbConfig>>>, fb: Weak<Fb
         let mut last_cfg = None;
         let mut still = 0u32;
         loop {
-            std::thread::sleep(if still >= IDLE_AFTER { IDLE_PERIOD } else { PERIOD });
+            let Some(f) = fb.upgrade() else { return };
+            // Nobody watching (headless): screendumps only, rarely needed.
+            let period = if !f.has_viewer() {
+                HEADLESS_PERIOD
+            } else if still >= IDLE_AFTER {
+                IDLE_PERIOD
+            } else {
+                PERIOD
+            };
+            drop(f);
+            std::thread::sleep(period);
             let Some(fb) = fb.upgrade() else { return };
             let Some(c) = *cfg.lock().unwrap_or_else(|e| e.into_inner()) else { continue };
             let len = c.stride as usize * c.height as usize;
