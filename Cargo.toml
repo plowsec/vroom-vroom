@@ -28,6 +28,7 @@ vroom-gpu3d = { path = "crates/gpu3d" }
 vroom-fs = { path = "crates/fs" }
 vroom-audio = { path = "crates/audio" }
 vroom-state = { path = "crates/state" }
+vroom-import = { path = "crates/import" }
 
 thiserror = "2"
 log = "0.4"

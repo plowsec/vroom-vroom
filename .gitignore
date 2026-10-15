@@ -1,4 +1,5 @@
 /target
+/target-*
 *.img
 *.qcow2
 /images

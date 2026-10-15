@@ -5350,6 +5350,7 @@ dependencies = [
  "vroom-config",
  "vroom-display",
  "vroom-hv",
+ "vroom-import",
  "vroom-net",
  "vroom-sandbox",
  "vroom-vmm",
@@ -5442,6 +5443,16 @@ dependencies = [
  "serde",
  "thiserror 2.0.21",
  "vroom-memory",
+]
+
+[[package]]
+name = "vroom-import"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "thiserror 2.0.21",
+ "vroom-block",
+ "vroom-config",
 ]
 
 [[package]]

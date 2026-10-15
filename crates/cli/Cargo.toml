@@ -22,6 +22,7 @@ vroom-net.workspace = true
 vroom-audio.workspace = true
 vroom-sandbox.workspace = true
 vroom-display.workspace = true
+vroom-import.workspace = true
 arboard = { version = "3", default-features = false }
 
 [lints]

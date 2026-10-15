@@ -33,6 +33,51 @@ scripts/build.sh
 - `VROOM_HOME=dir` uses another data dir. `VROOM_SHOT=out.png` saves a
   picture of the window and quits (that's how the README pictures are made).
 
+## Moving a VM from VMware
+
+ARM64 VMs from VMware Fusion (or Workstation on ARM) come over with their
+disks. VMware's copy is only read, never changed.
+
+```bash
+vroom import "~/Virtual Machines.localized/Ubuntu.vmwarevm" --dry-run   # what would happen
+vroom import "~/Virtual Machines.localized/Ubuntu.vmwarevm" --dir ~/VMs
+```
+
+In the app: "Import from VMware" in the `⋯` menu or `⌘K`, or drop the
+`.vmwarevm` on the window.
+
+What happens:
+
+- Disks are copied to qcow2 (only the used parts). Split disks, snapshot
+  chains and linked clones are read through; the current state is what
+  you get. VMware snapshots stay in VMware.
+- CPUs, memory, shared folders, sound and the TPM setting carry over.
+  Every network adapter becomes NAT; switch it in the settings if you need
+  bridged or host-only.
+- ISOs stay where they are and are attached as CDs.
+
+Before you import:
+
+- Shut the VM down in VMware and quit VMware. A suspended VM can be
+  imported (`--yes`), but what was in its memory is lost.
+- x86 VMs can't run here (ARM64 guests only).
+- VMs with encrypted disks: remove the encryption in VMware first. A
+  Windows 11 VM with only its TPM encrypted (Fusion's default) is fine,
+  but the TPM's contents can't come along: if BitLocker is on, have the
+  recovery key.
+
+After the import:
+
+- Linux guests boot as they are. Remove `open-vm-tools` if you like.
+- Windows guests boot from NVMe, but need the virtio-win drivers and the
+  vroom tools for network, clipboard and resizing: attach `tools.raw` and
+  the virtio-win ISO, run `vroom-setup.cmd` as administrator. Fusion puts
+  Windows on NVMe; a Windows installed on a SATA disk may not boot from
+  NVMe (INACCESSIBLE_BOOT_DEVICE). That case isn't handled yet.
+- Windows may ask to reactivate (it sees new hardware).
+  `--keep-hardware-ids` keeps VMware's BIOS UUID and SMBIOS names, which
+  helps, but then the guest can tell it came from VMware.
+
 ## Ubuntu 24.04 (cloud image, direct kernel boot)
 
 ```bash

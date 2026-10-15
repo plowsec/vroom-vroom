@@ -2,6 +2,7 @@
 
 mod clip;
 mod disk;
+mod import;
 mod log_limit;
 mod new;
 mod session;
@@ -56,6 +57,8 @@ enum Cmd {
     AudioOut,
     /// Create a VM: write <name>.toml and its disk.
     New(new::NewArgs),
+    /// Bring a VM over from VMware (copies its disks, VMware's copy stays).
+    Import(import::ImportArgs),
     /// Snapshot housekeeping (list, delete, prune disk layers).
     #[command(subcommand)]
     Snapshot(snap::SnapCmd),
@@ -86,6 +89,7 @@ fn main() -> ExitCode {
         Cmd::Disk(d) => disk::run(d),
         Cmd::Snapshot(s) => snap::run(s, load, default_state_dir),
         Cmd::New(a) => new::run(a, load),
+        Cmd::Import(a) => import::run(a),
         Cmd::AudioOut => audio_out(),
         Cmd::Check { config } => load(&config).and_then(|c| {
             print!("{}", c.to_toml().map_err(|e| e.to_string())?);
