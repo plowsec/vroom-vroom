@@ -65,6 +65,13 @@ impl Swtpm {
         let exe = find_swtpm().ok_or_else(|| Error::Setup("tpm = true needs swtpm (brew install swtpm)".into()))?;
         std::fs::create_dir_all(dir)?;
         let _ = std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700));
+        // swtpm < 0.8 has no "terminate" (exit when the control channel
+        // closes); then only our kill on drop stops it.
+        let terminate = Command::new(&exe)
+            .args(["socket", "--print-capabilities"])
+            .stderr(Stdio::null())
+            .output()
+            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("ctrl-opt-terminate"));
         let (ctrl, ctrl_child) = UnixStream::pair()?;
         let (data, data_child) = UnixStream::pair()?;
         let args = [
@@ -73,7 +80,7 @@ impl Swtpm {
             "--tpmstate".into(),
             format!("dir={},mode=0600", dir.display()),
             "--ctrl".into(),
-            "type=unixio,clientfd=3,terminate".into(),
+            if terminate { "type=unixio,clientfd=3,terminate" } else { "type=unixio,clientfd=3" }.into(),
             "--log".into(),
             format!("file={},level=1,truncate", dir.join("swtpm.log").display()),
         ];
