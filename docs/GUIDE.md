@@ -180,9 +180,14 @@ flushes a lot). `"none"` ignores flushes: scratch disks only.
 
 ## Known limitations
 
-- x86_64 hosts: not implemented.
+- x86_64 hosts: everything builds, but there is no x86 board: VMs can't
+  start there yet.
 - Bridged / host-only: needs `bulwark-netd` running as root; not tested
   with real vmnet/tap yet.
-- Windows 11 is installed with its hardware checks bypassed; add
-  `tpm = true` (needs `brew install swtpm`) for a real TPM 2.0.
-- 3D snapshots, GL (virgl) path, Windows 3D: not supported.
+- Windows 11 is installed with its hardware checks bypassed (no Secure
+  Boot); `tpm = true` (needs `brew install swtpm`) gives it a real TPM 2.0,
+  which Windows sees and uses.
+- Windows guests: no shared folders without WinFsp (untested), no sound
+  (no virtio-snd driver), no 3D (no Venus driver).
+- 3D snapshots, OpenGL on Venus (Zink, see above): not supported.
+- NAT connections don't survive suspend/resume (the guest reconnects).
