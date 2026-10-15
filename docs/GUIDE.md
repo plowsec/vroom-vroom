@@ -313,9 +313,9 @@ administrator, again after adding your first share is fine):
   MSI on the tools disk (`WINFSP_MSI=path/to.msi
   scripts/make-windows-tools.sh tools.raw virtio-win.iso`);
 - one service per share, `VroomShare_<tag>`, running
-  `virtiofs.exe -t <tag> -m Z:`. The agent service checks at every boot
-  and adds services for new shares, so shares added later show up after
-  a reboot.
+  `virtiofs.exe -t <tag> -m Z:`. The agent service checks at every boot:
+  it adds services for new shares and deletes those of shares removed
+  from the config. So both take effect after a reboot.
 
 The drivers come from the tools disk: build it with the virtio-win ISO
 (`scripts/make-windows-tools.sh tools.raw virtio-win.iso`); Windows can't
@@ -328,9 +328,8 @@ sc config VroomShare_host binPath= "\"C:\Program Files\Vroom\virtiofs.exe\" -t h
 sc stop VroomShare_host & sc start VroomShare_host
 ```
 
-Setup only adds services, it never changes yours. A share you removed
-from the config leaves its service behind, failing to start; delete it
-with `sc delete VroomShare_<tag>`.
+Setup never changes the service of a share that still exists, so your
+`sc config` stays. A removed share's service is deleted at the next boot.
 
 What to expect:
 

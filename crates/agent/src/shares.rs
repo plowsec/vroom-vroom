@@ -7,10 +7,10 @@
 //! A service that already exists is only started: change its mount point
 //! with `sc config` and it stays. Runs from `vroom-setup.cmd`
 //! (`--mount-shares`) and when the agent service starts, so shares added
-//! later show up after a reboot.
+//! later show up after a reboot, and services of shares that are gone
+//! (no device with that tag) are removed.
 
 /// Service name prefix; the tag follows.
-#[cfg_attr(not(windows), allow(dead_code))]
 pub const PREFIX: &str = "VroomShare_";
 
 /// Tags as the VM config allows them: 1-36 of `[A-Za-z0-9._-]`. Anything
@@ -40,6 +40,15 @@ pub fn pick_letter(used: u32) -> Option<char> {
     (3..26u32).rev().find(|i| used & (1 << i) == 0).map(|i| (b'A' + i as u8) as char)
 }
 
+/// Our services (`names`) whose share is gone: no device has their tag.
+pub fn stale<'a>(names: &'a [String], tags: &[String]) -> Vec<&'a str> {
+    names
+        .iter()
+        .filter(|n| n.strip_prefix(PREFIX).is_some_and(|t| !tags.iter().any(|x| x == t)))
+        .map(|n| n.as_str())
+        .collect()
+}
+
 pub fn command_line(exe: &str, tag: &str, letter: char) -> String {
     format!("\"{exe}\" -t {tag} -m {letter}:")
 }
@@ -58,8 +67,10 @@ mod os {
     use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SERVICE_ALREADY_RUNNING, GENERIC_READ, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{CreateFileW, GetLogicalDrives, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING};
     use windows_sys::Win32::System::Services::{
-        CloseServiceHandle, CreateServiceW, OpenSCManagerW, OpenServiceW, QueryServiceConfigW, StartServiceW, QUERY_SERVICE_CONFIGW,
-        SC_HANDLE, SC_MANAGER_ALL_ACCESS, SERVICE_ALL_ACCESS, SERVICE_AUTO_START, SERVICE_ERROR_NORMAL, SERVICE_WIN32_OWN_PROCESS,
+        CloseServiceHandle, ControlService, CreateServiceW, DeleteService, EnumServicesStatusExW, OpenSCManagerW, OpenServiceW,
+        QueryServiceConfigW, StartServiceW, ENUM_SERVICE_STATUS_PROCESSW, QUERY_SERVICE_CONFIGW, SC_ENUM_PROCESS_INFO, SC_HANDLE,
+        SC_MANAGER_ALL_ACCESS, SERVICE_ALL_ACCESS, SERVICE_AUTO_START, SERVICE_CONTROL_STOP, SERVICE_ERROR_NORMAL, SERVICE_STATE_ALL,
+        SERVICE_STATUS, SERVICE_WIN32, SERVICE_WIN32_OWN_PROCESS,
     };
     use windows_sys::Win32::System::IO::DeviceIoControl;
 
@@ -146,6 +157,73 @@ mod os {
         Some(String::from_utf16_lossy(s))
     }
 
+    /// Names of all services starting with PREFIX.
+    fn ours(scm: &Sc) -> io::Result<Vec<String>> {
+        let mut out = Vec::new();
+        let mut resume = 0u32;
+        let mut buf = vec![0u64; 8192];
+        loop {
+            let (mut need, mut n) = (0u32, 0u32);
+            // SAFETY: valid SCM handle; buf is 8-aligned and writable for
+            // its byte length.
+            let ok = unsafe {
+                EnumServicesStatusExW(
+                    scm.0,
+                    SC_ENUM_PROCESS_INFO,
+                    SERVICE_WIN32,
+                    SERVICE_STATE_ALL,
+                    buf.as_mut_ptr().cast(),
+                    (buf.len() * 8) as u32,
+                    &mut need,
+                    &mut n,
+                    &mut resume,
+                    std::ptr::null(),
+                )
+            };
+            let more = ok == 0 && io::Error::last_os_error().raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_MORE_DATA as i32);
+            if ok == 0 && !more {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: the call wrote n entries at the start of buf.
+            let entries = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const ENUM_SERVICE_STATUS_PROCESSW, n as usize) };
+            for e in entries {
+                // SAFETY: NUL-terminated string inside buf.
+                let name = unsafe { std::slice::from_raw_parts(e.lpServiceName, (0..).take_while(|&i| *e.lpServiceName.add(i) != 0).count()) };
+                let name = String::from_utf16_lossy(name);
+                if name.starts_with(PREFIX) {
+                    out.push(name);
+                }
+            }
+            if !more {
+                return Ok(out);
+            }
+            if n == 0 {
+                buf.resize((need as usize).div_ceil(8).clamp(buf.len() + 1, 1 << 20), 0);
+            }
+        }
+    }
+
+    /// Stop and delete a service.
+    fn remove(scm: &Sc, name: &str) {
+        let w = wide(name);
+        // SAFETY: valid SCM handle and name.
+        let h = unsafe { OpenServiceW(scm.0, w.as_ptr(), SERVICE_ALL_ACCESS) };
+        if h.is_null() {
+            return;
+        }
+        let svc = Sc(h);
+        // SAFETY: zeroed SERVICE_STATUS is a valid out value.
+        let mut st: SERVICE_STATUS = unsafe { std::mem::zeroed() };
+        // SAFETY: valid handle and out pointer; failing (not running) is fine.
+        unsafe { ControlService(svc.0, SERVICE_CONTROL_STOP, &mut st) };
+        // SAFETY: valid handle.
+        if unsafe { DeleteService(svc.0) } == 0 {
+            log::warn!("shares: delete {name}: {}", io::Error::last_os_error());
+        } else {
+            log::info!("shares: removed {name} (share gone)");
+        }
+    }
+
     fn start(svc: &Sc, name: &str) {
         // SAFETY: valid service handle, no arguments.
         if unsafe { StartServiceW(svc.0, 0, std::ptr::null()) } == 0 {
@@ -164,15 +242,18 @@ mod os {
         }
         let exe = exe.to_string_lossy().into_owned();
         let mut tags = Vec::new();
+        // Only remove services when every device's tag is known: one we
+        // failed to read may still be in use.
+        let mut all = true;
         for d in devices()? {
             match tag(&d) {
                 Ok(t) if valid_tag(&t) => tags.push(t),
                 Ok(t) => log::warn!("shares: skipping a device with tag {t:?}"),
-                Err(e) => log::warn!("shares: {d}: {e}"),
+                Err(e) => {
+                    all = false;
+                    log::warn!("shares: {d}: {e}");
+                }
             }
-        }
-        if tags.is_empty() {
-            return Ok(());
         }
         // SAFETY: local SCM, plain access mask.
         let scm = unsafe { OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_ALL_ACCESS) };
@@ -180,6 +261,12 @@ mod os {
             return Err(io::Error::last_os_error());
         }
         let scm = Sc(scm);
+        if all {
+            match ours(&scm) {
+                Ok(names) => stale(&names, &tags).into_iter().for_each(|n| remove(&scm, n)),
+                Err(e) => log::warn!("shares: listing services: {e}"),
+            }
+        }
         // SAFETY: plain call.
         let mut used = unsafe { GetLogicalDrives() };
         let mut todo = Vec::new();
@@ -248,6 +335,14 @@ mod tests {
         for bad in ["", "a b", "a\"b", "x -m C:", &"a".repeat(37), "é"] {
             assert!(!valid_tag(bad), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn stale_services() {
+        let names: Vec<String> = ["VroomShare_host", "VroomShare_old", "VroomShare_", "Other_old"].map(String::from).into();
+        assert_eq!(stale(&names, &["host".into()]), ["VroomShare_old", "VroomShare_"]);
+        assert_eq!(stale(&names, &["host".into(), "old".into(), "".into()]), Vec::<&str>::new());
+        assert_eq!(stale(&[], &[]), Vec::<&str>::new());
     }
 
     #[test]
