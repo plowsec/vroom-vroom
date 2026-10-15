@@ -164,7 +164,9 @@ controls: agent protocol, the viewer protocol (both directions), network frames,
 guest memory, virtio-gpu 2D commands, virtio-fs (FUSE) requests, virtio-snd control
 and PCM transfers, the virtio-pci transport and PCI
 config space, xHCI, NVMe, TPM TIS, fw_cfg (DMA included) and flash, each
-driven by arbitrary register writes plus guest RAM; and qcow2 images. Run with
+driven by arbitrary register writes plus guest RAM; and qcow2 images,
+both parsing and a differential target (random writes, discards, zero
+writes, reopens and compactions checked byte for byte against a model). Run with
 `cargo +nightly fuzz run -O <target>`. First runs found two qcow2 bugs
 (a crash on short v3 headers, multi-GB allocations from crafted table
 sizes); both fixed.

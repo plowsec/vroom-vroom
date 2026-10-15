@@ -111,3 +111,9 @@ name = "display_proto"
 path = "fuzz_targets/display_proto.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "qcow2_ops"
+path = "fuzz_targets/qcow2_ops.rs"
+test = false
+doc = false
