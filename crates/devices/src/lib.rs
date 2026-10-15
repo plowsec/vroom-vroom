@@ -7,7 +7,9 @@
 
 mod bus;
 mod irq;
+pub mod audio;
 pub mod fw_cfg;
+pub mod hda;
 pub mod nvme;
 pub mod pci;
 pub mod pflash;
