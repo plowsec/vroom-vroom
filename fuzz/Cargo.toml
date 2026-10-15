@@ -85,3 +85,9 @@ name = "pci_virtio"
 path = "fuzz_targets/pci_virtio.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "nat_dhcp_frag"
+path = "fuzz_targets/nat_dhcp_frag.rs"
+test = false
+doc = false

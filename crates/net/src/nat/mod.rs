@@ -12,6 +12,22 @@ mod dhcp;
 mod fragment;
 mod ping;
 
+/// Pure guest-input parsers, exposed for the fuzz targets only.
+#[doc(hidden)]
+pub mod fuzzing {
+    pub use super::dhcp::{handle as dhcp, Lease};
+
+    #[derive(Default)]
+    #[allow(missing_debug_implementations)]
+    pub struct Reassembly(super::fragment::Reassembly);
+
+    impl Reassembly {
+        pub fn push(&mut self, frame: &[u8]) -> Option<Vec<u8>> {
+            self.0.push(frame)
+        }
+    }
+}
+
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4};
