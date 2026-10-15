@@ -61,8 +61,14 @@ Each vCPU thread owns its hypervisor handle and reacts to commands
 device bus; PSCI is handled in the VMM (HVF) or the kernel (KVM). WFI is
 emulated with short sleeps bounded by the guest timer deadline.
 
-Pausing is synchronous: every vCPU acknowledges, and device workers park
-before anything reads guest memory. That's what makes snapshots consistent.
+Pausing is synchronous: every vCPU acknowledges, device workers park and
+disk I/O threads finish their requests before anything reads guest
+memory. That's what makes snapshots consistent.
+
+Disks (virtio-blk, NVMe): a lone small request runs on the vCPU that
+submitted it; when the guest keeps several in flight they go to a few
+I/O threads per disk, and data moves between the image and guest RAM
+without a bounce buffer. See [PERFORMANCE.md](PERFORMANCE.md).
 
 ## Snapshots and suspend
 

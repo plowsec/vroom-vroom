@@ -99,5 +99,6 @@ gpu = "virtio2d"
 - [NETWORKING.md](docs/NETWORKING.md): NAT, bridged, host-only
 - [SECURITY.md](docs/SECURITY.md): what is isolated and how, known gaps
 - [ARCHITECTURE.md](docs/ARCHITECTURE.md): how the code is laid out
+- [PERFORMANCE.md](docs/PERFORMANCE.md): numbers against QEMU, how to measure
 
 Apache-2.0.
