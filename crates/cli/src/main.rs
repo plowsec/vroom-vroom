@@ -54,7 +54,11 @@ enum Cmd {
     Disk(disk::DiskCmd),
     /// Audio helper started by the VMM (internal).
     #[command(hide = true)]
-    AudioOut,
+    AudioOut {
+        /// The VM may record from the microphone (`[audio] input`).
+        #[arg(long)]
+        input: bool,
+    },
     /// Create a VM: write <name>.toml and its disk.
     New(new::NewArgs),
     /// Bring a VM over from VMware (copies its disks, VMware's copy stays).
@@ -90,7 +94,7 @@ fn main() -> ExitCode {
         Cmd::Snapshot(s) => snap::run(s, load, default_state_dir),
         Cmd::New(a) => new::run(a, load),
         Cmd::Import(a) => import::run(a),
-        Cmd::AudioOut => audio_out(),
+        Cmd::AudioOut { input } => audio_out(input),
         Cmd::Check { config } => load(&config).and_then(|c| {
             print!("{}", c.to_toml().map_err(|e| e.to_string())?);
             for w in c.warnings() {
@@ -117,11 +121,12 @@ fn load(p: &Path) -> Result<VmConfig, String> {
 }
 
 /// The VMM hands us a datagram socket as stdin.
-fn audio_out() -> Result<(), String> {
+fn audio_out(input: bool) -> Result<(), String> {
     use std::os::fd::FromRawFd;
     // SAFETY: fd 0 is the socket our parent set up for us; nobody else
     // in this process uses stdin.
     let sock = unsafe { std::os::unix::net::UnixDatagram::from_raw_fd(0) };
-    let wav = std::env::var_os("VROOM_AUDIO_WAV").map(std::path::PathBuf::from);
-    vroom_audio::helper_main(sock, wav).map_err(|e| e.to_string())
+    let path = |v: &str| std::env::var_os(v).map(PathBuf::from);
+    let opts = vroom_audio::HelperOpts { wav_out: path("VROOM_AUDIO_WAV"), wav_in: path("VROOM_AUDIO_WAV_IN"), input };
+    vroom_audio::helper_main(sock, opts).map_err(|e| e.to_string())
 }

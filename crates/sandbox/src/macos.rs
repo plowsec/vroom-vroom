@@ -84,9 +84,10 @@ pub fn profile(p: &Policy) -> Result<String> {
 /// system libraries, read/write `rw_dir`, nothing else (no network, no
 /// home directory, no further exec).
 /// Profile for the audio helper: CoreAudio's client side and nothing
-/// else (no files beyond the system, no network, no exec). `wav_dir`: a
-/// test mode writing WAV files instead of playing.
-pub fn audio_profile(exe: &Path, wav_dir: Option<&Path>) -> Result<String> {
+/// else (no files beyond the system, no network, no exec). The
+/// microphone only if `input` (`[audio] input`). `wav_dir`: a test mode
+/// writing (and reading) WAV files instead of using the devices.
+pub fn audio_profile(exe: &Path, wav_dir: Option<&Path>, input: bool) -> Result<String> {
     let exe_real = exe.canonicalize().unwrap_or_else(|_| exe.to_path_buf());
     let mut s = format!(
         r#"(version 1)
@@ -107,6 +108,9 @@ pub fn audio_profile(exe: &Path, wav_dir: Option<&Path>) -> Result<String> {
 "#,
         exe = q(&exe_real)?,
     );
+    if input {
+        s += "(allow device-microphone)\n";
+    }
     if let Some(d) = wav_dir {
         s += &format!("(allow file-read* file-write* (subpath {}))\n", q(d)?);
     }

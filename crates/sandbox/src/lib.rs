@@ -60,10 +60,11 @@ pub fn profile_text(p: &Policy) -> Result<String> {
     macos::profile(p)
 }
 
-/// Seatbelt profile for the audio helper (macOS).
+/// Seatbelt profile for the audio helper (macOS). The microphone only
+/// with `input`.
 #[cfg(target_os = "macos")]
-pub fn audio_profile(exe: &std::path::Path, wav_dir: Option<&std::path::Path>) -> Result<String> {
-    macos::audio_profile(exe, wav_dir)
+pub fn audio_profile(exe: &std::path::Path, wav_dir: Option<&std::path::Path>, input: bool) -> Result<String> {
+    macos::audio_profile(exe, wav_dir, input)
 }
 
 /// Seatbelt profile for a helper process (macOS); run it with
