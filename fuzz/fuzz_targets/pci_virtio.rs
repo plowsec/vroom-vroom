@@ -5,7 +5,7 @@
 use std::sync::{Arc, Mutex};
 
 use vroom_devices::pci::{IntxRouter, MsiSender, PciRoot, SharedPciDevice};
-use vroom_devices::{BusDevice, NoIrq};
+use vroom_devices::{BusDevice, ConcurrentBusDevice, NoIrq};
 use vroom_memory::{GuestAddress, GuestMemory};
 use vroom_virtio::devices::rng::Rng;
 use vroom_virtio::pci::VirtioPci;
