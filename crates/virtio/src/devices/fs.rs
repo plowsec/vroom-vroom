@@ -584,6 +584,9 @@ impl FuseServer {
             _ => {}
         }
         let res = if op != INIT && !self.inited { Err(EIO) } else { self.op(op, node, &mut body, uid, gid, room) };
+        if let Err(e) = res {
+            log::trace!("fs: op {op} node {node}: errno {e}");
+        }
         // virtiofs.exe turns EROFS into "unexpected error"; EACCES is
         // "access denied", which is what Explorer should say.
         let res = match res {
@@ -904,11 +907,14 @@ impl FuseServer {
 }
 
 /// Windows only has a read-only attribute, and virtiofs.exe sends 0664
-/// (or 0444) for it, directories included. Apply just that: read-only
-/// clears every write bit, writable gives the owner one back. Type and
-/// execute bits stay.
+/// (or 0444) for it, directories included. Apply just that to files:
+/// read-only clears every write bit, writable gives the owner one back.
+/// Type and execute bits stay. Directories keep their mode: Windows
+/// ignores read-only on them (robocopy copies it from a read-only share).
 fn windows_mode(cur: u32, req: u32) -> u32 {
-    let m = if req & 0o222 == 0 {
+    let m = if cur & S_IFMT == 0o040000 {
+        cur
+    } else if req & 0o222 == 0 {
         cur & !0o222
     } else if cur & 0o200 == 0 {
         cur | 0o200

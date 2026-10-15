@@ -386,6 +386,10 @@ fn windows_mode_is_the_read_only_bit() {
     // directory must stay a usable directory.
     assert_eq!(t.setattr(sub, FATTR_MODE, 0o664).0, 0);
     assert_eq!(mode_of(&t.root.join("sub")), before);
+    // Read-only means nothing on a Windows directory (robocopy sets it
+    // when it copies one from a read-only share).
+    assert_eq!(t.setattr(sub, FATTR_MODE, 0o40555).0, 0);
+    assert_eq!(mode_of(&t.root.join("sub")), before);
     let f = t.lookup(sub, "hello.txt").unwrap();
     std::fs::set_permissions(t.root.join("sub/hello.txt"), std::fs::Permissions::from_mode(0o755)).unwrap();
     // Read-only attribute: write bits go, x stays.
