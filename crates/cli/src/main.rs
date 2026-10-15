@@ -66,6 +66,9 @@ fn main() -> ExitCode {
     let r = match Cli::parse().cmd {
         Cmd::Run { config, restore, fresh, state_dir, host_clipboard_file, no_sandbox, ui_fd } => {
             load(&config).and_then(|cfg| {
+                for w in cfg.warnings() {
+                    eprintln!("bulwark: warning: {w}");
+                }
                 let state_dir = state_dir.unwrap_or_else(|| default_state_dir(&config, &cfg));
                 // Absolute before the sandbox: no cwd lookups after that.
                 let state_dir = std::path::absolute(&state_dir).unwrap_or(state_dir);
@@ -86,6 +89,9 @@ fn main() -> ExitCode {
         Cmd::AudioOut => audio_out(),
         Cmd::Check { config } => load(&config).and_then(|c| {
             print!("{}", c.to_toml().map_err(|e| e.to_string())?);
+            for w in c.warnings() {
+                eprintln!("warning: {w}");
+            }
             Ok(())
         }),
     };

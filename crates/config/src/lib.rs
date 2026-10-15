@@ -412,6 +412,50 @@ impl VmConfig {
         toml::to_string_pretty(self).map_err(|e| Error::Parse(e.to_string()))
     }
 
+    /// Valid but risky choices, in plain words (shown by `check` and at
+    /// start). Not errors: each can be what the user wants.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut w = Vec::new();
+        if !self.security.sandbox {
+            w.push("security.sandbox = false: a guest that breaks the VMM gets your user's full access".into());
+        }
+        for n in &self.nets {
+            if n.allow_host_loopback {
+                w.push("net.allow_host_loopback: the guest can reach services listening on this Mac's 127.0.0.1".into());
+            }
+            for f in &n.port_forwards {
+                if f.host_addr != "127.0.0.1" && f.host_addr != "::1" {
+                    w.push(format!(
+                        "port forward {}:{} -> guest {}: reachable from other machines, not only this one",
+                        f.host_addr, f.host_port, f.guest_port
+                    ));
+                }
+            }
+            if n.mode == NetKind::Bridged {
+                w.push("bridged network: the guest sits on your LAN like a physical machine".into());
+            }
+        }
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        for s in &self.shares {
+            let p = std::fs::canonicalize(&s.path).unwrap_or_else(|_| s.path.clone());
+            let broad = p.parent().is_none() || home.as_deref().is_some_and(|h| h.starts_with(&p));
+            if broad {
+                w.push(format!("share {:?} ({}) exposes your whole home folder or more", s.tag, p.display()));
+            }
+            if !s.readonly {
+                w.push(format!("share {:?} is writable: the guest can change or delete files in {}", s.tag, p.display()));
+            }
+        }
+        if self.clipboard.guest_to_host && self.clipboard.host_to_guest {
+            // The default, and gated on window focus: worth a mention only
+            // together with a disabled sandbox.
+            if !self.security.sandbox {
+                w.push("clipboard both ways with no sandbox".into());
+            }
+        }
+        w
+    }
+
     pub fn validate(&self) -> Result<()> {
         let bad = |m: String| Err(Error::Invalid(m));
         if !valid_name(&self.name) {
@@ -525,6 +569,35 @@ pub fn format_mac(m: &[u8; 6]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn risky_choices_are_named() {
+        let c = super::VmConfig::from_toml(
+            r#"
+name = "w"
+[boot]
+type = "uefi"
+vars = "w.state/efivars.fd"
+[[net]]
+mode = "nat"
+allow_host_loopback = true
+port_forwards = [{ host_port = 2222, guest_port = 22, host_addr = "0.0.0.0" }]
+[[share]]
+path = "/"
+tag = "root"
+readonly = false
+[security]
+sandbox = false
+"#,
+        )
+        .unwrap();
+        let w = c.warnings().join("\n");
+        for needle in ["sandbox", "127.0.0.1", "0.0.0.0:2222", "whole home folder", "writable"] {
+            assert!(w.contains(needle), "{needle} missing in {w}");
+        }
+        let quiet = super::VmConfig::from_toml("name = \"q\"\n[boot]\ntype = \"uefi\"\nvars = \"v.fd\"\n").unwrap();
+        assert!(quiet.warnings().is_empty());
+    }
+
     use super::*;
 
     const SAMPLE: &str = r#"
