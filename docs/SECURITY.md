@@ -56,6 +56,14 @@ refused by the NAT code only.
 
 `--no-sandbox` exists for debugging and prints a warning.
 
+Check it on your machine: `BULWARK_SANDBOX_SELFTEST=1 bulwark run vm.toml`
+makes the VMM, once locked down, try to read `/etc/passwd` and
+`~/.ssh`, exec a program, open a listener, reach host loopback
+(`BULWARK_SELFTEST_LOOPBACK_PORT=<a port you listen on>`), connect to
+`$SSH_AUTH_SOCK` and reach the internet, and print what happened. On
+Linux the Unix-socket probe ends the process (seccomp kills it): that is
+the expected result.
+
 ## Clipboard
 
 Text only, size capped, and sync happens only while the VM window has focus.
@@ -163,6 +171,10 @@ running VM's images, even with `-U`.
 
 ## Known gaps
 
+- No UEFI Secure Boot: Homebrew's aarch64 EDK2 isn't built with it, and
+  without a protected (secure-world) variable store a guest kernel could
+  rewrite the keys anyway. Windows 11 is installed with that check
+  bypassed.
 - The Windows agent split is new; installs from before it run the
   all-in-one agent elevated (re-run `bulwark-setup.cmd` to upgrade).
 - x86_64 isn't implemented, so none of this is tested there.
