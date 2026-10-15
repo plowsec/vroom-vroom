@@ -514,10 +514,9 @@ impl VmdkImage {
                 }
                 let mut b = Vec::new();
                 (&file).take(MAX_DESCRIPTOR).read_to_end(&mut b)?;
-                if b.contains(&0) {
-                    return Err(bad(format!("{name}: not a VMDK file")));
-                }
-                (parse_descriptor(&String::from_utf8_lossy(&b), &name)?, None)
+                // qemu pads descriptors to a sector with NULs.
+                let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+                (parse_descriptor(&String::from_utf8_lossy(&b[..end]), &name)?, None)
             }
         };
         let create_type = desc.create_type.clone().ok_or_else(|| bad(format!("{name}: not a VMDK descriptor (no createType)")))?;
@@ -1203,5 +1202,223 @@ mod tests {
         let half = descriptor(1, None, "monolithicFlat", "RW 8 ZERO") + "parentFileNameHint=\"base.vmdk\"\n";
         std::fs::write(dir.join("h.vmdk"), half).unwrap();
         assert!(err(&dir.join("h.vmdk")).contains("no parentCID"));
+    }
+
+    // Cross-checks against other tools (slow, GiBs of reads):
+    //   cargo test -p vroom-block -- --ignored vmdk --nocapture
+    // Needs qemu-img and qemu-io (brew install qemu). Disks made by VMware
+    // Fusion's vmware-vdiskmanager are checked too when it is installed.
+    // VMDK_CHECK_DIR=<dir> also compares every VMware disk below <dir>
+    // (read-only) with what qemu-io reads.
+
+    const VDISKMANAGER: &str = "/Applications/VMware Fusion.app/Contents/Library/vmware-vdiskmanager";
+    const OVFTOOL: &str = "/Applications/VMware Fusion.app/Contents/Library/VMware OVF Tool/ovftool";
+
+    fn run(cmd: &str, args: &[&str]) -> bool {
+        let out = std::process::Command::new(cmd).args(args).output().unwrap();
+        if !out.status.success() {
+            eprintln!("{cmd} {args:?} failed: {}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        }
+        out.status.success()
+    }
+
+    fn same_as_raw(img: &VmdkImage, raw: &Path) {
+        let f = File::open(raw).unwrap();
+        assert_eq!(img.size(), f.metadata().unwrap().len());
+        let (mut a, mut b) = (vec![0u8; 4 << 20], vec![0u8; 4 << 20]);
+        let mut off = 0;
+        while off < img.size() {
+            let n = ((img.size() - off) as usize).min(a.len());
+            img.read_at(&mut a[..n], off).unwrap();
+            f.read_exact_at(&mut b[..n], off).unwrap();
+            if a[..n] != b[..n] {
+                let i = (0..n).find(|&i| a[i] != b[i]).unwrap_or(0);
+                panic!("{}: differs at {:#x}", img.path.display(), off + i as u64);
+            }
+            off += n as u64;
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn vmdk_matches_qemu_img_and_vdiskmanager() {
+        let td = tempfile::tempdir().unwrap();
+        let raw = td.path().join("src.raw");
+        // Several extents in the split formats (qemu cuts at 2 GiB, VMware
+        // at ~4 GiB), a partial last grain.
+        let size: u64 = (4 << 30) + (5 << 20) + 7 * 512;
+        {
+            let f = File::create(&raw).unwrap();
+            f.set_len(size).unwrap();
+            for (i, (off, len)) in [(0, 1 << 20), ((2 << 30) - 300_000, 600_000), (123 << 20, 4096), (1 << 30, 65536 + 17), ((4 << 30) - 4096, 8192), (size - 100_000, 100_000)].into_iter().enumerate() {
+                f.write_all_at(&pattern(i as u64 + 1, len as usize), off).unwrap();
+            }
+        }
+        let raw_s = raw.to_str().unwrap();
+        for sub in ["monolithicSparse", "monolithicFlat", "twoGbMaxExtentSparse", "twoGbMaxExtentFlat", "streamOptimized"] {
+            let dir = td.path().join(sub);
+            std::fs::create_dir(&dir).unwrap();
+            let out = dir.join("disk.vmdk");
+            assert!(run("qemu-img", &["convert", "-f", "raw", "-O", "vmdk", "-o", &format!("subformat={sub}"), raw_s, out.to_str().unwrap()]));
+            let img = VmdkImage::open(&out).unwrap();
+            same_as_raw(&img, &raw);
+            eprintln!("qemu-img {sub}: same bytes ({} files)", img.files().len());
+        }
+
+        // A delta with data and zeroed grains, written by qemu.
+        let dir = td.path().join("monolithicSparse");
+        let delta = dir.join("delta.vmdk");
+        let d = delta.to_str().unwrap();
+        assert!(run("qemu-img", &["create", "-f", "vmdk", "-o", "zeroed_grain=on", "-b", "disk.vmdk", "-F", "vmdk", d]));
+        assert!(run("qemu-io", &["-f", "vmdk", "-c", "write -P 0x5a 65536 131072", "-c", "write -z 0 65536", "-c", "write -P 0x11 1073741000 9000", d]));
+        let delta_raw = td.path().join("delta.raw");
+        assert!(run("qemu-img", &["convert", "-f", "vmdk", "-O", "raw", d, delta_raw.to_str().unwrap()]));
+        let img = VmdkImage::open(&delta).unwrap();
+        assert_eq!(img.files().len(), 2);
+        same_as_raw(&img, &delta_raw);
+        eprintln!("qemu-img delta over monolithicSparse: same bytes");
+
+        let src = dir.join("disk.vmdk");
+        // An OVA export: streamOptimized with the grain directory at the end.
+        if Path::new(OVFTOOL).exists() {
+            let dir = td.path().join("ova");
+            std::fs::create_dir(&dir).unwrap();
+            let vmx = dir.join("t.vmx");
+            let conf = format!("config.version = \"8\"\nvirtualHW.version = \"21\"\nguestOS = \"other-64\"\nmemsize = \"256\"\nscsi0.present = \"TRUE\"\nscsi0.virtualDev = \"lsilogic\"\nscsi0:0.present = \"TRUE\"\nscsi0:0.fileName = \"{}\"\n", src.display());
+            std::fs::write(&vmx, conf).unwrap();
+            let ova = dir.join("t.ova");
+            assert!(run(OVFTOOL, &["--acceptAllEulas", vmx.to_str().unwrap(), ova.to_str().unwrap()]));
+            assert!(run("tar", &["-xf", ova.to_str().unwrap(), "-C", dir.to_str().unwrap()]));
+            let img = VmdkImage::open(&dir.join("t-disk1.vmdk")).unwrap();
+            assert!(matches!(&img.extents[0].kind, Kind::Sparse(sp) if sp.compressed));
+            same_as_raw(&img, &raw);
+            eprintln!("ovftool OVA export ({}): same bytes", img.create_type);
+        } else {
+            eprintln!("no ovftool, skipped");
+        }
+
+        if !Path::new(VDISKMANAGER).exists() {
+            eprintln!("no vmware-vdiskmanager, skipped");
+            return;
+        }
+        for t in 0..=6 {
+            let dir = td.path().join(format!("vdm{t}"));
+            std::fs::create_dir(&dir).unwrap();
+            let out = dir.join("disk.vmdk");
+            if !run(VDISKMANAGER, &["-r", src.to_str().unwrap(), "-t", &t.to_string(), out.to_str().unwrap()]) {
+                eprintln!("vmware-vdiskmanager -t {t}: refused");
+                continue;
+            }
+            match VmdkImage::open(&out) {
+                Ok(img) => {
+                    same_as_raw(&img, &raw);
+                    eprintln!("vmware-vdiskmanager -t {t} ({}): same bytes ({} files)", img.create_type, img.files().len());
+                }
+                Err(e) => eprintln!("vmware-vdiskmanager -t {t}: not opened: {e}"),
+            }
+            // Preallocated ones are big.
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// Reads through qemu-io, which dumps them as hex; parsed here, never
+    /// printed (the disks may hold private data).
+    fn qemu_io_reads(path: &Path, reads: &[(u64, usize)]) -> Vec<Vec<u8>> {
+        let mut args = vec!["-r".to_string(), "-U".into(), "-f".into(), "vmdk".into()];
+        for (off, len) in reads {
+            args.push("-c".into());
+            args.push(format!("read -v {off} {len}"));
+        }
+        args.push(path.to_str().unwrap().into());
+        let out = std::process::Command::new("qemu-io").args(&args).output().unwrap();
+        assert!(out.status.success(), "qemu-io failed on {}: {}", path.display(), String::from_utf8_lossy(&out.stderr));
+        let text = String::from_utf8(out.stdout).unwrap();
+        let mut res = Vec::new();
+        let mut cur = Vec::new();
+        for line in text.lines() {
+            if line.starts_with("read ") {
+                res.push(std::mem::take(&mut cur));
+            } else if let Some((_, rest)) = line.split_once(":  ") {
+                let want = reads[res.len()].1;
+                let n = (want - cur.len()).min(16);
+                for i in 0..n {
+                    cur.push(u8::from_str_radix(&rest[3 * i..3 * i + 2], 16).unwrap());
+                }
+            }
+        }
+        assert_eq!(res.len(), reads.len(), "{}: qemu-io output", path.display());
+        res
+    }
+
+    #[test]
+    #[ignore]
+    fn vmdk_matches_qemu_io_on_real_disks() {
+        let Some(root) = std::env::var_os("VMDK_CHECK_DIR") else {
+            eprintln!("VMDK_CHECK_DIR not set, skipped");
+            return;
+        };
+        let mut descs = Vec::new();
+        let mut dirs = vec![PathBuf::from(root)];
+        while let Some(d) = dirs.pop() {
+            for e in std::fs::read_dir(&d).unwrap() {
+                let p = e.unwrap().path();
+                let name = p.file_name().unwrap().to_string_lossy().to_string();
+                if p.is_dir() {
+                    dirs.push(p);
+                } else if name.to_ascii_lowercase().ends_with(".vmdk") && p.metadata().unwrap().len() < MAX_DESCRIPTOR {
+                    // Skip split extents (-s001.vmdk), they aren't disks.
+                    let stem = name[..name.len() - 5].to_string();
+                    let extent = stem.rsplit_once("-s").is_some_and(|(_, n)| n.len() == 3 && n.bytes().all(|b| b.is_ascii_digit()));
+                    if !extent {
+                        descs.push(p);
+                    }
+                }
+            }
+        }
+        descs.sort();
+        let mut bad_disks = 0;
+        for p in &descs {
+            let img = match VmdkImage::open(p) {
+                Ok(i) => i,
+                Err(e) => {
+                    eprintln!("{}: not opened: {e}", p.display());
+                    bad_disks += 1;
+                    continue;
+                }
+            };
+            let size = img.size();
+            let mut reads = vec![(0, 1 << 20), (size - (1 << 20), 1 << 20)];
+            let mut x = 0x1234_5678_9abc_def1u64 ^ size;
+            for i in 0..200 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let mut off = x % (size - 65536);
+                if i % 2 == 0 {
+                    off &= !65535;
+                }
+                reads.push((off, 65536));
+            }
+            // Our shared flock keeps qemu out on macOS (even with -U).
+            drop(img);
+            let theirs = qemu_io_reads(p, &reads);
+            let img = VmdkImage::open(p).unwrap();
+            let mut ok = true;
+            for ((off, len), t) in reads.iter().zip(&theirs) {
+                let mut mine = vec![0u8; *len];
+                img.read_at(&mut mine, *off).unwrap();
+                if &mine != t {
+                    eprintln!("{}: MISMATCH at {off:#x}+{len:#x}", p.display());
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                eprintln!("{}: match ({}, {} GiB, chain of {} files)", p.display(), img.create_type, size >> 30, img.files().len());
+            } else {
+                bad_disks += 1;
+            }
+        }
+        assert_eq!(bad_disks, 0);
     }
 }
