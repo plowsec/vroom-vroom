@@ -1,6 +1,6 @@
 [package]
 name = "vroom-block"
-description = "Disk images: raw and qcow2 (with backing files for snapshots)."
+description = "Disk images: raw and qcow2 (with backing files for snapshots), read-only VMDK."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

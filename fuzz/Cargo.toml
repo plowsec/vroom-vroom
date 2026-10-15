@@ -117,3 +117,9 @@ name = "qcow2_ops"
 path = "fuzz_targets/qcow2_ops.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "vmdk"
+path = "fuzz_targets/vmdk.rs"
+test = false
+doc = false
