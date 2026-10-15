@@ -17,6 +17,7 @@ vroom-memory = { path = "../crates/memory" }
 vroom-block = { path = "../crates/block" }
 vroom-fs = { path = "../crates/fs" }
 vroom-display = { path = "../crates/display" }
+vroom-usb = { path = "../crates/usb" }
 tempfile = "3"
 
 # Not part of the main workspace (needs nightly + sanitizers).
@@ -121,5 +122,17 @@ doc = false
 [[bin]]
 name = "vmdk"
 path = "fuzz_targets/vmdk.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "hda"
+path = "fuzz_targets/hda.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "usb_proto"
+path = "fuzz_targets/usb_proto.rs"
 test = false
 doc = false

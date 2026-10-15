@@ -70,8 +70,10 @@ After the import:
 
 - Linux guests boot as they are. Remove `open-vm-tools` if you like.
 - Windows guests boot from NVMe, but need the virtio-win drivers and the
-  vroom tools for network, clipboard and resizing: attach `tools.raw` and
-  the virtio-win ISO, run `vroom-setup.cmd` as administrator. Fusion puts
+  vroom tools for network, clipboard and resizing: build the tools disk
+  with the drivers on it (`scripts/make-windows-tools.sh tools.raw
+  virtio-win.iso`; Windows can't read the ISO itself from an NVMe disk),
+  attach it and run `vroom-setup.cmd` as administrator. Fusion puts
   Windows on NVMe; a Windows installed on a SATA disk may not boot from
   NVMe (INACCESSIBLE_BOOT_DEVICE). That case isn't handled yet.
 - Until the tools are in, Windows' clock is off by your time zone (it
@@ -172,31 +174,108 @@ mode = "nat"
 
 The agent is a Windows service (`VroomAgent`, clock sync and clean
 shutdown via `Ctrl+Alt+Shift+D`) plus an unprivileged helper started at
-each logon (clipboard, window resizes). The status line says when it
+each logon (clipboard, window resizes, UI scale). The status line says when it
 connects. Upgrading an older install: run the new `vroom-setup.cmd` as
 administrator.
 
 Until the agent runs, Windows may show two monitors (firmware framebuffer
 and virtio-gpu). The window shows whichever one Windows last drew on.
 
+## Retina screens
+
+With `[display] hidpi = true` (the default; "Full resolution on Retina"
+in the Display settings) a window on a Retina screen gives the guest its
+real pixels, 2560x1600 for a window that looks 1280x800, and the guest
+agent sets the guest's UI scale to 200% so things keep their size. The
+picture is shown 1:1, without the blur of scaling it up. It can be
+switched while the VM runs.
+
+- Needs the current guest agent. Older agents, or a guest without one,
+  get the old behavior: half the pixels, scaled up.
+- Linux: GNOME (X11 and Wayland). Other desktops don't get the scale yet:
+  set it in the guest yourself, or turn `hidpi` off.
+- Windows: the scale changes right away, without logging off. The shell
+  and most apps redraw sharp; a few older apps look blurry until they are
+  restarted.
+- Windows' display driver (viogpudo) has a 16 MiB framebuffer: modes up
+  to about 4 million pixels (2560x1600). A bigger window gets the largest
+  mode of the same shape that fits, scaled up a little.
+- Turning `hidpi` off puts the guest's own scale back.
+
 ## 3D acceleration (Linux guests)
 
 ```bash
-brew install meson ninja libepoxy molten-vk
-scripts/build-virglrenderer.sh
+brew install meson ninja molten-vk
+scripts/build-angle.sh            # OpenGL: ANGLE on Metal (about 10 minutes)
+scripts/build-virglrenderer.sh    # virglrenderer, for Vulkan and OpenGL
 ```
 
-Set `[display] gpu = "virtio3d"`. In the guest: `mesa-vulkan-drivers`
-(Mesa ≥ 24), the user in the `render` group, and on macOS hosts a kernel
-with **16 KiB pages** (HVF maps guest memory at 16 KiB granularity).
-Ubuntu ships no such kernel; build one from Ubuntu's config with
-`CONFIG_ARM64_16K_PAGES=y` (see `examples/ubuntu/kernel-16k.sh`).
-`vulkaninfo --summary` should show `Virtio-GPU Venus (Apple M…)`.
+Set `[display] gpu = "virtio3d"`. The guest gets two drivers, and Mesa
+picks the right one by itself:
 
-OpenGL on top of it (Mesa's Zink) doesn't work yet: Zink needs Vulkan's
-`nullDescriptor` (robustness2), which MoltenVK can't offer on Metal, so GL
-apps fall back to llvmpipe. Windows guests are not covered: Windows has no
-Venus driver.
+- **OpenGL** (virgl): Mesa's virgl driver sends GL work to the host,
+  where virglrenderer replays it on OpenGL ES, which ANGLE turns into
+  Metal. Stock Ubuntu works as it is (any kernel, Mesa from the archive).
+  `glxinfo -B` shows `virgl (ANGLE (Apple, ANGLE Metal Renderer: Apple M…))`
+  and GNOME draws with the Mac's GPU.
+- **Vulkan** (Venus): needs `mesa-vulkan-drivers` (Mesa ≥ 24), the user
+  in the `render` group, and on macOS hosts a kernel with **16 KiB pages**
+  (HVF maps guest memory at 16 KiB granularity). Ubuntu ships no such
+  kernel; build one from Ubuntu's config with `CONFIG_ARM64_16K_PAGES=y`
+  (see `examples/ubuntu/kernel-16k.sh`). `vulkaninfo --summary` should
+  show `Virtio-GPU Venus (Apple M…)`. There is no swapchain
+  (`VK_KHR_swapchain` is missing, with or without OpenGL): Vulkan apps
+  can compute and render off screen, not show a window.
+
+What OpenGL apps get: OpenGL 2.1 and OpenGL ES 3.0. ANGLE's Metal
+backend stops at ES 3.0, and virgl can't offer more than its host has.
+That covers desktops and apps written for GL 2 or GLES; apps that need
+GL 3.3 core (Blender, recent games) won't start. `LIBGL_ALWAYS_SOFTWARE=1`
+runs one app on llvmpipe instead, which has GL 4.5.
+
+`[display] opengl = false` keeps Vulkan only (the guest's GL then runs on
+llvmpipe). That keeps less host code in reach of the guest, and keeps
+suspend working (see below).
+
+Speed, Ubuntu 24.04 GNOME (Wayland), 1280×800, 6 vCPUs, M3 Max,
+glmark2 2023.01 at its default 800×600 window:
+
+| | `virtio2d` (llvmpipe) | `virtio3d` (virgl on Metal) |
+|---|---|---|
+| glmark2 score | 463, 478 | 806 to 925 (four runs) |
+| glmark2 terrain | 16 to 22 fps | 520 to 530 fps |
+| glmark2 refract | 42 to 47 fps | 770 to 850 fps |
+| glxgears (vsync off) | about 2,700 fps | 400 to 1,600 fps |
+| guest CPU busy during terrain | 59% | 3% |
+
+Numbers move with the host's load (these were taken next to other VMs).
+glxgears is the one test llvmpipe wins: its frames are tiny, and with
+virgl each one makes a round trip to the host GPU, and the window shows
+a copy of the guest's screen read back from it. Anything with real work
+is many times faster, and the guest's CPUs stay free.
+
+Why virgl and not OpenGL on top of Vulkan (Zink): Zink needs Vulkan's
+`nullDescriptor` (robustness2), which MoltenVK can't offer on Metal.
+Faking it on the host would mean rewriting descriptor sets in
+virglrenderer's Venus decoder. virgl on ANGLE is the route UTM takes on
+macOS, and it works with any guest kernel.
+
+Snapshots and suspend: GPU state lives on the host GPU and can't be
+saved, so snapshots and suspend are refused while 3D contexts exist.
+With OpenGL on, the GNOME desktop itself is one, so in practice: shut the
+guest down instead of suspending it. Closing the window then leaves the
+VM paused with "suspend failed"; resume it and shut down from the guest,
+or power it off. With `opengl = false` this only happens while a Vulkan
+app runs. Windows guests are not covered: Windows has no virgl or Venus
+driver.
+
+The build: `build-angle.sh` fetches ANGLE at the commit Chrome's stable
+release uses, with Google's depot_tools, about 3 GB while it builds
+(removed afterwards), and leaves `libEGL.dylib` and `libGLESv2.dylib`
+(6 MB) in `target/angle`. `build-virglrenderer.sh` builds libepoxy 1.5.10
+(EGL on, patched to load ANGLE from its own directory) into
+virglrenderer (3.4 MB). Both copy their results next to `target/*/vroom`,
+where the VMM looks; ship the three dylibs with the binary.
 
 ## Shared folders
 
@@ -211,18 +290,167 @@ Linux guest: `sudo mount -t virtiofs host /mnt` (or in `/etc/fstab`:
 `host /mnt virtiofs defaults 0 0`). Files show up owned by whoever looks
 at them; the guest can't create symlinks, hard links or device nodes in
 the share, and symlinks already there are shown but never followed on the
-host. Windows guests need virtio-win's virtiofs service and WinFsp (not
-tested yet).
+host.
+
+### Windows guests
+
+Each share becomes a drive letter: the first gets Z:, the next Y:, and so
+on. It takes three pieces, all set up by `vroom-setup.cmd` (run it as
+administrator, again after adding your first share is fine):
+
+- the viofs driver from virtio-win;
+- [WinFsp](https://winfsp.dev), a file system library virtio-win's
+  `virtiofs.exe` runs on. It isn't ours to ship (GPLv3), so setup takes
+  `winfsp-2.1.25156.msi` from next to the script if it's there, or
+  downloads that version from WinFsp's GitHub releases. Either way it
+  checks the SHA-256 before installing. No internet in the guest: put the
+  MSI on the tools disk (`WINFSP_MSI=path/to.msi
+  scripts/make-windows-tools.sh tools.raw virtio-win.iso`);
+- one service per share, `VroomShare_<tag>`, running
+  `virtiofs.exe -t <tag> -m Z:`. The agent service checks at every boot
+  and adds services for new shares, so shares added later show up after
+  a reboot.
+
+The drivers come from the tools disk: build it with the virtio-win ISO
+(`scripts/make-windows-tools.sh tools.raw virtio-win.iso`); Windows can't
+read the ISO itself from an NVMe disk.
+
+A folder instead of a drive letter (the folder must not exist yet):
+
+```bat
+sc config VroomShare_host binPath= "\"C:\Program Files\Vroom\virtiofs.exe\" -t host -m C:\Shares\host"
+sc stop VroomShare_host & sc start VroomShare_host
+```
+
+Setup only adds services, it never changes yours. A share you removed
+from the config leaves its service behind, failing to start; delete it
+with `sc delete VroomShare_<tag>`.
+
+What to expect:
+
+- Read-only shares refuse changes with "Access denied". Their files look
+  read-only to Windows, so copies of them come out read-only, like files
+  copied from a CD.
+- Whether case matters is up to the host: on a Mac `README.txt` and
+  `readme.txt` are one file, as Windows expects; on a Linux host, two.
+- No symlinks, junctions or hard links can be made in a share. Symlinks
+  already there show up but don't lead anywhere outside it.
+- Paths are limited to 259 characters (virtiofs.exe's limit).
+- Free space shown is the host disk's.
+- `virtiofs.exe` never tells us when it is done with a file, so a share
+  with more than about 260,000 files and folders opened makes us drop the
+  ones it doesn't have open; it looks them up again by name.
+
+## USB devices
+
+```bash
+brew install libusb          # the helper loads it at run time
+vroom usb list               # what's plugged in, with its id
+```
+
+```toml
+[[usb]]
+id = "1209:000a"
+```
+
+In the app: the "USB devices" card, "Add device" lists what's plugged in.
+The VM takes the device while it runs; unplugging and plugging it back
+in works while the VM runs, and the guest sees a new device after a
+suspend/resume or a snapshot revert (in-flight transfers can't be saved).
+
+The device goes to the guest through a helper process (`vroom usb-host`,
+one per device, in its own sandbox); the VM process itself never opens a
+host device. See [SECURITY.md](SECURITY.md#usb-devices).
+
+What works on macOS, as a normal user: devices no macOS driver holds.
+That's vendor-specific devices: many dev boards, flashing and DFU modes,
+debug probes, logic analyzers, SDR sticks, Android phones in adb or
+fastboot mode. `vroom usb list` says when a macOS driver holds a device.
+What doesn't:
+
+- Keyboards, mice, game pads and FIDO security keys (HID), disks and
+  card readers (mass storage), sound cards, webcams, USB Ethernet,
+  iPhones, and the common USB serial chips (FTDI, CP210x, CH34x, PL2303,
+  CDC-ACM): macOS has drivers for these and keeps them. Taking a device
+  away from a macOS driver needs root, or Apple's
+  `com.apple.vm.device-access` entitlement (Apple gives it to approved VM
+  vendors only; vroom can't ship it). With either, the same code takes
+  the device: libusb's "detach kernel driver" does it.
+- Isochronous transfers (webcams, sound cards) aren't passed through
+  yet: such a device shows up in the guest but doesn't stream.
+- A device composed of several functions works for the ones macOS
+  leaves alone; the guest sees the others but they fail.
+
+Control, bulk and interrupt transfers work, at USB 1.1, 2.0 and 3.x speeds
+(SuperSpeed devices show up on a USB 3 port). No USB 3 bulk streams (UAS
+disks fall back to the older protocol).
+
+On Linux hosts the helper uses usbfs: give your user access to the device
+with a udev rule, e.g.
+`SUBSYSTEM=="usb", ATTR{idVendor}=="1209", ATTR{idProduct}=="000a", MODE="0660", TAG+="uaccess"`.
+Linux drivers bound to the device's interfaces are detached while the VM
+has it.
+
+Testing without hardware: `VROOM_USB_FAKE=acm` makes every helper serve
+a pretend USB serial port that echoes what it's sent (CDC-ACM; Linux
+guests see `/dev/ttyACM0` if they have the `cdc_acm` module, or use it
+from userspace through `/dev/bus/usb`). `VROOM_USB_FAKE_UNPLUG=<secs>`
+pulls it out once, for three seconds.
 
 ## Sound
 
-`[audio] output = true` gives Linux guests a sound card (virtio-snd; the
-`virtio_snd` module, in stock Ubuntu kernels). 44.1/48 kHz, 16-bit,
-mono/stereo. There is no input: the guest can't reach the microphone.
-Windows has no virtio-snd driver, so Windows guests stay silent.
-On Linux hosts the helper plays through ALSA (`libasound`, loaded at run
-time): use a normal (glibc) build there; a static musl build can't load it
-and stays silent.
+```toml
+[audio]
+output = true    # guest sound through the Mac's speakers
+input = true     # the Mac's microphone, for video calls (off by default)
+```
+
+The guest gets a sound card with 44.1/48 kHz, 16-bit, mono/stereo:
+
+- Windows: an Intel HD Audio card. Windows' own driver picks it up
+  (Device Manager: "High Definition Audio Controller", then "Speakers"
+  and "Microphone (High Definition Audio Device)"). Nothing to install.
+- Linux: virtio-snd (`virtio_snd` module). Ubuntu's cloud images keep
+  it in `linux-modules-extra-$(uname -r)`; desktop installs have it.
+  `device = "hda"` gives Linux the HD Audio card too (`snd_hda_intel`).
+
+`vroom check` names the microphone as a risk when it's on.
+
+### Microphone
+
+The microphone is off unless `input = true` (app: Settings, Sound,
+Microphone). When on, sound from it reaches the guest only while all of
+these hold:
+
+- the VM's window is open (closing it suspends the VM anyway; `vroom run`
+  without a window never gets the microphone),
+- the VM runs (pausing it stops the microphone),
+- the guest records (an app in it opened the input).
+
+The window shows "Microphone in use" in its toolbar, and a small "Mic"
+pill at the top while the toolbar is hidden. macOS shows its own orange
+dot in the menu bar too. Focus doesn't matter: a call keeps going while
+you work in another window, the way a native app would.
+
+The first time a guest records, macOS asks for the microphone
+permission. It asks for the app that started vroom, not vroom itself:
+Terminal (or iTerm, VS Code...) for `vroom run` and for `vroom-gui`
+started from a terminal. Saying yes lets everything started from that
+app use the microphone. If you said no, or never saw the question, the
+guest records silence and the window says so after two seconds; turn
+the app on in System Settings, Privacy & Security, Microphone (or reset
+the question with `tccutil reset Microphone com.apple.Terminal`).
+Sound input in the guest follows the Mac's default input device (System
+Settings, Sound, Input).
+
+On Linux hosts the helper plays and records through ALSA (`libasound`,
+loaded at run time, "default" device): use a normal (glibc) build there;
+a static musl build can't load it and stays silent.
+
+Testing without speakers or a microphone: `VROOM_AUDIO_WAV_DIR=dir vroom
+run ...` writes what the guest plays to `dir/audio.wav` and, with
+`input = true`, feeds `dir/mic.wav` (16-bit PCM, looped) to the guest
+instead of the microphone. The window gate still applies.
 
 ## Snapshots, suspend
 
@@ -231,7 +459,8 @@ and stays silent.
   (the disks too).
 - `Ctrl-A z` / `Ctrl+Alt+Shift+Z` / closing the GUI window: suspend; the
   next `run` resumes. `--fresh` ignores the suspend image.
-- Not possible while 3D contexts are active.
+- Not possible while 3D contexts are active. With OpenGL on, the GNOME
+  desktop is one (see 3D acceleration).
 - `vroom snapshot list vm.toml`, `vroom snapshot delete vm.toml snap-…`:
   deleting a snapshot also removes the disk layers only it used, and merges
   layers that became pass-through, so disk chains stay short.
@@ -268,7 +497,10 @@ flushes a lot). `"none"` ignores flushes: scratch disks only.
 - Windows 11 is installed with its hardware checks bypassed (no Secure
   Boot); `tpm = true` (needs `brew install swtpm`) gives it a real TPM 2.0,
   which Windows sees and uses.
-- Windows guests: no shared folders without WinFsp (untested), no sound
-  (no virtio-snd driver), no 3D (no Venus driver).
-- 3D snapshots, OpenGL on Venus (Zink, see above): not supported.
+- Windows guests: no 3D (no Venus or virgl driver). Shared folders need
+  WinFsp (see above).
+- 3D snapshots: not supported. Guest OpenGL stops at 2.1 / ES 3.0.
 - NAT connections don't survive suspend/resume (the guest reconnects).
+- USB passthrough: not yet tried with a real device (none was at hand);
+  tested with the pretend device behind the real helper and sandbox. No
+  isochronous transfers. On macOS only devices macOS has no driver for.

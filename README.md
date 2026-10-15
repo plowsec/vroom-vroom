@@ -10,16 +10,18 @@ and every virtual device treats the guest as hostile.
 
 - Ubuntu, Debian, Alpine, Windows 11 ARM64
 - Window with clipboard both ways and auto resolution
-- 3D for Linux guests (Vulkan, about 90% of native speed)
+- 3D for Linux guests: Vulkan (about 90% of native speed) and OpenGL
 - Snapshots, suspend/resume, reset
 - NAT with port forwards, several network adapters. Bridged and host-only need a root helper.
-- Shared folders and sound (Linux guests)
+- Sound in Linux and Windows guests; microphone if you turn it on
+- Shared folders (Linux and Windows guests)
 - TPM 2.0 (Windows 11 needs it)
 - Nested VMs (M3 or newer)
 - Import from VMware Fusion (ARM64 VMs)
+- USB devices from the host (those macOS has no driver for; needs libusb)
 
 Not yet: x86_64 hosts (it builds, can't run VMs yet), Secure Boot, and
-sound, 3D or shared folders in Windows guests.
+3D in Windows guests.
 
 ## Try it
 
@@ -51,6 +53,7 @@ vroom import ~/Virtual\ Machines.localized/X.vmwarevm   # from VMware Fusion
 vroom snapshot list|delete|prune dev.toml
 vroom disk create x.qcow2 --size 64G
 vroom disk compact x.qcow2        # give freed space back to the host
+vroom usb list                    # host USB devices, the id for [[usb]]
 ```
 
 | In the VM window | Keys |

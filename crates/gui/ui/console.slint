@@ -24,8 +24,12 @@ export component ConsoleWindow inherits Window {
     in property <string> toast;
     in property <bool> captured;
     in property <bool> fullscreen;
+    // The guest is recording from the host microphone.
+    in property <bool> mic-on;
     // Rust keeps the bar out for a moment after start.
     in property <bool> bar-pinned;
+    // Set when saving the VM's state failed (why, from the VMM).
+    in property <string> suspend-error;
     callback mouse-move(float, float);
     callback button(int, bool);
     callback wheel(length, length);
@@ -147,6 +151,84 @@ export component ConsoleWindow inherits Window {
         }
     }
 
+    // Microphone in use, while the toolbar is away: a small pill where it
+    // would be, so it never goes unnoticed.
+    if root.mic-on && !root.bar-out: Rectangle {
+        x: (root.width - self.width) / 2;
+        y: 8px;
+        width: mpl.preferred-width;
+        height: 22px;
+        border-radius: 11px;
+        background: #1c1c1ee6;
+        border-width: 1px;
+        border-color: #ffffff24;
+        mpl := HorizontalLayout {
+            padding-left: 8px;
+            padding-right: 9px;
+            spacing: 5px;
+            StatusDot {
+                width: 7px;
+                height: 7px;
+                y: (parent.height - self.height) / 2;
+                tint: #ef4444;
+            }
+            Text {
+                text: "Mic";
+                color: #ffffffd0;
+                font-size: 10px;
+                vertical-alignment: center;
+            }
+        }
+    }
+
+    if root.suspend-error != "": Rectangle {
+        background: #000000a0;
+        TouchArea { }
+        Rectangle {
+            width: min(460px, root.width - 40px);
+            height: el.preferred-height;
+            border-radius: 12px;
+            background: #242427f2;
+            border-width: 1px;
+            border-color: #ffffff24;
+            el := VerticalLayout {
+                padding: 20px;
+                spacing: 12px;
+                Text {
+                    text: "Can't save this VM's state";
+                    color: #ffffff;
+                    font-size: Theme.fs-xl;
+                    font-weight: 700;
+                }
+                Text {
+                    text: root.suspend-error + "\n\nIt's paused. Shut it down, or keep it running.";
+                    color: #ffffffb0;
+                    font-size: Theme.fs-md;
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: end;
+                    Button {
+                        text: "Keep running";
+                        kind: "ghost";
+                        clicked => { root.act("resume"); }
+                    }
+                    Button {
+                        text: "Force off";
+                        kind: "danger";
+                        clicked => { root.act("poweroff"); }
+                    }
+                    Button {
+                        text: "Shut down";
+                        kind: "primary";
+                        clicked => { root.act("shutdown"); }
+                    }
+                }
+            }
+        }
+    }
+
     // Toolbar.
     bar := Rectangle {
         x: (root.width - self.width) / 2;
@@ -193,6 +275,30 @@ export component ConsoleWindow inherits Window {
                         text: root.captured ? "Keyboard goes to the VM" : root.state == VmState.paused ? "Paused" : "Running";
                         color: #ffffff99;
                         font-size: 10px;
+                    }
+                }
+            }
+            if root.mic-on: Rectangle {
+                y: (parent.height - self.height) / 2;
+                height: 26px;
+                width: ml.preferred-width;
+                border-radius: 13px;
+                background: #ffffff14;
+                ml := HorizontalLayout {
+                    padding-left: 9px;
+                    padding-right: 10px;
+                    spacing: 6px;
+                    StatusDot {
+                        width: 8px;
+                        height: 8px;
+                        y: (parent.height - self.height) / 2;
+                        tint: #ef4444;
+                    }
+                    Text {
+                        text: "Microphone in use";
+                        color: #ffffffd0;
+                        font-size: 11px;
+                        vertical-alignment: center;
                     }
                 }
             }

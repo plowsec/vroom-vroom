@@ -26,9 +26,8 @@ use slint::winit_030::winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use slint::winit_030::{EventResult, WinitWindowAccessor};
 use slint::{ComponentHandle, Rgba8Pixel, SharedPixelBuffer};
 use vroom_config::{GuestOs, VmConfig};
-use vroom_display::{recv_fd, Command, Decoder, SharedFb, ToViewer, ToVmm, POINTER_MAX};
+use vroom_display::{recv_fd, Command, Decoder, SharedFb, ToViewer, ToVmm, MAX_HEIGHT, MAX_WIDTH, POINTER_MAX};
 
-use crate::frame::{FrameBufs, Rect};
 use crate::msg::{self, Msg};
 use crate::{ConsoleWindow, VmState};
 
@@ -53,10 +52,14 @@ const LOG_TAIL: u64 = 16 << 10;
 struct Shared {
     mode: (u32, u32),
     frame: bool,
-    /// What changed since the UI last looked (clipped there).
-    dirty: Option<Rect>,
+    /// The whole picture changed (new mode).
+    full: bool,
+    /// What changed since the UI last looked: x0, y0, x1, y1.
+    damage: Option<[u32; 4]>,
     status: VecDeque<String>,
     clipboard: Option<String>,
+    /// The guest records from the microphone (latest word from the VMM).
+    mic: Option<bool>,
     posted: bool,
 }
 
@@ -70,15 +73,12 @@ impl Shared {
                 }
                 self.mode = (width, height);
                 self.frame = true;
-                self.dirty = Some(Rect::full(width, height));
+                self.full = true;
             }
             ToViewer::Damage { x, y, w, h } => {
-                // 0 x 0 means "everything" (what older VMMs send).
-                let r = if w == 0 || h == 0 { Rect::full(u32::MAX, u32::MAX) } else { Rect { x, y, w, h } };
-                // Clipped first: then adding rects can't overflow.
-                if let Some(c) = r.clip(u32::MAX, u32::MAX) {
-                    self.dirty = crate::frame::add(self.dirty, Some(c));
-                }
+                // Clipped to the mode when used.
+                let r = [x, y, x.saturating_add(w), y.saturating_add(h)];
+                self.damage = Some(self.damage.map_or(r, |d| [d[0].min(r[0]), d[1].min(r[1]), d[2].max(r[2]), d[3].max(r[3])]));
                 self.frame = true;
             }
             ToViewer::ClipboardSet(t) => self.clipboard = Some(t),
@@ -95,6 +95,7 @@ impl Shared {
                 }
                 self.status.push_back(t);
             }
+            ToViewer::Mic(on) => self.mic = Some(on),
             ToViewer::Closed => return false,
         }
         !std::mem::replace(&mut self.posted, true)
@@ -157,14 +158,17 @@ pub struct Console {
     fb: Option<SharedFb>,
     shared: Arc<Mutex<Shared>>,
     child: Child,
-    bufs: FrameBufs,
+    /// The guest screen as shown (RGBA), updated in place where it changed.
+    img: Option<SharedPixelBuffer<Rgba8Pixel>>,
     mode: (u32, u32),
     last_thumb: Instant,
     last_save: Instant,
     clip_policy: vroom_config::Clipboard,
     clipboard: Option<arboard::Clipboard>,
     clip_seen: Option<String>,
-    pending_resize: Option<(Instant, u32, u32)>,
+    pending_resize: Option<Instant>,
+    /// `[display] hidpi`: give the guest physical pixels.
+    hidpi: bool,
     toast_id: u64,
     ever_ran: bool,
     gone: Arc<AtomicBool>,
@@ -202,6 +206,33 @@ pub fn show(key: &str) {
 /// The VM file's clipboard rules changed: apply them now (we enforce them).
 pub fn set_clip_policy(key: &str, p: vroom_config::Clipboard) {
     with(key, |c| c.clip_policy = p);
+}
+
+/// `[display] hidpi` changed: ask the guest for the new size now.
+pub fn set_hidpi(key: &str, on: bool) {
+    with(key, |c| {
+        if c.hidpi != on {
+            c.hidpi = on;
+            c.pending_resize = Some(Instant::now());
+        }
+    });
+}
+
+/// What to ask the guest for, for a window of `w` x `h` physical pixels
+/// at scale factor `sf`: (width, height, scale percent), see
+/// `ToVmm::Resize`. HiDPI: physical pixels, shrunk to fit the shared
+/// framebuffer if need be (the scale shrinks with them so the guest's UI
+/// keeps its size). Off: logical pixels, the guest's scale left alone.
+fn guest_size(w: u32, h: u32, sf: f32, hidpi: bool) -> (u32, u32, u32) {
+    let sf = if sf.is_finite() { sf.clamp(0.5, 5.0) } else { 1.0 };
+    let (w, h) = (w.max(1), h.max(1));
+    if !hidpi {
+        return (((w as f32 / sf) as u32).max(1), ((h as f32 / sf) as u32).max(1), 0);
+    }
+    let k = (w as f32 / MAX_WIDTH as f32).max(h as f32 / MAX_HEIGHT as f32).max(1.0);
+    let (gw, gh) = (((w as f32 / k) as u32).clamp(1, MAX_WIDTH), ((h as f32 / k) as u32).clamp(1, MAX_HEIGHT));
+    let scale = ((sf / k * 100.0).round() as u32).clamp(vroom_display::SCALE_MIN, vroom_display::SCALE_MAX);
+    (gw, gh, scale)
 }
 
 pub fn command(key: &str, cmd: &str) {
@@ -360,7 +391,7 @@ pub fn start(path: &Path, cfg: &VmConfig, extra: &[String]) -> Result<String, St
         fb: None,
         shared,
         child,
-        bufs: FrameBufs::default(),
+        img: None,
         mode: (0, 0),
         last_thumb: Instant::now(),
         last_save: Instant::now(),
@@ -368,6 +399,7 @@ pub fn start(path: &Path, cfg: &VmConfig, extra: &[String]) -> Result<String, St
         clipboard: arboard::Clipboard::new().ok(),
         clip_seen: None,
         pending_resize: None,
+        hidpi: cfg.display.hidpi,
         toast_id: 0,
         ever_ran: false,
         gone,
@@ -470,15 +502,11 @@ fn winit_event(key: &str, io: &Rc<RefCell<Io>>, ev: &WindowEvent) -> EventResult
             }
             EventResult::PreventDefault
         }
-        WindowEvent::Resized(sz) => {
+        // Moving to a screen with another scale also resizes.
+        WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
             let key = key.to_string();
-            let (w, h) = (sz.width, sz.height);
             slint::Timer::single_shot(Duration::ZERO, move || {
-                with(&key, |c| {
-                    let sf = c.win.window().scale_factor().max(0.5);
-                    let (lw, lh) = ((w as f32 / sf) as u32, (h as f32 / sf) as u32);
-                    c.pending_resize = Some((Instant::now() + RESIZE_DEBOUNCE, lw, lh));
-                });
+                with(&key, |c| c.pending_resize = Some(Instant::now() + RESIZE_DEBOUNCE));
             });
             EventResult::Propagate
         }
@@ -626,7 +654,10 @@ impl Console {
         let send = |c: &mut Console, m: Command| c.io.borrow_mut().send(ToVmm::Command(m));
         match cmd {
             "pause" => send(self, Command::Pause),
-            "resume" => send(self, Command::Resume),
+            "resume" => {
+                self.win.set_suspend_error("".into());
+                send(self, Command::Resume);
+            }
             "toggle-pause" => {
                 let m = if self.state == VmState::Paused { Command::Resume } else { Command::Pause };
                 send(self, m);
@@ -637,10 +668,16 @@ impl Console {
             }
             "reset" => send(self, Command::Reset),
             "shutdown" => {
+                self.win.set_suspend_error("".into());
+                // A paused guest can't hear the request.
+                if self.state == VmState::Paused {
+                    send(self, Command::Resume);
+                }
                 send(self, Command::Shutdown);
                 self.toast("Asked the guest to shut down");
             }
             "poweroff" => {
+                self.win.set_suspend_error("".into());
                 self.set_state(VmState::Stopping);
                 send(self, Command::PowerOff);
             }
@@ -677,19 +714,23 @@ impl Console {
 
     /// What the reader thread collected since the last wakeup.
     fn inbox(&mut self) {
-        let (frame, status, clip) = {
+        let (frame, full, damage, status, clip, mic) = {
             let mut s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
             s.posted = false;
-            (std::mem::take(&mut s.frame), std::mem::take(&mut s.status), s.clipboard.take())
+            let f = (std::mem::take(&mut s.frame), std::mem::take(&mut s.full), s.damage.take());
+            (f.0, f.1, f.2, std::mem::take(&mut s.status), s.clipboard.take(), s.mic.take())
         };
         for t in status {
             self.status(&t);
+        }
+        if let Some(on) = mic {
+            self.mic(on);
         }
         if let Some(t) = clip {
             self.guest_clipboard(t);
         }
         if frame {
-            self.frame();
+            self.frame(full, damage);
         }
     }
 
@@ -710,11 +751,33 @@ impl Console {
                 msg::send(Msg::SnapshotTaken { key: self.key.clone() });
             }
             _ if t.starts_with("guest agent connected") => self.toast("Guest tools connected: clipboard and resizing work"),
+            _ if t.starts_with("suspend failed") => {
+                // Usually 3D in use. Say why and offer the ways out,
+                // rather than leaving a paused window that won't close.
+                let why = t.trim_start_matches("suspend failed").trim_start_matches([':', ' ']);
+                self.win.set_suspend_error(why.into());
+            }
             _ if t.starts_with("host disk almost full") => {
                 self.toast(&t);
                 msg::send(Msg::Toast { text: format!("{}: {t}", self.name), kind: 2, action: String::new() });
             }
             _ => self.toast(&t),
+        }
+    }
+
+    /// Microphone indicator. Turning on also shows the toolbar for a
+    /// moment so it gets noticed.
+    fn mic(&mut self, on: bool) {
+        if on == self.win.get_mic_on() {
+            return;
+        }
+        self.win.set_mic_on(on);
+        if on {
+            self.win.set_bar_pinned(true);
+            let k = self.key.clone();
+            slint::Timer::single_shot(Duration::from_secs(3), move || {
+                with(&k, |c| c.win.set_bar_pinned(false));
+            });
         }
     }
 
@@ -729,11 +792,11 @@ impl Console {
 
     fn tick(&mut self) {
         let now = Instant::now();
-        if let Some((at, w, h)) = self.pending_resize {
-            if now >= at {
-                self.pending_resize = None;
-                self.io.borrow_mut().send(ToVmm::Resize { width: w, height: h });
-            }
+        if self.pending_resize.is_some_and(|at| now >= at) {
+            self.pending_resize = None;
+            let sz = self.win.window().size();
+            let (width, height, scale) = guest_size(sz.width, sz.height, self.win.window().scale_factor(), self.hidpi);
+            self.io.borrow_mut().send(ToVmm::Resize { width, height, scale });
         }
         // Host clipboard -> guest, only while this window has focus.
         if self.io.borrow().focused && self.clip_policy.host_to_guest {
@@ -760,11 +823,8 @@ impl Console {
         self.win.set_captured(self.io.borrow().focused && self.state == VmState::Running);
     }
 
-    fn frame(&mut self) {
-        let (mode, dirty) = {
-            let mut s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-            (s.mode, s.dirty.take())
-        };
+    fn frame(&mut self, full: bool, damage: Option<[u32; 4]>) {
+        let mode = self.shared.lock().unwrap_or_else(|e| e.into_inner()).mode;
         let Some(fb) = &self.fb else { return };
         let (w, h) = mode;
         if w == 0 || h == 0 {
@@ -773,14 +833,29 @@ impl Console {
             self.win.set_mode_h(0);
             return;
         }
-        let Some(buf) = self.bufs.update(fb, w, h, dirty) else { return };
-        self.win.set_frame(slint::Image::from_rgba8(buf));
+        let fresh = full || self.mode != mode || self.img.as_ref().is_none_or(|b| (b.width(), b.height()) != mode);
+        let [x0, y0, x1, y1] = match damage {
+            Some(d) if !fresh => [d[0].min(w), d[1].min(h), d[2].min(w), d[3].min(h)],
+            _ => [0, 0, w, h],
+        };
+        if x1 > x0 && y1 > y0 {
+            // Let go of the picture on screen, so ours is the only
+            // reference and only the changed rows get written.
+            let mut buf = match self.img.take() {
+                Some(b) if !fresh => {
+                    self.win.set_frame(slint::Image::default());
+                    b
+                }
+                _ => SharedPixelBuffer::new(w, h),
+            };
+            to_rgba(fb, w, [x0, y0, x1, y1], buf.make_mut_bytes());
+            self.img = Some(buf.clone());
+            self.win.set_frame(slint::Image::from_rgba8(buf));
+        }
         if self.mode != mode {
             // Ask the guest to match the window on the first frame.
             if self.mode == (0, 0) {
-                let sz = self.win.window().size();
-                let sf = self.win.window().scale_factor().max(0.5);
-                self.pending_resize = Some((Instant::now(), (sz.width as f32 / sf) as u32, (sz.height as f32 / sf) as u32));
+                self.pending_resize = Some(Instant::now());
             }
             self.mode = mode;
             self.win.set_mode_w(w as i32);
@@ -801,9 +876,12 @@ impl Console {
 
     /// The screen, at most `max_w` wide.
     fn scaled(&self, max_w: u32) -> Option<(SharedPixelBuffer<Rgba8Pixel>, u32, u32)> {
-        let (w, h) = self.mode;
-        let src = self.bufs.current().filter(|b| (b.width(), b.height()) == (w, h))?;
-        let src = src.as_slice();
+        let img = self.img.as_ref()?;
+        let (w, h) = (img.width(), img.height());
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let px = img.as_slice();
         let tw = w.min(max_w);
         let th = (h as u64 * tw as u64 / w as u64).max(1) as u32;
         let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(tw, th);
@@ -812,7 +890,7 @@ impl Console {
             let sy = y * h as usize / th as usize;
             for x in 0..tw as usize {
                 let sx = x * w as usize / tw as usize;
-                out[y * tw as usize + x] = src[sy * w as usize + sx];
+                out[y * tw as usize + x] = px[sy * w as usize + sx];
             }
         }
         Some((buf, tw, th))
@@ -829,6 +907,29 @@ impl Console {
         if let Err(e) = write_png(&p, &buf, w, h) {
             log::warn!("thumbnail {}: {e}", p.display());
         }
+    }
+}
+
+/// Copy the `x0..x1` x `y0..y1` part of the guest screen (`fb_w` wide)
+/// into the same place of `out` (RGBA, as wide), converting from XRGB.
+/// The changed part only: at 5K a whole frame is 59 MB.
+fn to_rgba(fb: &SharedFb, fb_w: u32, [x0, y0, x1, y1]: [u32; 4], out: &mut [u8]) {
+    let stride = fb_w as usize * 4;
+    let Some(dst) = out.get_mut(y0 as usize * stride + x0 as usize * 4..) else { return };
+    fb.read_rect(fb_w, x0, y0, x1 - x0, y1 - y0, dst, stride);
+    let row = (x1 - x0) as usize * 4;
+    for r in 0..(y1 - y0) as usize {
+        if let Some(px) = dst.get_mut(r * stride..r * stride + row) {
+            xrgb_to_rgba(px);
+        }
+    }
+}
+
+/// In place: little-endian XRGB (bytes B, G, R, X) to RGBA.
+fn xrgb_to_rgba(px: &mut [u8]) {
+    for p in px.as_chunks_mut::<4>().0 {
+        let v = u32::from_le_bytes(*p);
+        *p = (((v >> 16) & 0xff) | (v & 0xff00) | ((v & 0xff) << 16) | 0xff00_0000).to_le_bytes();
     }
 }
 
@@ -872,6 +973,47 @@ mod tests {
         s.status.clear();
         assert!(s.push(ToViewer::Status("é".repeat(MAX_STATUS_LEN))));
         assert!(s.status[0].len() <= MAX_STATUS_LEN);
+    }
+
+    #[test]
+    fn guest_sizes() {
+        // Retina, HiDPI: every pixel, 2x.
+        assert_eq!(guest_size(3456, 2234, 2.0, true), (3456, 2234, 200));
+        assert_eq!(guest_size(3456, 2234, 2.0, false), (1728, 1117, 0));
+        assert_eq!(guest_size(1920, 1080, 1.0, true), (1920, 1080, 100));
+        // Bigger than the framebuffer (16K wide): shrunk to fit, scale too.
+        let (w, h, s) = guest_size(15360, 8640, 2.0, true);
+        assert!(w <= MAX_WIDTH && h <= MAX_HEIGHT && s == 100, "{w}x{h} {s}");
+        // Junk scale factors stay sane.
+        assert_eq!(guest_size(800, 600, f32::NAN, true), (800, 600, 100));
+        assert_eq!(guest_size(0, 0, 0.0, false), (2, 2, 0));
+    }
+
+    #[test]
+    fn damage_converts_only_its_rect() {
+        let fb = SharedFb::create().unwrap();
+        // 4x2 screen, every pixel XRGB 0x00112233.
+        fb.write_rect(4, 0, 0, 4, 2, &[0x33, 0x22, 0x11, 0x00].repeat(8), 16);
+        let mut out = vec![0u8; 4 * 2 * 4];
+        to_rgba(&fb, 4, [1, 1, 3, 2], &mut out);
+        let px = |i: usize| &out[i * 4..i * 4 + 4];
+        assert_eq!(px(5), &[0x11, 0x22, 0x33, 0xff]);
+        assert_eq!(px(6), &[0x11, 0x22, 0x33, 0xff]);
+        assert!([0, 1, 2, 3, 4, 7].iter().all(|&i| px(i) == [0; 4]), "outside the rect: untouched");
+        // A rect past the buffer: nothing written, no panic.
+        to_rgba(&fb, 4, [0, 5, 4, 9], &mut out);
+    }
+
+    #[test]
+    fn damage_adds_up() {
+        let mut s = Shared::default();
+        s.push(ToViewer::Damage { x: 10, y: 10, w: 5, h: 5 });
+        s.push(ToViewer::Damage { x: 2, y: 30, w: 1, h: 1 });
+        s.push(ToViewer::Damage { x: u32::MAX, y: 0, w: 9, h: 1 });
+        assert_eq!(s.damage, Some([2, 0, u32::MAX, 31]));
+        assert!(!s.full);
+        s.push(ToViewer::Mode { width: 8, height: 8 });
+        assert!(s.full);
     }
 
     #[test]

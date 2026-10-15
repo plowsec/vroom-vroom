@@ -49,7 +49,14 @@ pub fn profile(p: &Policy) -> Result<String> {
         s += &format!("(allow file-read* (subpath {}))\n", q(d)?);
     }
     for d in &p.share_rw {
-        s += &format!("(allow file-read* file-write-data file-write-create file-write-unlink file-write-mode file-write-times (subpath {}))\n", q(d)?);
+        // Setting times (utimensat) isn't file-write-times on current
+        // macOS: allow the writes, then take back what the FUSE server
+        // never does (set-id bits, owner, ACLs, flags, xattrs).
+        s += &format!("(allow file-read* file-write* (subpath {}))\n", q(d)?);
+        s += &format!(
+            "(deny file-write-setugid file-write-owner file-write-acl file-write-flags file-write-xattr file-write-finderinfo (subpath {}))\n",
+            q(d)?
+        );
     }
     if p.network_outbound {
         // IP only: no Unix sockets (ssh-agent, docker.sock...). netd is
@@ -84,9 +91,10 @@ pub fn profile(p: &Policy) -> Result<String> {
 /// system libraries, read/write `rw_dir`, nothing else (no network, no
 /// home directory, no further exec).
 /// Profile for the audio helper: CoreAudio's client side and nothing
-/// else (no files beyond the system, no network, no exec). `wav_dir`: a
-/// test mode writing WAV files instead of playing.
-pub fn audio_profile(exe: &Path, wav_dir: Option<&Path>) -> Result<String> {
+/// else (no files beyond the system, no network, no exec). The
+/// microphone only if `input` (`[audio] input`). `wav_dir`: a test mode
+/// writing (and reading) WAV files instead of using the devices.
+pub fn audio_profile(exe: &Path, wav_dir: Option<&Path>, input: bool) -> Result<String> {
     let exe_real = exe.canonicalize().unwrap_or_else(|_| exe.to_path_buf());
     let mut s = format!(
         r#"(version 1)
@@ -107,10 +115,42 @@ pub fn audio_profile(exe: &Path, wav_dir: Option<&Path>) -> Result<String> {
 "#,
         exe = q(&exe_real)?,
     );
+    if input {
+        s += "(allow device-microphone)\n";
+    }
     if let Some(d) = wav_dir {
         s += &format!("(allow file-read* file-write* (subpath {}))\n", q(d)?);
     }
     Ok(s)
+}
+
+/// Profile for the USB helper: libusb (from Homebrew or /usr/local), the
+/// IOKit registry, and the USB device and interface user clients. No
+/// files beyond the system and libusb, no network, no exec, no other
+/// IOKit drivers. Which device it opens is up to the helper (the one its
+/// command line names); the sandbox can't tell USB devices apart.
+pub fn usb_profile(exe: &Path) -> Result<String> {
+    let exe_real = exe.canonicalize().unwrap_or_else(|_| exe.to_path_buf());
+    Ok(format!(
+        r#"(version 1)
+(deny default)
+(allow process-exec (literal {exe}))
+(allow file-read* (literal {exe}) (subpath "/usr/lib") (subpath "/System") (subpath "/Library/Apple")
+  (subpath "/opt/homebrew/lib") (subpath "/opt/homebrew/Cellar/libusb") (subpath "/opt/homebrew/opt/libusb")
+  (subpath "/usr/local/lib") (subpath "/usr/local/Cellar/libusb") (subpath "/usr/local/opt/libusb")
+  (literal "/dev/urandom") (literal "/dev/null") (literal "/private/etc/localtime") (subpath "/private/var/db/timezone"))
+(allow file-write* (literal "/dev/null"))
+(allow file-read-metadata)
+(allow file-read-data (literal "/"))
+(allow sysctl-read)
+(allow signal (target self))
+(allow mach-task-name (target self))
+(allow iokit-get-properties)
+(allow iokit-open (iokit-user-client-class "AppleUSBHostDeviceUserClient" "AppleUSBHostInterfaceUserClient"
+  "AppleUSBLegacyDeviceUserClient" "AppleUSBLegacyInterfaceUserClient" "IOUSBDeviceUserClientV2" "IOUSBInterfaceUserClientV3"))
+"#,
+        exe = q(&exe_real)?,
+    ))
 }
 
 pub fn helper_profile(exe: &Path, rw_dir: &Path) -> Result<String> {

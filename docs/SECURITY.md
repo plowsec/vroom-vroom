@@ -17,7 +17,8 @@ service by a guest against its own VM.
 
 - One process per VM, written in Rust. `devices`, `virtio`, `arch`, `net`,
   `config`, `snapshot` and `proto` are `forbid(unsafe_code)`; unsafe code
-  is confined to `hv`, `memory`, `sandbox`, `gpu3d`, `ipc` and a few FFI
+  is confined to `hv`, `memory`, `sandbox`, `gpu3d`, `ipc`, `usb` (libusb,
+  loaded by the USB helper only, and IOKit device listing) and a few FFI
   shims, with `// SAFETY:` notes.
 - Guest memory goes through bounds-checked `GuestMemory`; there are no raw
   pointers into guest RAM in device code.
@@ -112,18 +113,103 @@ the walk, so neither a guest-planted link nor one swapped in on the host
 mid-walk leads outside. Names with `/`, NUL, `.` or `..` are refused; only
 regular files and directories are opened (no FIFOs, devices, sockets);
 the guest can't create links or device nodes. Node, handle and directory
-listing counts are capped. The sandbox only grants the share's own
-subtree (read-only shares: read access only). The FUSE server is fuzzed.
+listing counts are capped, and so are path lengths (4096 bytes) and the
+memory all node paths take together. The sandbox only grants the share's
+own subtree (read-only shares: read access only; writable ones: no set-id
+bits, owner changes, ACLs, file flags or extended attributes). The FUSE
+server is fuzzed, as both clients and on both kinds of share.
+
+Windows guests (virtio-win's virtiofs.exe) get the same server. Names
+that mean something special to Windows (`name:stream`, `CON`, trailing
+dots) are plain names on a Mac or Linux host: they stay inside the share.
+So does a Mac's `file/..namedfork/rsrc`, since a file is never walked
+through. The only extra name accepted is `.` for "this directory", which
+the Windows client uses for the root; `..` is still refused. The guest
+side needs WinFsp: setup installs one pinned version and checks its
+SHA-256 first.
 
 ## Sound
 
-Off unless `[audio] output = true`, and output only: the device has no
-capture stream and nothing in the VMM can read the microphone. PCM goes
-over a datagram socket to a helper process (`vroom audio-out`) that
-plays it, so CoreAudio and the plug-ins it loads never run in the VMM. The
-helper runs under its own Seatbelt profile: system libraries, the
-CoreAudio services and the audio user client only; no user files, no
-network, no exec. The VMM never blocks on it (it drops audio instead).
+Off unless `[audio] output` or `input` is on. PCM goes over a datagram
+socket to a helper process (`vroom audio-out`) that plays it, so
+CoreAudio and the plug-ins it loads never run in the VMM. The helper
+runs under its own Seatbelt profile: system libraries, the CoreAudio
+services and the audio user client only; no user files, no network, no
+exec. The VMM never blocks on it (it drops audio instead).
+
+Both sound cards parse guest input with the same care as the rest:
+virtio-snd chains as virtqueues; HD Audio registers of any width and
+offset, CORB/RIRB rings (pointers masked to the ring size, one pass per
+doorbell), buffer descriptor lists (index masked, empty or unreachable
+entries stop the stream with an error), DMA amounts capped per tick.
+Both are fuzzed.
+
+### Microphone
+
+There is a microphone path now, off by default. How it works:
+
+- `[audio] input = false` (the default): the guest's sound card has no
+  input at all (no capture stream, no mic pin). The helper is started
+  without `--input`, so it refuses to record whatever the VMM asks, and
+  its Seatbelt profile has no `device-microphone`. Both are fixed before
+  the guest runs; a guest that took over the VMM can't change them.
+- `input = true`: the helper may record and its profile allows the
+  microphone. The VMM itself still has no microphone access: only the
+  helper talks to CoreAudio (or ALSA). The VMM asks for audio only
+  while a VM window is open (a viewer is connected; headless runs never),
+  the VM runs (pausing stops it) and the guest records. The window shows
+  "Microphone in use" whenever the VMM says it asked.
+- What that gate does not cover: with `input = true`, the gate and the
+  indicator are enforced by the VMM process. A guest that broke out into
+  the VMM could ask the helper for the microphone at any time while the
+  VM runs, and not tell the window. macOS's own indicator (the orange
+  dot in the menu bar) can't be faked by it. That's why it's opt-in.
+- macOS asks for the microphone permission on behalf of the app that
+  started vroom (Terminal, iTerm, VS Code...): a yes covers everything
+  started from that app, not just vroom. See [GUIDE.md](GUIDE.md#microphone).
+- What the helper sends back is parsed by the VMM like guest input
+  (sizes, whole frames, a generation number so audio from an earlier
+  request is dropped), and at most a quarter second is buffered.
+
+## USB devices
+
+Off unless the VM file lists `[[usb]]` devices. The VM process never
+touches the host's USB stack: each device gets a helper process
+(`vroom usb-host`), started before the VMM locks itself down, that opens
+that one device with libusb. The two talk over a socketpair with a small
+protocol: submit a transfer, cancel one, reset the device; back come
+attached/detached and transfer results.
+
+The helper treats the VMM as hostile, like the VMM treats the guest:
+
+- It only opens the device its command line names (vendor and product,
+  and serial number if given), chosen by the VMM's config before the
+  sandbox; the protocol has no way to name another device, list devices
+  or change the address.
+- Every request is checked: sizes (1 MiB per transfer), at most 64
+  transfers in flight, endpoints only those of the configuration and
+  alternate settings the guest selected, with the type the descriptors
+  give. Configuration, interface and halt changes go through libusb's own
+  calls; SET_ADDRESS is refused. Hubs are never opened.
+- Malformed messages end the connection.
+
+The VMM checks the helper the same way: answers must match a transfer it
+sent (size, direction), and never write past the guest's buffers. A dead
+or misbehaving helper looks like an unplugged device. The vCPUs never
+wait on a helper.
+
+The helper's own sandbox (macOS, Seatbelt): system libraries and libusb,
+the IOKit registry, and the USB device and interface user clients only;
+no files, no network, no exec, no other drivers. Seatbelt can't tell USB
+devices apart, so a compromised helper could open other USB devices macOS
+lets a normal user open (none that a macOS driver holds: not keyboards,
+mice or disks). On Linux the helper sets no_new_privs and Landlock
+(`/dev/bus/usb` and sysfs only); it has no seccomp filter yet, and can
+open whatever USB device nodes your user may open (udev rules decide).
+
+The guest gets full control of a device it is given (it can send it any
+request, including firmware updates). Give it only devices you'd plug
+into that machine.
 
 ## Snapshots
 
@@ -142,21 +228,35 @@ reverts its TPM too.
 
 ## What 3D costs
 
-`gpu = "virtio3d"` loads virglrenderer and MoltenVK into the VMM. Guest
-command streams are then parsed by C code (virglrenderer's Venus decoder)
-and reach the Apple GPU driver. The sandbox keeps working but has to allow
-the GPU: three IOKit user clients (`AGXDeviceUserClient`,
-`AGXSharedUserClient`, `IOSurfaceRootUserClient`), the Metal compiler
-service, framework reads and the Metal shader cache. Use 3D only for guests
-that need it. A future step is moving the renderer into its own process
-(possible for most of Venus; host-visible memory needs shared mappings).
+`gpu = "virtio3d"` loads virglrenderer and MoltenVK into the VMM, and
+with `opengl` (the default) ANGLE too. Guest command streams are then
+parsed by C code and reach the Apple GPU driver: Venus (Vulkan) commands
+by virglrenderer's Venus decoder, virgl (OpenGL) commands by its GL
+decoder (vrend), which has the longer history of bugs. vrend's GL calls go
+to ANGLE, which checks every call the way a browser checks WebGL before
+anything reaches Metal, so a vrend mistake meets a second check. The GL
+contexts ask for robust buffer access (out-of-bounds reads give zeros).
+`opengl = false` leaves vrend and ANGLE out entirely.
+
+The sandbox keeps working but has to allow the GPU: three IOKit user
+clients (`AGXDeviceUserClient`, `AGXSharedUserClient`,
+`IOSurfaceRootUserClient`), the Metal compiler service, framework reads
+and the Metal shader cache. OpenGL needed nothing more: ANGLE uses the
+same Metal device, and is loaded (with the display and a first context)
+before the sandbox goes up. libepoxy is built to load ANGLE only from
+virglrenderer's own directory, never Apple's OpenGL or a search path.
+
+Use 3D only for guests that need it. A future step is moving the renderer
+into its own process (possible for most of Venus and for virgl, whose
+frames already come back by copy; host-visible memory needs shared
+mappings).
 
 ## Guest agent (Windows)
 
 The VirtIO serial port only admits Administrators and SYSTEM, so the agent
 is split. A LocalSystem service owns the port and does clock sync and
 clean shutdown. An unprivileged helper in the console session does
-clipboard and resolution, and talks to the service over a named pipe:
+clipboard, resolution and UI scale, and talks to the service over a named pipe:
 SYSTEM/Administrators/interactive users only, remote clients refused,
 only clients from the active console session served. The helper only
 talks to a pipe server in session 0, so a user process squatting the pipe
@@ -174,15 +274,20 @@ active on seat0, and the helper only talks to a root-owned peer.
 `fuzz/` has cargo-fuzz targets for what a guest (or a downloaded image)
 controls: agent protocol, the viewer protocol (both directions), network frames, virtqueue chains over arbitrary
 guest memory, virtio-gpu 2D commands, virtio-fs (FUSE) requests, virtio-snd control
-and PCM transfers, the virtio-pci transport and PCI
+and PCM transfers (playback and capture), the HD Audio controller (registers,
+CORB/RIRB, buffer descriptor lists, stream DMA, MSI), the virtio-pci transport and PCI
 config space, xHCI, NVMe, TPM TIS, fw_cfg (DMA included) and flash, each
 driven by arbitrary register writes plus guest RAM; and qcow2 images,
 both parsing and a differential target (random writes, discards, zero
 writes, reopens and compactions checked byte for byte against a model),
-and VMDK (sparse headers, grain tables, compressed grains, descriptors). Run with
+and VMDK (sparse headers, grain tables, compressed grains, descriptors),
+the USB passthrough protocol both ways with the helper's checks, and USB
+descriptors (the xHCI target also has a passthrough device whose answers
+come from the input). Run with
 `cargo +nightly fuzz run -O <target>`. First runs found two qcow2 bugs
 (a crash on short v3 headers, multi-GB allocations from crafted table
-sizes); both fixed.
+sizes); both fixed. The USB target found a short configuration descriptor
+read out of bounds (a panic, not memory corruption); fixed.
 
 ## Host resources
 
@@ -204,7 +309,7 @@ running VM's images, even with `-U`.
 - The Windows agent split is new; installs from before it run the
   all-in-one agent elevated (re-run `vroom-setup.cmd` to upgrade).
 - x86_64 isn't implemented, so none of this is tested there.
-- Fuzzing doesn't cover Venus (3D) command streams: that is
+- Fuzzing doesn't cover Venus or virgl (3D) command streams: that is
   virglrenderer's C code, which runs in the VMM process when 3D is on.
 
 ## What the guest can tell
@@ -216,8 +321,9 @@ These come from the VM's `[identity]` (see [CONFIG.md](CONFIG.md#identity)):
 - ACPI table header IDs and the FADT hypervisor vendor.
 - The device tree model (direct kernel boot).
 - Disks: NVMe model, serial, firmware revision; virtio disk serials.
-- PCI IDs of the host bridge, NVMe and USB controllers. The defaults are
-  QEMU's (vendor 0x1B36).
+- PCI IDs of the host bridge, NVMe, USB and HD Audio controllers, and
+  the HD Audio codec's IDs. The defaults are QEMU's (vendor 0x1B36; HD
+  Audio: QEMU's Intel ICH6 `intel-hda` and `hda-duplex` codec).
 - USB keyboard/tablet vendor ID and names, virtio input names and vendor.
 - Generated MACs (prefix), and the NAT network: guest, gateway and DNS
   addresses and the gateway's MAC. The defaults (10.0.2.15, .2, .3) are
@@ -239,8 +345,13 @@ Still visible, whatever the config says:
 - PSCI 1.0 / SMCCC 1.1 answers. They name no vendor. On KVM hosts the
   kernel's PSCI also answers the KVM vendor-hypervisor UID call.
 - The firmware itself: EDK2 reports its own vendor in UEFI tables.
+- The display size follows the window, so it says something about your
+  screen; with `[display] hidpi` the guest also learns its pixel density
+  (the scale its agent is asked for).
 - The display: ramfb, then virtio-gpu with no EDID. With 3D, Vulkan shows
-  the host GPU (MoltenVK on Apple).
+  the host GPU (MoltenVK on Apple). OpenGL's renderer name follows
+  `gl_renderer`, but its limits (GL 2.1, ES 3.0, texture sizes, formats)
+  still look like ANGLE on Metal.
 - CPU ID registers come from the host CPU (an Apple core on a Mac), and
   timing differs from bare metal.
 - The vTPM is swtpm: its manufacturer is IBM, and the TIS DID/VID register
@@ -248,6 +359,8 @@ Still visible, whatever the config says:
 - NAT's TCP/IP stack (smoltcp) and the absolute-pointer tablet behave like
   no physical router or mouse.
 - The guest agent, if installed (its protocol says "vroom").
+- Shared folders, if any: virtio-fs itself, the host disk's size and free
+  space, and on Windows the `VroomShare_<tag>` services.
 
 So this makes casual checks fail. It doesn't make a VM look like real
 hardware to software that tries hard.

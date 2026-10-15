@@ -91,6 +91,21 @@ pub trait Renderer3d: Send {
     fn unmap_blob(&mut self, resource: u32);
     /// Copy out of a mapped blob (scanout of host memory).
     fn read_mapped(&mut self, resource: u32, offset: u64, out: &mut [u8]) -> bool;
+    /// Read a box of a GL resource (level 0) back from the GPU into `out`,
+    /// rows `stride` bytes apart, top row first (scanout of GL frames).
+    fn read_back(&mut self, resource: u32, bx: Box3d, stride: u32, out: &mut [u8]) -> bool;
+    /// Like [`Renderer3d::read_back`], but as BGRX rows (`bx.w * 4` bytes
+    /// each), by a faster path that doesn't wait for the GPU: collect it
+    /// with `scanout_poll`. One at a time. False if the renderer can't:
+    /// then use `read_back`.
+    fn scanout_start(&mut self, _resource: u32, _bx: Box3d) -> bool {
+        false
+    }
+    /// The read `scanout_start` began: None while the GPU is at it (unless
+    /// `wait`) or if there is none, else whether `out` holds it.
+    fn scanout_poll(&mut self, _out: &mut [u8], _wait: bool) -> Option<bool> {
+        None
+    }
     fn unref(&mut self, resource: u32);
 
     /// Fence on `ctx`'s timeline `ring`, or a global fence (ring None).
@@ -101,6 +116,9 @@ pub trait Renderer3d: Send {
     fn poll(&mut self) -> Vec<FenceDone>;
     /// Drop every context and resource (device reset).
     fn reset(&mut self);
+    /// The calling thread is done with the renderer (a GPU worker
+    /// stopping): another thread may take it over.
+    fn release_thread(&mut self) {}
 }
 
 /// Puts renderer buffers into the guest's host-visible window (the VMM

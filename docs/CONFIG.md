@@ -77,8 +77,10 @@ Bridged and host-only need the `vroom-netd` helper running as root. See
 
 | Key | Default | What it does |
 |---|---|---|
-| `gpu` | `none` | `none` (serial console only), `virtio2d`, `virtio3d` (Vulkan through MoltenVK, Linux guests). |
+| `gpu` | `none` | `none` (serial console only), `virtio2d`, `virtio3d` (Vulkan and OpenGL drawn by the host GPU, Linux guests; see the [guide](GUIDE.md#3d-acceleration-linux-guests)). |
+| `opengl` | true | With `virtio3d`: OpenGL too (virgl on ANGLE). `false` keeps Vulkan only: less host code facing the guest, and suspend keeps working on desktops. |
 | `width`, `height` | 1280, 800 | Starting resolution. The guest follows the window size once its agent or driver runs. |
+| `hidpi` | true | Full resolution on Retina (HiDPI) screens: the guest gets every pixel of the window and its agent sets its UI scale to match (2x on Retina), so text is sharp. Guests without an agent that can scale get half the pixels and the window scales the picture up, as with `false`. See [GUIDE.md](GUIDE.md#retina-screens). |
 
 ## `[[share]]` (host folders, up to 8)
 
@@ -89,13 +91,46 @@ tag = "host"                     # in the guest: mount -t virtiofs host /mnt
 readonly = true                  # default; false lets the guest change files
 ```
 
-Linux guests only for now.
+`tag`: 1-36 of `[A-Za-z0-9._-]`, different for each share. Windows guests
+see each share as a drive letter (Z:, Y:, ...) once `vroom-setup.cmd` ran;
+see [GUIDE.md](GUIDE.md#windows-guests).
+
+## `[[usb]]` (host USB devices, up to 8)
+
+```toml
+[[usb]]
+id = "1209:000a"                 # vendor:product, as `vroom usb list` shows it
+serial = "A1B2C3"                # optional: only this one of several alike
+name = "dev board"               # optional label for the app
+```
+
+| Key | Default | What it does |
+|---|---|---|
+| `id` | required | `vendor:product`, 4 hex digits each. |
+| `serial` | none | Pick one device by its serial number. Without it, the first device with that `id` is taken. |
+| `name` | none | Shown in the app. The guest never sees it. |
+
+The VM takes the device when it starts and gives it back when it stops.
+Unplug it and plug it back in while the VM runs: the guest sees that too.
+A device added while the VM runs is picked up at the next start.
+
+The guest sees the device's own descriptors. On macOS, a device that a
+macOS driver holds (keyboards, mice, disks, security keys, most USB
+serial chips) can't be taken without root: see
+[GUIDE.md](GUIDE.md#usb-devices). Needs libusb (`brew install libusb`).
 
 ## `[audio]`
 
 | Key | Default | What it does |
 |---|---|---|
-| `output` | false | Guest sound out through the host speakers. There is no microphone path. Linux guests only. |
+| `output` | false | Guest sound out through the host speakers. |
+| `input` | false | The host microphone, for the guest to record from (video calls). It only flows while the VM's window is open, the VM runs and the guest records; the window shows when. Headless runs (`vroom run`) never get it. |
+| `device` | `auto` | The sound card: `hda` (Intel HD Audio: Windows and Linux have a driver built in), `virtio` (virtio-snd: Linux only). `auto` is `hda` for Windows guests (`os`, or guessed from the name), `virtio` otherwise. |
+
+The card is there when `output` or `input` is on. With `output` off the
+guest still sees speakers but they play nowhere; with `input` off the
+guest has no microphone at all. See [GUIDE.md](GUIDE.md#sound) for the
+macOS microphone permission.
 
 ## `[clipboard]`
 
@@ -144,6 +179,8 @@ defaults below. New VMs get random serials, so two VMs never match.
 | `pci_bridge_id` | `1b36:0008` | PCI IDs of the host bridge |
 | `nvme_pci_id` | `1b36:0010` | PCI IDs of the NVMe controller; Identify reports the same vendor |
 | `usb_pci_id` | `1b36:000d` | PCI IDs of the USB (xHCI) controller |
+| `hda_pci_id` | `8086:2668:1af4:1100` | PCI IDs of the HD Audio sound card (QEMU's `intel-hda`: an Intel ICH6) |
+| `hda_codec_id` | `1af4:0022:1af4:0022` | HD Audio codec vendor:device and subsystem (QEMU's `hda-duplex`); Windows shows it as `HDAUDIO\FUNC_01&VEN_..&DEV_..&SUBSYS_..` |
 | `usb_vendor_id` | `0x1209` | USB keyboard and tablet vendor ID, also the virtio input vendor |
 | `usb_manufacturer` | `vroom` | USB and virtio input device names |
 | `mac_prefix` | `02` | first 1-3 bytes of generated NIC MACs, e.g. `00:1b:21` |
@@ -151,12 +188,17 @@ defaults below. New VMs get random serials, so two VMs never match.
 | `nat_gateway` | `10.0.2.2` | NAT gateway (DHCP server, default route) |
 | `nat_dns` | `10.0.2.3` | NAT DNS relay; may be the gateway's address |
 | `nat_gateway_mac` | `02:42:57:4b:00:01` | the gateway's MAC in the guest's ARP table |
+| `gl_renderer` | the host's | OpenGL renderer name with `virtio3d`: `glxinfo` shows `virgl (<this>)`. The host's names its GPU and macOS version. Up to 63 chars |
 | `agent_port` | `org.vroom.agent.0` | guest agent port name. The agent finds a renamed port by itself if it's the only one; else start it with `--port` |
 
 PCI IDs are `vendor:device` or `vendor:device:subvendor:subdevice`, 4 hex
 digits each (`lspci -nn` shows them). Without the subsystem part it is
 `vendor:0000`. The default `1b36` is QEMU's vendor ID. A real chip's IDs
 make Linux apply that chip's driver quirks; class and revision don't change.
+The same goes for `hda_codec_id`: a real codec's IDs (say Realtek
+`10ec:0887`) make Linux load that codec's driver, which expects the real
+chip's layout, so keep a codec vendor Linux treats as generic unless the
+guest is Windows.
 
 The three NAT addresses share one private /24 (10/8, 172.16/12,
 192.168/16). Adapter N adds N to the third number, so `192.168.1.100`

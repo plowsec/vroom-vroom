@@ -1,4 +1,5 @@
-//! Host side of the guest agent channel: clipboard, time sync, shutdown.
+//! Host side of the guest agent channel: clipboard, time sync, shutdown,
+//! display size and scale.
 //!
 //! Clipboard rules (see docs/SECURITY.md):
 //! - Text only, size-capped, each direction can be turned off.
@@ -15,7 +16,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use vroom_config::Clipboard as ClipPolicy;
-use vroom_proto::{features, Decoder, Message};
+use vroom_proto::{features, Decoder, Message, SCALE_MAX, SCALE_MIN};
+use vroom_virtio::devices::gpu::GpuControl;
 
 /// Host clipboard access, provided by the frontend.
 pub trait ClipboardProvider: Send {
@@ -33,7 +35,11 @@ pub enum AgentCmd {
     /// Copy the guest's latest clipboard to the host now.
     PullClipboard,
     SyncTime,
-    SetResolution(u32, u32),
+    /// The window's size. `scale` 0: in guest pixels, the guest's UI
+    /// scale is left alone. Else (HiDPI) in physical pixels, with the
+    /// scale (percent) the guest's UI needs to look the same size; a
+    /// guest that can't scale gets the size divided by it instead.
+    Display { width: u32, height: u32, scale: u32 },
     Shutdown { reboot: bool },
     Stop,
 }
@@ -81,10 +87,28 @@ struct Service {
     last_guest_update: Option<Instant>,
     /// What we last saw on / wrote to the host clipboard (echo suppression).
     host_seen: Option<String>,
+    screen: Screen,
+    /// The window's last size request, redone when an agent connects.
+    display: Option<(u32, u32, u32)>,
 }
 
+/// The monitor whose size the window drives. Resizes go through the agent
+/// service: whether the guest gets physical pixels depends on its agent.
+#[derive(Debug, Clone, Default)]
+pub struct Screen {
+    pub gpu: Option<GpuControl>,
+    /// Largest mode (in pixels) the guest's driver takes; bigger windows
+    /// get a smaller mode of the same shape. 0: no limit.
+    pub max_pixels: u64,
+}
+
+/// Windows' virtio-gpu driver (viogpudo) sizes its framebuffer when it
+/// starts: 16 MiB unless the screen is already bigger then. A larger mode
+/// fails and leaves the driver unable to change modes until a reboot.
+pub const WINDOWS_MAX_PIXELS: u64 = (16 << 20) / 4;
+
 /// Start the service on the host end of the agent port.
-pub fn spawn(stream: UnixStream, policy: ClipPolicy, clip: Option<Box<dyn ClipboardProvider>>) -> std::io::Result<Agent> {
+pub fn spawn(stream: UnixStream, policy: ClipPolicy, clip: Option<Box<dyn ClipboardProvider>>, screen: Screen) -> std::io::Result<Agent> {
     let (tx, rx) = mpsc::channel();
     let status = Arc::new(Mutex::new(AgentStatus::default()));
     stream.set_read_timeout(Some(POLL))?;
@@ -100,6 +124,8 @@ pub fn spawn(stream: UnixStream, policy: ClipPolicy, clip: Option<Box<dyn Clipbo
         guest_clip: None,
         last_guest_update: None,
         host_seen: None,
+        screen,
+        display: None,
     };
     std::thread::Builder::new().name("agent".into()).spawn(move || svc.run())?;
     Ok(Agent { tx, status })
@@ -161,11 +187,30 @@ impl Service {
                 if features & vroom_proto::features::TIME_SYNC != 0 {
                     self.sync_time();
                 }
+                // Now it may scale: give it the window's real size.
+                self.apply_display();
             }
             Message::ClipboardText(t) => self.guest_clipboard(t),
             Message::Ping(v) => self.send(&Message::Pong(v)),
             // Host-bound only; a guest sending these is ignored.
             _ => {}
+        }
+    }
+
+    fn can_scale(&self) -> bool {
+        let s = self.status.lock().unwrap_or_else(|e| e.into_inner());
+        s.connected && s.features & features::SCALE != 0
+    }
+
+    fn apply_display(&mut self) {
+        let Some((w, h, scale)) = self.display else { return };
+        let (w, h, set_scale) = guest_display(w, h, scale, self.can_scale(), self.screen.max_pixels);
+        if let Some(g) = &self.screen.gpu {
+            g.resize(w, h);
+        }
+        self.send(&Message::SetResolution { width: w, height: h });
+        if let Some(p) = set_scale {
+            self.send(&Message::SetScale { percent: p });
         }
     }
 
@@ -234,10 +279,43 @@ impl Service {
                 }
             }
             AgentCmd::SyncTime => self.sync_time(),
-            AgentCmd::SetResolution(w, h) => self.send(&Message::SetResolution { width: w, height: h }),
+            AgentCmd::Display { width, height, scale } => {
+                if width == 0 || height == 0 || (scale != 0 && !(SCALE_MIN..=SCALE_MAX).contains(&scale)) {
+                    return;
+                }
+                self.display = Some((width, height, scale));
+                self.apply_display();
+            }
             AgentCmd::Shutdown { reboot } => self.send(&Message::Shutdown { reboot }),
             AgentCmd::Stop => {}
         }
+    }
+}
+
+/// What the guest gets for a window of `w` x `h` at `scale`: its size,
+/// and the scale message for its agent, if any.
+fn guest_display(w: u32, h: u32, scale: u32, can_scale: bool, max_pixels: u64) -> (u32, u32, Option<u32>) {
+    let (w, h, s) = unlimited(w, h, scale, can_scale);
+    let px = w as u64 * h as u64;
+    if max_pixels == 0 || px <= max_pixels {
+        return (w, h, s);
+    }
+    // Same shape, fewer pixels; the UI scale shrinks with them.
+    let k = (px as f64 / max_pixels as f64).sqrt();
+    let (w, h) = (((w as f64 / k) as u32).max(1), ((h as f64 / k) as u32).max(1));
+    let s = s.map(|s| if s == 0 { 0 } else { ((s as f64 / k).round() as u32).max(SCALE_MIN) });
+    (w, h, s)
+}
+
+fn unlimited(w: u32, h: u32, scale: u32, can_scale: bool) -> (u32, u32, Option<u32>) {
+    match (scale, can_scale) {
+        // HiDPI off: leave the guest's scale alone, or put back the
+        // user's if we changed it earlier.
+        (0, true) => (w, h, Some(0)),
+        (0, false) => (w, h, None),
+        (s, true) => (w, h, Some(s)),
+        // Physical pixels at 1x would make everything tiny: the old way.
+        (s, false) => ((w as u64 * 100 / s as u64).max(1) as u32, (h as u64 * 100 / s as u64).max(1) as u32, None),
     }
 }
 
@@ -273,10 +351,43 @@ mod tests {
     }
 
     #[test]
+    fn guests_that_cant_scale_get_logical_pixels() {
+        assert_eq!(guest_display(2560, 1600, 200, true, 0), (2560, 1600, Some(200)));
+        assert_eq!(guest_display(2560, 1600, 200, false, 0), (1280, 800, None));
+        assert_eq!(guest_display(2560, 1600, 0, true, 0), (2560, 1600, Some(0)));
+        assert_eq!(guest_display(1280, 800, 0, false, 0), (1280, 800, None));
+        // Windows' driver: at most 16 MiB of pixels.
+        assert_eq!(guest_display(2560, 1600, 200, true, WINDOWS_MAX_PIXELS), (2560, 1600, Some(200)));
+        let (w, h, s) = guest_display(3456, 2234, 200, true, WINDOWS_MAX_PIXELS);
+        assert!(w as u64 * h as u64 <= WINDOWS_MAX_PIXELS && w > 2500 && matches!(s, Some(140..=150)), "{w}x{h} {s:?}");
+        assert_eq!(guest_display(3840, 2160, 0, false, WINDOWS_MAX_PIXELS).2, None);
+        assert_eq!(guest_display(7680, 4320, 0, true, WINDOWS_MAX_PIXELS).2, Some(0));
+        assert_eq!(guest_display(7680, 4320, 200, true, WINDOWS_MAX_PIXELS).2, Some(100));
+    }
+
+    #[test]
+    fn display_waits_for_an_agent_that_scales() {
+        let (host, mut guest) = UnixStream::pair().unwrap();
+        let a = spawn(host, ClipPolicy::default(), None, Screen::default()).unwrap();
+        let mut d = Decoder::new(1 << 20);
+        a.send(AgentCmd::Display { width: 3456, height: 2234, scale: 200 });
+        a.send(AgentCmd::Display { width: 10, height: 10, scale: 7 }); // ignored
+        let m = read_msgs(&mut guest, &mut d);
+        assert!(m.contains(&Message::SetResolution { width: 1728, height: 1117 }), "{m:?}");
+        assert!(!m.iter().any(|m| matches!(m, Message::SetScale { .. })), "{m:?}");
+        let f = features::RESOLUTION | features::SCALE;
+        guest.write_all(&Message::Hello { features: f, agent: "t".into() }.encode()).unwrap();
+        let m = read_msgs(&mut guest, &mut d);
+        assert!(m.contains(&Message::SetResolution { width: 3456, height: 2234 }), "{m:?}");
+        assert!(m.contains(&Message::SetScale { percent: 200 }), "{m:?}");
+        a.send(AgentCmd::Stop);
+    }
+
+    #[test]
     fn focus_gates_clipboard() {
         let (host, mut guest) = UnixStream::pair().unwrap();
         let clip = FakeClip::default();
-        let a = spawn(host, ClipPolicy::default(), Some(Box::new(clip.clone()))).unwrap();
+        let a = spawn(host, ClipPolicy::default(), Some(Box::new(clip.clone())), Screen::default()).unwrap();
         let mut d = Decoder::new(1 << 20);
         assert!(matches!(read_msgs(&mut guest, &mut d)[0], Message::Hello { .. }));
 
@@ -304,7 +415,7 @@ mod tests {
         let (host, mut guest) = UnixStream::pair().unwrap();
         let clip = FakeClip::default();
         let pol = ClipPolicy { host_to_guest: true, guest_to_host: false, max_bytes: 8 };
-        let a = spawn(host, pol, Some(Box::new(clip.clone()))).unwrap();
+        let a = spawn(host, pol, Some(Box::new(clip.clone())), Screen::default()).unwrap();
         a.send(AgentCmd::Focus(true));
         guest.write_all(&Message::ClipboardText("x".into()).encode()).unwrap();
         std::thread::sleep(Duration::from_millis(400));

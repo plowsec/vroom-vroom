@@ -26,6 +26,7 @@ pub const NAME_MAX: usize = 255;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Stat {
+    pub dev: u64,
     pub ino: u64,
     pub size: u64,
     pub blocks: u64,
@@ -134,6 +135,13 @@ impl Share {
         }
     }
 
+    /// Attributes of the entries `names` of directory `dir` (None: gone
+    /// or not a valid name). The directory is walked to once.
+    pub fn stat_children(&self, dir: &Rel, names: &[&OsStr]) -> io::Result<Vec<Option<Stat>>> {
+        let d = self.dir(dir)?;
+        Ok(names.iter().map(|n| cname(n).ok().and_then(|c| sys::fstatat(d.as_raw_fd(), &c).ok())).collect())
+    }
+
     /// Open a regular file.
     pub fn open_file(&self, p: &Rel, write: bool) -> io::Result<File> {
         if write {
@@ -191,8 +199,17 @@ impl Share {
         self.writable()?;
         let (fd, td) = (self.dir(from)?, self.dir(to)?);
         let (fname, tname) = (cname(from_name)?, cname(to_name)?);
-        if no_replace && sys::fstatat(td.as_raw_fd(), &tname).is_ok() {
-            return Err(os(libc::EEXIST));
+        if no_replace {
+            if let Ok(t) = sys::fstatat(td.as_raw_fd(), &tname) {
+                // On a case-insensitive host "a" -> "A" finds the file
+                // itself: that's a case change, not a replace.
+                let same = from == to
+                    && same_ignoring_case(from_name, to_name)
+                    && sys::fstatat(fd.as_raw_fd(), &fname).is_ok_and(|f| (f.dev, f.ino) == (t.dev, t.ino));
+                if !same {
+                    return Err(os(libc::EEXIST));
+                }
+            }
         }
         sys::renameat(fd.as_raw_fd(), &fname, td.as_raw_fd(), &tname)
     }
@@ -234,6 +251,13 @@ impl Share {
 
     pub fn statfs(&self) -> io::Result<FsStat> {
         sys::fstatvfs(self.root.as_raw_fd())
+    }
+}
+
+fn same_ignoring_case(a: &OsStr, b: &OsStr) -> bool {
+    match (a.to_str(), b.to_str()) {
+        (Some(a), Some(b)) => a.to_lowercase() == b.to_lowercase(),
+        _ => a.as_bytes().eq_ignore_ascii_case(b.as_bytes()),
     }
 }
 
@@ -307,6 +331,7 @@ mod sys {
     fn conv(s: &libc::stat) -> Stat {
         let (a, m, c) = ((s.st_atime, s.st_atime_nsec), (s.st_mtime, s.st_mtime_nsec), (s.st_ctime, s.st_ctime_nsec));
         Stat {
+            dev: s.st_dev as u64,
             ino: s.st_ino as u64,
             size: s.st_size as u64,
             blocks: s.st_blocks as u64,
@@ -342,6 +367,12 @@ mod sys {
     }
 
     pub fn read_dir(dir: OwnedFd, max: usize) -> io::Result<Vec<DirEntry>> {
+        // The root's fd is a dup of the share's: it shares the read
+        // position with every earlier listing. Start from the top.
+        // SAFETY: valid fd.
+        if unsafe { libc::lseek(dir.as_raw_fd(), 0, libc::SEEK_SET) } < 0 {
+            return Err(last());
+        }
         let raw = dir.into_raw_fd();
         // SAFETY: fdopendir takes ownership of `raw` on success.
         let d = unsafe { libc::fdopendir(raw) };
@@ -552,6 +583,37 @@ mod tests {
         let s = Share::open(&root, false).unwrap();
         // Must return, not block, and must refuse.
         assert!(s.open_file(&p(&["fifo"]), false).is_err());
+    }
+
+    #[test]
+    fn listing_twice_lists_twice() {
+        let (_td, root) = fixture();
+        let s = Share::open(&root, true).unwrap();
+        // The root fd is shared: a second listing must not start at its end.
+        assert_eq!(s.read_dir(&p(&[]), 100).unwrap().len(), 3);
+        assert_eq!(s.read_dir(&p(&[]), 100).unwrap().len(), 3);
+        let st = s.stat_children(&p(&["sub"]), &[OsStr::new("hello.txt"), OsStr::new("gone"), OsStr::new("..")]).unwrap();
+        assert_eq!(st[0].map(|s| s.size), Some(2));
+        assert!(st[1].is_none() && st[2].is_none());
+    }
+
+    #[test]
+    fn rename_no_replace_allows_case_changes_only() {
+        let (_td, root) = fixture();
+        let s = Share::open(&root, false).unwrap();
+        s.create(&p(&[]), OsStr::new("a.txt"), 0o644, true).unwrap();
+        // Case change: fine on case-insensitive hosts (the target "exists")
+        // and on case-sensitive ones (it doesn't).
+        s.rename(&p(&[]), OsStr::new("a.txt"), &p(&[]), OsStr::new("A.TXT"), true).unwrap();
+        assert!(s.read_dir(&p(&[]), 100).unwrap().iter().any(|e| e.name == "A.TXT"));
+        // Hard links to the same file under other names are still refused.
+        std::fs::hard_link(root.join("A.TXT"), root.join("b.txt")).unwrap();
+        let e = s.rename(&p(&[]), OsStr::new("A.TXT"), &p(&[]), OsStr::new("b.txt"), true).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::EEXIST));
+        // Same name, other directory: refused.
+        s.create(&p(&["sub"]), OsStr::new("a.txt"), 0o644, true).unwrap();
+        let e = s.rename(&p(&[]), OsStr::new("A.TXT"), &p(&["sub"]), OsStr::new("a.txt"), true).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::EEXIST));
     }
 
     #[test]

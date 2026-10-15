@@ -15,6 +15,10 @@ mod port;
 // tested everywhere.
 #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 mod relay;
+mod scale;
+// Windows only; the pure parts are tested everywhere.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod shares;
 mod sys;
 #[cfg(windows)]
 mod winsvc;
@@ -62,6 +66,17 @@ fn parse_args() -> Result<Args, String> {
             #[cfg(any(windows, target_os = "linux"))]
             "--service" => a.role = Role::Service,
             #[cfg(windows)]
+            "--mount-shares" => {
+                // Needs admin rights (it makes services): setup runs it.
+                match shares::mount_all() {
+                    Ok(()) => std::process::exit(0),
+                    Err(e) => {
+                        log::error!("shares: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            #[cfg(windows)]
             "--session" => {
                 a.role = Role::Session;
                 a.port = Some(winsvc::PIPE.into());
@@ -72,7 +87,7 @@ fn parse_args() -> Result<Args, String> {
                 a.port = Some(linsvc::SOCKET.into());
             }
             "-h" | "--help" => {
-                println!("vroom-agent [--port PATH] [--clipboard-file PATH | --no-clipboard] [--service | --session]");
+                println!("vroom-agent [--port PATH] [--clipboard-file PATH | --no-clipboard] [--service | --session | --mount-shares]");
                 println!();
                 println!("--port PATH  host channel. Default: virtio-serial port {AGENT_PORT}.");
                 println!("             If it's missing ([identity].agent_port renamed it), the");
@@ -214,12 +229,12 @@ fn session(args: &Args) -> std::io::Result<()> {
 }
 
 fn hello() -> Message {
-    let features = features::CLIPBOARD_TEXT | features::TIME_SYNC | features::SHUTDOWN;
+    let features = features::CLIPBOARD_TEXT | features::TIME_SYNC | features::SHUTDOWN | features::SCALE;
     Message::Hello { features, agent: format!("vroom-agent {}", env!("CARGO_PKG_VERSION")) }
 }
 
 /// `system`: we own the host link and may act on privileged requests.
-/// The session helper only ever gets clipboard and resolution messages.
+/// The session helper only ever gets clipboard, resolution and scale messages.
 fn handle(m: Message, system: bool, w: &mut port::Writer, clip: &mut dyn clip::Clip, last: &mut Option<String>) -> std::io::Result<()> {
     match m {
         Message::Hello { .. } | Message::TimeSync { .. } | Message::Shutdown { .. } | Message::Ping(_) if !system => {
@@ -243,10 +258,12 @@ fn handle(m: Message, system: bool, w: &mut port::Writer, clip: &mut dyn clip::C
         }
         Message::Shutdown { reboot } => sys::shutdown(reboot),
         Message::SetResolution { width, height } => {
+            scale::note_resolution(width, height);
             if let Err(e) = sys::set_resolution(width, height) {
                 log::debug!("resolution {width}x{height}: {e}");
             }
         }
+        Message::SetScale { percent } => scale::set(percent),
         Message::Ping(v) => w.write_all(&Message::Pong(v).encode())?,
         Message::Pong(_) => {}
     }

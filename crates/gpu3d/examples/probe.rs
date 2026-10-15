@@ -14,11 +14,11 @@ fn main() {
         print!("{}", vroom_sandbox::profile_text(&p).expect("profile"));
         return;
     }
-    if !vroom_gpu3d::load() {
+    if !vroom_gpu3d::load(true) {
         eprintln!("virglrenderer not found");
         std::process::exit(1);
     }
-    let Some(mut r) = vroom_gpu3d::Virgl::new() else {
+    let Some(mut r) = vroom_gpu3d::Virgl::new(None) else {
         eprintln!("init failed");
         std::process::exit(1);
     };
@@ -34,6 +34,13 @@ fn main() {
     }
     println!("ctx create (venus): {}", r.context_create(1, 4, b"probe"));
     r.context_destroy(1);
+    if let Some(caps) = r.capset(2, 2) {
+        let name = caps.get(696..760).unwrap_or_default();
+        let name = String::from_utf8_lossy(name.split(|&b| b == 0).next().unwrap_or_default()).into_owned();
+        println!("gl renderer: {name}");
+        println!("ctx create (virgl): {}", r.context_create(2, 2, b"probe-gl"));
+        r.context_destroy(2);
+    }
 }
 
 fn env_logger_lite() {}

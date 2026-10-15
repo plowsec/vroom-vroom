@@ -318,18 +318,40 @@ export component SettingsPanel inherits Rectangle {
                         changed(i) => { Bus.set("gpu", i); }
                     }
                     Text {
-                        text: root.s.gpu == 2 ? "Vulkan in Linux guests, drawn by your Mac's GPU. Needs the 3D library (see guide)."
+                        text: root.s.gpu == 2 ? "Vulkan and OpenGL in Linux guests, drawn by your Mac's GPU. Needs the 3D libraries (see guide)."
                             : root.s.gpu == 1 ? "Works everywhere. The guest follows the window size."
                             : "No screen. Use the serial console (vroom run).";
                         font-size: Theme.fs-xs;
                         color: Theme.text-3;
                         wrap: word-wrap;
                     }
+                    if root.s.gpu != 0: Row {
+                        label: "Full resolution on Retina";
+                        hint: "The guest gets every pixel of the window and its tools scale its UI, so text is sharp. Guests without the tools get half and are scaled up.";
+                        key: "hidpi";
+                        Toggle {
+                            y: (parent.height - self.height) / 2;
+                            checked: root.s.hidpi;
+                            toggled(v) => { Bus.set("hidpi", v ? "true" : "false"); }
+                        }
+                    }
+                    if root.s.gpu == 2: Row {
+                        label: "OpenGL";
+                        hint: "Off: Vulkan only. Less host code faces the guest, and snapshots keep working when no 3D app runs.";
+                        key: "display.opengl";
+                        Toggle {
+                            y: (parent.height - self.height) / 2;
+                            checked: root.s.opengl;
+                            enabled: !root.lk;
+                            toggled(v) => { Bus.set("opengl", v ? "true" : "false"); }
+                        }
+                    }
                     Row {
                         label: "Starting size";
                         key: "width, height";
                         HorizontalLayout {
                             spacing: 6px;
+                            alignment: end;
                             Field {
                                 width: 70px;
                                 text: root.s.width;
@@ -580,7 +602,8 @@ export component SettingsPanel inherits Rectangle {
                         }
                     }
                     Text {
-                        text: "Linux guests. Read-only unless you allow changes.";
+                        text: "Linux: the command above. Windows: each share is a drive letter (Z: first) once vroom-setup.cmd ran. Read-only unless you allow changes.";
+                        wrap: word-wrap;
                         font-size: Theme.fs-xs;
                         color: Theme.text-3;
                     }
@@ -598,6 +621,55 @@ export component SettingsPanel inherits Rectangle {
                     }
                 }
 
+                if root.vis.usb: SectionCard {
+                    icon: Icons.link;
+                    title: "USB devices";
+                    summary: root.s.sum-usb;
+                    force-open: root.open-all || root.s.usb-picking;
+                    for u[i] in root.s.usb: Row {
+                        label: u.label;
+                        hint: u.note;
+                        key: "usb";
+                        warn: u.warn;
+                        IconButton {
+                            icon: Icons.trash;
+                            tip: "Remove";
+                            size: 28px;
+                            y: (parent.height - self.height) / 2;
+                            enabled: !root.lk;
+                            clicked => { Bus.act("usb." + i + ".remove"); }
+                        }
+                    }
+                    // What's plugged in, while "Add device" is open (a
+                    // repeater: an `if` here wouldn't grow the card).
+                    for h[j] in root.s.usb-host: Row {
+                        label: h.label;
+                        hint: h.note;
+                        Button {
+                            small: true;
+                            text: h.taken ? "Added" : "Add";
+                            y: (parent.height - self.height) / 2;
+                            enabled: !h.taken && !root.lk;
+                            clicked => { Bus.act("usb.pick." + j); }
+                        }
+                    }
+                    Row {
+                        label: "Host devices";
+                        hint: root.s.usb-picking && root.s.usb-host.length == 0 ? "Nothing plugged in." : "Taken from this Mac while the VM runs.";
+                        key: "[[usb]]";
+                        Button {
+                            small: true;
+                            kind: "ghost";
+                            text: root.s.usb-picking ? "Done" : "Add device";
+                            icon: root.s.usb-picking ? Icons.check : Icons.plus;
+                            has-icon: true;
+                            y: (parent.height - self.height) / 2;
+                            enabled: !root.lk;
+                            clicked => { Bus.act("usb.add"); }
+                        }
+                    }
+                }
+
                 if root.vis.sound: SectionCard {
                     icon: Icons.speaker;
                     title: "Sound";
@@ -605,13 +677,26 @@ export component SettingsPanel inherits Rectangle {
                     force-open: root.open-all;
                     Row {
                         label: "Play guest sound";
-                        hint: "Through this Mac's speakers. Linux guests. There is no microphone.";
+                        hint: "Through this Mac's speakers.";
                         key: "audio.output";
                         Toggle {
                             y: (parent.height - self.height) / 2;
                             checked: root.s.audio;
                             enabled: !root.lk;
                             toggled(v) => { Bus.set("audio", v ? "true" : "false"); }
+                        }
+                    }
+                    Row {
+                        label: "Microphone";
+                        hint: root.s.audio-in ? "The guest hears this Mac's microphone while its window is open and it records. The window shows when." : "For video calls. Off: the guest has no microphone.";
+                        key: "audio.input";
+                        warn: root.s.audio-in;
+                        Toggle {
+                            y: (parent.height - self.height) / 2;
+                            checked: root.s.audio-in;
+                            danger: true;
+                            enabled: !root.lk;
+                            toggled(v) => { Bus.set("audio.in", v ? "true" : "false"); }
                         }
                     }
                 }
@@ -832,7 +917,7 @@ export component SettingsPanel inherits Rectangle {
                     }
                 }
 
-                if root.vis.searching && !(root.vis.hw || root.vis.display || root.vis.storage || root.vis.net || root.vis.share || root.vis.sound || root.vis.clip || root.vis.security || root.vis.boot): Text {
+                if root.vis.searching && !(root.vis.hw || root.vis.display || root.vis.storage || root.vis.net || root.vis.share || root.vis.usb || root.vis.sound || root.vis.clip || root.vis.security || root.vis.boot): Text {
                     text: "Nothing matches. The config file has every option: ⋯ → Open config file.";
                     font-size: Theme.fs-sm;
                     color: Theme.text-3;

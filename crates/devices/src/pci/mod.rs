@@ -1,12 +1,14 @@
 //! PCI(e): config space, MSI-X, INTx routing and the ECAM root complex.
 
 mod config;
+pub mod msi;
 pub mod msix;
 mod root;
 
 use std::sync::{Arc, Mutex};
 
 pub use config::{BarSpec, ConfigSpace, PciId, VendorIds, CFG_SIZE};
+pub use msi::Msi;
 pub use msix::{Msix, MsiSender};
 pub use root::{Intx, IntxRouter, PciRoot};
 

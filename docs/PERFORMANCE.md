@@ -150,12 +150,10 @@ guest's submit call returns, so fio's own latency figure would say
   RAM; a guest can send any bytes with a right checksum anyway).
 - **Pings to the gateway answer** (they were dropped: a smoltcp feature
   was off).
-- **VM window.** The VMM sends the rectangle that changed, not "redraw
-  everything", and the window converts only that rectangle, into two
-  buffers it reuses. A 5120x2880 frame cost 8.2 ms of conversion every
-  time; now a full-screen change costs 3.2 ms and a changed text line
-  0.12 ms (`cargo test --release -p vroom-gui frame_cost -- --ignored
-  --nocapture`).
+- **VM window.** Damage rectangles from the VMM, and a window that
+  converts only what changed into a reused buffer, landed separately
+  (the hidpi work); on a 5120x2880 screen that turns an 8 ms conversion
+  per frame into a fraction of a millisecond for a changed text line.
 - **Memory.** A kernel-booted VM kept the unpacked kernel (about 50 MB
   for Ubuntu's) for resets; it keeps the file as read and unpacks it
   again on reset. The VMM's own heap after a kernel boot went from about

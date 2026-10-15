@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 pub const MAX_CPUS: u32 = 64;
 pub const MAX_DISKS: usize = 16;
 pub const MAX_NICS: usize = 8;
+pub const MAX_USB: usize = 8;
 pub const MIN_MEMORY_MIB: u64 = 64;
 pub const MAX_MEMORY_MIB: u64 = 512 * 1024;
 
@@ -71,9 +72,44 @@ pub struct VmConfig {
     /// VM is the same either way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub os: Option<GuestOs>,
+    /// Host USB devices handed to the guest (passthrough).
+    #[serde(default, rename = "usb", skip_serializing_if = "Vec::is_empty")]
+    pub usb: Vec<Usb>,
     /// What the guest can read about its "hardware".
     #[serde(default, skip_serializing_if = "Identity::is_default")]
     pub identity: Identity,
+}
+
+/// A host USB device the guest gets to use. The VM takes the first
+/// device that matches `id` (and `serial`, if set) while it runs; a
+/// device that is unplugged and plugged back in comes back to the guest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Usb {
+    /// "vendor:product", 4 hex digits each, as `vroom usb list` and
+    /// `lsusb` print them.
+    pub id: String,
+    /// Only the device with this serial number (two of the same kind).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial: Option<String>,
+    /// A label for the app; the guest never sees it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+impl Usb {
+    /// (vendor, product) from `id`.
+    pub fn ids(&self) -> Option<(u16, u16)> {
+        usb_id(&self.id)
+    }
+}
+
+/// "vendor:product" in hex, e.g. "1050:0407". Vendor 0 isn't a device.
+pub fn usb_id(s: &str) -> Option<(u16, u16)> {
+    let hex = |x: &str| (x.len() == 4 && x.bytes().all(|b| b.is_ascii_hexdigit())).then(|| u16::from_str_radix(x, 16).ok()).flatten();
+    let (v, p) = s.split_once(':')?;
+    let (v, p) = (hex(v)?, hex(p)?);
+    (v != 0).then_some((v, p))
 }
 
 /// Every name and number the guest can read about the machine it runs on
@@ -129,6 +165,10 @@ pub struct Identity {
     pub pci_bridge_id: String,
     pub nvme_pci_id: String,
     pub usb_pci_id: String,
+    /// Sound card (HD Audio controller), when `[audio]` uses one.
+    pub hda_pci_id: String,
+    /// HD Audio codec: vendor:device, then its subsystem ID (same format).
+    pub hda_codec_id: String,
     /// USB keyboard and tablet (and virtio input): vendor ID and
     /// manufacturer string.
     pub usb_vendor_id: u16,
@@ -147,6 +187,10 @@ pub struct Identity {
     /// The guest agent's virtio-console port. The agent must be told if
     /// this changes (`vroom-agent --port`).
     pub agent_port: String,
+    /// OpenGL renderer name (virtio3d): the guest shows "virgl (<this>)".
+    /// Default: the host's, which names its GPU and macOS version.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gl_renderer: Option<String>,
 }
 
 impl Default for Identity {
@@ -173,6 +217,8 @@ impl Default for Identity {
             pci_bridge_id: "1b36:0008".into(),
             nvme_pci_id: "1b36:0010".into(),
             usb_pci_id: "1b36:000d".into(),
+            hda_pci_id: "8086:2668:1af4:1100".into(),
+            hda_codec_id: "1af4:0022:1af4:0022".into(),
             usb_vendor_id: 0x1209,
             usb_manufacturer: "vroom".into(),
             mac_prefix: "02".into(),
@@ -181,6 +227,7 @@ impl Default for Identity {
             nat_dns: Ipv4Addr::new(10, 0, 2, 3),
             nat_gateway_mac: "02:42:57:4b:00:01".into(),
             agent_port: "org.vroom.agent.0".into(),
+            gl_renderer: None,
         }
     }
 }
@@ -218,10 +265,20 @@ impl Identity {
         text("cpu_name", &self.cpu_name, 64, false)?;
         text("dt_model", &self.dt_model, 64, false)?;
         text("disk_firmware", &self.disk_firmware, 8, false)?;
+        if let Some(s) = &self.gl_renderer {
+            // 63 + NUL fill virgl's 64-byte field.
+            text("gl_renderer", s, 63, false)?;
+        }
         if !(1..=0x24).contains(&self.chassis_type) {
             return Err(Error::Invalid("identity.chassis_type: 1-36 (SMBIOS chassis type)".into()));
         }
-        for (what, v) in [("pci_bridge_id", &self.pci_bridge_id), ("nvme_pci_id", &self.nvme_pci_id), ("usb_pci_id", &self.usb_pci_id)] {
+        for (what, v) in [
+            ("pci_bridge_id", &self.pci_bridge_id),
+            ("nvme_pci_id", &self.nvme_pci_id),
+            ("usb_pci_id", &self.usb_pci_id),
+            ("hda_pci_id", &self.hda_pci_id),
+            ("hda_codec_id", &self.hda_codec_id),
+        ] {
             // Vendor 0xffff reads as "no device here".
             if !pci_ids(v).is_some_and(|[vendor, ..]| vendor != 0 && vendor != 0xffff) {
                 return Err(Error::Invalid(format!(
@@ -351,6 +408,18 @@ pub enum Transport {
 }
 
 impl VmConfig {
+    /// The sound card to build, if any (`auto` resolved).
+    pub fn sound_device(&self) -> Option<SoundDevice> {
+        if !self.audio.output && !self.audio.input {
+            return None;
+        }
+        Some(match self.audio.device {
+            SoundDevice::Auto if self.guest_os() == GuestOs::Windows => SoundDevice::Hda,
+            SoundDevice::Auto => SoundDevice::Virtio,
+            d => d,
+        })
+    }
+
     /// Resolved transport.
     pub fn use_pci(&self) -> bool {
         match self.virtio_transport {
@@ -397,13 +466,33 @@ pub enum DiskFormat {
     Qcow2,
 }
 
-/// Sound. Output only: there is no microphone path at all.
+/// Sound. The microphone is a separate opt-in (`input`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Audio {
-    /// Guest playback through the host's speakers (virtio-snd; Linux guests).
+    /// Guest playback through the host's speakers.
     #[serde(default)]
     pub output: bool,
+    /// The host microphone, for the guest to record from. Flows only while
+    /// the VM's window is open, the VM runs and the guest records.
+    #[serde(default)]
+    pub input: bool,
+    /// Which sound card the guest gets.
+    #[serde(default)]
+    pub device: SoundDevice,
+}
+
+/// The emulated sound card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SoundDevice {
+    /// HD Audio for Windows guests, virtio-snd for the others.
+    #[default]
+    Auto,
+    /// Intel HD Audio: Windows and Linux have a driver built in.
+    Hda,
+    /// virtio-snd: Linux (`virtio_snd`); Windows has no driver.
+    Virtio,
 }
 
 /// A host folder shared with the guest. Linux: `mount -t virtiofs <tag> /mnt`.
@@ -587,6 +676,16 @@ pub struct Display {
     pub width: u32,
     #[serde(default = "default_h")]
     pub height: u32,
+    /// Full resolution on HiDPI (Retina) screens: the window gives the
+    /// guest its size in physical pixels and has the guest agent scale
+    /// the guest's UI to match. Without an agent that can, or off: the
+    /// guest gets logical pixels and the window scales the picture up.
+    #[serde(default = "yes")]
+    pub hidpi: bool,
+    /// With `virtio3d`: OpenGL (virgl, on ANGLE/Metal) next to Vulkan.
+    /// Off keeps Venus only: less host code parsing guest commands.
+    #[serde(default = "yes")]
+    pub opengl: bool,
 }
 
 fn default_w() -> u32 {
@@ -598,7 +697,7 @@ fn default_h() -> u32 {
 
 impl Default for Display {
     fn default() -> Self {
-        Display { gpu: Gpu::None, width: default_w(), height: default_h() }
+        Display { gpu: Gpu::None, width: default_w(), height: default_h(), hidpi: true, opengl: true }
     }
 }
 
@@ -778,6 +877,9 @@ impl VmConfig {
                 w.push(format!("share {:?} is writable: the guest can change or delete files in {}", s.tag, p.display()));
             }
         }
+        if self.audio.input {
+            w.push("audio.input: the guest hears your microphone while its window is open and it records".into());
+        }
         if self.clipboard.guest_to_host && self.clipboard.host_to_guest {
             // The default, and gated on window focus: worth a mention only
             // together with a disabled sandbox.
@@ -816,6 +918,24 @@ impl VmConfig {
         }
         if self.nets.len() > MAX_NICS {
             return bad(format!("at most {MAX_NICS} network adapters"));
+        }
+        if self.usb.len() > MAX_USB {
+            return bad(format!("at most {MAX_USB} USB devices"));
+        }
+        let printable = |v: &str, max: usize| !v.is_empty() && v.len() <= max && v.bytes().all(|b| (0x20..0x7f).contains(&b));
+        for (i, u) in self.usb.iter().enumerate() {
+            if u.ids().is_none() {
+                return bad(format!("usb id {:?}: \"vendor:product\", 4 hex digits each (vroom usb list shows them)", u.id));
+            }
+            if u.serial.as_deref().is_some_and(|s| !printable(s, 126)) {
+                return bad(format!("usb {}: serial must be 1-126 printable ASCII chars", u.id));
+            }
+            if u.name.as_deref().is_some_and(|s| !printable(s, 64)) {
+                return bad(format!("usb {}: name must be 1-64 printable ASCII chars", u.id));
+            }
+            if self.usb[..i].iter().any(|o| o.ids() == u.ids() && o.serial == u.serial) {
+                return bad(format!("usb {} listed twice", u.id));
+            }
         }
         if let Boot::Kernel { cmdline, .. } = &self.boot {
             if cmdline.len() > 2048 {
@@ -937,6 +1057,23 @@ pub fn format_mac(m: &[u8; 6]) -> String {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn usb_entries() {
+        let base = "name = \"u\"\n[boot]\ntype = \"kernel\"\nkernel = \"/k\"\n";
+        let ok = super::VmConfig::from_toml(&format!("{base}[[usb]]\nid = \"1050:0407\"\nserial = \"123\"\n[[usb]]\nid = \"1050:0407\"\n")).unwrap();
+        assert_eq!(ok.usb[0].ids(), Some((0x1050, 0x0407)));
+        for bad in [
+            "[[usb]]\nid = \"1050\"\n",
+            "[[usb]]\nid = \"0000:0001\"\n",
+            "[[usb]]\nid = \"1050:04079\"\n",
+            "[[usb]]\nid = \"1050:0407\"\nserial = \"\"\n",
+            "[[usb]]\nid = \"1050:0407\"\nbus = 1\n",
+            "[[usb]]\nid = \"1050:0407\"\n[[usb]]\nid = \"1050:0407\"\n",
+        ] {
+            assert!(super::VmConfig::from_toml(&format!("{base}{bad}")).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn risky_choices_are_named() {
         let c = super::VmConfig::from_toml(
             r#"
@@ -1055,11 +1192,32 @@ guest_to_host = false
         // A [[net]] MAC can't be the gateway's.
         let clash = format!("{SAMPLE}\n[identity]\nnat_gateway_mac = \"52:54:00:aa:bb:cc\"\n");
         assert!(VmConfig::from_toml(&clash).is_err());
+        // The GL renderer name fills a 64-byte C string.
+        let gl = format!("{SAMPLE}\n[identity]\ngl_renderer = \"Mali-G78\"\n");
+        assert_eq!(VmConfig::from_toml(&gl).unwrap().identity.gl_renderer.as_deref(), Some("Mali-G78"));
+        assert!(VmConfig::from_toml(&gl.replace("Mali-G78", &"x".repeat(64))).is_err());
+        assert!(VmConfig::from_toml(&gl.replace("Mali-G78", "")).is_err());
 
         let mut i = Identity::default();
         i.randomize_serials([1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(i.serial.as_deref(), Some("010203040506"));
         assert_eq!(i.disk_serial, "0708");
+    }
+
+    #[test]
+    fn sound_device_follows_the_guest() {
+        let base = "name = \"x\"\n[boot]\ntype = \"uefi\"\nvars = \"v.fd\"\n";
+        let c = |extra: &str| VmConfig::from_toml(&format!("{base}{extra}")).unwrap();
+        assert_eq!(c("").sound_device(), None);
+        assert_eq!(c("[audio]\noutput = true\n").sound_device(), Some(SoundDevice::Virtio));
+        let win = VmConfig::from_toml(&format!("os = \"windows\"\n{base}[audio]\ninput = true\n")).unwrap();
+        assert_eq!(win.sound_device(), Some(SoundDevice::Hda));
+        assert_eq!(c("[audio]\noutput = true\ndevice = \"hda\"\n").sound_device(), Some(SoundDevice::Hda));
+        assert!(c("[audio]\ninput = true\n").warnings().iter().any(|w| w.contains("microphone")));
+        assert!(VmConfig::from_toml(&format!("{base}[audio]\ndevice = \"ac97\"\n")).is_err());
+        let ids = c("[identity]\nhda_pci_id = \"8086:a0c8:17aa:22d8\"\nhda_codec_id = \"10ec:0287:17aa:22d8\"\n");
+        assert_eq!(pci_ids(&ids.identity.hda_codec_id), Some([0x10ec, 0x0287, 0x17aa, 0x22d8]));
+        assert!(VmConfig::from_toml(&format!("{base}[identity]\nhda_codec_id = \"0000:0287\"\n")).is_err());
     }
 
     #[test]
@@ -1072,6 +1230,7 @@ guest_to_host = false
         assert_eq!(port_forwards[0].host_addr, "127.0.0.1");
         assert!(c.clipboard.host_to_guest && !c.clipboard.guest_to_host);
         assert!(c.security.sandbox);
+        assert!(c.display.opengl, "GL on by default with 3D");
         // Round trip.
         let again = VmConfig::from_toml(&c.to_toml().unwrap()).unwrap();
         assert_eq!(again, c);

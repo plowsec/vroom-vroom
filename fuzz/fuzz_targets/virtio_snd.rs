@@ -1,10 +1,11 @@
 //! virtio-snd from a hostile driver: control requests (params, state
-//! changes in any order) and PCM transfers, all from guest memory.
+//! changes in any order) and PCM transfers both ways (with or without a
+//! capture stream), all from guest memory.
 #![no_main]
 use std::sync::Arc;
 
 use vroom_memory::{GuestAddress, GuestMemory};
-use vroom_virtio::devices::sound::{AudioSink, Sound};
+use vroom_virtio::devices::sound::{AudioSink, AudioSource, Sound};
 use vroom_virtio::{ActivateContext, Queue, VirtioInterrupt};
 use libfuzzer_sys::fuzz_target;
 
@@ -13,6 +14,14 @@ impl AudioSink for Null {
     fn start(&mut self, _r: u32, _c: u8) {}
     fn write(&mut self, pcm: &[u8]) {
         std::hint::black_box(pcm.len());
+    }
+    fn stop(&mut self) {}
+}
+struct Mic;
+impl AudioSource for Mic {
+    fn start(&mut self, _r: u32, _c: u8) {}
+    fn read(&mut self, out: &mut [u8]) {
+        out.fill(1);
     }
     fn stop(&mut self) {}
 }
@@ -43,6 +52,9 @@ fuzz_target!(|data: &[u8]| {
     mem.write(GuestAddress(0), &data[1..1 + n]).unwrap();
     let size = 1 << (data[0] % 5);
     let mut s = Sound::new(Box::new(|| Box::new(Null) as Box<dyn AudioSink>));
+    if data[0] & 0x80 != 0 {
+        s = s.with_capture(Box::new(|| Box::new(Mic) as Box<dyn AudioSource>));
+    }
     let ctx = ActivateContext {
         mem,
         queues: (0..4).map(|i| queue(i * 0x200, size)).collect(),

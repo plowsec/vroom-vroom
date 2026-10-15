@@ -4,6 +4,9 @@ use crate::{Error, Result};
 
 /// Absolute pointer range (like a USB tablet).
 pub const POINTER_MAX: u16 = 32767;
+/// Window scales a resize may carry, in percent (0 = none).
+pub const SCALE_MIN: u32 = 100;
+pub const SCALE_MAX: u32 = 500;
 const MAX_MSG: usize = 16 << 20;
 
 /// VMM -> viewer.
@@ -19,6 +22,8 @@ pub enum ToViewer {
     Status(String),
     /// VM is gone; viewer should close.
     Closed,
+    /// The guest is recording from the host microphone (true) or stopped.
+    Mic(bool),
 }
 
 /// Lifecycle requests from the viewer.
@@ -45,8 +50,10 @@ pub enum ToVmm {
     /// evdev button code (BTN_LEFT = 0x110 ...).
     Button { code: u16, down: bool },
     Wheel { dx: i16, dy: i16 },
-    /// Window content size in pixels; guests that can follow will.
-    Resize { width: u32, height: u32 },
+    /// Window content size; guests that can follow will. `scale` 0: in
+    /// logical pixels. Else (HiDPI) in physical pixels, and the window's
+    /// scale in percent (200 on Retina), for the guest's UI.
+    Resize { width: u32, height: u32, scale: u32 },
     Focus(bool),
     /// Host clipboard changed (only sent while focused).
     Clipboard(String),
@@ -82,6 +89,7 @@ impl ToViewer {
             ToViewer::ClipboardSet(s) => frame(3, s.as_bytes()),
             ToViewer::Status(s) => frame(4, s.as_bytes()),
             ToViewer::Closed => frame(5, &[]),
+            ToViewer::Mic(on) => frame(6, &[*on as u8]),
         }
     }
 
@@ -92,6 +100,7 @@ impl ToViewer {
             3 => ToViewer::ClipboardSet(text(p)?),
             4 => ToViewer::Status(text(p)?),
             5 => ToViewer::Closed,
+            6 => ToViewer::Mic(*p.first().ok_or(Error::Proto("short"))? != 0),
             _ => return Err(Error::Proto("unknown viewer message")),
         })
     }
@@ -104,7 +113,7 @@ impl ToVmm {
             ToVmm::Pointer { x, y } => frame(2, &u32s(&[*x as u32, *y as u32])),
             ToVmm::Button { code, down } => frame(3, &u32s(&[*code as u32, *down as u32])),
             ToVmm::Wheel { dx, dy } => frame(4, &u32s(&[*dx as u16 as u32, *dy as u16 as u32])),
-            ToVmm::Resize { width, height } => frame(5, &u32s(&[*width, *height])),
+            ToVmm::Resize { width, height, scale } => frame(5, &u32s(&[*width, *height, *scale])),
             ToVmm::Focus(f) => frame(6, &[*f as u8]),
             ToVmm::Clipboard(s) => frame(7, s.as_bytes()),
             ToVmm::Command(c) => frame(8, &[*c as u8]),
@@ -121,7 +130,14 @@ impl ToVmm {
             }
             3 => ToVmm::Button { code: small(get_u32(p, 0)?)?, down: get_u32(p, 1)? != 0 },
             4 => ToVmm::Wheel { dx: get_u32(p, 0)? as u16 as i16, dy: get_u32(p, 1)? as u16 as i16 },
-            5 => ToVmm::Resize { width: get_u32(p, 0)?, height: get_u32(p, 1)? },
+            5 => {
+                // The scale is optional (older viewers, scripts): 0.
+                let scale = if p.len() >= 12 { get_u32(p, 2)? } else { 0 };
+                if scale != 0 && !(SCALE_MIN..=SCALE_MAX).contains(&scale) {
+                    return Err(Error::Proto("scale"));
+                }
+                ToVmm::Resize { width: get_u32(p, 0)?, height: get_u32(p, 1)?, scale }
+            }
             6 => ToVmm::Focus(*p.first().ok_or(Error::Proto("short"))? != 0),
             7 => ToVmm::Clipboard(text(p)?),
             8 => ToVmm::Command(match p.first() {
@@ -195,7 +211,8 @@ mod tests {
             ToVmm::Pointer { x: 100, y: 32767 },
             ToVmm::Button { code: 0x110, down: false },
             ToVmm::Wheel { dx: -1, dy: 3 },
-            ToVmm::Resize { width: 1920, height: 1080 },
+            ToVmm::Resize { width: 1920, height: 1080, scale: 0 },
+            ToVmm::Resize { width: 3456, height: 2234, scale: 200 },
             ToVmm::Focus(true),
             ToVmm::Clipboard("x".into()),
             ToVmm::Command(Command::Snapshot),
@@ -207,7 +224,12 @@ mod tests {
         for m in &vm {
             assert_eq!(d.next_to_vmm().unwrap().as_ref(), Some(m));
         }
-        let v = [ToViewer::Mode { width: 800, height: 600 }, ToViewer::Damage { x: 1, y: 2, w: 3, h: 4 }, ToViewer::Closed];
+        let v = [
+            ToViewer::Mode { width: 800, height: 600 },
+            ToViewer::Damage { x: 1, y: 2, w: 3, h: 4 },
+            ToViewer::Closed,
+            ToViewer::Mic(true),
+        ];
         for m in &v {
             d.push(&m.encode());
         }
@@ -222,6 +244,11 @@ mod tests {
         d.push(&[1, 0xff, 0xff, 0xff, 0xff]);
         assert!(d.next_to_vmm().is_err());
         d.push(&[2, 4, 0, 0, 0, 1, 2, 3, 4]); // pointer with 1 field
+        assert!(d.next_to_vmm().is_err());
+        // resize without a scale: logical pixels
+        d.push(&[5, 8, 0, 0, 0, 0, 4, 0, 0, 0, 3, 0, 0]);
+        assert_eq!(d.next_to_vmm().unwrap(), Some(ToVmm::Resize { width: 1024, height: 768, scale: 0 }));
+        d.push(&ToVmm::Resize { width: 1, height: 1, scale: 99 }.encode());
         assert!(d.next_to_vmm().is_err());
     }
 }

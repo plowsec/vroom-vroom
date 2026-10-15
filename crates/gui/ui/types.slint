@@ -57,6 +57,20 @@ export struct ShareRow {
     readonly: bool,
 }
 
+// A `[[usb]]` device of the VM.
+export struct UsbRow {
+    label: string,
+    note: string,   // id, plugged in or not, held by the host
+    warn: bool,
+}
+
+// A device plugged into this machine (the Add list).
+export struct UsbHostRow {
+    label: string,
+    note: string,
+    taken: bool,    // already in the VM's list
+}
+
 export struct SnapRow {
     name: string,
     when: string,
@@ -74,12 +88,18 @@ export struct VmSettings {
     nested: bool,
     tpm: bool,
     gpu: int,        // 0 none, 1 2d, 2 3d
+    opengl: bool,
     width: string,
     height: string,
+    hidpi: bool,
     disks: [DiskRow],
     nets: [NetRow],
     shares: [ShareRow],
+    usb: [UsbRow],
+    usb-host: [UsbHostRow],
+    usb-picking: bool,
     audio: bool,
+    audio-in: bool,
     clip-in: bool,
     clip-out: bool,
     clip-max-kib: string,
@@ -110,6 +130,7 @@ export struct VmSettings {
     sum-storage: string,
     sum-net: string,
     sum-share: string,
+    sum-usb: string,
     sum-sound: string,
     sum-clip: string,
     sum-security: string,
@@ -124,6 +145,7 @@ export struct CardVis {
     storage: bool,
     net: bool,
     share: bool,
+    usb: bool,
     sound: bool,
     clip: bool,
     security: bool,

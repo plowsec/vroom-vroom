@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table};
 use vroom_config::{
-    Boot, Disk, DiskBus, DiskFormat, DiskSync, GuestOs, Gpu, Net, NetKind, PortForward, Serial, Share, Transport, VmConfig,
+    Boot, Disk, DiskBus, DiskFormat, DiskSync, GuestOs, Gpu, Net, NetKind, PortForward, Serial, Share, Transport, Usb, VmConfig,
 };
 
 fn bool_of(v: &str) -> Result<bool, String> {
@@ -55,11 +55,14 @@ pub fn set(c: &mut VmConfig, key: &str, v: &str, default_iface: Option<&str>) ->
         ["nested"] => c.nested = bool_of(v)?,
         ["tpm"] => c.tpm = bool_of(v)?,
         ["audio"] => c.audio.output = bool_of(v)?,
+        ["audio", "in"] => c.audio.input = bool_of(v)?,
         ["sandbox"] => c.security.sandbox = bool_of(v)?,
         ["os"] => c.os = Some(GuestOs::ALL[choice(v, GuestOs::ALL.len(), "system")?]),
         ["gpu"] => c.display.gpu = [Gpu::None, Gpu::Virtio2d, Gpu::Virtio3d][choice(v, 3, "display")?],
+        ["opengl"] => c.display.opengl = bool_of(v)?,
         ["width"] => c.display.width = num(v, "width")?,
         ["height"] => c.display.height = num(v, "height")?,
+        ["hidpi"] => c.display.hidpi = bool_of(v)?,
         ["clip", "in"] => c.clipboard.host_to_guest = bool_of(v)?,
         ["clip", "out"] => c.clipboard.guest_to_host = bool_of(v)?,
         ["clip", "max"] => c.clipboard.max_bytes = num::<u32>(v, "size")?.saturating_mul(1024),
@@ -216,6 +219,10 @@ pub fn act(c: &mut VmConfig, key: &str) -> Result<(), String> {
             let i = idx(&mut c.disks, i, "disk")?;
             c.disks.remove(i);
         }
+        ["usb", i, "remove"] => {
+            let i = idx(&mut c.usb, i, "USB device")?;
+            c.usb.remove(i);
+        }
         _ => return Err(format!("unknown action {key}")),
     }
     Ok(())
@@ -234,6 +241,20 @@ pub fn add_share(c: &mut VmConfig, path: &Path) {
         n += 1;
     }
     c.shares.push(Share { path: path.to_path_buf(), tag, readonly: true });
+}
+
+/// Give the VM a host USB device (from the app's list of them). The
+/// serial number pins it when it has a usable one; the name is a label.
+pub fn add_usb(c: &mut VmConfig, id: &str, serial: Option<&str>, name: Option<&str>) -> Result<(), String> {
+    let text = |ch: char| (' '..='~').contains(&ch);
+    // A serial that isn't plain text can't go in the file: match by id then.
+    let serial = serial.filter(|s| !s.is_empty() && s.len() <= 126 && s.chars().all(text)).map(str::to_string);
+    let name = name.map(|n| n.chars().filter(|&ch| text(ch)).take(64).collect::<String>().trim().to_string()).filter(|n| !n.is_empty());
+    if c.usb.iter().any(|u| u.id == id && u.serial == serial) {
+        return Err("That device is already in the list".into());
+    }
+    c.usb.push(Usb { id: id.to_string(), serial, name });
+    Ok(())
 }
 
 pub enum NewDisk {
@@ -640,8 +661,10 @@ gpu = "virtio2d"
         ("nested", "true"),
         ("os", "1"),
         ("gpu", "2"),
+        ("opengl", "false"),
         ("width", "1600"),
         ("height", "900"),
+        ("hidpi", "false"),
         ("disk.0.bus", "1"),
         ("disk.0.readonly", "true"),
         ("disk.0.sync", "0"),
@@ -655,6 +678,7 @@ gpu = "virtio2d"
         ("share.0.tag", "work"),
         ("share.0.writable", "true"),
         ("audio", "true"),
+        ("audio.in", "true"),
         ("clip.in", "false"),
         ("clip.out", "false"),
         ("clip.max", "64"),
@@ -677,13 +701,23 @@ gpu = "virtio2d"
         ("net.0.network", "lab2"),
     ];
 
-    const UI_ACTS: &[&str] =
-        &["net.0.fwd.add", "net.0.fwd.0.remove", "net.0.mac.random", "identity.random", "share.0.remove", "disk.0.remove", "net.add", "net.0.remove"];
+    const UI_ACTS: &[&str] = &[
+        "net.0.fwd.add",
+        "net.0.fwd.0.remove",
+        "net.0.mac.random",
+        "identity.random",
+        "share.0.remove",
+        "disk.0.remove",
+        "usb.0.remove",
+        "net.add",
+        "net.0.remove",
+    ];
 
     #[test]
     fn every_ui_key_works() {
         let mut c = VmConfig::from_toml(FILE).unwrap();
         add_share(&mut c, Path::new("/tmp/x"));
+        add_usb(&mut c, "1050:0407", Some("12345"), Some("YubiKey")).unwrap();
         for (k, v) in UI_SETS {
             set(&mut c, k, v, None).unwrap_or_else(|e| panic!("{k}={v}: {e}"));
             c.validate().unwrap_or_else(|e| panic!("{k}={v}: {e}"));
@@ -718,7 +752,7 @@ gpu = "virtio2d"
             match call {
                 "set" => assert!(UI_SETS.iter().any(|(k, _)| k == &key), "Bus.set({key:?}) not tested"),
                 "act" => assert!(
-                    UI_ACTS.contains(&key) || ["disk.add-new", "disk.add-existing", "disk.add-iso", "share.add", "edit-file"].contains(&key),
+                    UI_ACTS.contains(&key) || ["disk.add-new", "disk.add-existing", "disk.add-iso", "share.add", "usb.add", "edit-file"].contains(&key),
                     "Bus.act({key:?}) not tested"
                 ),
                 _ => {}
@@ -758,6 +792,21 @@ gpu = "virtio2d"
         assert_eq!(c.shares[0].tag, "mystuff");
         assert_eq!(c.memory_mib, 8192);
         assert!(t.contains("# my dev box"), "{t}");
+    }
+
+    #[test]
+    fn usb_devices() {
+        let (t, c) = edit(|c| {
+            add_usb(c, "1050:0407", Some("0012\u{1}"), Some("Yubico YubiKey OTP+FIDO+CCID \u{2122}")).unwrap();
+            add_usb(c, "0403:6001", Some("A1"), None).unwrap();
+            assert!(add_usb(c, "0403:6001", Some("A1"), None).is_err(), "twice");
+        });
+        assert_eq!(c.usb[0].serial, None, "control characters: no serial");
+        assert_eq!(c.usb[0].name.as_deref(), Some("Yubico YubiKey OTP+FIDO+CCID"));
+        assert!(t.contains("[[usb]]") && t.contains("# system disk"), "{t}");
+        let (t, c) = edit_file(&t, |c| act(c, "usb.0.remove").unwrap());
+        assert_eq!(c.usb.len(), 1);
+        assert!(t.contains("0403:6001") && !t.contains("1050:0407"), "{t}");
     }
 
     #[test]

@@ -2,8 +2,8 @@
 //!
 //! Owns the shared framebuffer and the socket to the viewer. Guest frames
 //! come in through [`FbSink`] (virtio-gpu), viewer input goes out to the
-//! virtio-input devices, resize to the GPU / agent, focus + clipboard to
-//! the agent, lifecycle commands to the main loop.
+//! virtio-input devices, resize, focus + clipboard to the agent (which
+//! also drives the GPU's size), lifecycle commands to the main loop.
 
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use vroom_display::{send_fd, Decoder, SharedFb, ToViewer, ToVmm};
 use vroom_devices::usb::hid::HidEvent;
 use vroom_devices::usb::xhci::Xhci;
-use vroom_virtio::devices::gpu::{DisplaySink, GpuControl};
+use vroom_virtio::devices::gpu::DisplaySink;
 use vroom_virtio::devices::input::{self as ev, event};
 
 use crate::agent::{Agent, AgentCmd, ClipboardProvider};
@@ -24,30 +24,26 @@ use crate::vcpu::VmEvent;
 /// Sends to the viewer without ever blocking the caller.
 ///
 /// A dedicated thread does the (blocking) socket writes. Damage is
-/// coalesced into one rectangle covering everything that changed since
-/// the last one went out, so a viewer that stops reading costs us at most
-/// a handful of queued messages, never a stall, and a viewer that keeps
-/// up only converts what changed.
-/// Corners of a damaged area: (x0, y0, x1, y1).
-type Corners = (u32, u32, u32, u32);
-
+/// coalesced into one rect (the union of everything since the viewer was
+/// last told), so a viewer that stops reading costs us at most a handful
+/// of queued messages, never a stall, and one that keeps up only converts
+/// what changed.
 #[derive(Clone)]
 pub(crate) struct ViewerTx {
     q: std::sync::mpsc::Sender<ToViewer>,
-    /// Union of the damage not sent yet.
-    damage: Arc<Mutex<Option<Corners>>>,
+    /// x0, y0, x1, y1 not yet sent; Some means a marker is queued.
+    damage: Arc<Mutex<Option<[u32; 4]>>>,
 }
 
 impl ViewerTx {
     fn spawn(mut sock: UnixStream) -> std::io::Result<Self> {
         let (q, rx) = std::sync::mpsc::channel::<ToViewer>();
-        let damage = Arc::new(Mutex::new(None::<Corners>));
-        let dmg = damage.clone();
+        let damage = Arc::new(Mutex::new(None::<[u32; 4]>));
+        let pending = damage.clone();
         std::thread::Builder::new().name("viewer-tx".into()).spawn(move || {
             while let Ok(mut m) = rx.recv() {
                 if matches!(m, ToViewer::Damage { .. }) {
-                    // Whatever accumulated until now goes out as one rect.
-                    let Some((x0, y0, x1, y1)) = dmg.lock().unwrap_or_else(|e| e.into_inner()).take() else { continue };
+                    let Some([x0, y0, x1, y1]) = pending.lock().unwrap_or_else(|e| e.into_inner()).take() else { continue };
                     m = ToViewer::Damage { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
                 }
                 if sock.write_all(&m.encode()).is_err() {
@@ -59,15 +55,14 @@ impl ViewerTx {
     }
 
     pub fn send(&self, m: &ToViewer) {
-        if let &ToViewer::Damage { x, y, w, h } = m {
-            let r = (x, y, x.saturating_add(w), y.saturating_add(h));
+        if let ToViewer::Damage { x, y, w, h } = *m {
+            let r = [x, y, x.saturating_add(w), y.saturating_add(h)];
             let mut d = self.damage.lock().unwrap_or_else(|e| e.into_inner());
             match d.as_mut() {
-                // A message is already queued: it will carry this too.
-                Some(u) => *u = (u.0.min(r.0), u.1.min(r.1), u.2.max(r.2), u.3.max(r.3)),
+                Some(u) => *u = union(*u, r),
                 None => {
                     *d = Some(r);
-                    drop(d);
+                    // The rect is filled in when it goes out.
                     let _ = self.q.send(ToViewer::Damage { x: 0, y: 0, w: 0, h: 0 });
                 }
             }
@@ -75,6 +70,10 @@ impl ViewerTx {
         }
         let _ = self.q.send(m.clone());
     }
+}
+
+fn union(a: [u32; 4], b: [u32; 4]) -> [u32; 4] {
+    [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]
 }
 
 /// Two sources can feed the screen: ramfb (firmware, boot, Windows before
@@ -309,10 +308,10 @@ impl DisplayServer {
     /// Start reading viewer input.
     pub fn run(
         self,
-        gpu: Option<GpuControl>,
         input: Option<InputPipes>,
         agent: Agent,
         events: Sender<VmEvent>,
+        on_close: Option<Box<dyn FnOnce() + Send>>,
     ) -> std::io::Result<()> {
         let mut stream = self.stream;
         let latest = self.clip_latest;
@@ -327,7 +326,7 @@ impl DisplayServer {
                 dec.push(&buf[..n]);
                 loop {
                     match dec.next_to_vmm() {
-                        Ok(Some(m)) => handle(m, gpu.as_ref(), input.as_ref(), &agent, &events, &latest),
+                        Ok(Some(m)) => handle(m, input.as_ref(), &agent, &events, &latest),
                         Ok(None) => break,
                         Err(e) => {
                             log::warn!("display: {e}");
@@ -337,6 +336,9 @@ impl DisplayServer {
                 }
             }
             log::info!("viewer disconnected");
+            if let Some(f) = on_close {
+                f();
+            }
             let _ = events.send(VmEvent::ViewerClosed);
         })?;
         Ok(())
@@ -354,7 +356,6 @@ fn send_events(sock: &Option<UnixDatagram>, evs: &[[u8; 8]]) {
 
 fn handle(
     m: ToVmm,
-    gpu: Option<&GpuControl>,
     input: Option<&InputPipes>,
     agent: &Agent,
     events: &Sender<VmEvent>,
@@ -393,12 +394,9 @@ fn handle(
             e.push(syn);
             send_events(&input.tablet, &e);
         }
-        ToVmm::Resize { width, height } => {
-            log::debug!("display: viewer asks for {width}x{height}");
-            if let Some(g) = gpu {
-                g.resize(width, height);
-            }
-            agent.send(AgentCmd::SetResolution(width, height));
+        ToVmm::Resize { width, height, scale } => {
+            log::debug!("display: viewer asks for {width}x{height} at {scale}%");
+            agent.send(AgentCmd::Display { width, height, scale });
         }
         ToVmm::Focus(f) => agent.send(AgentCmd::Focus(f)),
         ToVmm::Clipboard(t) => *latest.lock().unwrap_or_else(|e| e.into_inner()) = Some(t),
@@ -420,27 +418,32 @@ mod tests {
     }
 
     #[test]
-    fn damage_goes_out_as_one_rect() {
+    fn damage_is_merged_not_lost() {
         let (a, mut b) = UnixStream::pair().unwrap();
         let tx = ViewerTx::spawn(a).unwrap();
-        // Queued behind a big message, these coalesce into one rect.
-        tx.send(&ToViewer::Status("x".repeat(1 << 20)));
-        tx.send(&ToViewer::Damage { x: 10, y: 20, w: 5, h: 5 });
-        tx.send(&ToViewer::Damage { x: 100, y: 2, w: 1, h: 1 });
-        tx.send(&ToViewer::Damage { x: u32::MAX, y: 0, w: 9, h: 1 });
-        let mut dec = Decoder::default();
-        let mut got = Vec::new();
-        let mut buf = vec![0u8; 1 << 16];
-        b.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        while got.len() < 2 {
+        for (x, y) in [(10, 20), (300, 5), (40, 400)] {
+            tx.send(&ToViewer::Damage { x, y, w: 8, h: 8 });
+        }
+        tx.send(&ToViewer::Closed);
+        let mut d = vroom_display::Decoder::default();
+        let mut got: Option<[u32; 4]> = None;
+        let mut buf = [0u8; 256];
+        b.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        'read: loop {
             let n = b.read(&mut buf).unwrap();
-            assert!(n > 0);
-            dec.push(&buf[..n]);
-            while let Some(m) = dec.next_to_viewer().unwrap() {
-                got.push(m);
+            d.push(&buf[..n]);
+            while let Some(m) = d.next_to_viewer().unwrap() {
+                match m {
+                    ToViewer::Damage { x, y, w, h } => {
+                        let r = [x, y, x + w, y + h];
+                        got = Some(got.map_or(r, |u| union(u, r)));
+                    }
+                    ToViewer::Closed => break 'read,
+                    _ => {}
+                }
             }
         }
-        assert_eq!(got[1], ToViewer::Damage { x: 10, y: 0, w: u32::MAX - 10, h: 25 });
+        assert_eq!(got, Some([10, 5, 308, 408]));
     }
 
     #[test]

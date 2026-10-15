@@ -105,6 +105,12 @@ pub fn run_service(port: Option<String>) -> std::io::Result<()> {
 
 /// The service's work: keep the host port open, accept helpers, relay.
 fn serve(port: Option<&str>) {
+    // Shared folders added since the last boot get their drive letter.
+    std::thread::spawn(|| {
+        if let Err(e) = crate::shares::mount_all() {
+            log::info!("shares: {e}");
+        }
+    });
     let (tx, rx) = channel::<Ev>();
     {
         let tx = tx.clone();

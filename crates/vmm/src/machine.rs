@@ -6,7 +6,10 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use vroom_arch::aarch64::{self as board, layout};
-use vroom_config::{Boot, DiskBus, Gpu, Identity, VmConfig};
+use vroom_config::{Boot, DiskBus, Gpu, GuestOs, Identity, SoundDevice, VmConfig};
+use vroom_devices::audio::{AudioSink, AudioSource, NullSink, Silence};
+use vroom_devices::hda::{codec::CodecIds, Hda, HdaIds};
+use vroom_virtio::devices::sound::Sound;
 use vroom_devices::{pl011::Pl011, pl031::Pl031, BusBuilder, BusDevice, ConcurrentBusDevice};
 use vroom_hv::{
     aarch64::mpidr_for, BootRegs, GicMsiConfig, Hypervisor, IrqChipConfig, IrqChipInfo, Vm, VmParams,
@@ -18,7 +21,7 @@ use vroom_net::nat::{Nat, NatConfig, NatPolicy, TcpForward};
 use vroom_net::socket::FrameSocket;
 use vroom_net::{netd, NetBackend};
 use vroom_virtio::devices::gpu::{DisplaySink, Gpu as GpuDev, ThreeD};
-use vroom_virtio::devices::gpu3d::{Mapping, ShmMapper};
+use vroom_virtio::devices::gpu3d::{Mapping, Renderer3d, ShmMapper};
 use vroom_virtio::devices::input::{Input, InputKind};
 use vroom_virtio::devices::{block::Block, console::Console, fs::Fs, net::Net, rng::Rng};
 use vroom_devices::nvme::{Namespace, Nvme};
@@ -238,14 +241,19 @@ impl BootImage {
 /// Host-visible window size for GPU buffers (address space, not memory).
 const GPU_SHM_SIZE: u64 = 8 << 30;
 
-/// Venus through virglrenderer, or a clear error.
-fn three_d(vm: &Arc<dyn Vm>) -> Result<ThreeD> {
-    if !vroom_gpu3d::load() {
+/// Venus (and GL, if asked and ANGLE is there) through virglrenderer, or
+/// a clear error.
+fn three_d(vm: &Arc<dyn Vm>, config: &VmConfig) -> Result<ThreeD> {
+    if !vroom_gpu3d::load(config.display.opengl) {
         return Err(Error::Setup(
-            "gpu = \"virtio3d\" needs virglrenderer with Venus (macOS: brew install slp/krunkit/virglrenderer)".into(),
+            "gpu = \"virtio3d\" needs virglrenderer with Venus (scripts/build-virglrenderer.sh, or brew install slp/krunkit/virglrenderer)".into(),
         ));
     }
-    let r = vroom_gpu3d::Virgl::new().ok_or_else(|| Error::Setup("virglrenderer: Venus init failed (no Vulkan driver?)".into()))?;
+    let r = vroom_gpu3d::Virgl::new(config.identity.gl_renderer.clone())
+        .ok_or_else(|| Error::Setup("virglrenderer: Venus init failed (no Vulkan driver?)".into()))?;
+    if config.display.opengl && !r.capsets().iter().any(|c| c.0 == 2) {
+        log::warn!("gpu: no OpenGL for the guest (needs ANGLE next to virglrenderer: scripts/build-angle.sh); Vulkan only");
+    }
     Ok(ThreeD::new(Box::new(r), Arc::new(VmShm(vm.clone())), GPU_SHM_SIZE))
 }
 
@@ -290,6 +298,66 @@ fn vendor_ids(s: &str) -> Result<VendorIds> {
     let [vendor, device, subsys_vendor, subsys] =
         vroom_config::pci_ids(s).ok_or_else(|| Error::Setup(format!("bad PCI id {s:?}")))?;
     Ok(VendorIds { vendor, device, subsys_vendor, subsys })
+}
+
+/// The sound card `[audio]` asks for, fed by the audio helper. Returns
+/// the helper (its microphone gate follows the VM window).
+fn sound_card(
+    board: &mut Board,
+    config: &VmConfig,
+    dev: SoundDevice,
+    ui: Option<&DisplayServer>,
+) -> Result<Arc<crate::audio::AudioHelper>> {
+    use crate::audio::{AudioHelper, HelperSink, HelperSource};
+    // VROOM_AUDIO_WAV_DIR: test mode, record to / from WAV files instead
+    // of the speakers and the microphone.
+    let wav = std::env::var_os("VROOM_AUDIO_WAV_DIR").map(std::path::PathBuf::from);
+    let (output, input) = (config.audio.output, config.audio.input);
+    let helper = AudioHelper::spawn(wav.as_deref(), input)?;
+    if let Some(ds) = ui {
+        helper.set_viewer(ds.tx());
+        helper.set_window(true);
+    }
+    let h = helper.clone();
+    let make_sink = move || -> Box<dyn AudioSink> {
+        if output {
+            Box::new(HelperSink(h.clone()))
+        } else {
+            Box::new(NullSink)
+        }
+    };
+    let h = helper.clone();
+    let make_source = move || -> Box<dyn AudioSource> { Box::new(HelperSource(h.clone())) };
+    match dev {
+        SoundDevice::Hda => {
+            let ident = &config.identity;
+            let [vendor, device, sv, sd] = vroom_config::pci_ids(&ident.hda_codec_id)
+                .ok_or_else(|| Error::Setup(format!("bad HD Audio codec id {:?}", ident.hda_codec_id)))?;
+            let ids = HdaIds {
+                pci: vendor_ids(&ident.hda_pci_id)?,
+                codec: CodecIds { vendor, device, subsys: (sv as u32) << 16 | sd as u32 },
+            };
+            let mem = board.mem.clone();
+            let mut keep = None;
+            board.add_pci(|slot, intx, msi| {
+                let source: Box<dyn AudioSource> = if input { make_source() } else { Box::new(Silence) };
+                let d = Arc::new(Mutex::new(Hda::new(slot, mem, intx, msi, ids, input, make_sink(), source)));
+                keep = Some(d.clone());
+                d
+            })?;
+            if let Some(d) = keep {
+                vroom_devices::hda::spawn_timer(&d)?;
+            }
+        }
+        SoundDevice::Virtio | SoundDevice::Auto => {
+            let mut s = Sound::new(Box::new(make_sink));
+            if input {
+                s = s.with_capture(Box::new(make_source));
+            }
+            board.add_virtio(Box::new(s))?;
+        }
+    }
+    Ok(helper)
 }
 
 /// Backend for one NIC, and the MAC the guest must use.
@@ -399,13 +467,10 @@ pub(crate) fn build(
         board.reg.add_bus_only(layout::GIC_MSI_BASE, info.msi_size, frame)?;
     }
     board.add_virtio(Box::new(Rng::new()))?;
-    if config.audio.output {
-        // VROOM_AUDIO_WAV_DIR: test mode, record instead of playing.
-        let wav = std::env::var_os("VROOM_AUDIO_WAV_DIR").map(std::path::PathBuf::from);
-        let helper = crate::audio::AudioHelper::spawn(wav.as_deref())?;
-        let make = move || -> Box<dyn vroom_virtio::devices::sound::AudioSink> { Box::new(crate::audio::HelperSink(helper.clone())) };
-        board.add_virtio(Box::new(vroom_virtio::devices::sound::Sound::new(Box::new(make))))?;
-    }
+    let audio = match config.sound_device() {
+        Some(dev) => Some(sound_card(&mut board, config, dev, ui.as_ref())?),
+        None => None,
+    };
     for s in &config.shares {
         board.add_virtio(Box::new(Fs::new(&s.tag, s.path.clone(), s.readonly).map_err(|e| Error::Setup(e.to_string()))?))?;
     }
@@ -454,26 +519,43 @@ pub(crate) fn build(
         let sink: Arc<dyn DisplaySink> = fb.clone();
         let (mut gpu, ctl) = GpuDev::new(config.display.width, config.display.height, sink);
         if config.display.gpu == Gpu::Virtio3d {
-            gpu = gpu.with_3d(three_d(&vm)?);
+            gpu = gpu.with_3d(three_d(&vm, config)?);
         }
         board.add_virtio(Box::new(gpu))?;
         gpu_ctl = Some(ctl);
     }
     // Input: virtio-input for direct-boot Linux, USB HID otherwise (UEFI,
     // Windows setup: works with zero drivers). Never both: no doubled keys.
+    // The xHCI also carries passthrough devices, each behind its own
+    // helper process (started here, before the sandbox).
     let mut input = None;
+    let mut xhci = None;
+    if (screen.is_some() && board.use_pci) || !config.usb.is_empty() {
+        let mut helpers = Vec::new();
+        let mut links = Vec::new();
+        for u in &config.usb {
+            let (h, link) = crate::usb::spawn(u)?;
+            helpers.push(h);
+            links.push(link);
+        }
+        let mem2 = mem.clone();
+        let pci_ids = vendor_ids(&ident.usb_pci_id)?;
+        board.add_pci(|slot, intx, msi| {
+            let ids = UsbIds { vendor_id: ident.usb_vendor_id, manufacturer: ident.usb_manufacturer.clone() };
+            let x = Xhci::new(slot, mem2, intx, msi).with_ids(&ids).with_pci_ids(pci_ids).with_passthrough(links);
+            let x = Arc::new(Mutex::new(x));
+            xhci = Some(x.clone());
+            x
+        })?;
+        if let Some(x) = &xhci {
+            for (i, h) in helpers.into_iter().enumerate() {
+                h.run(i, x.clone())?;
+            }
+        }
+    }
     if screen.is_some() {
         if board.use_pci {
-            let mem2 = mem.clone();
-            let mut keep = None;
-            let pci_ids = vendor_ids(&ident.usb_pci_id)?;
-            board.add_pci(|slot, intx, msi| {
-                let ids = UsbIds { vendor_id: ident.usb_vendor_id, manufacturer: ident.usb_manufacturer.clone() };
-                let x = Arc::new(Mutex::new(Xhci::new(slot, mem2, intx, msi).with_ids(&ids).with_pci_ids(pci_ids)));
-                keep = Some(x.clone());
-                x
-            })?;
-            input = Some(InputPipes { kbd: None, tablet: None, usb: keep });
+            input = Some(InputPipes { kbd: None, tablet: None, usb: xhci });
         } else {
             let (kbd_host, kbd_dev) = UnixDatagram::pair()?;
             let (tab_host, tab_dev) = UnixDatagram::pair()?;
@@ -491,13 +573,16 @@ pub(crate) fn build(
         Some(ds) => Some(ds.clipboard()),
         None => clipboard,
     };
-    let agent = agent::spawn(host_end, config.clipboard.clone(), clipboard)?;
+    let max_pixels = if config.guest_os() == GuestOs::Windows { agent::WINDOWS_MAX_PIXELS } else { 0 };
+    let agent = agent::spawn(host_end, config.clipboard.clone(), clipboard, agent::Screen { gpu: gpu_ctl, max_pixels })?;
     let viewer = ui.as_ref().map(|d| d.tx());
     if let Some(ds) = ui {
         if screen.is_none() {
             return Err(Error::Setup("a viewer needs a display (display.gpu or UEFI boot)".into()));
         }
-        ds.run(gpu_ctl, input, agent.clone(), events.clone())?;
+        // The microphone gate closes with the window.
+        let on_close = audio.map(|a| Box::new(move || a.set_window(false)) as Box<dyn FnOnce() + Send>);
+        ds.run(input, agent.clone(), events.clone(), on_close)?;
     }
     for (i, n) in config.nets.iter().enumerate() {
         let mac = match &n.mac {
