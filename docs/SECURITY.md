@@ -134,7 +134,8 @@ clipboard text (size-capped).
 
 `fuzz/` has cargo-fuzz targets for what a guest (or a downloaded image)
 controls: agent protocol, network frames, virtqueue chains over arbitrary
-guest memory, virtio-gpu 2D commands, the virtio-pci transport and PCI
+guest memory, virtio-gpu 2D commands, virtio-fs (FUSE) requests, virtio-snd control
+and PCM transfers, the virtio-pci transport and PCI
 config space, xHCI, NVMe, TPM TIS, fw_cfg (DMA included) and flash, each
 driven by arbitrary register writes plus guest RAM; and qcow2 images. Run with
 `cargo +nightly fuzz run -O <target>`. First runs found two qcow2 bugs

@@ -329,6 +329,21 @@ impl Sound {
     pub fn new(make_sink: Box<dyn FnMut() -> Box<dyn AudioSink> + Send>) -> Self {
         Sound { make_sink, worker: WorkerSlot::default() }
     }
+
+    /// Fuzzing: run every queue once, synchronously, then a tick and a
+    /// release. Not for anything else.
+    #[doc(hidden)]
+    pub fn fuzz_queues(&mut self, ctx: ActivateContext) {
+        let mut h = SoundHandler::new((self.make_sink)(), Snap::default());
+        let mut c = crate::worker::QueueCtx::new(ctx);
+        for _ in 0..2 {
+            for q in 0..4 {
+                h.process_queue(&mut c, q);
+            }
+            h.tick(&mut c);
+        }
+        h.complete(&mut c, true);
+    }
 }
 
 impl VirtioDevice for Sound {

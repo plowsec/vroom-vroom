@@ -98,3 +98,9 @@ name = "virtio_fs"
 path = "fuzz_targets/virtio_fs.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "virtio_snd"
+path = "fuzz_targets/virtio_snd.rs"
+test = false
+doc = false
