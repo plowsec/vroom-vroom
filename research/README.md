@@ -20,12 +20,19 @@ Use a disposable overlay. Separate state directory. Starts paused.
 
 | Key | Action |
 |---|---|
+| Enter | Open selected callback/function: assembly + C |
 | F2 | Toggle execution breakpoint |
+| F3 | Analyze current address |
 | F4 | Kernel + symbols + modules |
 | F5 / F6 / F7 | Continue / pause / instruction step |
 | F9 | Side panels |
+| F10 | Expand Code view |
 | : | Command |
 | Ctrl+Q | Power off + quit |
+
+Code: assembly left, angr C right. Requires `--atui`.
+Live/File button: paused memory or matching binary. Cached while paused.
+`PARTIAL`: missing pages. `reloc?`: unresolved absolute internal pointers.
 
 ## commands
 
@@ -34,7 +41,7 @@ functions ntoskrnl Ps           prefix filter; Enter opens function
 next / prev                    function pages (200 rows)
 symbols ntdll                   download/cache matching PDB
 x nt!KeBugCheckEx               resolve
-dis nt!KeBugCheckEx             disassemble
+dis nt!KeBugCheckEx             assembly + C
 bp nt!KeBugCheckEx              execution breakpoint; 4 slots
 bc                             clear execution breakpoints
 watch ADDRESS 8 w              data watchpoint; r/w/rw; 2 slots
@@ -71,6 +78,7 @@ checkpoint /new/directory       save paused VM
 - PDBs: GUID/age checked. Binaries: ARM64, timestamp, image size, GUID/age checked.
 - File analysis: original code/data; no live patches, resolved imports, or heap state.
 - Partial live images: absent/discarded pages. Full binaries may exist on Microsoft's server; local files work too.
+- Decompilation: angr recovery limits apply; some ARM64 syscall stubs remain assembly-only.
 - Guest paging: resident pages only. No page-in injection, WOW64, KDNET, KVM debugging, or WinDbg dump reader.
 - Interrupts remain visible during stepping. No step-over/out or register/memory editing yet.
 

@@ -76,7 +76,9 @@ async def test_callback_tab_contains_live_fields():
     async with app.run_test(size=(150, 45)) as pilot:
         await pilot.pause()
         await app.workers.wait_for_complete()
-        assert app.query_one(TabbedContent).active == 'callback-tab'
+        assert app.query_one(TabbedContent).active == 'code-tab'
+        app.query_one(TabbedContent).active = 'callback-tab'
+        await pilot.pause()
         fields = app.query_one('#process-event', DataTable)
         assert fields.get_row_at(1) == ['PID', '42']
         assert fields.get_row_at(6) == ['Image', 'example.exe']

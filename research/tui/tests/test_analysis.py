@@ -51,3 +51,15 @@ def test_invalid_relocation_block_is_rejected(tmp_path):
     path.write_bytes(data)
     with pytest.raises(ValueError, match='block size'):
         prepare_rva_image(exported)
+
+
+def test_partial_mode_rejects_all_relocations_when_later_block_is_discarded(tmp_path):
+    exported = fixture(tmp_path)
+    exported['image']['relocation_directory'][1] = 20
+    # First block is valid; the following mapped/discarded bytes are all zero.
+    with pytest.raises(ValueError, match='block size'):
+        prepare_rva_image(exported)
+    result, metadata = prepare_rva_image(exported, allow_unrelocated=True)
+    assert 'block size' in metadata['warning']
+    assert metadata['relocated_internal_pointers'] == 0
+    assert struct.unpack_from('<Q', result.read_bytes(), 0x1000)[0] == exported['image']['base'] + 0x1234

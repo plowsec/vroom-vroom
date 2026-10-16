@@ -2,7 +2,10 @@
 import argparse
 import asyncio
 import shlex
+import os
+import signal
 from pathlib import Path
+from functools import partial
 
 from capstone import Cs, CS_ARCH_ARM64, CS_MODE_ARM
 from rich.text import Text
@@ -12,7 +15,7 @@ from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import DataTable, Footer, Header, Input, Label, RichLog, Static, TabbedContent, TabPane
+from textual.widgets import Button, DataTable, Footer, Header, Input, Label, RichLog, Static, TabbedContent, TabPane
 
 from .client import Client
 from .analysis import prepare_rva_image
@@ -33,7 +36,15 @@ class KernelApp(App):
     #center { width: 1fr; }
     #register-pane { width: 34; border-left: solid #2c4054; }
     #registers { padding: 0 1; }
-    #code { padding: 1 2; }
+    #code-split { height: 1fr; }
+    #disassembly-pane, #decompiler-pane { width: 1fr; min-width: 24; }
+    #decompiler-pane { border-left: solid #2c4054; }
+    #code, #decompiler { padding: 0 1; width: auto; min-width: 100%; }
+    #code-scroll, #decompiler-scroll { height: 1fr; overflow-x: auto; }
+    #analysis-toolbar { height: 3; }
+    #analysis-source { min-width: 8; width: 8; height: 3; margin: 0 1; }
+    #analysis-status { width: 1fr; height: 3; content-align: left middle; }
+    #code-title { height: 3; padding: 1; color: #72d6cb; }
     #process-event { height: 1fr; background: #101720; }
     #events { height: 8; border-top: solid #2c4054; background: #0c121a; padding: 0 1; }
     #command { dock: bottom; height: 3; border: solid #38516b; }
@@ -44,12 +55,16 @@ class KernelApp(App):
     Screen.narrow.show-registers #register-pane { display: block; width: 30; }
     Screen.short #events { height: 4; }
     Screen.short .section, Screen.short #status { height: 1; }
+    Screen.code-focus #sidebar, Screen.code-focus #register-pane,
+    Screen.narrow.code-focus #sidebar, Screen.narrow.code-focus #register-pane { display: none; }
+    Screen.code-focus #events { height: 3; }
     """
     BINDINGS = [
         Binding('f4', 'discover', 'Windows'), Binding('f5', 'resume', 'Continue'),
         Binding('f6', 'pause', 'Pause'), Binding('f7', 'step', 'Step'),
         Binding('f2', 'breakpoint', 'Breakpoint'), Binding('colon', 'command', 'Command'),
         Binding('f9', 'panels', 'Panels'),
+        Binding('f3', 'decompile', 'Decompile'), Binding('f10', 'code_focus', 'Code focus'),
         Binding('ctrl+q', 'poweroff', 'Power off & quit'),
     ]
 
@@ -71,6 +86,11 @@ class KernelApp(App):
         self.watchpoints = []
         self.analysis_cache = {}
         self.generation = 0
+        self.view_revision = 0
+        self.view_context = True
+        self.analysis_mode = 'live'
+        self.cpu_ttbr0 = None
+        self.analysis_lock = asyncio.Lock()
         self.running = False
         self.ready = False
         self.decoder = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
@@ -89,8 +109,17 @@ class KernelApp(App):
             with Vertical(id='center'):
                 with TabbedContent():
                     with TabPane('Code', id='code-tab'):
-                        with VerticalScroll():
-                            yield Static('', id='code')
+                        with Horizontal(id='code-split'):
+                            with Vertical(id='disassembly-pane'):
+                                yield Static('DISASSEMBLY · LIVE', id='code-title')
+                                with VerticalScroll(id='code-scroll'):
+                                    yield Static('', id='code')
+                            with Vertical(id='decompiler-pane'):
+                                with Horizontal(id='analysis-toolbar'):
+                                    yield Static('DECOMPILE', id='analysis-status')
+                                    yield Button('Live', id='analysis-source')
+                                with VerticalScroll(id='decompiler-scroll'):
+                                    yield Static('', id='decompiler')
                     with TabPane('Functions', id='functions-tab'):
                         yield Input(placeholder='Function prefix', id='function-filter')
                         yield DataTable(id='functions', cursor_type='row')
@@ -105,9 +134,6 @@ class KernelApp(App):
                     with TabPane('Memory', id='memory-tab'):
                         with VerticalScroll():
                             yield Static('', id='memory')
-                    with TabPane('Decompiler', id='decompiler-tab'):
-                        with VerticalScroll():
-                            yield Static('', id='decompiler')
             with VerticalScroll(id='register-pane'):
                 yield Label('CPU / REGISTERS', classes='section')
                 yield Static('', id='registers')
@@ -132,18 +158,46 @@ class KernelApp(App):
     @on(TabbedContent.TabActivated)
     @work(group='tab-load', exclusive=True)
     async def load_tab(self, event):
-        if not self.ready or self.running:
+        if not self.ready or self.running or event.pane.id != self.query_one(TabbedContent).active:
             return
         try:
             if event.pane.id == 'functions-tab': self.refresh_functions()
-            elif event.pane.id == 'processes-tab': await self.load_processes()
-            elif event.pane.id == 'peb-tab' and (self.context or {}).get('pid'): await self.show_peb()
-            elif event.pane.id == 'stack-tab': await self.show_stack()
+            elif event.pane.id == 'processes-tab': await self.load_processes(activate=False)
+            elif event.pane.id == 'peb-tab' and (self.context or {}).get('pid'): await self.show_peb(activate=False)
+            elif event.pane.id == 'stack-tab': await self.show_stack(activate=False)
         except Exception as error: self.log_message(error)
 
     def on_resize(self, event):
         self.screen.set_class(event.size.width < 120, 'narrow')
         self.screen.set_class(event.size.height < 35, 'short')
+
+    def action_code_focus(self):
+        self.screen.toggle_class('code-focus')
+        self.query_one(TabbedContent).active = 'code-tab'
+
+    def invalidate_code(self, reason='', clear_code=True):
+        self.view_revision += 1
+        self.workers.cancel_group(self, 'decompile')
+        self.query_one('#decompiler', Static).update('')
+        self.query_one('#analysis-status', Static).update(reason or 'DECOMPILE')
+        if clear_code:
+            self.query_one('#code', Static).update('')
+
+    def owner(self, address, context=True):
+        if not context and address < (1 << 63) and (self.context or {}).get('pid'):
+            table = self.context.get('directory_table')
+            if table is None or self.cpu_ttbr0 is None or table & 0x0000fffffffff000 != self.cpu_ttbr0 & 0x0000fffffffff000:
+                return None
+        return next((m for m in self.modules if m['base'] <= address < m['base'] + m['size']), None)
+
+    def action_decompile(self):
+        self.run_worker(self.show_address(self.address, context=self.view_context), group='browse', exclusive=True)
+
+    @on(Button.Pressed, '#analysis-source')
+    def switch_analysis_source(self):
+        self.analysis_mode = 'file' if self.analysis_mode == 'live' else 'live'
+        self.query_one('#analysis-source', Button).label = self.analysis_mode.title()
+        self.action_decompile()
 
     def action_panels(self):
         if not self.screen.has_class('narrow'):
@@ -168,6 +222,7 @@ class KernelApp(App):
     def event(self, event):
         kind = event['event']
         if kind in ('ready', 'stopped', 'fault', 'reset_requested'):
+            self.invalidate_code()
             self.generation += 1
             self.analysis_cache.clear()
             self.ready = True
@@ -178,6 +233,7 @@ class KernelApp(App):
             if kind == 'ready' and self.ex_callback_demo:
                 self.start_demo()
         elif kind in ('shutdown', 'disconnected'):
+            self.invalidate_code('DISCONNECTED')
             self.ready = False
             self.running = False
             self.status('DISCONNECTED  /  backend stopped')
@@ -197,6 +253,7 @@ class KernelApp(App):
             self.query_one('#callbacks', DataTable).move_cursor(row=index)
             await self.show_address(regs['pc'])
             await self.show_process_event()
+            self.query_one(TabbedContent).active = 'code-tab'
             self.status(f"PAUSED  /  {callback['module'] or 'callback'}  /  process notification  /  CPU {self.cpu}")
         except Exception as error:
             self.log_message(error)
@@ -219,21 +276,25 @@ class KernelApp(App):
 
     @work(exclusive=True, group='refresh')
     async def refresh_state(self):
+        revision = self.view_revision
         try:
             regs = await self.client.call('registers', cpu=self.cpu)
+            if revision != self.view_revision: return
             lines = [f"PC   {regs['pc']:016x}", f"SP   {regs['sp']:016x}", f"PS   {regs['pstate']:08x}", '']
             lines += [f"x{i:<2}  {value:016x}" for i, value in enumerate(regs['x'])]
             lines += ['', f"TTBR1 {regs['ttbr1']:016x}"]
             self.query_one('#registers', Static).update('\n'.join(lines))
-            await self.disassemble(regs['pc'], context=False)
+            self.cpu_ttbr0 = regs.get('ttbr0')
+            await self.show_address(regs['pc'], context=False, activate=False)
         except Exception as error:
             self.log_message(error)
 
-    async def disassemble(self, address, context=True):
-        self.address = address
+    async def disassemble(self, address, context=True, revision=None):
+        if revision is None: revision = self.view_revision
         data = await self.client.call('read_virtual', cpu=self.cpu, address=address, length=128, context=context)
-        text = Text()
-        owner = next((m for m in self.modules if m['base'] <= address < m['base'] + m['size']), None)
+        if revision != self.view_revision: return
+        text = Text(no_wrap=True, overflow='ignore')
+        owner = self.owner(address, context)
         title = f"{owner['name']} + 0x{address-owner['base']:x}" if owner else f'0x{address:016x}'
         text.append(title + '\n\n', style='bold #72d6cb')
         for instruction in self.decoder.disasm(bytes.fromhex(data['hex']), address):
@@ -241,6 +302,7 @@ class KernelApp(App):
             text.append(f'{mark} {instruction.address:016x}  ', style='#69839c')
             text.append(f'{instruction.mnemonic:<9}', style='#72d6cb')
             text.append(instruction.op_str + '\n', style='#d7e0eb')
+        self.query_one('#code', Static).styles.width = max(line.cell_len for line in text.split('\n')) + 2
         self.query_one('#code', Static).update(text)
 
     @work(group='control', exclusive=True)
@@ -255,6 +317,7 @@ class KernelApp(App):
     @work(group='control', exclusive=True)
     async def action_resume(self):
         try:
+            self.invalidate_code('RUNNING')
             await self.client.call('resume')
             self.running = True
             self.status('RUNNING')
@@ -263,6 +326,7 @@ class KernelApp(App):
     @work(group='control', exclusive=True)
     async def action_step(self):
         try:
+            self.invalidate_code('STEPPING')
             await self.client.call('step', cpu=self.cpu)
             self.status(f'STEPPING  /  CPU {self.cpu}')
         except Exception as error: self.log_message(error)
@@ -294,16 +358,17 @@ class KernelApp(App):
         for i, module in enumerate(self.modules):
             table.add_row(module['name'], f"{module['size']//1024}K", key=str(i))
 
-    async def load_processes(self):
+    async def load_processes(self, activate=True):
         self.processes = await self.client.call('processes', cpu=self.cpu)
         table = self.query_one('#processes', DataTable)
         table.clear()
         for i, p in enumerate(self.processes):
             table.add_row(str(p['pid']), p['name'], str(p['parent_pid']), f"{p['eprocess']:016x}", key=str(i))
-        self.query_one(TabbedContent).active = 'processes-tab'
+        if activate: self.query_one(TabbedContent).active = 'processes-tab'
 
     async def select_process(self, pid=None):
         try:
+            self.invalidate_code()
             self.context = await self.client.call('process', cpu=self.cpu, **({'pid':pid} if pid is not None else {}))
             await self.load_modules()
             if pid is not None:
@@ -314,12 +379,12 @@ class KernelApp(App):
         except Exception as error:
             self.log_message(error)
 
-    async def show_peb(self):
+    async def show_peb(self, activate=True):
         peb = await self.client.call('peb', cpu=self.cpu)
         table = self.query_one('#peb', DataTable)
         table.clear()
         table.add_rows((key, hex(value) if isinstance(value, int) else str(value or '—')) for key, value in peb.items())
-        self.query_one(TabbedContent).active = 'peb-tab'
+        if activate: self.query_one(TabbedContent).active = 'peb-tab'
 
     async def symbol_address(self, name):
         try: return int(name, 0)
@@ -358,14 +423,14 @@ class KernelApp(App):
                 table.add_row(f['name'], f"{f['address']:016x}", key=str(i))
         except Exception as error: self.log_message(error)
 
-    async def show_stack(self):
+    async def show_stack(self, activate=True):
         result = await self.client.call('stack', cpu=self.cpu)
         table = self.query_one('#stack', DataTable)
         table.clear()
         for i, f in enumerate(result['frames']):
             table.add_row(str(i), f"{f['pc']:016x}", f"{f['sp']:016x}", f.get('symbol') or '', f['method'])
         if result.get('stop'): self.log_message(result['stop'])
-        self.query_one(TabbedContent).active = 'stack-tab'
+        if activate: self.query_one(TabbedContent).active = 'stack-tab'
 
     async def load_callbacks(self):
         self.callbacks = await self.client.call('callbacks', cpu=self.cpu)
@@ -390,7 +455,8 @@ class KernelApp(App):
         else: addresses.append(address)
         self.breakpoints = await self.client.call('breakpoints', addresses=addresses)
         self.log_message('Hardware breakpoints: ' + ', '.join(f'0x{x:x}' for x in self.breakpoints))
-        await self.disassemble(address)
+        if address == self.address:
+            await self.disassemble(address, context=self.view_context)
 
     def action_command(self):
         self.query_one('#command', Input).focus()
@@ -408,13 +474,24 @@ class KernelApp(App):
             return
         index = int(event.row_key.value)
         address = self.callbacks[index]['function'] if event.data_table.id == 'callbacks' else self.modules[index]['base']
-        self.run_worker(self.show_address(address), group='browse', exclusive=True)
+        self.run_worker(self.show_address(address, analyze=event.data_table.id == 'callbacks'), group='browse', exclusive=True)
 
-    async def show_address(self, address):
+    async def show_address(self, address, context=True, activate=True, analyze=True, allow_missing=True, file_image=None):
+        self.invalidate_code()
+        revision = self.view_revision
+        self.address, self.view_context = address, context
+        if activate: self.query_one(TabbedContent).active = 'code-tab'
+        self.query_one('#code-scroll', VerticalScroll).scroll_home(animate=False)
+        self.query_one('#decompiler-scroll', VerticalScroll).scroll_home(animate=False)
         try:
-            await self.disassemble(address)
-            self.query_one(TabbedContent).active = 'code-tab'
-        except Exception as error: self.log_message(error)
+            await self.disassemble(address, context=context, revision=revision)
+        except Exception as error:
+            if revision == self.view_revision:
+                self.query_one('#code', Static).update(Text(str(error)))
+        if revision != self.view_revision or not analyze: return
+        if file_image is None: file_image = self.analysis_mode == 'file'
+        self.run_worker(partial(self.decompile, address, allow_missing=allow_missing, file_image=file_image,
+                                       revision=revision, context=context), group='decompile', exclusive=True)
 
     @on(Input.Submitted, '#command')
     @work(group='commands', exclusive=True)
@@ -462,7 +539,9 @@ class KernelApp(App):
                 self.log_message('All hardware breakpoints cleared')
             elif op in ('dec', 'dec-file', 'dec-partial'):
                 address = await self.symbol_address(args[0]) if args else self.address
-                self.run_worker(self.decompile(address, allow_missing=op == 'dec-partial', file_image=op == 'dec-file'), group='decompile', exclusive=True)
+                self.analysis_mode = 'file' if op == 'dec-file' else 'live'
+                self.query_one('#analysis-source', Button).label = self.analysis_mode.title()
+                await self.show_address(address, allow_missing=op != 'dec', file_image=op == 'dec-file')
             elif op in ('bp', 'dis', 'mem', 'x'):
                 address = await self.symbol_address(args[0])
                 if op == 'bp': await self.toggle_breakpoint(address)
@@ -486,55 +565,95 @@ class KernelApp(App):
     async def on_unmount(self):
         await self.client.close()
 
-    async def decompile(self, address, allow_missing=False, file_image=False):
+    async def run_angr(self, path, rva):
         process = None
         try:
-            if not self.atui:
-                raise RuntimeError('Pass --atui /path/to/run-atui-macos.sh to enable angr analysis')
-            module = next((m for m in self.modules if m['base'] <= address < m['base'] + m['size']), None)
-            if not module:
-                raise RuntimeError('Load Windows modules before decompiling')
-            self.query_one(TabbedContent).active = 'decompiler-tab'
-            cache_key = ('file' if file_image else self.generation, self.generation, (self.context or {}).get('pid'), module['base'], address, allow_missing)
-            if cache_key in self.analysis_cache:
-                self.query_one('#decompiler', Static).update(self.analysis_cache[cache_key])
-                return
-            self.query_one('#decompiler', Static).update('angr…')
-            # Strict export: missing pages must not be mistaken for real code.
-            exported = await self.client.call('image' if file_image else 'export', cpu=self.cpu, base=module['base'], allow_missing=allow_missing)
-            missing = exported['missing_page_rvas']
-            if ((address - module['base']) & ~4095) in missing:
-                raise RuntimeError('The requested function is on a missing page')
-            analysis_path, provenance = await asyncio.to_thread(prepare_rva_image, exported, allow_unrelocated=allow_missing)
-            process = await asyncio.create_subprocess_exec(str(self.atui), str(analysis_path), '--dec', hex(address-module['base']),
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            process = await asyncio.create_subprocess_exec(str(self.atui), str(path), '--dec', hex(rva),
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, start_new_session=True)
             stdout, stderr = await asyncio.wait_for(process.communicate(), 180)
             if process.returncode:
                 raise RuntimeError(stderr.decode(errors='replace')[-4000:] or 'angr analysis failed')
-            warning = f'PARTIAL · {len(missing)} missing pages\n' if missing else ''
-            if provenance['warning']:
-                warning += 'Relocations unavailable · absolute internal pointers unresolved\n'
-            mapping = ('FILE / ' if file_image else 'LIVE / ') + f"{module['name']} / runtime 0x{address:x} / RVA 0x{address-module['base']:x}\nRVA view\n\n"
-            rendered = Group(
-                Text(warning, style='#e9b65d'), Text(mapping, style='#72d6cb'),
-                Syntax(stdout.decode(errors='replace'), 'c', theme='monokai',
-                       background_color='#101720', line_numbers=True))
-            if len(self.analysis_cache) >= 128:
-                self.analysis_cache.pop(next(iter(self.analysis_cache)))
-            self.analysis_cache[cache_key] = rendered
-            self.query_one('#decompiler', Static).update(rendered)
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            self.query_one('#decompiler', Static).update(Text(str(error)))
+            return stdout.decode(errors='replace')
         finally:
             if process and process.returncode is None:
-                process.terminate()
+                # The launcher may have children. Stop the entire analysis job,
+                # then reap it before allowing another job to acquire the lock.
+                try: os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError: pass
                 try:
                     await asyncio.wait_for(process.wait(), 5)
                 except asyncio.TimeoutError:
-                    process.kill()
+                    try: os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError: pass
                     await process.wait()
+
+    async def decompile(self, address, allow_missing=False, file_image=False, revision=None, context=True):
+        if revision is None:
+            self.analysis_mode = 'file' if file_image else 'live'
+            self.query_one('#analysis-source', Button).label = self.analysis_mode.title()
+            await self.show_address(address, context=context, analyze=False)
+            revision = self.view_revision
+        generation, pid, cpu = self.generation, (self.context or {}).get('pid'), self.cpu
+        module = self.owner(address, context)
+        def current():
+            return (revision == self.view_revision and generation == self.generation
+                    and pid == (self.context or {}).get('pid') and self.ready and not self.running)
+        async with self.analysis_lock:
+            if not current(): return
+            try:
+                if not self.atui:
+                    self.query_one('#analysis-status', Static).update('angr unavailable · --atui PATH')
+                    return
+                if not module:
+                    raise RuntimeError('No module in this context')
+                source = 'FILE' if file_image else 'LIVE'
+                key = (generation, pid, cpu, context, module['base'], address, allow_missing, file_image)
+                if key in self.analysis_cache:
+                    rendered, status, width = self.analysis_cache[key]
+                else:
+                    self.query_one('#analysis-status', Static).update(f'DECOMPILE · {source} · …')
+                    exported = await self.client.call('image' if file_image else 'export', cpu=cpu,
+                                                      base=module['base'], allow_missing=allow_missing)
+                    if not current(): return
+                    missing = exported['missing_page_rvas']
+                    rva = address - module['base']
+                    if (rva & ~4095) in missing:
+                        raise RuntimeError('Function page absent · select File')
+                    preparation = asyncio.create_task(asyncio.to_thread(prepare_rva_image, exported,
+                                                                        allow_unrelocated=allow_missing and not file_image))
+                    try:
+                        analysis_path, provenance = await asyncio.shield(preparation)
+                    except asyncio.CancelledError:
+                        # Do not race two writers of the same cached RVA image.
+                        await asyncio.gather(preparation, return_exceptions=True)
+                        raise
+                    if not current(): return
+                    code = await self.run_angr(analysis_path, rva)
+                    if not current(): return
+                    if not code.strip() or code.lstrip().startswith('// no function recovered'):
+                        raise RuntimeError('angr could not recover this function')
+                    status = f'DECOMPILE · {source}'
+                    if missing: status += f' · PARTIAL {len(missing)}p'
+                    if provenance['warning']: status += ' · reloc?'
+                    rendered = Group(
+                        Text(f"{module['name']}+0x{rva:x} · RVA\n", style='#72d6cb'),
+                        Syntax(code, 'c', theme='monokai', background_color='#101720',
+                               line_numbers=True, word_wrap=False))
+                    lines = code.expandtabs(4).splitlines()
+                    width = max(len(line) for line in lines) + len(str(len(lines))) + 6
+                    if len(self.analysis_cache) >= 128:
+                        self.analysis_cache.pop(next(iter(self.analysis_cache)))
+                    self.analysis_cache[key] = rendered, status, width
+                if current():
+                    self.query_one('#analysis-status', Static).update(status)
+                    self.query_one('#decompiler', Static).styles.width = width
+                    self.query_one('#decompiler', Static).update(rendered)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                if current():
+                    self.query_one('#analysis-status', Static).update('DECOMPILE · unavailable')
+                    self.query_one('#decompiler', Static).update(Text(str(error)))
 
 
 def main():

@@ -31,41 +31,46 @@ def prepare_rva_image(exported, *, allow_unrelocated=False):
     if struct.unpack_from('<Q', data, pe+48)[0] != base:
         raise ValueError('Runtime image base does not match its manifest')
     start, length = exported['image']['relocation_directory']
+    # Validate the whole table before rebasing any pointer. Discarded sections
+    # can remain mapped but contain zero/reused bytes instead of relocations.
+    targets = []
     relocation_warning = None
     try:
         readable(start, length)
-    except ValueError:
+        cursor, end = start, start + length
+        while cursor < end:
+            if cursor + 8 > end:
+                raise ValueError('Truncated relocation block')
+            page, block_size = struct.unpack_from('<II', data, cursor)
+            if block_size < 8 or block_size % 2 or cursor + block_size > end:
+                raise ValueError('Invalid relocation block size')
+            for offset in range(cursor+8, cursor+block_size, 2):
+                entry, = struct.unpack_from('<H', data, offset)
+                kind, target = entry >> 12, page + (entry & 4095)
+                if kind == 0:
+                    continue
+                if kind != 10:
+                    raise ValueError(f'Unsupported ARM64 relocation type {kind}')
+                if target + 8 > size:
+                    raise ValueError('Relocation target outside image')
+                targets.append(target)
+            cursor += block_size
+    except ValueError as error:
         if not allow_unrelocated or start < 0 or length < 0 or start + length > size:
             raise
-        relocation_warning = 'Relocations are unreadable: code uses RVAs, but absolute internal pointers remain runtime addresses and cannot be resolved in this view.'
-        length = 0
-    cursor, end = start, start + length
+        targets.clear()
+        relocation_warning = f'{error}: code uses RVAs, but absolute internal pointers remain runtime addresses and cannot be resolved in this view.'
     relocated, retained, unavailable = 0, 0, 0
-    while cursor < end:
-        if cursor + 8 > end:
-            raise ValueError('Truncated relocation block')
-        page, block_size = struct.unpack_from('<II', data, cursor)
-        if block_size < 8 or block_size % 2 or cursor + block_size > end:
-            raise ValueError('Invalid relocation block size')
-        for offset in range(cursor+8, cursor+block_size, 2):
-            entry, = struct.unpack_from('<H', data, offset)
-            kind, target = entry >> 12, page + (entry & 4095)
-            if kind == 0:
-                continue
-            if kind != 10:
-                raise ValueError(f'Unsupported ARM64 relocation type {kind}')
-            if target + 8 > size:
-                raise ValueError('Relocation target outside image')
-            if target // 4096 * 4096 in missing or (target+7) // 4096 * 4096 in missing:
-                unavailable += 1
-                continue
-            value, = struct.unpack_from('<Q', data, target)
-            if base <= value < base + size:
-                struct.pack_into('<Q', data, target, value-base)
-                relocated += 1
-            else:
-                retained += 1
-        cursor += block_size
+    for target in targets:
+        if target // 4096 * 4096 in missing or (target+7) // 4096 * 4096 in missing:
+            unavailable += 1
+            continue
+        value, = struct.unpack_from('<Q', data, target)
+        if base <= value < base + size:
+            struct.pack_into('<Q', data, target, value-base)
+            relocated += 1
+        else:
+            retained += 1
     struct.pack_into('<Q', data, pe+48, 0)
     destination = source.with_suffix('.rva.exe')
     # Reuse an identical analysis copy. Fail if a different file already owns
