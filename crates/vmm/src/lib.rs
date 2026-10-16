@@ -20,6 +20,7 @@ mod display;
 mod firmware;
 mod irq;
 mod machine;
+pub use machine::gpu_in_process;
 pub mod psci;
 mod ramfb;
 mod snapshot;

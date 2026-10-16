@@ -228,19 +228,54 @@ reverts its TPM too.
 
 ## What 3D costs
 
-`gpu = "virtio3d"` loads virglrenderer and MoltenVK into the VMM, and
-with `opengl` (the default) a GL driver too. Guest command streams are
-then parsed by C code and reach the Apple GPU driver: Venus (Vulkan)
-commands by virglrenderer's Venus decoder, virgl (OpenGL) commands by its
-GL decoder (vrend), which has the longer history of bugs. Where vrend's
-GL calls go depends on `opengl_host`:
+With `gpu = "virtio3d"`, guest command streams are parsed by C code and
+reach the Apple GPU driver: Venus (Vulkan) commands by virglrenderer's
+Venus decoder, virgl (OpenGL) commands by its GL decoder (vrend), which
+has the longer history of bugs, and on Windows, Direct3D 11 calls
+(Neptune, UTM's protocol) by virglrenderer's Neptune decoder and DXMT,
+which turns the guest's Direct3D shaders into Metal ones with its own
+LLVM-based converter. That is a large amount of young C and C++ code in
+reach of the guest. So none of it runs in the VMM.
+
+### The GPU process
+
+As browsers do, the renderer has a process of its own: `vroom gpu-helper`,
+started by the VMM, one per VM. virglrenderer, MoltenVK, DXMT and the GL
+driver are loaded there and only there; the VMM never loads them and its
+sandbox has no GPU rules at all (no AGX user clients, no Metal compiler
+service, no shared memory but its own guest RAM).
+
+What a bug in the 3D code can reach from the GPU process:
+
+- the GPU (the AGX and IOSurface user clients, the Metal compiler
+  service, framework reads: what Metal needs, nothing else);
+- that VM's guest RAM, which it maps (shared memory the VMM hands over
+  as fds; the guest has it all anyway) and the buffers it made itself;
+- its DXMT shader cache in the VM's state dir, the one place it may write;
+- the two sockets to the VMM.
+
+What it can't: disks, the network, shared folders, the clipboard, the
+hypervisor (it has no vCPUs and no VM; a VM belongs to the process that
+made it), the viewer, other VMs, any file of the user's, other processes
+(no exec, no signals, no other process's shared memory). The sandbox goes
+up after the libraries are loaded and before the first guest command.
+
+What the VMM trusts from it: nothing it can't check. Replies are framed
+with size limits; buffers it hands over are mapped at the size the guest
+asked for, never more; frames come back through a shared buffer the VMM
+made, copied out at the size the VMM asked for. If the GPU process dies,
+the VMM sees the socket close: 3D stops for that VM (the guest gets GPU
+errors, nothing else breaks) until the VM is started again.
+`VROOM_GPU_IN_PROCESS=1` puts the renderer back in the VMM, with the GPU
+rules in its sandbox (for debugging; macOS only has the GPU process).
+
+Where vrend's GL calls go depends on `opengl_host`:
 
 - `"apple"` (the default): macOS's own OpenGL 4.1. vrend's checks are the
   only ones before Apple's driver, and macOS's GL has no robust buffer
   access, so a shader reading out of bounds reads whatever GPU memory of
-  the VMM follows (its own guest's data; each VM is its own process) or
-  crashes the VMM. In exchange the guest gets OpenGL 4.1, which most
-  Linux apps need.
+  the GPU process follows (its own guest's data) or crashes it. In
+  exchange the guest gets OpenGL 4.1, which most Linux apps need.
 - `"angle"`: ANGLE on Metal, which checks every call the way a browser
   checks WebGL before anything reaches Metal, so a vrend mistake meets a
   second check. Its contexts ask for robust buffer access (out-of-bounds
@@ -248,35 +283,22 @@ GL calls go depends on `opengl_host`:
 
 `opengl = false` leaves vrend and both GL drivers out entirely.
 
-Windows guests with the viogpu3d driver send Direct3D 11 calls (Neptune,
-UTM's protocol). They go through virglrenderer's Neptune decoder to DXMT,
-which turns the guest's Direct3D shaders into Metal ones with its own
-LLVM-based converter and runs everything on Metal. That is a large amount
-of young C and C++ code in reach of the guest, with no browser-grade
-checks in front of Metal, so a Windows guest with 3D should be one you
-trust about as much as an app you run on the Mac. Venus and Neptune run
-in virglrenderer's render server, which here is a thread of the VMM, not
-a process of its own: it has the VMM's sandbox, nothing stricter.
-
-The sandbox keeps working but has to allow the GPU: three IOKit user
-clients (`AGXDeviceUserClient`, `AGXSharedUserClient`,
-`IOSurfaceRootUserClient`), the Metal compiler service, framework reads
-and reading the Metal shader cache. OpenGL needed nothing more: ANGLE and Apple's
-OpenGL (on Apple Silicon it runs on Metal too) are loaded, with a first
-context, before the sandbox goes up. libepoxy is built to load ANGLE only
-from virglrenderer's own directory, and Apple's OpenGL only by its system
-path, when the VMM made a CGL context current first; never a search path.
-DXMT (LGPL, a separate dylib) is loaded from the same directory before
-the sandbox goes up, and virglrenderer is patched to look for it only
-there. The render server passes buffers as POSIX shared memory: the
-sandbox lets the VMM create, map and unlink shared memory only under
-names carrying its own process id and the render server's prefixes, and
-open no other (not even read: another app's shared memory is out of
-reach; `VROOM_SANDBOX_SELFTEST=1` checks). Metal's shader cache, which
-the user's other apps share, is read only for the VMM, so a VMM taken
-over can't plant GPU code for them. DXMT's cache (Metal versions of
-guest shaders) is per VM, in its state dir: one guest can't plant
-shaders for another.
+Venus and Neptune run in virglrenderer's render server, a thread of the
+GPU process (contexts in processes of their own are a later step).
+libepoxy is built to load ANGLE only from virglrenderer's own directory,
+and Apple's OpenGL only by its system path, when the GPU process made a
+CGL context current first; never a search path. DXMT (LGPL, a separate
+dylib) is loaded from the same directory before the sandbox goes up, and
+virglrenderer is patched to look for it only there. The render server
+passes buffers as POSIX shared memory: the sandbox lets the GPU process
+create, map and unlink shared memory only under names carrying its own
+process id and the render server's prefixes, and open no other (not
+even read: another app's shared memory is out of reach;
+`VROOM_SANDBOX_SELFTEST=1` checks it for the VMM). Metal's shader cache,
+which the user's other apps share, is read only, so a GPU process taken
+over can't plant GPU code for them. DXMT's cache (Metal versions of guest
+shaders) is per VM, in its state dir: one guest can't plant shaders for
+another.
 
 With 3D, the GPU's host-visible window (8 GiB of guest address space) is
 backed by reserved memory where no buffer is mapped, as a real card's
@@ -290,10 +312,9 @@ command the guest sends, and resource sizes, backing ranges and counts get
 the same limits as guest commands: a tampered snapshot can do what the
 guest could, no more.
 
-Use 3D only for guests that need it. A future step is moving the renderer
-into its own process (possible for most of Venus and for virgl, whose
-frames already come back by copy; host-visible memory needs shared
-mappings).
+Use 3D only for guests that need it: the GPU process confines the 3D
+code, but a guest that breaks out of it still holds the host GPU, and
+GPU drivers are kernel code.
 
 ## The viewer socket
 
@@ -367,7 +388,7 @@ running VM's images, even with `-U`.
 - x86_64 isn't implemented, so none of this is tested there.
 - Fuzzing doesn't cover Venus, virgl or Neptune (3D) command streams:
   that is virglrenderer's C code (and DXMT's C++ for Neptune), which runs
-  in the VMM process when 3D is on.
+  in the GPU process.
 
 ## What the guest can tell
 

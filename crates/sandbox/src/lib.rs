@@ -49,6 +49,8 @@ pub struct Policy {
     pub clipboard: bool,
     /// Use the host GPU (virtio-gpu 3D through virglrenderer/Vulkan).
     pub gpu: bool,
+    /// Guest RAM is shared memory: a reset makes new objects.
+    pub shared_ram: bool,
     /// Our helper processes: the only ones we may signal (Linux; macOS's
     /// profile allows no signals but to ourselves, and we cope).
     pub helper_pids: Vec<u32>,

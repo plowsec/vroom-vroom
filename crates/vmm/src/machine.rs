@@ -273,9 +273,26 @@ fn viewer_socket(state_dir: &std::path::Path) -> std::io::Result<std::os::unix::
 /// Host-visible window size for GPU buffers (address space, not memory).
 const GPU_SHM_SIZE: u64 = 8 << 30;
 
-/// Venus (and GL, if asked and ANGLE is there) through virglrenderer, or
-/// a clear error.
-fn three_d(vm: &Arc<dyn Vm>, config: &VmConfig) -> Result<ThreeD> {
+/// Whether the renderer runs in the VMM (`VROOM_GPU_IN_PROCESS=1`, for
+/// debugging, and off macOS) rather than in a GPU process of its own.
+pub fn gpu_in_process() -> bool {
+    !cfg!(target_os = "macos") || std::env::var_os("VROOM_GPU_IN_PROCESS").is_some_and(|v| v != "0")
+}
+
+/// Venus, Direct3D 11 and GL (if asked) through virglrenderer, in the GPU
+/// process (or in here, see [`gpu_in_process`]), or a clear error.
+fn three_d(vm: &Arc<dyn Vm>, config: &VmConfig, mem: &GuestMemory, state_dir: &std::path::Path) -> Result<ThreeD> {
+    let r: Box<dyn Renderer3d> = if gpu_in_process() { in_process(vm, config)? } else { gpu_process(vm, config, mem, state_dir)? };
+    if config.display.opengl && !r.capsets().iter().any(|c| c.0 == 2) {
+        log::warn!("gpu: no OpenGL for the guest (opengl_host = \"angle\" needs ANGLE next to virglrenderer: scripts/build-angle.sh); Vulkan only");
+    }
+    Ok(ThreeD::new(r, Arc::new(VmShm { vm: vm.clone(), filler: Mutex::new(None) }), GPU_SHM_SIZE))
+}
+
+const NO_VIRGL: &str =
+    "gpu = \"virtio3d\" needs virglrenderer with Venus (scripts/build-virglrenderer.sh, or brew install slp/krunkit/virglrenderer)";
+
+fn in_process(vm: &Arc<dyn Vm>, config: &VmConfig) -> Result<Box<dyn Renderer3d>> {
     #[cfg(target_os = "macos")]
     let gl = config.display.opengl.then_some(match config.display.opengl_host {
         vroom_config::OpenglHost::Angle => vroom_gpu3d::GlHost::Angle,
@@ -284,17 +301,44 @@ fn three_d(vm: &Arc<dyn Vm>, config: &VmConfig) -> Result<ThreeD> {
     #[cfg(not(target_os = "macos"))]
     let gl = config.display.opengl;
     if !vroom_gpu3d::load(gl) {
-        return Err(Error::Setup(
-            "gpu = \"virtio3d\" needs virglrenderer with Venus (scripts/build-virglrenderer.sh, or brew install slp/krunkit/virglrenderer)".into(),
-        ));
+        return Err(Error::Setup(NO_VIRGL.into()));
     }
     vroom_gpu3d::set_map_granule(vm.map_granule());
     let r = vroom_gpu3d::Virgl::new(config.identity.gl_renderer.clone())
         .ok_or_else(|| Error::Setup("virglrenderer: Venus init failed (no Vulkan driver?)".into()))?;
-    if config.display.opengl && !r.capsets().iter().any(|c| c.0 == 2) {
-        log::warn!("gpu: no OpenGL for the guest (opengl_host = \"angle\" needs ANGLE next to virglrenderer: scripts/build-angle.sh); Vulkan only");
-    }
-    Ok(ThreeD::new(Box::new(r), Arc::new(VmShm { vm: vm.clone(), filler: Mutex::new(None) }), GPU_SHM_SIZE))
+    log::warn!("gpu: the 3D renderer runs inside the VMM (VROOM_GPU_IN_PROCESS)");
+    Ok(Box::new(r))
+}
+
+/// The GPU process: `vroom gpu-helper`, sandboxed on its own (the GPU,
+/// guest RAM, its shader cache; no files, network or hypervisor). The
+/// VMM then never loads virglrenderer, GL, MoltenVK or DXMT.
+#[cfg(unix)]
+fn gpu_process(vm: &Arc<dyn Vm>, config: &VmConfig, mem: &GuestMemory, state_dir: &std::path::Path) -> Result<Box<dyn Renderer3d>> {
+    let exe = std::env::current_exe().map_err(|e| Error::Setup(format!("gpu process: {e}")))?;
+    let shaders = state_dir.join("shaders");
+    std::fs::create_dir_all(&shaders).map_err(|e| Error::Setup(format!("{}: {e}", shaders.display())))?;
+    let gl = config.display.opengl.then_some(match config.display.opengl_host {
+        vroom_config::OpenglHost::Angle => "angle",
+        vroom_config::OpenglHost::Apple => "apple",
+    });
+    let args = vroom_gpu3d::remote::HelperArgs {
+        exe: &exe,
+        gl,
+        gl_renderer: config.identity.gl_renderer.as_deref(),
+        map_granule: vm.map_granule(),
+        shaders: &shaders,
+    };
+    let r = vroom_gpu3d::remote::Remote::spawn(&args, mem.clone()).map_err(|e| {
+        Error::Setup(format!("gpu process: {e} (3D needs virglrenderer: scripts/build-virglrenderer.sh; RUST_LOG=info shows more)"))
+    })?;
+    crate::note_helper(r.pid());
+    Ok(Box::new(r))
+}
+
+#[cfg(not(unix))]
+fn gpu_process(vm: &Arc<dyn Vm>, config: &VmConfig, _mem: &GuestMemory, _state_dir: &std::path::Path) -> Result<Box<dyn Renderer3d>> {
+    in_process(vm, config)
 }
 
 /// Maps GPU buffers into the guest with the hypervisor.
@@ -555,7 +599,10 @@ pub(crate) fn build(
         small_pages: config.display.gpu == Gpu::Virtio3d,
     })?;
 
-    let mem = GuestMemory::new(&[(GuestAddress(layout::RAM_BASE), ram_size)])?;
+    // With 3D, RAM is shared memory: the GPU process maps it too (the
+    // buffers the guest hands the GPU live there).
+    let ram = [(GuestAddress(layout::RAM_BASE), ram_size)];
+    let mem = if config.display.gpu == Gpu::Virtio3d { GuestMemory::new_shared(&ram)? } else { GuestMemory::new(&ram)? };
     vm.map_memory(&mem)?;
 
     let mut board = Board::new(vm.clone(), mem.clone(), config.use_pci());
@@ -626,7 +673,7 @@ pub(crate) fn build(
         let sink: Arc<dyn DisplaySink> = fb.clone();
         let (mut gpu, ctl) = GpuDev::new(config.display.width, config.display.height, sink);
         if config.display.gpu == Gpu::Virtio3d {
-            gpu = gpu.with_3d(three_d(&vm, config)?);
+            gpu = gpu.with_3d(three_d(&vm, config, &mem, &env.state_dir)?);
         }
         board.add_virtio(Box::new(gpu))?;
         gpu_ctl = Some(ctl);

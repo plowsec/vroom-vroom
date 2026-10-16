@@ -36,7 +36,7 @@ limits, source-MAC anti-spoofing). The VMM never holds an interface.
 | `virtio` | Split-queue handling (hardened), MMIO and modern PCI transports, devices (blk, net, console, rng, gpu, input, fs, sound), a pausable worker per device. `forbid(unsafe_code)`. |
 | `fs` | Host side of shared folders: component-wise `openat(O_NOFOLLOW)` walks from a root fd, Linux errno mapping. The virtio-fs FUSE server lives in `virtio`; it serves Linux and virtio-win's virtiofs.exe (Windows), telling them apart by their INIT flags. |
 | `audio` | Sound helper: datagram protocol, ring buffer, CoreAudio (macOS) / ALSA (Linux, `dlopen`) playback and recording, WAV test files. |
-| `gpu3d` | virglrenderer loaded with `dlopen`, behind the `Renderer3d` trait the virtio crate defines. The one place with GPU FFI. |
+| `gpu3d` | virglrenderer loaded with `dlopen`, behind the `Renderer3d` trait the virtio crate defines. The one place with GPU FFI. `remote`: the same trait over a socket to the GPU process, and that process's loop. |
 | `block` | raw and qcow2 (COW, compressed reads, backing chains with an allow-list, discard/zero clusters with hole punching, folding a layer into its child), sync modes, swappable layers, flock-based image locks. VMDK reader (read-only) for importing VMware disks. |
 | `net` | Userspace NAT (smoltcp for the guest side, host sockets outward), DHCP/DNS, ICMP echo, fragments; netd wire protocol. |
 | `snapshot` | `Snapshottable` trait, snapshot directories with per-blob SHA-256 and an atomic manifest. |
@@ -114,10 +114,25 @@ or with `opengl_host = "angle"` on OpenGL ES from ANGLE's Metal backend.
 Neptune: Windows' viogpu3d driver sends Direct3D 11 calls, virglrenderer
 (UTM's fork) replays them on DXMT, Direct3D on Metal. All capsets are
 offered; Mesa picks per API, Windows takes Neptune. Venus and Neptune run
-in virglrenderer's render server, a thread of the VMM; their buffers are
-shared memory it creates. Guest memory a renderer may
-touch is passed as host iovecs; host-visible buffers are
-mapped into the guest's shared memory window with the hypervisor.
+in virglrenderer's render server, a thread of the renderer; their buffers
+are shared memory it creates. Host-visible buffers are mapped into the
+guest's shared memory window with the hypervisor.
+
+The renderer runs in the GPU process (`gpu3d/src/remote.rs`,
+`vroom gpu-helper`; see SECURITY.md): the VMM's virtio-gpu device talks
+to a `Remote`, the same `Renderer3d` trait the in-process `Virgl`
+implements, over a Unix socket. One call at a time, each answered, in
+the worker's order, so the device code can't tell the difference. A
+second socket carries a byte when fences may be done (the worker's
+backend fd). With 3D, guest RAM is shared memory (`MmapRegion::new_shared`)
+the GPU process maps too; guest buffers go over as (region, offset,
+length), checked against its mapping. A reset gives the guest new RAM
+objects (zeroed); `GuestMemory::generation` changes and the next call
+that names guest memory first sends the new ones. Buffers the guest maps
+(Venus, Neptune) come back as shared memory fds the VMM maps itself;
+frames read back land in a shared frame buffer the VMM made (sending
+them over the socket cost a third of glmark2's score; now within a few
+percent of in-process). `VROOM_GPU_IN_PROCESS=1` keeps it all in the VMM.
 
 GL details (`gpu3d/src/gl.rs`): we create the CGL or EGL contexts
 virglrenderer asks for (one share group, no surfaces) and keep the right

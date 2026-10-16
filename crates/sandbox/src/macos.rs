@@ -76,6 +76,12 @@ pub fn profile(p: &Policy) -> Result<String> {
     if p.clipboard {
         s += "(allow mach-lookup (global-name \"com.apple.pasteboard.1\") (global-name \"com.apple.distributed_notifications@Uv3\"))\n";
     }
+    if p.shared_ram {
+        s += &format!(
+            "(allow ipc-posix-shm-write-create ipc-posix-shm-write-unlink ipc-posix-shm-read-data ipc-posix-shm-write-data\n  (ipc-posix-name-regex #\"^/vroom-ram-{}-[0-9a-f]+-[0-9a-f]+$\"))\n",
+            std::process::id()
+        );
+    }
     if p.gpu {
         s += GPU_RULES;
         // Anonymous shared memory for the render server (Venus, Direct3D)

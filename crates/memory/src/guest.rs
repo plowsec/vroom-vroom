@@ -1,5 +1,5 @@
 use std::io::{Read, Write};
-use std::sync::atomic::{fence, AtomicU16, Ordering};
+use std::sync::atomic::{fence, AtomicU16, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::{page_size, ByteValued, Error, GuestAddress, MmapRegion, Result};
@@ -47,11 +47,35 @@ impl GuestRegion {
 #[derive(Debug, Clone, Default)]
 pub struct GuestMemory {
     regions: Arc<Vec<GuestRegion>>,
+    /// Bumped when shared RAM gets new objects (reset): whoever maps it
+    /// elsewhere must map again.
+    generation: Arc<AtomicU64>,
 }
 
 impl GuestMemory {
     /// Build guest RAM from `(start, size)` pairs. Ranges must not overlap.
     pub fn new(layout: &[(GuestAddress, u64)]) -> Result<Self> {
+        Self::build(layout, false)
+    }
+
+    /// Guest RAM in shared memory, for another process (the GPU process)
+    /// to map: see [`GuestMemory::shared_fds`].
+    pub fn new_shared(layout: &[(GuestAddress, u64)]) -> Result<Self> {
+        Self::build(layout, true)
+    }
+
+    /// Each region's shared memory object and size, if RAM is shared, and
+    /// the generation they belong to.
+    pub fn shared_fds(&self) -> Option<(Vec<(std::os::fd::RawFd, u64)>, u64)> {
+        let fds = self.regions.iter().map(|r| r.mmap.shared_fd().map(|f| (f, r.len()))).collect::<Option<Vec<_>>>()?;
+        Some((fds, self.generation.load(Ordering::Acquire)))
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    fn build(layout: &[(GuestAddress, u64)], shared: bool) -> Result<Self> {
         let ps = page_size() as u64;
         let mut regions = Vec::with_capacity(layout.len());
         let mut sorted = layout.to_vec();
@@ -67,9 +91,10 @@ impl GuestMemory {
             }
             prev_end = end;
             let size = usize::try_from(size).map_err(|_| Error::Overflow)?;
-            regions.push(GuestRegion { start, mmap: MmapRegion::new(size)? });
+            let mmap = if shared { MmapRegion::new_shared(size)? } else { MmapRegion::new(size)? };
+            regions.push(GuestRegion { start, mmap });
         }
-        Ok(GuestMemory { regions: Arc::new(regions) })
+        Ok(GuestMemory { regions: Arc::new(regions), generation: Arc::default() })
     }
 
     pub fn regions(&self) -> impl Iterator<Item = &GuestRegion> {
@@ -255,6 +280,7 @@ impl GuestMemory {
         for r in self.regions.iter() {
             r.mmap.discard(0, r.mmap.size())?;
         }
+        self.generation.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 }
@@ -346,6 +372,38 @@ mod tests {
         let f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&p).unwrap();
         let _ = std::fs::remove_file(&p);
         f
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn shared_ram_is_seen_by_another_mapping_and_reset_gets_a_new_object() {
+        let ps = page_size() as u64;
+        let m = GuestMemory::new_shared(&[(GuestAddress(0x1000_0000), 4 * ps)]).unwrap();
+        let (fds, gen) = m.shared_fds().unwrap();
+        assert_eq!((fds.len(), fds[0].1, gen), (1, 4 * ps, 0));
+        m.write(GuestAddress(0x1000_0000 + ps), &[7u8; 16]).unwrap();
+        // What another process mapping the object sees.
+        let other = |fd| {
+            // SAFETY: a fresh read-only shared mapping of the object.
+            let p = unsafe { libc::mmap(std::ptr::null_mut(), (4 * ps) as usize, libc::PROT_READ, libc::MAP_SHARED, fd, 0) };
+            assert_ne!(p, libc::MAP_FAILED);
+            // SAFETY: inside the mapping just made.
+            let b = unsafe { *(p as *const u8).add(ps as usize) };
+            // SAFETY: unmapping it.
+            unsafe { libc::munmap(p, (4 * ps) as usize) };
+            b
+        };
+        assert_eq!(other(fds[0].0), 7);
+        m.discard_all().unwrap();
+        let (fds2, gen2) = m.shared_fds().unwrap();
+        assert_eq!(gen2, 1);
+        let mut b = [1u8; 16];
+        m.read(GuestAddress(0x1000_0000 + ps), &mut b).unwrap();
+        assert_eq!(b, [0; 16], "zeroed");
+        m.write(GuestAddress(0x1000_0000 + ps), &[9u8; 1]).unwrap();
+        assert_eq!(other(fds2[0].0), 9, "the new object is what the guest uses");
+        // Private RAM has no objects to share.
+        assert!(GuestMemory::new(&[(GuestAddress(0), ps)]).unwrap().shared_fds().is_none());
     }
 
     fn mem() -> GuestMemory {

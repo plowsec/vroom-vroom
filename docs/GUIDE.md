@@ -344,6 +344,13 @@ VMM looks; ship the dylibs with the binary (`scripts/dist.sh` does): virglrender
 and MoltenVK always, ANGLE's two only for `opengl_host = "angle"`,
 DXMT's only for Windows guests.
 
+A VM with 3D runs as two processes: the VM (`vroom run`) and its GPU
+process (`vroom gpu-helper`), which holds virglrenderer and the GPU and
+nothing else (see [SECURITY.md](SECURITY.md#the-gpu-process)). It comes
+and goes with its VM. If it crashes, the guest loses 3D until the VM is
+started again (`gpu: the GPU process is gone` in the log); the rest of
+the VM keeps running.
+
 ## 3D in Windows guests (Direct3D 11)
 
 ```bash

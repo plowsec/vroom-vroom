@@ -24,6 +24,8 @@ use vroom_virtio::devices::gpu3d::{Blob, Box3d, Create3d, FenceDone, HostIov, Ma
 
 #[cfg(target_os = "macos")]
 mod gl;
+#[cfg(unix)]
+pub mod remote;
 
 #[cfg(target_os = "macos")]
 pub use gl::Host as GlHost;
@@ -547,30 +549,35 @@ impl Virgl {
         if let Some(&v) = self.views.get(&resource) {
             return Some(v);
         }
+        let (fd, len) = self.export(resource)?;
+        // SAFETY: a fresh read-only shared mapping of the whole object.
+        let p = unsafe { libc::mmap(std::ptr::null_mut(), len as usize, libc::PROT_READ, libc::MAP_SHARED, fd.as_raw_fd(), 0) };
+        if p == libc::MAP_FAILED {
+            return None;
+        }
+        self.views.insert(resource, (p as *mut u8, len));
+        Some((p as *mut u8, len))
+    }
+
+    /// A blob's shared memory (render server resources: Direct3D, Venus)
+    /// and its size. None for anything else.
+    pub fn export(&mut self, resource: u32) -> Option<(OwnedFd, u64)> {
         let export = self.lib.export_blob?;
         let (mut ty, mut fd) = (0u32, -1 as c_int);
         // SAFETY: valid out pointers; a returned fd is ours to close.
         if unsafe { export(resource, &mut ty, &mut fd) } != 0 || fd < 0 {
             return None;
         }
+        // SAFETY: a fresh fd, ours from here on.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
         const FD_TYPE_SHM: u32 = 3;
         // SAFETY: stat is plain old data; all zeroes is a valid value.
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         // SAFETY: fd is open; st is a valid out buffer.
-        let len = if ty == FD_TYPE_SHM && unsafe { libc::fstat(fd, &mut st) } == 0 { st.st_size.max(0) as u64 } else { 0 };
-        let p = if len > 0 {
-            // SAFETY: a fresh read-only shared mapping of the whole object.
-            unsafe { libc::mmap(std::ptr::null_mut(), len as usize, libc::PROT_READ, libc::MAP_SHARED, fd, 0) }
-        } else {
-            libc::MAP_FAILED
-        };
-        // SAFETY: we own fd; the mapping doesn't need it.
-        unsafe { libc::close(fd) };
-        if p == libc::MAP_FAILED {
+        if ty != FD_TYPE_SHM || unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 || st.st_size <= 0 {
             return None;
         }
-        self.views.insert(resource, (p as *mut u8, len));
-        Some((p as *mut u8, len))
+        Some((fd, st.st_size as u64))
     }
 
     fn drop_view(&mut self, resource: u32) {

@@ -10,6 +10,7 @@ rust-version.workspace = true
 log.workspace = true
 libc.workspace = true
 vroom-virtio.workspace = true
+vroom-memory.workspace = true
 
 [lints]
 workspace = true

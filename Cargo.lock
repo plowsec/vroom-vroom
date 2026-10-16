@@ -5351,6 +5351,7 @@ dependencies = [
  "vroom-block",
  "vroom-config",
  "vroom-display",
+ "vroom-gpu3d",
  "vroom-hv",
  "vroom-import",
  "vroom-net",
@@ -5407,6 +5408,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "log",
+ "vroom-memory",
  "vroom-sandbox",
  "vroom-virtio",
 ]

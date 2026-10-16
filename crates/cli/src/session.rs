@@ -57,7 +57,9 @@ fn lock_down(cfg: &VmConfig, state_dir: &Path, clipboard: bool, helpers: Vec<u32
     let mut p = vroom_sandbox::Policy {
         write_dirs: vec![state_dir.to_path_buf()],
         clipboard,
-        gpu: cfg.display.gpu == vroom_config::Gpu::Virtio3d,
+        // With 3D the GPU is the GPU process's, unless it runs in here.
+        gpu: cfg.display.gpu == vroom_config::Gpu::Virtio3d && vroom_vmm::gpu_in_process(),
+        shared_ram: cfg.display.gpu == vroom_config::Gpu::Virtio3d,
         ..Default::default()
     };
     for d in &cfg.disks {
@@ -88,15 +90,16 @@ fn lock_down(cfg: &VmConfig, state_dir: &Path, clipboard: bool, helpers: Vec<u32
     vroom_sandbox::apply(&p).map_err(|e| e.to_string())?;
     log::info!("sandbox applied");
     if std::env::var_os("VROOM_SANDBOX_SELFTEST").is_some() {
-        selftest(clipboard);
+        selftest("vmm", clipboard);
     }
     Ok(())
 }
 
-fn selftest(clipboard: bool) {
+/// Probe what the sandbox should block; `who` names the process.
+pub(crate) fn selftest(who: &str, clipboard: bool) {
     let probe = |path: &str| match std::fs::read(path) {
-        Ok(_) => eprintln!("sandbox selftest: {path} READABLE (bad)"),
-        Err(e) => eprintln!("sandbox selftest: {path} blocked ({e})"),
+        Ok(_) => eprintln!("{who} sandbox selftest: {path} READABLE (bad)"),
+        Err(e) => eprintln!("{who} sandbox selftest: {path} blocked ({e})"),
     };
     probe("/etc/passwd");
     // Another process's shared memory (notifyd's, there on every Mac).
@@ -107,53 +110,53 @@ fn selftest(clipboard: bool) {
         #[allow(unsafe_code)]
         let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY) };
         if fd >= 0 {
-            eprintln!("sandbox selftest: foreign shared memory OPENED (bad)");
+            eprintln!("{who} sandbox selftest: foreign shared memory OPENED (bad)");
             // SAFETY: an fd we just got.
             #[allow(unsafe_code)]
             unsafe {
                 libc::close(fd)
             };
         } else {
-            eprintln!("sandbox selftest: foreign shared memory blocked ({})", std::io::Error::last_os_error());
+            eprintln!("{who} sandbox selftest: foreign shared memory blocked ({})", std::io::Error::last_os_error());
         }
     }
     if clipboard {
         // Read only: the user's clipboard isn't ours to change, nor to print.
         match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
-            Ok(_) | Err(arboard::Error::ContentNotAvailable) => eprintln!("sandbox selftest: clipboard readable"),
-            Err(e) => eprintln!("sandbox selftest: clipboard FAILED ({e})"),
+            Ok(_) | Err(arboard::Error::ContentNotAvailable) => eprintln!("{who} sandbox selftest: clipboard readable"),
+            Err(e) => eprintln!("{who} sandbox selftest: clipboard FAILED ({e})"),
         }
     }
     probe(&format!("{}/.ssh/known_hosts", std::env::var("HOME").unwrap_or_default()));
     match std::process::Command::new("/bin/echo").arg("x").output() {
-        Ok(_) => eprintln!("sandbox selftest: exec ALLOWED (bad)"),
-        Err(e) => eprintln!("sandbox selftest: exec blocked ({e})"),
+        Ok(_) => eprintln!("{who} sandbox selftest: exec ALLOWED (bad)"),
+        Err(e) => eprintln!("{who} sandbox selftest: exec blocked ({e})"),
     }
     // On Linux, seccomp kills the process on bind() or an AF_UNIX
     // socket(): those probes go last there, and dying is the pass.
     if cfg!(target_os = "macos") {
         match std::net::TcpListener::bind("127.0.0.1:0") {
-            Ok(_) => eprintln!("sandbox selftest: new listener ALLOWED (bad)"),
-            Err(e) => eprintln!("sandbox selftest: new listener blocked ({e})"),
+            Ok(_) => eprintln!("{who} sandbox selftest: new listener ALLOWED (bad)"),
+            Err(e) => eprintln!("{who} sandbox selftest: new listener blocked ({e})"),
         }
     }
     // Host services: loopback TCP and Unix sockets (ssh-agent...).
     let t = Duration::from_secs(2);
     if let Some(port) = std::env::var("VROOM_SELFTEST_LOOPBACK_PORT").ok().and_then(|p| p.parse::<u16>().ok()) {
         match std::net::TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), t) {
-            Ok(_) => eprintln!("sandbox selftest: host loopback ALLOWED (bad unless allow_host_loopback)"),
-            Err(e) => eprintln!("sandbox selftest: host loopback blocked ({e})"),
+            Ok(_) => eprintln!("{who} sandbox selftest: host loopback ALLOWED (bad unless allow_host_loopback)"),
+            Err(e) => eprintln!("{who} sandbox selftest: host loopback blocked ({e})"),
         }
     }
     match std::net::TcpStream::connect_timeout(&([1, 1, 1, 1], 53).into(), t) {
-        Ok(_) => eprintln!("sandbox selftest: internet reachable (NAT works)"),
-        Err(e) => eprintln!("sandbox selftest: internet: {e}"),
+        Ok(_) => eprintln!("{who} sandbox selftest: internet reachable (NAT works)"),
+        Err(e) => eprintln!("{who} sandbox selftest: internet: {e}"),
     }
     if let Some(sock) = std::env::var_os("SSH_AUTH_SOCK") {
-        eprintln!("sandbox selftest: unix socket probe (Linux: expect SIGSYS now)");
+        eprintln!("{who} sandbox selftest: unix socket probe (Linux: expect SIGSYS now)");
         match std::os::unix::net::UnixStream::connect(&sock) {
-            Ok(_) => eprintln!("sandbox selftest: unix socket {} ALLOWED (bad)", sock.to_string_lossy()),
-            Err(e) => eprintln!("sandbox selftest: unix sockets blocked ({e})"),
+            Ok(_) => eprintln!("{who} sandbox selftest: unix socket {} ALLOWED (bad)", sock.to_string_lossy()),
+            Err(e) => eprintln!("{who} sandbox selftest: unix sockets blocked ({e})"),
         }
     }
 }

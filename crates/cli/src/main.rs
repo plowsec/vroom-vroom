@@ -2,6 +2,8 @@
 
 mod clip;
 mod disk;
+#[cfg(unix)]
+mod gpu;
 mod import;
 mod log_limit;
 mod new;
@@ -60,6 +62,10 @@ enum Cmd {
         #[arg(long)]
         input: bool,
     },
+    /// GPU process started by the VMM for 3D (internal).
+    #[cfg(unix)]
+    #[command(hide = true)]
+    GpuHelper(gpu::HelperArgs),
     /// USB passthrough helper started by the VMM (internal).
     #[command(hide = true)]
     UsbHost(usb::HostArgs),
@@ -77,8 +83,9 @@ enum Cmd {
 
 /// Apps started from the Dock or Finder get 256 open files. A Windows
 /// guest with 3D keeps one or more per Direct3D event and fence (DXMT,
-/// the render server), and runs out of them in minutes: fences then never
-/// finish and the guest hangs. Take what the system allows.
+/// the render server, in the GPU process, which inherits this limit), and
+/// runs out of them in minutes: fences then never finish and the guest
+/// hangs. Take what the system allows.
 fn raise_open_files() {
     let mut r = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
     // SAFETY: valid out pointer.
@@ -86,6 +93,7 @@ fn raise_open_files() {
         return;
     }
     // macOS refuses more than kern.maxfilesperproc (and RLIM_INFINITY).
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut cap: libc::rlim_t = 1 << 16;
     #[cfg(target_os = "macos")]
     {
@@ -134,6 +142,8 @@ fn main() -> ExitCode {
         Cmd::New(a) => new::run(a, load),
         Cmd::Import(a) => import::run(a),
         Cmd::AudioOut { input } => audio_out(input),
+        #[cfg(unix)]
+        Cmd::GpuHelper(a) => gpu::helper(a),
         Cmd::UsbHost(a) => usb::host(a),
         Cmd::Usb(c) => usb::run(c),
         Cmd::Check { config } => load(&config).and_then(|c| {
