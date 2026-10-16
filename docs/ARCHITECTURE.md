@@ -104,6 +104,38 @@ Shared folders keep their FUSE node table as paths, so a snapshot carries
 it and open files are reopened by path on restore. Sound hands back
 in-flight buffers before saving.
 
+## Several monitors
+
+`[display] monitors` (1 to 4). The shared framebuffer has a slot per
+monitor; each monitor's sink (`FbSink`) writes its slot and tells the
+viewer (`Mode`/`Damage` for the first, `HeadMode`/`HeadDamage` with the
+monitor's number for the others). ramfb only shares the first.
+
+virtio-gpu has a scanout per sink. A resource can show on several
+scanouts at different places (X11 makes one framebuffer for all
+monitors): a flush goes to each scanout that shows it, clipped to its
+part; a GL flush reads the union of those parts back once and hands
+each scanout its piece. GET_DISPLAY_INFO reports each scanout, and a
+window that closes unplugs its monitor (a display event).
+
+Linux gets one GPU with N scanouts. Windows' drivers drive one scanout
+each, so a Windows guest gets one GPU per monitor, added after the other
+devices (their PCI slots don't move) and numbered in the PCI subsystem
+id (0x1100 + n), which the agent reads to tell them apart. Only the
+first has 3D: two 3D GPUs would need to share frames (Windows draws a
+monitor on one GPU and shows it on another), which the Direct3D driver
+can't do across renderers. The others are 2D; Windows' 2D driver clears
+"its framebuffer" in BAR 0 with stores the hypervisor can't decode, so
+those GPUs have plain memory there and their registers in BAR 2.
+
+The viewer sends each window's size (`HeadResize`, 0x0 when it closes)
+and pointer (`HeadPointer`). The agent service turns the sizes into one
+layout, monitors side by side, top edges lined up (`SetLayout`, applied
+with xrandr, Mutter's DisplayConfig, or ChangeDisplaySettingsEx); the
+display thread maps a monitor's pointer onto that desktop for the
+tablet. Windows maps the tablet to its main monitor only: there the
+tablet, elsewhere the agent moves the pointer (`Mouse`, SendInput).
+
 ## Drag and drop
 
 Finder drags reach the app's window as winit events (no position: the

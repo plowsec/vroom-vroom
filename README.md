@@ -85,6 +85,7 @@ uses them, and the window says so. Details: [SECURITY.md](docs/SECURITY.md).
 - Import from VMware Fusion (ARM64 VMs)
 - USB devices from the host (those macOS has no driver for; needs libusb)
 - Drag and drop files from the Mac into the guest
+- Up to 4 guest monitors, a window each, full screen on several Mac screens
 - The Mac's camera as a webcam in the guest, if you turn it on
 - Fast disk and network I/O, measured against QEMU ([numbers](docs/PERFORMANCE.md))
 

@@ -83,6 +83,7 @@ Bridged and host-only need the `vroom-netd` helper running as root. See
 | `opengl_host` | `"apple"` | What runs the guest's OpenGL: `"apple"` (macOS's OpenGL 4.1; the guest gets OpenGL 4.1) or `"angle"` (ANGLE on Metal; the guest gets OpenGL 2.1, with every call checked). See the [guide](GUIDE.md#3d-acceleration-linux-guests). |
 | `width`, `height` | 1280, 800 | Starting resolution. The guest follows the window size once its agent or driver runs. |
 | `hidpi` | true | Full resolution on Retina (HiDPI) screens: the guest gets every pixel of the window and its agent sets its UI scale to match (2x on Retina), so text is sharp. Guests without an agent that can scale get half the pixels and the window scales the picture up, as with `false`. See [GUIDE.md](GUIDE.md#retina-screens). |
+| `monitors` | 1 | Guest monitors, 1 to 4, each in a window of its own. Needs a `gpu`. Linux gets one GPU with that many outputs; Windows gets a GPU per monitor, the extra ones 2D. See [GUIDE.md](GUIDE.md#several-monitors). |
 
 ## `[[share]]` (host folders, up to 8)
 

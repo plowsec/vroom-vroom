@@ -45,7 +45,8 @@ fuzz_target!(|data: &[u8]| {
     let n = (data.len() - 2).min(MEM as usize);
     mem.write(GuestAddress(0), &data[2..2 + n]).unwrap();
     let size = 1 << (data[0] % 5); // 1..16
-    let (gpu, _ctl) = Gpu::new(64, 64, Arc::new(Null));
+    // Two scanouts: the multi-monitor paths too.
+    let (gpu, _ctl) = Gpu::with_heads(&[(64, 64), (32, 32)], vec![Arc::new(Null), Arc::new(Null)]);
     let ctx = ActivateContext {
         mem,
         queues: vec![queue(0, size, data[1] as u16 % 4), queue(0x200, size, 0)],

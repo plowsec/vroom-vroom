@@ -189,7 +189,7 @@ pub fn gpu_drivers(first_3d: bool) {
     use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
         SetupDiBuildDriverInfoList, SetupDiCallClassInstaller, SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo, SetupDiEnumDriverInfoW,
         SetupDiGetClassDevsW, SetupDiGetDeviceRegistryPropertyW, SetupDiSetSelectedDriverW, DIGCF_PRESENT, GUID_DEVCLASS_DISPLAY,
-        DIF_INSTALLDEVICE, SPDIT_COMPATDRIVER, SPDRP_DEVICEDESC, SPDRP_HARDWAREID, SP_DEVINFO_DATA, SP_DRVINFO_DATA_V2_W,
+        CM_Get_DevNode_Status, CR_SUCCESS, DIF_INSTALLDEVICE, SPDIT_COMPATDRIVER, SPDRP_DEVICEDESC, SPDRP_HARDWAREID, SP_DEVINFO_DATA, SP_DRVINFO_DATA_V2_W,
     };
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     let text = |w: &[u16]| String::from_utf16_lossy(&w[..w.iter().position(|&c| c == 0).unwrap_or(w.len())]);
@@ -215,8 +215,16 @@ pub fn gpu_drivers(first_3d: bool) {
             if ok != 0 { text(&buf) } else { String::new() }
         };
         let hwid = prop(SPDRP_HARDWAREID);
+        // The 3D driver on a GPU without 3D (the VM was set to 2D) fails
+        // to start: Windows would get its basic display (800x600).
+        let failed = || {
+            let (mut status, mut problem) = (0u32, 0u32);
+            // SAFETY: valid out pointers and a devnode from the list.
+            unsafe { CM_Get_DevNode_Status(&mut status, &mut problem, d.DevInst, 0) == CR_SUCCESS && problem != 0 }
+        };
         let want = match crate::layout::gpu_head(&hwid) {
             Some(0) if first_3d => "VirtIO GPU 3D",
+            Some(0) if prop(SPDRP_DEVICEDESC).contains("VirtIO GPU 3D") && failed() => "VirtIO GPU DOD",
             Some(h) if h > 0 => "VirtIO GPU DOD",
             _ => continue,
         };

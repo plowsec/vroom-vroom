@@ -57,9 +57,11 @@ Windows guests:
 - USB passthrough with real devices, bridged networking with real
   vmnet (being tested now).
 - A signed, notarized app with an installer and updates; crash reports.
-- Multiple monitors, drag and drop from the guest to the Mac (Mac to
-  guest works), a live drag in Linux guests (they get files on the
-  Desktop for now).
+- Drag and drop from the guest to the Mac (Mac to guest works), a live
+  drag in Linux guests (they get files on the Desktop for now).
+- Several monitors: one UI scale for all of them (a window per Mac
+  screen with its own scale would want per-monitor scales), Direct3D on
+  Windows' first monitor only (the others are copied to 2D GPUs).
 - Rosetta for Linux guests (x86_64 Linux programs). Apple only offers it
   through its Virtualization framework; we'd have to look like it.
 - Benchmarks against VMware Fusion and Parallels on the same Mac, the

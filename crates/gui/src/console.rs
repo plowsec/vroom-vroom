@@ -390,6 +390,11 @@ pub fn snapshot_any() -> Option<Result<SharedPixelBuffer<Rgba8Pixel>, slint::Pla
     CONSOLES.with(|c| c.borrow().values().next().map(|c| c.win.window().take_snapshot()))
 }
 
+/// A picture of some VM's window for monitor `n` (2, 3...; for `VROOM_SHOT`).
+pub fn snapshot_monitor(n: usize) -> Option<Result<SharedPixelBuffer<Rgba8Pixel>, slint::PlatformError>> {
+    CONSOLES.with(|c| c.borrow().values().find_map(|c| c.extra.get(n.checked_sub(2)?)?.as_ref().map(|e| e.win.window().take_snapshot())))
+}
+
 /// Ask every running VM to suspend (app quitting).
 pub fn suspend_all() {
     CONSOLES.with(|c| {
@@ -1531,7 +1536,7 @@ impl Console {
             if mode == (0, 0) {
                 return;
             }
-            match self.open_extra(head, mode) {
+            match self.open_extra(head) {
                 Ok(e) => self.extra[head - 1] = Some(e),
                 Err(e) => {
                     log::warn!("{}: display {}: {e}", self.name, head + 1);
@@ -1560,15 +1565,15 @@ impl Console {
         }
     }
 
-    fn open_extra(&mut self, head: usize, mode: (u32, u32)) -> Result<Extra, slint::PlatformError> {
+    fn open_extra(&mut self, head: usize) -> Result<Extra, slint::PlatformError> {
         let win = MonitorWindow::new()?;
         win.set_vm_name(self.name.clone().into());
         win.set_number(head as i32 + 1);
         wire_extra(&win, &self.key, head, &self.io);
-        // About the guest's size: in points on a Retina screen with HiDPI.
-        let sf = self.win.window().scale_factor().max(1.0);
-        let k = if self.hidpi { sf } else { 1.0 };
-        win.window().set_size(slint::LogicalSize::new(mode.0 as f32 / k, mode.1 as f32 / k));
+        // As big as the first monitor's screen area; the guest follows.
+        let (sz, sf) = (self.win.window().size(), self.win.window().scale_factor().max(0.5));
+        let bar = self.win.get_bar_height();
+        win.window().set_size(slint::LogicalSize::new(sz.width as f32 / sf, (sz.height as f32 / sf - bar).max(200.0)));
         win.show()?;
         let mut e = Extra { win, img: None, mode: (0, 0), pending_resize: Some(Instant::now() + RESIZE_DEBOUNCE), over: false, pointer: None, closed: false };
         if self.win.window().is_fullscreen() {
