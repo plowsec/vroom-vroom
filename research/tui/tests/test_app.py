@@ -66,7 +66,7 @@ async def test_pause_discover_callback_and_breakpoint():
         await app.workers.wait_for_complete()
         assert not app.running
         assert any(op == 'pause' for op, _ in client.calls)
-        assert 'PC' in str(app.query_one('#registers', Static).render())
+        assert app.query_one('#registers', DataTable).get_row_at(0)[0] == 'PC'
 
 
 async def test_callback_tab_contains_live_fields():

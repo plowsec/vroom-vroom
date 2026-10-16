@@ -82,6 +82,9 @@ pub struct KvmVcpu {
     mpidr: u64,
     kicker: Arc<KvmKicker>,
     pending_read: Option<usize>,
+    debug_slots: usize,
+    watch_slots: usize,
+    guest_debug: bool,
 }
 
 impl std::fmt::Debug for KvmVcpu {
@@ -102,7 +105,12 @@ impl KvmVcpu {
         }
         fd.vcpu_init(&kvi).map_err(kerr("KVM_ARM_VCPU_INIT"))?;
         set_thread_run(fd.get_kvm_run() as *mut _);
-        let mut v = KvmVcpu { fd, index, mpidr: 0, kicker: KvmKicker::current(), pending_read: None };
+        let kvm = Kvm::new().map_err(kerr("open KVM capabilities"))?;
+        let mut v = KvmVcpu { fd, index, mpidr: 0, kicker: KvmKicker::current(), pending_read: None,
+            debug_slots: kvm.check_extension_int(Cap::DebugHwBps).max(0) as usize,
+            watch_slots: kvm.check_extension_int(Cap::DebugHwWps).max(0) as usize,
+            guest_debug: kvm.check_extension(Cap::SetGuestDebug),
+        };
         v.mpidr = v.get(sysreg(3, 0, 0, 0, 5))?;
         Ok(v)
     }
@@ -119,6 +127,27 @@ impl KvmVcpu {
 }
 
 impl Vcpu for KvmVcpu {
+    fn debug_write_register(&mut self, register: crate::debug::Register, value: u64) -> Result<()> {
+        use crate::debug::Register::*;
+        register.validate(value)?;
+        let id = match register {
+            X(n) => x_reg(n as u64), Pc => PC, Pstate => PSTATE,
+            Sp => core_reg(if self.get(PSTATE)? & 1 == 0 { 248 } else { 272 }),
+            Ttbr0 => sysreg(3,0,2,0,0), Ttbr1 => sysreg(3,0,2,0,1),
+            Tcr => sysreg(3,0,2,0,2), Sctlr => sysreg(3,0,1,0,0), Vbar => sysreg(3,0,12,0,0),
+        };
+        self.set(id, value)
+    }
+
+    fn configure_debug(&mut self, config: &crate::debug::DebugConfig) -> Result<()> {
+        if !self.guest_debug {
+            return if *config == Default::default() { Ok(()) }
+                else { Err(Error::Unsupported("KVM_CAP_SET_GUEST_DEBUG")) };
+        }
+        let debug = debug_config(config, self.debug_slots, self.watch_slots)?;
+        self.fd.set_guest_debug(&debug).map_err(kerr("KVM_SET_GUEST_DEBUG"))
+    }
+
     fn index(&self) -> u32 {
         self.index
     }
@@ -139,6 +168,12 @@ impl Vcpu for KvmVcpu {
                     let n = data.len().min(8);
                     d[..n].copy_from_slice(&data[..n]);
                     VcpuExit::MmioWrite { addr, len: n, data: d }
+                }
+                Ok(KExit::Debug(debug)) => {
+                    let syndrome = (debug.hsr as u64) | ((debug.hsr_high as u64) << 32);
+                    let reason = crate::debug::arm64_reason(syndrome)
+                        .ok_or_else(|| Error::GuestFault(format!("unknown KVM debug syndrome {syndrome:#x}")))?;
+                    VcpuExit::Debug(crate::debug::DebugStop { cpu: self.index, pc: self.get(PC)?, syndrome, reason })
                 }
                 Ok(KExit::SystemEvent(ty, _)) => {
                     if ty == KVM_SYSTEM_EVENT_RESET {
@@ -247,9 +282,54 @@ impl Vcpu for KvmVcpu {
     }
 }
 
+// KVM owns the guest/host debug-register switch and forwards guest BRKs
+// unless USE_SW_BP is explicitly requested. No guest register emulation here.
+fn debug_config(config: &crate::debug::DebugConfig, bps: usize, wps: usize) -> Result<kvm_bindings::kvm_guest_debug> {
+    use kvm_bindings::*;
+    if config.breakpoints.len() > bps.min(16) || config.watchpoints.len() > wps.min(16)
+        || config.breakpoints.iter().any(|a| a & 3 != 0) {
+        return Err(Error::Invalid("KVM debug slot limit or unaligned breakpoint".into()));
+    }
+    if !config.enabled && (config.single_step || !config.breakpoints.is_empty()
+        || !config.watchpoints.is_empty() || config.trap_software_breakpoints) {
+        return Err(Error::Invalid("debug controls require enabled=true".into()));
+    }
+    let mut out = kvm_guest_debug::default();
+    if config.enabled { out.control |= KVM_GUESTDBG_ENABLE; }
+    if config.single_step { out.control |= KVM_GUESTDBG_SINGLESTEP; }
+    if config.trap_software_breakpoints { out.control |= KVM_GUESTDBG_USE_SW_BP; }
+    if !config.breakpoints.is_empty() || !config.watchpoints.is_empty() { out.control |= KVM_GUESTDBG_USE_HW; }
+    for (i, address) in config.breakpoints.iter().enumerate() {
+        out.arch.dbg_bvr[i] = *address;
+        out.arch.dbg_bcr[i] = 1 | (3 << 1) | (15 << 5);
+    }
+    for (i, watch) in config.watchpoints.iter().enumerate() {
+        out.arch.dbg_wvr[i] = watch.address & !7;
+        out.arch.dbg_wcr[i] = watch.arm64_control()?;
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_controls_use_host_slots_and_leave_guest_brks_alone() {
+        use crate::debug::*;
+        let mut c = DebugConfig { enabled: true, single_step: true,
+            breakpoints: vec![0x1000], watchpoints: vec![Watchpoint {address: 0x2003, size: 2, read: false, write: true}],
+            ..Default::default() };
+        let d = debug_config(&c, 4, 2).unwrap();
+        assert_eq!(d.control, kvm_bindings::KVM_GUESTDBG_ENABLE | kvm_bindings::KVM_GUESTDBG_SINGLESTEP | kvm_bindings::KVM_GUESTDBG_USE_HW);
+        assert_eq!(d.arch.dbg_bvr[0], 0x1000);
+        assert_eq!(d.arch.dbg_wvr[0], 0x2000);
+        assert_eq!(d.arch.dbg_wcr[0], c.watchpoints[0].arm64_control().unwrap());
+        assert!(debug_config(&c, 0, 2).is_err());
+        c.enabled = false;
+        assert!(debug_config(&c, 4, 2).is_err());
+        assert_eq!(debug_config(&Default::default(), 4, 2).unwrap().control, 0);
+    }
 
     #[test]
     fn reg_ids() {

@@ -2,6 +2,7 @@
 pub mod arm64;
 pub mod binary;
 pub mod cache;
+pub mod control;
 pub mod process;
 pub mod symbols;
 pub mod unwind;

@@ -199,6 +199,9 @@ pub enum BootRegs {
 
 /// A virtual CPU. Not `Send`: lives and dies on its own thread.
 pub trait Vcpu {
+    fn debug_write_register(&mut self, _register: debug::Register, _value: u64) -> Result<()> {
+        Err(Error::Unsupported("register editing on this backend"))
+    }
     /// Configure host debugging on the owning thread, while stopped.
     fn configure_debug(&mut self, _config: &debug::DebugConfig) -> Result<()> {
         Err(Error::Unsupported("host debugging on this backend"))

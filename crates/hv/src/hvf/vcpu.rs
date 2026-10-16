@@ -400,6 +400,20 @@ impl Drop for HvfVcpu {
 }
 
 impl Vcpu for HvfVcpu {
+    fn debug_write_register(&mut self, register: crate::debug::Register, value: u64) -> Result<()> {
+        use crate::debug::Register::*;
+        register.validate(value)?;
+        match register {
+            X(n) => self.set_x(n, value),
+            Pc => self.set(ffi::HV_REG_PC, value),
+            Pstate => self.set(ffi::HV_REG_CPSR, value),
+            Sp => self.set_sys(if self.get(ffi::HV_REG_CPSR)? & 1 == 0 { 0xc208 } else { 0xe208 }, value),
+            Ttbr0 => self.set_sys(0xc100, value), Ttbr1 => self.set_sys(0xc101, value),
+            Tcr => self.set_sys(0xc102, value), Sctlr => self.set_sys(0xc080, value),
+            Vbar => self.set_sys(0xc600, value),
+        }
+    }
+
     fn configure_debug(&mut self, config: &DebugConfig) -> Result<()> {
         if self.el2 {
             return Err(Error::Unsupported("debugging nested EL2 guests"));

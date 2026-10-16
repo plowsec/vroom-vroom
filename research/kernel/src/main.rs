@@ -35,6 +35,19 @@ fn number(v: &Value) -> Result<u64, String> {
     .map_err(|e| format!("invalid address: {e}"))
 }
 
+fn vector_length(request: &Value) -> Result<Option<u16>, String> {
+    request
+        .get("vector_length")
+        .map(|v| {
+            let n = number(v)?;
+            if !(16..=256).contains(&n) || n % 16 != 0 {
+                return Err("vector_length: 16..256 bytes, multiple of 16".into());
+            }
+            Ok(n as u16)
+        })
+        .transpose()
+}
+
 fn output(v: Value) -> Result<(), String> {
     let mut out = std::io::stdout().lock();
     serde_json::to_writer(&mut out, &v).map_err(|e| e.to_string())?;
@@ -50,6 +63,7 @@ struct Session {
     watchpoints: Vec<Watchpoint>,
     watch_stopped: Option<usize>,
     step_cpu: Option<usize>,
+    run_to: Option<vroom_kernel::control::RunTo>,
     kernel: Option<vroom_kernel::windows::Image>,
     symbols: Option<vroom_kernel::symbols::Symbols>,
     pages: PageCache,
@@ -70,7 +84,7 @@ struct Session {
 impl Session {
     fn registers(&self, cpu: usize, context: bool) -> Result<Registers, String> {
         let state = self.vm.debug_registers(cpu).map_err(|e| e.to_string())?;
-        let mut regs = Registers::from_hvf(&state).map_err(|e| e.to_string())?;
+        let mut regs = Registers::from_state(&state).map_err(|e| e.to_string())?;
         if context {
             if let Some(process) = &self.process {
                 let active = self
@@ -143,15 +157,37 @@ impl Session {
         .ok_or_else(|| "load matching symbols first".into())
     }
 
+    fn invalidate(&mut self) {
+        self.pages.clear();
+        self.process_cache.borrow_mut().take();
+        self.module_cache.borrow_mut().take();
+        self.unwind.clear();
+        self.export_cache.clear();
+        self.module_symbols.clear();
+    }
+    fn execution_breakpoints(&self) -> Vec<u64> {
+        let mut addresses = self.breakpoints.clone();
+        if let Some(run) = &self.run_to {
+            if !addresses.contains(&run.address) {
+                addresses.push(run.address);
+            }
+        }
+        addresses
+    }
+    fn cancel_run_to(&mut self) -> Result<(), String> {
+        self.run_to = None;
+        self.configure()
+    }
     fn configure(&self) -> Result<(), String> {
+        let addresses = self.execution_breakpoints();
         for cpu in 0..self.vm.config().cpus as usize {
             self.vm
                 .debug_configure(
                     cpu,
                     DebugConfig {
-                        enabled: !self.breakpoints.is_empty() || !self.watchpoints.is_empty(),
+                        enabled: !addresses.is_empty() || !self.watchpoints.is_empty(),
                         single_step: false,
-                        breakpoints: self.breakpoints.clone(),
+                        breakpoints: addresses.clone(),
                         watchpoints: self.watchpoints.clone(),
                         trap_software_breakpoints: false,
                     },
@@ -171,12 +207,13 @@ impl Session {
         }
         match op {
             "status" => Ok(
-                json!({"state": format!("{:?}", self.vm.state()), "cpus": self.vm.config().cpus, "breakpoints": self.breakpoints}),
+                json!({"state": format!("{:?}", self.vm.state()), "cpus": self.vm.config().cpus, "breakpoints": self.breakpoints, "temporary":self.run_to.as_ref().map(|r|r.address)}),
             ),
             "pause" => {
                 self.continue_cpus.clear();
                 self.continuing = false;
                 self.vm.pause().map_err(|e| e.to_string())?;
+                self.cancel_run_to()?;
                 Ok(json!("paused"))
             }
             "resume" => {
@@ -197,31 +234,158 @@ impl Session {
                 self.continue_cpus.clear();
                 for cpu in 0..self.vm.config().cpus as usize {
                     let state = self.vm.debug_registers(cpu).map_err(|e| e.to_string())?;
-                    let regs = Registers::from_hvf(&state).map_err(|e| e.to_string())?;
+                    let regs = Registers::from_state(&state).map_err(|e| e.to_string())?;
                     if state.powered_on
-                        && (self.breakpoints.contains(&regs.pc) || self.watch_stopped == Some(cpu))
+                        && (self.execution_breakpoints().contains(&regs.pc)
+                            || self.watch_stopped == Some(cpu))
                     {
                         self.continue_cpus.push_back(cpu);
                     }
                 }
                 self.watch_stopped = None;
-                self.pages.clear();
-                self.process_cache.borrow_mut().take();
-                self.module_cache.borrow_mut().take();
-                self.unwind.clear();
-                self.export_cache.clear();
-                self.module_symbols.clear();
+                self.invalidate();
                 self.continuing = true;
                 self.continue_next()?;
                 Ok(json!("running"))
             }
+            "write_register" => {
+                let register = vroom_hv::debug::Register::parse(
+                    request["register"].as_str().ok_or("missing register")?,
+                )
+                .map_err(|e| e.to_string())?;
+                let value = number(&request["value"])?;
+                self.vm
+                    .debug_write_register(cpu, register, value)
+                    .map_err(|e| e.to_string())?;
+                self.invalidate();
+                Ok(json!(self.registers(cpu, false)?))
+            }
+            "write_virtual" | "write_physical" => {
+                let address = number(&request["address"])?;
+                let hex = request["hex"].as_str().ok_or("missing hex bytes")?;
+                if hex.is_empty() || hex.len() > 32768 || hex.len() % 2 != 0 || !hex.is_ascii() {
+                    return Err("write requires 1..16384 hex-encoded bytes".into());
+                }
+                let data = (0..hex.len())
+                    .step_by(2)
+                    .map(|i| {
+                        u8::from_str_radix(&hex[i..i + 2], 16)
+                            .map_err(|_| "invalid hex byte".to_owned())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mappings = if op == "write_physical" {
+                    vec![(address, 0..data.len())]
+                } else {
+                    let regs = self.registers(cpu, request["context"].as_bool().unwrap_or(true))?;
+                    AddressSpace {
+                        memory: &self.vm,
+                        registers: &regs,
+                    }
+                    .write_spans(address, data.len())
+                    .map_err(|e| e.to_string())?
+                };
+                let spans: Vec<_> = mappings
+                    .iter()
+                    .map(|(pa, range)| (*pa, &data[range.clone()]))
+                    .collect();
+                self.vm
+                    .debug_write_physical(&spans)
+                    .map_err(|e| e.to_string())?;
+                self.invalidate();
+                Ok(json!({"address":address, "written":data.len()}))
+            }
+            "step_over" | "step_out" => {
+                self.cancel_run_to()?;
+                let mut original = self.registers(cpu, false)?;
+                original.sve_vl = vector_length(request)?;
+                let space = AddressSpace {
+                    memory: &CachedMemory {
+                        memory: &self.vm,
+                        cache: &self.pages,
+                    },
+                    registers: &original,
+                };
+                let (address, sp) = if op == "step_over" {
+                    let mut bytes = [0; 4];
+                    space
+                        .read(original.pc, &mut bytes)
+                        .map_err(|e| e.to_string())?;
+                    if !vroom_kernel::control::is_call(u32::from_le_bytes(bytes)) {
+                        return self.command(&json!({"op":"step", "cpu":cpu}));
+                    }
+                    (
+                        original.pc.checked_add(4).ok_or("PC overflow")?,
+                        original.sp,
+                    )
+                } else {
+                    let mut modules = self.kernel_modules(cpu)?;
+                    if original.pc >> 63 == 0 {
+                        let process = self
+                            .processes(cpu)?
+                            .into_iter()
+                            .find(|p| {
+                                p.directory_table & 0x0000_ffff_ffff_f000
+                                    == original.ttbr0 & 0x0000_ffff_ffff_f000
+                            })
+                            .ok_or("CPU process not found")?;
+                        modules.extend(
+                            process::modules(
+                                &space,
+                                self.symbols.as_ref().ok_or("load kernel symbols first")?,
+                                &process,
+                            )
+                            .map_err(|e| e.to_string())?,
+                        );
+                    }
+                    let module = modules
+                        .iter()
+                        .find(|m| original.pc >= m.base && original.pc - m.base < m.size as u64)
+                        .ok_or("no module for CPU's current function")?;
+                    let mut caller = original.clone();
+                    self.unwind
+                        .step(&space, module, &mut caller, false)
+                        .map_err(|e| e.to_string())?;
+                    (caller.pc, caller.sp)
+                };
+                if address == 0
+                    || address & 3 != 0
+                    || sp & 15 != 0
+                    || (address == original.pc && sp == original.sp)
+                {
+                    return Err("invalid caller/return location".into());
+                }
+                // Validate the destination while stopped, before arming any control.
+                space.translate(address).map_err(|e| e.to_string())?;
+                if self.breakpoints.len() == 4 && !self.breakpoints.contains(&address) {
+                    return Err("step-over/out needs one free hardware breakpoint slot".into());
+                }
+                self.run_to = Some(vroom_kernel::control::RunTo {
+                    address,
+                    sp,
+                    ttbr0: original.ttbr0,
+                    reason: if op == "step_over" {
+                        "StepOver"
+                    } else {
+                        "StepOut"
+                    },
+                });
+                match self.command(&json!({"op":"resume", "cpu":cpu})) {
+                    Ok(_) => Ok(json!({"state":"running", "until":address})),
+                    Err(error) => {
+                        let _ = self.cancel_run_to();
+                        Err(error)
+                    }
+                }
+            }
             "registers" => {
                 let regs = self.vm.debug_registers(cpu).map_err(|e| e.to_string())?;
-                Ok(json!(Registers::from_hvf(&regs).map_err(|e| e.to_string())?))
+                Ok(json!(
+                    Registers::from_state(&regs).map_err(|e| e.to_string())?
+                ))
             }
             "process_event" => {
                 let state = self.vm.debug_registers(cpu).map_err(|e| e.to_string())?;
-                let regs = Registers::from_hvf(&state).map_err(|e| e.to_string())?;
+                let regs = Registers::from_state(&state).map_err(|e| e.to_string())?;
                 let space = AddressSpace {
                     memory: &CachedMemory {
                         memory: &self.vm,
@@ -243,7 +407,7 @@ impl Session {
                     );
                 }
                 let state = self.vm.debug_registers(cpu).map_err(|e| e.to_string())?;
-                let regs = Registers::from_hvf(&state).map_err(|e| e.to_string())?;
+                let regs = Registers::from_state(&state).map_err(|e| e.to_string())?;
                 let space = AddressSpace {
                     memory: &CachedMemory {
                         memory: &self.vm,
@@ -379,7 +543,9 @@ impl Session {
             "stack" => {
                 // CPU stack always uses the actual CPU address space, even when
                 // another process has been selected for memory inspection.
-                let regs = self.registers(cpu, false)?;
+                let mut regs = self.registers(cpu, false)?;
+                regs.tcr &= !(1 << 7);
+                regs.sve_vl = vector_length(request)?;
                 let space = AddressSpace {
                     memory: &CachedMemory {
                         memory: &self.vm,
@@ -390,16 +556,15 @@ impl Session {
                 let symbols = self.symbols.as_ref().ok_or("load kernel symbols first")?;
                 let mut modules = self.kernel_modules(cpu)?;
                 let mut stack_process = 0;
-                if regs.pc >> 63 == 0 {
+                {
                     let processes = self.processes(cpu)?;
                     if let Some(process) = processes.iter().find(|p| {
                         p.directory_table & 0x0000fffffffff000 == regs.ttbr0 & 0x0000fffffffff000
                     }) {
                         stack_process = process.eprocess;
-                        modules.extend(
-                            process::modules(&space, symbols, process)
-                                .map_err(|e| e.to_string())?,
-                        );
+                        if let Ok(user) = process::modules(&space, symbols, process) {
+                            modules.extend(user);
+                        }
                     }
                 }
                 let mut stack =
@@ -549,7 +714,7 @@ impl Session {
                     .as_ref()
                     .ok_or("load matching kernel symbols first")?;
                 let state = self.vm.debug_registers(cpu).map_err(|e| e.to_string())?;
-                let regs = Registers::from_hvf(&state).map_err(|e| e.to_string())?;
+                let regs = Registers::from_state(&state).map_err(|e| e.to_string())?;
                 let space = AddressSpace {
                     memory: &CachedMemory {
                         memory: &self.vm,
@@ -717,12 +882,8 @@ impl Session {
                 Ok(json!(self.breakpoints))
             }
             "step" => {
-                self.pages.clear();
-                self.process_cache.borrow_mut().take();
-                self.module_cache.borrow_mut().take();
-                self.unwind.clear();
-                self.export_cache.clear();
-                self.module_symbols.clear();
+                self.cancel_run_to()?;
+                self.invalidate();
                 self.configure()?;
                 // Temporarily remove breakpoints on the selected CPU so the
                 // stopped instruction can execute; rearm them at the stop.
@@ -825,6 +986,9 @@ fn run() -> Result<(), String> {
         .open(state_dir.join("lab-serial.log"))
         .map_err(|e| e.to_string())?;
     let hv = vroom_hv::default_hypervisor().map_err(|e| e.to_string())?;
+    if hv.arch() != vroom_hv::Arch::Aarch64 {
+        return Err("Windows debugger requires an ARM64 host (HVF or KVM)".into());
+    }
     let cache = state_dir.join("symbols");
     let exports = state_dir.join("exports");
     // A small headless viewer keeps the ordinary display/input path available
@@ -861,6 +1025,7 @@ fn run() -> Result<(), String> {
         watchpoints: Vec::new(),
         watch_stopped: None,
         step_cpu: None,
+        run_to: None,
         pages: PageCache::default(),
         process_cache: Default::default(),
         module_cache: Default::default(),
@@ -918,23 +1083,44 @@ fn run() -> Result<(), String> {
                         session.continue_next()?;
                         continue;
                     }
+                    let mut reason = format!("{:?}", stop.reason);
                     if stop.reason == vroom_hv::debug::DebugReason::Breakpoint {
-                        if let Some(process) = session.breakpoint_contexts.get(&stop.pc) {
-                            let regs = session.registers(stop.cpu as usize, false)?;
-                            let mask = 0x0000_ffff_ffff_f000;
-                            if regs.ttbr0 & mask != process.directory_table & mask {
-                                session.continue_cpus.clear();
-                                session.continue_cpus.push_back(stop.cpu as usize);
-                                session.continuing = true;
-                                session.continue_next()?;
-                                continue;
-                            }
+                        let regs = session.registers(stop.cpu as usize, false)?;
+                        let user_hit = session.breakpoints.contains(&stop.pc)
+                            && session.breakpoint_contexts.get(&stop.pc).is_none_or(|p| {
+                                p.directory_table & 0x0000_ffff_ffff_f000
+                                    == regs.ttbr0 & 0x0000_ffff_ffff_f000
+                            });
+                        let temporary_hit = session
+                            .run_to
+                            .as_ref()
+                            .is_some_and(|run| run.matches(&regs));
+                        if temporary_hit {
+                            reason = session
+                                .run_to
+                                .as_ref()
+                                .expect("matched temporary")
+                                .reason
+                                .into();
+                        } else if !user_hit
+                            && (session.breakpoints.contains(&stop.pc)
+                                || session
+                                    .run_to
+                                    .as_ref()
+                                    .is_some_and(|run| run.address == stop.pc))
+                        {
+                            session.continue_cpus.clear();
+                            session.continue_cpus.push_back(stop.cpu as usize);
+                            session.continuing = true;
+                            session.continue_next()?;
+                            continue;
                         }
                     }
+                    session.cancel_run_to()?;
                     session.continuing = false;
                     session.continue_cpus.clear();
                     output(json!({"event":"stopped", "cpu":stop.cpu, "pc":stop.pc,
-                        "reason":format!("{:?}",stop.reason), "syndrome":stop.syndrome}))?;
+                        "reason":reason, "syndrome":stop.syndrome}))?;
                 }
                 VmEvent::Shutdown => {
                     session.vm.shutdown();
@@ -943,10 +1129,12 @@ fn run() -> Result<(), String> {
                 }
                 VmEvent::Crashed(e) => {
                     session.vm.pause().map_err(|e| e.to_string())?;
+                    session.cancel_run_to()?;
                     output(json!({"event":"fault", "message":e}))?;
                 }
                 VmEvent::Reset => {
                     session.vm.pause().map_err(|e| e.to_string())?;
+                    session.cancel_run_to()?;
                     output(
                         json!({"event":"reset_requested", "message":"guest requested reset; restart the lab to reboot"}),
                     )?;

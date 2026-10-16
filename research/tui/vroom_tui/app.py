@@ -27,15 +27,26 @@ class KernelApp(App):
     CSS = """
     Screen { background: #101720; color: #d7e0eb; }
     Header { background: #182431; }
-    #status { height: 2; padding: 0 2; background: #182431; color: #72d6cb; }
+    #status { height: 1; padding: 0 2; background: #182431; color: #72d6cb; }
     #workspace { height: 1fr; }
-    #sidebar { width: 38; border-right: solid #2c4054; }
-    .section { height: 2; padding: 0 1; color: #7fa7ce; text-style: bold; }
+    #execution-toolbar { height: 1; background: #101720; }
+    #execution-toolbar Button { min-width: 10; width: auto; height: 1; margin-right: 1; border: none; background: #182431; }
+    #execution-toolbar Button:hover { background: #234a64; }
+    #run-button { color: #72d6cb; }
+    #pause-button { color: #e9b65d; }
+    #execution-toolbar Button:disabled { color: #526272; }
+    #module-filter { height: 3; border: solid #2c4054; }
+    #memory-table, #breakpoints { height: 1fr; background: #101720; }
+    #status.error { color: #ff8080; }
+    #analysis-source { border: none; background: #234a64; }
+    Screen.short #execution-toolbar { display: none; }
+    #sidebar { width: 30; border-right: solid #2c4054; }
+    .section { height: 1; padding: 0 1; color: #7fa7ce; text-style: bold; }
     #modules { height: 1fr; background: #101720; }
     #callbacks { height: 1fr; background: #101720; }
     #center { width: 1fr; }
-    #register-pane { width: 34; border-left: solid #2c4054; }
-    #registers { padding: 0 1; }
+    #register-pane { width: 28; border-left: solid #2c4054; }
+    #registers { height: 1fr; background: #101720; }
     #code-split { height: 1fr; }
     #disassembly-pane, #decompiler-pane { width: 1fr; min-width: 24; }
     #decompiler-pane { border-left: solid #2c4054; }
@@ -46,7 +57,7 @@ class KernelApp(App):
     #analysis-status { width: 1fr; height: 3; content-align: left middle; }
     #code-title { height: 3; padding: 1; color: #72d6cb; }
     #process-event { height: 1fr; background: #101720; }
-    #events { height: 8; border-top: solid #2c4054; background: #0c121a; padding: 0 1; }
+    #events { height: 4; border-top: solid #2c4054; background: #0c121a; padding: 0 1; }
     #command { dock: bottom; height: 3; border: solid #38516b; }
     Footer { background: #182431; }
     DataTable > .datatable--cursor { background: #234a64; color: #ffffff; }
@@ -60,12 +71,14 @@ class KernelApp(App):
     Screen.code-focus #events { height: 3; }
     """
     BINDINGS = [
-        Binding('f4', 'discover', 'Windows'), Binding('f5', 'resume', 'Continue'),
-        Binding('f6', 'pause', 'Pause'), Binding('f7', 'step', 'Step'),
-        Binding('f2', 'breakpoint', 'Breakpoint'), Binding('colon', 'command', 'Command'),
+        Binding('f4', 'discover', 'Windows'), Binding('f5', 'resume', 'Run'),
+        Binding('f6', 'pause', 'Pause'), Binding('f7', 'step', 'Into'),
+        Binding('f8', 'step_over', 'Over'), Binding('shift+f8', 'step_out', 'Out'),
+        Binding('f2', 'breakpoint', 'BP'), Binding('colon', 'command', 'Command'),
         Binding('f9', 'panels', 'Panels'),
         Binding('f3', 'decompile', 'Decompile'), Binding('f10', 'code_focus', 'Code focus'),
-        Binding('ctrl+q', 'poweroff', 'Power off & quit'),
+        Binding('ctrl+q', 'poweroff', 'Quit'),
+        Binding('up', 'history_previous', show=False), Binding('down', 'history_next', show=False),
     ]
 
     def __init__(self, binary=None, config=None, client=None, atui=None, restore=None, ex_callback_demo=False):
@@ -91,6 +104,16 @@ class KernelApp(App):
         self.analysis_mode = 'live'
         self.cpu_ttbr0 = None
         self.analysis_lock = asyncio.Lock()
+        self.register_values = {}
+        self.register_cpu = None
+        self.current_pc = None
+        self.memory_address = None
+        self.memory_length = 256
+        self.memory_physical = False
+        self.history = []
+        self.history_index = 0
+        self.execution_lock = asyncio.Lock()
+        self.command_lock = asyncio.Lock()
         self.running = False
         self.ready = False
         self.decoder = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
@@ -99,10 +122,17 @@ class KernelApp(App):
 
     def compose(self) -> ComposeResult:
         yield Header()
-        yield Static('Connecting to vroom-lab…', id='status')
+        yield Static('Connecting…', id='status')
+        with Horizontal(id='execution-toolbar'):
+            yield Button('F5 Run', id='run-button', disabled=True)
+            yield Button('F6 Pause', id='pause-button', disabled=True)
+            yield Button('F7 Into', id='into-button', disabled=True)
+            yield Button('F8 Over', id='over-button', disabled=True)
+            yield Button('S-F8 Out', id='out-button', disabled=True)
         with Horizontal(id='workspace'):
             with Vertical(id='sidebar'):
-                yield Label('LOADED MODULES', classes='section')
+                yield Label('MODULES', classes='section')
+                yield Input(placeholder='Filter modules', id='module-filter')
                 yield DataTable(id='modules', cursor_type='row')
                 yield Label('PROCESS CALLBACKS', classes='section')
                 yield DataTable(id='callbacks', cursor_type='row')
@@ -132,16 +162,21 @@ class KernelApp(App):
                     with TabPane('Callback event', id='callback-tab'):
                         yield DataTable(id='process-event', cursor_type='row')
                     with TabPane('Memory', id='memory-tab'):
-                        with VerticalScroll():
-                            yield Static('', id='memory')
-            with VerticalScroll(id='register-pane'):
-                yield Label('CPU / REGISTERS', classes='section')
-                yield Static('', id='registers')
+                        yield DataTable(id='memory-table', cursor_type='row')
+                    with TabPane('Breakpoints', id='breakpoints-tab'):
+                        yield DataTable(id='breakpoints', cursor_type='row')
+            with Vertical(id='register-pane'):
+                yield Label('REGISTERS', classes='section')
+                yield DataTable(id='registers', cursor_type='row', show_header=False, cell_padding=0)
         yield RichLog(id='events', wrap=True, markup=False)
         yield Input(placeholder=':', id='command')
         yield Footer()
 
     async def on_mount(self):
+        self.query_one('#registers', DataTable).add_column('Register', width=7)
+        self.query_one('#registers', DataTable).add_column('Value', width=16)
+        self.query_one('#memory-table', DataTable).add_columns('Address', 'Bytes', 'ASCII')
+        self.query_one('#breakpoints', DataTable).add_columns('Type', 'Address', 'Access', 'Scope')
         self.query_one('#functions', DataTable).add_columns('Function', 'Address')
         self.query_one('#processes', DataTable).add_columns('PID', 'Image', 'Parent', 'EPROCESS')
         self.query_one('#peb', DataTable).add_columns('Field', 'Value')
@@ -168,7 +203,7 @@ class KernelApp(App):
         except Exception as error: self.log_message(error)
 
     def on_resize(self, event):
-        self.screen.set_class(event.size.width < 120, 'narrow')
+        self.screen.set_class(event.size.width < 140, 'narrow')
         self.screen.set_class(event.size.height < 35, 'short')
 
     def action_code_focus(self):
@@ -200,6 +235,7 @@ class KernelApp(App):
         self.action_decompile()
 
     def action_panels(self):
+        self.screen.remove_class('code-focus')
         if not self.screen.has_class('narrow'):
             self.query_one('#modules', DataTable).focus()
         elif self.screen.has_class('show-sidebar'):
@@ -214,9 +250,10 @@ class KernelApp(App):
     def log_message(self, message):
         self.query_one('#events', RichLog).write(str(message))
 
-    def status(self, text):
+    def status(self, text, error=False):
         if text.startswith('PAUSED') and (self.context or {}).get('pid') and 'PID ' not in text:
             text += f" / PID {self.context['pid']}"
+        self.query_one('#status', Static).set_class(error, 'error')
         self.query_one('#status', Static).update(text)
 
     def event(self, event):
@@ -225,6 +262,8 @@ class KernelApp(App):
             self.invalidate_code()
             self.generation += 1
             self.analysis_cache.clear()
+            self.query_one('#memory-table', DataTable).clear()
+            self.memory_address = None
             self.ready = True
             self.running = False
             self.cpu = event.get('cpu', self.cpu)
@@ -237,7 +276,8 @@ class KernelApp(App):
             self.ready = False
             self.running = False
             self.status('DISCONNECTED  /  backend stopped')
-        self.log_message(event)
+        self.sync_controls()
+        if kind != 'ready': self.log_message(f"{kind} · {event.get('reason', event.get('message', ''))}")
 
     @work(group='demo', exclusive=True)
     async def start_demo(self):
@@ -280,10 +320,7 @@ class KernelApp(App):
         try:
             regs = await self.client.call('registers', cpu=self.cpu)
             if revision != self.view_revision: return
-            lines = [f"PC   {regs['pc']:016x}", f"SP   {regs['sp']:016x}", f"PS   {regs['pstate']:08x}", '']
-            lines += [f"x{i:<2}  {value:016x}" for i, value in enumerate(regs['x'])]
-            lines += ['', f"TTBR1 {regs['ttbr1']:016x}"]
-            self.query_one('#registers', Static).update('\n'.join(lines))
+            self.render_registers(regs)
             self.cpu_ttbr0 = regs.get('ttbr0')
             await self.show_address(regs['pc'], context=False, activate=False)
         except Exception as error:
@@ -298,38 +335,114 @@ class KernelApp(App):
         title = f"{owner['name']} + 0x{address-owner['base']:x}" if owner else f'0x{address:016x}'
         text.append(title + '\n\n', style='bold #72d6cb')
         for instruction in self.decoder.disasm(bytes.fromhex(data['hex']), address):
-            mark = '●' if instruction.address in self.breakpoints else ' '
+            mark = '*' if instruction.address in self.breakpoints else '>' if instruction.address == self.current_pc else ' '
             text.append(f'{mark} {instruction.address:016x}  ', style='#69839c')
             text.append(f'{instruction.mnemonic:<9}', style='#72d6cb')
             text.append(instruction.op_str + '\n', style='#d7e0eb')
         self.query_one('#code', Static).styles.width = max(line.cell_len for line in text.split('\n')) + 2
         self.query_one('#code', Static).update(text)
 
-    @work(group='control', exclusive=True)
-    async def action_pause(self):
-        try:
-            await self.client.call('pause')
-            self.running = False
-            self.status(f'PAUSED  /  CPU {self.cpu}')
-            self.refresh_state()
-        except Exception as error: self.log_message(error)
+    def sync_controls(self):
+        for name in ('run', 'into', 'over', 'out'):
+            self.query_one(f'#{name}-button', Button).disabled = not self.ready or self.running
+        self.query_one('#pause-button', Button).disabled = not self.ready
 
-    @work(group='control', exclusive=True)
-    async def action_resume(self):
-        try:
-            self.invalidate_code('RUNNING')
-            await self.client.call('resume')
-            self.running = True
-            self.status('RUNNING')
-        except Exception as error: self.log_message(error)
+    @on(Button.Pressed)
+    def execution_button(self, event):
+        actions = {'run-button':self.action_resume, 'pause-button':self.action_pause,
+                   'into-button':self.action_step, 'over-button':self.action_step_over, 'out-button':self.action_step_out}
+        if event.button.id in actions: actions[event.button.id]()
 
-    @work(group='control', exclusive=True)
-    async def action_step(self):
-        try:
-            self.invalidate_code('STEPPING')
-            await self.client.call('step', cpu=self.cpu)
-            self.status(f'STEPPING  /  CPU {self.cpu}')
-        except Exception as error: self.log_message(error)
+    async def execute(self, operation, vector_length=None):
+        if not self.ready or (self.execution_lock.locked() and operation != 'pause'): return
+        async with self.execution_lock:
+            if self.running and operation != 'pause': return
+            generation = self.generation
+            self.invalidate_code('PAUSING' if operation == 'pause' else 'RUNNING')
+            self.running = operation != 'pause'
+            if self.running:
+                self.query_one('#memory-table', DataTable).clear()
+                self.memory_address = None
+            self.sync_controls()
+            try:
+                await self.client.call(operation, cpu=self.cpu, **({'vector_length':vector_length} if vector_length is not None else {}))
+                if generation == self.generation:
+                    self.running = operation != 'pause'
+                    self.status(f"{'PAUSED' if operation == 'pause' else operation.upper().replace('_', ' ')} / CPU {self.cpu}")
+                    if operation == 'pause': self.refresh_state()
+            except Exception as error:
+                self.running = False
+                self.status(str(error), error=True)
+                self.log_message(error)
+                self.refresh_state()
+            finally:
+                self.sync_controls()
+
+    @work(group='control')
+    async def action_pause(self): await self.execute('pause')
+
+    @work(group='control')
+    async def action_resume(self): await self.execute('resume')
+
+    @work(group='control')
+    async def action_step(self): await self.execute('step')
+
+    @work(group='control')
+    async def action_step_over(self): await self.execute('step_over')
+
+    @work(group='control')
+    async def action_step_out(self): await self.execute('step_out')
+
+    def render_registers(self, regs):
+        self.register_cpu = self.cpu
+        values = {name:regs[name] for name in ('pc','sp','pstate')}
+        values.update({f'x{i}':v for i,v in enumerate(regs['x'])})
+        values.update({name:regs[name] for name in ('ttbr0','ttbr1','tcr','sctlr','vbar') if name in regs})
+        previous = self.register_values.get(self.cpu, {})
+        table = self.query_one('#registers', DataTable)
+        row = table.cursor_row
+        table.clear()
+        for name,value in values.items():
+            changed = name in previous and previous[name] != value
+            table.add_row(name.upper(), Text(f'{value:016x}', style='bold #e9b65d' if changed else '#d7e0eb'), key=name)
+        table.move_cursor(row=min(row,len(values)-1))
+        self.register_values[self.cpu] = values
+        self.current_pc = regs['pc']
+
+    def edit_command(self, text):
+        command = self.query_one('#command', Input)
+        command.value = text
+        command.focus()
+        command.cursor_position = len(text)
+
+    def action_history_previous(self):
+        if self.focused is self.query_one('#command') and self.history:
+            self.history_index = max(0, self.history_index-1)
+            self.edit_command(self.history[self.history_index])
+
+    def action_history_next(self):
+        if self.focused is self.query_one('#command') and self.history:
+            self.history_index = min(len(self.history), self.history_index+1)
+            self.edit_command(self.history[self.history_index] if self.history_index < len(self.history) else '')
+
+    def render_breakpoints(self):
+        table = self.query_one('#breakpoints', DataTable)
+        table.clear()
+        for address in self.breakpoints:
+            table.add_row('Exec', f'{address:016x}', 'x', 'kernel' if address >> 63 else 'process', key=f'{address}')
+        for watch in self.watchpoints:
+            table.add_row(f"Data {watch['size']}B", f"{watch['address']:016x}", watch['mode'], 'all CPUs')
+
+    async def show_memory(self, address, length=256, physical=False):
+        result = await self.client.call('read_physical' if physical else 'read_virtual', address=address, cpu=self.cpu, length=length)
+        data = bytes.fromhex(result['hex'])
+        table = self.query_one('#memory-table', DataTable)
+        table.clear()
+        for i in range(0,len(data),16):
+            chunk = data[i:i+16]
+            table.add_row(f'{address+i:016x}', chunk.hex(' '), ''.join(chr(b) if 32 <= b < 127 else '.' for b in chunk), key=str(address+i))
+        self.memory_address, self.memory_length, self.memory_physical = address, length, physical
+        self.query_one(TabbedContent).active = 'memory-tab'
 
     @work(group='control', exclusive=True)
     async def action_discover(self):
@@ -353,10 +466,16 @@ class KernelApp(App):
         if (self.context or {}).get('pid'):
             try: self.modules += await self.client.call('user_modules', cpu=self.cpu)
             except Exception as error: self.log_message(error)
+        self.filter_modules()
+
+    @on(Input.Changed, '#module-filter')
+    def filter_modules(self):
+        query = self.query_one('#module-filter', Input).value.casefold()
         table = self.query_one('#modules', DataTable)
         table.clear()
         for i, module in enumerate(self.modules):
-            table.add_row(module['name'], f"{module['size']//1024}K", key=str(i))
+            if query in module['name'].casefold():
+                table.add_row(module['name'], f"{module['size']//1024}K", key=str(i))
 
     async def load_processes(self, activate=True):
         self.processes = await self.client.call('processes', cpu=self.cpu)
@@ -369,6 +488,8 @@ class KernelApp(App):
     async def select_process(self, pid=None):
         try:
             self.invalidate_code()
+            self.query_one('#memory-table', DataTable).clear()
+            self.memory_address = None
             self.context = await self.client.call('process', cpu=self.cpu, **({'pid':pid} if pid is not None else {}))
             await self.load_modules()
             if pid is not None:
@@ -423,8 +544,8 @@ class KernelApp(App):
                 table.add_row(f['name'], f"{f['address']:016x}", key=str(i))
         except Exception as error: self.log_message(error)
 
-    async def show_stack(self, activate=True):
-        result = await self.client.call('stack', cpu=self.cpu)
+    async def show_stack(self, activate=True, vector_length=None):
+        result = await self.client.call('stack', cpu=self.cpu, **({'vector_length':vector_length} if vector_length is not None else {}))
         table = self.query_one('#stack', DataTable)
         table.clear()
         for i, f in enumerate(result['frames']):
@@ -440,13 +561,18 @@ class KernelApp(App):
             owner = callback['module'] or 'unresolved'
             offset = callback['module_offset']
             table.add_row(str(callback['slot']), f"{owner}+0x{offset:x}" if offset is not None else owner, key=str(i))
-        self.log_message(f'{len(self.callbacks)} live process callbacks; select one to inspect')
+        self.log_message(f'callbacks: {len(self.callbacks)}')
         for source in sorted({c.get('layout_source', 'fixture') for c in self.callbacks}):
             self.log_message('Layout evidence: ' + source)
 
     @work(group='control', exclusive=True)
     async def action_breakpoint(self):
-        try: await self.toggle_breakpoint(self.address)
+        address = self.address
+        table = self.focused
+        if isinstance(table, DataTable) and table.row_count and table.id in ('callbacks','functions'):
+            index = int(table.ordered_rows[table.cursor_row].key.value)
+            address = self.callbacks[index]['function'] if table.id == 'callbacks' else self.functions[index]['address']
+        try: await self.toggle_breakpoint(address)
         except Exception as error: self.log_message(error)
 
     async def toggle_breakpoint(self, address):
@@ -454,6 +580,7 @@ class KernelApp(App):
         if address in addresses: addresses.remove(address)
         else: addresses.append(address)
         self.breakpoints = await self.client.call('breakpoints', addresses=addresses)
+        self.render_breakpoints()
         self.log_message('Hardware breakpoints: ' + ', '.join(f'0x{x:x}' for x in self.breakpoints))
         if address == self.address:
             await self.disassemble(address, context=self.view_context)
@@ -463,6 +590,24 @@ class KernelApp(App):
 
     @on(DataTable.RowSelected)
     def selected(self, event):
+        if event.data_table.id == 'registers':
+            if self.register_cpu != self.cpu: return
+            name = str(event.row_key.value)
+            self.edit_command(f"reg {name} 0x{self.register_values[self.cpu][name]:x}")
+            return
+        if event.data_table.id == 'memory-table':
+            row = event.data_table.get_row(event.row_key)
+            self.edit_command(f"{'write-phys' if self.memory_physical else 'write'} 0x{int(event.row_key.value):x} {row[1].replace(' ', '')}")
+            return
+        if event.data_table.id == 'breakpoints':
+            address = int(event.data_table.get_row(event.row_key)[1],16)
+            kind = event.data_table.get_row(event.row_key)[0]
+            self.edit_command(f"{'wc' if str(kind).startswith('Data') else 'bc'} 0x{address:x}")
+            return
+        if event.data_table.id == 'stack':
+            address = int(event.data_table.get_row(event.row_key)[1],16)
+            self.run_worker(self.show_address(address,context=False), group='browse', exclusive=True)
+            return
         if event.data_table.id == 'processes':
             pid = self.processes[int(event.row_key.value)]['pid']
             self.run_worker(self.select_process(pid), group='browse', exclusive=True)
@@ -473,8 +618,35 @@ class KernelApp(App):
         if event.data_table.id not in ('modules', 'callbacks'):
             return
         index = int(event.row_key.value)
-        address = self.callbacks[index]['function'] if event.data_table.id == 'callbacks' else self.modules[index]['base']
-        self.run_worker(self.show_address(address, analyze=event.data_table.id == 'callbacks'), group='browse', exclusive=True)
+        if event.data_table.id == 'modules':
+            self.run_worker(self.browse_module(self.modules[index]['base']), group='browse', exclusive=True)
+        else:
+            self.run_worker(self.show_address(self.callbacks[index]['function']), group='browse', exclusive=True)
+
+    @on(Input.Submitted, '#function-filter')
+    def open_filtered_function(self):
+        if self.functions:
+            self.run_worker(self.show_address(self.functions[0]['address']), group='browse', exclusive=True)
+
+    @on(Input.Submitted, '#module-filter')
+    def open_filtered_module(self):
+        table = self.query_one('#modules', DataTable)
+        if table.row_count:
+            index = int(table.ordered_rows[0].key.value)
+            self.run_worker(self.browse_module(self.modules[index]['base']), group='browse', exclusive=True)
+
+    async def browse_module(self, base):
+        try:
+            self.function_base = base
+            self.function_offset = 0
+            await self.client.call('symbols', cpu=self.cpu, base=base)
+            self.query_one('#function-filter', Input).value = ''
+            self.query_one(TabbedContent).active = 'functions-tab'
+            self.refresh_functions()
+            self.query_one('#function-filter', Input).focus()
+        except Exception as error:
+            self.status(str(error), error=True)
+            self.log_message(error)
 
     async def show_address(self, address, context=True, activate=True, analyze=True, allow_missing=True, file_image=None):
         self.invalidate_code()
@@ -494,21 +666,48 @@ class KernelApp(App):
                                        revision=revision, context=context), group='decompile', exclusive=True)
 
     @on(Input.Submitted, '#command')
-    @work(group='commands', exclusive=True)
+    @work(group='commands')
     async def command(self, event):
         event.input.value = ''
+        async with self.command_lock:
+            await self.submit_command(event)
+
+    async def submit_command(self, event):
+        if event.value.strip() and (not self.history or self.history[-1] != event.value):
+            self.history.append(event.value)
+            self.history = self.history[-100:]
+        self.history_index = len(self.history)
         try:
             words = shlex.split(event.value.lstrip(':').strip())
             if not words: return
             op, *args = words
-            if op == 'callbacks': await self.load_callbacks()
+            if op in ('reg', 'write', 'write-phys'):
+                async with self.execution_lock:
+                    if self.running: raise RuntimeError('Pause before editing')
+                    if op == 'reg':
+                        regs = await self.client.call('write_register', cpu=self.cpu, register=args[0], value=int(args[1],0))
+                        self.render_registers(regs)
+                    else:
+                        address = await self.symbol_address(args[0])
+                        data = bytes.fromhex(''.join(args[1:]))
+                        await self.client.call('write_physical' if op == 'write-phys' else 'write_virtual', cpu=self.cpu, address=address, hex=data.hex())
+                    self.generation += 1
+                    self.analysis_cache.clear()
+                    self.invalidate_code()
+                    if op == 'reg': await self.show_address(regs['pc'], context=False)
+                    elif self.memory_address is not None: await self.show_memory(self.memory_address,self.memory_length,self.memory_physical)
+                    else: await self.show_address(self.address,context=self.view_context)
+                    self.status(f'PAUSED / CPU {self.cpu} / updated')
+            elif op in ('go', 'into', 'over', 'out'):
+                await self.execute({'go':'resume', 'into':'step', 'over':'step_over', 'out':'step_out'}[op], vector_length=int(args[0],0) if args and op == 'out' else None)
+            elif op == 'callbacks': await self.load_callbacks()
             elif op == 'event':
                 await self.show_process_event()
             elif op == 'modules': await self.load_modules()
             elif op == 'ps': await self.load_processes()
             elif op == 'process': await self.select_process(int(args[0], 0) if args else None)
             elif op == 'peb': await self.show_peb()
-            elif op == 'stack': await self.show_stack()
+            elif op == 'stack': await self.show_stack(vector_length=int(args[0],0) if args else None)
             elif op in ('symbols', 'functions'):
                 self.function_base = self.module_named(args[0])['base'] if args else None
                 await self.client.call('symbols', cpu=self.cpu, **({'base':self.function_base} if self.function_base is not None else {}))
@@ -525,9 +724,11 @@ class KernelApp(App):
             elif op == 'watch':
                 watch = {'address':await self.symbol_address(args[0]), 'size':int(args[1],0), 'mode':args[2]}
                 self.watchpoints = await self.client.call('watchpoints', watches=[*self.watchpoints, watch])
-                self.log_message(self.watchpoints)
+                self.render_breakpoints()
             elif op == 'wc':
-                self.watchpoints = await self.client.call('watchpoints', watches=[])
+                remove = await self.symbol_address(args[0]) if args else None
+                self.watchpoints = await self.client.call('watchpoints', watches=[w for w in self.watchpoints if w['address'] != remove] if args else [])
+                self.render_breakpoints()
             elif op == 'image':
                 module = self.module_named(args[0])
                 exported = await self.client.call('image', cpu=self.cpu, base=module['base'], **({'path':args[1]} if len(args)>1 else {}))
@@ -535,27 +736,27 @@ class KernelApp(App):
             elif op == 'cpu':
                 self.cpu = int(args[0]); self.refresh_state()
             elif op == 'bc':
-                self.breakpoints = await self.client.call('breakpoints', addresses=[])
-                self.log_message('All hardware breakpoints cleared')
+                remove = await self.symbol_address(args[0]) if args else None
+                self.breakpoints = await self.client.call('breakpoints', addresses=[a for a in self.breakpoints if a != remove] if args else [])
+                self.render_breakpoints()
             elif op in ('dec', 'dec-file', 'dec-partial'):
                 address = await self.symbol_address(args[0]) if args else self.address
                 self.analysis_mode = 'file' if op == 'dec-file' else 'live'
                 self.query_one('#analysis-source', Button).label = self.analysis_mode.title()
                 await self.show_address(address, allow_missing=op != 'dec', file_image=op == 'dec-file')
-            elif op in ('bp', 'dis', 'mem', 'x'):
+            elif op in ('bp', 'dis', 'mem', 'mem-phys', 'x'):
                 address = await self.symbol_address(args[0])
                 if op == 'bp': await self.toggle_breakpoint(address)
                 elif op == 'dis': await self.show_address(address)
                 elif op == 'x': self.log_message(f'{args[0]} = 0x{address:016x}')
                 else:
-                    result = await self.client.call('read_virtual', address=address, cpu=self.cpu, length=int(args[1], 0) if len(args)>1 else 256)
-                    data = bytes.fromhex(result['hex'])
-                    self.query_one('#memory', Static).update('\n'.join(f'{address+i:016x}  {data[i:i+16].hex(" ")}' for i in range(0, len(data), 16)))
-                    self.query_one(TabbedContent).active = 'memory-tab'
+                    await self.show_memory(address, int(args[1],0) if len(args)>1 else 256, op == 'mem-phys')
             elif op == 'dump': self.log_message(await self.client.call('dump', cpu=self.cpu, address=await self.symbol_address(args[0]), length=int(args[1],0)))
             elif op == 'checkpoint': self.log_message(await self.client.call('checkpoint', path=args[0]))
-            else: self.log_message('ps · process PID · peb · modules · symbols MODULE · functions MODULE PREFIX · next/prev · stack · bp/dis/mem/x SYMBOL · watch ADDRESS SIZE r/w/rw · bc/wc · dec/dec-file/dec-partial SYMBOL · image MODULE [PATH] · dump ADDRESS N · callbacks · event · cpu N · checkpoint PATH')
-        except Exception as error: self.log_message(error)
+            else: self.log_message('reg NAME VALUE · write ADDRESS HEX · into/over/out · ps · process PID · peb · modules · symbols MODULE · functions MODULE PREFIX · next/prev · stack · bp/dis/mem/x SYMBOL · watch ADDRESS SIZE r/w/rw · bc/wc · dec/dec-file/dec-partial SYMBOL · image MODULE [PATH] · dump ADDRESS N · callbacks · event · cpu N · checkpoint PATH')
+        except Exception as error:
+            self.status(str(error), error=True)
+            self.log_message(error)
 
     @work(group='exit', exclusive=True)
     async def action_poweroff(self):

@@ -16,10 +16,15 @@ pub struct Registers {
     pub tcr: u64,
     pub sctlr: u64,
     pub vbar: u64,
+    /// Effective SVE vector length in bytes, when supplied by the caller.
+    pub sve_vl: Option<u16>,
 }
 
 impl Registers {
-    pub fn from_hvf(state: &VcpuState) -> Result<Self> {
+    pub fn from_state(state: &VcpuState) -> Result<Self> {
+        if state.backend == "kvm" {
+            return Self::from_kvm(state);
+        }
         if state.backend != "hvf" {
             return Err(Error::Invalid(format!(
                 "unsupported register backend {}",
@@ -55,6 +60,45 @@ impl Registers {
             tcr: reg(0x1c102)?,
             sctlr: reg(0x1c080)?,
             vbar: reg(0x1c600)?,
+            sve_vl: None,
+        })
+    }
+    fn from_kvm(state: &VcpuState) -> Result<Self> {
+        let reg = |id| -> Result<u64> {
+            let b = &state
+                .raw
+                .iter()
+                .find(|(r, _)| *r == id)
+                .ok_or_else(|| Error::Invalid(format!("missing ARM64 KVM register {id:#x}")))?
+                .1;
+            Ok(u64::from_le_bytes(b.as_slice().try_into().map_err(
+                |_| Error::Invalid("invalid KVM register width".into()),
+            )?))
+        };
+        let core = |offset: u64| 0x6030_0000_0010_0000 | (offset / 4);
+        let sys = |id: u64| 0x6030_0000_0013_0000 | id;
+        let pstate = reg(core(264))?;
+        if !matches!(pstate & 31, 0 | 4 | 5) {
+            return Err(Error::Invalid(
+                "only EL0/EL1 AArch64 contexts are supported".into(),
+            ));
+        }
+        let mut x = [0; 31];
+        for (i, value) in x.iter_mut().enumerate() {
+            *value = reg(core(i as u64 * 8))?;
+        }
+        Ok(Self {
+            cpu: state.index,
+            x,
+            pc: reg(core(256))?,
+            pstate,
+            sp: reg(core(if pstate & 1 == 0 { 248 } else { 272 }))?,
+            ttbr0: reg(sys(0xc100))?,
+            ttbr1: reg(sys(0xc101))?,
+            tcr: reg(sys(0xc102))?,
+            sctlr: reg(sys(0xc080))?,
+            vbar: reg(sys(0xc600))?,
+            sve_vl: None,
         })
     }
 }
@@ -189,6 +233,26 @@ impl<M: PhysicalMemory + ?Sized> AddressSpace<'_, M> {
         Err(invalid("no leaf descriptor"))
     }
 
+    pub fn write_spans(
+        &self,
+        address: u64,
+        length: usize,
+    ) -> Result<Vec<(u64, std::ops::Range<usize>)>> {
+        address
+            .checked_add(length as u64)
+            .ok_or_else(|| Error::Invalid("virtual write overflows".into()))?;
+        let mut spans = Vec::new();
+        let mut done = 0;
+        while done < length {
+            let t = self.translate(address + done as u64)?;
+            // Split at 4 KiB even for block mappings, so every span is checked RAM.
+            let n = (4096 - (t.physical & 4095) as usize).min(length - done);
+            spans.push((t.physical, done..done + n));
+            done += n;
+        }
+        Ok(spans)
+    }
+
     pub fn read(&self, address: u64, data: &mut [u8]) -> Result<()> {
         address
             .checked_add(data.len() as u64)
@@ -247,6 +311,7 @@ mod tests {
             tcr: 16 | (16 << 16) | (2 << 30) | (5 << 32),
             sctlr: 1,
             vbar: 0,
+            sve_vl: None,
         };
         (m, r)
     }
@@ -362,5 +427,42 @@ mod tests {
             .physical,
             0x8000
         );
+    }
+    #[test]
+    fn write_plan_validates_every_page_before_any_mutation() {
+        let (m, r) = fixture();
+        let space = AddressSpace {
+            memory: &m,
+            registers: &r,
+        };
+        assert_eq!(
+            space.write_spans(0xffe, 4).unwrap(),
+            vec![(0x8ffe, 0..2), (0xa000, 2..4)]
+        );
+        assert!(space.write_spans(0x1ffe, 4).is_err());
+        assert!(space.write_spans(u64::MAX, 4).is_err());
+    }
+    #[test]
+    fn kvm_core_state_uses_the_selected_stack_bank() {
+        let core = |off: u64| 0x6030_0000_0010_0000 | off / 4;
+        let mut s = VcpuState {
+            backend: "kvm".into(),
+            index: 2,
+            ..Default::default()
+        };
+        for n in 0..31 {
+            s.raw.push((core(n * 8), n.to_le_bytes().to_vec()));
+        }
+        for (off, v) in [(248, 0x1000u64), (256, 0x8000), (264, 5), (272, 0x2000)] {
+            s.raw.push((core(off), v.to_le_bytes().to_vec()));
+        }
+        for id in [0xc100, 0xc101, 0xc102, 0xc080, 0xc600] {
+            s.raw
+                .push((0x6030_0000_0013_0000 | id, 0u64.to_le_bytes().to_vec()));
+        }
+        let r = Registers::from_state(&s).unwrap();
+        assert_eq!((r.cpu, r.pc, r.sp, r.x[30]), (2, 0x8000, 0x2000, 30));
+        s.raw.iter_mut().find(|r| r.0 == core(264)).unwrap().1 = 0u64.to_le_bytes().to_vec();
+        assert_eq!(Registers::from_state(&s).unwrap().sp, 0x1000);
     }
 }

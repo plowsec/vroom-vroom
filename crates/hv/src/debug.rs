@@ -23,9 +23,14 @@ pub struct Watchpoint {
 }
 impl Watchpoint {
     pub fn arm64_control(&self) -> crate::Result<u64> {
-        if self.size == 0 || self.size > 8 || (self.address & 7) + self.size as u64 > 8
-            || (!self.read && !self.write) {
-            return Err(crate::Error::Invalid("watchpoint: 1..8 bytes within one 8-byte granule, read and/or write".into()));
+        if self.size == 0
+            || self.size > 8
+            || (self.address & 7) + self.size as u64 > 8
+            || (!self.read && !self.write)
+        {
+            return Err(crate::Error::Invalid(
+                "watchpoint: 1..8 bytes within one 8-byte granule, read and/or write".into(),
+            ));
         }
         let bas = ((1u64 << self.size) - 1) << (self.address & 7);
         Ok(1 | (3 << 1) | (u64::from(self.read) << 3) | (u64::from(self.write) << 4) | (bas << 5))
@@ -132,5 +137,58 @@ mod tests {
             0x8200
         );
         assert!(arm64_el1_exception_entry(9, 0, 0x8000, true, false).is_err());
+    }
+}
+
+/// Architectural scalar registers exposed by the paused debugger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Register {
+    X(u8),
+    Pc,
+    Sp,
+    Pstate,
+    Ttbr0,
+    Ttbr1,
+    Tcr,
+    Sctlr,
+    Vbar,
+}
+impl Register {
+    pub fn parse(name: &str) -> crate::Result<Self> {
+        Ok(match name.to_ascii_lowercase().as_str() {
+            "pc" => Self::Pc,
+            "sp" => Self::Sp,
+            "pstate" | "cpsr" => Self::Pstate,
+            "fp" => Self::X(29),
+            "lr" => Self::X(30),
+            "ttbr0" => Self::Ttbr0,
+            "ttbr1" => Self::Ttbr1,
+            "tcr" => Self::Tcr,
+            "sctlr" => Self::Sctlr,
+            "vbar" => Self::Vbar,
+            name => match name.strip_prefix('x').and_then(|n| n.parse::<u8>().ok()) {
+                Some(n @ 0..=30) => Self::X(n),
+                _ => return Err(crate::Error::Invalid("unknown ARM64 register".into())),
+            },
+        })
+    }
+    pub fn validate(self, value: u64) -> crate::Result<()> {
+        let valid = match self {
+            Self::X(n) => n <= 30,
+            Self::Pc => value & 3 == 0,
+            Self::Sp => value & 15 == 0,
+            Self::Vbar => value & 2047 == 0,
+            Self::Pstate => {
+                matches!(value & 31, 0 | 4 | 5) && value >> 32 == 0 && value & (1 << 21) == 0
+            }
+            _ => true,
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(crate::Error::Invalid(
+                "invalid register value/alignment or CPU mode".into(),
+            ))
+        }
     }
 }
