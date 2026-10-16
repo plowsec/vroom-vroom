@@ -255,9 +255,10 @@ struct Snap {
     tablet: Vec<u8>,
     #[serde(default)]
     camera: Vec<u8>,
-    /// The layout had a camera port (older saves: no).
+    /// The layout had a camera port. Saves from before this field: told
+    /// by the port count.
     #[serde(default)]
-    camera_port: bool,
+    camera_port: Option<bool>,
 }
 
 pub struct Xhci {
@@ -1617,7 +1618,7 @@ impl PciDevice for Xhci {
             kbd: self.kbd.save(),
             tablet: self.tablet.save(),
             camera: self.camera.as_ref().map(|c| c.save()).unwrap_or_default(),
-            camera_port: self.camera_port,
+            camera_port: Some(self.camera_port),
         })
     }
 
@@ -1626,7 +1627,8 @@ impl PciDevice for Xhci {
         let mut cfg = s.cfg;
         // The saved layout wins on the camera port (the guest knows its
         // port count); the rest must match.
-        let saved_ports = HID_PORTS + s.camera_port as usize + 2 * self.pass.len();
+        let camera_port = s.camera_port.unwrap_or(s.ports.len() == HID_PORTS + 1 + 2 * self.pass.len());
+        let saved_ports = HID_PORTS + camera_port as usize + 2 * self.pass.len();
         if !cfg.rebuild_masks(&self.cfg)
             || s.msix.vectors() != self.msix.vectors()
             || s.slots.len() != self.slots.len()
@@ -1634,7 +1636,7 @@ impl PciDevice for Xhci {
         {
             return Err(vroom_snapshot::Error::Invalid("xhci layout".into()));
         }
-        if s.slots.iter().flatten().any(|sl| sl.port as usize > self.ports.len() || sl.eps.keys().any(|&d| d == 0 || d > 31)) {
+        if s.slots.iter().flatten().any(|sl| sl.port as usize > saved_ports || sl.eps.keys().any(|&d| d == 0 || d > 31)) {
             return Err(vroom_snapshot::Error::Invalid("xhci slots".into()));
         }
         let sender = self.msix.sender();
@@ -1648,7 +1650,7 @@ impl PciDevice for Xhci {
         self.intr = s.intr;
         self.intr.erstsz = self.intr.erstsz.min(16);
         self.cmd = s.cmd;
-        self.camera_port = s.camera_port;
+        self.camera_port = camera_port;
         self.ports = s.ports;
         self.slots = s.slots;
         self.kbd.restore(&s.kbd);
@@ -1722,10 +1724,11 @@ mod tests {
             }
         };
         let (mut with, mut without) = (mk(true), mk(false));
-        let saved_with = with.save().unwrap();
         let saved_without = without.save().unwrap();
         // Camera turned off while saved: the port stays, empty, and the
-        // guest is told it changed.
+        // guest is told it changed. (A slot on the camera port too.)
+        with.slots[1] = Some(Slot { port: HID_PORTS as u8 + 1, ctx: 0, eps: BTreeMap::new() });
+        let saved_with = with.save().unwrap();
         let mut x = mk(false);
         x.restore(&saved_with).unwrap();
         assert_eq!(x.ports.len(), HID_PORTS + 1);
