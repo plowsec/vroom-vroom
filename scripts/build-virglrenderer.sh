@@ -74,7 +74,7 @@ for d in debug release; do
   [ -d "$ROOT/target/$d" ] || continue
   cp "$PREFIX/lib/libvirglrenderer.1.dylib" "$ROOT/target/$d/"
   # Venus loads MoltenVK from virglrenderer's directory.
-  cp "$MVK/lib/libMoltenVK.dylib" "$ROOT/target/$d/"
+  cp -f "$MVK/lib/libMoltenVK.dylib" "$ROOT/target/$d/"
   for l in libEGL libGLESv2; do
     [ -f "$ROOT/target/angle/$l.dylib" ] && cp "$ROOT/target/angle/$l.dylib" "$ROOT/target/$d/"
   done
