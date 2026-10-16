@@ -1375,6 +1375,17 @@ impl GpuHandler {
                 })();
                 if let Some(hdr) = hdr {
                     let (ty, body) = self.command(&ctx.mem, &mut r, &hdr);
+                    // A context gone takes its fences with it (the renderer
+                    // forgets them): give the guest its commands back.
+                    if hdr.ty == CTX_DESTROY && ty < ERR_UNSPEC {
+                        self.pending.retain(|p| {
+                            let gone = p.ctx == hdr.ctx && p.ring.is_some();
+                            if gone {
+                                ctx.add_used(p.q, p.head, p.len);
+                            }
+                            !gone
+                        });
+                    }
                     if ty >= ERR_UNSPEC {
                         log::debug!("gpu: command {:#x} ctx {} -> {ty:#x}", hdr.ty, hdr.ctx);
                     } else {

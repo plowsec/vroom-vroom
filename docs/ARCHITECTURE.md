@@ -132,9 +132,13 @@ commands, virglrenderer's vrend replays them on macOS's OpenGL 4.1 (CGL),
 or with `opengl_host = "angle"` on OpenGL ES from ANGLE's Metal backend.
 Neptune: Windows' viogpu3d driver sends Direct3D 11 calls, virglrenderer
 (UTM's fork) replays them on DXMT, Direct3D on Metal. All capsets are
-offered; Mesa picks per API, Windows takes Neptune. Venus and Neptune run
-in virglrenderer's render server, a thread of the renderer; their buffers
-are shared memory it creates. Host-visible buffers are mapped into the
+offered; Mesa picks per API, Windows takes Neptune. Venus and Neptune go
+through virglrenderer's proxy to its render server: ours
+(`gpu3d/src/server.rs`, `vroom gpu-server`) starts one `vroom gpu-worker`
+per guest context, which runs that context with virglrenderer's own
+worker code (patch 0006 exports it) and sends buffers back as shared
+memory it creates. GL contexts stay in the renderer: vrend shares one GL
+context group between them. Host-visible buffers are mapped into the
 guest's shared memory window with the hypervisor.
 
 The renderer runs in the GPU process (`gpu3d/src/remote.rs`,

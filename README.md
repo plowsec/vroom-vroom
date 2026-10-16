@@ -47,14 +47,23 @@ Who can touch what, one VM running:
 +---------+ +----------+ +---------+ +---------+ +---------+
 | GPU     | | audio    | | camera  | | USB     | | TPM     |
 | process | | helper   | | helper  | | helper  | | swtpm   |
-|virgl,   | |speakers; | |the Mac  | |one per  | |its state|
-|DXMT,    | |mic only  | |camera,  | |device,  | |folder   |
-|MoltenVK | |if you    | |only if  | |that     | |only     |
-|GPU and  | |turned it | |you      | |device   | |         |
-|guest RAM| |on        | |turned it| |only     | |         |
+|OpenGL;  | |speakers; | |the Mac  | |one per  | |its state|
+|GPU and  | |mic only  | |camera,  | |device,  | |folder   |
+|guest RAM| |if you    | |only if  | |that     | |only     |
+|         | |turned it | |you      | |device   | |         |
+|         | |on        | |turned it| |only     | |         |
 |         | |          | |on       | |         | |         |
-+---------+ +----------+ +---------+ +---------+ +---------+
-  each started by the VMM in its own Seatbelt sandbox: none of your
++----+----+ +----------+ +---------+ +---------+ +---------+
+     |  through a small launcher (no sandbox, starts only these)
+     v
++------------------------+
+| one process per Vulkan |
+| or Direct3D app in the |
+| guest: MoltenVK or     |
+| DXMT, the GPU, its own |
+| buffers, nothing else  |
++------------------------+
+  every box down here has its own Seatbelt sandbox: none of your
   files, no network, no programs, only the one device it serves
 
 +---------------------------------------------------------------------+
@@ -66,9 +75,11 @@ Who can touch what, one VM running:
 
 A guest that breaks a device lands in the VMM's sandbox, with its own
 disks and nothing else of yours. Breaking the 3D code lands in the GPU
-process, which can't even reach the disks. Camera and microphone are off
-unless you turn them on, run only while the window is open and the guest
-uses them, and the window says so. Details: [SECURITY.md](docs/SECURITY.md).
+process, which can't even reach the disks; breaking Vulkan or Direct3D
+lands in that one app's process, away from the other apps' GPU data.
+Camera and microphone are off unless you turn them on, run only while
+the window is open and the guest uses them, and the window says so.
+Details: [SECURITY.md](docs/SECURITY.md).
 
 
 ## What works

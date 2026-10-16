@@ -304,6 +304,11 @@ fn in_process(vm: &Arc<dyn Vm>, config: &VmConfig) -> Result<Box<dyn Renderer3d>
         return Err(Error::Setup(NO_VIRGL.into()));
     }
     vroom_gpu3d::set_map_granule(vm.map_granule());
+    // Venus and Direct3D contexts still get processes of their own.
+    #[cfg(target_os = "macos")]
+    if let Err(e) = std::env::current_exe().and_then(|exe| vroom_gpu3d::server::start(&exe)) {
+        log::warn!("gpu: no render server ({e}): Venus runs in here, no Direct3D");
+    }
     let r = vroom_gpu3d::Virgl::new(config.identity.gl_renderer.clone())
         .ok_or_else(|| Error::Setup("virglrenderer: Venus init failed (no Vulkan driver?)".into()))?;
     log::warn!("gpu: the 3D renderer runs inside the VMM (VROOM_GPU_IN_PROCESS)");

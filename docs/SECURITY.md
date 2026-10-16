@@ -272,8 +272,10 @@ reach of the guest. So none of it runs in the VMM.
 ### The GPU process
 
 As browsers do, the renderer has a process of its own: `vroom gpu-helper`,
-started by the VMM, one per VM. virglrenderer, MoltenVK, DXMT and the GL
-driver are loaded there and only there; the VMM never loads them and its
+started by the VMM, one per VM, with OpenGL in it; Vulkan and Direct3D
+contexts get a process each below it (next section). virglrenderer,
+MoltenVK, DXMT and the GL driver are loaded there and only there; the
+VMM never loads them and its
 sandbox has no GPU rules at all (no AGX user clients, no Metal compiler
 service, no shared memory but its own guest RAM).
 
@@ -283,8 +285,7 @@ What a bug in the 3D code can reach from the GPU process:
   service, framework reads: what Metal needs, nothing else);
 - that VM's guest RAM, which it maps (shared memory the VMM hands over
   as fds; the guest has it all anyway) and the buffers it made itself;
-- its DXMT shader cache in the VM's state dir, the one place it may write;
-- the two sockets to the VMM.
+- the two sockets to the VMM, and the one to the render server.
 
 What it can't: disks, the network, shared folders, the clipboard, the
 hypervisor (it has no vCPUs and no VM; a VM belongs to the process that
@@ -315,22 +316,78 @@ Where vrend's GL calls go depends on `opengl_host`:
 
 `opengl = false` leaves vrend and both GL drivers out entirely.
 
-Venus and Neptune run in virglrenderer's render server, a thread of the
-GPU process (contexts in processes of their own are a later step).
+### A process per Vulkan and Direct3D context
+
+Each Vulkan (Venus) and Direct3D (Neptune) context of the guest, roughly
+one per app using the GPU, runs in a process of its own:
+
+```text
+ GPU process (sandboxed)          render server (no sandbox)
+ virgl GL contexts, proxy  ---->  vroom gpu-server: starts workers
+   |  one socket per context           |
+   v                                   v  (posix_spawn, fixed arguments)
+ vroom gpu-worker, one per context, each in its own sandbox:
+ the GPU, its own shared memory; Direct3D ones DXMT's shader cache
+```
+
+A worker loads virglrenderer and the one driver it needs (MoltenVK or
+DXMT) from vroom's own directory, never a search path, then sandboxes
+itself (the GPU rules above, shared memory under its own process id
+only, and for Direct3D the VM's shader cache) before it reads anything
+from the guest. Its environment is cleared but for logging and the
+drivers' debug switches, never a variable that names a library. A guest
+app that breaks its driver lands in a process with only its own GPU
+objects: it can't read another app's textures or buffers, nor the GL
+state in the GPU process, nor guest RAM (workers never map it: Vulkan
+and Direct3D buffers are shared memory the worker makes and hands to the
+GPU process). Workers talk to the GPU process only, over their socket.
+
+The render server has no sandbox, because on macOS a process can't
+narrow the sandbox it inherits: whatever starts sandboxed workers must
+have none. It is kept small: it reads four fixed-size requests from the
+GPU process (start, reset, create and destroy a context), refuses
+backends the GPU process didn't ask for and more than 256 workers,
+starts only `vroom gpu-worker` with arguments it builds itself (the
+guest's name for the context is cut to 31 letters, digits and `._-`),
+and never loads virglrenderer or any GPU code. A GPU process taken over
+can ask it for more workers, each sandboxed like the others: nothing it
+didn't have. The server exits when the GPU process does, and kills its
+workers.
+
+A worker that crashes (or is killed) takes its context with it, nothing
+else: the server logs it, the GPU process retires that context's fences
+so the guest doesn't wait forever, and the other contexts go on. In a
+Linux guest the Vulkan app sees its device lost and stops. In Windows,
+an app's Direct3D device stops drawing; if the context was the desktop
+compositor's, the screen stops updating until Windows restarts its
+graphics (Win+Ctrl+Shift+B; tested: the desktop comes back). Holding the
+fences back instead doesn't help: Windows' GPU watchdog doesn't fire
+with this driver, the desktop just hangs.
+
+OpenGL (virgl) contexts stay together in the GPU process: vrend shares
+one GL context group across them (shared objects, one GL thread), so
+splitting them would mean a GL driver per guest app and copying every
+shared texture. A GL bug reaches every GL app of that VM, and guest RAM.
+
+Costs: a new Vulkan or Direct3D context takes about 50 ms more (start
+the process, load the driver, make a Metal device). A Windows desktop
+with Edge open has 15 to 20 contexts, 10 to 60 MB each: 200 to 400 MB
+more than with one process.
+
 libepoxy is built to load ANGLE only from virglrenderer's own directory,
 and Apple's OpenGL only by its system path, when the GPU process made a
 CGL context current first; never a search path. DXMT (LGPL, a separate
 dylib) is loaded from the same directory before the sandbox goes up, and
-virglrenderer is patched to look for it only there. The render server
-passes buffers as POSIX shared memory: the sandbox lets the GPU process
-create, map and unlink shared memory only under names carrying its own
-process id and the render server's prefixes, and open no other (not
-even read: another app's shared memory is out of reach;
-`VROOM_SANDBOX_SELFTEST=1` checks it for the VMM). Metal's shader cache,
-which the user's other apps share, is read only, so a GPU process taken
-over can't plant GPU code for them. DXMT's cache (Metal versions of guest
-shaders) is per VM, in its state dir: one guest can't plant shaders for
-another.
+virglrenderer is patched to look for it only there, and to never start a
+render server of its own. Shared memory: the sandbox lets the GPU
+process and each worker create, map and unlink shared memory only under
+names carrying its own process id and virglrenderer's prefixes, and
+open no other (not even read: another app's or another worker's shared
+memory is out of reach; `VROOM_SANDBOX_SELFTEST=1` checks it). Metal's
+shader cache, which the user's other apps share, is read only, so a
+process taken over can't plant GPU code for them. DXMT's cache (Metal
+versions of guest shaders) is per VM, in its state dir: one guest can't
+plant shaders for another.
 
 With 3D, the GPU's host-visible window (8 GiB of guest address space) is
 backed by reserved memory where no buffer is mapped, as a real card's

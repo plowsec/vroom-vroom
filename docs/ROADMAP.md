@@ -64,5 +64,7 @@ Windows guests:
   through its Virtualization framework; we'd have to look like it.
 - Benchmarks against VMware Fusion and Parallels on the same Mac, the
   losses published with the wins.
-- 3D processes per guest context (one GPU process per app, not per VM).
 - Fuzzing the 3D command streams (later).
+- Windows: when the desktop's own Direct3D process dies, the screen
+  freezes until Win+Ctrl+Shift+B. The guest driver should report a lost
+  device for that context (Windows then rebuilds it by itself).
