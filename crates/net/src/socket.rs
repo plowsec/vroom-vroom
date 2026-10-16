@@ -14,6 +14,18 @@ use crate::{NetBackend, RESUME_TOKEN, TOKEN_BASE};
 
 const MAX_FRAME: usize = 65536;
 const MAX_QUEUED: usize = 1024;
+/// Socket buffers for frame sockets. macOS gives a Unix datagram socket
+/// 4 KiB to receive into, two full frames: past that the sender's sends
+/// fail (ENOBUFS), and older vroom-netd builds gave the port up then. This
+/// holds a burst of about 1400 frames.
+pub const SOCK_BUF: usize = 2 << 20;
+
+/// Make room in a frame socket (both ways). Best effort.
+pub fn grow_buffers(s: &StdUnixDatagram) {
+    let r = socket2::SockRef::from(s);
+    let _ = r.set_recv_buffer_size(SOCK_BUF);
+    let _ = r.set_send_buffer_size(SOCK_BUF);
+}
 
 #[derive(Debug)]
 pub struct FrameSocket {
@@ -23,6 +35,7 @@ pub struct FrameSocket {
 
 impl FrameSocket {
     pub fn new(sock: StdUnixDatagram) -> io::Result<Self> {
+        grow_buffers(&sock);
         sock.set_nonblocking(true)?;
         Ok(FrameSocket { sock: UnixDatagram::from_std(sock), rx: VecDeque::new() })
     }

@@ -21,6 +21,7 @@ mod display;
 mod firmware;
 mod irq;
 mod machine;
+mod net;
 pub use machine::gpu_in_process;
 pub mod psci;
 mod ramfb;
@@ -95,6 +96,9 @@ pub struct VmmOptions {
     pub ui: Option<std::os::unix::net::UnixStream>,
     /// Per-VM state directory (disk layers live in `disks/`).
     pub state_dir: PathBuf,
+    /// The frontend sandboxes the VMM once it is built (what a network
+    /// adapter changed later may still reach).
+    pub sandbox: bool,
 }
 
 impl std::fmt::Debug for VmmOptions {
@@ -168,10 +172,16 @@ impl Vmm {
         };
         let disks = disks::DiskSet::open(&config, &opts.state_dir, &layers)?;
         let uuid = machine_uuid(&opts.state_dir)?;
+        let saved = match &opts.start {
+            StartMode::Restore(dir) => Some(snapshot::saved_config(dir)?),
+            StartMode::Boot => None,
+        };
         let env = machine::BuildEnv {
             uuid,
             state_dir: opts.state_dir.clone(),
             resuming: matches!(opts.start, StartMode::Restore(_)),
+            saved,
+            sandbox: opts.sandbox,
         };
         let m = machine::build(&config, hv.as_ref(), opts.serial_out, opts.clipboard, ui, &disks, ev_tx, &env)?;
         let mut vmm = Vmm {

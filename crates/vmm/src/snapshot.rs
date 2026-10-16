@@ -61,6 +61,12 @@ pub(crate) fn disk_plan(dir: &Path) -> Result<BTreeMap<usize, PathBuf>> {
     Ok(layers)
 }
 
+/// The VM file as it was when `dir` was saved.
+pub(crate) fn saved_config(dir: &Path) -> Result<vroom_config::VmConfig> {
+    let snap = SnapshotDir::open(dir)?;
+    serde_json::from_value(snap.manifest.config.clone()).map_err(|e| Error::Setup(format!("snapshot config: {e}")))
+}
+
 pub(crate) fn save(vmm: &mut Vmm, dir: &Path, description: &str, kind: Kind) -> Result<()> {
     let mut snap = SnapshotDir::create(dir)?;
     match kind {
