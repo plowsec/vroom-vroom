@@ -416,7 +416,12 @@ picks the right one by itself:
   it is (any kernel, Mesa from the archive), in Wayland and X11 sessions.
 - **Vulkan** (Venus): needs `mesa-vulkan-drivers` (Mesa ≥ 24) and the
   user in the `render` group; stock Ubuntu kernels work. `vulkaninfo
-  --summary` should show `Virtio-GPU Venus (Apple M…)`. With 3D on, vroom
+  --summary` should show `Virtio-GPU Venus (Apple M…)`. If every Vulkan
+  app crashes instead (a segmentation fault after "Error opening
+  virtio-gpu device for Asahi native context"), the guest has Mesa 25.2,
+  whose Asahi driver crashes on any virtio GPU without its own native
+  context: the guest tools' `install-agent.sh` turns that driver off, or
+  set `VK_LOADER_DRIVERS_DISABLE='*asahi*'` yourself. With 3D on, vroom
   maps guest memory in 4 KiB steps instead of the Mac's 16 KiB, so the
   guest kernel can put GPU buffers where it likes (macOS 15 has this only
   as a private call; without it, 16 KiB steps and the guest needs a 16 KiB
