@@ -3,7 +3,7 @@ Description=vroom network helper (bridged / host-only VM networking)
 After=network-online.target
 
 [Service]
-ExecStart=/usr/local/libexec/vroom-netd /etc/vroom/netd.toml
+ExecStart=/usr/local/libexec/vroom/vroom-netd /etc/vroom/netd.toml
 Restart=on-failure
 # Needs CAP_NET_ADMIN for tap/bridge; nothing else.
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_CHOWN
@@ -15,6 +15,8 @@ PrivateTmp=yes
 RuntimeDirectory=vroom
 ReadWritePaths=/run/vroom
 DeviceAllow=/dev/net/tun rw
+# USB devices ([usb] in netd.toml): the USB helper it starts opens them.
+DeviceAllow=char-usb_device rw
 
 [Install]
 WantedBy=multi-user.target

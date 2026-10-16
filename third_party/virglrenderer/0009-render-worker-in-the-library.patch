@@ -1,0 +1,294 @@
+diff --git a/config.h.meson b/config.h.meson
+--- a/config.h.meson
++++ b/config.h.meson
+@@ -53,6 +53,7 @@
+ #mesondefine ENABLE_RENDER_SERVER_WORKER_PROCESS
+ #mesondefine ENABLE_RENDER_SERVER_WORKER_THREAD
+ #mesondefine ENABLE_RENDER_SERVER_WORKER_MINIJAIL
++#mesondefine ENABLE_RENDER_WORKER_IN_LIBRARY
+ #mesondefine RENDER_SERVER_EXEC_PATH
+ #mesondefine HAVE_EVENTFD_H
+ #mesondefine HAVE_DMABUF_H
+diff --git a/meson.build b/meson.build
+--- a/meson.build
++++ b/meson.build
+@@ -353,6 +353,7 @@
+ with_venus = get_option('venus')
+ with_neptune = get_option('neptune')
+ with_render_server = ''
++with_render_worker_in_library = false
+ if with_venus or with_neptune
+    with_render_server = get_option('render-server-mode')
+ endif
+@@ -445,6 +446,18 @@
+          error('render-server-worker must be \'thread\' if render-server-mode is \'thread\'')
+       endif
+    endif
++
++   # vroom: on macOS the embedder runs the server and starts the workers
++   # (its own executable, sandboxed per context), and a worker enters the
++   # library through virgl_renderer_render_worker_main.  No server
++   # executable, and the proxy never starts one.
++   with_render_worker_in_library = with_render_server == 'process' and with_host_darwin
++   if with_render_worker_in_library
++      if with_render_server_worker != 'process'
++         error('render-server-mode=process on macOS needs render-server-worker=process')
++      endif
++      conf_data.set('ENABLE_RENDER_WORKER_IN_LIBRARY', 1)
++   endif
+ endif
+ 
+ with_video = get_option('video')
+@@ -489,7 +502,7 @@
+    subdir('vtest')
+ endif
+ 
+-if with_render_server == 'process'
++if with_render_server == 'process' and not with_render_worker_in_library
+ subdir('server')
+ endif
+ 
+diff --git a/server/render_common.c b/server/render_common.c
+--- a/server/render_common.c
++++ b/server/render_common.c
+@@ -4,7 +4,7 @@
+  */
+ 
+ #include "render_common.h"
+-#ifdef ENABLE_SAME_PROCESS_RENDER_SERVER
++#ifdef RENDER_LOG_TO_VIRGL
+ #include "virgl_util.h"
+ #endif
+ 
+@@ -24,7 +24,7 @@
+    va_list va;
+ 
+    va_start(va, fmt);
+-#ifdef ENABLE_SAME_PROCESS_RENDER_SERVER
++#ifdef RENDER_LOG_TO_VIRGL
+    virgl_prefixed_logv("server", VIRGL_LOG_LEVEL_INFO, fmt, va);
+ #else
+    vsyslog(LOG_DEBUG, fmt, va);
+diff --git a/server/render_common.h b/server/render_common.h
+--- a/server/render_common.h
++++ b/server/render_common.h
+@@ -28,6 +28,12 @@
+ struct render_worker;
+ struct render_worker_jail;
+ 
++/* Where render_log goes: virglrenderer's log when the server or the worker
++ * lives in the library (the embedder sees it), syslog otherwise. */
++#if defined(ENABLE_SAME_PROCESS_RENDER_SERVER) || defined(ENABLE_RENDER_WORKER_IN_LIBRARY)
++#define RENDER_LOG_TO_VIRGL 1
++#endif
++
+ void
+ render_log_init(void);
+ 
+diff --git a/server/render_context.c b/server/render_context.c
+--- a/server/render_context.c
++++ b/server/render_context.c
+@@ -462,11 +462,13 @@
+    assert(args->valid && args->ctx_id && args->ctx_fd >= 0);
+ 
+    if (!render_state_init(args->init_flags)) {
++      render_log("ctx %u: renderer init failed (flags 0x%x)", args->ctx_id, args->init_flags);
+       close(args->ctx_fd);
+       return false;
+    }
+ 
+    if (!render_context_init(&ctx, args)) {
++      render_log("ctx %u: context init failed", args->ctx_id);
+       render_state_fini();
+       close(args->ctx_fd);
+       return false;
+diff --git a/server/render_state.c b/server/render_state.c
+--- a/server/render_state.c
++++ b/server/render_state.c
+@@ -109,7 +109,7 @@
+    return ctx;
+ }
+ 
+-#ifndef ENABLE_SAME_PROCESS_RENDER_SERVER
++#ifndef RENDER_LOG_TO_VIRGL
+ static void
+ render_state_cb_debug_logger(UNUSED enum virgl_log_level_flags log_level,
+                              const char *message,
+@@ -131,7 +131,7 @@
+ 
+ #ifdef ENABLE_VENUS
+ static const struct vkr_renderer_callbacks render_state_vkr_cbs = {
+-#ifndef ENABLE_SAME_PROCESS_RENDER_SERVER
++#ifndef RENDER_LOG_TO_VIRGL
+    .debug_logger = render_state_cb_debug_logger,
+ #endif
+    .retire_fence = render_state_cb_retire_fence,
+@@ -140,7 +140,7 @@
+ 
+ #ifdef ENABLE_NEPTUNE
+ static const struct npt_renderer_callbacks render_state_npt_cbs = {
+-#ifndef ENABLE_SAME_PROCESS_RENDER_SERVER
++#ifndef RENDER_LOG_TO_VIRGL
+    .debug_logger = render_state_cb_debug_logger,
+ #endif
+    .retire_fence = render_state_cb_retire_fence,
+diff --git a/src/meson.build b/src/meson.build
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -181,6 +181,16 @@
+    'proxy/proxy_socket.c',
+ ]
+ 
++if with_render_worker_in_library
++   # The worker side only: the embedder is the server.
++   proxy_sources += [
++      '../server/render_common.c',
++      '../server/render_context.c',
++      '../server/render_socket.c',
++      '../server/render_state.c',
++   ]
++endif
++
+ if with_render_server == 'thread'
+    proxy_sources += [
+       '../server/render_client.c',
+diff --git a/src/proxy/proxy_context.c b/src/proxy/proxy_context.c
+--- a/src/proxy/proxy_context.c
++++ b/src/proxy/proxy_context.c
+@@ -116,15 +116,22 @@
+    /* check if the socket has been disconnected (i.e., the other end has
+     * crashed) if no progress is made after a while
+     */
+-   if (timeline->cur_seqno == cur_seqno && !list_is_empty(&timeline->fences)) {
++   if (!ctx->worker_gone && timeline->cur_seqno == cur_seqno &&
++       !list_is_empty(&timeline->fences)) {
+       timeline->cur_seqno_stall_count++;
+       if (timeline->cur_seqno_stall_count < 100 ||
+           proxy_socket_is_connected(&ctx->socket))
+          return false;
+ 
+       /* socket has been disconnected */
+-      force_retire_all = true;
++      ctx->worker_gone = true;
++      proxy_log("ctx %d: the worker is gone", ctx->base.ctx_id);
+    }
++   /* vroom: retire them all, so the guest isn't left waiting on a context
++    * that will never answer (a Venus app then sees its ring dead).  Held
++    * back, Direct3D fences don't make Windows reset the GPU: it hangs. */
++   if (ctx->worker_gone)
++      force_retire_all = true;
+ 
+    timeline->cur_seqno = cur_seqno;
+    timeline->cur_seqno_stall_count = 0;
+@@ -196,6 +203,20 @@
+ 
+          proxy_log("failed to poll fence eventfd");
+          break;
++      }
++
++      /* vroom: a hung-up socket stays readable; stop watching it (it would
++       * spin this thread) and settle the fences left right away (see
++       * proxy_context_retire_timeline_fences_locked). */
++      if (poll_fds[1].fd >= 0 && (poll_fds[1].revents & (POLLHUP | POLLERR | POLLNVAL))) {
++         if (proxy_renderer.flags & VIRGL_RENDERER_ASYNC_FENCE_CB)
++            mtx_lock(&ctx->timeline_mutex);
++         if (!ctx->worker_gone)
++            proxy_log("ctx %d: the worker is gone", ctx->base.ctx_id);
++         ctx->worker_gone = true;
++         if (proxy_renderer.flags & VIRGL_RENDERER_ASYNC_FENCE_CB)
++            mtx_unlock(&ctx->timeline_mutex);
++         poll_fds[1].fd = -1;
+       }
+ 
+       proxy_context_retire_fences_internal(ctx);
+diff --git a/src/proxy/proxy_context.h b/src/proxy/proxy_context.h
+--- a/src/proxy/proxy_context.h
++++ b/src/proxy/proxy_context.h
+@@ -32,6 +32,11 @@
+ 
+    uint32_t capset_id;
+ 
++   /* vroom: the worker's socket hung up (it crashed or was killed): every
++    * fence of this context retires at once from then on, so the guest
++    * isn't left waiting on a context that will never answer. */
++   bool worker_gone;
++
+    /* Out-of-band fence channel (RENDER_CONTEXT_OP_ATTACH_FENCE_SOCKET):
+     * write end of a socketpair whose read end a dedicated server thread
+     * drains, so arrival-order-tolerant fences (Neptune event rings)
+diff --git a/src/proxy/proxy_server.c b/src/proxy/proxy_server.c
+--- a/src/proxy/proxy_server.c
++++ b/src/proxy/proxy_server.c
+@@ -237,6 +237,14 @@
+       free(srv);
+       return NULL;
+    }
++#elif defined(ENABLE_RENDER_WORKER_IN_LIBRARY)
++   /* vroom: the embedder is the server; never start a program ourselves. */
++   (void)proxy_server_fork;
++   if (!proxy_server_init_fd(srv)) {
++      proxy_log("no render server: the embedder gave no server fd");
++      free(srv);
++      return NULL;
++   }
+ #else
+    if (!proxy_server_init_fd(srv)) {
+       /* start the render server on demand when the client does not provide a
+diff --git a/src/virglrenderer.c b/src/virglrenderer.c
+--- a/src/virglrenderer.c
++++ b/src/virglrenderer.c
+@@ -1743,3 +1743,32 @@
+ 
+    return ctx->get_device_fd(ctx);
+ }
++
++#ifdef ENABLE_RENDER_WORKER_IN_LIBRARY
++#include "server/render_context.h"
++
++int virgl_renderer_render_worker_main(int ctx_fd,
++                                      uint32_t ctx_id,
++                                      uint32_t init_flags,
++                                      const char *ctx_name)
++{
++   if (ctx_fd < 0 || !ctx_id) {
++      if (ctx_fd >= 0)
++         close(ctx_fd);
++      return -1;
++   }
++
++   struct render_context_args args = {
++      .valid = true,
++      .init_flags = init_flags,
++      .ctx_id = ctx_id,
++      .ctx_fd = ctx_fd,
++   };
++   if (ctx_name)
++      snprintf(args.ctx_name, sizeof(args.ctx_name), "%s", ctx_name);
++
++   /* takes ctx_fd; false also for the normal end (the proxy hung up) */
++   render_context_main(&args);
++   return 0;
++}
++#endif
+diff --git a/src/virglrenderer.h b/src/virglrenderer.h
+--- a/src/virglrenderer.h
++++ b/src/virglrenderer.h
+@@ -353,6 +353,18 @@
+                                          void* user_data,
+                                          virgl_free_data_callback_type free_user_data_cb);
+ 
++/* vroom: run one render server context (Venus or Neptune) in this process,
++ * the worker the embedder started for it.  ctx_fd is the worker's end of
++ * the socket pair whose other end went to the proxy (ownership taken, even
++ * on errors); init_flags are VIRGL_RENDERER_NO_VIRGL plus the one backend.
++ * Returns when the context ends (the proxy hung up, or an error, logged).
++ * Only in builds with the worker in the library (macOS, render server in
++ * process mode): look it up with dlsym. */
++VIRGL_EXPORT int virgl_renderer_render_worker_main(int ctx_fd,
++                                                   uint32_t ctx_id,
++                                                   uint32_t init_flags,
++                                                   const char *ctx_name);
++
+ /* return information about a resource */
+ 
+ struct virgl_renderer_resource_info {

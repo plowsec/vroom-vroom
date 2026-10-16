@@ -10,10 +10,24 @@
 
 mod clip;
 #[cfg(windows)]
+mod coh_win;
+#[cfg(target_os = "linux")]
+mod coh_x11;
+mod coherence;
+// X11 arithmetic for coh_x11; built everywhere so it's tested everywhere.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod ewmh;
+#[cfg(windows)]
 mod dnd_win;
 // The session side; built everywhere so it's tested everywhere.
 #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 mod drop;
+// Built everywhere so it's tested everywhere; only Windows and X11 find
+// drags to take.
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+mod dragout;
+#[cfg(target_os = "linux")]
+mod dnd_x11;
 mod find;
 mod layout;
 mod port;
@@ -175,7 +189,8 @@ fn open_link(args: &Args) -> std::io::Result<(String, port::Reader, port::Writer
 }
 
 fn session(args: &Args) -> std::io::Result<()> {
-    let (path, mut reader, mut writer) = open_link(args)?;
+    let (path, mut reader, writer) = open_link(args)?;
+    let mut writer = dragout::Shared::new(writer);
     let system = args.role == Role::Full;
     sys::single_display();
     let mut clip: Box<dyn clip::Clip> = if args.no_clipboard {
@@ -192,27 +207,39 @@ fn session(args: &Args) -> std::io::Result<()> {
     log::info!("connected to {path}");
 
     // Blocking reads on their own thread; main loop polls the clipboard.
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    // Coherence's window events wake it too.
+    let (tx, rx) = mpsc::channel::<In>();
+    let wake = std::sync::Mutex::new(tx.clone());
     std::thread::spawn(move || {
         let mut buf = vec![0u8; 64 << 10];
         while let Ok(n) = reader.read(&mut buf) {
-            if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+            if n == 0 || tx.send(In::Host(buf[..n].to_vec())).is_err() {
                 break;
             }
         }
+        let _ = tx.send(In::Closed);
     });
 
     let mut dec = Decoder::new(MAX_CLIP + 64);
     let mut last = clip.get();
     let mut drops = drop::Drops::new();
+    // Dropped (taskbar back) when the session ends.
+    let mut coh = coherence::Coherence::new(std::sync::Arc::new(move || {
+        let _ = wake.lock().unwrap_or_else(|e| e.into_inner()).send(In::Wake);
+    }));
+    let mut clip_at = std::time::Instant::now();
+    let mut dragout = dragout::DragOut::new();
     loop {
-        match rx.recv_timeout(POLL) {
-            Ok(bytes) => {
+        match rx.recv_timeout(coh.wait().unwrap_or(POLL).min(POLL)) {
+            // Coherence: something changed on screen.
+            Ok(In::Wake) => {}
+            Ok(In::Closed) => return Err(std::io::Error::other("port closed")),
+            Ok(In::Host(bytes)) => {
                 dec.push(&bytes);
                 loop {
                     match dec.next() {
                         Ok(Some(m)) => {
-                            if !drops.handle(&m, &mut writer)? {
+                            if !drops.handle(&m, &mut writer)? && !coh.handle(&m, &mut writer)? && !dragout.handle(&m, &writer)? {
                                 handle(m, system, &mut writer, clip.as_mut(), &mut last)?
                             }
                         }
@@ -226,6 +253,11 @@ fn session(args: &Args) -> std::io::Result<()> {
                 return Err(std::io::Error::other("port closed"));
             }
         }
+        coh.tick(&mut writer)?;
+        if clip_at.elapsed() < POLL {
+            continue;
+        }
+        clip_at = std::time::Instant::now();
         // Local copy happened? Tell the host.
         let now = clip.get();
         if now.is_some() && now != last {
@@ -239,20 +271,35 @@ fn session(args: &Args) -> std::io::Result<()> {
     }
 }
 
+/// What wakes the session loop.
+enum In {
+    Host(Vec<u8>),
+    /// The host link is gone.
+    Closed,
+    /// Coherence: the windows changed.
+    Wake,
+}
+
 fn hello() -> Message {
     let mut features = features::CLIPBOARD_TEXT | features::TIME_SYNC | features::SHUTDOWN | features::SCALE | features::FILE_DROP;
     if cfg!(any(windows, target_os = "linux")) {
-        features |= features::MONITORS;
+        features |= features::DRAG_OUT | features::MONITORS;
     }
     if cfg!(windows) {
         features |= features::GPU3D;
+    }
+    if coherence::Coherence::supported() {
+        features |= features::COHERENCE;
+    }
+    if coherence::Coherence::starts_apps() {
+        features |= features::START_APP;
     }
     Message::Hello { features, agent: format!("vroom-agent {}", env!("CARGO_PKG_VERSION")) }
 }
 
 /// `system`: we own the host link and may act on privileged requests.
 /// The session helper only ever gets clipboard, resolution and scale messages.
-fn handle(m: Message, system: bool, w: &mut port::Writer, clip: &mut dyn clip::Clip, last: &mut Option<String>) -> std::io::Result<()> {
+fn handle(m: Message, system: bool, w: &mut dyn Write, clip: &mut dyn clip::Clip, last: &mut Option<String>) -> std::io::Result<()> {
     match m {
         Message::Hello { .. } | Message::TimeSync { .. } | Message::Shutdown { .. } | Message::Ping(_) if !system => {
             log::debug!("ignoring a privileged message on the session link");
@@ -293,14 +340,27 @@ fn handle(m: Message, system: bool, w: &mut port::Writer, clip: &mut dyn clip::C
         Message::Ping(v) => w.write_all(&Message::Pong(v).encode())?,
         // Windows' service handles it (relay); nothing to turn off here.
         Message::Gpu3d { .. } | Message::Pong(_) => {}
-        // Drops are drop.rs's; the rest is guest -> host.
+        // Drops are drop.rs's, Coherence coherence.rs's; the rest is
+        // guest -> host.
         Message::DragEnter { .. }
         | Message::DragCancel { .. }
         | Message::DropEntry { .. }
         | Message::DropData { .. }
         | Message::DropEnd { .. }
         | Message::DragReady { .. }
-        | Message::DropDone { .. } => {}
+        | Message::DropDone { .. }
+        | Message::Coherence { .. }
+        | Message::WindowDo { .. }
+        | Message::Windows(_)
+        | Message::DragOutQuery { .. }
+        | Message::DragOutItems { .. }
+        | Message::DragOutGet { .. }
+        | Message::DragOutEnd { .. }
+        | Message::DragOutFail { .. }
+        | Message::StartApp(_)
+        | Message::WindowIcon { .. }
+        | Message::CoherenceNo(_)
+        => {}
     }
     Ok(())
 }

@@ -10,7 +10,7 @@
 //! clipboard rules from the VM file are enforced here too.
 
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
@@ -32,6 +32,9 @@ use vroom_display::{recv_fd, Command, Decoder, GuestCursor, SharedFb, ToViewer, 
 use crate::msg::{self, Msg};
 use crate::{ConsoleWindow, MonitorWindow, VmState};
 
+mod usbmenu;
+mod coherence;
+
 const CLIP_POLL: Duration = Duration::from_millis(500);
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(300);
 const THUMB_EVERY: Duration = Duration::from_secs(2);
@@ -41,6 +44,8 @@ const WHEEL_STEP: f32 = 30.0;
 
 /// Status lines waiting for the UI thread; more are dropped.
 const MAX_STATUS: usize = 16;
+/// Window icons waiting for the UI thread (one per window); more are dropped.
+const MAX_ICONS: usize = 2 * vroom_proto::WINDOWS_MAX;
 /// Status lines are short; snapshot ones hold a path.
 const MAX_STATUS_LEN: usize = 4096;
 /// How much of the end of a VMM log we read for an error message.
@@ -69,6 +74,16 @@ struct Shared {
     drag: VecDeque<ToViewer>,
     /// The other monitors (index: monitor; 0 unused, it's the above).
     heads: [HeadIn; MAX_HEADS],
+    /// The host USB devices the VM has, the latest list.
+    usb: Option<Vec<vroom_display::UsbPort>>,
+    /// What the guest agent can do, when it (re)connects.
+    features: Option<u64>,
+    /// Coherence: the guest's latest window list.
+    windows: Option<Vec<vroom_display::GuestWindow>>,
+    /// Coherence: window icons not yet shown, the latest per window.
+    icons: BTreeMap<u32, (u32, u32, Vec<u8>)>,
+    /// Coherence can't work in the guest, and why.
+    coh_no: Option<String>,
     posted: bool,
 }
 
@@ -135,12 +150,22 @@ impl Shared {
             ToViewer::Mic(on) => self.mic = Some(on),
             ToViewer::Camera(on) => self.camera = Some(on),
             ToViewer::Cursor(c) => self.cursor = Some(c),
-            m @ (ToViewer::DragReady { .. } | ToViewer::DropDone { .. }) => {
+            m @ (ToViewer::DragReady { .. } | ToViewer::DropDone { .. } | ToViewer::DragOutItems { .. }) => {
                 if self.drag.len() >= MAX_STATUS {
                     return false;
                 }
                 self.drag.push_back(m);
             }
+            ToViewer::Usb(l) => self.usb = Some(l),
+            ToViewer::Agent { features } => self.features = Some(features),
+            ToViewer::Windows(list) => self.windows = Some(list),
+            ToViewer::WindowIcon { id, w, h, rgba } => {
+                if self.icons.len() >= MAX_ICONS && !self.icons.contains_key(&id) {
+                    return false;
+                }
+                self.icons.insert(id, (w, h, rgba));
+            }
+            ToViewer::CoherenceNo(why) => self.coh_no = Some(why),
             ToViewer::Closed => return false,
         }
         !std::mem::replace(&mut self.posted, true)
@@ -157,6 +182,9 @@ struct Io {
     buttons: BTreeSet<u16>,
     wheel: (f32, f32),
     focused: bool,
+    /// The guest's left button went down and the mouse hasn't left the
+    /// screen since: leaving it asks the guest for a drag out.
+    out_armed: bool,
 }
 
 impl Io {
@@ -176,6 +204,9 @@ impl Io {
     }
 
     fn button(&mut self, code: u16, down: bool) {
+        if code == BTN_LEFT {
+            self.out_armed = down;
+        }
         if down {
             self.buttons.insert(code);
         } else {
@@ -198,6 +229,8 @@ pub struct Console {
     pub key: String,
     pub state: VmState,
     name: String,
+    /// The VM file.
+    path: PathBuf,
     win: ConsoleWindow,
     io: Rc<RefCell<Io>>,
     fb: Option<SharedFb>,
@@ -246,6 +279,16 @@ pub struct Console {
     drag: Option<Drag>,
     drag_seq: u32,
     drag_timer: slint::Timer,
+    /// Host USB devices: the menu, and what the VM has.
+    usb: usbmenu::UsbMenu,
+    /// What the guest agent says it can do (0: none connected yet).
+    features: u64,
+    windows_guest: bool,
+    /// In Coherence: the guest's windows as Mac windows.
+    coh: Option<coherence::Coherence>,
+    /// Files dragged out of the guest, to the Mac.
+    out: Option<OutDrag>,
+    out_timer: slint::Timer,
 }
 
 /// Another monitor's window.
@@ -259,6 +302,28 @@ struct Extra {
     /// Closed by the user: the monitor is off until "Show all displays".
     closed: bool,
 }
+
+/// Files dragged from the guest out of the window (see dragout.rs).
+struct OutDrag {
+    id: u32,
+    asked: Instant,
+    items: Vec<(String, bool)>,
+    /// The Mac's drag, once the guest said what it drags.
+    #[cfg(target_os = "macos")]
+    session: Option<crate::dragout_mac::Session>,
+    progress: Arc<crate::dnd::Progress>,
+    /// The Mac drag ended with a drop, waiting for the copies since then.
+    dropped: Option<Instant>,
+    /// An item is being copied.
+    fetching: bool,
+    copied: u32,
+    failed: Option<String>,
+}
+
+/// The guest answers a drag out by then, or there is none.
+const OUT_ASK: Duration = Duration::from_secs(5);
+/// After a drop, the Mac asks for the files by then, or never will.
+const OUT_IDLE: Duration = Duration::from_secs(60);
 
 /// Files from the Mac over the window (see dnd.rs).
 struct Drag {
@@ -364,15 +429,42 @@ pub fn command_any(cmd: &str) {
     });
 }
 
-/// A key press to every VM's guest (for `VROOM_SHOT`).
-pub fn key_any(code: u16) {
+/// Keys to every VM's guest (for `VROOM_SHOT`), pressed in order and let
+/// go the other way (Win+R: [125, 19]).
+pub fn keys_any(codes: &[u16]) {
     CONSOLES.with(|c| {
         for con in c.borrow().values() {
             let mut io = con.io.borrow_mut();
-            io.key(code, true);
-            io.key(code, false);
+            for &k in codes {
+                io.key(k, true);
+            }
+            for &k in codes.iter().rev() {
+                io.key(k, false);
+            }
         }
     });
+}
+
+/// Text typed on the guest's (US) keyboard, for `VROOM_SHOT`: letters,
+/// digits, space and a few signs; anything else is skipped.
+pub fn type_any(text: &str) {
+    const ROWS: [(&str, u16); 4] = [("1234567890-=", 2), ("qwertyuiop[]", 16), ("asdfghjkl;'", 30), ("zxcvbnm,./", 44)];
+    for ch in text.chars() {
+        let lower = ch.to_ascii_lowercase();
+        let code = match lower {
+            ' ' => Some(57),
+            '\\' => Some(43),
+            ':' => Some(39),
+            '"' => Some(40),
+            _ => ROWS.iter().find_map(|(row, base)| row.find(lower).map(|i| base + i as u16)),
+        };
+        let Some(code) = code else { continue };
+        if ch.is_ascii_uppercase() || ch == ':' || ch == '"' {
+            keys_any(&[42, code]);
+        } else {
+            keys_any(&[code]);
+        }
+    }
 }
 
 /// The mouse to a point of every VM window, as if moved there (for
@@ -385,6 +477,21 @@ pub fn move_any(x: f32, y: f32) {
     }
 }
 
+/// A click at a point of the Coherence window in front (for `VROOM_SHOT`):
+/// goes through the window like a real one. `title`: the window whose
+/// title has it, else the guest's window in front.
+pub fn coh_click_any(x: f32, y: f32, title: &str) {
+    use slint::platform::{PointerEventButton, WindowEvent as SlintEvent};
+    let wins: Vec<crate::CoherenceWindow> = CONSOLES.with(|c| c.borrow().values().filter_map(|c| c.coh_window(title)).collect());
+    for w in wins {
+        let position = slint::LogicalPosition::new(x, y);
+        let win = w.window();
+        win.dispatch_event(SlintEvent::PointerMoved { position });
+        win.dispatch_event(SlintEvent::PointerPressed { position, button: PointerEventButton::Left });
+        win.dispatch_event(SlintEvent::PointerReleased { position, button: PointerEventButton::Left });
+    }
+}
+
 /// A picture of some VM window (for `VROOM_SHOT`).
 pub fn snapshot_any() -> Option<Result<SharedPixelBuffer<Rgba8Pixel>, slint::PlatformError>> {
     CONSOLES.with(|c| c.borrow().values().next().map(|c| c.win.window().take_snapshot()))
@@ -393,6 +500,20 @@ pub fn snapshot_any() -> Option<Result<SharedPixelBuffer<Rgba8Pixel>, slint::Pla
 /// A picture of some VM's window for monitor `n` (2, 3...; for `VROOM_SHOT`).
 pub fn snapshot_monitor(n: usize) -> Option<Result<SharedPixelBuffer<Rgba8Pixel>, slint::PlatformError>> {
     CONSOLES.with(|c| c.borrow().values().find_map(|c| c.extra.get(n.checked_sub(2)?)?.as_ref().map(|e| e.win.window().take_snapshot())))
+}
+
+/// Type a name in the Coherence bar's app field and press Enter (for
+/// `VROOM_SHOT`).
+pub fn coh_start_any(name: &str) {
+    let bar = CONSOLES.with(|c| c.borrow().values().find_map(|c| c.coh.as_ref().map(|h| h.bar.clone_strong())));
+    if let Some(b) = bar {
+        b.invoke_start_app(name.into());
+    }
+}
+
+/// The Coherence bar of the first VM in Coherence (for `VROOM_SHOT`).
+pub fn snapshot_bar() -> Option<Result<SharedPixelBuffer<Rgba8Pixel>, slint::PlatformError>> {
+    CONSOLES.with(|c| c.borrow().values().find_map(|c| c.coh.as_ref().map(|h| h.bar.window().take_snapshot())))
 }
 
 /// Ask every running VM to suspend (app quitting).
@@ -482,6 +603,15 @@ pub fn start(path: &Path, cfg: &VmConfig, extra: &[String]) -> Result<String, St
         show(&key);
         return Ok(key);
     }
+    // Read before the VMM starts: it removes the suspend image once it
+    // has resumed from it.
+    let state_dir = extra
+        .iter()
+        .position(|a| a == "--state-dir")
+        .and_then(|i| extra.get(i + 1))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| cfg.default_state_dir(path));
+    let resuming = state_dir.join("suspend").join("manifest.json").is_file() && !extra.iter().any(|a| a == "--fresh");
     let log = crate::paths::log_file(&key);
     if let Some(d) = log.parent() {
         std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
@@ -495,7 +625,8 @@ pub fn start(path: &Path, cfg: &VmConfig, extra: &[String]) -> Result<String, St
     unsafe {
         libc::fcntl(theirs.as_raw_fd(), libc::F_SETFD, 0)
     };
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    // Through a symlink (in /usr/local/bin, say): the real one's folder.
+    let exe = std::env::current_exe().and_then(std::fs::canonicalize).map_err(|e| e.to_string())?;
     let vmm = exe.with_file_name("vroom");
     let child = Proc::new(&vmm)
         .arg("run")
@@ -510,7 +641,9 @@ pub fn start(path: &Path, cfg: &VmConfig, extra: &[String]) -> Result<String, St
         .map_err(|e| format!("start {}: {e}", vmm.display()))?;
     drop(theirs);
     let pid = child.id();
-    open(key, cfg, ours, Some(child), pid, VmState::Starting)
+    let key = open(key, path, cfg, ours, Some(child), pid, VmState::Starting)?;
+    with(&key, |c| c.usb_prepare(resuming));
+    Ok(key)
 }
 
 /// How long a VMM we reattach to gets to send its screen.
@@ -535,11 +668,11 @@ pub fn attach(path: &Path, cfg: &VmConfig, sock: &Path, pid: u32) -> Result<Stri
     let s = UnixStream::connect(sock).map_err(|e| format!("it doesn't answer ({e})"))?;
     // A VMM that hangs never sends the screen: give up then (see reader).
     s.set_read_timeout(Some(ATTACH_WAIT)).map_err(|e| e.to_string())?;
-    open(key, cfg, s, None, pid, VmState::Running)
+    open(key, path, cfg, s, None, pid, VmState::Running)
 }
 
 /// The window for a VMM on the other end of `ours`.
-fn open(key: String, cfg: &VmConfig, ours: UnixStream, child: Option<Child>, pid: u32, state: VmState) -> Result<String, String> {
+fn open(key: String, path: &Path, cfg: &VmConfig, ours: UnixStream, child: Option<Child>, pid: u32, state: VmState) -> Result<String, String> {
     let fail = |child: Option<Child>, e: String| match child {
         Some(c) => abandon(c, e),
         None => e,
@@ -566,6 +699,7 @@ fn open(key: String, cfg: &VmConfig, ours: UnixStream, child: Option<Child>, pid
         buttons: BTreeSet::new(),
         wheel: (0.0, 0.0),
         focused: false,
+        out_armed: false,
     }));
     wire(&win, &key, &io);
 
@@ -587,6 +721,7 @@ fn open(key: String, cfg: &VmConfig, ours: UnixStream, child: Option<Child>, pid
         key: key.clone(),
         state,
         name: cfg.name.clone(),
+        path: path.to_path_buf(),
         win,
         io,
         fb: None,
@@ -618,6 +753,12 @@ fn open(key: String, cfg: &VmConfig, ours: UnixStream, child: Option<Child>, pid
         drag: None,
         drag_seq: 0,
         drag_timer: slint::Timer::default(),
+        usb: usbmenu::UsbMenu::default(),
+        features: 0,
+        windows_guest: os == GuestOs::Windows,
+        coh: None,
+        out: None,
+        out_timer: slint::Timer::default(),
     };
     CONSOLES.with(|m| m.borrow_mut().insert(key.clone(), c));
     ensure_timer();
@@ -677,20 +818,6 @@ fn wire(win: &ConsoleWindow, key: &str, io: &Rc<RefCell<Io>>) {
     win.window().on_winit_window_event(move |_w, ev| winit_event(&k, 0, &io, ev));
 }
 
-/// Mouse wheel: whole steps to the guest, the rest kept for later.
-fn wheel(io: &Rc<RefCell<Io>>, dx: f32, dy: f32) {
-    let mut io = io.borrow_mut();
-    io.wheel.0 += dx;
-    io.wheel.1 += dy;
-    let sx = (io.wheel.0 / WHEEL_STEP).trunc();
-    let sy = (io.wheel.1 / WHEEL_STEP).trunc();
-    if sx != 0.0 || sy != 0.0 {
-        io.wheel.0 -= sx * WHEEL_STEP;
-        io.wheel.1 -= sy * WHEEL_STEP;
-        io.send(ToVmm::Wheel { dx: sx as i16, dy: sy as i16 });
-    }
-}
-
 /// Another monitor's window: its pointer goes to that monitor.
 fn wire_extra(win: &MonitorWindow, key: &str, head: usize, io: &Rc<RefCell<Io>>) {
     {
@@ -738,30 +865,27 @@ fn wire_extra(win: &MonitorWindow, key: &str, head: usize, io: &Rc<RefCell<Io>>)
     win.window().on_winit_window_event(move |_w, ev| winit_event(&k, head, &io, ev));
 }
 
-/// Keys as physical key codes (what the guest's keyboard sends), focus,
-/// resizes. Text input never goes through here. `head`: which monitor's
-/// window (files can only be dropped on the first's).
-fn winit_event(key: &str, head: usize, io: &Rc<RefCell<Io>>, ev: &WindowEvent) -> EventResult {
+/// Scrolling (logical pixels) as wheel clicks for the guest.
+fn wheel(io: &Rc<RefCell<Io>>, dx: f32, dy: f32) {
+    let mut io = io.borrow_mut();
+    io.wheel.0 += dx;
+    io.wheel.1 += dy;
+    let sx = (io.wheel.0 / WHEEL_STEP).trunc();
+    let sy = (io.wheel.1 / WHEEL_STEP).trunc();
+    if sx != 0.0 || sy != 0.0 {
+        io.wheel.0 -= sx * WHEEL_STEP;
+        io.wheel.1 -= sy * WHEEL_STEP;
+        io.send(ToVmm::Wheel { dx: sx as i16, dy: sy as i16 });
+    }
+}
+
+/// Keys as physical key codes (what the guest's keyboard sends); the
+/// host's own shortcuts (Ctrl+Alt+Shift+key) never reach it. For the VM
+/// window and its Coherence windows alike.
+fn input_event(key: &str, io: &Rc<RefCell<Io>>, ev: &WindowEvent) -> EventResult {
     match ev {
         WindowEvent::ModifiersChanged(m) => {
             io.borrow_mut().mods = m.state();
-            EventResult::Propagate
-        }
-        WindowEvent::Focused(f) => {
-            let mut i = io.borrow_mut();
-            i.focused = *f;
-            if !*f {
-                i.release_all();
-            }
-            i.send(ToVmm::Focus(*f));
-            drop(i);
-            if *f {
-                // Can arrive from inside show(): don't touch the registry now.
-                let key = key.to_string();
-                slint::Timer::single_shot(Duration::ZERO, move || {
-                    with(&key, |c| c.clip_seen = None);
-                });
-            }
             EventResult::Propagate
         }
         WindowEvent::KeyboardInput { event, .. } => {
@@ -783,6 +907,33 @@ fn winit_event(key: &str, head: usize, io: &Rc<RefCell<Io>>, ev: &WindowEvent) -
             }
             EventResult::PreventDefault
         }
+        _ => EventResult::Propagate,
+    }
+}
+
+/// The VM window's events: keys (above), focus, files from Finder, resizes.
+/// Text input never goes through here. `head`: which monitor's window
+/// (files can only be dropped on the first's).
+fn winit_event(key: &str, head: usize, io: &Rc<RefCell<Io>>, ev: &WindowEvent) -> EventResult {
+    match ev {
+        WindowEvent::ModifiersChanged(_) | WindowEvent::KeyboardInput { .. } => input_event(key, io, ev),
+        WindowEvent::Focused(f) => {
+            let mut i = io.borrow_mut();
+            i.focused = *f;
+            if !*f {
+                i.release_all();
+            }
+            i.send(ToVmm::Focus(*f));
+            drop(i);
+            if *f {
+                // Can arrive from inside show(): don't touch the registry now.
+                let key = key.to_string();
+                slint::Timer::single_shot(Duration::ZERO, move || {
+                    with(&key, |c| c.clip_seen = None);
+                });
+            }
+            EventResult::Propagate
+        }
         WindowEvent::HoveredFile(_) | WindowEvent::HoveredFileCancelled | WindowEvent::DroppedFile(_) if head > 0 => EventResult::Propagate,
         // Files from the Mac: one event per file, all at once.
         WindowEvent::HoveredFile(p) => {
@@ -796,6 +947,22 @@ fn winit_event(key: &str, head: usize, io: &Rc<RefCell<Io>>, ev: &WindowEvent) -
             let key = key.to_string();
             slint::Timer::single_shot(Duration::ZERO, move || {
                 with(&key, |c| c.drag_left());
+            });
+            EventResult::Propagate
+        }
+        // The mouse leaving the guest screen with the guest's button
+        // held may be a drag of files out of the guest.
+        WindowEvent::CursorMoved { position, .. } if io.borrow().out_armed => {
+            let (key, p) = (key.to_string(), (position.x, position.y));
+            slint::Timer::single_shot(Duration::ZERO, move || {
+                with(&key, |c| c.drag_out_check(Some(p)));
+            });
+            EventResult::Propagate
+        }
+        WindowEvent::CursorLeft { .. } if io.borrow().out_armed => {
+            let key = key.to_string();
+            slint::Timer::single_shot(Duration::ZERO, move || {
+                with(&key, |c| c.drag_out_check(None));
             });
             EventResult::Propagate
         }
@@ -839,6 +1006,7 @@ fn host_shortcut(k: KeyCode) -> Option<&'static str> {
         KeyCode::KeyZ => "suspend",
         KeyCode::KeyF => "fullscreen",
         KeyCode::KeyL => "library",
+        KeyCode::KeyC => "coherence",
         _ => return None,
     })
 }
@@ -904,8 +1072,10 @@ fn ready(key: &str, fd: OwnedFd) {
 }
 
 fn closed(key: &str) {
+    usbmenu::forget(key);
     let Some(mut c) = CONSOLES.with(|m| m.borrow_mut().remove(key)) else { return };
     c.save_thumb(None);
+    c.coh_close();
     let _ = c.win.hide();
     for e in c.extra.iter().flatten() {
         let _ = e.win.hide();
@@ -1030,6 +1200,7 @@ impl Console {
                 }
             }
             "displays" => self.show_extras(),
+            "fullscreen" if self.coh.is_some() => {}
             "fullscreen" => {
                 let w = self.win.window();
                 let fs = !w.is_fullscreen();
@@ -1047,6 +1218,10 @@ impl Console {
                     });
                 }
             }
+            c if c.starts_with("usb") => {
+                self.usb_command(c);
+            }
+            "coherence" => self.coherence_toggle(),
             "library" => msg::send(Msg::ShowLibrary(None)),
             "settings" => msg::send(Msg::ShowLibrary(Some(self.key.clone()))),
             _ => {}
@@ -1055,7 +1230,7 @@ impl Console {
 
     /// What the reader thread collected since the last wakeup.
     fn inbox(&mut self) {
-        let (frame, full, damage, status, clip, mic, cursor, drag, camera, heads) = {
+        let (frame, full, damage, status, clip, mic, cursor, drag, camera, usb, features, windows, (icons, coh_no), heads) = {
             let mut s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
             s.posted = false;
             let heads = s.heads;
@@ -1063,7 +1238,10 @@ impl Console {
                 (h.frame, h.full, h.damage) = (false, false, None);
             }
             let f = (std::mem::take(&mut s.frame), std::mem::take(&mut s.full), s.damage.take());
-            (f.0, f.1, f.2, std::mem::take(&mut s.status), s.clipboard.take(), s.mic.take(), s.cursor.take(), std::mem::take(&mut s.drag), s.camera.take(), heads)
+            let t = (std::mem::take(&mut s.status), s.clipboard.take(), s.mic.take(), s.cursor.take(), std::mem::take(&mut s.drag));
+            let c = (s.camera.take(), s.usb.take(), s.features.take(), s.windows.take());
+            let h = (std::mem::take(&mut s.icons), s.coh_no.take());
+            (f.0, f.1, f.2, t.0, t.1, t.2, t.3, t.4, c.0, c.1, c.2, c.3, h, heads)
         };
         for (h, hd) in heads.iter().enumerate().skip(1).take(self.monitors.saturating_sub(1)) {
             if hd.frame {
@@ -1073,10 +1251,18 @@ impl Console {
         if let Some(on) = camera {
             self.camera(on);
         }
+        if let Some(l) = usb {
+            self.usb_list(l);
+        }
+        if let Some(f) = features {
+            self.features = f;
+            self.win.set_coherence_why(self.coherence_why().into());
+        }
         for m in drag {
             match m {
                 ToViewer::DragReady { id, live } => self.drag_ready(id, live),
                 ToViewer::DropDone { id, ok, place } => self.drop_done(id, ok, &clean(&place)),
+                ToViewer::DragOutItems { id, items } => self.drag_out_items(id, items),
                 _ => {}
             }
         }
@@ -1099,6 +1285,15 @@ impl Console {
         if frame {
             self.frame(full, damage);
         }
+        if let Some(list) = windows {
+            self.coh_windows(list);
+        }
+        if !icons.is_empty() {
+            self.coh_icons(icons);
+        }
+        if let Some(why) = coh_no {
+            self.coh_no(&why);
+        }
     }
 
     fn status(&mut self, raw: &str) {
@@ -1118,6 +1313,10 @@ impl Console {
                 msg::send(Msg::SnapshotTaken { key: self.key.clone() });
             }
             _ if t.starts_with("guest agent connected") => self.toast("Guest tools connected: clipboard and resizing work"),
+            _ if t.starts_with("USB: ") => {
+                self.usb_refused();
+                self.toast(&t);
+            }
             _ if t.starts_with("suspend failed") => {
                 // Usually 3D in use. Say why and offer the ways out,
                 // rather than leaving a paused window that won't close.
@@ -1192,6 +1391,7 @@ impl Console {
             e.win.set_paused(self.state == VmState::Paused);
         }
         self.cpu_meter(now);
+        self.usb_tick(now);
         // State, size or the screen's place changed: the pointer may too.
         self.apply_pointer();
         // Host clipboard -> guest, only while this window has focus.
@@ -1217,6 +1417,8 @@ impl Console {
             }
         }
         self.win.set_captured(self.io.borrow().focused && self.state == VmState::Running);
+        self.win.set_coherence_why(self.coherence_why().into());
+        self.coh_tick();
     }
 
     /// A file is dragged over the window (several come at once).
@@ -1368,6 +1570,13 @@ impl Console {
             let io = self.io.borrow();
             let tx = io.tx.as_ref().ok_or_else(|| std::io::Error::other("the VM is gone"))?;
             vroom_display::send_fd_with(tx, &ToVmm::Drop { id }.encode(), theirs.as_raw_fd()).map_err(|e| std::io::Error::other(e.to_string()))?;
+            // Not closed at once: macOS can hand over a socket already
+            // disconnected when the sender's copy closes while it is in
+            // flight (about 1 in 10 here). The VMM has it within moments.
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(3));
+                drop(theirs);
+            });
             Ok(ours)
         });
         match sent.and_then(|ours| std::thread::Builder::new().name("drop".into()).spawn(move || crate::dnd::send(id, paths, ours, progress))) {
@@ -1413,6 +1622,215 @@ impl Console {
             (false, _) => format!("Copy to {} failed: {place}", self.name),
         };
         self.toast(&t);
+    }
+
+    /// The mouse moved (`Some`: where, in physical pixels on the window)
+    /// or left the window, with the guest's button held since a press on
+    /// its screen. Out of the screen: ask the guest what it drags.
+    fn drag_out_check(&mut self, at: Option<(f64, f64)>) {
+        if !self.io.borrow().out_armed || self.out.is_some() || self.drag.is_some() || self.state != VmState::Running {
+            return;
+        }
+        if let Some((x, y)) = at {
+            let sf = self.win.window().scale_factor() as f64;
+            let (x, y) = (x / sf, y / sf);
+            let (sx, sy) = (self.win.get_screen_x() as f64, self.win.get_screen_y() as f64);
+            let (sw, sh) = (self.win.get_screen_width() as f64, self.win.get_screen_height() as f64);
+            const M: f64 = 2.0;
+            if x >= sx - M && x <= sx + sw + M && y >= sy - M && y <= sy + sh + M {
+                return;
+            }
+        }
+        // Once per press.
+        self.io.borrow_mut().out_armed = false;
+        self.drag_seq = self.drag_seq.wrapping_add(1);
+        let id = self.drag_seq;
+        self.out = Some(OutDrag {
+            id,
+            asked: Instant::now(),
+            items: Vec::new(),
+            #[cfg(target_os = "macos")]
+            session: None,
+            progress: Arc::default(),
+            dropped: None,
+            fetching: false,
+            copied: 0,
+            failed: None,
+        });
+        log::info!("drag {id} out: the mouse left the screen with the button held, asking the guest");
+        self.io.borrow_mut().send(ToVmm::DragOut { id, end: false });
+        let k = self.key.clone();
+        self.out_timer.start(slint::TimerMode::Repeated, Duration::from_millis(100), move || {
+            with(&k, |c| c.drag_out_tick());
+        });
+    }
+
+    /// The guest's answer: what it drags (nothing: no drag of files).
+    fn drag_out_items(&mut self, id: u32, items: Vec<(String, bool)>) {
+        let Some(o) = self.out.as_mut().filter(|o| o.id == id && o.items.is_empty()) else { return };
+        // Names from the guest: ones a Mac folder takes as they are.
+        if items.is_empty() || items.len() > vroom_proto::DROP_ITEMS_MAX || !items.iter().all(|(n, _)| vroom_proto::drop_name_ok(n)) {
+            self.drag_out_end(None);
+            return;
+        }
+        o.items = items;
+        match self.drag_out_start(id) {
+            Ok(()) => {
+                // The Mac has the drag now: give up the guest's (Escape
+                // cancels it there, nothing is dropped in the guest).
+                let mut io = self.io.borrow_mut();
+                io.key(KEY_ESC, true);
+                io.key(KEY_ESC, false);
+                io.button(BTN_LEFT, false);
+            }
+            Err(e) => {
+                log::info!("drag {id} out: {e}");
+                self.drag_out_end(None);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn drag_out_start(&mut self, id: u32) -> Result<(), String> {
+        use slint::winit_030::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        if !crate::dragout_mac::button_down() {
+            return Err("the mouse button is up already".into());
+        }
+        let view = self
+            .win
+            .window()
+            .with_winit_window(|w| match w.window_handle().ok()?.as_raw() {
+                RawWindowHandle::AppKit(h) => Some(h.ns_view.as_ptr()),
+                _ => None,
+            })
+            .flatten()
+            .ok_or("no window to drag from")?;
+        let Some(o) = self.out.as_mut() else { return Err("over".into()) };
+        let key = self.key.clone();
+        let (k1, k2, k3) = (key.clone(), key.clone(), key);
+        let job = Arc::new(crate::dragout_mac::Job {
+            id,
+            get: Box::new(move |item| {
+                // A pipe for the item; the window's thread hands one end
+                // to the VMM.
+                let (ours, theirs) = UnixStream::pair()?;
+                let k = k1.clone();
+                slint::invoke_from_event_loop(move || {
+                    with(&k, |c| c.drag_out_get(id, item, theirs));
+                })
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+                Ok(ours)
+            }),
+            done: Box::new(move |item, r| {
+                let k = k2.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    with(&k, |c| c.drag_out_written(id, item, r));
+                });
+            }),
+            progress: o.progress.clone(),
+        });
+        let ended = Box::new(move |dropped: bool| {
+            // Not from inside AppKit's callback.
+            slint::Timer::single_shot(Duration::ZERO, move || {
+                with(&k3, |c| c.drag_out_ended(id, dropped));
+            });
+        });
+        o.session = Some(crate::dragout_mac::start(view, &o.items, job, ended)?);
+        log::info!("drag {id} out: {} item(s) on the Mac", o.items.len());
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn drag_out_start(&mut self, _id: u32) -> Result<(), String> {
+        Err("no drags out of the window here".into())
+    }
+
+    /// The Mac's drag ended: dropped somewhere, or given up.
+    fn drag_out_ended(&mut self, id: u32, dropped: bool) {
+        let Some(o) = self.out.as_mut().filter(|o| o.id == id) else { return };
+        if !dropped && o.copied == 0 && !o.fetching {
+            self.drag_out_end(None);
+            return;
+        }
+        o.dropped = Some(Instant::now());
+    }
+
+    /// The Mac drop wants item `item`: the VMM writes it into `pipe`.
+    fn drag_out_get(&mut self, id: u32, item: u32, pipe: UnixStream) {
+        let Some(o) = self.out.as_mut().filter(|o| o.id == id) else { return };
+        o.fetching = true;
+        o.dropped.get_or_insert_with(Instant::now);
+        let io = self.io.borrow();
+        if let Some(tx) = io.tx.as_ref() {
+            if let Err(e) = vroom_display::send_fd_with(tx, &ToVmm::DragOutGet { id, item }.encode(), pipe.as_raw_fd()) {
+                log::warn!("drag {id} out: {e}");
+            }
+        }
+        // Dropping our copy of the VMM's end: the pipe then closes when
+        // the VMM is done with it (or never got it).
+    }
+
+    fn drag_out_written(&mut self, id: u32, item: u32, r: Result<PathBuf, String>) {
+        let Some(o) = self.out.as_mut().filter(|o| o.id == id) else { return };
+        o.fetching = false;
+        o.dropped = Some(Instant::now());
+        match r {
+            Ok(p) => {
+                log::info!("drag {id} out: item {item} written to {}", p.display());
+                o.copied += 1;
+            }
+            Err(e) => o.failed = Some(e),
+        }
+        if o.failed.is_some() || o.copied as usize >= o.items.len() {
+            let t = self.drag_out_summary();
+            self.drag_out_end(Some(t));
+        }
+    }
+
+    fn drag_out_summary(&self) -> String {
+        let Some(o) = &self.out else { return String::new() };
+        let what = |n: u32| if n == 1 { o.items.first().map(|i| i.0.clone()).unwrap_or_default() } else { format!("{n} items") };
+        match &o.failed {
+            None => format!("Copied {} from {} to the Mac", what(o.copied), self.name),
+            Some(e) => format!("Copy from {} failed: {}", self.name, clean(e)),
+        }
+    }
+
+    fn drag_out_tick(&mut self) {
+        let Some(o) = &self.out else {
+            self.out_timer.stop();
+            return;
+        };
+        let now = Instant::now();
+        if o.items.is_empty() && now - o.asked > OUT_ASK {
+            self.drag_out_end(None);
+            return;
+        }
+        if o.fetching {
+            let (sent, total) = (o.progress.sent.load(Ordering::Relaxed), o.progress.total.load(Ordering::Relaxed));
+            let f = if total == 0 { 0.0 } else { (sent as f32 / total as f32).min(1.0) };
+            let what = if o.items.len() == 1 { o.items[0].0.clone() } else { format!("{} items", o.items.len()) };
+            self.win.set_drop_text(format!("Copying {what} to the Mac: {}%", (f * 100.0) as u32).into());
+            self.win.set_drop_progress(f);
+        } else if o.dropped.is_some_and(|t| now - t > OUT_IDLE) {
+            let t = (o.copied > 0 || o.failed.is_some()).then(|| self.drag_out_summary());
+            self.drag_out_end(t);
+        }
+    }
+
+    /// The drag out is over: the guest may forget it.
+    fn drag_out_end(&mut self, toast: Option<String>) {
+        let Some(o) = self.out.take() else { return };
+        o.progress.stop.store(true, Ordering::Relaxed);
+        self.out_timer.stop();
+        self.io.borrow_mut().send(ToVmm::DragOut { id: o.id, end: true });
+        if self.drag.is_none() {
+            self.win.set_drop_text("".into());
+            self.win.set_drop_progress(-1.0);
+        }
+        if let Some(t) = toast {
+            self.toast(&t);
+        }
     }
 
     /// "12%": the host CPU time the VM took over the last second or so,
@@ -1582,6 +2000,34 @@ impl Console {
         Ok(e)
     }
 
+    /// Coherence starts: the other monitors go off (their windows hide).
+    /// The ones that were on.
+    pub(super) fn extras_pause(&mut self) -> Vec<usize> {
+        let mut off = Vec::new();
+        for (i, e) in self.extra.iter_mut().enumerate() {
+            let Some(e) = e.as_mut().filter(|e| !e.closed) else { continue };
+            e.closed = true;
+            e.pending_resize = None;
+            let _ = e.win.hide();
+            off.push(i + 1);
+        }
+        for &head in &off {
+            self.io.borrow_mut().send(ToVmm::HeadResize { head: head as u32, width: 0, height: 0, scale: 0 });
+        }
+        off
+    }
+
+    /// Coherence ends: those monitors come back.
+    pub(super) fn extras_resume(&mut self, heads: &[usize]) {
+        for &h in heads {
+            if let Some(e) = self.extra.get_mut(h.wrapping_sub(1)).and_then(Option::as_mut) {
+                e.closed = false;
+                let _ = e.win.show();
+                e.pending_resize = Some(Instant::now());
+            }
+        }
+    }
+
     /// Its window closed: the guest loses that monitor.
     fn close_extra(&mut self, head: usize) {
         let Some(e) = self.extra.get_mut(head.wrapping_sub(1)).and_then(Option::as_mut) else { return };
@@ -1652,6 +2098,7 @@ impl Console {
             self.mode = (0, 0);
             self.win.set_mode_w(0);
             self.win.set_mode_h(0);
+            self.coh_mode();
             return;
         }
         let fresh = full || self.mode != mode;
@@ -1661,12 +2108,16 @@ impl Console {
         }
         if self.mode != mode {
             // Ask the guest to match the window on the first frame.
-            if self.mode == (0, 0) {
+            if self.mode == (0, 0) && self.coh.is_none() {
                 self.pending_resize = Some(Instant::now());
             }
             self.mode = mode;
             self.win.set_mode_w(w as i32);
             self.win.set_mode_h(h as i32);
+            // Coherence windows sit by the new size; their pictures follow.
+            self.coh_mode();
+        } else {
+            self.coh_pictures(if fresh { None } else { damage });
         }
         if self.state == VmState::Starting {
             self.ever_ran = true;
@@ -1973,6 +2424,7 @@ mod tests {
             buttons: BTreeSet::new(),
             wheel: (0.0, 0.0),
             focused: true,
+            out_armed: false,
         };
         io.key(30, true);
         io.button(272, true);

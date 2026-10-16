@@ -10,9 +10,21 @@ Commands, one per line, on <state-dir>.cmd (a fifo):
   resize W H | focus 0|1 | clip TEXT | cmd N | quit
   hmove N X Y | hclick N X Y   on monitor N (2, 3...), its guest pixels
   hresize N W H          monitor N's window size (0 0: closed)
+  coherence 0|1          Coherence on/off (windows show as "windows N: ...")
+  win ID activate|minimize|close | win ID move X Y W H
+  startapp NAME          start a guest app by name (icons show as "icon ID ...")
   serial TEXT            to the serial console (\\n for Enter)
   drop X Y X2 Y2 PATH... drag files in at X,Y, move to X2,Y2, drop there
                          (what the app does when files come from Finder)
+  usb ID [SERIAL]        plug a host USB device in, as the app does: start
+                         `vroom usb-host` for it, hand the VMM its socket
+                         (VROOM_USB_FAKE=acm in our environment: a pretend
+                         serial port)
+  usbdetach PORT         pull out the device on that port pair
+  dragout X Y X2 Y2 DIR  press at X,Y, drag to X2,Y2 (an edge), ask the guest
+                         what it drags out (as the app does when the mouse
+                         leaves the window), cancel its drag with Escape and
+                         fetch every item into DIR (as the Mac drop would)
 Viewer events (mode, clipboard, status, mic, guest pointer: its picture as
 <state-dir>.cursor-N.png) go to <state-dir>.events.
 """
@@ -73,6 +85,41 @@ def reader():
                 i, ok = struct.unpack("<IB", pl[:5]); place = pl[5:].decode(errors="replace")
                 ev.write(f"dropdone {i} {ok} {place}\n")
                 drag_ev.append(("done", i, ok)); drag_cv.set()
+            elif t == 11:
+                n, o, out = pl[0], 1, []
+                for _ in range(n):
+                    port, flags = pl[o], pl[o + 1]; o += 2
+                    f = []
+                    for _ in range(3):
+                        ln = struct.unpack("<H", pl[o:o + 2])[0]; f.append(pl[o + 2:o + 2 + ln].decode()); o += 2 + ln
+                    out.append(f"{port}:{f[0]}{'' if flags & 1 else '(away)'}{'(always)' if flags & 2 else ''}")
+                ev.write("usb " + " ".join(out) + "\n")
+            elif t == 10:
+                ev.write(f"camera {pl[0]}\n")
+            elif t == 12:
+                ev.write(f"agent features {struct.unpack('<Q', pl)[0]:#x}\n")
+            elif t == 13:
+                n, o, out = struct.unpack("<I", pl[:4])[0], 4, []
+                for _ in range(n):
+                    i, x, y, w, h, f, tl = struct.unpack("<IiiIIIH", pl[o:o + 26])
+                    out.append(f"{i:#x} {x},{y} {w}x{h} f{f} {pl[o + 26:o + 26 + tl].decode(errors='replace')!r}")
+                    o += 26 + tl
+                ev.write(f"windows {n}: " + " | ".join(out) + "\n")
+            elif t == 14:
+                i, = struct.unpack("<I", pl[:4]); items, o = [], 4
+                while o < len(pl):
+                    d, n = pl[o], struct.unpack("<H", pl[o + 1:o + 3])[0]
+                    items.append((pl[o + 3:o + 3 + n].decode(), bool(d))); o += 3 + n
+                ev.write(f"dragout {i}: {items}\n")
+                drag_ev.append(("out", i, items)); drag_cv.set()
+            elif t == 18:
+                i, w, h = struct.unpack("<IHH", pl[:8])
+                png = f"{state}.icon-{i:x}.png"
+                if w:
+                    write_png(png, w, h, pl[8:])
+                ev.write(f"icon {i:#x} {w}x{h} {png if w else 'none'}\n")
+            elif t == 19:
+                ev.write(f"no coherence: {pl.decode(errors='replace')}\n")
             elif t == 7:
                 if pl[0] != 2:
                     ev.write("cursor " + ("unset", "hidden")[pl[0]] + "\n"); continue
@@ -174,6 +221,71 @@ def drop(x, y, x2, y2, paths):
     if live:
         button(0x110, False)
 
+helpers = []
+def usb_attach(id_, serial=""):
+    r, w = socket.socketpair()
+    args = [vroom, "usb-host", "--id", id_] + (["--serial", serial] if serial else [])
+    helpers.append(subprocess.Popen(args, stdin=w.fileno(), stdout=subprocess.DEVNULL,
+                                    stderr=open(state + ".log", "ab")))
+    w.close()
+    pl = b"".join(struct.pack("<H", len(x.encode())) + x.encode() for x in (id_, serial, "test " + id_))
+    socket.send_fds(a, [struct.pack("<BI", 12, len(pl)) + pl], [r.fileno()]); r.close()
+def fetch(i, idx, into):
+    r, w = socket.socketpair()
+    socket.send_fds(a, [struct.pack("<BI", 17, 8) + u32s(i, idx)], [w.fileno()]); w.close()
+    buf, f, t0, n = b"", None, time.time(), 0
+    r.settimeout(60)
+    while True:
+        try:
+            d = r.recv(1 << 20)
+        except socket.timeout:
+            return "timeout"
+        if not d:
+            return "pipe closed"
+        buf += d
+        while len(buf) >= 8:
+            t, ln = buf[3], struct.unpack("<I", buf[4:8])[0]
+            if len(buf) < 8 + ln:
+                break
+            pl, buf = buf[8:8 + ln], buf[8 + ln:]
+            if t == 13:
+                isdir, size, path = pl[4], struct.unpack("<Q", pl[5:13])[0], pl[13:].decode()
+                if ".." in path.split("/") or path.startswith("/"):
+                    return "bad path " + path
+                dst = os.path.join(into, path)
+                if f: f.close(); f = None
+                if isdir: os.makedirs(dst, exist_ok=True)
+                else: f = open(dst, "xb")
+            elif t == 14:
+                f.write(pl[4:]); n += len(pl) - 4
+            elif t == 15:
+                if f: f.close()
+                return f"ok {n} bytes in {time.time() - t0:.1f}s"
+            elif t == 24:
+                return "failed: " + pl[4:].decode(errors="replace")
+
+out_id = [500]
+def dragout(x, y, x2, y2, into):
+    out_id[0] += 1; i = out_id[0]
+    move(x, y); button(0x110, True)
+    for k in range(1, 21):
+        move(x + (x2 - x) * k // 20, y + (y2 - y) * k // 20); time.sleep(0.03)
+    time.sleep(0.3)
+    t0 = time.time()
+    send(16, u32s(i) + b"\x00")
+    e = wait_drag(("out",), i, 10)
+    ev.write(f"dragout {i}: answer after {time.time() - t0:.2f}s: {e}\n")
+    if os.path.exists(state + ".dropshot"):  # screenshot mid-drag (tests)
+        p.stdin.write(b"\x01g"); p.stdin.flush(); time.sleep(1.5)
+    items = e[2] if e else []
+    if items:
+        key(1, True); key(1, False)
+    button(0x110, False)
+    os.makedirs(into, exist_ok=True)
+    for idx, (name, d) in enumerate(items):
+        ev.write(f"dragout {i}: {name}: {fetch(i, idx, into)}\n")
+    send(16, u32s(i) + b"\x01")
+
 send(6, b"\x01")  # focused: lets clipboard flow
 import select
 def lines():
@@ -227,7 +339,21 @@ if True:
                 elif c == "drop":
                     v = arg.split(" ", 4)
                     drop(int(v[0]), int(v[1]), int(v[2]), int(v[3]), v[4].split("|"))
+                elif c == "usb": usb_attach(*arg.split())
+                elif c == "usbdetach": send(13, bytes([int(arg)]))
+                elif c == "dragout":
+                    v = arg.split(" ", 4)
+                    dragout(int(v[0]), int(v[1]), int(v[2]), int(v[3]), v[4])
                 elif c == "quit": p.stdin.write(b"\x01x"); p.stdin.flush()
+                elif c == "coherence": send(14, bytes([int(arg)]))
+                elif c == "startapp": send(20, arg.strip().encode())
+                elif c == "win":
+                    v = arg.split()
+                    ops = {"activate": 1, "minimize": 2, "close": 3, "move": 4}
+                    pl = u32s(int(v[0], 0)) + bytes([ops[v[1]]])
+                    if v[1] == "move":
+                        pl += u32s(*[int(x) for x in v[2:6]])
+                    send(15, pl)
             except Exception as e:
                 ev.write(f"error {line.strip()}: {e}\n")
 p.wait()

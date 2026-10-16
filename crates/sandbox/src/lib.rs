@@ -81,6 +81,13 @@ pub fn usb_profile(exe: &std::path::Path) -> Result<String> {
     macos::usb_profile(exe)
 }
 
+/// The same for the helper vroom-netd starts as root: libusb only from
+/// `lib`, a root-owned copy.
+#[cfg(target_os = "macos")]
+pub fn usb_profile_root(exe: &std::path::Path, lib: &std::path::Path) -> Result<String> {
+    macos::usb_profile_root(exe, lib)
+}
+
 /// Lock down the USB passthrough helper (Linux), once libusb is loaded:
 /// no new privileges, and Landlock leaves it the USB device nodes and
 /// sysfs (read-only) only. Its seccomp filter is still to come.

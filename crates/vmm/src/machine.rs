@@ -309,6 +309,11 @@ fn in_process(vm: &Arc<dyn Vm>, config: &VmConfig) -> Result<Box<dyn Renderer3d>
         return Err(Error::Setup(NO_VIRGL.into()));
     }
     vroom_gpu3d::set_map_granule(vm.map_granule());
+    // Venus and Direct3D contexts still get processes of their own.
+    #[cfg(target_os = "macos")]
+    if let Err(e) = std::env::current_exe().and_then(|exe| vroom_gpu3d::server::start(&exe)) {
+        log::warn!("gpu: no render server ({e}): Venus runs in here, no Direct3D");
+    }
     let r = vroom_gpu3d::Virgl::new(config.identity.gl_renderer.clone())
         .ok_or_else(|| Error::Setup("virglrenderer: Venus init failed (no Vulkan driver?)".into()))?;
     log::warn!("gpu: the 3D renderer runs inside the VMM (VROOM_GPU_IN_PROCESS)");
@@ -713,6 +718,7 @@ pub(crate) fn build(
     // helper process (started here, before the sandbox).
     let mut input = None;
     let mut xhci = None;
+    let mut usb_ports = None;
     // The camera: a USB device on the xHCI, fed by its helper.
     let camera = if config.camera {
         let feed = Arc::new(vroom_devices::usb::uvc::CameraFeed::default());
@@ -742,9 +748,8 @@ pub(crate) fn build(
             x
         })?;
         if let Some(x) = &xhci {
-            for (i, h) in helpers.into_iter().enumerate() {
-                h.run(i, x.clone())?;
-            }
+            let viewer = ui.as_ref().map(|d| d.tx());
+            usb_ports = Some(crate::usb::UsbPorts::new(x.clone(), helpers, viewer)?);
             if let Some((c, _)) = &camera {
                 c.run(x.clone())?;
             }
@@ -803,7 +808,7 @@ pub(crate) fn build(
             }
         };
         let windows = config.guest_os() == GuestOs::Windows;
-        ds.run(input, agent.clone(), events.clone(), window, listener, screens.clone(), windows)?;
+        ds.run(input, agent.clone(), events.clone(), window, listener, screens.clone(), windows, usb_ports)?;
     }
     for (i, n) in config.nets.iter().enumerate() {
         let mac = match &n.mac {

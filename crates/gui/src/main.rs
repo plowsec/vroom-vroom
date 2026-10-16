@@ -6,13 +6,19 @@
 mod app;
 mod console;
 mod dnd;
+mod dragout;
+#[cfg(target_os = "macos")]
+mod dragout_mac;
 mod edit;
 mod fmt;
 mod host;
+mod hostusb;
 mod keymap;
 mod library;
+mod mac;
 mod msg;
 mod paths;
+mod rootd;
 mod shot;
 mod vm;
 
@@ -54,18 +60,23 @@ pub fn fallback(m: msg::Msg) {
                 let _ = slint::quit_event_loop();
             }
         }
+        Msg::Open(p) => match app::launch() {
+            Ok(()) => msg::send(Msg::Open(p)),
+            Err(e) => eprintln!("vroom-gui: {e}"),
+        },
         Msg::Toast { text, .. } => eprintln!("vroom-gui: {text}"),
         _ => {}
     }
 }
 
 fn main() {
+    mac::log_to_file_if_detached();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     if let Err(e) = slint::BackendSelector::new().backend_name("winit".into()).select() {
         eprintln!("vroom-gui: {e}");
         std::process::exit(1);
     }
-    let mut args = std::env::args().skip(1);
+    let mut args = std::env::args().skip(1).filter(|a| !mac::is_finder_arg(a));
     let r = match args.next() {
         None => app::launch(),
         Some(a) if a == "-h" || a == "--help" => {
@@ -86,13 +97,25 @@ fn main() {
                     eprintln!("vroom-gui: library: {e}");
                 }
             }
-            vroom_config::VmConfig::load(&p).map_err(|e| e.to_string()).and_then(|cfg| console::start(&p, &cfg, &extra).map(|_| ()))
+            vroom_config::VmConfig::load(&p).map_err(|e| e.to_string()).and_then(|cfg| {
+                // Running without a window (the app crashed): show it again.
+                let dir = cfg.default_state_dir(&p);
+                match console::viewer_socket(&dir) {
+                    Some(sock) if vroom_state::StateLock::in_use(&dir) => {
+                        let pid = vroom_state::StateLock::holder(&dir).unwrap_or(0);
+                        console::attach(&p, &cfg, &sock, pid).map(|_| ())
+                    }
+                    _ => console::start(&p, &cfg, &extra).map(|_| ()),
+                }
+            })
         }
     };
     if let Err(e) = r {
         eprintln!("vroom-gui: {e}");
         std::process::exit(1);
     }
+    // Files opened from Finder and the Dock icon.
+    mac::install();
     if let Some(shot) = std::env::var_os("VROOM_SHOT") {
         shot::schedule(std::path::PathBuf::from(shot));
     }

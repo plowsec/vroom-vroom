@@ -1,6 +1,7 @@
 //! Framed messages: type u8 | len u32 LE | payload.
 
 use crate::{Error, Result, MAX_HEADS};
+pub use vroom_proto::{GuestWindow, WindowOp};
 
 /// Absolute pointer range (like a USB tablet).
 pub const POINTER_MAX: u16 = 32767;
@@ -12,6 +13,63 @@ const MAX_MSG: usize = 16 << 20;
 pub const DRAG_ITEMS_MAX: usize = 4096;
 /// Biggest guest pointer picture, in pixels on a side.
 pub const CURSOR_MAX: u32 = 256;
+/// Most host USB devices a VM lists (its port pairs).
+pub const USB_PORTS_MAX: usize = 16;
+
+/// A host USB device, as the viewer names it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UsbDev {
+    /// "vendor:product", 4 hex digits each.
+    pub id: String,
+    /// Empty: none.
+    pub serial: String,
+    /// A label for people.
+    pub name: String,
+}
+
+impl UsbDev {
+    /// Plain text only, and short: these end up in the VM file and on
+    /// screen.
+    pub fn valid(&self) -> bool {
+        let hex = |s: &str| s.len() == 4 && s.bytes().all(|b| b.is_ascii_hexdigit());
+        let id = self.id.split_once(':').is_some_and(|(v, p)| hex(v) && hex(p));
+        let text = |s: &str, max: usize| s.len() <= max && !s.chars().any(char::is_control);
+        id && text(&self.serial, 126) && text(&self.name, 128)
+    }
+
+    fn encode(&self, p: &mut Vec<u8>) {
+        for s in [&self.id, &self.serial, &self.name] {
+            p.extend_from_slice(&(s.len() as u16).to_le_bytes());
+            p.extend_from_slice(s.as_bytes());
+        }
+    }
+
+    fn decode(p: &[u8], o: &mut usize) -> Result<UsbDev> {
+        let mut f = || -> Result<String> {
+            let len = u16::from_le_bytes(p.get(*o..*o + 2).ok_or(Error::Proto("short"))?.try_into().map_err(|_| Error::Proto("short"))?) as usize;
+            let s = text(p.get(*o + 2..*o + 2 + len).ok_or(Error::Proto("short"))?)?;
+            *o += 2 + len;
+            Ok(s)
+        };
+        let d = UsbDev { id: f()?, serial: f()?, name: f()? };
+        if !d.valid() {
+            return Err(Error::Proto("usb device"));
+        }
+        Ok(d)
+    }
+}
+
+/// A host device on one of the VM's USB port pairs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsbPort {
+    pub port: u8,
+    pub dev: UsbDev,
+    /// Its helper has it open (else it was unplugged from the Mac, or
+    /// not found yet).
+    pub here: bool,
+    /// From the VM file (`[[usb]]`), connected at every start.
+    pub always: bool,
+}
 
 /// VMM -> viewer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +97,24 @@ pub enum ToViewer {
     /// The dropped files are in the guest (`ok`), or why not. `place`:
     /// where they went, without a live drag.
     DropDone { id: u32, ok: bool, place: String },
+    /// The host USB devices the VM has now. Sent once the VM has a USB
+    /// controller to plug them into, and whenever the list changes.
+    Usb(Vec<UsbPort>),
+    /// The guest agent said hello: what it can do (`vroom_proto::features`).
+    Agent { features: u64 },
+    /// Coherence: the guest's windows, front to back (checked like the
+    /// agent's message; the viewer still clips them to the screen).
+    Windows(Vec<GuestWindow>),
+    /// Files dragged out of the guest (answer to `ToVmm::DragOut`): their
+    /// top-level names and whether each is a folder; none when the guest
+    /// isn't dragging files.
+    DragOutItems { id: u32, items: Vec<(String, bool)> },
+    /// Coherence: the app icon of a guest window, `w` x `h` RGBA (not
+    /// premultiplied), at most `vroom_proto::ICON_MAX` on a side; 0 x 0:
+    /// none. Checked like the agent's message.
+    WindowIcon { id: u32, w: u32, h: u32, rgba: Vec<u8> },
+    /// Coherence can't work in the guest's session, and why.
+    CoherenceNo(String),
     /// Another guest monitor's mode (`head` 1..MAX_HEADS; head 0 is
     /// `Mode`). 0x0: the guest turned it off. Its pixels are in slot
     /// `head` of the framebuffer.
@@ -99,6 +175,26 @@ pub enum ToVmm {
     /// Dropped: comes with a pipe (SCM_RIGHTS) the viewer writes the
     /// files into, as guest agent frames (DropEntry, DropData, DropEnd).
     Drop { id: u32 },
+    /// Plug a host USB device in: comes with the socket of the helper the
+    /// viewer started for it (SCM_RIGHTS), which the VMM talks to as it
+    /// does to the helpers it starts itself.
+    UsbAttach(UsbDev),
+    /// Pull the device on this port pair out; its helper is told to go.
+    UsbDetach { port: u8 },
+    /// Coherence on or off (the guest agent shows and hides its taskbar).
+    Coherence(bool),
+    /// Coherence: do this to a guest window.
+    Window { id: u32, op: WindowOp },
+    /// The mouse left the window with the guest's button held (`end`
+    /// false): is the guest dragging files out? Or (`end`) that drag is
+    /// over, the guest may forget it.
+    DragOut { id: u32, end: bool },
+    /// The Mac drop wants item `item` of a drag out: comes with a pipe
+    /// (SCM_RIGHTS) the VMM writes it into, as guest agent frames
+    /// (DropEntry, DropData, DropEnd, or DragOutFail), checked.
+    DragOutGet { id: u32, item: u32 },
+    /// Start the guest app with this name (`vroom_proto::line_ok`).
+    StartApp(String),
     /// Another monitor's window changed size (as `Resize`, for monitor
     /// `head` 1..MAX_HEADS). 0x0: its window is closed, unplug it.
     HeadResize { head: u32, width: u32, height: u32, scale: u32 },
@@ -132,8 +228,44 @@ fn head(h: u32) -> Result<u32> {
     }
 }
 
+/// id u32, then dir u8 | len u16 | name for each item.
+fn items_payload(id: u32, items: &[(String, bool)]) -> Vec<u8> {
+    let mut p = id.to_le_bytes().to_vec();
+    for (name, dir) in items {
+        p.push(*dir as u8);
+        p.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        p.extend_from_slice(name.as_bytes());
+    }
+    p
+}
+
+fn parse_items(p: &[u8]) -> Result<(u32, Vec<(String, bool)>)> {
+    let id = get_u32(p, 0)?;
+    let mut items = Vec::new();
+    let mut o = 4;
+    while o < p.len() {
+        if items.len() >= DRAG_ITEMS_MAX {
+            return Err(Error::Proto("drag items"));
+        }
+        let len = u16::from_le_bytes(p.get(o + 1..o + 3).ok_or(Error::Proto("short"))?.try_into().map_err(|_| Error::Proto("short"))?) as usize;
+        let name = text(p.get(o + 3..o + 3 + len).ok_or(Error::Proto("short"))?)?;
+        items.push((name, p[o] != 0));
+        o += 3 + len;
+    }
+    Ok((id, items))
+}
+
 fn text(p: &[u8]) -> Result<String> {
     std::str::from_utf8(p).map(|s| s.to_string()).map_err(|_| Error::Proto("utf-8"))
+}
+
+/// One short line of plain text (`vroom_proto::line_ok`).
+fn line(p: &[u8]) -> Result<String> {
+    let s = text(p)?;
+    if !vroom_proto::line_ok(&s) {
+        return Err(Error::Proto("line"));
+    }
+    Ok(s)
 }
 
 impl ToViewer {
@@ -165,6 +297,20 @@ impl ToViewer {
                 p.extend_from_slice(place.as_bytes());
                 frame(9, &p)
             }
+            ToViewer::Usb(ports) => {
+                let mut p = vec![ports.len() as u8];
+                for u in ports {
+                    p.push(u.port);
+                    p.push(u.here as u8 | (u.always as u8) << 1);
+                    u.dev.encode(&mut p);
+                }
+                frame(11, &p)
+            }
+            ToViewer::Agent { features } => frame(12, &features.to_le_bytes()),
+            ToViewer::Windows(list) => frame(13, &vroom_proto::encode_windows(list)),
+            ToViewer::DragOutItems { id, items } => frame(14, &items_payload(*id, items)),
+            ToViewer::WindowIcon { id, w, h, rgba } => frame(18, &vroom_proto::encode_icon(*id, *w, *h, rgba)),
+            ToViewer::CoherenceNo(s) => frame(19, s.as_bytes()),
             ToViewer::HeadMode { head, width, height } => frame(16, &u32s(&[*head, *width, *height])),
             ToViewer::HeadDamage { head, x, y, w, h } => frame(17, &u32s(&[*head, *x, *y, *w, *h])),
         }
@@ -201,7 +347,36 @@ impl ToViewer {
             }),
             10 => ToViewer::Camera(*p.first().ok_or(Error::Proto("short"))? != 0),
             8 if p.len() == 5 => ToViewer::DragReady { id: get_u32(p, 0)?, live: p[4] != 0 },
+            14 => {
+                let (id, items) = parse_items(p)?;
+                ToViewer::DragOutItems { id, items }
+            }
             9 if p.len() >= 5 => ToViewer::DropDone { id: get_u32(p, 0)?, ok: p[4] != 0, place: text(&p[5..])?.chars().take(256).collect() },
+            11 => {
+                let n = *p.first().ok_or(Error::Proto("short"))? as usize;
+                if n > USB_PORTS_MAX {
+                    return Err(Error::Proto("usb ports"));
+                }
+                let mut o = 1;
+                let mut ports = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let (port, flags) = (*p.get(o).ok_or(Error::Proto("short"))?, *p.get(o + 1).ok_or(Error::Proto("short"))?);
+                    o += 2;
+                    let dev = UsbDev::decode(p, &mut o)?;
+                    ports.push(UsbPort { port, dev, here: flags & 1 != 0, always: flags & 2 != 0 });
+                }
+                if o != p.len() {
+                    return Err(Error::Proto("usb ports"));
+                }
+                ToViewer::Usb(ports)
+            }
+            12 if p.len() == 8 => ToViewer::Agent { features: u64::from(get_u32(p, 0)?) | u64::from(get_u32(p, 1)?) << 32 },
+            13 => ToViewer::Windows(vroom_proto::decode_windows(p).ok_or(Error::Proto("windows"))?),
+            18 => {
+                let (id, w, h, rgba) = vroom_proto::decode_icon(p).ok_or(Error::Proto("window icon"))?;
+                ToViewer::WindowIcon { id, w, h, rgba }
+            }
+            19 => ToViewer::CoherenceNo(line(p)?),
             _ => return Err(Error::Proto("unknown viewer message")),
         })
     }
@@ -218,17 +393,28 @@ impl ToVmm {
             ToVmm::Focus(f) => frame(6, &[*f as u8]),
             ToVmm::Clipboard(s) => frame(7, s.as_bytes()),
             ToVmm::Command(c) => frame(8, &[*c as u8]),
-            ToVmm::DragEnter { id, items } => {
-                let mut p = id.to_le_bytes().to_vec();
-                for (name, dir) in items {
-                    p.push(*dir as u8);
-                    p.extend_from_slice(&(name.len() as u16).to_le_bytes());
-                    p.extend_from_slice(name.as_bytes());
-                }
-                frame(9, &p)
-            }
+            ToVmm::DragEnter { id, items } => frame(9, &items_payload(*id, items)),
             ToVmm::DragCancel { id } => frame(10, &id.to_le_bytes()),
             ToVmm::Drop { id } => frame(11, &id.to_le_bytes()),
+            ToVmm::UsbAttach(d) => {
+                let mut p = Vec::new();
+                d.encode(&mut p);
+                frame(12, &p)
+            }
+            ToVmm::UsbDetach { port } => frame(13, &[*port]),
+            ToVmm::Coherence(on) => frame(14, &[*on as u8]),
+            ToVmm::Window { id, op } => {
+                let mut p = id.to_le_bytes().to_vec();
+                p.extend_from_slice(&op.encode());
+                frame(15, &p)
+            }
+            ToVmm::DragOut { id, end } => {
+                let mut p = id.to_le_bytes().to_vec();
+                p.push(*end as u8);
+                frame(16, &p)
+            }
+            ToVmm::DragOutGet { id, item } => frame(17, &u32s(&[*id, *item])),
+            ToVmm::StartApp(s) => frame(20, s.as_bytes()),
             ToVmm::HeadResize { head, width, height, scale } => frame(18, &u32s(&[*head, *width, *height, *scale])),
             ToVmm::HeadPointer { head, x, y } => frame(19, &u32s(&[*head, *x as u32, *y as u32])),
         }
@@ -265,22 +451,28 @@ impl ToVmm {
                 _ => return Err(Error::Proto("unknown command")),
             }),
             9 => {
-                let id = get_u32(p, 0)?;
-                let mut items = Vec::new();
-                let mut o = 4;
-                while o < p.len() {
-                    let len = u16::from_le_bytes(p.get(o + 1..o + 3).ok_or(Error::Proto("short"))?.try_into().map_err(|_| Error::Proto("short"))?) as usize;
-                    let name = text(p.get(o + 3..o + 3 + len).ok_or(Error::Proto("short"))?)?;
-                    items.push((name, p[o] != 0));
-                    o += 3 + len;
-                }
-                if items.is_empty() || items.len() > DRAG_ITEMS_MAX {
+                let (id, items) = parse_items(p)?;
+                if items.is_empty() {
                     return Err(Error::Proto("drag items"));
                 }
                 ToVmm::DragEnter { id, items }
             }
             10 if p.len() == 4 => ToVmm::DragCancel { id: get_u32(p, 0)? },
             11 if p.len() == 4 => ToVmm::Drop { id: get_u32(p, 0)? },
+            12 => {
+                let mut o = 0;
+                let d = UsbDev::decode(p, &mut o)?;
+                if o != p.len() {
+                    return Err(Error::Proto("usb device"));
+                }
+                ToVmm::UsbAttach(d)
+            }
+            13 if p.len() == 1 => ToVmm::UsbDetach { port: p[0] },
+            14 if p.len() == 1 => ToVmm::Coherence(p[0] != 0),
+            15 if p.len() > 4 => ToVmm::Window { id: get_u32(p, 0)?, op: WindowOp::decode(&p[4..]).ok_or(Error::Proto("window op"))? },
+            16 if p.len() == 5 => ToVmm::DragOut { id: get_u32(p, 0)?, end: p[4] != 0 },
+            17 if p.len() == 8 => ToVmm::DragOutGet { id: get_u32(p, 0)?, item: get_u32(p, 1)? },
+            20 => ToVmm::StartApp(line(p)?),
             18 if p.len() == 16 => {
                 let (width, height, scale) = (get_u32(p, 1)?, get_u32(p, 2)?, get_u32(p, 3)?);
                 if scale != 0 && !(SCALE_MIN..=SCALE_MAX).contains(&scale) {
@@ -364,6 +556,15 @@ mod tests {
             ToVmm::DragEnter { id: 4, items: vec![("a.txt".into(), false), ("dir".into(), true)] },
             ToVmm::DragCancel { id: 4 },
             ToVmm::Drop { id: 4 },
+            ToVmm::UsbAttach(UsbDev { id: "1209:000a".into(), serial: "A1".into(), name: "dev board".into() }),
+            ToVmm::UsbDetach { port: 3 },
+            ToVmm::Coherence(true),
+            ToVmm::Window { id: 9, op: WindowOp::Activate },
+            ToVmm::Window { id: 9, op: WindowOp::Move { x: -3, y: 4, w: 100, h: 50 } },
+            ToVmm::DragOut { id: 5, end: false },
+            ToVmm::DragOut { id: 5, end: true },
+            ToVmm::DragOutGet { id: 5, item: 2 },
+            ToVmm::StartApp("Paint".into()),
             ToVmm::HeadResize { head: 1, width: 1920, height: 1080, scale: 200 },
             ToVmm::HeadResize { head: 3, width: 0, height: 0, scale: 0 },
             ToVmm::HeadPointer { head: 2, x: 5, y: 32767 },
@@ -386,6 +587,18 @@ mod tests {
             ToViewer::DragReady { id: 4, live: true },
             ToViewer::Camera(true),
             ToViewer::DropDone { id: 4, ok: false, place: "Desktop".into() },
+            ToViewer::Usb(vec![]),
+            ToViewer::Usb(vec![
+                UsbPort { port: 0, dev: UsbDev { id: "1209:000a".into(), serial: String::new(), name: "x".into() }, here: true, always: true },
+                UsbPort { port: 5, dev: UsbDev { id: "05ac:12a8".into(), serial: "s".into(), name: String::new() }, here: false, always: false },
+            ]),
+            ToViewer::Agent { features: 1 << 40 | 128 },
+            ToViewer::Windows(vec![GuestWindow { id: 1, x: 0, y: -2, w: 3, h: 4, flags: 4, title: "Paint".into() }]),
+            ToViewer::DragOutItems { id: 5, items: vec![("a b.txt".into(), false), ("dir".into(), true)] },
+            ToViewer::DragOutItems { id: 6, items: Vec::new() },
+            ToViewer::WindowIcon { id: 1, w: 1, h: 1, rgba: vec![1, 2, 3, 4] },
+            ToViewer::WindowIcon { id: 1, w: 0, h: 0, rgba: Vec::new() },
+            ToViewer::CoherenceNo("a Wayland session".into()),
             ToViewer::HeadMode { head: 1, width: 1024, height: 768 },
             ToViewer::HeadMode { head: 3, width: 0, height: 0 },
             ToViewer::HeadDamage { head: 2, x: 1, y: 2, w: 3, h: 4 },
@@ -440,5 +653,43 @@ mod tests {
         assert!(d.next_to_vmm().is_err());
         d.push(&frame(19, &u32s(&[1, 1 << 16, 0])));
         assert!(d.next_to_vmm().is_err(), "pointer out of range");
+    }
+
+    #[test]
+    fn usb_devices_are_checked() {
+        let dev = |id: &str, serial: &str, name: &str| UsbDev { id: id.into(), serial: serial.into(), name: name.into() };
+        let mut d = Decoder::default();
+        for bad in [dev("1209:0a", "", ""), dev("1209:000g", "", ""), dev("1209000a", "", ""), dev("1209:000a", "a\nb", ""), dev("1209:000a", "", &"n".repeat(129))] {
+            assert!(!bad.valid(), "{bad:?}");
+            d.push(&ToVmm::UsbAttach(bad).encode());
+            assert!(d.next_to_vmm().is_err());
+        }
+        // Trailing bytes, a list longer than it says, too many ports.
+        let mut p = Vec::new();
+        dev("1209:000a", "", "").encode(&mut p);
+        p.push(0);
+        d.push(&frame(12, &p));
+        assert!(d.next_to_vmm().is_err());
+        d.push(&frame(11, &[1]));
+        assert!(d.next_to_viewer().is_err());
+        d.push(&frame(11, &[USB_PORTS_MAX as u8 + 1]));
+        assert!(d.next_to_viewer().is_err());
+        d.push(&frame(13, &[1, 2]));
+        assert!(d.next_to_vmm().is_err());
+    }
+
+    #[test]
+    fn icons_and_lines_are_checked() {
+        let mut d = Decoder::default();
+        d.push(&frame(18, &vroom_proto::encode_icon(1, 2, 2, &[0; 12])));
+        assert!(d.next_to_viewer().is_err());
+        d.push(&frame(18, &vroom_proto::encode_icon(1, 65, 1, &[0; 260])));
+        assert!(d.next_to_viewer().is_err());
+        for bad in ["", "a\nb", &"x".repeat(vroom_proto::START_MAX + 1)] {
+            d.push(&frame(20, bad.as_bytes()));
+            assert!(d.next_to_vmm().is_err(), "{bad:?}");
+            d.push(&frame(19, bad.as_bytes()));
+            assert!(d.next_to_viewer().is_err(), "{bad:?}");
+        }
     }
 }

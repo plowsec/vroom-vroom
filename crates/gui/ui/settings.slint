@@ -64,11 +64,45 @@ component NetCard inherits SubCard {
     }
     Text {
         text: root.net.mode == 0 ? "The guest reaches the internet through this Mac. Nothing reaches the guest unless you forward a port."
-            : root.net.mode == 1 ? "The guest sits on your network like a real machine. Needs vroom-netd (root)."
-            : "A private network for VMs and this Mac. No internet. Needs vroom-netd (root).";
+            : root.net.mode == 1 ? "The guest sits on your network like a real machine."
+            : "A private network for VMs and this Mac. No internet.";
         font-size: Theme.fs-xs;
         color: Theme.text-3;
         wrap: word-wrap;
+    }
+    // Bridged and host-only go through vroom-netd, which runs as root.
+    if root.net.mode != 0 && root.host.netd == "ready": HorizontalLayout {
+        spacing: 8px;
+        Text {
+            text: "Goes through vroom-netd, vroom's helper that runs as root. It's running.";
+            font-size: Theme.fs-xs;
+            color: Theme.text-3;
+            wrap: word-wrap;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+        Button {
+            small: true;
+            kind: "ghost";
+            text: "Remove";
+            clicked => { Bus.act("netd.remove"); }
+        }
+    }
+    if root.net.mode != 0 && root.host.netd != "ready" && root.host.netd != "": Banner {
+        kind: 2;
+        text: root.host.netd == "stopped" ? "vroom-netd, the helper this needs (it runs as root), is installed but doesn't answer. Setting it up again starts it; macOS asks for an admin password."
+            : root.host.netd == "old" ? "vroom-netd, the helper this needs (it runs as root), is from an older vroom. Set it up again; macOS asks for an admin password."
+            : "This needs vroom-netd, a small helper that runs as root. It's set up once; macOS asks for an admin password.";
+    }
+    if root.net.mode != 0 && root.host.netd != "ready" && root.host.netd != "": HorizontalLayout {
+        alignment: start;
+        Button {
+            small: true;
+            kind: "primary";
+            text: root.host.netd-busy ? "Waiting for your password..." : "Set up (asks for your password)";
+            busy: root.host.netd-busy;
+            clicked => { Bus.act("netd.setup"); }
+        }
     }
     if root.net.mode == 0: VerticalLayout {
         spacing: 4px;

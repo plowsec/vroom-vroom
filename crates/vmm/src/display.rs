@@ -12,13 +12,14 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use vroom_display::{send_fd, Decoder, GuestCursor, SharedFb, ToViewer, ToVmm, MAX_HEADS, POINTER_MAX};
+use vroom_display::{send_fd, Decoder, GuestCursor, GuestWindow, SharedFb, ToViewer, ToVmm, MAX_HEADS, POINTER_MAX};
 use vroom_devices::usb::hid::HidEvent;
 use vroom_devices::usb::xhci::Xhci;
 use vroom_virtio::devices::gpu::{Cursor, DisplaySink};
 use vroom_virtio::devices::input::{self as ev, event};
 
 use crate::agent::{Agent, AgentCmd, ClipboardProvider};
+use crate::usb::UsbPorts;
 use crate::vcpu::VmEvent;
 
 /// Sends to the viewer without ever blocking the caller.
@@ -33,14 +34,30 @@ use crate::vcpu::VmEvent;
 /// what a newcomer needs to catch up is kept (`Sticky`).
 #[derive(Clone)]
 pub(crate) struct ViewerTx {
-    q: std::sync::mpsc::Sender<ToViewer>,
+    /// Messages, with the viewer generation they were sent in.
+    q: std::sync::mpsc::Sender<(u64, ToViewer)>,
+    /// Goes up with each viewer that attaches: what was queued before it
+    /// is stale (the catch-up replay told it the current state), so it is
+    /// dropped, not sent after the replay.
+    gen: Arc<std::sync::atomic::AtomicU64>,
     /// Per monitor: x0, y0, x1, y1 not yet sent; Some means a marker is
     /// queued.
     damage: Arc<Mutex<[Option<[u32; 4]>; MAX_HEADS]>>,
+    /// The guest's latest window list not yet sent (Coherence): like
+    /// damage, a guest that keeps changing it costs one queued message.
+    windows: Arc<Mutex<Option<Vec<GuestWindow>>>>,
+    /// Window icons not yet sent, by window: the latest of each, at most
+    /// `ICONS_PENDING` windows.
+    icons: Arc<Mutex<Icons>>,
     /// The viewer now, if any.
     sock: Arc<Mutex<Option<UnixStream>>>,
     sticky: Arc<Mutex<Sticky>>,
 }
+
+type Icons = std::collections::BTreeMap<u32, (u32, u32, Vec<u8>)>;
+
+/// Most window icons waiting for a slow viewer (16 KiB each at most).
+const ICONS_PENDING: usize = 2 * vroom_proto::WINDOWS_MAX;
 
 /// The last word on each thing a viewer shows: a new one gets these first.
 #[derive(Default)]
@@ -54,6 +71,10 @@ struct Sticky {
     state: Option<String>,
     /// "guest agent connected (...)".
     agent: Option<String>,
+    /// Host USB devices plugged in (once there is a USB controller).
+    usb: Option<Vec<vroom_display::UsbPort>>,
+    /// What the guest agent can do.
+    features: Option<u64>,
 }
 
 impl std::fmt::Debug for ViewerTx {
@@ -64,27 +85,52 @@ impl std::fmt::Debug for ViewerTx {
 
 impl ViewerTx {
     fn spawn(sock: Option<UnixStream>) -> std::io::Result<Self> {
-        let (q, rx) = std::sync::mpsc::channel::<ToViewer>();
+        let (q, rx) = std::sync::mpsc::channel::<(u64, ToViewer)>();
+        let gen = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let now = gen.clone();
         let damage = Arc::new(Mutex::new([None::<[u32; 4]>; MAX_HEADS]));
         let pending = damage.clone();
+        let windows = Arc::new(Mutex::new(None::<Vec<GuestWindow>>));
+        let pending_windows = windows.clone();
+        let icons = Arc::new(Mutex::new(Icons::new()));
+        let pending_icons = icons.clone();
         let sock = Arc::new(Mutex::new(sock));
         let out = sock.clone();
         std::thread::Builder::new().name("viewer-tx".into()).spawn(move || {
-            while let Ok(mut m) = rx.recv() {
+            while let Ok((g, mut m)) = rx.recv() {
+                // Damage and window markers take the state as it is now:
+                // fine for any viewer. Anything else from before the
+                // viewer attached is old news.
+                let marker = matches!(m, ToViewer::Damage { .. } | ToViewer::HeadDamage { .. } | ToViewer::Windows(_) | ToViewer::WindowIcon { .. });
                 if let Some(head) = damage_head(&m) {
                     let Some([x0, y0, x1, y1]) = pending.lock().unwrap_or_else(|e| e.into_inner())[head].take() else { continue };
                     let (x, y, w, h) = (x0, y0, x1 - x0, y1 - y0);
                     m = if head == 0 { ToViewer::Damage { x, y, w, h } } else { ToViewer::HeadDamage { head: head as u32, x, y, w, h } };
                 }
+                if matches!(m, ToViewer::Windows(_)) {
+                    let Some(list) = pending_windows.lock().unwrap_or_else(|e| e.into_inner()).take() else { continue };
+                    m = ToViewer::Windows(list);
+                }
+                let mut batch = vec![m];
+                if matches!(batch[0], ToViewer::WindowIcon { .. }) {
+                    let all = std::mem::take(&mut *pending_icons.lock().unwrap_or_else(|e| e.into_inner()));
+                    batch = all.into_iter().map(|(id, (w, h, rgba))| ToViewer::WindowIcon { id, w, h, rgba }).collect();
+                }
                 let mut s = out.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(v) = s.as_mut() {
-                    if v.write_all(&m.encode()).is_err() {
-                        *s = None;
+                // Checked under the lock attach() holds while it replays.
+                if !marker && g < now.load(std::sync::atomic::Ordering::Acquire) {
+                    continue;
+                }
+                for m in batch {
+                    if let Some(v) = s.as_mut() {
+                        if v.write_all(&m.encode()).is_err() {
+                            *s = None;
+                        }
                     }
                 }
             }
         })?;
-        Ok(ViewerTx { q, damage, sock, sticky: Arc::default() })
+        Ok(ViewerTx { q, gen, damage, windows, icons, sock, sticky: Arc::default() })
     }
 
     /// A viewer is connected.
@@ -98,8 +144,15 @@ impl ViewerTx {
 
     /// A new viewer: the framebuffer first (as at start), then what it
     /// missed, then everything from here on.
+    fn gen(&self) -> u64 {
+        self.gen.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     fn attach(&self, mut v: UnixStream, fb: RawFd) -> std::io::Result<()> {
         let mut s = self.sock.lock().unwrap_or_else(|e| e.into_inner());
+        // What is queued now is in the replay below (sticky is updated
+        // before a message is queued): drop the queued copies.
+        self.gen.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         send_fd(&v, fb).map_err(|e| std::io::Error::other(e.to_string()))?;
         let st = self.sticky.lock().unwrap_or_else(|e| e.into_inner());
         let mut first = Vec::new();
@@ -118,7 +171,9 @@ impl ViewerTx {
         first.extend(st.mic.map(ToViewer::Mic));
         first.extend(st.camera.map(ToViewer::Camera));
         first.extend(st.agent.clone().map(ToViewer::Status));
+        first.extend(st.features.map(|features| ToViewer::Agent { features }));
         first.extend(st.state.clone().map(ToViewer::Status));
+        first.extend(st.usb.clone().map(ToViewer::Usb));
         drop(st);
         for m in first {
             v.write_all(&m.encode())?;
@@ -143,6 +198,8 @@ impl ViewerTx {
                 st.state = Some(t.clone())
             }
             ToViewer::Status(t) if t.starts_with("guest agent connected") => st.agent = Some(t.clone()),
+            ToViewer::Usb(l) => st.usb = Some(l.clone()),
+            ToViewer::Agent { features } => st.features = Some(*features),
             _ => {}
         }
     }
@@ -157,13 +214,27 @@ impl ViewerTx {
                 None => {
                     d[head] = Some(r);
                     // The rect is filled in when it goes out.
-                    let _ = self.q.send(m.clone());
+                    let _ = self.q.send((self.gen(), m.clone()));
                 }
             }
             return;
         }
+        if let ToViewer::Windows(list) = m {
+            if self.windows.lock().unwrap_or_else(|e| e.into_inner()).replace(list.clone()).is_none() {
+                // Filled in when it goes out.
+                let _ = self.q.send((self.gen(), ToViewer::Windows(Vec::new())));
+            }
+            return;
+        }
+        if let ToViewer::WindowIcon { id, w, h, rgba } = m {
+            if hold(&mut self.icons.lock().unwrap_or_else(|e| e.into_inner()), *id, (*w, *h, rgba.clone())) {
+                // All waiting icons go out with it.
+                let _ = self.q.send((self.gen(), ToViewer::WindowIcon { id: 0, w: 0, h: 0, rgba: Vec::new() }));
+            }
+            return;
+        }
         self.remember(m);
-        let _ = self.q.send(m.clone());
+        let _ = self.q.send((self.gen(), m.clone()));
     }
 }
 
@@ -174,6 +245,16 @@ fn damage_head(m: &ToViewer) -> Option<usize> {
         ToViewer::HeadDamage { head, .. } => Some(head as usize).filter(|&h| h < MAX_HEADS),
         _ => None,
     }
+}
+
+/// Keep a window's icon until it goes out (the latest per window, up to
+/// `ICONS_PENDING` windows). True if it is the first one waiting.
+fn hold(icons: &mut Icons, id: u32, icon: (u32, u32, Vec<u8>)) -> bool {
+    let first = icons.is_empty();
+    if icons.len() < ICONS_PENDING || icons.contains_key(&id) {
+        icons.insert(id, icon);
+    }
+    first
 }
 
 fn union(a: [u32; 4], b: [u32; 4]) -> [u32; 4] {
@@ -472,8 +553,9 @@ impl DisplayServer {
         listener: Option<UnixListener>,
         screens: Vec<Arc<FbSink>>,
         windows: bool,
+        usb: Option<Arc<UsbPorts>>,
     ) -> std::io::Result<()> {
-        let ctx = Arc::new(Serve { input, agent, events, window, latest: self.clip_latest, tx: self.tx, screens, windows, ptr: Mutex::default() });
+        let ctx = Arc::new(Serve { input, agent, events, window, latest: self.clip_latest, tx: self.tx, screens, windows, ptr: Mutex::default(), usb });
         let c = ctx.clone();
         let first = self.stream;
         std::thread::Builder::new().name("display".into()).spawn(move || serve(first, &c))?;
@@ -519,6 +601,9 @@ struct Serve {
     /// A Windows guest: its tablet only reaches the main monitor.
     windows: bool,
     ptr: Mutex<Ptr>,
+    /// Host USB devices plugged in while the VM runs (if it has a USB
+    /// controller).
+    usb: Option<Arc<UsbPorts>>,
 }
 
 /// Where the viewer's pointer is (which monitor), and its buttons.
@@ -581,7 +666,8 @@ impl Serve {
 fn serve(stream: UnixStream, c: &Serve) {
     let mut dec = Decoder::default();
     let mut buf = vec![0u8; 64 << 10];
-    // Fds that came with the bytes (a drop's pipe), in order.
+    // Fds that came with the bytes (a drop's pipe, a USB helper's
+    // socket), in order.
     let mut fds = Vec::new();
     loop {
         let n = match vroom_ipc::read_with_fds(&stream, &mut buf, &mut fds) {
@@ -594,6 +680,29 @@ fn serve(stream: UnixStream, c: &Serve) {
                 Ok(Some(ToVmm::Drop { id })) => match (!fds.is_empty()).then(|| fds.remove(0)) {
                     Some(from) => c.agent.send(AgentCmd::Drop { id, from }),
                     None => log::warn!("display: a drop without its pipe"),
+                },
+                Ok(Some(ToVmm::UsbAttach(dev))) => {
+                    let Some(fd) = (!fds.is_empty()).then(|| fds.remove(0)) else {
+                        log::warn!("display: a USB device without its helper");
+                        continue;
+                    };
+                    let r = match &c.usb {
+                        Some(u) => u.attach(dev, UnixStream::from(fd)),
+                        None => Err("this VM has no USB controller".into()),
+                    };
+                    if let Err(e) = r {
+                        log::warn!("usb: {e}");
+                        c.tx.send(&ToViewer::Status(format!("USB: {e}")));
+                    }
+                }
+                Ok(Some(ToVmm::UsbDetach { port })) => {
+                    if let Some(u) = &c.usb {
+                        u.detach(port);
+                    }
+                }
+                Ok(Some(ToVmm::DragOutGet { id, item })) => match (!fds.is_empty()).then(|| fds.remove(0)) {
+                    Some(to) => c.agent.send(AgentCmd::DragOutGet { id, item, to }),
+                    None => log::warn!("display: a drag out without its pipe"),
                 },
                 Ok(Some(m)) => {
                     if let Some(m) = c.route(m) {
@@ -610,6 +719,8 @@ fn serve(stream: UnixStream, c: &Serve) {
     }
     log::info!("viewer disconnected");
     c.tx.detach();
+    // Its Coherence windows are gone: the guest gets its taskbar back.
+    c.agent.send(AgentCmd::Coherence(false));
     if let Some(w) = &c.window {
         w(false);
     }
@@ -717,8 +828,13 @@ fn handle(
         }
         ToVmm::DragEnter { id, items } => agent.send(AgentCmd::DragEnter { id, items }),
         ToVmm::DragCancel { id } => agent.send(AgentCmd::DragCancel { id }),
-        // serve() pairs it with its pipe.
-        ToVmm::Drop { .. } => {}
+        // serve() pairs these with their fds.
+        ToVmm::Drop { .. } | ToVmm::UsbAttach(_) | ToVmm::UsbDetach { .. } | ToVmm::DragOutGet { .. } => {}
+        ToVmm::Coherence(on) => agent.send(AgentCmd::Coherence(on)),
+        ToVmm::Window { id, op } => agent.send(AgentCmd::Window { id, op }),
+        ToVmm::DragOut { id, end: false } => agent.send(AgentCmd::DragOut { id }),
+        ToVmm::DragOut { id, end: true } => agent.send(AgentCmd::DragOutEnd { id }),
+        ToVmm::StartApp(name) => agent.send(AgentCmd::StartApp(name)),
     }
 }
 
@@ -877,6 +993,17 @@ mod tests {
             }
         }
         assert_eq!(got, Some([10, 5, 308, 408]));
+    }
+
+    #[test]
+    fn icons_wait_one_per_window() {
+        // A viewer that doesn't keep up: icons pile up, one per window, capped.
+        let mut icons = Icons::new();
+        let firsts = (0..ICONS_PENDING as u32 + 10).filter(|i| hold(&mut icons, *i, (1, 1, vec![0; 4]))).count();
+        assert_eq!(firsts, 1, "one message queued for them all");
+        hold(&mut icons, 3, (1, 1, vec![9; 4]));
+        assert_eq!(icons.len(), ICONS_PENDING);
+        assert_eq!(icons[&3].2, vec![9; 4], "the latest wins");
     }
 
     #[test]

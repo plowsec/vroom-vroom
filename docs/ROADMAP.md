@@ -6,31 +6,67 @@ move to the docs (GUIDE, ARCHITECTURE) once they work.
 
 ## In progress
 
-- **Isochronous USB transfers** for passed-through devices (USB sound
-  cards, webcams macOS lets go of). The Mac's own camera already reaches
-  the guest (`camera = true`).
-- **Coherence** (VMware: Unity): each guest app window as a window of its
-  own on the Mac desktop, without the guest's desktop around it.
+- **Coherence, next steps** (see GUIDE.md): starting Linux apps by
+  name; Store app icons on Windows (from the package's logo); GNOME's
+  top bar (only an extension can hide it); Wayland sessions would need a
+  helper inside the compositor (a KWin script, a GNOME Shell extension).
 
 ## 3D: catching up with VMware and Parallels
 
-Where we are: Linux gets OpenGL 4.1 and Vulkan (off screen only);
+Where we are: Linux gets OpenGL 4.1 (virgl), Vulkan 1.3 in windows and
+off screen (Venus), and OpenGL 4.4 for the apps you start on Zink (below);
 Windows gets Direct3D 11. VMware Fusion gives Windows on Apple Silicon
 Direct3D 11 and OpenGL 4.3, and Linux OpenGL 4.3.
 
-Linux guests:
+What we found (October 2026, macOS 15.6, MoltenVK 1.4.2, guest Mesa 25.2):
 
-- **OpenGL 4.3 and up** (compute shaders). macOS's own OpenGL stops at
-  4.1 and never moves. The way past it is OpenGL on top of Vulkan in the
-  guest (Mesa's Zink), over Venus. Zink needs a Vulkan feature MoltenVK
-  doesn't have (`nullDescriptor`). Paths: LunarG's KosmicKrisp (a newer
-  Vulkan-on-Metal driver in Mesa) if it has it, a MoltenVK patch, or
-  faking it in virglrenderer's Venus decoder. That gives OpenGL 4.6.
-- **Vulkan apps showing a window** (`VK_KHR_swapchain`), which also
-  unlocks Proton/DXVK games. The guest's Venus driver needs buffers it
-  can hand to the guest's display (DRM format modifiers), which MoltenVK
-  doesn't offer either; same paths as above, plus our side of blob
-  scanout.
+- macOS's own OpenGL stops at 4.1. The only way past it is OpenGL on top
+  of Vulkan in the guest (Mesa's Zink) over Venus. Zink needs more from
+  Vulkan than `nullDescriptor`. With only that, it gave OpenGL 2.1:
+  MoltenVK also has no transform feedback (needed from OpenGL 3.0), no
+  depth clip control (3.2), no packed 10-bit vertex formats (3.3) and no
+  RGB32 texel buffers (4.0). 4.5 needs cull distances, which Metal lacks.
+- LunarG's KosmicKrisp (Vulkan on Metal, in Mesa since late 2025, Vulkan
+  1.4 conformant) has all of the above, but it is built on Metal 4 and so
+  needs macOS 26. It can't run on macOS 15. MoltenVK's main branch still
+  says `nullDescriptor = false`.
+- So we fill the gaps in virglrenderer's Venus decoder
+  (`third_party/virglrenderer/0007-venus-what-zink-needs.patch`):
+  null descriptors become small zeroed objects of our own, depth clip off
+  becomes depth clamp (what Metal does anyway), and, for Zink only (it
+  names itself when it starts), transform feedback is accepted but not
+  captured, and the missing formats are read through the nearest one.
+  Zink then reports OpenGL 4.4 core and compatibility, and OpenGL ES 3.1.
+  A GL 4.3 compute shader test gives the right results, 330 times faster
+  than llvmpipe.
+- Vulkan windows: the guest's Venus driver only offers `VK_KHR_swapchain`
+  when the host can import sync fds into semaphores, which MoltenVK can't.
+  The guest has always waited for the fd itself; the host just has to mark
+  the semaphore signaled, which an empty submission does. Window images
+  must live in memory the host can share, so they now get host visible
+  memory. The guest's compositor (Xorg's glamor, Weston, GNOME Shell) then
+  shows the frame with OpenGL through virgl, and macOS's OpenGL can't
+  share memory with Vulkan: vrend copies the frame into a texture when
+  the compositor uses it (`0008-venus-swapchain.patch`). The same fix
+  gives the guest Vulkan 1.3 (it lacked `synchronization2`). Proton and
+  DXVK still can't run: they need geometry shaders, which neither MoltenVK
+  nor KosmicKrisp has.
+
+Linux guests, next:
+
+- **Transform feedback for real** (Zink, and Vulkan apps). Today it is
+  accepted and nothing is written, which is wrong for the few apps that
+  use it (some games' particles, some CAD). It would rewrite the vertex
+  shader to store its outputs into the buffers, and is only simple for
+  non-indexed draws.
+- **KosmicKrisp on macOS 26**: load it instead of MoltenVK when the Mac
+  has Metal 4. Zink then gets most of what we emulate for real, and its
+  speed should be checked against MoltenVK.
+- **Zink speed and gaps**: about half virgl's speed on glmark2's terrain,
+  and glmark2's refract scene fails (a depth render target Zink can't
+  make on MoltenVK). virgl stays the default; Zink is per app.
+- **No copy for Vulkan windows**: an IOSurface shared by Metal and
+  OpenGL instead of copying each frame. The copy is fine at 1280x800.
 - **Snapshots and suspend while a Vulkan app runs.** Vulkan state lives
   on the Mac's GPU. Like we do for OpenGL, we'd follow what each Vulkan
   app creates and rebuild it on resume; Vulkan has far more kinds of
@@ -38,6 +74,10 @@ Linux guests:
 - **Hardware video decoding** (H.264, HEVC, VP9, AV1 in browsers and
   players): a virtio video device decoding with the Mac's VideoToolbox,
   and the guest's VA-API on top of it.
+- **Xwayland under GNOME on virgl**: its GL context breaks at login
+  (`vrend_clear_surface: ... Illegal surface 0`), so X11 apps in a
+  GNOME Wayland session show nothing. Not new; seen with the old library
+  too.
 
 Windows guests:
 
@@ -51,20 +91,34 @@ Windows guests:
 
 ## Before it's ready for people other than us
 
+- A Windows guest with 3D stopped once with "undecodable MMIO access at
+  0x8200010000" (the 3D device's memory window, about 40 s after login)
+  on a build from master 01a3d48. Not seen again: ten minutes on the
+  next master with the old and new guest tools, resizes and Coherence.
+  If it shows up again, the window's filler memory is the first suspect.
+
 - Test on other Macs (M1 to M4, base models with 8 GB) and macOS versions,
   and days-long runs: sleep and wake with VMs running, full disks.
 - Windows 3D: the text that sometimes doesn't draw (an agent is on it).
 - USB passthrough with real devices, bridged networking with real
-  vmnet (being tested now).
-- A signed, notarized app with an installer and updates; crash reports.
-- Drag and drop from the guest to the Mac (Mac to guest works), a live
-  drag in Linux guests (they get files on the Desktop for now).
+  vmnet, and vroom-netd as root taking devices from macOS drivers
+  (the app sets it up; not tried as root yet).
+- Signing and notarizing vroom.app (`scripts/app.sh` builds it, signed
+  ad hoc: needs a Developer ID and the hardened runtime), a disk image
+  to install from, updates, crash reports.
+- Drag and drop: try the Mac side of a drag out of the guest with a real
+  mouse (Finder, Mail, the Desktop; the guest side and the copy are
+  tested); Wayland guests (no live drag either way: an outside program
+  can't take part in a Wayland drag).
 - Several monitors: one UI scale for all of them (a window per Mac
   screen with its own scale would want per-monitor scales), Direct3D on
-  Windows' first monitor only (the others are copied to 2D GPUs).
+  Windows' first monitor only (the others are copied to 2D GPUs),
+  Coherence on the first monitor only (the others are off meanwhile).
 - Rosetta for Linux guests (x86_64 Linux programs). Apple only offers it
   through its Virtualization framework; we'd have to look like it.
 - Benchmarks against VMware Fusion and Parallels on the same Mac, the
   losses published with the wins.
-- 3D processes per guest context (one GPU process per app, not per VM).
 - Fuzzing the 3D command streams (later).
+- Windows: when the desktop's own Direct3D process dies, the screen
+  freezes until Win+Ctrl+Shift+B. The guest driver should report a lost
+  device for that context (Windows then rebuilds it by itself).

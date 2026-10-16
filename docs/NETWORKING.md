@@ -43,7 +43,8 @@ and [Darwin ICMP implementation](https://github.com/apple-oss-distributions/xnu/
 
 - IPv6, router advertisements, DHCPv6 and NAT64 are not implemented.
 - Bridged and host-only go through `vroom-netd` (root): vmnet on macOS,
-  tap + bridge on Linux. The plumbing is tested, but not yet against a real
+  tap + bridge on Linux. The app sets it up when a VM needs it (macOS
+  asks for an admin password once); by hand: [GUIDE.md](GUIDE.md#the-root-helper-vroom-netd). The plumbing is tested, but not yet against a real
   vmnet/tap (needs root). netd only accepts locally administered unicast
   MACs (`x2:`, `x6:`, `xA:`, `xE:`...), so a VM can't take a real device's
   address on the LAN; the default per-VM MACs (`02:...`) are such. It

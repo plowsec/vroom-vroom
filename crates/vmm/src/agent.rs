@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use vroom_config::Clipboard as ClipPolicy;
-use vroom_proto::{features, Decoder, Message, Monitor, SCALE_MAX, SCALE_MIN};
+use vroom_proto::{features, Decoder, Message, Monitor, WindowOp, SCALE_MAX, SCALE_MIN};
 use vroom_display::ToViewer;
 use vroom_virtio::devices::gpu::GpuControl;
 
@@ -51,6 +51,19 @@ pub enum AgentCmd {
     DragCancel { id: u32 },
     /// Dropped: the viewer writes them into this pipe, as agent frames.
     Drop { id: u32, from: std::os::fd::OwnedFd },
+    /// Coherence on or off: the guest's windows as windows of the host.
+    Coherence(bool),
+    /// Coherence: do this to a window of the guest's last list.
+    Window { id: u32, op: WindowOp },
+    /// The mouse left the window with the guest's button held: is the
+    /// guest dragging files out? The answer goes to the viewer.
+    DragOut { id: u32 },
+    /// That drag is over (dropped and copied, or given up).
+    DragOutEnd { id: u32 },
+    /// The Mac drop wants item `item`: write it into this pipe, checked.
+    DragOutGet { id: u32, item: u32, to: std::os::fd::OwnedFd },
+    /// Start a guest app by name (checked by the viewer protocol).
+    StartApp(String),
     /// The pointer on the whole desktop (see `Message::Mouse`).
     Mouse { x: u16, y: u16, buttons: u8, wheel: i8 },
     Stop,
@@ -69,6 +82,9 @@ pub struct AgentStatus {
 }
 
 const POLL: Duration = Duration::from_millis(250);
+/// A viewer that doesn't take a dragged file's data for this long has
+/// given up on it.
+const PIPE_TIMEOUT: Duration = Duration::from_secs(20);
 const GUEST_CLIP_MIN_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Handle held by the VMM / frontend.
@@ -117,6 +133,31 @@ struct Service {
     /// was last sent at.
     mode: Vec<Message>,
     mode_sent: Option<u32>,
+    /// Coherence is on (the window asked), and the ids of the guest's
+    /// last window list: the only windows the window may act on.
+    coherence: bool,
+    win_ids: Vec<u32>,
+    /// Files dragged out of the guest, if any.
+    dragout: Option<OutDrag>,
+    streams: u32,
+}
+
+/// A drag of files out of the guest (see `AgentCmd::DragOut`).
+struct OutDrag {
+    id: u32,
+    /// What the guest says it drags; None until it answers.
+    items: Option<Vec<(String, bool)>>,
+    /// The item on its way to the viewer.
+    fetch: Option<Fetch>,
+}
+
+struct Fetch {
+    /// The guest's frames for it carry this number.
+    stream: u32,
+    check: vroom_proto::TreeCheck,
+    pipe: UnixStream,
+    bytes: u64,
+    t0: Instant,
 }
 
 /// The monitors whose sizes the windows drive. Resizes go through the
@@ -148,7 +189,9 @@ pub fn spawn(stream: UnixStream, policy: ClipPolicy, clip: Option<Box<dyn Clipbo
     let (tx, rx) = mpsc::channel();
     let status = Arc::new(Mutex::new(AgentStatus::default()));
     stream.set_read_timeout(Some(POLL))?;
-    let max = policy.max_bytes as usize + 64;
+    // Room for dragged files' data too; clipboard text is held to the
+    // policy's size where it is taken.
+    let max = (policy.max_bytes as usize).max(vroom_proto::DROP_CHUNK + 64) + 64;
     let out = Arc::new(Mutex::new(stream.try_clone()?));
     let svc = Service {
         stream,
@@ -166,6 +209,10 @@ pub fn spawn(stream: UnixStream, policy: ClipPolicy, clip: Option<Box<dyn Clipbo
         screen,
         mode: Vec::new(),
         mode_sent: None,
+        coherence: false,
+        win_ids: Vec::new(),
+        dragout: None,
+        streams: 0,
     };
     std::thread::Builder::new().name("agent".into()).spawn(move || svc.run())?;
     Ok(Agent { tx, status })
@@ -243,6 +290,26 @@ impl Service {
                 }
                 // Now it may scale: give it the window's real size.
                 self.apply_display();
+                self.to_viewer(ToViewer::Agent { features });
+                // An agent that came back (guest reboot, new logon) while
+                // the window is in Coherence.
+                self.win_ids.clear();
+                if self.coherence && features & features::COHERENCE != 0 {
+                    self.send(&Message::Coherence { on: true });
+                }
+            }
+            Message::Windows(list) if self.coherence => {
+                self.win_ids = list.iter().map(|w| w.id).collect();
+                self.to_viewer(ToViewer::Windows(list));
+            }
+            // Only for windows of the last list (and checked for size by
+            // the decoder).
+            Message::WindowIcon { id, w, h, rgba } if self.coherence && self.win_ids.contains(&id) => {
+                self.to_viewer(ToViewer::WindowIcon { id, w, h, rgba });
+            }
+            Message::CoherenceNo(why) if self.coherence => {
+                log::info!("guest: no coherence here: {why}");
+                self.to_viewer(ToViewer::CoherenceNo(why));
             }
             Message::ClipboardText(t) => self.guest_clipboard(t),
             Message::Ping(v) => self.send(&Message::Pong(v)),
@@ -256,6 +323,15 @@ impl Service {
                 log::info!("guest: drop {id} {}{place}", if ok { "done " } else { "failed: " });
                 self.to_viewer(ToViewer::DropDone { id, ok, place });
             }
+            Message::DragOutItems { id, items } => {
+                // Only an answer to our question, and only once.
+                if let Some(o) = self.dragout.as_mut().filter(|o| o.id == id && o.items.is_none()) {
+                    log::info!("guest: drag {id} out: {} item(s)", items.len());
+                    o.items = Some(items.clone());
+                    self.to_viewer(ToViewer::DragOutItems { id, items });
+                }
+            }
+            m @ (Message::DropEntry { .. } | Message::DropData { .. } | Message::DropEnd { .. } | Message::DragOutFail { .. }) => self.drag_out_frame(m),
             // Host-bound only; a guest sending these is ignored.
             _ => {}
         }
@@ -411,6 +487,25 @@ impl Service {
                 }
             }
             AgentCmd::DragCancel { id } => self.send(&Message::DragCancel { id }),
+            AgentCmd::Coherence(on) => {
+                let had = std::mem::replace(&mut self.coherence, on);
+                self.win_ids.clear();
+                let s = self.status();
+                if (on || had) && s.connected && s.features & features::COHERENCE != 0 {
+                    self.send(&Message::Coherence { on });
+                }
+            }
+            AgentCmd::Window { id, op } => {
+                // Only windows the guest listed last, only in Coherence.
+                if self.coherence && self.win_ids.contains(&id) {
+                    self.send(&Message::WindowDo { id, op });
+                }
+            }
+            AgentCmd::StartApp(name) => {
+                if self.status().features & features::START_APP != 0 && vroom_proto::line_ok(&name) {
+                    self.send(&Message::StartApp(name));
+                }
+            }
             AgentCmd::Mouse { x, y, buttons, wheel } => self.send(&Message::Mouse { x, y, buttons, wheel }),
             AgentCmd::Drop { id, from } => {
                 let out = self.out.clone();
@@ -419,7 +514,92 @@ impl Service {
                     self.send(&Message::DragCancel { id });
                 }
             }
+            AgentCmd::DragOut { id } => {
+                let s = self.status();
+                if !s.connected || s.features & features::DRAG_OUT == 0 {
+                    self.to_viewer(ToViewer::DragOutItems { id, items: Vec::new() });
+                    return;
+                }
+                if let Some(o) = self.dragout.take() {
+                    self.send(&Message::DragOutEnd { id: o.id });
+                }
+                self.dragout = Some(OutDrag { id, items: None, fetch: None });
+                self.send(&Message::DragOutQuery { id });
+            }
+            AgentCmd::DragOutEnd { id } => {
+                if self.dragout.as_ref().is_some_and(|o| o.id == id) {
+                    self.dragout = None;
+                    self.send(&Message::DragOutEnd { id });
+                }
+            }
+            AgentCmd::DragOutGet { id, item, to } => {
+                // Anything not asked for: the pipe closes, the viewer stops.
+                let pipe = UnixStream::from(to);
+                let Some(o) = self.dragout.as_mut().filter(|o| o.id == id) else { return };
+                let Some((name, dir)) = o.items.as_ref().and_then(|v| v.get(item as usize)).cloned() else { return };
+                if pipe.set_write_timeout(Some(PIPE_TIMEOUT)).is_err() {
+                    return;
+                }
+                // A new number: late frames of an item given up on can't
+                // pass for this one's.
+                self.streams = self.streams.wrapping_add(1);
+                let stream = self.streams;
+                o.fetch = Some(Fetch { stream, check: vroom_proto::TreeCheck::new(stream, &name, dir), pipe, bytes: 0, t0: Instant::now() });
+                self.send(&Message::DragOutGet { id, item, stream });
+            }
             AgentCmd::Stop => {}
+        }
+    }
+
+    /// A frame of the item being fetched: checked, then to the viewer
+    /// with the drag's id. A guest that breaks the rules loses the drag.
+    fn drag_out_frame(&mut self, m: Message) {
+        let Some(o) = self.dragout.as_mut() else { return };
+        let id = o.id;
+        let Some(f) = o.fetch.as_mut() else { return };
+        let stream = match &m {
+            Message::DropEntry { id, .. } | Message::DropData { id, .. } | Message::DropEnd { id } => *id,
+            Message::DragOutFail { stream, .. } => *stream,
+            _ => return,
+        };
+        if stream != f.stream {
+            // One given up on.
+            return;
+        }
+        let (fwd, done, bad) = match f.check.check(&m) {
+            Ok(end) => {
+                let fwd = match m {
+                    Message::DropEntry { path, dir, size, .. } => Message::DropEntry { id, path, dir, size },
+                    Message::DropData { data, .. } => {
+                        f.bytes += data.len() as u64;
+                        Message::DropData { id, data }
+                    }
+                    _ => Message::DropEnd { id },
+                };
+                (fwd, end, false)
+            }
+            Err(_) if matches!(m, Message::DragOutFail { .. }) => {
+                let Message::DragOutFail { why, .. } = m else { return };
+                let why: String = why.chars().filter(|c| !c.is_control()).take(200).collect();
+                log::info!("guest: drag {id} out: {why}");
+                (Message::DragOutFail { stream: id, why }, true, false)
+            }
+            Err(e) => {
+                log::warn!("guest: drag {id} out: {e}");
+                (Message::DragOutFail { stream: id, why: format!("the guest sent a bad file list ({e})") }, true, true)
+            }
+        };
+        let gone = f.pipe.write_all(&fwd.encode()).is_err();
+        if done && !bad && !gone {
+            log::info!("drag {id} out: {} bytes to the viewer in {:?}", f.bytes, f.t0.elapsed());
+        }
+        if done || gone {
+            o.fetch = None;
+        }
+        if bad || gone {
+            // Stop the guest sending.
+            self.dragout = None;
+            self.send(&Message::DragOutEnd { id });
         }
     }
 }
@@ -663,6 +843,74 @@ mod tests {
         drop(w);
         a.send(AgentCmd::Drop { id: 5, from: r.into() });
         assert_eq!(read_msgs(&mut guest, &mut d), vec![Message::DragCancel { id: 5 }]);
+        a.send(AgentCmd::Stop);
+    }
+
+    #[test]
+    fn drags_out_of_the_guest_are_checked() {
+        let (host, mut guest) = UnixStream::pair().unwrap();
+        let a = spawn(host, ClipPolicy { max_bytes: 8, ..ClipPolicy::default() }, None, Screen::default()).unwrap();
+        let mut d = Decoder::new(1 << 20);
+        read_msgs(&mut guest, &mut d);
+        // An agent that can't: the guest isn't asked.
+        a.send(AgentCmd::DragOut { id: 1 });
+        assert!(read_msgs(&mut guest, &mut d).is_empty());
+        guest.write_all(&Message::Hello { features: features::DRAG_OUT, agent: "t".into() }.encode()).unwrap();
+        read_msgs(&mut guest, &mut d);
+        a.send(AgentCmd::DragOut { id: 7 });
+        assert_eq!(read_msgs(&mut guest, &mut d), vec![Message::DragOutQuery { id: 7 }]);
+        let items = vec![("a.txt".to_string(), false), ("D".to_string(), true)];
+        guest.write_all(&Message::DragOutItems { id: 7, items: items.clone() }.encode()).unwrap();
+        // Asked once: a second answer changes nothing.
+        guest.write_all(&Message::DragOutItems { id: 7, items: vec![("x".into(), false)] }.encode()).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+
+        let get = |item: u32, d: &mut Decoder, guest: &mut UnixStream| {
+            let (r, w) = UnixStream::pair().unwrap();
+            a.send(AgentCmd::DragOutGet { id: 7, item, to: w.into() });
+            match read_msgs(guest, d).as_slice() {
+                [Message::DragOutGet { id: 7, item: i, stream }] if *i == item => (*stream, r),
+                m => panic!("{m:?}"),
+            }
+        };
+        let (s, mut r) = get(1, &mut d, &mut guest);
+        let data = vec![5u8; 300];
+        for m in [
+            // Late frames of another stream are dropped.
+            Message::DropEntry { id: s.wrapping_add(9), path: "zzz".into(), dir: false, size: 1 },
+            Message::DropEntry { id: s, path: "D".into(), dir: true, size: 300 },
+            Message::DropEntry { id: s, path: "D/x".into(), dir: false, size: 300 },
+            // Bigger than the clipboard's limit: still passes.
+            Message::DropData { id: s, data: data.clone() },
+            Message::DropEnd { id: s },
+        ] {
+            guest.write_all(&m.encode()).unwrap();
+        }
+        let mut pd = Decoder::new(1 << 20);
+        assert_eq!(
+            read_msgs(&mut r, &mut pd),
+            vec![
+                Message::DropEntry { id: 7, path: "D".into(), dir: true, size: 300 },
+                Message::DropEntry { id: 7, path: "D/x".into(), dir: false, size: 300 },
+                Message::DropData { id: 7, data },
+                Message::DropEnd { id: 7 },
+            ]
+        );
+        // The guest's reason goes through.
+        let (s, mut r) = get(0, &mut d, &mut guest);
+        guest.write_all(&Message::DragOutFail { stream: s, why: "locked\n".into() }.encode()).unwrap();
+        assert_eq!(read_msgs(&mut r, &mut pd), vec![Message::DragOutFail { stream: 7, why: "locked".into() }]);
+        // Something that isn't the item: the drag is over for the guest.
+        let (s, mut r) = get(0, &mut d, &mut guest);
+        guest.write_all(&Message::DropEntry { id: s, path: "other".into(), dir: false, size: 0 }.encode()).unwrap();
+        assert!(matches!(read_msgs(&mut r, &mut pd).as_slice(), [Message::DragOutFail { stream: 7, .. }]));
+        assert_eq!(read_msgs(&mut guest, &mut d), vec![Message::DragOutEnd { id: 7 }]);
+        // And nothing more is fetched.
+        let (r, w) = UnixStream::pair().unwrap();
+        a.send(AgentCmd::DragOutGet { id: 7, item: 0, to: w.into() });
+        assert!(read_msgs(&mut guest, &mut d).is_empty());
+        // Its pipe was closed.
+        assert!(matches!((&r).read(&mut [0u8; 8]), Ok(0) | Err(_)));
         a.send(AgentCmd::Stop);
     }
 

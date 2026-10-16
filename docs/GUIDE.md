@@ -4,11 +4,64 @@
 
 ```bash
 brew install qemu            # only for the EDK2 firmware files and qemu-img
-scripts/build.sh
+scripts/app.sh --install     # vroom.app, in /Applications
 ```
 
 `qemu` is not used to run anything: vroom only reads
 `/opt/homebrew/share/qemu/edk2-aarch64-code.fd` (UEFI) from it.
+`scripts/build.sh` builds just the two programs, in `target/debug`
+(`--release`: `target/release`), for use from the terminal.
+
+## The Mac app
+
+`scripts/app.sh` builds `target/dist/vroom.app`; `--install` also copies
+it to `/Applications` (it refuses while VMs run from the copy there).
+You can also drag it there yourself. Then vroom starts like any Mac app:
+from Finder, Launchpad, Spotlight, or the Dock once you keep it there.
+
+Build the 3D libraries before the app if you want 3D in its VMs
+(`scripts/build-virglrenderer.sh`, then `scripts/build-dxmt.sh` for
+Windows guests, see below). `app.sh` puts whatever was built in the app.
+
+What it does that the bare `vroom-gui` doesn't:
+
+- Open a VM file with it (right-click, Open With, vroom, or drop it on
+  the Dock icon): the VM starts, as with `vroom-gui vm.toml`. vroom
+  doesn't make itself the default app for `.toml` files; to double-click
+  VM files, pick vroom in Finder's Get Info, "Open with", for that file.
+- Drop an ISO on the Dock icon: New VM, with that installer. A VMware VM
+  (`.vmwarevm`): the import.
+- Camera and microphone questions name vroom, not Terminal.
+- Its own messages go to `~/Library/Application Support/vroom/logs/vroom-gui.log`
+  (there is no terminal to print to). Each VM's last run log is in
+  `logs/` there too (`⋯` → Show log).
+
+The terminal still works: `/Applications/vroom.app/Contents/MacOS/vroom`
+is the VMM with all its commands (a symlink to it in your `PATH` is fine).
+
+Inside the app:
+
+```text
+vroom.app/Contents/
+  MacOS/vroom-gui        the app
+  MacOS/vroom            the VMM, started by the app
+  Frameworks/*.dylib     3D: virglrenderer, MoltenVK, DXMT, ANGLE
+  Resources/vroom.icns   the icon (packaging/macos/)
+  Info.plist             packaging/macos/Info.plist
+```
+
+The app is signed ad hoc: the VMM with the hypervisor entitlement, then
+the bundle. That is enough on the Mac that built it. It isn't enough to
+give it to other people: their Mac blocks it ("not from an identified
+developer") until they allow it in System Settings, Privacy & Security.
+A proper release needs an Apple Developer ID certificate, signing with
+the hardened runtime (and then the camera and microphone entitlements,
+`com.apple.security.device.camera` and `...device.audio-input`, next to
+the hypervisor one), and Apple's notarization. None of that is set up.
+
+macOS remembers the camera and microphone answers for the app's
+signature. An ad hoc signature changes with each build, so after a
+rebuild macOS may ask again.
 
 ## The app
 
@@ -39,7 +92,8 @@ A bar along the top of the window holds the VM's name and state, then
 pause, snapshot, suspend, the power menu (shut down, restart, force power
 off) and, for Windows, Ctrl+Alt+Del. On the right: how busy the VM is
 (the host CPU time it uses, out of what its CPUs could use), "3D" or
-"Direct3D 11" when 3D is on, the settings (the VM's page in the app),
+"Direct3D 11" when 3D is on, USB devices (see [USB devices](#usb-devices)),
+Coherence (below), the settings (the VM's page in the app),
 full screen, and the VM list. The guest gets the rest of the window: a
 guest with the agent takes exactly that size. In full screen the bar
 goes away and slides in when the mouse touches the top edge.
@@ -64,7 +118,12 @@ the guest. Needs the guest tools (the agent) of this version or later.
   the files inside Windows: into an Explorer folder, onto the desktop, into
   a mail as an attachment, onto an app. While you hover, Windows shows
   its own drag picture and "Copy to Documents".
-- **Linux:** the files go to the Desktop (a name that is taken gets a
+- **Linux, X11 desktops** (Ubuntu's GNOME on Xorg, Xfce, KDE on X11):
+  the same, a real drag in the guest: drop into a Files window, onto the
+  desktop, into a browser. (An empty folder's "Folder is Empty" page in
+  GNOME Files takes no drops; drop on the folder's icon instead.)
+- **Linux, Wayland:** a program outside the desktop can't start a drag
+  there, so the files go to the Desktop (a name that is taken gets a
   number: `photo (2).jpg`), and the desktop shows a notification.
 
 While the files hover, the window's edge lights up and a line at the
@@ -73,8 +132,78 @@ tools, nobody logged in). Nothing reaches the guest until you drop: only
 the names, so it can get ready. Then a bar shows the copy's progress.
 
 Names Windows can't take (`:` `?` `*` and the like) get a `_` instead.
-Links inside dropped folders are left out. Dragging from the guest to the
-Mac isn't there yet.
+Links inside dropped folders are left out.
+
+The other way works too: drag files or folders from the guest (Explorer,
+the Windows desktop, GNOME Files or the desktop on X11) out of the VM
+window and drop them in Finder, on the Mac's desktop or into a Mac app
+that takes files. Nothing is copied while you drag: the files come from
+the guest when you drop, and a bar in the VM window shows how far the
+copy is. A name that is taken where you drop gets a number, the way
+Finder does it (`report 2.pdf`); nothing is overwritten. The copy stops
+if the Mac's disk would have less than 2 GB free. A file the guest
+can't read (open in another app with a lock) fails the copy with its
+name. Not on Wayland guests (the desktop keeps its drags to itself), and
+only files that are real files in the guest (not what is inside a zip
+in Explorer, nor attachments dragged from a mail app). Mac apps that
+only take files that exist already (Terminal, some editors) get nothing:
+drop in Finder first.
+
+### Coherence
+
+Coherence shows each guest app as a window of its own on your Mac,
+without the guest's desktop and taskbar around it. VMware calls it Unity.
+It works with Windows guests and with Linux guests in an X11 session.
+Needs the guest tools of this version or later.
+
+- Turn it on with the window button in the VM's bar, or
+  `Ctrl+Alt+Shift+C`. The VM window goes away; each guest window gets a
+  Mac window where it was on the guest's screen.
+- The guest's screen takes the size of your Mac screen (less the menu bar,
+  the Dock and the bar below), so a maximized app fills the screen.
+- Every such window has a thin strip on top with the VM's name and the
+  window's title. Drag the strip to move the window; drag its edges to
+  resize it. The guest app follows. Moving it by its own title bar works
+  too.
+- A bar at the bottom stands in for the taskbar: **Start** opens the Start
+  menu, a field to open an app by name (Windows: type `calc` or
+  `Paint` and press Enter; it searches the Start menu as you would),
+  then one button per app window with its icon (minimized ones too:
+  click to bring one back), and **Leave Coherence**. The bar can be
+  dragged anywhere.
+- Several Mac screens: the guest's screen is on the screen the bar is
+  on. Drag the bar to another screen and the guest's screen goes there
+  (its windows with it). A window dragged onto another screen goes back
+  to the bar's screen when you let go: the guest has one screen.
+- `Cmd+W` on a Coherence window asks the app to close (it may ask to save
+  first).
+- Leaving (the bar, the VM's shortcut, or closing the bar) brings back the
+  VM window, the taskbar and the VM's old size. A VM that stops, suspends,
+  or whose guest tools go away leaves Coherence too.
+
+Linux guests:
+
+- Only X11 sessions. GNOME on Ubuntu 22.04 and later logs in to Wayland
+  by default: pick "Ubuntu on Xorg" with the gear on the login screen.
+  On Wayland only the compositor knows where windows are, so Coherence
+  says so and doesn't start.
+- The window manager must follow the usual desktop conventions (EWMH):
+  GNOME, KDE, Xfce, Cinnamon and MATE do.
+- GNOME's top bar stays, out of sight: maximized windows start below it,
+  so they leave a strip free at the top of the Mac screen. Ubuntu's dock
+  is set to hide while Coherence is on and put back after.
+- The session helper of the guest tools must run in the desktop session
+  (`install-agent.sh` sets it up to start at login).
+
+Window tiling tools (Amethyst, yabai, Rectangle): they move and resize
+Coherence windows like any other, and the guest apps follow, which works
+but fights the guest's own placement. Tell the tool to leave vroom alone
+(Amethyst: Preferences, Floating, add `vroom` or `vroom-gui` when run from
+a terminal).
+
+Not there yet: one Dock tile per guest app (macOS gives an app one Dock
+tile; all Coherence windows are vroom's). Windows Store apps without an
+icon of their own (Calculator) show none in the bar.
 
 ### When the app crashes, or a VM stops answering
 
@@ -287,6 +416,9 @@ The guest's desktop has them side by side, top edges lined up, in order
   monitors the agent moves the pointer (as SPICE's agent does), so
   before logging in only the first monitor has a pointer.
 - One UI scale for all monitors: the first window's.
+- Coherence uses the first monitor only: while it is on, the others are
+  off in the guest (their windows hide, and the guest gathers its
+  windows on one screen); they come back when Coherence ends.
 
 ## Retina screens
 
@@ -325,14 +457,21 @@ picks the right one by itself:
   it is (any kernel, Mesa from the archive), in Wayland and X11 sessions.
 - **Vulkan** (Venus): needs `mesa-vulkan-drivers` (Mesa ≥ 24) and the
   user in the `render` group; stock Ubuntu kernels work. `vulkaninfo
-  --summary` should show `Virtio-GPU Venus (Apple M…)`. With 3D on, vroom
+  --summary` should show `Virtio-GPU Venus (Apple M…)`. If every Vulkan
+  app crashes instead (a segmentation fault after "Error opening
+  virtio-gpu device for Asahi native context"), the guest has Mesa 25.2,
+  whose Asahi driver crashes on any virtio GPU without its own native
+  context: the guest tools' `install-agent.sh` turns that driver off, or
+  set `VK_LOADER_DRIVERS_DISABLE='*asahi*'` yourself. With 3D on, vroom
   maps guest memory in 4 KiB steps instead of the Mac's 16 KiB, so the
   guest kernel can put GPU buffers where it likes (macOS 15 has this only
   as a private call; without it, 16 KiB steps and the guest needs a 16 KiB
   page kernel, see `examples/ubuntu/kernel-16k.sh`). Memory speed in the
-  guest doesn't change measurably (fill and random reads, both ways). There is no swapchain
-  (`VK_KHR_swapchain` is missing, with or without OpenGL): Vulkan apps
-  can compute and render off screen, not show a window.
+  guest doesn't change measurably (fill and random reads, both ways).
+  The guest gets Vulkan 1.3, and Vulkan apps show their windows like
+  others (`vkcube` runs at about 730 frames a second in a 500x500 window
+  under Xorg; Weston and GNOME on Wayland work too). Each frame is copied
+  once on the Mac, from the Vulkan app's memory to the desktop's OpenGL.
 
 Two ways to run the guest's OpenGL, `[display] opengl_host`:
 
@@ -347,8 +486,8 @@ With `angle`, apps that need GL 3 won't start, and some that assume it
 crash (glmark2 does, on its framebuffer scenes). Most desktop Linux apps
 want GL 3.3 now, so `apple` is the default; see SECURITY.md for what
 the extra ANGLE checks buy. Neither gets past GL 4.1 (no compute
-shaders: that's GL 4.3, which macOS never had). `LIBGL_ALWAYS_SOFTWARE=1`
-runs one app on llvmpipe instead, which has GL 4.5.
+shaders: that's GL 4.3, which macOS never had). For more, run the app on
+Zink (below), or with `LIBGL_ALWAYS_SOFTWARE=1` on llvmpipe (GL 4.5, slow).
 
 `[display] opengl = false` keeps Vulkan only (the guest's GL then runs on
 llvmpipe). That keeps less host code in reach of the guest, and keeps
@@ -370,10 +509,26 @@ trip to the host, and the window shows a copy read back from the GPU.
 Anything with real work is many times faster, and the guest's CPUs stay
 free.
 
-Why virgl and not OpenGL on top of Vulkan (Zink): Zink needs Vulkan's
-`nullDescriptor` (robustness2), which MoltenVK can't offer on Metal.
-Faking it on the host would mean rewriting descriptor sets in
-virglrenderer's Venus decoder. virgl works with any guest kernel.
+### OpenGL 4.4 for one app (Zink)
+
+macOS's OpenGL stops at 4.1, so virgl can't give compute shaders (4.3).
+Mesa's Zink runs OpenGL on Vulkan, here on Venus, and gives OpenGL 4.4
+(core and compatibility) and OpenGL ES 3.1. Start the app with it:
+
+```bash
+MESA_LOADER_DRIVER_OVERRIDE=zink glxinfo -B   # zink Vulkan 1.3(Virtio-GPU Venus (Apple M3 Max) (MOLTENVK))
+```
+
+In an Xorg session add `LIBGL_KOPPER_DRI2=1` (Xorg's modesetting driver
+doesn't offer what Zink wants for windows there; Wayland sessions don't
+need it). The host fills in what MoltenVK lacks, and some of it only
+roughly, for Zink only: transform feedback is accepted but writes nothing
+(apps that read it back get zeros), and packed 10-bit vertex formats and
+RGB32 texel buffers, which Metal doesn't have, read wrong. Few apps use
+them. Zink is slower than virgl for ordinary drawing (glmark2's terrain:
+211 fps against 413), so keep virgl for the desktop and use Zink for apps
+that need more than 4.1. A compute shader test (1M invocations, 4096
+`sin` each) takes 9.4 ms on Zink, 3.1 s on llvmpipe.
 
 Snapshots and suspend work with OpenGL. GL state lives on the host GPU,
 so vroom keeps track of what each GL app set up (its shaders, states and
@@ -399,7 +554,8 @@ release uses, with Google's depot_tools, about 3 GB while it builds
 when the VMM asks for it) into virglrenderer (3.4 MB), with our patches
 from `third_party/virglrenderer/` (two of them make it work on macOS's
 OpenGL 4.1). Both copy their results next to `target/*/vroom`, where the
-VMM looks; ship the dylibs with the binary (`scripts/dist.sh` does): virglrenderer
+VMM looks; in vroom.app they go in `Contents/Frameworks`, where the VMM
+looks too (`scripts/app.sh` and `scripts/dist.sh` do that). virglrenderer
 and MoltenVK always, ANGLE's two only for `opengl_host = "angle"`,
 DXMT's only for Windows guests.
 
@@ -409,6 +565,14 @@ nothing else (see [SECURITY.md](SECURITY.md#the-gpu-process)). It comes
 and goes with its VM. If it crashes, the guest loses 3D until the VM is
 started again (`gpu: the GPU process is gone` in the log); the rest of
 the VM keeps running.
+
+Each Vulkan or Direct3D app in the guest gets one more process,
+`vroom gpu-worker`, started by `vroom gpu-server` (a Windows desktop has
+15 to 20 of them). If one crashes, only that app loses its GPU
+(`worker for context N ... died` in the log). In Linux the app stops
+with a lost device. In Windows the app stops drawing; if it was the
+desktop's own, the screen freezes: press Win+Ctrl+Shift+B in the guest
+and Windows restarts its graphics.
 
 ## 3D in Windows guests (Direct3D 11)
 
@@ -535,6 +699,19 @@ What to expect:
 
 ```bash
 brew install libusb          # the helper loads it at run time
+```
+
+In the VM window: the USB button in the bar lists the Mac's USB devices.
+Click one to connect it to the VM, click it again to give it back to
+the Mac, like VMware's "Connect (Disconnect from Host)". A connected
+device has "Always connect to this VM" under it: tick it and it goes in
+the VM file, so the VM takes it at every start. Without the tick it is
+only for this run; a suspended VM gets it back when it resumes, if it is
+still plugged into the Mac.
+
+From the terminal, the same thing for every start:
+
+```bash
 vroom usb list               # what's plugged in, with its id
 ```
 
@@ -543,36 +720,53 @@ vroom usb list               # what's plugged in, with its id
 id = "1209:000a"
 ```
 
-In the app: the "USB devices" card, "Add device" lists what's plugged in.
-The VM takes the device while it runs; unplugging and plugging it back
-in works while the VM runs, and the guest sees a new device after a
-suspend/resume or a snapshot revert (in-flight transfers can't be saved).
+The library's "USB devices" card edits that list too.
 
-The device goes to the guest through a helper process (`vroom usb-host`,
+Unplugging a device and plugging it back in works while the VM runs.
+After a suspend/resume or a snapshot revert the guest sees the device
+plugged in anew (transfers in flight can't be saved). Devices connected
+only for the run are given back on suspend; connect them again after.
+
+Each device goes to the guest through a helper process (`vroom usb-host`,
 one per device, in its own sandbox); the VM process itself never opens a
-host device. See [SECURITY.md](SECURITY.md#usb-devices).
+host device. For a device connected while the VM runs, the app starts
+the helper and hands the VM its socket. See
+[SECURITY.md](SECURITY.md#usb-devices).
 
-What works on macOS, as a normal user: devices no macOS driver holds.
-That's vendor-specific devices: many dev boards, flashing and DFU modes,
-debug probes, logic analyzers, SDR sticks, Android phones in adb or
-fastboot mode. `vroom usb list` says when a macOS driver holds a device.
-What doesn't:
+### Devices macOS uses
 
-- Keyboards, mice, game pads and FIDO security keys (HID), disks and
-  card readers (mass storage), sound cards, webcams, USB Ethernet,
-  iPhones, and the common USB serial chips (FTDI, CP210x, CH34x, PL2303,
-  CDC-ACM): macOS has drivers for these and keeps them. Taking a device
-  away from a macOS driver needs root, or Apple's
-  `com.apple.vm.device-access` entitlement (Apple gives it to approved VM
-  vendors only; vroom can't ship it). With either, the same code takes
-  the device: libusb's "detach kernel driver" does it.
-- Isochronous transfers (webcams, sound cards) aren't passed through
-  yet: such a device shows up in the guest but doesn't stream.
+Keyboards, mice, game pads and FIDO security keys (HID), disks and card
+readers (mass storage), sound cards, webcams, USB Ethernet, and the
+common USB serial chips (FTDI, CP210x, CH34x, PL2303, CDC-ACM) have a
+macOS driver that holds them. The menu says so ("macOS uses it as a
+disk"). Taking a device from a macOS driver needs root, or Apple's
+`com.apple.vm.device-access` entitlement, which Apple gives to approved
+VM vendors only.
+
+vroom does it with vroom-netd, its one helper that runs as root (the
+same one bridged networking needs, see below). The first time, the menu
+shows "Set up (asks for your password)": macOS asks for an admin
+password once, and from then on these devices connect like the others.
+vroom-netd starts the USB helper as root for that one device; the app
+and the VM stay unprivileged. Eject a disk in Finder before you connect
+it: macOS lets go of it, mounted or not.
+
+Devices that work without it: those no macOS driver holds. That's
+vendor-specific devices: many dev boards, flashing and DFU modes, debug
+probes, logic analyzers, SDR sticks, Android phones in adb or fastboot
+mode.
+
+### Limits
+
 - A device composed of several functions works for the ones macOS
   leaves alone; the guest sees the others but they fail.
 
-Control, bulk and interrupt transfers work, at USB 1.1, 2.0 and 3.x speeds
-(SuperSpeed devices show up on a USB 3 port). No USB 3 bulk streams (UAS
+Control, bulk, interrupt and isochronous transfers work, at USB 1.1, 2.0
+and 3.x speeds (SuperSpeed devices show up on a USB 3 port). Isochronous
+is what sound cards and webcams stream with: once the guest has such a
+device (on macOS, see above), it streams. The host sends the packets as
+soon as it can, in order: a guest asking for an exact start frame gets
+the next free one. No USB 3 bulk streams (UAS
 disks fall back to the older protocol).
 
 On Linux hosts the helper uses usbfs: give your user access to the device
@@ -584,8 +778,75 @@ has it.
 Testing without hardware: `VROOM_USB_FAKE=acm` makes every helper serve
 a pretend USB serial port that echoes what it's sent (CDC-ACM; Linux
 guests see `/dev/ttyACM0` if they have the `cdc_acm` module, or use it
-from userspace through `/dev/bus/usb`). `VROOM_USB_FAKE_UNPLUG=<secs>`
-pulls it out once, for three seconds.
+from userspace through `/dev/bus/usb`). `VROOM_USB_FAKE=audio` serves a
+pretend USB sound card instead: speakers (48 kHz, 16-bit stereo) and a
+microphone (48 kHz, 16-bit mono) whose samples count up by one, so a
+recording shows whether anything was lost. It runs in real time, one
+packet per millisecond. Linux guests need the `snd-usb-audio` module (on
+Ubuntu cloud images: `linux-modules-extra-$(uname -r)`). `arecord -l`
+shows its card number (here 0); then, as root or in the `audio` group:
+`arecord -D hw:0,0 -f S16_LE -r 48000 -c 1 -d 5 -t raw mic.raw`.
+`VROOM_USB_FAKE_UNPLUG=<secs>` pulls the device out once, for three
+seconds.
+Started with `VROOM_USB_FAKE`, the app's USB menu also lists a pretend
+device (1209:00aa) to connect.
+
+## The root helper (vroom-netd)
+
+Two things need root on a Mac: bridged and host-only networking (vmnet),
+and taking a USB device from a macOS driver. vroom keeps both in one
+small daemon, vroom-netd, so nothing else ever runs as root. What it can
+do and why that's safe: [SECURITY.md](SECURITY.md#the-root-helper-vroom-netd).
+
+### Set up from the app
+
+The app offers it where it's needed: the network card of a VM with a
+bridged or host-only adapter, starting such a VM, and the USB menu next
+to a device macOS uses. Click "Set up (asks for your password)"; macOS
+shows its own password prompt. It installs:
+
+- `/usr/local/libexec/vroom/vroom-netd`, and a copy of libusb next to it
+  (root owns both: a root process loads nothing a user can replace);
+- `/etc/vroom/netd.toml`, its settings (kept if there is one already);
+- `/Library/LaunchDaemons/org.vroom.netd.plist`, so it starts with the
+  Mac; it logs to `/var/log/vroom-netd.log`.
+
+The app needs `vroom-netd` next to `vroom-gui` (`scripts/build.sh`
+builds it). Setting it up again (after an update) replaces the binary
+and keeps your settings. `⌘K` → "Set up vroom-netd" does it from
+anywhere; `⌘K` → "Remove vroom-netd" takes it away again (the password
+once more).
+
+### By hand
+
+```bash
+sudo mkdir -p /usr/local/libexec/vroom /etc/vroom
+sudo install -o root -g wheel -m 755 target/release/vroom-netd /usr/local/libexec/vroom/
+sudo install -o root -g wheel -m 644 "$(realpath /opt/homebrew/lib/libusb-1.0.0.dylib)" \
+    /usr/local/libexec/vroom/libusb-1.0.0.dylib
+sudo install -o root -g wheel -m 644 packaging/netd.toml /etc/vroom/
+sudo install -o root -g wheel -m 644 packaging/org.vroom.netd.plist /Library/LaunchDaemons/
+sudo launchctl bootstrap system /Library/LaunchDaemons/org.vroom.netd.plist
+```
+
+Remove it:
+
+```bash
+sudo launchctl bootout system/org.vroom.netd
+sudo rm -rf /Library/LaunchDaemons/org.vroom.netd.plist /usr/local/libexec/vroom /etc/vroom
+```
+
+`/etc/vroom/netd.toml` says who may use it: members of `group` (`staff`,
+every user of the Mac) for networking, members of `[usb] group`
+(`admin`, the users who could use sudo anyway) for USB devices,
+`[usb] enabled = false` turns USB off. `bridge_interfaces = ["en*"]`
+allows every Ethernet and Wi-Fi port; list names (`["en0"]`) to allow
+fewer. Restart it after a change:
+`sudo launchctl kickstart -k system/org.vroom.netd`.
+
+Linux: `packaging/vroom-netd.service` (systemd), same config file, the
+`vroom` group. There the USB part is optional: a udev rule gives your
+user the device, and the helper detaches Linux drivers itself.
 
 ## Sound
 
@@ -623,13 +884,14 @@ orange dot in the menu bar too. Focus doesn't matter: a call keeps going while
 you work in another window, the way a native app would.
 
 The first time a guest records, macOS asks for the microphone
-permission. It asks for the app that started vroom, not vroom itself:
-Terminal (or iTerm, VS Code...) for `vroom run` and for `vroom-gui`
-started from a terminal. Saying yes lets everything started from that
-app use the microphone. If you said no, or never saw the question, the
-guest records silence and the window says so after two seconds; turn
-the app on in System Settings, Privacy & Security, Microphone (or reset
-the question with `tccutil reset Microphone com.apple.Terminal`).
+permission, for the app that started vroom: "vroom" when you use
+vroom.app, Terminal (or iTerm, VS Code...) for `vroom run` and for
+`vroom-gui` started from a terminal. Saying yes to Terminal lets
+everything started from it use the microphone. If you said no, or never
+saw the question, the guest records silence and the window says so after
+two seconds; turn the app on in System Settings, Privacy & Security,
+Microphone (or reset the question with `tccutil reset Microphone
+org.vroom.app`, or `com.apple.Terminal`).
 Sound input in the guest follows the Mac's default input device (System
 Settings, Sound, Input).
 
@@ -659,9 +921,9 @@ second, uncompressed. The Mac's picture (16:9) is cropped to the shape the
 guest asked for, around its middle, then scaled.
 
 The first time, macOS asks for the camera permission for the app that
-started vroom (Terminal, iTerm...), as for the microphone. If you said
-no, the window says so; turn the app on in System Settings, Privacy &
-Security, Camera.
+started vroom (vroom with vroom.app; Terminal, iTerm... from a
+terminal), as for the microphone. If you said no, the window says so;
+turn the app on in System Settings, Privacy & Security, Camera.
 
 Testing without a camera: `VROOM_CAMERA_TEST=1 vroom run ...` sends
 moving color bars instead.
@@ -706,8 +968,8 @@ flushes a lot). `"none"` ignores flushes: scratch disks only.
 
 - x86_64 hosts: everything builds, but there is no x86 board: VMs can't
   start there yet.
-- Bridged / host-only: needs `vroom-netd` running as root; not tested
-  with real vmnet/tap yet.
+- Bridged / host-only: needs vroom-netd (set up from the app, see
+  above); not tested with real vmnet/tap yet.
 - Windows 11 is installed with its hardware checks bypassed (no Secure
   Boot); `tpm = true` (needs `brew install swtpm`) gives it a real TPM 2.0,
   which Windows sees and uses.
@@ -716,6 +978,10 @@ flushes a lot). `"none"` ignores flushes: scratch disks only.
 - 3D snapshots: not while a Vulkan app runs. Guest OpenGL stops at 4.1
   (2.1 with `opengl_host = "angle"`).
 - NAT connections don't survive suspend/resume (the guest reconnects).
-- USB passthrough: not yet tried with a real device (none was at hand);
-  tested with the pretend device behind the real helper and sandbox. No
-  isochronous transfers. On macOS only devices macOS has no driver for.
+- USB passthrough: not yet tried with a real device in a guest; tested
+  with the pretend devices behind the real helper and sandbox
+  (isochronous: the pretend sound card in a Linux guest), connected from
+  the VM file and from the app's menu while the VM runs. Taking a device
+  from a macOS driver through vroom-netd isn't tested as root yet (the
+  request, the root helper's sandbox and its libusb were, as a normal
+  user).

@@ -16,16 +16,17 @@
 
 #![allow(unsafe_code)]
 
-use std::ffi::c_void;
-use std::os::windows::ffi::OsStrExt;
-use std::path::Path;
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::cell::{Cell, RefCell};
+use std::ffi::{c_void, OsString};
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
 
 use windows_sys::core::GUID;
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, POINTL, WPARAM};
 use windows_sys::Win32::Graphics::Dwm::DwmFlush;
 use windows_sys::Win32::Graphics::Gdi::{GetStockObject, UpdateWindow, BLACK_BRUSH};
 use windows_sys::Win32::System::Com::{
@@ -35,20 +36,21 @@ use windows_sys::Win32::System::DataExchange::RegisterClipboardFormatW;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows_sys::Win32::System::Ole::{
-    OleInitialize, OleUninitialize, DROPEFFECT_COPY, DROPEFFECT_MOVE,
+    OleInitialize, OleUninitialize, RegisterDragDrop, ReleaseStgMedium, RevokeDragDrop, CF_HDROP, DROPEFFECT_COPY, DROPEFFECT_MOVE,
+    DROPEFFECT_NONE,
 };
 use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows_sys::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows_sys::Win32::UI::Shell::{
-    ILCreateFromPathW, ILFindLastID, ILFree, SHCreateDataObject, SHDoDragDrop,
+    DragQueryFileW, ILCreateFromPathW, ILFindLastID, ILFree, SHCreateDataObject, SHDoDragDrop,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
     GetForegroundWindow, GetMessageW, GetWindowThreadProcessId, KillTimer, PostMessageW,
-    PostQuitMessage, RegisterClassW, SetForegroundWindow, SetLayeredWindowAttributes, SetTimer,
+    PostQuitMessage, RegisterClassW, SetCursorPos, SetForegroundWindow, SetLayeredWindowAttributes, SetTimer,
     SetWindowPos, TranslateMessage, HWND_TOPMOST, LWA_ALPHA, MSG, SWP_NOACTIVATE, SWP_NOMOVE,
     SWP_NOSIZE, SWP_SHOWWINDOW, WM_CLOSE, WM_DESTROY, WM_LBUTTONDOWN, WM_TIMER, WNDCLASSW,
-    WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 /// {0000010e-0000-0000-C000-000000000046}
@@ -352,6 +354,316 @@ fn drag_thread(dir: &Path, items: &[(String, bool)], h2: &AtomicIsize, tx: mpsc:
         }
         OBJ.with(|o| o.set(std::ptr::null_mut()));
         release(obj);
+        OleUninitialize();
+    }
+}
+
+// ---------------------------------------------------------------------
+// Drag out (guest -> host): a drop target under the pointer.
+//
+// The host's mouse left the VM window with the button held, so the
+// guest's pointer sits at the screen edge. A tiny window of ours goes
+// there, registered as an OLE drop target. If a drag of files is going
+// on, Windows hands it to our window as soon as the pointer moves over
+// it (we nudge it); we read the paths from the data object (CF_HDROP)
+// and say "copy". We never take the drop: the host cancels the drag here
+// with Escape once the Mac has taken over (and a drop on us takes
+// nothing).
+
+/// {00000122-0000-0000-C000-000000000046}
+const IID_IDROPTARGET: GUID = GUID { data1: 0x0000_0122, data2: 0, data3: 0, data4: [0xc0, 0, 0, 0, 0, 0, 0, 0x46] };
+/// {00000000-0000-0000-C000-000000000046}
+const IID_IUNKNOWN: GUID = GUID { data1: 0, data2: 0, data3: 0, data4: [0xc0, 0, 0, 0, 0, 0, 0, 0x46] };
+const E_NOINTERFACE: i32 = 0x8000_4002_u32 as i32;
+/// No drag entered by then: there is none (of files, or at all).
+const ENTER_MS: u32 = 1_500;
+/// The host has the files by then, or never will.
+const KEEP_MS: u32 = 30_000;
+const PROBE_GIVE_UP: usize = 3;
+
+#[repr(C)]
+struct TargetVtbl {
+    query_interface: unsafe extern "system" fn(*mut Target, *const GUID, *mut *mut c_void) -> i32,
+    add_ref: unsafe extern "system" fn(*mut Target) -> u32,
+    release: unsafe extern "system" fn(*mut Target) -> u32,
+    drag_enter: unsafe extern "system" fn(*mut Target, *mut c_void, u32, POINTL, *mut u32) -> i32,
+    drag_over: unsafe extern "system" fn(*mut Target, u32, POINTL, *mut u32) -> i32,
+    drag_leave: unsafe extern "system" fn(*mut Target) -> i32,
+    drop: unsafe extern "system" fn(*mut Target, *mut c_void, u32, POINTL, *mut u32) -> i32,
+}
+
+/// Our IDropTarget. Only ever called on the probe window's thread (an
+/// STA: calls from the dragging process come through its messages).
+#[repr(C)]
+struct Target {
+    vtbl: *const TargetVtbl,
+    refs: AtomicU32,
+    hwnd: Cell<HWND>,
+    /// The drag over us carries files.
+    files: Cell<bool>,
+    /// Where the first drag's paths go.
+    tx: RefCell<Option<mpsc::Sender<Vec<PathBuf>>>>,
+}
+
+static TARGET_VTBL: TargetVtbl = TargetVtbl {
+    query_interface: t_query_interface,
+    add_ref: t_add_ref,
+    release: t_release,
+    drag_enter: t_drag_enter,
+    drag_over: t_drag_over,
+    drag_leave: t_drag_leave,
+    drop: t_drop,
+};
+
+fn guid_eq(a: &GUID, b: &GUID) -> bool {
+    a.data1 == b.data1 && a.data2 == b.data2 && a.data3 == b.data3 && a.data4 == b.data4
+}
+
+unsafe extern "system" fn t_query_interface(this: *mut Target, iid: *const GUID, out: *mut *mut c_void) -> i32 {
+    // SAFETY: COM calling convention: valid pointers from the caller.
+    unsafe {
+        if out.is_null() || iid.is_null() {
+            return E_NOINTERFACE;
+        }
+        if guid_eq(&*iid, &IID_IUNKNOWN) || guid_eq(&*iid, &IID_IDROPTARGET) {
+            t_add_ref(this);
+            *out = this.cast();
+            return 0;
+        }
+        *out = std::ptr::null_mut();
+        E_NOINTERFACE
+    }
+}
+
+unsafe extern "system" fn t_add_ref(this: *mut Target) -> u32 {
+    // SAFETY: a live Target (COM holds a reference while it calls).
+    unsafe { (*this).refs.fetch_add(1, Ordering::AcqRel) + 1 }
+}
+
+unsafe extern "system" fn t_release(this: *mut Target) -> u32 {
+    // SAFETY: as above; the last reference frees the Box it came from.
+    unsafe {
+        let n = (*this).refs.fetch_sub(1, Ordering::AcqRel) - 1;
+        if n == 0 {
+            drop(Box::from_raw(this));
+        }
+        n
+    }
+}
+
+/// The paths a data object carries as CF_HDROP (none: not files, or
+/// virtual ones such as what is inside a zip).
+unsafe fn hdrop_paths(obj: *mut c_void) -> Vec<PathBuf> {
+    // SAFETY: IDataObject::GetData (vtable slot 3) on a live data object;
+    // the medium is released here.
+    unsafe {
+        let mut fmt = FORMATETC { cfFormat: CF_HDROP, ptd: std::ptr::null_mut(), dwAspect: DVASPECT_CONTENT, lindex: -1, tymed: TYMED_HGLOBAL as u32 };
+        let mut med: STGMEDIUM = std::mem::zeroed();
+        let vtbl = *(obj as *const *const usize);
+        type GetData = unsafe extern "system" fn(*mut c_void, *mut FORMATETC, *mut STGMEDIUM) -> i32;
+        let f: GetData = std::mem::transmute(*vtbl.add(3));
+        if f(obj, &mut fmt, &mut med) < 0 {
+            return Vec::new();
+        }
+        let h = med.u.hGlobal;
+        let n = DragQueryFileW(h, u32::MAX, std::ptr::null_mut(), 0).min(vroom_proto::DROP_ITEMS_MAX as u32);
+        let mut out = Vec::new();
+        for i in 0..n {
+            let len = DragQueryFileW(h, i, std::ptr::null_mut(), 0);
+            if len == 0 || len > 32_767 {
+                continue;
+            }
+            let mut buf = vec![0u16; len as usize + 1];
+            let got = DragQueryFileW(h, i, buf.as_mut_ptr(), len + 1) as usize;
+            out.push(PathBuf::from(OsString::from_wide(&buf[..got.min(len as usize)])));
+        }
+        ReleaseStgMedium(&mut med);
+        out
+    }
+}
+
+unsafe extern "system" fn t_drag_enter(this: *mut Target, obj: *mut c_void, _keys: u32, _pt: POINTL, effect: *mut u32) -> i32 {
+    // SAFETY: called by OLE on our thread with a live data object.
+    unsafe {
+        let t = &*this;
+        let paths = if obj.is_null() { Vec::new() } else { hdrop_paths(obj) };
+        t.files.set(!paths.is_empty());
+        if let Some(tx) = t.tx.borrow_mut().take() {
+            log::info!("drag out: a drag of {} file(s) entered", paths.len());
+            let _ = tx.send(paths);
+        }
+        if !effect.is_null() {
+            *effect = if t.files.get() { *effect & DROPEFFECT_COPY } else { DROPEFFECT_NONE };
+        }
+        if !t.files.get() {
+            // Not files: nothing for us.
+            PostMessageW(t.hwnd.get(), WM_CLOSE, 0, 0);
+        }
+        0
+    }
+}
+
+unsafe extern "system" fn t_drag_over(this: *mut Target, _keys: u32, _pt: POINTL, effect: *mut u32) -> i32 {
+    // SAFETY: as above.
+    unsafe {
+        if !effect.is_null() {
+            *effect = if (*this).files.get() { *effect & DROPEFFECT_COPY } else { DROPEFFECT_NONE };
+        }
+        0
+    }
+}
+
+unsafe extern "system" fn t_drag_leave(this: *mut Target) -> i32 {
+    // SAFETY: as above. The drag was given up (the host's Escape) or
+    // went elsewhere: our part is done.
+    unsafe {
+        PostMessageW((*this).hwnd.get(), WM_CLOSE, 0, 0);
+        0
+    }
+}
+
+unsafe extern "system" fn t_drop(this: *mut Target, _obj: *mut c_void, _keys: u32, _pt: POINTL, effect: *mut u32) -> i32 {
+    // SAFETY: as above. We take nothing: the files go to the Mac.
+    unsafe {
+        if !effect.is_null() {
+            *effect = DROPEFFECT_NONE;
+        }
+        PostMessageW((*this).hwnd.get(), WM_CLOSE, 0, 0);
+        0
+    }
+}
+
+unsafe extern "system" fn probe_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    // SAFETY: our own window, on its thread.
+    unsafe {
+        match msg {
+            WM_TIMER if wp == FOLLOW => {
+                // Stay under the pointer: the host moves it along the
+                // edge as the mouse moves outside the window.
+                let mut pt = POINT { x: 0, y: 0 };
+                GetCursorPos(&mut pt);
+                SetWindowPos(hwnd, HWND_TOPMOST, pt.x - SIDE / 2, pt.y - SIDE / 2, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+                0
+            }
+            WM_TIMER | WM_CLOSE => {
+                DestroyWindow(hwnd);
+                0
+            }
+            WM_DESTROY => {
+                RevokeDragDrop(hwnd);
+                PostQuitMessage(0);
+                0
+            }
+            _ => DefWindowProcW(hwnd, msg, wp, lp),
+        }
+    }
+}
+
+/// Find the files of a drag going on under the pointer, if any.
+pub fn probe() -> Result<crate::dragout::Found, String> {
+    let hwnd = Arc::new(AtomicIsize::new(0));
+    let h2 = hwnd.clone();
+    let (tx, rx) = mpsc::channel::<Vec<PathBuf>>();
+    std::thread::Builder::new().name("drag-out-target".into()).spawn(move || probe_thread(tx, &h2)).map_err(|e| e.to_string())?;
+    // The channel closes without a word when no drag came.
+    let paths = rx.recv_timeout(Duration::from_millis(ENTER_MS as u64 + 3_000)).unwrap_or_default();
+    let close: Box<dyn FnOnce() + Send> = Box::new(move || {
+        let h = hwnd.load(Ordering::Acquire);
+        if h != 0 {
+            // SAFETY: posting to a window of ours (or a gone one: fails).
+            unsafe { PostMessageW(h as HWND, WM_CLOSE, 0, 0) };
+        }
+    });
+    if paths.is_empty() {
+        close();
+        return Ok(crate::dragout::Found { paths, close: None });
+    }
+    Ok(crate::dragout::Found { paths, close: Some(close) })
+}
+
+fn probe_thread(tx: mpsc::Sender<Vec<PathBuf>>, h2: &AtomicIsize) {
+    // SAFETY: plain Win32 and OLE calls on this thread's own window and
+    // drop target, run until the window goes.
+    unsafe {
+        if OleInitialize(std::ptr::null()) < 0 {
+            return;
+        }
+        let class: Vec<u16> = "VroomDropTarget\0".encode_utf16().collect();
+        let inst = GetModuleHandleW(std::ptr::null());
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(probe_wndproc),
+            hInstance: inst,
+            lpszClassName: class.as_ptr(),
+            // Painted: Windows looks through the parts of a layered
+            // window that were never drawn.
+            hbrBackground: GetStockObject(BLACK_BRUSH),
+            ..std::mem::zeroed()
+        };
+        RegisterClassW(&wc);
+        let mut pt = POINT { x: 0, y: 0 };
+        GetCursorPos(&mut pt);
+        let w = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            class.as_ptr(),
+            class.as_ptr(),
+            WS_POPUP,
+            pt.x - SIDE / 2,
+            pt.y - SIDE / 2,
+            SIDE,
+            SIDE,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            inst,
+            std::ptr::null(),
+        );
+        if w.is_null() {
+            OleUninitialize();
+            return;
+        }
+        let target = Box::into_raw(Box::new(Target {
+            vtbl: &TARGET_VTBL,
+            refs: AtomicU32::new(1),
+            hwnd: Cell::new(w),
+            files: Cell::new(false),
+            tx: RefCell::new(Some(tx)),
+        }));
+        let hr = RegisterDragDrop(w, target.cast());
+        if hr < 0 {
+            log::warn!("drag out: RegisterDragDrop: {hr:#x}");
+            DestroyWindow(w);
+        } else {
+            // Alpha 1, not 0: a fully transparent window is looked through.
+            SetLayeredWindowAttributes(w, 0, 1, LWA_ALPHA);
+            // In front, without taking the focus from the app dragging
+            // (its drag ends with Escape, which must reach it).
+            SetWindowPos(w, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            UpdateWindow(w);
+            DwmFlush();
+            DwmFlush();
+            // The drag looks for a target when the pointer moves: move it
+            // a little, and back.
+            GetCursorPos(&mut pt);
+            SetCursorPos(pt.x - 2, pt.y - 2);
+            SetCursorPos(pt.x, pt.y);
+            SetTimer(w, PROBE_GIVE_UP, ENTER_MS, None);
+            SetTimer(w, FOLLOW, 10, None);
+            h2.store(w as isize, Ordering::Release);
+            let mut msg: MSG = std::mem::zeroed();
+            while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+                if msg.message == WM_TIMER && msg.wParam == PROBE_GIVE_UP && (*target).files.get() {
+                    // Entered: keep the window until the host is done.
+                    KillTimer(w, PROBE_GIVE_UP);
+                    SetTimer(w, GIVE_UP, KEEP_MS, None);
+                    continue;
+                }
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            h2.store(0, Ordering::Release);
+        }
+        // No drag came: say so by closing the channel.
+        (*target).tx.borrow_mut().take();
+        t_release(target);
         OleUninitialize();
     }
 }

@@ -1535,6 +1535,11 @@ impl GpuHandler {
                 })();
                 if let Some(hdr) = hdr {
                     let (ty, body) = self.command(&ctx.mem, &mut r, &hdr);
+                    if hdr.ty == CTX_DESTROY && ty == OK_NODATA {
+                        for (q, head, len) in self.drop_context_fences(hdr.ctx) {
+                            ctx.add_used(q, head, len);
+                        }
+                    }
                     if ty >= ERR_UNSPEC {
                         log::debug!("gpu: command {:#x} ctx {} -> {ty:#x}", hdr.ty, hdr.ctx);
                     } else {
@@ -1557,6 +1562,20 @@ impl GpuHandler {
             }
             ctx.add_used(q, head, len);
         }
+    }
+
+    /// A context is gone: the renderer drops its fences, so commands still
+    /// waiting on one of its rings go back now (they would wait forever).
+    fn drop_context_fences(&mut self, id: u32) -> Vec<(usize, u16, u32)> {
+        let mut out = Vec::new();
+        self.pending.retain(|p| {
+            let gone = p.ring.is_some() && p.ctx == id;
+            if gone {
+                out.push((p.q, p.head, p.len));
+            }
+            !gone
+        });
+        out
     }
 
     fn complete_fences(&mut self, ctx: &mut QueueCtx) {
@@ -2286,6 +2305,19 @@ mod tests {
         let mem = ring.mem.clone();
         let (mut r, _) = ring.q.clone().pop(&mem).unwrap().unwrap().into_rw().unwrap();
         h.command(&mem, &mut r, &hdr).0
+    }
+
+    #[test]
+    fn context_fences_go_back_with_the_context() {
+        let (gpu, _ctl) = Gpu::new(64, 64, Arc::new(Rec::default()));
+        let mut h = gpu.handler();
+        let now = std::time::Instant::now();
+        for (head, ctx, ring) in [(1, 3, Some(1)), (2, 3, None), (3, 4, Some(1)), (4, 3, Some(0))] {
+            h.pending.push(Pending { q: 0, head, len: 24, ctx, ring, fence: 7, since: now, late: false });
+        }
+        assert_eq!(h.drop_context_fences(3), [(0, 1, 24), (0, 4, 24)]);
+        // Global fences and other contexts' stay.
+        assert_eq!(h.pending.iter().map(|p| p.head).collect::<Vec<_>>(), [2, 3]);
     }
 
     #[test]

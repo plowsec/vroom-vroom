@@ -8,6 +8,22 @@ import { Icons } from "icons.slint";
 import { VmState } from "types.slint";
 import { IconButton, Icon, Spinner, OsBadge, StatusDot, Button } from "controls.slint";
 
+// One host USB device in the VM window's USB menu.
+export struct UsbMenuRow {
+    label: string,
+    // Under the name: connected, why it can't be, where it is.
+    note: string,
+    // Connected to this VM.
+    on: bool,
+    // In the VM file: connected at every start.
+    always: bool,
+    // The note is a warning (needs the root helper, in use elsewhere).
+    warn: bool,
+    // Being connected or let go.
+    busy: bool,
+    enabled: bool,
+}
+
 component BarButton inherits IconButton {
     tint: #ffffffd0;
     size: 30px;
@@ -39,8 +55,16 @@ component VmBar inherits HorizontalLayout {
     in property <bool> monitors;
     // Spans the window: the indicators go to the right.
     in property <bool> wide;
+    // The VM has a USB controller to plug host devices into; how many are.
+    in property <bool> usb-shown;
+    in property <int> usb-count;
+    in property <bool> usb-open;
+    // Coherence: why it can't start (empty: it can).
+    in property <string> coherence-why;
     out property <bool> power-open: false;
     callback act(string);
+    // The USB button was clicked: where its bottom right corner is.
+    callback usb-at(length, length);
 
     padding-left: 8px;
     padding-right: 6px;
@@ -193,11 +217,47 @@ component VmBar inherits HorizontalLayout {
         y: (parent.height - self.height) / 2;
         clicked => { root.act("displays"); }
     }
+    if root.usb-shown: Rectangle {
+        width: 30px;
+        height: 30px;
+        y: (parent.height - self.height) / 2;
+        ub := BarButton {
+            icon: Icons.usb;
+            tip: root.usb-open ? "" : root.usb-count == 0 ? "USB devices" : root.usb-count == 1 ? "1 USB device connected" : root.usb-count + " USB devices connected";
+            active: root.usb-open;
+            clicked => {
+                root.usb-at(self.absolute-position.x + self.width, self.absolute-position.y + self.height);
+                root.act("usb-menu");
+            }
+        }
+        // How many are connected, on the icon's corner.
+        if root.usb-count > 0: Rectangle {
+            x: parent.width - self.width - 1px;
+            y: 2px;
+            width: max(13px, ct.preferred-width + 6px);
+            height: 13px;
+            border-radius: 6.5px;
+            background: Theme.accent;
+            ct := Text {
+                text: root.usb-count;
+                color: #ffffff;
+                font-size: 9px;
+                font-weight: 700;
+            }
+        }
+    }
     BarButton {
         icon: Icons.sliders;
         tip: "Settings";
         y: (parent.height - self.height) / 2;
         clicked => { root.act("settings"); }
+    }
+    BarButton {
+        icon: Icons.window;
+        tip: root.coherence-why == "" ? "Coherence: the VM's windows on your desktop" : root.coherence-why;
+        dim: root.coherence-why != "";
+        y: (parent.height - self.height) / 2;
+        clicked => { root.act("coherence"); }
     }
     BarButton {
         icon: Icons.maximize;
@@ -289,6 +349,8 @@ export component ConsoleWindow inherits Window {
     in property <string> cpu-text;
     in property <string> gpu-text;
     in property <bool> monitors;
+    // Why Coherence can't start now (empty: it can).
+    in property <string> coherence-why: "Coherence needs the guest tools";
     // Height of the bar above the guest screen (none in full screen).
     // Rust takes it off the size it asks the guest for.
     out property <length> bar-height: root.fullscreen ? 0px : 38px;
@@ -303,6 +365,20 @@ export component ConsoleWindow inherits Window {
     in property <bool> drop-over;
     in property <string> drop-text;
     in property <float> drop-progress: -1;
+    // Host USB devices: the VM can take them (it has a USB controller),
+    // how many it has, the menu and what is in it.
+    in property <bool> usb-shown;
+    in property <int> usb-count;
+    in-out property <bool> usb-open;
+    in property <[UsbMenuRow]> usb-rows;
+    // Under the list: what the root helper is for, if a device needs it;
+    // with `usb-setup`, the button that sets it up.
+    in property <string> usb-note;
+    in property <bool> usb-setup;
+    in property <bool> usb-setup-busy;
+    // Where the menu hangs from (the USB button's bottom right corner).
+    in-out property <length> usb-x: root.width - 120px;
+    in-out property <length> usb-y: root.bar-height;
     callback mouse-move(float, float);
     callback button(int, bool);
     callback wheel(length, length);
@@ -322,7 +398,7 @@ export component ConsoleWindow inherits Window {
     property <float> ar: mode-w > 0 && mode-h > 0 ? mode-w / mode-h : 1.6;
     property <length> avail-h: root.height - root.bar-height;
     property <bool> near-top: screen-ta.has-hover && screen-ta.mouse-y + screen.y < 8px;
-    property <bool> float-out: root.fullscreen && (root.bar-pinned || root.near-top || float-ta.has-hover || float-bar.power-open || root.state != VmState.running);
+    property <bool> float-out: root.fullscreen && (root.bar-pinned || root.near-top || float-ta.has-hover || float-bar.power-open || root.usb-open || root.state != VmState.running);
 
     screen := Rectangle {
         width: min(root.width, root.avail-h * root.ar);
@@ -539,7 +615,15 @@ export component ConsoleWindow inherits Window {
             cpu-text: root.cpu-text;
             gpu-text: root.gpu-text;
             monitors: root.monitors;
+            coherence-why: root.coherence-why;
             wide: true;
+            usb-shown: root.usb-shown;
+            usb-count: root.usb-count;
+            usb-open: root.usb-open;
+            usb-at(x, y) => {
+                root.usb-x = x;
+                root.usb-y = y;
+            }
             act(a) => { root.act(a); }
         }
     }
@@ -573,6 +657,14 @@ export component ConsoleWindow inherits Window {
             camera-on: root.camera-on;
             monitors: root.monitors;
             wide: false;
+            usb-shown: root.usb-shown;
+            usb-count: root.usb-count;
+            usb-open: root.usb-open;
+            usb-at(x, y) => {
+                root.usb-x = x;
+                root.usb-y = y;
+            }
+            coherence-why: root.coherence-why;
             act(a) => { root.act(a); }
         }
     }
@@ -618,6 +710,155 @@ export component ConsoleWindow inherits Window {
                 height: 100%;
                 border-radius: 2px;
                 background: Theme.accent;
+            }
+        }
+    }
+
+    // Host USB devices, under the bar's USB button. A click outside
+    // closes it.
+    if root.usb-open: TouchArea {
+        clicked => { root.usb-open = false; }
+    }
+    if root.usb-open: Rectangle {
+        width: min(360px, root.width - 16px);
+        height: ul.preferred-height;
+        x: clamp(root.usb-x - self.width, 8px, root.width - self.width - 8px);
+        y: root.usb-y + 4px;
+        background: #242427f2;
+        border-radius: Theme.r-lg;
+        border-width: 1px;
+        border-color: #ffffff24;
+        TouchArea { }
+        ul := VerticalLayout {
+            padding: 5px;
+            spacing: 0px;
+            Text {
+                text: "USB devices on this Mac";
+                color: #ffffff80;
+                font-size: Theme.fs-xs;
+                font-weight: 600;
+                height: 26px;
+                vertical-alignment: center;
+                x: 10px;
+            }
+            if root.usb-rows.length == 0: Text {
+                text: "Nothing plugged in.";
+                color: #ffffffb0;
+                font-size: Theme.fs-md;
+                height: 34px;
+                vertical-alignment: center;
+                x: 10px;
+            }
+            for it[i] in root.usb-rows: VerticalLayout {
+                Rectangle {
+                    height: 44px;
+                    border-radius: Theme.r-sm;
+                    background: rta.has-hover && it.enabled ? #ffffff14 : transparent;
+                    opacity: it.enabled ? 1 : 0.5;
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        spacing: 10px;
+                        Rectangle {
+                            width: 16px;
+                            if it.busy: Spinner {
+                                tint: #ffffffb0;
+                                y: (parent.height - self.height) / 2;
+                            }
+                            if it.on && !it.busy: Icon {
+                                source: Icons.check;
+                                width: 16px;
+                                height: 16px;
+                                y: (parent.height - self.height) / 2;
+                                tint: Theme.accent;
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 2px;
+                            Text {
+                                text: it.label;
+                                color: #ffffff;
+                                font-size: Theme.fs-md;
+                                overflow: elide;
+                            }
+                            Text {
+                                text: it.note;
+                                color: it.warn ? #fbbf24 : #ffffff80;
+                                font-size: Theme.fs-xs;
+                                overflow: elide;
+                            }
+                        }
+                    }
+                    rta := TouchArea {
+                        enabled: it.enabled && !it.busy;
+                        mouse-cursor: pointer;
+                        clicked => { root.act("usb.toggle." + i); }
+                    }
+                }
+                // Connected, or in the VM file: keep it there, or not.
+                if it.on || it.always: Rectangle {
+                    height: 28px;
+                    HorizontalLayout {
+                        padding-left: 36px;
+                        spacing: 8px;
+                        Rectangle {
+                            width: 14px;
+                            height: 14px;
+                            y: (parent.height - self.height) / 2;
+                            border-radius: 3px;
+                            border-width: it.always ? 0px : 1px;
+                            border-color: #ffffff60;
+                            background: it.always ? Theme.accent : transparent;
+                            if it.always: Icon {
+                                source: Icons.check;
+                                width: 11px;
+                                height: 11px;
+                                tint: #ffffff;
+                            }
+                        }
+                        Text {
+                            text: "Always connect to this VM";
+                            color: ata.has-hover ? #ffffff : #ffffffb0;
+                            font-size: Theme.fs-sm;
+                            vertical-alignment: center;
+                        }
+                    }
+                    ata := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.act("usb.always." + i); }
+                    }
+                }
+            }
+            if root.usb-note != "": Rectangle {
+                height: nl.preferred-height + 6px;
+                Rectangle {
+                    y: 2px;
+                    height: 1px;
+                    background: #ffffff14;
+                }
+                nl := VerticalLayout {
+                    y: 6px;
+                    padding: 10px;
+                    padding-top: 8px;
+                    spacing: 10px;
+                    Text {
+                        text: root.usb-note;
+                        color: #ffffffb0;
+                        font-size: Theme.fs-sm;
+                        wrap: word-wrap;
+                    }
+                    if root.usb-setup: HorizontalLayout {
+                        alignment: start;
+                        Button {
+                            kind: "primary";
+                            small: true;
+                            text: root.usb-setup-busy ? "Waiting for your password..." : "Set up (asks for your password)";
+                            busy: root.usb-setup-busy;
+                            clicked => { root.act("usb.setup"); }
+                        }
+                    }
+                }
             }
         }
     }

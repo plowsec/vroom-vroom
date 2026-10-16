@@ -756,7 +756,7 @@ gpu = "virtio2d"
             match call {
                 "set" => assert!(UI_SETS.iter().any(|(k, _)| k == &key), "Bus.set({key:?}) not tested"),
                 "act" => assert!(
-                    UI_ACTS.contains(&key) || ["disk.add-new", "disk.add-existing", "disk.add-iso", "share.add", "usb.add", "edit-file"].contains(&key),
+                    UI_ACTS.contains(&key) || ["disk.add-new", "disk.add-existing", "disk.add-iso", "share.add", "usb.add", "edit-file", "netd.setup", "netd.remove"].contains(&key),
                     "Bus.act({key:?}) not tested"
                 ),
                 _ => {}

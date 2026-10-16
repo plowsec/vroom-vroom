@@ -5365,6 +5365,7 @@ dependencies = [
  "serde_json",
  "vroom-proto",
  "windows-sys 0.59.0",
+ "x11rb",
 ]
 
 [[package]]
@@ -5463,6 +5464,7 @@ dependencies = [
  "libc",
  "thiserror 2.0.21",
  "vroom-ipc",
+ "vroom-proto",
 ]
 
 [[package]]
@@ -5489,10 +5491,14 @@ name = "vroom-gui"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "block2 0.6.2",
  "env_logger",
  "i-slint-backend-testing",
  "libc",
  "log",
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
  "png 0.17.16",
  "rfd",
  "serde",
@@ -5506,7 +5512,9 @@ dependencies = [
  "vroom-config",
  "vroom-display",
  "vroom-import",
+ "vroom-net",
  "vroom-proto",
+ "vroom-sandbox",
  "vroom-state",
  "vroom-usb",
 ]
@@ -5577,9 +5585,12 @@ dependencies = [
  "log",
  "serde",
  "serde_json",
+ "tempfile",
  "toml 0.8.23",
  "vroom-ipc",
  "vroom-net",
+ "vroom-sandbox",
+ "vroom-usb",
 ]
 
 [[package]]
