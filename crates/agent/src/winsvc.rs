@@ -111,6 +111,8 @@ fn serve(port: Option<&str>) {
             log::info!("shares: {e}");
         }
     });
+    // More monitors: their GPUs want the 2D driver.
+    std::thread::spawn(|| crate::sys::gpu_drivers(false));
     let (tx, rx) = channel::<Ev>();
     {
         let tx = tx.clone();

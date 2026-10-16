@@ -35,6 +35,8 @@ const CFG_DEVICE: u8 = 4;
 const CFG_PCI: u8 = 5;
 const CFG_SHARED_MEMORY: u8 = 8;
 /// Shared memory regions (GPU host-visible memory) live in BAR 2.
+/// Where the shared memory region goes (see `pci_shm_first`: then the
+/// two swap).
 const SHM_BAR: usize = 2;
 
 fn class_for(device_type: u32) -> u32 {
@@ -114,6 +116,10 @@ pub struct VirtioPci {
     pci_cfg_cap: usize,
     /// Shared memory region in BAR 2 (id) and where the guest put it.
     shm: Option<(u8, u64)>,
+    /// The BARs of the virtio registers and of the shared memory region
+    /// (0 and 2, or swapped: `pci_shm_first`).
+    vbar: usize,
+    sbar: usize,
 }
 
 impl std::fmt::Debug for VirtioPci {
@@ -146,6 +152,8 @@ impl VirtioPci {
         let ty = dev.device_type();
         let nq = dev.queue_max_sizes().len();
         let subsys = dev.pci_subsystem();
+        let swap = dev.pci_shm_first() && !dev.shm_regions().is_empty();
+        let (vbar, sbar) = if swap { (SHM_BAR, 0) } else { (0, SHM_BAR) };
         let mut cfg = ConfigSpace::new(
             PciId {
                 vendor: 0x1af4,
@@ -157,8 +165,13 @@ impl VirtioPci {
             },
             1,
         );
-        cfg.add_bar(0, BarSpec { size: BAR_SIZE, is64: true, prefetch: false });
+        cfg.add_bar(vbar, BarSpec { size: BAR_SIZE, is64: true, prefetch: false });
         let ro = |n: usize| vec![0u8; n];
+        let vendor_cap = |t, o, l, e: &[u8]| {
+            let mut c = vendor_cap(t, o, l, e);
+            c[2] = vbar as u8;
+            c
+        };
         let c = vendor_cap(CFG_COMMON, COMMON as u32, 0x38, &[]);
         cfg.add_capability(CAP_VENDOR, &c, &ro(c.len()));
         let c = vendor_cap(CFG_NOTIFY, NOTIFY as u32, (nq as u32) * NOTIFY_MULT, &NOTIFY_MULT.to_le_bytes());
@@ -178,9 +191,9 @@ impl VirtioPci {
         // One shared memory region at most (virtio-gpu), at offset 0 of BAR 2.
         let shm_id = dev.shm_regions().first().map(|&(id, len)| {
             let size = len.next_power_of_two().max(1 << 20);
-            cfg.add_bar(SHM_BAR, BarSpec { size, is64: true, prefetch: true });
+            cfg.add_bar(sbar, BarSpec { size, is64: true, prefetch: true });
             // virtio_pci_cap64: cap + offset_hi + length_hi.
-            let mut c = vec![24, CFG_SHARED_MEMORY, SHM_BAR as u8, id, 0, 0];
+            let mut c = vec![24, CFG_SHARED_MEMORY, sbar as u8, id, 0, 0];
             c.extend_from_slice(&0u32.to_le_bytes());
             c.extend_from_slice(&(len as u32).to_le_bytes());
             c.extend_from_slice(&0u32.to_le_bytes());
@@ -189,7 +202,7 @@ impl VirtioPci {
             id
         });
         let vectors = (nq + 1) as u16;
-        let msix = Msix::new(&mut cfg, vectors, 0, MSIX_TABLE as u32, MSIX_PBA as u32, msi);
+        let msix = Msix::new(&mut cfg, vectors, vbar as u8, MSIX_TABLE as u32, MSIX_PBA as u32, msi);
         let irq_state = Arc::new(Mutex::new(IrqState { msix, isr: 0, queue_vec: vec![NO_VECTOR; nq], config_vec: NO_VECTOR }));
         let irq = Arc::new(PciInterrupt { st: irq_state.clone(), intx });
         let id = format!("virtio-{}@{slot:02x}", dev.name());
@@ -202,6 +215,8 @@ impl VirtioPci {
             irq,
             pci_cfg_cap,
             shm: shm_id.map(|id| (id, 0)),
+            vbar,
+            sbar,
         }
     }
 
@@ -366,7 +381,7 @@ impl PciDevice for VirtioPci {
         let window = self.pci_cfg_cap + 16;
         if off == window {
             let (bar, boff, len) = self.pci_cfg_target();
-            if bar == 0 && matches!(len, 1 | 2 | 4) && boff + len as u64 <= BAR_SIZE {
+            if bar as usize == self.vbar && matches!(len, 1 | 2 | 4) && boff + len as u64 <= BAR_SIZE {
                 let mut tmp = [0u8; 4];
                 self.bar0_read(boff, &mut tmp[..len]);
                 let n = data.len().min(4);
@@ -381,14 +396,14 @@ impl PciDevice for VirtioPci {
         let window = self.pci_cfg_cap + 16;
         if off == window {
             let (bar, boff, l) = self.pci_cfg_target();
-            if bar == 0 && matches!(l, 1 | 2 | 4) && boff + l as u64 <= BAR_SIZE {
+            if bar as usize == self.vbar && matches!(l, 1 | 2 | 4) && boff + l as u64 <= BAR_SIZE {
                 let mut d = [0u8; 4];
                 d.copy_from_slice(&self.cfg.raw()[window..window + 4]);
                 self.bar0_write(boff, &d[..l.min(len.max(1))]);
             }
         }
         if let Some((id, base)) = self.shm {
-            let now = self.cfg.bar_addr(SHM_BAR).unwrap_or(0);
+            let now = self.cfg.bar_addr(self.sbar).unwrap_or(0);
             if now != base && now != 0 {
                 self.shm = Some((id, now));
                 self.core.set_shm_base(id, now);
@@ -402,7 +417,7 @@ impl PciDevice for VirtioPci {
     }
 
     fn bar_read(&mut self, bar: usize, off: u64, data: &mut [u8]) {
-        if bar == 0 {
+        if bar == self.vbar {
             self.bar0_read(off, data);
         } else {
             data.fill(0);
@@ -410,7 +425,7 @@ impl PciDevice for VirtioPci {
     }
 
     fn bar_write(&mut self, bar: usize, off: u64, data: &[u8]) {
-        if bar == 0 {
+        if bar == self.vbar {
             self.bar0_write(off, data);
         }
     }
@@ -452,7 +467,7 @@ impl PciDevice for VirtioPci {
             }
         }
         self.cfg = cfg;
-        if let (Some((id, _)), Some(addr)) = (self.shm, self.cfg.bar_addr(SHM_BAR)) {
+        if let (Some((id, _)), Some(addr)) = (self.shm, self.cfg.bar_addr(self.sbar)) {
             self.shm = Some((id, addr));
             self.core.set_shm_base(id, addr);
         }

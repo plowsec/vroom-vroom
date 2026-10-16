@@ -45,6 +45,10 @@ impl System for RealSystem {
         crate::sys::shutdown(reboot);
     }
     fn gpu3d(&mut self, on: bool) -> Option<bool> {
+        // The host has 3D: the first GPU wants the 3D driver.
+        if on {
+            crate::sys::gpu_drivers(true);
+        }
         crate::sys::gpu3d(on)
     }
 }
@@ -116,7 +120,7 @@ impl<S: System> Relay<S> {
                 self.display.1 = Some(m.clone());
                 self.send_helper(&m);
             }
-            m @ Message::ClipboardText(_) => self.send_helper(&m),
+            m @ (Message::ClipboardText(_) | Message::Mouse { .. }) => self.send_helper(&m),
             // Dropped files are written by the user, in their session.
             Message::DragEnter { id, .. } if self.helper.is_none() => {
                 let place = "nobody is logged in to the guest".to_string();

@@ -51,6 +51,8 @@ pub enum AgentCmd {
     DragCancel { id: u32 },
     /// Dropped: the viewer writes them into this pipe, as agent frames.
     Drop { id: u32, from: std::os::fd::OwnedFd },
+    /// The pointer on the whole desktop (see `Message::Mouse`).
+    Mouse { x: u16, y: u16, buttons: u8, wheel: i8 },
     Stop,
 }
 
@@ -83,6 +85,12 @@ impl Agent {
 
     pub fn status(&self) -> AgentStatus {
         self.status.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// The connected agent's features (0: none connected).
+    pub fn features(&self) -> u64 {
+        let s = self.status.lock().unwrap_or_else(|e| e.into_inner());
+        if s.connected { s.features } else { 0 }
     }
 }
 
@@ -403,6 +411,7 @@ impl Service {
                 }
             }
             AgentCmd::DragCancel { id } => self.send(&Message::DragCancel { id }),
+            AgentCmd::Mouse { x, y, buttons, wheel } => self.send(&Message::Mouse { x, y, buttons, wheel }),
             AgentCmd::Drop { id, from } => {
                 let out = self.out.clone();
                 let r = std::thread::Builder::new().name("agent-drop".into()).spawn(move || forward_drop(id, from, &out));

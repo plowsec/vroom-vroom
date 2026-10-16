@@ -105,23 +105,23 @@ pub fn xrandr_args(outputs: &[Output], monitors: &[Option<Monitor>]) -> Option<V
 #[cfg(windows)]
 pub fn apply(monitors: &[Option<Monitor>]) -> io::Result<()> {
     use windows_sys::Win32::Graphics::Gdi::{
-        ChangeDisplaySettingsExW, EnumDisplayDevicesW, CDS_NORESET, CDS_SET_PRIMARY, CDS_UPDATEREGISTRY, DEVMODEW, DISPLAY_DEVICEW,
-        DISPLAY_DEVICE_ATTACHED_TO_DESKTOP, DISP_CHANGE_SUCCESSFUL, DM_PELSHEIGHT, DM_PELSWIDTH, DM_POSITION,
+        ChangeDisplaySettingsExW, CDS_NORESET, CDS_SET_PRIMARY, CDS_UPDATEREGISTRY, DEVMODEW, DISP_CHANGE_SUCCESSFUL, DM_PELSHEIGHT, DM_PELSWIDTH,
+        DM_POSITION,
     };
     let text = |w: &[u16]| String::from_utf16_lossy(&w[..w.iter().position(|&c| c == 0).unwrap_or(w.len())]);
-    // (device name, our monitor if it is one, on the desktop)
-    let mut displays = Vec::new();
-    for i in 0.. {
-        // SAFETY: plain data; all zeroes is valid once cb is set.
-        let mut dd: DISPLAY_DEVICEW = unsafe { std::mem::zeroed() };
-        dd.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
-        // SAFETY: valid out pointer, null device = adapters.
-        if unsafe { EnumDisplayDevicesW(std::ptr::null(), i, &mut dd, 0) } == 0 {
-            break;
-        }
-        displays.push((dd.DeviceName, gpu_head(&text(&dd.DeviceID)), dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP != 0));
-    }
     let wanted = |h: Option<usize>| h.and_then(|h| monitors.get(h).copied().flatten());
+    let mut displays = list();
+    // A monitor we want that Windows keeps off its desktop: Windows
+    // won't take one back with ChangeDisplaySettingsEx alone. Extend the
+    // desktop over all of them first (Win+P "Extend"), then arrange.
+    if displays.iter().any(|d| wanted(d.1).is_some() && !d.2) {
+        use windows_sys::Win32::Devices::Display::{SetDisplayConfig, SDC_APPLY, SDC_TOPOLOGY_EXTEND};
+        // SAFETY: no arrays: apply a stock topology.
+        let r = unsafe { SetDisplayConfig(0, std::ptr::null(), 0, std::ptr::null(), SDC_APPLY | SDC_TOPOLOGY_EXTEND) };
+        log::info!("layout: a monitor is off the desktop; extend: {r}");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        displays = list();
+    }
     if !displays.iter().any(|d| wanted(d.1).is_some()) {
         return Err(io::Error::other(format!("none of the {} displays is one of the host's monitors", displays.len())));
     }
@@ -161,6 +161,26 @@ pub fn apply(monitors: &[Option<Monitor>]) -> io::Result<()> {
     Ok(())
 }
 
+/// Windows' display devices: (device name, our monitor if it is one,
+/// on the desktop).
+#[cfg(windows)]
+fn list() -> Vec<([u16; 32], Option<usize>, bool)> {
+    use windows_sys::Win32::Graphics::Gdi::{EnumDisplayDevicesW, DISPLAY_DEVICEW, DISPLAY_DEVICE_ATTACHED_TO_DESKTOP};
+    let text = |w: &[u16]| String::from_utf16_lossy(&w[..w.iter().position(|&c| c == 0).unwrap_or(w.len())]);
+    let mut displays = Vec::new();
+    for i in 0.. {
+        // SAFETY: plain data; all zeroes is valid once cb is set.
+        let mut dd: DISPLAY_DEVICEW = unsafe { std::mem::zeroed() };
+        dd.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
+        // SAFETY: valid out pointer, null device = adapters.
+        if unsafe { EnumDisplayDevicesW(std::ptr::null(), i, &mut dd, 0) } == 0 {
+            break;
+        }
+        displays.push((dd.DeviceName, gpu_head(&text(&dd.DeviceID)), dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP != 0));
+    }
+    displays
+}
+
 #[cfg(windows)]
 fn m_x(dm: &windows_sys::Win32::Graphics::Gdi::DEVMODEW) -> i32 {
     // SAFETY: the display variant of the union, which we set.
@@ -173,23 +193,49 @@ fn m_y(dm: &windows_sys::Win32::Graphics::Gdi::DEVMODEW) -> i32 {
     unsafe { dm.Anonymous1.Anonymous2.dmPosition.y }
 }
 
+/// The pointer, on a monitor the USB tablet can't reach (Windows maps it
+/// to the main one): moved like a mouse would, over the whole desktop.
+/// `buttons`: what the host has down; changes since the last call are
+/// pressed or let go here.
+#[cfg(windows)]
+pub fn mouse(x: u16, y: u16, buttons: u8, wheel: i8) {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
+        MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL,
+        MOUSEINPUT,
+    };
+    static DOWN: AtomicU8 = AtomicU8::new(0);
+    let before = DOWN.swap(buttons, Ordering::Relaxed);
+    let mut flags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+    for (bit, down, up) in [(1, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP), (2, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP), (4, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP)] {
+        match (before & bit != 0, buttons & bit != 0) {
+            (false, true) => flags |= down,
+            (true, false) => flags |= up,
+            _ => {}
+        }
+    }
+    let mut data = 0u32;
+    if wheel != 0 {
+        flags |= MOUSEEVENTF_WHEEL;
+        // Up is positive for Windows, as for evdev.
+        data = (wheel as i32 * 120) as u32;
+    }
+    let mi = MOUSEINPUT { dx: x as i32, dy: y as i32, mouseData: data, dwFlags: flags, time: 0, dwExtraInfo: 0 };
+    let input = INPUT { r#type: INPUT_MOUSE, Anonymous: INPUT_0 { mi } };
+    // SAFETY: one valid INPUT of the size given.
+    if unsafe { SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) } != 1 {
+        log::debug!("SendInput: {}", io::Error::last_os_error());
+    }
+}
+
+#[cfg(not(windows))]
+pub fn mouse(_x: u16, _y: u16, _buttons: u8, _wheel: i8) {}
+
 /// Windows: how many of the host's GPUs show as displays.
 #[cfg(windows)]
 pub fn our_displays() -> usize {
-    use windows_sys::Win32::Graphics::Gdi::{EnumDisplayDevicesW, DISPLAY_DEVICEW};
-    let mut n = 0;
-    for i in 0.. {
-        // SAFETY: as in apply().
-        let mut dd: DISPLAY_DEVICEW = unsafe { std::mem::zeroed() };
-        dd.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
-        // SAFETY: as in apply().
-        if unsafe { EnumDisplayDevicesW(std::ptr::null(), i, &mut dd, 0) } == 0 {
-            break;
-        }
-        let id = String::from_utf16_lossy(&dd.DeviceID[..dd.DeviceID.iter().position(|&c| c == 0).unwrap_or(128)]);
-        n += gpu_head(&id).is_some() as usize;
-    }
-    n
+    list().iter().filter(|d| d.1.is_some()).count()
 }
 
 #[cfg(target_os = "linux")]

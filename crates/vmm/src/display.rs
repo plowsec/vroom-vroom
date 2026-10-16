@@ -338,6 +338,10 @@ impl DisplaySink for FbSink {
     }
 
     fn cursor(&self, c: &Cursor) {
+        // One pointer for the viewer: the first monitor's GPU says.
+        if self.head > 0 {
+            return;
+        }
         let c = match c {
             Cursor::Unset => GuestCursor::Unset,
             Cursor::Hidden => GuestCursor::Hidden,
@@ -458,6 +462,7 @@ impl DisplayServer {
     /// Start reading viewer input. `window(open)`: the microphone gate,
     /// open while a viewer is there. With `listener`, a later viewer
     /// (the app restarted after a crash) can take over: one at a time.
+    #[allow(clippy::too_many_arguments)]
     pub fn run(
         self,
         input: Option<InputPipes>,
@@ -466,8 +471,9 @@ impl DisplayServer {
         window: Option<Box<dyn Fn(bool) + Send + Sync>>,
         listener: Option<UnixListener>,
         screens: Vec<Arc<FbSink>>,
+        windows: bool,
     ) -> std::io::Result<()> {
-        let ctx = Arc::new(Serve { input, agent, events, window, latest: self.clip_latest, tx: self.tx, screens });
+        let ctx = Arc::new(Serve { input, agent, events, window, latest: self.clip_latest, tx: self.tx, screens, windows, ptr: Mutex::default() });
         let c = ctx.clone();
         let first = self.stream;
         std::thread::Builder::new().name("display".into()).spawn(move || serve(first, &c))?;
@@ -510,6 +516,65 @@ struct Serve {
     tx: ViewerTx,
     /// Every monitor, the first first: where pointers land.
     screens: Vec<Arc<FbSink>>,
+    /// A Windows guest: its tablet only reaches the main monitor.
+    windows: bool,
+    ptr: Mutex<Ptr>,
+}
+
+/// Where the viewer's pointer is (which monitor), and its buttons.
+#[derive(Debug, Default)]
+struct Ptr {
+    head: usize,
+    buttons: u8,
+    at: (u16, u16),
+}
+
+impl Serve {
+    /// Pointer input, where it should go. Windows maps the USB tablet to
+    /// its main monitor only: there the tablet, on the others the guest
+    /// agent moves the pointer (as SPICE's does). Without an agent that
+    /// can, or another guest: the tablet, over the whole desktop.
+    fn route(&self, m: ToVmm) -> Option<ToVmm> {
+        let mut p = self.ptr.lock().unwrap_or_else(|e| e.into_inner());
+        if let ToVmm::Button { code, down } = m {
+            let bit = match code {
+                ev::BTN_LEFT => 1,
+                ev::BTN_RIGHT => 2,
+                ev::BTN_MIDDLE => 4,
+                _ => 0,
+            };
+            p.buttons = if down { p.buttons | bit } else { p.buttons & !bit };
+        }
+        let agent = self.windows && self.screens.len() > 1 && self.agent.features() & vroom_proto::features::MONITORS != 0;
+        if !agent {
+            return Some(desktop_pointer(m, &self.screens));
+        }
+        let mouse = |p: &Ptr, wheel: i8| AgentCmd::Mouse { x: p.at.0, y: p.at.1, buttons: p.buttons, wheel };
+        match m {
+            ToVmm::Pointer { .. } => {
+                p.head = 0;
+                Some(m)
+            }
+            ToVmm::HeadPointer { head, x, y } => {
+                let modes: Vec<(u32, u32)> = self.screens.iter().map(|s| s.mode()).collect();
+                let (gx, gy) = place(&modes, head as usize, x, y);
+                let wide = |v: u16| (v as u32 * 65535 / POINTER_MAX as u32) as u16;
+                p.head = head as usize;
+                p.at = (wide(gx), wide(gy));
+                self.agent.send(mouse(&p, 0));
+                None
+            }
+            ToVmm::Button { .. } if p.head > 0 => {
+                self.agent.send(mouse(&p, 0));
+                None
+            }
+            ToVmm::Wheel { dy, .. } if p.head > 0 => {
+                self.agent.send(mouse(&p, dy.clamp(-127, 127) as i8));
+                None
+            }
+            m => Some(m),
+        }
+    }
 }
 
 /// Read one viewer's input until it goes away.
@@ -531,8 +596,9 @@ fn serve(stream: UnixStream, c: &Serve) {
                     None => log::warn!("display: a drop without its pipe"),
                 },
                 Ok(Some(m)) => {
-                    let m = desktop_pointer(m, &c.screens);
-                    handle(m, c.input.as_ref(), &c.agent, &c.events, &c.latest)
+                    if let Some(m) = c.route(m) {
+                        handle(m, c.input.as_ref(), &c.agent, &c.events, &c.latest)
+                    }
                 }
                 Ok(None) => break,
                 Err(e) => {

@@ -273,6 +273,10 @@ fn viewer_socket(state_dir: &std::path::Path) -> std::io::Result<std::os::unix::
 
 /// Host-visible window size for GPU buffers (address space, not memory).
 const GPU_SHM_SIZE: u64 = 8 << 30;
+/// Windows' extra GPUs: the most its 2D driver's framebuffer takes
+/// (16 MiB, `agent::WINDOWS_MAX_PIXELS`), with room. Only what the guest
+/// writes is ever memory.
+const EXTRA_GPU_VRAM: u64 = 32 << 20;
 
 /// Whether the renderer runs in the VMM (`VROOM_GPU_IN_PROCESS=1`, for
 /// debugging, and off macOS) rather than in a GPU process of its own.
@@ -282,16 +286,8 @@ pub fn gpu_in_process() -> bool {
 
 /// Venus, Direct3D 11 and GL (if asked) through virglrenderer, in the GPU
 /// process (or in here, see [`gpu_in_process`]), or a clear error.
-/// `n`: which GPU (Windows gets one per monitor, each with a GPU process).
-fn three_d(vm: &Arc<dyn Vm>, config: &VmConfig, mem: &GuestMemory, state_dir: &std::path::Path, n: usize) -> Result<ThreeD> {
-    let r: Box<dyn Renderer3d> = if gpu_in_process() {
-        if n > 0 {
-            return Err(Error::Setup("several Windows monitors with 3D need the GPU process (not VROOM_GPU_IN_PROCESS)".into()));
-        }
-        in_process(vm, config)?
-    } else {
-        gpu_process(vm, config, mem, state_dir, n)?
-    };
+fn three_d(vm: &Arc<dyn Vm>, config: &VmConfig, mem: &GuestMemory, state_dir: &std::path::Path) -> Result<ThreeD> {
+    let r: Box<dyn Renderer3d> = if gpu_in_process() { in_process(vm, config)? } else { gpu_process(vm, config, mem, state_dir)? };
     if config.display.opengl && !r.capsets().iter().any(|c| c.0 == 2) {
         log::warn!("gpu: no OpenGL for the guest (opengl_host = \"angle\" needs ANGLE next to virglrenderer: scripts/build-angle.sh); Vulkan only");
     }
@@ -323,10 +319,9 @@ fn in_process(vm: &Arc<dyn Vm>, config: &VmConfig) -> Result<Box<dyn Renderer3d>
 /// guest RAM, its shader cache; no files, network or hypervisor). The
 /// VMM then never loads virglrenderer, GL, MoltenVK or DXMT.
 #[cfg(unix)]
-fn gpu_process(vm: &Arc<dyn Vm>, config: &VmConfig, mem: &GuestMemory, state_dir: &std::path::Path, n: usize) -> Result<Box<dyn Renderer3d>> {
+fn gpu_process(vm: &Arc<dyn Vm>, config: &VmConfig, mem: &GuestMemory, state_dir: &std::path::Path) -> Result<Box<dyn Renderer3d>> {
     let exe = std::env::current_exe().map_err(|e| Error::Setup(format!("gpu process: {e}")))?;
-    // A cache per GPU process: they'd write the same files at once.
-    let shaders = if n == 0 { state_dir.join("shaders") } else { state_dir.join(format!("shaders-{}", n + 1)) };
+    let shaders = state_dir.join("shaders");
     std::fs::create_dir_all(&shaders).map_err(|e| Error::Setup(format!("{}: {e}", shaders.display())))?;
     let gl = config.display.opengl.then_some(match config.display.opengl_host {
         vroom_config::OpenglHost::Angle => "angle",
@@ -347,7 +342,7 @@ fn gpu_process(vm: &Arc<dyn Vm>, config: &VmConfig, mem: &GuestMemory, state_dir
 }
 
 #[cfg(not(unix))]
-fn gpu_process(vm: &Arc<dyn Vm>, config: &VmConfig, _mem: &GuestMemory, _state_dir: &std::path::Path, _n: usize) -> Result<Box<dyn Renderer3d>> {
+fn gpu_process(vm: &Arc<dyn Vm>, config: &VmConfig, _mem: &GuestMemory, _state_dir: &std::path::Path) -> Result<Box<dyn Renderer3d>> {
     in_process(vm, config)
 }
 
@@ -670,8 +665,8 @@ pub(crate) fn build(
     // Display. UEFI always gets ramfb (firmware / installer screen);
     // virtio-gpu takes over once a guest driver drives it.
     // Several monitors: Linux gets one GPU with a scanout each; Windows
-    // a GPU each (its drivers drive one scanout), added last so the other
-    // devices keep their PCI slots.
+    // a GPU each (its drivers drive one scanout; the others 2D), added
+    // last so the other devices keep their PCI slots.
     let uefi = matches!(config.boot, Boot::Uefi { .. });
     let monitors = if config.display.gpu == Gpu::None { 1 } else { config.display.monitors.clamp(1, vroom_config::MAX_MONITORS) as usize };
     let screens: Vec<Arc<FbSink>> = if config.display.gpu != Gpu::None || uefi {
@@ -693,8 +688,15 @@ pub(crate) fn build(
         for (n, group) in sinks.chunks(per_gpu).enumerate() {
             let (gpu, ctl) = GpuDev::with_heads(&vec![size; group.len()], group.to_vec());
             let mut gpu = gpu.with_index(n as u16);
-            if config.display.gpu == Gpu::Virtio3d {
-                gpu = gpu.with_3d(three_d(&vm, config, &mem, &env.state_dir, n)?);
+            // Windows' extra GPUs stay 2D: Direct3D can't share frames
+            // between two 3D GPUs (cross-adapter surfaces), so Windows
+            // draws on the first and copies to the others.
+            if config.display.gpu == Gpu::Virtio3d && n == 0 {
+                gpu = gpu.with_3d(three_d(&vm, config, &mem, &env.state_dir)?);
+            }
+            if n > 0 {
+                // Room for the framebuffer Windows' 2D driver clears.
+                gpu = gpu.with_vram(Arc::new(VmShm { vm: vm.clone(), filler: Mutex::new(None) }), EXTRA_GPU_VRAM);
             }
             heads.extend((0..group.len()).map(|sid| (ctl.clone(), sid)));
             gpus.push(ctl);
@@ -800,7 +802,8 @@ pub(crate) fn build(
                 None
             }
         };
-        ds.run(input, agent.clone(), events.clone(), window, listener, screens.clone())?;
+        let windows = config.guest_os() == GuestOs::Windows;
+        ds.run(input, agent.clone(), events.clone(), window, listener, screens.clone(), windows)?;
     }
     for (i, n) in config.nets.iter().enumerate() {
         let mac = match &n.mac {

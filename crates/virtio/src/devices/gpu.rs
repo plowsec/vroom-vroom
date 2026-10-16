@@ -78,6 +78,8 @@ const F_CONTEXT_INIT: u64 = 1 << 4;
 
 /// VIRTIO_GPU_SHM_ID_HOST_VISIBLE.
 pub const SHM_HOST_VISIBLE: u8 = 1;
+/// Ours, not in the spec (drivers skip ids they don't know): `with_vram`.
+const SHM_VRAM: u8 = 0x7f;
 const BLOB_MEM_GUEST: u32 = 1;
 const BLOB_MEM_HOST3D: u32 = 2;
 const BLOB_MEM_HOST3D_GUEST: u32 = 3;
@@ -376,6 +378,8 @@ impl ThreeD {
 pub struct Gpu {
     /// Which GPU of the VM (Windows guests get one per monitor).
     index: u16,
+    /// Plain memory in BAR 0 (see `with_vram`), and what places it.
+    vram: Option<(Arc<dyn ShmMapper>, u64)>,
     shared: Arc<Mutex<Shared>>,
     /// One per scanout.
     sinks: Vec<Arc<dyn DisplaySink>>,
@@ -401,7 +405,19 @@ impl Gpu {
         sizes.resize(n, sizes.first().copied().unwrap_or((1280, 800)));
         let sinks: Vec<_> = sinks.into_iter().take(n).collect();
         let shared = Arc::new(Mutex::new(Shared::new(&sizes)));
-        (Gpu { index: 0, shared: shared.clone(), sinks, three_d: None, worker: WorkerSlot::default() }, GpuControl(shared))
+        (Gpu { index: 0, vram: None, shared: shared.clone(), sinks, three_d: None, worker: WorkerSlot::default() }, GpuControl(shared))
+    }
+
+    /// Windows' 2D driver (viogpudo) on a GPU other than the boot one
+    /// clears "its framebuffer", BAR 0, with stores a hypervisor can't
+    /// decode, and the VM stops. Give 2D GPUs like that `size` bytes of
+    /// plain memory there (as QEMU's virtio-vga has), the registers next.
+    /// The device never reads it.
+    pub fn with_vram(mut self, mapper: Arc<dyn ShmMapper>, size: u64) -> Self {
+        if self.three_d.is_none() {
+            self.vram = Some((mapper, size));
+        }
+        self
     }
 
     /// The VM's `n`th GPU (from 0): its PCI subsystem id is 0x1100 + n,
@@ -1598,9 +1614,8 @@ impl GpuHandler {
             },
         };
         if self.cursor_shown.as_ref() != Some(&c) {
-            for s in &self.sinks {
-                s.cursor(&c);
-            }
+            // One pointer for all the monitors: through the first.
+            self.sinks[0].cursor(&c);
             self.cursor_shown = Some(c);
         }
         true
@@ -2018,6 +2033,9 @@ impl VirtioDevice for Gpu {
     fn pci_subsystem(&self) -> u16 {
         0x1100 + self.index
     }
+    fn pci_shm_first(&self) -> bool {
+        self.vram.is_some()
+    }
     fn device_features(&self) -> u64 {
         let base = crate::features::RING_EVENT_IDX | crate::features::RING_INDIRECT_DESC;
         match &self.three_d {
@@ -2051,9 +2069,15 @@ impl VirtioDevice for Gpu {
         }
     }
     fn shm_regions(&self) -> Vec<(u8, u64)> {
+        if let Some((_, size)) = &self.vram {
+            return vec![(SHM_VRAM, *size)];
+        }
         self.three_d.as_ref().map(|t| vec![(SHM_HOST_VISIBLE, t.shm_size)]).unwrap_or_default()
     }
     fn set_shm_base(&mut self, id: u8, gpa: u64) {
+        if let (SHM_VRAM, Some((m, size))) = (id, &self.vram) {
+            m.place(gpa, *size);
+        }
         if let (SHM_HOST_VISIBLE, Some(t)) = (id, &self.three_d) {
             t.shm_base.store(gpa, Ordering::Release);
             t.mapper.place(gpa, t.shm_size);

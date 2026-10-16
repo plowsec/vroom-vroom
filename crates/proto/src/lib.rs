@@ -30,7 +30,8 @@ pub mod features {
     pub const GPU3D: u64 = 32;
     /// Files dropped on the VM window land in the guest (`DragEnter`...).
     pub const FILE_DROP: u64 = 64;
-    /// The agent arranges several monitors (`SetLayout`).
+    /// The agent arranges several monitors (`SetLayout`), and on Windows
+    /// moves the pointer over all of them (`Mouse`).
     pub const MONITORS: u64 = 512;
 }
 
@@ -102,6 +103,11 @@ pub enum Message {
     /// order (the host's first, second... GPU output); `None`: that one is
     /// off. Sent instead of SetResolution when there is more than one.
     SetLayout { monitors: Vec<Option<Monitor>> },
+    /// Host -> guest (Windows, several monitors): the pointer at `x`, `y`
+    /// on the whole desktop (0..=65535 each way), these buttons down
+    /// (bit 0 left, 1 right, 2 middle), wheel clicks. Windows maps the
+    /// USB tablet to its main monitor only.
+    Mouse { x: u16, y: u16, buttons: u8, wheel: i8 },
 }
 
 /// Whether `p` is a path a drop may carry: relative, '/' between names,
@@ -151,6 +157,7 @@ const T_DROP_DATA: u8 = 14;
 const T_DROP_END: u8 = 15;
 const T_DROP_DONE: u8 = 16;
 const T_LAYOUT: u8 = 25;
+const T_MOUSE: u8 = 26;
 
 impl Message {
     pub fn encode(&self) -> Vec<u8> {
@@ -222,6 +229,13 @@ impl Message {
                     p.extend_from_slice(&m2.height.to_le_bytes());
                 }
                 (T_LAYOUT, p)
+            }
+            Message::Mouse { x, y, buttons, wheel } => {
+                let mut p = x.to_le_bytes().to_vec();
+                p.extend_from_slice(&y.to_le_bytes());
+                p.push(*buttons);
+                p.push(*wheel as u8);
+                (T_MOUSE, p)
             }
         };
         let mut out = Vec::with_capacity(HDR + payload.len());
@@ -321,8 +335,11 @@ impl Message {
                 }
                 Message::SetLayout { monitors }
             }
+            T_MOUSE if p.len() == 6 && p[4] < 8 => {
+                Message::Mouse { x: u16::from_le_bytes([p[0], p[1]]), y: u16::from_le_bytes([p[2], p[3]]), buttons: p[4], wheel: p[5] as i8 }
+            }
             T_TIME | T_RES | T_SCALE | T_SHUTDOWN | T_PING | T_PONG | T_GPU3D | T_DRAG_READY | T_DRAG_CANCEL | T_DROP_ENTRY | T_DROP_DATA
-            | T_DROP_END | T_DROP_DONE | T_LAYOUT => return Err(Error::Malformed),
+            | T_DROP_END | T_DROP_DONE | T_LAYOUT | T_MOUSE => return Err(Error::Malformed),
             t => return Err(Error::Type(t)),
         })
     }
@@ -412,6 +429,7 @@ mod tests {
             Message::SetLayout {
                 monitors: vec![Some(Monitor { x: 0, y: 0, width: 1280, height: 800 }), None, Some(Monitor { x: 1280, y: -5, width: 640, height: 480 })],
             },
+            Message::Mouse { x: 65535, y: 3, buttons: 5, wheel: -2 },
         ]
     }
 

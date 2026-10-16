@@ -289,6 +289,7 @@ fn handle(m: Message, system: bool, w: &mut port::Writer, clip: &mut dyn clip::C
             }
         }
         Message::SetScale { percent } => scale::set(percent),
+        Message::Mouse { x, y, buttons, wheel } => layout::mouse(x, y, buttons, wheel),
         Message::Ping(v) => w.write_all(&Message::Pong(v).encode())?,
         // Windows' service handles it (relay); nothing to turn off here.
         Message::Gpu3d { .. } | Message::Pong(_) => {}
