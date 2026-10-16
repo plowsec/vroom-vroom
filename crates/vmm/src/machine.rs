@@ -738,7 +738,7 @@ pub(crate) fn build(
         let mut helpers = Vec::new();
         let mut links = Vec::new();
         for u in &config.usb {
-            let (h, link) = crate::usb::spawn(u)?;
+            let (h, link) = crate::usb::spawn(&config.name, u)?;
             helpers.push(h);
             links.push(link);
         }
