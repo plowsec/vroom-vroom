@@ -67,8 +67,9 @@ pub fn is_app(normal: bool, transient: bool, skip_taskbar: bool) -> bool {
 /// What one of the root's children is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Top {
-    /// The window manager's frame of this client (or the client itself).
-    Frame(u32),
+    /// The window manager's frame of this client (or the client itself),
+    /// and whether it is on screen (mapped).
+    Frame(u32, bool),
     /// A window the window manager leaves alone (menus, tooltips) that is
     /// on screen.
     Popup,
@@ -77,14 +78,15 @@ pub enum Top {
 
 /// The order windows are in, front to back: the root's children
 /// (`tree`, back to front as X gives them) as clients and pop-ups. Pop-ups
-/// below every client (the window manager's own) are left out. Clients
-/// whose frame wasn't found go last.
+/// below every client on screen are the window manager's own (mutter's
+/// guard window, which has minimized windows under it) and are left out.
+/// Clients whose frame wasn't found go last.
 pub fn order(tree: &[(u32, Top)], clients: &[u32]) -> Vec<u32> {
-    let lowest = tree.iter().position(|(_, t)| matches!(t, Top::Frame(_))).unwrap_or(tree.len());
+    let lowest = tree.iter().position(|(_, t)| matches!(t, Top::Frame(_, true))).unwrap_or(tree.len());
     let mut out = Vec::new();
     for (i, (w, t)) in tree.iter().enumerate().rev() {
         match t {
-            Top::Frame(c) if clients.contains(c) && !out.contains(c) => out.push(*c),
+            Top::Frame(c, _) if clients.contains(c) && !out.contains(c) => out.push(*c),
             Top::Popup if i > lowest => out.push(*w),
             _ => {}
         }
@@ -142,10 +144,10 @@ mod tests {
     #[test]
     fn windows_go_front_to_back() {
         use Top::*;
-        // Back to front: the window manager's guard, frames of 10 and 11,
-        // a menu, something unknown.
-        let tree = [(1, Popup), (2, Frame(10)), (3, Other), (4, Frame(11)), (5, Popup), (6, Other)];
-        assert_eq!(order(&tree, &[10, 11, 12]), vec![5, 11, 10, 12]);
+        // Back to front: a minimized window, the window manager's guard,
+        // frames of 10 and 11, a menu, something unknown.
+        let tree = [(9, Frame(13, false)), (1, Popup), (2, Frame(10, true)), (3, Other), (4, Frame(11, true)), (5, Popup), (6, Other)];
+        assert_eq!(order(&tree, &[10, 11, 12, 13]), vec![5, 11, 10, 13, 12]);
         assert_eq!(order(&tree, &[11]), vec![5, 11], "frames of windows no longer listed are skipped");
     }
 }

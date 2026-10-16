@@ -417,6 +417,20 @@ pub fn snapshot_any() -> Option<Result<SharedPixelBuffer<Rgba8Pixel>, slint::Pla
     CONSOLES.with(|c| c.borrow().values().next().map(|c| c.win.window().take_snapshot()))
 }
 
+/// Type a name in the Coherence bar's app field and press Enter (for
+/// `VROOM_SHOT`).
+pub fn coh_start_any(name: &str) {
+    let bar = CONSOLES.with(|c| c.borrow().values().find_map(|c| c.coh.as_ref().map(|h| h.bar.clone_strong())));
+    if let Some(b) = bar {
+        b.invoke_start_app(name.into());
+    }
+}
+
+/// The Coherence bar of the first VM in Coherence (for `VROOM_SHOT`).
+pub fn snapshot_bar() -> Option<Result<SharedPixelBuffer<Rgba8Pixel>, slint::PlatformError>> {
+    CONSOLES.with(|c| c.borrow().values().find_map(|c| c.coh.as_ref().map(|h| h.bar.window().take_snapshot())))
+}
+
 /// Ask every running VM to suspend (app quitting).
 pub fn suspend_all() {
     CONSOLES.with(|c| {

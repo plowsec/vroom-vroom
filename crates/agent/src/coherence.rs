@@ -34,6 +34,7 @@ pub const SLOW: Duration = Duration::from_millis(500);
 /// change them: a browser shows the page's).
 const ICONS_AGAIN: Duration = Duration::from_secs(2);
 /// The icon size we ask the desktop for, in pixels.
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 pub const ICON_SIZE: u32 = 32;
 
 /// Tells the session loop to call `tick` soon. Called from the desktop's

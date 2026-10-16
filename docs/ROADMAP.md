@@ -6,10 +6,10 @@ move to the docs (GUIDE, ARCHITECTURE) once they work.
 
 ## In progress
 
-- **Coherence, next steps** (Windows guests have a first version, see
-  GUIDE.md): Linux guests (X11 first), app icons in the bar and the Dock,
-  several Mac screens, smoother window drags (window events from the
-  guest instead of a 40 ms look), starting a guest app from the Mac.
+- **Coherence, next steps** (see GUIDE.md): starting Linux apps by
+  name; Store app icons on Windows (from the package's logo); GNOME's
+  top bar (only an extension can hide it); Wayland sessions would need a
+  helper inside the compositor (a KWin script, a GNOME Shell extension).
 
 ## 3D: catching up with VMware and Parallels
 

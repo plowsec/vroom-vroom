@@ -152,16 +152,38 @@ impl X11Desktop {
             self.frames.insert(cl, w);
         }
         let tree = c.query_tree(root).ok()?.reply().ok()?.children;
+        let scr = c.get_geometry(root).ok()?.reply().ok()?;
+        let (sw, sh) = (scr.width as i32, scr.height as i32);
         let by_frame: HashMap<u32, u32> = self.frames.iter().map(|(cl, f)| (*f, *cl)).collect();
-        // Pop-ups: the root's children no window manager looks after.
-        let others: Vec<u32> = tree.iter().copied().filter(|w| !by_frame.contains_key(w)).take(1024).collect();
-        let attrs: Vec<_> = others.iter().map(|w| c.get_window_attributes(*w).ok()).collect();
-        let mut kinds: HashMap<u32, Top> = HashMap::new();
-        for (w, a) in others.iter().zip(attrs) {
-            let popup = a.and_then(|a| a.reply().ok()).is_some_and(|a| a.override_redirect && a.map_state == MapState::VIEWABLE);
-            kinds.insert(*w, if popup { Top::Popup } else { Top::Other });
-        }
-        let tree: Vec<(u32, Top)> = tree.iter().map(|w| (*w, by_frame.get(w).map_or_else(|| kinds.get(w).copied().unwrap_or(Top::Other), |cl| Top::Frame(*cl)))).collect();
+        // Minimized clients: mutter keeps them mapped, under its guard window.
+        let states: Vec<_> = clients.iter().map(|w| c.get_property(false, *w, a._NET_WM_STATE, AtomEnum::ATOM, 0, 64).ok()).collect();
+        let minimized: Vec<u32> = clients
+            .iter()
+            .zip(states)
+            .filter_map(|(w, s)| {
+                let r = s?.reply().ok()?;
+                let hidden = r.value32()?.any(|x| x == a._NET_WM_STATE_HIDDEN);
+                hidden.then_some(*w)
+            })
+            .collect();
+        // Frames (on screen or not) and pop-ups (the root's children no
+        // window manager looks after, on screen).
+        let tree: Vec<u32> = tree.into_iter().take(2048).collect();
+        let attrs: Vec<_> = tree.iter().map(|w| c.get_window_attributes(*w).ok()).collect();
+        let tree: Vec<(u32, Top)> = tree
+            .iter()
+            .zip(attrs)
+            .map(|(w, a)| {
+                let a = a.and_then(|a| a.reply().ok());
+                let shown = a.as_ref().is_some_and(|a| a.map_state == MapState::VIEWABLE);
+                let kind = match by_frame.get(w) {
+                    Some(cl) => Top::Frame(*cl, shown && !minimized.contains(cl)),
+                    None if shown && a.is_some_and(|a| a.override_redirect) => Top::Popup,
+                    None => Top::Other,
+                };
+                (*w, kind)
+            })
+            .collect();
         let order = ewmh::order(&tree, &clients);
         let popups: Vec<u32> = tree.iter().filter(|(_, t)| *t == Top::Popup).map(|(w, _)| *w).collect();
 
@@ -202,6 +224,11 @@ impl X11Desktop {
             let (frame, shadow) = (if managed { Self::extents(&v32(5)) } else { [0; 4] }, Self::extents(&v32(6)));
             let (x, y, ww, hh) = ewmh::visible((at.dst_x as i32, at.dst_y as i32, geo.width as u32, geo.height as u32), frame, shadow);
             let hidden = state.contains(&a._NET_WM_STATE_HIDDEN);
+            // Off the screen, or a speck (GNOME keeps a 1x1 window at -200,-200).
+            let off = x >= sw || y >= sh || x as i64 + ww as i64 <= 0 || y as i64 + hh as i64 <= 0;
+            if !hidden && (off || ww < 2 || hh < 2) {
+                continue;
+            }
             let maximized = state.contains(&a._NET_WM_STATE_MAXIMIZED_VERT) && state.contains(&a._NET_WM_STATE_MAXIMIZED_HORZ);
             if !managed && !popups.contains(&w) {
                 continue;
@@ -382,20 +409,19 @@ struct Dock {
     ours: Option<bool>,
 }
 
-const DOCK: &str = "org.gnome.shell.extensions.dash-to-dock";
+/// The dock's setting, read and written in dconf: the dock reads its own
+/// copy of the schema, whose default (Ubuntu's: fixed) `gsettings` on the
+/// command line doesn't see.
+const DOCK: &str = "/org/gnome/shell/extensions/dash-to-dock/dock-fixed";
 
 impl Dock {
     fn note() -> Option<std::path::PathBuf> {
         std::env::var_os("XDG_RUNTIME_DIR").map(|d| std::path::PathBuf::from(d).join("vroom-coherence-dock"))
     }
 
-    fn get() -> Option<String> {
-        let o = std::process::Command::new("gsettings").args(["get", DOCK, "dock-fixed"]).output().ok()?;
+    fn dconf(args: &[&str]) -> Option<String> {
+        let o = std::process::Command::new("dconf").args(args).output().ok()?;
         o.status.success().then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
-    }
-
-    fn put(v: &str) {
-        let _ = std::process::Command::new("gsettings").args(["set", DOCK, "dock-fixed", v]).status();
     }
 
     fn set(&mut self, on: bool) {
@@ -405,13 +431,22 @@ impl Dock {
         self.ours = Some(on);
         let Some(note) = Dock::note() else { return };
         if on {
-            if Dock::get().as_deref() == Some("true") {
-                let _ = std::fs::write(&note, "true");
-                Dock::put("false");
+            // "" (the default: fixed on Ubuntu) or "true": hide it, and
+            // note what to put back.
+            let Some(was) = Dock::dconf(&["read", DOCK]) else { return };
+            if was != "false" {
+                let _ = std::fs::write(&note, if was.is_empty() { "default" } else { "true" });
+                Dock::dconf(&["write", DOCK, "false"]);
             }
         } else {
-            if std::fs::read_to_string(&note).is_ok_and(|v| v == "true") {
-                Dock::put("true");
+            match std::fs::read_to_string(&note).as_deref() {
+                Ok("default") => {
+                    Dock::dconf(&["reset", DOCK]);
+                }
+                Ok("true") => {
+                    Dock::dconf(&["write", DOCK, "true"]);
+                }
+                _ => {}
             }
             let _ = std::fs::remove_file(&note);
         }

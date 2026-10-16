@@ -5,7 +5,8 @@
 //! code; "vmkey:125+19" a combination), "vmtype:notepad" text,
 //! "cohclick:X,Y[,title]" a click on a Coherence window, "vmmove:X,Y"
 //! the mouse to a VM window's point, "shot:out.png" a
-//! picture now). `VROOM_SHOT_VM=1`: picture the VM window instead. Used
+//! picture now, "barshot:out.png" one of the Coherence bar, "cohstart:Calculator" a
+//! name in its app field). `VROOM_SHOT_VM=1`: picture the VM window instead. Used
 //! for the README pictures and
 //! to check the UI without a person at the screen.
 
@@ -70,6 +71,12 @@ fn run(acts: Vec<String>, i: usize, out: PathBuf, delay: f64) {
             crate::console::move_any(x.parse().unwrap_or(0.0), y.parse().unwrap_or(0.0));
         } else if let Some(p) = a.strip_prefix("shot:") {
             picture(&PathBuf::from(p));
+        } else if let Some(n) = a.strip_prefix("cohstart:") {
+            crate::console::coh_start_any(n);
+        } else if let Some(p) = a.strip_prefix("barshot:") {
+            if let Some(Ok(buf)) = crate::console::snapshot_bar() {
+                let _ = crate::console::write_png(std::path::Path::new(p), &buf, buf.width(), buf.height());
+            }
         } else if let Some(i) = a.strip_prefix("select:") {
             msg::send(Msg::Select(i.parse().unwrap_or(0)));
         } else if let Some((k, v)) = a.strip_prefix("set:").and_then(|kv| kv.split_once('=')) {

@@ -130,34 +130,61 @@ Names Windows can't take (`:` `?` `*` and the like) get a `_` instead.
 Links inside dropped folders are left out. Dragging from the guest to the
 Mac isn't there yet.
 
-### Coherence (Windows guests)
+### Coherence
 
-Coherence shows each Windows app as a window of its own on your Mac,
-without the Windows desktop and taskbar around it. VMware calls it Unity.
+Coherence shows each guest app as a window of its own on your Mac,
+without the guest's desktop and taskbar around it. VMware calls it Unity.
+It works with Windows guests and with Linux guests in an X11 session.
 Needs the guest tools of this version or later.
 
 - Turn it on with the window button in the VM's bar, or
-  `Ctrl+Alt+Shift+C`. The VM window goes away; each Windows window gets a
-  Mac window where it was on the Windows screen.
-- Windows' screen takes the size of your Mac screen (less the menu bar,
-  the Dock and the bar below), so a maximized Windows app fills the screen.
+  `Ctrl+Alt+Shift+C`. The VM window goes away; each guest window gets a
+  Mac window where it was on the guest's screen.
+- The guest's screen takes the size of your Mac screen (less the menu bar,
+  the Dock and the bar below), so a maximized app fills the screen.
 - Every such window has a thin strip on top with the VM's name and the
   window's title. Drag the strip to move the window; drag its edges to
-  resize it. The Windows app follows. Moving it by its own title bar works
+  resize it. The guest app follows. Moving it by its own title bar works
   too.
 - A bar at the bottom stands in for the taskbar: **Start** opens the Start
-  menu, then one button per app window (minimized ones too: click to bring
-  one back), and **Leave Coherence**. The bar can be dragged anywhere.
-- `Cmd+W` on a Coherence window asks the Windows app to close (it may ask
-  to save first).
+  menu, a field to open an app by name (Windows: type `calc` or
+  `Paint` and press Enter; it searches the Start menu as you would),
+  then one button per app window with its icon (minimized ones too:
+  click to bring one back), and **Leave Coherence**. The bar can be
+  dragged anywhere.
+- Several Mac screens: the guest's screen is on the screen the bar is
+  on. Drag the bar to another screen and the guest's screen goes there
+  (its windows with it). A window dragged onto another screen goes back
+  to the bar's screen when you let go: the guest has one screen.
+- `Cmd+W` on a Coherence window asks the app to close (it may ask to save
+  first).
 - Leaving (the bar, the VM's shortcut, or closing the bar) brings back the
   VM window, the taskbar and the VM's old size. A VM that stops, suspends,
   or whose guest tools go away leaves Coherence too.
 
-Not there yet: Linux guests, several Mac screens (the Windows screen sits
-on the screen the VM window was on), app icons in the bar and the Dock.
-A window tiling tool (Amethyst, yabai) moves Coherence windows like any
-other, and the Windows apps follow it: tell it to leave `vroom-gui` alone.
+Linux guests:
+
+- Only X11 sessions. GNOME on Ubuntu 22.04 and later logs in to Wayland
+  by default: pick "Ubuntu on Xorg" with the gear on the login screen.
+  On Wayland only the compositor knows where windows are, so Coherence
+  says so and doesn't start.
+- The window manager must follow the usual desktop conventions (EWMH):
+  GNOME, KDE, Xfce, Cinnamon and MATE do.
+- GNOME's top bar stays, out of sight: maximized windows start below it,
+  so they leave a strip free at the top of the Mac screen. Ubuntu's dock
+  is set to hide while Coherence is on and put back after.
+- The session helper of the guest tools must run in the desktop session
+  (`install-agent.sh` sets it up to start at login).
+
+Window tiling tools (Amethyst, yabai, Rectangle): they move and resize
+Coherence windows like any other, and the guest apps follow, which works
+but fights the guest's own placement. Tell the tool to leave vroom alone
+(Amethyst: Preferences, Floating, add `vroom` or `vroom-gui` when run from
+a terminal).
+
+Not there yet: one Dock tile per guest app (macOS gives an app one Dock
+tile; all Coherence windows are vroom's). Windows Store apps without an
+icon of their own (Calculator) show none in the bar.
 
 ### When the app crashes, or a VM stops answering
 

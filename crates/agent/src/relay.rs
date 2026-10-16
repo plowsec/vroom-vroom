@@ -85,6 +85,11 @@ impl<S: System> Relay<S> {
                 Ev::HostGone => return Err(io::Error::other("port closed")),
                 Ev::HelperUp(id, w) => {
                     log::info!("session helper {id} connected");
+                    // A helper it replaces (started twice in a session)
+                    // leaves Coherence, or two would fight over the taskbar.
+                    if self.coherence {
+                        self.send_helper(&Message::Coherence { on: false });
+                    }
                     self.helper = Some((id, w, Decoder::new(self.max + 64)));
                     for m in [self.display.0.clone(), self.display.1.clone()].into_iter().flatten() {
                         self.send_helper(&m);
@@ -359,6 +364,14 @@ mod tests {
         assert_eq!(out[1..], [Message::Windows(vec![w]), Message::WindowIcon { id: 5, w: 0, h: 0, rgba: Vec::new() }, Message::Windows(Vec::new())]);
         assert_eq!(h1.msgs(), vec![Message::Coherence { on: true }, Message::WindowDo { id: 5, op: vroom_proto::WindowOp::Close }]);
         assert_eq!(h2.msgs(), vec![Message::Coherence { on: true }]);
+    }
+
+    #[test]
+    fn a_replaced_helper_leaves_coherence() {
+        let (old, new) = (Sink::default(), Sink::default());
+        run(vec![host(Message::Coherence { on: true }), Ev::HelperUp(1, Box::new(old.clone())), Ev::HelperUp(2, Box::new(new.clone()))]);
+        assert_eq!(old.msgs(), vec![Message::Coherence { on: true }, Message::Coherence { on: false }]);
+        assert_eq!(new.msgs(), vec![Message::Coherence { on: true }]);
     }
 
     #[test]

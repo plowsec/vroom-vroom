@@ -357,7 +357,7 @@ pub struct Coherence {
     /// The guest's screen on the Mac (points); the mode once known.
     area: Rect,
     map: Option<Map>,
-    bar: CoherenceBar,
+    pub(super) bar: CoherenceBar,
     chips: Rc<VecModel<CohChip>>,
     /// Chips in the order their windows first came.
     chip_order: Vec<u32>,
