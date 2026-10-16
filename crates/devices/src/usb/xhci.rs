@@ -5,7 +5,8 @@
 //! USB 3 root port each, after the HID ones; the device shows up on the
 //! one that fits its speed. Their transfers are asynchronous: a TD goes
 //! to the device's helper process as a request and completes when the
-//! answer comes back (`usb_event`).
+//! answer comes back (`usb_event`). Isochronous TDs (one packet each) go
+//! in batches, several batches ahead, so the device never runs dry.
 //!
 //! Rings live in guest memory and the guest controls them: walks are
 //! bounded, Link TRB chains are capped, and every address is checked by
@@ -19,7 +20,7 @@ use std::time::Instant;
 
 use vroom_memory::{GuestAddress, GuestMemory};
 use vroom_snapshot::{decode, encode};
-use vroom_usb::proto::{Done, Event, Request, Speed, Status, Submit, XferType, MAX_DATA};
+use vroom_usb::proto::{Done, Event, IsoDone, IsoSubmit, Request, Speed, Status, Submit, XferType, MAX_DATA, MAX_ISO_PACKET, MAX_ISO_PACKETS};
 use serde::{Deserialize, Serialize};
 
 use super::hid::{HidEvent, Keyboard, Tablet, UsbIds};
@@ -49,6 +50,15 @@ const PASS_TD_TRBS: usize = 320;
 /// Passthrough transfers in flight: per endpoint, per device.
 const MAX_EP_INFLIGHT: usize = 8;
 const MAX_DEV_INFLIGHT: usize = 32;
+/// Isochronous: one request carries at most this much bus time of TDs
+/// (in 125 us microframes: 8 ms), so a few requests keep the device
+/// busy without holding completions back long.
+const ISO_BATCH_UFRAMES: u32 = 64;
+/// A stream asked to start on a Frame ID: fine up to 895 frames ahead
+/// (xHCI 4.11.2.5), or a little late (it starts as soon as it can).
+/// Anything else is a missed service.
+const ISO_AHEAD_FRAMES: u32 = 895;
+const ISO_LATE_FRAMES: u32 = 16;
 /// Helper events held while paused (completions are bounded by the
 /// above; the rest is attach/detach noise).
 const MAX_DEFERRED_USB: usize = 256;
@@ -58,8 +68,10 @@ const T_NORMAL: u32 = 1;
 const T_SETUP: u32 = 2;
 const T_DATA: u32 = 3;
 const T_STATUS: u32 = 4;
+const T_ISOCH: u32 = 5;
 const T_LINK: u32 = 6;
 const T_EVENT_DATA: u32 = 7;
+const T_NOOP: u32 = 8;
 const C_ENABLE_SLOT: u32 = 9;
 const C_DISABLE_SLOT: u32 = 10;
 const C_ADDRESS: u32 = 11;
@@ -84,8 +96,11 @@ const CC_NO_SLOTS: u32 = 9;
 const CC_SLOT_NOT_ENABLED: u32 = 11;
 const CC_EP_NOT_ENABLED: u32 = 12;
 const CC_SHORT: u32 = 13;
+const CC_RING_UNDERRUN: u32 = 14;
+const CC_RING_OVERRUN: u32 = 15;
 const CC_PARAMETER: u32 = 17;
 const CC_CONTEXT_STATE: u32 = 19;
+const CC_MISSED_SERVICE: u32 = 23;
 
 // USBCMD / USBSTS
 const CMD_RUN: u32 = 1;
@@ -119,6 +134,8 @@ const TRB_ISP: u32 = 1 << 2;
 const TRB_CH: u32 = 1 << 4;
 const TRB_IOC: u32 = 1 << 5;
 const TRB_IDT: u32 = 1 << 6;
+const TRB_BEI: u32 = 1 << 9;
+const TRB_SIA: u32 = 1 << 31;
 
 const EP_RUNNING: u32 = 1;
 const EP_HALTED: u32 = 2;
@@ -140,6 +157,9 @@ struct Ep {
     /// 3/7 interrupt, 1/5 isochronous.
     #[serde(default)]
     kind: u8,
+    /// Service interval: 2^interval x 125 us.
+    #[serde(default)]
+    interval: u8,
 }
 
 const EPT_ISO_OUT: u8 = 1;
@@ -160,7 +180,20 @@ struct Pending {
     td: Vec<(u64, Trb)>,
     is_in: bool,
     len: u32,
-    done: Option<Done>,
+    /// Isochronous: where each TD (one packet) ends in `td`, and its
+    /// length. Empty for the other types.
+    iso: Vec<(usize, u32)>,
+    done: Option<Answer>,
+}
+
+/// How a passthrough TD ended.
+#[derive(Debug)]
+enum Answer {
+    Plain(Done),
+    Iso(IsoDone),
+    /// Isochronous TD the controller finished by itself (No-op, bad TRB,
+    /// missed service): this completion code.
+    Local(u32),
 }
 
 /// A host device behind a helper process.
@@ -177,7 +210,6 @@ struct Passthrough {
     pending: BTreeMap<u32, Pending>,
     /// Transfers per (slot, dci), oldest first: completed in this order.
     queues: BTreeMap<(usize, u8), VecDeque<u32>>,
-    warned_iso: bool,
 }
 
 impl Passthrough {
@@ -337,7 +369,6 @@ impl Xhci {
                 next_id: 0,
                 pending: BTreeMap::new(),
                 queues: BTreeMap::new(),
-                warned_iso: false,
             })
             .collect();
         self.ports = vec![0; HID_PORTS + 2 * n];
@@ -456,7 +487,13 @@ impl Xhci {
         true
     }
 
-    fn post_event(&mut self, mut t: Trb) {
+    fn post_event(&mut self, t: Trb) {
+        self.post_event_irq(t, true);
+    }
+
+    /// Post an event; `irq` false: don't interrupt for it (a TRB with
+    /// Block Event Interrupt: the driver knows a later one will).
+    fn post_event_irq(&mut self, mut t: Trb, irq: bool) {
         if self.intr.erstsz == 0 || self.intr.seg_left == 0 {
             return;
         }
@@ -483,6 +520,9 @@ impl Xhci {
             }
             self.load_segment();
         }
+        if !irq {
+            return;
+        }
         self.intr.iman |= 1;
         self.op.usbsts |= STS_EINT;
         if self.intr.iman & 2 != 0 && self.op.usbcmd & CMD_INTE != 0 && self.msix.enabled() {
@@ -497,8 +537,12 @@ impl Xhci {
     }
 
     fn transfer_event(&mut self, ptr: u64, code: u32, residual: u32, slot: u8, dci: u8) {
+        self.transfer_event_irq(ptr, code, residual, slot, dci, true);
+    }
+
+    fn transfer_event_irq(&mut self, ptr: u64, code: u32, residual: u32, slot: u8, dci: u8, irq: bool) {
         log::debug!("xhci: transfer event slot {slot} dci {dci} ptr {ptr:#x} cc {code} residual {residual}");
-        self.post_event([ptr as u32, (ptr >> 32) as u32, code << 24 | (residual & 0xff_ffff), E_TRANSFER << 10 | (dci as u32) << 16 | (slot as u32) << 24]);
+        self.post_event_irq([ptr as u32, (ptr >> 32) as u32, code << 24 | (residual & 0xff_ffff), E_TRANSFER << 10 | (dci as u32) << 16 | (slot as u32) << 24], irq);
     }
 
     // ---- rings ----
@@ -655,7 +699,7 @@ impl Xhci {
         }
         let Some(out) = self.output_ctx(id) else { return CC_PARAMETER };
         let ring = Ring { deq: (ep0[2] as u64 | (ep0[3] as u64) << 32) & !0xf, cycle: ep0[2] & 1 == 1 };
-        let ep = Ep { ring, state: EP_RUNNING, kind: EPT_CONTROL };
+        let ep = Ep { ring, state: EP_RUNNING, kind: EPT_CONTROL, interval: 0 };
         let mut sc = slot_ctx.clone();
         sc[3] = if bsr { 1 << 27 } else { 2 << 27 | id as u32 };
         self.ctx_write(out, &sc);
@@ -700,7 +744,8 @@ impl Xhci {
                 let mut out_e = e.clone();
                 out_e[0] = (out_e[0] & !7) | EP_RUNNING;
                 self.ctx_write(ctx + 0x20 * dci as u64, &out_e);
-                new_eps.push((dci, Ep { ring, state: EP_RUNNING, kind: ((e[1] >> 3) & 7) as u8 }));
+                let interval = (((e[0] >> 16) & 0xff) as u8).min(15);
+                new_eps.push((dci, Ep { ring, state: EP_RUNNING, kind: ((e[1] >> 3) & 7) as u8, interval }));
             }
         }
         let s = self.slot_mut(id).expect("checked above");
@@ -888,8 +933,10 @@ impl Xhci {
         let (slot, mut off, mut edtla, mut short) = (id as u8, 0usize, 0u32, false);
         for &(addr, t) in td {
             let ioc = t[3] & TRB_IOC != 0;
+            // Block Event Interrupt (Normal, Isoch, Event Data TRBs).
+            let irq = !(t[3] & TRB_BEI != 0 && matches!(trb_type(&t), T_NORMAL | T_ISOCH | T_EVENT_DATA));
             match trb_type(&t) {
-                T_DATA | T_NORMAL => {
+                T_DATA | T_NORMAL | T_ISOCH => {
                     let len = (t[2] & 0x1ffff) as usize;
                     let n = match input {
                         Some(src) => {
@@ -907,10 +954,10 @@ impl Xhci {
                     if residual > 0 {
                         short = true;
                         if ioc || t[3] & TRB_ISP != 0 {
-                            self.transfer_event(addr, CC_SHORT, residual, slot, dci);
+                            self.transfer_event_irq(addr, CC_SHORT, residual, slot, dci, irq);
                         }
                     } else if ioc {
-                        self.transfer_event(addr, CC_SUCCESS, 0, slot, dci);
+                        self.transfer_event_irq(addr, CC_SUCCESS, 0, slot, dci, irq);
                     }
                 }
                 T_EVENT_DATA => {
@@ -918,7 +965,7 @@ impl Xhci {
                         let cc = if short { CC_SHORT } else { CC_SUCCESS };
                         let p = param(&t);
                         log::debug!("xhci: event data slot {slot} dci {dci} edtla {edtla} cc {cc}");
-                        self.post_event([p as u32, (p >> 32) as u32, cc << 24 | (edtla & 0xff_ffff), E_TRANSFER << 10 | TRB_ED | (dci as u32) << 16 | (slot as u32) << 24]);
+                        self.post_event_irq([p as u32, (p >> 32) as u32, cc << 24 | (edtla & 0xff_ffff), E_TRANSFER << 10 | TRB_ED | (dci as u32) << 16 | (slot as u32) << 24], irq);
                     }
                     edtla = 0;
                     short = false;
@@ -982,12 +1029,7 @@ impl Xhci {
                 return;
             }
             if matches!(ep.kind, EPT_ISO_OUT | EPT_ISO_IN) {
-                // Not passed through yet: the TDs stay queued (an error
-                // per TD would just have the driver spin resubmitting).
-                if !std::mem::replace(&mut self.pass[i].warned_iso, true) {
-                    log::warn!("usb: isochronous endpoints (audio, video) aren't passed through yet");
-                }
-                return;
+                return self.run_pass_iso(i, id, dci);
             }
             let p = &self.pass[i];
             let queued = p.queues.get(&(id, dci)).map_or(0, |q| q.len());
@@ -1014,9 +1056,197 @@ impl Xhci {
                 self.pass_halt(id, dci, start, at, CC_TRANSACTION);
                 return;
             }
-            p.pending.insert(rid, Pending { slot: id, dci, start, td, is_in, len, done: None });
+            p.pending.insert(rid, Pending { slot: id, dci, start, td, is_in, len, iso: Vec::new(), done: None });
             p.queues.entry((id, dci)).or_default().push_back(rid);
         }
+    }
+
+    /// Isochronous TDs to the helper: each TD is one packet (one service
+    /// interval); consecutive TDs go in one request, a few requests ahead.
+    /// The host sends them as soon as it can, back to back, so a Frame ID
+    /// only matters when a stream starts (nothing in flight).
+    fn run_pass_iso(&mut self, i: usize, id: usize, dci: u8) {
+        let is_in = dci % 2 == 1;
+        for _ in 0..WALK_LIMIT {
+            let Some((_, mut ep)) = self.ep(id, dci) else { return };
+            if ep.state != EP_RUNNING || self.pass[i].speed.is_none() {
+                return;
+            }
+            let p = &self.pass[i];
+            let queued = p.queues.get(&(id, dci)).map_or(0, |q| q.len());
+            if queued >= MAX_EP_INFLIGHT || p.pending.len() >= MAX_DEV_INFLIGHT {
+                return;
+            }
+            let start = ep.ring;
+            let budget = (ISO_BATCH_UFRAMES.checked_shr(ep.interval as u32).unwrap_or(0) as usize).clamp(1, MAX_ISO_PACKETS);
+            let (mut ring, mut td, mut ends, mut out, mut total) = (ep.ring, Vec::new(), Vec::new(), Vec::new(), 0usize);
+            let mut local = None;
+            while ends.len() < budget {
+                let Some((r, one)) = self.gather_td(ring, false, PASS_TD_TRBS) else { break };
+                match self.iso_td(&one, queued == 0 && ends.is_empty(), is_in) {
+                    Ok((len, data)) => {
+                        if total + len as usize > MAX_DATA {
+                            break;
+                        }
+                        let last = one.last().map_or(0, |t| t.1[3]);
+                        total += len as usize;
+                        out.extend_from_slice(&data);
+                        td.extend_from_slice(&one);
+                        ends.push((td.len(), len));
+                        ring = r;
+                        // The driver wants to hear about this one now: the
+                        // end of its URB, likely. End the request here.
+                        if last & TRB_IOC != 0 && last & TRB_BEI == 0 {
+                            break;
+                        }
+                    }
+                    Err(cc) => {
+                        // Finished here, in order: alone, after the batch.
+                        if ends.is_empty() {
+                            local = Some((one, cc));
+                            ring = r;
+                        }
+                        break;
+                    }
+                }
+            }
+            if ends.is_empty() && local.is_none() {
+                return;
+            }
+            ep.ring = ring;
+            self.set_ep(id, dci, ep);
+            if let Some((one, cc)) = local {
+                self.iso_local(i, id, dci, start, one, cc);
+                continue;
+            }
+            let p = &mut self.pass[i];
+            let rid = p.alloc_id();
+            let addr = (dci / 2) | if is_in { 0x80 } else { 0 };
+            let sub = IsoSubmit { id: rid, ep: addr, packets: ends.iter().map(|e| e.1).collect(), data: out };
+            if p.link.send(Request::IsoSubmit(sub)).is_err() {
+                let at = td.last().map_or(0, |t| t.0);
+                self.pass_halt(id, dci, start, at, CC_TRANSACTION);
+                return;
+            }
+            p.pending.insert(rid, Pending { slot: id, dci, start, td, is_in, len: total as u32, iso: ends, done: None });
+            p.queues.entry((id, dci)).or_default().push_back(rid);
+        }
+    }
+
+    /// One isochronous TD: its packet length and, for OUT, its data.
+    /// Err: the controller finishes it itself, with that code. `starts`:
+    /// the first of a stream (its Frame ID counts).
+    fn iso_td(&self, td: &[(u64, Trb)], starts: bool, is_in: bool) -> Result<(u32, Vec<u8>), u32> {
+        let Some(&(_, first)) = td.first() else { return Err(CC_TRB_ERROR) };
+        match trb_type(&first) {
+            T_ISOCH => {}
+            // TDs the driver cancelled by turning them into No-ops.
+            T_NOOP if td.iter().all(|(_, t)| matches!(trb_type(t), T_NOOP | T_EVENT_DATA)) => return Err(CC_SUCCESS),
+            _ => return Err(CC_TRB_ERROR),
+        }
+        let data: Vec<&Trb> = td.iter().map(|(_, t)| t).filter(|t| matches!(trb_type(t), T_ISOCH | T_NORMAL)).collect();
+        let len: u32 = data.iter().map(|t| t[2] & 0x1ffff).sum();
+        if len > MAX_ISO_PACKET {
+            return Err(CC_TRB_ERROR);
+        }
+        if starts && first[3] & TRB_SIA == 0 && self.frame_missed((first[3] >> 20) & 0x7ff) {
+            return Err(CC_MISSED_SERVICE);
+        }
+        let mut out = Vec::new();
+        if !is_in {
+            for t in data {
+                let n = (t[2] & 0x1ffff) as usize;
+                if t[3] & TRB_IDT != 0 {
+                    out.extend_from_slice(&param(t).to_le_bytes()[..n.min(8)]);
+                } else {
+                    let mut b = vec![0u8; n];
+                    self.mem.read(GuestAddress(param(t)), &mut b).map_err(|_| CC_TRB_ERROR)?;
+                    out.extend_from_slice(&b);
+                }
+            }
+        }
+        Ok((len, out))
+    }
+
+    /// A stream asked to start on Frame ID `fid`: too late, or too far
+    /// ahead? (Frames are 1 ms, the MFINDEX register's upper bits.)
+    fn frame_missed(&self, fid: u32) -> bool {
+        let now = (self.epoch.elapsed().as_micros() / 1000) as u32 & 0x7ff;
+        let ahead = fid.wrapping_sub(now) & 0x7ff;
+        ahead > ISO_AHEAD_FRAMES && 0x800 - ahead > ISO_LATE_FRAMES
+    }
+
+    /// An isochronous TD the controller finishes itself: now if nothing
+    /// is in flight before it, else in turn.
+    fn iso_local(&mut self, i: usize, id: usize, dci: u8, start: Ring, td: Vec<(u64, Trb)>, cc: u32) {
+        let p = &mut self.pass[i];
+        if p.queues.get(&(id, dci)).is_none_or(|q| q.is_empty()) {
+            return self.iso_finish(id, dci, &td, cc);
+        }
+        let rid = p.alloc_id();
+        let pending = Pending { slot: id, dci, start, td, is_in: dci % 2 == 1, len: 0, iso: Vec::new(), done: Some(Answer::Local(cc)) };
+        p.pending.insert(rid, pending);
+        p.queues.entry((id, dci)).or_default().push_back(rid);
+    }
+
+    /// Post an isochronous TD that moved no data: a No-op TD succeeds
+    /// (events for its IOC TRBs); anything else reports `cc` on its last
+    /// TRB, whatever its flags say (errors always do).
+    fn iso_finish(&mut self, slot: usize, dci: u8, td: &[(u64, Trb)], cc: u32) {
+        if cc == CC_SUCCESS {
+            return self.complete_td(slot, dci, td, None);
+        }
+        let Some(&(at, t)) = td.last() else { return };
+        let residual = if matches!(trb_type(&t), T_ISOCH | T_NORMAL) { t[2] & 0x1ffff } else { 0 };
+        self.transfer_event(at, cc, residual, slot as u8, dci);
+    }
+
+    /// A finished isochronous request: each TD gets its packet's result,
+    /// in order. The answer must match what was asked (as many packets,
+    /// none longer than asked, IN data adding up); else every TD fails.
+    /// Isochronous endpoints never halt.
+    fn iso_complete(&mut self, p: &Pending, d: IsoDone) {
+        let (slot, dci) = (p.slot, p.dci);
+        let fits = d.packets.len() == p.iso.len()
+            && d.packets.iter().zip(&p.iso).all(|(k, t)| k.actual <= t.1)
+            && d.data.len() == if p.is_in { d.actual() } else { 0 };
+        let failed = d.status != Status::Ok && d.packets.is_empty() && d.data.is_empty();
+        if !fits && !failed {
+            log::debug!("usb: isochronous answer doesn't match the request");
+        }
+        let (mut from, mut off) = (0, 0usize);
+        for (k, &(end, _)) in p.iso.iter().enumerate() {
+            let td = &p.td[from..end.min(p.td.len())];
+            from = end;
+            let (status, actual) = match (fits, failed) {
+                (true, _) => (d.packets[k].status, d.packets[k].actual as usize),
+                (false, true) => (d.status, 0),
+                (false, false) => (Status::Babble, 0),
+            };
+            let data = if p.is_in && fits { &d.data[off..off + actual] } else { &[][..] };
+            off += if fits && p.is_in { actual } else { 0 };
+            match status {
+                Status::Ok => self.complete_td(slot, dci, td, p.is_in.then_some(data)),
+                Status::Babble => self.iso_finish(slot, dci, td, CC_BABBLE),
+                _ => self.iso_finish(slot, dci, td, CC_TRANSACTION),
+            }
+        }
+    }
+
+    /// An isochronous endpoint ran out of TDs with nothing in flight: a
+    /// real controller says so (ring underrun for OUT, overrun for IN)
+    /// and waits for the doorbell.
+    fn iso_idle(&mut self, i: usize, slot: usize, dci: u8) {
+        let Some((_, ep)) = self.ep(slot, dci) else { return };
+        if !matches!(ep.kind, EPT_ISO_OUT | EPT_ISO_IN) || ep.state != EP_RUNNING {
+            return;
+        }
+        let mut r = ep.ring;
+        if self.pass[i].queues.get(&(slot, dci)).is_some_and(|q| !q.is_empty()) || self.ring_peek(&mut r).is_some() {
+            return;
+        }
+        let cc = if dci % 2 == 1 { CC_RING_OVERRUN } else { CC_RING_UNDERRUN };
+        self.transfer_event(0, cc, 0, slot as u8, dci);
     }
 
     /// The request for one TD. Err: (TRB, completion code) to fail it with.
@@ -1098,7 +1328,8 @@ impl Xhci {
                 log::info!("usb: device {dev} detached");
                 self.pass_attach(dev, None);
             }
-            Event::Done(d) => self.pass_done(dev, d),
+            Event::Done(d) => self.pass_done(dev, d.id, Answer::Plain(d)),
+            Event::IsoDone(d) => self.pass_done(dev, d.id, Answer::Iso(d)),
         }
     }
 
@@ -1145,13 +1376,18 @@ impl Xhci {
         }
     }
 
-    fn pass_done(&mut self, i: usize, d: Done) {
-        let Some(p) = self.pass[i].pending.get_mut(&d.id) else {
+    fn pass_done(&mut self, i: usize, id: u32, a: Answer) {
+        let Some(p) = self.pass[i].pending.get_mut(&id) else {
             // Cancelled already, or made up.
             return;
         };
-        p.done = Some(d);
+        if p.done.is_some() {
+            // Answered twice, or not ours to answer.
+            return;
+        }
+        p.done = Some(a);
         let key = (p.slot, p.dci);
+        let mut finished = false;
         // Complete in order: a TD finishes only after those before it.
         loop {
             let pass = &mut self.pass[i];
@@ -1164,12 +1400,25 @@ impl Xhci {
             }
             let Some(p) = pass.pending.remove(&front) else { break };
             self.pass_complete(p);
+            finished = true;
         }
         self.run_pass(i, key.0, key.1);
+        if finished {
+            self.iso_idle(i, key.0, key.1);
+        }
     }
 
-    fn pass_complete(&mut self, p: Pending) {
-        let Some(d) = p.done else { return };
+    fn pass_complete(&mut self, mut p: Pending) {
+        let d = match p.done.take() {
+            None => return,
+            Some(Answer::Local(cc)) => return self.iso_finish(p.slot, p.dci, &p.td, cc),
+            // An isochronous request answered as a plain one: failed.
+            Some(Answer::Plain(_)) if !p.iso.is_empty() => return self.iso_complete(&p, IsoDone::failed(0, Status::Error)),
+            Some(Answer::Iso(d)) if !p.iso.is_empty() => return self.iso_complete(&p, d),
+            Some(Answer::Plain(d)) => d,
+            // And the other way round: babble.
+            Some(Answer::Iso(d)) => Done { id: d.id, status: Status::Babble, actual: 0, data: Vec::new() },
+        };
         let (slot, dci) = (p.slot, p.dci);
         // The helper must answer what was asked: never more data than
         // the TD has room for, never data for an OUT transfer.
@@ -1210,7 +1459,9 @@ impl Xhci {
                 for id in ids {
                     if let Some(x) = p.pending.remove(&id) {
                         first = first.or(Some(x.start));
-                        let _ = p.link.send(Request::Cancel { id });
+                        if x.done.is_none() {
+                            let _ = p.link.send(Request::Cancel { id });
+                        }
                     }
                 }
                 if let (Some(start), Some((_, mut ep))) = (first, self.ep(key.0, key.1)) {
@@ -1797,19 +2048,26 @@ mod tests {
         assert_eq!(x.config().raw()[0x0b], 0x0c, "class stays USB");
     }
 
-    /// The helper side, in-process: the fake serial port behind a session.
-    struct FakeHelper {
+    /// The helper side, in-process: a fake device (the serial port unless
+    /// said otherwise) behind a session.
+    struct FakeHelper<D = vroom_usb::fake::Acm> {
         rx: std::sync::mpsc::Receiver<Request>,
         events: std::sync::mpsc::Receiver<Event>,
         session: vroom_usb::helper::Session,
-        dev: vroom_usb::fake::Acm,
+        dev: D,
     }
 
     impl FakeHelper {
         fn new() -> (FakeHelper, Sender<Request>) {
+            FakeHelper::with(|etx| vroom_usb::fake::Acm::new(etx, 0x1209, 0x000a))
+        }
+    }
+
+    impl<D: vroom_usb::helper::Device> FakeHelper<D> {
+        fn with(dev: impl FnOnce(Sender<Event>) -> D) -> (FakeHelper<D>, Sender<Request>) {
             let (tx, rx) = std::sync::mpsc::channel();
             let (etx, events) = std::sync::mpsc::channel();
-            let dev = vroom_usb::fake::Acm::new(etx.clone(), 0x1209, 0x000a);
+            let dev = dev(etx.clone());
             (FakeHelper { rx, events, session: vroom_usb::helper::Session::new(etx), dev }, tx)
         }
 
@@ -1999,5 +2257,213 @@ mod tests {
         h.x.usb_event(0, Event::Done(Done { id: 999, status: Status::Ok, actual: 0, data: vec![] }));
         h.x.usb_event(5, Event::Detached);
         assert!(h.events().is_empty());
+    }
+
+    // ---- isochronous, with the pretend sound card ----
+
+    use vroom_usb::fake::Audio;
+    use vroom_usb::proto::IsoPacket;
+
+    const ISO_OUT_RING: u64 = EP1;
+    const ISO_IN_RING: u64 = EP2;
+    const IN_BUF: u64 = RAM + 0xc000;
+    const OUT_BUF: u64 = RAM + 0xd000;
+    /// Speakers: endpoint 1 OUT. Microphone: endpoint 2 IN.
+    const DCI_OUT: u8 = 2;
+    const DCI_IN: u8 = 5;
+
+    fn isoch(buf: u64, len: u32, flags: u32) -> Trb {
+        [buf as u32, (buf >> 32) as u32, len, T_ISOCH << 10 | flags | 1]
+    }
+
+    fn codes(ev: &[Trb]) -> Vec<u32> {
+        ev.iter().map(|e| e[2] >> 24).collect()
+    }
+
+    /// The pretend sound card on the first passthrough port, slot 1,
+    /// both streaming interfaces on, its two isochronous endpoints
+    /// configured (1 ms interval).
+    fn audio_host() -> (Host, FakeHelper<Audio>) {
+        let mem = GuestMemory::new(&[(GuestAddress(RAM), 1 << 20)]).unwrap();
+        let r = IntxRouter::new((0..4).map(|_| Arc::new(NoIrq) as Arc<dyn crate::IrqLine>).collect());
+        let (mut helper, link) = FakeHelper::with(|etx| Audio::new(etx, 0x1209, 0x0002, false));
+        let x = Xhci::new(6, mem.clone(), r.pin(6, 1), Arc::new(NoMsi)).with_passthrough(vec![link]);
+        let mut h = Host::with(x, mem);
+        h.events();
+        h.x.usb_event(0, Event::Attached { speed: Speed::Full, vendor: 0x1209, product: 0x0002 });
+        h.w(PASS_PORT, (PS_PP | PS_PR | PS_CSC) as u64);
+        h.events();
+        h.command([0, 0, 0, C_ENABLE_SLOT << 10]);
+        let mut input = [0u32; 3 * 8];
+        input[1] = 3;
+        input[8 + 1] = (HID_PORTS as u32 + 1) << 16;
+        input[16 + 1] = 64 << 16 | (EPT_CONTROL as u32) << 3;
+        input[16 + 2] = EP0 as u32 | 1;
+        h.write_u32s(INPUT, &input);
+        h.command([INPUT as u32, (INPUT >> 32) as u32, 0, C_ADDRESS << 10 | 1 << 24]);
+        // SET_CONFIGURATION(1), SET_INTERFACE(1, 1), SET_INTERFACE(2, 1).
+        let set_alt = |iface: u64| 0x01 | 11 << 8 | 1 << 16 | iface << 32;
+        for (k, setup) in [9u64 << 8 | 1 << 16, set_alt(1), set_alt(2)].into_iter().enumerate() {
+            let at = EP0 + 32 * k as u64;
+            h.put_trb(at, [setup as u32, (setup >> 32) as u32, 8, T_SETUP << 10 | TRB_IDT | 1]);
+            h.put_trb(at + 16, [0, 0, 0, T_STATUS << 10 | TRB_IOC | 1]);
+            h.w(DB + 4, 1);
+            helper.pump(&mut h.x);
+            assert_eq!(codes(&h.events()), vec![CC_SUCCESS]);
+        }
+        let mut input = [0u32; 7 * 8];
+        input[1] = 1 | 1 << DCI_OUT | 1 << DCI_IN;
+        for (dci, ty, ring, mp) in [(DCI_OUT, EPT_ISO_OUT, ISO_OUT_RING, 200u32), (DCI_IN, EPT_ISO_IN, ISO_IN_RING, 100)] {
+            let at = 8 + 8 * dci as usize;
+            input[at] = 3 << 16; // 2^3 x 125 us
+            input[at + 1] = mp << 16 | (ty as u32) << 3;
+            input[at + 2] = ring as u32 | 1;
+        }
+        h.write_u32s(INPUT, &input);
+        h.command([INPUT as u32, (INPUT >> 32) as u32, 0, C_CONFIGURE << 10 | 1 << 24]);
+        (h, helper)
+    }
+
+    #[test]
+    fn passthrough_isochronous_in() {
+        let (mut h, mut helper) = audio_host();
+        // One URB of 8 packets, as Linux queues them: IOC on each TD, BEI
+        // on all but the last, ISP. The device sends 96 bytes a packet.
+        for k in 0..8u64 {
+            let bei = if k < 7 { TRB_BEI } else { 0 };
+            h.put_trb(ISO_IN_RING + 16 * k, isoch(IN_BUF + 100 * k, 100, TRB_SIA | TRB_IOC | TRB_ISP | bei));
+        }
+        h.w(DB + 4, DCI_IN as u64);
+        assert!(h.events().is_empty());
+        assert_eq!(h.x.pass[0].pending.len(), 1, "one request for the URB");
+        helper.pump(&mut h.x);
+        let ev = h.events();
+        assert_eq!(ev.len(), 9, "{ev:x?}");
+        for (k, e) in ev[..8].iter().enumerate() {
+            assert_eq!((param(e), e[2] >> 24, e[2] & 0xff_ffff), (ISO_IN_RING + 16 * k as u64, CC_SHORT, 4));
+        }
+        // The ring ran dry: overrun (IN), no TRB.
+        assert_eq!((param(&ev[8]), ev[8][2] >> 24, (ev[8][3] >> 16) & 0x1f), (0, CC_RING_OVERRUN, DCI_IN as u32));
+        // The samples count up, packet after packet.
+        let mut b = [0u8; 800];
+        h.mem.read(GuestAddress(IN_BUF), &mut b).unwrap();
+        for k in 0..8 {
+            for s in 0..48 {
+                assert_eq!(u16::from_le_bytes([b[100 * k + 2 * s], b[100 * k + 2 * s + 1]]), (48 * k + s) as u16);
+            }
+        }
+        assert_eq!(h.x.ep(1, DCI_IN).unwrap().1.state, EP_RUNNING);
+    }
+
+    #[test]
+    fn passthrough_isochronous_out_queues_ahead() {
+        let (mut h, mut helper) = audio_host();
+        // 12 URBs of 2 packets: a request each, 8 in flight, the rest
+        // wait on the ring and go as the first ones finish.
+        for k in 0..24u64 {
+            h.mem.write(GuestAddress(OUT_BUF + 192 * k), &[k as u8; 192]).unwrap();
+            let ioc = if k % 2 == 1 { TRB_IOC } else { 0 };
+            h.put_trb(ISO_OUT_RING + 16 * k, isoch(OUT_BUF + 192 * k, 192, TRB_SIA | ioc));
+        }
+        h.w(DB + 4, DCI_OUT as u64);
+        assert_eq!(h.x.pass[0].queues[&(1, DCI_OUT)].len(), MAX_EP_INFLIGHT);
+        helper.pump(&mut h.x);
+        let ev = h.events();
+        assert_eq!(ev.len(), 13, "{ev:x?}");
+        for (k, e) in ev[..12].iter().enumerate() {
+            assert_eq!((param(e), e[2] >> 24), (ISO_OUT_RING + 16 * (2 * k as u64 + 1), CC_SUCCESS));
+        }
+        assert_eq!((param(&ev[12]), ev[12][2] >> 24), (0, CC_RING_UNDERRUN));
+        assert_eq!((helper.dev.played, helper.dev.played_sum), (24 * 192, 192 * (0..24).sum::<u64>()));
+    }
+
+    #[test]
+    fn passthrough_isochronous_frames_and_noops() {
+        let (mut h, mut helper) = audio_host();
+        let now = (h.x.epoch.elapsed().as_millis() as u32) & 0x7ff;
+        let fid = |f: u32| (f & 0x7ff) << 20;
+        // A stream asked to start 1000 frames from now: missed service,
+        // nothing sent. A No-op TD (one the driver cancelled): success.
+        h.put_trb(ISO_IN_RING, isoch(IN_BUF, 100, fid(now + 1000) | TRB_IOC));
+        h.put_trb(ISO_IN_RING + 16, [0, 0, 0, T_NOOP << 10 | TRB_IOC | 1]);
+        // Two frames from now: fine. The next one's frame ID no longer
+        // counts: the stream runs.
+        h.put_trb(ISO_IN_RING + 32, isoch(IN_BUF, 100, fid(now + 2) | TRB_IOC));
+        h.put_trb(ISO_IN_RING + 48, isoch(IN_BUF + 100, 100, fid(now + 1500) | TRB_IOC));
+        // Not starting with an Isoch TRB: TRB error, after the others.
+        h.put_trb(ISO_IN_RING + 64, [IN_BUF as u32, 0, 100, T_NORMAL << 10 | TRB_IOC | 1]);
+        h.w(DB + 4, DCI_IN as u64);
+        let ev = h.events();
+        assert_eq!(codes(&ev), vec![CC_MISSED_SERVICE, CC_SUCCESS]);
+        assert_eq!((param(&ev[0]), ev[0][2] & 0xff_ffff, param(&ev[1])), (ISO_IN_RING, 100, ISO_IN_RING + 16));
+        assert_eq!(h.x.pass[0].pending.len(), 3);
+        helper.pump(&mut h.x);
+        let ev = h.events();
+        assert_eq!(codes(&ev), vec![CC_SHORT, CC_SHORT, CC_TRB_ERROR, CC_RING_OVERRUN]);
+        assert_eq!((param(&ev[0]), param(&ev[1]), param(&ev[2])), (ISO_IN_RING + 32, ISO_IN_RING + 48, ISO_IN_RING + 64));
+    }
+
+    #[test]
+    fn passthrough_isochronous_answers_are_checked() {
+        let (mut h, _helper) = audio_host();
+        let ok = |actual| IsoPacket { status: Status::Ok, actual };
+        let submit = |h: &mut Host, at: u64, buf: u64| {
+            h.put_trb(at, isoch(buf, 100, TRB_SIA | TRB_IOC | TRB_BEI));
+            h.put_trb(at + 16, isoch(buf + 100, 100, TRB_SIA | TRB_IOC));
+            h.w(DB + 4, DCI_IN as u64);
+            *h.x.pass[0].pending.keys().next().unwrap()
+        };
+        h.mem.write(GuestAddress(IN_BUF), &[0xaa; 400]).unwrap();
+        // A packet longer than asked: every TD babbles, nothing written,
+        // the endpoint keeps running.
+        let id = submit(&mut h, ISO_IN_RING, IN_BUF);
+        h.x.usb_event(0, Event::IsoDone(IsoDone { id, status: Status::Ok, packets: vec![ok(101), ok(0)], data: vec![1; 101] }));
+        assert_eq!(codes(&h.events()), vec![CC_BABBLE, CC_BABBLE, CC_RING_OVERRUN]);
+        let mut b = [0u8; 200];
+        h.mem.read(GuestAddress(IN_BUF), &mut b).unwrap();
+        assert_eq!(b, [0xaa; 200]);
+        assert_eq!(h.x.ep(1, DCI_IN).unwrap().1.state, EP_RUNNING);
+        // A packet that failed, one short: each says so.
+        let id = submit(&mut h, ISO_IN_RING + 32, IN_BUF + 200);
+        let err = IsoPacket { status: Status::Error, actual: 0 };
+        h.x.usb_event(0, Event::IsoDone(IsoDone { id, status: Status::Ok, packets: vec![err, ok(10)], data: vec![7; 10] }));
+        // A second answer to the same request is ignored.
+        h.x.usb_event(0, Event::IsoDone(IsoDone { id, status: Status::Ok, packets: vec![ok(1), ok(1)], data: vec![1, 1] }));
+        let ev = h.events();
+        assert_eq!(codes(&ev), vec![CC_TRANSACTION, CC_SHORT, CC_RING_OVERRUN]);
+        assert_eq!((ev[0][2] & 0xff_ffff, ev[1][2] & 0xff_ffff), (100, 90));
+        h.mem.read(GuestAddress(IN_BUF + 300), &mut b[..11]).unwrap();
+        assert_eq!(b[..11], [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 0xaa]);
+        // Answered as a plain transfer: the TDs fail.
+        let id = submit(&mut h, ISO_IN_RING + 64, IN_BUF);
+        h.x.usb_event(0, Event::Done(Done { id, status: Status::Ok, actual: 0, data: vec![] }));
+        assert_eq!(codes(&h.events()), vec![CC_TRANSACTION, CC_TRANSACTION, CC_RING_OVERRUN]);
+    }
+
+    #[test]
+    fn passthrough_isochronous_stop() {
+        let (mut h, mut helper) = audio_host();
+        for k in 0..20u64 {
+            h.put_trb(ISO_IN_RING + 16 * k, isoch(IN_BUF + 100 * k, 100, TRB_SIA | TRB_IOC));
+        }
+        h.w(DB + 4, DCI_IN as u64);
+        assert_eq!(h.x.pass[0].queues[&(1, DCI_IN)].len(), MAX_EP_INFLIGHT);
+        // Stop: what is in flight is cancelled, the ring is back at the
+        // first TD.
+        h.command([0, 0, 0, C_STOP_EP << 10 | (DCI_IN as u32) << 16 | 1 << 24]);
+        assert!(h.x.pass[0].pending.is_empty());
+        let mut e = [0u8; 16];
+        h.mem.read(GuestAddress(OUTPUT + 0x20 * DCI_IN as u64), &mut e).unwrap();
+        assert_eq!(u64::from_le_bytes(e[8..16].try_into().unwrap()) & !0xf, ISO_IN_RING);
+        // The helper's late answers are ignored.
+        helper.pump(&mut h.x);
+        assert!(h.events().is_empty());
+        // The doorbell starts it again from there.
+        h.w(DB + 4, DCI_IN as u64);
+        helper.pump(&mut h.x);
+        let ev = h.events();
+        assert_eq!(ev.len(), 21);
+        assert!(ev[..20].iter().enumerate().all(|(k, e)| param(e) == ISO_IN_RING + 16 * k as u64 && e[2] >> 24 == CC_SHORT));
+        assert_eq!(ev[20][2] >> 24, CC_RING_OVERRUN);
     }
 }

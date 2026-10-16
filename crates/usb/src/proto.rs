@@ -366,7 +366,7 @@ impl Request {
                 if n == 0 || n > MAX_ISO_PACKETS || p.len() < ISO_HDR + 4 * n {
                     return Err(bad("isochronous packet count"));
                 }
-                let packets: Vec<u32> = p[ISO_HDR..ISO_HDR + 4 * n].chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                let packets: Vec<u32> = p[ISO_HDR..ISO_HDR + 4 * n].as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
                 if packets.iter().any(|&l| l > MAX_ISO_PACKET) {
                     return Err(bad("isochronous packet too large"));
                 }
@@ -439,7 +439,7 @@ impl Event {
                     return Err(bad("isochronous packet count"));
                 }
                 let mut packets = Vec::with_capacity(n);
-                for c in p[ISO_HDR..ISO_HDR + 8 * n].chunks_exact(8) {
+                for c in p[ISO_HDR..ISO_HDR + 8 * n].as_chunks::<8>().0 {
                     let status = Status::from_wire(c[0]).ok_or_else(|| bad("status"))?;
                     let actual = u32::from_le_bytes([c[4], c[5], c[6], c[7]]);
                     if c[1..4] != [0, 0, 0] || actual > MAX_ISO_PACKET {

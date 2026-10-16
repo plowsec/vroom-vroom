@@ -386,7 +386,7 @@ mod iso_tests {
     /// Samples the pretend microphone sent: they count up by one.
     fn check_ramp(data: &[u8], from: u16) -> u16 {
         let mut want = from;
-        for c in data.chunks_exact(2) {
+        for c in data.as_chunks::<2>().0 {
             assert_eq!(u16::from_le_bytes([c[0], c[1]]), want);
             want = want.wrapping_add(1);
         }

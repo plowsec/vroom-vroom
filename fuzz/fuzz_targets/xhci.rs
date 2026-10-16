@@ -12,7 +12,7 @@ use vroom_devices::usb::hid::HidEvent;
 use vroom_devices::usb::xhci::Xhci;
 use vroom_devices::NoIrq;
 use vroom_memory::{GuestAddress, GuestMemory};
-use vroom_usb::proto::{Done, Event, Request, Speed, Status};
+use vroom_usb::proto::{Done, Event, IsoDone, IsoPacket, Request, Speed, Status};
 use libfuzzer_sys::fuzz_target;
 
 struct NoMsi;
@@ -51,8 +51,10 @@ fuzz_target!(|data: &[u8]| {
         let off = u16::from_le_bytes([op[1], op[2]]) as u64 % 0x4000;
         let v = u64::from_le_bytes(op[3..11].try_into().unwrap());
         while let Ok(r) = requests.try_recv() {
-            if let Request::Submit(s) = r {
-                sent.push(s.id);
+            match r {
+                Request::Submit(s) => sent.push(s.id),
+                Request::IsoSubmit(s) => sent.push(s.id),
+                _ => {}
             }
         }
         match op[0] % 8 {
@@ -77,7 +79,14 @@ fuzz_target!(|data: &[u8]| {
                 let status = [Status::Ok, Status::Stall, Status::Error, Status::Babble, Status::Cancelled, Status::NoDevice][op[3] as usize % 6];
                 let n = u16::from_le_bytes([op[4], op[5]]) as usize % 2048;
                 let data = if op[6] & 1 == 0 { vec![op[7]; n] } else { Vec::new() };
-                x.usb_event(0, Event::Done(Done { id, status, actual: n as u32, data }));
+                if op[8] & 1 == 0 {
+                    x.usb_event(0, Event::Done(Done { id, status, actual: n as u32, data }));
+                } else {
+                    // Isochronous: some packets, each some size, data or not.
+                    let k = op[9] as usize % 10;
+                    let packets = (0..k).map(|j| IsoPacket { status, actual: (op[10] as u32).wrapping_mul(j as u32 + 1) % 300 }).collect();
+                    x.usb_event(0, Event::IsoDone(IsoDone { id, status, packets, data }));
+                }
             }
         }
     }
