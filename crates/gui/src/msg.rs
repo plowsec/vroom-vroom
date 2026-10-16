@@ -64,7 +64,12 @@ pub fn set_handler(h: Handler) {
 pub fn send(m: Msg) {
     QUEUE.with(|q| q.borrow_mut().push_back(m));
     if !SCHEDULED.with(|s| s.replace(true)) {
-        slint::Timer::single_shot(std::time::Duration::ZERO, drain);
+        // From the event loop, not a timer: a handler may open a modal file
+        // dialog, whose own loop runs Slint's timers (a VM window's tick),
+        // and Slint aborts on timers run from inside a timer.
+        if slint::invoke_from_event_loop(drain).is_err() {
+            slint::Timer::single_shot(std::time::Duration::ZERO, drain);
+        }
     }
 }
 
