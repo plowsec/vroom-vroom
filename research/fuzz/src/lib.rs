@@ -738,4 +738,15 @@ mod tests {
         assert_eq!(a, b);
         assert!(a.len() <= 32);
     }
+
+    #[test]
+    fn mutator_preserves_ioctl_prefix() {
+        let seed = [0x22, 0x33, 0x44, 0x55, 1, 2, 3, 4];
+        let mut mutator = Mutator::new(9, 32);
+        for _ in 0..64 {
+            let input = mutator.mutate_preserving_prefix(&seed, 4);
+            assert_eq!(&input[..4], &seed[..4]);
+            assert!(input.len() <= 32);
+        }
+    }
 }
