@@ -12,12 +12,12 @@
 use std::ffi::c_void;
 
 use vroom_proto::{win_flags, GuestWindow, WindowOp};
-use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
+use windows_sys::Win32::Foundation::{HWND, RECT};
 use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId};
 use windows_sys::Win32::UI::HiDpi::{SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, EnumWindows, FindWindowW, GetClassNameW, GetForegroundWindow, GetSystemMetrics, GetWindow, GetWindowLongPtrW,
+    BringWindowToTop, FindWindowW, GetAncestor, GetTopWindow, GA_ROOT, GW_HWNDNEXT, GetClassNameW, GetForegroundWindow, GetSystemMetrics, GetWindow, GetWindowLongPtrW,
     GetWindowPlacement, GetWindowRect, GetWindowThreadProcessId, InternalGetWindowText, IsIconic, IsWindow, IsWindowVisible, IsZoomed,
     PeekMessageW, PostMessageW, SetForegroundWindow, SetWindowPos, ShowWindowAsync, SystemParametersInfoW, GWL_EXSTYLE, GWL_STYLE, GW_OWNER,
     MSG, PM_NOREMOVE, SC_CLOSE, SM_CXSCREEN, SM_CYSCREEN, SPIF_SENDCHANGE, SPI_GETWORKAREA, SPI_SETWORKAREA, SWP_ASYNCWINDOWPOS,
@@ -35,6 +35,8 @@ pub struct WinDesktop {
     hidden: bool,
     /// This process hid it.
     ours: bool,
+    /// The last window in front we said we leave out (logs).
+    fg_seen: isize,
 }
 
 /// Runs `f` with per-monitor DPI awareness on this thread.
@@ -56,13 +58,6 @@ fn wide(s: &str) -> Vec<u16> {
 fn hwnd(id: u32) -> HWND {
     // Window handles are 32-bit values, sign-extended on 64-bit Windows.
     id as i32 as isize as HWND
-}
-
-unsafe extern "system" fn collect(h: HWND, lp: LPARAM) -> BOOL {
-    // SAFETY: lp is the Vec EnumWindows was given, alive for the call.
-    let v = unsafe { &mut *(lp as *mut Vec<HWND>) };
-    v.push(h);
-    (v.len() < 4096) as BOOL
 }
 
 fn class(h: HWND) -> String {
@@ -121,6 +116,67 @@ fn set_work_area(mut r: RECT) {
     unsafe { SystemParametersInfoW(SPI_SETWORKAREA, 0, &mut r as *mut RECT as *mut c_void, SPIF_SENDCHANGE) };
 }
 
+/// One window as the host sees it, or why it is left out.
+fn entry(h: HWND, fg: HWND, me: u32, scr: &RECT) -> Result<GuestWindow, &'static str> {
+    // SAFETY: plain calls on a handle from the walk (one that went
+    // meanwhile makes them fail, nothing worse).
+    let (visible, iconic, zoomed) = unsafe { (IsWindowVisible(h) != 0, IsIconic(h) != 0, IsZoomed(h) != 0) };
+    if !visible {
+        return Err("hidden");
+    }
+    if cloaked(h) {
+        return Err("cloaked");
+    }
+    let mut pid = 0u32;
+    // SAFETY: out pointer.
+    unsafe { GetWindowThreadProcessId(h, &mut pid) };
+    if pid == me || SKIP.contains(&class(h).as_str()) {
+        return Err("desktop or ours");
+    }
+    // SAFETY: plain calls.
+    let (style, ex, owner) = unsafe { (GetWindowLongPtrW(h, GWL_STYLE) as u32, GetWindowLongPtrW(h, GWL_EXSTYLE) as u32, GetWindow(h, GW_OWNER)) };
+    let title = title(h);
+    let app = (owner.is_null() && ex & WS_EX_TOOLWINDOW == 0 && style & WS_CAPTION == WS_CAPTION || ex & WS_EX_APPWINDOW != 0) && !title.is_empty();
+    let r = if iconic {
+        // Where it goes back to; the host only lists it.
+        // SAFETY: zeroed WINDOWPLACEMENT with its length set.
+        let mut p: WINDOWPLACEMENT = unsafe { std::mem::zeroed() };
+        p.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+        // SAFETY: out pointer.
+        if !app || unsafe { GetWindowPlacement(h, &mut p) } == 0 {
+            return Err("minimized");
+        }
+        let r = p.rcNormalPosition;
+        if r.right <= r.left || r.bottom <= r.top {
+            return Err("empty");
+        }
+        r
+    } else {
+        let r = bounds(h).ok_or("empty")?;
+        if r.right <= scr.left || r.bottom <= scr.top || r.left >= scr.right || r.top >= scr.bottom {
+            return Err("off the screen");
+        }
+        if r.right - r.left < 2 || r.bottom - r.top < 2 {
+            return Err("too small");
+        }
+        r
+    };
+    let mut flags = 0;
+    if h == fg {
+        flags |= win_flags::FOREGROUND;
+    }
+    if iconic {
+        flags |= win_flags::MINIMIZED;
+    }
+    if app {
+        flags |= win_flags::APP;
+    }
+    if zoomed {
+        flags |= win_flags::MAXIMIZED;
+    }
+    Ok(GuestWindow { id: h as isize as u32, x: r.left, y: r.top, w: (r.right - r.left) as u32, h: (r.bottom - r.top) as u32, flags, title })
+}
+
 impl WinDesktop {
     pub fn new() -> WinDesktop {
         // AttachThreadInput needs a message queue on this thread.
@@ -130,69 +186,46 @@ impl WinDesktop {
             PeekMessageW(&mut m, std::ptr::null_mut(), 0, 0, PM_NOREMOVE);
         }
         // Not ours yet; shell(false) at start shows it if a crashed agent hid it.
-        WinDesktop { listed: Vec::new(), hidden: true, ours: false }
+        WinDesktop { listed: Vec::new(), hidden: true, ours: false, fg_seen: 0 }
     }
 
     fn list(&mut self) -> Vec<GuestWindow> {
+        // Top-level windows front to back. Not EnumWindows: since Windows
+        // 8 it leaves out Store apps' and the shell's own (the Start menu).
         let mut all: Vec<HWND> = Vec::new();
-        // SAFETY: the callback only pushes to `all`, which outlives the call.
-        unsafe { EnumWindows(Some(collect), &mut all as *mut Vec<HWND> as LPARAM) };
-        // SAFETY: plain calls on handles EnumWindows gave (a handle that
-        // went meanwhile makes them fail, nothing worse).
+        // SAFETY: plain calls; the walk is capped (the order may change under it).
+        let mut h = unsafe { GetTopWindow(std::ptr::null_mut()) };
+        while !h.is_null() && all.len() < 4096 {
+            all.push(h);
+            // SAFETY: as above.
+            h = unsafe { GetWindow(h, GW_HWNDNEXT) };
+        }
+        // SAFETY: plain calls.
         let (fg, me, scr) = unsafe { (GetForegroundWindow(), GetCurrentProcessId(), screen()) };
+        // The Start menu and search (Windows 11) are in front without being
+        // in the walk: they come first.
+        // SAFETY: plain call.
+        let root = unsafe { GetAncestor(fg, GA_ROOT) };
+        let front = if root.is_null() { fg } else { root };
+        if !front.is_null() && !all.contains(&front) {
+            all.insert(0, front);
+        }
         let mut out = Vec::new();
         for h in all {
-            // SAFETY: as above.
-            let (visible, iconic, zoomed) = unsafe { (IsWindowVisible(h) != 0, IsIconic(h) != 0, IsZoomed(h) != 0) };
-            if !visible || cloaked(h) {
-                continue;
-            }
-            let mut pid = 0u32;
-            // SAFETY: out pointer.
-            unsafe { GetWindowThreadProcessId(h, &mut pid) };
-            if pid == me || SKIP.contains(&class(h).as_str()) {
-                continue;
-            }
-            // SAFETY: plain calls.
-            let (style, ex, owner) = unsafe { (GetWindowLongPtrW(h, GWL_STYLE) as u32, GetWindowLongPtrW(h, GWL_EXSTYLE) as u32, GetWindow(h, GW_OWNER)) };
-            let title = title(h);
-            let app = (owner.is_null() && ex & WS_EX_TOOLWINDOW == 0 && style & WS_CAPTION == WS_CAPTION || ex & WS_EX_APPWINDOW != 0) && !title.is_empty();
-            let r = if iconic {
-                // Where it goes back to; the host only lists it.
-                // SAFETY: zeroed WINDOWPLACEMENT with its length set.
-                let mut p: WINDOWPLACEMENT = unsafe { std::mem::zeroed() };
-                p.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
-                // SAFETY: out pointer.
-                if !app || unsafe { GetWindowPlacement(h, &mut p) } == 0 {
-                    continue;
+            match entry(h, fg, me, &scr) {
+                Ok(w) => out.push(w),
+                Err(why) if h == fg && self.fg_seen != h as isize => {
+                    // Once per window: why the one in front isn't shown.
+                    log::info!("coherence: window in front {:#x} ({}, {:?}) left out: {why}", h as isize, class(h), title(h));
+                    self.fg_seen = h as isize;
                 }
-                let r = p.rcNormalPosition;
-                if r.right <= r.left || r.bottom <= r.top {
-                    continue;
+                // The first list after Coherence goes on: what's left out
+                // and why (only windows with a title, the rest is noise).
+                Err(why) if self.listed.is_empty() && why != "hidden" && !title(h).is_empty() => {
+                    log::info!("coherence: {:#x} ({}, {:?}) left out: {why}", h as isize, class(h), title(h));
                 }
-                r
-            } else {
-                let Some(r) = bounds(h) else { continue };
-                // Off the screen, or too small to matter.
-                if r.right <= scr.left || r.bottom <= scr.top || r.left >= scr.right || r.top >= scr.bottom || r.right - r.left < 2 || r.bottom - r.top < 2 {
-                    continue;
-                }
-                r
-            };
-            let mut flags = 0;
-            if h == fg {
-                flags |= win_flags::FOREGROUND;
+                Err(_) => {}
             }
-            if iconic {
-                flags |= win_flags::MINIMIZED;
-            }
-            if app {
-                flags |= win_flags::APP;
-            }
-            if zoomed {
-                flags |= win_flags::MAXIMIZED;
-            }
-            out.push(GuestWindow { id: h as isize as u32, x: r.left, y: r.top, w: (r.right - r.left) as u32, h: (r.bottom - r.top) as u32, flags, title });
             if out.len() == vroom_proto::WINDOWS_MAX {
                 break;
             }
@@ -275,7 +308,10 @@ impl crate::coherence::Desktop for WinDesktop {
                         ShowWindowAsync(tray, SW_HIDE);
                     }
                     self.hidden = true;
-                    self.ours = true;
+                    if !std::mem::replace(&mut self.ours, true) {
+                        // Just turned on (logs say what's left out).
+                        self.listed.clear();
+                    }
                     // Windows puts the taskbar's share back on screen changes.
                     let s = screen();
                     if !same(&work_area(), &s) {
