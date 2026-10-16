@@ -12,8 +12,10 @@ vroom run <vm.toml>   one process per VM, sandboxed after setup ◄───┘
    ├─ optional: unix socket to vroom-netd (root) for bridged/host-only
    ├─ optional: swtpm (vTPM), own sandbox, control + data socketpairs
    ├─ optional: vroom audio-out (sound, microphone), own sandbox, datagram socket
-   └─ optional: vroom usb-host (one per [[usb]] device), own sandbox,
-      stream socket: transfer requests in, results and plug events out
+   ├─ optional: vroom usb-host (one per [[usb]] device), own sandbox,
+   │  stream socket: transfer requests in, results and plug events out
+   └─ optional: vroom video-helper (video_decode), own sandbox, stream
+      socket: bitstreams and credits in, pictures out (VideoToolbox)
 ```
 
 The GUI never touches the guest: it shows a framebuffer the VMM shares
@@ -32,8 +34,9 @@ limits, source-MAC anti-spoofing). The VMM never holds an interface.
 | `memory` | Guest RAM as guarded mmaps; every access bounds-checked (`GuestMemory`). |
 | `arch` | Board layout (QEMU-virt compatible), FDT, ACPI tables (own AML encoder), SMBIOS, kernel image loader (Image, gzip, EFI zboot). |
 | `devices` | Bus, PL011, PL031, fw_cfg (+DMA), CFI flash (NVRAM), PCI host (ECAM, MSI, MSI-X, INTx), NVMe, xHCI + USB HID (passthrough devices get a USB 2 and a USB 3 root port each and asynchronous transfers), Intel HD Audio (controller + codec, streams moved by a timer thread). Parses hostile input only; `forbid(unsafe_code)`. |
+| `video` | Hardware video decoding, shared by the VMM and `vroom video-helper`: their protocol (credits, epochs), H.264/HEVC NAL unit, access unit and parameter set parsing, picture order counts. Parses hostile input only; `forbid(unsafe_code)`. |
 | `usb` | USB passthrough: the VMM/helper protocol, the helper's request checks, libusb (loaded with `dlopen`, helper only), host device listing (IOKit registry / sysfs), a pretend serial port for tests. |
-| `virtio` | Split-queue handling (hardened), MMIO and modern PCI transports, devices (blk, net, console, rng, gpu, input, fs, sound), a pausable worker per device. `forbid(unsafe_code)`. |
+| `virtio` | Split-queue handling (hardened), MMIO and modern PCI transports, devices (blk, net, console, rng, gpu, input, fs, sound, media), a pausable worker per device. `forbid(unsafe_code)`. |
 | `fs` | Host side of shared folders: component-wise `openat(O_NOFOLLOW)` walks from a root fd, Linux errno mapping. The virtio-fs FUSE server lives in `virtio`; it serves Linux and virtio-win's virtiofs.exe (Windows), telling them apart by their INIT flags. |
 | `audio` | Sound helper: datagram protocol, ring buffer, CoreAudio (macOS) / ALSA (Linux, `dlopen`) playback and recording, WAV test files. |
 | `gpu3d` | virglrenderer loaded with `dlopen`, behind the `Renderer3d` trait the virtio crate defines. The one place with GPU FFI. `remote`: the same trait over a socket to the GPU process, and that process's loop. |
@@ -122,6 +125,39 @@ other as agent frames; the VMM forwards them, checked, from a thread of
 its own. When the guest says `DropDone`, the app lets go of the button
 and the app under the pointer takes the files. Leaving the window sends
 `DragCancel`, Escape and the button up.
+
+## Video decoding
+
+`video_decode = true` adds a virtio-media device (`virtio/src/devices/media`):
+V4L2 carried over virtio, the guest's kernel forwarding each ioctl of
+its `/dev/videoN` on the command queue. The device plays a V4L2 stateful
+decoder: H.264 or HEVC buffers in (OUTPUT queue), NV12 pictures out
+(CAPTURE queue), with the source-change event, the LAST buffer and
+decoder STOP/START the V4L2 decoder interface describes. Buffers are
+allocated in one shared memory window (region 0, 1 GiB, mapped into the
+guest where the guest puts it; `vmm/src/video.rs`), and the guest maps
+them with virtio-media's MMAP command.
+
+The decoding happens in `vroom video-helper` (`cli/src/video.rs`,
+`cli/src/vt.rs`). The VMM copies each bitstream buffer out of the window
+and sends it; the helper splits it into access units and parameter sets
+(`video/src/nal.rs`), makes a VideoToolbox decompression session for
+the parameter sets (a new one when the size changes, announced to the
+VMM before its first picture), decodes, and puts the pictures back in
+display order: VideoToolbox hands them out in decoding order, so the
+helper works out each picture's order count from its slice header, as
+the standards define it, and holds as many as the stream's SPS says it
+may reorder (`video/src/poc.rs`). Pictures go back only against credits:
+one per picture buffer the guest has queued, under an epoch the VMM bumps
+when those buffers change (size change, seek, stream off); the VMM drops
+pictures from an older epoch. The VMM then copies the picture into the
+guest's buffer and returns it with the timestamp of the bitstream buffer
+it came from. Bitstream buffers go back to the guest as soon as they are
+copied out.
+
+A pause (snapshot) first answers every command the guest waits on (its
+driver gives up after 5 seconds). Decoders don't survive a restore: the
+device saves only which sessions were open and fails them afterwards.
 
 ## 3D
 

@@ -41,19 +41,19 @@ Who can touch what, one VM running:
 |  |  window has focus), screen size, dropped files, clean         |  |
 |  |  shutdown; shared folders through virtio-fs                   |  |
 |  +---------------------------------------------------------------+  |
-+---+-----------+------------+------------+------------+--------------+
-    | sockets   |            |            |            |
-    v           v            v            v            v
-+---------+ +----------+ +---------+ +---------+ +---------+
-| GPU     | | audio    | | camera  | | USB     | | TPM     |
-| process | | helper   | | helper  | | helper  | | swtpm   |
-|virgl,   | |speakers; | |the Mac  | |one per  | |its state|
-|DXMT,    | |mic only  | |camera,  | |device,  | |folder   |
-|MoltenVK | |if you    | |only if  | |that     | |only     |
-|GPU and  | |turned it | |you      | |device   | |         |
-|guest RAM| |on        | |turned it| |only     | |         |
-|         | |          | |on       | |         | |         |
-+---------+ +----------+ +---------+ +---------+ +---------+
++---+-----------+-----------+-----------+-----------+-----------+-----+
+    | sockets   |           |           |           |           |
+    v           v           v           v           v           v
++---------+ +---------+ +---------+ +---------+ +---------+ +---------+
+| GPU     | | audio   | | camera  | | video   | | USB     | | TPM     |
+| process | | helper  | | helper  | | helper  | | helper  | | swtpm   |
+|virgl,   | |speakers;| |the Mac  | |Video-   | |one per  | |its state|
+|DXMT,    | |mic only | |camera,  | |Toolbox, | |device,  | |folder   |
+|MoltenVK | |if you   | |only if  | |if you   | |that     | |only     |
+|GPU and  | |turned it| |you      | |turned it| |device   | |         |
+|guest RAM| |on       | |turned it| |on       | |only     | |         |
+|         | |         | |on       | |         | |         | |         |
++---------+ +---------+ +---------+ +---------+ +---------+ +---------+
   each started by the VMM in its own Seatbelt sandbox: none of your
   files, no network, no programs, only the one device it serves
 
@@ -86,6 +86,7 @@ uses them, and the window says so. Details: [SECURITY.md](docs/SECURITY.md).
 - USB devices from the host (those macOS has no driver for; needs libusb)
 - Drag and drop files from the Mac into the guest
 - The Mac's camera as a webcam in the guest, if you turn it on
+- Hardware video decoding (H.264, HEVC) for Linux guests on the Mac's VideoToolbox, if you turn it on
 - Fast disk and network I/O, measured against QEMU ([numbers](docs/PERFORMANCE.md))
 
 Not yet: x86_64 hosts (it builds, can't run VMs yet) and Secure Boot.

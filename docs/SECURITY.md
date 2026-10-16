@@ -16,10 +16,11 @@ service by a guest against its own VM.
 ## Layer 1: small, careful device code
 
 - One process per VM, written in Rust. `devices`, `virtio`, `arch`, `net`,
-  `config`, `snapshot` and `proto` are `forbid(unsafe_code)`; unsafe code
-  is confined to `hv`, `memory`, `sandbox`, `gpu3d`, `ipc`, `usb` (libusb,
-  loaded by the USB helper only, and IOKit device listing) and a few FFI
-  shims, with `// SAFETY:` notes.
+  `config`, `snapshot`, `proto` and `video` are `forbid(unsafe_code)`;
+  unsafe code is confined to `hv`, `memory`, `sandbox`, `gpu3d`, `ipc`,
+  `usb` (libusb, loaded by the USB helper only, and IOKit device listing)
+  and a few FFI shims (VideoToolbox in the video helper among them), with
+  `// SAFETY:` notes.
 - Guest memory goes through bounds-checked `GuestMemory`; there are no raw
   pointers into guest RAM in device code.
 - Every guest-controlled value is validated: virtqueue rings (loops, sizes,
@@ -202,6 +203,69 @@ microphone applies: a guest that broke out into the VMM could ask for the
 camera while the VM runs without telling the window; macOS's green
 camera light can't be faked by it. Frames from the helper are checked
 like guest input (size, a whole frame) before they reach the guest.
+
+## Video decoding
+
+Off unless `[display] video_decode = true`. A guest's video stream is
+about the most hostile input there is: decoders are big, old C code. So
+the decoding never happens in the VMM:
+
+```text
+guest V4L2 decoder --virtio-media--> VMM device (Rust)  --socket--> vroom video-helper --XPC--> Apple's decoder service
+                                     checks every ioctl,             parses the stream,          (macOS's own sandbox)
+                                     copies bitstreams out            then VideoToolbox
+                                     and pictures in
+```
+
+The VMM's device (`virtio/src/devices/media`, no unsafe code) speaks
+V4L2 to the guest and nothing else: every ioctl is size-checked, queue
+types, buffer indices and memory types are checked, at most 8 decoders,
+16 bitstream buffers (8 MiB each at most) and 24 picture buffers each
+(4096x2304 at most). The buffers live in one shared memory window of
+1 GiB the guest maps; the guest can only map our buffers' offsets in it.
+A bitstream is copied out of the window before it goes anywhere (the
+guest can't change it under the helper), and no more than 16 MiB or 32
+buffers per decoder wait at the helper. Pending events are capped.
+
+The helper (`vroom video-helper`, one per VM, started before the VMM's
+sandbox goes up) runs under its own Seatbelt profile: system libraries
+(read), VideoToolbox's decoder service (an XPC service, the only
+service it may look up) and frame buffers (IOSurface). No files, no
+network, no exec, no GPU, no writes. Before VideoToolbox sees anything
+it takes the stream apart itself (`crates/video`, fuzzed): NAL units
+(4096 per buffer at most), parameter sets (4 KiB each, ids within what
+the standards allow), access units (256 per buffer), slice headers for
+the display order. VideoToolbox gets parameter sets and length-prefixed
+access units only.
+
+Each side treats the other as hostile. The helper takes from the VMM
+only messages of known kinds within their size (8 MiB of bitstream), for
+8 sessions, 64 queued buffers each. The VMM takes from the helper only
+pictures it gave a credit for (one per free guest buffer, under an epoch
+that changes whenever the guest's buffers do), of exactly the size it
+announced, which must fit the guest's buffer; a format must be a valid
+size; more than 256 unread messages, or a write that blocks for 2
+seconds, and the helper counts as gone. Then the guest's decoders fail
+with `EIO` and the rest of the VM runs on.
+
+What a bug reachable from a stream gets:
+
+- in the helper: VideoToolbox's client side, its decoder service and
+  IOSurfaces; the streams of that VM's other decoders. Nothing else of
+  the user's.
+- in Apple's decoder service (`com.apple.coremedia.videodecoder`), which
+  the hardware decoder's kernel driver sits behind: the same reach a video
+  file opened in Safari or QuickTime has. That code is Apple's and shared
+  with every app on the Mac; this is the real cost of turning it on.
+
+Memory a guest can make us use: the window (up to 1 GiB, only what its
+buffers touch), and in the helper per decoder up to 16 MiB of bitstream
+and 24 pictures (8 waiting for a guest buffer, up to 16 held for display
+order): about 350 MB for a 4K decoder.
+
+The guest side runs Google's virtio-media driver, out of tree.
+`scripts/guest/install-virtio-media.sh` downloads one pinned commit and
+checks its SHA-256 before building it.
 
 ## USB devices
 
@@ -392,7 +456,9 @@ writes, reopens and compactions checked byte for byte against a model),
 and VMDK (sparse headers, grain tables, compressed grains, descriptors),
 the USB passthrough protocol both ways with the helper's checks, and USB
 descriptors (the xHCI target also has a passthrough device whose answers
-come from the input). Run with
+come from the input), and the video helper's stream parsing (NAL units,
+parameter sets, display order) and its protocol both ways (`video`; the
+virtio-media device has a junk-command test of its own). Run with
 `cargo +nightly fuzz run -O <target>`. First runs found two qcow2 bugs
 (a crash on short v3 headers, multi-GB allocations from crafted table
 sizes); both fixed. The USB target found a short configuration descriptor
@@ -447,6 +513,8 @@ Still visible, whatever the config says:
 - virtio devices: PCI vendor 0x1AF4, subsystem 0x1AF4:1100, revision 1.
   Linux and the Windows drivers match on these (virtio-win INFs list
   `SUBSYS_11001AF4&REV_01`).
+- With `video_decode`: a virtio-media device (id 48) named "Video
+  decoder", whose formats, sizes and levels are VideoToolbox's.
 - fw_cfg: the "QEMU" signature, its DMA signature and file names
   (`etc/acpi/tables`, `etc/smbios/...`, `etc/ramfb`). EDK2 looks for them.
 - The board: QEMU virt memory map, PL011/PL031 PrimeCell IDs, CFI flash

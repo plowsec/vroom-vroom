@@ -81,6 +81,7 @@ Bridged and host-only need the `vroom-netd` helper running as root. See
 | `gpu` | `none` | `none` (serial console only), `virtio2d`, `virtio3d` (Vulkan and OpenGL drawn by the host GPU, Linux guests; see the [guide](GUIDE.md#3d-acceleration-linux-guests)). |
 | `opengl` | true | With `virtio3d`: OpenGL too (virgl). `false` keeps Vulkan only: less host code facing the guest. |
 | `opengl_host` | `"apple"` | What runs the guest's OpenGL: `"apple"` (macOS's OpenGL 4.1; the guest gets OpenGL 4.1) or `"angle"` (ANGLE on Metal; the guest gets OpenGL 2.1, with every call checked). See the [guide](GUIDE.md#3d-acceleration-linux-guests). |
+| `video_decode` | false | Hardware video decoding for Linux guests: a V4L2 decoder (H.264, HEVC) backed by the Mac's VideoToolbox in a sandboxed helper. Needs the guest's virtio-media driver. See the [guide](GUIDE.md#video-decoding). |
 | `width`, `height` | 1280, 800 | Starting resolution. The guest follows the window size once its agent or driver runs. |
 | `hidpi` | true | Full resolution on Retina (HiDPI) screens: the guest gets every pixel of the window and its agent sets its UI scale to match (2x on Retina), so text is sharp. Guests without an agent that can scale get half the pixels and the window scales the picture up, as with `false`. See [GUIDE.md](GUIDE.md#retina-screens). |
 

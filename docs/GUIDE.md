@@ -428,6 +428,76 @@ What works and what doesn't (Windows 11 24H2, M3 Max):
 - DXMT keeps the Metal versions of the shaders it has converted in the
   VM's state folder (`shaders/`), so apps start faster the second time.
 
+## Video decoding
+
+Linux guests can hand H.264 and HEVC video to the Mac's hardware decoder
+(VideoToolbox). Off by default for now:
+
+```toml
+[display]
+video_decode = true
+```
+
+The guest sees a V4L2 video decoder (`/dev/video0`, "Video decoder"):
+H.264 (Baseline to High, up to level 5.2) and HEVC Main in, NV12
+pictures out, up to 4096 pixels wide or high (4096x2304 at most). It
+needs Google's virtio-media driver, which isn't in mainline Linux yet.
+`scripts/guest/install-virtio-media.sh` builds it in the guest with DKMS
+(so new kernels get it too): it downloads one pinned version, checks
+its SHA-256, and patches two small things (older kernels; a `poll()`
+answer GStreamer stops on). Run it as root in the guest (Debian or
+Ubuntu; Ubuntu 24.04 is what we test):
+
+```bash
+sudo sh install-virtio-media.sh
+v4l2-ctl --list-devices            # Video decoder (platform:virtio-media)
+sudo usermod -aG video $USER       # then log in again
+```
+
+What uses it:
+
+```bash
+# GStreamer (gstreamer1.0-plugins-good)
+gst-launch-1.0 filesrc location=movie.mp4 ! qtdemux ! h264parse ! v4l2h264dec ! autovideosink
+gst-launch-1.0 filesrc location=movie.mp4 ! qtdemux ! h265parse ! v4l2h265dec ! autovideosink
+# FFmpeg (mpv should work too with --hwdec=v4l2m2m-copy; not tried)
+ffmpeg -c:v h264_v4l2m2m -i movie.mp4 -f null -
+ffmpeg -c:v hevc_v4l2m2m -i movie.mp4 -f null -
+```
+
+Browsers don't use it yet: Chromium and Firefox decode with VA-API on
+Linux (see [ROADMAP.md](ROADMAP.md#hardware-video-decoding)).
+
+The pictures are bit for bit what software decoding gives (checked
+against FFmpeg's decoder, H.264 and HEVC, 720p to 4K, size changes in the
+middle of a stream). What it saves is the guest's CPU. On an M-series
+Mac, guest with 4 vCPUs, FFmpeg decoding to nowhere:
+
+| Stream | Hardware: time, guest CPU | Software: time, guest CPU |
+|---|---|---|
+| H.264 1080p, 20 Mbit/s, 300 pictures | 1.3 s, 0.2 s | 1.4 s, 4.6 s |
+| HEVC 1080p, 300 pictures | 0.45 s, 0.04 s | 0.5 s, 1.5 s |
+| HEVC 4K, 30 Mbit/s, 120 pictures | 0.54 s, 0.04 s | 1.6 s, 5.7 s |
+
+That is 220 to 650 pictures a second, far more than playing needs; on
+easy streams 4 software cores still go faster (pictures cross two copies
+on their way; see the roadmap).
+
+Good to know:
+
+- Up to 8 decoders at once. Their buffers share a 1 GiB window (only what
+  they use is real memory); a fifth 4K decoder may get fewer buffers.
+- A decoder open during a snapshot keeps going; after restoring the
+  snapshot, or resuming a suspended VM, it fails and the player has to
+  open it again.
+- FFmpeg 6.1's `v4l2m2m` decoders (Ubuntu 24.04) hang on a size change in
+  the middle of a stream, and can drop the last pictures when what comes
+  after them is slow. GStreamer handles both.
+- The decoding runs in `vroom video-helper`, a process of its own
+  sandboxed to VideoToolbox (see [SECURITY.md](SECURITY.md#video-decoding)).
+  If it dies, decoders in the guest fail (`EIO`) until the VM restarts;
+  the rest of the VM is fine.
+
 ## Shared folders
 
 ```toml
