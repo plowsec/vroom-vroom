@@ -31,7 +31,9 @@ pub use gl::Host as GlHost;
 const CAPSET_VIRGL: u32 = 1;
 const CAPSET_VIRGL2: u32 = 2;
 const CAPSET_VENUS: u32 = 4;
-const KNOWN_CAPSETS: [u32; 3] = [CAPSET_VIRGL, CAPSET_VIRGL2, CAPSET_VENUS];
+/// Direct3D 11 (Neptune: Windows guests with the viogpu3d driver).
+const CAPSET_NEPTUNE: u32 = 7;
+const KNOWN_CAPSETS: [u32; 4] = [CAPSET_VIRGL, CAPSET_VIRGL2, CAPSET_VENUS, CAPSET_NEPTUNE];
 /// Where `char renderer[64]` sits in virgl caps v2 (virgl_hw.h; the
 /// layout is guest ABI, it only grows).
 const CAPS_V2_RENDERER: std::ops::Range<usize> = 696..760;
@@ -41,6 +43,8 @@ const THREAD_SYNC: c_int = 2;
 const VENUS: c_int = 1 << 6;
 const NO_VIRGL: c_int = 1 << 7;
 const ASYNC_FENCE_CB: c_int = 1 << 8;
+const RENDER_SERVER: c_int = 1 << 9;
+const NEPTUNE: c_int = 1 << 15;
 
 #[repr(C)]
 struct CreateArgs {
@@ -126,6 +130,9 @@ struct Lib {
     get_info: unsafe extern "C" fn(c_int, *mut c_void) -> c_int,
     /// macOS fork (krunkit): blobs come with a host pointer already.
     get_map_ptr: Option<unsafe extern "C" fn(u32, *mut u64) -> c_int>,
+    /// virgl_renderer_resource_export_blob: an fd for a blob (the render
+    /// server's are shared memory).
+    export_blob: Option<unsafe extern "C" fn(u32, *mut u32, *mut c_int) -> c_int>,
 }
 
 // SAFETY: plain function pointers into a library that stays loaded.
@@ -231,6 +238,13 @@ fn open_lib() -> Option<Lib> {
             // SAFETY: signature from the fork's virglrenderer.h.
             (!f.is_null()).then(|| unsafe { std::mem::transmute::<*mut c_void, unsafe extern "C" fn(u32, *mut u64) -> c_int>(f) })
         },
+        export_blob: {
+            let c = CString::new("virgl_renderer_resource_export_blob").ok()?;
+            // SAFETY: valid handle and name.
+            let f = unsafe { libc::dlsym(handle, c.as_ptr()) };
+            // SAFETY: signature from virglrenderer.h.
+            (!f.is_null()).then(|| unsafe { std::mem::transmute::<*mut c_void, unsafe extern "C" fn(u32, *mut u32, *mut c_int) -> c_int>(f) })
+        },
     })
 }
 
@@ -243,7 +257,30 @@ pub fn load(gl: Option<GlHost>) -> bool {
     if let Some(host) = gl {
         GL.get_or_init(|| load_gl(lib, host));
     }
+    if let Some(dir) = &lib.dir {
+        preload_dxmt(dir);
+    }
     true
+}
+
+/// Direct3D 11 for Windows guests (Neptune) runs on DXMT, which the
+/// library loads from its own directory when a guest first asks. That is
+/// after the sandbox is up, so load it now: the later dlopen finds it
+/// already there and opens nothing.
+#[cfg(target_os = "macos")]
+fn preload_dxmt(dir: &std::path::Path) {
+    let path = dir.join("libdxmt-native.dylib");
+    if !path.exists() {
+        return;
+    }
+    let Ok(c) = CString::new(path.as_os_str().as_encoded_bytes()) else { return };
+    // SAFETY: dlopen with a valid C string; the handle is kept for good.
+    let h = unsafe { libc::dlopen(c.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+    if h.is_null() {
+        log::warn!("gpu3d: can't load {}: no Direct3D for Windows guests", path.display());
+    } else {
+        log::info!("gpu3d: loaded {} (Direct3D 11 for Windows guests)", path.display());
+    }
 }
 
 /// Load the library (no GL off macOS). See the macOS one.
@@ -437,8 +474,9 @@ fn leave() {
 /// Set once virglrenderer is up: whether with GL.
 static INIT: Mutex<Option<bool>> = Mutex::new(None);
 
-/// virgl_renderer_init, with GL contexts from [`egl`] or without GL.
-fn init(lib: &Lib, gl: bool) -> c_int {
+/// virgl_renderer_init, with GL contexts from [`gl`] or without GL, and
+/// with or without the render server (`proxy`: Venus and Neptune there).
+fn init(lib: &Lib, gl: bool, proxy: bool) -> c_int {
     type Create = extern "C" fn(*mut c_void, c_int, *mut GlCtxParam) -> *mut c_void;
     type Destroy = extern "C" fn(*mut c_void, *mut c_void);
     type Current = extern "C" fn(*mut c_void, c_int, *mut c_void) -> c_int;
@@ -461,7 +499,12 @@ fn init(lib: &Lib, gl: bool) -> c_int {
     // With GL, no fence thread: ANGLE serializes the contexts of a share
     // group, so a thread blocked on a GL fence would stall every submit.
     // GL fences are polled by the GPU worker instead (`poll`).
-    let flags = VENUS | ASYNC_FENCE_CB | if gl { 0 } else { NO_VIRGL | THREAD_SYNC };
+    // The render server's contexts only get a fence thread with
+    // THREAD_SYNC, and with ASYNC_FENCE_CB the poll skips them: with GL
+    // and the server, no async callbacks, so the poll retires those too.
+    // (Venus in place has fence threads of its own either way.)
+    let async_cb = if gl && proxy { 0 } else { ASYNC_FENCE_CB };
+    let flags = VENUS | async_cb | if gl { 0 } else { NO_VIRGL | THREAD_SYNC } | if proxy { RENDER_SERVER | NEPTUNE } else { 0 };
     // virgl refuses a null cookie; ours is never used (callbacks reach statics).
     static COOKIE: u8 = 0;
     // SAFETY: valid callbacks for the process lifetime; the cookie is only
@@ -479,6 +522,9 @@ pub struct Virgl {
     maps: HashMap<u32, (*mut u8, u64, bool)>,
     /// Blob sizes, for pointer-only mappings.
     blob_sizes: HashMap<u32, u64>,
+    /// Read-only views of blobs the guest doesn't map but shows (Direct3D
+    /// frames, in the render server's shared memory): resource -> (ptr, len).
+    views: HashMap<u32, (*mut u8, u64)>,
     /// GL renderer name the guest sees instead of the host's.
     gl_renderer: Option<String>,
 }
@@ -494,6 +540,45 @@ impl std::fmt::Debug for Virgl {
 }
 
 impl Virgl {
+    /// A read-only view of a blob in shared memory, made the first time it
+    /// is shown and kept until the resource goes.
+    fn view(&mut self, resource: u32) -> Option<(*mut u8, u64)> {
+        if let Some(&v) = self.views.get(&resource) {
+            return Some(v);
+        }
+        let export = self.lib.export_blob?;
+        let (mut ty, mut fd) = (0u32, -1 as c_int);
+        // SAFETY: valid out pointers; a returned fd is ours to close.
+        if unsafe { export(resource, &mut ty, &mut fd) } != 0 || fd < 0 {
+            return None;
+        }
+        const FD_TYPE_SHM: u32 = 3;
+        // SAFETY: stat is plain old data; all zeroes is a valid value.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: fd is open; st is a valid out buffer.
+        let len = if ty == FD_TYPE_SHM && unsafe { libc::fstat(fd, &mut st) } == 0 { st.st_size.max(0) as u64 } else { 0 };
+        let p = if len > 0 {
+            // SAFETY: a fresh read-only shared mapping of the whole object.
+            unsafe { libc::mmap(std::ptr::null_mut(), len as usize, libc::PROT_READ, libc::MAP_SHARED, fd, 0) }
+        } else {
+            libc::MAP_FAILED
+        };
+        // SAFETY: we own fd; the mapping doesn't need it.
+        unsafe { libc::close(fd) };
+        if p == libc::MAP_FAILED {
+            return None;
+        }
+        self.views.insert(resource, (p as *mut u8, len));
+        Some((p as *mut u8, len))
+    }
+
+    fn drop_view(&mut self, resource: u32) {
+        if let Some((p, len)) = self.views.remove(&resource) {
+            // SAFETY: a mapping view() made, used by nothing else now.
+            unsafe { libc::munmap(p as *mut c_void, len as usize) };
+        }
+    }
+
     /// Initialise virglrenderer (once per process): Venus, plus virgl if
     /// [`load`] brought up GL. `gl_renderer` replaces the host's GL
     /// renderer name in what the guest reads.
@@ -506,13 +591,23 @@ impl Virgl {
                 let _ = sink();
                 enter();
                 let mut gl = GL.get().copied().unwrap_or(false);
-                let mut r = if gl { init(lib, true) } else { -1 };
+                // Venus and Neptune through the render server (a thread
+                // in this process) where the library has one; older
+                // libraries run Venus in place and have no Neptune.
+                let mut r = -1;
+                for proxy in [true, false] {
+                    if gl && r != 0 {
+                        r = init(lib, true, proxy);
+                    }
+                }
                 if gl && r != 0 {
                     log::warn!("gpu3d: OpenGL (virgl) init failed ({r}): Venus only");
                     gl = false;
                 }
-                if r != 0 {
-                    r = init(lib, false);
+                for proxy in [true, false] {
+                    if r != 0 {
+                        r = init(lib, false, proxy);
+                    }
                 }
                 if r != 0 {
                     log::warn!("gpu3d: virgl_renderer_init failed: {r}");
@@ -527,7 +622,7 @@ impl Virgl {
         };
         let mut capsets = Vec::new();
         // virglrenderer reports the GL sets even with GL off (then empty).
-        for id in KNOWN_CAPSETS.into_iter().filter(|&id| gl || id == CAPSET_VENUS) {
+        for id in KNOWN_CAPSETS.into_iter().filter(|&id| gl || id == CAPSET_VENUS || id == CAPSET_NEPTUNE) {
             let (mut ver, mut size) = (0u32, 0u32);
             // SAFETY: valid out pointers.
             unsafe { (lib.get_cap_set)(id, &mut ver, &mut size) };
@@ -539,7 +634,7 @@ impl Virgl {
         if capsets.is_empty() {
             return None;
         }
-        Some(Virgl { lib, capsets, iovs: HashMap::new(), contexts: Vec::new(), maps: HashMap::new(), blob_sizes: HashMap::new(), gl_renderer })
+        Some(Virgl { lib, capsets, iovs: HashMap::new(), contexts: Vec::new(), maps: HashMap::new(), blob_sizes: HashMap::new(), views: HashMap::new(), gl_renderer })
     }
 
     fn iov(&mut self, resource: u32, iov: HostIov) -> (*mut libc::iovec, usize) {
@@ -613,8 +708,18 @@ impl Renderer3d for Virgl {
         if cmds.len() % 4 != 0 {
             return false;
         }
+        // Nothing to run (Windows sends these to carry a fence). An empty
+        // slice's pointer is dangling and unaligned: the library would
+        // refuse it.
+        if cmds.is_empty() {
+            return true;
+        }
         // SAFETY: cmds is valid for len bytes = ndw dwords.
-        unsafe { (self.lib.submit)(cmds.as_mut_ptr() as *mut c_void, ctx as c_int, (cmds.len() / 4) as c_int) == 0 }
+        let r = unsafe { (self.lib.submit)(cmds.as_mut_ptr() as *mut c_void, ctx as c_int, (cmds.len() / 4) as c_int) };
+        if r != 0 {
+            log::debug!("gpu3d: submit of {} bytes to context {ctx}: {r}", cmds.len());
+        }
+        r == 0
     }
 
     fn create_3d(&mut self, resource: u32, a: &Create3d) -> bool {
@@ -738,7 +843,13 @@ impl Renderer3d for Virgl {
 
     fn read_mapped(&mut self, resource: u32, offset: u64, out: &mut [u8]) -> bool {
         enter();
-        let Some(&(p, size, _)) = self.maps.get(&resource) else { return false };
+        let (p, size) = match self.maps.get(&resource) {
+            Some(&(p, size, _)) => (p, size),
+            None => match self.view(resource) {
+                Some(v) => v,
+                None => return false,
+            },
+        };
         let Some(end) = offset.checked_add(out.len() as u64) else { return false };
         if end > size {
             return false;
@@ -821,6 +932,7 @@ impl Renderer3d for Virgl {
     fn unref(&mut self, resource: u32) {
         enter();
         self.unmap_blob(resource);
+        self.drop_view(resource);
         self.detach_backing(resource);
         // SAFETY: plain call; unknown ids are ignored by the library.
         unsafe { (self.lib.res_unref)(resource) };
@@ -863,6 +975,9 @@ impl Renderer3d for Virgl {
         self.contexts.clear();
         self.maps.clear();
         self.blob_sizes.clear();
+        for id in self.views.keys().copied().collect::<Vec<_>>() {
+            self.drop_view(id);
+        }
         sink().done.lock().unwrap_or_else(|e| e.into_inner()).clear();
         leave();
     }

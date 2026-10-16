@@ -406,7 +406,13 @@ struct Pending {
     ctx: u32,
     ring: Option<u8>,
     fence: u64,
+    /// When it was queued, and whether we said it is late.
+    since: std::time::Instant,
+    late: bool,
 }
+
+/// A fence that takes this long means a stuck guest driver: say so once.
+const FENCE_LATE: Duration = Duration::from_secs(5);
 
 pub struct GpuHandler {
     shared: Arc<Mutex<Shared>>,
@@ -998,6 +1004,7 @@ impl GpuHandler {
         self.finish_read(true);
         let Some(rect) = Rect::read(r) else { return ERR_INVALID_PARAMETER };
         let (Some(sid), Some(id)) = (rd32(r), rd32(r)) else { return ERR_INVALID_PARAMETER };
+        log::trace!("gpu: set scanout {sid} to res {id} {rect:?}");
         if sid != 0 {
             return ERR_INVALID_SCANOUT_ID;
         }
@@ -1028,6 +1035,7 @@ impl GpuHandler {
             *x = n;
         }
         let [sid, id, width, height, format, _pad, stride, _, _, _, offset, ..] = v;
+        log::trace!("gpu: set scanout blob {sid} to res {id} {width}x{height} format {format} stride {stride} offset {offset} {rect:?}");
         if sid != 0 {
             return ERR_INVALID_SCANOUT_ID;
         }
@@ -1173,9 +1181,9 @@ impl GpuHandler {
                 if let Some(hdr) = hdr {
                     let (ty, body) = self.command(&ctx.mem, &mut r, &hdr);
                     if ty >= ERR_UNSPEC {
-                        log::debug!("gpu: command {:#x} -> {ty:#x}", hdr.ty);
+                        log::debug!("gpu: command {:#x} ctx {} -> {ty:#x}", hdr.ty, hdr.ctx);
                     } else {
-                        log::trace!("gpu: command {:#x} ok", hdr.ty);
+                        log::trace!("gpu: command {:#x} ctx {} ok", hdr.ty, hdr.ctx);
                     }
                     Self::respond(&mut w, &hdr, ty, &body);
                     len = w.written() as u32;
@@ -1188,7 +1196,7 @@ impl GpuHandler {
             // Fenced commands go back once the GPU has caught up.
             if let (Some((fctx, ring, id)), Some(t)) = (fence, &self.three_d) {
                 if self.pending.len() < MAX_PENDING_FENCES && t.r().create_fence(fctx, ring, id) {
-                    self.pending.push(Pending { q, head, len, ctx: fctx, ring, fence: id });
+                    self.pending.push(Pending { q, head, len, ctx: fctx, ring, fence: id, since: std::time::Instant::now(), late: false });
                     continue;
                 }
             }
@@ -1211,6 +1219,10 @@ impl GpuHandler {
                 }
                 !hit
             });
+        }
+        for p in self.pending.iter_mut().filter(|p| !p.late && p.since.elapsed() > FENCE_LATE) {
+            p.late = true;
+            log::warn!("gpu: fence {} (context {}, ring {:?}) still not done after {:?}", p.fence, p.ctx, p.ring, FENCE_LATE);
         }
     }
 

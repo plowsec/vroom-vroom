@@ -79,9 +79,21 @@ pub fn profile(p: &Policy) -> Result<String> {
     }
     if p.gpu {
         s += GPU_RULES;
+        // Anonymous shared memory for the render server (Venus, Direct3D)
+        // and DXMT: made with shm_open under a name of our own pid and
+        // unlinked straight away. Only those names, only this process.
+        s += &format!(
+            "(allow ipc-posix-shm-write-create ipc-posix-shm-write-unlink ipc-posix-shm-read-data ipc-posix-shm-write-data\n  (ipc-posix-name-regex #\"^/(proxy-ctx|vkr-shmem|vkr-host-mem|npt-shmem|dxn)-{}-[0-9a-f]+-[0-9a-f]+$\"))\n",
+            std::process::id()
+        );
         if let Some(cache) = user_cache_dir() {
-            // Metal's shader cache.
-            s += &format!("(allow file-read* file-write* (subpath {}))\n", q(&cache.join("com.apple.metal"))?);
+            // Metal's shader cache, and DXMT's (Direct3D shaders already
+            // turned into Metal ones).
+            s += &format!(
+                "(allow file-read* file-write* (subpath {}) (subpath {}))\n",
+                q(&cache.join("com.apple.metal"))?,
+                q(&cache.join("dxmt"))?
+            );
         }
     }
     Ok(s)

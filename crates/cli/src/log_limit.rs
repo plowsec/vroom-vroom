@@ -2,7 +2,8 @@
 //! (bad queues, bad agent messages...): without a limit a hostile guest
 //! could flood the terminal or fill the disk behind a log file. Errors
 //! always get through; the rest at most `PER_SEC` lines a second, then one
-//! line saying how many were dropped.
+//! line saying how many were dropped. `VROOM_LOG_ALL=1` lifts the ceiling
+//! (debugging with trace logs).
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -14,12 +15,14 @@ const PER_SEC: u32 = 50;
 pub struct Limited {
     inner: env_logger::Logger,
     win: Mutex<(Instant, u32, u64)>,
+    unlimited: bool,
 }
 
 impl Limited {
     pub fn install(inner: env_logger::Logger) {
         let max = inner.filter();
-        let l = Limited { inner, win: Mutex::new((Instant::now(), 0, 0)) };
+        let unlimited = std::env::var_os("VROOM_LOG_ALL").is_some_and(|v| v == "1");
+        let l = Limited { inner, win: Mutex::new((Instant::now(), 0, 0)), unlimited };
         if log::set_boxed_logger(Box::new(l)).is_ok() {
             log::set_max_level(max);
         }
@@ -28,6 +31,9 @@ impl Limited {
     /// Room for one more line? Reports what was dropped when a new
     /// window opens.
     fn admit(&self) -> bool {
+        if self.unlimited {
+            return true;
+        }
         let mut w = self.win.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         if now.duration_since(w.0) >= Duration::from_secs(1) {
@@ -94,7 +100,7 @@ mod tests {
             .filter_level(log::LevelFilter::Info)
             .target(env_logger::Target::Pipe(Box::new(buf.clone())))
             .build();
-        let l = Limited { inner, win: Mutex::new((Instant::now(), 0, 0)) };
+        let l = Limited { inner, win: Mutex::new((Instant::now(), 0, 0)), unlimited: false };
         let warn = |l: &Limited| l.log(&Record::builder().level(Level::Warn).target("t").args(format_args!("guest did x")).build());
         for _ in 0..200 {
             warn(&l);
