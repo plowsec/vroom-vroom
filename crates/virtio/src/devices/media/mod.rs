@@ -481,7 +481,7 @@ impl Handler {
         }
     }
 
-    fn from_helper(&mut self, m: FromHelper) {
+    fn on_helper(&mut self, m: FromHelper) {
         let id = m.session();
         let Some(s) = self.sessions.get_mut(&id) else { return };
         if s.dead {
@@ -1041,7 +1041,7 @@ impl Handler {
 
     fn messages(&mut self) {
         while let Some(m) = self.link.try_recv() {
-            self.from_helper(m);
+            self.on_helper(m);
         }
         if !self.helper_lost && !self.link.alive() {
             self.lost();
