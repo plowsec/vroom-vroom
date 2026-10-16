@@ -14,6 +14,11 @@ vroom run <vm.toml>   one process per VM, sandboxed after setup ◄───┘
    ├─ optional: vroom audio-out (sound, microphone), own sandbox, datagram socket
    └─ optional: vroom usb-host (one per [[usb]] device), own sandbox,
       stream socket: transfer requests in, results and plug events out
+
+vroom-gui ── starts vroom usb-host for a device connected from the VM
+             window, or asks vroom-netd to start it as root; passes its
+             socket to the VMM (viewer socket, SCM_RIGHTS)
+vroom-netd   root daemon (launchd): vmnet ports, root USB helpers
 ```
 
 The GUI never touches the guest: it shows a framebuffer the VMM shares
@@ -23,6 +28,31 @@ with it and forwards input. Closing it makes the VMM suspend the VM.
 tap+bridge (Linux) and hands each VMM an `AF_UNIX` datagram socket carrying
 Ethernet frames, after policy checks (allow-listed interfaces, per-user
 limits, source-MAC anti-spoofing). The VMM never holds an interface.
+It also starts the USB helper as root (`vroom-netd usb-host`, sandboxed)
+for a device a macOS driver holds, when the app asks for it by id, and
+hands the app its socket. The app installs and removes it with macOS's
+password prompt (`gui/src/rootd.rs`). Its protocol (`net/src/netd.rs`) is
+one JSON line in: a network request (the VMM), a USB request or a status
+question (the app).
+
+## USB devices while the VM runs
+
+The xHCI has 8 USB 2 + USB 3 port pairs for host devices whatever the
+VM file lists (`PASS_PORTS`); the VM file's devices take the first ones.
+The VM window's USB menu lists the Mac's devices (`usb/src/list.rs`,
+IOKit registry). Connecting one: the app starts `vroom usb-host` for it
+in its sandbox (or gets a root one from vroom-netd), and sends
+`ToVmm::UsbAttach` with the helper's socket attached. The VMM
+(`vmm/src/usb.rs`) puts it on a free pair (`Xhci::pass_plug`) and wires
+it like the helpers it starts itself; the guest sees the port's connect
+change once the helper says the device is there. `ToVmm::UsbDetach`
+shuts the socket: the guest sees the device go (`pass_unplug`), the
+helper ends. Each plug bumps a generation, so a helper that is going
+away can't speak for the next device on the same pair. The VMM tells
+the window what it has plugged in (`ToViewer::Usb`), and the window
+tells the next one, if the app restarts. A saved VM keeps the number of
+pairs it was saved with (the guest read it at driver start); older saves
+had one pair per device in the VM file.
 
 ## Layers
 
@@ -31,8 +61,8 @@ limits, source-MAC anti-spoofing). The VMM never holds an interface.
 | `hv` | `Hypervisor` / `Vm` / `Vcpu` traits. HVF backend (in-kernel GICv3, vtimer, EL2 for nested), KVM arm64 backend (vGICv3 with save/restore, in-kernel PSCI). Exits are decoded into `VcpuExit` (MMIO, hypercall, PSCI events). |
 | `memory` | Guest RAM as guarded mmaps; every access bounds-checked (`GuestMemory`). |
 | `arch` | Board layout (QEMU-virt compatible), FDT, ACPI tables (own AML encoder), SMBIOS, kernel image loader (Image, gzip, EFI zboot). |
-| `devices` | Bus, PL011, PL031, fw_cfg (+DMA), CFI flash (NVRAM), PCI host (ECAM, MSI, MSI-X, INTx), NVMe, xHCI + USB HID (passthrough devices get a USB 2 and a USB 3 root port each and asynchronous transfers), Intel HD Audio (controller + codec, streams moved by a timer thread). Parses hostile input only; `forbid(unsafe_code)`. |
-| `usb` | USB passthrough: the VMM/helper protocol, the helper's request checks, libusb (loaded with `dlopen`, helper only), host device listing (IOKit registry / sysfs), a pretend serial port for tests. |
+| `devices` | Bus, PL011, PL031, fw_cfg (+DMA), CFI flash (NVRAM), PCI host (ECAM, MSI, MSI-X, INTx), NVMe, xHCI + USB HID (8 USB 2 + USB 3 port pairs for passthrough devices, plugged in and out while the VM runs; asynchronous transfers), Intel HD Audio (controller + codec, streams moved by a timer thread). Parses hostile input only; `forbid(unsafe_code)`. |
+| `usb` | USB passthrough: the VMM/helper protocol, the helper's request checks, libusb (loaded with `dlopen`, helper only; the root helper only from its own copy), host device listing (IOKit registry / sysfs), a pretend serial port for tests. |
 | `virtio` | Split-queue handling (hardened), MMIO and modern PCI transports, devices (blk, net, console, rng, gpu, input, fs, sound), a pausable worker per device. `forbid(unsafe_code)`. |
 | `fs` | Host side of shared folders: component-wise `openat(O_NOFOLLOW)` walks from a root fd, Linux errno mapping. The virtio-fs FUSE server lives in `virtio`; it serves Linux and virtio-win's virtiofs.exe (Windows), telling them apart by their INIT flags. |
 | `audio` | Sound helper: datagram protocol, ring buffer, CoreAudio (macOS) / ALSA (Linux, `dlopen`) playback and recording, WAV test files. |

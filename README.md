@@ -50,13 +50,13 @@ else of yours. Details in [SECURITY.md](docs/SECURITY.md).
 - Window with clipboard both ways and auto resolution, sharp on Retina
 - 3D: Vulkan (about 90% of native speed) and OpenGL 4.1 in Linux guests, Direct3D 11 in Windows guests
 - Snapshots, suspend/resume, reset
-- NAT with port forwards, several network adapters. Bridged and host-only need a root helper.
+- NAT with port forwards, several network adapters. Bridged and host-only go through a small root helper the app sets up (one password prompt).
 - Sound in Linux and Windows guests; microphone if you turn it on
 - Shared folders (Linux and Windows guests)
 - TPM 2.0 (Windows 11 needs it)
 - Nested VMs (M3 or newer)
 - Import from VMware Fusion (ARM64 VMs)
-- USB devices from the host (those macOS has no driver for; needs libusb)
+- USB devices from the host, connected from the VM window while it runs (needs libusb; devices macOS uses go through the root helper)
 - Drag and drop files from the Mac into the guest
 - The Mac's camera as a webcam in the guest, if you turn it on
 - Fast disk and network I/O, measured against QEMU ([numbers](docs/PERFORMANCE.md))

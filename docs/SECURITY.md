@@ -119,7 +119,7 @@ NAT is a userspace proxy: the guest never gets raw access to the host
 network stack. Host loopback is unreachable unless `allow_host_loopback`;
 `block_private` keeps the guest off your LAN. Bridged and host-only go
 through `vroom-netd`, which enforces allow-listed interfaces and source
-MAC anti-spoofing.
+MAC anti-spoofing (see [the root helper](#the-root-helper-vroom-netd)).
 
 ## Shared folders
 
@@ -205,12 +205,17 @@ like guest input (size, a whole frame) before they reach the guest.
 
 ## USB devices
 
-Off unless the VM file lists `[[usb]]` devices. The VM process never
-touches the host's USB stack: each device gets a helper process
-(`vroom usb-host`), started before the VMM locks itself down, that opens
-that one device with libusb. The two talk over a socketpair with a small
-protocol: submit a transfer, cancel one, reset the device; back come
-attached/detached and transfer results.
+Off unless the VM file lists `[[usb]]` devices or you connect one from
+the VM window. The VM process never touches the host's USB stack: each
+device gets a helper process (`vroom usb-host`) that opens that one
+device with libusb. The VMM starts the VM file's helpers before it
+locks itself down; for a device connected while the VM runs, the app
+starts the helper (or vroom-netd does, below) and passes its socket to
+the VMM over the viewer connection. The VMM can't start anything itself
+and gains nothing new: one more socket to a helper that is as limited
+as the others. The two talk with a small protocol: submit a transfer,
+cancel one, reset the device; back come attached/detached and transfer
+results.
 
 The helper treats the VMM as hostile, like the VMM treats the guest:
 
@@ -242,6 +247,75 @@ open whatever USB device nodes your user may open (udev rules decide).
 The guest gets full control of a device it is given (it can send it any
 request, including firmware updates). Give it only devices you'd plug
 into that machine.
+
+The VM's xHCI always has 8 USB 2 + USB 3 port pairs for these devices
+(fixed, so the guest and saved VMs see the same controller); the
+viewer protocol caps names and the list, and the VMM checks every
+device id it is handed. A VMM taken over by a guest can't plug in a
+device: it gets only the sockets the app gives it.
+
+## The root helper (vroom-netd)
+
+Bridged and host-only networking, and taking a USB device from a macOS
+driver, need root. vroom has one process for that, `vroom-netd`, a
+launchd daemon. The app sets it up when asked (macOS's own password
+prompt, `osascript ... with administrator privileges`): a root-owned
+copy of the binary and of libusb in `/usr/local/libexec/vroom`, its
+config in `/etc/vroom/netd.toml`, its launchd file. The setup refuses to
+go under a `/usr/local` or `/usr/local/libexec` someone other than root
+can change. The app itself never runs as root.
+
+What it does, and only that:
+
+- Network: on request, a vmnet (macOS) or tap (Linux) port for one VM
+  adapter, handed back as a datagram socket of Ethernet frames. Only
+  interfaces `bridge_interfaces` allows, only host-only networks it
+  lists; locally administered unicast MACs only, every frame's source
+  MAC checked; 32 ports per user.
+- USB: on request, the USB helper (`vroom-netd usb-host`, the same code
+  as `vroom usb-host`) started as root for one device, handed back as a
+  stream socket.
+
+Who can ask: its socket (`/var/run/vroom/netd.sock`) is root-owned,
+mode 0660, group `group` (`staff`: the Mac's users). Each connection's
+user comes from the kernel (`getpeereid`, `SO_PEERCRED` on Linux), not
+from what it says. USB requests are for members of `[usb] group` only
+(`admin` by default: users who could do the same with sudo), and off
+unless `[usb] enabled`.
+
+What a request can say: one JSON line, strictly parsed (unknown fields
+refused, bounded length, 5 seconds to send it). For USB: a VM name for
+the log, a `vendor:product` id and maybe a serial number (printable
+ASCII). No paths, no bus locations, no arguments, no environment. The
+device must be plugged in and not a hub, and not already served to a
+VM. At most 10 USB requests a minute per user, 8 USB helpers per user,
+16 in all, 64 connections at once.
+
+How the root USB helper is run: `/usr/bin/sandbox-exec` with its own
+Seatbelt profile, as the user's helper but libusb only from the
+root-owned copy (`/opt/homebrew` is the user's: nothing a user can
+write is loaded into a root process), with an empty environment. The
+daemon checks before each start that its binary and that libusb, and
+every directory above them, belong to root and no one else can write
+them. So the helper can do what the user's helper does (the USB device
+user clients, the IOKit registry; no files, no network, no exec), plus
+what root adds there: open and take any USB device. That is what was
+asked for: the user named the device, and the helper serves only that
+one. On Linux the root helper sets no_new_privs and Landlock like the
+user's.
+
+What a compromised VMM can do with it: nothing new. It never talks to
+the USB side (the app does), and the network side was already its
+business. A compromised user account in `admin` could take USB devices
+(keyboards included) without the password; it could also wait for the
+next sudo. The daemon logs every request with the user to
+`/var/log/vroom-netd.log`.
+
+Passing sockets: macOS can deliver a socket already disconnected when
+the sender closes its own copy while the socket is still in flight
+(about 1 in 10 times here). The daemon keeps its copy until the
+client hangs up; the app keeps its copy of a helper's socket for a few
+seconds after handing it to the VMM.
 
 ## Snapshots
 

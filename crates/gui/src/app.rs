@@ -1605,6 +1605,12 @@ impl App {
         all.push(e("New VM".into(), "⌘N", "plus", "newvm".into()));
         all.push(e("Add a VM file".into(), "", "file", "import".into()));
         all.push(e("Import from VMware".into(), "", "upload", "vmware".into()));
+        // vroom-netd, the root helper: bridged, host-only, USB devices macOS uses.
+        match rootd::state() {
+            rootd::Helper::Ready(_) => all.push(e("Remove vroom-netd (root helper)".into(), "", "shield-off", "netd.remove".into())),
+            rootd::Helper::Unknown => {}
+            _ => all.push(e("Set up vroom-netd (root helper for bridged networking and USB)".into(), "", "shield", "netd.setup".into())),
+        }
         for (i, v) in self.vms.iter().enumerate() {
             all.push(e(format!("Go to {}", v.name()), "", "arrow-right", format!("vm:{i}:select")));
         }

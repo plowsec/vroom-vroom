@@ -39,7 +39,8 @@ A bar along the top of the window holds the VM's name and state, then
 pause, snapshot, suspend, the power menu (shut down, restart, force power
 off) and, for Windows, Ctrl+Alt+Del. On the right: how busy the VM is
 (the host CPU time it uses, out of what its CPUs could use), "3D" or
-"Direct3D 11" when 3D is on, the settings (the VM's page in the app),
+"Direct3D 11" when 3D is on, USB devices (see [USB devices](#usb-devices)),
+the settings (the VM's page in the app),
 full screen, and the VM list. The guest gets the rest of the window: a
 guest with the agent takes exactly that size. In full screen the bar
 goes away and slides in when the mouse touches the top edge.
@@ -495,6 +496,18 @@ What to expect:
 
 ```bash
 brew install libusb          # the helper loads it at run time
+```
+
+In the VM window: the USB button in the bar lists the Mac's USB devices.
+Click one to connect it to the VM, click it again to give it back to
+the Mac, like VMware's "Connect (Disconnect from Host)". A connected
+device has "Always connect to this VM" under it: tick it and it goes in
+the VM file, so the VM takes it at every start. Without the tick it is
+only for this run.
+
+From the terminal, the same thing for every start:
+
+```bash
 vroom usb list               # what's plugged in, with its id
 ```
 
@@ -503,29 +516,44 @@ vroom usb list               # what's plugged in, with its id
 id = "1209:000a"
 ```
 
-In the app: the "USB devices" card, "Add device" lists what's plugged in.
-The VM takes the device while it runs; unplugging and plugging it back
-in works while the VM runs, and the guest sees a new device after a
-suspend/resume or a snapshot revert (in-flight transfers can't be saved).
+The library's "USB devices" card edits that list too.
 
-The device goes to the guest through a helper process (`vroom usb-host`,
+Unplugging a device and plugging it back in works while the VM runs.
+After a suspend/resume or a snapshot revert the guest sees the device
+plugged in anew (transfers in flight can't be saved). Devices connected
+only for the run are given back on suspend; connect them again after.
+
+Each device goes to the guest through a helper process (`vroom usb-host`,
 one per device, in its own sandbox); the VM process itself never opens a
-host device. See [SECURITY.md](SECURITY.md#usb-devices).
+host device. For a device connected while the VM runs, the app starts
+the helper and hands the VM its socket. See
+[SECURITY.md](SECURITY.md#usb-devices).
 
-What works on macOS, as a normal user: devices no macOS driver holds.
-That's vendor-specific devices: many dev boards, flashing and DFU modes,
-debug probes, logic analyzers, SDR sticks, Android phones in adb or
-fastboot mode. `vroom usb list` says when a macOS driver holds a device.
-What doesn't:
+### Devices macOS uses
 
-- Keyboards, mice, game pads and FIDO security keys (HID), disks and
-  card readers (mass storage), sound cards, webcams, USB Ethernet,
-  iPhones, and the common USB serial chips (FTDI, CP210x, CH34x, PL2303,
-  CDC-ACM): macOS has drivers for these and keeps them. Taking a device
-  away from a macOS driver needs root, or Apple's
-  `com.apple.vm.device-access` entitlement (Apple gives it to approved VM
-  vendors only; vroom can't ship it). With either, the same code takes
-  the device: libusb's "detach kernel driver" does it.
+Keyboards, mice, game pads and FIDO security keys (HID), disks and card
+readers (mass storage), sound cards, webcams, USB Ethernet, and the
+common USB serial chips (FTDI, CP210x, CH34x, PL2303, CDC-ACM) have a
+macOS driver that holds them. The menu says so ("macOS uses it as a
+disk"). Taking a device from a macOS driver needs root, or Apple's
+`com.apple.vm.device-access` entitlement, which Apple gives to approved
+VM vendors only.
+
+vroom does it with vroom-netd, its one helper that runs as root (the
+same one bridged networking needs, see below). The first time, the menu
+shows "Set up (asks for your password)": macOS asks for an admin
+password once, and from then on these devices connect like the others.
+vroom-netd starts the USB helper as root for that one device; the app
+and the VM stay unprivileged. Eject a disk in Finder before you connect
+it: macOS lets go of it, mounted or not.
+
+Devices that work without it: those no macOS driver holds. That's
+vendor-specific devices: many dev boards, flashing and DFU modes, debug
+probes, logic analyzers, SDR sticks, Android phones in adb or fastboot
+mode.
+
+### Limits
+
 - Isochronous transfers (webcams, sound cards) aren't passed through
   yet: such a device shows up in the guest but doesn't stream.
 - A device composed of several functions works for the ones macOS
@@ -545,7 +573,65 @@ Testing without hardware: `VROOM_USB_FAKE=acm` makes every helper serve
 a pretend USB serial port that echoes what it's sent (CDC-ACM; Linux
 guests see `/dev/ttyACM0` if they have the `cdc_acm` module, or use it
 from userspace through `/dev/bus/usb`). `VROOM_USB_FAKE_UNPLUG=<secs>`
-pulls it out once, for three seconds.
+pulls it out once, for three seconds. Started with it, the app's USB
+menu also lists a "Pretend serial port (test)" (1209:00aa) to connect.
+
+## The root helper (vroom-netd)
+
+Two things need root on a Mac: bridged and host-only networking (vmnet),
+and taking a USB device from a macOS driver. vroom keeps both in one
+small daemon, vroom-netd, so nothing else ever runs as root. What it can
+do and why that's safe: [SECURITY.md](SECURITY.md#the-root-helper-vroom-netd).
+
+### Set up from the app
+
+The app offers it where it's needed: the network card of a VM with a
+bridged or host-only adapter, starting such a VM, and the USB menu next
+to a device macOS uses. Click "Set up (asks for your password)"; macOS
+shows its own password prompt. It installs:
+
+- `/usr/local/libexec/vroom/vroom-netd`, and a copy of libusb next to it
+  (root owns both: a root process loads nothing a user can replace);
+- `/etc/vroom/netd.toml`, its settings (kept if there is one already);
+- `/Library/LaunchDaemons/org.vroom.netd.plist`, so it starts with the
+  Mac; it logs to `/var/log/vroom-netd.log`.
+
+The app needs `vroom-netd` next to `vroom-gui` (`scripts/build.sh`
+builds it). Setting it up again (after an update) replaces the binary
+and keeps your settings. `⌘K` → "Set up vroom-netd" does it from
+anywhere; `⌘K` → "Remove vroom-netd" takes it away again (the password
+once more).
+
+### By hand
+
+```bash
+sudo mkdir -p /usr/local/libexec/vroom /etc/vroom
+sudo install -o root -g wheel -m 755 target/release/vroom-netd /usr/local/libexec/vroom/
+sudo install -o root -g wheel -m 644 "$(realpath /opt/homebrew/lib/libusb-1.0.0.dylib)" \
+    /usr/local/libexec/vroom/libusb-1.0.0.dylib
+sudo install -o root -g wheel -m 644 packaging/netd.toml /etc/vroom/
+sudo install -o root -g wheel -m 644 packaging/org.vroom.netd.plist /Library/LaunchDaemons/
+sudo launchctl bootstrap system /Library/LaunchDaemons/org.vroom.netd.plist
+```
+
+Remove it:
+
+```bash
+sudo launchctl bootout system/org.vroom.netd
+sudo rm -rf /Library/LaunchDaemons/org.vroom.netd.plist /usr/local/libexec/vroom /etc/vroom
+```
+
+`/etc/vroom/netd.toml` says who may use it: members of `group` (`staff`,
+every user of the Mac) for networking, members of `[usb] group`
+(`admin`, the users who could use sudo anyway) for USB devices,
+`[usb] enabled = false` turns USB off. `bridge_interfaces = ["en*"]`
+allows every Ethernet and Wi-Fi port; list names (`["en0"]`) to allow
+fewer. Restart it after a change:
+`sudo launchctl kickstart -k system/org.vroom.netd`.
+
+Linux: `packaging/vroom-netd.service` (systemd), same config file, the
+`vroom` group. There the USB part is optional: a udev rule gives your
+user the device, and the helper detaches Linux drivers itself.
 
 ## Sound
 
@@ -666,8 +752,8 @@ flushes a lot). `"none"` ignores flushes: scratch disks only.
 
 - x86_64 hosts: everything builds, but there is no x86 board: VMs can't
   start there yet.
-- Bridged / host-only: needs `vroom-netd` running as root; not tested
-  with real vmnet/tap yet.
+- Bridged / host-only: needs vroom-netd (set up from the app, see
+  above); not tested with real vmnet/tap yet.
 - Windows 11 is installed with its hardware checks bypassed (no Secure
   Boot); `tpm = true` (needs `brew install swtpm`) gives it a real TPM 2.0,
   which Windows sees and uses.
@@ -676,6 +762,9 @@ flushes a lot). `"none"` ignores flushes: scratch disks only.
 - 3D snapshots: not while a Vulkan app runs. Guest OpenGL stops at 4.1
   (2.1 with `opengl_host = "angle"`).
 - NAT connections don't survive suspend/resume (the guest reconnects).
-- USB passthrough: not yet tried with a real device (none was at hand);
-  tested with the pretend device behind the real helper and sandbox. No
-  isochronous transfers. On macOS only devices macOS has no driver for.
+- USB passthrough: not yet tried with a real device in a guest; tested
+  with the pretend device behind the real helper and sandbox, connected
+  from the VM file and from the app's menu while the VM runs. Taking a
+  device from a macOS driver through vroom-netd isn't tested as root
+  yet (the request, the root helper's sandbox and its libusb were, as a
+  normal user). No isochronous transfers yet.

@@ -71,7 +71,9 @@ port_forwards = [{ host_port = 2222, guest_port = 22 }]
 | `network` | host-only | Network name. VMs with the same name see each other. |
 | `mac` | generated | `02:12:34:56:78:9a`. Generated ones start with `identity.mac_prefix`. |
 
-Bridged and host-only need the `vroom-netd` helper running as root. See
+Bridged and host-only need the `vroom-netd` helper running as root; the
+app sets it up when a VM needs it. See
+[GUIDE.md](GUIDE.md#the-root-helper-vroom-netd) and
 [NETWORKING.md](NETWORKING.md).
 
 ## `[display]`
@@ -114,12 +116,14 @@ name = "dev board"               # optional label for the app
 
 The VM takes the device when it starts and gives it back when it stops.
 Unplug it and plug it back in while the VM runs: the guest sees that too.
-A device added while the VM runs is picked up at the next start.
+A device added to the file while the VM runs is picked up at the next
+start; to connect one right away, use the USB button in the VM window
+("Always connect to this VM" there writes this entry).
 
 The guest sees the device's own descriptors. On macOS, a device that a
 macOS driver holds (keyboards, mice, disks, security keys, most USB
-serial chips) can't be taken without root: see
-[GUIDE.md](GUIDE.md#usb-devices). Needs libusb (`brew install libusb`).
+serial chips) is taken through vroom-netd, the root helper: see
+[GUIDE.md](GUIDE.md#devices-macos-uses). Needs libusb (`brew install libusb`).
 
 ## `[audio]`
 

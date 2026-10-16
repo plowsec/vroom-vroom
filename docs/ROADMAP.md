@@ -55,7 +55,8 @@ Windows guests:
   and days-long runs: sleep and wake with VMs running, full disks.
 - Windows 3D: the text that sometimes doesn't draw (an agent is on it).
 - USB passthrough with real devices, bridged networking with real
-  vmnet (being tested now).
+  vmnet, and vroom-netd as root taking devices from macOS drivers
+  (the app sets it up; not tried as root yet).
 - A signed, notarized app with an installer and updates; crash reports.
 - Multiple monitors, drag and drop from the guest to the Mac (Mac to
   guest works), a live drag in Linux guests (they get files on the
