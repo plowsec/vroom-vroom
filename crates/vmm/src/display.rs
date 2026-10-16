@@ -560,6 +560,10 @@ fn serve(stream: UnixStream, c: &Serve) {
                         u.detach(port);
                     }
                 }
+                Ok(Some(ToVmm::DragOutGet { id, item })) => match (!fds.is_empty()).then(|| fds.remove(0)) {
+                    Some(to) => c.agent.send(AgentCmd::DragOutGet { id, item, to }),
+                    None => log::warn!("display: a drag out without its pipe"),
+                },
                 Ok(Some(m)) => handle(m, c.input.as_ref(), &c.agent, &c.events, &c.latest),
                 Ok(None) => break,
                 Err(e) => {
@@ -640,9 +644,11 @@ fn handle(
         ToVmm::DragEnter { id, items } => agent.send(AgentCmd::DragEnter { id, items }),
         ToVmm::DragCancel { id } => agent.send(AgentCmd::DragCancel { id }),
         // serve() pairs these with their fds.
-        ToVmm::Drop { .. } | ToVmm::UsbAttach(_) | ToVmm::UsbDetach { .. } => {}
+        ToVmm::Drop { .. } | ToVmm::UsbAttach(_) | ToVmm::UsbDetach { .. } | ToVmm::DragOutGet { .. } => {}
         ToVmm::Coherence(on) => agent.send(AgentCmd::Coherence(on)),
         ToVmm::Window { id, op } => agent.send(AgentCmd::Window { id, op }),
+        ToVmm::DragOut { id, end: false } => agent.send(AgentCmd::DragOut { id }),
+        ToVmm::DragOut { id, end: true } => agent.send(AgentCmd::DragOutEnd { id }),
     }
 }
 

@@ -12,30 +12,14 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use vroom_proto::{Message, DROP_CHUNK, DROP_NAME_MAX, DROP_PATH_MAX};
+use vroom_proto::{Message, DROP_CHUNK, DROP_PATH_MAX};
 
 /// Most files and folders one drop may carry (the walk stops there).
 const MAX_ENTRIES: usize = 200_000;
 
-/// A name the guest takes: what Windows or a shell would read another way
-/// becomes `_` (macOS allows `:` and `?` in names, Windows doesn't).
+/// A name the guest takes (see `vroom_proto::fix_name`).
 pub fn guest_name(n: &str) -> String {
-    let mut s: String = n
-        .chars()
-        .filter(|c| !c.is_control())
-        .map(|c| if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { c })
-        .collect();
-    if s.len() > DROP_NAME_MAX {
-        let mut end = DROP_NAME_MAX;
-        while !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        s.truncate(end);
-    }
-    if s.is_empty() || s == "." || s == ".." {
-        s = "_".into();
-    }
-    s
+    vroom_proto::fix_name(n)
 }
 
 /// Top-level names and whether each is a folder.

@@ -146,7 +146,11 @@ in front of the active app and composed before it answers (Windows routes
 no click to a window before that), and answers `DragReady { live }`. The
 app presses the guest's left button: the window gets it and starts a
 shell drag (`SHDoDragDrop`) of the staged names, which Windows tracks as
-the pointer moves. On the drop the app opens a socket pair, sends one end
+the pointer moves. On X11 desktops (`dnd_x11.rs`) the window is an
+InputOnly one and the agent is the source of an XDND drag (it owns
+`XdndSelection` and hands out the staged files as `text/uri-list`).
+Wayland has no way for an outside program to drag: the files go to the
+Desktop. On the drop the app opens a socket pair, sends one end
 to the VMM with `ToVmm::Drop` (SCM_RIGHTS), and writes the files into the
 other as agent frames; the VMM forwards them, checked, from a thread of
 its own. When the guest says `DropDone`, the app lets go of the button
@@ -188,6 +192,25 @@ lists app windows and sends the Windows key for Start. Leaving sends
 `Coherence(false)` and the VM window's size; a viewer that goes away
 (the app crashed) turns Coherence off in the VMM, and the agent puts the
 taskbar back when its session ends or it starts again.
+The other way (guest to Mac, `gui/src/dragout.rs`): when the mouse
+leaves the guest screen with the guest's button held since a press on
+it, the app asks once (`ToVmm::DragOut`, agent `DragOutQuery`). The
+agent (`agent/src/dragout.rs`) puts a small window under the guest's
+pointer, now at the screen edge, and makes it a drop target: an OLE
+`IDropTarget` on Windows, an `XdndAware` window on X11. It nudges the
+pointer so the drag going on finds it; if that drag carries files
+(CF_HDROP, or `text/uri-list` with file URIs), it learns their paths and
+answers their names (`DragOutItems`, `ToViewer::DragOutItems`). The app
+then starts an AppKit drag of file promises (`dragout_mac.rs`) from the
+VM window while the Mac's button is still down, and gives up the guest's
+drag (Escape, button up: the guest drops nothing). When something takes
+the drop, AppKit asks each promise where to write; for each item the app
+sends a pipe to the VMM (`ToVmm::DragOutGet`, SCM_RIGHTS), the VMM asks
+the guest (`DragOutGet` with a stream number of its own) and passes the
+guest's DropEntry, DropData and DropEnd frames on, checked, with the
+drag's id. The app writes the item where the promise says. When all are
+written (or the drag ends with no drop) the app sends `DragOut` with
+`end`, and the agent forgets the paths.
 
 ## 3D
 

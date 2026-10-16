@@ -114,7 +114,7 @@ impl Shared {
             ToViewer::Mic(on) => self.mic = Some(on),
             ToViewer::Camera(on) => self.camera = Some(on),
             ToViewer::Cursor(c) => self.cursor = Some(c),
-            m @ (ToViewer::DragReady { .. } | ToViewer::DropDone { .. }) => {
+            m @ (ToViewer::DragReady { .. } | ToViewer::DropDone { .. } | ToViewer::DragOutItems { .. }) => {
                 if self.drag.len() >= MAX_STATUS {
                     return false;
                 }
@@ -139,6 +139,9 @@ struct Io {
     buttons: BTreeSet<u16>,
     wheel: (f32, f32),
     focused: bool,
+    /// The guest's left button went down and the mouse hasn't left the
+    /// screen since: leaving it asks the guest for a drag out.
+    out_armed: bool,
 }
 
 impl Io {
@@ -158,6 +161,9 @@ impl Io {
     }
 
     fn button(&mut self, code: u16, down: bool) {
+        if code == BTN_LEFT {
+            self.out_armed = down;
+        }
         if down {
             self.buttons.insert(code);
         } else {
@@ -230,7 +236,32 @@ pub struct Console {
     windows_guest: bool,
     /// In Coherence: the guest's windows as Mac windows.
     coh: Option<coherence::Coherence>,
+    /// Files dragged out of the guest, to the Mac.
+    out: Option<OutDrag>,
+    out_timer: slint::Timer,
 }
+
+/// Files dragged from the guest out of the window (see dragout.rs).
+struct OutDrag {
+    id: u32,
+    asked: Instant,
+    items: Vec<(String, bool)>,
+    /// The Mac's drag, once the guest said what it drags.
+    #[cfg(target_os = "macos")]
+    session: Option<crate::dragout_mac::Session>,
+    progress: Arc<crate::dnd::Progress>,
+    /// The Mac drag ended with a drop, waiting for the copies since then.
+    dropped: Option<Instant>,
+    /// An item is being copied.
+    fetching: bool,
+    copied: u32,
+    failed: Option<String>,
+}
+
+/// The guest answers a drag out by then, or there is none.
+const OUT_ASK: Duration = Duration::from_secs(5);
+/// After a drop, the Mac asks for the files by then, or never will.
+const OUT_IDLE: Duration = Duration::from_secs(60);
 
 /// Files from the Mac over the window (see dnd.rs).
 struct Drag {
@@ -585,6 +616,7 @@ fn open(key: String, path: &Path, cfg: &VmConfig, ours: UnixStream, child: Optio
         buttons: BTreeSet::new(),
         wheel: (0.0, 0.0),
         focused: false,
+        out_armed: false,
     }));
     wire(&win, &key, &io);
 
@@ -640,6 +672,8 @@ fn open(key: String, path: &Path, cfg: &VmConfig, ours: UnixStream, child: Optio
         features: 0,
         windows_guest: os == GuestOs::Windows,
         coh: None,
+        out: None,
+        out_timer: slint::Timer::default(),
     };
     CONSOLES.with(|m| m.borrow_mut().insert(key.clone(), c));
     ensure_timer();
@@ -779,6 +813,22 @@ fn winit_event(key: &str, io: &Rc<RefCell<Io>>, ev: &WindowEvent) -> EventResult
             let key = key.to_string();
             slint::Timer::single_shot(Duration::ZERO, move || {
                 with(&key, |c| c.drag_left());
+            });
+            EventResult::Propagate
+        }
+        // The mouse leaving the guest screen with the guest's button
+        // held may be a drag of files out of the guest.
+        WindowEvent::CursorMoved { position, .. } if io.borrow().out_armed => {
+            let (key, p) = (key.to_string(), (position.x, position.y));
+            slint::Timer::single_shot(Duration::ZERO, move || {
+                with(&key, |c| c.drag_out_check(Some(p)));
+            });
+            EventResult::Propagate
+        }
+        WindowEvent::CursorLeft { .. } if io.borrow().out_armed => {
+            let key = key.to_string();
+            slint::Timer::single_shot(Duration::ZERO, move || {
+                with(&key, |c| c.drag_out_check(None));
             });
             EventResult::Propagate
         }
@@ -1053,6 +1103,7 @@ impl Console {
             match m {
                 ToViewer::DragReady { id, live } => self.drag_ready(id, live),
                 ToViewer::DropDone { id, ok, place } => self.drop_done(id, ok, &clean(&place)),
+                ToViewer::DragOutItems { id, items } => self.drag_out_items(id, items),
                 _ => {}
             }
         }
@@ -1396,6 +1447,215 @@ impl Console {
             (false, _) => format!("Copy to {} failed: {place}", self.name),
         };
         self.toast(&t);
+    }
+
+    /// The mouse moved (`Some`: where, in physical pixels on the window)
+    /// or left the window, with the guest's button held since a press on
+    /// its screen. Out of the screen: ask the guest what it drags.
+    fn drag_out_check(&mut self, at: Option<(f64, f64)>) {
+        if !self.io.borrow().out_armed || self.out.is_some() || self.drag.is_some() || self.state != VmState::Running {
+            return;
+        }
+        if let Some((x, y)) = at {
+            let sf = self.win.window().scale_factor() as f64;
+            let (x, y) = (x / sf, y / sf);
+            let (sx, sy) = (self.win.get_screen_x() as f64, self.win.get_screen_y() as f64);
+            let (sw, sh) = (self.win.get_screen_width() as f64, self.win.get_screen_height() as f64);
+            const M: f64 = 2.0;
+            if x >= sx - M && x <= sx + sw + M && y >= sy - M && y <= sy + sh + M {
+                return;
+            }
+        }
+        // Once per press.
+        self.io.borrow_mut().out_armed = false;
+        self.drag_seq = self.drag_seq.wrapping_add(1);
+        let id = self.drag_seq;
+        self.out = Some(OutDrag {
+            id,
+            asked: Instant::now(),
+            items: Vec::new(),
+            #[cfg(target_os = "macos")]
+            session: None,
+            progress: Arc::default(),
+            dropped: None,
+            fetching: false,
+            copied: 0,
+            failed: None,
+        });
+        log::info!("drag {id} out: the mouse left the screen with the button held, asking the guest");
+        self.io.borrow_mut().send(ToVmm::DragOut { id, end: false });
+        let k = self.key.clone();
+        self.out_timer.start(slint::TimerMode::Repeated, Duration::from_millis(100), move || {
+            with(&k, |c| c.drag_out_tick());
+        });
+    }
+
+    /// The guest's answer: what it drags (nothing: no drag of files).
+    fn drag_out_items(&mut self, id: u32, items: Vec<(String, bool)>) {
+        let Some(o) = self.out.as_mut().filter(|o| o.id == id && o.items.is_empty()) else { return };
+        // Names from the guest: ones a Mac folder takes as they are.
+        if items.is_empty() || items.len() > vroom_proto::DROP_ITEMS_MAX || !items.iter().all(|(n, _)| vroom_proto::drop_name_ok(n)) {
+            self.drag_out_end(None);
+            return;
+        }
+        o.items = items;
+        match self.drag_out_start(id) {
+            Ok(()) => {
+                // The Mac has the drag now: give up the guest's (Escape
+                // cancels it there, nothing is dropped in the guest).
+                let mut io = self.io.borrow_mut();
+                io.key(KEY_ESC, true);
+                io.key(KEY_ESC, false);
+                io.button(BTN_LEFT, false);
+            }
+            Err(e) => {
+                log::info!("drag {id} out: {e}");
+                self.drag_out_end(None);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn drag_out_start(&mut self, id: u32) -> Result<(), String> {
+        use slint::winit_030::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        if !crate::dragout_mac::button_down() {
+            return Err("the mouse button is up already".into());
+        }
+        let view = self
+            .win
+            .window()
+            .with_winit_window(|w| match w.window_handle().ok()?.as_raw() {
+                RawWindowHandle::AppKit(h) => Some(h.ns_view.as_ptr()),
+                _ => None,
+            })
+            .flatten()
+            .ok_or("no window to drag from")?;
+        let Some(o) = self.out.as_mut() else { return Err("over".into()) };
+        let key = self.key.clone();
+        let (k1, k2, k3) = (key.clone(), key.clone(), key);
+        let job = Arc::new(crate::dragout_mac::Job {
+            id,
+            get: Box::new(move |item| {
+                // A pipe for the item; the window's thread hands one end
+                // to the VMM.
+                let (ours, theirs) = UnixStream::pair()?;
+                let k = k1.clone();
+                slint::invoke_from_event_loop(move || {
+                    with(&k, |c| c.drag_out_get(id, item, theirs));
+                })
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+                Ok(ours)
+            }),
+            done: Box::new(move |item, r| {
+                let k = k2.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    with(&k, |c| c.drag_out_written(id, item, r));
+                });
+            }),
+            progress: o.progress.clone(),
+        });
+        let ended = Box::new(move |dropped: bool| {
+            // Not from inside AppKit's callback.
+            slint::Timer::single_shot(Duration::ZERO, move || {
+                with(&k3, |c| c.drag_out_ended(id, dropped));
+            });
+        });
+        o.session = Some(crate::dragout_mac::start(view, &o.items, job, ended)?);
+        log::info!("drag {id} out: {} item(s) on the Mac", o.items.len());
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn drag_out_start(&mut self, _id: u32) -> Result<(), String> {
+        Err("no drags out of the window here".into())
+    }
+
+    /// The Mac's drag ended: dropped somewhere, or given up.
+    fn drag_out_ended(&mut self, id: u32, dropped: bool) {
+        let Some(o) = self.out.as_mut().filter(|o| o.id == id) else { return };
+        if !dropped && o.copied == 0 && !o.fetching {
+            self.drag_out_end(None);
+            return;
+        }
+        o.dropped = Some(Instant::now());
+    }
+
+    /// The Mac drop wants item `item`: the VMM writes it into `pipe`.
+    fn drag_out_get(&mut self, id: u32, item: u32, pipe: UnixStream) {
+        let Some(o) = self.out.as_mut().filter(|o| o.id == id) else { return };
+        o.fetching = true;
+        o.dropped.get_or_insert_with(Instant::now);
+        let io = self.io.borrow();
+        if let Some(tx) = io.tx.as_ref() {
+            if let Err(e) = vroom_display::send_fd_with(tx, &ToVmm::DragOutGet { id, item }.encode(), pipe.as_raw_fd()) {
+                log::warn!("drag {id} out: {e}");
+            }
+        }
+        // Dropping our copy of the VMM's end: the pipe then closes when
+        // the VMM is done with it (or never got it).
+    }
+
+    fn drag_out_written(&mut self, id: u32, item: u32, r: Result<PathBuf, String>) {
+        let Some(o) = self.out.as_mut().filter(|o| o.id == id) else { return };
+        o.fetching = false;
+        o.dropped = Some(Instant::now());
+        match r {
+            Ok(p) => {
+                log::info!("drag {id} out: item {item} written to {}", p.display());
+                o.copied += 1;
+            }
+            Err(e) => o.failed = Some(e),
+        }
+        if o.failed.is_some() || o.copied as usize >= o.items.len() {
+            let t = self.drag_out_summary();
+            self.drag_out_end(Some(t));
+        }
+    }
+
+    fn drag_out_summary(&self) -> String {
+        let Some(o) = &self.out else { return String::new() };
+        let what = |n: u32| if n == 1 { o.items.first().map(|i| i.0.clone()).unwrap_or_default() } else { format!("{n} items") };
+        match &o.failed {
+            None => format!("Copied {} from {} to the Mac", what(o.copied), self.name),
+            Some(e) => format!("Copy from {} failed: {}", self.name, clean(e)),
+        }
+    }
+
+    fn drag_out_tick(&mut self) {
+        let Some(o) = &self.out else {
+            self.out_timer.stop();
+            return;
+        };
+        let now = Instant::now();
+        if o.items.is_empty() && now - o.asked > OUT_ASK {
+            self.drag_out_end(None);
+            return;
+        }
+        if o.fetching {
+            let (sent, total) = (o.progress.sent.load(Ordering::Relaxed), o.progress.total.load(Ordering::Relaxed));
+            let f = if total == 0 { 0.0 } else { (sent as f32 / total as f32).min(1.0) };
+            let what = if o.items.len() == 1 { o.items[0].0.clone() } else { format!("{} items", o.items.len()) };
+            self.win.set_drop_text(format!("Copying {what} to the Mac: {}%", (f * 100.0) as u32).into());
+            self.win.set_drop_progress(f);
+        } else if o.dropped.is_some_and(|t| now - t > OUT_IDLE) {
+            let t = (o.copied > 0 || o.failed.is_some()).then(|| self.drag_out_summary());
+            self.drag_out_end(t);
+        }
+    }
+
+    /// The drag out is over: the guest may forget it.
+    fn drag_out_end(&mut self, toast: Option<String>) {
+        let Some(o) = self.out.take() else { return };
+        o.progress.stop.store(true, Ordering::Relaxed);
+        self.out_timer.stop();
+        self.io.borrow_mut().send(ToVmm::DragOut { id: o.id, end: true });
+        if self.drag.is_none() {
+            self.win.set_drop_text("".into());
+            self.win.set_drop_progress(-1.0);
+        }
+        if let Some(t) = toast {
+            self.toast(&t);
+        }
     }
 
     /// "12%": the host CPU time the VM took over the last second or so,
@@ -1792,6 +2052,7 @@ mod tests {
             buttons: BTreeSet::new(),
             wheel: (0.0, 0.0),
             focused: true,
+            out_armed: false,
         };
         io.key(30, true);
         io.button(272, true);

@@ -5365,6 +5365,7 @@ dependencies = [
  "serde_json",
  "vroom-proto",
  "windows-sys 0.59.0",
+ "x11rb",
 ]
 
 [[package]]
@@ -5490,10 +5491,14 @@ name = "vroom-gui"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "block2 0.6.2",
  "env_logger",
  "i-slint-backend-testing",
  "libc",
  "log",
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
  "png 0.17.16",
  "rfd",
  "serde",

@@ -111,7 +111,27 @@ names Windows reads another way, under a name the drag announced) and
 writes no more bytes than each file announced. Files land in a staging
 folder of the logged-in user (their temp folder on Windows, their cache
 folder on Linux), then go where the drop lands. The drag window the agent
-puts under the pointer on Windows only starts a drag of those files.
+puts under the pointer (Windows, X11) only starts a drag of those files.
+
+Files dragged out of the guest go the other way, and there the guest is
+the one to distrust. It can only answer a question: the app asks once
+per press of the mouse button, when the mouse leaves the guest screen
+with the button held, and the VMM takes one answer per question; a list
+of names alone starts a drag on the Mac but copies nothing. Data only
+flows when something on the Mac takes the drop and asks for an item, and
+only that item. The guest picks the names and the sizes, so both are
+checked twice, in the VMM and in the app (vroom-proto's `TreeCheck`):
+names `drop_name_ok` takes (no `/`, `..`, control characters), the item
+asked for first, every entry inside a folder announced before it, no
+more bytes than a file announced, at most 200,000 entries; frames of an
+item the app gave up on carry an old stream number and are dropped. A
+guest that breaks a rule loses the drag. The app, not the VMM, writes
+the files, where the Mac drop says: it only creates new files and
+folders (`O_EXCL`, `O_NOFOLLOW`, `mkdir`), never writes through a link
+or over something there (a taken name gets a number), removes what it
+wrote if the copy fails, and stops when the disk would have less than
+2 GB free. In the guest the agent reads only the paths the desktop's
+drag handed its drop target, and leaves out links inside folders.
 
 ## Coherence
 

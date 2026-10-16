@@ -33,6 +33,9 @@ pub mod features {
     /// Coherence: the agent reports the guest's windows (`Windows`) and
     /// acts on them (`WindowDo`).
     pub const COHERENCE: u64 = 128;
+    /// Files dragged out of the guest's desktop reach the Mac
+    /// (`DragOutQuery`...).
+    pub const DRAG_OUT: u64 = 256;
 }
 
 /// Most windows one `Windows` list may carry, and the longest title (bytes).
@@ -89,6 +92,8 @@ pub const DROP_NAME_MAX: usize = 255;
 pub const DROP_ITEMS_MAX: usize = 4096;
 /// File data goes in pieces of at most this.
 pub const DROP_CHUNK: usize = 256 << 10;
+/// Most files and folders one dragged item may hold.
+pub const DROP_ENTRIES_MAX: usize = 200_000;
 
 /// UI scales a host may ask for, in percent. 0 = "the host no longer
 /// manages the scale": the agent puts back what the guest had before.
@@ -141,6 +146,27 @@ pub enum Message {
     Windows(Vec<GuestWindow>),
     /// Host -> guest: do this to a window of the last list.
     WindowDo { id: u32, op: WindowOp },
+    /// Host -> guest: the mouse left the VM window with the button held.
+    /// If the guest's desktop is dragging files, the agent says which
+    /// (DragOutItems), and nothing else until the Mac drop asks.
+    DragOutQuery { id: u32 },
+    /// Guest -> host: the files being dragged (top-level names, and
+    /// whether each is a folder); none if it isn't a drag of files.
+    DragOutItems { id: u32, items: Vec<(String, bool)> },
+    /// Host -> guest: the Mac drop wants item `item` (an index into
+    /// DragOutItems) of drag `id`. The guest sends it as DropEntry,
+    /// DropData and DropEnd frames whose id is `stream` (the item first,
+    /// then what is in it, folders before their contents), or
+    /// DragOutFail. A new stream number for each, so the frames of one
+    /// the host gave up on can't pass for the next. One at a time: a new
+    /// DragOutGet stops the one underway. The item's own DropEntry, when
+    /// it is a folder, has the total size of its files (for progress).
+    DragOutGet { id: u32, item: u32, stream: u32 },
+    /// Host -> guest: the drag is over; stop sending, forget it.
+    DragOutEnd { id: u32 },
+    /// Guest -> host: DragOutGet `stream` can't be done (a file can't be
+    /// read).
+    DragOutFail { stream: u32, why: String },
 }
 
 fn rect_ok(x: i32, y: i32, w: u32, h: u32) -> bool {
@@ -219,6 +245,107 @@ impl WindowOp {
     }
 }
 
+/// A name `drop_name_ok` takes, made from any file name: what Windows or
+/// a shell would read another way becomes `_` (macOS and Linux allow `:`
+/// and `?` in names, Windows doesn't), control characters go, long names
+/// are cut.
+pub fn fix_name(n: &str) -> String {
+    let mut s: String = n
+        .chars()
+        .filter(|c| !c.is_control())
+        .map(|c| if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { c })
+        .collect();
+    if s.len() > DROP_NAME_MAX {
+        let mut end = DROP_NAME_MAX;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
+    if s.is_empty() || s == "." || s == ".." {
+        s = "_".into();
+    }
+    s
+}
+
+/// Checks one dragged item as its frames come in (DropEntry, DropData,
+/// DropEnd, in order), on the side that receives it: the item itself
+/// first, then what is in it, each entry under a folder announced before
+/// it; data only for the file just announced and never more than it
+/// said; at most `DROP_ENTRIES_MAX` entries. Guest -> host drags run it
+/// twice: in the VMM and in the app that writes the files.
+#[derive(Debug)]
+pub struct TreeCheck {
+    id: u32,
+    top: String,
+    dir: bool,
+    /// Folders announced so far (hashes: a hostile sender could make
+    /// many long names).
+    dirs: std::collections::HashSet<u64>,
+    hasher: std::collections::hash_map::RandomState,
+    /// Bytes the current file still owes.
+    left: u64,
+    entries: usize,
+}
+
+impl TreeCheck {
+    /// For item `top` (a folder if `dir`) of drag `id`.
+    pub fn new(id: u32, top: &str, dir: bool) -> TreeCheck {
+        TreeCheck { id, top: top.to_string(), dir, dirs: Default::default(), hasher: Default::default(), left: 0, entries: 0 }
+    }
+
+    fn key(&self, p: &str) -> u64 {
+        use std::hash::BuildHasher;
+        self.hasher.hash_one(p)
+    }
+
+    /// Whether `m` may come next: Ok(true) when it was the end.
+    pub fn check(&mut self, m: &Message) -> Result<bool, &'static str> {
+        match m {
+            Message::DropEntry { id, path, dir, size } if *id == self.id => {
+                if self.left != 0 {
+                    return Err("a file came short");
+                }
+                if self.entries >= DROP_ENTRIES_MAX {
+                    return Err("too many files");
+                }
+                if self.entries == 0 {
+                    if *path != self.top || *dir != self.dir {
+                        return Err("not the item asked for");
+                    }
+                } else {
+                    let parent = path.rsplit_once('/').map(|p| p.0).ok_or("not inside the item")?;
+                    if !self.dirs.contains(&self.key(parent)) || self.dirs.contains(&self.key(path)) {
+                        return Err("not inside the item");
+                    }
+                }
+                self.entries += 1;
+                if *dir {
+                    let k = self.key(path);
+                    self.dirs.insert(k);
+                } else {
+                    self.left = *size;
+                }
+                Ok(false)
+            }
+            Message::DropData { id, data } if *id == self.id && self.entries > 0 => {
+                if data.len() as u64 > self.left {
+                    return Err("more data than announced");
+                }
+                self.left -= data.len() as u64;
+                Ok(false)
+            }
+            Message::DropEnd { id } if *id == self.id && self.entries > 0 => {
+                if self.left != 0 {
+                    return Err("a file came short");
+                }
+                Ok(true)
+            }
+            _ => Err("unexpected message"),
+        }
+    }
+}
+
 /// Whether `p` is a path a drop may carry: relative, '/' between names,
 /// no empty, "." or ".." names, nothing Windows or a shell would read
 /// another way.
@@ -268,6 +395,45 @@ const T_DROP_DONE: u8 = 16;
 const T_COHERENCE: u8 = 17;
 const T_WINDOWS: u8 = 18;
 const T_WINDOW_DO: u8 = 19;
+const T_DRAG_OUT_QUERY: u8 = 20;
+const T_DRAG_OUT_ITEMS: u8 = 21;
+const T_DRAG_OUT_GET: u8 = 22;
+const T_DRAG_OUT_END: u8 = 23;
+const T_DRAG_OUT_FAIL: u8 = 24;
+
+fn put_items(p: &mut Vec<u8>, items: &[(String, bool)]) {
+    p.extend_from_slice(&(items.len() as u32).to_le_bytes());
+    for (name, dir) in items {
+        p.push(*dir as u8);
+        p.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        p.extend_from_slice(name.as_bytes());
+    }
+}
+
+/// Items after the id: count, then dir u8 | len u16 | name each. Each
+/// name must be one `drop_name_ok` takes; `min`: the fewest allowed.
+fn get_items(p: &[u8], min: usize) -> Result<Vec<(String, bool)>, Error> {
+    let n = u32::from_le_bytes(p.get(4..8).ok_or(Error::Malformed)?.try_into().map_err(|_| Error::Malformed)?) as usize;
+    if n < min || n > DROP_ITEMS_MAX {
+        return Err(Error::Malformed);
+    }
+    let mut items = Vec::with_capacity(n);
+    let mut o = 8;
+    for _ in 0..n {
+        let dir = *p.get(o).ok_or(Error::Malformed)? != 0;
+        let len = u16::from_le_bytes(p.get(o + 1..o + 3).ok_or(Error::Malformed)?.try_into().map_err(|_| Error::Malformed)?) as usize;
+        let name = std::str::from_utf8(p.get(o + 3..o + 3 + len).ok_or(Error::Malformed)?).map_err(|_| Error::Malformed)?;
+        if !drop_name_ok(name) {
+            return Err(Error::Malformed);
+        }
+        items.push((name.to_string(), dir));
+        o += 3 + len;
+    }
+    if o != p.len() {
+        return Err(Error::Malformed);
+    }
+    Ok(items)
+}
 
 impl Message {
     pub fn encode(&self) -> Vec<u8> {
@@ -295,12 +461,7 @@ impl Message {
             Message::Gpu3d { on } => (T_GPU3D, vec![*on as u8]),
             Message::DragEnter { id, items } => {
                 let mut p = id.to_le_bytes().to_vec();
-                p.extend_from_slice(&(items.len() as u32).to_le_bytes());
-                for (name, dir) in items {
-                    p.push(*dir as u8);
-                    p.extend_from_slice(&(name.len() as u16).to_le_bytes());
-                    p.extend_from_slice(name.as_bytes());
-                }
+                put_items(&mut p, items);
                 (T_DRAG_ENTER, p)
             }
             Message::DragReady { id, live } => {
@@ -334,6 +495,24 @@ impl Message {
                 let mut p = id.to_le_bytes().to_vec();
                 p.extend_from_slice(&op.encode());
                 (T_WINDOW_DO, p)
+            }
+            Message::DragOutQuery { id } => (T_DRAG_OUT_QUERY, id.to_le_bytes().to_vec()),
+            Message::DragOutItems { id, items } => {
+                let mut p = id.to_le_bytes().to_vec();
+                put_items(&mut p, items);
+                (T_DRAG_OUT_ITEMS, p)
+            }
+            Message::DragOutGet { id, item, stream } => {
+                let mut p = id.to_le_bytes().to_vec();
+                p.extend_from_slice(&item.to_le_bytes());
+                p.extend_from_slice(&stream.to_le_bytes());
+                (T_DRAG_OUT_GET, p)
+            }
+            Message::DragOutEnd { id } => (T_DRAG_OUT_END, id.to_le_bytes().to_vec()),
+            Message::DragOutFail { stream, why } => {
+                let mut p = stream.to_le_bytes().to_vec();
+                p.extend_from_slice(why.as_bytes());
+                (T_DRAG_OUT_FAIL, p)
             }
         };
         let mut out = Vec::with_capacity(HDR + payload.len());
@@ -386,28 +565,7 @@ impl Message {
             T_PING if p.len() == 8 => Message::Ping(u64_at(0)?),
             T_PONG if p.len() == 8 => Message::Pong(u64_at(0)?),
             T_GPU3D if p.len() == 1 => Message::Gpu3d { on: p[0] != 0 },
-            T_DRAG_ENTER => {
-                let n = u32_at(4)? as usize;
-                if n == 0 || n > DROP_ITEMS_MAX {
-                    return Err(Error::Malformed);
-                }
-                let mut items = Vec::with_capacity(n);
-                let mut o = 8;
-                for _ in 0..n {
-                    let dir = *p.get(o).ok_or(Error::Malformed)? != 0;
-                    let len = u16::from_le_bytes(p.get(o + 1..o + 3).ok_or(Error::Malformed)?.try_into().map_err(|_| Error::Malformed)?) as usize;
-                    let name = std::str::from_utf8(p.get(o + 3..o + 3 + len).ok_or(Error::Malformed)?).map_err(|_| Error::Malformed)?;
-                    if !drop_name_ok(name) {
-                        return Err(Error::Malformed);
-                    }
-                    items.push((name.to_string(), dir));
-                    o += 3 + len;
-                }
-                if o != p.len() {
-                    return Err(Error::Malformed);
-                }
-                Message::DragEnter { id: u32_at(0)?, items }
-            }
+            T_DRAG_ENTER => Message::DragEnter { id: u32_at(0)?, items: get_items(p, 1)? },
             T_DRAG_READY if p.len() == 5 => Message::DragReady { id: u32_at(0)?, live: p[4] != 0 },
             T_DRAG_CANCEL if p.len() == 4 => Message::DragCancel { id: u32_at(0)? },
             T_DROP_ENTRY if p.len() > 13 => {
@@ -423,8 +581,15 @@ impl Message {
             T_COHERENCE if p.len() == 1 => Message::Coherence { on: p[0] != 0 },
             T_WINDOWS => Message::Windows(decode_windows(p).ok_or(Error::Malformed)?),
             T_WINDOW_DO if p.len() > 4 => Message::WindowDo { id: u32_at(0)?, op: WindowOp::decode(&p[4..]).ok_or(Error::Malformed)? },
+            T_DRAG_OUT_QUERY if p.len() == 4 => Message::DragOutQuery { id: u32_at(0)? },
+            T_DRAG_OUT_ITEMS => Message::DragOutItems { id: u32_at(0)?, items: get_items(p, 0)? },
+            T_DRAG_OUT_GET if p.len() == 12 => Message::DragOutGet { id: u32_at(0)?, item: u32_at(4)?, stream: u32_at(8)? },
+            T_DRAG_OUT_END if p.len() == 4 => Message::DragOutEnd { id: u32_at(0)? },
+            T_DRAG_OUT_FAIL if p.len() >= 4 => Message::DragOutFail { stream: u32_at(0)?, why: text(&p[4..])?.chars().take(256).collect() },
             T_TIME | T_RES | T_SCALE | T_SHUTDOWN | T_PING | T_PONG | T_GPU3D | T_DRAG_READY | T_DRAG_CANCEL | T_DROP_ENTRY | T_DROP_DATA
-            | T_DROP_END | T_DROP_DONE | T_COHERENCE | T_WINDOW_DO => return Err(Error::Malformed),
+            | T_DROP_END | T_DROP_DONE | T_COHERENCE | T_WINDOW_DO | T_DRAG_OUT_QUERY | T_DRAG_OUT_GET | T_DRAG_OUT_END | T_DRAG_OUT_FAIL => {
+                return Err(Error::Malformed)
+            }
             t => return Err(Error::Type(t)),
         })
     }
@@ -521,6 +686,12 @@ mod tests {
             Message::WindowDo { id: 1, op: WindowOp::Close },
             Message::WindowDo { id: 1, op: WindowOp::Minimize },
             Message::WindowDo { id: 1, op: WindowOp::Move { x: -5, y: 3, w: 640, h: 480 } },
+            Message::DragOutQuery { id: 9 },
+            Message::DragOutItems { id: 9, items: vec![("report.pdf".into(), false), ("Photos".into(), true)] },
+            Message::DragOutItems { id: 9, items: Vec::new() },
+            Message::DragOutGet { id: 9, item: 1, stream: 10 },
+            Message::DragOutEnd { id: 9 },
+            Message::DragOutFail { stream: 10, why: "can't read report.pdf".into() },
         ]
     }
 
@@ -551,6 +722,60 @@ mod tests {
         let mut m = WindowOp::Move { x: 0, y: 0, w: 1, h: 1 }.encode();
         m[9..13].copy_from_slice(&0u32.to_le_bytes());
         assert_eq!(WindowOp::decode(&m), None);
+    }
+
+    #[test]
+    fn fixed_names_are_taken() {
+        assert_eq!(fix_name("a:b?.txt"), "a_b_.txt");
+        assert_eq!(fix_name(".."), "_");
+        assert_eq!(fix_name("x\ny"), "xy");
+        assert_eq!(fix_name("a/b\\c"), "a_b_c");
+        assert!(drop_name_ok(&fix_name(&"é".repeat(300))));
+    }
+
+    #[test]
+    fn guest_names_are_checked() {
+        for bad in ["..", "a/b", "c:", ""] {
+            let mut d = Decoder::new(1 << 20);
+            d.push(&Message::DragOutItems { id: 1, items: vec![(bad.into(), false)] }.encode());
+            assert_eq!(d.next(), Err(Error::Malformed), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn trees_come_in_order_and_whole() {
+        let e = |path: &str, dir: bool, size: u64| Message::DropEntry { id: 1, path: path.into(), dir, size };
+        let data = |n: usize| Message::DropData { id: 1, data: vec![0; n] };
+        let end = Message::DropEnd { id: 1 };
+        let run = |top: &str, dir: bool, ms: &[Message]| -> Result<bool, &'static str> {
+            let mut c = TreeCheck::new(1, top, dir);
+            let mut last = false;
+            for m in ms {
+                last = c.check(m)?;
+            }
+            Ok(last)
+        };
+        // A folder with a sub folder and files.
+        let good = [e("F", true, 9), e("F/a", false, 3), data(2), data(1), e("F/s", true, 0), e("F/s/b", false, 0), end.clone()];
+        assert_eq!(run("F", true, &good), Ok(true));
+        assert_eq!(run("a.txt", false, &[e("a.txt", false, 1), data(1), end.clone()]), Ok(true));
+        // Not the item asked for, or something outside it.
+        assert!(run("F", true, &[e("G", true, 0)]).is_err());
+        assert!(run("F", true, &[e("F", false, 0)]).is_err());
+        assert!(run("F", true, &[e("F", true, 0), e("G/a", false, 0)]).is_err());
+        assert!(run("F", true, &[e("F", true, 0), e("F/s/b", false, 0)]).is_err());
+        // Nothing under a file, nothing announced twice.
+        assert!(run("a", false, &[e("a", false, 0), e("a/b", false, 0)]).is_err());
+        assert!(run("F", true, &[e("F", true, 0), e("F/s", true, 0), e("F/s", true, 0)]).is_err());
+        // Sizes hold.
+        assert!(run("a", false, &[e("a", false, 1), data(2)]).is_err());
+        assert!(run("a", false, &[e("a", false, 2), data(1), end.clone()]).is_err());
+        assert!(run("F", true, &[e("F", true, 0), e("F/a", false, 2), e("F/b", false, 0)]).is_err());
+        // Another drag's frames, data or an end before any entry.
+        assert!(run("a", false, &[Message::DropEntry { id: 2, path: "a".into(), dir: false, size: 0 }]).is_err());
+        assert!(run("a", false, &[data(0)]).is_err());
+        assert!(run("a", false, std::slice::from_ref(&end)).is_err());
+        assert!(run("a", false, &[Message::Ping(1)]).is_err());
     }
 
     #[test]

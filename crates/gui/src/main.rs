@@ -6,6 +6,9 @@
 mod app;
 mod console;
 mod dnd;
+mod dragout;
+#[cfg(target_os = "macos")]
+mod dragout_mac;
 mod edit;
 mod fmt;
 mod host;
