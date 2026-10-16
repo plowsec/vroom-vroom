@@ -872,8 +872,41 @@ same one bridged networking needs, see below). The first time, the menu
 shows "Set up (asks for your password)": macOS asks for an admin
 password once, and from then on these devices connect like the others.
 vroom-netd starts the USB helper as root for that one device; the app
-and the VM stay unprivileged. Eject a disk in Finder before you connect
-it: macOS lets go of it, mounted or not.
+and the VM stay unprivileged. A device in the VM file goes the same way
+when the VM starts.
+
+The root helper takes the device from macOS as soon as it opens it:
+macOS re-enumerates it with its own drivers kept off (a USB stick
+disappears from Finder). The device stays the VM's through guest
+reboots and resets. When the VM stops, or you disconnect the device,
+the helper re-enumerates it once more without that hold, and macOS
+takes it back: a stick mounts again as before. Eject a disk in Finder
+before you connect it, so macOS finishes its writes first.
+
+USB disks need one more thing on macOS 15: macOS lets a program open a
+USB storage device only with its Full Disk Access permission, root
+included. Without it the guest can't use the disk (macOS logs
+`deny(1) iokit-open-service IOUSBHostInterface` for vroom-netd). Give it
+in System Settings, Privacy & Security, Full Disk Access: the + button,
+then Command-Shift-G and `/usr/local/libexec/vroom/vroom-netd`. A new
+vroom-netd (after an update, or "Set up" again) needs it again, as
+macOS ties the permission to that exact binary. Only USB storage needs
+this; keyboards, serial adapters and the rest don't. What it means for
+security: [SECURITY.md](SECURITY.md#the-root-helper-vroom-netd).
+
+When no part of a device can be used (macOS refused it, or a macOS
+driver holds it and the root helper isn't set up), the helper says why
+in its log (the VM's log, or `/var/log/vroom-netd.log` for the root
+helper), gives the device back to macOS and the guest sees it
+unplugged, rather than a device whose every transfer fails.
+
+A device an older vroom left taken from macOS shows in `vroom usb list`
+as "taken from macOS by a root helper earlier". Unplug it and plug it
+back in, or:
+
+```bash
+vroom usb reset 18a5:0302    # through vroom-netd: macOS takes it back
+```
 
 Devices that work without it: those no macOS driver holds. That's
 vendor-specific devices: many dev boards, flashing and DFU modes, debug
@@ -882,8 +915,9 @@ mode.
 
 ### Limits
 
-- A device composed of several functions works for the ones macOS
-  leaves alone; the guest sees the others but they fail.
+- Without the root helper, a device composed of several functions works
+  for the ones macOS leaves alone; the guest sees the others but they
+  fail. The root helper takes the whole device.
 
 Control, bulk, interrupt and isochronous transfers work, at USB 1.1, 2.0
 and 3.x speeds (SuperSpeed devices show up on a USB 3 port). Isochronous
@@ -897,7 +931,7 @@ On Linux hosts the helper uses usbfs: give your user access to the device
 with a udev rule, e.g.
 `SUBSYSTEM=="usb", ATTR{idVendor}=="1209", ATTR{idProduct}=="000a", MODE="0660", TAG+="uaccess"`.
 Linux drivers bound to the device's interfaces are detached while the VM
-has it.
+has it, and bound again when the helper ends.
 
 Testing without hardware: `VROOM_USB_FAKE=acm` makes every helper serve
 a pretend USB serial port that echoes what it's sent (CDC-ACM; Linux
@@ -910,6 +944,12 @@ packet per millisecond. Linux guests need the `snd-usb-audio` module (on
 Ubuntu cloud images: `linux-modules-extra-$(uname -r)`). `arecord -l`
 shows its card number (here 0); then, as root or in the `audio` group:
 `arecord -D hw:0,0 -f S16_LE -r 48000 -c 1 -d 5 -t raw mic.raw`.
+`VROOM_USB_FAKE=disk` serves a pretend USB stick: high speed, mass
+storage (Bulk-Only Transport, SCSI), a 128 MiB RAM disk that starts
+empty. Guests use their own storage driver: Linux shows `/dev/sda`, to
+partition, format, mount, read and write. `VROOM_USB_FAKE=disk-broken`
+fails every transfer of it, to check that a guest (and its firmware)
+gets past a broken device.
 `VROOM_USB_FAKE_UNPLUG=<secs>` pulls the device out once, for three
 seconds.
 Started with `VROOM_USB_FAKE`, the app's USB menu also lists a pretend
@@ -937,9 +977,10 @@ shows its own password prompt. It installs:
 
 The app needs `vroom-netd` next to `vroom-gui` (`scripts/build.sh`
 builds it). Setting it up again (after an update) replaces the binary
-and keeps your settings. `⌘K` → "Set up vroom-netd" does it from
-anywhere; `⌘K` → "Remove vroom-netd" takes it away again (the password
-once more).
+and keeps your settings; for USB disks, give the new binary Full Disk
+Access again (see [Devices macOS uses](#devices-macos-uses)). `⌘K` →
+"Set up vroom-netd" does it from anywhere; `⌘K` → "Remove vroom-netd"
+takes it away again (the password once more).
 
 ### By hand
 
@@ -1102,10 +1143,10 @@ flushes a lot). `"none"` ignores flushes: scratch disks only.
 - 3D snapshots: not while a Vulkan app runs. Guest OpenGL stops at 4.1
   (2.1 with `opengl_host = "angle"`).
 - NAT connections don't survive suspend/resume (the guest reconnects).
-- USB passthrough: not yet tried with a real device in a guest; tested
-  with the pretend devices behind the real helper and sandbox
-  (isochronous: the pretend sound card in a Linux guest), connected from
-  the VM file and from the app's menu while the VM runs. Taking a device
-  from a macOS driver through vroom-netd isn't tested as root yet (the
-  request, the root helper's sandbox and its libusb were, as a normal
-  user).
+- USB passthrough: tested with the pretend devices behind the real
+  helper and sandbox (isochronous: the pretend sound card; mass storage:
+  the pretend stick, read at about 340 MB/s in a Linux guest), from the
+  VM file and plugged in while the VM runs. A real USB stick through
+  vroom-netd: macOS lets go of it and gets it back, but the guest
+  couldn't use it yet, because that vroom-netd had no Full Disk Access
+  (see [Devices macOS uses](#devices-macos-uses)); not tried with it.

@@ -478,6 +478,7 @@ name = "lab"
                 ports: vec![2],
                 interface_classes: vec![2, 10],
                 claimed_by: vec!["AppleUSBCDCACMData".into()],
+                captured: false,
             }]
         };
         // SAFETY: getuid has no preconditions.

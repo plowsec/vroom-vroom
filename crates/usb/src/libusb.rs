@@ -5,6 +5,16 @@
 //! Transfers are asynchronous: one thread runs libusb's event loop and
 //! sends completions to the VMM as they come; cancelling is
 //! `libusb_cancel_transfer`, whose completion still comes back.
+//!
+//! Host drivers: macOS, as root (vroom-netd's helper): a device macOS's
+//! drivers hold is taken as soon as it is opened: libusb "captures" it,
+//! re-enumerating it with macOS's drivers kept off. Linux: an interface
+//! a kernel driver holds is taken from it when the guest configures the
+//! device. Either way the device stays ours until the helper ends,
+//! through guest resets and reconfigurations, and only then goes back to
+//! the host's drivers (macOS: one more re-enumeration). Taking and
+//! giving back on every guest reset would let the host mount a disk in
+//! between.
 
 #![allow(unsafe_code)]
 
@@ -104,7 +114,9 @@ api! {
     get_device_speed: fn(*mut Dev) -> c_int;
     open: fn(*mut Dev, *mut *mut Handle) -> c_int;
     close: fn(*mut Handle);
-    set_auto_detach_kernel_driver: fn(*mut Handle, c_int) -> c_int;
+    kernel_driver_active: fn(*mut Handle, c_int) -> c_int;
+    detach_kernel_driver: fn(*mut Handle, c_int) -> c_int;
+    attach_kernel_driver: fn(*mut Handle, c_int) -> c_int;
     get_configuration: fn(*mut Handle, *mut c_int) -> c_int;
     set_configuration: fn(*mut Handle, c_int) -> c_int;
     claim_interface: fn(*mut Handle, c_int) -> c_int;
@@ -282,6 +294,14 @@ pub struct UsbDevice {
     shared: Arc<Shared>,
     claimed: Vec<u8>,
     num_configs: u8,
+    /// Interfaces taken from a host driver: given back when we're done.
+    detached: Vec<u8>,
+    /// macOS: an earlier root helper captured the device and didn't give
+    /// it back. We take it over (and give it back at the end).
+    captured: bool,
+    /// Set when the device can't be used at all (no interface could be
+    /// claimed): the opener leaves it alone from then on.
+    refused: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for UsbDevice {
@@ -308,6 +328,80 @@ impl UsbDevice {
             // SAFETY: live handle.
             unsafe { (self.u.lib.release_interface)(self.h, i as c_int) };
         }
+    }
+
+    /// macOS, as root: take the whole device from macOS's drivers (one
+    /// re-enumeration). A device an earlier helper captured is taken over
+    /// the same way, so that our guest's resets don't hand it to macOS.
+    fn capture(&mut self) {
+        // SAFETY: live handle. The interface number doesn't matter on
+        // macOS: the whole device is taken.
+        match unsafe { (self.u.lib.detach_kernel_driver)(self.h, 0) } {
+            0 => {
+                log::info!("usb: device taken from macOS's drivers");
+                self.detached.push(0);
+            }
+            rc => log::warn!("usb: can't take the device from macOS's drivers ({})", err_name(self.u, rc)),
+        }
+    }
+
+    /// Take interface `a` from the host driver holding it, if any.
+    fn take(&mut self, a: u8) {
+        // SAFETY: live handle.
+        if unsafe { (self.u.lib.kernel_driver_active)(self.h, a as c_int) } == 1 {
+            self.detach(a);
+        }
+    }
+
+    fn detach(&mut self, a: u8) {
+        // SAFETY: live handle.
+        match unsafe { (self.u.lib.detach_kernel_driver)(self.h, a as c_int) } {
+            0 => {
+                log::info!("usb: interface {a} taken from the host's driver");
+                self.detached.push(a);
+            }
+            rc => log::info!("usb: interface {a}: can't take it from the host's driver ({})", err_name(self.u, rc)),
+        }
+    }
+
+    /// Claim interface `a`. Right after a macOS capture the device is
+    /// still coming back: a few tries.
+    fn claim(&mut self, a: u8) -> c_int {
+        let mut rc = 0;
+        for i in 0..4 {
+            if i > 0 {
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            // SAFETY: live handle.
+            rc = unsafe { (self.u.lib.claim_interface)(self.h, a as c_int) };
+            if rc == 0 || self.detached.is_empty() || !cfg!(target_os = "macos") {
+                break;
+            }
+        }
+        rc
+    }
+
+    /// Hand what we took back to the host's drivers (end of use).
+    fn give_back(&mut self) {
+        let detached = std::mem::take(&mut self.detached);
+        for &a in &detached {
+            // SAFETY: live handle, interfaces released. macOS:
+            // re-enumerates the device on the last one, without capture.
+            let rc = unsafe { (self.u.lib.attach_kernel_driver)(self.h, a as c_int) };
+            if rc != 0 {
+                log::info!("usb: giving interface {a} back to the host: {}", err_name(self.u, rc));
+            }
+        }
+        if !detached.is_empty() {
+            log::info!("usb: device given back to the host's drivers");
+        } else if cfg!(target_os = "macos") && self.captured {
+            // Captured before us and never taken over: a plain reset
+            // re-enumerates it without capture, macOS's drivers come back.
+            // SAFETY: live handle.
+            let rc = unsafe { (self.u.lib.reset_device)(self.h) };
+            log::info!("usb: re-enumerated for macOS's drivers ({})", if rc == 0 { "ok".into() } else { err_name(self.u, rc) });
+        }
+        self.captured = false;
     }
 }
 
@@ -461,18 +555,29 @@ impl Device for UsbDevice {
                 return Err(map_rc(rc));
             }
         }
-        for a in cfg.map(|c| c.interfaces()).unwrap_or_default() {
-            // SAFETY: live handle.
-            let rc = unsafe { (self.u.lib.claim_interface)(self.h, a as c_int) };
+        let wanted = cfg.map(|c| c.interfaces()).unwrap_or_default();
+        let mut failed = Vec::new();
+        for &a in &wanted {
+            self.take(a);
+            let rc = self.claim(a);
             if rc == 0 {
                 self.claimed.push(a);
             } else {
                 let class = cfg.and_then(|c| c.alt(a, 0)).map(|x| x.class).unwrap_or(0);
-                log::warn!(
-                    "usb: interface {a} (class {class:#04x}) is in use by the host ({}): the guest can't use it",
-                    err_name(self.u, rc)
-                );
+                log::warn!("usb: interface {a} (class {class:#04x}): {}", why_unclaimed(class, !self.detached.is_empty(), &err_name(self.u, rc)));
+                failed.push(a);
             }
+        }
+        if !wanted.is_empty() && failed.len() == wanted.len() {
+            // Nothing the guest could use: a device whose every transfer
+            // fails only makes it reset and retry (firmware too). Refuse
+            // it, give it back to the host now, and leave it alone.
+            let back = if self.detached.is_empty() && !self.captured { "" } else { ", giving it back to the host" };
+            log::warn!("usb: no interface of the device can be used: unplugging it from the VM{back}");
+            self.give_back();
+            self.refused.store(true, Ordering::Relaxed);
+            self.shared.gone.store(true, Ordering::Relaxed);
+            return Err(Status::Stall);
         }
         Ok(())
     }
@@ -498,6 +603,27 @@ impl Device for UsbDevice {
     }
 }
 
+/// Why an interface couldn't be claimed, in words.
+fn why_unclaimed(class: u8, taken: bool, err: &str) -> String {
+    let root = {
+        // SAFETY: geteuid has no preconditions.
+        unsafe { libc::geteuid() == 0 }
+    };
+    if cfg!(target_os = "macos") && class == 8 && (taken || root) {
+        // macOS 15 lets a program open USB storage only with its Full
+        // Disk Access (or Removable Volumes) permission, root included.
+        let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "vroom-netd".into());
+        format!(
+            "macOS refused USB storage to this program ({err}): give {exe} Full Disk Access \
+             (System Settings, Privacy & Security, Full Disk Access)"
+        )
+    } else if cfg!(target_os = "macos") && !root {
+        format!("in use by a macOS driver ({err}): only vroom-netd's root helper can take it")
+    } else {
+        format!("in use by the host ({err}): the guest can't use it")
+    }
+}
+
 impl Drop for UsbDevice {
     fn drop(&mut self) {
         let ids: Vec<u32> = self.shared.inflight.lock().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
@@ -515,6 +641,7 @@ impl Drop for UsbDevice {
             std::thread::sleep(Duration::from_millis(10));
         }
         self.release_all();
+        self.give_back();
         // SAFETY: live handle, nothing in flight.
         unsafe { (self.u.lib.close)(self.h) };
     }
@@ -526,13 +653,32 @@ impl Drop for UsbDevice {
 pub struct LibusbOpener {
     sel: Selector,
     at: Option<(u8, Vec<u8>)>,
+    /// The device turned out unusable (see `UsbDevice::refused`).
+    refused: Arc<AtomicBool>,
+    /// Said why we can't open it (once).
+    told: bool,
 }
 
 impl LibusbOpener {
     /// Loads libusb: fails if it isn't installed.
     pub fn new(sel: Selector) -> Result<LibusbOpener, String> {
         usb()?;
-        Ok(LibusbOpener { sel, at: None })
+        Ok(LibusbOpener { sel, at: None, refused: Arc::new(AtomicBool::new(false)), told: false })
+    }
+
+    /// The host lists the device, but we couldn't open it: say why, once.
+    fn tell(&mut self, listed: &[crate::list::HostDevice]) {
+        let Some(d) = listed.first().filter(|_| !self.told) else { return };
+        self.told = true;
+        if d.captured {
+            log::warn!(
+                "usb: {} was taken from macOS by a root helper and not given back: only root can open it now \
+                 (vroom-netd's helper), or unplug it and plug it back in",
+                d.id()
+            );
+        } else {
+            log::warn!("usb: {} is plugged in, but it can't be opened", d.id());
+        }
     }
 }
 
@@ -584,15 +730,17 @@ impl Drop for DevList {
 impl Opener for LibusbOpener {
     fn open(&mut self, sink: &Sink) -> Option<(Box<dyn Device>, Speed, u16, u16)> {
         let u = usb().ok()?;
-        // A serial number picks the device by where the host listing
-        // (registry / sysfs, no device opened) says it is.
-        let wanted: Option<Vec<(u8, Vec<u8>)>> = self.sel.serial.as_ref().map(|s| {
-            crate::list::list()
-                .into_iter()
-                .filter(|d| d.vendor == self.sel.vendor && d.product == self.sel.product && d.serial.as_ref() == Some(s))
-                .map(|d| (d.bus, d.ports))
-                .collect()
-        });
+        if self.refused.load(Ordering::Relaxed) {
+            return None;
+        }
+        // What the host lists (registry / sysfs, no device opened). A
+        // serial number picks the device by where that says it is.
+        let listed: Vec<crate::list::HostDevice> = crate::list::list()
+            .into_iter()
+            .filter(|d| d.vendor == self.sel.vendor && d.product == self.sel.product && d.class != 9)
+            .filter(|d| self.sel.serial.is_none() || d.serial == self.sel.serial)
+            .collect();
+        let wanted: Option<Vec<(u8, Vec<u8>)>> = self.sel.serial.as_ref().map(|_| listed.iter().map(|d| (d.bus, d.ports.clone())).collect());
         let list = DevList::get(u)?;
         for d in list.devices() {
             let Some((desc, bus, ports)) = list.info(d) else { continue };
@@ -606,14 +754,15 @@ impl Opener for LibusbOpener {
             // SAFETY: d is in our list (ref held); out pointer to our local.
             let rc = unsafe { (u.lib.open)(d, &mut h) };
             if rc != 0 {
-                log::warn!("usb: open {:04x}:{:04x}: {}", desc.vendor, desc.product, err_name(u, rc));
+                if !self.told {
+                    log::warn!("usb: open {:04x}:{:04x}: {}", desc.vendor, desc.product, err_name(u, rc));
+                    self.told = true;
+                }
                 continue;
             }
-            // Linux: take interfaces from kernel drivers when claiming
-            // (allowed with access to the device node). macOS: works for
-            // root or with Apple's VM entitlement only; else claiming fails.
-            // SAFETY: live handle.
-            unsafe { (u.lib.set_auto_detach_kernel_driver)(h, 1) };
+            let here = listed.iter().find(|l| (l.bus, &l.ports) == (bus, &ports));
+            let captured = here.is_some_and(|l| l.captured);
+            let held = here.is_some_and(|l| !l.claimed_by.is_empty());
             // SAFETY: d is live.
             let speed = match unsafe { (u.lib.get_device_speed)(d) } {
                 1 => Speed::Low,
@@ -624,9 +773,26 @@ impl Opener for LibusbOpener {
             };
             self.at = Some((bus, ports));
             let shared = Arc::new(Shared { inflight: Mutex::new(HashMap::new()), sink: sink.clone(), gone: AtomicBool::new(false) });
-            let dev = UsbDevice { u, h, shared, claimed: Vec::new(), num_configs: desc.configs };
+            let mut dev = UsbDevice {
+                u,
+                h,
+                shared,
+                claimed: Vec::new(),
+                num_configs: desc.configs,
+                detached: Vec::new(),
+                captured,
+                refused: self.refused.clone(),
+            };
+            // SAFETY: geteuid has no preconditions.
+            if cfg!(target_os = "macos") && (captured || held) && unsafe { libc::geteuid() } == 0 {
+                dev.capture();
+            }
+            self.told = false;
             return Some((Box::new(dev), speed, desc.vendor, desc.product));
         }
+        // libusb leaves out what it can't open (macOS: a device captured
+        // for root).
+        self.tell(&listed);
         None
     }
 

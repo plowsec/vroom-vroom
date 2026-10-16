@@ -168,11 +168,18 @@ A guest needs a driver and an API its players use. What exists:
 
 - Test on other Macs (M1 to M4, base models with 8 GB) and macOS versions,
   and days-long runs: sleep and wake with VMs running, full disks.
-- Things only a person at the Mac can try: USB passthrough with real
-  devices, bridged networking with real vmnet, vroom-netd as root taking
-  devices from macOS drivers (the app sets it up), a drag out of the
-  guest to Finder, Mail or the Desktop with a real mouse, Coherence next
-  to a window tiler, several monitors on several Mac screens.
+- USB disks through vroom-netd: give the installed vroom-netd Full Disk
+  Access and try a real stick in a guest (macOS 15 refuses USB storage
+  to a program without it, root included; tried here without it only:
+  macOS lets go of the stick and takes it back, the guest can't read
+  it). Other real devices (serial adapters, keyboards, webcams, sound
+  cards) not tried yet. The helper could tell the VMM why it gave up on
+  a device, so the app shows it (today: the log only). A Developer ID
+  signature would keep vroom-netd's permission across updates.
+- Things only a person at the Mac can try: bridged networking with real
+  vmnet, a drag out of the guest to Finder, Mail or the Desktop with a
+  real mouse, Coherence next to a window tiler, several monitors on
+  several Mac screens.
 - A signed, notarized vroom.app (`scripts/app.sh` builds it, signed ad
   hoc: needs a Developer ID and the hardened runtime), a disk image to
   install from, updates, crash reports.

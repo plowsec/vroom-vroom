@@ -14,6 +14,8 @@ vroom run <vm.toml>   one process per VM, sandboxed after setup ◄───┘
    ├─ optional: vroom audio-out (sound, microphone), own sandbox, datagram socket
    ├─ optional: vroom usb-host (one per [[usb]] device), own sandbox,
    │  stream socket: transfer requests in, results and plug events out
+   │  (a device a macOS driver holds: vroom-netd's root helper instead,
+   │  asked for before the sandbox)
    └─ optional: vroom video-helper (video_decode), own sandbox, stream
       socket: bitstreams and credits in, pictures out (VideoToolbox)
 
@@ -65,7 +67,7 @@ had one pair per device in the VM file.
 | `arch` | Board layout (QEMU-virt compatible), FDT, ACPI tables (own AML encoder), SMBIOS, kernel image loader (Image, gzip, EFI zboot). |
 | `devices` | Bus, PL011, PL031, fw_cfg (+DMA), CFI flash (NVRAM), PCI host (ECAM, MSI, MSI-X, INTx), NVMe, xHCI + USB HID (8 USB 2 + USB 3 port pairs for passthrough devices, plugged in and out while the VM runs; asynchronous transfers; isochronous TDs go out in batches, a few batches ahead), Intel HD Audio (controller + codec, streams moved by a timer thread). Parses hostile input only; `forbid(unsafe_code)`. |
 | `video` | Hardware video decoding, shared by the VMM and `vroom video-helper`: their protocol (credits, epochs), H.264/HEVC NAL unit, access unit and parameter set parsing, picture order counts. Parses hostile input only; `forbid(unsafe_code)`. |
-| `usb` | USB passthrough: the VMM/helper protocol, the helper's request checks, libusb (loaded with `dlopen`, helper only; the root helper only from its own copy), host device listing (IOKit registry / sysfs), a pretend serial port and sound card for tests. |
+| `usb` | USB passthrough: the VMM/helper protocol, the helper's request checks, libusb (loaded with `dlopen`, helper only; the root helper only from its own copy), host device listing (IOKit registry / sysfs), taking a device from the host's drivers and giving it back, a pretend serial port, sound card and USB stick for tests. |
 | `virtio` | Split-queue handling (hardened), MMIO and modern PCI transports, devices (blk, net, console, rng, gpu, input, fs, sound, media), a pausable worker per device. `forbid(unsafe_code)`. |
 | `fs` | Host side of shared folders: component-wise `openat(O_NOFOLLOW)` walks from a root fd, Linux errno mapping. The virtio-fs FUSE server lives in `virtio`; it serves Linux and virtio-win's virtiofs.exe (Windows), telling them apart by their INIT flags. |
 | `audio` | Sound helper: datagram protocol, ring buffer, CoreAudio (macOS) / ALSA (Linux, `dlopen`) playback and recording, WAV test files. |
