@@ -526,13 +526,15 @@ What doesn't:
   `com.apple.vm.device-access` entitlement (Apple gives it to approved VM
   vendors only; vroom can't ship it). With either, the same code takes
   the device: libusb's "detach kernel driver" does it.
-- Isochronous transfers (webcams, sound cards) aren't passed through
-  yet: such a device shows up in the guest but doesn't stream.
 - A device composed of several functions works for the ones macOS
   leaves alone; the guest sees the others but they fail.
 
-Control, bulk and interrupt transfers work, at USB 1.1, 2.0 and 3.x speeds
-(SuperSpeed devices show up on a USB 3 port). No USB 3 bulk streams (UAS
+Control, bulk, interrupt and isochronous transfers work, at USB 1.1, 2.0
+and 3.x speeds (SuperSpeed devices show up on a USB 3 port). Isochronous
+is what sound cards and webcams stream with: once the guest has such a
+device (on macOS, see above), it streams. The host sends the packets as
+soon as it can, in order: a guest asking for an exact start frame gets
+the next free one. No USB 3 bulk streams (UAS
 disks fall back to the older protocol).
 
 On Linux hosts the helper uses usbfs: give your user access to the device
@@ -544,8 +546,16 @@ has it.
 Testing without hardware: `VROOM_USB_FAKE=acm` makes every helper serve
 a pretend USB serial port that echoes what it's sent (CDC-ACM; Linux
 guests see `/dev/ttyACM0` if they have the `cdc_acm` module, or use it
-from userspace through `/dev/bus/usb`). `VROOM_USB_FAKE_UNPLUG=<secs>`
-pulls it out once, for three seconds.
+from userspace through `/dev/bus/usb`). `VROOM_USB_FAKE=audio` serves a
+pretend USB sound card instead: speakers (48 kHz, 16-bit stereo) and a
+microphone (48 kHz, 16-bit mono) whose samples count up by one, so a
+recording shows whether anything was lost. It runs in real time, one
+packet per millisecond. Linux guests need the `snd-usb-audio` module (on
+Ubuntu cloud images: `linux-modules-extra-$(uname -r)`). `arecord -l`
+shows its card number (here 0); then, as root or in the `audio` group:
+`arecord -D hw:0,0 -f S16_LE -r 48000 -c 1 -d 5 -t raw mic.raw`.
+`VROOM_USB_FAKE_UNPLUG=<secs>` pulls the device out once, for three
+seconds.
 
 ## Sound
 
@@ -677,5 +687,6 @@ flushes a lot). `"none"` ignores flushes: scratch disks only.
   (2.1 with `opengl_host = "angle"`).
 - NAT connections don't survive suspend/resume (the guest reconnects).
 - USB passthrough: not yet tried with a real device (none was at hand);
-  tested with the pretend device behind the real helper and sandbox. No
-  isochronous transfers. On macOS only devices macOS has no driver for.
+  tested with the pretend devices behind the real helper and sandbox
+  (isochronous: the pretend sound card in a Linux guest). On macOS only
+  devices macOS has no driver for.

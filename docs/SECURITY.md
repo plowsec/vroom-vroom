@@ -221,12 +221,16 @@ The helper treats the VMM as hostile, like the VMM treats the guest:
 - Every request is checked: sizes (1 MiB per transfer), at most 64
   transfers in flight, endpoints only those of the configuration and
   alternate settings the guest selected, with the type the descriptors
-  give. Configuration, interface and halt changes go through libusb's own
+  give. Isochronous transfers: at most 128 packets, none larger than
+  what the endpoint moves per interval (its descriptors say).
+  Configuration, interface and halt changes go through libusb's own
   calls; SET_ADDRESS is refused. Hubs are never opened.
 - Malformed messages end the connection.
 
 The VMM checks the helper the same way: answers must match a transfer it
-sent (size, direction), and never write past the guest's buffers. A dead
+sent (size, direction, for isochronous the packet count and each
+packet's size), and never write past the guest's buffers. The VMM keeps
+at most 8 transfers in flight per endpoint and 32 per device. A dead
 or misbehaving helper looks like an unplugged device. The vCPUs never
 wait on a helper.
 
