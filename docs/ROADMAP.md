@@ -159,31 +159,18 @@ A guest needs a driver and an API its players use. What exists:
 
 ## Before it's ready for people other than us
 
-- A Windows guest with 3D stopped once with "undecodable MMIO access at
-  0x8200010000" (the 3D device's memory window, about 40 s after login)
-  on a build from master 01a3d48. Not seen again: ten minutes on the
-  next master with the old and new guest tools, resizes and Coherence.
-  If it shows up again, the window's filler memory is the first suspect.
-
 - Test on other Macs (M1 to M4, base models with 8 GB) and macOS versions,
   and days-long runs: sleep and wake with VMs running, full disks.
-- Windows 3D: the text that sometimes doesn't draw (an agent is on it).
-- USB passthrough with real devices, bridged networking with real
-  vmnet, and vroom-netd as root taking devices from macOS drivers
-  (the app sets it up; not tried as root yet).
-- Signing and notarizing vroom.app (`scripts/app.sh` builds it, signed
-  ad hoc: needs a Developer ID and the hardened runtime), a disk image
-  to install from, updates, crash reports.
-- Multiple monitors, drag and drop from the guest to the Mac (Mac to
-  guest works), a live drag in Linux guests (they get files on the
-  Desktop for now).
-  vmnet (being tested now).
-- A signed, notarized app with an installer and updates; crash reports.
-- Multiple monitors.
-- Drag and drop: try the Mac side of a drag out of the guest with a real
-  mouse (Finder, Mail, the Desktop; the guest side and the copy are
-  tested); Wayland guests (no live drag either way: an outside program
-  can't take part in a Wayland drag).
+- Things only a person at the Mac can try: USB passthrough with real
+  devices, bridged networking with real vmnet, vroom-netd as root taking
+  devices from macOS drivers (the app sets it up), a drag out of the
+  guest to Finder, Mail or the Desktop with a real mouse, Coherence next
+  to a window tiler, several monitors on several Mac screens.
+- A signed, notarized vroom.app (`scripts/app.sh` builds it, signed ad
+  hoc: needs a Developer ID and the hardened runtime), a disk image to
+  install from, updates, crash reports.
+- Drag and drop in Wayland guests (no live drag either way: an outside
+  program can't take part in a Wayland drag; files land on the Desktop).
 - Rosetta for Linux guests (x86_64 Linux programs). Apple only offers it
   through its Virtualization framework; we'd have to look like it.
 - Benchmarks against VMware Fusion and Parallels on the same Mac, the
@@ -192,3 +179,8 @@ A guest needs a driver and an API its players use. What exists:
 - Windows: when the desktop's own Direct3D process dies, the screen
   freezes until Win+Ctrl+Shift+B. The guest driver should report a lost
   device for that context (Windows then rebuilds it by itself).
+- A Windows guest with 3D stopped once with "undecodable MMIO access at
+  0x8200010000" (the 3D device's memory window, about 40 s after login)
+  on a build from master 01a3d48. Not seen again: ten minutes on the
+  next master with the old and new guest tools, resizes and Coherence.
+  If it shows up again, the window's filler memory is the first suspect.
