@@ -30,6 +30,11 @@ pub const MAX_PER_MINUTE: usize = 10;
 /// One device, as the helper's command line names it.
 pub type Device = (u16, u16, Option<String>);
 
+/// Lists the host's USB devices.
+pub type Lister = Box<dyn Fn() -> Vec<HostDevice> + Send + Sync>;
+/// Is this user in that group?
+pub type Member = Box<dyn Fn(u32, &str) -> bool + Send + Sync>;
+
 /// A started helper.
 pub trait Running: Send {
     /// Until it has exited.
@@ -61,9 +66,8 @@ pub struct Usb {
     pub group: String,
     spawner: Box<dyn Spawn>,
     /// The host's devices now (IOKit / sysfs).
-    lister: Box<dyn Fn() -> Vec<HostDevice> + Send + Sync>,
-    /// Is this user in that group?
-    member: Box<dyn Fn(u32, &str) -> bool + Send + Sync>,
+    lister: Lister,
+    member: Member,
     book: Mutex<Book>,
 }
 
@@ -86,8 +90,8 @@ impl Usb {
         enabled: bool,
         group: String,
         spawner: Box<dyn Spawn>,
-        lister: Box<dyn Fn() -> Vec<HostDevice> + Send + Sync>,
-        member: Box<dyn Fn(u32, &str) -> bool + Send + Sync>,
+        lister: Lister,
+        member: Member,
     ) -> Usb {
         Usb { enabled, group, spawner, lister, member, book: Mutex::default() }
     }
