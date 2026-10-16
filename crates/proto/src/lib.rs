@@ -30,6 +30,21 @@ pub mod features {
     pub const GPU3D: u64 = 32;
     /// Files dropped on the VM window land in the guest (`DragEnter`...).
     pub const FILE_DROP: u64 = 64;
+    /// The agent arranges several monitors (`SetLayout`).
+    pub const MONITORS: u64 = 512;
+}
+
+/// Most monitors a layout may hold.
+pub const LAYOUT_MAX: usize = 16;
+
+/// One monitor of a layout, in guest pixels on the guest's desktop. The
+/// first is the main one, at 0,0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Monitor {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
 }
 
 /// Longest relative path a drop may carry, and longest name in it.
@@ -83,6 +98,10 @@ pub enum Message {
     /// Guest -> host: the files are written. `place`: where they went
     /// when there was no live drag ("Desktop"), or why it failed.
     DropDone { id: u32, ok: bool, place: String },
+    /// Host -> guest: several monitors, each to this size and place; in
+    /// order (the host's first, second... GPU output); `None`: that one is
+    /// off. Sent instead of SetResolution when there is more than one.
+    SetLayout { monitors: Vec<Option<Monitor>> },
 }
 
 /// Whether `p` is a path a drop may carry: relative, '/' between names,
@@ -131,6 +150,7 @@ const T_DROP_ENTRY: u8 = 13;
 const T_DROP_DATA: u8 = 14;
 const T_DROP_END: u8 = 15;
 const T_DROP_DONE: u8 = 16;
+const T_LAYOUT: u8 = 25;
 
 impl Message {
     pub fn encode(&self) -> Vec<u8> {
@@ -190,6 +210,18 @@ impl Message {
                 p.push(*ok as u8);
                 p.extend_from_slice(place.as_bytes());
                 (T_DROP_DONE, p)
+            }
+            Message::SetLayout { monitors } => {
+                let mut p = Vec::with_capacity(monitors.len() * 17);
+                for m in monitors {
+                    let m2 = m.unwrap_or(Monitor { x: 0, y: 0, width: 0, height: 0 });
+                    p.push(m.is_some() as u8);
+                    p.extend_from_slice(&m2.x.to_le_bytes());
+                    p.extend_from_slice(&m2.y.to_le_bytes());
+                    p.extend_from_slice(&m2.width.to_le_bytes());
+                    p.extend_from_slice(&m2.height.to_le_bytes());
+                }
+                (T_LAYOUT, p)
             }
         };
         let mut out = Vec::with_capacity(HDR + payload.len());
@@ -276,8 +308,21 @@ impl Message {
             T_DROP_DATA if p.len() >= 4 && p.len() - 4 <= DROP_CHUNK => Message::DropData { id: u32_at(0)?, data: p[4..].to_vec() },
             T_DROP_END if p.len() == 4 => Message::DropEnd { id: u32_at(0)? },
             T_DROP_DONE if p.len() >= 5 => Message::DropDone { id: u32_at(0)?, ok: p[4] != 0, place: text(&p[5..])?.chars().take(256).collect() },
+            T_LAYOUT if !p.is_empty() && p.len().is_multiple_of(17) && p.len() / 17 <= LAYOUT_MAX => {
+                let mut monitors = Vec::new();
+                for o in (0..p.len()).step_by(17) {
+                    let (on, x, y, w, h) = (p[o], u32_at(o + 1)? as i32, u32_at(o + 5)? as i32, u32_at(o + 9)?, u32_at(o + 13)?);
+                    let fits = |v: i32| (-65536..=65536).contains(&v);
+                    monitors.push(match on {
+                        0 => None,
+                        1 if w > 0 && h > 0 && w <= 16384 && h <= 16384 && fits(x) && fits(y) => Some(Monitor { x, y, width: w, height: h }),
+                        _ => return Err(Error::Malformed),
+                    });
+                }
+                Message::SetLayout { monitors }
+            }
             T_TIME | T_RES | T_SCALE | T_SHUTDOWN | T_PING | T_PONG | T_GPU3D | T_DRAG_READY | T_DRAG_CANCEL | T_DROP_ENTRY | T_DROP_DATA
-            | T_DROP_END | T_DROP_DONE => return Err(Error::Malformed),
+            | T_DROP_END | T_DROP_DONE | T_LAYOUT => return Err(Error::Malformed),
             t => return Err(Error::Type(t)),
         })
     }
@@ -364,7 +409,28 @@ mod tests {
             Message::DropData { id: 3, data: Vec::new() },
             Message::DropEnd { id: 3 },
             Message::DropDone { id: 3, ok: true, place: "Desktop".into() },
+            Message::SetLayout {
+                monitors: vec![Some(Monitor { x: 0, y: 0, width: 1280, height: 800 }), None, Some(Monitor { x: 1280, y: -5, width: 640, height: 480 })],
+            },
         ]
+    }
+
+    #[test]
+    fn layouts_are_checked() {
+        let bad = |m: Monitor| {
+            let mut d = Decoder::new(1024);
+            d.push(&Message::SetLayout { monitors: vec![Some(m)] }.encode());
+            d.next()
+        };
+        assert_eq!(bad(Monitor { x: 0, y: 0, width: 0, height: 5 }), Err(Error::Malformed));
+        assert_eq!(bad(Monitor { x: 0, y: 0, width: 16385, height: 5 }), Err(Error::Malformed));
+        assert_eq!(bad(Monitor { x: i32::MIN, y: 0, width: 5, height: 5 }), Err(Error::Malformed));
+        let mut d = Decoder::new(1024);
+        d.push(&Message::SetLayout { monitors: vec![None; LAYOUT_MAX + 1] }.encode());
+        assert_eq!(d.next(), Err(Error::Malformed));
+        let mut d = Decoder::new(1024);
+        d.push(&Message::SetLayout { monitors: vec![] }.encode());
+        assert_eq!(d.next(), Err(Error::Malformed));
     }
 
     #[test]

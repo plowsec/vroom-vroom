@@ -27,10 +27,10 @@ use slint::winit_030::winit::window::{CursorIcon, CustomCursor};
 use slint::winit_030::{EventResult, WinitWindowAccessor};
 use slint::{ComponentHandle, Rgba8Pixel, SharedPixelBuffer};
 use vroom_config::{GuestOs, VmConfig};
-use vroom_display::{recv_fd, Command, Decoder, GuestCursor, SharedFb, ToViewer, ToVmm, MAX_HEIGHT, MAX_WIDTH, POINTER_MAX};
+use vroom_display::{recv_fd, Command, Decoder, GuestCursor, SharedFb, ToViewer, ToVmm, MAX_HEADS, MAX_HEIGHT, MAX_WIDTH, POINTER_MAX};
 
 use crate::msg::{self, Msg};
-use crate::{ConsoleWindow, VmState};
+use crate::{ConsoleWindow, MonitorWindow, VmState};
 
 const CLIP_POLL: Duration = Duration::from_millis(500);
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(300);
@@ -67,7 +67,23 @@ struct Shared {
     cursor: Option<GuestCursor>,
     /// Answers about files dragged over the window, in order.
     drag: VecDeque<ToViewer>,
+    /// The other monitors (index: monitor; 0 unused, it's the above).
+    heads: [HeadIn; MAX_HEADS],
     posted: bool,
+}
+
+/// What came in for another monitor since the UI last looked.
+#[derive(Debug, Default, Clone, Copy)]
+struct HeadIn {
+    mode: (u32, u32),
+    frame: bool,
+    full: bool,
+    damage: Option<[u32; 4]>,
+}
+
+/// Union of two x0, y0, x1, y1 rects.
+fn grow(d: Option<[u32; 4]>, r: [u32; 4]) -> Option<[u32; 4]> {
+    Some(d.map_or(r, |d| [d[0].min(r[0]), d[1].min(r[1]), d[2].max(r[2]), d[3].max(r[3])]))
 }
 
 impl Shared {
@@ -85,8 +101,22 @@ impl Shared {
             ToViewer::Damage { x, y, w, h } => {
                 // Clipped to the mode when used.
                 let r = [x, y, x.saturating_add(w), y.saturating_add(h)];
-                self.damage = Some(self.damage.map_or(r, |d| [d[0].min(r[0]), d[1].min(r[1]), d[2].max(r[2]), d[3].max(r[3])]));
+                self.damage = grow(self.damage, r);
                 self.frame = true;
+            }
+            ToViewer::HeadMode { head, width, height } => {
+                if width != 0 && !SharedFb::mode_ok(width, height) {
+                    return false;
+                }
+                let Some(h) = self.heads.get_mut(head as usize) else { return false };
+                h.mode = (width, height);
+                h.frame = true;
+                h.full = true;
+            }
+            ToViewer::HeadDamage { head, x, y, w, h } => {
+                let Some(hd) = self.heads.get_mut(head as usize) else { return false };
+                hd.damage = grow(hd.damage, [x, y, x.saturating_add(w), y.saturating_add(h)]);
+                hd.frame = true;
             }
             ToViewer::ClipboardSet(t) => self.clipboard = Some(t),
             ToViewer::Status(mut t) => {
@@ -201,7 +231,14 @@ pub struct Console {
     /// The host pointer last set: what it is, and the one made from the
     /// guest's picture (picture, size).
     pointer: Option<Pointer>,
-    host_cursor: Option<(u64, u32, CustomCursor)>,
+    /// Host pointers made from the guest's picture: (picture, size, it).
+    /// A few: windows on screens of different scales want other sizes.
+    host_cursors: Vec<(u64, u32, CustomCursor)>,
+    /// The guest's monitors (`[display] monitors`).
+    monitors: usize,
+    /// Windows of the other monitors (index: monitor - 1), made when the
+    /// guest first uses one.
+    extra: Vec<Option<Extra>>,
     /// The VM's CPUs, and its CPU time when last looked at.
     cpus: u32,
     cpu_seen: Option<(Instant, Duration)>,
@@ -209,6 +246,18 @@ pub struct Console {
     drag: Option<Drag>,
     drag_seq: u32,
     drag_timer: slint::Timer,
+}
+
+/// Another monitor's window.
+struct Extra {
+    win: MonitorWindow,
+    img: Option<SharedPixelBuffer<Rgba8Pixel>>,
+    mode: (u32, u32),
+    pending_resize: Option<Instant>,
+    over: bool,
+    pointer: Option<Pointer>,
+    /// Closed by the user: the monitor is off until "Show all displays".
+    closed: bool,
 }
 
 /// Files from the Mac over the window (see dnd.rs).
@@ -500,6 +549,8 @@ fn open(key: String, cfg: &VmConfig, ours: UnixStream, child: Option<Child>, pid
     win.set_state(state);
     win.set_has_display(cfg.display.gpu != vroom_config::Gpu::None);
     win.set_windows_guest(os == GuestOs::Windows);
+    let monitors = if cfg.display.gpu == vroom_config::Gpu::None { 1 } else { (cfg.display.monitors as usize).clamp(1, MAX_HEADS) };
+    win.set_monitors(monitors > 1);
     if cfg.display.gpu == vroom_config::Gpu::Virtio3d {
         win.set_gpu_text(if os == GuestOs::Windows { "Direct3D 11" } else { "3D" }.into());
     }
@@ -554,7 +605,9 @@ fn open(key: String, cfg: &VmConfig, ours: UnixStream, child: Option<Child>, pid
         draws_pointer: os == GuestOs::Windows,
         over_screen: false,
         pointer: None,
-        host_cursor: None,
+        host_cursors: Vec::new(),
+        monitors,
+        extra: (1..monitors).map(|_| None).collect(),
         cpus: cfg.cpus.max(1),
         cpu_seen: None,
         drag: None,
@@ -582,18 +635,7 @@ fn wire(win: &ConsoleWindow, key: &str, io: &Rc<RefCell<Io>>) {
     }
     {
         let io = io.clone();
-        win.on_wheel(move |dx, dy| {
-            let mut io = io.borrow_mut();
-            io.wheel.0 += dx;
-            io.wheel.1 += dy;
-            let sx = (io.wheel.0 / WHEEL_STEP).trunc();
-            let sy = (io.wheel.1 / WHEEL_STEP).trunc();
-            if sx != 0.0 || sy != 0.0 {
-                io.wheel.0 -= sx * WHEEL_STEP;
-                io.wheel.1 -= sy * WHEEL_STEP;
-                io.send(ToVmm::Wheel { dx: sx as i16, dy: sy as i16 });
-            }
-        });
+        win.on_wheel(move |dx, dy| wheel(&io, dx, dy));
     }
     {
         let k = key.to_string();
@@ -627,12 +669,74 @@ fn wire(win: &ConsoleWindow, key: &str, io: &Rc<RefCell<Io>>) {
         });
     }
     let (k, io) = (key.to_string(), io.clone());
-    win.window().on_winit_window_event(move |_w, ev| winit_event(&k, &io, ev));
+    win.window().on_winit_window_event(move |_w, ev| winit_event(&k, 0, &io, ev));
+}
+
+/// Mouse wheel: whole steps to the guest, the rest kept for later.
+fn wheel(io: &Rc<RefCell<Io>>, dx: f32, dy: f32) {
+    let mut io = io.borrow_mut();
+    io.wheel.0 += dx;
+    io.wheel.1 += dy;
+    let sx = (io.wheel.0 / WHEEL_STEP).trunc();
+    let sy = (io.wheel.1 / WHEEL_STEP).trunc();
+    if sx != 0.0 || sy != 0.0 {
+        io.wheel.0 -= sx * WHEEL_STEP;
+        io.wheel.1 -= sy * WHEEL_STEP;
+        io.send(ToVmm::Wheel { dx: sx as i16, dy: sy as i16 });
+    }
+}
+
+/// Another monitor's window: its pointer goes to that monitor.
+fn wire_extra(win: &MonitorWindow, key: &str, head: usize, io: &Rc<RefCell<Io>>) {
+    {
+        let io = io.clone();
+        win.on_mouse_move(move |fx, fy| {
+            let x = (fx.clamp(0.0, 1.0) * POINTER_MAX as f32) as u16;
+            let y = (fy.clamp(0.0, 1.0) * POINTER_MAX as f32) as u16;
+            io.borrow_mut().send(ToVmm::HeadPointer { head: head as u32, x, y });
+        });
+    }
+    {
+        let io = io.clone();
+        win.on_button(move |code, down| io.borrow_mut().button(code as u16, down));
+    }
+    {
+        let io = io.clone();
+        win.on_wheel(move |dx, dy| wheel(&io, dx, dy));
+    }
+    {
+        let k = key.to_string();
+        win.on_pointer_over(move |over| {
+            let k = k.clone();
+            slint::Timer::single_shot(Duration::ZERO, move || {
+                with(&k, |c| {
+                    if let Some(e) = c.extra.get_mut(head - 1).and_then(Option::as_mut) {
+                        e.over = over;
+                        e.pointer = None;
+                    }
+                    c.apply_pointer();
+                });
+            });
+        });
+    }
+    {
+        let k = key.to_string();
+        win.window().on_close_requested(move || {
+            let k = k.clone();
+            slint::Timer::single_shot(Duration::ZERO, move || {
+                with(&k, |c| c.close_extra(head));
+            });
+            slint::CloseRequestResponse::KeepWindowShown
+        });
+    }
+    let (k, io) = (key.to_string(), io.clone());
+    win.window().on_winit_window_event(move |_w, ev| winit_event(&k, head, &io, ev));
 }
 
 /// Keys as physical key codes (what the guest's keyboard sends), focus,
-/// resizes. Text input never goes through here.
-fn winit_event(key: &str, io: &Rc<RefCell<Io>>, ev: &WindowEvent) -> EventResult {
+/// resizes. Text input never goes through here. `head`: which monitor's
+/// window (files can only be dropped on the first's).
+fn winit_event(key: &str, head: usize, io: &Rc<RefCell<Io>>, ev: &WindowEvent) -> EventResult {
     match ev {
         WindowEvent::ModifiersChanged(m) => {
             io.borrow_mut().mods = m.state();
@@ -674,6 +778,7 @@ fn winit_event(key: &str, io: &Rc<RefCell<Io>>, ev: &WindowEvent) -> EventResult
             }
             EventResult::PreventDefault
         }
+        WindowEvent::HoveredFile(_) | WindowEvent::HoveredFileCancelled | WindowEvent::DroppedFile(_) if head > 0 => EventResult::Propagate,
         // Files from the Mac: one event per file, all at once.
         WindowEvent::HoveredFile(p) => {
             let (key, p) = (key.to_string(), p.clone());
@@ -700,7 +805,17 @@ fn winit_event(key: &str, io: &Rc<RefCell<Io>>, ev: &WindowEvent) -> EventResult
         WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
             let key = key.to_string();
             slint::Timer::single_shot(Duration::ZERO, move || {
-                with(&key, |c| c.pending_resize = Some(Instant::now() + RESIZE_DEBOUNCE));
+                with(&key, |c| {
+                    let at = Some(Instant::now() + RESIZE_DEBOUNCE);
+                    match head {
+                        0 => c.pending_resize = at,
+                        h => {
+                            if let Some(e) = c.extra.get_mut(h - 1).and_then(Option::as_mut) {
+                                e.pending_resize = at;
+                            }
+                        }
+                    }
+                });
             });
             EventResult::Propagate
         }
@@ -787,6 +902,9 @@ fn closed(key: &str) {
     let Some(mut c) = CONSOLES.with(|m| m.borrow_mut().remove(key)) else { return };
     c.save_thumb(None);
     let _ = c.win.hide();
+    for e in c.extra.iter().flatten() {
+        let _ = e.win.hide();
+    }
     let Some(mut child) = c.child.take() else {
         // Reattached: not ours to reap. Never got going: it hangs.
         let error = (!c.ever_ran).then(|| format!("{} isn't answering. Force power off (power menu) stops it.", c.name));
@@ -906,11 +1024,13 @@ impl Console {
                     io.send(ToVmm::Key { code, down: false });
                 }
             }
+            "displays" => self.show_extras(),
             "fullscreen" => {
                 let w = self.win.window();
                 let fs = !w.is_fullscreen();
                 w.set_fullscreen(fs);
                 self.win.set_fullscreen(fs);
+                self.extras_fullscreen(fs);
                 // The bar comes and goes: the guest gets another size.
                 self.pending_resize = Some(Instant::now() + RESIZE_DEBOUNCE);
                 if fs {
@@ -930,12 +1050,21 @@ impl Console {
 
     /// What the reader thread collected since the last wakeup.
     fn inbox(&mut self) {
-        let (frame, full, damage, status, clip, mic, cursor, drag, camera) = {
+        let (frame, full, damage, status, clip, mic, cursor, drag, camera, heads) = {
             let mut s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
             s.posted = false;
+            let heads = s.heads;
+            for h in s.heads.iter_mut() {
+                (h.frame, h.full, h.damage) = (false, false, None);
+            }
             let f = (std::mem::take(&mut s.frame), std::mem::take(&mut s.full), s.damage.take());
-            (f.0, f.1, f.2, std::mem::take(&mut s.status), s.clipboard.take(), s.mic.take(), s.cursor.take(), std::mem::take(&mut s.drag), s.camera.take())
+            (f.0, f.1, f.2, std::mem::take(&mut s.status), s.clipboard.take(), s.mic.take(), s.cursor.take(), std::mem::take(&mut s.drag), s.camera.take(), heads)
         };
+        for (h, hd) in heads.iter().enumerate().skip(1).take(self.monitors.saturating_sub(1)) {
+            if hd.frame {
+                self.head_frame(h, hd.mode, hd.full, hd.damage);
+            }
+        }
         if let Some(on) = camera {
             self.camera(on);
         }
@@ -1046,6 +1175,16 @@ impl Console {
             let bar = (self.win.get_bar_height() * sf).round() as u32;
             let (width, height, scale) = guest_size(sz.width, sz.height.saturating_sub(bar), sf, self.hidpi);
             self.io.borrow_mut().send(ToVmm::Resize { width, height, scale });
+        }
+        for (i, e) in self.extra.iter_mut().enumerate() {
+            let Some(e) = e.as_mut().filter(|e| !e.closed && e.pending_resize.is_some_and(|at| now >= at)) else { continue };
+            e.pending_resize = None;
+            let (sz, sf) = (e.win.window().size(), e.win.window().scale_factor());
+            let (width, height, scale) = guest_size(sz.width, sz.height, sf, self.hidpi);
+            self.io.borrow_mut().send(ToVmm::HeadResize { head: i as u32 + 1, width, height, scale });
+        }
+        for e in self.extra.iter().flatten() {
+            e.win.set_paused(self.state == VmState::Paused);
         }
         self.cpu_meter(now);
         // State, size or the screen's place changed: the pointer may too.
@@ -1297,25 +1436,54 @@ impl Console {
     /// draws its own into the frame, else the usual arrow. Off the screen,
     /// Slint picks the pointer. Does nothing if that's already so.
     fn apply_pointer(&mut self) {
+        let live = self.state == VmState::Running && self.win.get_suspend_error().is_empty();
         if !self.over_screen {
             self.pointer = None;
-            return;
+        } else {
+            let win = self.win.clone_strong();
+            let want = self.want_pointer(live && self.mode != (0, 0), self.mode.0, win.get_screen_width(), win.window().scale_factor());
+            if self.pointer != Some(want) {
+                log::debug!("{}: pointer over the guest screen: {want:?}", self.name);
+                self.pointer = self.set_pointer(win.window(), want);
+            }
         }
-        let live = self.state == VmState::Running && self.mode != (0, 0) && self.win.get_suspend_error().is_empty();
-        let sf = self.win.window().scale_factor();
-        let want = match &self.cursor {
+        for i in 0..self.extra.len() {
+            let Some(e) = &self.extra[i] else { continue };
+            let want = if e.over {
+                let w = e.win.clone_strong();
+                Some((w.clone_strong(), self.want_pointer(live && e.mode != (0, 0), e.mode.0, w.get_screen_width(), w.window().scale_factor())))
+            } else {
+                None
+            };
+            let got = match want {
+                Some((w, want)) if e.pointer != Some(want) => self.set_pointer(w.window(), want),
+                Some(_) => e.pointer,
+                None => None,
+            };
+            if let Some(e) = self.extra[i].as_mut() {
+                e.pointer = got;
+            }
+        }
+    }
+
+    /// The pointer a window wants over the guest screen: the guest's own
+    /// picture when it gives one (VMware does the same), none when it hid
+    /// it or draws its own into the frame, else the usual arrow.
+    fn want_pointer(&self, live: bool, mode_w: u32, screen_w: f32, sf: f32) -> Pointer {
+        match &self.cursor {
             _ if !live => Pointer::Arrow,
-            GuestCursor::Image { w, .. } => Pointer::Guest(self.cursor_gen, cursor_px(*w, self.mode.0, self.win.get_screen_width(), sf)),
+            GuestCursor::Image { w, .. } => Pointer::Guest(self.cursor_gen, cursor_px(*w, mode_w, screen_w, sf)),
             GuestCursor::Hidden => Pointer::Hidden,
             GuestCursor::Unset if self.draws_pointer => Pointer::Hidden,
             GuestCursor::Unset => Pointer::Arrow,
-        };
-        if self.pointer == Some(want) {
-            return;
         }
-        log::debug!("{}: pointer over the guest screen: {want:?}", self.name);
-        let set =|c: Option<&CustomCursor>, visible: bool| {
-            self.win.window().with_winit_window(|w| {
+    }
+
+    /// Set `want` on window `w`: what it now has (a guest picture being
+    /// made counts: it is set when ready).
+    fn set_pointer(&mut self, w: &slint::Window, want: Pointer) -> Option<Pointer> {
+        let set = |c: Option<&CustomCursor>, visible: bool| {
+            w.with_winit_window(|w| {
                 match c {
                     Some(c) => w.set_cursor(c.clone()),
                     None => w.set_cursor(CursorIcon::Default),
@@ -1326,28 +1494,149 @@ impl Console {
         match want {
             Pointer::Arrow => set(None, true),
             Pointer::Hidden => set(None, false),
-            Pointer::Guest(id, px) => match &self.host_cursor {
-                Some((i, p, c)) if (*i, *p) == (id, px) => set(Some(c), true),
-                _ => {
+            Pointer::Guest(id, px) => match self.host_cursors.iter().find(|c| (c.0, c.1) == (id, px)) {
+                Some((_, _, c)) => set(Some(c), true),
+                None => {
                     // Made on the event loop (winit wants it); applied then.
-                    let GuestCursor::Image { w, h, hot_x, hot_y, rgba } = &self.cursor else { return };
+                    let GuestCursor::Image { w, h, hot_x, hot_y, rgba } = &self.cursor else { return None };
                     let (tw, th, px_rgba, (hx, hy)) = scale_cursor(*w, *h, rgba, (*hot_x, *hot_y), px);
-                    let Ok(src) = CustomCursor::from_rgba(px_rgba, tw as u16, th as u16, hx as u16, hy as u16) else { return };
+                    let src = CustomCursor::from_rgba(px_rgba, tw as u16, th as u16, hx as u16, hy as u16).ok()?;
                     let k = self.key.clone();
-                    self.pointer = Some(want);
                     let _ = slint::winit_030::invoke_from_active_event_loop(move |el| {
                         let c = el.create_custom_cursor(src);
                         with(&k, |con| {
-                            con.host_cursor = Some((id, px, c));
+                            con.host_cursors.retain(|c| c.0 == id);
+                            con.host_cursors.truncate(3);
+                            con.host_cursors.push((id, px, c));
                             con.pointer = None;
+                            for e in con.extra.iter_mut().flatten() {
+                                e.pointer = None;
+                            }
                             con.apply_pointer();
                         });
                     });
-                    return;
                 }
             },
         }
-        self.pointer = Some(want);
+        Some(want)
+    }
+
+    /// Monitor `head` (1..) changed: its window shows it, made the first
+    /// time the guest uses that monitor.
+    fn head_frame(&mut self, head: usize, mode: (u32, u32), full: bool, damage: Option<[u32; 4]>) {
+        if self.fb.is_none() || head == 0 || head > self.extra.len() {
+            return;
+        }
+        if self.extra[head - 1].is_none() {
+            if mode == (0, 0) {
+                return;
+            }
+            match self.open_extra(head, mode) {
+                Ok(e) => self.extra[head - 1] = Some(e),
+                Err(e) => {
+                    log::warn!("{}: display {}: {e}", self.name, head + 1);
+                    return;
+                }
+            }
+        }
+        let Some(fb) = &self.fb else { return };
+        let Some(e) = self.extra[head - 1].as_mut() else { return };
+        if mode.0 == 0 || mode.1 == 0 {
+            e.mode = (0, 0);
+            e.img = None;
+            e.win.set_mode_w(0);
+            e.win.set_mode_h(0);
+            e.win.set_frame(slint::Image::default());
+            return;
+        }
+        let win = e.win.clone_strong();
+        if let Some(img) = paint(fb, head, mode, full || e.mode != mode, damage, &mut e.img, &|| win.set_frame(slint::Image::default())) {
+            e.win.set_frame(img);
+        }
+        if e.mode != mode {
+            e.mode = mode;
+            e.win.set_mode_w(mode.0 as i32);
+            e.win.set_mode_h(mode.1 as i32);
+        }
+    }
+
+    fn open_extra(&mut self, head: usize, mode: (u32, u32)) -> Result<Extra, slint::PlatformError> {
+        let win = MonitorWindow::new()?;
+        win.set_vm_name(self.name.clone().into());
+        win.set_number(head as i32 + 1);
+        wire_extra(&win, &self.key, head, &self.io);
+        // About the guest's size: in points on a Retina screen with HiDPI.
+        let sf = self.win.window().scale_factor().max(1.0);
+        let k = if self.hidpi { sf } else { 1.0 };
+        win.window().set_size(slint::LogicalSize::new(mode.0 as f32 / k, mode.1 as f32 / k));
+        win.show()?;
+        let mut e = Extra { win, img: None, mode: (0, 0), pending_resize: Some(Instant::now() + RESIZE_DEBOUNCE), over: false, pointer: None, closed: false };
+        if self.win.window().is_fullscreen() {
+            self.fullscreen_on_other_screen(&mut e, head);
+        }
+        Ok(e)
+    }
+
+    /// Its window closed: the guest loses that monitor.
+    fn close_extra(&mut self, head: usize) {
+        let Some(e) = self.extra.get_mut(head.wrapping_sub(1)).and_then(Option::as_mut) else { return };
+        e.closed = true;
+        e.pending_resize = None;
+        let _ = e.win.hide();
+        self.io.borrow_mut().send(ToVmm::HeadResize { head: head as u32, width: 0, height: 0, scale: 0 });
+        self.toast(&format!("Display {} is off. \"Show all displays\" on the bar brings it back.", head + 1));
+    }
+
+    /// "Show all displays": closed monitor windows come back (the guest
+    /// gets those monitors again), all come to the front.
+    fn show_extras(&mut self) {
+        let mut off = Vec::new();
+        for (i, e) in self.extra.iter_mut().enumerate() {
+            match e {
+                Some(e) => {
+                    if std::mem::replace(&mut e.closed, false) {
+                        let _ = e.win.show();
+                        e.pending_resize = Some(Instant::now());
+                    }
+                    e.win.window().with_winit_window(|w| w.focus_window());
+                }
+                // Never used: plug it in at the main window's size.
+                None => off.push(i + 1),
+            }
+        }
+        let (w, h) = self.mode;
+        for head in off.into_iter().filter(|_| w > 0) {
+            self.io.borrow_mut().send(ToVmm::HeadResize { head: head as u32, width: w, height: h, scale: 0 });
+        }
+    }
+
+    /// The main window went full screen (or left it): the other monitors'
+    /// windows go full screen on the Mac's other screens ("use all
+    /// displays"), one each while there are screens.
+    fn extras_fullscreen(&mut self, fs: bool) {
+        for i in 0..self.extra.len() {
+            let Some(mut e) = self.extra[i].take() else { continue };
+            if fs && !e.closed {
+                self.fullscreen_on_other_screen(&mut e, i + 1);
+            } else if !fs && e.win.window().is_fullscreen() {
+                e.win.window().set_fullscreen(false);
+                e.pending_resize = Some(Instant::now() + RESIZE_DEBOUNCE);
+            }
+            self.extra[i] = Some(e);
+        }
+    }
+
+    fn fullscreen_on_other_screen(&self, e: &mut Extra, head: usize) {
+        // The Mac's screens other than the main window's, in order.
+        let screens = self.win.window().with_winit_window(|w| {
+            let here = w.current_monitor();
+            w.available_monitors().filter(|m| Some(m) != here.as_ref()).collect::<Vec<_>>()
+        });
+        let Some(target) = screens.and_then(|s| s.into_iter().nth(head - 1)) else { return };
+        let pos = target.position();
+        e.win.window().with_winit_window(|w| w.set_outer_position(pos));
+        e.win.window().set_fullscreen(true);
+        e.pending_resize = Some(Instant::now() + RESIZE_DEBOUNCE);
     }
 
     fn frame(&mut self, full: bool, damage: Option<[u32; 4]>) {
@@ -1360,24 +1649,10 @@ impl Console {
             self.win.set_mode_h(0);
             return;
         }
-        let fresh = full || self.mode != mode || self.img.as_ref().is_none_or(|b| (b.width(), b.height()) != mode);
-        let [x0, y0, x1, y1] = match damage {
-            Some(d) if !fresh => [d[0].min(w), d[1].min(h), d[2].min(w), d[3].min(h)],
-            _ => [0, 0, w, h],
-        };
-        if x1 > x0 && y1 > y0 {
-            // Let go of the picture on screen, so ours is the only
-            // reference and only the changed rows get written.
-            let mut buf = match self.img.take() {
-                Some(b) if !fresh => {
-                    self.win.set_frame(slint::Image::default());
-                    b
-                }
-                _ => SharedPixelBuffer::new(w, h),
-            };
-            to_rgba(fb, w, [x0, y0, x1, y1], buf.make_mut_bytes());
-            self.img = Some(buf.clone());
-            self.win.set_frame(slint::Image::from_rgba8(buf));
+        let fresh = full || self.mode != mode;
+        let win = self.win.clone_strong();
+        if let Some(img) = paint(fb, 0, mode, fresh, damage, &mut self.img, &|| win.set_frame(slint::Image::default())) {
+            self.win.set_frame(img);
         }
         if self.mode != mode {
             // Ask the guest to match the window on the first frame.
@@ -1437,13 +1712,46 @@ impl Console {
     }
 }
 
+/// Bring `img` up to date with monitor `head` of `fb` at `mode`: all of
+/// it (`fresh`, or no picture yet) or the `damage` part. `release` lets go
+/// of the picture on screen first, so ours is the only reference and only
+/// the changed rows get written. The picture to show, if it changed.
+fn paint(
+    fb: &SharedFb,
+    head: usize,
+    (w, h): (u32, u32),
+    fresh: bool,
+    damage: Option<[u32; 4]>,
+    img: &mut Option<SharedPixelBuffer<Rgba8Pixel>>,
+    release: &dyn Fn(),
+) -> Option<slint::Image> {
+    let fresh = fresh || img.as_ref().is_none_or(|b| (b.width(), b.height()) != (w, h));
+    let [x0, y0, x1, y1] = match damage {
+        Some(d) if !fresh => [d[0].min(w), d[1].min(h), d[2].min(w), d[3].min(h)],
+        _ => [0, 0, w, h],
+    };
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    let mut buf = match img.take() {
+        Some(b) if !fresh => {
+            release();
+            b
+        }
+        _ => SharedPixelBuffer::new(w, h),
+    };
+    to_rgba(fb, head, w, [x0, y0, x1, y1], buf.make_mut_bytes());
+    *img = Some(buf.clone());
+    Some(slint::Image::from_rgba8(buf))
+}
+
 /// Copy the `x0..x1` x `y0..y1` part of the guest screen (`fb_w` wide)
 /// into the same place of `out` (RGBA, as wide), converting from XRGB.
 /// The changed part only: at 5K a whole frame is 59 MB.
-fn to_rgba(fb: &SharedFb, fb_w: u32, [x0, y0, x1, y1]: [u32; 4], out: &mut [u8]) {
+fn to_rgba(fb: &SharedFb, head: usize, fb_w: u32, [x0, y0, x1, y1]: [u32; 4], out: &mut [u8]) {
     let stride = fb_w as usize * 4;
     let Some(dst) = out.get_mut(y0 as usize * stride + x0 as usize * 4..) else { return };
-    fb.read_rect(fb_w, x0, y0, x1 - x0, y1 - y0, dst, stride);
+    fb.read_rect_on(head, fb_w, x0, y0, x1 - x0, y1 - y0, dst, stride);
     let row = (x1 - x0) as usize * 4;
     for r in 0..(y1 - y0) as usize {
         if let Some(px) = dst.get_mut(r * stride..r * stride + row) {
@@ -1574,13 +1882,13 @@ mod tests {
         // 4x2 screen, every pixel XRGB 0x00112233.
         fb.write_rect(4, 0, 0, 4, 2, &[0x33, 0x22, 0x11, 0x00].repeat(8), 16);
         let mut out = vec![0u8; 4 * 2 * 4];
-        to_rgba(&fb, 4, [1, 1, 3, 2], &mut out);
+        to_rgba(&fb, 0, 4, [1, 1, 3, 2], &mut out);
         let px = |i: usize| &out[i * 4..i * 4 + 4];
         assert_eq!(px(5), &[0x11, 0x22, 0x33, 0xff]);
         assert_eq!(px(6), &[0x11, 0x22, 0x33, 0xff]);
         assert!([0, 1, 2, 3, 4, 7].iter().all(|&i| px(i) == [0; 4]), "outside the rect: untouched");
         // A rect past the buffer: nothing written, no panic.
-        to_rgba(&fb, 4, [0, 5, 4, 9], &mut out);
+        to_rgba(&fb, 0, 4, [0, 5, 4, 9], &mut out);
     }
 
     #[test]

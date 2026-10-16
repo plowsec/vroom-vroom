@@ -15,6 +15,7 @@ mod dnd_win;
 #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 mod drop;
 mod find;
+mod layout;
 mod port;
 // Used by the service mode (Windows, Linux); built everywhere so it's
 // tested everywhere.
@@ -240,6 +241,9 @@ fn session(args: &Args) -> std::io::Result<()> {
 
 fn hello() -> Message {
     let mut features = features::CLIPBOARD_TEXT | features::TIME_SYNC | features::SHUTDOWN | features::SCALE | features::FILE_DROP;
+    if cfg!(any(windows, target_os = "linux")) {
+        features |= features::MONITORS;
+    }
     if cfg!(windows) {
         features |= features::GPU3D;
     }
@@ -274,6 +278,14 @@ fn handle(m: Message, system: bool, w: &mut port::Writer, clip: &mut dyn clip::C
             scale::note_resolution(width, height);
             if let Err(e) = sys::set_resolution(width, height) {
                 log::debug!("resolution {width}x{height}: {e}");
+            }
+        }
+        Message::SetLayout { monitors } => {
+            if let Some(Some(m)) = monitors.first() {
+                scale::note_resolution(m.width, m.height);
+            }
+            if let Err(e) = layout::apply(&monitors) {
+                log::info!("monitors: {e}");
             }
         }
         Message::SetScale { percent } => scale::set(percent),

@@ -84,6 +84,11 @@ pub fn single_display() {
     if unsafe { GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut paths, &mut modes) } != 0 || paths <= 1 {
         return;
     }
+    // Several monitors of ours: the host's layout (SetLayout) says which
+    // are on, and takes the basic display off.
+    if crate::layout::our_displays() > 1 {
+        return;
+    }
     // SAFETY: no arrays: apply a stock topology.
     let r = unsafe { SetDisplayConfig(0, std::ptr::null(), 0, std::ptr::null(), SDC_APPLY | SDC_TOPOLOGY_INTERNAL) };
     log::info!("{paths} active displays; internal-only topology: {r}");
@@ -151,9 +156,14 @@ pub fn gpu3d(on: bool) -> Option<bool> {
                 log::warn!("3D display device: {}", std::io::Error::last_os_error());
             }
         }
-        result = Some(is_on());
-        log::info!("3D display device {}", if result == Some(true) { "on" } else { "off" });
-        break;
+        // Several (a GPU per monitor): it's done when every one is.
+        let now = is_on();
+        log::info!("3D display device {i} {}", if now { "on" } else { "off" });
+        result = Some(match result {
+            None => now,
+            Some(r) if on => r && now,
+            Some(r) => r || now,
+        });
     }
     // SAFETY: the list from above, not used after this.
     unsafe { SetupDiDestroyDeviceInfoList(set) };

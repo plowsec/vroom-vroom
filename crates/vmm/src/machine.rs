@@ -160,10 +160,11 @@ pub(crate) struct Machine {
     pub devices: Vec<StatefulDevice>,
     pub uart: Arc<Mutex<Pl011>>,
     pub agent: Agent,
-    /// The virtio-gpu's control handle (window size, Direct3D state).
-    pub gpu: Option<GpuControl>,
+    /// Each virtio-gpu's control handle (window size, Direct3D state).
+    pub gpus: Vec<GpuControl>,
     pub viewer: Option<ViewerTx>,
-    pub screen: Option<Arc<FbSink>>,
+    /// Every monitor, the first (with the firmware screen) first.
+    pub screens: Vec<Arc<FbSink>>,
     pub boot: BootImage,
 }
 
@@ -281,8 +282,16 @@ pub fn gpu_in_process() -> bool {
 
 /// Venus, Direct3D 11 and GL (if asked) through virglrenderer, in the GPU
 /// process (or in here, see [`gpu_in_process`]), or a clear error.
-fn three_d(vm: &Arc<dyn Vm>, config: &VmConfig, mem: &GuestMemory, state_dir: &std::path::Path) -> Result<ThreeD> {
-    let r: Box<dyn Renderer3d> = if gpu_in_process() { in_process(vm, config)? } else { gpu_process(vm, config, mem, state_dir)? };
+/// `n`: which GPU (Windows gets one per monitor, each with a GPU process).
+fn three_d(vm: &Arc<dyn Vm>, config: &VmConfig, mem: &GuestMemory, state_dir: &std::path::Path, n: usize) -> Result<ThreeD> {
+    let r: Box<dyn Renderer3d> = if gpu_in_process() {
+        if n > 0 {
+            return Err(Error::Setup("several Windows monitors with 3D need the GPU process (not VROOM_GPU_IN_PROCESS)".into()));
+        }
+        in_process(vm, config)?
+    } else {
+        gpu_process(vm, config, mem, state_dir, n)?
+    };
     if config.display.opengl && !r.capsets().iter().any(|c| c.0 == 2) {
         log::warn!("gpu: no OpenGL for the guest (opengl_host = \"angle\" needs ANGLE next to virglrenderer: scripts/build-angle.sh); Vulkan only");
     }
@@ -314,9 +323,10 @@ fn in_process(vm: &Arc<dyn Vm>, config: &VmConfig) -> Result<Box<dyn Renderer3d>
 /// guest RAM, its shader cache; no files, network or hypervisor). The
 /// VMM then never loads virglrenderer, GL, MoltenVK or DXMT.
 #[cfg(unix)]
-fn gpu_process(vm: &Arc<dyn Vm>, config: &VmConfig, mem: &GuestMemory, state_dir: &std::path::Path) -> Result<Box<dyn Renderer3d>> {
+fn gpu_process(vm: &Arc<dyn Vm>, config: &VmConfig, mem: &GuestMemory, state_dir: &std::path::Path, n: usize) -> Result<Box<dyn Renderer3d>> {
     let exe = std::env::current_exe().map_err(|e| Error::Setup(format!("gpu process: {e}")))?;
-    let shaders = state_dir.join("shaders");
+    // A cache per GPU process: they'd write the same files at once.
+    let shaders = if n == 0 { state_dir.join("shaders") } else { state_dir.join(format!("shaders-{}", n + 1)) };
     std::fs::create_dir_all(&shaders).map_err(|e| Error::Setup(format!("{}: {e}", shaders.display())))?;
     let gl = config.display.opengl.then_some(match config.display.opengl_host {
         vroom_config::OpenglHost::Angle => "angle",
@@ -337,7 +347,7 @@ fn gpu_process(vm: &Arc<dyn Vm>, config: &VmConfig, mem: &GuestMemory, state_dir
 }
 
 #[cfg(not(unix))]
-fn gpu_process(vm: &Arc<dyn Vm>, config: &VmConfig, _mem: &GuestMemory, _state_dir: &std::path::Path) -> Result<Box<dyn Renderer3d>> {
+fn gpu_process(vm: &Arc<dyn Vm>, config: &VmConfig, _mem: &GuestMemory, _state_dir: &std::path::Path, _n: usize) -> Result<Box<dyn Renderer3d>> {
     in_process(vm, config)
 }
 
@@ -659,24 +669,41 @@ pub(crate) fn build(
 
     // Display. UEFI always gets ramfb (firmware / installer screen);
     // virtio-gpu takes over once a guest driver drives it.
+    // Several monitors: Linux gets one GPU with a scanout each; Windows
+    // a GPU each (its drivers drive one scanout), added last so the other
+    // devices keep their PCI slots.
     let uefi = matches!(config.boot, Boot::Uefi { .. });
-    let screen = if config.display.gpu != Gpu::None || uefi {
-        Some(match &ui {
-            Some(ds) => ds.sink()?,
-            None => FbSink::headless()?,
-        })
-    } else {
-        None
-    };
-    let mut gpu_ctl = None;
-    if let (Some(fb), true) = (&screen, config.display.gpu != Gpu::None) {
-        let sink: Arc<dyn DisplaySink> = fb.clone();
-        let (mut gpu, ctl) = GpuDev::new(config.display.width, config.display.height, sink);
-        if config.display.gpu == Gpu::Virtio3d {
-            gpu = gpu.with_3d(three_d(&vm, config, &mem, &env.state_dir)?);
+    let monitors = if config.display.gpu == Gpu::None { 1 } else { config.display.monitors.clamp(1, vroom_config::MAX_MONITORS) as usize };
+    let screens: Vec<Arc<FbSink>> = if config.display.gpu != Gpu::None || uefi {
+        match &ui {
+            Some(ds) => ds.sinks(monitors)?,
+            None => FbSink::headless(monitors)?,
         }
-        board.add_virtio(Box::new(gpu))?;
-        gpu_ctl = Some(ctl);
+    } else {
+        Vec::new()
+    };
+    let screen = screens.first().cloned();
+    let mut gpus = Vec::new();
+    let mut heads: Vec<(GpuControl, usize)> = Vec::new();
+    let mut later_gpus = Vec::new();
+    if config.display.gpu != Gpu::None {
+        let size = (config.display.width, config.display.height);
+        let sinks: Vec<Arc<dyn DisplaySink>> = screens.iter().map(|s| s.clone() as Arc<dyn DisplaySink>).collect();
+        let per_gpu = if config.guest_os() == GuestOs::Windows { 1 } else { sinks.len() };
+        for (n, group) in sinks.chunks(per_gpu).enumerate() {
+            let (gpu, ctl) = GpuDev::with_heads(&vec![size; group.len()], group.to_vec());
+            let mut gpu = gpu.with_index(n as u16);
+            if config.display.gpu == Gpu::Virtio3d {
+                gpu = gpu.with_3d(three_d(&vm, config, &mem, &env.state_dir, n)?);
+            }
+            heads.extend((0..group.len()).map(|sid| (ctl.clone(), sid)));
+            gpus.push(ctl);
+            if n == 0 {
+                board.add_virtio(Box::new(gpu))?;
+            } else {
+                later_gpus.push(gpu);
+            }
+        }
     }
     // Input: virtio-input for direct-boot Linux, USB HID otherwise (UEFI,
     // Windows setup: works with zero drivers). Never both: no doubled keys.
@@ -743,7 +770,7 @@ pub(crate) fn build(
     };
     let max_pixels = if config.guest_os() == GuestOs::Windows { agent::WINDOWS_MAX_PIXELS } else { 0 };
     let viewer = ui.as_ref().map(|d| d.tx());
-    let screen_ctl = agent::Screen { gpu: gpu_ctl.clone(), max_pixels, gpu3d: config.display.gpu == Gpu::Virtio3d, viewer: viewer.clone() };
+    let screen_ctl = agent::Screen { heads, max_pixels, gpu3d: config.display.gpu == Gpu::Virtio3d, viewer: viewer.clone() };
     let agent = agent::spawn(host_end, config.clipboard.clone(), clipboard, screen_ctl)?;
     if let Some(ds) = ui {
         if screen.is_none() {
@@ -766,15 +793,14 @@ pub(crate) fn build(
             }) as Box<dyn Fn(bool) + Send + Sync>
         });
         // A viewer can come back (the app crashed, then started again).
-        let listener = match (viewer_socket(&env.state_dir), &screen) {
-            (Ok(l), Some(fb)) => Some((l, fb.clone())),
-            (Err(e), _) => {
+        let listener = match viewer_socket(&env.state_dir) {
+            Ok(l) => Some(l),
+            Err(e) => {
                 log::warn!("display: no viewer socket in the state dir ({e}): a window lost can't be reopened");
                 None
             }
-            _ => None,
         };
-        ds.run(input, agent.clone(), events.clone(), window, listener)?;
+        ds.run(input, agent.clone(), events.clone(), window, listener, screens.clone())?;
     }
     for (i, n) in config.nets.iter().enumerate() {
         let mac = match &n.mac {
@@ -783,6 +809,9 @@ pub(crate) fn build(
         };
         let (backend, mac) = net_backend(&config.name, ident, i, n, mac)?;
         board.add_virtio(Box::new(Net::new(&format!("eth{i}"), mac, backend)))?;
+    }
+    for gpu in later_gpus {
+        board.add_virtio(Box::new(gpu))?;
     }
     let need_pci = board.finish_pci(vendor_ids(&ident.pci_bridge_id)?)?;
     let Board { mut reg, fdt: mut fdt_devices, .. } = board;
@@ -887,7 +916,7 @@ pub(crate) fn build(
     let _ = shared.peers.set(vcpus.iter().map(|v| v.peer.clone()).collect());
     vm.finalize()?;
 
-    Ok(Machine { vm, mem, shared, vcpus, devices: reg.stateful, uart, agent, gpu: gpu_ctl, viewer, screen, boot })
+    Ok(Machine { vm, mem, shared, vcpus, devices: reg.stateful, uart, agent, gpus, viewer, screens, boot })
 }
 
 #[cfg(test)]

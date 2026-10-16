@@ -694,6 +694,19 @@ pub struct Display {
     /// What runs the guest's OpenGL on the host (see [`OpenglHost`]).
     #[serde(default)]
     pub opengl_host: OpenglHost,
+    /// Guest monitors, 1 to [`MAX_MONITORS`]: the app shows each in a
+    /// window of its own. Linux guests get one GPU with that many
+    /// outputs; Windows guests one GPU per monitor (its drivers drive one
+    /// output each). UEFI's firmware screen stays on the first.
+    #[serde(default = "one")]
+    pub monitors: u32,
+}
+
+/// Most guest monitors a VM can have.
+pub const MAX_MONITORS: u32 = 4;
+
+fn one() -> u32 {
+    1
 }
 
 /// What runs guest OpenGL on the host.
@@ -718,7 +731,7 @@ fn default_h() -> u32 {
 
 impl Default for Display {
     fn default() -> Self {
-        Display { gpu: Gpu::None, width: default_w(), height: default_h(), hidpi: true, opengl: true, opengl_host: OpenglHost::Apple }
+        Display { gpu: Gpu::None, width: default_w(), height: default_h(), hidpi: true, opengl: true, opengl_host: OpenglHost::Apple, monitors: 1 }
     }
 }
 
@@ -1011,6 +1024,12 @@ impl VmConfig {
         let d = &self.display;
         if d.width < 320 || d.height < 200 || d.width > 7680 || d.height > 4320 {
             return bad("display size out of range".into());
+        }
+        if !(1..=MAX_MONITORS).contains(&d.monitors) {
+            return bad(format!("display.monitors: 1 to {MAX_MONITORS}"));
+        }
+        if d.monitors > 1 && d.gpu == Gpu::None {
+            return bad("display.monitors needs a GPU (display.gpu)".into());
         }
         if self.clipboard.max_bytes > 64 << 20 {
             return bad("clipboard.max_bytes too large (max 64 MiB)".into());

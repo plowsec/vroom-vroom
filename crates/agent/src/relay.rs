@@ -108,7 +108,7 @@ impl<S: System> Relay<S> {
             Message::Ping(v) => host.write_all(&Message::Pong(v).encode())?,
             Message::TimeSync { unix_secs, nanos } => self.sys.set_time(unix_secs, nanos),
             Message::Shutdown { reboot } => self.sys.shutdown(reboot),
-            Message::SetResolution { .. } => {
+            Message::SetResolution { .. } | Message::SetLayout { .. } => {
                 self.display.0 = Some(m.clone());
                 self.send_helper(&m);
             }

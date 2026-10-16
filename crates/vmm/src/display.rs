@@ -12,7 +12,7 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use vroom_display::{send_fd, Decoder, GuestCursor, SharedFb, ToViewer, ToVmm};
+use vroom_display::{send_fd, Decoder, GuestCursor, SharedFb, ToViewer, ToVmm, MAX_HEADS, POINTER_MAX};
 use vroom_devices::usb::hid::HidEvent;
 use vroom_devices::usb::xhci::Xhci;
 use vroom_virtio::devices::gpu::{Cursor, DisplaySink};
@@ -24,18 +24,19 @@ use crate::vcpu::VmEvent;
 /// Sends to the viewer without ever blocking the caller.
 ///
 /// A dedicated thread does the (blocking) socket writes. Damage is
-/// coalesced into one rect (the union of everything since the viewer was
-/// last told), so a viewer that stops reading costs us at most a handful
-/// of queued messages, never a stall, and one that keeps up only converts
-/// what changed.
+/// coalesced into one rect per monitor (the union of everything since the
+/// viewer was last told), so a viewer that stops reading costs us at most
+/// a handful of queued messages, never a stall, and one that keeps up
+/// only converts what changed.
 ///
 /// The viewer can go (the app crashed) and another come (the app again):
 /// what a newcomer needs to catch up is kept (`Sticky`).
 #[derive(Clone)]
 pub(crate) struct ViewerTx {
     q: std::sync::mpsc::Sender<ToViewer>,
-    /// x0, y0, x1, y1 not yet sent; Some means a marker is queued.
-    damage: Arc<Mutex<Option<[u32; 4]>>>,
+    /// Per monitor: x0, y0, x1, y1 not yet sent; Some means a marker is
+    /// queued.
+    damage: Arc<Mutex<[Option<[u32; 4]>; MAX_HEADS]>>,
     /// The viewer now, if any.
     sock: Arc<Mutex<Option<UnixStream>>>,
     sticky: Arc<Mutex<Sticky>>,
@@ -44,7 +45,8 @@ pub(crate) struct ViewerTx {
 /// The last word on each thing a viewer shows: a new one gets these first.
 #[derive(Default)]
 struct Sticky {
-    mode: Option<(u32, u32)>,
+    /// Each monitor's.
+    modes: [Option<(u32, u32)>; MAX_HEADS],
     cursor: Option<GuestCursor>,
     mic: Option<bool>,
     camera: Option<bool>,
@@ -63,15 +65,16 @@ impl std::fmt::Debug for ViewerTx {
 impl ViewerTx {
     fn spawn(sock: Option<UnixStream>) -> std::io::Result<Self> {
         let (q, rx) = std::sync::mpsc::channel::<ToViewer>();
-        let damage = Arc::new(Mutex::new(None::<[u32; 4]>));
+        let damage = Arc::new(Mutex::new([None::<[u32; 4]>; MAX_HEADS]));
         let pending = damage.clone();
         let sock = Arc::new(Mutex::new(sock));
         let out = sock.clone();
         std::thread::Builder::new().name("viewer-tx".into()).spawn(move || {
             while let Ok(mut m) = rx.recv() {
-                if matches!(m, ToViewer::Damage { .. }) {
-                    let Some([x0, y0, x1, y1]) = pending.lock().unwrap_or_else(|e| e.into_inner()).take() else { continue };
-                    m = ToViewer::Damage { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+                if let Some(head) = damage_head(&m) {
+                    let Some([x0, y0, x1, y1]) = pending.lock().unwrap_or_else(|e| e.into_inner())[head].take() else { continue };
+                    let (x, y, w, h) = (x0, y0, x1 - x0, y1 - y0);
+                    m = if head == 0 { ToViewer::Damage { x, y, w, h } } else { ToViewer::HeadDamage { head: head as u32, x, y, w, h } };
                 }
                 let mut s = out.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(v) = s.as_mut() {
@@ -100,9 +103,16 @@ impl ViewerTx {
         send_fd(&v, fb).map_err(|e| std::io::Error::other(e.to_string()))?;
         let st = self.sticky.lock().unwrap_or_else(|e| e.into_inner());
         let mut first = Vec::new();
-        if let Some((width, height)) = st.mode {
+        if let Some((width, height)) = st.modes[0] {
             first.push(ToViewer::Mode { width, height });
             first.push(ToViewer::Damage { x: 0, y: 0, w: width, h: height });
+        }
+        for (head, m) in st.modes.iter().enumerate().skip(1) {
+            if let Some((width, height)) = *m {
+                let head = head as u32;
+                first.push(ToViewer::HeadMode { head, width, height });
+                first.push(ToViewer::HeadDamage { head, x: 0, y: 0, w: width, h: height });
+            }
         }
         first.extend(st.cursor.clone().map(ToViewer::Cursor));
         first.extend(st.mic.map(ToViewer::Mic));
@@ -120,7 +130,12 @@ impl ViewerTx {
     fn remember(&self, m: &ToViewer) {
         let mut st = self.sticky.lock().unwrap_or_else(|e| e.into_inner());
         match m {
-            ToViewer::Mode { width, height } => st.mode = Some((*width, *height)),
+            ToViewer::Mode { width, height } => st.modes[0] = Some((*width, *height)),
+            ToViewer::HeadMode { head, width, height } => {
+                if let Some(m) = st.modes.get_mut(*head as usize) {
+                    *m = Some((*width, *height));
+                }
+            }
             ToViewer::Cursor(c) => st.cursor = Some(c.clone()),
             ToViewer::Mic(on) => st.mic = Some(*on),
             ToViewer::Camera(on) => st.camera = Some(*on),
@@ -133,21 +148,31 @@ impl ViewerTx {
     }
 
     pub fn send(&self, m: &ToViewer) {
-        if let ToViewer::Damage { x, y, w, h } = *m {
+        if let Some(head) = damage_head(m) {
+            let (ToViewer::Damage { x, y, w, h } | ToViewer::HeadDamage { x, y, w, h, .. }) = *m else { return };
             let r = [x, y, x.saturating_add(w), y.saturating_add(h)];
             let mut d = self.damage.lock().unwrap_or_else(|e| e.into_inner());
-            match d.as_mut() {
+            match d[head].as_mut() {
                 Some(u) => *u = union(*u, r),
                 None => {
-                    *d = Some(r);
+                    d[head] = Some(r);
                     // The rect is filled in when it goes out.
-                    let _ = self.q.send(ToViewer::Damage { x: 0, y: 0, w: 0, h: 0 });
+                    let _ = self.q.send(m.clone());
                 }
             }
             return;
         }
         self.remember(m);
         let _ = self.q.send(m.clone());
+    }
+}
+
+/// The monitor a damage message is for (checked: a slot we have).
+fn damage_head(m: &ToViewer) -> Option<usize> {
+    match *m {
+        ToViewer::Damage { .. } => Some(0),
+        ToViewer::HeadDamage { head, .. } => Some(head as usize).filter(|&h| h < MAX_HEADS),
+        _ => None,
     }
 }
 
@@ -178,8 +203,11 @@ fn quiet(t: Option<Instant>, now: Instant) -> bool {
     t.is_none_or(|t| now.duration_since(t) >= HOLD)
 }
 
+/// One guest monitor's picture: its slot of the shared framebuffer. The
+/// first monitor's also has the firmware screen (ramfb) to share with.
 pub(crate) struct FbSink {
-    fb: SharedFb,
+    fb: Arc<SharedFb>,
+    head: usize,
     mode: Mutex<(u32, u32)>,
     arb: Mutex<Arbiter>,
     /// None when headless: frames still land in the buffer (screendumps).
@@ -187,9 +215,22 @@ pub(crate) struct FbSink {
 }
 
 impl FbSink {
-    pub fn headless() -> std::io::Result<Arc<Self>> {
-        let fb = SharedFb::create().map_err(|e| std::io::Error::other(e.to_string()))?;
-        Ok(Arc::new(FbSink { fb, mode: Mutex::new((0, 0)), arb: Mutex::default(), tx: None }))
+    /// `heads` monitors with nobody watching.
+    pub fn headless(heads: usize) -> std::io::Result<Vec<Arc<Self>>> {
+        let fb = SharedFb::create_heads(heads).map_err(|e| std::io::Error::other(e.to_string()))?;
+        Ok(Self::all(Arc::new(fb), None))
+    }
+
+    /// A sink per slot of `fb`.
+    fn all(fb: Arc<SharedFb>, tx: Option<ViewerTx>) -> Vec<Arc<Self>> {
+        (0..fb.heads())
+            .map(|head| Arc::new(FbSink { fb: fb.clone(), head, mode: Mutex::new((0, 0)), arb: Mutex::default(), tx: tx.clone() }))
+            .collect()
+    }
+
+    /// What the guest shows on this monitor now (0x0: off).
+    pub fn mode(&self) -> (u32, u32) {
+        *self.mode.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// A viewer window is attached.
@@ -236,9 +277,9 @@ impl FbSink {
         }
         *m = (width, height);
         drop(m);
-        log::debug!("display: mode {width}x{height}");
+        log::debug!("display: monitor {} mode {width}x{height}", self.head + 1);
         if let Some(tx) = &self.tx {
-            tx.send(&ToViewer::Mode { width, height });
+            tx.send(&if self.head == 0 { ToViewer::Mode { width, height } } else { ToViewer::HeadMode { head: self.head as u32, width, height } });
         }
     }
 
@@ -253,9 +294,9 @@ impl FbSink {
         if x.saturating_add(w) > mw || y.saturating_add(h) > mh {
             return;
         }
-        self.fb.write_rect(mw, x, y, w, h, rows, stride);
+        self.fb.write_rect_on(self.head, mw, x, y, w, h, rows, stride);
         if let Some(tx) = &self.tx {
-            tx.send(&ToViewer::Damage { x, y, w, h });
+            tx.send(&if self.head == 0 { ToViewer::Damage { x, y, w, h } } else { ToViewer::HeadDamage { head: self.head as u32, x, y, w, h } });
         }
     }
 
@@ -266,7 +307,7 @@ impl FbSink {
             return Err(std::io::Error::other("display is off"));
         }
         let mut px = vec![0u32; w as usize * h as usize];
-        self.fb.read_into(w, h, &mut px);
+        self.fb.read_into_on(self.head, w, h, &mut px);
         let rgb: Vec<u8> = px.iter().flat_map(|p| [(p >> 16) as u8, (p >> 8) as u8, *p as u8]).collect();
         let f = std::fs::File::create(path)?;
         let mut enc = png::Encoder::new(std::io::BufWriter::new(f), w, h);
@@ -398,16 +439,12 @@ impl DisplayServer {
         Ok(DisplayServer { stream, tx, clip_latest: Arc::new(Mutex::new(None)) })
     }
 
-    /// Create the framebuffer and hand it to the viewer.
-    pub fn sink(&self) -> std::io::Result<Arc<FbSink>> {
-        let fb = SharedFb::create().map_err(|e| std::io::Error::other(e.to_string()))?;
+    /// Create the framebuffer for `heads` monitors and hand it to the
+    /// viewer. A sink per monitor.
+    pub fn sinks(&self, heads: usize) -> std::io::Result<Vec<Arc<FbSink>>> {
+        let fb = SharedFb::create_heads(heads).map_err(|e| std::io::Error::other(e.to_string()))?;
         send_fd(&self.stream, fb.fd().as_raw_fd()).map_err(|e| std::io::Error::other(e.to_string()))?;
-        Ok(Arc::new(FbSink {
-            fb,
-            mode: Mutex::new((0, 0)),
-            arb: Mutex::default(),
-            tx: Some(self.tx.clone()),
-        }))
+        Ok(FbSink::all(Arc::new(fb), Some(self.tx.clone())))
     }
 
     pub fn clipboard(&self) -> Box<dyn ClipboardProvider> {
@@ -427,13 +464,14 @@ impl DisplayServer {
         agent: Agent,
         events: Sender<VmEvent>,
         window: Option<Box<dyn Fn(bool) + Send + Sync>>,
-        listener: Option<(UnixListener, Arc<FbSink>)>,
+        listener: Option<UnixListener>,
+        screens: Vec<Arc<FbSink>>,
     ) -> std::io::Result<()> {
-        let ctx = Arc::new(Serve { input, agent, events, window, latest: self.clip_latest, tx: self.tx });
+        let ctx = Arc::new(Serve { input, agent, events, window, latest: self.clip_latest, tx: self.tx, screens });
         let c = ctx.clone();
         let first = self.stream;
         std::thread::Builder::new().name("display".into()).spawn(move || serve(first, &c))?;
-        if let Some((l, sink)) = listener {
+        if let Some(l) = listener {
             std::thread::Builder::new().name("viewer-listen".into()).spawn(move || {
                 for v in l.incoming() {
                     let Ok(v) = v else { continue };
@@ -443,7 +481,8 @@ impl DisplayServer {
                         continue;
                     }
                     let Ok(r) = v.try_clone() else { continue };
-                    if let Err(e) = ctx.tx.attach(v, sink.fb.fd().as_raw_fd()) {
+                    let Some(fb) = ctx.screens.first().map(|s| s.fb.fd().as_raw_fd()) else { continue };
+                    if let Err(e) = ctx.tx.attach(v, fb) {
                         log::warn!("display: viewer: {e}");
                         continue;
                     }
@@ -469,6 +508,8 @@ struct Serve {
     window: Option<Box<dyn Fn(bool) + Send + Sync>>,
     latest: Arc<Mutex<Option<String>>>,
     tx: ViewerTx,
+    /// Every monitor, the first first: where pointers land.
+    screens: Vec<Arc<FbSink>>,
 }
 
 /// Read one viewer's input until it goes away.
@@ -489,7 +530,10 @@ fn serve(stream: UnixStream, c: &Serve) {
                     Some(from) => c.agent.send(AgentCmd::Drop { id, from }),
                     None => log::warn!("display: a drop without its pipe"),
                 },
-                Ok(Some(m)) => handle(m, c.input.as_ref(), &c.agent, &c.events, &c.latest),
+                Ok(Some(m)) => {
+                    let m = desktop_pointer(m, &c.screens);
+                    handle(m, c.input.as_ref(), &c.agent, &c.events, &c.latest)
+                }
                 Ok(None) => break,
                 Err(e) => {
                     log::warn!("display: {e}");
@@ -504,6 +548,41 @@ fn serve(stream: UnixStream, c: &Serve) {
         w(false);
     }
     let _ = c.events.send(VmEvent::ViewerClosed);
+}
+
+/// With several monitors the guest's tablet spans its whole desktop:
+/// the monitors side by side, top edges lined up, in order (the layout
+/// the guest agent asks for). A pointer on one monitor's window becomes
+/// a point on that desktop. One monitor on: as it is.
+fn desktop_pointer(m: ToVmm, screens: &[Arc<FbSink>]) -> ToVmm {
+    let (head, x, y) = match m {
+        ToVmm::Pointer { x, y } => (0, x, y),
+        ToVmm::HeadPointer { head, x, y } => (head as usize, x, y),
+        m => return m,
+    };
+    let modes: Vec<(u32, u32)> = screens.iter().map(|s| s.mode()).collect();
+    let (x, y) = place(&modes, head, x, y);
+    ToVmm::Pointer { x, y }
+}
+
+/// Monitor `head`'s point `x`, `y` (0..=POINTER_MAX) on the desktop of
+/// `modes` (0x0: off).
+fn place(modes: &[(u32, u32)], head: usize, x: u16, y: u16) -> (u16, u16) {
+    let on = |m: &&(u32, u32)| m.0 > 0 && m.1 > 0;
+    let total_w: u64 = modes.iter().filter(on).map(|m| m.0 as u64).sum();
+    let max_h = modes.iter().filter(on).map(|m| m.1).max().unwrap_or(0) as u64;
+    let Some(&(w, h)) = modes.get(head).filter(|m| on(m)) else { return (x, y) };
+    if total_w <= w as u64 && max_h <= h as u64 {
+        return (x, y);
+    }
+    let left: u64 = modes[..head].iter().filter(on).map(|m| m.0 as u64).sum();
+    let max = POINTER_MAX as u64;
+    // Pixel on the desktop, then back to the tablet's range.
+    let px = left + x as u64 * (w as u64 - 1) / max;
+    let py = y as u64 * (h as u64 - 1) / max;
+    let gx = px * max / (total_w - 1).max(1);
+    let gy = py * max / (max_h - 1).max(1);
+    (gx.min(max) as u16, gy.min(max) as u16)
 }
 
 fn send_events(sock: &Option<UnixDatagram>, evs: &[[u8; 8]]) {
@@ -557,8 +636,14 @@ fn handle(
         }
         ToVmm::Resize { width, height, scale } => {
             log::debug!("display: viewer asks for {width}x{height} at {scale}%");
-            agent.send(AgentCmd::Display { width, height, scale });
+            agent.send(AgentCmd::Display { head: 0, width, height, scale });
         }
+        ToVmm::HeadResize { head, width, height, scale } => {
+            log::debug!("display: viewer asks for {width}x{height} at {scale}% on monitor {}", head + 1);
+            agent.send(AgentCmd::Display { head: head as usize, width, height, scale });
+        }
+        // desktop_pointer() made it a plain pointer.
+        ToVmm::HeadPointer { .. } => {}
         ToVmm::Focus(f) => agent.send(AgentCmd::Focus(f)),
         ToVmm::Clipboard(t) => *latest.lock().unwrap_or_else(|e| e.into_inner()) = Some(t),
         ToVmm::Command(c) => {
@@ -579,8 +664,81 @@ mod tests {
     fn px(sink: &FbSink) -> u32 {
         let (w, h) = *sink.mode.lock().unwrap();
         let mut v = vec![0u32; (w * h) as usize];
-        sink.fb.read_into(w, h, &mut v);
+        sink.fb.read_into_on(sink.head, w, h, &mut v);
         v[0]
+    }
+
+    #[test]
+    fn pointers_land_on_their_monitor() {
+        // One monitor: untouched.
+        assert_eq!(place(&[(1280, 800)], 0, 100, 200), (100, 200));
+        assert_eq!(place(&[(1280, 800), (0, 0)], 0, 100, 200), (100, 200));
+        // Two side by side, the second smaller.
+        let m = [(1000, 800), (1000, 400)];
+        let max = POINTER_MAX;
+        assert_eq!(place(&m, 0, 0, 0), (0, 0));
+        // Right edge of the first: just left of the middle.
+        let (x, y) = place(&m, 0, max, max);
+        assert!((16300..16400).contains(&x) && y == max, "{x} {y}");
+        // Left edge of the second: the middle; its bottom is half way down.
+        let (x, y) = place(&m, 1, 0, max);
+        assert!((16390..16420).contains(&x) && (16340..16420).contains(&y), "{x} {y}");
+        assert_eq!(place(&m, 1, max, 0), (max, 0));
+        // A monitor that's off, or not there: as it came.
+        assert_eq!(place(&[(1000, 800), (0, 0), (1000, 800)], 2, 0, 0).0, 16391);
+        assert_eq!(place(&m, 3, 5, 5), (5, 5));
+    }
+
+    #[test]
+    fn monitors_get_their_own_messages() {
+        let (a, mut b) = UnixStream::pair().unwrap();
+        let tx = ViewerTx::spawn(Some(a)).unwrap();
+        let s = FbSink::all(Arc::new(SharedFb::create_heads(2).unwrap()), Some(tx.clone()));
+        s[1].set_mode(4, 2);
+        s[1].flush(1, 1, 1, 1, &[7; 4], 4);
+        s[0].set_mode(8, 8);
+        tx.send(&ToViewer::Closed);
+        let mut d = vroom_display::Decoder::default();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 4096];
+        b.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        'read: loop {
+            let n = b.read(&mut buf).unwrap();
+            d.push(&buf[..n]);
+            while let Some(m) = d.next_to_viewer().unwrap() {
+                if m == ToViewer::Closed {
+                    break 'read;
+                }
+                got.push(m);
+            }
+        }
+        assert_eq!(
+            got,
+            vec![
+                ToViewer::HeadMode { head: 1, width: 4, height: 2 },
+                ToViewer::HeadDamage { head: 1, x: 1, y: 1, w: 1, h: 1 },
+                ToViewer::Mode { width: 8, height: 8 },
+            ]
+        );
+        let mut r = [0u8; 4];
+        s[1].fb.read_rect_on(1, 4, 1, 1, 1, 1, &mut r, 4);
+        assert_eq!(r, [7; 4]);
+        // A viewer that comes later gets both monitors.
+        let (a, b) = UnixStream::pair().unwrap();
+        tx.detach();
+        tx.attach(a, s[0].fb.fd().as_raw_fd()).unwrap();
+        vroom_display::recv_fd(&b).unwrap();
+        let mut d = vroom_display::Decoder::default();
+        let mut got = Vec::new();
+        b.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        while got.len() < 4 {
+            let n = (&b).read(&mut buf).unwrap();
+            d.push(&buf[..n]);
+            while let Ok(Some(m)) = d.next_to_viewer() {
+                got.push(m);
+            }
+        }
+        assert_eq!(got[2], ToViewer::HeadMode { head: 1, width: 4, height: 2 });
     }
 
     #[test]
@@ -592,6 +750,8 @@ mod tests {
         tx.send(&ToViewer::Status("paused".into()));
         tx.send(&ToViewer::Status("snapshot: /x".into()));
         tx.send(&ToViewer::Mic(true));
+        // Let the sender drop what went to nobody first.
+        std::thread::sleep(Duration::from_millis(100));
         let (a, b) = UnixStream::pair().unwrap();
         let (pa, _pb) = UnixStream::pair().unwrap();
         assert!(!tx.attached());
@@ -656,8 +816,8 @@ mod tests {
     #[test]
     fn the_guest_pointer_goes_with_the_gpu_picture() {
         let (a, mut b) = UnixStream::pair().unwrap();
-        let fb = SharedFb::create().unwrap();
-        let s = FbSink { fb, mode: Mutex::new((0, 0)), arb: Mutex::default(), tx: Some(ViewerTx::spawn(Some(a)).unwrap()) };
+        let fb = Arc::new(SharedFb::create().unwrap());
+        let s = FbSink { fb, head: 0, mode: Mutex::new((0, 0)), arb: Mutex::default(), tx: Some(ViewerTx::spawn(Some(a)).unwrap()) };
         let t0 = Instant::now();
         s.set_mode(4, 2);
         let img = Cursor::Image { w: 1, h: 1, hot_x: 0, hot_y: 0, rgba: vec![1, 2, 3, 4] };
@@ -688,7 +848,7 @@ mod tests {
 
     #[test]
     fn the_source_that_changes_wins_after_a_quiet_spell() {
-        let s = FbSink::headless().unwrap();
+        let s = FbSink::headless(1).unwrap().remove(0);
         let t0 = Instant::now();
         let (ramfb, gpu) = ([0x11u8; 4 * 4 * 2], [0x22u8; 4 * 4 * 2]);
         s.ramfb_frame_at(t0, 4, 2, &ramfb, 16, (0, 2));

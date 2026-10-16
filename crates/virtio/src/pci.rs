@@ -145,6 +145,7 @@ impl VirtioPci {
     pub fn new(slot: u8, dev: Box<dyn VirtioDevice>, mem: GuestMemory, intx: Arc<Intx>, msi: Arc<dyn MsiSender>) -> Self {
         let ty = dev.device_type();
         let nq = dev.queue_max_sizes().len();
+        let subsys = dev.pci_subsystem();
         let mut cfg = ConfigSpace::new(
             PciId {
                 vendor: 0x1af4,
@@ -152,7 +153,7 @@ impl VirtioPci {
                 class: class_for(ty),
                 revision: 1,
                 subsys_vendor: 0x1af4,
-                subsys: 0x1100,
+                subsys,
             },
             1,
         );

@@ -97,6 +97,12 @@ impl Saved for SavedFile {
     }
 }
 
+/// GNOME (or another Wayland desktop) runs on Wayland.
+#[cfg(target_os = "linux")]
+pub fn wayland() -> bool {
+    mutter::wayland()
+}
+
 /// The desktop's backend, if we know how to scale it.
 pub fn system() -> Option<Box<dyn Backend>> {
     #[cfg(windows)]

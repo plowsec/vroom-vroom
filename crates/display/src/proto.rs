@@ -1,6 +1,6 @@
 //! Framed messages: type u8 | len u32 LE | payload.
 
-use crate::{Error, Result};
+use crate::{Error, Result, MAX_HEADS};
 
 /// Absolute pointer range (like a USB tablet).
 pub const POINTER_MAX: u16 = 32767;
@@ -39,6 +39,12 @@ pub enum ToViewer {
     /// The dropped files are in the guest (`ok`), or why not. `place`:
     /// where they went, without a live drag.
     DropDone { id: u32, ok: bool, place: String },
+    /// Another guest monitor's mode (`head` 1..MAX_HEADS; head 0 is
+    /// `Mode`). 0x0: the guest turned it off. Its pixels are in slot
+    /// `head` of the framebuffer.
+    HeadMode { head: u32, width: u32, height: u32 },
+    /// Pixels changed on another monitor.
+    HeadDamage { head: u32, x: u32, y: u32, w: u32, h: u32 },
 }
 
 /// What the guest's pointer looks like.
@@ -93,6 +99,11 @@ pub enum ToVmm {
     /// Dropped: comes with a pipe (SCM_RIGHTS) the viewer writes the
     /// files into, as guest agent frames (DropEntry, DropData, DropEnd).
     Drop { id: u32 },
+    /// Another monitor's window changed size (as `Resize`, for monitor
+    /// `head` 1..MAX_HEADS). 0x0: its window is closed, unplug it.
+    HeadResize { head: u32, width: u32, height: u32, scale: u32 },
+    /// Absolute pointer on another monitor's window, 0..=POINTER_MAX.
+    HeadPointer { head: u32, x: u16, y: u16 },
 }
 
 fn frame(ty: u8, payload: &[u8]) -> Vec<u8> {
@@ -110,6 +121,15 @@ fn u32s(v: &[u32]) -> Vec<u8> {
 fn get_u32(p: &[u8], i: usize) -> Result<u32> {
     let b = p.get(i * 4..i * 4 + 4).ok_or(Error::Proto("short"))?;
     Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// A monitor other than the first.
+fn head(h: u32) -> Result<u32> {
+    if (1..MAX_HEADS as u32).contains(&h) {
+        Ok(h)
+    } else {
+        Err(Error::Proto("monitor"))
+    }
 }
 
 fn text(p: &[u8]) -> Result<String> {
@@ -145,11 +165,17 @@ impl ToViewer {
                 p.extend_from_slice(place.as_bytes());
                 frame(9, &p)
             }
+            ToViewer::HeadMode { head, width, height } => frame(16, &u32s(&[*head, *width, *height])),
+            ToViewer::HeadDamage { head, x, y, w, h } => frame(17, &u32s(&[*head, *x, *y, *w, *h])),
         }
     }
 
     fn decode(ty: u8, p: &[u8]) -> Result<Self> {
         Ok(match ty {
+            16 if p.len() == 12 => ToViewer::HeadMode { head: head(get_u32(p, 0)?)?, width: get_u32(p, 1)?, height: get_u32(p, 2)? },
+            17 if p.len() == 20 => {
+                ToViewer::HeadDamage { head: head(get_u32(p, 0)?)?, x: get_u32(p, 1)?, y: get_u32(p, 2)?, w: get_u32(p, 3)?, h: get_u32(p, 4)? }
+            }
             1 => ToViewer::Mode { width: get_u32(p, 0)?, height: get_u32(p, 1)? },
             2 => ToViewer::Damage { x: get_u32(p, 0)?, y: get_u32(p, 1)?, w: get_u32(p, 2)?, h: get_u32(p, 3)? },
             3 => ToViewer::ClipboardSet(text(p)?),
@@ -203,6 +229,8 @@ impl ToVmm {
             }
             ToVmm::DragCancel { id } => frame(10, &id.to_le_bytes()),
             ToVmm::Drop { id } => frame(11, &id.to_le_bytes()),
+            ToVmm::HeadResize { head, width, height, scale } => frame(18, &u32s(&[*head, *width, *height, *scale])),
+            ToVmm::HeadPointer { head, x, y } => frame(19, &u32s(&[*head, *x as u32, *y as u32])),
         }
     }
 
@@ -253,6 +281,20 @@ impl ToVmm {
             }
             10 if p.len() == 4 => ToVmm::DragCancel { id: get_u32(p, 0)? },
             11 if p.len() == 4 => ToVmm::Drop { id: get_u32(p, 0)? },
+            18 if p.len() == 16 => {
+                let (width, height, scale) = (get_u32(p, 1)?, get_u32(p, 2)?, get_u32(p, 3)?);
+                if scale != 0 && !(SCALE_MIN..=SCALE_MAX).contains(&scale) {
+                    return Err(Error::Proto("scale"));
+                }
+                if (width == 0) != (height == 0) {
+                    return Err(Error::Proto("size"));
+                }
+                ToVmm::HeadResize { head: head(get_u32(p, 0)?)?, width, height, scale }
+            }
+            19 if p.len() == 12 => {
+                let (x, y) = (small(get_u32(p, 1)?)?, small(get_u32(p, 2)?)?);
+                ToVmm::HeadPointer { head: head(get_u32(p, 0)?)?, x: x.min(POINTER_MAX), y: y.min(POINTER_MAX) }
+            }
             _ => return Err(Error::Proto("unknown vmm message")),
         })
     }
@@ -322,6 +364,9 @@ mod tests {
             ToVmm::DragEnter { id: 4, items: vec![("a.txt".into(), false), ("dir".into(), true)] },
             ToVmm::DragCancel { id: 4 },
             ToVmm::Drop { id: 4 },
+            ToVmm::HeadResize { head: 1, width: 1920, height: 1080, scale: 200 },
+            ToVmm::HeadResize { head: 3, width: 0, height: 0, scale: 0 },
+            ToVmm::HeadPointer { head: 2, x: 5, y: 32767 },
         ];
         let mut d = Decoder::default();
         for m in &vm {
@@ -341,6 +386,9 @@ mod tests {
             ToViewer::DragReady { id: 4, live: true },
             ToViewer::Camera(true),
             ToViewer::DropDone { id: 4, ok: false, place: "Desktop".into() },
+            ToViewer::HeadMode { head: 1, width: 1024, height: 768 },
+            ToViewer::HeadMode { head: 3, width: 0, height: 0 },
+            ToViewer::HeadDamage { head: 2, x: 1, y: 2, w: 3, h: 4 },
         ];
         for m in &v {
             d.push(&m.encode());
@@ -379,5 +427,18 @@ mod tests {
         assert!(d.next_to_viewer().is_err());
         d.push(&img(2, 2, 1, 16));
         assert!(matches!(d.next_to_viewer().unwrap(), Some(ToViewer::Cursor(GuestCursor::Image { w: 2, h: 2, .. }))));
+        // Monitors: 1..MAX_HEADS only, sizes both or neither.
+        for h in [0, MAX_HEADS as u32, u32::MAX] {
+            d.push(&ToViewer::HeadMode { head: h, width: 1, height: 1 }.encode());
+            assert!(d.next_to_viewer().is_err(), "{h}");
+            d.push(&ToVmm::HeadPointer { head: h, x: 0, y: 0 }.encode());
+            assert!(d.next_to_vmm().is_err(), "{h}");
+        }
+        d.push(&ToVmm::HeadResize { head: 1, width: 0, height: 5, scale: 0 }.encode());
+        assert!(d.next_to_vmm().is_err());
+        d.push(&ToVmm::HeadResize { head: 1, width: 5, height: 5, scale: 7 }.encode());
+        assert!(d.next_to_vmm().is_err());
+        d.push(&frame(19, &u32s(&[1, 1 << 16, 0])));
+        assert!(d.next_to_vmm().is_err(), "pointer out of range");
     }
 }

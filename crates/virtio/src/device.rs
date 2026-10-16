@@ -55,6 +55,11 @@ pub trait VirtioDevice: Send {
     }
     /// The transport placed region `id` at guest physical `gpa`.
     fn set_shm_base(&mut self, _id: u8, _gpa: u64) {}
+    /// PCI subsystem id. Devices of a kind that come several times may
+    /// number themselves (the Windows guest agent tells GPUs apart so).
+    fn pci_subsystem(&self) -> u16 {
+        0x1100
+    }
     /// Driver kicked `queue`. Called on a vCPU thread: keep it cheap.
     fn queue_notify(&mut self, queue: u16);
     /// Device reset by the driver: stop everything, forget queues.

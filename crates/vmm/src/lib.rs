@@ -126,10 +126,10 @@ pub struct Vmm {
     devices: Vec<StatefulDevice>,
     uart: Arc<Mutex<Pl011>>,
     agent: agent::Agent,
-    gpu: Option<vroom_virtio::devices::gpu::GpuControl>,
+    gpus: Vec<vroom_virtio::devices::gpu::GpuControl>,
     disks: disks::DiskSet,
     viewer: Option<display::ViewerTx>,
-    screen: Option<Arc<display::FbSink>>,
+    screens: Vec<Arc<display::FbSink>>,
     /// Captured right after build; reset = restore these.
     pristine_devices: Vec<Vec<u8>>,
     /// None when the backend can't save its irqchip (KVM for now).
@@ -185,10 +185,10 @@ impl Vmm {
             devices: m.devices,
             uart: m.uart,
             agent: m.agent,
-            gpu: m.gpu,
+            gpus: m.gpus,
             disks,
             viewer: m.viewer,
-            screen: m.screen,
+            screens: m.screens,
             pristine_devices: Vec::new(),
             pristine_irqchip: None,
             boot: m.boot,
@@ -238,12 +238,17 @@ impl Vmm {
         self.state
     }
 
-    /// Save the guest screen as PNG. Returns the mode.
+    /// Save the guest screen as PNG. Returns the mode. Other monitors
+    /// that are on go next to it, as `<name>-2.png` and so on.
     pub fn screendump(&self, path: &Path) -> Result<(u32, u32)> {
-        match &self.screen {
-            Some(s) => Ok(s.screendump(path)?),
-            None => Err(Error::Setup("VM has no display".into())),
+        let Some(first) = self.screens.first() else { return Err(Error::Setup("VM has no display".into())) };
+        for (i, s) in self.screens.iter().enumerate().skip(1) {
+            if s.mode().0 > 0 {
+                let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                let _ = s.screendump(&path.with_file_name(format!("{stem}-{}.png", i + 1)));
+            }
         }
+        Ok(first.screendump(path)?)
     }
 
     /// Tell the viewer something (status line).
@@ -365,8 +370,9 @@ impl Vmm {
     /// every Direct3D object; the agent turns it back on when it next
     /// connects, or right after a snapshot. Whether it was parked.
     fn park_direct3d(&mut self) -> Result<bool> {
-        let Some(gpu) = self.gpu.clone() else { return Ok(false) };
-        if !gpu.direct3d() || self.state == RunState::Stopped {
+        let gpus = self.gpus.clone();
+        let direct3d = || gpus.iter().any(|g| g.direct3d());
+        if !direct3d() || self.state == RunState::Stopped {
             return Ok(false);
         }
         let s = self.agent.status();
@@ -384,7 +390,7 @@ impl Vmm {
         log::info!("turning the guest's 3D display off for the save");
         self.agent.send(agent::AgentCmd::Gpu3d(false));
         let deadline = Instant::now() + PARK_TIMEOUT;
-        while gpu.direct3d() || self.agent.status().gpu3d != Some(false) {
+        while direct3d() || self.agent.status().gpu3d != Some(false) {
             if Instant::now() > deadline {
                 self.agent.send(agent::AgentCmd::Gpu3d(true));
                 if paused {
