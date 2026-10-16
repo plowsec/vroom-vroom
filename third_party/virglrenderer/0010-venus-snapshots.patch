@@ -517,6 +517,28 @@
     }
  
     return obj;
+--- a/src/venus/vkr_descriptor_set.c
++++ b/src/venus/vkr_descriptor_set.c
+@@ -139,6 +139,19 @@
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
++   /* vroom: what it writes, before the handles are replaced (snapshots) */
++   if (vkr_snap_tls) {
++      for (uint32_t i = 0; args->pDescriptorWrites && i < args->descriptorWriteCount; i++) {
++         const VkWriteDescriptorSet *w = &args->pDescriptorWrites[i];
++         const struct vkr_object *set = (const struct vkr_object *)w->dstSet;
++         if (set)
++            vkr_snap_note_write(set->id, w->dstBinding, w->dstArrayElement,
++                                w->descriptorCount);
++      }
++      if (args->descriptorCopyCount)
++         vkr_snap_note_copy();
++   }
++
+    vn_replace_vkUpdateDescriptorSets_args_handle(args);
+    vkr_device_fill_null_descriptors(dev, args->descriptorWriteCount,
+                                     args->pDescriptorWrites);
 --- a/src/venus/vkr_device_memory.h
 +++ b/src/venus/vkr_device_memory.h
 @@ -39,6 +39,9 @@
@@ -900,7 +922,7 @@
  struct vkr_ring *
 --- /dev/null
 +++ b/src/venus/vkr_snap.c
-@@ -0,0 +1,2012 @@
+@@ -0,0 +1,2344 @@
 +/*
 + * vroom: snapshots of a Venus context (see vkr_snap.h).
 + * SPDX-License-Identifier: MIT
@@ -939,6 +961,11 @@
 +#define VKR_SNAP_STAGING_MIN (32u << 20)
 +#define VKR_SNAP_STAGING_MAX (512u << 20)
 +
++/* past this many kept commands or bytes, after a clean-up, a context isn't
++ * followed any more (it comes back lost) */
++#define VKR_SNAP_MAX_COMMANDS (4u << 20)
++#define VKR_SNAP_MAX_BYTES (1ull << 30)
++
 +#define VKR_SNAP_MAGIC 0x31534b56 /* "VKS1" */
 +#define VKR_SNAP_VERSION 1
 +#define VKR_SNAP_FLAG_LOST 1u
@@ -974,6 +1001,9 @@
 +struct vkr_snap_cmd {
 +   struct vkr_snap *snap;
 +   struct vkr_snap_ids creates, refs, destroys;
++   /* descriptor writes: (set, binding << 32 | first element, count) */
++   struct vkr_snap_ids writes;
++   bool copies;
 +   vkr_object_id first_ref;
 +   VkObjectType first_ref_type;
 +   vkr_object_id pool;
@@ -981,14 +1011,57 @@
 +   bool have_first, have_seq;
 +};
 +
-+/* a kept command: ids (creates, refs, destroys), then the bytes */
++/* a descriptor write a kept command made */
++struct vkr_snap_write {
++   uint64_t set;
++   uint32_t binding, first, count;
++   bool covered; /* a later command writes all of it again */
++};
++
++/* a kept command: ids (creates, refs, destroys), then its descriptor
++ * writes, then the bytes */
 +struct vkr_snap_entry {
 +   uint64_t seq;
 +   vkr_object_id owner; /* the command buffer it records into, or 0 */
 +   uint32_t size;
 +   uint32_t ncreates, nrefs, ndestroys;
++   uint32_t nwrites, writes_left;
++   /* command buffers recorded with these writes in place: kept while
++    * those recordings are */
++   uint32_t pins;
 +   bool needed;
 +   uint64_t ids[];
++};
++
++static struct vkr_snap_write *
++vkr_snap_entry_writes(struct vkr_snap_entry *e)
++{
++   return (struct vkr_snap_write *)(e->ids + e->ncreates + e->nrefs + e->ndestroys);
++}
++
++static const uint8_t *
++vkr_snap_entry_bytes(const struct vkr_snap_entry *e)
++{
++   return (const uint8_t *)(e->ids + e->ncreates + e->nrefs + e->ndestroys) +
++          sizeof(struct vkr_snap_write) * e->nwrites;
++}
++
++/* the write commands a command buffer's recording saw (it bound their
++ * sets) */
++struct vkr_snap_pins {
++   uint64_t cmd_buf;
++   uint32_t n, cap;
++   struct vkr_snap_entry **v;
++};
++
++/* the kept descriptor writes to one set, not yet written again */
++struct vkr_snap_set_writes {
++   uint64_t set;
++   uint32_t n, cap;
++   struct {
++      struct vkr_snap_entry *e;
++      uint32_t w;
++   } *v;
 +};
 +
 +struct vkr_snap_id {
@@ -1003,6 +1076,9 @@
 +   uint64_t seq;
 +   struct hash_table *live;    /* struct vkr_snap_id: objects alive now */
 +   struct hash_table *shm_res; /* struct vkr_snap_id: our shm resources */
++   struct hash_table *set_writes; /* struct vkr_snap_set_writes, by set */
++   struct hash_table *pins;       /* struct vkr_snap_pins, by command buffer */
++   uint64_t bytes;                /* kept, all entries */
 +   bool off;
 +   const char *broken;
 +
@@ -1031,6 +1107,22 @@
 +   free(e->data);
 +}
 +
++static void
++vkr_snap_free_set_writes(struct hash_entry *e)
++{
++   struct vkr_snap_set_writes *sw = e->data;
++   free(sw->v);
++   free(sw);
++}
++
++static void
++vkr_snap_free_pins(struct hash_entry *e)
++{
++   struct vkr_snap_pins *p = e->data;
++   free(p->v);
++   free(p);
++}
++
 +struct vkr_snap *
 +vkr_snap_create(void)
 +{
@@ -1039,7 +1131,10 @@
 +      return NULL;
 +   snap->live = _mesa_hash_table_create(NULL, vkr_snap_hash, vkr_snap_equal);
 +   snap->shm_res = _mesa_hash_table_create(NULL, vkr_snap_hash, vkr_snap_equal);
-+   if (!snap->live || !snap->shm_res || mtx_init(&snap->mutex, mtx_plain) != thrd_success)
++   snap->set_writes = _mesa_hash_table_create(NULL, vkr_snap_hash, vkr_snap_equal);
++   snap->pins = _mesa_hash_table_create(NULL, vkr_snap_hash, vkr_snap_equal);
++   if (!snap->live || !snap->shm_res || !snap->set_writes || !snap->pins ||
++       mtx_init(&snap->mutex, mtx_plain) != thrd_success)
 +      goto fail;
 +   if (mtx_init(&snap->gate_mutex, mtx_plain) != thrd_success) {
 +      mtx_destroy(&snap->mutex);
@@ -1065,6 +1160,10 @@
 +      _mesa_hash_table_destroy(snap->live, NULL);
 +   if (snap->shm_res)
 +      _mesa_hash_table_destroy(snap->shm_res, NULL);
++   if (snap->set_writes)
++      _mesa_hash_table_destroy(snap->set_writes, NULL);
++   if (snap->pins)
++      _mesa_hash_table_destroy(snap->pins, NULL);
 +   free(snap);
 +   return NULL;
 +}
@@ -1079,6 +1178,8 @@
 +   free(snap->entries);
 +   _mesa_hash_table_destroy(snap->live, vkr_snap_free_key);
 +   _mesa_hash_table_destroy(snap->shm_res, vkr_snap_free_key);
++   _mesa_hash_table_destroy(snap->set_writes, vkr_snap_free_set_writes);
++   _mesa_hash_table_destroy(snap->pins, vkr_snap_free_pins);
 +   cnd_destroy(&snap->gate_cond);
 +   mtx_destroy(&snap->gate_mutex);
 +   mtx_destroy(&snap->mutex);
@@ -1113,11 +1214,8 @@
 +}
 +
 +static void
-+vkr_snap_ids_push(struct vkr_snap_ids *ids, uint64_t id)
++vkr_snap_ids_push_raw(struct vkr_snap_ids *ids, uint64_t id)
 +{
-+   /* the same handle often comes twice in a row (a device, a buffer) */
-+   if (ids->n && ids->v[ids->n - 1] == id)
-+      return;
 +   if (ids->n == ids->cap) {
 +      if (ids->cap >= (1u << 24))
 +         return;
@@ -1134,6 +1232,15 @@
 +   ids->v[ids->n++] = id;
 +}
 +
++static void
++vkr_snap_ids_push(struct vkr_snap_ids *ids, uint64_t id)
++{
++   /* the same handle often comes twice in a row (a device, a buffer) */
++   if (ids->n && ids->v[ids->n - 1] == id)
++      return;
++   vkr_snap_ids_push_raw(ids, id);
++}
++
 +void
 +vkr_snap_note_ref(vkr_object_id id, VkObjectType type)
 +{
@@ -1148,6 +1255,30 @@
 +   if (type == VK_OBJECT_TYPE_COMMAND_POOL && !cmd->pool)
 +      cmd->pool = id;
 +   vkr_snap_ids_push(&cmd->refs, id);
++}
++
++void
++vkr_snap_note_write(vkr_object_id set, uint32_t binding, uint32_t first, uint32_t count)
++{
++   struct vkr_snap_cmd *cmd = vkr_snap_tls;
++   if (!cmd)
++      return;
++   const uint32_t n = cmd->writes.n;
++   vkr_snap_ids_push_raw(&cmd->writes, set);
++   vkr_snap_ids_push_raw(&cmd->writes, (uint64_t)binding << 32 | first);
++   vkr_snap_ids_push_raw(&cmd->writes, count);
++   if (cmd->writes.n != n + 3) {
++      /* out of room: this one stays for good */
++      cmd->writes.n = n;
++      cmd->copies = true;
++   }
++}
++
++void
++vkr_snap_note_copy(void)
++{
++   if (vkr_snap_tls)
++      vkr_snap_tls->copies = true;
 +}
 +
 +static bool
@@ -1202,6 +1333,8 @@
 +   mtx_unlock(&snap->mutex);
 +}
 +
++static void vkr_snap_unpin(struct vkr_snap *snap, uint64_t cmd_buf);
++
 +void
 +vkr_snap_note_remove(struct vkr_snap *snap, vkr_object_id id)
 +{
@@ -1210,6 +1343,8 @@
 +   mtx_lock(&snap->mutex);
 +   if (!snap->off) {
 +      vkr_snap_set_remove(snap->live, id);
++      /* a command buffer gone: its recording no longer holds writes */
++      vkr_snap_unpin(snap, id);
 +      struct vkr_snap_cmd *cmd = vkr_snap_tls;
 +      if (cmd && cmd->snap == snap)
 +         vkr_snap_ids_push(&cmd->destroys, id);
@@ -1270,11 +1405,186 @@
 +}
 +
 +static void
++vkr_snap_unindex(struct vkr_snap *snap, struct vkr_snap_entry *e)
++{
++   struct vkr_snap_write *w = vkr_snap_entry_writes(e);
++   for (uint32_t i = 0; i < e->nwrites; i++) {
++      struct hash_entry *he = _mesa_hash_table_search(snap->set_writes, &w[i].set);
++      if (!he)
++         continue;
++      struct vkr_snap_set_writes *sw = he->data;
++      for (uint32_t j = 0; j < sw->n;) {
++         if (sw->v[j].e == e)
++            sw->v[j] = sw->v[--sw->n];
++         else
++            j++;
++      }
++      if (!sw->n) {
++         _mesa_hash_table_remove(snap->set_writes, he);
++         free(sw->v);
++         free(sw);
++      }
++   }
++}
++
++static void
 +vkr_snap_drop(struct vkr_snap *snap, uint32_t i)
 +{
-+   free(snap->entries[i]);
++   struct vkr_snap_entry *e = snap->entries[i];
++   if (e->nwrites)
++      vkr_snap_unindex(snap, e);
++   if (e->pins) {
++      /* rare (the clean-up drops it): every recording lets go of it */
++      hash_table_foreach (snap->pins, he) {
++         struct vkr_snap_pins *p = he->data;
++         for (uint32_t j = 0; j < p->n;) {
++            if (p->v[j] == e)
++               p->v[j] = p->v[--p->n];
++            else
++               j++;
++         }
++      }
++   }
++   snap->bytes -= e->size;
++   free(e);
 +   snap->entries[i] = NULL;
 +   snap->holes++;
++}
++
++/* A command that writes descriptors: older writes it writes again are
++ * covered, and an older command whose writes are all covered goes. */
++static void
++vkr_snap_supersede_writes(struct vkr_snap *snap, struct vkr_snap_entry *e)
++{
++   struct vkr_snap_write *nw = vkr_snap_entry_writes(e);
++   for (uint32_t i = 0; i < e->nwrites; i++) {
++      struct hash_entry *he = _mesa_hash_table_search(snap->set_writes, &nw[i].set);
++      if (!he)
++         continue;
++      struct vkr_snap_set_writes *sw = he->data;
++      for (uint32_t j = 0; j < sw->n; j++) {
++         struct vkr_snap_write *ow = &vkr_snap_entry_writes(sw->v[j].e)[sw->v[j].w];
++         if (sw->v[j].e == e || ow->covered || ow->binding != nw[i].binding ||
++             ow->first < nw[i].first ||
++             (uint64_t)ow->first + ow->count > (uint64_t)nw[i].first + nw[i].count)
++            continue;
++         ow->covered = true;
++         sw->v[j].e->writes_left--;
++      }
++   }
++   /* the covered commands no recording saw, found by their place in the
++    * log */
++   for (uint32_t i = snap->count; i-- > 0;) {
++      struct vkr_snap_entry *old = snap->entries[i];
++      if (old && old != e && old->nwrites && !old->writes_left && !old->pins)
++         vkr_snap_drop(snap, i);
++   }
++}
++
++/* A recording binds descriptor sets: the writes it saw stay as long as it
++ * does (a replay records it again with them in place). */
++static void
++vkr_snap_pin(struct vkr_snap *snap, uint64_t cmd_buf, const uint64_t *refs, uint32_t nrefs)
++{
++   struct vkr_snap_pins *p = NULL;
++   for (uint32_t r = 0; r < nrefs; r++) {
++      struct hash_entry *he = _mesa_hash_table_search(snap->set_writes, &refs[r]);
++      if (!he)
++         continue;
++      struct vkr_snap_set_writes *sw = he->data;
++      if (!p) {
++         struct hash_entry *pe = _mesa_hash_table_search(snap->pins, &cmd_buf);
++         p = pe ? pe->data : NULL;
++         if (!p) {
++            p = calloc(1, sizeof(*p));
++            if (!p)
++               return;
++            p->cmd_buf = cmd_buf;
++            _mesa_hash_table_insert(snap->pins, &p->cmd_buf, p);
++         }
++      }
++      for (uint32_t j = 0; j < sw->n; j++) {
++         struct vkr_snap_entry *e = sw->v[j].e;
++         bool have = false;
++         for (uint32_t k = 0; k < p->n && !have; k++)
++            have = p->v[k] == e;
++         if (have)
++            continue;
++         if (p->n == p->cap) {
++            const uint32_t cap = MAX2(p->cap * 2, 8);
++            void *v = realloc(p->v, sizeof(*p->v) * cap);
++            if (!v)
++               return;
++            p->v = v;
++            p->cap = cap;
++         }
++         p->v[p->n++] = e;
++         e->pins++;
++      }
++   }
++}
++
++/* A recording is gone: the writes only it held on to may go. */
++static void
++vkr_snap_unpin(struct vkr_snap *snap, uint64_t cmd_buf)
++{
++   struct hash_entry *pe = _mesa_hash_table_search(snap->pins, &cmd_buf);
++   if (!pe)
++      return;
++   struct vkr_snap_pins *p = pe->data;
++   bool any = false;
++   for (uint32_t k = 0; k < p->n; k++) {
++      if (!--p->v[k]->pins && !p->v[k]->writes_left && p->v[k]->nwrites)
++         any = true;
++   }
++   _mesa_hash_table_remove(snap->pins, pe);
++   free(p->v);
++   free(p);
++   if (!any)
++      return;
++   for (uint32_t i = snap->count; i-- > 0;) {
++      struct vkr_snap_entry *old = snap->entries[i];
++      if (old && old->nwrites && !old->writes_left && !old->pins)
++         vkr_snap_drop(snap, i);
++   }
++}
++
++static void
++vkr_snap_index(struct vkr_snap *snap, struct vkr_snap_entry *e)
++{
++   struct vkr_snap_write *w = vkr_snap_entry_writes(e);
++   for (uint32_t i = 0; i < e->nwrites; i++) {
++      struct hash_entry *he = _mesa_hash_table_search(snap->set_writes, &w[i].set);
++      struct vkr_snap_set_writes *sw = he ? he->data : NULL;
++      if (!sw) {
++         sw = calloc(1, sizeof(*sw));
++         if (!sw)
++            continue;
++         sw->set = w[i].set;
++         _mesa_hash_table_insert(snap->set_writes, &sw->set, sw);
++      }
++      if (sw->n == sw->cap) {
++         const uint32_t cap = MAX2(sw->cap * 2, 4);
++         void *v = realloc(sw->v, sizeof(*sw->v) * cap);
++         if (!v)
++            continue;
++         sw->v = v;
++         sw->cap = cap;
++      }
++      sw->v[sw->n].e = e;
++      sw->v[sw->n].w = i;
++      sw->n++;
++   }
++}
++
++/* A command that copies descriptors reads the sets it copies from: no
++ * older write may go from now on. */
++static void
++vkr_snap_unindex_all(struct vkr_snap *snap)
++{
++   hash_table_foreach (snap->set_writes, he)
++      vkr_snap_free_set_writes(he);
++   _mesa_hash_table_clear(snap->set_writes, NULL);
 +}
 +
 +/* the recording of a command buffer starts over */
@@ -1286,6 +1596,7 @@
 +      if (e && e->owner == cmd_buf)
 +         vkr_snap_drop(snap, i);
 +   }
++   vkr_snap_unpin(snap, cmd_buf);
 +}
 +
 +static void
@@ -1426,7 +1737,9 @@
 +      goto out;
 +
 +   const uint32_t nids = cmd->creates.n + cmd->refs.n + cmd->destroys.n;
-+   struct vkr_snap_entry *e = malloc(sizeof(*e) + sizeof(uint64_t) * nids + size);
++   const uint32_t nwrites = cmd->copies ? 0 : cmd->writes.n / 3;
++   struct vkr_snap_entry *e = malloc(sizeof(*e) + sizeof(uint64_t) * nids +
++                                     sizeof(struct vkr_snap_write) * nwrites + size);
 +   if (!e) {
 +      snap->broken = "out of memory";
 +      goto out;
@@ -1437,6 +1750,9 @@
 +   e->ncreates = cmd->creates.n;
 +   e->nrefs = cmd->refs.n;
 +   e->ndestroys = cmd->destroys.n;
++   e->nwrites = nwrites;
++   e->writes_left = nwrites;
++   e->pins = 0;
 +   e->needed = false;
 +   uint64_t *ids = e->ids;
 +   memcpy(ids, cmd->creates.v, sizeof(uint64_t) * cmd->creates.n);
@@ -1444,8 +1760,17 @@
 +   memcpy(ids, cmd->refs.v, sizeof(uint64_t) * cmd->refs.n);
 +   ids += cmd->refs.n;
 +   memcpy(ids, cmd->destroys.v, sizeof(uint64_t) * cmd->destroys.n);
-+   ids += cmd->destroys.n;
-+   memcpy(ids, bytes, size);
++   struct vkr_snap_write *w = vkr_snap_entry_writes(e);
++   for (uint32_t i = 0; i < nwrites; i++) {
++      const uint64_t *v = &cmd->writes.v[i * 3];
++      w[i] = (struct vkr_snap_write){
++         .set = v[0],
++         .binding = (uint32_t)(v[1] >> 32),
++         .first = (uint32_t)v[1],
++         .count = (uint32_t)v[2],
++      };
++   }
++   memcpy((uint8_t *)(w + nwrites), bytes, size);
 +
 +   if (snap->count == snap->cap) {
 +      const uint32_t cap = MAX2(snap->cap * 2, 256);
@@ -1466,9 +1791,36 @@
 +   }
 +   snap->entries[at] = e;
 +   snap->count++;
++   snap->bytes += size;
 +
-+   if (snap->count >= snap->gc_at)
++   if (e->owner && e->nrefs)
++      vkr_snap_pin(snap, e->owner, e->ids + e->ncreates, e->nrefs);
++   if (cmd->copies)
++      vkr_snap_unindex_all(snap);
++   if (nwrites) {
++      vkr_snap_supersede_writes(snap, e);
++      vkr_snap_index(snap, e);
++   }
++
++   if (snap->count >= snap->gc_at) {
 +      vkr_snap_gc(snap);
++      /* still that much after the clean-up: a context we won't follow */
++      if (snap->count > VKR_SNAP_MAX_COMMANDS || snap->bytes > VKR_SNAP_MAX_BYTES) {
++         vkr_log("snapshot: %u commands, %" PRIu64 " MiB kept: no longer following this context",
++                 snap->count, snap->bytes >> 20);
++         snap->broken = "too much state";
++         snap->off = true;
++         vkr_snap_unindex_all(snap);
++         hash_table_foreach (snap->pins, he)
++            vkr_snap_free_pins(he);
++         _mesa_hash_table_clear(snap->pins, NULL);
++         for (uint32_t i = 0; i < snap->count; i++)
++            free(snap->entries[i]);
++         snap->count = 0;
++         snap->holes = 0;
++         snap->bytes = 0;
++      }
++   }
 +
 +out:
 +   mtx_unlock(&snap->mutex);
@@ -1490,6 +1842,7 @@
 +   vkr_snap_ids_init(&cmd.creates);
 +   vkr_snap_ids_init(&cmd.refs);
 +   vkr_snap_ids_init(&cmd.destroys);
++   vkr_snap_ids_init(&cmd.writes);
 +
 +   struct vkr_snap_cmd *prev = vkr_snap_tls;
 +   vkr_snap_tls = &cmd;
@@ -1502,6 +1855,7 @@
 +   vkr_snap_ids_fini(&cmd.creates);
 +   vkr_snap_ids_fini(&cmd.refs);
 +   vkr_snap_ids_fini(&cmd.destroys);
++   vkr_snap_ids_fini(&cmd.writes);
 +}
 +
 +/* ---- the gate ---- */
@@ -2187,7 +2541,7 @@
 +      const struct vkr_snap_entry *e = snap->entries[i];
 +      uint8_t *p = vkr_snap_w_rec(w, VKR_SNAP_TAG_CMD, e->size);
 +      if (p)
-+         memcpy(p, e->ids + e->ncreates + e->nrefs + e->ndestroys, e->size);
++         memcpy(p, vkr_snap_entry_bytes(e), e->size);
 +   }
 +
 +   for (uint32_t d = 0; d < objs->device_count; d++) {
@@ -2915,7 +3269,7 @@
 +}
 --- /dev/null
 +++ b/src/venus/vkr_snap.h
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,109 @@
 +/*
 + * vroom: snapshots of a Venus context.
 + * SPDX-License-Identifier: MIT
@@ -2971,6 +3325,14 @@
 +
 +void
 +vkr_snap_note_remove(struct vkr_snap *snap, vkr_object_id id);
++
++/* descriptor writes of the command being dispatched (a later write of
++ * the same descriptors makes an older command unneeded), and copies */
++void
++vkr_snap_note_write(vkr_object_id set, uint32_t binding, uint32_t first, uint32_t count);
++
++void
++vkr_snap_note_copy(void);
 +
 +/* shm resources the context made (blob id 0) */
 +void
