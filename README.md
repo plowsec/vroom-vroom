@@ -16,6 +16,60 @@ The security design is better than the big three’s, at least on paper:
 - per-VM shared memory;
 - guest code can’t reach your files, other apps or the network stack.
 
+Who can touch what, one VM running:
+
+```text
+ your user, no sandbox
++---------------------------------------------------------------------+
+| vroom-gui (the app)                                                 |
+|  window, keyboard and mouse, host clipboard (its rules are enforced |
+|  here), reads the files you drop on the window. Never maps guest    |
+|  memory; what the VMM sends is checked like untrusted input.        |
++------------------+--------------------------------------------------+
+                   | socket + shared framebuffer
+                   v
++---------------------------------------------------------------------+
+| vroom run: the VMM               Seatbelt sandbox, set before boot  |
+|  vCPUs (Hypervisor.framework), guest RAM, every device in Rust      |
+|  may:    its own disk images, the shared folders you listed,        |
+|          NAT (outbound IP only), its state dir                      |
+|  may not: start programs, open other files, listen, use the GPU,    |
+|           camera, microphone or USB devices                         |
+|  +---------------------------------------------------------------+  |
+|  | the guest (treated as hostile)                                |  |
+|  |  vroom agent on a virtio port: clipboard text (only while the |  |
+|  |  window has focus), screen size, dropped files, clean         |  |
+|  |  shutdown; shared folders through virtio-fs                   |  |
+|  +---------------------------------------------------------------+  |
++---+-----------+------------+------------+------------+--------------+
+    | sockets   |            |            |            |
+    v           v            v            v            v
++---------+ +----------+ +---------+ +---------+ +---------+
+| GPU     | | audio    | | camera  | | USB     | | TPM     |
+| process | | helper   | | helper  | | helper  | | swtpm   |
+|virgl,   | |speakers; | |the Mac  | |one per  | |its state|
+|DXMT,    | |mic only  | |camera,  | |device,  | |folder   |
+|MoltenVK | |if you    | |only if  | |that     | |only     |
+|GPU and  | |turned it | |you      | |device   | |         |
+|guest RAM| |on        | |turned it| |only     | |         |
+|         | |          | |on       | |         | |         |
++---------+ +----------+ +---------+ +---------+ +---------+
+  each started by the VMM in its own Seatbelt sandbox: none of your
+  files, no network, no programs, only the one device it serves
+
++---------------------------------------------------------------------+
+| vroom-netd (optional, root, a launchd daemon)                       |
+|  bridged and host-only networks (vmnet). Small; checks every frame  |
+|  (source MAC, allowed interfaces); VMs reach it over a socket.      |
++---------------------------------------------------------------------+
+```
+
+A guest that breaks a device lands in the VMM's sandbox, with its own
+disks and nothing else of yours. Breaking the 3D code lands in the GPU
+process, which can't even reach the disks. Camera and microphone are off
+unless you turn them on, run only while the window is open and the guest
+uses them, and the window says so. Details: [SECURITY.md](docs/SECURITY.md).
+
 
 ## What works
 
@@ -30,6 +84,8 @@ The security design is better than the big three’s, at least on paper:
 - Nested VMs (M3 or newer)
 - Import from VMware Fusion (ARM64 VMs)
 - USB devices from the host (those macOS has no driver for; needs libusb)
+- Drag and drop files from the Mac into the guest
+- The Mac's camera as a webcam in the guest, if you turn it on
 - Fast disk and network I/O, measured against QEMU ([numbers](docs/PERFORMANCE.md))
 
 Not yet: x86_64 hosts (it builds, can't run VMs yet) and Secure Boot.
