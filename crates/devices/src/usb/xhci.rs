@@ -26,6 +26,7 @@ use vroom_usb::proto::{Done, Event, Request, Speed, Status, Submit, XferType, MA
 use serde::{Deserialize, Serialize};
 
 use super::hid::{HidEvent, Keyboard, Tablet, UsbIds};
+use super::uvc::Camera;
 use super::{Setup, UsbDevice};
 use crate::pci::{BarSpec, ConfigSpace, Intx, MsiSender, Msix, PciDevice, PciId, VendorIds};
 use crate::{get_le, put_le};
@@ -46,6 +47,8 @@ const HID_PORTS: usize = 2;
 /// free for devices plugged in while the VM runs. Fixed, so the guest
 /// sees the same controller whatever is plugged in (and snapshots fit).
 pub const PASS_PORTS: usize = 8;
+/// Most pairs a saved VM may come back with.
+const MAX_PASS_PAIRS: usize = 16;
 /// Most TRBs handled per doorbell / ring walk.
 const WALK_LIMIT: usize = 256;
 const LINK_LIMIT: usize = 8;
@@ -227,6 +230,8 @@ impl Passthrough {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PortKind {
     Hid,
+    /// The camera (UVC), after the HID ports.
+    Camera,
     /// Passthrough device, on its USB 2 or USB 3 port.
     Pass(usize, bool),
 }
@@ -282,6 +287,14 @@ struct Snap {
     slots: Vec<Option<Slot>>,
     kbd: Vec<u8>,
     tablet: Vec<u8>,
+    #[serde(default)]
+    camera: Vec<u8>,
+    /// The layout had a camera port (older saves: no).
+    #[serde(default)]
+    camera_port: bool,
+    /// Passthrough port pairs (older saves: none, see `restore`).
+    #[serde(default)]
+    pass_pairs: Option<u32>,
 }
 
 pub struct Xhci {
@@ -299,6 +312,12 @@ pub struct Xhci {
     slots: Vec<Option<Slot>>,
     kbd: Keyboard,
     tablet: Tablet,
+    camera: Option<Camera>,
+    /// A camera port in the layout. Usually "there is a camera", but a
+    /// resumed VM keeps the layout it was saved with (the guest read the
+    /// port count when it started): the port may be empty, or the camera
+    /// portless until the next start.
+    camera_port: bool,
     pass: Vec<Passthrough>,
     paused: bool,
     deferred: VecDeque<HidEvent>,
@@ -344,6 +363,8 @@ impl Xhci {
             slots: vec![None; MAX_SLOTS + 1],
             kbd: Keyboard::default(),
             tablet: Tablet::default(),
+            camera: None,
+            camera_port: false,
             pass: Vec::new(),
             paused: false,
             deferred: VecDeque::new(),
@@ -363,10 +384,42 @@ impl Xhci {
         let n = links.len().max(PASS_PORTS);
         let mut links = links.into_iter();
         self.pass = (0..n).map(|_| Passthrough::new(links.next())).collect();
-        self.ports = vec![0; HID_PORTS + 2 * n];
-        self.slots = vec![None; MAX_SLOTS.max(HID_PORTS + n) + 1];
-        self.hc_reset();
+        self.layout();
         self
+    }
+
+    /// A camera on a USB 2 port of its own, after the HID ports.
+    pub fn with_camera(mut self, cam: Camera) -> Self {
+        self.camera = Some(cam);
+        self.camera_port = true;
+        self.layout();
+        self
+    }
+
+    /// Ports and slots for what is plugged in.
+    fn layout(&mut self) {
+        let (e, n) = (self.emu(), self.pass.len());
+        self.ports = vec![0; e + 2 * n];
+        self.slots = vec![None; MAX_SLOTS.max(e + n) + 1];
+        self.hc_reset();
+    }
+
+    /// Ports of our own devices (HID, camera), before passthrough ones.
+    fn emu(&self) -> usize {
+        HID_PORTS + self.camera_port as usize
+    }
+
+    /// A new frame from the camera: hand it to a transfer that waits.
+    pub fn camera_frame(&mut self) {
+        if self.paused || self.camera.is_none() || !self.camera_port {
+            return;
+        }
+        let port = HID_PORTS as u8 + 1;
+        let ids: Vec<usize> = (1..=self.max_slots()).filter(|&i| self.slots[i].as_ref().is_some_and(|s| s.port == port)).collect();
+        for id in ids {
+            // EP1 IN.
+            self.run_interrupt_in(id, 3);
+        }
     }
 
     fn max_slots(&self) -> usize {
@@ -375,18 +428,19 @@ impl Xhci {
 
     fn port_kind(&self, port: u8) -> Option<PortKind> {
         let p = (port as usize).checked_sub(1)?;
-        let n = self.pass.len();
+        let (e, n) = (self.emu(), self.pass.len());
         match p {
             _ if p < HID_PORTS => Some(PortKind::Hid),
-            _ if p < HID_PORTS + n => Some(PortKind::Pass(p - HID_PORTS, false)),
-            _ if p < HID_PORTS + 2 * n => Some(PortKind::Pass(p - HID_PORTS - n, true)),
+            _ if p < e => Some(PortKind::Camera),
+            _ if p < e + n => Some(PortKind::Pass(p - e, false)),
+            _ if p < e + 2 * n => Some(PortKind::Pass(p - e - n, true)),
             _ => None,
         }
     }
 
     /// Index into `ports` of passthrough device `i`'s USB 2 / USB 3 port.
     fn pass_port(&self, i: usize, usb3: bool) -> usize {
-        HID_PORTS + i + if usb3 { self.pass.len() } else { 0 }
+        self.emu() + i + if usb3 { self.pass.len() } else { 0 }
     }
 
     /// PORTSC of a passthrough port with (Some) or without a device.
@@ -416,6 +470,7 @@ impl Xhci {
         match port {
             1 => Some(&mut self.kbd),
             2 => Some(&mut self.tablet),
+            3 if self.camera_port => self.camera.as_mut().map(|c| c as &mut dyn UsbDevice),
             _ => None,
         }
     }
@@ -425,9 +480,14 @@ impl Xhci {
         self.intr = Intr::default();
         self.cmd = Ring::default();
         self.slots = vec![None; self.max_slots() + 1];
-        for p in 0..HID_PORTS {
+        for p in 0..self.emu() {
             // Device attached, powered, waiting for a port reset.
-            self.ports[p] = PS_CCS | PS_PP | PS_CSC | PLS_POLLING << PS_PLS_SHIFT | (super::SPEED_FULL as u32) << PS_SPEED_SHIFT;
+            let speed = if p < HID_PORTS { super::SPEED_FULL } else { super::SPEED_HIGH };
+            self.ports[p] = PS_CCS | PS_PP | PS_CSC | PLS_POLLING << PS_PLS_SHIFT | (speed as u32) << PS_SPEED_SHIFT;
+            if p >= HID_PORTS && self.camera.is_none() {
+                // An empty camera port (see `camera_port`).
+                self.ports[p] = PS_PP | PLS_RXDETECT << PS_PLS_SHIFT;
+            }
         }
         for i in 0..self.pass.len() {
             self.pass_forget(i);
@@ -446,6 +506,9 @@ impl Xhci {
         }
         self.kbd.reset();
         self.tablet.reset();
+        if let Some(c) = &mut self.camera {
+            c.reset();
+        }
         self.intx.set(false);
     }
 
@@ -970,8 +1033,9 @@ impl Xhci {
             let Some((r, td)) = self.gather_td(ep.ring, false, TD_TRBS) else { return };
             // TDs with a data buffer wait for a report; pure No-op /
             // Event Data TDs complete right away.
+            let room: usize = td.iter().filter(|(_, t)| trb_type(t) == T_NORMAL).map(|(_, t)| (t[2] & 0x1ffff) as usize).sum();
             let report = if td.iter().any(|(_, t)| trb_type(t) == T_NORMAL) {
-                match self.dev(port).and_then(|d| d.poll_in(epnum)) {
+                match self.dev(port).and_then(|d| d.poll_in_max(epnum, room)) {
                     Some(r) => r,
                     None => return,
                 }
@@ -1339,10 +1403,10 @@ impl Xhci {
             // passthrough device), then USB 3.0 if there are any.
             o if o == XECP => 0x0200_0002 | if n > 0 { 4 << 8 } else { 0 },
             o if o == XECP + 4 => 0x2042_5355, // "USB "
-            o if o == XECP + 8 => (HID_PORTS as u32 + n) << 8 | 1,
+            o if o == XECP + 8 => (self.emu() as u32 + n) << 8 | 1,
             o if o == XECP + 0x10 && n > 0 => 0x0300_0002,
             o if o == XECP + 0x14 && n > 0 => 0x2042_5355,
-            o if o == XECP + 0x18 && n > 0 => n << 8 | (HID_PORTS as u32 + n + 1),
+            o if o == XECP + 0x18 && n > 0 => n << 8 | (self.emu() as u32 + n + 1),
             _ => 0,
         }
     }
@@ -1626,46 +1690,43 @@ impl PciDevice for Xhci {
             slots: self.slots.clone(),
             kbd: self.kbd.save(),
             tablet: self.tablet.save(),
+            camera: self.camera.as_ref().map(|c| c.save()).unwrap_or_default(),
+            camera_port: self.camera_port,
+            pass_pairs: Some(self.pass.len() as u32),
         })
     }
 
     fn restore(&mut self, data: &[u8]) -> vroom_snapshot::Result<()> {
-        let mut s: Snap = decode(data)?;
+        let s: Snap = decode(data)?;
         let mut cfg = s.cfg;
-        // Snapshots from before the fixed port pairs had one pair per
-        // device in the VM file: their ports move to where they are now.
-        let old_n = s.ports.len().checked_sub(HID_PORTS).filter(|n| n % 2 == 0).map(|n| n / 2);
-        if !cfg.rebuild_masks(&self.cfg) || s.msix.vectors() != self.msix.vectors() || s.slots.len() > self.slots.len() || old_n.is_none_or(|n| n > self.pass.len()) {
+        // The saved layout wins (the guest read the port count when its
+        // driver started): the camera port, and as many passthrough port
+        // pairs as there were. Older saves have one pair per device the
+        // VM file had then, and no count.
+        let emu = HID_PORTS + s.camera_port as usize;
+        let pairs = match s.pass_pairs {
+            Some(n) => n as usize,
+            None => s.ports.len().saturating_sub(emu) / 2,
+        };
+        if !cfg.rebuild_masks(&self.cfg)
+            || s.msix.vectors() != self.msix.vectors()
+            || pairs > MAX_PASS_PAIRS
+            || s.ports.len() != emu + 2 * pairs
+            || s.slots.len() < 2
+            || s.slots.len() > MAX_SLOTS.max(emu + pairs) + 1
+        {
             return Err(vroom_snapshot::Error::Invalid("xhci layout".into()));
         }
         if s.slots.iter().flatten().any(|sl| sl.port as usize > s.ports.len() || sl.eps.keys().any(|&d| d == 0 || d > 31)) {
             return Err(vroom_snapshot::Error::Invalid("xhci slots".into()));
         }
-        let old_n = old_n.unwrap_or(0);
-        if old_n != self.pass.len() {
-            let n = self.pass.len();
-            let at = |p: usize| match p.checked_sub(HID_PORTS) {
-                None => p,
-                Some(q) if q < old_n => HID_PORTS + q,
-                Some(q) => HID_PORTS + n + (q - old_n),
-            };
-            let mut ports = vec![0; self.ports.len()];
-            for (p, v) in s.ports.iter().enumerate() {
-                ports[at(p)] = *v;
-            }
-            for i in old_n..n {
-                for usb3 in [false, true] {
-                    ports[self.pass_port(i, usb3)] = Self::pass_portsc(None, usb3);
-                }
-            }
-            s.ports = ports;
-            for sl in s.slots.iter_mut().flatten() {
-                if sl.port > 0 {
-                    sl.port = (at(sl.port as usize - 1) + 1) as u8;
-                }
-            }
+        if pairs < self.pass.len() && self.pass[pairs..].iter().any(|p| p.used) {
+            log::info!("usb: the VM was saved with fewer USB ports; devices past them come at its next start");
         }
-        s.slots.resize(self.slots.len(), None);
+        self.pass.truncate(pairs);
+        while self.pass.len() < pairs {
+            self.pass.push(Passthrough::new(None));
+        }
         let sender = self.msix.sender();
         self.cfg = cfg;
         self.msix = s.msix;
@@ -1677,10 +1738,25 @@ impl PciDevice for Xhci {
         self.intr = s.intr;
         self.intr.erstsz = self.intr.erstsz.min(16);
         self.cmd = s.cmd;
+        self.camera_port = s.camera_port;
         self.ports = s.ports;
         self.slots = s.slots;
         self.kbd.restore(&s.kbd);
         self.tablet.restore(&s.tablet);
+        if let Some(c) = &mut self.camera {
+            c.restore(&s.camera);
+        }
+        if self.camera.is_some() && !self.camera_port {
+            log::info!("usb camera: added while the VM was saved; there from its next start");
+        }
+        if self.camera_port && self.camera.is_none() {
+            // Removed while saved: the guest sees it unplugged.
+            let p = HID_PORTS;
+            if self.ports[p] & PS_CCS != 0 {
+                self.ports[p] = PS_PP | PLS_RXDETECT << PS_PLS_SHIFT | PS_CSC;
+                self.port_events_due = true;
+            }
+        }
         // Passthrough devices can't be saved: what the guest had is
         // gone. It sees the device leave, and come back if it is here.
         for i in 0..self.pass.len() {
@@ -1721,6 +1797,38 @@ mod tests {
     struct NoMsi;
     impl MsiSender for NoMsi {
         fn send(&self, _a: u64, _d: u32) {}
+    }
+
+    #[test]
+    fn a_saved_vm_keeps_its_camera_port() {
+        let mem = GuestMemory::new(&[(GuestAddress(RAM), 1 << 20)]).unwrap();
+        let mk = |cam: bool| {
+            let r = IntxRouter::new((0..4).map(|_| Arc::new(NoIrq) as Arc<dyn crate::IrqLine>).collect());
+            let x = Xhci::new(6, mem.clone(), r.pin(6, 1), Arc::new(NoMsi));
+            if cam {
+                x.with_camera(Camera::new(&UsbIds::default(), Arc::new(super::super::uvc::CameraFeed::default())))
+            } else {
+                x
+            }
+        };
+        let (mut with, mut without) = (mk(true), mk(false));
+        let saved_with = with.save().unwrap();
+        let saved_without = without.save().unwrap();
+        // Camera turned off while saved: the port stays, empty, and the
+        // guest is told it changed.
+        let mut x = mk(false);
+        x.restore(&saved_with).unwrap();
+        assert_eq!(x.ports.len(), HID_PORTS + 1);
+        assert_eq!(x.ports[HID_PORTS] & (PS_CCS | PS_CSC), PS_CSC);
+        assert!(x.dev(3).is_none());
+        // Turned on while saved: no port until the next start.
+        let mut x = mk(true);
+        x.restore(&saved_without).unwrap();
+        assert_eq!(x.ports.len(), HID_PORTS);
+        assert!(x.dev(3).is_none());
+        // Unchanged: as before.
+        with.restore(&saved_with).unwrap();
+        assert!(with.dev(3).is_some());
     }
 
     const RAM: u64 = 0x4000_0000;
@@ -2210,24 +2318,54 @@ mod tests {
     }
 
     #[test]
-    fn snapshots_from_before_the_fixed_pairs_restore() {
+    fn a_saved_vm_keeps_its_usb_port_pairs() {
         let (mut h, _helper) = pass_host();
         h.x.pause();
         let mut snap: Snap = decode(&h.x.save().unwrap()).unwrap();
-        // One pair, as a VM with one [[usb]] device had: USB 2 port 3,
-        // USB 3 port 4; a slot on the USB 3 one.
+        assert_eq!(snap.pass_pairs, Some(PASS_PORTS as u32));
+        // A save from before the spare pairs: one pair, as a VM with one
+        // [[usb]] device had (USB 2 port 3, USB 3 port 4), and no count.
         let ports = snap.ports.clone();
         snap.ports = vec![ports[0], ports[1], ports[HID_PORTS], ports[HID_PORTS + PASS_PORTS]];
+        snap.pass_pairs = None;
         snap.slots.truncate(MAX_SLOTS + 1);
         snap.slots[1].as_mut().unwrap().port = 4;
         h.x.restore(&encode(&snap).unwrap()).unwrap();
-        assert_eq!(h.x.ports.len(), HID_PORTS + 2 * PASS_PORTS);
-        assert_eq!(h.x.slots[1].as_ref().unwrap().port as usize, HID_PORTS + PASS_PORTS + 1);
+        assert_eq!((h.x.ports.len(), h.x.pass.len()), (HID_PORTS + 2, 1), "the layout it was saved with");
+        assert_eq!(h.x.slots[1].as_ref().unwrap().port, 4);
+        assert_eq!(h.x.pass_free(), None, "no spare pair until the next start");
         h.x.resume();
         assert_eq!(portsc(&mut h, PASS_PORT) & (PS_CCS | PS_CSC), PS_CSC, "the device left");
-        // A layout with more pairs than there are: refused.
-        let mut big: Snap = decode(&h.x.save().unwrap()).unwrap();
-        big.ports = vec![0; HID_PORTS + 2 * (PASS_PORTS + 1)];
-        assert!(h.x.restore(&encode(&big).unwrap()).is_err());
+        // And back to the spare pairs from a save that had them.
+        h.x.pause();
+        let back: Snap = decode(&h.x.save().unwrap()).unwrap();
+        assert_eq!(back.pass_pairs, Some(1));
+        let mut x8 = snap.clone_with_pairs(PASS_PORTS);
+        x8.slots.truncate(MAX_SLOTS + 1);
+        h.x.restore(&encode(&x8).unwrap()).unwrap();
+        assert_eq!(h.x.pass.len(), PASS_PORTS);
+        assert!(h.x.pass_free().is_some());
+        // Counts that don't add up, or too many pairs: refused.
+        let mut bad = x8.clone_with_pairs(3);
+        bad.ports.push(0);
+        assert!(h.x.restore(&encode(&bad).unwrap()).is_err());
+        assert!(h.x.restore(&encode(&x8.clone_with_pairs(MAX_PASS_PAIRS + 1)).unwrap()).is_err());
+    }
+
+    impl Snap {
+        /// This save with `n` empty passthrough pairs.
+        fn clone_with_pairs(&self, n: usize) -> Snap {
+            let mut s: Snap = decode(&encode(self).unwrap()).unwrap();
+            let emu = HID_PORTS + s.camera_port as usize;
+            s.ports.truncate(emu);
+            s.ports.extend(std::iter::repeat_n(PS_PP, 2 * n));
+            s.pass_pairs = Some(n as u32);
+            for sl in s.slots.iter_mut() {
+                if sl.as_ref().is_some_and(|sl| sl.port as usize > emu) {
+                    *sl = None;
+                }
+            }
+            s
+        }
     }
 }

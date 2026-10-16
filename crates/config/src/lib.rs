@@ -61,6 +61,11 @@ pub struct VmConfig {
     pub nested: bool,
     #[serde(default)]
     pub audio: Audio,
+    /// The Mac's camera, as a USB webcam in the guest (Windows and Linux
+    /// drivers built in). On only while the guest uses it and the VM's
+    /// window is open; macOS asks for permission the first time.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub camera: bool,
     /// Host folders the guest can mount (virtio-fs).
     #[serde(default, rename = "share")]
     pub shares: Vec<Share>,

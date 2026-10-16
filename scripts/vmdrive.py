@@ -72,7 +72,7 @@ def reader():
                 i, ok = struct.unpack("<IB", pl[:5]); place = pl[5:].decode(errors="replace")
                 ev.write(f"dropdone {i} {ok} {place}\n")
                 drag_ev.append(("done", i, ok)); drag_cv.set()
-            elif t == 10:
+            elif t == 11:
                 n, o, out = pl[0], 1, []
                 for _ in range(n):
                     port, flags = pl[o], pl[o + 1]; o += 2

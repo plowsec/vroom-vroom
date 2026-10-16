@@ -48,6 +48,7 @@ struct Sticky {
     mode: Option<(u32, u32)>,
     cursor: Option<GuestCursor>,
     mic: Option<bool>,
+    camera: Option<bool>,
     /// Running, paused, or why a suspend failed.
     state: Option<String>,
     /// "guest agent connected (...)".
@@ -108,6 +109,7 @@ impl ViewerTx {
         }
         first.extend(st.cursor.clone().map(ToViewer::Cursor));
         first.extend(st.mic.map(ToViewer::Mic));
+        first.extend(st.camera.map(ToViewer::Camera));
         first.extend(st.agent.clone().map(ToViewer::Status));
         first.extend(st.state.clone().map(ToViewer::Status));
         first.extend(st.usb.clone().map(ToViewer::Usb));
@@ -125,6 +127,7 @@ impl ViewerTx {
             ToViewer::Mode { width, height } => st.mode = Some((*width, *height)),
             ToViewer::Cursor(c) => st.cursor = Some(c.clone()),
             ToViewer::Mic(on) => st.mic = Some(*on),
+            ToViewer::Camera(on) => st.camera = Some(*on),
             ToViewer::Status(t) if t == "running" || t == "paused" || t.starts_with("suspend failed") || t.starts_with("host disk almost full") => {
                 st.state = Some(t.clone())
             }

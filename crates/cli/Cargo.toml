@@ -27,5 +27,15 @@ vroom-usb.workspace = true
 vroom-gpu3d.workspace = true
 arboard = { version = "3", default-features = false }
 
+# The camera helper (`vroom camera-helper`): the Mac's camera via AVFoundation.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSDictionary", "NSValue", "NSObject", "NSError", "NSObjCRuntime"] }
+objc2-av-foundation = { version = "0.3", default-features = false, features = ["std", "AVCaptureSession", "AVCaptureSessionPreset", "AVCaptureDevice", "AVCaptureInput", "AVCaptureOutputBase", "AVCaptureVideoDataOutput", "AVMediaFormat", "objc2-core-media", "dispatch2", "block2"] }
+objc2-core-media = { version = "0.3", default-features = false, features = ["std", "CMSampleBuffer", "objc2-core-video"] }
+objc2-core-video = { version = "0.3", default-features = false, features = ["std", "CVBase", "CVPixelBuffer", "CVImageBuffer", "CVBuffer", "CVReturn"] }
+dispatch2 = { version = "0.3", default-features = false, features = ["std", "objc2"] }
+block2 = "0.6"
+
 [lints]
 workspace = true

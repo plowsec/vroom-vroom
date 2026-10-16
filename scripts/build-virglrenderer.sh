@@ -72,11 +72,12 @@ done
   meson compile -C build && meson install -C build; } >>"$log" 2>&1 || { tail -20 "$log"; exit 1; }
 for d in debug release; do
   [ -d "$ROOT/target/$d" ] || continue
-  cp "$PREFIX/lib/libvirglrenderer.1.dylib" "$ROOT/target/$d/"
+  # -f: Homebrew's MoltenVK is read-only, and so is our copy of it.
+  cp -f "$PREFIX/lib/libvirglrenderer.1.dylib" "$ROOT/target/$d/"
   # Venus loads MoltenVK from virglrenderer's directory.
-  cp "$MVK/lib/libMoltenVK.dylib" "$ROOT/target/$d/"
+  cp -f "$MVK/lib/libMoltenVK.dylib" "$ROOT/target/$d/"
   for l in libEGL libGLESv2; do
-    [ -f "$ROOT/target/angle/$l.dylib" ] && cp "$ROOT/target/angle/$l.dylib" "$ROOT/target/$d/"
+    [ -f "$ROOT/target/angle/$l.dylib" ] && cp -f "$ROOT/target/angle/$l.dylib" "$ROOT/target/$d/"
   done
 done
 echo "built: $PREFIX/lib/libvirglrenderer.1.dylib"

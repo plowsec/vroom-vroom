@@ -6,6 +6,7 @@
 
 pub mod agent;
 mod audio;
+mod camera;
 mod disks;
 
 /// Helper processes we started (swtpm, audio): the only processes the

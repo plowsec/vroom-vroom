@@ -171,6 +171,14 @@ once a Neptune context exists, a resize reports scanout 0 disabled, then
 enabled at the new size (checked and retried until Windows shows it), and
 the guest agent is asked for the mode after that.
 
+The guest creates IMMUTABLE buffers and textures without data and fills
+them right after with an update. Direct3D forbids writing those, and DXMT
+orders nothing on them, so a copy or draw could read one before its
+contents landed: in Explorer the glyph atlas lost its white texel (copied
+from a 1x1 IMMUTABLE texture), and text and boxes drawn with it went
+missing. Our virglrenderer patch creates such resources DEFAULT
+(`third_party/virglrenderer/`).
+
 The viewer can come and go. The VMM a window starts also listens on a
 socket in the user's temp dir (`$TMPDIR/vroom/<hash of the state dir>.sock`,
 0600 in a 0700 dir; the state dir's `viewer` file names it; socket paths

@@ -16,6 +16,33 @@ The security design is better than the big three’s, at least on paper:
 - per-VM shared memory;
 - guest code can’t reach your files, other apps or the network stack.
 
+```text
+ ┌──────────────────────────── your Mac ─────────────────────────────┐
+ │                                                                   │
+ │   ┌───────────┐                                                   │
+ │   │ vroom-gui │◄──── window · keyboard · clipboard · drops        │
+ │   └─────┬─────┘                                                   │
+ │         │                                                         │
+ │   ╔═════╧═══════════════ VMM ════════════════╗                    │
+ │   ║                                          ╟──── disks          │
+ │   ║   ┌──────────── guest ──────────────┐    ╟──── shared folders │
+ │   ║   │  Linux / Windows      (hostile) │    ╟──── NAT            │
+ │   ║   └─────────────────────────────────┘    ║                    │
+ │   ╚═══╤════════╤════════╤════════╤════════╤══╝                    │
+ │       │        │        │        │        │                       │
+ │   ╔═══╧═══╗╔═══╧═══╗╔═══╧═══╗╔═══╧═══╗╔═══╧═══╗   ┌──────────┐    │
+ │   ║  3D   ║║ audio ║║camera ║║  USB  ║║  TPM  ║   │   netd   │    │
+ │   ╚═══╤═══╝╚═══╤═══╝╚═══╤═══╝╚═══╤═══╝╚═══════╝   │  (root)  │    │
+ │       │        │        │        │                └────┬─────┘    │
+ │      GPU    speaker   camera   device                  LAN        │
+ │              (mic)                                                │
+ └───────────────────────────────────────────────────────────────────┘
+   ═══ own sandbox        ─── no sandbox        camera, mic: opt-in
+```
+
+A guest that breaks out lands in the VMM's sandbox: its own disks, nothing
+else of yours. Details in [SECURITY.md](docs/SECURITY.md).
+
 
 ## What works
 
@@ -30,6 +57,8 @@ The security design is better than the big three’s, at least on paper:
 - Nested VMs (M3 or newer)
 - Import from VMware Fusion (ARM64 VMs)
 - USB devices from the host (those macOS has no driver for; needs libusb)
+- Drag and drop files from the Mac into the guest
+- The Mac's camera as a webcam in the guest, if you turn it on
 - Fast disk and network I/O, measured against QEMU ([numbers](docs/PERFORMANCE.md))
 
 Not yet: x86_64 hosts (it builds, can't run VMs yet) and Secure Boot.

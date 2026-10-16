@@ -69,6 +69,12 @@ pub fn audio_profile(exe: &std::path::Path, wav_dir: Option<&std::path::Path>, i
     macos::audio_profile(exe, wav_dir, input)
 }
 
+/// Seatbelt profile for the camera helper (macOS).
+#[cfg(target_os = "macos")]
+pub fn camera_profile(exe: &std::path::Path) -> Result<String> {
+    macos::camera_profile(exe)
+}
+
 /// Seatbelt profile for the USB passthrough helper (macOS).
 #[cfg(target_os = "macos")]
 pub fn usb_profile(exe: &std::path::Path) -> Result<String> {
