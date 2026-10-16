@@ -60,7 +60,7 @@ vroom usb list                    # host USB devices, the id for [[usb]]
 |---|---|
 | snapshot / suspend / pause | `Ctrl+Alt+Shift` + `S` / `Z` / `P` |
 | reset / shut down / power off | `Ctrl+Alt+Shift` + `R` / `D` / `Q` |
-| toolbar | move the mouse to the top edge |
+| toolbar in full screen | move the mouse to the top edge |
 | close the window | suspends the VM, next start resumes it |
 
 | In `vroom run` | `Ctrl-A` then |

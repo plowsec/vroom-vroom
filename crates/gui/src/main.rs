@@ -40,11 +40,11 @@ pub fn os_id(os: GuestOs) -> &'static str {
 pub fn fallback(m: msg::Msg) {
     use msg::Msg;
     match m {
-        Msg::ShowLibrary => {
-            if let Err(e) = app::launch() {
-                eprintln!("vroom-gui: {e}");
-            }
-        }
+        Msg::ShowLibrary(key) => match app::launch() {
+            // The library handles messages now: let it pick the VM.
+            Ok(()) => msg::send(Msg::ShowLibrary(key)),
+            Err(e) => eprintln!("vroom-gui: {e}"),
+        },
         Msg::ConsoleGone { error, .. } => {
             if let Some(e) = error {
                 eprintln!("vroom-gui: {e}");

@@ -1,6 +1,7 @@
-// A running VM's window. The guest screen fills it; a toolbar slides in
-// when the mouse touches the top edge. Keys go to the guest from Rust
-// (raw key codes, not text), so nothing here handles the keyboard.
+// A running VM's window. A bar along the top holds the VM's actions and
+// state; the guest screen gets the rest. In full screen the bar slides in
+// when the mouse touches the top edge instead. Keys go to the guest from
+// Rust (raw key codes, not text), so nothing here handles the keyboard.
 
 import { Theme } from "theme.slint";
 import { Icons } from "icons.slint";
@@ -9,7 +10,251 @@ import { IconButton, Icon, Spinner, OsBadge, StatusDot, Button } from "controls.
 
 component BarButton inherits IconButton {
     tint: #ffffffd0;
-    size: 32px;
+    size: 30px;
+}
+
+// Thin divider between groups of bar buttons.
+component BarRule inherits Rectangle {
+    width: 1px;
+    height: 18px;
+    background: #ffffff24;
+}
+
+// What both bars show: the VM, its state, its actions. The power button
+// opens shut down / restart / power off.
+component VmBar inherits HorizontalLayout {
+    in property <string> vm-name;
+    in property <string> os;
+    in property <VmState> state;
+    in property <bool> windows-guest;
+    in property <bool> captured;
+    in property <bool> fullscreen;
+    in property <bool> mic-on;
+    // Host CPU time the VM uses ("12%"; empty: unknown).
+    in property <string> cpu-text;
+    // "3D", "Direct3D 11"; empty without 3D.
+    in property <string> gpu-text;
+    // Spans the window: the indicators go to the right.
+    in property <bool> wide;
+    out property <bool> power-open: false;
+    callback act(string);
+
+    padding-left: 8px;
+    padding-right: 6px;
+    spacing: 2px;
+    OsBadge {
+        os: root.os;
+        size: 22px;
+        y: (parent.height - self.height) / 2;
+    }
+    HorizontalLayout {
+        horizontal-stretch: 0;
+        padding-left: 6px;
+        padding-right: 8px;
+        spacing: 7px;
+        Text {
+            text: root.vm-name;
+            color: #ffffff;
+            font-size: Theme.fs-md;
+            font-weight: 650;
+            vertical-alignment: center;
+            overflow: elide;
+            max-width: 220px;
+        }
+        StatusDot {
+            width: 6px;
+            height: 6px;
+            y: (parent.height - self.height) / 2;
+            tint: root.state == VmState.running ? #34d399 : #fbbf24;
+        }
+        Text {
+            text: root.state == VmState.paused ? "Paused" : root.state == VmState.starting ? "Starting"
+                : root.state == VmState.suspending ? "Saving state" : root.state == VmState.stopping ? "Shutting down"
+                : root.captured ? "Keyboard goes to the VM" : "Running";
+            color: #ffffff99;
+            font-size: Theme.fs-xs;
+            vertical-alignment: center;
+        }
+    }
+    BarRule {
+        y: (parent.height - self.height) / 2;
+    }
+    BarButton {
+        icon: root.state == VmState.paused ? Icons.play : Icons.pause;
+        tip: root.state == VmState.paused ? "Continue" : "Pause";
+        y: (parent.height - self.height) / 2;
+        clicked => { root.act(root.state == VmState.paused ? "resume" : "pause"); }
+    }
+    BarButton {
+        icon: Icons.camera;
+        tip: "Snapshot";
+        y: (parent.height - self.height) / 2;
+        clicked => { root.act("snapshot"); }
+    }
+    BarButton {
+        icon: Icons.moon;
+        tip: "Suspend and close";
+        y: (parent.height - self.height) / 2;
+        clicked => { root.act("suspend"); }
+    }
+    pb := BarButton {
+        icon: Icons.power;
+        tip: "Shut down...";
+        active: root.power-open;
+        y: (parent.height - self.height) / 2;
+        clicked => {
+            root.power-open = true;
+            power.show();
+        }
+    }
+    if root.windows-guest: BarButton {
+        icon: Icons.keyboard;
+        tip: "Send Ctrl+Alt+Del";
+        y: (parent.height - self.height) / 2;
+        clicked => { root.act("cad"); }
+    }
+    if root.wide: Rectangle {
+        horizontal-stretch: 1;
+    }
+    if root.mic-on: Rectangle {
+        y: (parent.height - self.height) / 2;
+        height: 22px;
+        width: ml.preferred-width;
+        border-radius: 11px;
+        background: #ffffff14;
+        ml := HorizontalLayout {
+            padding-left: 8px;
+            padding-right: 9px;
+            spacing: 6px;
+            StatusDot {
+                width: 7px;
+                height: 7px;
+                y: (parent.height - self.height) / 2;
+                tint: #ef4444;
+            }
+            Text {
+                text: "Microphone in use";
+                color: #ffffffd0;
+                font-size: Theme.fs-xs;
+                vertical-alignment: center;
+            }
+        }
+    }
+    if root.wide && root.cpu-text != "": HorizontalLayout {
+        horizontal-stretch: 0;
+        padding-left: 8px;
+        spacing: 5px;
+        Icon {
+            source: Icons.cpu;
+            width: 14px;
+            height: 14px;
+            y: (parent.height - self.height) / 2;
+            tint: #ffffff80;
+        }
+        Text {
+            // Room for "100%": the bar doesn't twitch as it changes.
+            min-width: 30px;
+            text: root.cpu-text;
+            color: #ffffffb0;
+            font-size: Theme.fs-xs;
+            vertical-alignment: center;
+        }
+    }
+    if root.wide && root.gpu-text != "": HorizontalLayout {
+        horizontal-stretch: 0;
+        padding-left: 8px;
+        spacing: 5px;
+        Icon {
+            source: Icons.sparkles;
+            width: 14px;
+            height: 14px;
+            y: (parent.height - self.height) / 2;
+            tint: #ffffff80;
+        }
+        Text {
+            text: root.gpu-text;
+            color: #ffffffb0;
+            font-size: Theme.fs-xs;
+            vertical-alignment: center;
+        }
+    }
+    Rectangle {
+        width: 6px;
+    }
+    BarRule {
+        y: (parent.height - self.height) / 2;
+    }
+    BarButton {
+        icon: Icons.sliders;
+        tip: "Settings";
+        y: (parent.height - self.height) / 2;
+        clicked => { root.act("settings"); }
+    }
+    BarButton {
+        icon: Icons.maximize;
+        tip: root.fullscreen ? "Leave full screen" : "Full screen";
+        y: (parent.height - self.height) / 2;
+        clicked => { root.act("fullscreen"); }
+    }
+    BarButton {
+        icon: Icons.logo;
+        tip: "VM library";
+        y: (parent.height - self.height) / 2;
+        clicked => { root.act("library"); }
+    }
+    power := PopupWindow {
+        x: pb.x + pb.width - self.width;
+        y: root.height + 2px;
+        width: 200px;
+        close-policy: close-on-click-outside;
+        changed visible => {
+            if !self.visible {
+                root.power-open = false;
+            }
+        }
+        Rectangle {
+            background: #242427f2;
+            border-radius: Theme.r-lg;
+            border-width: 1px;
+            border-color: #ffffff24;
+            VerticalLayout {
+                padding: 5px;
+                for it in [
+                    { icon: Icons.power, text: "Shut down", action: "shutdown", danger: false },
+                    { icon: Icons.restart, text: "Restart", action: "reset", danger: false },
+                    { icon: Icons.x, text: "Force power off", action: "poweroff", danger: true },
+                ]: Rectangle {
+                    height: 32px;
+                    border-radius: Theme.r-sm;
+                    background: pta.has-hover ? (it.danger ? #f8717133 : #ffffff14) : transparent;
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        spacing: 10px;
+                        Icon {
+                            source: it.icon;
+                            width: 16px;
+                            height: 16px;
+                            y: (parent.height - self.height) / 2;
+                            tint: it.danger ? #f87171 : #ffffffb0;
+                        }
+                        Text {
+                            text: it.text;
+                            color: it.danger ? #f87171 : #ffffff;
+                            font-size: Theme.fs-md;
+                            vertical-alignment: center;
+                        }
+                    }
+                    pta := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            root.power-open = false;
+                            root.act(it.action);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 export component ConsoleWindow inherits Window {
@@ -26,33 +271,43 @@ export component ConsoleWindow inherits Window {
     in property <bool> fullscreen;
     // The guest is recording from the host microphone.
     in property <bool> mic-on;
-    // Rust keeps the bar out for a moment after start.
+    // Rust keeps the full-screen bar out for a moment after going full screen.
     in property <bool> bar-pinned;
     // Set when saving the VM's state failed (why, from the VMM).
     in property <string> suspend-error;
+    in property <string> cpu-text;
+    in property <string> gpu-text;
+    // Height of the bar above the guest screen (none in full screen).
+    // Rust takes it off the size it asks the guest for.
+    out property <length> bar-height: root.fullscreen ? 0px : 38px;
+    // The guest screen's width on the window (for the pointer's size).
+    out property <length> screen-width: screen.width;
     callback mouse-move(float, float);
     callback button(int, bool);
     callback wheel(length, length);
     callback act(string);
+    // The mouse went over the guest screen (true) or left it.
+    callback pointer-over(bool);
 
     title: vm-name + " — vroom";
     icon: Icons.logo;
     background: #000000;
+    // The guest starts at 1280x800.
     preferred-width: 1280px;
-    preferred-height: 800px;
-    min-width: 480px;
+    preferred-height: 800px + root.bar-height;
+    min-width: 640px;
     min-height: 320px;
 
     property <float> ar: mode-w > 0 && mode-h > 0 ? mode-w / mode-h : 1.6;
+    property <length> avail-h: root.height - root.bar-height;
     property <bool> near-top: screen-ta.has-hover && screen-ta.mouse-y + screen.y < 8px;
-    property <bool> bar-out: bar-pinned || near-top || bar-ta.has-hover || power-open || state != VmState.running;
-    property <bool> power-open: false;
+    property <bool> float-out: root.fullscreen && (root.bar-pinned || root.near-top || float-ta.has-hover || float-bar.power-open || root.state != VmState.running);
 
     screen := Rectangle {
-        width: min(root.width, root.height * root.ar);
+        width: min(root.width, root.avail-h * root.ar);
         height: self.width / root.ar;
         x: (root.width - self.width) / 2;
-        y: (root.height - self.height) / 2;
+        y: root.bar-height + (root.avail-h - self.height) / 2;
         Image {
             width: 100%;
             height: 100%;
@@ -61,6 +316,11 @@ export component ConsoleWindow inherits Window {
             image-rendering: smooth;
         }
         screen-ta := TouchArea {
+            // Rust sets the pointer here (the guest's picture, an arrow,
+            // or none). A cursor no other item uses makes Slint set the
+            // right one again whenever the mouse leaves.
+            mouse-cursor: none;
+            changed has-hover => { root.pointer-over(self.has-hover); }
             changed mouse-x => { root.mouse-move(self.mouse-x / self.width, self.mouse-y / self.height); }
             changed mouse-y => { root.mouse-move(self.mouse-x / self.width, self.mouse-y / self.height); }
             pointer-event(ev) => {
@@ -79,8 +339,10 @@ export component ConsoleWindow inherits Window {
         }
     }
 
-    // Center messages.
+    // Center messages, over the guest screen's area.
     if root.state == VmState.starting || root.state == VmState.suspending || root.state == VmState.stopping || (root.mode-w == 0 && root.state == VmState.running): Rectangle {
+        y: root.bar-height;
+        height: root.avail-h;
         background: root.mode-w == 0 ? #000000 : #000000a0;
         VerticalLayout {
             alignment: center;
@@ -110,6 +372,8 @@ export component ConsoleWindow inherits Window {
         }
     }
     if root.state == VmState.paused: Rectangle {
+        y: root.bar-height;
+        height: root.avail-h;
         background: #00000099;
         VerticalLayout {
             alignment: center;
@@ -151,9 +415,9 @@ export component ConsoleWindow inherits Window {
         }
     }
 
-    // Microphone in use, while the toolbar is away: a small pill where it
-    // would be, so it never goes unnoticed.
-    if root.mic-on && !root.bar-out: Rectangle {
+    // Microphone in use, in full screen while the bar is away: a small
+    // pill where it would be, so it never goes unnoticed.
+    if root.mic-on && root.fullscreen && !root.float-out: Rectangle {
         x: (root.width - self.width) / 2;
         y: 8px;
         width: mpl.preferred-width;
@@ -182,6 +446,8 @@ export component ConsoleWindow inherits Window {
     }
 
     if root.suspend-error != "": Rectangle {
+        y: root.bar-height;
+        height: root.avail-h;
         background: #000000a0;
         TouchArea { }
         Rectangle {
@@ -229,188 +495,60 @@ export component ConsoleWindow inherits Window {
         }
     }
 
-    // Toolbar.
-    bar := Rectangle {
+    // The bar, in a window: above the guest screen, which gets the rest.
+    if !root.fullscreen: Rectangle {
+        y: 0;
+        height: root.bar-height;
+        background: #1c1c1e;
+        TouchArea { }
+        Rectangle {
+            y: parent.height - 1px;
+            height: 1px;
+            background: #ffffff14;
+        }
+        VmBar {
+            vm-name: root.vm-name;
+            os: root.os;
+            state: root.state;
+            windows-guest: root.windows-guest;
+            captured: root.captured;
+            fullscreen: root.fullscreen;
+            mic-on: root.mic-on;
+            cpu-text: root.cpu-text;
+            gpu-text: root.gpu-text;
+            wide: true;
+            act(a) => { root.act(a); }
+        }
+    }
+
+    // Full screen: the same bar floats in from the top edge.
+    float := Rectangle {
         x: (root.width - self.width) / 2;
-        y: root.bar-out ? 10px : -self.height - 12px;
+        y: root.float-out ? 10px : -self.height - 12px;
         animate y { duration: 240ms; easing: ease-out; }
-        width: bl.preferred-width;
-        height: 46px;
-        border-radius: 23px;
+        width: min(root.width - 20px, float-bar.preferred-width);
+        height: 42px;
+        border-radius: 21px;
         background: #1c1c1ee6;
         border-width: 1px;
         border-color: #ffffff24;
-        drop-shadow-blur: 30px;
-        drop-shadow-color: #00000099;
-        drop-shadow-offset-y: 8px;
-        bar-ta := TouchArea { }
-        bl := HorizontalLayout {
-            padding-left: 8px;
-            padding-right: 8px;
-            spacing: 2px;
-            OsBadge {
-                os: root.os;
-                size: 28px;
-                y: (parent.height - self.height) / 2;
-            }
-            VerticalLayout {
-                alignment: center;
-                padding-left: 6px;
-                padding-right: 10px;
-                Text {
-                    text: root.vm-name;
-                    color: #ffffff;
-                    font-size: Theme.fs-md;
-                    font-weight: 650;
-                }
-                HorizontalLayout {
-                    spacing: 5px;
-                    StatusDot {
-                        width: 6px;
-                        height: 6px;
-                        y: (parent.height - self.height) / 2;
-                        tint: root.state == VmState.running ? #34d399 : #fbbf24;
-                    }
-                    Text {
-                        text: root.captured ? "Keyboard goes to the VM" : root.state == VmState.paused ? "Paused" : "Running";
-                        color: #ffffff99;
-                        font-size: 10px;
-                    }
-                }
-            }
-            if root.mic-on: Rectangle {
-                y: (parent.height - self.height) / 2;
-                height: 26px;
-                width: ml.preferred-width;
-                border-radius: 13px;
-                background: #ffffff14;
-                ml := HorizontalLayout {
-                    padding-left: 9px;
-                    padding-right: 10px;
-                    spacing: 6px;
-                    StatusDot {
-                        width: 8px;
-                        height: 8px;
-                        y: (parent.height - self.height) / 2;
-                        tint: #ef4444;
-                    }
-                    Text {
-                        text: "Microphone in use";
-                        color: #ffffffd0;
-                        font-size: 11px;
-                        vertical-alignment: center;
-                    }
-                }
-            }
-            Rectangle {
-                width: 1px;
-                height: 22px;
-                y: (parent.height - self.height) / 2;
-                background: #ffffff24;
-            }
-            BarButton {
-                icon: root.state == VmState.paused ? Icons.play : Icons.pause;
-                tip: root.state == VmState.paused ? "Continue" : "Pause";
-                y: (parent.height - self.height) / 2;
-                clicked => { root.act(root.state == VmState.paused ? "resume" : "pause"); }
-            }
-            BarButton {
-                icon: Icons.camera;
-                tip: "Snapshot";
-                y: (parent.height - self.height) / 2;
-                clicked => { root.act("snapshot"); }
-            }
-            BarButton {
-                icon: Icons.moon;
-                tip: "Suspend and close";
-                y: (parent.height - self.height) / 2;
-                clicked => { root.act("suspend"); }
-            }
-            BarButton {
-                icon: Icons.power;
-                tip: "Shut down...";
-                active: root.power-open;
-                y: (parent.height - self.height) / 2;
-                clicked => {
-                    root.power-open = true;
-                    power.show();
-                }
-            }
-            if root.windows-guest: BarButton {
-                icon: Icons.keyboard;
-                tip: "Send Ctrl+Alt+Del";
-                y: (parent.height - self.height) / 2;
-                clicked => { root.act("cad"); }
-            }
-            Rectangle {
-                width: 1px;
-                height: 22px;
-                y: (parent.height - self.height) / 2;
-                background: #ffffff24;
-            }
-            BarButton {
-                icon: Icons.maximize;
-                tip: root.fullscreen ? "Leave full screen" : "Full screen";
-                y: (parent.height - self.height) / 2;
-                clicked => { root.act("fullscreen"); }
-            }
-            BarButton {
-                icon: Icons.logo;
-                tip: "VM library";
-                y: (parent.height - self.height) / 2;
-                clicked => { root.act("library"); }
-            }
+        // It lies over the guest screen: going back to it is going over
+        // the screen again.
+        float-ta := TouchArea {
+            changed has-hover => { root.pointer-over(!self.has-hover && screen-ta.has-hover); }
         }
-        power := PopupWindow {
-            x: bar.width - 250px;
-            y: bar.height + 6px;
-            width: 200px;
-            close-policy: close-on-click-outside;
-            changed visible => { if !self.visible { root.power-open = false; } }
-            Rectangle {
-                background: #242427f2;
-                border-radius: 12px;
-                border-width: 1px;
-                border-color: #ffffff24;
-                drop-shadow-blur: 24px;
-                drop-shadow-color: #00000099;
-                VerticalLayout {
-                    padding: 5px;
-                    for it in [
-                        { icon: Icons.power, text: "Shut down", action: "shutdown", danger: false },
-                        { icon: Icons.restart, text: "Restart", action: "reset", danger: false },
-                        { icon: Icons.x, text: "Force power off", action: "poweroff", danger: true },
-                    ]: Rectangle {
-                        height: 34px;
-                        border-radius: 8px;
-                        background: pta.has-hover ? (it.danger ? #f8717133 : #ffffff14) : transparent;
-                        HorizontalLayout {
-                            padding-left: 10px;
-                            spacing: 10px;
-                            Icon {
-                                source: it.icon;
-                                width: 16px;
-                                height: 16px;
-                                y: (parent.height - self.height) / 2;
-                                tint: it.danger ? #f87171 : #ffffffb0;
-                            }
-                            Text {
-                                text: it.text;
-                                color: it.danger ? #f87171 : #ffffff;
-                                font-size: Theme.fs-md;
-                                vertical-alignment: center;
-                            }
-                        }
-                        pta := TouchArea {
-                            mouse-cursor: pointer;
-                            clicked => {
-                                root.power-open = false;
-                                root.act(it.action);
-                            }
-                        }
-                    }
-                }
-            }
+        float-bar := VmBar {
+            padding-left: 10px;
+            padding-right: 8px;
+            vm-name: root.vm-name;
+            os: root.os;
+            state: root.state;
+            windows-guest: root.windows-guest;
+            captured: root.captured;
+            fullscreen: root.fullscreen;
+            mic-on: root.mic-on;
+            wide: false;
+            act(a) => { root.act(a); }
         }
     }
 

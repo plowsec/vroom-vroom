@@ -27,7 +27,8 @@ pub enum Msg {
     Thumb { key: String, image: slint::Image },
     SnapshotTaken { key: String },
     ConsoleGone { key: String, error: Option<String> },
-    ShowLibrary,
+    /// The library window, on this VM (its key) if given.
+    ShowLibrary(Option<String>),
     // From background jobs.
     Toast { text: String, kind: i32, action: String },
     Refresh,

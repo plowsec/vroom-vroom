@@ -33,6 +33,28 @@ scripts/build.sh
 - `VROOM_HOME=dir` uses another data dir. `VROOM_SHOT=out.png` saves a
   picture of the window and quits (that's how the README pictures are made).
 
+### The VM window
+
+A bar along the top of the window holds the VM's name and state, then
+pause, snapshot, suspend, the power menu (shut down, restart, force power
+off) and, for Windows, Ctrl+Alt+Del. On the right: how busy the VM is
+(the host CPU time it uses, out of what its CPUs could use), "3D" or
+"Direct3D 11" when 3D is on, the settings (the VM's page in the app),
+full screen, and the VM list. The guest gets the rest of the window: a
+guest with the agent takes exactly that size. In full screen the bar
+goes away and slides in when the mouse touches the top edge.
+
+The mouse pointer over the guest is one pointer, the guest's:
+
+- A guest that hands its pointer to the GPU (Linux desktops that use the
+  hardware cursor) gets the Mac's pointer drawn with the guest's picture,
+  as in VMware. When the guest hides it, it's hidden.
+- Windows draws its pointer into the screen picture itself (its virtio-gpu
+  drivers, 2D and 3D, have no hardware pointer). Over a Windows guest the
+  Mac's pointer hides and Windows' own shows, as fast as the guest draws.
+  It's hidden during boot too, when Windows shows none.
+- Any other guest that gives no pointer keeps the Mac's arrow.
+
 ## Moving a VM from VMware
 
 ARM64 VMs from VMware Fusion (or Workstation on ARM) come over with their
@@ -497,9 +519,9 @@ these hold:
 - the VM runs (pausing it stops the microphone),
 - the guest records (an app in it opened the input).
 
-The window shows "Microphone in use" in its toolbar, and a small "Mic"
-pill at the top while the toolbar is hidden. macOS shows its own orange
-dot in the menu bar too. Focus doesn't matter: a call keeps going while
+The window shows "Microphone in use" in its bar, and in full screen a
+small "Mic" pill at the top while the bar is hidden. macOS shows its own
+orange dot in the menu bar too. Focus doesn't matter: a call keeps going while
 you work in another window, the way a native app would.
 
 The first time a guest records, macOS asks for the microphone

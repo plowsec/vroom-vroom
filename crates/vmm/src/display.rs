@@ -12,10 +12,10 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use vroom_display::{send_fd, Decoder, SharedFb, ToViewer, ToVmm};
+use vroom_display::{send_fd, Decoder, GuestCursor, SharedFb, ToViewer, ToVmm};
 use vroom_devices::usb::hid::HidEvent;
 use vroom_devices::usb::xhci::Xhci;
-use vroom_virtio::devices::gpu::DisplaySink;
+use vroom_virtio::devices::gpu::{Cursor, DisplaySink};
 use vroom_virtio::devices::input::{self as ev, event};
 
 use crate::agent::{Agent, AgentCmd, ClipboardProvider};
@@ -89,6 +89,8 @@ struct Arbiter {
     gpu_shadow: Vec<u8>,
     last_gpu: Option<Instant>,
     last_ramfb: Option<Instant>,
+    /// The GPU's pointer; ramfb has none.
+    gpu_cursor: Option<GuestCursor>,
 }
 
 const HOLD: Duration = Duration::from_secs(3);
@@ -131,6 +133,9 @@ impl FbSink {
             }
             log::info!("display: showing the firmware framebuffer (virtio-gpu is idle)");
             a.gpu_on_screen = false;
+            if a.gpu_cursor.is_some() {
+                self.send(ToViewer::Cursor(GuestCursor::Unset));
+            }
             // Taking over the screen: all of it.
             self.apply_mode(w, h);
             self.draw(0, 0, w, h, rows, stride);
@@ -155,6 +160,12 @@ impl FbSink {
         log::debug!("display: mode {width}x{height}");
         if let Some(tx) = &self.tx {
             tx.send(&ToViewer::Mode { width, height });
+        }
+    }
+
+    fn send(&self, m: ToViewer) {
+        if let Some(tx) = &self.tx {
+            tx.send(&m);
         }
     }
 
@@ -205,6 +216,26 @@ impl DisplaySink for FbSink {
     fn flush(&self, x: u32, y: u32, w: u32, h: u32, rows: &[u8], stride: usize) {
         self.flush_at(Instant::now(), x, y, w, h, rows, stride)
     }
+
+    fn cursor(&self, c: &Cursor) {
+        let c = match c {
+            Cursor::Unset => GuestCursor::Unset,
+            Cursor::Hidden => GuestCursor::Hidden,
+            Cursor::Image { w, h, hot_x, hot_y, rgba } => {
+                GuestCursor::Image { w: *w, h: *h, hot_x: *hot_x, hot_y: *hot_y, rgba: rgba.clone() }
+            }
+        };
+        if let GuestCursor::Image { w, h, hot_x, hot_y, .. } = &c {
+            log::debug!("display: guest pointer {w}x{h}, hot spot {hot_x},{hot_y}");
+        } else {
+            log::debug!("display: guest pointer {c:?}");
+        }
+        let mut a = self.arb.lock().unwrap_or_else(|e| e.into_inner());
+        if a.gpu_on_screen || c == GuestCursor::Unset {
+            self.send(ToViewer::Cursor(c.clone()));
+        }
+        a.gpu_cursor = (c != GuestCursor::Unset).then_some(c);
+    }
 }
 
 impl FbSink {
@@ -227,6 +258,9 @@ impl FbSink {
         } else if quiet(a.last_ramfb, now) {
             log::info!("display: showing virtio-gpu again");
             a.gpu_on_screen = true;
+            if let Some(c) = a.gpu_cursor.clone() {
+                self.send(ToViewer::Cursor(c));
+            }
             self.apply_mode(mw, mh);
             self.draw(0, 0, mw, mh, &a.gpu_shadow, mw as usize * 4);
         }
@@ -444,6 +478,39 @@ mod tests {
             }
         }
         assert_eq!(got, Some([10, 5, 308, 408]));
+    }
+
+    #[test]
+    fn the_guest_pointer_goes_with_the_gpu_picture() {
+        let (a, mut b) = UnixStream::pair().unwrap();
+        let fb = SharedFb::create().unwrap();
+        let s = FbSink { fb, mode: Mutex::new((0, 0)), arb: Mutex::default(), tx: Some(ViewerTx::spawn(a).unwrap()) };
+        let t0 = Instant::now();
+        s.set_mode(4, 2);
+        let img = Cursor::Image { w: 1, h: 1, hot_x: 0, hot_y: 0, rgba: vec![1, 2, 3, 4] };
+        s.cursor(&img);
+        // The firmware screen takes over: it has no pointer of its own.
+        s.ramfb_frame_at(t0 + Duration::from_secs(5), 4, 2, &[0x11; 32], 16, (0, 2));
+        // The GPU again: its pointer comes back.
+        s.flush_at(t0 + Duration::from_secs(10), 0, 0, 1, 1, &[0x33; 4], 4);
+        s.tx.as_ref().unwrap().send(&ToViewer::Closed);
+        let mut d = vroom_display::Decoder::default();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 4096];
+        b.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        'read: loop {
+            let n = b.read(&mut buf).unwrap();
+            d.push(&buf[..n]);
+            while let Some(m) = d.next_to_viewer().unwrap() {
+                match m {
+                    ToViewer::Cursor(c) => got.push(c),
+                    ToViewer::Closed => break 'read,
+                    _ => {}
+                }
+            }
+        }
+        let gimg = GuestCursor::Image { w: 1, h: 1, hot_x: 0, hot_y: 0, rgba: vec![1, 2, 3, 4] };
+        assert_eq!(got, vec![gimg.clone(), GuestCursor::Unset, gimg]);
     }
 
     #[test]

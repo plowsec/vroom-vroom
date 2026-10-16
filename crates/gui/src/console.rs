@@ -23,10 +23,11 @@ use std::time::{Duration, Instant};
 
 use slint::winit_030::winit::event::{ElementState, WindowEvent};
 use slint::winit_030::winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
+use slint::winit_030::winit::window::{CursorIcon, CustomCursor};
 use slint::winit_030::{EventResult, WinitWindowAccessor};
 use slint::{ComponentHandle, Rgba8Pixel, SharedPixelBuffer};
 use vroom_config::{GuestOs, VmConfig};
-use vroom_display::{recv_fd, Command, Decoder, SharedFb, ToViewer, ToVmm, MAX_HEIGHT, MAX_WIDTH, POINTER_MAX};
+use vroom_display::{recv_fd, Command, Decoder, GuestCursor, SharedFb, ToViewer, ToVmm, MAX_HEIGHT, MAX_WIDTH, POINTER_MAX};
 
 use crate::msg::{self, Msg};
 use crate::{ConsoleWindow, VmState};
@@ -60,6 +61,8 @@ struct Shared {
     clipboard: Option<String>,
     /// The guest records from the microphone (latest word from the VMM).
     mic: Option<bool>,
+    /// The guest's pointer, the latest.
+    cursor: Option<GuestCursor>,
     posted: bool,
 }
 
@@ -96,6 +99,7 @@ impl Shared {
                 self.status.push_back(t);
             }
             ToViewer::Mic(on) => self.mic = Some(on),
+            ToViewer::Cursor(c) => self.cursor = Some(c),
             ToViewer::Closed => return false,
         }
         !std::mem::replace(&mut self.posted, true)
@@ -172,6 +176,31 @@ pub struct Console {
     toast_id: u64,
     ever_ran: bool,
     gone: Arc<AtomicBool>,
+    /// The guest's pointer, as it last said.
+    cursor: GuestCursor,
+    /// Bumped with each new picture of it.
+    cursor_gen: u64,
+    /// The guest draws its own pointer into the frame when it gives us
+    /// none (Windows: its virtio-gpu drivers have no hardware pointer).
+    draws_pointer: bool,
+    /// The mouse is over the guest screen.
+    over_screen: bool,
+    /// The host pointer last set: what it is, and the one made from the
+    /// guest's picture (picture, size).
+    pointer: Option<Pointer>,
+    host_cursor: Option<(u64, u32, CustomCursor)>,
+    /// The VM's CPUs, and its CPU time when last looked at.
+    cpus: u32,
+    cpu_seen: Option<(Instant, Duration)>,
+}
+
+/// What the host pointer is over the guest screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pointer {
+    Arrow,
+    Hidden,
+    /// The guest's picture (its number), at this size in pixels.
+    Guest(u64, u32),
 }
 
 thread_local! {
@@ -246,6 +275,27 @@ pub fn command_any(cmd: &str) {
             con.command(cmd);
         }
     });
+}
+
+/// A key press to every VM's guest (for `VROOM_SHOT`).
+pub fn key_any(code: u16) {
+    CONSOLES.with(|c| {
+        for con in c.borrow().values() {
+            let mut io = con.io.borrow_mut();
+            io.key(code, true);
+            io.key(code, false);
+        }
+    });
+}
+
+/// The mouse to a point of every VM window, as if moved there (for
+/// `VROOM_SHOT`): goes through the window like a real one.
+pub fn move_any(x: f32, y: f32) {
+    let wins: Vec<ConsoleWindow> = CONSOLES.with(|c| c.borrow().values().map(|c| c.win.clone_strong()).collect());
+    for w in wins {
+        let position = slint::LogicalPosition::new(x, y);
+        w.window().dispatch_event(slint::platform::WindowEvent::PointerMoved { position });
+    }
 }
 
 /// A picture of some VM window (for `VROOM_SHOT`).
@@ -354,7 +404,9 @@ pub fn start(path: &Path, cfg: &VmConfig, extra: &[String]) -> Result<String, St
     win.set_state(VmState::Starting);
     win.set_has_display(cfg.display.gpu != vroom_config::Gpu::None);
     win.set_windows_guest(os == GuestOs::Windows);
-    win.set_bar_pinned(true);
+    if cfg.display.gpu == vroom_config::Gpu::Virtio3d {
+        win.set_gpu_text(if os == GuestOs::Windows { "Direct3D 11" } else { "3D" }.into());
+    }
     let io = Rc::new(RefCell::new(Io {
         tx: ours.try_clone().ok(),
         mods: ModifiersState::empty(),
@@ -389,13 +441,6 @@ pub fn start(path: &Path, cfg: &VmConfig, extra: &[String]) -> Result<String, St
     if let Err(e) = win.show() {
         return Err(abandon(child, e.to_string()));
     }
-    // Keep the toolbar out for a few seconds so people see it exists.
-    {
-        let k = key.clone();
-        slint::Timer::single_shot(Duration::from_secs(4), move || {
-            with(&k, |c| c.win.set_bar_pinned(false));
-        });
-    }
 
     let shared = Arc::new(Mutex::new(Shared::default()));
     let gone = Arc::new(AtomicBool::new(false));
@@ -428,6 +473,14 @@ pub fn start(path: &Path, cfg: &VmConfig, extra: &[String]) -> Result<String, St
         toast_id: 0,
         ever_ran: false,
         gone,
+        cursor: GuestCursor::Unset,
+        cursor_gen: 0,
+        draws_pointer: os == GuestOs::Windows,
+        over_screen: false,
+        pointer: None,
+        host_cursor: None,
+        cpus: cfg.cpus.max(1),
+        cpu_seen: None,
     };
     CONSOLES.with(|m| m.borrow_mut().insert(key.clone(), c));
     ensure_timer();
@@ -461,6 +514,21 @@ fn wire(win: &ConsoleWindow, key: &str, io: &Rc<RefCell<Io>>) {
                 io.wheel.1 -= sy * WHEEL_STEP;
                 io.send(ToVmm::Wheel { dx: sx as i16, dy: sy as i16 });
             }
+        });
+    }
+    {
+        let k = key.to_string();
+        win.on_pointer_over(move |over| {
+            let k = k.clone();
+            // After Slint is done with the event: it sets its own pointer
+            // as the mouse moves from one item to another.
+            slint::Timer::single_shot(Duration::ZERO, move || {
+                with(&k, |c| {
+                    c.over_screen = over;
+                    c.pointer = None;
+                    c.apply_pointer();
+                });
+            });
         });
     }
     {
@@ -731,25 +799,43 @@ impl Console {
                 let fs = !w.is_fullscreen();
                 w.set_fullscreen(fs);
                 self.win.set_fullscreen(fs);
+                // The bar comes and goes: the guest gets another size.
+                self.pending_resize = Some(Instant::now() + RESIZE_DEBOUNCE);
+                if fs {
+                    // Show the floating bar for a moment so people see where it went.
+                    self.win.set_bar_pinned(true);
+                    let k = self.key.clone();
+                    slint::Timer::single_shot(Duration::from_secs(3), move || {
+                        with(&k, |c| c.win.set_bar_pinned(false));
+                    });
+                }
             }
-            "library" => msg::send(Msg::ShowLibrary),
+            "library" => msg::send(Msg::ShowLibrary(None)),
+            "settings" => msg::send(Msg::ShowLibrary(Some(self.key.clone()))),
             _ => {}
         }
     }
 
     /// What the reader thread collected since the last wakeup.
     fn inbox(&mut self) {
-        let (frame, full, damage, status, clip, mic) = {
+        let (frame, full, damage, status, clip, mic, cursor) = {
             let mut s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
             s.posted = false;
             let f = (std::mem::take(&mut s.frame), std::mem::take(&mut s.full), s.damage.take());
-            (f.0, f.1, f.2, std::mem::take(&mut s.status), s.clipboard.take(), s.mic.take())
+            (f.0, f.1, f.2, std::mem::take(&mut s.status), s.clipboard.take(), s.mic.take(), s.cursor.take())
         };
         for t in status {
             self.status(&t);
         }
         if let Some(on) = mic {
             self.mic(on);
+        }
+        if let Some(c) = cursor {
+            if matches!(c, GuestCursor::Image { .. }) {
+                self.cursor_gen += 1;
+            }
+            self.cursor = c;
+            self.apply_pointer();
         }
         if let Some(t) = clip {
             self.guest_clipboard(t);
@@ -818,10 +904,15 @@ impl Console {
         let now = Instant::now();
         if self.pending_resize.is_some_and(|at| now >= at) {
             self.pending_resize = None;
-            let sz = self.win.window().size();
-            let (width, height, scale) = guest_size(sz.width, sz.height, self.win.window().scale_factor(), self.hidpi);
+            // The guest gets the window below the bar.
+            let (sz, sf) = (self.win.window().size(), self.win.window().scale_factor());
+            let bar = (self.win.get_bar_height() * sf).round() as u32;
+            let (width, height, scale) = guest_size(sz.width, sz.height.saturating_sub(bar), sf, self.hidpi);
             self.io.borrow_mut().send(ToVmm::Resize { width, height, scale });
         }
+        self.cpu_meter(now);
+        // State, size or the screen's place changed: the pointer may too.
+        self.apply_pointer();
         // Host clipboard -> guest, only while this window has focus.
         if self.io.borrow().focused && self.clip_policy.host_to_guest {
             if let Some(Ok(t)) = self.clipboard.as_mut().map(|c| c.get_text()) {
@@ -845,6 +936,85 @@ impl Console {
             }
         }
         self.win.set_captured(self.io.borrow().focused && self.state == VmState::Running);
+    }
+
+    /// "12%": the host CPU time the VM took over the last second or so,
+    /// out of what its CPUs could have taken.
+    fn cpu_meter(&mut self, now: Instant) {
+        if self.state != VmState::Running {
+            self.cpu_seen = None;
+            self.win.set_cpu_text("".into());
+            return;
+        }
+        let Some(t) = crate::host::cpu_time(self.child.id()) else { return };
+        match self.cpu_seen {
+            Some((at, before)) if now.duration_since(at) >= Duration::from_secs(1) => {
+                let used = t.saturating_sub(before).as_secs_f64() / now.duration_since(at).as_secs_f64();
+                let pct = (used / self.cpus as f64 * 100.0).round().clamp(0.0, 100.0);
+                self.win.set_cpu_text(format!("{pct}%").into());
+                self.cpu_seen = Some((now, t));
+            }
+            Some(_) => {}
+            None => self.cpu_seen = Some((now, t)),
+        }
+    }
+
+    /// Set the host pointer over the guest screen: the guest's own picture
+    /// when it gives one (VMware does the same), none when it hid it or
+    /// draws its own into the frame, else the usual arrow. Off the screen,
+    /// Slint picks the pointer. Does nothing if that's already so.
+    fn apply_pointer(&mut self) {
+        if !self.over_screen {
+            self.pointer = None;
+            return;
+        }
+        let live = self.state == VmState::Running && self.mode != (0, 0) && self.win.get_suspend_error().is_empty();
+        let sf = self.win.window().scale_factor();
+        let want = match &self.cursor {
+            _ if !live => Pointer::Arrow,
+            GuestCursor::Image { w, .. } => Pointer::Guest(self.cursor_gen, cursor_px(*w, self.mode.0, self.win.get_screen_width(), sf)),
+            GuestCursor::Hidden => Pointer::Hidden,
+            GuestCursor::Unset if self.draws_pointer => Pointer::Hidden,
+            GuestCursor::Unset => Pointer::Arrow,
+        };
+        if self.pointer == Some(want) {
+            return;
+        }
+        log::debug!("{}: pointer over the guest screen: {want:?}", self.name);
+        let set =|c: Option<&CustomCursor>, visible: bool| {
+            self.win.window().with_winit_window(|w| {
+                match c {
+                    Some(c) => w.set_cursor(c.clone()),
+                    None => w.set_cursor(CursorIcon::Default),
+                }
+                w.set_cursor_visible(visible);
+            });
+        };
+        match want {
+            Pointer::Arrow => set(None, true),
+            Pointer::Hidden => set(None, false),
+            Pointer::Guest(id, px) => match &self.host_cursor {
+                Some((i, p, c)) if (*i, *p) == (id, px) => set(Some(c), true),
+                _ => {
+                    // Made on the event loop (winit wants it); applied then.
+                    let GuestCursor::Image { w, h, hot_x, hot_y, rgba } = &self.cursor else { return };
+                    let (tw, th, px_rgba, (hx, hy)) = scale_cursor(*w, *h, rgba, (*hot_x, *hot_y), px);
+                    let Ok(src) = CustomCursor::from_rgba(px_rgba, tw as u16, th as u16, hx as u16, hy as u16) else { return };
+                    let k = self.key.clone();
+                    self.pointer = Some(want);
+                    let _ = slint::winit_030::invoke_from_active_event_loop(move |el| {
+                        let c = el.create_custom_cursor(src);
+                        with(&k, |con| {
+                            con.host_cursor = Some((id, px, c));
+                            con.pointer = None;
+                            con.apply_pointer();
+                        });
+                    });
+                    return;
+                }
+            },
+        }
+        self.pointer = Some(want);
     }
 
     fn frame(&mut self, full: bool, damage: Option<[u32; 4]>) {
@@ -957,6 +1127,50 @@ fn xrgb_to_rgba(px: &mut [u8]) {
     }
 }
 
+/// How wide, in the host cursor's pixels, a guest pointer `w` pixels wide
+/// looks on a screen of `mode_w` guest pixels shown `screen_w` wide
+/// (logical). macOS takes cursor pictures in points, others in pixels.
+fn cursor_px(w: u32, mode_w: u32, screen_w: f32, sf: f32) -> u32 {
+    let k = if mode_w == 0 || !screen_w.is_finite() { 1.0 } else { screen_w / mode_w as f32 };
+    let k = if cfg!(target_os = "macos") || !sf.is_finite() { k } else { k * sf };
+    ((w as f32 * k).round() as u32).clamp(1, 2 * vroom_display::CURSOR_MAX)
+}
+
+/// A guest pointer picture (RGBA) resized to `tw` wide, and its hot spot.
+/// Each pixel averages the pixels it covers, weighted by alpha (shrinking
+/// a HiDPI guest's pointer); growing repeats them.
+fn scale_cursor(w: u32, h: u32, rgba: &[u8], hot: (u32, u32), tw: u32) -> (u32, u32, Vec<u8>, (u32, u32)) {
+    let (w, h, tw) = (w.max(1), h.max(1), tw.max(1));
+    let th = ((h as u64 * tw as u64 + w as u64 / 2) / w as u64).max(1) as u32;
+    let px = |x: u32, y: u32| rgba.get((y * w + x) as usize * 4..(y * w + x) as usize * 4 + 4).unwrap_or(&[0; 4]);
+    let mut out = vec![0u8; tw as usize * th as usize * 4];
+    for ty in 0..th {
+        let (y0, y1) = (ty * h / th, ((ty + 1) * h).div_ceil(th).max(ty * h / th + 1).min(h));
+        for tx in 0..tw {
+            let (x0, x1) = (tx * w / tw, ((tx + 1) * w).div_ceil(tw).max(tx * w / tw + 1).min(w));
+            let (mut c, mut a, mut n) = ([0u32; 3], 0u32, 0u32);
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let p = px(x, y);
+                    for i in 0..3 {
+                        c[i] += p[i] as u32 * p[3] as u32;
+                    }
+                    a += p[3] as u32;
+                    n += 1;
+                }
+            }
+            let o = (ty * tw + tx) as usize * 4;
+            for i in 0..3 {
+                out[o + i] = c[i].checked_div(a).unwrap_or(0) as u8;
+            }
+            out[o + 3] = (a / n.max(1)) as u8;
+        }
+    }
+    let hx = (hot.0 as u64 * tw as u64 / w as u64).min(tw as u64 - 1) as u32;
+    let hy = (hot.1 as u64 * th as u64 / h as u64).min(th as u64 - 1) as u32;
+    (tw, th, out, (hx, hy))
+}
+
 pub fn write_png(p: &Path, buf: &SharedPixelBuffer<Rgba8Pixel>, w: u32, h: u32) -> Result<(), String> {
     if let Some(d) = p.parent() {
         std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
@@ -1046,6 +1260,27 @@ mod tests {
         assert!(!s.full);
         s.push(ToViewer::Mode { width: 8, height: 8 });
         assert!(s.full);
+    }
+
+    #[test]
+    fn guest_pointer_sizes() {
+        // HiDPI guest (2x pixels) on macOS: half as many points.
+        let pts = cursor_px(64, 2560, 1280.0, 2.0);
+        assert_eq!(pts, if cfg!(target_os = "macos") { 32 } else { 64 });
+        assert_eq!(cursor_px(32, 1280, 1280.0, 1.0), 32);
+        assert_eq!(cursor_px(32, 0, f32::NAN, f32::NAN), 32);
+        // 2x2 -> 1x1: alpha-weighted color, mean alpha.
+        let rgba = [255, 0, 0, 255, 0, 255, 0, 0, 255, 0, 0, 255, 0, 0, 255, 0];
+        let (w, h, px, hot) = scale_cursor(2, 2, &rgba, (1, 1), 1);
+        assert_eq!((w, h, hot), (1, 1, (0, 0)));
+        assert_eq!(px, [255, 0, 0, 127]);
+        // Growing repeats pixels; the hot spot moves with them.
+        let (w, h, px, hot) = scale_cursor(1, 2, &[1, 2, 3, 4, 5, 6, 7, 8], (0, 1), 2);
+        assert_eq!((w, h, hot), (2, 4, (0, 2)));
+        assert_eq!(&px[..8], &[1, 2, 3, 4, 1, 2, 3, 4]);
+        assert_eq!(&px[24..], &[5, 6, 7, 8, 5, 6, 7, 8]);
+        // Short pixel data doesn't panic.
+        let _ = scale_cursor(4, 4, &[0; 3], (9, 9), 3);
     }
 
     #[test]

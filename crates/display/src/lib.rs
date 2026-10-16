@@ -27,7 +27,7 @@ fn ipc_err(e: vroom_ipc::Error) -> Error {
         vroom_ipc::Error::Proto(m) => Error::Proto(m),
     }
 }
-pub use proto::{Command, Decoder, ToViewer, ToVmm, POINTER_MAX, SCALE_MAX, SCALE_MIN};
+pub use proto::{Command, Decoder, GuestCursor, ToViewer, ToVmm, CURSOR_MAX, POINTER_MAX, SCALE_MAX, SCALE_MIN};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

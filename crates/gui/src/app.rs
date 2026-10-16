@@ -267,7 +267,12 @@ impl App {
                 }
                 self.push_all();
             }
-            Msg::ShowLibrary => {
+            Msg::ShowLibrary(key) => {
+                // From a VM window's settings button: its page, where the
+                // settings are.
+                if let Some(i) = key.and_then(|k| self.vms.iter().position(|v| v.key == k)) {
+                    self.update(Msg::Select(i));
+                }
                 let _ = self.ui.show();
                 self.ui.window().with_winit_window(|w| w.focus_window());
             }

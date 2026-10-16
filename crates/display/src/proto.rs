@@ -8,6 +8,8 @@ pub const POINTER_MAX: u16 = 32767;
 pub const SCALE_MIN: u32 = 100;
 pub const SCALE_MAX: u32 = 500;
 const MAX_MSG: usize = 16 << 20;
+/// Biggest guest pointer picture, in pixels on a side.
+pub const CURSOR_MAX: u32 = 256;
 
 /// VMM -> viewer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,6 +26,20 @@ pub enum ToViewer {
     Closed,
     /// The guest is recording from the host microphone (true) or stopped.
     Mic(bool),
+    /// The guest's pointer, for the viewer to show as its own.
+    Cursor(GuestCursor),
+}
+
+/// What the guest's pointer looks like.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuestCursor {
+    /// The guest gives none: it draws its own into the frame, or has none.
+    Unset,
+    /// It hid it.
+    Hidden,
+    /// `w` x `h` RGBA (not premultiplied), at most `CURSOR_MAX` on a side;
+    /// the hot spot is inside it.
+    Image { w: u32, h: u32, hot_x: u32, hot_y: u32, rgba: Vec<u8> },
 }
 
 /// Lifecycle requests from the viewer.
@@ -90,6 +106,14 @@ impl ToViewer {
             ToViewer::Status(s) => frame(4, s.as_bytes()),
             ToViewer::Closed => frame(5, &[]),
             ToViewer::Mic(on) => frame(6, &[*on as u8]),
+            ToViewer::Cursor(GuestCursor::Unset) => frame(7, &[0]),
+            ToViewer::Cursor(GuestCursor::Hidden) => frame(7, &[1]),
+            ToViewer::Cursor(GuestCursor::Image { w, h, hot_x, hot_y, rgba }) => {
+                let mut p = vec![2];
+                p.extend_from_slice(&u32s(&[*w, *h, *hot_x, *hot_y]));
+                p.extend_from_slice(rgba);
+                frame(7, &p)
+            }
         }
     }
 
@@ -101,6 +125,23 @@ impl ToViewer {
             4 => ToViewer::Status(text(p)?),
             5 => ToViewer::Closed,
             6 => ToViewer::Mic(*p.first().ok_or(Error::Proto("short"))? != 0),
+            7 => ToViewer::Cursor(match p.first() {
+                Some(0) => GuestCursor::Unset,
+                Some(1) => GuestCursor::Hidden,
+                Some(2) => {
+                    let q = &p[1..];
+                    let (w, h, hot_x, hot_y) = (get_u32(q, 0)?, get_u32(q, 1)?, get_u32(q, 2)?, get_u32(q, 3)?);
+                    if w == 0 || h == 0 || w > CURSOR_MAX || h > CURSOR_MAX || hot_x >= w || hot_y >= h {
+                        return Err(Error::Proto("cursor size"));
+                    }
+                    let rgba = &q[16..];
+                    if rgba.len() != w as usize * h as usize * 4 {
+                        return Err(Error::Proto("cursor size"));
+                    }
+                    GuestCursor::Image { w, h, hot_x, hot_y, rgba: rgba.to_vec() }
+                }
+                _ => return Err(Error::Proto("unknown cursor")),
+            }),
             _ => return Err(Error::Proto("unknown viewer message")),
         })
     }
@@ -229,6 +270,9 @@ mod tests {
             ToViewer::Damage { x: 1, y: 2, w: 3, h: 4 },
             ToViewer::Closed,
             ToViewer::Mic(true),
+            ToViewer::Cursor(GuestCursor::Hidden),
+            ToViewer::Cursor(GuestCursor::Image { w: 2, h: 1, hot_x: 1, hot_y: 0, rgba: vec![1, 2, 3, 4, 5, 6, 7, 8] }),
+            ToViewer::Cursor(GuestCursor::Unset),
         ];
         for m in &v {
             d.push(&m.encode());
@@ -250,5 +294,22 @@ mod tests {
         assert_eq!(d.next_to_vmm().unwrap(), Some(ToVmm::Resize { width: 1024, height: 768, scale: 0 }));
         d.push(&ToVmm::Resize { width: 1, height: 1, scale: 99 }.encode());
         assert!(d.next_to_vmm().is_err());
+        // Cursors: pixels must match the size, the hot spot be inside.
+        let img = |w: u32, h: u32, hx: u32, n: usize| {
+            let mut p = vec![2u8];
+            p.extend(u32s(&[w, h, hx, 0]));
+            p.extend(vec![0u8; n]);
+            frame(7, &p)
+        };
+        d.push(&img(2, 2, 0, 15));
+        assert!(d.next_to_viewer().is_err());
+        d.push(&img(2, 2, 2, 16));
+        assert!(d.next_to_viewer().is_err());
+        d.push(&img(CURSOR_MAX + 1, 1, 0, (CURSOR_MAX as usize + 1) * 4));
+        assert!(d.next_to_viewer().is_err());
+        d.push(&frame(7, &[2, 1, 0]));
+        assert!(d.next_to_viewer().is_err());
+        d.push(&img(2, 2, 1, 16));
+        assert!(matches!(d.next_to_viewer().unwrap(), Some(ToViewer::Cursor(GuestCursor::Image { w: 2, h: 2, .. }))));
     }
 }

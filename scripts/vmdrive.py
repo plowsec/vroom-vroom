@@ -8,7 +8,8 @@ Commands, one per line, on <state-dir>.cmd (a fifo):
   shot                   screendump (path shows in <state-dir>.log)
   resize W H | focus 0|1 | clip TEXT | cmd N | quit
   serial TEXT            to the serial console (\\n for Enter)
-Viewer events (mode, clipboard, status, mic) go to <state-dir>.events.
+Viewer events (mode, clipboard, status, mic, guest pointer: its picture as
+<state-dir>.cursor-N.png) go to <state-dir>.events.
 """
 import os, socket, struct, subprocess, sys, threading, time
 
@@ -24,7 +25,16 @@ p = subprocess.Popen([vroom, "run", cfg, "--ui-fd", str(b.fileno()), "--state-di
 b.close()
 socket.recv_fds(a, 1, 1)  # framebuffer shm; we use screendumps instead
 mode = [800, 600]
+cursors = [0]
 ev = open(evp, "a", buffering=1)
+
+def write_png(path, w, h, rgba):
+    import zlib
+    rows = b"".join(b"\0" + rgba[y * w * 4:(y + 1) * w * 4] for y in range(h))
+    chunk = lambda t, d: struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d))
+    with open(path, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
 
 def reader():
     buf = b""
@@ -48,6 +58,14 @@ def reader():
                 ev.write("closed\n")
             elif t == 6:
                 ev.write(f"mic {pl[0]}\n")
+            elif t == 7:
+                if pl[0] != 2:
+                    ev.write("cursor " + ("unset", "hidden")[pl[0]] + "\n"); continue
+                w, h, hx, hy = struct.unpack("<IIII", pl[1:17])
+                cursors[0] += 1
+                png = f"{state}.cursor-{cursors[0]}.png"
+                write_png(png, w, h, pl[17:])
+                ev.write(f"cursor {w}x{h} hot {hx},{hy} {png}\n")
 threading.Thread(target=reader, daemon=True).start()
 
 def send(t, payload):

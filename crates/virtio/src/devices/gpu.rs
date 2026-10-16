@@ -104,7 +104,25 @@ pub trait DisplaySink: Send + Sync {
     fn set_mode(&self, width: u32, height: u32);
     /// `rows` holds `h` rows of `w` BGRX pixels, `stride` bytes apart.
     fn flush(&self, x: u32, y: u32, w: u32, h: u32, rows: &[u8], stride: usize);
+    /// The guest's pointer changed (cursor queue).
+    fn cursor(&self, _c: &Cursor) {}
 }
+
+/// The pointer a guest shows through the cursor queue, for the host to
+/// draw as its own. Guests that draw their pointer into the frame never
+/// send one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Cursor {
+    /// None set (yet, or since a reset).
+    Unset,
+    /// The guest hid its pointer.
+    Hidden,
+    /// `w` x `h` RGBA, not premultiplied; the hot spot is inside it.
+    Image { w: u32, h: u32, hot_x: u32, hot_y: u32, rgba: Vec<u8> },
+}
+
+/// Biggest cursor taken (drivers use 64x64).
+const MAX_CURSOR: u32 = 256;
 
 /// Display size the host wants; read by GET_DISPLAY_INFO.
 struct Shared {
@@ -232,6 +250,8 @@ impl Gpu {
             ctx_info: HashMap::new(),
             reading: None,
             read_buf: Vec::new(),
+            cursor: None,
+            cursor_shown: None,
         }
     }
 }
@@ -289,6 +309,9 @@ struct Snap2d {
     resources: Vec<SnapRes>,
     /// (resource id, visible rect x, y, w, h) on scanout 0.
     scanout: Option<(u32, u32, u32, u32, u32)>,
+    /// The pointer: (resource id or 0 for hidden, hot x, hot y).
+    #[serde(default)]
+    cursor: Option<(u32, u32, u32)>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -440,6 +463,10 @@ pub struct GpuHandler {
     /// A GL scanout on its way back from the GPU, and where it lands.
     reading: Option<Reading>,
     read_buf: Vec<u8>,
+    /// The pointer as last set: (resource id or 0, hot x, hot y), and
+    /// what the sink was last given.
+    cursor: Option<(u32, u32, u32)>,
+    cursor_shown: Option<Cursor>,
 }
 
 /// Where a GL frame being read back goes.
@@ -489,6 +516,16 @@ fn rd64(r: &mut Reader) -> Option<u64> {
 
 fn le(v: &[u32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+/// Which source byte is alpha in a cursor. The X of an X format counts:
+/// Linux makes every dumb buffer B8G8R8X8, its cursors too, and puts
+/// alpha there (QEMU reads it that way as well).
+fn cursor_alpha(format: u32) -> usize {
+    match format {
+        3 | 4 | 68 | 121 => 0, // A8R8G8B8 / X8R8G8B8 / X8B8G8R8 / A8B8G8R8
+        _ => 3,
+    }
 }
 
 /// For each output byte (B, G, R, X), which source byte to take.
@@ -583,8 +620,13 @@ impl GpuHandler {
                     _ => (ERR_INVALID_RESOURCE_ID, vec![]),
                 }
             }
-            // Hardware cursor: the host pointer is shown instead (tablet input).
-            UPDATE_CURSOR | MOVE_CURSOR => (OK_NODATA, vec![]),
+            // The pointer follows the host's (tablet input): only its
+            // picture matters, not where the guest says it is.
+            UPDATE_CURSOR => {
+                self.update_cursor(mem, r);
+                (OK_NODATA, vec![])
+            }
+            MOVE_CURSOR => (OK_NODATA, vec![]),
             _ if self.three_d.is_some() => self.command_3d(mem, r, hdr),
             _ => (ERR_UNSPEC, vec![]),
         }
@@ -1242,6 +1284,78 @@ impl GpuHandler {
         }
     }
 
+    /// UPDATE_CURSOR: pos (scanout, x, y, padding), resource, hot x, hot y.
+    fn update_cursor(&mut self, mem: &GuestMemory, r: &mut Reader) {
+        let mut v = [0u32; 7];
+        for x in v.iter_mut() {
+            let Some(n) = rd32(r) else { return };
+            *x = n;
+        }
+        let [scanout, _, _, _, id, hot_x, hot_y] = v;
+        if scanout != 0 {
+            return;
+        }
+        let before = self.cursor.replace((id, hot_x, hot_y));
+        if !self.show_cursor(mem) {
+            self.cursor = before;
+        }
+    }
+
+    /// Hand the pointer as set to the sink, if it changed. False if its
+    /// picture can't be read.
+    fn show_cursor(&mut self, mem: &GuestMemory) -> bool {
+        let c = match self.cursor {
+            None => Cursor::Unset,
+            Some((0, _, _)) => Cursor::Hidden,
+            Some((id, hx, hy)) => match self.cursor_image(mem, id) {
+                Some((w, h, rgba)) => Cursor::Image { w, h, hot_x: hx.min(w - 1), hot_y: hy.min(h - 1), rgba },
+                None => {
+                    log::debug!("gpu: cursor resource {id} can't be read");
+                    return false;
+                }
+            },
+        };
+        if self.cursor_shown.as_ref() != Some(&c) {
+            self.sink.cursor(&c);
+            self.cursor_shown = Some(c);
+        }
+        true
+    }
+
+    /// A cursor resource's pixels as RGBA: from our copy (2D), or from its
+    /// guest backing (a dumb buffer in the renderer: the guest wrote it
+    /// there, then transferred it).
+    fn cursor_image(&self, mem: &GuestMemory, id: u32) -> Option<(u32, u32, Vec<u8>)> {
+        let (format, w, h, src) = if let Some(res) = self.resources.get(&id) {
+            (res.format, res.width, res.height, None)
+        } else {
+            let res = self.res3d.get(&id)?;
+            let (format, w, h) = res.tex?;
+            (format, w, h, Some(&res.backing))
+        };
+        if w == 0 || h == 0 || w > MAX_CURSOR || h > MAX_CURSOR {
+            return None;
+        }
+        let sw = swizzle(format)?;
+        let a = cursor_alpha(format);
+        let mut px = vec![0u8; w as usize * h as usize * 4];
+        match src {
+            None => px.copy_from_slice(&self.resources.get(&id)?.pixels),
+            Some(backing) => {
+                if backing.is_empty() || !read_backing(mem, backing, 0, &mut px) {
+                    return None;
+                }
+            }
+        }
+        // No alpha at all: a guest that really meant X. Opaque, not invisible.
+        let opaque = px.as_chunks::<4>().0.iter().all(|p| p[a] == 0);
+        for p in px.as_chunks_mut::<4>().0 {
+            let s = *p;
+            *p = [s[sw[2]], s[sw[1]], s[sw[0]], if opaque { 0xff } else { s[a] }];
+        }
+        Some((w, h, px))
+    }
+
     fn save_2d(&self) -> Snap2d {
         let mut resources: Vec<SnapRes> = self
             .resources
@@ -1253,7 +1367,7 @@ impl GpuHandler {
             Some(Scanout::Cpu { id, view }) => Some((id, view.x, view.y, view.w, view.h)),
             _ => None,
         };
-        Snap2d { resources, scanout }
+        Snap2d { resources, scanout, cursor: self.cursor }
     }
 
     /// Rebuild from a snapshot (untrusted input: same checks as commands).
@@ -1285,6 +1399,8 @@ impl GpuHandler {
             self.set_mode(w, h);
             self.flush_all(mem);
         }
+        // Shown once every resource is back (it may be a 3D one).
+        self.cursor = s.cursor;
         Ok(())
     }
 
@@ -1634,6 +1750,7 @@ impl VirtioDevice for Gpu {
         s.direct3d = false;
         drop(s);
         self.sink.set_mode(0, 0);
+        self.sink.cursor(&Cursor::Unset);
     }
     fn pause(&mut self) {
         self.worker.pause();
@@ -1673,6 +1790,7 @@ impl VirtioDevice for Gpu {
             h.restore_2d(&ctx.mem, &snap)?;
             shown = snap.scanout.map(|(_, _, _, w, h)| (w, h));
         }
+        h.show_cursor(&ctx.mem);
         self.worker.start("gpu", ctx, h, true)?;
         // Fenced commands the GPU finished before the snapshot: return them.
         if !pending.is_empty() {
@@ -1935,6 +2053,7 @@ mod tests {
     struct Rec {
         modes: Mutex<Vec<(u32, u32)>>,
         frames: Mutex<Vec<(u32, u32, Vec<u8>)>>,
+        cursors: Mutex<Vec<Cursor>>,
     }
     impl DisplaySink for Rec {
         fn set_mode(&self, w: u32, h: u32) {
@@ -1944,6 +2063,41 @@ mod tests {
             let px: Vec<u8> = (0..h as usize).flat_map(|i| rows[i * stride..i * stride + w as usize * 4].to_vec()).collect();
             self.frames.lock().unwrap().push((w, h, px));
         }
+        fn cursor(&self, c: &Cursor) {
+            self.cursors.lock().unwrap().push(c.clone());
+        }
+    }
+
+    #[test]
+    fn cursor_pictures_reach_the_sink() {
+        let mem = GuestMemory::new(&[(GuestAddress(0), 1 << 20)]).unwrap();
+        let sink = Arc::new(Rec::default());
+        let (gpu, _ctl) = Gpu::new(64, 64, sink.clone());
+        let mut h = gpu.handler();
+        // A 2x1 B8G8R8X8 dumb buffer (what Linux makes) with alpha in X.
+        assert_eq!(h.create_cpu(5, 2, 2, 1), OK_NODATA);
+        mem.write(GuestAddress(0x1000), &[1, 2, 3, 0xff, 4, 5, 6, 0]).unwrap();
+        h.resources.get_mut(&5).unwrap().backing = vec![(0x1000, 8)];
+        assert_eq!(h.transfer(&mem, 5, Rect { x: 0, y: 0, w: 2, h: 1 }, 0, None), OK_NODATA);
+        let upd = |h: &mut GpuHandler, id: u32, hx: u32| {
+            let b: Vec<u8> = [0u32, 10, 20, 0, id, hx, 7].iter().flat_map(|v| v.to_le_bytes()).collect();
+            let mut ring = crate::queue::tests::TestRing::new(4);
+            ring.add_chain(&[(b.len() as u32, false)]);
+            ring.mem.write(GuestAddress(crate::queue::tests::DATA), &b).unwrap();
+            let m = ring.mem.clone();
+            let (mut r, _) = ring.q.clone().pop(&m).unwrap().unwrap().into_rw().unwrap();
+            h.update_cursor(&mem, &mut r);
+        };
+        upd(&mut h, 5, 1);
+        upd(&mut h, 5, 1); // same picture: not sent again
+        upd(&mut h, 0, 0);
+        upd(&mut h, 99, 0); // no such resource: ignored
+        let c = sink.cursors.lock().unwrap().clone();
+        // RGBA; the hot spot is kept inside the picture.
+        let img = Cursor::Image { w: 2, h: 1, hot_x: 1, hot_y: 0, rgba: vec![3, 2, 1, 0xff, 6, 5, 4, 0] };
+        assert_eq!(c, vec![img, Cursor::Hidden]);
+        // It's in the snapshot and comes back with the resources.
+        assert_eq!(h.save_2d().cursor, Some((0, 0, 7)));
     }
 
     /// A 4x2 B8G8R8X8 resource, backing split over two guest pages, shown
