@@ -4,8 +4,9 @@
 //! unprivileged helper in the console session, over a local pipe.
 //!
 //! The helper is less trusted than the service: it may only send
-//! clipboard text and answers about dropped files towards the host,
-//! size-capped like everything else.
+//! clipboard text, answers about dropped files and files dragged out of
+//! the guest towards the host, size-capped like everything else (the
+//! host checks those again).
 
 use std::io::{self, Write};
 use std::sync::mpsc::Receiver;
@@ -127,12 +128,17 @@ impl<S: System> Relay<S> {
             | Message::DropEntry { .. }
             | Message::DropData { .. }
             | Message::DropEnd { .. }) => self.send_helper(&m),
+            // Files dragged out are the user's, read in their session.
+            Message::DragOutQuery { id } if self.helper.is_none() => {
+                host.write_all(&Message::DragOutItems { id, items: Vec::new() }.encode())?;
+            }
+            m @ (Message::DragOutQuery { .. } | Message::DragOutGet { .. } | Message::DragOutEnd { .. }) => self.send_helper(&m),
             Message::Gpu3d { on } => {
                 if let Some(on) = self.sys.gpu3d(on) {
                     host.write_all(&Message::Gpu3d { on }.encode())?;
                 }
             }
-            Message::Pong(_) | Message::DragReady { .. } | Message::DropDone { .. } => {}
+            Message::Pong(_) | Message::DragReady { .. } | Message::DropDone { .. } | Message::DragOutItems { .. } | Message::DragOutFail { .. } => {}
         }
         Ok(())
     }
@@ -157,7 +163,15 @@ impl<S: System> Relay<S> {
                 Ok(Some(Message::ClipboardText(t))) if t.len() <= self.max => {
                     host.write_all(&Message::ClipboardText(t).encode())?;
                 }
-                Ok(Some(m @ (Message::DragReady { .. } | Message::DropDone { .. }))) => host.write_all(&m.encode())?,
+                Ok(Some(
+                    m @ (Message::DragReady { .. }
+                    | Message::DropDone { .. }
+                    | Message::DragOutItems { .. }
+                    | Message::DropEntry { .. }
+                    | Message::DropData { .. }
+                    | Message::DropEnd { .. }
+                    | Message::DragOutFail { .. }),
+                )) => host.write_all(&m.encode())?,
                 Ok(Some(_)) => log::debug!("session helper {id}: ignoring a message it may not send"),
                 Ok(None) => return Ok(()),
                 Err(e) => {
@@ -315,6 +329,30 @@ mod tests {
         ]);
         assert_eq!(helper.msgs().len(), 4);
         assert_eq!(out[1..], [Message::DragReady { id: 2, live: true }, Message::DropDone { id: 2, ok: true, place: String::new() }]);
+    }
+
+    #[test]
+    fn drags_out_go_through_the_helper() {
+        let (out, _) = run(vec![host(Message::DragOutQuery { id: 1 })]);
+        assert_eq!(out[1..], [Message::DragOutItems { id: 1, items: Vec::new() }]);
+        let helper = Sink::default();
+        let frames = [
+            Message::DragOutItems { id: 2, items: vec![("a".into(), false)] },
+            Message::DropEntry { id: 3, path: "a".into(), dir: false, size: 1 },
+            Message::DropData { id: 3, data: vec![1] },
+            Message::DropEnd { id: 3 },
+            Message::DragOutFail { stream: 4, why: "x".into() },
+        ];
+        let mut evs = vec![
+            Ev::HelperUp(1, Box::new(helper.clone())),
+            host(Message::DragOutQuery { id: 2 }),
+            host(Message::DragOutGet { id: 2, item: 0, stream: 3 }),
+            host(Message::DragOutEnd { id: 2 }),
+        ];
+        evs.extend(frames.iter().map(|m| Ev::Helper(1, m.encode())));
+        let (out, _) = run(evs);
+        assert_eq!(helper.msgs().len(), 3);
+        assert_eq!(out[1..], frames);
     }
 
     #[test]

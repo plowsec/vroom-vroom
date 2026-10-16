@@ -39,6 +39,10 @@ pub enum ToViewer {
     /// The dropped files are in the guest (`ok`), or why not. `place`:
     /// where they went, without a live drag.
     DropDone { id: u32, ok: bool, place: String },
+    /// Files dragged out of the guest (answer to `ToVmm::DragOut`): their
+    /// top-level names and whether each is a folder; none when the guest
+    /// isn't dragging files.
+    DragOutItems { id: u32, items: Vec<(String, bool)> },
 }
 
 /// What the guest's pointer looks like.
@@ -93,6 +97,14 @@ pub enum ToVmm {
     /// Dropped: comes with a pipe (SCM_RIGHTS) the viewer writes the
     /// files into, as guest agent frames (DropEntry, DropData, DropEnd).
     Drop { id: u32 },
+    /// The mouse left the window with the guest's button held (`end`
+    /// false): is the guest dragging files out? Or (`end`) that drag is
+    /// over, the guest may forget it.
+    DragOut { id: u32, end: bool },
+    /// The Mac drop wants item `item` of a drag out: comes with a pipe
+    /// (SCM_RIGHTS) the VMM writes it into, as guest agent frames
+    /// (DropEntry, DropData, DropEnd, or DragOutFail), checked.
+    DragOutGet { id: u32, item: u32 },
 }
 
 fn frame(ty: u8, payload: &[u8]) -> Vec<u8> {
@@ -110,6 +122,33 @@ fn u32s(v: &[u32]) -> Vec<u8> {
 fn get_u32(p: &[u8], i: usize) -> Result<u32> {
     let b = p.get(i * 4..i * 4 + 4).ok_or(Error::Proto("short"))?;
     Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// id u32, then dir u8 | len u16 | name for each item.
+fn items_payload(id: u32, items: &[(String, bool)]) -> Vec<u8> {
+    let mut p = id.to_le_bytes().to_vec();
+    for (name, dir) in items {
+        p.push(*dir as u8);
+        p.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        p.extend_from_slice(name.as_bytes());
+    }
+    p
+}
+
+fn parse_items(p: &[u8]) -> Result<(u32, Vec<(String, bool)>)> {
+    let id = get_u32(p, 0)?;
+    let mut items = Vec::new();
+    let mut o = 4;
+    while o < p.len() {
+        if items.len() >= DRAG_ITEMS_MAX {
+            return Err(Error::Proto("drag items"));
+        }
+        let len = u16::from_le_bytes(p.get(o + 1..o + 3).ok_or(Error::Proto("short"))?.try_into().map_err(|_| Error::Proto("short"))?) as usize;
+        let name = text(p.get(o + 3..o + 3 + len).ok_or(Error::Proto("short"))?)?;
+        items.push((name, p[o] != 0));
+        o += 3 + len;
+    }
+    Ok((id, items))
 }
 
 fn text(p: &[u8]) -> Result<String> {
@@ -145,6 +184,7 @@ impl ToViewer {
                 p.extend_from_slice(place.as_bytes());
                 frame(9, &p)
             }
+            ToViewer::DragOutItems { id, items } => frame(14, &items_payload(*id, items)),
         }
     }
 
@@ -175,6 +215,10 @@ impl ToViewer {
             }),
             10 => ToViewer::Camera(*p.first().ok_or(Error::Proto("short"))? != 0),
             8 if p.len() == 5 => ToViewer::DragReady { id: get_u32(p, 0)?, live: p[4] != 0 },
+            14 => {
+                let (id, items) = parse_items(p)?;
+                ToViewer::DragOutItems { id, items }
+            }
             9 if p.len() >= 5 => ToViewer::DropDone { id: get_u32(p, 0)?, ok: p[4] != 0, place: text(&p[5..])?.chars().take(256).collect() },
             _ => return Err(Error::Proto("unknown viewer message")),
         })
@@ -192,17 +236,15 @@ impl ToVmm {
             ToVmm::Focus(f) => frame(6, &[*f as u8]),
             ToVmm::Clipboard(s) => frame(7, s.as_bytes()),
             ToVmm::Command(c) => frame(8, &[*c as u8]),
-            ToVmm::DragEnter { id, items } => {
-                let mut p = id.to_le_bytes().to_vec();
-                for (name, dir) in items {
-                    p.push(*dir as u8);
-                    p.extend_from_slice(&(name.len() as u16).to_le_bytes());
-                    p.extend_from_slice(name.as_bytes());
-                }
-                frame(9, &p)
-            }
+            ToVmm::DragEnter { id, items } => frame(9, &items_payload(*id, items)),
             ToVmm::DragCancel { id } => frame(10, &id.to_le_bytes()),
             ToVmm::Drop { id } => frame(11, &id.to_le_bytes()),
+            ToVmm::DragOut { id, end } => {
+                let mut p = id.to_le_bytes().to_vec();
+                p.push(*end as u8);
+                frame(16, &p)
+            }
+            ToVmm::DragOutGet { id, item } => frame(17, &u32s(&[*id, *item])),
         }
     }
 
@@ -237,22 +279,16 @@ impl ToVmm {
                 _ => return Err(Error::Proto("unknown command")),
             }),
             9 => {
-                let id = get_u32(p, 0)?;
-                let mut items = Vec::new();
-                let mut o = 4;
-                while o < p.len() {
-                    let len = u16::from_le_bytes(p.get(o + 1..o + 3).ok_or(Error::Proto("short"))?.try_into().map_err(|_| Error::Proto("short"))?) as usize;
-                    let name = text(p.get(o + 3..o + 3 + len).ok_or(Error::Proto("short"))?)?;
-                    items.push((name, p[o] != 0));
-                    o += 3 + len;
-                }
-                if items.is_empty() || items.len() > DRAG_ITEMS_MAX {
+                let (id, items) = parse_items(p)?;
+                if items.is_empty() {
                     return Err(Error::Proto("drag items"));
                 }
                 ToVmm::DragEnter { id, items }
             }
             10 if p.len() == 4 => ToVmm::DragCancel { id: get_u32(p, 0)? },
             11 if p.len() == 4 => ToVmm::Drop { id: get_u32(p, 0)? },
+            16 if p.len() == 5 => ToVmm::DragOut { id: get_u32(p, 0)?, end: p[4] != 0 },
+            17 if p.len() == 8 => ToVmm::DragOutGet { id: get_u32(p, 0)?, item: get_u32(p, 1)? },
             _ => return Err(Error::Proto("unknown vmm message")),
         })
     }
@@ -322,6 +358,9 @@ mod tests {
             ToVmm::DragEnter { id: 4, items: vec![("a.txt".into(), false), ("dir".into(), true)] },
             ToVmm::DragCancel { id: 4 },
             ToVmm::Drop { id: 4 },
+            ToVmm::DragOut { id: 5, end: false },
+            ToVmm::DragOut { id: 5, end: true },
+            ToVmm::DragOutGet { id: 5, item: 2 },
         ];
         let mut d = Decoder::default();
         for m in &vm {
@@ -341,6 +380,8 @@ mod tests {
             ToViewer::DragReady { id: 4, live: true },
             ToViewer::Camera(true),
             ToViewer::DropDone { id: 4, ok: false, place: "Desktop".into() },
+            ToViewer::DragOutItems { id: 5, items: vec![("a b.txt".into(), false), ("dir".into(), true)] },
+            ToViewer::DragOutItems { id: 6, items: Vec::new() },
         ];
         for m in &v {
             d.push(&m.encode());

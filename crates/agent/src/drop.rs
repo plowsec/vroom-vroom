@@ -3,13 +3,14 @@
 //! While files are dragged over the window the host sends their names
 //! (`DragEnter`); nothing more unless they are dropped. We make a staging
 //! folder with the top-level names in it (empty), and where the desktop
-//! can (Windows) start a drag of our own from under the pointer: the host
+//! can (Windows, X11) start a drag of our own under the pointer: the host
 //! holds the guest's mouse button down and moves the pointer as the
 //! user's moves, so the drop lands in whatever app is under it, as if the
 //! files had been dragged there from inside the guest. On the drop the
 //! host sends the contents (`DropEntry`, `DropData`, `DropEnd`); once
 //! they are written we say `DropDone` and the host lets go of the button.
-//! Without a live drag the files go to the Desktop instead.
+//! Without a live drag (Wayland, or no desktop) the files go to the
+//! Desktop instead. X11 desktops get the live drag from dnd_x11.rs.
 //!
 //! The host is trusted more than the guest, still: paths come checked by
 //! vroom-proto (relative, no `..`), must start with a name from
@@ -397,7 +398,12 @@ fn live_drag(dir: &Path, items: &[(String, bool)]) -> Option<Box<dyn LiveDrag>> 
     crate::dnd_win::start(dir, items).map(|d| Box::new(d) as Box<dyn LiveDrag>)
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn live_drag(dir: &Path, items: &[(String, bool)]) -> Option<Box<dyn LiveDrag>> {
+    crate::dnd_x11::start(dir, items).map(|d| Box::new(d) as Box<dyn LiveDrag>)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn live_drag(_: &Path, _: &[(String, bool)]) -> Option<Box<dyn LiveDrag>> {
     None
 }

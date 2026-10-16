@@ -14,6 +14,12 @@ mod dnd_win;
 // The session side; built everywhere so it's tested everywhere.
 #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 mod drop;
+// Built everywhere so it's tested everywhere; only Windows and X11 find
+// drags to take.
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+mod dragout;
+#[cfg(target_os = "linux")]
+mod dnd_x11;
 mod find;
 mod port;
 // Used by the service mode (Windows, Linux); built everywhere so it's
@@ -174,7 +180,8 @@ fn open_link(args: &Args) -> std::io::Result<(String, port::Reader, port::Writer
 }
 
 fn session(args: &Args) -> std::io::Result<()> {
-    let (path, mut reader, mut writer) = open_link(args)?;
+    let (path, mut reader, writer) = open_link(args)?;
+    let mut writer = dragout::Shared::new(writer);
     let system = args.role == Role::Full;
     sys::single_display();
     let mut clip: Box<dyn clip::Clip> = if args.no_clipboard {
@@ -204,6 +211,7 @@ fn session(args: &Args) -> std::io::Result<()> {
     let mut dec = Decoder::new(MAX_CLIP + 64);
     let mut last = clip.get();
     let mut drops = drop::Drops::new();
+    let mut dragout = dragout::DragOut::new();
     loop {
         match rx.recv_timeout(POLL) {
             Ok(bytes) => {
@@ -211,7 +219,7 @@ fn session(args: &Args) -> std::io::Result<()> {
                 loop {
                     match dec.next() {
                         Ok(Some(m)) => {
-                            if !drops.handle(&m, &mut writer)? {
+                            if !drops.handle(&m, &mut writer)? && !dragout.handle(&m, &writer)? {
                                 handle(m, system, &mut writer, clip.as_mut(), &mut last)?
                             }
                         }
@@ -240,6 +248,9 @@ fn session(args: &Args) -> std::io::Result<()> {
 
 fn hello() -> Message {
     let mut features = features::CLIPBOARD_TEXT | features::TIME_SYNC | features::SHUTDOWN | features::SCALE | features::FILE_DROP;
+    if cfg!(any(windows, target_os = "linux")) {
+        features |= features::DRAG_OUT;
+    }
     if cfg!(windows) {
         features |= features::GPU3D;
     }
@@ -248,7 +259,7 @@ fn hello() -> Message {
 
 /// `system`: we own the host link and may act on privileged requests.
 /// The session helper only ever gets clipboard, resolution and scale messages.
-fn handle(m: Message, system: bool, w: &mut port::Writer, clip: &mut dyn clip::Clip, last: &mut Option<String>) -> std::io::Result<()> {
+fn handle(m: Message, system: bool, w: &mut dyn Write, clip: &mut dyn clip::Clip, last: &mut Option<String>) -> std::io::Result<()> {
     match m {
         Message::Hello { .. } | Message::TimeSync { .. } | Message::Shutdown { .. } | Message::Ping(_) if !system => {
             log::debug!("ignoring a privileged message on the session link");
@@ -287,7 +298,12 @@ fn handle(m: Message, system: bool, w: &mut port::Writer, clip: &mut dyn clip::C
         | Message::DropData { .. }
         | Message::DropEnd { .. }
         | Message::DragReady { .. }
-        | Message::DropDone { .. } => {}
+        | Message::DropDone { .. }
+        | Message::DragOutQuery { .. }
+        | Message::DragOutItems { .. }
+        | Message::DragOutGet { .. }
+        | Message::DragOutEnd { .. }
+        | Message::DragOutFail { .. } => {}
     }
     Ok(())
 }

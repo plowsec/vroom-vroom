@@ -489,6 +489,10 @@ fn serve(stream: UnixStream, c: &Serve) {
                     Some(from) => c.agent.send(AgentCmd::Drop { id, from }),
                     None => log::warn!("display: a drop without its pipe"),
                 },
+                Ok(Some(ToVmm::DragOutGet { id, item })) => match (!fds.is_empty()).then(|| fds.remove(0)) {
+                    Some(to) => c.agent.send(AgentCmd::DragOutGet { id, item, to }),
+                    None => log::warn!("display: a drag out without its pipe"),
+                },
                 Ok(Some(m)) => handle(m, c.input.as_ref(), &c.agent, &c.events, &c.latest),
                 Ok(None) => break,
                 Err(e) => {
@@ -566,8 +570,10 @@ fn handle(
         }
         ToVmm::DragEnter { id, items } => agent.send(AgentCmd::DragEnter { id, items }),
         ToVmm::DragCancel { id } => agent.send(AgentCmd::DragCancel { id }),
-        // serve() pairs it with its pipe.
-        ToVmm::Drop { .. } => {}
+        ToVmm::DragOut { id, end: false } => agent.send(AgentCmd::DragOut { id }),
+        ToVmm::DragOut { id, end: true } => agent.send(AgentCmd::DragOutEnd { id }),
+        // serve() pairs them with their pipes.
+        ToVmm::Drop { .. } | ToVmm::DragOutGet { .. } => {}
     }
 }
 
