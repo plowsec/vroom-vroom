@@ -181,6 +181,8 @@ pub fn classify(codec: Codec, nal: &[u8]) -> Option<Kind> {
                 _ => Kind::Other,
             })
         }
+        // Not NAL unit streams.
+        Codec::Vp9 | Codec::Av1 => None,
     }
 }
 
@@ -227,6 +229,59 @@ fn hevc_sps_id(nal: &[u8]) -> Option<u32> {
         }
     }
     b.ue().filter(|&id| id <= 15)
+}
+
+/// Bits per luma sample an SPS asks for.
+pub fn sps_depth(codec: Codec, nal: &[u8]) -> Option<u32> {
+    match codec {
+        Codec::H264 => {
+            let r = rbsp(nal.get(1..)?, 64);
+            let mut b = Bits::new(&r);
+            let profile = b.bits(8)?;
+            b.skip(16)?;
+            b.ue()?;
+            if !matches!(profile, 100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135) {
+                return Some(8);
+            }
+            if b.ue()? == 3 {
+                b.skip(1)?;
+            }
+            Some(b.ue().filter(|&d| d <= 6)? + 8)
+        }
+        Codec::Hevc => {
+            let r = rbsp(nal.get(2..)?, 128);
+            let mut b = Bits::new(&r);
+            b.skip(4)?;
+            let sub_layers = b.bits(3)? as usize;
+            if sub_layers > 6 {
+                return None;
+            }
+            b.skip(1 + 88 + 8)?;
+            let mut present = [(false, false); 6];
+            for p in present.iter_mut().take(sub_layers) {
+                *p = (b.bit()? == 1, b.bit()? == 1);
+            }
+            if sub_layers > 0 {
+                b.skip(2 * (8 - sub_layers))?;
+            }
+            for &(profile, level) in present.iter().take(sub_layers) {
+                b.skip(if profile { 88 } else { 0 } + if level { 8 } else { 0 })?;
+            }
+            b.ue()?; // id
+            if b.ue()? == 3 {
+                b.skip(1)?;
+            }
+            b.ue()?;
+            b.ue()?;
+            if b.bit()? == 1 {
+                for _ in 0..4 {
+                    b.ue()?;
+                }
+            }
+            Some(b.ue().filter(|&d| d <= 8)? + 8)
+        }
+        _ => None,
+    }
 }
 
 fn hevc_pps_id(nal: &[u8]) -> Option<u32> {
@@ -317,6 +372,11 @@ impl ParamSets {
     /// All of them, VPS then SPS then PPS, by id.
     pub fn list(&self) -> Vec<&[u8]> {
         self.sets.values().map(|v| v.as_slice()).collect()
+    }
+
+    /// The most bits per luma sample any SPS asks for (8 if none says).
+    pub fn depth(&self) -> u32 {
+        self.sets.iter().filter(|(k, _)| k.0 == Param::Sps).filter_map(|(_, n)| sps_depth(self.codec, n)).max().unwrap_or(8)
     }
 
     pub fn clear(&mut self) {
