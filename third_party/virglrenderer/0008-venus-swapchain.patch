@@ -1,0 +1,645 @@
+diff --git a/src/venus/vkr_buffer.c b/src/venus/vkr_buffer.c
+index 33ecdba..7f37a84 100644
+--- a/src/venus/vkr_buffer.c
++++ b/src/venus/vkr_buffer.c
+@@ -12,16 +12,19 @@
+  * name: the allocation is shm wrapped in an MTLBuffer and is imported, never
+  * exported.  Create the host buffer as non-external instead.
+  */
+-static void
++static bool
+ vkr_buffer_fix_create_info(struct vkr_device *dev, VkBufferCreateInfo *pCreateInfo)
+ {
+    if (!dev->physical_device->is_dma_buf_emulated)
+-      return;
++      return false;
+ 
+    VkExternalMemoryBufferCreateInfo *ext_create_info =
+       vkr_find_struct(pCreateInfo, VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO);
+-   if (ext_create_info)
+-      ext_create_info->handleTypes &= ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
++   if (!ext_create_info ||
++       !(ext_create_info->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT))
++      return false;
++   ext_create_info->handleTypes &= ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
++   return true;
+ }
+ 
+ static void
+@@ -30,7 +33,8 @@ vkr_dispatch_vkCreateBuffer(struct vn_dispatch_context *dispatch,
+ {
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+ 
+-   vkr_buffer_fix_create_info(dev, (VkBufferCreateInfo *)args->pCreateInfo);
++   const bool shm_backed =
++      vkr_buffer_fix_create_info(dev, (VkBufferCreateInfo *)args->pCreateInfo);
+    if (dev->fake_xfb) {
+       ((VkBufferCreateInfo *)args->pCreateInfo)->usage &=
+          ~(VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT |
+@@ -62,7 +66,9 @@ vkr_dispatch_vkCreateBuffer(struct vn_dispatch_context *dispatch,
+     * vkr_physical_device_init_memory_properties as well.
+     */
+ 
+-   vkr_buffer_create_and_add(dispatch->data, args);
++   struct vkr_buffer *buf = vkr_buffer_create_and_add(dispatch->data, args);
++   if (buf)
++      buf->shm_backed = shm_backed;
+ }
+ 
+ static void
+@@ -80,8 +86,11 @@ vkr_dispatch_vkGetBufferMemoryRequirements(
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
++   const struct vkr_buffer *buf = vkr_buffer_from_handle(args->buffer);
+    vn_replace_vkGetBufferMemoryRequirements_args_handle(args);
+    vk->GetBufferMemoryRequirements(args->device, args->buffer, args->pMemoryRequirements);
++   if (buf && buf->shm_backed)
++      vkr_device_shm_memory_types(dev, args->pMemoryRequirements);
+ }
+ 
+ static void
+@@ -92,8 +101,11 @@ vkr_dispatch_vkGetBufferMemoryRequirements2(
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
++   const struct vkr_buffer *buf = vkr_buffer_from_handle(args->pInfo->buffer);
+    vn_replace_vkGetBufferMemoryRequirements2_args_handle(args);
+    vk->GetBufferMemoryRequirements2(args->device, args->pInfo, args->pMemoryRequirements);
++   if (buf && buf->shm_backed)
++      vkr_device_shm_memory_types(dev, &args->pMemoryRequirements->memoryRequirements);
+ }
+ 
+ static void
+@@ -167,11 +179,14 @@ vkr_dispatch_vkGetDeviceBufferMemoryRequirements(
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
+-   vkr_buffer_fix_create_info(dev, (VkBufferCreateInfo *)args->pInfo->pCreateInfo);
++   const bool shm_backed =
++      vkr_buffer_fix_create_info(dev, (VkBufferCreateInfo *)args->pInfo->pCreateInfo);
+ 
+    vn_replace_vkGetDeviceBufferMemoryRequirements_args_handle(args);
+    vk->GetDeviceBufferMemoryRequirements(args->device, args->pInfo,
+                                          args->pMemoryRequirements);
++   if (shm_backed)
++      vkr_device_shm_memory_types(dev, &args->pMemoryRequirements->memoryRequirements);
+ }
+ 
+ void
+diff --git a/src/venus/vkr_buffer.h b/src/venus/vkr_buffer.h
+index d1575b5..e009b24 100644
+--- a/src/venus/vkr_buffer.h
++++ b/src/venus/vkr_buffer.h
+@@ -10,6 +10,8 @@
+ 
+ struct vkr_buffer {
+    struct vkr_object base;
++   /* the guest may export it as a dma_buf (see vkr_image) */
++   bool shm_backed;
+ };
+ VKR_DEFINE_OBJECT_CAST(buffer, VK_OBJECT_TYPE_BUFFER, VkBuffer)
+ 
+diff --git a/src/venus/vkr_device.c b/src/venus/vkr_device.c
+index 17d2173..adbb09d 100644
+--- a/src/venus/vkr_device.c
++++ b/src/venus/vkr_device.c
+@@ -133,7 +133,7 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+    const bool drop_emulated =
+       physical_dev->is_dma_buf_emulated || !physical_dev->EXT_image_drm_format_modifier ||
+       !physical_dev->EXT_queue_family_foreign || physical_dev->emulate_depth_clip ||
+-      physical_dev->emulate_xfb;
++      physical_dev->emulate_xfb || physical_dev->emulate_sync_fd_import;
+ 
+    bool dev_xfb = false;
+ 
+@@ -172,6 +172,9 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+          if (physical_dev->emulate_depth_clip &&
+              !strcmp(name, VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME))
+             continue;
++         if (physical_dev->emulate_sync_fd_import &&
++             !strcmp(name, VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME))
++            continue;
+          if (physical_dev->emulate_xfb &&
+              !strcmp(name, VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME)) {
+             dev_xfb = true;
+@@ -726,6 +729,23 @@ vkr_device_fill_null_vertex_buffers(struct vkr_device *dev,
+    }
+ }
+ 
++/* dma_buf is emulated with shm imported as host memory, which only host
++ * visible memory types take (the guest would pick device local otherwise,
++ * and the import would fail). */
++void
++vkr_device_shm_memory_types(struct vkr_device *dev, VkMemoryRequirements *reqs)
++{
++   const VkPhysicalDeviceMemoryProperties *props =
++      &dev->physical_device->memory_properties;
++   uint32_t host = 0;
++   for (uint32_t i = 0; i < props->memoryTypeCount; i++) {
++      if (props->memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
++         host |= 1u << i;
++   }
++   if (reqs->memoryTypeBits & host)
++      reqs->memoryTypeBits &= host;
++}
++
+ void
+ vkr_device_destroy(struct vkr_context *ctx, struct vkr_device *dev, bool destroy_vk)
+ {
+diff --git a/src/venus/vkr_device.h b/src/venus/vkr_device.h
+index fac10c4..014c143 100644
+--- a/src/venus/vkr_device.h
++++ b/src/venus/vkr_device.h
+@@ -60,6 +60,9 @@ vkr_context_init_device_dispatch(struct vkr_context *ctx);
+ void
+ vkr_device_destroy(struct vkr_context *ctx, struct vkr_device *dev, bool destroy_vk);
+ 
++void
++vkr_device_shm_memory_types(struct vkr_device *dev, VkMemoryRequirements *reqs);
++
+ void
+ vkr_device_fill_null_descriptors(struct vkr_device *dev,
+                                  uint32_t count,
+diff --git a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
+index 1c460fd..9f61291 100644
+--- a/src/venus/vkr_device_memory.c
++++ b/src/venus/vkr_device_memory.c
+@@ -380,7 +380,14 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+       args->ret = dev->GetMemoryHostPointerPropertiesEXT(
+          dev->base.handle.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+          shm->ptr, &host_props);
+-      if (args->ret == VK_SUCCESS && !(host_props.memoryTypeBits & (1u << mem_type_index))) {
++      if (args->ret == VK_SUCCESS && !(host_props.memoryTypeBits & (1u << mem_type_index)) &&
++          !(property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && host_props.memoryTypeBits) {
++         /* Device local memory the guest wants to export (a window's
++          * frame): the guest never maps it, so host memory of a type that
++          * takes the import serves as well. */
++         alloc_info->memoryTypeIndex = ffs(host_props.memoryTypeBits) - 1;
++      } else if (args->ret == VK_SUCCESS &&
++                 !(host_props.memoryTypeBits & (1u << mem_type_index))) {
+          vkr_log("host memory import is unsupported for memory type %u", mem_type_index);
+          args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+       }
+diff --git a/src/venus/vkr_image.c b/src/venus/vkr_image.c
+index c9d9964..16a86e8 100644
+--- a/src/venus/vkr_image.c
++++ b/src/venus/vkr_image.c
+@@ -8,19 +8,24 @@
+ #include "vkr_image_gen.h"
+ #include "vkr_physical_device.h"
+ 
+-/* See vkr_buffer_fix_create_info. */
+-static void
++/* See vkr_buffer_fix_create_info.  True if the guest may export the image's
++ * memory as a dma_buf. */
++static bool
+ vkr_image_fix_create_info(struct vkr_device *dev, VkImageCreateInfo *pCreateInfo)
+ {
+    if (!dev->physical_device->is_dma_buf_emulated)
+-      return;
++      return false;
+ 
+    VkExternalMemoryImageCreateInfo *ext_create_info =
+       vkr_find_struct(pCreateInfo, VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
+-   if (ext_create_info)
+-      ext_create_info->handleTypes &= ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
++   if (!ext_create_info ||
++       !(ext_create_info->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT))
++      return false;
++   ext_create_info->handleTypes &= ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
++   return true;
+ }
+ 
++
+ static VkResult
+ vkr_image_fix_drm_format(struct vkr_device *dev,
+                          VkImageCreateInfo *pCreateInfo)
+@@ -65,7 +70,8 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
+ {
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+ 
+-   vkr_image_fix_create_info(dev, (VkImageCreateInfo *)args->pCreateInfo);
++   const bool shm_backed =
++      vkr_image_fix_create_info(dev, (VkImageCreateInfo *)args->pCreateInfo);
+ 
+    if (!dev->physical_device->EXT_image_drm_format_modifier) {
+       args->ret = vkr_image_fix_drm_format(dev, (VkImageCreateInfo *)args->pCreateInfo);
+@@ -93,7 +99,9 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
+     * situation because the app does not consider the memory external.
+     */
+ 
+-   vkr_image_create_and_add(dispatch->data, args);
++   struct vkr_image *img = vkr_image_create_and_add(dispatch->data, args);
++   if (img)
++      img->shm_backed = shm_backed;
+ }
+ 
+ static void
+@@ -111,8 +119,11 @@ vkr_dispatch_vkGetImageMemoryRequirements(
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
++   const struct vkr_image *img = vkr_image_from_handle(args->image);
+    vn_replace_vkGetImageMemoryRequirements_args_handle(args);
+    vk->GetImageMemoryRequirements(args->device, args->image, args->pMemoryRequirements);
++   if (img && img->shm_backed)
++      vkr_device_shm_memory_types(dev, args->pMemoryRequirements);
+ }
+ 
+ static void
+@@ -123,8 +134,11 @@ vkr_dispatch_vkGetImageMemoryRequirements2(
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
++   const struct vkr_image *img = vkr_image_from_handle(args->pInfo->image);
+    vn_replace_vkGetImageMemoryRequirements2_args_handle(args);
+    vk->GetImageMemoryRequirements2(args->device, args->pInfo, args->pMemoryRequirements);
++   if (img && img->shm_backed)
++      vkr_device_shm_memory_types(dev, &args->pMemoryRequirements->memoryRequirements);
+ }
+ 
+ static void
+@@ -289,11 +303,14 @@ vkr_dispatch_vkGetDeviceImageMemoryRequirements(
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
+-   vkr_image_fix_create_info(dev, (VkImageCreateInfo *)args->pInfo->pCreateInfo);
++   const bool shm_backed =
++      vkr_image_fix_create_info(dev, (VkImageCreateInfo *)args->pInfo->pCreateInfo);
+ 
+    vn_replace_vkGetDeviceImageMemoryRequirements_args_handle(args);
+    vk->GetDeviceImageMemoryRequirements(args->device, args->pInfo,
+                                         args->pMemoryRequirements);
++   if (shm_backed)
++      vkr_device_shm_memory_types(dev, &args->pMemoryRequirements->memoryRequirements);
+ }
+ 
+ static void
+diff --git a/src/venus/vkr_image.h b/src/venus/vkr_image.h
+index 70a9800..e9342ea 100644
+--- a/src/venus/vkr_image.h
++++ b/src/venus/vkr_image.h
+@@ -10,6 +10,9 @@
+ 
+ struct vkr_image {
+    struct vkr_object base;
++   /* the guest may export it as a dma_buf: its memory must be shm we can
++    * import, so only host visible memory types are offered */
++   bool shm_backed;
+ };
+ VKR_DEFINE_OBJECT_CAST(image, VK_OBJECT_TYPE_IMAGE, VkImage)
+ 
+diff --git a/src/venus/vkr_physical_device.c b/src/venus/vkr_physical_device.c
+index 5580a08..a89ec5b 100644
+--- a/src/venus/vkr_physical_device.c
++++ b/src/venus/vkr_physical_device.c
+@@ -275,6 +275,7 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
+    uint32_t advertised_count = 0;
+    physical_dev->emulate_depth_clip = true;
+    physical_dev->emulate_xfb = physical_dev->zink;
++   physical_dev->emulate_sync_fd_import = true;
+    for (uint32_t i = 0; i < count; i++) {
+       VkExtensionProperties *props = &exts[i];
+ 
+@@ -282,6 +283,8 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
+          physical_dev->emulate_depth_clip = false;
+       else if (!strcmp(props->extensionName, "VK_EXT_transform_feedback"))
+          physical_dev->emulate_xfb = false;
++      else if (!strcmp(props->extensionName, "VK_KHR_external_semaphore_fd"))
++         physical_dev->emulate_sync_fd_import = false;
+ 
+       if (!strcmp(props->extensionName, "VK_KHR_external_memory_fd"))
+          physical_dev->KHR_external_memory_fd = true;
+@@ -324,12 +327,18 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
+    emulated_count += !physical_dev->EXT_queue_family_foreign;
+    emulated_count += physical_dev->emulate_depth_clip;
+    emulated_count += physical_dev->emulate_xfb;
++   emulated_count += physical_dev->emulate_sync_fd_import;
+    exts = realloc(exts, sizeof(*exts) * (advertised_count + emulated_count));
+    if (physical_dev->emulate_depth_clip) {
+       strcpy(prop.extensionName, VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
+       prop.specVersion = vkr_extension_get_spec_version(prop.extensionName);
+       exts[advertised_count++] = prop;
+    }
++   if (physical_dev->emulate_sync_fd_import) {
++      strcpy(prop.extensionName, VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME);
++      prop.specVersion = vkr_extension_get_spec_version(prop.extensionName);
++      exts[advertised_count++] = prop;
++   }
+    if (physical_dev->emulate_xfb) {
+       strcpy(prop.extensionName, VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME);
+       prop.specVersion = vkr_extension_get_spec_version(prop.extensionName);
+@@ -1057,6 +1066,18 @@ vkr_dispatch_vkGetPhysicalDeviceExternalSemaphoreProperties(
+    vk->GetPhysicalDeviceExternalSemaphoreProperties(args->physicalDevice,
+                                                     args->pExternalSemaphoreInfo,
+                                                     args->pExternalSemaphoreProperties);
++
++   const VkSemaphoreTypeCreateInfo *type = vkr_find_struct(
++      args->pExternalSemaphoreInfo->pNext, VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO);
++   if (physical_dev->emulate_sync_fd_import &&
++       args->pExternalSemaphoreInfo->handleType ==
++          VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT &&
++       (!type || type->semaphoreType == VK_SEMAPHORE_TYPE_BINARY)) {
++      VkExternalSemaphoreProperties *props = args->pExternalSemaphoreProperties;
++      props->exportFromImportedHandleTypes = 0;
++      props->compatibleHandleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
++      props->externalSemaphoreFeatures = VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT;
++   }
+ }
+ 
+ static void
+diff --git a/src/venus/vkr_physical_device.h b/src/venus/vkr_physical_device.h
+index 3a4f0a1..c592db3 100644
+--- a/src/venus/vkr_physical_device.h
++++ b/src/venus/vkr_physical_device.h
+@@ -45,6 +45,12 @@ struct vkr_physical_device {
+    bool zink;
+    bool emulate_xfb;
+ 
++   /* VK_KHR_external_semaphore_fd, import of signaled sync fds only: the
++    * guest has waited for the fd itself and asks us to mark the semaphore
++    * signaled (vkImportSemaphoreResourceMESA).  Guest venus needs it for
++    * VK_KHR_swapchain and VK_KHR_synchronization2. */
++   bool emulate_sync_fd_import;
++
+    VkPhysicalDeviceMemoryProperties memory_properties;
+    VkPhysicalDeviceIDProperties id_properties;
+    bool is_dma_buf_fd_export_supported;
+diff --git a/src/venus/vkr_queue.c b/src/venus/vkr_queue.c
+index 91f6ec3..116c21e 100644
+--- a/src/venus/vkr_queue.c
++++ b/src/venus/vkr_queue.c
+@@ -566,6 +566,30 @@ vkr_dispatch_vkWaitSemaphoreResourceMESA(
+ 
+    vn_replace_vkWaitSemaphoreResourceMESA_args_handle(args);
+ 
++   if (dev->physical_device->emulate_sync_fd_import) {
++      /* Exporting a sync fd consumes the semaphore's signal, as a wait
++       * does: an empty submission waiting on it. */
++      if (list_is_empty(&dev->queues)) {
++         vkr_context_set_fatal(ctx);
++         return;
++      }
++      struct vkr_queue *queue =
++         list_first_entry(&dev->queues, struct vkr_queue, base.track_head);
++      const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
++      const VkSubmitInfo submit = {
++         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++         .waitSemaphoreCount = 1,
++         .pWaitSemaphores = &args->semaphore,
++         .pWaitDstStageMask = &stage,
++      };
++      mtx_lock(&queue->vk_mutex);
++      VkResult result = vk->QueueSubmit(queue->base.handle.queue, 1, &submit, VK_NULL_HANDLE);
++      mtx_unlock(&queue->vk_mutex);
++      if (result != VK_SUCCESS)
++         vkr_context_set_fatal(ctx);
++      return;
++   }
++
+    const VkSemaphoreGetFdInfoKHR info = {
+       .sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
+       .semaphore = args->semaphore,
+@@ -595,6 +619,29 @@ vkr_dispatch_vkImportSemaphoreResourceMESA(
+ 
+    const VkImportSemaphoreResourceInfoMESA *res_info = args->pImportSemaphoreResourceInfo;
+ 
++   if (dev->physical_device->emulate_sync_fd_import) {
++      /* The guest waited for the sync fd; the host semaphore just has to be
++       * signaled before the guest's next wait on it.  An empty submission
++       * signaling it does that, and keeps queue order. */
++      if (res_info->resourceId || list_is_empty(&dev->queues)) {
++         vkr_context_set_fatal(ctx);
++         return;
++      }
++      struct vkr_queue *queue =
++         list_first_entry(&dev->queues, struct vkr_queue, base.track_head);
++      const VkSubmitInfo submit = {
++         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++         .signalSemaphoreCount = 1,
++         .pSignalSemaphores = &res_info->semaphore,
++      };
++      mtx_lock(&queue->vk_mutex);
++      VkResult result = vk->QueueSubmit(queue->base.handle.queue, 1, &submit, VK_NULL_HANDLE);
++      mtx_unlock(&queue->vk_mutex);
++      if (result != VK_SUCCESS)
++         vkr_context_set_fatal(ctx);
++      return;
++   }
++
+    /* resourceId 0 is for importing a signaled payload to sync_fd fence */
+    assert(!res_info->resourceId);
+ 
+diff --git a/src/vrend/vrend_decode.c b/src/vrend/vrend_decode.c
+index 7774a25..8f5c9c8 100644
+--- a/src/vrend/vrend_decode.c
++++ b/src/vrend/vrend_decode.c
+@@ -2050,6 +2050,8 @@ static int vrend_decode_ctx_submit_cmd(struct virgl_context *ctx,
+                                        const void *buffer,
+                                        size_t size)
+ {
++   vrend_renderer_shm_epoch_next();
++
+    TRACE_FUNC();
+    struct vrend_decode_ctx *gdctx = (struct vrend_decode_ctx *)ctx;
+    bool bret;
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 7b3bef8..fecac29 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -22,6 +22,9 @@
+  *
+  **************************************************************************/
+ #ifdef HAVE_CONFIG_H
++#ifndef WIN32
++#include <sys/mman.h>
++#endif
+ #include "config.h"
+ #endif
+ 
+@@ -5360,6 +5363,93 @@ static void vrend_draw_bind_vertex_binding(struct vrend_context *ctx,
+    }
+ }
+ 
++static int vrend_resource_alloc_texture(struct vrend_resource *gr,
++                                        enum virgl_formats format,
++                                        void *image_oes);
++
++static uint32_t vrend_shm_epoch = 1;
++
++void vrend_renderer_shm_epoch_next(void)
++{
++   if (++vrend_shm_epoch == 0)
++      vrend_shm_epoch = 1;
++}
++
++/* Copy a Venus blob's current contents into its GL texture, once per
++ * command stream.  Texture unit 0's 2D binding and the unpack state are put
++ * back as they were. */
++static void vrend_resource_shm_refresh(struct vrend_resource *res)
++{
++   if (!res || !res->shm_map || res->shm_epoch == vrend_shm_epoch)
++      return;
++   res->shm_epoch = vrend_shm_epoch;
++
++   const struct vrend_format_table *tf = &tex_conv_table[res->base.format];
++   const unsigned bpp = util_format_get_blocksize(res->base.format);
++   GLint active, bound, pbo, row_length, alignment;
++   glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
++   glActiveTexture(GL_TEXTURE0);
++   glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
++   glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &pbo);
++   glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row_length);
++   glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
++
++   glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
++   glBindTexture(GL_TEXTURE_2D, res->gl_id);
++   glPixelStorei(GL_UNPACK_ROW_LENGTH, res->shm_stride / bpp);
++   glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
++   glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, res->base.width0, res->base.height0,
++                   tf->glformat, tf->gltype, res->shm_map + res->shm_offset);
++
++   glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
++   glPixelStorei(GL_UNPACK_ROW_LENGTH, row_length);
++   glBindTexture(GL_TEXTURE_2D, bound);
++   glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
++   glActiveTexture(active);
++}
++
++#ifndef WIN32
++/* set_type for a Venus blob without EGL (macOS's OpenGL): a texture of our
++ * own and the blob's memory mapped read only, checked against the layout
++ * the guest gave. */
++static int vrend_resource_from_shm(struct vrend_resource *gr,
++                                   struct virgl_resource *res,
++                                   const struct vrend_renderer_resource_set_type_args *args)
++{
++   struct pipe_resource *pr = &gr->base;
++   const unsigned bpp = util_format_get_blocksize(pr->format);
++   const uint64_t row = (uint64_t)pr->width0 * bpp;
++
++   if (pr->target != PIPE_TEXTURE_2D || !bpp || !args->plane_count || res->fd < 0 ||
++       util_format_is_compressed(pr->format) ||
++       tex_conv_table[pr->format].glformat == GL_NONE)
++      return EINVAL;
++   const uint64_t stride = args->plane_strides[0];
++   const uint64_t offset = args->plane_offsets[0];
++   if (stride < row || stride % bpp || !pr->height0 ||
++       offset + stride * (pr->height0 - 1) + row > res->map_size)
++      return EINVAL;
++
++   void *map = mmap(NULL, res->map_size, PROT_READ, MAP_SHARED, res->fd, 0);
++   if (map == MAP_FAILED)
++      return ENOMEM;
++
++   int ret = vrend_resource_alloc_texture(gr, pr->format, NULL);
++   if (ret) {
++      munmap(map, res->map_size);
++      return ret;
++   }
++   gr->shm_map = map;
++   gr->shm_map_size = res->map_size;
++   gr->shm_stride = stride;
++   gr->shm_offset = offset;
++   gr->shm_epoch = 0;
++   vrend_resource_shm_refresh(gr);
++   return 0;
++}
++
++#endif
++
+ static GLuint vrend_draw_bind_samplers_shader(struct vrend_sub_context *sub_ctx,
+                                               int shader_type,
+                                               GLuint next_sampler_id)
+@@ -5375,6 +5465,9 @@ static GLuint vrend_draw_bind_samplers_shader(struct vrend_sub_context *sub_ctx,
+       int i = u_bit_scan(&mask);
+       struct vrend_sampler_view *tview = shader_view->views[i];
+ 
++      if (tview)
++         vrend_resource_shm_refresh(tview->texture);
++
+       if ((dirty & (1 << i)) && tview) {
+          glActiveTexture(GL_TEXTURE0 + next_sampler_id);
+          glUniform1i(sprog->sampler_locs[shader_type][sampler_index], next_sampler_id);
+@@ -9131,6 +9224,11 @@ vrend_renderer_resource_create(const struct vrend_renderer_resource_create_args
+ 
+ void vrend_renderer_resource_destroy(struct vrend_resource *res)
+ {
++#ifndef WIN32
++   if (res->shm_map)
++      munmap((void *)res->shm_map, res->shm_map_size);
++#endif
++
+    if (has_bit(res->storage_bits, VREND_STORAGE_GL_TEXTURE)) {
+       glDeleteTextures(1, &res->gl_id);
+    } else if (has_bit(res->storage_bits, VREND_STORAGE_GL_BUFFER)) {
+@@ -11097,6 +11195,8 @@ void vrend_renderer_resource_copy_region(struct vrend_context *ctx,
+       return;
+    }
+ 
++   vrend_resource_shm_refresh(src_res);
++
+    if (!resource_contains_box(src_res, src_box, src_level)) {
+       vrend_report_context_error(ctx, VIRGL_ERROR_CTX_ILLEGAL_CMD_BUFFER, src_handle);
+       return;
+@@ -11654,6 +11754,8 @@ void vrend_renderer_blit(struct vrend_context *ctx,
+    if (ctx->in_error)
+       return;
+ 
++   vrend_resource_shm_refresh(src_res);
++
+    if (unlikely(info->src.format >= VIRGL_FORMAT_MAX ||
+                 tex_conv_table[info->src.format].format == VIRGL_FORMAT_NONE)) {
+       vrend_report_context_error(ctx, VIRGL_ERROR_CTX_ILLEGAL_FORMAT, info->src.format);
+@@ -14183,6 +14285,20 @@ vrend_renderer_pipe_resource_set_type(struct vrend_context *ctx,
+          int fd = -1;
+          GLenum internalformat = tex_conv_table[gr->base.format].internalformat;
+ 
++#ifndef WIN32
++         if (res->fd_type == VIRGL_RESOURCE_FD_SHM && !has_feature(feat_memory_object_fd)) {
++            int ret = vrend_resource_from_shm(gr, res, args);
++            if (ret) {
++               virgl_warn("%s: can't show blob %u through GL: %d\n", __func__, res_id, ret);
++               FREE(gr);
++               return ret;
++            }
++            res->pipe_resource = &gr->base;
++            vrend_ctx_resource_insert(ctx->res_hash, res->res_id, gr);
++            return 0;
++         }
++#endif
++
+          if (!has_feature(feat_memory_object_fd) || !has_feature(feat_memory_object)) {
+             FREE(gr);
+             return EINVAL;
+diff --git a/src/vrend/vrend_renderer.h b/src/vrend/vrend_renderer.h
+index 814eb7e..97b36dd 100644
+--- a/src/vrend/vrend_renderer.h
++++ b/src/vrend/vrend_renderer.h
+@@ -126,6 +126,15 @@ struct vrend_resource {
+    uint32_t blob_id;
+    struct list_head head;
+    bool is_imported;
++
++   /* A Venus blob (a Vulkan app's frame) seen through plain GL, which can't
++    * share memory with Vulkan on macOS: the texture is a copy, filled again
++    * from the blob's shared memory when a new command stream uses it. */
++   const uint8_t *shm_map;
++   uint64_t shm_map_size;
++   uint32_t shm_stride;
++   uint32_t shm_offset;
++   uint32_t shm_epoch;
+ };
+ 
+ #define VIRGL_TEXTURE_NEED_SWIZZLE        (1 << 0)
+@@ -641,6 +650,9 @@ vrend_renderer_pipe_resource_set_type(struct vrend_context *ctx,
+ 
+ uint32_t vrend_renderer_resource_get_map_info(struct pipe_resource *pres);
+ 
++/* A new command stream: copies of Venus blobs are refreshed on next use. */
++void vrend_renderer_shm_epoch_next(void);
++
+ int vrend_renderer_resource_map(struct pipe_resource *pres, void **map, uint64_t *out_size);
+ 
+ int vrend_renderer_resource_unmap(struct pipe_resource *pres);
