@@ -1,13 +1,20 @@
-# /etc/vroom/netd.toml — vroom-netd (runs as root).
-# Only members of `group` can attach VMs.
+# /etc/vroom/netd.toml: vroom-netd, vroom's helper that runs as root.
+# Only members of `group` can talk to it.
 socket = "/var/run/vroom/netd.sock"
-group = "staff"            # Linux default: "vroom"
+group = "staff"            # Linux: "vroom"
 
-# Interfaces VMs may bridge onto. macOS: physical interfaces (en0...).
+# Interfaces VMs may bridge onto. A name ending in * covers all that
+# start that way: en* is every Ethernet and Wi-Fi port of a Mac.
 # Linux: an existing bridge (br0) you created with your NIC enslaved.
-bridge_interfaces = ["en0"]
+bridge_interfaces = ["en*"]
 
 # Private host-only networks (VMs + host, no outside access).
 [[host_only]]
 name = "lab"
 gateway = "192.168.77.1/24"   # Linux bridge address; macOS vmnet picks its own
+
+# USB devices macOS holds (keyboards, disks, webcams, serial chips): the
+# helper takes them from macOS for a VM. Only members of this group may ask.
+[usb]
+enabled = true
+group = "admin"            # Linux: "vroom"

@@ -15,7 +15,7 @@ name=vroom-$ver-$os-$(uname -m)
 d=target/dist/$name
 rm -rf "$d"
 mkdir -p "$d"
-cp target/release/vroom target/release/vroom-gui "$d/"
+cp target/release/vroom target/release/vroom-gui target/release/vroom-netd "$d/"
 note=""
 if [ -f target/release/libvirglrenderer.1.dylib ]; then
   # virglrenderer, and what it loads from its own directory: MoltenVK

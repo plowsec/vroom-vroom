@@ -32,6 +32,8 @@ use vroom_display::{recv_fd, Command, Decoder, GuestCursor, SharedFb, ToViewer, 
 use crate::msg::{self, Msg};
 use crate::{ConsoleWindow, VmState};
 
+mod usbmenu;
+
 const CLIP_POLL: Duration = Duration::from_millis(500);
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(300);
 const THUMB_EVERY: Duration = Duration::from_secs(2);
@@ -65,6 +67,8 @@ struct Shared {
     cursor: Option<GuestCursor>,
     /// Answers about files dragged over the window, in order.
     drag: VecDeque<ToViewer>,
+    /// The host USB devices the VM has, the latest list.
+    usb: Option<Vec<vroom_display::UsbPort>>,
     posted: bool,
 }
 
@@ -108,6 +112,7 @@ impl Shared {
                 }
                 self.drag.push_back(m);
             }
+            ToViewer::Usb(l) => self.usb = Some(l),
             ToViewer::Closed => return false,
         }
         !std::mem::replace(&mut self.posted, true)
@@ -165,6 +170,8 @@ pub struct Console {
     pub key: String,
     pub state: VmState,
     name: String,
+    /// The VM file.
+    path: PathBuf,
     win: ConsoleWindow,
     io: Rc<RefCell<Io>>,
     fb: Option<SharedFb>,
@@ -206,6 +213,8 @@ pub struct Console {
     drag: Option<Drag>,
     drag_seq: u32,
     drag_timer: slint::Timer,
+    /// Host USB devices: the menu, and what the VM has.
+    usb: usbmenu::UsbMenu,
 }
 
 /// Files from the Mac over the window (see dnd.rs).
@@ -453,7 +462,7 @@ pub fn start(path: &Path, cfg: &VmConfig, extra: &[String]) -> Result<String, St
         .map_err(|e| format!("start {}: {e}", vmm.display()))?;
     drop(theirs);
     let pid = child.id();
-    open(key, cfg, ours, Some(child), pid, VmState::Starting)
+    open(key, path, cfg, ours, Some(child), pid, VmState::Starting)
 }
 
 /// How long a VMM we reattach to gets to send its screen.
@@ -478,11 +487,11 @@ pub fn attach(path: &Path, cfg: &VmConfig, sock: &Path, pid: u32) -> Result<Stri
     let s = UnixStream::connect(sock).map_err(|e| format!("it doesn't answer ({e})"))?;
     // A VMM that hangs never sends the screen: give up then (see reader).
     s.set_read_timeout(Some(ATTACH_WAIT)).map_err(|e| e.to_string())?;
-    open(key, cfg, s, None, pid, VmState::Running)
+    open(key, path, cfg, s, None, pid, VmState::Running)
 }
 
 /// The window for a VMM on the other end of `ours`.
-fn open(key: String, cfg: &VmConfig, ours: UnixStream, child: Option<Child>, pid: u32, state: VmState) -> Result<String, String> {
+fn open(key: String, path: &Path, cfg: &VmConfig, ours: UnixStream, child: Option<Child>, pid: u32, state: VmState) -> Result<String, String> {
     let fail = |child: Option<Child>, e: String| match child {
         Some(c) => abandon(c, e),
         None => e,
@@ -528,6 +537,7 @@ fn open(key: String, cfg: &VmConfig, ours: UnixStream, child: Option<Child>, pid
         key: key.clone(),
         state,
         name: cfg.name.clone(),
+        path: path.to_path_buf(),
         win,
         io,
         fb: None,
@@ -557,6 +567,7 @@ fn open(key: String, cfg: &VmConfig, ours: UnixStream, child: Option<Child>, pid
         drag: None,
         drag_seq: 0,
         drag_timer: slint::Timer::default(),
+        usb: usbmenu::UsbMenu::default(),
     };
     CONSOLES.with(|m| m.borrow_mut().insert(key.clone(), c));
     ensure_timer();
@@ -781,6 +792,7 @@ fn ready(key: &str, fd: OwnedFd) {
 }
 
 fn closed(key: &str) {
+    usbmenu::forget(key);
     let Some(mut c) = CONSOLES.with(|m| m.borrow_mut().remove(key)) else { return };
     c.save_thumb(None);
     let _ = c.win.hide();
@@ -919,6 +931,9 @@ impl Console {
                     });
                 }
             }
+            c if c.starts_with("usb") => {
+                self.usb_command(c);
+            }
             "library" => msg::send(Msg::ShowLibrary(None)),
             "settings" => msg::send(Msg::ShowLibrary(Some(self.key.clone()))),
             _ => {}
@@ -927,12 +942,15 @@ impl Console {
 
     /// What the reader thread collected since the last wakeup.
     fn inbox(&mut self) {
-        let (frame, full, damage, status, clip, mic, cursor, drag) = {
+        let (frame, full, damage, status, clip, mic, cursor, drag, usb) = {
             let mut s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
             s.posted = false;
             let f = (std::mem::take(&mut s.frame), std::mem::take(&mut s.full), s.damage.take());
-            (f.0, f.1, f.2, std::mem::take(&mut s.status), s.clipboard.take(), s.mic.take(), s.cursor.take(), std::mem::take(&mut s.drag))
+            (f.0, f.1, f.2, std::mem::take(&mut s.status), s.clipboard.take(), s.mic.take(), s.cursor.take(), std::mem::take(&mut s.drag), s.usb.take())
         };
+        if let Some(l) = usb {
+            self.usb_list(l);
+        }
         for m in drag {
             match m {
                 ToViewer::DragReady { id, live } => self.drag_ready(id, live),
@@ -978,6 +996,10 @@ impl Console {
                 msg::send(Msg::SnapshotTaken { key: self.key.clone() });
             }
             _ if t.starts_with("guest agent connected") => self.toast("Guest tools connected: clipboard and resizing work"),
+            _ if t.starts_with("USB: ") => {
+                self.usb_refused();
+                self.toast(&t);
+            }
             _ if t.starts_with("suspend failed") => {
                 // Usually 3D in use. Say why and offer the ways out,
                 // rather than leaving a paused window that won't close.
@@ -1027,6 +1049,7 @@ impl Console {
             self.io.borrow_mut().send(ToVmm::Resize { width, height, scale });
         }
         self.cpu_meter(now);
+        self.usb_tick(now);
         // State, size or the screen's place changed: the pointer may too.
         self.apply_pointer();
         // Host clipboard -> guest, only while this window has focus.

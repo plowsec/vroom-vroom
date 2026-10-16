@@ -9,10 +9,12 @@ mod dnd;
 mod edit;
 mod fmt;
 mod host;
+mod hostusb;
 mod keymap;
 mod library;
 mod msg;
 mod paths;
+mod rootd;
 mod shot;
 mod vm;
 

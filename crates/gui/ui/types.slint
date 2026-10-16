@@ -158,6 +158,10 @@ export struct HostInfo {
     memory-gib: int,
     interfaces: [string],
     free: string,
+    // vroom-netd, the root helper: "ready", "old", "stopped", "missing",
+    // "" (not known yet). Busy: being set up or removed.
+    netd: string,
+    netd-busy: bool,
 }
 
 export struct Toast {

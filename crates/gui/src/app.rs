@@ -372,7 +372,28 @@ impl App {
             memory_gib: (host::memory_bytes() >> 30) as i32,
             interfaces: model(self.host_ifaces.iter().map(s).collect()),
             free: s(free.map(|f| format!("{} free on this machine", fmt::bytes(f))).unwrap_or_default()),
+            netd: s(rootd::state().word()),
+            netd_busy: rootd::busy(),
         });
+    }
+
+    /// Set up (`true`) or remove vroom-netd; macOS asks for the password.
+    fn netd(&mut self, install: bool) {
+        if rootd::busy() {
+            return;
+        }
+        let f: fn() -> Result<(), String> = if install { rootd::install } else { rootd::uninstall };
+        rootd::in_background(f, move |r| {
+            let (text, kind) = match r {
+                Ok(()) if install => ("vroom-netd is set up: bridged and host-only networks and USB devices macOS uses work now".to_string(), 1),
+                Ok(()) => ("vroom-netd is removed".to_string(), 1),
+                Err(e) if e == "cancelled" => return msg::send(Msg::Refresh),
+                Err(e) => (format!("vroom-netd: {e}"), 3),
+            };
+            msg::send(Msg::Toast { text, kind, action: String::new() });
+            msg::send(Msg::Refresh);
+        });
+        self.push_host();
     }
 
     fn item(&self, i: usize, v: &Vm) -> VmItem {
@@ -1007,6 +1028,17 @@ impl App {
                 }
             }
             "do.vmware" => self.vmware_run(),
+            // vroom-netd, the root helper (bridged, host-only, USB devices
+            // macOS holds).
+            "netd.setup" => self.netd(true),
+            "netd.remove" => self.ask(
+                "Remove vroom-netd?",
+                "Bridged and host-only networks, and USB devices macOS uses, stop working until you set it up again. macOS asks for an admin password.",
+                "Remove",
+                true,
+                "do.netd.remove",
+            ),
+            "do.netd.remove" => self.netd(false),
             "import" => {
                 if let Some(p) = rfd::FileDialog::new().set_title("Add a VM file").add_filter("VM file", &["toml"]).pick_file() {
                     self.import(&p);
@@ -1241,6 +1273,17 @@ impl App {
         let Some(cfg) = v.resolved() else {
             return self.toast("Fix the VM file first: it has an error.", 3);
         };
+        // Bridged and host-only need the root helper: offer to set it up
+        // rather than fail to start.
+        if cfg.nets.iter().any(|n| n.mode != vroom_config::NetKind::Nat) && matches!(rootd::state_now(), rootd::Helper::Missing | rootd::Helper::Stopped) {
+            return self.ask(
+                "Set up vroom-netd?",
+                "This VM has a bridged or host-only network adapter. Those go through vroom-netd, a small helper that runs as root. It's set up once; macOS asks for an admin password. Start the VM again once it's done.",
+                "Set up",
+                false,
+                "netd.setup",
+            );
+        }
         let (path, name) = (v.path.clone(), cfg.name.clone());
         match console::start(&path, &cfg, extra) {
             Ok(_) => {}

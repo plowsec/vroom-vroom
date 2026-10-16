@@ -23,6 +23,8 @@ vroom-state.workspace = true
 vroom-block.workspace = true
 vroom-import.workspace = true
 vroom-usb.workspace = true
+vroom-net.workspace = true
+vroom-sandbox.workspace = true
 slint = { version = "1.18", features = ["unstable-winit-030"] }
 arboard = { version = "3", default-features = false }
 rfd = "0.15"

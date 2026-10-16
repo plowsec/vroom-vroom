@@ -10,7 +10,7 @@ if pgrep -f "^($(pwd)/)?target/(debug|release)/vroom run" >/dev/null 2>&1; then
   echo "a VM is running from target/: stop or suspend it first (or set CARGO_TARGET_DIR)" >&2
   exit 1
 fi
-cargo build "$@" -p vroom-cli -p vroom-gui
+cargo build "$@" -p vroom-cli -p vroom-gui -p vroom-netd
 dir=target/debug
 case " $* " in *" --release "*) dir=target/release ;; esac
 scripts/sign.sh "$dir/vroom"
