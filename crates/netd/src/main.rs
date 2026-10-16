@@ -1,14 +1,20 @@
-//! vroom-netd: privileged network helper.
+//! vroom-netd: vroom's one privileged helper.
 //!
-//! Runs as root, owns the real network attachments (vmnet on macOS,
-//! tap+bridge on Linux) and hands each sandboxed VMM a socket that carries
-//! Ethernet frames. The VMM never gets privileges or interface handles.
+//! Runs as root and does two things for unprivileged vroom processes:
+//!
+//! - networking: owns the real network attachments (vmnet on macOS,
+//!   tap+bridge on Linux) and hands each sandboxed VMM a socket that
+//!   carries Ethernet frames. The VMM never gets privileges or interface
+//!   handles.
+//! - USB devices a macOS driver holds: starts the USB helper as root for
+//!   one device the app names, and hands back its socket (`usb.rs`).
 //!
 //! Hardening: strict request parsing, admin allow-lists, socket group
-//! access control, per-user port limits, and source-MAC anti-spoofing on
-//! every guest frame.
+//! access control, per-user limits, and source-MAC anti-spoofing on every
+//! guest frame.
 
 mod port;
+mod usb;
 
 use std::collections::HashMap;
 use std::io::{BufReader, Write};
@@ -20,9 +26,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use vroom_net::netd::{read_line, Attach, Request, Response, VERSION};
 use port::Port;
 use serde::Deserialize;
+use vroom_net::netd::{read_line, Attach, Hello, Request, Response, Status, UsbRequest, VERSION};
 
 const MAX_PORTS_PER_USER: usize = 32;
 /// Connections handled at once (each holds a thread): a local user can't
@@ -46,17 +52,41 @@ fn default_gateway() -> String {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct UsbConfig {
+    /// Serve USB devices a host driver holds (off unless set).
+    #[serde(default)]
+    enabled: bool,
+    /// Who may ask. macOS: `admin`, the users who could use sudo anyway.
+    #[serde(default = "default_usb_group")]
+    group: String,
+}
+
+impl Default for UsbConfig {
+    fn default() -> Self {
+        UsbConfig { enabled: false, group: default_usb_group() }
+    }
+}
+
+fn default_usb_group() -> String {
+    if cfg!(target_os = "macos") { "admin" } else { "vroom" }.into()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Config {
     #[serde(default = "default_socket")]
     socket: PathBuf,
     /// Unix group allowed to connect.
     #[serde(default = "default_group")]
     group: String,
-    /// Host interfaces VMs may bridge onto (Linux: bridge names).
+    /// Host interfaces VMs may bridge onto (Linux: bridge names). A name
+    /// ending in `*` stands for all that start that way (`en*`).
     #[serde(default)]
     bridge_interfaces: Vec<String>,
     #[serde(default)]
     host_only: Vec<HostOnly>,
+    #[serde(default)]
+    usb: UsbConfig,
 }
 
 fn default_socket() -> PathBuf {
@@ -71,10 +101,20 @@ fn valid_name(s: &str) -> bool {
     !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
 }
 
+/// `pattern` is a name, or a prefix followed by `*`.
+fn iface_allowed(patterns: &[String], iface: &str) -> bool {
+    valid_name(iface)
+        && patterns.iter().any(|p| match p.strip_suffix('*') {
+            Some(prefix) => iface.starts_with(prefix) && iface.len() > prefix.len(),
+            None => p == iface,
+        })
+}
+
 struct State {
     cfg: Config,
     /// uid -> open ports
     per_user: Mutex<HashMap<u32, usize>>,
+    usb: usb::Usb,
 }
 
 fn peer_uid(s: &UnixStream) -> Option<u32> {
@@ -96,11 +136,15 @@ fn peer_uid(s: &UnixStream) -> Option<u32> {
     }
 }
 
-fn reply(s: &mut UnixStream, r: &Response) {
+fn reply_json(s: &mut UnixStream, r: &impl serde::Serialize) {
     if let Ok(mut l) = serde_json::to_string(r) {
         l.push('\n');
         let _ = s.write_all(l.as_bytes());
     }
+}
+
+fn reply(s: &mut UnixStream, r: &Response) {
+    reply_json(s, r)
 }
 
 fn refuse(s: &mut UnixStream, msg: &str) {
@@ -112,7 +156,7 @@ fn open_port(st: &State, req: &Request) -> Result<Arc<dyn Port>, String> {
     let id = port::uuid_of(&format!("{}/{}", req.vm, req.nic));
     match &req.attach {
         Attach::Bridged { interface } => {
-            if !st.cfg.bridge_interfaces.contains(interface) {
+            if !iface_allowed(&st.cfg.bridge_interfaces, interface) {
                 return Err(format!("bridging onto {interface} is not allowed (netd.toml bridge_interfaces)"));
             }
             #[cfg(target_os = "macos")]
@@ -202,10 +246,58 @@ fn handle(st: Arc<State>, mut s: UnixStream) {
         Ok(l) => l,
         Err(_) => return,
     };
-    let req: Request = match serde_json::from_str(&line) {
-        Ok(r) => r,
-        Err(e) => return refuse(&mut s, &format!("bad request: {e}")),
+    match serde_json::from_str::<Hello>(&line) {
+        Ok(Hello::Net(req)) => net(&st, s, uid, req),
+        Ok(Hello::Usb(req)) => usb_request(&st, s, uid, &req),
+        Ok(Hello::Status(r)) if r.version == VERSION && r.status => status(&st, s, uid),
+        Ok(Hello::Status(_)) => refuse(&mut s, "invalid request"),
+        Err(e) => refuse(&mut s, &format!("bad request: {e}")),
+    }
+}
+
+fn status(st: &State, mut s: UnixStream, uid: u32) {
+    let why = st.usb.may(uid).err();
+    let r = Status {
+        ok: true,
+        version: VERSION,
+        bridge_interfaces: st.cfg.bridge_interfaces.clone(),
+        host_only: st.cfg.host_only.iter().map(|h| h.name.clone()).collect(),
+        usb: why.is_none(),
+        usb_why: why.unwrap_or_default(),
     };
+    reply_json(&mut s, &r);
+}
+
+fn usb_request(st: &Arc<State>, mut s: UnixStream, uid: u32, req: &UsbRequest) {
+    let g = match st.usb.grant(uid, req) {
+        Ok(g) => g,
+        Err(e) => {
+            log::warn!("uid {uid}: usb {} for {}: {e}", req.usb.id, req.vm);
+            return refuse(&mut s, &e);
+        }
+    };
+    log::info!("uid {uid}: usb {} for {}", req.usb.id, req.vm);
+    let usb::Grant { sock, mut helper, dev, uid } = g;
+    reply(&mut s, &Response { ok: true, error: String::new(), mac: [0; 6], mtu: 0 });
+    if let Err(e) = vroom_ipc::send_fd(&s, sock.as_raw_fd()) {
+        log::warn!("uid {uid}: usb: {e}");
+    }
+    // Ours goes once the caller has its copy (it hangs up then): macOS
+    // can disconnect a socket whose last other copy closes while it is
+    // still in flight. From then on only the caller's copy keeps the
+    // helper going.
+    let _ = std::io::Read::read(&mut s, &mut [0u8; 1]);
+    drop(sock);
+    drop(s);
+    let st = st.clone();
+    std::thread::spawn(move || {
+        helper.wait();
+        log::info!("uid {uid}: usb {:04x}:{:04x} helper ended", dev.0, dev.1);
+        st.usb.release(uid, &dev);
+    });
+}
+
+fn net(st: &State, mut s: UnixStream, uid: u32, req: Request) {
     if req.version != VERSION || !valid_name(&req.vm) || req.nic >= 16 {
         return refuse(&mut s, "invalid request");
     }
@@ -228,30 +320,33 @@ fn handle(st: Arc<State>, mut s: UnixStream) {
             *n = n.saturating_sub(1);
         }
     };
-    let port = match open_port(&st, &req) {
+    let port = match open_port(st, &req) {
         Ok(p) => p,
         Err(e) => {
-            release(&st);
+            release(st);
             return refuse(&mut s, &e);
         }
     };
     let (vmm_end, our_end) = match UnixDatagram::pair() {
         Ok(p) => p,
         Err(e) => {
-            release(&st);
+            release(st);
             return refuse(&mut s, &e.to_string());
         }
     };
     log::info!("uid {uid}: {} nic{} {:?} mac {:02x?}", req.vm, req.nic, req.attach, port.mac());
     reply(&mut s, &Response { ok: true, error: String::new(), mac: port.mac(), mtu: port.mtu() });
     if vroom_ipc::send_fd(&s, vmm_end.as_raw_fd()).is_err() {
-        release(&st);
+        release(st);
         return;
     }
+    // Not before the VMM has its copy (it hangs up then): see usb_request.
+    let _ = std::io::Read::read(&mut s, &mut [0u8; 1]);
     drop(vmm_end);
+    drop(s);
     pump(our_end, port);
     log::info!("uid {uid}: {} nic{} detached", req.vm, req.nic);
-    release(&st);
+    release(st);
 }
 
 fn group_gid(name: &str) -> Option<u32> {
@@ -264,7 +359,15 @@ fn group_gid(name: &str) -> Option<u32> {
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    let path = std::env::args().nth(1).unwrap_or_else(|| "/etc/vroom/netd.toml".into());
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("usb-host") {
+        if let Err(e) = usb::host_main(&args[2..]) {
+            eprintln!("vroom-netd usb-host: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    let path = args.get(1).cloned().unwrap_or_else(|| "/etc/vroom/netd.toml".into());
     let cfg: Config = match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|s| toml::from_str(&s).map_err(|e| e.to_string())) {
         Ok(c) => c,
         Err(e) => {
@@ -272,13 +375,14 @@ fn main() {
             std::process::exit(2);
         }
     };
-    if cfg.host_only.iter().any(|n| !valid_name(&n.name)) || cfg.bridge_interfaces.iter().any(|i| !valid_name(i)) {
+    let pattern_ok = |p: &String| valid_name(p.strip_suffix('*').unwrap_or(p));
+    if cfg.host_only.iter().any(|n| !valid_name(&n.name)) || !cfg.bridge_interfaces.iter().all(pattern_ok) || !valid_name(&cfg.usb.group) {
         eprintln!("vroom-netd: invalid names in config");
         std::process::exit(2);
     }
     // SAFETY: geteuid has no preconditions.
     if unsafe { libc::geteuid() } != 0 {
-        log::warn!("not running as root: vmnet / tap will fail");
+        log::warn!("not running as root: vmnet / tap and USB devices will fail");
     }
     if let Some(dir) = cfg.socket.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -296,8 +400,17 @@ fn main() {
         // SAFETY: valid path; chown to root:group.
         unsafe { libc::chown(c.as_ptr(), 0, gid) };
     }
-    log::info!("listening on {} (group {})", cfg.socket.display(), cfg.group);
-    let st = Arc::new(State { cfg, per_user: Mutex::new(HashMap::new()) });
+    log::info!("listening on {} (group {}; usb {})", cfg.socket.display(), cfg.group, if cfg.usb.enabled { &cfg.usb.group } else { "off" });
+    // The USB helper is this program; libusb is our own copy next to it.
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/usr/local/libexec/vroom/vroom-netd"));
+    let lib = exe.with_file_name("libusb-1.0.0.dylib");
+    let spawner = usb::Exec { libusb: (cfg!(target_os = "macos") && lib.exists()).then_some(lib), exe };
+    let usb = usb::Usb::new(cfg.usb.enabled, cfg.usb.group.clone(), Box::new(spawner), Box::new(vroom_usb::list::list), Box::new(usb::in_group));
+    let st = Arc::new(State { cfg, per_user: Mutex::new(HashMap::new()), usb });
+    serve(listener, st);
+}
+
+fn serve(listener: UnixListener, st: Arc<State>) {
     let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     for conn in listener.incoming() {
         match conn {
@@ -315,5 +428,136 @@ fn main() {
             }
             Err(e) => log::warn!("accept: {e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vroom_net::netd::UsbWanted;
+
+    /// The pretend serial port, served in-process.
+    struct Fake;
+    struct Thread(Option<std::thread::JoinHandle<()>>);
+    impl usb::Running for Thread {
+        fn wait(&mut self) {
+            if let Some(t) = self.0.take() {
+                let _ = t.join();
+            }
+        }
+    }
+    impl usb::Spawn for Fake {
+        fn spawn(&self, dev: &usb::Device, sock: UnixStream) -> std::io::Result<Box<dyn usb::Running>> {
+            let (v, p) = (dev.0, dev.1);
+            let t = std::thread::spawn(move || {
+                let _ = vroom_usb::helper::serve(sock, Box::new(vroom_usb::fake::FakeOpener::new(v, p, None)));
+            });
+            Ok(Box::new(Thread(Some(t))))
+        }
+    }
+
+    fn state(usb_on: bool) -> Arc<State> {
+        let cfg: Config = toml::from_str(
+            r#"
+bridge_interfaces = ["en*", "br0"]
+[[host_only]]
+name = "lab"
+"#,
+        )
+        .unwrap();
+        let lister = || {
+            vec![vroom_usb::list::HostDevice {
+                vendor: 0x1209,
+                product: 0x000a,
+                manufacturer: None,
+                name: None,
+                serial: None,
+                class: 0,
+                speed: None,
+                bus: 1,
+                ports: vec![2],
+                interface_classes: vec![2, 10],
+                claimed_by: vec!["AppleUSBCDCACMData".into()],
+            }]
+        };
+        // SAFETY: getuid has no preconditions.
+        let me = unsafe { libc::getuid() };
+        let usb = usb::Usb::new(usb_on, "admin".into(), Box::new(Fake), Box::new(lister), Box::new(move |uid, _| uid == me));
+        Arc::new(State { cfg, per_user: Mutex::new(HashMap::new()), usb })
+    }
+
+    /// One connection to the daemon, served on a thread.
+    fn connect(st: &Arc<State>) -> UnixStream {
+        let (client, server) = UnixStream::pair().unwrap();
+        let st = st.clone();
+        std::thread::spawn(move || handle(st, server));
+        client
+    }
+
+    #[test]
+    fn config_defaults_keep_usb_off() {
+        let c: Config = toml::from_str("").unwrap();
+        assert!(!c.usb.enabled);
+        assert!(toml::from_str::<Config>("[usb]\nenabled = true\nevil = 1").is_err());
+    }
+
+    #[test]
+    fn interface_patterns() {
+        let p = vec!["en*".to_string(), "br0".into()];
+        assert!(iface_allowed(&p, "en0") && iface_allowed(&p, "en12") && iface_allowed(&p, "br0"));
+        assert!(!iface_allowed(&p, "en") && !iface_allowed(&p, "br01") && !iface_allowed(&p, "lo0") && !iface_allowed(&p, "en0/../x"));
+    }
+
+    #[test]
+    fn status_says_what_is_offered() {
+        let st = state(true);
+        let s = vroom_net::netd::status_on(&connect(&st)).unwrap();
+        assert_eq!((s.bridge_interfaces.len(), s.host_only.as_slice(), s.usb), (2, &["lab".to_string()][..], true));
+        let st = state(false);
+        let s = vroom_net::netd::status_on(&connect(&st)).unwrap();
+        assert!(!s.usb && s.usb_why.contains("turned off"));
+    }
+
+    #[test]
+    fn usb_device_comes_back_as_a_helper_socket() {
+        let st = state(true);
+        let req = vroom_net::netd::UsbRequest { version: VERSION, vm: "dev".into(), usb: UsbWanted { id: "1209:000a".into(), serial: None } };
+        let sock = vroom_net::netd::usb_on(&connect(&st), &req).unwrap();
+        let mut r = std::io::BufReader::new(sock.try_clone().unwrap());
+        let ev = vroom_usb::proto::read_event(&mut r).unwrap().unwrap();
+        assert!(matches!(ev, vroom_usb::proto::Event::Attached { vendor: 0x1209, product: 0x000a, .. }), "{ev:?}");
+        // A second one for the same device is refused while this lives.
+        let e = vroom_net::netd::usb_on(&connect(&st), &req).unwrap_err();
+        assert!(e.to_string().contains("in use"), "{e}");
+        // Anything not quite right is refused, with a reason.
+        let bad = vroom_net::netd::UsbRequest { usb: UsbWanted { id: "1209:000b".into(), serial: None }, ..req.clone() };
+        assert!(vroom_net::netd::usb_on(&connect(&st), &bad).unwrap_err().to_string().contains("plugged in"));
+        let mut raw = connect(&st);
+        raw.write_all(b"{\"version\":1,\"vm\":\"dev\",\"usb\":{\"id\":\"1209:000a\",\"argv\":[\"-x\"]}}\n").unwrap();
+        let mut l = String::new();
+        std::io::Read::read_to_string(&mut raw, &mut l).unwrap();
+        assert!(l.contains("\"ok\":false"), "{l}");
+        // The VM is done with it: the device is free again.
+        drop(r);
+        sock.shutdown(std::net::Shutdown::Both).unwrap();
+        drop(sock);
+        let t0 = std::time::Instant::now();
+        loop {
+            match vroom_net::netd::usb_on(&connect(&st), &req) {
+                Ok(_) => break,
+                Err(e) if t0.elapsed() < Duration::from_secs(5) => {
+                    assert!(e.to_string().contains("in use"), "{e}");
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn usb_refused_when_off() {
+        let st = state(false);
+        let req = vroom_net::netd::UsbRequest { version: VERSION, vm: "dev".into(), usb: UsbWanted { id: "1209:000a".into(), serial: None } };
+        assert!(vroom_net::netd::usb_on(&connect(&st), &req).unwrap_err().to_string().contains("turned off"));
     }
 }

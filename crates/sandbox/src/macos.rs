@@ -145,14 +145,28 @@ pub fn audio_profile(exe: &Path, wav_dir: Option<&Path>, input: bool) -> Result<
 /// IOKit drivers. Which device it opens is up to the helper (the one its
 /// command line names); the sandbox can't tell USB devices apart.
 pub fn usb_profile(exe: &Path) -> Result<String> {
+    usb_profile_with(
+        exe,
+        r#"(subpath "/opt/homebrew/lib") (subpath "/opt/homebrew/Cellar/libusb") (subpath "/opt/homebrew/opt/libusb")
+  (subpath "/usr/local/lib") (subpath "/usr/local/Cellar/libusb") (subpath "/usr/local/opt/libusb")"#,
+    )
+}
+
+/// The USB helper vroom-netd starts as root: libusb from `lib` (its own
+/// root-owned copy) and nowhere else, as nothing a user can write may be
+/// loaded into a root process.
+pub fn usb_profile_root(exe: &Path, lib: &Path) -> Result<String> {
+    usb_profile_with(exe, &format!("(literal {})", q(lib)?))
+}
+
+fn usb_profile_with(exe: &Path, libs: &str) -> Result<String> {
     let exe_real = exe.canonicalize().unwrap_or_else(|_| exe.to_path_buf());
     Ok(format!(
         r#"(version 1)
 (deny default)
 (allow process-exec (literal {exe}))
 (allow file-read* (literal {exe}) (subpath "/usr/lib") (subpath "/System") (subpath "/Library/Apple")
-  (subpath "/opt/homebrew/lib") (subpath "/opt/homebrew/Cellar/libusb") (subpath "/opt/homebrew/opt/libusb")
-  (subpath "/usr/local/lib") (subpath "/usr/local/Cellar/libusb") (subpath "/usr/local/opt/libusb")
+  {libs}
   (literal "/dev/urandom") (literal "/dev/null") (literal "/private/etc/localtime") (subpath "/private/var/db/timezone"))
 (allow file-write* (literal "/dev/null"))
 (allow file-read-metadata)

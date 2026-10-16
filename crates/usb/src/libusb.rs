@@ -117,7 +117,19 @@ struct Usb {
 
 static USB: OnceLock<Result<Usb, String>> = OnceLock::new();
 
+static ONLY: OnceLock<String> = OnceLock::new();
+
+/// Load libusb from `path` and nowhere else (the helper vroom-netd runs
+/// as root: its own root-owned copy, never one a user can replace).
+/// Before the first use; later calls do nothing.
+pub fn only_from(path: &str) {
+    let _ = ONLY.set(path.to_string());
+}
+
 fn candidates() -> Vec<String> {
+    if let Some(p) = ONLY.get() {
+        return vec![p.clone()];
+    }
     let mut v: Vec<String> = std::env::var("VROOM_LIBUSB").into_iter().collect();
     if cfg!(target_os = "macos") {
         v.extend(["/opt/homebrew/lib/libusb-1.0.0.dylib", "/usr/local/lib/libusb-1.0.0.dylib"].map(String::from));

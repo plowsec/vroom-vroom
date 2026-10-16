@@ -5506,9 +5506,12 @@ dependencies = [
  "log",
  "serde",
  "serde_json",
+ "tempfile",
  "toml 0.8.23",
  "vroom-ipc",
  "vroom-net",
+ "vroom-sandbox",
+ "vroom-usb",
 ]
 
 [[package]]
