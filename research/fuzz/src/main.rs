@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use std::time::Instant;
 use vroom_fuzz::{CorpusStore, CoverageBlock, CoverageMap, Engine, Harness, Mutator, Result};
 
 #[derive(Debug, Parser)]
@@ -79,6 +80,7 @@ fn main() -> Result<()> {
             engine.instrument()?;
             let seed = std::fs::read(seed)?;
             let mut mutator = Mutator::new(0x7632_6f6f_6d_u64, engine.harness.max_input);
+            let campaign_start = Instant::now();
             for i in 0..iterations {
                 let input = if i == 0 {
                     seed.clone()
@@ -102,6 +104,12 @@ fn main() -> Result<()> {
                 root.join("blocks.json"),
                 serde_json::to_vec_pretty(&engine.harness.coverage)?,
             )?;
+            eprintln!(
+                "campaign: {} executions, {} blocks, {:.1} executions/s",
+                engine.coverage.executions,
+                engine.coverage.covered(),
+                engine.coverage.executions as f64 / campaign_start.elapsed().as_secs_f64()
+            );
         }
     }
     Ok(())

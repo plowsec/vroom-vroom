@@ -54,6 +54,29 @@ pub struct Harness {
     pub state_dir: PathBuf,
     pub input_gpa: u64,
     pub input_capacity: usize,
+    /// Optional guest virtual address passed to the target call. The runner
+    /// writes it to `input_register` when a testcase is inserted.
+    #[serde(default)]
+    pub input_va: Option<u64>,
+    /// Treat the first four testcase bytes as a little-endian IOCTL code.
+    #[serde(default)]
+    pub ioctl_prefix: bool,
+    /// ARM64 register names used by a call-site snapshot (for example HEVD's
+    /// x1/x2/x3 DeviceIoControl arguments).
+    #[serde(default)]
+    pub ioctl_register: Option<String>,
+    #[serde(default)]
+    pub input_register: Option<String>,
+    #[serde(default)]
+    pub input_length_register: Option<String>,
+    /// Address immediately after the target call. A breakpoint here ends a
+    /// successful iteration instead of waiting for the timeout.
+    #[serde(default)]
+    pub stop_pc: Option<u64>,
+    /// Treat a guest reset as a kernel bugcheck. This is useful for drivers
+    /// such as HEVD whose deliberate faults reset the lab guest.
+    #[serde(default)]
+    pub reset_is_bugcheck: bool,
     #[serde(default = "default_timeout")]
     pub timeout_ms: u64,
     #[serde(default)]
@@ -82,6 +105,17 @@ impl Harness {
         }
         if h.max_input > h.input_capacity {
             return Err(Error::Invalid("max_input exceeds input_capacity".into()));
+        }
+        if h.ioctl_prefix && h.ioctl_register.is_none() {
+            return Err(Error::Invalid("ioctl_prefix needs ioctl_register".into()));
+        }
+        if h.input_va.is_some() != h.input_register.is_some() {
+            return Err(Error::Invalid(
+                "input_va and input_register must be paired".into(),
+            ));
+        }
+        if h.stop_pc.is_some_and(|pc| pc & 3 != 0) {
+            return Err(Error::Invalid("stop_pc must be instruction aligned".into()));
         }
         if h.coverage.iter().any(|b| b.size == 0 || b.gpa & 3 != 0) {
             return Err(Error::Invalid(
@@ -397,15 +431,62 @@ impl Engine {
             return Err(Error::Invalid("input exceeds max_input".into()));
         }
         self.vm.research_reset()?;
+        let (ioctl, payload) = if self.harness.ioctl_prefix {
+            if input.len() < 4 {
+                return Err(Error::Invalid(
+                    "IOCTL-prefixed input is shorter than four bytes".into(),
+                ));
+            }
+            (
+                Some(u32::from_le_bytes(
+                    input[..4].try_into().expect("four bytes"),
+                )),
+                &input[4..],
+            )
+        } else {
+            (None, input)
+        };
+        if payload.len() > self.harness.input_capacity {
+            return Err(Error::Invalid("payload exceeds input_capacity".into()));
+        }
         let mut padded = vec![0u8; self.harness.input_capacity];
-        padded[..input.len()].copy_from_slice(input);
+        padded[..payload.len()].copy_from_slice(payload);
         self.vm
             .debug_write_physical(&[(self.harness.input_gpa, &padded)])?;
+        if let Some(value) = ioctl {
+            let register = self
+                .harness
+                .ioctl_register
+                .as_deref()
+                .ok_or_else(|| Error::Invalid("ioctl_prefix needs ioctl_register".into()))?;
+            self.vm.debug_write_register(
+                0,
+                vroom_hv::debug::Register::parse(register)?,
+                value.into(),
+            )?;
+        }
+        if let Some(value) = self.harness.input_va {
+            let register = self
+                .harness
+                .input_register
+                .as_deref()
+                .ok_or_else(|| Error::Invalid("input_va needs input_register".into()))?;
+            self.vm
+                .debug_write_register(0, vroom_hv::debug::Register::parse(register)?, value)?;
+        }
+        if let Some(register) = self.harness.input_length_register.as_deref() {
+            self.vm.debug_write_register(
+                0,
+                vroom_hv::debug::Register::parse(register)?,
+                payload.len() as u64,
+            )?;
+        }
         self.vm.debug_configure(
             0,
             vroom_hv::debug::DebugConfig {
                 enabled: true,
                 trap_software_breakpoints: true,
+                breakpoints: self.harness.stop_pc.into_iter().collect(),
                 ..Default::default()
             },
         )?;
@@ -427,7 +508,15 @@ impl Engine {
             match event {
                 vroom_vmm::VmEvent::Debug(stop) => {
                     self.vm.pause()?;
-                    if let Some(block) = self.harness.coverage.iter().find(|b| b.gpa == stop.pc) {
+                    if self.harness.stop_pc == Some(stop.pc) {
+                        break;
+                    }
+                    let block = self
+                        .harness
+                        .coverage
+                        .iter()
+                        .find(|b| b.va == Some(stop.pc) || b.gpa == stop.pc);
+                    if let Some(block) = block {
                         if let Some(previous) = previous_pc {
                             self.coverage.observe_edge(previous, block.id);
                         }
@@ -437,46 +526,43 @@ impl Engine {
                         }
                     }
                     if stop.reason == vroom_hv::debug::DebugReason::SoftwareBreakpoint {
-                        if let Some(original) = self.originals.get(&stop.pc) {
-                            self.vm
-                                .debug_write_physical(&[(stop.pc, &original.to_le_bytes())])?;
-                            self.vm.debug_step(
-                                0,
-                                vroom_hv::debug::DebugConfig {
-                                    enabled: true,
-                                    trap_software_breakpoints: true,
-                                    ..Default::default()
-                                },
-                            )?;
-                            while let Some(next) = self.vm.next_event(Duration::from_millis(20)) {
-                                if matches!(next, vroom_vmm::VmEvent::Debug(_)) {
-                                    break;
+                        if let Some(block) = block {
+                            let gpa = block.gpa;
+                            if let Some(original) = self.originals.get(&gpa) {
+                                self.vm
+                                    .debug_write_physical(&[(gpa, &original.to_le_bytes())])?;
+                                self.vm.debug_step(
+                                    0,
+                                    vroom_hv::debug::DebugConfig {
+                                        enabled: true,
+                                        trap_software_breakpoints: true,
+                                        breakpoints: self.harness.stop_pc.into_iter().collect(),
+                                        ..Default::default()
+                                    },
+                                )?;
+                                while let Some(next) = self.vm.next_event(Duration::from_millis(20))
+                                {
+                                    if matches!(next, vroom_vmm::VmEvent::Debug(_)) {
+                                        break;
+                                    }
                                 }
+                                self.vm.pause()?;
+                                self.vm.debug_configure(
+                                    0,
+                                    vroom_hv::debug::DebugConfig {
+                                        enabled: true,
+                                        trap_software_breakpoints: true,
+                                        breakpoints: self.harness.stop_pc.into_iter().collect(),
+                                        ..Default::default()
+                                    },
+                                )?;
+                                self.vm.debug_write_physical(&[(
+                                    gpa,
+                                    &(0xd420_0000u32 | ((block.id as u32 & 0xffff) << 5))
+                                        .to_le_bytes(),
+                                )])?;
+                                self.vm.resume()?;
                             }
-                            self.vm.pause()?;
-                            self.vm.debug_configure(
-                                0,
-                                vroom_hv::debug::DebugConfig {
-                                    enabled: true,
-                                    trap_software_breakpoints: true,
-                                    ..Default::default()
-                                },
-                            )?;
-                            self.vm.debug_write_physical(&[(
-                                stop.pc,
-                                &(0xd420_0000u32
-                                    | ((self
-                                        .harness
-                                        .coverage
-                                        .iter()
-                                        .find(|b| b.gpa == stop.pc)
-                                        .map_or(0, |b| b.id)
-                                        as u32
-                                        & 0xffff)
-                                        << 5))
-                                    .to_le_bytes(),
-                            )])?;
-                            self.vm.resume()?;
                         }
                     }
                 }
@@ -485,8 +571,15 @@ impl Engine {
                     finding = detect(&detail, None, &token, false);
                     break;
                 }
-                vroom_vmm::VmEvent::Shutdown | vroom_vmm::VmEvent::Reset => {
+                vroom_vmm::VmEvent::Shutdown => {
                     self.vm.pause()?;
+                    break;
+                }
+                vroom_vmm::VmEvent::Reset => {
+                    self.vm.pause()?;
+                    if self.harness.reset_is_bugcheck {
+                        finding = detect("guest reset after bugcheck", None, &token, false);
+                    }
                     break;
                 }
                 _ => {}
@@ -497,6 +590,7 @@ impl Engine {
             input_hash: token,
             new_blocks,
             finding,
+            elapsed_us: start.elapsed().as_micros() as u64,
         })
     }
 }
@@ -506,6 +600,10 @@ pub struct RunResult {
     pub input_hash: String,
     pub new_blocks: usize,
     pub finding: Option<Finding>,
+    /// Wall-clock iteration time, including reset, instrumentation and guest
+    /// execution. Keeping it beside coverage makes target comparisons
+    /// reproducible instead of relying on console timing.
+    pub elapsed_us: u64,
 }
 
 #[cfg(test)]

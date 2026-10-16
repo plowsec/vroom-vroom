@@ -32,6 +32,13 @@ cargo check -p vroom-vmm --features research
 The first command is the normal product build. The second enables private
 file-backed RAM baselines and the paused restore API used by `vroom-fuzz`.
 
+## targets
+
+`hevd/` contains the first end-to-end target notes, an ARM64 call-site client,
+the Ghidra block exporter and a manifest verifier for HackSys Extreme
+Vulnerable Driver. Target source, driver binaries, checkpoints and generated
+coverage stay outside the repository.
+
 ## run
 
 ```sh
@@ -140,6 +147,7 @@ Function filtering debounced; 200-row pages. Downloads/angr run outside TUI rend
 
 ```text
 research/kernel/     backend, PE/PDB, process inspection, unwind
+research/hevd/       HEVD ARM64 target notes and coverage audit tools
 research/tui/        Textual, Capstone, optional angr_tui
 research/tests/      diskless integration checks
 experiments/         ignored local scripts/captures
