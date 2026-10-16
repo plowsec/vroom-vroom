@@ -218,7 +218,7 @@ impl UsbPorts {
                         match ev {
                             Event::Attached { .. } => self.here(i, gen, true),
                             Event::Detached => self.here(i, gen, false),
-                            Event::Done(_) => {}
+                            Event::Done(_) | Event::IsoDone(_) => {}
                         }
                         self.xhci().pass_event(i, gen, ev);
                     }

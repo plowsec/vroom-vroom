@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use crate::desc::{Config, DeviceDesc};
 use crate::helper::{Device, Opener, Sink};
-use crate::proto::{Done, Event, Speed, Status, Submit, XferType};
+use crate::proto::{Done, Event, IsoDone, IsoPacket, IsoSubmit, Speed, Status, Submit, XferType};
 use crate::Selector;
 
 type Ctx = c_void;
@@ -37,6 +37,17 @@ struct Transfer {
     user_data: *mut c_void,
     buffer: *mut u8,
     num_iso_packets: c_int,
+    /// `iso_packet_desc[]`: `num_iso_packets` of them follow.
+    iso: [IsoDesc; 0],
+}
+
+/// `struct libusb_iso_packet_descriptor`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct IsoDesc {
+    length: c_uint,
+    actual_length: c_uint,
+    status: c_int,
 }
 
 /// `struct libusb_device_descriptor`: the wire layout, 2-byte aligned.
@@ -53,6 +64,7 @@ const T_CANCELLED: c_int = 3;
 const T_STALL: c_int = 4;
 const T_NO_DEVICE: c_int = 5;
 const T_OVERFLOW: c_int = 6;
+const TYPE_ISO: u8 = 1;
 
 macro_rules! api {
     ($($name:ident: fn($($a:ty),*) $(-> $r:ty)?;)*) => {
@@ -205,6 +217,23 @@ struct XferCtx {
     control: bool,
     shared: Arc<Shared>,
     buf: Vec<u8>,
+    /// Isochronous: the packet lengths (the packets sit back to back in
+    /// `buf`). Empty otherwise.
+    iso: Vec<u32>,
+}
+
+fn status_of(s: c_int, shared: &Shared) -> Status {
+    match s {
+        T_COMPLETED => Status::Ok,
+        T_CANCELLED => Status::Cancelled,
+        T_STALL => Status::Stall,
+        T_OVERFLOW => Status::Babble,
+        T_NO_DEVICE => {
+            shared.gone.store(true, Ordering::Relaxed);
+            Status::NoDevice
+        }
+        _ => Status::Error,
+    }
 }
 
 unsafe extern "C" fn on_done(t: *mut Transfer) {
@@ -212,21 +241,33 @@ unsafe extern "C" fn on_done(t: *mut Transfer) {
     // SAFETY: libusb hands back the transfer we submitted; user_data is
     // the XferCtx we leaked for it, reclaimed exactly once here.
     let (ctx, status, actual) = unsafe { (Box::from_raw((*t).user_data as *mut XferCtx), (*t).status, (*t).actual_length) };
+    // Isochronous: each packet's result, from the descriptors libusb
+    // filled in (as many as we allocated the transfer with).
+    let iso: Vec<IsoDesc> = (0..ctx.iso.len())
+        // SAFETY: the transfer was allocated with ctx.iso.len() packet
+        // descriptors after the struct.
+        .map(|i| unsafe { *std::ptr::addr_of!((*t).iso).cast::<IsoDesc>().add(i) })
+        .collect();
     ctx.shared.inflight.lock().unwrap_or_else(|e| e.into_inner()).remove(&ctx.id);
     // SAFETY: the transfer is ours and finished; nothing refers to it now
     // (removed from the map above, under the lock cancel uses).
     unsafe { (u.lib.free_transfer)(t) };
-    let status = match status {
-        T_COMPLETED => Status::Ok,
-        T_CANCELLED => Status::Cancelled,
-        T_STALL => Status::Stall,
-        T_OVERFLOW => Status::Babble,
-        T_NO_DEVICE => {
-            ctx.shared.gone.store(true, Ordering::Relaxed);
-            Status::NoDevice
+    let status = status_of(status, &ctx.shared);
+    if !ctx.iso.is_empty() {
+        // Each packet's bytes sit at its offset in the buffer; the VMM
+        // gets them back to back.
+        let (mut off, mut data, mut packets) = (0usize, Vec::new(), Vec::with_capacity(iso.len()));
+        for (d, &want) in iso.iter().zip(&ctx.iso) {
+            let n = (d.actual_length as usize).min(want as usize);
+            if ctx.is_in {
+                data.extend_from_slice(&ctx.buf[off..off + n]);
+            }
+            packets.push(IsoPacket { status: status_of(d.status, &ctx.shared), actual: n as u32 });
+            off += want as usize;
         }
-        _ => Status::Error,
-    };
+        let _ = ctx.shared.sink.send(Event::IsoDone(IsoDone { id: ctx.id, status, packets, data }));
+        return;
+    }
     let off = if ctx.control { 8 } else { 0 };
     let room = ctx.buf.len().saturating_sub(off);
     let actual = (actual.max(0) as usize).min(room);
@@ -270,44 +311,36 @@ impl UsbDevice {
     }
 }
 
-impl Device for UsbDevice {
-    fn submit(&mut self, s: Submit) -> Result<(), Status> {
-        let is_in = s.is_in();
-        let control = s.kind == XferType::Control;
-        let mut buf = Vec::with_capacity(8 + s.len as usize);
-        if control {
-            buf.extend_from_slice(&s.setup);
-        }
-        if is_in {
-            buf.resize(buf.len() + s.len as usize, 0);
-        } else {
-            buf.extend_from_slice(&s.data);
-        }
-        let len = c_int::try_from(buf.len()).map_err(|_| Status::Error)?;
-        // SAFETY: plain allocation.
-        let t = unsafe { (self.u.lib.alloc_transfer)(0) };
+impl UsbDevice {
+    /// Hand one transfer to libusb: `ctx` carries its buffer and, for
+    /// isochronous, its packet lengths.
+    fn start(&mut self, ep: u8, kind: u8, flags: u8, mut ctx: Box<XferCtx>) -> Result<(), Status> {
+        let len = c_int::try_from(ctx.buf.len()).map_err(|_| Status::Error)?;
+        let n = ctx.iso.len();
+        // SAFETY: plain allocation, with n packet descriptors.
+        let t = unsafe { (self.u.lib.alloc_transfer)(n as c_int) };
         if t.is_null() {
             return Err(Status::Error);
         }
-        let mut ctx = Box::new(XferCtx { id: s.id, is_in, control, shared: self.shared.clone(), buf });
+        let id = ctx.id;
         let bufp = ctx.buf.as_mut_ptr();
-        let kind = match s.kind {
-            XferType::Control => 0,
-            XferType::Bulk => 2,
-            XferType::Interrupt => 3,
-        };
-        // SAFETY: t is a fresh transfer we own; the buffer lives in ctx
-        // (heap, not moved) until the callback frees it.
+        // SAFETY: t is a fresh transfer we own, with room for n packet
+        // descriptors; the buffer lives in ctx (heap, not moved) until
+        // the callback frees it.
         unsafe {
             (*t).dev_handle = self.h;
-            (*t).flags = if s.zero_packet { ADD_ZERO_PACKET } else { 0 };
-            (*t).endpoint = s.ep;
+            (*t).flags = flags;
+            (*t).endpoint = ep;
             (*t).kind = kind;
             (*t).timeout = 0;
             (*t).length = len;
             (*t).callback = Some(on_done);
             (*t).buffer = bufp;
-            (*t).num_iso_packets = 0;
+            (*t).num_iso_packets = n as c_int;
+            let descs = std::ptr::addr_of_mut!((*t).iso).cast::<IsoDesc>();
+            for (i, &l) in ctx.iso.iter().enumerate() {
+                descs.add(i).write(IsoDesc { length: l, actual_length: 0, status: 0 });
+            }
         }
         let mut map = self.shared.inflight.lock().unwrap_or_else(|e| e.into_inner());
         let raw = Box::into_raw(ctx);
@@ -325,11 +358,43 @@ impl Device for UsbDevice {
             if rc == ERROR_NO_DEVICE {
                 self.shared.gone.store(true, Ordering::Relaxed);
             }
-            log::debug!("usb: submit {} ep {:#x}: {}", s.id, s.ep, err_name(self.u, rc));
+            log::debug!("usb: submit {id} ep {ep:#x}: {}", err_name(self.u, rc));
             return Err(map_rc(rc));
         }
-        map.insert(s.id, t as usize);
+        map.insert(id, t as usize);
         Ok(())
+    }
+}
+
+impl Device for UsbDevice {
+    fn submit(&mut self, s: Submit) -> Result<(), Status> {
+        let is_in = s.is_in();
+        let control = s.kind == XferType::Control;
+        let mut buf = Vec::with_capacity(8 + s.len as usize);
+        if control {
+            buf.extend_from_slice(&s.setup);
+        }
+        if is_in {
+            buf.resize(buf.len() + s.len as usize, 0);
+        } else {
+            buf.extend_from_slice(&s.data);
+        }
+        let kind = match s.kind {
+            XferType::Control => 0,
+            XferType::Bulk => 2,
+            XferType::Interrupt => 3,
+            XferType::Iso => return Err(Status::Error),
+        };
+        let flags = if s.zero_packet { ADD_ZERO_PACKET } else { 0 };
+        let ctx = Box::new(XferCtx { id: s.id, is_in, control, shared: self.shared.clone(), buf, iso: Vec::new() });
+        self.start(s.ep, kind, flags, ctx)
+    }
+
+    fn submit_iso(&mut self, s: IsoSubmit) -> Result<(), Status> {
+        let is_in = s.is_in();
+        let buf = if is_in { vec![0u8; s.len()] } else { s.data };
+        let ctx = Box::new(XferCtx { id: s.id, is_in, control: false, shared: self.shared.clone(), buf, iso: s.packets });
+        self.start(s.ep, TYPE_ISO, 0, ctx)
     }
 
     fn cancel(&mut self, id: u32) {

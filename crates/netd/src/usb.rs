@@ -341,7 +341,7 @@ mod tests {
             self.started.lock().unwrap().push(dev.clone());
             let (v, p) = (dev.0, dev.1);
             let t = std::thread::spawn(move || {
-                let _ = vroom_usb::helper::serve(sock, Box::new(vroom_usb::fake::FakeOpener::new(v, p, None)));
+                let _ = vroom_usb::helper::serve(sock, Box::new(vroom_usb::fake::FakeOpener::new(vroom_usb::fake::FakeKind::Acm, v, p, None)));
             });
             Ok(Box::new(Thread(Some(t))))
         }

@@ -13,17 +13,22 @@ use vroom_config::VmConfig;
 use vroom_display::UsbDev;
 use vroom_usb::list::HostDevice;
 
-/// The Mac's USB devices, hubs left out. With `VROOM_USB_FAKE=acm` (test
-/// mode: every helper serves a pretend serial port) a pretend device
-/// 1209:00aa is listed too, so the menu can be tried without hardware.
+/// The Mac's USB devices, hubs left out. With `VROOM_USB_FAKE` (test
+/// mode: every helper serves a pretend device) a pretend device 1209:00aa
+/// is listed too, so the menu can be tried without hardware.
 pub fn host_list() -> Vec<HostDevice> {
     let mut v: Vec<HostDevice> = vroom_usb::list::list().into_iter().filter(|d| d.class != 9).collect();
-    if std::env::var("VROOM_USB_FAKE").as_deref() == Ok("acm") {
+    let fake = std::env::var("VROOM_USB_FAKE").ok();
+    if let Some(name) = match fake.as_deref() {
+        Some("acm") => Some("Pretend serial port (test)"),
+        Some("audio") => Some("Pretend sound card (test)"),
+        _ => None,
+    } {
         v.push(HostDevice {
             vendor: 0x1209,
             product: 0x00aa,
             manufacturer: None,
-            name: Some("Pretend serial port (test)".into()),
+            name: Some(name.into()),
             serial: None,
             class: 2,
             speed: Some(vroom_usb::proto::Speed::Full),

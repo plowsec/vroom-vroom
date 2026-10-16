@@ -6,9 +6,6 @@ move to the docs (GUIDE, ARCHITECTURE) once they work.
 
 ## In progress
 
-- **Isochronous USB transfers** for passed-through devices (USB sound
-  cards, webcams macOS lets go of). The Mac's own camera already reaches
-  the guest (`camera = true`).
 - **Coherence** (VMware: Unity): each guest app window as a window of its
   own on the Mac desktop, without the guest's desktop around it.
 
