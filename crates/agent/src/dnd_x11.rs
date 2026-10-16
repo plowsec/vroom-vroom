@@ -250,12 +250,14 @@ fn source(paths: &[PathBuf], stop: &AtomicBool, ready: &mpsc::Sender<bool>) -> R
             };
             match ev {
                 Event::MotionNotify(e) if dropped_at.is_none() => {
+                    log::trace!("drop: x11 motion {},{}", e.root_x, e.root_y);
                     let now = target_at(&c, &a, root, us, e.root_x, e.root_y)?;
                     if now.map(|t| t.0) != target.map(|t| t.0) {
                         if let Some((t, _)) = target {
                             client_message(&c, t, a.leave, [us, 0, 0, 0, 0])?;
                         }
                         target = now;
+                        log::debug!("drop: x11 drag over {:?}", target);
                         (waiting, pending, accepted) = (false, None, false);
                         if let Some((t, v)) = target {
                             client_message(&c, t, a.enter, [us, v << 24, a.uri_list, 0, 0])?;
@@ -274,6 +276,7 @@ fn source(paths: &[PathBuf], stop: &AtomicBool, ready: &mpsc::Sender<bool>) -> R
                     let d = e.data.as_data32();
                     if target.is_some_and(|t| t.0 == d[0]) {
                         accepted = d[1] & 1 != 0;
+                        log::debug!("drop: x11 status: accepted {accepted}");
                         waiting = false;
                         if let (Some((t, _)), Some((x, y, time))) = (target, pending.take()) {
                             position(t, x, y, time)?;
@@ -282,6 +285,7 @@ fn source(paths: &[PathBuf], stop: &AtomicBool, ready: &mpsc::Sender<bool>) -> R
                     }
                 }
                 Event::ButtonRelease(e) if e.detail == 1 && dropped_at.is_none() => {
+                    log::debug!("drop: x11 release at {},{}: target {target:?}, accepted {accepted}", e.root_x, e.root_y);
                     c.ungrab_keyboard(e.time)?;
                     match target {
                         Some((t, _)) if accepted => {
@@ -308,6 +312,7 @@ fn source(paths: &[PathBuf], stop: &AtomicBool, ready: &mpsc::Sender<bool>) -> R
                     return Ok(());
                 }
                 Event::SelectionRequest(r) if r.selection == a.selection => {
+                    log::debug!("drop: x11 data asked for (target {}, property {})", r.target, r.property);
                     let prop = if r.property == NONE { r.target } else { r.property };
                     let ok = if r.target == a.uri_list {
                         c.change_property8(PropMode::REPLACE, r.requestor, prop, a.uri_list, list.as_bytes())?;
@@ -330,7 +335,7 @@ fn source(paths: &[PathBuf], stop: &AtomicBool, ready: &mpsc::Sender<bool>) -> R
                     c.send_event(false, r.requestor, EventMask::NO_EVENT, ev)?;
                     c.flush()?;
                 }
-                _ => {}
+                ev => log::trace!("drop: x11 event {ev:?}"),
             }
         }
     })();

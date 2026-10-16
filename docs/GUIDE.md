@@ -64,7 +64,12 @@ the guest. Needs the guest tools (the agent) of this version or later.
   the files inside Windows: into an Explorer folder, onto the desktop, into
   a mail as an attachment, onto an app. While you hover, Windows shows
   its own drag picture and "Copy to Documents".
-- **Linux:** the files go to the Desktop (a name that is taken gets a
+- **Linux, X11 desktops** (Ubuntu's GNOME on Xorg, Xfce, KDE on X11):
+  the same, a real drag in the guest: drop into a Files window, onto the
+  desktop, into a browser. (An empty folder's "Folder is Empty" page in
+  GNOME Files takes no drops; drop on the folder's icon instead.)
+- **Linux, Wayland:** a program outside the desktop can't start a drag
+  there, so the files go to the Desktop (a name that is taken gets a
   number: `photo (2).jpg`), and the desktop shows a notification.
 
 While the files hover, the window's edge lights up and a line at the
@@ -73,8 +78,22 @@ tools, nobody logged in). Nothing reaches the guest until you drop: only
 the names, so it can get ready. Then a bar shows the copy's progress.
 
 Names Windows can't take (`:` `?` `*` and the like) get a `_` instead.
-Links inside dropped folders are left out. Dragging from the guest to the
-Mac isn't there yet.
+Links inside dropped folders are left out.
+
+The other way works too: drag files or folders from the guest (Explorer,
+the Windows desktop, GNOME Files or the desktop on X11) out of the VM
+window and drop them in Finder, on the Mac's desktop or into a Mac app
+that takes files. Nothing is copied while you drag: the files come from
+the guest when you drop, and a bar in the VM window shows how far the
+copy is. A name that is taken where you drop gets a number, the way
+Finder does it (`report 2.pdf`); nothing is overwritten. The copy stops
+if the Mac's disk would have less than 2 GB free. A file the guest
+can't read (open in another app with a lock) fails the copy with its
+name. Not on Wayland guests (the desktop keeps its drags to itself), and
+only files that are real files in the guest (not what is inside a zip
+in Explorer, nor attachments dragged from a mail app). Mac apps that
+only take files that exist already (Terminal, some editors) get nothing:
+drop in Finder first.
 
 ### When the app crashes, or a VM stops answering
 

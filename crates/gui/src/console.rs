@@ -1355,6 +1355,7 @@ impl Console {
             copied: 0,
             failed: None,
         });
+        log::info!("drag {id} out: the mouse left the screen with the button held, asking the guest");
         self.io.borrow_mut().send(ToVmm::DragOut { id, end: false });
         let k = self.key.clone();
         self.out_timer.start(slint::TimerMode::Repeated, Duration::from_millis(100), move || {

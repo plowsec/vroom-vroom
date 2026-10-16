@@ -57,9 +57,11 @@ Windows guests:
 - USB passthrough with real devices, bridged networking with real
   vmnet (being tested now).
 - A signed, notarized app with an installer and updates; crash reports.
-- Multiple monitors, drag and drop from the guest to the Mac (Mac to
-  guest works), a live drag in Linux guests (they get files on the
-  Desktop for now).
+- Multiple monitors.
+- Drag and drop: try the Mac side of a drag out of the guest with a real
+  mouse (Finder, Mail, the Desktop; the guest side and the copy are
+  tested); Wayland guests (no live drag either way: an outside program
+  can't take part in a Wayland drag).
 - Rosetta for Linux guests (x86_64 Linux programs). Apple only offers it
   through its Virtualization framework; we'd have to look like it.
 - Benchmarks against VMware Fusion and Parallels on the same Mac, the
