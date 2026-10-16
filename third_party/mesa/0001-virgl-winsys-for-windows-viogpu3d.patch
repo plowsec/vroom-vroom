@@ -122,7 +122,7 @@ diff --git a/src/gallium/winsys/virgl/win32/virgl_win32_public.h b/src/gallium/w
 diff --git a/src/gallium/winsys/virgl/win32/virgl_win32_winsys.c b/src/gallium/winsys/virgl/win32/virgl_win32_winsys.c
 --- a/src/gallium/winsys/virgl/win32/virgl_win32_winsys.c
 +++ b/src/gallium/winsys/virgl/win32/virgl_win32_winsys.c
-@@ -0,0 +1,995 @@
+@@ -0,0 +1,1036 @@
 +/*
 + * Copyright 2026 vroom authors
 + * SPDX-License-Identifier: MIT
@@ -164,6 +164,7 @@ diff --git a/src/gallium/winsys/virgl/win32/virgl_win32_winsys.c b/src/gallium/w
 +#include "virgl_win32_public.h"
 +
 +#define VIOGPU_CAPSET_VIRGL2 2
++#define VIRGL_STATUS_DEVICE_REMOVED ((NTSTATUS)0xC00002B6L)
 +
 +/* Errors go to the file VROOM_GL_LOG names, if set: an ICD has no console. */
 +static FILE *ws_log_file;
@@ -201,6 +202,7 @@ diff --git a/src/gallium/winsys/virgl/win32/virgl_win32_winsys.c b/src/gallium/w
 +   uint32_t width, height, stride;
 +
 +   void *ptr;                      /* D3DKMTLock mapping, kept until destroy */
++   bool standin;                   /* no device: ptr is plain memory */
 +   int num_cs_references;
 +   struct virgl_win32_fence *fence; /* last submission that used it */
 +
@@ -230,6 +232,11 @@ diff --git a/src/gallium/winsys/virgl/win32/virgl_win32_winsys.c b/src/gallium/w
 +   D3DKMT_HANDLE context;
 +   void *cmd;
 +   UINT cmd_size;
++
++   /* The 3D display went away (a VM suspend or snapshot turns it off):
++    * the app's GL state with it. From then on nothing reaches the host
++    * and the window keeps its last frame, rather than the app crashing. */
++   bool lost;
 +
 +   struct virgl_resource_cache cache;
 +   bool cache_ready;
@@ -282,6 +289,11 @@ diff --git a/src/gallium/winsys/virgl/win32/virgl_win32_winsys.c b/src/gallium/w
 +      FREE(f);
 +      return NULL;
 +   }
++   if (ws->lost) {
++      SetEvent(f->event);
++      pipe_reference_init(&f->reference, 1);
++      return f;
++   }
 +   D3DKMT_SIGNALSYNCHRONIZATIONOBJECT2 sig = {
 +      .hContext = ws->context,
 +      .ObjectCount = 0,
@@ -319,6 +331,8 @@ diff --git a/src/gallium/winsys/virgl/win32/virgl_win32_winsys.c b/src/gallium/w
 +   }
 +   if (!NT_SUCCESS(st)) {
 +      ws_log("virgl/win32: render failed: 0x%lx\n", st);
++      if (st == VIRGL_STATUS_DEVICE_REMOVED)
++         ws->lost = true;
 +      return false;
 +   }
 +   return true;
@@ -344,6 +358,8 @@ diff --git a/src/gallium/winsys/virgl/win32/virgl_win32_winsys.c b/src/gallium/w
 +submit_locked(struct virgl_win32_winsys *ws, UINT type, const void *body,
 +              UINT body_size, struct virgl_hw_res **res, unsigned nres)
 +{
++   if (ws->lost)
++      return fence_create_locked(ws);
 +   if (!reserve_locked(ws, body_size))
 +      return NULL;
 +
@@ -383,6 +399,11 @@ diff --git a/src/gallium/winsys/virgl/win32/virgl_win32_winsys.c b/src/gallium/w
 +static void
 +virgl_hw_res_destroy(struct virgl_win32_winsys *ws, struct virgl_hw_res *res)
 +{
++   if (res->standin) {
++      FREE(res->ptr);
++      FREE(res);
++      return;
++   }
 +   /* dxgkrnl doesn't know our packets use it (no allocation lists). */
 +   fence_done(res->fence, INFINITE);
 +   if (res->ptr) {
@@ -508,6 +529,51 @@ diff --git a/src/gallium/winsys/virgl/win32/virgl_win32_winsys.c b/src/gallium/w
 +   return true;
 +}
 +
++/* The host side of a resource: a 3D allocation, its id, and residency. */
++static bool
++alloc_host(struct virgl_win32_winsys *ws, struct virgl_hw_res *res,
++           VIOGPU_CREATE_ALLOCATION_EXCHANGE *ex)
++{
++   VIOGPU_CREATE_RESOURCE_EXCHANGE res_ex = { 0 };
++   D3DDDI_ALLOCATIONINFO ai = {
++      .pPrivateDriverData = ex,
++      .PrivateDriverDataSize = sizeof(*ex),
++   };
++   D3DKMT_CREATEALLOCATION ca = {
++      .hDevice = ws->device,
++      .pPrivateDriverData = &res_ex,
++      .PrivateDriverDataSize = sizeof(res_ex),
++      .NumAllocations = 1,
++      .pAllocationInfo = &ai,
++      .Flags = { .CreateResource = 1 },
++   };
++   NTSTATUS st = D3DKMTCreateAllocation(&ca);
++   if (!NT_SUCCESS(st)) {
++      ws_log("virgl/win32: create allocation failed: 0x%lx\n", st);
++      if (st == VIRGL_STATUS_DEVICE_REMOVED)
++         ws->lost = true;
++      return false;
++   }
++
++   VIOGPU_ESCAPE info;
++   memset(&info, 0, sizeof(info));
++   info.Type = VIOGPU_RES_INFO;
++   info.DataLength = sizeof(info.ResourceInfo);
++   info.ResourceInfo.ResHandle = ai.hAllocation;
++   st = escape(ws, &info);
++   if (!NT_SUCCESS(st) || info.ResourceInfo.Id == 0 ||
++       !make_resident(ws, ai.hAllocation, (uint32_t)ex->Size)) {
++      ws_log("virgl/win32: resource info failed: 0x%lx\n", st);
++      D3DKMT_DESTROYALLOCATION d = { .hDevice = ws->device, .hResource = ca.hResource };
++      D3DKMTDestroyAllocation(&d);
++      return false;
++   }
++   res->res_handle = info.ResourceInfo.Id;
++   res->hresource = ca.hResource;
++   res->halloc = ai.hAllocation;
++   return true;
++}
++
 +static struct virgl_hw_res *
 +virgl_win32_resource_create(struct virgl_winsys *vws,
 +                            enum pipe_texture_target target,
@@ -527,6 +593,16 @@ diff --git a/src/gallium/winsys/virgl/win32/virgl_win32_winsys.c b/src/gallium/w
 +      size = MAX2(size, util_format_get_2d_size(format, stride, height));
 +   }
 +
++   struct virgl_hw_res *res = CALLOC_STRUCT(virgl_hw_res);
++   if (!res)
++      return NULL;
++   res->size = align(MAX2(size, 1), 4096);
++   res->bind = bind;
++   res->format = format;
++   res->width = width;
++   res->height = height;
++   res->stride = stride;
++
 +   VIOGPU_CREATE_ALLOCATION_EXCHANGE ex;
 +   memset(&ex, 0, sizeof(ex));
 +   ex.Type = VIOGPU_RESOURCE_TYPE_3D;
@@ -540,56 +616,17 @@ diff --git a/src/gallium/winsys/virgl/win32/virgl_win32_winsys.c b/src/gallium/w
 +   ex.Options3D.last_level = last_level;
 +   ex.Options3D.nr_samples = nr_samples;
 +   ex.Options3D.flags = flags;
-+   ex.Size = align(MAX2(size, 1), 4096);
-+
-+   VIOGPU_CREATE_RESOURCE_EXCHANGE res_ex = { 0 };
-+   D3DDDI_ALLOCATIONINFO ai = {
-+      .pPrivateDriverData = &ex,
-+      .PrivateDriverDataSize = sizeof(ex),
-+   };
-+   D3DKMT_CREATEALLOCATION ca = {
-+      .hDevice = ws->device,
-+      .pPrivateDriverData = &res_ex,
-+      .PrivateDriverDataSize = sizeof(res_ex),
-+      .NumAllocations = 1,
-+      .pAllocationInfo = &ai,
-+      .Flags = { .CreateResource = 1 },
-+   };
-+   NTSTATUS st = D3DKMTCreateAllocation(&ca);
-+   if (!NT_SUCCESS(st)) {
-+      ws_log("virgl/win32: create allocation failed: 0x%lx\n", st);
-+      return NULL;
++   ex.Size = res->size;
++   if (ws->lost || !alloc_host(ws, res, &ex)) {
++      /* Mesa can't take a NULL here everywhere: hand out memory that
++       * reaches nothing. */
++      res->standin = true;
++      res->ptr = CALLOC(1, res->size);
++      if (!res->ptr) {
++         FREE(res);
++         return NULL;
++      }
 +   }
-+
-+   VIOGPU_ESCAPE info;
-+   memset(&info, 0, sizeof(info));
-+   info.Type = VIOGPU_RES_INFO;
-+   info.DataLength = sizeof(info.ResourceInfo);
-+   info.ResourceInfo.ResHandle = ai.hAllocation;
-+   st = escape(ws, &info);
-+   if (!NT_SUCCESS(st) || info.ResourceInfo.Id == 0) {
-+      ws_log("virgl/win32: resource info failed: 0x%lx\n", st);
-+      D3DKMT_DESTROYALLOCATION d = { .hDevice = ws->device, .hResource = ca.hResource };
-+      D3DKMTDestroyAllocation(&d);
-+      return NULL;
-+   }
-+
-+   struct virgl_hw_res *res = make_resident(ws, ai.hAllocation, (uint32_t)ex.Size) ?
-+                              CALLOC_STRUCT(virgl_hw_res) : NULL;
-+   if (!res) {
-+      D3DKMT_DESTROYALLOCATION d = { .hDevice = ws->device, .hResource = ca.hResource };
-+      D3DKMTDestroyAllocation(&d);
-+      return NULL;
-+   }
-+   res->res_handle = info.ResourceInfo.Id;
-+   res->hresource = ca.hResource;
-+   res->halloc = ai.hAllocation;
-+   res->size = ex.Size;
-+   res->bind = bind;
-+   res->format = format;
-+   res->width = width;
-+   res->height = height;
-+   res->stride = stride;
 +   pipe_reference_init(&res->reference, 1);
 +   p_atomic_set(&res->num_cs_references, 0);
 +
@@ -641,7 +678,7 @@ diff --git a/src/gallium/winsys/virgl/win32/virgl_win32_winsys.c b/src/gallium/w
 +virgl_win32_resource_map(struct virgl_winsys *vws, struct virgl_hw_res *res)
 +{
 +   struct virgl_win32_winsys *ws = virgl_win32_winsys(vws);
-+   if (res->ptr)
++   if (res->ptr || res->standin)
 +      return res->ptr;
 +
 +   /* Synchronization is ours (fences), so don't let the lock wait. */
@@ -884,7 +921,11 @@ diff --git a/src/gallium/winsys/virgl/win32/virgl_win32_winsys.c b/src/gallium/w
 +                              struct pipe_box *sub_box)
 +{
 +   HDC hdc = winsys_drawable_handle;
-+   if (!res->stride || !hdc)
++   if (virgl_win32_winsys(vws)->lost) {
++      Sleep(16); /* keep a frame rate, not a busy loop */
++      return;
++   }
++   if (!res->stride || !hdc || res->standin)
 +      return;
 +   /* What GDI takes as it is. */
 +   if (res->format != PIPE_FORMAT_B8G8R8A8_UNORM &&

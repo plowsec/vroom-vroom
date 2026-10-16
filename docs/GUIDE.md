@@ -671,7 +671,9 @@ core profile: 4.1, GLSL 4.10, 154 extensions
   (about 220 at 624x441 for a spinning-gears test); big windows are
   slower.
 - Like Direct3D apps, an OpenGL app loses its GPU when the VM suspends or
-  takes a snapshot.
+  takes a snapshot (the 3D display goes off for the save): it keeps
+  running, its window keeps its last frame, and it draws again once you
+  start it again. Apps started after the save draw as usual.
 - `VROOM_GL_LOG=C:\path\gl.log` in an app's environment logs the
   driver's errors there.
 
