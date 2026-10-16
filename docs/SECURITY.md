@@ -395,6 +395,11 @@ The guest gets full control of a device it is given (it can send it any
 request, including firmware updates). Give it only devices you'd plug
 into that machine.
 
+The test devices (`VROOM_USB_FAKE`: serial port, sound card, USB stick)
+run inside the helper in place of libusb, behind the same checks. The
+stick parses the guest's SCSI commands there: fixed-size blocks, every
+offset checked against its RAM disk.
+
 The VM's xHCI always has 8 USB 2 + USB 3 port pairs for these devices
 (fixed, so the guest and saved VMs see the same controller); the
 viewer protocol caps names and the list, and the VMM checks every
@@ -451,11 +456,31 @@ asked for: the user named the device, and the helper serves only that
 one. On Linux the root helper sets no_new_privs and Landlock like the
 user's.
 
-What a compromised VMM can do with it: nothing new. It never talks to
-the USB side (the app does), and the network side was already its
-business. A compromised user account in `admin` could take USB devices
-(keyboards included) without the password; it could also wait for the
-next sudo. The daemon logs every request with the user to
+What the root USB helper does to the device: as soon as it opens one a
+macOS driver holds (or one an earlier helper left taken), it takes the
+whole device (libusb's "capture": macOS re-enumerates it and keeps its
+drivers off; a mounted disk is unmounted). It keeps it through the
+guest's resets, so macOS never mounts the disk in between, and gives
+it back when it ends (one more re-enumeration, macOS's drivers come
+back). A device the guest can't use at all is given back at once.
+
+macOS 15 opens USB storage only to a program with Full Disk Access,
+root or not. For USB disks the user gives vroom-netd that permission
+(GUIDE). That covers the daemon and the helpers it starts: macOS then
+lets them read the user's protected files too (Mail, Messages, other
+apps' data), which root alone can't. Neither does: the daemon reads
+only its config, and the helpers' Seatbelt profile allows no files at
+all. It is a real widening still: code execution in vroom-netd would
+get it. Without the permission everything else works; only USB disks
+fail, and they go back to macOS.
+
+What a compromised VMM can do with it: nothing new. The VMM asks for
+the VM file's USB devices when it starts, before it locks itself down
+(the user wrote that file); afterwards its sandbox has no way to reach
+the daemon's socket. Devices connected while the VM runs come from the
+app. The network side was already its business. A compromised user
+account in `admin` could take USB devices (keyboards included) without
+the password; it could also wait for the next sudo. The daemon logs every request with the user to
 `/var/log/vroom-netd.log`.
 
 Passing sockets: macOS can deliver a socket already disconnected when
