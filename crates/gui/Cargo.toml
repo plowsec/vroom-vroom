@@ -17,6 +17,7 @@ serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 vroom-display.workspace = true
+vroom-proto.workspace = true
 vroom-config.workspace = true
 vroom-state.workspace = true
 vroom-block.workspace = true

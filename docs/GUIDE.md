@@ -55,6 +55,27 @@ The mouse pointer over the guest is one pointer, the guest's:
   It's hidden during boot too, when Windows shows none.
 - Any other guest that gives no pointer keeps the Mac's arrow.
 
+### Drag and drop
+
+Drag files or folders from Finder onto the VM window to copy them into
+the guest. Needs the guest tools (the agent) of this version or later.
+
+- **Windows:** the drop lands wherever you let go, as if you had dragged
+  the files inside Windows: into an Explorer folder, onto the desktop, into
+  a mail as an attachment, onto an app. While you hover, Windows shows
+  its own drag picture and "Copy to Documents".
+- **Linux:** the files go to the Desktop (a name that is taken gets a
+  number: `photo (2).jpg`), and the desktop shows a notification.
+
+While the files hover, the window's edge lights up and a line at the
+bottom says what a drop does (or why the guest can't take them: no guest
+tools, nobody logged in). Nothing reaches the guest until you drop: only
+the names, so it can get ready. Then a bar shows the copy's progress.
+
+Names Windows can't take (`:` `?` `*` and the like) get a `_` instead.
+Links inside dropped folders are left out. Dragging from the guest to the
+Mac isn't there yet.
+
 ### When the app crashes, or a VM stops answering
 
 Each VM runs in a process of its own, so a crash of the app doesn't stop
@@ -580,6 +601,30 @@ Testing without speakers or a microphone: `VROOM_AUDIO_WAV_DIR=dir vroom
 run ...` writes what the guest plays to `dir/audio.wav` and, with
 `input = true`, feeds `dir/mic.wav` (16-bit PCM, looped) to the guest
 instead of the microphone. The window gate still applies.
+
+## Camera
+
+`camera = true` (app: Settings, Sound and camera, Camera) gives the guest
+a USB webcam fed by the Mac's camera. Windows and Linux use it with their
+own drivers (it is a standard USB video class camera): the Camera app,
+browsers (Google Meet, Teams, Zoom on the web), `cheese`, OBS.
+
+Like the microphone, the camera is on only while the VM's window is open
+and an app in the guest uses it; it goes off two seconds after the app
+stops. The window shows "Camera in use" (or "Camera and microphone in
+use") in its bar, and macOS lights the green dot next to the camera.
+
+The guest picks one of 640x480, 1280x720 or 320x240, at 30 or 15 frames a
+second, uncompressed. The Mac's picture (16:9) is cropped to the shape the
+guest asked for, around its middle, then scaled.
+
+The first time, macOS asks for the camera permission for the app that
+started vroom (Terminal, iTerm...), as for the microphone. If you said
+no, the window says so; turn the app on in System Settings, Privacy &
+Security, Camera.
+
+Testing without a camera: `VROOM_CAMERA_TEST=1 vroom run ...` sends
+moving color bars instead.
 
 ## Snapshots, suspend
 

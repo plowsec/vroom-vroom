@@ -61,8 +61,12 @@ struct Shared {
     clipboard: Option<String>,
     /// The guest records from the microphone (latest word from the VMM).
     mic: Option<bool>,
+    /// The guest has the camera on (latest word).
+    camera: Option<bool>,
     /// The guest's pointer, the latest.
     cursor: Option<GuestCursor>,
+    /// Answers about files dragged over the window, in order.
+    drag: VecDeque<ToViewer>,
     posted: bool,
 }
 
@@ -99,7 +103,14 @@ impl Shared {
                 self.status.push_back(t);
             }
             ToViewer::Mic(on) => self.mic = Some(on),
+            ToViewer::Camera(on) => self.camera = Some(on),
             ToViewer::Cursor(c) => self.cursor = Some(c),
+            m @ (ToViewer::DragReady { .. } | ToViewer::DropDone { .. }) => {
+                if self.drag.len() >= MAX_STATUS {
+                    return false;
+                }
+                self.drag.push_back(m);
+            }
             ToViewer::Closed => return false,
         }
         !std::mem::replace(&mut self.posted, true)
@@ -194,7 +205,32 @@ pub struct Console {
     /// The VM's CPUs, and its CPU time when last looked at.
     cpus: u32,
     cpu_seen: Option<(Instant, Duration)>,
+    /// Files dragged over the window, or being dropped.
+    drag: Option<Drag>,
+    drag_seq: u32,
+    drag_timer: slint::Timer,
 }
+
+/// Files from the Mac over the window (see dnd.rs).
+struct Drag {
+    id: u32,
+    paths: Vec<PathBuf>,
+    /// The guest's answer: whether it runs a live drag, or why it can't
+    /// take the files.
+    ready: Option<Result<bool, String>>,
+    /// We hold the guest's left button for its live drag.
+    pressed: bool,
+    /// Dropped: the copy underway.
+    copy: Option<Arc<crate::dnd::Progress>>,
+    pointer: Option<(u16, u16)>,
+}
+
+/// The guest's left button, and Escape (evdev).
+const BTN_LEFT: u16 = 0x110;
+const KEY_ESC: u16 = 1;
+/// How often the pointer follows the mouse during a drag (the window gets
+/// no mouse events then).
+const DRAG_POLL: Duration = Duration::from_millis(16);
 
 /// What the host pointer is over the guest screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -521,6 +557,9 @@ fn open(key: String, cfg: &VmConfig, ours: UnixStream, child: Option<Child>, pid
         host_cursor: None,
         cpus: cfg.cpus.max(1),
         cpu_seen: None,
+        drag: None,
+        drag_seq: 0,
+        drag_timer: slint::Timer::default(),
     };
     CONSOLES.with(|m| m.borrow_mut().insert(key.clone(), c));
     ensure_timer();
@@ -634,6 +673,28 @@ fn winit_event(key: &str, io: &Rc<RefCell<Io>>, ev: &WindowEvent) -> EventResult
                 io.borrow_mut().key(code, down);
             }
             EventResult::PreventDefault
+        }
+        // Files from the Mac: one event per file, all at once.
+        WindowEvent::HoveredFile(p) => {
+            let (key, p) = (key.to_string(), p.clone());
+            slint::Timer::single_shot(Duration::ZERO, move || {
+                with(&key, |c| c.drag_hover(p));
+            });
+            EventResult::Propagate
+        }
+        WindowEvent::HoveredFileCancelled => {
+            let key = key.to_string();
+            slint::Timer::single_shot(Duration::ZERO, move || {
+                with(&key, |c| c.drag_left());
+            });
+            EventResult::Propagate
+        }
+        WindowEvent::DroppedFile(p) => {
+            let (key, p) = (key.to_string(), p.clone());
+            slint::Timer::single_shot(Duration::ZERO, move || {
+                with(&key, |c| c.drag_dropped(p));
+            });
+            EventResult::Propagate
         }
         // Moving to a screen with another scale also resizes.
         WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
@@ -869,12 +930,22 @@ impl Console {
 
     /// What the reader thread collected since the last wakeup.
     fn inbox(&mut self) {
-        let (frame, full, damage, status, clip, mic, cursor) = {
+        let (frame, full, damage, status, clip, mic, cursor, drag, camera) = {
             let mut s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
             s.posted = false;
             let f = (std::mem::take(&mut s.frame), std::mem::take(&mut s.full), s.damage.take());
-            (f.0, f.1, f.2, std::mem::take(&mut s.status), s.clipboard.take(), s.mic.take(), s.cursor.take())
+            (f.0, f.1, f.2, std::mem::take(&mut s.status), s.clipboard.take(), s.mic.take(), s.cursor.take(), std::mem::take(&mut s.drag), s.camera.take())
         };
+        if let Some(on) = camera {
+            self.camera(on);
+        }
+        for m in drag {
+            match m {
+                ToViewer::DragReady { id, live } => self.drag_ready(id, live),
+                ToViewer::DropDone { id, ok, place } => self.drop_done(id, ok, &clean(&place)),
+                _ => {}
+            }
+        }
         for t in status {
             self.status(&t);
         }
@@ -942,6 +1013,21 @@ impl Console {
         }
     }
 
+    /// Camera indicator; like the microphone's.
+    fn camera(&mut self, on: bool) {
+        if on == self.win.get_camera_on() {
+            return;
+        }
+        self.win.set_camera_on(on);
+        if on {
+            self.win.set_bar_pinned(true);
+            let k = self.key.clone();
+            slint::Timer::single_shot(Duration::from_secs(3), move || {
+                with(&k, |c| c.win.set_bar_pinned(false));
+            });
+        }
+    }
+
     fn guest_clipboard(&mut self, t: String) {
         let focused = self.io.borrow().focused;
         let ok = focused && self.clip_policy.guest_to_host && t.len() <= self.clip_policy.max_bytes as usize;
@@ -987,6 +1073,202 @@ impl Console {
             }
         }
         self.win.set_captured(self.io.borrow().focused && self.state == VmState::Running);
+    }
+
+    /// A file is dragged over the window (several come at once).
+    fn drag_hover(&mut self, p: PathBuf) {
+        if let Some(d) = self.drag.as_mut().filter(|d| d.copy.is_none()) {
+            if d.ready.is_none() && !d.paths.contains(&p) {
+                d.paths.push(p);
+            }
+            return;
+        }
+        if self.drag.is_some() {
+            // Still copying the last drop.
+            return;
+        }
+        self.drag_seq = self.drag_seq.wrapping_add(1);
+        self.drag = Some(Drag { id: self.drag_seq, paths: vec![p], ready: None, pressed: false, copy: None, pointer: None });
+        // After this burst of events: then all the names are in.
+        let k = self.key.clone();
+        slint::Timer::single_shot(Duration::ZERO, move || {
+            with(&k, |c| c.drag_enter());
+        });
+    }
+
+    fn drag_enter(&mut self) {
+        let Some(d) = &self.drag else { return };
+        let items = crate::dnd::items(&d.paths);
+        let id = d.id;
+        if items.is_empty() {
+            self.drag = None;
+            return;
+        }
+        self.io.borrow_mut().send(ToVmm::DragEnter { id, items });
+        self.win.set_drop_over(true);
+        self.win.set_drop_text(format!("Copy to {}", self.name).into());
+        let k = self.key.clone();
+        self.drag_timer.start(slint::TimerMode::Repeated, DRAG_POLL, move || {
+            with(&k, |c| c.drag_poll());
+        });
+    }
+
+    /// Where the mouse is over the guest screen (0..1 each way), if it is.
+    fn mouse_on_screen(&self) -> Option<(f32, f32)> {
+        let (mx, my) = crate::dnd::mouse()?;
+        let sf = self.win.window().scale_factor() as f64;
+        let inner = self.win.window().with_winit_window(|w| w.inner_position().ok()).flatten()?;
+        let (lx, ly) = (mx - inner.x as f64 / sf, my - inner.y as f64 / sf);
+        let fx = (lx - self.win.get_screen_x() as f64) / self.win.get_screen_width() as f64;
+        let fy = (ly - self.win.get_screen_y() as f64) / self.win.get_screen_height() as f64;
+        ((0.0..=1.0).contains(&fx) && (0.0..=1.0).contains(&fy)).then_some((fx as f32, fy as f32))
+    }
+
+    /// The guest's pointer follows the mouse; a copy shows how far it is.
+    fn drag_poll(&mut self) {
+        let Some(d) = &self.drag else {
+            self.drag_timer.stop();
+            return;
+        };
+        if let Some(p) = &d.copy {
+            let (sent, total) = (p.sent.load(Ordering::Relaxed), p.total.load(Ordering::Relaxed));
+            let f = if total == 0 { 1.0 } else { sent as f32 / total as f32 };
+            self.win.set_drop_progress(f.min(1.0));
+            let what = match d.paths.len() {
+                1 => d.paths[0].file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                n => format!("{n} items"),
+            };
+            let text = if sent >= total { format!("Copying {what} to {}...", self.name) } else { format!("Copying {what} to {}: {}%", self.name, (f * 100.0) as u32) };
+            self.win.set_drop_text(text.into());
+        }
+        let Some((fx, fy)) = self.mouse_on_screen() else { return };
+        let ptr = ((fx * POINTER_MAX as f32) as u16, (fy * POINTER_MAX as f32) as u16);
+        if self.drag.as_ref().is_some_and(|d| d.pointer != Some(ptr)) {
+            self.io.borrow_mut().send(ToVmm::Pointer { x: ptr.0, y: ptr.1 });
+            if let Some(d) = self.drag.as_mut() {
+                d.pointer = Some(ptr);
+            }
+        }
+    }
+
+    fn drag_ready(&mut self, id: u32, live: bool) {
+        let Some(d) = self.drag.as_mut().filter(|d| d.id == id) else { return };
+        d.ready = Some(Ok(live));
+        if live && !d.pressed {
+            // The guest's drag window is under its pointer: press on it.
+            // The guest then shows where a drop would go.
+            d.pressed = true;
+            self.io.borrow_mut().send(ToVmm::Button { code: BTN_LEFT, down: true });
+        }
+        if d.copy.is_none() {
+            let t = if live { format!("Copy to {}: drop where you want the files", self.name) } else { format!("Copy to the Desktop of {}", self.name) };
+            self.win.set_drop_text(t.into());
+        }
+    }
+
+    /// Let go of the guest's drag: drop (`drop`), or give up (Escape).
+    fn release(&mut self, drop: bool) {
+        let Some(d) = self.drag.as_mut() else { return };
+        if !std::mem::replace(&mut d.pressed, false) {
+            return;
+        }
+        let mut io = self.io.borrow_mut();
+        if !drop {
+            io.send(ToVmm::Key { code: KEY_ESC, down: true });
+            io.send(ToVmm::Key { code: KEY_ESC, down: false });
+        }
+        io.send(ToVmm::Button { code: BTN_LEFT, down: false });
+    }
+
+    fn drag_end(&mut self) {
+        self.drag = None;
+        self.drag_timer.stop();
+        self.win.set_drop_over(false);
+        self.win.set_drop_text("".into());
+        self.win.set_drop_progress(-1.0);
+    }
+
+    fn drag_left(&mut self) {
+        let Some(d) = &self.drag else { return };
+        if d.copy.is_some() {
+            return;
+        }
+        let id = d.id;
+        self.release(false);
+        self.io.borrow_mut().send(ToVmm::DragCancel { id });
+        self.drag_end();
+    }
+
+    /// Dropped (one event per file, all at once).
+    fn drag_dropped(&mut self, p: PathBuf) {
+        if self.drag.is_none() {
+            self.drag_hover(p);
+        }
+        let Some(d) = self.drag.as_mut() else { return };
+        if d.copy.is_some() {
+            return;
+        }
+        if let Some(Err(why)) = &d.ready {
+            let t = format!("Can't copy to {}: {why}", self.name);
+            self.drag_end();
+            self.toast(&t);
+            return;
+        }
+        let progress = Arc::new(crate::dnd::Progress::default());
+        d.copy = Some(progress.clone());
+        let (id, paths) = (d.id, d.paths.clone());
+        self.win.set_drop_over(false);
+        self.win.set_drop_progress(0.0);
+        // A pipe for the files: the VMM passes what we write to the guest.
+        let sent = UnixStream::pair().and_then(|(ours, theirs)| {
+            let io = self.io.borrow();
+            let tx = io.tx.as_ref().ok_or_else(|| std::io::Error::other("the VM is gone"))?;
+            vroom_display::send_fd_with(tx, &ToVmm::Drop { id }.encode(), theirs.as_raw_fd()).map_err(|e| std::io::Error::other(e.to_string()))?;
+            Ok(ours)
+        });
+        match sent.and_then(|ours| std::thread::Builder::new().name("drop".into()).spawn(move || crate::dnd::send(id, paths, ours, progress))) {
+            Ok(_) => {}
+            Err(e) => {
+                self.release(false);
+                self.drag_end();
+                self.toast(&format!("Can't copy to {}: {e}", self.name));
+            }
+        }
+    }
+
+    fn drop_done(&mut self, id: u32, ok: bool, place: &str) {
+        let Some(d) = self.drag.as_ref().filter(|d| d.id == id) else { return };
+        if d.copy.is_none() {
+            // Before any drop: the guest can't take files. Say so while
+            // they hover; a drop then only shows it.
+            if !ok {
+                let why = if place.is_empty() { "the guest refused".to_string() } else { place.to_string() };
+                self.win.set_drop_text(format!("Can't copy to {}: {why}", self.name).into());
+                self.win.set_drop_over(false);
+                if let Some(d) = self.drag.as_mut() {
+                    d.ready = Some(Err(why));
+                }
+            }
+            return;
+        }
+        let n = d.copy.as_ref().map_or(0, |p| p.files.load(Ordering::Relaxed));
+        let live = matches!(d.ready, Some(Ok(true)));
+        if ok && live && !d.pressed {
+            // The guest was ready only after the drop: drop where it is.
+            self.io.borrow_mut().send(ToVmm::Button { code: BTN_LEFT, down: true });
+            if let Some(d) = self.drag.as_mut() {
+                d.pressed = true;
+            }
+        }
+        self.release(ok);
+        self.drag_end();
+        let what = if n == 1 { "1 file".to_string() } else { format!("{n} files") };
+        let t = match (ok, live) {
+            (true, true) => format!("Copied {what} to {}", self.name),
+            (true, false) => format!("Copied {what} to {} ({})", self.name, if place.is_empty() { "Desktop" } else { place }),
+            (false, _) => format!("Copy to {} failed: {place}", self.name),
+        };
+        self.toast(&t);
     }
 
     /// "12%": the host CPU time the VM took over the last second or so,

@@ -104,6 +104,25 @@ Shared folders keep their FUSE node table as paths, so a snapshot carries
 it and open files are reopened by path on restore. Sound hands back
 in-flight buffers before saving.
 
+## Drag and drop
+
+Finder drags reach the app's window as winit events (no position: the
+app polls the mouse while files hover and moves the guest's pointer with
+it). The app sends the names (`ToVmm::DragEnter`); the VMM's agent
+service passes them on (`Message::DragEnter`), and the guest agent's
+session side (`agent/src/drop.rs`) makes a staging folder with them. On
+Windows (`dnd_win.rs`) it then shows a window under the pointer, brought
+in front of the active app and composed before it answers (Windows routes
+no click to a window before that), and answers `DragReady { live }`. The
+app presses the guest's left button: the window gets it and starts a
+shell drag (`SHDoDragDrop`) of the staged names, which Windows tracks as
+the pointer moves. On the drop the app opens a socket pair, sends one end
+to the VMM with `ToVmm::Drop` (SCM_RIGHTS), and writes the files into the
+other as agent frames; the VMM forwards them, checked, from a thread of
+its own. When the guest says `DropDone`, the app lets go of the button
+and the app under the pointer takes the files. Leaving the window sends
+`DragCancel`, Escape and the button up.
+
 ## 3D
 
 `gpu = "virtio3d"` adds three protocols to virtio-gpu. Venus: guest Vulkan

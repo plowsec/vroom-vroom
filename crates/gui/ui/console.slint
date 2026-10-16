@@ -30,6 +30,7 @@ component VmBar inherits HorizontalLayout {
     in property <bool> captured;
     in property <bool> fullscreen;
     in property <bool> mic-on;
+    in property <bool> camera-on;
     // Host CPU time the VM uses ("12%"; empty: unknown).
     in property <string> cpu-text;
     // "3D", "Direct3D 11"; empty without 3D.
@@ -116,7 +117,7 @@ component VmBar inherits HorizontalLayout {
     if root.wide: Rectangle {
         horizontal-stretch: 1;
     }
-    if root.mic-on: Rectangle {
+    if root.mic-on || root.camera-on: Rectangle {
         y: (parent.height - self.height) / 2;
         height: 22px;
         width: ml.preferred-width;
@@ -133,7 +134,7 @@ component VmBar inherits HorizontalLayout {
                 tint: #ef4444;
             }
             Text {
-                text: "Microphone in use";
+                text: root.mic-on && root.camera-on ? "Camera and microphone in use" : root.camera-on ? "Camera in use" : "Microphone in use";
                 color: #ffffffd0;
                 font-size: Theme.fs-xs;
                 vertical-alignment: center;
@@ -271,6 +272,8 @@ export component ConsoleWindow inherits Window {
     in property <bool> fullscreen;
     // The guest is recording from the host microphone.
     in property <bool> mic-on;
+    // The guest has the host camera on.
+    in property <bool> camera-on;
     // Rust keeps the full-screen bar out for a moment after going full screen.
     in property <bool> bar-pinned;
     // Set when saving the VM's state failed (why, from the VMM).
@@ -280,8 +283,17 @@ export component ConsoleWindow inherits Window {
     // Height of the bar above the guest screen (none in full screen).
     // Rust takes it off the size it asks the guest for.
     out property <length> bar-height: root.fullscreen ? 0px : 38px;
-    // The guest screen's width on the window (for the pointer's size).
+    // The guest screen's place on the window (the pointer's size; where a
+    // drag is over the guest).
     out property <length> screen-width: screen.width;
+    out property <length> screen-height: screen.height;
+    out property <length> screen-x: screen.x;
+    out property <length> screen-y: screen.y;
+    // Files dragged over the window: outline the screen, say what a drop
+    // does; while copying, how far along (0..1, or -1 for no bar).
+    in property <bool> drop-over;
+    in property <string> drop-text;
+    in property <float> drop-progress: -1;
     callback mouse-move(float, float);
     callback button(int, bool);
     callback wheel(length, length);
@@ -417,7 +429,7 @@ export component ConsoleWindow inherits Window {
 
     // Microphone in use, in full screen while the bar is away: a small
     // pill where it would be, so it never goes unnoticed.
-    if root.mic-on && root.fullscreen && !root.float-out: Rectangle {
+    if (root.mic-on || root.camera-on) && root.fullscreen && !root.float-out: Rectangle {
         x: (root.width - self.width) / 2;
         y: 8px;
         width: mpl.preferred-width;
@@ -437,7 +449,7 @@ export component ConsoleWindow inherits Window {
                 tint: #ef4444;
             }
             Text {
-                text: "Mic";
+                text: root.mic-on && root.camera-on ? "Cam, mic" : root.camera-on ? "Cam" : "Mic";
                 color: #ffffffd0;
                 font-size: 10px;
                 vertical-alignment: center;
@@ -514,6 +526,7 @@ export component ConsoleWindow inherits Window {
             captured: root.captured;
             fullscreen: root.fullscreen;
             mic-on: root.mic-on;
+            camera-on: root.camera-on;
             cpu-text: root.cpu-text;
             gpu-text: root.gpu-text;
             wide: true;
@@ -547,8 +560,54 @@ export component ConsoleWindow inherits Window {
             captured: root.captured;
             fullscreen: root.fullscreen;
             mic-on: root.mic-on;
+            camera-on: root.camera-on;
             wide: false;
             act(a) => { root.act(a); }
+        }
+    }
+
+    if root.drop-over: Rectangle {
+        x: screen.x;
+        y: screen.y;
+        width: screen.width;
+        height: screen.height;
+        border-width: 2px;
+        border-color: Theme.accent;
+    }
+
+    // What a drop does, then how the copy goes.
+    if root.drop-text != "": Rectangle {
+        x: (root.width - self.width) / 2;
+        y: root.height - self.height - (root.toast != "" ? 66px : 22px);
+        width: min(root.width - 40px, max(dt.preferred-width + 32px, root.drop-progress >= 0 ? 260px : 0px));
+        height: root.drop-progress >= 0 ? 44px : 36px;
+        border-radius: 18px;
+        background: #1c1c1ee6;
+        border-width: 1px;
+        border-color: #ffffff24;
+        clip: true;
+        dt := Text {
+            y: root.drop-progress >= 0 ? 8px : (parent.height - self.height) / 2;
+            x: (parent.width - self.width) / 2;
+            text: root.drop-text;
+            color: #ffffff;
+            font-size: Theme.fs-md;
+            overflow: elide;
+        }
+        if root.drop-progress >= 0: Rectangle {
+            x: 16px;
+            y: parent.height - 12px;
+            width: parent.width - 32px;
+            height: 4px;
+            border-radius: 2px;
+            background: #ffffff24;
+            Rectangle {
+                x: 0;
+                width: parent.width * clamp(root.drop-progress, 0, 1);
+                height: 100%;
+                border-radius: 2px;
+                background: Theme.accent;
+            }
         }
     }
 

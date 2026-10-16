@@ -6,6 +6,7 @@
 
 pub mod agent;
 mod audio;
+mod camera;
 mod debug;
 mod disks;
 

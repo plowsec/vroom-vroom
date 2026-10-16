@@ -28,7 +28,17 @@ pub mod features {
     /// The agent can turn the 3D display device off and on (Windows:
     /// Direct3D state can't be saved, so a suspend parks it).
     pub const GPU3D: u64 = 32;
+    /// Files dropped on the VM window land in the guest (`DragEnter`...).
+    pub const FILE_DROP: u64 = 64;
 }
+
+/// Longest relative path a drop may carry, and longest name in it.
+pub const DROP_PATH_MAX: usize = 1024;
+pub const DROP_NAME_MAX: usize = 255;
+/// Most top-level items in one drop.
+pub const DROP_ITEMS_MAX: usize = 4096;
+/// File data goes in pieces of at most this.
+pub const DROP_CHUNK: usize = 256 << 10;
 
 /// UI scales a host may ask for, in percent. 0 = "the host no longer
 /// manages the scale": the agent puts back what the guest had before.
@@ -54,6 +64,41 @@ pub enum Message {
     /// Host -> guest: turn the 3D display device off (before a suspend)
     /// or on. Guest -> host: whether it is on now.
     Gpu3d { on: bool },
+    /// Host -> guest: files are being dragged over the VM window (names
+    /// only: nothing is sent unless they are dropped). `items`: top-level
+    /// names, and whether each is a folder. The guest answers DragReady.
+    DragEnter { id: u32, items: Vec<(String, bool)> },
+    /// Guest -> host: ready for the drop. `live`: the guest runs a drag of
+    /// its own under the pointer (Windows), which the host drives with
+    /// the mouse button; otherwise the files land in a folder.
+    DragReady { id: u32, live: bool },
+    /// Host -> guest: the drag left the window or was given up.
+    DragCancel { id: u32 },
+    /// Host -> guest, after a drop: one file or folder (relative path,
+    /// '/' between names), then its data in DropData, in order.
+    DropEntry { id: u32, path: String, dir: bool, size: u64 },
+    DropData { id: u32, data: Vec<u8> },
+    /// Host -> guest: that was all of it.
+    DropEnd { id: u32 },
+    /// Guest -> host: the files are written. `place`: where they went
+    /// when there was no live drag ("Desktop"), or why it failed.
+    DropDone { id: u32, ok: bool, place: String },
+}
+
+/// Whether `p` is a path a drop may carry: relative, '/' between names,
+/// no empty, "." or ".." names, nothing Windows or a shell would read
+/// another way.
+pub fn drop_path_ok(p: &str) -> bool {
+    p.len() <= DROP_PATH_MAX && !p.is_empty() && p.split('/').all(drop_name_ok)
+}
+
+/// One name of a drop path.
+pub fn drop_name_ok(n: &str) -> bool {
+    !n.is_empty()
+        && n.len() <= DROP_NAME_MAX
+        && n != "."
+        && n != ".."
+        && !n.chars().any(|c| c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -79,6 +124,13 @@ const T_PING: u8 = 6;
 const T_PONG: u8 = 7;
 const T_SCALE: u8 = 8;
 const T_GPU3D: u8 = 9;
+const T_DRAG_ENTER: u8 = 10;
+const T_DRAG_READY: u8 = 11;
+const T_DRAG_CANCEL: u8 = 12;
+const T_DROP_ENTRY: u8 = 13;
+const T_DROP_DATA: u8 = 14;
+const T_DROP_END: u8 = 15;
+const T_DROP_DONE: u8 = 16;
 
 impl Message {
     pub fn encode(&self) -> Vec<u8> {
@@ -104,6 +156,41 @@ impl Message {
             Message::Ping(v) => (T_PING, v.to_le_bytes().to_vec()),
             Message::Pong(v) => (T_PONG, v.to_le_bytes().to_vec()),
             Message::Gpu3d { on } => (T_GPU3D, vec![*on as u8]),
+            Message::DragEnter { id, items } => {
+                let mut p = id.to_le_bytes().to_vec();
+                p.extend_from_slice(&(items.len() as u32).to_le_bytes());
+                for (name, dir) in items {
+                    p.push(*dir as u8);
+                    p.extend_from_slice(&(name.len() as u16).to_le_bytes());
+                    p.extend_from_slice(name.as_bytes());
+                }
+                (T_DRAG_ENTER, p)
+            }
+            Message::DragReady { id, live } => {
+                let mut p = id.to_le_bytes().to_vec();
+                p.push(*live as u8);
+                (T_DRAG_READY, p)
+            }
+            Message::DragCancel { id } => (T_DRAG_CANCEL, id.to_le_bytes().to_vec()),
+            Message::DropEntry { id, path, dir, size } => {
+                let mut p = id.to_le_bytes().to_vec();
+                p.push(*dir as u8);
+                p.extend_from_slice(&size.to_le_bytes());
+                p.extend_from_slice(path.as_bytes());
+                (T_DROP_ENTRY, p)
+            }
+            Message::DropData { id, data } => {
+                let mut p = id.to_le_bytes().to_vec();
+                p.extend_from_slice(data);
+                (T_DROP_DATA, p)
+            }
+            Message::DropEnd { id } => (T_DROP_END, id.to_le_bytes().to_vec()),
+            Message::DropDone { id, ok, place } => {
+                let mut p = id.to_le_bytes().to_vec();
+                p.push(*ok as u8);
+                p.extend_from_slice(place.as_bytes());
+                (T_DROP_DONE, p)
+            }
         };
         let mut out = Vec::with_capacity(HDR + payload.len());
         out.extend_from_slice(&MAGIC);
@@ -155,7 +242,42 @@ impl Message {
             T_PING if p.len() == 8 => Message::Ping(u64_at(0)?),
             T_PONG if p.len() == 8 => Message::Pong(u64_at(0)?),
             T_GPU3D if p.len() == 1 => Message::Gpu3d { on: p[0] != 0 },
-            T_TIME | T_RES | T_SCALE | T_SHUTDOWN | T_PING | T_PONG | T_GPU3D => return Err(Error::Malformed),
+            T_DRAG_ENTER => {
+                let n = u32_at(4)? as usize;
+                if n == 0 || n > DROP_ITEMS_MAX {
+                    return Err(Error::Malformed);
+                }
+                let mut items = Vec::with_capacity(n);
+                let mut o = 8;
+                for _ in 0..n {
+                    let dir = *p.get(o).ok_or(Error::Malformed)? != 0;
+                    let len = u16::from_le_bytes(p.get(o + 1..o + 3).ok_or(Error::Malformed)?.try_into().map_err(|_| Error::Malformed)?) as usize;
+                    let name = std::str::from_utf8(p.get(o + 3..o + 3 + len).ok_or(Error::Malformed)?).map_err(|_| Error::Malformed)?;
+                    if !drop_name_ok(name) {
+                        return Err(Error::Malformed);
+                    }
+                    items.push((name.to_string(), dir));
+                    o += 3 + len;
+                }
+                if o != p.len() {
+                    return Err(Error::Malformed);
+                }
+                Message::DragEnter { id: u32_at(0)?, items }
+            }
+            T_DRAG_READY if p.len() == 5 => Message::DragReady { id: u32_at(0)?, live: p[4] != 0 },
+            T_DRAG_CANCEL if p.len() == 4 => Message::DragCancel { id: u32_at(0)? },
+            T_DROP_ENTRY if p.len() > 13 => {
+                let path = std::str::from_utf8(&p[13..]).map_err(|_| Error::Malformed)?;
+                if !drop_path_ok(path) {
+                    return Err(Error::Malformed);
+                }
+                Message::DropEntry { id: u32_at(0)?, dir: p[4] != 0, size: u64_at(5)?, path: path.to_string() }
+            }
+            T_DROP_DATA if p.len() >= 4 && p.len() - 4 <= DROP_CHUNK => Message::DropData { id: u32_at(0)?, data: p[4..].to_vec() },
+            T_DROP_END if p.len() == 4 => Message::DropEnd { id: u32_at(0)? },
+            T_DROP_DONE if p.len() >= 5 => Message::DropDone { id: u32_at(0)?, ok: p[4] != 0, place: text(&p[5..])?.chars().take(256).collect() },
+            T_TIME | T_RES | T_SCALE | T_SHUTDOWN | T_PING | T_PONG | T_GPU3D | T_DRAG_READY | T_DRAG_CANCEL | T_DROP_ENTRY | T_DROP_DATA
+            | T_DROP_END | T_DROP_DONE => return Err(Error::Malformed),
             t => return Err(Error::Type(t)),
         })
     }
@@ -233,7 +355,37 @@ mod tests {
             Message::Pong(42),
             Message::Gpu3d { on: false },
             Message::Gpu3d { on: true },
+            Message::DragEnter { id: 3, items: vec![("photo.jpg".into(), false), ("Some folder".into(), true)] },
+            Message::DragReady { id: 3, live: true },
+            Message::DragCancel { id: 3 },
+            Message::DropEntry { id: 3, path: "Some folder/sub/é.txt".into(), dir: false, size: 12 },
+            Message::DropEntry { id: 3, path: "Some folder".into(), dir: true, size: 0 },
+            Message::DropData { id: 3, data: vec![1, 2, 3] },
+            Message::DropData { id: 3, data: Vec::new() },
+            Message::DropEnd { id: 3 },
+            Message::DropDone { id: 3, ok: true, place: "Desktop".into() },
         ]
+    }
+
+    #[test]
+    fn drop_paths_stay_inside() {
+        for bad in ["", "/etc/passwd", "a/../b", "..", "a//b", "a/", "./a", "C:\\x", "c:x", "a\\b", "a\nb", "x?", "con\0"] {
+            assert!(!drop_path_ok(bad), "{bad:?}");
+        }
+        for good in ["a", "a b/c.d", "photo (1).JPG", "Ünïcode/日本"] {
+            assert!(drop_path_ok(good), "{good:?}");
+        }
+        let mut f = Message::DropEntry { id: 1, path: "aa/bb".into(), dir: false, size: 1 }.encode();
+        let n = f.len();
+        // "aa/bb" -> "aa/.."
+        f[n - 1] = b'.';
+        f[n - 2] = b'.';
+        let mut d = Decoder::new(1024);
+        d.push(&f);
+        assert_eq!(d.next(), Err(Error::Malformed));
+        let mut d = Decoder::new(1 << 20);
+        d.push(&Message::DragEnter { id: 1, items: vec![("..".into(), true)] }.encode());
+        assert_eq!(d.next(), Err(Error::Malformed));
     }
 
     #[test]

@@ -96,7 +96,24 @@ it shows come from its own data dir, taken from the shared framebuffer,
 never from image files a VMM could have planted. Snapshot names from VMM
 status messages must be valid names before they become file names.
 
-## Networking
+## Drag and drop
+
+Files dragged onto a VM window are read by the app, which the user
+dragged them to, never by the VMM: its sandbox opens no file of the
+user's. The app writes them into a pipe it hands the VMM; the VMM checks
+each frame (this drop's id, file entries and data only, size-capped) and
+passes it to the guest agent. While files only hover, the guest gets
+their names and nothing else, so a guest can't read what the user merely
+dragged across its window.
+
+In the guest the agent checks every path again (relative, no `..`, no
+names Windows reads another way, under a name the drag announced) and
+writes no more bytes than each file announced. Files land in a staging
+folder of the logged-in user (their temp folder on Windows, their cache
+folder on Linux), then go where the drop lands. The drag window the agent
+puts under the pointer on Windows only starts a drag of those files.
+
+
 
 NAT is a userspace proxy: the guest never gets raw access to the host
 network stack. Host loopback is unreachable unless `allow_host_loopback`;
@@ -170,6 +187,21 @@ There is a microphone path now, off by default. How it works:
 - What the helper sends back is parsed by the VMM like guest input
   (sizes, whole frames, a generation number so audio from an earlier
   request is dropped), and at most a quarter second is buffered.
+
+### Camera
+
+Off unless `camera = true`; then there is a USB camera in the guest and a
+helper process (`vroom camera-helper`) with a Seatbelt profile of its
+own: the camera, the system's camera services and frame buffers
+(IOSurface), reading the system's libraries; no files of the user's, no
+writes, no network, no exec. The VMM never touches the camera. It asks
+the helper for frames only while a window is open and the guest reads
+them (two seconds after the guest stops, the camera goes off), and the
+window shows "Camera in use" whenever it asked. The same limit as the
+microphone applies: a guest that broke out into the VMM could ask for the
+camera while the VM runs without telling the window; macOS's green
+camera light can't be faked by it. Frames from the helper are checked
+like guest input (size, a whole frame) before they reach the guest.
 
 ## USB devices
 

@@ -684,7 +684,15 @@ pub(crate) fn build(
     // helper process (started here, before the sandbox).
     let mut input = None;
     let mut xhci = None;
-    if (screen.is_some() && board.use_pci) || !config.usb.is_empty() {
+    // The camera: a USB device on the xHCI, fed by its helper.
+    let camera = if config.camera {
+        let feed = Arc::new(vroom_devices::usb::uvc::CameraFeed::default());
+        let test = std::env::var_os("VROOM_CAMERA_TEST").is_some_and(|v| v == "1");
+        Some((crate::camera::CameraHelper::spawn(feed.clone(), test)?, feed))
+    } else {
+        None
+    };
+    if (screen.is_some() && board.use_pci) || !config.usb.is_empty() || camera.is_some() {
         let mut helpers = Vec::new();
         let mut links = Vec::new();
         for u in &config.usb {
@@ -696,7 +704,10 @@ pub(crate) fn build(
         let pci_ids = vendor_ids(&ident.usb_pci_id)?;
         board.add_pci(|slot, intx, msi| {
             let ids = UsbIds { vendor_id: ident.usb_vendor_id, manufacturer: ident.usb_manufacturer.clone() };
-            let x = Xhci::new(slot, mem2, intx, msi).with_ids(&ids).with_pci_ids(pci_ids).with_passthrough(links);
+            let mut x = Xhci::new(slot, mem2, intx, msi).with_ids(&ids).with_pci_ids(pci_ids).with_passthrough(links);
+            if let Some((_, feed)) = &camera {
+                x = x.with_camera(vroom_devices::usb::uvc::Camera::new(&ids, feed.clone()));
+            }
             let x = Arc::new(Mutex::new(x));
             xhci = Some(x.clone());
             x
@@ -704,6 +715,9 @@ pub(crate) fn build(
         if let Some(x) = &xhci {
             for (i, h) in helpers.into_iter().enumerate() {
                 h.run(i, x.clone())?;
+            }
+            if let Some((c, _)) = &camera {
+                c.run(x.clone())?;
             }
         }
     }
@@ -728,14 +742,29 @@ pub(crate) fn build(
         None => clipboard,
     };
     let max_pixels = if config.guest_os() == GuestOs::Windows { agent::WINDOWS_MAX_PIXELS } else { 0 };
-    let agent = agent::spawn(host_end, config.clipboard.clone(), clipboard, agent::Screen { gpu: gpu_ctl.clone(), max_pixels, gpu3d: config.display.gpu == Gpu::Virtio3d })?;
     let viewer = ui.as_ref().map(|d| d.tx());
+    let screen_ctl = agent::Screen { gpu: gpu_ctl.clone(), max_pixels, gpu3d: config.display.gpu == Gpu::Virtio3d, viewer: viewer.clone() };
+    let agent = agent::spawn(host_end, config.clipboard.clone(), clipboard, screen_ctl)?;
     if let Some(ds) = ui {
         if screen.is_none() {
             return Err(Error::Setup("a viewer needs a display (display.gpu or UEFI boot)".into()));
         }
-        // The microphone gate closes with the window.
-        let window = audio.map(|a| Box::new(move |open| a.set_window(open)) as Box<dyn Fn(bool) + Send + Sync>);
+        // The microphone and camera gates close with the window.
+        let cam = camera.as_ref().map(|(c, _)| c.clone());
+        if let Some(c) = &cam {
+            c.set_viewer(ds.tx());
+            c.set_window(true);
+        }
+        let window = (audio.is_some() || cam.is_some()).then(|| {
+            Box::new(move |open| {
+                if let Some(a) = &audio {
+                    a.set_window(open);
+                }
+                if let Some(c) = &cam {
+                    c.set_window(open);
+                }
+            }) as Box<dyn Fn(bool) + Send + Sync>
+        });
         // A viewer can come back (the app crashed, then started again).
         let listener = match (viewer_socket(&env.state_dir), &screen) {
             (Ok(l), Some(fb)) => Some((l, fb.clone())),

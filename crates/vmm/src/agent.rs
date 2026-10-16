@@ -17,6 +17,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use vroom_config::Clipboard as ClipPolicy;
 use vroom_proto::{features, Decoder, Message, SCALE_MAX, SCALE_MIN};
+use vroom_display::ToViewer;
 use vroom_virtio::devices::gpu::GpuControl;
 
 /// Host clipboard access, provided by the frontend.
@@ -26,7 +27,7 @@ pub trait ClipboardProvider: Send {
 }
 
 /// Commands from the frontend.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum AgentCmd {
     /// The VM window gained/lost focus (enables automatic sync).
     Focus(bool),
@@ -44,6 +45,11 @@ pub enum AgentCmd {
     /// Turn the guest's 3D display device on or off (Windows, around a
     /// suspend: Direct3D state can't be saved).
     Gpu3d(bool),
+    /// Files are dragged over the window (names only; see vroom-proto).
+    DragEnter { id: u32, items: Vec<(String, bool)> },
+    DragCancel { id: u32 },
+    /// Dropped: the viewer writes them into this pipe, as agent frames.
+    Drop { id: u32, from: std::os::fd::OwnedFd },
     Stop,
 }
 
@@ -81,6 +87,8 @@ impl Agent {
 
 struct Service {
     stream: UnixStream,
+    /// Writes to the guest: ours, and a drop's (frame by frame).
+    out: Arc<Mutex<UnixStream>>,
     policy: ClipPolicy,
     clip: Option<Box<dyn ClipboardProvider>>,
     rx: Receiver<AgentCmd>,
@@ -114,6 +122,8 @@ pub struct Screen {
     /// device is asked to have it on whenever it connects (a suspend
     /// turned it off, and the VM may have been resumed, or killed).
     pub gpu3d: bool,
+    /// The window, for answers about dropped files.
+    pub(crate) viewer: Option<crate::display::ViewerTx>,
 }
 
 /// Windows' virtio-gpu driver (viogpudo) sizes its framebuffer when it
@@ -127,8 +137,10 @@ pub fn spawn(stream: UnixStream, policy: ClipPolicy, clip: Option<Box<dyn Clipbo
     let status = Arc::new(Mutex::new(AgentStatus::default()));
     stream.set_read_timeout(Some(POLL))?;
     let max = policy.max_bytes as usize + 64;
+    let out = Arc::new(Mutex::new(stream.try_clone()?));
     let svc = Service {
         stream,
+        out,
         policy,
         clip,
         rx,
@@ -149,7 +161,13 @@ pub fn spawn(stream: UnixStream, policy: ClipPolicy, clip: Option<Box<dyn Clipbo
 
 impl Service {
     fn send(&mut self, m: &Message) {
-        let _ = self.stream.write_all(&m.encode());
+        let _ = self.out.lock().unwrap_or_else(|e| e.into_inner()).write_all(&m.encode());
+    }
+
+    fn to_viewer(&self, m: ToViewer) {
+        if let Some(v) = &self.screen.viewer {
+            v.send(&m);
+        }
     }
 
     fn hello(&mut self) {
@@ -218,6 +236,12 @@ impl Service {
             Message::Gpu3d { on } => {
                 log::info!("guest: 3D display device {}", if on { "on" } else { "off" });
                 self.status.lock().unwrap_or_else(|e| e.into_inner()).gpu3d = Some(on);
+            }
+            Message::DragReady { id, live } => self.to_viewer(ToViewer::DragReady { id, live }),
+            Message::DropDone { id, ok, place } => {
+                let place: String = place.chars().filter(|c| !c.is_control()).take(200).collect();
+                log::info!("guest: drop {id} {}{place}", if ok { "done " } else { "failed: " });
+                self.to_viewer(ToViewer::DropDone { id, ok, place });
             }
             // Host-bound only; a guest sending these is ignored.
             _ => {}
@@ -335,9 +359,91 @@ impl Service {
                 self.status.lock().unwrap_or_else(|e| e.into_inner()).gpu3d = None;
                 self.send(&Message::Gpu3d { on });
             }
+            AgentCmd::DragEnter { id, items } => {
+                let s = self.status();
+                let why = if !s.connected {
+                    Some("no guest agent is running")
+                } else if s.features & features::FILE_DROP == 0 {
+                    Some("the guest agent is too old for drag and drop (update the vroom tools in the guest)")
+                } else if items.is_empty() || items.len() > vroom_proto::DROP_ITEMS_MAX || !items.iter().all(|(n, _)| vroom_proto::drop_name_ok(n)) {
+                    Some("a name the guest can't take")
+                } else {
+                    None
+                };
+                match why {
+                    Some(w) => self.to_viewer(ToViewer::DropDone { id, ok: false, place: w.into() }),
+                    None => self.send(&Message::DragEnter { id, items }),
+                }
+            }
+            AgentCmd::DragCancel { id } => self.send(&Message::DragCancel { id }),
+            AgentCmd::Drop { id, from } => {
+                let out = self.out.clone();
+                let r = std::thread::Builder::new().name("agent-drop".into()).spawn(move || forward_drop(id, from, &out));
+                if r.is_err() {
+                    self.send(&Message::DragCancel { id });
+                }
+            }
             AgentCmd::Stop => {}
         }
     }
+}
+
+impl Service {
+    fn status(&self) -> AgentStatus {
+        self.status.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+/// Pass a drop's frames from the viewer's pipe to the guest, checked:
+/// only this drop's entries, data and end. A pipe that ends early (the
+/// viewer gave up, or went) cancels it in the guest.
+fn forward_drop(id: u32, from: std::os::fd::OwnedFd, out: &Mutex<UnixStream>) {
+    let mut from = std::fs::File::from(from);
+    let mut dec = Decoder::new(vroom_proto::DROP_CHUNK + vroom_proto::DROP_PATH_MAX + 64);
+    let mut buf = vec![0u8; vroom_proto::DROP_CHUNK];
+    let (mut bytes, t0) = (0u64, Instant::now());
+    let send = |m: &Message| out.lock().unwrap_or_else(|e| e.into_inner()).write_all(&m.encode());
+    loop {
+        let n = match from.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        dec.push(&buf[..n]);
+        loop {
+            let m = match dec.next() {
+                Ok(Some(m)) => m,
+                Ok(None) => break,
+                Err(e) => {
+                    log::warn!("drop {id}: bad frame from the viewer: {e}");
+                    let _ = send(&Message::DragCancel { id });
+                    return;
+                }
+            };
+            let ok = match &m {
+                Message::DropEntry { id: i, .. } => *i == id,
+                Message::DropData { id: i, data } => {
+                    bytes += data.len() as u64;
+                    *i == id
+                }
+                Message::DropEnd { id: i } => *i == id,
+                _ => false,
+            };
+            if !ok {
+                log::warn!("drop {id}: unexpected frame from the viewer");
+                let _ = send(&Message::DragCancel { id });
+                return;
+            }
+            if send(&m).is_err() {
+                return;
+            }
+            if matches!(m, Message::DropEnd { .. }) {
+                log::info!("drop {id}: {bytes} bytes to the guest in {:?}", t0.elapsed());
+                return;
+            }
+        }
+    }
+    log::info!("drop {id}: given up by the viewer");
+    let _ = send(&Message::DragCancel { id });
 }
 
 /// What the guest gets for a window of `w` x `h` at `scale`: its size,
@@ -428,6 +534,48 @@ mod tests {
         let m = read_msgs(&mut guest, &mut d);
         assert!(m.contains(&Message::SetResolution { width: 3456, height: 2234 }), "{m:?}");
         assert!(m.contains(&Message::SetScale { percent: 200 }), "{m:?}");
+        a.send(AgentCmd::Stop);
+    }
+
+    #[test]
+    fn drops_reach_the_guest_checked() {
+        let (host, mut guest) = UnixStream::pair().unwrap();
+        let a = spawn(host, ClipPolicy::default(), None, Screen::default()).unwrap();
+        let mut d = Decoder::new(1 << 20);
+        read_msgs(&mut guest, &mut d);
+        let items = vec![("a.txt".to_string(), false)];
+        // No agent that takes drops yet: nothing goes to the guest.
+        a.send(AgentCmd::DragEnter { id: 1, items: items.clone() });
+        assert!(read_msgs(&mut guest, &mut d).is_empty());
+        guest.write_all(&Message::Hello { features: features::FILE_DROP, agent: "t".into() }.encode()).unwrap();
+        read_msgs(&mut guest, &mut d);
+        a.send(AgentCmd::DragEnter { id: 2, items: items.clone() });
+        a.send(AgentCmd::DragEnter { id: 3, items: vec![("../x".into(), false)] });
+        assert_eq!(read_msgs(&mut guest, &mut d), vec![Message::DragEnter { id: 2, items }]);
+
+        let frames = [
+            Message::DropEntry { id: 2, path: "a.txt".into(), dir: false, size: 3 },
+            Message::DropData { id: 2, data: b"abc".to_vec() },
+            Message::DropEnd { id: 2 },
+        ];
+        let (r, mut w) = UnixStream::pair().unwrap();
+        for f in &frames {
+            w.write_all(&f.encode()).unwrap();
+        }
+        drop(w);
+        a.send(AgentCmd::Drop { id: 2, from: r.into() });
+        assert_eq!(read_msgs(&mut guest, &mut d), frames.to_vec());
+
+        // Another drop's frames, or anything else, cancel it.
+        let (r, mut w) = UnixStream::pair().unwrap();
+        w.write_all(&Message::DropEntry { id: 9, path: "a".into(), dir: false, size: 0 }.encode()).unwrap();
+        a.send(AgentCmd::Drop { id: 4, from: r.into() });
+        assert_eq!(read_msgs(&mut guest, &mut d), vec![Message::DragCancel { id: 4 }]);
+        // So does a pipe that ends early.
+        let (r, w) = UnixStream::pair().unwrap();
+        drop(w);
+        a.send(AgentCmd::Drop { id: 5, from: r.into() });
+        assert_eq!(read_msgs(&mut guest, &mut d), vec![Message::DragCancel { id: 5 }]);
         a.send(AgentCmd::Stop);
     }
 

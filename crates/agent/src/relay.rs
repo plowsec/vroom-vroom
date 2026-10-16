@@ -4,7 +4,8 @@
 //! unprivileged helper in the console session, over a local pipe.
 //!
 //! The helper is less trusted than the service: it may only send
-//! clipboard text towards the host, size-capped like everything else.
+//! clipboard text and answers about dropped files towards the host,
+//! size-capped like everything else.
 
 use std::io::{self, Write};
 use std::sync::mpsc::Receiver;
@@ -116,12 +117,22 @@ impl<S: System> Relay<S> {
                 self.send_helper(&m);
             }
             m @ Message::ClipboardText(_) => self.send_helper(&m),
+            // Dropped files are written by the user, in their session.
+            Message::DragEnter { id, .. } if self.helper.is_none() => {
+                let place = "nobody is logged in to the guest".to_string();
+                host.write_all(&Message::DropDone { id, ok: false, place }.encode())?;
+            }
+            m @ (Message::DragEnter { .. }
+            | Message::DragCancel { .. }
+            | Message::DropEntry { .. }
+            | Message::DropData { .. }
+            | Message::DropEnd { .. }) => self.send_helper(&m),
             Message::Gpu3d { on } => {
                 if let Some(on) = self.sys.gpu3d(on) {
                     host.write_all(&Message::Gpu3d { on }.encode())?;
                 }
             }
-            Message::Pong(_) => {}
+            Message::Pong(_) | Message::DragReady { .. } | Message::DropDone { .. } => {}
         }
         Ok(())
     }
@@ -146,6 +157,7 @@ impl<S: System> Relay<S> {
                 Ok(Some(Message::ClipboardText(t))) if t.len() <= self.max => {
                     host.write_all(&Message::ClipboardText(t).encode())?;
                 }
+                Ok(Some(m @ (Message::DragReady { .. } | Message::DropDone { .. }))) => host.write_all(&m.encode())?,
                 Ok(Some(_)) => log::debug!("session helper {id}: ignoring a message it may not send"),
                 Ok(None) => return Ok(()),
                 Err(e) => {
@@ -285,6 +297,24 @@ mod tests {
         let clips: Vec<_> = out.iter().filter_map(|m| if let Message::ClipboardText(t) = m { Some(t.clone()) } else { None }).collect();
         assert_eq!(clips, vec!["copied".to_string()]);
         assert!(seen.lock().unwrap().shutdown.is_empty());
+    }
+
+    #[test]
+    fn drops_go_to_the_helper_or_fail_without_one() {
+        let (out, _) = run(vec![host(Message::DragEnter { id: 1, items: vec![("a".into(), false)] })]);
+        assert!(matches!(&out[1], Message::DropDone { id: 1, ok: false, .. }));
+        let helper = Sink::default();
+        let (out, _) = run(vec![
+            Ev::HelperUp(1, Box::new(helper.clone())),
+            host(Message::DragEnter { id: 2, items: vec![("a".into(), false)] }),
+            host(Message::DropEntry { id: 2, path: "a".into(), dir: false, size: 1 }),
+            host(Message::DropData { id: 2, data: vec![9] }),
+            host(Message::DropEnd { id: 2 }),
+            Ev::Helper(1, Message::DragReady { id: 2, live: true }.encode()),
+            Ev::Helper(1, Message::DropDone { id: 2, ok: true, place: String::new() }.encode()),
+        ]);
+        assert_eq!(helper.msgs().len(), 4);
+        assert_eq!(out[1..], [Message::DragReady { id: 2, live: true }, Message::DropDone { id: 2, ok: true, place: String::new() }]);
     }
 
     #[test]

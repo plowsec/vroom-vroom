@@ -8,6 +8,8 @@ pub const POINTER_MAX: u16 = 32767;
 pub const SCALE_MIN: u32 = 100;
 pub const SCALE_MAX: u32 = 500;
 const MAX_MSG: usize = 16 << 20;
+/// Most names a drag may carry.
+pub const DRAG_ITEMS_MAX: usize = 4096;
 /// Biggest guest pointer picture, in pixels on a side.
 pub const CURSOR_MAX: u32 = 256;
 
@@ -26,8 +28,17 @@ pub enum ToViewer {
     Closed,
     /// The guest is recording from the host microphone (true) or stopped.
     Mic(bool),
+    /// The host camera is on for the guest (true) or off.
+    Camera(bool),
     /// The guest's pointer, for the viewer to show as its own.
     Cursor(GuestCursor),
+    /// The guest is ready for files dragged over the window (`DragEnter`).
+    /// `live`: it runs a drag of its own under the pointer, which the
+    /// viewer drives with the mouse button; else the files go to a folder.
+    DragReady { id: u32, live: bool },
+    /// The dropped files are in the guest (`ok`), or why not. `place`:
+    /// where they went, without a live drag.
+    DropDone { id: u32, ok: bool, place: String },
 }
 
 /// What the guest's pointer looks like.
@@ -74,6 +85,14 @@ pub enum ToVmm {
     /// Host clipboard changed (only sent while focused).
     Clipboard(String),
     Command(Command),
+    /// Files are dragged over the window: their top-level names, and
+    /// whether each is a folder. Nothing else goes until they are dropped.
+    DragEnter { id: u32, items: Vec<(String, bool)> },
+    /// The drag left the window, or the drop was given up.
+    DragCancel { id: u32 },
+    /// Dropped: comes with a pipe (SCM_RIGHTS) the viewer writes the
+    /// files into, as guest agent frames (DropEntry, DropData, DropEnd).
+    Drop { id: u32 },
 }
 
 fn frame(ty: u8, payload: &[u8]) -> Vec<u8> {
@@ -114,6 +133,18 @@ impl ToViewer {
                 p.extend_from_slice(rgba);
                 frame(7, &p)
             }
+            ToViewer::Camera(on) => frame(10, &[*on as u8]),
+            ToViewer::DragReady { id, live } => {
+                let mut p = id.to_le_bytes().to_vec();
+                p.push(*live as u8);
+                frame(8, &p)
+            }
+            ToViewer::DropDone { id, ok, place } => {
+                let mut p = id.to_le_bytes().to_vec();
+                p.push(*ok as u8);
+                p.extend_from_slice(place.as_bytes());
+                frame(9, &p)
+            }
         }
     }
 
@@ -142,6 +173,9 @@ impl ToViewer {
                 }
                 _ => return Err(Error::Proto("unknown cursor")),
             }),
+            10 => ToViewer::Camera(*p.first().ok_or(Error::Proto("short"))? != 0),
+            8 if p.len() == 5 => ToViewer::DragReady { id: get_u32(p, 0)?, live: p[4] != 0 },
+            9 if p.len() >= 5 => ToViewer::DropDone { id: get_u32(p, 0)?, ok: p[4] != 0, place: text(&p[5..])?.chars().take(256).collect() },
             _ => return Err(Error::Proto("unknown viewer message")),
         })
     }
@@ -158,6 +192,17 @@ impl ToVmm {
             ToVmm::Focus(f) => frame(6, &[*f as u8]),
             ToVmm::Clipboard(s) => frame(7, s.as_bytes()),
             ToVmm::Command(c) => frame(8, &[*c as u8]),
+            ToVmm::DragEnter { id, items } => {
+                let mut p = id.to_le_bytes().to_vec();
+                for (name, dir) in items {
+                    p.push(*dir as u8);
+                    p.extend_from_slice(&(name.len() as u16).to_le_bytes());
+                    p.extend_from_slice(name.as_bytes());
+                }
+                frame(9, &p)
+            }
+            ToVmm::DragCancel { id } => frame(10, &id.to_le_bytes()),
+            ToVmm::Drop { id } => frame(11, &id.to_le_bytes()),
         }
     }
 
@@ -191,6 +236,23 @@ impl ToVmm {
                 Some(6) => Command::Suspend,
                 _ => return Err(Error::Proto("unknown command")),
             }),
+            9 => {
+                let id = get_u32(p, 0)?;
+                let mut items = Vec::new();
+                let mut o = 4;
+                while o < p.len() {
+                    let len = u16::from_le_bytes(p.get(o + 1..o + 3).ok_or(Error::Proto("short"))?.try_into().map_err(|_| Error::Proto("short"))?) as usize;
+                    let name = text(p.get(o + 3..o + 3 + len).ok_or(Error::Proto("short"))?)?;
+                    items.push((name, p[o] != 0));
+                    o += 3 + len;
+                }
+                if items.is_empty() || items.len() > DRAG_ITEMS_MAX {
+                    return Err(Error::Proto("drag items"));
+                }
+                ToVmm::DragEnter { id, items }
+            }
+            10 if p.len() == 4 => ToVmm::DragCancel { id: get_u32(p, 0)? },
+            11 if p.len() == 4 => ToVmm::Drop { id: get_u32(p, 0)? },
             _ => return Err(Error::Proto("unknown vmm message")),
         })
     }
@@ -257,6 +319,9 @@ mod tests {
             ToVmm::Focus(true),
             ToVmm::Clipboard("x".into()),
             ToVmm::Command(Command::Snapshot),
+            ToVmm::DragEnter { id: 4, items: vec![("a.txt".into(), false), ("dir".into(), true)] },
+            ToVmm::DragCancel { id: 4 },
+            ToVmm::Drop { id: 4 },
         ];
         let mut d = Decoder::default();
         for m in &vm {
@@ -273,6 +338,9 @@ mod tests {
             ToViewer::Cursor(GuestCursor::Hidden),
             ToViewer::Cursor(GuestCursor::Image { w: 2, h: 1, hot_x: 1, hot_y: 0, rgba: vec![1, 2, 3, 4, 5, 6, 7, 8] }),
             ToViewer::Cursor(GuestCursor::Unset),
+            ToViewer::DragReady { id: 4, live: true },
+            ToViewer::Camera(true),
+            ToViewer::DropDone { id: 4, ok: false, place: "Desktop".into() },
         ];
         for m in &v {
             d.push(&m.encode());

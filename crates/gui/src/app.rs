@@ -42,6 +42,9 @@ struct PaletteEntry {
 pub struct App {
     ui: AppWindow,
     lib: Library,
+    /// When `library.toml` last changed: another window (a VM opened by
+    /// its file) may add to it.
+    lib_mtime: Option<std::time::SystemTime>,
     vms: Vec<Vm>,
     current: Option<usize>,
     live_thumbs: HashMap<String, slint::Image>,
@@ -178,7 +181,9 @@ impl App {
         wire(&ui);
         let timer = slint::Timer::default();
         timer.start(slint::TimerMode::Repeated, TICK, || msg::send(Msg::Tick));
+        let lib_mtime = std::fs::metadata(paths::library_file()).and_then(|m| m.modified()).ok();
         let mut app = App {
+            lib_mtime,
             ui,
             current: (!vms.is_empty()).then_some(0),
             vms,
@@ -645,6 +650,7 @@ impl App {
             usb_host: model(usb_host),
             audio: c.audio.output,
             audio_in: c.audio.input,
+            camera: c.camera,
             clip_in: c.clipboard.host_to_guest,
             clip_out: c.clipboard.guest_to_host,
             clip_max_kib: s((c.clipboard.max_bytes / 1024).to_string()),
@@ -722,12 +728,16 @@ impl App {
                 (0, _) => "Nothing shared".to_string(),
                 (n, w) => format!("{n} folder{}{}", if n == 1 { "" } else { "s" }, if w { ", guest can write" } else { ", read-only" }),
             }),
-            sum_sound: s(match (c.audio.output, c.audio.input) {
-                (false, false) => "Off",
-                (true, false) => "Plays through this machine's speakers",
-                (false, true) => "Microphone only",
-                (true, true) => "Speakers and microphone",
-            }),
+            sum_sound: s(format!(
+                "{}{}",
+                match (c.audio.output, c.audio.input) {
+                    (false, false) => "Off",
+                    (true, false) => "Plays through this machine's speakers",
+                    (false, true) => "Microphone only",
+                    (true, true) => "Speakers and microphone",
+                },
+                if c.camera { ", camera" } else { "" }
+            )),
             sum_clip: s(match (c.clipboard.host_to_guest, c.clipboard.guest_to_host) {
                 (true, true) => "Both ways",
                 (true, false) => "To the guest only",
@@ -764,7 +774,7 @@ impl App {
             net: any || hit("network net nat bridged host-only hostonly port forward forwarding ssh mac address interface internet lan localhost loopback adapter"),
             share: any || hit("shared folders share folder virtiofs mount files tag"),
             usb: any || hit("usb devices device passthrough serial adapter security key phone dongle"),
-            sound: any || hit("sound audio speakers music output microphone mic input"),
+            sound: any || hit("sound audio speakers music output microphone mic input camera webcam video call"),
             clip: any || hit("clipboard copy paste"),
             security: any || hit("security sandbox tpm transport mmio pci serial console identity fingerprint hardware maker vendor model product smbios acpi hide vm detection"),
             boot: any || hit("boot uefi firmware kernel initrd cmdline command line nvram efi"),
@@ -786,7 +796,7 @@ impl App {
     // ---- periodic ----
 
     fn tick(&mut self) {
-        let mut changed = false;
+        let mut changed = self.follow_library();
         for v in &mut self.vms {
             if v.changed_on_disk() {
                 v.reload();
@@ -1383,6 +1393,35 @@ impl App {
         }
     }
 
+    /// Pick up VMs another window added to the list (and drop ones it
+    /// took out, unless they run here).
+    fn follow_library(&mut self) -> bool {
+        let m = std::fs::metadata(paths::library_file()).and_then(|m| m.modified()).ok();
+        if m == self.lib_mtime {
+            return false;
+        }
+        self.lib_mtime = m;
+        let lib = Library::load(&paths::library_file());
+        if lib.error.is_some() {
+            return false;
+        }
+        let before = self.vms.len();
+        let cur = self.current.and_then(|i| self.vms.get(i)).map(|v| v.path.clone());
+        self.vms.retain(|v| lib.vms.contains(&v.path) || console::is_running(&v.key));
+        let removed = self.vms.len() != before;
+        for p in &lib.vms {
+            if !self.vms.iter().any(|v| &v.path == p) {
+                self.vms.push(Vm::open(p));
+            }
+        }
+        let theme = self.lib.theme.clone();
+        self.lib = lib;
+        self.lib.theme = theme;
+        self.current = cur.and_then(|c| self.vms.iter().position(|v| v.path == c)).or((!self.vms.is_empty()).then_some(0));
+        self.last_settings = None;
+        removed || self.vms.len() != before
+    }
+
     fn add_vm(&mut self, p: &Path) {
         let p = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
         if let Some(i) = self.vms.iter().position(|v| v.path == p) {
@@ -1720,6 +1759,24 @@ mod tests {
 
     fn names(a: &App) -> Vec<String> {
         a.vms.iter().map(Vm::name).collect()
+    }
+
+    #[test]
+    fn a_vm_another_window_adds_shows_up() {
+        let (t, mut a) = app(&["one"]);
+        let p = t.path().join("two.toml");
+        std::fs::write(&p, VM.replace("NAME", "two")).unwrap();
+        // What `vroom-gui two.toml` does in its own process.
+        let mut lib = Library::load(&paths::library_file());
+        assert!(lib.add(&p));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        lib.save().unwrap();
+        a.tick();
+        assert_eq!(names(&a), vec!["one", "two"]);
+        // The window's settings button finds its page.
+        let key = a.vms[1].key.clone();
+        a.update(Msg::ShowLibrary(Some(key)));
+        assert_eq!(a.current, Some(1));
     }
 
     fn act(a: &mut App, s: &str) {

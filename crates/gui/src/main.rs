@@ -5,6 +5,7 @@
 
 mod app;
 mod console;
+mod dnd;
 mod edit;
 mod fmt;
 mod host;
@@ -75,6 +76,16 @@ fn main() {
         Some(config) => {
             let extra: Vec<String> = args.collect();
             let p = std::path::PathBuf::from(config);
+            // The same name the library uses for it, and in the library:
+            // a VM opened by its file shows in the list, and the window's
+            // settings button finds its page.
+            let p = std::fs::canonicalize(&p).unwrap_or(p);
+            let mut lib = library::Library::load(&paths::library_file());
+            if lib.add(&p) {
+                if let Err(e) = lib.save() {
+                    eprintln!("vroom-gui: library: {e}");
+                }
+            }
             vroom_config::VmConfig::load(&p).map_err(|e| e.to_string()).and_then(|cfg| console::start(&p, &cfg, &extra).map(|_| ()))
         }
     };

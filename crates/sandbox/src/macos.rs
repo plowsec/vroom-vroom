@@ -139,6 +139,35 @@ pub fn audio_profile(exe: &Path, wav_dir: Option<&Path>, input: bool) -> Result<
     Ok(s)
 }
 
+/// Profile for the camera helper: AVFoundation's client side, the camera
+/// services and frame buffers (IOSurface), the camera itself. No files
+/// beyond the system, no network, no exec, no writes.
+pub fn camera_profile(exe: &Path) -> Result<String> {
+    let exe_real = exe.canonicalize().unwrap_or_else(|_| exe.to_path_buf());
+    Ok(format!(
+        r#"(version 1)
+(deny default)
+(allow process-exec (literal {exe}))
+(allow file-read* (literal {exe}) (subpath "/usr/lib") (subpath "/System") (subpath "/Library/Apple")
+  (subpath "/Library/CoreMediaIO") (literal "/dev/urandom") (literal "/dev/null")
+  (literal "/private/etc/localtime") (subpath "/private/var/db/timezone"))
+(allow file-read-metadata)
+(allow file-read-data (literal "/"))
+(allow sysctl-read)
+(allow signal (target self))
+(allow mach-task-name (target self))
+(allow device-camera)
+(allow mach-lookup (global-name-regex #"^com\.apple\.cmio\.") (global-name "com.apple.tccd") (global-name "com.apple.tccd.system")
+  (global-name "com.apple.coremedia.capturesession") (global-name "com.apple.coremedia.capturesource")
+  (global-name "com.apple.CoreServices.coreservicesd") (global-name "com.apple.lsd.mapdb"))
+(allow iokit-get-properties)
+(allow iokit-open (iokit-user-client-class "IOSurfaceRootUserClient" "IOUserClient"))
+(allow ipc-posix-shm-read-data ipc-posix-shm-read-metadata)
+"#,
+        exe = q(&exe_real)?,
+    ))
+}
+
 /// Profile for the USB helper: libusb (from Homebrew or /usr/local), the
 /// IOKit registry, and the USB device and interface user clients. No
 /// files beyond the system and libusb, no network, no exec, no other

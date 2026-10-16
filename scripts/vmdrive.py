@@ -8,6 +8,8 @@ Commands, one per line, on <state-dir>.cmd (a fifo):
   shot                   screendump (path shows in <state-dir>.log)
   resize W H | focus 0|1 | clip TEXT | cmd N | quit
   serial TEXT            to the serial console (\\n for Enter)
+  drop X Y X2 Y2 PATH... drag files in at X,Y, move to X2,Y2, drop there
+                         (what the app does when files come from Finder)
 Viewer events (mode, clipboard, status, mic, guest pointer: its picture as
 <state-dir>.cursor-N.png) go to <state-dir>.events.
 """
@@ -58,6 +60,13 @@ def reader():
                 ev.write("closed\n")
             elif t == 6:
                 ev.write(f"mic {pl[0]}\n")
+            elif t == 8:
+                i, live = struct.unpack("<IB", pl[:5]); ev.write(f"dragready {i} {live}\n")
+                drag_ev.append(("ready", i, live)); drag_cv.set()
+            elif t == 9:
+                i, ok = struct.unpack("<IB", pl[:5]); place = pl[5:].decode(errors="replace")
+                ev.write(f"dropdone {i} {ok} {place}\n")
+                drag_ev.append(("done", i, ok)); drag_cv.set()
             elif t == 7:
                 if pl[0] != 2:
                     ev.write("cursor " + ("unset", "hidden")[pl[0]] + "\n"); continue
@@ -66,6 +75,7 @@ def reader():
                 png = f"{state}.cursor-{cursors[0]}.png"
                 write_png(png, w, h, pl[17:])
                 ev.write(f"cursor {w}x{h} hot {hx},{hy} {png}\n")
+drag_ev, drag_cv = [], threading.Event()
 threading.Thread(target=reader, daemon=True).start()
 
 def send(t, payload):
@@ -98,6 +108,62 @@ def type_text(s):
         if sh: key(42, True)
         key(code, True); key(code, False)
         if sh: key(42, False)
+
+def agent_frame(t, payload):
+    return b"VR\x01" + bytes([t]) + struct.pack("<I", len(payload)) + payload
+
+def wait_drag(kind, i, secs):
+    end = time.time() + secs
+    while time.time() < end:
+        for e in list(drag_ev):
+            if e[1] == i and e[0] in kind:
+                drag_ev.remove(e); return e
+        drag_cv.wait(0.1); drag_cv.clear()
+    return None
+
+drop_id = [100]
+def drop(x, y, x2, y2, paths):
+    drop_id[0] += 1; i = drop_id[0]
+    move(x, y)
+    items = b"".join(bytes([os.path.isdir(q)]) + struct.pack("<H", len(os.path.basename(q).encode())) + os.path.basename(q).encode() for q in paths)
+    send(9, u32s(i) + items)
+    e = wait_drag(("ready", "done"), i, 10)
+    ev.write(f"drop {i}: guest says {e}\n")
+    if e is None or e[0] == "done":
+        return
+    live = e[2]
+    if live:
+        button(0x110, True)
+    for k in range(1, 11):
+        move(x + (x2 - x) * k // 10, y + (y2 - y) * k // 10); time.sleep(0.05)
+    if os.path.exists(state + ".dropshot"):  # screenshot mid-drag (tests)
+        p.stdin.write(b"\x01g"); p.stdin.flush(); time.sleep(1.5)
+    r, w = socket.socketpair()
+    socket.send_fds(a, [struct.pack("<BI", 11, 4) + u32s(i)], [r.fileno()]); r.close()
+    def writer():
+        def walk(path, rel):
+            if os.path.isdir(path):
+                w.sendall(agent_frame(13, u32s(i) + b"\x01" + struct.pack("<Q", 0) + rel.encode()))
+                for n in sorted(os.listdir(path)):
+                    walk(os.path.join(path, n), rel + "/" + n)
+            elif os.path.isfile(path):
+                size = os.path.getsize(path)
+                w.sendall(agent_frame(13, u32s(i) + b"\x00" + struct.pack("<Q", size) + rel.encode()))
+                with open(path, "rb") as f:
+                    while True:
+                        d = f.read(256 << 10)
+                        if not d: break
+                        w.sendall(agent_frame(14, u32s(i) + d))
+        t0 = time.time()
+        for q in paths:
+            walk(q, os.path.basename(q))
+        w.sendall(agent_frame(15, u32s(i))); w.close()
+        ev.write(f"drop {i}: sent in {time.time() - t0:.1f}s\n")
+    threading.Thread(target=writer, daemon=True).start()
+    e = wait_drag(("done",), i, 600)
+    ev.write(f"drop {i}: done {e}\n")
+    if live:
+        button(0x110, False)
 
 send(6, b"\x01")  # focused: lets clipboard flow
 import select
@@ -141,6 +207,9 @@ if True:
                 elif c == "clip": send(7, arg.encode())
                 elif c == "cmd": send(8, bytes([int(arg)]))
                 elif c == "serial": p.stdin.write(arg.replace("\\n", "\r").encode()); p.stdin.flush()
+                elif c == "drop":
+                    v = arg.split(" ", 4)
+                    drop(int(v[0]), int(v[1]), int(v[2]), int(v[3]), v[4].split("|"))
                 elif c == "quit": p.stdin.write(b"\x01x"); p.stdin.flush()
             except Exception as e:
                 ev.write(f"error {line.strip()}: {e}\n")
