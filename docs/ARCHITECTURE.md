@@ -131,6 +131,11 @@ own, into a pixel buffer on the GPU, and shown when the copy lands while
 the worker goes on. Windows' Direct3D frames are blobs in the render
 server's shared memory that the guest never maps: a flush reads them
 through a read-only mapping of that memory, made on first use.
+Windows only lists the modes a monitor offered when it was plugged in,
+and viogpu3d reports a plug only when the scanout's enabled flag changes:
+once a Neptune context exists, a resize reports scanout 0 disabled, then
+enabled at the new size (checked and retried until Windows shows it), and
+the guest agent is asked for the mode after that.
 
 Direct3D state can't be saved. A suspend or snapshot of a Windows guest
 using it first asks the guest agent to turn the 3D display device off

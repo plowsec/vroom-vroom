@@ -355,6 +355,15 @@ What works and what doesn't (Windows 11 24H2, M3 Max):
 - Once, on the first boot with 3D, Settings lost its text in parts it
   didn't just redraw (pointing at it brought it back). Not seen again in
   later runs; if it happens, closing and reopening the app fixes it.
+- Windows follows the window's size and the Retina scale as with the 2D
+  driver. The 3D driver only takes a new size from a monitor that is
+  plugged in again, so on each resize vroom unplugs Windows' virtual
+  monitor and plugs it back in: the screen goes black for a moment and
+  windows stay where they were. At the login screen Windows uses its UI
+  scale from before (100%), so with `hidpi` text there is small until you
+  log in.
+- With the 3D driver installed, `gpu = "virtio2d"` gets Windows' basic
+  display driver (800x600, no resizing); install viogpudo again to use 2D.
 - No Direct3D 12, no Vulkan or OpenGL for Windows apps.
 - Suspend and snapshots work, a few seconds slower than without 3D.
   Direct3D's state lives on the Mac's GPU and can't be saved, so vroom

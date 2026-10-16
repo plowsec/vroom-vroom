@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use vroom_memory::{GuestAddress, GuestMemory};
 use serde::{Deserialize, Serialize};
@@ -132,6 +132,70 @@ struct Shared {
     irq: Option<Arc<dyn VirtioInterrupt>>,
     /// The guest has Direct3D contexts (Windows), which can't be saved.
     direct3d: bool,
+    /// Windows' Direct3D driver (viogpu3d) runs the display. It offers a
+    /// new size as a mode, but Windows hides modes its monitor didn't list
+    /// when it was plugged in, so a resize there unplugs the monitor and
+    /// plugs it back in with the new size (see `GpuControl::resize`).
+    replug: bool,
+    plug: Plug,
+    /// Replugs done for the current size, and in all.
+    tries: u32,
+    replugs: u32,
+    /// What the guest shows on scanout 0.
+    shown: (u32, u32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Plug {
+    In,
+    /// Unplugged, to come back at this size. `seen`: the guest cleared the
+    /// event, so its next read of the display info is the one that finds
+    /// the monitor gone.
+    Out { size: (u32, u32), seen: bool, since: Instant },
+    /// Back in since then: the guest should switch to the new size. A
+    /// resize meanwhile waits (`next`): Windows picks its mode on its own
+    /// time, and a replug in the middle of that leaves it at 1024x768.
+    Back { since: Instant, next: Option<(u32, u32)> },
+}
+
+/// Unplugged this long, the guest gets its monitor back anyway.
+const REPLUG_TIMEOUT: Duration = Duration::from_secs(3);
+/// Early in boot Windows sometimes lets a replug pass without looking at
+/// the monitor again. Not at the new size this long after: try again.
+const REPLUG_CHECK: Duration = Duration::from_secs(2);
+const REPLUG_TRIES: u32 = 3;
+/// Time Windows gets to pick its mode after a replug, before the guest
+/// agent is asked for the size.
+const REPLUG_SETTLE: Duration = Duration::from_millis(500);
+
+impl Shared {
+    fn new(width: u32, height: u32) -> Self {
+        Shared { width, height, events_read: 0, irq: None, direct3d: false, replug: false, plug: Plug::In, tries: 0, replugs: 0, shown: (0, 0) }
+    }
+
+    fn display_event(&mut self) {
+        self.events_read |= EVENT_DISPLAY;
+        if let Some(irq) = &self.irq {
+            irq.signal_config_changed();
+        }
+    }
+
+    fn unplug(&mut self, size: (u32, u32)) {
+        log::debug!("gpu: replugging the monitor for {}x{}", size.0, size.1);
+        self.tries += 1;
+        self.replugs = self.replugs.wrapping_add(1);
+        self.plug = Plug::Out { size, seen: false, since: Instant::now() };
+        self.display_event();
+    }
+
+    /// End a replug: the monitor is back, at the size asked for last.
+    fn plug_back(&mut self) {
+        if let Plug::Out { size, .. } = self.plug {
+            (self.width, self.height) = size;
+        }
+        self.plug = Plug::Back { since: Instant::now(), next: None };
+        self.display_event();
+    }
 }
 
 impl std::fmt::Debug for Shared {
@@ -151,14 +215,71 @@ impl GpuControl {
             return;
         }
         let mut s = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if (s.width, s.height) == (width, height) {
+        let current = (s.width, s.height);
+        match &mut s.plug {
+            Plug::Out { size, .. } => {
+                // Mid-replug: come back with this size instead.
+                *size = (width, height);
+                s.tries = 1;
+                return;
+            }
+            Plug::Back { next, .. } => {
+                *next = ((width, height) != current).then_some((width, height));
+                return;
+            }
+            Plug::In => {}
+        }
+        if current == (width, height) {
+            return;
+        }
+        s.tries = 0;
+        if s.replug {
+            // The guest reads the unplugged monitor, clears the event, then
+            // reads it again to see what is connected: that second read
+            // brings it back (GET_DISPLAY_INFO).
+            s.unplug((width, height));
             return;
         }
         s.width = width;
         s.height = height;
-        s.events_read |= EVENT_DISPLAY;
-        if let Some(irq) = &s.irq {
-            irq.signal_config_changed();
+        s.display_event();
+    }
+
+    /// Replugs so far, once the last one has had time to take: the guest's
+    /// agent should set the mode after each (a mode Windows' monitor
+    /// doesn't list yet can't be set). None while one runs.
+    pub fn replugs_done(&self) -> Option<u32> {
+        let s = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        match s.plug {
+            Plug::In => Some(s.replugs),
+            Plug::Back { since, .. } if s.shown == (s.width, s.height) || since.elapsed() >= REPLUG_SETTLE => Some(s.replugs),
+            _ => None,
+        }
+    }
+
+    /// Call now and then: follows up on replugs.
+    pub fn tick(&self) {
+        let mut s = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        match s.plug {
+            Plug::Out { since, .. } if since.elapsed() > REPLUG_TIMEOUT => {
+                log::warn!("gpu: the guest didn't take its monitor's unplug in; plugging it back");
+                s.plug_back();
+            }
+            Plug::Back { since, next } if s.shown == (s.width, s.height) || since.elapsed() > REPLUG_CHECK => {
+                if let Some(size) = next {
+                    s.tries = 0;
+                    s.unplug(size);
+                } else if s.shown == (s.width, s.height) {
+                    s.plug = Plug::In;
+                } else if s.tries < REPLUG_TRIES {
+                    let size = (s.width, s.height);
+                    s.unplug(size);
+                } else {
+                    log::info!("gpu: the guest stays at {}x{}, not {}x{}", s.shown.0, s.shown.1, s.width, s.height);
+                    s.plug = Plug::In;
+                }
+            }
+            _ => {}
         }
     }
 
@@ -213,7 +334,7 @@ impl std::fmt::Debug for Gpu {
 
 impl Gpu {
     pub fn new(width: u32, height: u32, sink: Arc<dyn DisplaySink>) -> (Self, GpuControl) {
-        let shared = Arc::new(Mutex::new(Shared { width, height, events_read: 0, irq: None, direct3d: false }));
+        let shared = Arc::new(Mutex::new(Shared::new(width, height)));
         (Gpu { shared: shared.clone(), sink, three_d: None, worker: WorkerSlot::default() }, GpuControl(shared))
     }
 
@@ -577,11 +698,23 @@ impl GpuHandler {
     fn command(&mut self, mem: &GuestMemory, r: &mut Reader, hdr: &Hdr) -> (u32, Vec<u8>) {
         match hdr.ty {
             GET_DISPLAY_INFO => {
-                let s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+                let mut s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
                 let mut b = vec![0u8; 16 * 24];
-                b[8..12].copy_from_slice(&s.width.to_le_bytes());
-                b[12..16].copy_from_slice(&s.height.to_le_bytes());
-                b[16..20].copy_from_slice(&1u32.to_le_bytes()); // enabled
+                match s.plug {
+                    Plug::Out { seen, .. } => {
+                        log::debug!("gpu: display info: unplugged");
+                        if seen {
+                            // The guest has seen the monitor go: bring it back.
+                            s.plug_back();
+                        }
+                    }
+                    _ => {
+                        log::debug!("gpu: display info: {}x{}", s.width, s.height);
+                        b[8..12].copy_from_slice(&s.width.to_le_bytes());
+                        b[12..16].copy_from_slice(&s.height.to_le_bytes());
+                        b[16..20].copy_from_slice(&1u32.to_le_bytes()); // enabled
+                    }
+                }
                 (OK_DISPLAY_INFO, b)
             }
             RESOURCE_CREATE_2D => match self.three_d.clone() {
@@ -672,6 +805,9 @@ impl GpuHandler {
                     return (ERR_UNSPEC, vec![]);
                 }
                 self.contexts.push(hdr.ctx);
+                if capset == CAPSET_NEPTUNE {
+                    self.shared.lock().unwrap_or_else(|e| e.into_inner()).replug = true;
+                }
                 let gl = (capset == 1 || capset == CAPSET_VIRGL2).then(GlState::default);
                 self.ctx_info.insert(hdr.ctx, CtxInfo { capset, name: name[..n].to_vec(), attached: Default::default(), gl });
                 self.note_direct3d();
@@ -1118,6 +1254,7 @@ impl GpuHandler {
 
     fn set_mode(&mut self, w: u32, h: u32) {
         if self.mode != (w, h) {
+            self.shared.lock().unwrap_or_else(|e| e.into_inner()).shown = (w, h);
             self.mode = (w, h);
             self.sink.set_mode(w, h);
         }
@@ -1723,7 +1860,11 @@ impl VirtioDevice for Gpu {
     fn write_config(&mut self, offset: u64, data: &[u8]) {
         if offset == 4 && data.len() == 4 {
             let v = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-            self.shared.lock().unwrap_or_else(|e| e.into_inner()).events_read &= !v;
+            let mut s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+            s.events_read &= !v;
+            if let (Plug::Out { seen, .. }, true) = (&mut s.plug, v & EVENT_DISPLAY != 0) {
+                *seen = true;
+            }
         }
     }
     fn shm_regions(&self) -> Vec<(u8, u64)> {
@@ -1748,6 +1889,12 @@ impl VirtioDevice for Gpu {
         let mut s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
         s.irq = None;
         s.direct3d = false;
+        // The next driver starts with the monitor plugged in.
+        s.replug = false;
+        if let Plug::Out { size, .. } | Plug::Back { next: Some(size), .. } = s.plug {
+            (s.width, s.height) = size;
+        }
+        s.plug = Plug::In;
         drop(s);
         self.sink.set_mode(0, 0);
         self.sink.cursor(&Cursor::Unset);
@@ -2158,5 +2305,91 @@ mod tests {
         assert_eq!(swizzle(67), Some([2, 1, 0, 3]));
         assert_eq!(swizzle(68), Some([1, 2, 3, 0]));
         assert_eq!(swizzle(999), None);
+    }
+
+    /// GET_DISPLAY_INFO: (width, height, enabled) of scanout 0.
+    fn display_info(h: &mut GpuHandler) -> (u32, u32, u32) {
+        use crate::queue::tests::*;
+        let mut ring = TestRing::new(4);
+        ring.add_chain(&[(4, false)]);
+        let mem = ring.mem.clone();
+        let (mut r, _) = ring.q.clone().pop(&mem).unwrap().unwrap().into_rw().unwrap();
+        let hdr = Hdr { ty: GET_DISPLAY_INFO, flags: 0, fence: 0, ctx: 0, ring: 0 };
+        let (ty, b) = h.command(&mem, &mut r, &hdr);
+        assert_eq!(ty, OK_DISPLAY_INFO);
+        let u = |i: usize| u32::from_le_bytes(b[i..i + 4].try_into().unwrap());
+        (u(8), u(12), u(16))
+    }
+
+    fn events(gpu: &Gpu) -> u32 {
+        let mut c = [0u8; 4];
+        gpu.read_config(0, &mut c);
+        u32::from_le_bytes(c)
+    }
+
+    /// What the guest's driver does on a display event: read, clear, read.
+    fn driver_reads(gpu: &mut Gpu, h: &mut GpuHandler) -> (u32, u32, u32) {
+        assert_eq!(events(gpu), EVENT_DISPLAY);
+        display_info(h);
+        gpu.write_config(4, &EVENT_DISPLAY.to_le_bytes());
+        display_info(h)
+    }
+
+    #[test]
+    fn resize_is_a_display_event() {
+        let (mut gpu, ctl) = Gpu::new(1280, 800, Arc::new(Rec::default()));
+        let mut h = gpu.handler();
+        assert_eq!(display_info(&mut h), (1280, 800, 1));
+        ctl.resize(1440, 900);
+        assert_eq!(driver_reads(&mut gpu, &mut h), (1440, 900, 1));
+        assert_eq!(events(&gpu), 0);
+        assert_eq!(ctl.replugs_done(), Some(0));
+    }
+
+    #[test]
+    fn windows_3d_driver_gets_its_monitor_replugged() {
+        let (mut gpu, ctl) = Gpu::new(1280, 800, Arc::new(Rec::default()));
+        let mut h = gpu.handler();
+        gpu.shared.lock().unwrap().replug = true;
+        ctl.resize(1440, 900);
+        assert_eq!(ctl.replugs_done(), None);
+        // Read, clear, read: the second read finds it unplugged and plugs
+        // it back in, with another event.
+        assert_eq!(driver_reads(&mut gpu, &mut h), (0, 0, 0));
+        assert_eq!(driver_reads(&mut gpu, &mut h), (1440, 900, 1));
+        // A resize while Windows picks its mode waits for it.
+        ctl.resize(1600, 1000);
+        assert_eq!(events(&gpu), 0);
+        assert_eq!(ctl.replugs_done(), None);
+        h.set_mode(1440, 900);
+        assert_eq!(ctl.replugs_done(), Some(1));
+        ctl.tick();
+        // Mid-replug: it comes back with the latest size.
+        ctl.resize(1700, 1050);
+        assert_eq!(driver_reads(&mut gpu, &mut h), (0, 0, 0));
+        assert_eq!(driver_reads(&mut gpu, &mut h), (1700, 1050, 1));
+        // Windows let it pass: after a while it's tried again, a few times.
+        let ago = Instant::now() - REPLUG_CHECK - Duration::from_millis(1);
+        for _ in 1..REPLUG_TRIES {
+            gpu.shared.lock().unwrap().plug = Plug::Back { since: ago, next: None };
+            assert_eq!(ctl.replugs_done(), Some(gpu.shared.lock().unwrap().replugs));
+            ctl.tick();
+            assert_eq!(driver_reads(&mut gpu, &mut h), (0, 0, 0));
+            assert_eq!(driver_reads(&mut gpu, &mut h), (1700, 1050, 1));
+        }
+        gpu.shared.lock().unwrap().plug = Plug::Back { since: ago, next: None };
+        ctl.tick();
+        assert_eq!(events(&gpu), 0, "gave up");
+        assert_eq!(gpu.shared.lock().unwrap().plug, Plug::In);
+        // A guest that never reads gets its monitor back.
+        ctl.resize(800, 600);
+        gpu.shared.lock().unwrap().plug = Plug::Out { size: (800, 600), seen: false, since: Instant::now() - REPLUG_TIMEOUT - Duration::from_millis(1) };
+        ctl.tick();
+        assert_eq!(display_info(&mut h), (800, 600, 1));
+        // A new driver (reset) starts plugged in, without replugs.
+        ctl.resize(1024, 768);
+        gpu.reset();
+        assert_eq!(display_info(&mut h), (1024, 768, 1));
+        assert!(!gpu.shared.lock().unwrap().replug);
     }
 }

@@ -95,6 +95,11 @@ struct Service {
     screen: Screen,
     /// The window's last size request, redone when an agent connects.
     display: Option<(u32, u32, u32)>,
+    /// What the guest agent gets for it, sent once the GPU is ready (after
+    /// a replug, see `GpuControl::replugs_done`), and the replug count it
+    /// was last sent at.
+    mode: Vec<Message>,
+    mode_sent: Option<u32>,
 }
 
 /// The monitor whose size the window drives. Resizes go through the agent
@@ -135,6 +140,8 @@ pub fn spawn(stream: UnixStream, policy: ClipPolicy, clip: Option<Box<dyn Clipbo
         host_seen: None,
         screen,
         display: None,
+        mode: Vec::new(),
+        mode_sent: None,
     };
     std::thread::Builder::new().name("agent".into()).spawn(move || svc.run())?;
     Ok(Agent { tx, status })
@@ -176,6 +183,10 @@ impl Service {
                     Err(TryRecvError::Empty) => break,
                 }
             }
+            if let Some(g) = &self.screen.gpu {
+                g.tick();
+            }
+            self.send_mode();
             if self.focus {
                 self.auto_push();
             }
@@ -224,9 +235,26 @@ impl Service {
         if let Some(g) = &self.screen.gpu {
             g.resize(w, h);
         }
-        self.send(&Message::SetResolution { width: w, height: h });
-        if let Some(p) = set_scale {
-            self.send(&Message::SetScale { percent: p });
+        self.mode = vec![Message::SetResolution { width: w, height: h }];
+        self.mode.extend(set_scale.map(|p| Message::SetScale { percent: p }));
+        self.mode_sent = None;
+        self.send_mode();
+    }
+
+    fn send_mode(&mut self) {
+        let n = match &self.screen.gpu {
+            Some(g) => match g.replugs_done() {
+                Some(n) => n,
+                None => return,
+            },
+            None => 0,
+        };
+        if self.mode.is_empty() || self.mode_sent == Some(n) {
+            return;
+        }
+        self.mode_sent = Some(n);
+        for m in self.mode.clone() {
+            self.send(&m);
         }
     }
 
