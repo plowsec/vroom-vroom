@@ -98,3 +98,59 @@ pub fn cpu_time(pid: u32) -> Option<std::time::Duration> {
 pub fn cpu_time(_pid: u32) -> Option<std::time::Duration> {
     None
 }
+
+/// Stop the VMM that holds `state_dir`: it hangs, or runs without a window
+/// that can come back. Asks first (SIGTERM), then pulls the plug (SIGKILL)
+/// if it's still there 3 s later. Only ever a `vroom` process: the pid
+/// comes from a file the guest's VMM can write.
+#[allow(unsafe_code)]
+pub fn force_stop(state_dir: &std::path::Path) -> Result<(), String> {
+    let pid = vroom_state::StateLock::holder(state_dir).ok_or("it isn't running")?;
+    if exe_name(pid).as_deref() != Some("vroom") {
+        return Err("the process using it isn't vroom".into());
+    }
+    // SAFETY: plain signal to a checked pid.
+    if unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) } != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let dir = state_dir.to_path_buf();
+    std::thread::spawn(move || {
+        for _ in 0..30 {
+            if !vroom_state::StateLock::in_use(&dir) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if vroom_state::StateLock::holder(&dir) == Some(pid) && exe_name(pid).as_deref() == Some("vroom") {
+            // SAFETY: as above, still the same vroom process.
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        }
+        crate::msg::post(|| crate::msg::Msg::Refresh);
+    });
+    Ok(())
+}
+
+/// The file name of a process's executable.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn exe_name(pid: u32) -> Option<String> {
+    let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: the buffer is as large as the call allows.
+    let n = unsafe { libc::proc_pidpath(pid as libc::c_int, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    if n <= 0 {
+        return None;
+    }
+    let p = std::path::PathBuf::from(String::from_utf8_lossy(&buf[..n as usize]).into_owned());
+    p.file_name().map(|f| f.to_string_lossy().into_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn exe_name(pid: u32) -> Option<String> {
+    let p = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    p.file_name().map(|f| f.to_string_lossy().into_owned())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn exe_name(_pid: u32) -> Option<String> {
+    None
+}

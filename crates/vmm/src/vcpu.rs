@@ -57,7 +57,10 @@ pub enum VmEvent {
     Crashed(String),
     /// Lifecycle request from the viewer window.
     Ui(vroom_display::Command),
+    /// The viewer went away without asking for anything (it crashed).
     ViewerClosed,
+    /// A viewer (re)connected through the state dir's socket.
+    ViewerAttached,
 }
 
 /// Shared by all vCPU threads.

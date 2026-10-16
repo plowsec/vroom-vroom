@@ -6,8 +6,8 @@
 //! also drives the GPU's size), lifecycle commands to the main loop.
 
 use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::net::{UnixDatagram, UnixStream};
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -28,30 +28,99 @@ use crate::vcpu::VmEvent;
 /// last told), so a viewer that stops reading costs us at most a handful
 /// of queued messages, never a stall, and one that keeps up only converts
 /// what changed.
+///
+/// The viewer can go (the app crashed) and another come (the app again):
+/// what a newcomer needs to catch up is kept (`Sticky`).
 #[derive(Clone)]
 pub(crate) struct ViewerTx {
     q: std::sync::mpsc::Sender<ToViewer>,
     /// x0, y0, x1, y1 not yet sent; Some means a marker is queued.
     damage: Arc<Mutex<Option<[u32; 4]>>>,
+    /// The viewer now, if any.
+    sock: Arc<Mutex<Option<UnixStream>>>,
+    sticky: Arc<Mutex<Sticky>>,
+}
+
+/// The last word on each thing a viewer shows: a new one gets these first.
+#[derive(Default)]
+struct Sticky {
+    mode: Option<(u32, u32)>,
+    cursor: Option<GuestCursor>,
+    mic: Option<bool>,
+    /// Running, paused, or why a suspend failed.
+    state: Option<String>,
+    /// "guest agent connected (...)".
+    agent: Option<String>,
 }
 
 impl ViewerTx {
-    fn spawn(mut sock: UnixStream) -> std::io::Result<Self> {
+    fn spawn(sock: Option<UnixStream>) -> std::io::Result<Self> {
         let (q, rx) = std::sync::mpsc::channel::<ToViewer>();
         let damage = Arc::new(Mutex::new(None::<[u32; 4]>));
         let pending = damage.clone();
+        let sock = Arc::new(Mutex::new(sock));
+        let out = sock.clone();
         std::thread::Builder::new().name("viewer-tx".into()).spawn(move || {
             while let Ok(mut m) = rx.recv() {
                 if matches!(m, ToViewer::Damage { .. }) {
                     let Some([x0, y0, x1, y1]) = pending.lock().unwrap_or_else(|e| e.into_inner()).take() else { continue };
                     m = ToViewer::Damage { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
                 }
-                if sock.write_all(&m.encode()).is_err() {
-                    break;
+                let mut s = out.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(v) = s.as_mut() {
+                    if v.write_all(&m.encode()).is_err() {
+                        *s = None;
+                    }
                 }
             }
         })?;
-        Ok(ViewerTx { q, damage })
+        Ok(ViewerTx { q, damage, sock, sticky: Arc::default() })
+    }
+
+    /// A viewer is connected.
+    pub fn attached(&self) -> bool {
+        self.sock.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
+
+    fn detach(&self) {
+        *self.sock.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// A new viewer: the framebuffer first (as at start), then what it
+    /// missed, then everything from here on.
+    fn attach(&self, mut v: UnixStream, fb: RawFd) -> std::io::Result<()> {
+        let mut s = self.sock.lock().unwrap_or_else(|e| e.into_inner());
+        send_fd(&v, fb).map_err(|e| std::io::Error::other(e.to_string()))?;
+        let st = self.sticky.lock().unwrap_or_else(|e| e.into_inner());
+        let mut first = Vec::new();
+        if let Some((width, height)) = st.mode {
+            first.push(ToViewer::Mode { width, height });
+            first.push(ToViewer::Damage { x: 0, y: 0, w: width, h: height });
+        }
+        first.extend(st.cursor.clone().map(ToViewer::Cursor));
+        first.extend(st.mic.map(ToViewer::Mic));
+        first.extend(st.agent.clone().map(ToViewer::Status));
+        first.extend(st.state.clone().map(ToViewer::Status));
+        drop(st);
+        for m in first {
+            v.write_all(&m.encode())?;
+        }
+        *s = Some(v);
+        Ok(())
+    }
+
+    fn remember(&self, m: &ToViewer) {
+        let mut st = self.sticky.lock().unwrap_or_else(|e| e.into_inner());
+        match m {
+            ToViewer::Mode { width, height } => st.mode = Some((*width, *height)),
+            ToViewer::Cursor(c) => st.cursor = Some(c.clone()),
+            ToViewer::Mic(on) => st.mic = Some(*on),
+            ToViewer::Status(t) if t == "running" || t == "paused" || t.starts_with("suspend failed") || t.starts_with("host disk almost full") => {
+                st.state = Some(t.clone())
+            }
+            ToViewer::Status(t) if t.starts_with("guest agent connected") => st.agent = Some(t.clone()),
+            _ => {}
+        }
     }
 
     pub fn send(&self, m: &ToViewer) {
@@ -68,6 +137,7 @@ impl ViewerTx {
             }
             return;
         }
+        self.remember(m);
         let _ = self.q.send(m.clone());
     }
 }
@@ -315,7 +385,7 @@ fn to_hid(m: &ToVmm) -> Option<HidEvent> {
 
 impl DisplayServer {
     pub fn new(stream: UnixStream) -> std::io::Result<Self> {
-        let tx = ViewerTx::spawn(stream.try_clone()?)?;
+        let tx = ViewerTx::spawn(Some(stream.try_clone()?))?;
         Ok(DisplayServer { stream, tx, clip_latest: Arc::new(Mutex::new(None)) })
     }
 
@@ -339,44 +409,86 @@ impl DisplayServer {
         self.tx.clone()
     }
 
-    /// Start reading viewer input.
+    /// Start reading viewer input. `window(open)`: the microphone gate,
+    /// open while a viewer is there. With `listener`, a later viewer
+    /// (the app restarted after a crash) can take over: one at a time.
     pub fn run(
         self,
         input: Option<InputPipes>,
         agent: Agent,
         events: Sender<VmEvent>,
-        on_close: Option<Box<dyn FnOnce() + Send>>,
+        window: Option<Box<dyn Fn(bool) + Send + Sync>>,
+        listener: Option<(UnixListener, Arc<FbSink>)>,
     ) -> std::io::Result<()> {
-        let mut stream = self.stream;
-        let latest = self.clip_latest;
-        std::thread::Builder::new().name("display".into()).spawn(move || {
-            let mut dec = Decoder::default();
-            let mut buf = vec![0u8; 64 << 10];
-            loop {
-                let n = match stream.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => n,
-                };
-                dec.push(&buf[..n]);
-                loop {
-                    match dec.next_to_vmm() {
-                        Ok(Some(m)) => handle(m, input.as_ref(), &agent, &events, &latest),
-                        Ok(None) => break,
-                        Err(e) => {
-                            log::warn!("display: {e}");
-                            break;
-                        }
+        let ctx = Arc::new(Serve { input, agent, events, window, latest: self.clip_latest, tx: self.tx });
+        let c = ctx.clone();
+        let first = self.stream;
+        std::thread::Builder::new().name("display".into()).spawn(move || serve(first, &c))?;
+        if let Some((l, sink)) = listener {
+            std::thread::Builder::new().name("viewer-listen".into()).spawn(move || {
+                for v in l.incoming() {
+                    let Ok(v) = v else { continue };
+                    if ctx.tx.attached() {
+                        // Someone is watching already.
+                        let _ = v.shutdown(std::net::Shutdown::Both);
+                        continue;
                     }
+                    let Ok(r) = v.try_clone() else { continue };
+                    if let Err(e) = ctx.tx.attach(v, sink.fb.fd().as_raw_fd()) {
+                        log::warn!("display: viewer: {e}");
+                        continue;
+                    }
+                    log::info!("viewer attached");
+                    if let Some(w) = &ctx.window {
+                        w(true);
+                    }
+                    let _ = ctx.events.send(VmEvent::ViewerAttached);
+                    let c = ctx.clone();
+                    let _ = std::thread::Builder::new().name("display".into()).spawn(move || serve(r, &c));
                 }
-            }
-            log::info!("viewer disconnected");
-            if let Some(f) = on_close {
-                f();
-            }
-            let _ = events.send(VmEvent::ViewerClosed);
-        })?;
+            })?;
+        }
         Ok(())
     }
+}
+
+/// What every viewer connection shares.
+struct Serve {
+    input: Option<InputPipes>,
+    agent: Agent,
+    events: Sender<VmEvent>,
+    window: Option<Box<dyn Fn(bool) + Send + Sync>>,
+    latest: Arc<Mutex<Option<String>>>,
+    tx: ViewerTx,
+}
+
+/// Read one viewer's input until it goes away.
+fn serve(mut stream: UnixStream, c: &Serve) {
+    let mut dec = Decoder::default();
+    let mut buf = vec![0u8; 64 << 10];
+    loop {
+        let n = match stream.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        dec.push(&buf[..n]);
+        loop {
+            match dec.next_to_vmm() {
+                Ok(Some(m)) => handle(m, c.input.as_ref(), &c.agent, &c.events, &c.latest),
+                Ok(None) => break,
+                Err(e) => {
+                    log::warn!("display: {e}");
+                    break;
+                }
+            }
+        }
+    }
+    log::info!("viewer disconnected");
+    c.tx.detach();
+    if let Some(w) = &c.window {
+        w(false);
+    }
+    let _ = c.events.send(VmEvent::ViewerClosed);
 }
 
 fn send_events(sock: &Option<UnixDatagram>, evs: &[[u8; 8]]) {
@@ -452,9 +564,50 @@ mod tests {
     }
 
     #[test]
+    fn a_viewer_that_comes_later_catches_up() {
+        let tx = ViewerTx::spawn(None).unwrap();
+        tx.send(&ToViewer::Mode { width: 64, height: 32 });
+        tx.send(&ToViewer::Status("guest agent connected (t)".into()));
+        tx.send(&ToViewer::Status("running".into()));
+        tx.send(&ToViewer::Status("paused".into()));
+        tx.send(&ToViewer::Status("snapshot: /x".into()));
+        tx.send(&ToViewer::Mic(true));
+        let (a, b) = UnixStream::pair().unwrap();
+        let (pa, _pb) = UnixStream::pair().unwrap();
+        assert!(!tx.attached());
+        tx.attach(a, pa.as_raw_fd()).unwrap();
+        assert!(tx.attached());
+        // The screen first, as at start.
+        vroom_display::recv_fd(&b).unwrap();
+        b.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut d = vroom_display::Decoder::default();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 4096];
+        while got.len() < 5 {
+            let n = (&b).read(&mut buf).unwrap();
+            d.push(&buf[..n]);
+            while let Ok(Some(m)) = d.next_to_viewer() {
+                got.push(m);
+            }
+        }
+        assert_eq!(
+            got,
+            vec![
+                ToViewer::Mode { width: 64, height: 32 },
+                ToViewer::Damage { x: 0, y: 0, w: 64, h: 32 },
+                ToViewer::Mic(true),
+                ToViewer::Status("guest agent connected (t)".into()),
+                ToViewer::Status("paused".into()),
+            ]
+        );
+        tx.detach();
+        assert!(!tx.attached());
+    }
+
+    #[test]
     fn damage_is_merged_not_lost() {
         let (a, mut b) = UnixStream::pair().unwrap();
-        let tx = ViewerTx::spawn(a).unwrap();
+        let tx = ViewerTx::spawn(Some(a)).unwrap();
         for (x, y) in [(10, 20), (300, 5), (40, 400)] {
             tx.send(&ToViewer::Damage { x, y, w: 8, h: 8 });
         }
@@ -484,7 +637,7 @@ mod tests {
     fn the_guest_pointer_goes_with_the_gpu_picture() {
         let (a, mut b) = UnixStream::pair().unwrap();
         let fb = SharedFb::create().unwrap();
-        let s = FbSink { fb, mode: Mutex::new((0, 0)), arb: Mutex::default(), tx: Some(ViewerTx::spawn(a).unwrap()) };
+        let s = FbSink { fb, mode: Mutex::new((0, 0)), arb: Mutex::default(), tx: Some(ViewerTx::spawn(Some(a)).unwrap()) };
         let t0 = Instant::now();
         s.set_mode(4, 2);
         let img = Cursor::Image { w: 1, h: 1, hot_x: 0, hot_y: 0, rgba: vec![1, 2, 3, 4] };

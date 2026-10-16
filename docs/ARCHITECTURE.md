@@ -137,6 +137,16 @@ once a Neptune context exists, a resize reports scanout 0 disabled, then
 enabled at the new size (checked and retried until Windows shows it), and
 the guest agent is asked for the mode after that.
 
+The viewer can come and go. The VMM a window starts also listens on a
+socket in the user's temp dir (`$TMPDIR/vroom/<hash of the state dir>.sock`,
+0600 in a 0700 dir; the state dir's `viewer` file names it; socket paths
+are too short for state dirs). A window that goes without asking for a
+suspend (the app crashed) leaves the VM running; the next app connects,
+gets the framebuffer and what it missed (mode, pointer, state, agent),
+then everything as usual. One viewer at a time. No viewer for 5 minutes:
+the VMM suspends. The state lock holds the VMM's pid, so the app can stop
+one that hangs (only a process whose executable is `vroom`).
+
 Direct3D state can't be saved. A suspend or snapshot of a Windows guest
 using it first asks the guest agent to turn the 3D display device off
 (SetupAPI, like Device Manager); the VMM waits until the guest has no

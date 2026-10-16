@@ -240,6 +240,36 @@ impl BootImage {
     }
 }
 
+/// Where the app finds a VM whose window it lost: a socket in the user's
+/// own temp dir (socket paths can't be long, state dirs can), named after
+/// the state dir, whose `viewer` file says where it is.
+pub(crate) const VIEWER_FILE: &str = "viewer";
+
+fn viewer_socket(state_dir: &std::path::Path) -> std::io::Result<std::os::unix::net::UnixListener> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    let dir = std::env::temp_dir().join("vroom");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    let real = std::fs::canonicalize(state_dir).unwrap_or_else(|_| state_dir.to_path_buf());
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in real.as_os_str().as_bytes() {
+        h = (h ^ *b as u64).wrapping_mul(0x100_0000_01b3);
+    }
+    let p = dir.join(format!("{h:016x}.sock"));
+    // One left by a VMM that died: we hold the state lock, so it's stale.
+    if let Ok(m) = std::fs::symlink_metadata(&p) {
+        if !m.file_type().is_socket() {
+            return Err(std::io::Error::other(format!("{} is not a socket", p.display())));
+        }
+        std::fs::remove_file(&p)?;
+    }
+    let l = std::os::unix::net::UnixListener::bind(&p)?;
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::write(state_dir.join(VIEWER_FILE), p.as_os_str().as_bytes())?;
+    Ok(l)
+}
+
 /// Host-visible window size for GPU buffers (address space, not memory).
 const GPU_SHM_SIZE: u64 = 8 << 30;
 
@@ -658,8 +688,17 @@ pub(crate) fn build(
             return Err(Error::Setup("a viewer needs a display (display.gpu or UEFI boot)".into()));
         }
         // The microphone gate closes with the window.
-        let on_close = audio.map(|a| Box::new(move || a.set_window(false)) as Box<dyn FnOnce() + Send>);
-        ds.run(input, agent.clone(), events.clone(), on_close)?;
+        let window = audio.map(|a| Box::new(move |open| a.set_window(open)) as Box<dyn Fn(bool) + Send + Sync>);
+        // A viewer can come back (the app crashed, then started again).
+        let listener = match (viewer_socket(&env.state_dir), &screen) {
+            (Ok(l), Some(fb)) => Some((l, fb.clone())),
+            (Err(e), _) => {
+                log::warn!("display: no viewer socket in the state dir ({e}): a window lost can't be reopened");
+                None
+            }
+            _ => None,
+        };
+        ds.run(input, agent.clone(), events.clone(), window, listener)?;
     }
     for (i, n) in config.nets.iter().enumerate() {
         let mac = match &n.mac {

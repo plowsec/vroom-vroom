@@ -344,8 +344,8 @@ impl Vmm {
 
     /// Save a full snapshot. The VM keeps running afterwards.
     pub fn snapshot(&mut self, dir: &Path, description: &str) -> Result<()> {
-        let parked = self.park_direct3d()?;
         let was_running = self.state == RunState::Running;
+        let parked = self.park_direct3d()?;
         self.pause()?;
         let r = snapshot::save(self, dir, description, snapshot::Kind::Snapshot);
         if was_running {
@@ -364,7 +364,7 @@ impl Vmm {
     /// connects, or right after a snapshot. Whether it was parked.
     fn park_direct3d(&mut self) -> Result<bool> {
         let Some(gpu) = self.gpu.clone() else { return Ok(false) };
-        if !gpu.direct3d() || self.state != RunState::Running {
+        if !gpu.direct3d() || self.state == RunState::Stopped {
             return Ok(false);
         }
         let s = self.agent.status();
@@ -373,12 +373,21 @@ impl Vmm {
                 "Windows draws with Direct3D, and its vroom agent can't turn 3D off for the save (not running, or too old). Update the vroom tools in Windows".into(),
             ));
         }
+        // A paused guest can't do it: let it run for that (the caller
+        // pauses it again to save).
+        let paused = self.state == RunState::Paused;
+        if paused {
+            self.resume()?;
+        }
         log::info!("turning the guest's 3D display off for the save");
         self.agent.send(agent::AgentCmd::Gpu3d(false));
         let deadline = Instant::now() + PARK_TIMEOUT;
         while gpu.direct3d() || self.agent.status().gpu3d != Some(false) {
             if Instant::now() > deadline {
                 self.agent.send(agent::AgentCmd::Gpu3d(true));
+                if paused {
+                    self.pause()?;
+                }
                 return Err(Error::CantSave("Windows didn't turn its 3D display off in time".into()));
             }
             std::thread::sleep(Duration::from_millis(50));

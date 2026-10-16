@@ -140,7 +140,13 @@ struct Session {
     agent_sessions: u32,
     next_space_check: std::time::Instant,
     low_space: u64,
+    /// The window went away unasked (the app crashed): when. The VM keeps
+    /// going for the app to come back; after `VIEWER_GRACE` it's suspended.
+    viewer_lost: Option<std::time::Instant>,
 }
+
+/// How long a VM whose app crashed keeps running for the app to return.
+const VIEWER_GRACE: Duration = Duration::from_secs(300);
 
 /// Below this, guest writes could fail half-way: pause first.
 /// `VROOM_LOW_SPACE_MIB` overrides it.
@@ -268,8 +274,20 @@ impl Session {
                 Command::PowerOff => Action::PowerOff,
                 Command::Suspend => Action::Suspend,
             }),
-            // Viewer went away without saying goodbye: keep state, suspend.
-            VmEvent::ViewerClosed => self.act(Action::Suspend),
+            // The window went away without asking (closing it asks for a
+            // suspend): the app crashed. Keep running for it to come back.
+            VmEvent::ViewerClosed => {
+                if self.viewer_lost.is_none() {
+                    self.viewer_lost = Some(std::time::Instant::now());
+                    self.note("window gone; the VM keeps running for vroom to show it again, and suspends in 5 minutes");
+                }
+                Flow::Continue
+            }
+            VmEvent::ViewerAttached => {
+                self.viewer_lost = None;
+                self.note("window back");
+                Flow::Continue
+            }
         })
     }
 }
@@ -326,7 +344,7 @@ pub fn run(o: RunOpts) -> Result<(), String> {
     } else {
         eprintln!("vroom: WARNING: running without sandbox");
     }
-    let mut s = Session { vmm, state_dir: o.state_dir, agent_sessions: 0,
+    let mut s = Session { vmm, state_dir: o.state_dir, agent_sessions: 0, viewer_lost: None,
         next_space_check: std::time::Instant::now(),
         low_space: std::env::var("VROOM_LOW_SPACE_MIB").ok().and_then(|v| v.parse::<u64>().ok()).map_or(LOW_SPACE, |m| m << 20),
     };
@@ -380,5 +398,14 @@ pub fn run(o: RunOpts) -> Result<(), String> {
         }
         s.check_agent();
         s.check_space();
+        if s.viewer_lost.is_some_and(|t| t.elapsed() > VIEWER_GRACE) {
+            // Nobody came back: save it rather than run unseen. If that
+            // can't be done, it stays up for a window to come and say why.
+            s.viewer_lost = None;
+            s.note("no window came back: suspending");
+            if let Flow::Exit = s.act(Action::Suspend) {
+                return Ok(());
+            }
+        }
     }
 }

@@ -55,6 +55,27 @@ The mouse pointer over the guest is one pointer, the guest's:
   It's hidden during boot too, when Windows shows none.
 - Any other guest that gives no pointer keeps the Mac's arrow.
 
+### When the app crashes, or a VM stops answering
+
+Each VM runs in a process of its own, so a crash of the app doesn't stop
+it:
+
+- The VM keeps running without its window. Start vroom again and the
+  window comes back by itself, as it was (the guest may have turned its
+  screen off meanwhile: press a key).
+- If vroom isn't started again within 5 minutes, the VM suspends itself
+  rather than run unseen. If it can't be saved (a Vulkan app runs, say),
+  it stays up and its window comes back the next time vroom starts.
+- In the list, such a VM shows as running, with "Running without a
+  window"; Show window, pause, snapshot and the power menu all bring the
+  window back first.
+- A VM that doesn't answer any more (its window can't come back) gets "isn't
+  answering". Force power off (power button, top right) stops it: vroom
+  asks the process to end, and kills it if it's still there 3 seconds
+  later. It only ever does that to a vroom process.
+- A VM started from a terminal (`vroom run`) has its window there; the
+  power button in the app can still force it off.
+
 ## Moving a VM from VMware
 
 ARM64 VMs from VMware Fusion (or Workstation on ARM) come over with their

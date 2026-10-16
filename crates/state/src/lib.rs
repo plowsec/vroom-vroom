@@ -47,6 +47,10 @@ impl StateLock {
         for _ in 0..20 {
             // SAFETY: valid fd we own; flock has no memory effects.
             if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                // Who holds it, for `holder` (the app stops a VMM that
+                // hangs or lost its window).
+                let _ = f.set_len(0);
+                let _ = std::io::Write::write_all(&mut &f, format!("{}\n", std::process::id()).as_bytes());
                 return Ok(StateLock(f));
             }
             let e = std::io::Error::last_os_error();
@@ -68,6 +72,20 @@ impl StateLock {
         // SAFETY: valid fd we own; the lock goes away with `f`.
         let r = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
         r != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EWOULDBLOCK)
+    }
+
+    /// The process holding the lock (it wrote its pid there), if any.
+    pub fn holder(dir: &Path) -> Option<u32> {
+        if !Self::in_use(dir) {
+            return None;
+        }
+        let mut o = std::fs::OpenOptions::new();
+        o.read(true);
+        std::os::unix::fs::OpenOptionsExt::custom_flags(&mut o, libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        let mut s = String::new();
+        let f = o.open(dir.join("lock")).ok()?;
+        std::io::Read::read_to_string(&mut std::io::Read::take(f, 32), &mut s).ok()?;
+        s.trim().parse().ok().filter(|&p| p > 1)
     }
 
     /// Bytes free for us on the state dir's filesystem (disk layers grow
@@ -306,9 +324,11 @@ mod tests {
         assert!(!StateLock::in_use(t.path()));
         let l = StateLock::acquire(t.path()).unwrap();
         assert!(StateLock::in_use(t.path()));
+        assert_eq!(StateLock::holder(t.path()), Some(std::process::id()));
         assert!(matches!(StateLock::acquire(t.path()), Err(Error::Busy(_))));
         drop(l);
         assert!(!StateLock::in_use(t.path()));
+        assert_eq!(StateLock::holder(t.path()), None);
         // The probe itself doesn't block a VMM from starting.
         let _l = StateLock::acquire(t.path()).unwrap();
     }

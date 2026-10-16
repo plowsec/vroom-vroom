@@ -292,6 +292,18 @@ into its own process (possible for most of Venus and for virgl, whose
 frames already come back by copy; host-visible memory needs shared
 mappings).
 
+## The viewer socket
+
+A VM started from the app accepts a new window on a Unix socket, so it
+survives the app crashing. The socket is in the user's own temp dir
+(`$TMPDIR/vroom/`, 0700), itself 0600, bound before the sandbox goes up.
+Whoever connects gets the guest's screen and sends it keys and commands:
+any process running as the user can, which matches what the user's
+processes can already do to the VM's files. One viewer at a time; the
+guest has no way to reach it. To stop a VM that hangs, the app reads the
+pid the VMM wrote into its state lock and signals it only if that process
+is a `vroom` executable (the VMM can write that file).
+
 ## Guest agent (Windows)
 
 The VirtIO serial port only admits Administrators and SYSTEM, so the agent

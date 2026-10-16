@@ -562,6 +562,13 @@ export component VmPage inherits Rectangle {
                     clicked => { power-menu.show(); }
                 }
             }
+            // Run from a terminal: nothing to show here, but it can be stopped.
+            if root.live && !root.vm.ours: IconButton {
+                icon: Icons.power;
+                tip: "Force power off...";
+                y: (parent.height - self.height) / 2;
+                clicked => { Bus.act("poweroff"); }
+            }
             if root.live && root.vm.ours: Button {
                 kind: "primary";
                 text: "Show window";

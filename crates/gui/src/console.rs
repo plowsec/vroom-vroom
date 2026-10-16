@@ -14,7 +14,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command as Proc, Stdio};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -161,7 +161,9 @@ pub struct Console {
     io: Rc<RefCell<Io>>,
     fb: Option<SharedFb>,
     shared: Arc<Mutex<Shared>>,
-    child: Child,
+    /// The VMM, if this app started it (not when reattached to one).
+    child: Option<Child>,
+    pid: u32,
     /// The guest screen as shown (RGBA), updated in place where it changed.
     img: Option<SharedPixelBuffer<Rgba8Pixel>>,
     mode: (u32, u32),
@@ -397,26 +399,6 @@ pub fn start(path: &Path, cfg: &VmConfig, extra: &[String]) -> Result<String, St
     // Keep the last run only: logs are for "why did it stop".
     let logf = std::fs::File::create(&log).map_err(|e| format!("{}: {e}", log.display()))?;
     let (ours, theirs) = UnixStream::pair().map_err(|e| e.to_string())?;
-    let os = cfg.guest_os();
-    let win = ConsoleWindow::new().map_err(|e| e.to_string())?;
-    win.set_vm_name(cfg.name.clone().into());
-    win.set_os(crate::os_id(os).into());
-    win.set_state(VmState::Starting);
-    win.set_has_display(cfg.display.gpu != vroom_config::Gpu::None);
-    win.set_windows_guest(os == GuestOs::Windows);
-    if cfg.display.gpu == vroom_config::Gpu::Virtio3d {
-        win.set_gpu_text(if os == GuestOs::Windows { "Direct3D 11" } else { "3D" }.into());
-    }
-    let io = Rc::new(RefCell::new(Io {
-        tx: ours.try_clone().ok(),
-        mods: ModifiersState::empty(),
-        down: BTreeSet::new(),
-        buttons: BTreeSet::new(),
-        wheel: (0.0, 0.0),
-        focused: false,
-    }));
-    wire(&win, &key, &io);
-
     // The child must inherit its end: clear close-on-exec.
     // SAFETY: fcntl on an fd we own.
     #[allow(unsafe_code)]
@@ -437,9 +419,66 @@ pub fn start(path: &Path, cfg: &VmConfig, extra: &[String]) -> Result<String, St
         .spawn()
         .map_err(|e| format!("start {}: {e}", vmm.display()))?;
     drop(theirs);
+    let pid = child.id();
+    open(key, cfg, ours, Some(child), pid, VmState::Starting)
+}
+
+/// How long a VMM we reattach to gets to send its screen.
+const ATTACH_WAIT: Duration = Duration::from_secs(5);
+
+/// Where a VM running without a window (its app crashed) can be shown
+/// again: the VMM says in its state dir.
+pub fn viewer_socket(state_dir: &Path) -> Option<PathBuf> {
+    let p = std::fs::read_to_string(state_dir.join("viewer")).ok()?;
+    let p = PathBuf::from(p.trim());
+    std::os::unix::fs::FileTypeExt::is_socket(&std::fs::symlink_metadata(&p).ok()?.file_type()).then_some(p)
+}
+
+/// Show a VM that runs without a window again (its app crashed, or was
+/// quit while it couldn't be saved).
+pub fn attach(path: &Path, cfg: &VmConfig, sock: &Path, pid: u32) -> Result<String, String> {
+    let key = crate::paths::key(path);
+    if is_running(&key) {
+        show(&key);
+        return Ok(key);
+    }
+    let s = UnixStream::connect(sock).map_err(|e| format!("it doesn't answer ({e})"))?;
+    // A VMM that hangs never sends the screen: give up then (see reader).
+    s.set_read_timeout(Some(ATTACH_WAIT)).map_err(|e| e.to_string())?;
+    open(key, cfg, s, None, pid, VmState::Running)
+}
+
+/// The window for a VMM on the other end of `ours`.
+fn open(key: String, cfg: &VmConfig, ours: UnixStream, child: Option<Child>, pid: u32, state: VmState) -> Result<String, String> {
+    let fail = |child: Option<Child>, e: String| match child {
+        Some(c) => abandon(c, e),
+        None => e,
+    };
+    let os = cfg.guest_os();
+    let win = match ConsoleWindow::new() {
+        Ok(w) => w,
+        Err(e) => return Err(fail(child, e.to_string())),
+    };
+    win.set_vm_name(cfg.name.clone().into());
+    win.set_os(crate::os_id(os).into());
+    win.set_state(state);
+    win.set_has_display(cfg.display.gpu != vroom_config::Gpu::None);
+    win.set_windows_guest(os == GuestOs::Windows);
+    if cfg.display.gpu == vroom_config::Gpu::Virtio3d {
+        win.set_gpu_text(if os == GuestOs::Windows { "Direct3D 11" } else { "3D" }.into());
+    }
+    let io = Rc::new(RefCell::new(Io {
+        tx: ours.try_clone().ok(),
+        mods: ModifiersState::empty(),
+        down: BTreeSet::new(),
+        buttons: BTreeSet::new(),
+        wheel: (0.0, 0.0),
+        focused: false,
+    }));
+    wire(&win, &key, &io);
 
     if let Err(e) = win.show() {
-        return Err(abandon(child, e.to_string()));
+        return Err(fail(child, e.to_string()));
     }
 
     let shared = Arc::new(Mutex::new(Shared::default()));
@@ -449,18 +488,19 @@ pub fn start(path: &Path, cfg: &VmConfig, extra: &[String]) -> Result<String, St
         let r = std::thread::Builder::new().name("vmm-reader".into()).spawn(move || reader(ours, key, shared, gone));
         if let Err(e) = r {
             let _ = win.hide();
-            return Err(abandon(child, e.to_string()));
+            return Err(fail(child, e.to_string()));
         }
     }
     let c = Console {
         key: key.clone(),
-        state: VmState::Starting,
+        state,
         name: cfg.name.clone(),
         win,
         io,
         fb: None,
         shared,
         child,
+        pid,
         img: None,
         mode: (0, 0),
         last_thumb: Instant::now(),
@@ -484,7 +524,7 @@ pub fn start(path: &Path, cfg: &VmConfig, extra: &[String]) -> Result<String, St
     };
     CONSOLES.with(|m| m.borrow_mut().insert(key.clone(), c));
     ensure_timer();
-    msg::send(Msg::ConsoleState { key: key.clone(), state: VmState::Starting });
+    msg::send(Msg::ConsoleState { key: key.clone(), state });
     Ok(key)
 }
 
@@ -626,6 +666,7 @@ fn reader(mut s: UnixStream, key: String, shared: Arc<Mutex<Shared>>, gone: Arc<
     // The VMM sends the framebuffer first.
     match recv_fd(&s) {
         Ok(fd) => {
+            let _ = s.set_read_timeout(None);
             let k = key.clone();
             let _ = slint::invoke_from_event_loop(move || ready(&k, fd));
         }
@@ -669,7 +710,12 @@ fn reader(mut s: UnixStream, key: String, shared: Arc<Mutex<Shared>>, gone: Arc<
 
 fn ready(key: &str, fd: OwnedFd) {
     with(key, |c| match SharedFb::from_fd(fd) {
-        Ok(fb) => c.fb = Some(fb),
+        Ok(fb) => {
+            c.fb = Some(fb);
+            // Damage that came before it (a VMM we reattached to replays
+            // its screen at once) was dropped: draw it all now.
+            c.frame(true, None);
+        }
         Err(e) => {
             c.toast(&format!("display: {e}"));
         }
@@ -680,17 +726,22 @@ fn closed(key: &str) {
     let Some(mut c) = CONSOLES.with(|m| m.borrow_mut().remove(key)) else { return };
     c.save_thumb(None);
     let _ = c.win.hide();
+    let Some(mut child) = c.child.take() else {
+        // Reattached: not ours to reap. Never got going: it hangs.
+        let error = (!c.ever_ran).then(|| format!("{} isn't answering. Force power off (power menu) stops it.", c.name));
+        msg::send(Msg::ConsoleGone { key: key.to_string(), error });
+        return;
+    };
     // The VMM exits right after saying goodbye; don't block the UI on it.
-    let status = match c.child.try_wait() {
+    let status = match child.try_wait() {
         Ok(Some(s)) => Some(s),
         _ => {
             std::thread::sleep(Duration::from_millis(50));
-            c.child.try_wait().ok().flatten()
+            child.try_wait().ok().flatten()
         }
     };
     let failed = status.is_some_and(|s| !s.success());
     if status.is_none() {
-        let mut child = c.child;
         std::thread::spawn(move || {
             let _ = child.wait();
         });
@@ -929,7 +980,7 @@ impl Console {
             self.save_thumb(None);
         }
         // A VMM that died without a goodbye.
-        if let Ok(Some(_)) = self.child.try_wait() {
+        if let Some(Ok(Some(_))) = self.child.as_mut().map(|c| c.try_wait()) {
             if !self.gone.swap(true, Ordering::AcqRel) {
                 let k = self.key.clone();
                 slint::Timer::single_shot(Duration::ZERO, move || closed(&k));
@@ -946,7 +997,7 @@ impl Console {
             self.win.set_cpu_text("".into());
             return;
         }
-        let Some(t) = crate::host::cpu_time(self.child.id()) else { return };
+        let Some(t) = crate::host::cpu_time(self.pid) else { return };
         match self.cpu_seen {
             Some((at, before)) if now.duration_since(at) >= Duration::from_secs(1) => {
                 let used = t.saturating_sub(before).as_secs_f64() / now.duration_since(at).as_secs_f64();

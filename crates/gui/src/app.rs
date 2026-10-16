@@ -206,6 +206,10 @@ impl App {
         }
         app.apply_theme();
         app.push_host();
+        // VMs whose windows went with a crashed app: show them again.
+        for i in 0..app.vms.len() {
+            app.attach(i, false);
+        }
         app.push_all();
         Ok(app)
     }
@@ -390,7 +394,9 @@ impl App {
             specs: s(specs),
             has_thumb: thumb.is_some(),
             thumb: thumb.unwrap_or_default(),
-            ours: console::is_running(&v.key),
+            // Its window is here, or can come back here (the app crashed).
+            ours: console::is_running(&v.key)
+                || (v.disk_state == DiskState::RunningElsewhere && console::viewer_socket(&v.state_dir()).is_some()),
             warnings: warnings as i32,
         }
     }
@@ -472,6 +478,9 @@ impl App {
                 true,
                 "Suspended. Hardware settings apply after a fresh boot: resume and shut down, or discard the saved state (⋯ menu).",
             ),
+            _ if !console::is_running(&v.key) && console::viewer_socket(&v.state_dir()).is_some() => {
+                (true, "Running without a window. Show brings it back; shut it down to change hardware.")
+            }
             _ if !console::is_running(&v.key) => (true, "Running from a terminal (vroom run). Stop it there to change settings."),
             _ => (true, "Running. Shut it down to change hardware. Clipboard settings apply right away."),
         };
@@ -942,6 +951,9 @@ impl App {
         match a {
             "start" => self.start_current(&[]),
             "show" | "pause" | "resume" | "snapshot" | "suspend" | "shutdown" | "reset" => {
+                if !self.ensure_window() {
+                    return;
+                }
                 if let Some(v) = self.cur() {
                     if a == "show" {
                         console::show(&v.key);
@@ -959,7 +971,15 @@ impl App {
             ),
             "do.poweroff" => {
                 if let Some(v) = self.cur() {
-                    console::command(&v.key, "poweroff");
+                    if console::is_running(&v.key) {
+                        console::command(&v.key, "poweroff");
+                    } else if v.disk_state == DiskState::RunningElsewhere {
+                        let (name, dir) = (v.name(), v.state_dir());
+                        match host::force_stop(&dir) {
+                            Ok(()) => self.toast(format!("{name} was stopped."), 0),
+                            Err(e) => self.toast(format!("Couldn't stop {name}: {e}"), 3),
+                        }
+                    }
                 }
             }
             "newvm" => self.newvm_open(None),
@@ -1215,7 +1235,8 @@ impl App {
             return console::show(&v.key);
         }
         if st == VmState::Running {
-            return self.toast("It's already running from a terminal.", 0);
+            self.ensure_window();
+            return;
         }
         let Some(cfg) = v.resolved() else {
             return self.toast("Fix the VM file first: it has an error.", 3);
@@ -1226,6 +1247,43 @@ impl App {
             Err(e) => self.toast(format!("Couldn't start {name}: {e}"), 3),
         }
         self.push_all();
+    }
+
+    /// The current VM has a window here, or gets one: a VM running
+    /// without one (its app crashed) is shown again. False if it can't be.
+    fn ensure_window(&mut self) -> bool {
+        let Some(i) = self.current else { return false };
+        self.attach(i, true)
+    }
+
+    /// Reattach to VM `i` if it runs without a window. `say`: explain
+    /// when that can't be done.
+    fn attach(&mut self, i: usize, say: bool) -> bool {
+        let Some(v) = self.vms.get(i) else { return false };
+        if console::is_running(&v.key) {
+            return true;
+        }
+        if v.disk_state != DiskState::RunningElsewhere {
+            return false;
+        }
+        let (name, dir) = (v.name(), v.state_dir());
+        let Some(sock) = console::viewer_socket(&dir) else {
+            if say {
+                self.toast(format!("{name} runs from a terminal (vroom run): its window is there."), 0);
+            }
+            return false;
+        };
+        let Some(cfg) = v.resolved() else { return false };
+        let pid = vroom_state::StateLock::holder(&dir).unwrap_or(0);
+        match console::attach(&v.path.clone(), &cfg, &sock, pid) {
+            Ok(_) => true,
+            Err(e) => {
+                if say {
+                    self.toast(format!("{name} runs, but {e}. Force power off (power menu) stops it."), 3);
+                }
+                false
+            }
+        }
     }
 
     fn restore_snapshot(&mut self, name: &str) {
