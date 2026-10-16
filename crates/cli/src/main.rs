@@ -70,6 +70,14 @@ enum Cmd {
     #[cfg(unix)]
     #[command(hide = true)]
     GpuHelper(gpu::HelperArgs),
+    /// Render server started by the GPU process (internal).
+    #[cfg(target_os = "macos")]
+    #[command(hide = true)]
+    GpuServer,
+    /// One guest 3D context, started by the render server (internal).
+    #[cfg(target_os = "macos")]
+    #[command(hide = true)]
+    GpuWorker(gpu::WorkerArgs),
     /// USB passthrough helper started by the VMM (internal).
     #[command(hide = true)]
     UsbHost(usb::HostArgs),
@@ -149,6 +157,10 @@ fn main() -> ExitCode {
         Cmd::CameraHelper => camera::helper(),
         #[cfg(unix)]
         Cmd::GpuHelper(a) => gpu::helper(a),
+        #[cfg(target_os = "macos")]
+        Cmd::GpuServer => gpu::server(),
+        #[cfg(target_os = "macos")]
+        Cmd::GpuWorker(a) => gpu::worker(a),
         Cmd::UsbHost(a) => usb::host(a),
         Cmd::Usb(c) => usb::run(c),
         Cmd::Check { config } => load(&config).and_then(|c| {

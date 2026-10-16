@@ -520,6 +520,14 @@ and goes with its VM. If it crashes, the guest loses 3D until the VM is
 started again (`gpu: the GPU process is gone` in the log); the rest of
 the VM keeps running.
 
+Each Vulkan or Direct3D app in the guest gets one more process,
+`vroom gpu-worker`, started by `vroom gpu-server` (a Windows desktop has
+15 to 20 of them). If one crashes, only that app loses its GPU
+(`worker for context N ... died` in the log). In Linux the app stops
+with a lost device. In Windows the app stops drawing; if it was the
+desktop's own, the screen freezes: press Win+Ctrl+Shift+B in the guest
+and Windows restarts its graphics.
+
 ## 3D in Windows guests (Direct3D 11)
 
 ```bash

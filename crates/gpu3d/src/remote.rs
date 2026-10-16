@@ -294,7 +294,7 @@ pub struct HelperArgs<'a> {
     pub gl_renderer: Option<&'a str>,
     pub map_granule: u64,
     /// Where DXMT keeps the Metal versions of guest shaders (the only
-    /// place the GPU process may write).
+    /// place the GPU process, or its Direct3D workers, may write).
     pub shaders: &'a std::path::Path,
 }
 

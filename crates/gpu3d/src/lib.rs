@@ -26,6 +26,8 @@ use vroom_virtio::devices::gpu3d::{Blob, Box3d, Create3d, FenceDone, HostIov, Ma
 mod gl;
 #[cfg(unix)]
 pub mod remote;
+#[cfg(target_os = "macos")]
+pub mod server;
 
 #[cfg(target_os = "macos")]
 pub use gl::Host as GlHost;
@@ -135,6 +137,11 @@ struct Lib {
     /// virgl_renderer_resource_export_blob: an fd for a blob (the render
     /// server's are shared memory).
     export_blob: Option<unsafe extern "C" fn(u32, *mut u32, *mut c_int) -> c_int>,
+    /// virgl_renderer_render_worker_main (our patch 0009): one render
+    /// server context in this process. Without it the library runs Venus
+    /// and Direct3D in a thread of its own (an older build).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    worker_main: Option<unsafe extern "C" fn(c_int, u32, u32, *const c_char) -> c_int>,
 }
 
 // SAFETY: plain function pointers into a library that stays loaded.
@@ -144,22 +151,28 @@ unsafe impl Sync for Lib {}
 
 static LIB: OnceLock<Option<Lib>> = OnceLock::new();
 
+/// Our patched build (scripts/build-virglrenderer.sh) ships next to the
+/// binary; whoever can write there can replace the binary anyway. In
+/// vroom.app the libraries are in Contents/Frameworks, next to
+/// Contents/MacOS: still our own bundle, not a search path.
+fn own_copy() -> Vec<String> {
+    let lib = if cfg!(target_os = "macos") { "libvirglrenderer.1.dylib" } else { "libvirglrenderer.so.1" };
+    let mut v = Vec::new();
+    if let Some(dir) = std::env::current_exe().and_then(std::fs::canonicalize).ok().and_then(|e| e.parent().map(|d| d.to_path_buf())) {
+        v.push(dir.join(lib).to_string_lossy().into_owned());
+        if let Some(fw) = bundle_frameworks(&dir) {
+            v.push(fw.join(lib).to_string_lossy().into_owned());
+        }
+    }
+    v
+}
+
 fn candidates() -> Vec<String> {
     let mut v = Vec::new();
     if let Ok(p) = std::env::var("VROOM_VIRGLRENDERER") {
         v.push(p);
     }
-    // Our patched build (scripts/build-virglrenderer.sh) ships next to the
-    // binary; whoever can write there can replace the binary anyway.
-    let lib = if cfg!(target_os = "macos") { "libvirglrenderer.1.dylib" } else { "libvirglrenderer.so.1" };
-    if let Some(dir) = std::env::current_exe().and_then(std::fs::canonicalize).ok().and_then(|e| e.parent().map(|d| d.to_path_buf())) {
-        v.push(dir.join(lib).to_string_lossy().into_owned());
-        // In vroom.app the libraries are in Contents/Frameworks, next to
-        // Contents/MacOS: still our own bundle, not a search path.
-        if let Some(fw) = bundle_frameworks(&dir) {
-            v.push(fw.join(lib).to_string_lossy().into_owned());
-        }
-    }
+    v.extend(own_copy());
     if cfg!(target_os = "macos") {
         v.extend(
             ["/opt/homebrew/lib/libvirglrenderer.1.dylib", "/usr/local/lib/libvirglrenderer.1.dylib", "libvirglrenderer.1.dylib"]
@@ -181,8 +194,8 @@ fn bundle_frameworks(exe_dir: &std::path::Path) -> Option<PathBuf> {
     is_bundle.then(|| contents.join("Frameworks"))
 }
 
-fn open_lib() -> Option<Lib> {
-    let (handle, path) = candidates().into_iter().find_map(|p| {
+fn open_lib(candidates: Vec<String>) -> Option<Lib> {
+    let (handle, path) = candidates.into_iter().find_map(|p| {
         let c = CString::new(p.clone()).ok()?;
         // SAFETY: dlopen with a valid C string.
         let h = unsafe { libc::dlopen(c.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
@@ -262,6 +275,13 @@ fn open_lib() -> Option<Lib> {
             // SAFETY: signature from virglrenderer.h.
             (!f.is_null()).then(|| unsafe { std::mem::transmute::<*mut c_void, unsafe extern "C" fn(u32, *mut u32, *mut c_int) -> c_int>(f) })
         },
+        worker_main: {
+            let c = CString::new("virgl_renderer_render_worker_main").ok()?;
+            // SAFETY: valid handle and name.
+            let f = unsafe { libc::dlsym(handle, c.as_ptr()) };
+            // SAFETY: signature from our patched virglrenderer.h.
+            (!f.is_null()).then(|| unsafe { std::mem::transmute::<*mut c_void, unsafe extern "C" fn(c_int, u32, u32, *const c_char) -> c_int>(f) })
+        },
     })
 }
 
@@ -270,7 +290,7 @@ fn open_lib() -> Option<Lib> {
 /// whether 3D is usable (GL or not).
 #[cfg(target_os = "macos")]
 pub fn load(gl: Option<GlHost>) -> bool {
-    let Some(lib) = LIB.get_or_init(open_lib) else { return false };
+    let Some(lib) = LIB.get_or_init(|| open_lib(candidates())) else { return false };
     if let Some(host) = gl {
         GL.get_or_init(|| load_gl(lib, host));
     }
@@ -301,10 +321,50 @@ fn preload(dir: &std::path::Path, name: &str, what: &str) {
     }
 }
 
+/// For a render server worker (`vroom gpu-worker`, see [`server`]): the
+/// library from our own directory only (no override, no search path), and
+/// the one driver its context needs, MoltenVK for Venus or DXMT for
+/// Direct3D, from there too. Call before the sandbox.
+#[cfg(target_os = "macos")]
+pub fn load_worker(capset: u32) -> Result<(), String> {
+    let flags = server::worker_flags(capset).ok_or_else(|| format!("capset {capset} doesn't run in a worker"))?;
+    let lib = LIB.get_or_init(|| open_lib(own_copy())).as_ref().ok_or("no virglrenderer next to vroom")?;
+    if lib.worker_main.is_none() {
+        return Err("this virglrenderer has no render worker (scripts/build-virglrenderer.sh)".into());
+    }
+    let dir = lib.dir.as_ref().ok_or("virglrenderer: no directory")?;
+    if flags & VENUS as u32 != 0 {
+        preload(dir, "libMoltenVK.dylib", "Vulkan");
+    }
+    if flags & NEPTUNE as u32 != 0 {
+        preload(dir, "libdxmt-native.dylib", "Direct3D 11 for Windows guests");
+    }
+    Ok(())
+}
+
+/// Serve one guest context on `sock` (the proxy's peer in the GPU
+/// process) until the GPU process closes it. After [`load_worker`] and the
+/// sandbox.
+#[cfg(target_os = "macos")]
+pub fn run_worker(sock: OwnedFd, ctx: u32, capset: u32, name: &str) -> Result<(), String> {
+    use std::os::fd::IntoRawFd;
+    let flags = server::worker_flags(capset).ok_or_else(|| format!("capset {capset} doesn't run in a worker"))?;
+    let main = lib().and_then(|l| l.worker_main).ok_or("no render worker in virglrenderer")?;
+    let name = CString::new(name).unwrap_or_default();
+    // SAFETY: the library takes the fd (and closes it); the name is a
+    // valid C string for the call.
+    let r = unsafe { main(sock.into_raw_fd(), ctx, flags, name.as_ptr()) };
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(format!("context {ctx} ended with an error"))
+    }
+}
+
 /// Load the library (no GL off macOS). See the macOS one.
 #[cfg(not(target_os = "macos"))]
 pub fn load(gl: bool) -> bool {
-    let Some(_lib) = LIB.get_or_init(open_lib) else { return false };
+    let Some(_lib) = LIB.get_or_init(|| open_lib(candidates())) else { return false };
     if gl {
         log::info!("gpu3d: OpenGL (virgl) is only wired up on macOS for now");
     }
@@ -512,6 +572,11 @@ fn init(lib: &Lib, gl: bool, proxy: bool) -> c_int {
         make_current: current,
         get_drm_fd: None,
         write_context_fence: Some(on_context_fence),
+        // Our render server (see `server`), when it runs: the library then
+        // runs each Venus and Direct3D context in a worker process.
+        #[cfg(target_os = "macos")]
+        get_server_fd: server::server_fd_callback(),
+        #[cfg(not(target_os = "macos"))]
         get_server_fd: None,
     }));
     // With GL, no fence thread: ANGLE serializes the contexts of a share
@@ -614,9 +679,10 @@ impl Virgl {
                 let _ = sink();
                 enter();
                 let mut gl = GL.get().copied().unwrap_or(false);
-                // Venus and Neptune through the render server (a thread
-                // in this process) where the library has one; older
-                // libraries run Venus in place and have no Neptune.
+                // Venus and Neptune through the render server: one worker
+                // process per context when ours runs (`server::start`),
+                // else a thread of the library's. Without a server at all
+                // Venus runs in place and there is no Neptune.
                 let mut r = -1;
                 for proxy in [true, false] {
                     if gl && r != 0 {

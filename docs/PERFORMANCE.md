@@ -200,6 +200,23 @@ The per-request time in the "µs per 4k read" rows is the real one.
 - The virtio-blk device now has one queue per vCPU (up to 16), so a
   suspend image made by an older vroom of a VM with virtio disks no
   longer resumes ("queue layout mismatch"): start it with `--fresh`.
+- Vulkan and Direct3D contexts each run in a process of their own (see
+  SECURITY.md). Measured against one shared process, M3 Max, a busy
+  host, so a few runs each:
+
+  | | one process | a process per context |
+  |---|---|---|
+  | glmark2 (Ubuntu 24.04, GL, off-screen) | 488, 508, 498 | 430, 444, 540 |
+  | Vulkan compute, 1M invocations | 4.1-4.4 TFLOP/s | 4.2-4.4 TFLOP/s |
+  | small Vulkan program, start to end | 0.35 s | 0.40 s |
+  | Edge window (Windows 11), first / later | 1.49 / 0.35-0.40 s | 1.42-1.78 / 0.29-0.44 s |
+  | Notepad window | 52-82 ms | 57-87 ms |
+
+  GL doesn't change (it stays in the GPU process; glmark2 moves 10 % from
+  run to run here). Drawing doesn't either. What costs is a new context:
+  about 50 ms to start the process, load MoltenVK or DXMT and make a
+  Metal device. Memory: a Windows desktop with Edge open runs 15 to 20
+  contexts, 200 to 400 MB more in all.
 
 ## Looked at, left alone
 

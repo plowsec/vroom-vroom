@@ -2,7 +2,8 @@
 # Build the virglrenderer vroom uses for 3D on macOS: virgl (OpenGL on
 # Apple's OpenGL or ANGLE's Metal backend), Venus (Vulkan on MoltenVK) and
 # Neptune (Direct3D 11 for Windows guests, on DXMT: scripts/build-dxmt.sh).
-# Venus and Neptune run in its render server, a thread of the VMM.
+# Venus and Neptune run in its render server's workers, one process per
+# guest context: vroom is the server and the worker (patch 0009).
 #
 # Base: UTM's macOS fork, pinned by hash, plus our patches in
 # third_party/virglrenderer/. Meson fetches one subproject at a pinned
@@ -67,7 +68,7 @@ for p in "$ROOT"/third_party/virglrenderer/*.patch; do
   patch -s -p1 < "$p"
 done
 { meson setup build --prefix="$PREFIX" --buildtype=release -Dvenus=true -Dneptune=true \
-    -Drender-server-mode=thread -Drender-server-worker=thread -Dtests=false -Dvtest=false \
+    -Drender-server-mode=process -Drender-server-worker=process -Dtests=false -Dvtest=false \
     -Dcheck-gl-errors=false &&
   meson compile -C build && meson install -C build; } >>"$log" 2>&1 || { tail -20 "$log"; exit 1; }
 for d in debug release; do

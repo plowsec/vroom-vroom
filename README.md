@@ -33,15 +33,17 @@ The security design is better than the big three’s, at least on paper:
  │   ╔═══╧═══╗╔═══╧═══╗╔═══╧═══╗╔═══╧═══╗╔═══╧═══╗   ┌──────────┐    │
  │   ║  3D   ║║ audio ║║camera ║║  USB  ║║  TPM  ║   │   netd   │    │
  │   ╚═══╤═══╝╚═══╤═══╝╚═══╤═══╝╚═══╤═══╝╚═══════╝   │  (root)  │    │
- │       │        │        │        │                └────┬─────┘    │
- │      GPU    speaker   camera   device                  LAN        │
- │              (mic)                                                │
+ │   ╔═══╧═══╗    │        │        │                └────┬─────┘    │
+ │   ║app·app║ speaker   camera   device                  LAN        │
+ │   ╚═══╤═══╝  (mic)                                                │
+ │      GPU                                                          │
  └───────────────────────────────────────────────────────────────────┘
    ═══ own sandbox        ─── no sandbox        camera, mic: opt-in
 ```
 
 A guest that breaks out lands in the VMM's sandbox: its own disks, nothing
-else of yours. Details in [SECURITY.md](docs/SECURITY.md).
+else of yours. Each Vulkan or Direct3D app in the guest gets a 3D process
+of its own (app·app). Details in [SECURITY.md](docs/SECURITY.md).
 
 
 ## What works
