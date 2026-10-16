@@ -431,7 +431,8 @@ What works and what doesn't (Windows 11 24H2, M3 Max):
 ## Video decoding
 
 Linux guests can hand H.264 and HEVC video to the Mac's hardware decoder
-(VideoToolbox). Off by default for now:
+(VideoToolbox). Off by default for now (app: Settings, Display, Hardware
+video decoding):
 
 ```toml
 [display]

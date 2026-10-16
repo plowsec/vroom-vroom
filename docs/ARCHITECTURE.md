@@ -128,7 +128,7 @@ and the app under the pointer takes the files. Leaving the window sends
 
 ## Video decoding
 
-`video_decode = true` adds a virtio-media device (`virtio/src/devices/media`):
+`video_decode = true` (app: Settings, Display, Hardware video decoding) adds a virtio-media device (`virtio/src/devices/media`):
 V4L2 carried over virtio, the guest's kernel forwarding each ioctl of
 its `/dev/videoN` on the command queue. The device plays a V4L2 stateful
 decoder: H.264 or HEVC buffers in (OUTPUT queue), NV12 pictures out
