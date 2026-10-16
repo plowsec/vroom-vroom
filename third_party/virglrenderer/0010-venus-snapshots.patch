@@ -1,0 +1,3135 @@
+--- a/server/render_context.c
++++ b/server/render_context.c
+@@ -253,6 +253,50 @@
+ }
+ 
+ static bool
++render_context_dispatch_save(struct render_context *ctx,
++                             UNUSED const union render_context_op_request *request,
++                             UNUSED const int *fds,
++                             UNUSED int fd_count)
++{
++   struct render_context_op_save_reply reply = { .status = -1 };
++   int fd = -1;
++   reply.status = render_state_save_context(ctx->ctx_id, &fd, &reply.size);
++   if (reply.status < 0 || fd < 0) {
++      reply.status = -1;
++      reply.size = 0;
++      return render_socket_send_reply(&ctx->socket, &reply, sizeof(reply));
++   }
++   const bool ok =
++      render_socket_send_reply_with_fds(&ctx->socket, &reply, sizeof(reply), &fd, 1);
++   close(fd);
++   return ok;
++}
++
++static bool
++render_context_dispatch_restore(struct render_context *ctx,
++                                const union render_context_op_request *request,
++                                const int *fds,
++                                int fd_count)
++{
++   struct render_context_op_restore_reply reply = { .ok = false };
++   if (fd_count == 1)
++      reply.ok = render_state_restore_context(ctx->ctx_id, fds[0], request->restore.size);
++   return render_socket_send_reply(&ctx->socket, &reply, sizeof(reply));
++}
++
++static bool
++render_context_dispatch_resume(struct render_context *ctx,
++                               UNUSED const union render_context_op_request *request,
++                               UNUSED const int *fds,
++                               UNUSED int fd_count)
++{
++   struct render_context_op_restore_reply reply = {
++      .ok = render_state_resume_context(ctx->ctx_id),
++   };
++   return render_socket_send_reply(&ctx->socket, &reply, sizeof(reply));
++}
++
++static bool
+ render_context_dispatch_nop(UNUSED struct render_context *ctx,
+                             UNUSED const union render_context_op_request *req,
+                             UNUSED const int *fds,
+@@ -285,6 +329,9 @@
+       RENDER_CONTEXT_DISPATCH(SUBMIT_CMD, submit_cmd, 0),
+       RENDER_CONTEXT_DISPATCH(SUBMIT_FENCE, submit_fence, 0),
+       RENDER_CONTEXT_DISPATCH(ATTACH_FENCE_SOCKET, attach_fence_socket, 1),
++      RENDER_CONTEXT_DISPATCH(SAVE, save, 0),
++      RENDER_CONTEXT_DISPATCH(RESTORE, restore, 1),
++      RENDER_CONTEXT_DISPATCH(RESUME, resume, 0),
+ #undef RENDER_CONTEXT_DISPATCH
+    };
+ 
+--- a/server/render_protocol.h
++++ b/server/render_protocol.h
+@@ -40,6 +40,10 @@
+    RENDER_CONTEXT_OP_SUBMIT_CMD,
+    RENDER_CONTEXT_OP_SUBMIT_FENCE,
+    RENDER_CONTEXT_OP_ATTACH_FENCE_SOCKET,
++   /* vroom: snapshots of Venus contexts */
++   RENDER_CONTEXT_OP_SAVE,
++   RENDER_CONTEXT_OP_RESTORE,
++   RENDER_CONTEXT_OP_RESUME,
+ 
+    RENDER_CONTEXT_OP_COUNT,
+ };
+@@ -235,9 +239,40 @@
+  * ("everything before me was consumed") and must stay on the main socket.
+  */
+ struct render_context_op_attach_fence_socket_request {
++   struct render_context_op_header header;
++};
++
++/* vroom: snapshot the context (vkr_snap.h).  Every thread of the context
++ * stops at a command boundary and the GPU finishes first; the reply's fd is
++ * a shm object of `size` bytes.  status: 0 everything saved, 1 only what
++ * makes the context come back lost, -1 nothing (no fd). */
++struct render_context_op_save_request {
++   struct render_context_op_header header;
++};
++
++struct render_context_op_save_reply {
++   int32_t status;
++   uint64_t size;
++   /* followed by 1 fd if status >= 0 */
++};
++
++/* vroom: build a fresh context again from a save, after its shm resources
++ * were made again.  One fd follows: `size` bytes of the save. */
++struct render_context_op_restore_request {
+    struct render_context_op_header header;
++   uint64_t size;
+ };
+ 
++/* vroom: start the restored context's rings, after the memory blobs were
++ * made again */
++struct render_context_op_resume_request {
++   struct render_context_op_header header;
++};
++
++struct render_context_op_restore_reply {
++   bool ok;
++};
++
+ union render_context_op_request {
+    struct render_context_op_header header;
+    struct render_context_op_nop_request nop;
+@@ -248,6 +283,9 @@
+    struct render_context_op_submit_cmd_request submit_cmd;
+    struct render_context_op_submit_fence_request submit_fence;
+    struct render_context_op_attach_fence_socket_request attach_fence_socket;
++   struct render_context_op_save_request save;
++   struct render_context_op_restore_request restore;
++   struct render_context_op_resume_request resume;
+ };
+ 
+ #ifdef __APPLE__
+--- a/server/render_state.c
++++ b/server/render_state.c
+@@ -6,6 +6,7 @@
+ #include "render_state.h"
+ 
+ #include <inttypes.h>
++#include <unistd.h>
+ 
+ #ifdef ENABLE_RENDER_SERVER_WORKER_THREAD
+ #include "c11/threads.h"
+@@ -436,5 +437,52 @@
+ #endif
+    default:
+       break;
++   }
++}
++
++int
++render_state_save_context(uint32_t ctx_id, int *out_fd, uint64_t *out_size)
++{
++   struct render_context *ctx = render_state_lookup_context(ctx_id);
++   *out_fd = -1;
++   *out_size = 0;
++   if (!ctx)
++      return -1;
++
++   SCOPE_LOCK_RENDERER();
++#ifdef ENABLE_VENUS
++   if (ctx->backend == RENDER_BACKEND_VENUS)
++      return vkr_renderer_save_context(ctx_id, out_fd, out_size);
++#endif
++   return -1;
++}
++
++bool
++render_state_restore_context(uint32_t ctx_id, int fd, uint64_t size)
++{
++   struct render_context *ctx = render_state_lookup_context(ctx_id);
++   if (ctx) {
++      SCOPE_LOCK_RENDERER();
++#ifdef ENABLE_VENUS
++      if (ctx->backend == RENDER_BACKEND_VENUS)
++         return vkr_renderer_restore_context(ctx_id, fd, size);
++#endif
+    }
++   close(fd);
++   return false;
+ }
++
++bool
++render_state_resume_context(uint32_t ctx_id)
++{
++   struct render_context *ctx = render_state_lookup_context(ctx_id);
++   if (!ctx)
++      return false;
++
++   SCOPE_LOCK_RENDERER();
++#ifdef ENABLE_VENUS
++   if (ctx->backend == RENDER_BACKEND_VENUS)
++      return vkr_renderer_resume_context(ctx_id);
++#endif
++   return false;
++}
+--- a/server/render_state.h
++++ b/server/render_state.h
+@@ -54,4 +54,14 @@
+ void
+ render_state_destroy_resource(uint32_t ctx_id, uint32_t res_id);
+ 
++/* vroom: snapshots of Venus contexts (see vkr_snap.h) */
++int
++render_state_save_context(uint32_t ctx_id, int *out_fd, uint64_t *out_size);
++
++bool
++render_state_restore_context(uint32_t ctx_id, int fd, uint64_t size);
++
++bool
++render_state_resume_context(uint32_t ctx_id);
++
+ #endif /* RENDER_STATE_H */
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -87,6 +87,7 @@
+    'venus/vkr_render_pass.c',
+    'venus/vkr_renderer.c',
+    'venus/vkr_ring.c',
++   'venus/vkr_snap.c',
+    'venus/vkr_transport.c',
+ ]
+ 
+--- a/src/proxy/proxy_context.c
++++ b/src/proxy/proxy_context.c
+@@ -682,8 +682,96 @@
+    proxy_socket_fini(&ctx->socket);
+ 
+    free(ctx);
++}
++
++/* vroom: snapshots.  A worker that doesn't answer in this long is stuck in
++ * its driver: the context is dropped (its app sees the device lost), the
++ * snapshot goes on without it. */
++#define PROXY_CONTEXT_SNAPSHOT_TIMEOUT_MS 120000
++
++static bool
++proxy_context_wait_reply(struct proxy_context *ctx)
++{
++   struct pollfd p = { .fd = ctx->socket.fd, .events = POLLIN };
++   int r;
++   do {
++      r = poll(&p, 1, PROXY_CONTEXT_SNAPSHOT_TIMEOUT_MS);
++   } while (r < 0 && errno == EINTR);
++   if (r > 0)
++      return true;
++   proxy_log("ctx %d: the worker didn't answer: dropping it", ctx->base.ctx_id);
++   shutdown(ctx->socket.fd, SHUT_RDWR);
++   ctx->worker_gone = true;
++   return false;
++}
++
++int
++proxy_context_save(struct virgl_context *base, int *out_fd, uint64_t *out_size)
++{
++   struct proxy_context *ctx = (struct proxy_context *)base;
++   *out_fd = -1;
++   *out_size = 0;
++   if (ctx->worker_gone)
++      return -1;
++
++   const struct render_context_op_save_request req = {
++      .header.op = RENDER_CONTEXT_OP_SAVE,
++   };
++   if (!proxy_socket_send_request(&ctx->socket, &req, sizeof(req)) ||
++       !proxy_context_wait_reply(ctx))
++      return -1;
++
++   struct render_context_op_save_reply reply;
++   int fd = -1;
++   int fd_count = 0;
++   if (!proxy_socket_receive_reply_with_fds(&ctx->socket, &reply, sizeof(reply), &fd, 1,
++                                            &fd_count))
++      return -1;
++   if (reply.status < 0 || fd_count != 1) {
++      if (fd_count)
++         close(fd);
++      return -1;
++   }
++   struct stat st;
++   if (fstat(fd, &st) || (uint64_t)st.st_size < reply.size) {
++      close(fd);
++      return -1;
++   }
++   *out_fd = fd;
++   *out_size = reply.size;
++   return reply.status;
+ }
+ 
++int
++proxy_context_restore(struct virgl_context *base, int fd, uint64_t size)
++{
++   struct proxy_context *ctx = (struct proxy_context *)base;
++   const struct render_context_op_restore_request req = {
++      .header.op = RENDER_CONTEXT_OP_RESTORE,
++      .size = size,
++   };
++   struct render_context_op_restore_reply reply = { .ok = false };
++   if (!ctx->worker_gone &&
++       proxy_socket_send_request_with_fds(&ctx->socket, &req, sizeof(req), &fd, 1) &&
++       proxy_context_wait_reply(ctx))
++      proxy_socket_receive_reply(&ctx->socket, &reply, sizeof(reply));
++   return reply.ok ? 0 : -1;
++}
++
++int
++proxy_context_resume(struct virgl_context *base)
++{
++   struct proxy_context *ctx = (struct proxy_context *)base;
++   const struct render_context_op_resume_request req = {
++      .header.op = RENDER_CONTEXT_OP_RESUME,
++   };
++   struct render_context_op_restore_reply reply = { .ok = false };
++   if (!ctx->worker_gone && proxy_socket_send_request(&ctx->socket, &req, sizeof(req)) &&
++       proxy_context_wait_reply(ctx))
++      proxy_socket_receive_reply(&ctx->socket, &reply, sizeof(reply));
++   return reply.ok ? 0 : -1;
++}
++
+ static void
+ proxy_context_init_base(struct proxy_context *ctx)
+ {
+--- a/src/proxy/proxy_renderer.h
++++ b/src/proxy/proxy_renderer.h
+@@ -38,9 +38,40 @@
+                      size_t debug_len,
+                      const char *debug_name);
+ 
++/* vroom: snapshots of a proxy context (render_protocol.h) */
++int
++proxy_context_save(struct virgl_context *ctx, int *out_fd, uint64_t *out_size);
++
++int
++proxy_context_restore(struct virgl_context *ctx, int fd, uint64_t size);
++
++int
++proxy_context_resume(struct virgl_context *ctx);
++
+ #else /* ENABLE_RENDER_SERVER */
+ 
+ static inline int
++proxy_context_save(UNUSED struct virgl_context *ctx, int *out_fd, uint64_t *out_size)
++{
++   *out_fd = -1;
++   *out_size = 0;
++   return -1;
++}
++
++static inline int
++proxy_context_restore(UNUSED struct virgl_context *ctx, UNUSED int fd, UNUSED uint64_t size)
++{
++   return -1;
++}
++
++static inline int
++proxy_context_resume(UNUSED struct virgl_context *ctx)
++{
++   return -1;
++}
++
++
++static inline int
+ proxy_renderer_init(UNUSED const struct proxy_renderer_cbs *cbs, UNUSED uint32_t flags)
+ {
+    virgl_error("Render server support was not enabled in virglrenderer\n");
+--- a/src/venus/vkr_buffer.c
++++ b/src/venus/vkr_buffer.c
+@@ -6,6 +6,7 @@
+ #include "vkr_buffer.h"
+ 
+ #include "vkr_buffer_gen.h"
++#include "vkr_device_memory.h"
+ #include "vkr_physical_device.h"
+ 
+ /* When dma_buf is emulated the guest asks for external memory the host cannot
+@@ -115,9 +116,12 @@
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
++   struct vkr_device_memory *mem = vkr_device_memory_from_handle(args->memory);
+    vn_replace_vkBindBufferMemory_args_handle(args);
+    args->ret =
+       vk->BindBufferMemory(args->device, args->buffer, args->memory, args->memoryOffset);
++   if (mem && args->ret == VK_SUCCESS)
++      mem->has_buffers = true;
+ }
+ 
+ static void
+@@ -127,6 +131,13 @@
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
++   /* vroom: the vkr objects, before the handles are replaced */
++   for (uint32_t i = 0; i < args->bindInfoCount; i++) {
++      struct vkr_device_memory *mem =
++         vkr_device_memory_from_handle(args->pBindInfos[i].memory);
++      if (mem)
++         mem->has_buffers = true;
++   }
+    vn_replace_vkBindBufferMemory2_args_handle(args);
+    args->ret = vk->BindBufferMemory2(args->device, args->bindInfoCount, args->pBindInfos);
+ }
+--- a/src/venus/vkr_context.c
++++ b/src/venus/vkr_context.c
+@@ -172,7 +172,9 @@
+    vkr_cs_decoder_set_buffer_stream(&ctx->decoder, buffer, size);
+ 
+    while (vkr_cs_decoder_has_command(&ctx->decoder)) {
+-      vn_dispatch_command(&ctx->dispatch);
++      vkr_snap_enter(ctx);
++      vkr_snap_dispatch(ctx, &ctx->dispatch);
++      vkr_snap_leave(ctx);
+       if (vkr_context_get_fatal(ctx)) {
+          vkr_log("submit_cmd: vn_dispatch_command failed");
+ 
+@@ -311,6 +313,7 @@
+       .map_info = VIRGL_RENDERER_MAP_CACHE_CACHED,
+    };
+ 
++   vkr_snap_note_shm(ctx->snap, res_id, true);
+    return true;
+ }
+ 
+@@ -415,6 +418,7 @@
+    }
+    mtx_unlock(&ctx->ring_mutex);
+ 
++   vkr_snap_note_shm(ctx->snap, res_id, false);
+    vkr_context_remove_resource(ctx, res_id);
+ }
+ 
+@@ -615,6 +619,8 @@
+ void
+ vkr_context_destroy(struct vkr_context *ctx)
+ {
++   vkr_snap_off(ctx->snap);
++
+    /* TODO Move the entire teardown process to a separate thread so that the main thread
+     * cannot get blocked by the vkDeviceWaitIdle upon device destruction.
+     */
+@@ -647,6 +653,7 @@
+ 
+    vkr_library_unload(&ctx->vulkan_library);
+ 
++   vkr_snap_destroy(ctx->snap);
+    free(ctx->debug_name);
+    free(ctx);
+ }
+@@ -706,6 +713,10 @@
+    ctx->on_worker_thread = false;
+ #endif
+ 
++   ctx->snap = vkr_snap_create();
++   if (!ctx->snap)
++      goto err_ctx_snap;
++
+    if (!vkr_context_wait_ring_init(ctx))
+       goto err_ctx_wait_ring_init;
+ 
+@@ -755,6 +766,8 @@
+ err_ctx_object_mutex:
+    vkr_context_wait_ring_fini(ctx);
+ err_ctx_wait_ring_init:
++   vkr_snap_destroy(ctx->snap);
++err_ctx_snap:
+    free(ctx->debug_name);
+ err_debug_name:
+    free(ctx);
+--- a/src/venus/vkr_context.h
++++ b/src/venus/vkr_context.h
+@@ -14,6 +14,7 @@
+ #include "virgl_resource.h"
+ 
+ #include "vkr_cs.h"
++#include "vkr_snap.h"
+ 
+ /*
+  * When vkr_context_create_resource or vkr_context_import_resource is called, a
+@@ -103,6 +104,10 @@
+ 
+    struct list_head head;
+    struct vulkan_library vulkan_library;
++
++   /* vroom: what a snapshot needs (vkr_snap.h).  Its lock nests inside
++    * object_mutex: nothing holding it takes object_mutex. */
++   struct vkr_snap *snap;
+ };
+ 
+ struct vkr_context *
+@@ -207,6 +212,8 @@
+    assert(!_mesa_hash_table_search(ctx->object_table, &obj->id));
+    _mesa_hash_table_insert(ctx->object_table, &obj->id, obj);
+    mtx_unlock(&ctx->object_mutex);
++
++   vkr_snap_note_add(ctx->snap, obj->id, obj->type);
+ }
+ 
+ static inline void
+@@ -216,6 +223,7 @@
+ 
+    struct hash_entry *entry = _mesa_hash_table_search(ctx->object_table, &obj->id);
+    if (likely(entry)) {
++      vkr_snap_note_remove(ctx->snap, obj->id);
+       vkr_context_free_object(entry);
+       _mesa_hash_table_remove(ctx->object_table, entry);
+    }
+--- a/src/venus/vkr_cs.h
++++ b/src/venus/vkr_cs.h
+@@ -7,6 +7,7 @@
+ #define VKR_CS_H
+ 
+ #include "vkr_common.h"
++#include "vkr_snap.h"
+ 
+ /* This is to avoid integer overflows and to catch bogus allocations (e.g.,
+  * the guest driver encodes an uninitialized value).  In practice, the largest
+@@ -319,6 +320,8 @@
+       else
+          vkr_log("failed to look up object %" PRIu64 " of type %d", id, type);
+       vkr_cs_decoder_set_fatal(dec);
++   } else if (unlikely(vkr_snap_tls)) {
++      vkr_snap_note_ref(id, type);
+    }
+ 
+    return obj;
+--- a/src/venus/vkr_device_memory.h
++++ b/src/venus/vkr_device_memory.h
+@@ -39,6 +39,9 @@
+    uint32_t memory_type_index;
+ 
+    bool exported;
++
++   /* vroom: a buffer was bound to it (snapshots copy such memory) */
++   bool has_buffers;
+ };
+ VKR_DEFINE_OBJECT_CAST(device_memory, VK_OBJECT_TYPE_DEVICE_MEMORY, VkDeviceMemory)
+ 
+--- a/src/venus/vkr_image.c
++++ b/src/venus/vkr_image.c
+@@ -64,6 +64,51 @@
+    return VK_SUCCESS;
+ }
+ 
++/* What a snapshot keeps of an image, and transfer usage added where the
++ * format allows it, so its contents can be copied out and back. */
++static struct vkr_image_snap
++vkr_image_snap_prepare(struct vkr_device *dev, VkImageCreateInfo *info)
++{
++   struct vkr_image_snap s = {
++      .device = dev,
++      .format = info->format,
++      .extent = info->extent,
++      .mip_levels = info->mipLevels,
++      .array_layers = info->arrayLayers,
++      .samples = info->samples,
++   };
++   const VkImageCreateFlags odd = VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
++                                  VK_IMAGE_CREATE_DISJOINT_BIT |
++                                  VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT;
++   s.valid = !(info->flags & odd);
++   if (info->usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT)
++      return s;
++
++   const VkImageUsageFlags xfer =
++      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++   if ((info->usage & xfer) == xfer) {
++      s.transfer = true;
++      return s;
++   }
++   struct vkr_physical_device *pd = dev->physical_device;
++   VkFormatProperties props = { 0 };
++   pd->proc_table.GetPhysicalDeviceFormatProperties(pd->base.handle.physical_device,
++                                                    info->format, &props);
++   const VkFormatFeatureFlags have = info->tiling == VK_IMAGE_TILING_LINEAR
++                                        ? props.linearTilingFeatures
++                                        : props.optimalTilingFeatures;
++   const VkFormatFeatureFlags need =
++      VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
++   /* a format list or a usage list of its own would need the same: leave
++    * those images alone */
++   if ((have & need) == need &&
++       !vkr_find_struct(info->pNext, VK_STRUCTURE_TYPE_IMAGE_STENCIL_USAGE_CREATE_INFO)) {
++      info->usage |= xfer;
++      s.transfer = true;
++   }
++   return s;
++}
++
+ static void
+ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
+                            struct vn_command_vkCreateImage *args)
+@@ -99,9 +144,15 @@
+     * situation because the app does not consider the memory external.
+     */
+ 
++   /* vroom: snapshots copy images to and from buffers */
++   VkImageCreateInfo *info = (VkImageCreateInfo *)args->pCreateInfo;
++   const struct vkr_image_snap snap = vkr_image_snap_prepare(dev, info);
++
+    struct vkr_image *img = vkr_image_create_and_add(dispatch->data, args);
+-   if (img)
++   if (img) {
+       img->shm_backed = shm_backed;
++      img->snap = snap;
++   }
+ }
+ 
+ static void
+@@ -176,9 +227,12 @@
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
++   struct vkr_image *img = vkr_image_from_handle(args->image);
+    vn_replace_vkBindImageMemory_args_handle(args);
+    args->ret =
+       vk->BindImageMemory(args->device, args->image, args->memory, args->memoryOffset);
++   if (img && args->ret == VK_SUCCESS)
++      img->snap.bound = true;
+ }
+ 
+ static void
+@@ -188,8 +242,17 @@
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
++   /* the vkr objects, before the handles are replaced */
++   struct vkr_image **imgs = calloc(MAX2(args->bindInfoCount, 1), sizeof(*imgs));
++   for (uint32_t i = 0; imgs && i < args->bindInfoCount; i++)
++      imgs[i] = vkr_image_from_handle(args->pBindInfos[i].image);
+    vn_replace_vkBindImageMemory2_args_handle(args);
+    args->ret = vk->BindImageMemory2(args->device, args->bindInfoCount, args->pBindInfos);
++   for (uint32_t i = 0; imgs && args->ret == VK_SUCCESS && i < args->bindInfoCount; i++) {
++      if (imgs[i])
++         imgs[i]->snap.bound = true;
++   }
++   free(imgs);
+ }
+ 
+ static void
+--- a/src/venus/vkr_image.h
++++ b/src/venus/vkr_image.h
+@@ -8,11 +8,25 @@
+ 
+ #include "vkr_common.h"
+ 
++/* vroom: what a snapshot needs to copy an image's contents */
++struct vkr_image_snap {
++   struct vkr_device *device;
++   VkFormat format;
++   VkExtent3D extent;
++   uint32_t mip_levels;
++   uint32_t array_layers;
++   VkSampleCountFlagBits samples;
++   bool valid;    /* a plain image (not sparse, not planar) */
++   bool transfer; /* we could add transfer usage */
++   bool bound;
++};
++
+ struct vkr_image {
+    struct vkr_object base;
+    /* the guest may export it as a dma_buf: its memory must be shm we can
+     * import, so only host visible memory types are offered */
+    bool shm_backed;
++   struct vkr_image_snap snap;
+ };
+ VKR_DEFINE_OBJECT_CAST(image, VK_OBJECT_TYPE_IMAGE, VkImage)
+ 
+--- a/src/venus/vkr_queue.c
++++ b/src/venus/vkr_queue.c
+@@ -366,7 +366,19 @@
+    return;
+ }
+ 
++/* vroom: binary semaphores waited on and signaled, before the handles are
++ * replaced (a snapshot signals again the ones left signaled) */
+ static void
++vkr_semaphore_snap_note(const VkSemaphore *sems, uint32_t count, bool signal)
++{
++   for (uint32_t i = 0; sems && i < count; i++) {
++      struct vkr_semaphore *sem = vkr_semaphore_from_handle(sems[i]);
++      if (sem && !sem->timeline)
++         sem->signaled = signal;
++   }
++}
++
++static void
+ vkr_dispatch_vkQueueSubmit(UNUSED struct vn_dispatch_context *dispatch,
+                            struct vn_command_vkQueueSubmit *args)
+ {
+@@ -374,6 +386,12 @@
+    struct vkr_queue *queue = vkr_queue_from_handle(args->queue);
+    struct vn_device_proc_table *vk = &queue->device->proc_table;
+ 
++   for (uint32_t i = 0; args->pSubmits && i < args->submitCount; i++) {
++      const VkSubmitInfo *s = &args->pSubmits[i];
++      vkr_semaphore_snap_note(s->pWaitSemaphores, s->waitSemaphoreCount, false);
++      vkr_semaphore_snap_note(s->pSignalSemaphores, s->signalSemaphoreCount, true);
++   }
++
+    vn_replace_vkQueueSubmit_args_handle(args);
+ 
+    mtx_lock(&queue->vk_mutex);
+@@ -415,6 +433,14 @@
+    struct vkr_queue *queue = vkr_queue_from_handle(args->queue);
+    struct vn_device_proc_table *vk = &queue->device->proc_table;
+ 
++   for (uint32_t i = 0; args->pSubmits && i < args->submitCount; i++) {
++      const VkSubmitInfo2 *s = &args->pSubmits[i];
++      for (uint32_t j = 0; s->pWaitSemaphoreInfos && j < s->waitSemaphoreInfoCount; j++)
++         vkr_semaphore_snap_note(&s->pWaitSemaphoreInfos[j].semaphore, 1, false);
++      for (uint32_t j = 0; s->pSignalSemaphoreInfos && j < s->signalSemaphoreInfoCount; j++)
++         vkr_semaphore_snap_note(&s->pSignalSemaphoreInfos[j].semaphore, 1, true);
++   }
++
+    vn_replace_vkQueueSubmit2_args_handle(args);
+ 
+    mtx_lock(&queue->vk_mutex);
+@@ -469,8 +495,11 @@
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
+    vn_replace_vkWaitForFences_args_handle(args);
++   /* vroom: a snapshot may go ahead meanwhile (this runs again after) */
++   const bool snap = vkr_snap_wait_begin(dispatch->data);
+    args->ret = vk->WaitForFences(args->device, args->fenceCount, args->pFences,
+                                  args->waitAll, args->timeout);
++   vkr_snap_wait_end(dispatch->data, snap);
+ }
+ 
+ static void
+@@ -508,7 +537,11 @@
+ vkr_dispatch_vkCreateSemaphore(struct vn_dispatch_context *dispatch,
+                                struct vn_command_vkCreateSemaphore *args)
+ {
+-   vkr_semaphore_create_and_add(dispatch->data, args);
++   const VkSemaphoreTypeCreateInfo *type =
++      vkr_find_struct(args->pCreateInfo->pNext, VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO);
++   struct vkr_semaphore *sem = vkr_semaphore_create_and_add(dispatch->data, args);
++   if (sem)
++      sem->timeline = type && type->semaphoreType == VK_SEMAPHORE_TYPE_TIMELINE;
+ }
+ 
+ static void
+@@ -538,7 +571,9 @@
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
+    vn_replace_vkWaitSemaphores_args_handle(args);
++   const bool snap = vkr_snap_wait_begin(dispatch->data);
+    args->ret = vk->WaitSemaphores(args->device, args->pWaitInfo, args->timeout);
++   vkr_snap_wait_end(dispatch->data, snap);
+ }
+ 
+ static void
+@@ -564,6 +599,7 @@
+    struct vn_device_proc_table *vk = &dev->proc_table;
+    int fd = -1;
+ 
++   vkr_semaphore_snap_note(&args->semaphore, 1, false);
+    vn_replace_vkWaitSemaphoreResourceMESA_args_handle(args);
+ 
+    if (dev->physical_device->emulate_sync_fd_import) {
+@@ -615,6 +651,7 @@
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
++   vkr_semaphore_snap_note(&args->pImportSemaphoreResourceInfo->semaphore, 1, true);
+    vn_replace_vkImportSemaphoreResourceMESA_args_handle(args);
+ 
+    const VkImportSemaphoreResourceInfoMESA *res_info = args->pImportSemaphoreResourceInfo;
+--- a/src/venus/vkr_queue.h
++++ b/src/venus/vkr_queue.h
+@@ -58,6 +58,11 @@
+ 
+ struct vkr_semaphore {
+    struct vkr_object base;
++
++   /* vroom, for snapshots: a timeline semaphore (its value is read back),
++    * or a binary one and whether its last operation was a signal */
++   bool timeline;
++   bool signaled;
+ };
+ VKR_DEFINE_OBJECT_CAST(semaphore, VK_OBJECT_TYPE_SEMAPHORE, VkSemaphore)
+ 
+--- a/src/venus/vkr_renderer.c
++++ b/src/venus/vkr_renderer.c
+@@ -11,6 +11,11 @@
+ 
+ #include "vkr_context.h"
+ 
++#include <errno.h>
++#include <inttypes.h>
++#include <sys/mman.h>
++#include <unistd.h>
++
+ struct vkr_renderer_state {
+    const struct vkr_renderer_callbacks *cbs;
+ 
+@@ -246,3 +251,37 @@
+    if (ctx)
+       vkr_context_destroy_resource(ctx, res_id);
+ }
++
++int
++vkr_renderer_save_context(uint32_t ctx_id, int *out_fd, uint64_t *out_size)
++{
++   struct vkr_context *ctx = vkr_renderer_lookup_context(ctx_id);
++   if (!ctx)
++      return -1;
++   return vkr_snap_save(ctx, out_fd, out_size);
++}
++
++bool
++vkr_renderer_restore_context(uint32_t ctx_id, int fd, uint64_t size)
++{
++   struct vkr_context *ctx = vkr_renderer_lookup_context(ctx_id);
++   bool ok = false;
++   if (ctx && size && size <= SIZE_MAX) {
++      void *p = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
++      if (p == MAP_FAILED)
++         vkr_log("snapshot: can't map %" PRIu64 " bytes (%d)", size, errno);
++      if (p != MAP_FAILED) {
++         ok = vkr_snap_restore(ctx, p, size);
++         munmap(p, size);
++      }
++   }
++   close(fd);
++   return ok;
++}
++
++bool
++vkr_renderer_resume_context(uint32_t ctx_id)
++{
++   struct vkr_context *ctx = vkr_renderer_lookup_context(ctx_id);
++   return ctx && vkr_snap_resume(ctx);
++}
+--- a/src/venus/vkr_renderer.h
++++ b/src/venus/vkr_renderer.h
+@@ -74,4 +74,16 @@
+ void
+ vkr_renderer_destroy_resource(uint32_t ctx_id, uint32_t res_id);
+ 
++/* vroom: snapshots (vkr_snap.h).  save: 0 with everything, 1 lost (rings
++ * only), -1 failed; the fd is a shm object of out_size bytes. */
++int
++vkr_renderer_save_context(uint32_t ctx_id, int *out_fd, uint64_t *out_size);
++
++/* takes fd */
++bool
++vkr_renderer_restore_context(uint32_t ctx_id, int fd, uint64_t size);
++
++bool
++vkr_renderer_resume_context(uint32_t ctx_id);
++
+ #endif /* VKR_RENDERER_H */
+--- a/src/venus/vkr_ring.c
++++ b/src/venus/vkr_ring.c
+@@ -226,9 +226,13 @@
+ 
+    vkr_cs_decoder_set_buffer_stream(dec, buffer, size);
+ 
++   struct vkr_context *ctx = ring->dispatch.data;
+    while (vkr_cs_decoder_has_command(dec)) {
+-      vn_dispatch_command(&ring->dispatch);
++      /* a snapshot sees the head move with each command (vkr_snap.h) */
++      vkr_snap_enter(ctx);
++      vkr_snap_dispatch(ctx, &ring->dispatch);
+       if (vkr_cs_decoder_get_fatal(dec)) {
++         vkr_snap_leave(ctx);
+          vkr_log("ring_submit_cmd: vn_dispatch_command failed");
+ 
+          vkr_cs_decoder_reset(dec);
+@@ -238,6 +242,7 @@
+       /* update the ring head intra-cs to optimize ring space */
+       const uint32_t cur_ring_head = ring_head + (dec->cur - buffer);
+       vkr_ring_store_head(ring, cur_ring_head);
++      vkr_snap_leave(ctx);
+       vkr_context_on_ring_seqno_update(ring->dispatch.data, ring->id, cur_ring_head);
+    }
+ 
+@@ -441,10 +446,14 @@
+ 
+    bool ok = true;
+ 
++   /* a snapshot may be taken meanwhile: this command runs again after */
++   struct vkr_context *ctx = ring->dispatch.data;
++   const bool snap = vkr_snap_wait_begin(ctx);
+    mtx_lock(&ring->mutex);
+    while (ok && ring->started && ring->virtqueue_seqno < seqno)
+       ok = cnd_wait(&ring->cond, &ring->mutex) == thrd_success;
+    mtx_unlock(&ring->mutex);
++   vkr_snap_wait_end(ctx, snap);
+ 
+    return ok;
+ }
+--- a/src/venus/vkr_ring.h
++++ b/src/venus/vkr_ring.h
+@@ -102,6 +102,10 @@
+    atomic_bool pending_notify;
+    atomic_bool monitor;
+    uint64_t virtqueue_seqno;
++
++   /* vroom: how it was made (no pNext), for snapshots */
++   VkRingCreateInfoMESA snap_info;
++   uint32_t snap_monitor_us;
+ };
+ 
+ struct vkr_ring *
+--- /dev/null
++++ b/src/venus/vkr_snap.c
+@@ -0,0 +1,2002 @@
++/*
++ * vroom: snapshots of a Venus context (see vkr_snap.h).
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "vkr_snap.h"
++
++#include <sys/mman.h>
++#include <time.h>
++#include <unistd.h>
++
++#include "util/anon_file.h"
++#include "util/hash_table.h"
++#include "venus-protocol/vn_protocol_renderer_dispatches.h"
++
++#include "vkr_command_buffer.h"
++#include "vkr_context.h"
++#include "vkr_cs.h"
++#include "vkr_device.h"
++#include "vkr_device_memory.h"
++#include "vkr_image.h"
++#include "vkr_physical_device.h"
++#include "vkr_queue.h"
++#include "vkr_ring.h"
++#include "vkr_transport.h"
++
++_Thread_local struct vkr_snap_cmd *vkr_snap_tls;
++/* how deep this thread is in vkr_snap_enter (nested command streams) */
++static _Thread_local uint32_t vkr_snap_depth;
++
++/* A snapshot waits this long for threads to reach a command boundary and
++ * for the GPU to finish; past that the context is saved as lost. */
++#define VKR_SNAP_QUIESCE_MS 5000
++#define VKR_SNAP_GPU_MS 10000
++/* staging for contents, and the largest single copy we make */
++#define VKR_SNAP_STAGING_MIN (32u << 20)
++#define VKR_SNAP_STAGING_MAX (512u << 20)
++
++#define VKR_SNAP_MAGIC 0x31534b56 /* "VKS1" */
++#define VKR_SNAP_VERSION 1
++#define VKR_SNAP_FLAG_LOST 1u
++
++enum vkr_snap_tag {
++   VKR_SNAP_TAG_SHM = 1,
++   VKR_SNAP_TAG_CMD,
++   VKR_SNAP_TAG_MEM,
++   VKR_SNAP_TAG_IMG,
++   VKR_SNAP_TAG_FENCE,
++   VKR_SNAP_TAG_EVENT,
++   VKR_SNAP_TAG_SEM,
++   VKR_SNAP_TAG_RING,
++   VKR_SNAP_TAG_ENC,
++};
++
++enum vkr_snap_class {
++   VKR_SNAP_OTHER,  /* kept only if it made or destroyed objects */
++   VKR_SNAP_STATE,  /* kept: binds, descriptor updates, recording */
++   VKR_SNAP_BEGIN,  /* kept, and the command buffer's old recording goes */
++   VKR_SNAP_RESET_CB,
++   VKR_SNAP_RESET_POOL,
++};
++
++#define VKR_SNAP_INLINE_IDS 32
++
++struct vkr_snap_ids {
++   uint64_t *v;
++   uint32_t n, cap;
++   uint64_t inline_v[VKR_SNAP_INLINE_IDS];
++};
++
++struct vkr_snap_cmd {
++   struct vkr_snap *snap;
++   struct vkr_snap_ids creates, refs, destroys;
++   vkr_object_id first_ref;
++   VkObjectType first_ref_type;
++   vkr_object_id pool;
++   uint64_t seq;
++   bool have_first, have_seq;
++};
++
++/* a kept command: ids (creates, refs, destroys), then the bytes */
++struct vkr_snap_entry {
++   uint64_t seq;
++   vkr_object_id owner; /* the command buffer it records into, or 0 */
++   uint32_t size;
++   uint32_t ncreates, nrefs, ndestroys;
++   bool needed;
++   uint64_t ids[];
++};
++
++struct vkr_snap_id {
++   uint64_t id;
++};
++
++struct vkr_snap {
++   mtx_t mutex;
++   struct vkr_snap_entry **entries;
++   uint32_t count, cap, holes;
++   uint32_t gc_at;
++   uint64_t seq;
++   struct hash_table *live;    /* struct vkr_snap_id: objects alive now */
++   struct hash_table *shm_res; /* struct vkr_snap_id: our shm resources */
++   bool off;
++   const char *broken;
++
++   mtx_t gate_mutex;
++   cnd_t gate_cond;
++   uint32_t active;
++   bool pending;
++};
++
++static uint32_t
++vkr_snap_hash(const void *key)
++{
++   const uint64_t v = *(const uint64_t *)key;
++   return (uint32_t)((v ^ (v >> 32)) * 0x9e3779b1u);
++}
++
++static bool
++vkr_snap_equal(const void *a, const void *b)
++{
++   return *(const uint64_t *)a == *(const uint64_t *)b;
++}
++
++static void
++vkr_snap_free_key(struct hash_entry *e)
++{
++   free(e->data);
++}
++
++struct vkr_snap *
++vkr_snap_create(void)
++{
++   struct vkr_snap *snap = calloc(1, sizeof(*snap));
++   if (!snap)
++      return NULL;
++   snap->live = _mesa_hash_table_create(NULL, vkr_snap_hash, vkr_snap_equal);
++   snap->shm_res = _mesa_hash_table_create(NULL, vkr_snap_hash, vkr_snap_equal);
++   if (!snap->live || !snap->shm_res || mtx_init(&snap->mutex, mtx_plain) != thrd_success)
++      goto fail;
++   if (mtx_init(&snap->gate_mutex, mtx_plain) != thrd_success) {
++      mtx_destroy(&snap->mutex);
++      goto fail;
++   }
++   if (cnd_init(&snap->gate_cond) != thrd_success) {
++      mtx_destroy(&snap->gate_mutex);
++      mtx_destroy(&snap->mutex);
++      goto fail;
++   }
++   snap->gc_at = 1024;
++   return snap;
++
++fail:
++   if (snap->live)
++      _mesa_hash_table_destroy(snap->live, NULL);
++   if (snap->shm_res)
++      _mesa_hash_table_destroy(snap->shm_res, NULL);
++   free(snap);
++   return NULL;
++}
++
++void
++vkr_snap_destroy(struct vkr_snap *snap)
++{
++   if (!snap)
++      return;
++   for (uint32_t i = 0; i < snap->count; i++)
++      free(snap->entries[i]);
++   free(snap->entries);
++   _mesa_hash_table_destroy(snap->live, vkr_snap_free_key);
++   _mesa_hash_table_destroy(snap->shm_res, vkr_snap_free_key);
++   cnd_destroy(&snap->gate_cond);
++   mtx_destroy(&snap->gate_mutex);
++   mtx_destroy(&snap->mutex);
++   free(snap);
++}
++
++void
++vkr_snap_off(struct vkr_snap *snap)
++{
++   if (!snap)
++      return;
++   mtx_lock(&snap->mutex);
++   snap->off = true;
++   mtx_unlock(&snap->mutex);
++}
++
++/* ---- following commands ---- */
++
++static void
++vkr_snap_ids_init(struct vkr_snap_ids *ids)
++{
++   ids->v = ids->inline_v;
++   ids->n = 0;
++   ids->cap = VKR_SNAP_INLINE_IDS;
++}
++
++static void
++vkr_snap_ids_fini(struct vkr_snap_ids *ids)
++{
++   if (ids->v != ids->inline_v)
++      free(ids->v);
++}
++
++static void
++vkr_snap_ids_push(struct vkr_snap_ids *ids, uint64_t id)
++{
++   /* the same handle often comes twice in a row (a device, a buffer) */
++   if (ids->n && ids->v[ids->n - 1] == id)
++      return;
++   if (ids->n == ids->cap) {
++      if (ids->cap >= (1u << 24))
++         return;
++      const uint32_t cap = ids->cap * 2;
++      uint64_t *v = ids->v == ids->inline_v ? malloc(sizeof(*v) * cap)
++                                            : realloc(ids->v, sizeof(*v) * cap);
++      if (!v)
++         return;
++      if (ids->v == ids->inline_v)
++         memcpy(v, ids->inline_v, sizeof(ids->inline_v));
++      ids->v = v;
++      ids->cap = cap;
++   }
++   ids->v[ids->n++] = id;
++}
++
++void
++vkr_snap_note_ref(vkr_object_id id, VkObjectType type)
++{
++   struct vkr_snap_cmd *cmd = vkr_snap_tls;
++   if (!cmd)
++      return;
++   if (!cmd->have_first) {
++      cmd->have_first = true;
++      cmd->first_ref = id;
++      cmd->first_ref_type = type;
++   }
++   if (type == VK_OBJECT_TYPE_COMMAND_POOL && !cmd->pool)
++      cmd->pool = id;
++   vkr_snap_ids_push(&cmd->refs, id);
++}
++
++static bool
++vkr_snap_set_has(struct hash_table *set, uint64_t id)
++{
++   return _mesa_hash_table_search(set, &id) != NULL;
++}
++
++static void
++vkr_snap_set_add(struct hash_table *set, uint64_t id)
++{
++   if (vkr_snap_set_has(set, id))
++      return;
++   struct vkr_snap_id *k = malloc(sizeof(*k));
++   if (!k)
++      return;
++   k->id = id;
++   _mesa_hash_table_insert(set, &k->id, k);
++}
++
++static void
++vkr_snap_set_remove(struct hash_table *set, uint64_t id)
++{
++   struct hash_entry *e = _mesa_hash_table_search(set, &id);
++   if (e) {
++      void *k = e->data;
++      _mesa_hash_table_remove(set, e);
++      free(k);
++   }
++}
++
++void
++vkr_snap_note_add(struct vkr_snap *snap, vkr_object_id id, VkObjectType type)
++{
++   (void)type;
++   if (!snap)
++      return;
++   mtx_lock(&snap->mutex);
++   if (!snap->off) {
++      vkr_snap_set_add(snap->live, id);
++      struct vkr_snap_cmd *cmd = vkr_snap_tls;
++      if (cmd && cmd->snap == snap) {
++         vkr_snap_ids_push(&cmd->creates, id);
++         /* ordered by when its first object appeared: a command on
++          * another ring may use it before this one is done */
++         if (!cmd->have_seq) {
++            cmd->have_seq = true;
++            cmd->seq = ++snap->seq;
++         }
++      }
++   }
++   mtx_unlock(&snap->mutex);
++}
++
++void
++vkr_snap_note_remove(struct vkr_snap *snap, vkr_object_id id)
++{
++   if (!snap)
++      return;
++   mtx_lock(&snap->mutex);
++   if (!snap->off) {
++      vkr_snap_set_remove(snap->live, id);
++      struct vkr_snap_cmd *cmd = vkr_snap_tls;
++      if (cmd && cmd->snap == snap)
++         vkr_snap_ids_push(&cmd->destroys, id);
++   }
++   mtx_unlock(&snap->mutex);
++}
++
++void
++vkr_snap_note_shm(struct vkr_snap *snap, uint32_t res_id, bool add)
++{
++   if (!snap)
++      return;
++   mtx_lock(&snap->mutex);
++   if (add)
++      vkr_snap_set_add(snap->shm_res, res_id);
++   else
++      vkr_snap_set_remove(snap->shm_res, res_id);
++   mtx_unlock(&snap->mutex);
++}
++
++void
++vkr_snap_note_broken(struct vkr_snap *snap, const char *why)
++{
++   if (!snap)
++      return;
++   mtx_lock(&snap->mutex);
++   if (!snap->broken) {
++      snap->broken = why;
++      vkr_log("snapshot: this context will come back lost: %s", why);
++   }
++   mtx_unlock(&snap->mutex);
++}
++
++static enum vkr_snap_class
++vkr_snap_classify(uint32_t type)
++{
++   static uint8_t cache[1024];
++   if (type >= ARRAY_SIZE(cache))
++      return VKR_SNAP_OTHER;
++   if (cache[type])
++      return cache[type] - 1;
++
++   const char *name = vn_dispatch_command_name(type);
++   enum vkr_snap_class c = VKR_SNAP_OTHER;
++   if (!strncmp(name, "vkCmd", 5) || !strcmp(name, "vkEndCommandBuffer") ||
++       !strncmp(name, "vkBindBufferMemory", 18) || !strncmp(name, "vkBindImageMemory", 17) ||
++       !strncmp(name, "vkUpdateDescriptorSet", 21))
++      c = VKR_SNAP_STATE;
++   else if (!strcmp(name, "vkBeginCommandBuffer"))
++      c = VKR_SNAP_BEGIN;
++   else if (!strcmp(name, "vkResetCommandBuffer"))
++      c = VKR_SNAP_RESET_CB;
++   else if (!strcmp(name, "vkResetCommandPool"))
++      c = VKR_SNAP_RESET_POOL;
++   /* benign race: every thread computes the same value */
++   cache[type] = (uint8_t)c + 1;
++   return c;
++}
++
++static void
++vkr_snap_drop(struct vkr_snap *snap, uint32_t i)
++{
++   free(snap->entries[i]);
++   snap->entries[i] = NULL;
++   snap->holes++;
++}
++
++/* the recording of a command buffer starts over */
++static void
++vkr_snap_supersede(struct vkr_snap *snap, vkr_object_id cmd_buf)
++{
++   for (uint32_t i = 0; i < snap->count; i++) {
++      const struct vkr_snap_entry *e = snap->entries[i];
++      if (e && e->owner == cmd_buf)
++         vkr_snap_drop(snap, i);
++   }
++}
++
++static void
++vkr_snap_compact(struct vkr_snap *snap)
++{
++   uint32_t n = 0;
++   for (uint32_t i = 0; i < snap->count; i++) {
++      if (snap->entries[i])
++         snap->entries[n++] = snap->entries[i];
++   }
++   snap->count = n;
++   snap->holes = 0;
++}
++
++static bool
++vkr_snap_all_in(struct hash_table *set, const uint64_t *ids, uint32_t n)
++{
++   for (uint32_t i = 0; i < n; i++) {
++      if (!vkr_snap_set_has(set, ids[i]))
++         return false;
++   }
++   return true;
++}
++
++static bool
++vkr_snap_any_in(struct hash_table *set, const uint64_t *ids, uint32_t n)
++{
++   for (uint32_t i = 0; i < n; i++) {
++      if (vkr_snap_set_has(set, ids[i]))
++         return true;
++   }
++   return false;
++}
++
++/* Drop the commands nothing alive needs.  An object is needed if it is
++ * alive or a needed command uses it; a command is needed if it makes a
++ * needed object, destroys one (the replay must too), or, making nothing,
++ * uses only needed objects.  Ids refer back in time, so this settles in a
++ * few passes. */
++static void
++vkr_snap_gc(struct vkr_snap *snap)
++{
++   if (snap->holes)
++      vkr_snap_compact(snap);
++
++   struct hash_table *needed = _mesa_hash_table_create(NULL, vkr_snap_hash, vkr_snap_equal);
++   if (!needed)
++      return;
++   hash_table_foreach (snap->live, e)
++      _mesa_hash_table_insert(needed, e->key, NULL);
++
++   for (uint32_t i = 0; i < snap->count; i++)
++      snap->entries[i]->needed = false;
++
++   bool changed = true;
++   while (changed) {
++      changed = false;
++      for (uint32_t i = snap->count; i-- > 0;) {
++         struct vkr_snap_entry *e = snap->entries[i];
++         if (e->needed)
++            continue;
++         const uint64_t *creates = e->ids;
++         const uint64_t *refs = creates + e->ncreates;
++         const uint64_t *destroys = refs + e->nrefs;
++         bool want;
++         if (e->ncreates)
++            want = vkr_snap_any_in(needed, creates, e->ncreates);
++         else if (e->ndestroys)
++            want = vkr_snap_any_in(needed, destroys, e->ndestroys);
++         else
++            want = vkr_snap_all_in(needed, refs, e->nrefs);
++         if (!want)
++            continue;
++         e->needed = true;
++         changed = true;
++         /* keys point into the entry, which stays until the end */
++         for (uint32_t j = 0; j < e->ncreates + e->nrefs; j++) {
++            if (!_mesa_hash_table_search(needed, &e->ids[j]))
++               _mesa_hash_table_insert(needed, &e->ids[j], NULL);
++         }
++      }
++   }
++   _mesa_hash_table_destroy(needed, NULL);
++
++   for (uint32_t i = 0; i < snap->count; i++) {
++      if (!snap->entries[i]->needed)
++         vkr_snap_drop(snap, i);
++   }
++   vkr_snap_compact(snap);
++   snap->gc_at = MAX2(snap->count * 2, 1024);
++}
++
++static void
++vkr_snap_commit(struct vkr_context *ctx,
++                struct vkr_snap_cmd *cmd,
++                const uint8_t *bytes,
++                size_t size)
++{
++   struct vkr_snap *snap = ctx->snap;
++   if (size < 8 || size > UINT32_MAX)
++      return;
++   uint32_t type;
++   memcpy(&type, bytes, sizeof(type));
++   const enum vkr_snap_class cls = vkr_snap_classify(type);
++   const bool on_cmd_buf = cmd->have_first && cmd->first_ref_type == VK_OBJECT_TYPE_COMMAND_BUFFER;
++
++   /* a pool's command buffers, before the snapshot lock (see vkr_context.h) */
++   uint64_t *pool_cbs = NULL;
++   uint32_t pool_cb_count = 0;
++   if (cls == VKR_SNAP_RESET_POOL && cmd->pool) {
++      struct vkr_command_pool *pool = vkr_context_get_object(ctx, cmd->pool);
++      if (pool && pool->base.type == VK_OBJECT_TYPE_COMMAND_POOL) {
++         list_for_each_entry (struct vkr_object, obj, &pool->command_buffers, track_head)
++            pool_cb_count++;
++         pool_cbs = malloc(sizeof(*pool_cbs) * MAX2(pool_cb_count, 1));
++         pool_cb_count = 0;
++         if (pool_cbs) {
++            list_for_each_entry (struct vkr_object, obj, &pool->command_buffers, track_head)
++               pool_cbs[pool_cb_count++] = obj->id;
++         }
++      }
++   }
++
++   mtx_lock(&snap->mutex);
++   if (snap->off)
++      goto out;
++
++   if ((cls == VKR_SNAP_BEGIN || cls == VKR_SNAP_RESET_CB) && on_cmd_buf)
++      vkr_snap_supersede(snap, cmd->first_ref);
++   for (uint32_t i = 0; i < pool_cb_count; i++)
++      vkr_snap_supersede(snap, pool_cbs[i]);
++   if (cls == VKR_SNAP_RESET_CB || cls == VKR_SNAP_RESET_POOL)
++      goto out;
++
++   const bool keep = cmd->creates.n || cmd->destroys.n || cls == VKR_SNAP_STATE ||
++                     cls == VKR_SNAP_BEGIN;
++   if (!keep)
++      goto out;
++
++   const uint32_t nids = cmd->creates.n + cmd->refs.n + cmd->destroys.n;
++   struct vkr_snap_entry *e = malloc(sizeof(*e) + sizeof(uint64_t) * nids + size);
++   if (!e) {
++      snap->broken = "out of memory";
++      goto out;
++   }
++   e->seq = cmd->have_seq ? cmd->seq : ++snap->seq;
++   e->owner = (on_cmd_buf && (cls == VKR_SNAP_STATE || cls == VKR_SNAP_BEGIN)) ? cmd->first_ref : 0;
++   e->size = (uint32_t)size;
++   e->ncreates = cmd->creates.n;
++   e->nrefs = cmd->refs.n;
++   e->ndestroys = cmd->destroys.n;
++   e->needed = false;
++   uint64_t *ids = e->ids;
++   memcpy(ids, cmd->creates.v, sizeof(uint64_t) * cmd->creates.n);
++   ids += cmd->creates.n;
++   memcpy(ids, cmd->refs.v, sizeof(uint64_t) * cmd->refs.n);
++   ids += cmd->refs.n;
++   memcpy(ids, cmd->destroys.v, sizeof(uint64_t) * cmd->destroys.n);
++   ids += cmd->destroys.n;
++   memcpy(ids, bytes, size);
++
++   if (snap->count == snap->cap) {
++      const uint32_t cap = MAX2(snap->cap * 2, 256);
++      struct vkr_snap_entry **v = realloc(snap->entries, sizeof(*v) * cap);
++      if (!v) {
++         free(e);
++         snap->broken = "out of memory";
++         goto out;
++      }
++      snap->entries = v;
++      snap->cap = cap;
++   }
++   /* in seq order: almost always the end */
++   uint32_t at = snap->count;
++   while (at > 0 && snap->entries[at - 1] && snap->entries[at - 1]->seq > e->seq) {
++      snap->entries[at] = snap->entries[at - 1];
++      at--;
++   }
++   snap->entries[at] = e;
++   snap->count++;
++
++   if (snap->count >= snap->gc_at)
++      vkr_snap_gc(snap);
++
++out:
++   mtx_unlock(&snap->mutex);
++   free(pool_cbs);
++}
++
++void
++vkr_snap_dispatch(struct vkr_context *ctx, struct vn_dispatch_context *dispatch)
++{
++   struct vkr_snap *snap = ctx->snap;
++   struct vkr_cs_decoder *dec = (struct vkr_cs_decoder *)dispatch->decoder;
++   if (!snap || snap->off) {
++      vn_dispatch_command(dispatch);
++      return;
++   }
++
++   const uint8_t *start = dec->cur;
++   struct vkr_snap_cmd cmd = { .snap = snap };
++   vkr_snap_ids_init(&cmd.creates);
++   vkr_snap_ids_init(&cmd.refs);
++   vkr_snap_ids_init(&cmd.destroys);
++
++   struct vkr_snap_cmd *prev = vkr_snap_tls;
++   vkr_snap_tls = &cmd;
++   vn_dispatch_command(dispatch);
++   vkr_snap_tls = prev;
++
++   if (!vkr_cs_decoder_get_fatal(dec) && dec->cur > start)
++      vkr_snap_commit(ctx, &cmd, start, (size_t)(dec->cur - start));
++
++   vkr_snap_ids_fini(&cmd.creates);
++   vkr_snap_ids_fini(&cmd.refs);
++   vkr_snap_ids_fini(&cmd.destroys);
++}
++
++/* ---- the gate ---- */
++
++void
++vkr_snap_enter(struct vkr_context *ctx)
++{
++   struct vkr_snap *snap = ctx->snap;
++   if (!snap || vkr_snap_depth++)
++      return;
++   mtx_lock(&snap->gate_mutex);
++   while (snap->pending)
++      cnd_wait(&snap->gate_cond, &snap->gate_mutex);
++   snap->active++;
++   mtx_unlock(&snap->gate_mutex);
++}
++
++void
++vkr_snap_leave(struct vkr_context *ctx)
++{
++   struct vkr_snap *snap = ctx->snap;
++   if (!snap || --vkr_snap_depth)
++      return;
++   mtx_lock(&snap->gate_mutex);
++   snap->active--;
++   cnd_broadcast(&snap->gate_cond);
++   mtx_unlock(&snap->gate_mutex);
++}
++
++bool
++vkr_snap_wait_begin(struct vkr_context *ctx)
++{
++   /* only a whole command can run again; one inside a command stream can't */
++   if (!ctx->snap || vkr_snap_depth != 1)
++      return false;
++   vkr_snap_leave(ctx);
++   return true;
++}
++
++void
++vkr_snap_wait_end(struct vkr_context *ctx, bool began)
++{
++   if (began)
++      vkr_snap_enter(ctx);
++}
++
++static struct timespec
++vkr_snap_deadline(uint32_t ms)
++{
++   struct timespec ts;
++   clock_gettime(CLOCK_REALTIME, &ts);
++   ts.tv_sec += ms / 1000;
++   ts.tv_nsec += (long)(ms % 1000) * 1000000;
++   if (ts.tv_nsec >= 1000000000) {
++      ts.tv_sec++;
++      ts.tv_nsec -= 1000000000;
++   }
++   return ts;
++}
++
++static bool
++vkr_snap_quiesce(struct vkr_snap *snap)
++{
++   const struct timespec deadline = vkr_snap_deadline(VKR_SNAP_QUIESCE_MS);
++   mtx_lock(&snap->gate_mutex);
++   snap->pending = true;
++   while (snap->active) {
++      if (cnd_timedwait(&snap->gate_cond, &snap->gate_mutex, &deadline) == thrd_timeout &&
++          snap->active)
++         break;
++   }
++   const bool ok = !snap->active;
++   mtx_unlock(&snap->gate_mutex);
++   return ok;
++}
++
++static void
++vkr_snap_unquiesce(struct vkr_snap *snap)
++{
++   mtx_lock(&snap->gate_mutex);
++   snap->pending = false;
++   cnd_broadcast(&snap->gate_cond);
++   mtx_unlock(&snap->gate_mutex);
++}
++
++/* ---- formats ---- */
++
++struct vkr_snap_block {
++   uint8_t w, h, bytes;
++};
++
++static bool
++vkr_snap_format_block(VkFormat f, struct vkr_snap_block *b)
++{
++   *b = (struct vkr_snap_block){ 1, 1, 0 };
++   if (f == VK_FORMAT_R4G4_UNORM_PACK8 || (f >= VK_FORMAT_R8_UNORM && f <= VK_FORMAT_R8_SRGB))
++      b->bytes = 1;
++   else if ((f >= VK_FORMAT_R4G4B4A4_UNORM_PACK16 && f <= VK_FORMAT_A1R5G5B5_UNORM_PACK16) ||
++            (f >= VK_FORMAT_R8G8_UNORM && f <= VK_FORMAT_R8G8_SRGB) ||
++            (f >= VK_FORMAT_R16_UNORM && f <= VK_FORMAT_R16_SFLOAT) ||
++            f == VK_FORMAT_A4R4G4B4_UNORM_PACK16 || f == VK_FORMAT_A4B4G4R4_UNORM_PACK16)
++      b->bytes = 2;
++   else if (f >= VK_FORMAT_R8G8B8_UNORM && f <= VK_FORMAT_B8G8R8_SRGB)
++      b->bytes = 3;
++   else if ((f >= VK_FORMAT_R8G8B8A8_UNORM && f <= VK_FORMAT_A2B10G10R10_SINT_PACK32) ||
++            (f >= VK_FORMAT_R16G16_UNORM && f <= VK_FORMAT_R16G16_SFLOAT) ||
++            (f >= VK_FORMAT_R32_UINT && f <= VK_FORMAT_R32_SFLOAT) ||
++            f == VK_FORMAT_B10G11R11_UFLOAT_PACK32 || f == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32)
++      b->bytes = 4;
++   else if (f >= VK_FORMAT_R16G16B16_UNORM && f <= VK_FORMAT_R16G16B16_SFLOAT)
++      b->bytes = 6;
++   else if ((f >= VK_FORMAT_R16G16B16A16_UNORM && f <= VK_FORMAT_R16G16B16A16_SFLOAT) ||
++            (f >= VK_FORMAT_R32G32_UINT && f <= VK_FORMAT_R32G32_SFLOAT) ||
++            (f >= VK_FORMAT_R64_UINT && f <= VK_FORMAT_R64_SFLOAT))
++      b->bytes = 8;
++   else if (f >= VK_FORMAT_R32G32B32_UINT && f <= VK_FORMAT_R32G32B32_SFLOAT)
++      b->bytes = 12;
++   else if ((f >= VK_FORMAT_R32G32B32A32_UINT && f <= VK_FORMAT_R32G32B32A32_SFLOAT) ||
++            (f >= VK_FORMAT_R64G64_UINT && f <= VK_FORMAT_R64G64_SFLOAT))
++      b->bytes = 16;
++   else if (f >= VK_FORMAT_R64G64B64_UINT && f <= VK_FORMAT_R64G64B64_SFLOAT)
++      b->bytes = 24;
++   else if (f >= VK_FORMAT_R64G64B64A64_UINT && f <= VK_FORMAT_R64G64B64A64_SFLOAT)
++      b->bytes = 32;
++   else if (f >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && f <= VK_FORMAT_BC7_SRGB_BLOCK) {
++      const bool eight = f <= VK_FORMAT_BC1_RGBA_SRGB_BLOCK ||
++                         f == VK_FORMAT_BC4_UNORM_BLOCK || f == VK_FORMAT_BC4_SNORM_BLOCK;
++      *b = (struct vkr_snap_block){ 4, 4, eight ? 8 : 16 };
++   } else if (f >= VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK && f <= VK_FORMAT_EAC_R11G11_SNORM_BLOCK) {
++      const bool sixteen = f == VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK ||
++                           f == VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK ||
++                           f == VK_FORMAT_EAC_R11G11_UNORM_BLOCK ||
++                           f == VK_FORMAT_EAC_R11G11_SNORM_BLOCK;
++      *b = (struct vkr_snap_block){ 4, 4, sixteen ? 16 : 8 };
++   } else if (f >= VK_FORMAT_ASTC_4x4_UNORM_BLOCK && f <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK) {
++      static const uint8_t dims[14][2] = { { 4, 4 },  { 5, 4 },   { 5, 5 },  { 6, 5 },
++                                           { 6, 6 },  { 8, 5 },   { 8, 6 },  { 8, 8 },
++                                           { 10, 5 }, { 10, 6 },  { 10, 8 }, { 10, 10 },
++                                           { 12, 10 }, { 12, 12 } };
++      const uint32_t i = (f - VK_FORMAT_ASTC_4x4_UNORM_BLOCK) / 2;
++      *b = (struct vkr_snap_block){ dims[i][0], dims[i][1], 16 };
++   }
++   return b->bytes != 0;
++}
++
++/* bytes per texel of one aspect of a depth/stencil format, as copies to
++ * buffers lay it out; 0 if not a depth/stencil format */
++static uint32_t
++vkr_snap_ds_bytes(VkFormat f, VkImageAspectFlagBits aspect)
++{
++   if (aspect == VK_IMAGE_ASPECT_STENCIL_BIT)
++      return (f == VK_FORMAT_S8_UINT || f == VK_FORMAT_D16_UNORM_S8_UINT ||
++              f == VK_FORMAT_D24_UNORM_S8_UINT || f == VK_FORMAT_D32_SFLOAT_S8_UINT)
++                ? 1
++                : 0;
++   switch (f) {
++   case VK_FORMAT_D16_UNORM:
++   case VK_FORMAT_D16_UNORM_S8_UINT:
++      return 2;
++   case VK_FORMAT_X8_D24_UNORM_PACK32:
++   case VK_FORMAT_D24_UNORM_S8_UINT:
++   case VK_FORMAT_D32_SFLOAT:
++   case VK_FORMAT_D32_SFLOAT_S8_UINT:
++      return 4;
++   default:
++      return 0;
++   }
++}
++
++/* one copy of an image's contents: a level and aspect, some layers */
++struct vkr_snap_region {
++   uint32_t level;
++   uint32_t aspect;
++   uint32_t layer0, layers;
++   VkExtent3D extent;
++   uint64_t bytes;
++};
++
++/* How an image's contents are split into copies.  Returns the number of
++ * regions (at most max), 0 if its contents aren't kept. */
++static uint32_t
++vkr_snap_image_regions(const struct vkr_image *img, struct vkr_snap_region *out, uint32_t max)
++{
++   const struct vkr_image_snap *s = &img->snap;
++   if (!s->valid || !s->bound || s->samples != VK_SAMPLE_COUNT_1_BIT || !s->transfer ||
++       s->mip_levels == 0 || s->mip_levels > 16 || s->array_layers == 0)
++      return 0;
++
++   VkImageAspectFlagBits aspects[2];
++   uint32_t naspects = 0;
++   struct vkr_snap_block block;
++   if (vkr_snap_ds_bytes(s->format, VK_IMAGE_ASPECT_DEPTH_BIT))
++      aspects[naspects++] = VK_IMAGE_ASPECT_DEPTH_BIT;
++   if (vkr_snap_ds_bytes(s->format, VK_IMAGE_ASPECT_STENCIL_BIT))
++      aspects[naspects++] = VK_IMAGE_ASPECT_STENCIL_BIT;
++   if (!naspects) {
++      if (!vkr_snap_format_block(s->format, &block))
++         return 0;
++      aspects[naspects++] = VK_IMAGE_ASPECT_COLOR_BIT;
++   }
++
++   uint32_t n = 0;
++   for (uint32_t a = 0; a < naspects; a++) {
++      struct vkr_snap_block b = { 1, 1, 0 };
++      if (aspects[a] == VK_IMAGE_ASPECT_COLOR_BIT)
++         b = block;
++      else
++         b.bytes = (uint8_t)vkr_snap_ds_bytes(s->format, aspects[a]);
++      for (uint32_t level = 0; level < s->mip_levels; level++) {
++         const VkExtent3D e = {
++            MAX2(s->extent.width >> level, 1),
++            MAX2(s->extent.height >> level, 1),
++            MAX2(s->extent.depth >> level, 1),
++         };
++         const uint64_t layer_bytes = (uint64_t)DIV_ROUND_UP(e.width, b.w) *
++                                      DIV_ROUND_UP(e.height, b.h) * e.depth * b.bytes;
++         if (layer_bytes > VKR_SNAP_STAGING_MAX)
++            return 0;
++         /* as many layers per copy as fit the largest staging */
++         const uint32_t per = (uint32_t)MIN2(VKR_SNAP_STAGING_MAX / layer_bytes, s->array_layers);
++         for (uint32_t l = 0; l < s->array_layers; l += per) {
++            if (n == max)
++               return 0;
++            out[n++] = (struct vkr_snap_region){
++               .level = level,
++               .aspect = aspects[a],
++               .layer0 = l,
++               .layers = MIN2(per, s->array_layers - l),
++               .extent = e,
++               .bytes = layer_bytes * MIN2(per, s->array_layers - l),
++            };
++         }
++      }
++   }
++   return n;
++}
++
++/* ---- copies through a staging buffer ---- */
++
++struct vkr_snap_xfer {
++   struct vkr_device *dev;
++   struct vn_device_proc_table *vk;
++   VkDevice device;
++   struct vkr_queue *queue;
++   VkCommandPool pool;
++   VkCommandBuffer cmd;
++   VkFence fence;
++   VkBuffer buf;
++   VkDeviceMemory mem;
++   uint8_t *ptr;
++   VkDeviceSize size;
++   VkDeviceSize used;
++   bool recording;
++};
++
++static uint32_t
++vkr_snap_memory_type(const struct vkr_device *dev,
++                     uint32_t bits,
++                     VkMemoryPropertyFlags want,
++                     VkMemoryPropertyFlags avoid)
++{
++   const VkPhysicalDeviceMemoryProperties *mp = &dev->physical_device->memory_properties;
++   for (uint32_t pass = 0; pass < 2; pass++) {
++      for (uint32_t i = 0; i < mp->memoryTypeCount; i++) {
++         const VkMemoryPropertyFlags f = mp->memoryTypes[i].propertyFlags;
++         if ((bits >> i & 1) && (f & want) == want && (pass || !(f & avoid)))
++            return i;
++      }
++   }
++   return UINT32_MAX;
++}
++
++static void
++vkr_snap_xfer_fini(struct vkr_snap_xfer *x)
++{
++   if (!x->vk)
++      return;
++   if (x->ptr)
++      x->vk->UnmapMemory(x->device, x->mem);
++   if (x->buf)
++      x->vk->DestroyBuffer(x->device, x->buf, NULL);
++   if (x->mem)
++      x->vk->FreeMemory(x->device, x->mem, NULL);
++   if (x->fence)
++      x->vk->DestroyFence(x->device, x->fence, NULL);
++   if (x->pool)
++      x->vk->DestroyCommandPool(x->device, x->pool, NULL);
++   memset(x, 0, sizeof(*x));
++}
++
++static bool
++vkr_snap_xfer_init(struct vkr_snap_xfer *x, struct vkr_device *dev, VkDeviceSize size)
++{
++   memset(x, 0, sizeof(*x));
++   if (list_is_empty(&dev->queues))
++      return false;
++   x->dev = dev;
++   x->vk = &dev->proc_table;
++   x->device = dev->base.handle.device;
++   x->queue = list_first_entry(&dev->queues, struct vkr_queue, base.track_head);
++   struct vn_device_proc_table *vk = x->vk;
++
++   const VkCommandPoolCreateInfo pool_info = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
++      .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
++      .queueFamilyIndex = x->queue->family,
++   };
++   if (vk->CreateCommandPool(x->device, &pool_info, NULL, &x->pool) != VK_SUCCESS)
++      goto fail;
++   const VkCommandBufferAllocateInfo cmd_info = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
++      .commandPool = x->pool,
++      .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
++      .commandBufferCount = 1,
++   };
++   if (vk->AllocateCommandBuffers(x->device, &cmd_info, &x->cmd) != VK_SUCCESS)
++      goto fail;
++   const VkFenceCreateInfo fence_info = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
++   if (vk->CreateFence(x->device, &fence_info, NULL, &x->fence) != VK_SUCCESS)
++      goto fail;
++
++   x->size = MIN2(MAX2(size, VKR_SNAP_STAGING_MIN), VKR_SNAP_STAGING_MAX);
++   const VkBufferCreateInfo buf_info = {
++      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++      .size = x->size,
++      .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++   };
++   if (vk->CreateBuffer(x->device, &buf_info, NULL, &x->buf) != VK_SUCCESS)
++      goto fail;
++   VkMemoryRequirements reqs;
++   vk->GetBufferMemoryRequirements(x->device, x->buf, &reqs);
++   const uint32_t type = vkr_snap_memory_type(
++      dev, reqs.memoryTypeBits,
++      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0);
++   if (type == UINT32_MAX)
++      goto fail;
++   const VkMemoryAllocateInfo mem_info = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .allocationSize = reqs.size,
++      .memoryTypeIndex = type,
++   };
++   if (vk->AllocateMemory(x->device, &mem_info, NULL, &x->mem) != VK_SUCCESS ||
++       vk->BindBufferMemory(x->device, x->buf, x->mem, 0) != VK_SUCCESS ||
++       vk->MapMemory(x->device, x->mem, 0, VK_WHOLE_SIZE, 0, (void **)&x->ptr) != VK_SUCCESS) {
++      x->ptr = NULL;
++      goto fail;
++   }
++   return true;
++
++fail:
++   vkr_log("snapshot: no staging buffer of %" PRIu64 " bytes", (uint64_t)size);
++   vkr_snap_xfer_fini(x);
++   return false;
++}
++
++static void
++vkr_snap_barrier(struct vkr_snap_xfer *x)
++{
++   const VkMemoryBarrier barrier = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++      .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
++      .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
++   };
++   x->vk->CmdPipelineBarrier(x->cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
++                             0, 1, &barrier, 0, NULL, 0, NULL);
++}
++
++static bool
++vkr_snap_xfer_begin(struct vkr_snap_xfer *x)
++{
++   if (x->recording)
++      return true;
++   const VkCommandBufferBeginInfo begin = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++      .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
++   };
++   if (x->vk->ResetCommandBuffer(x->cmd, 0) != VK_SUCCESS ||
++       x->vk->BeginCommandBuffer(x->cmd, &begin) != VK_SUCCESS)
++      return false;
++   vkr_snap_barrier(x);
++   x->recording = true;
++   x->used = 0;
++   return true;
++}
++
++static bool
++vkr_snap_xfer_run(struct vkr_snap_xfer *x)
++{
++   if (!x->recording)
++      return true;
++   x->recording = false;
++   vkr_snap_barrier(x);
++   if (x->vk->EndCommandBuffer(x->cmd) != VK_SUCCESS)
++      return false;
++   const VkSubmitInfo submit = {
++      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++      .commandBufferCount = 1,
++      .pCommandBuffers = &x->cmd,
++   };
++   mtx_lock(&x->queue->vk_mutex);
++   VkResult r = x->vk->QueueSubmit(x->queue->base.handle.queue, 1, &submit, x->fence);
++   mtx_unlock(&x->queue->vk_mutex);
++   if (r == VK_SUCCESS)
++      r = x->vk->WaitForFences(x->device, 1, &x->fence, VK_TRUE,
++                               (uint64_t)VKR_SNAP_GPU_MS * 1000000);
++   x->vk->ResetFences(x->device, 1, &x->fence);
++   if (r != VK_SUCCESS)
++      vkr_log("snapshot: a copy on the GPU failed (%d)", r);
++   return r == VK_SUCCESS;
++}
++
++/* Room for `size` bytes in the staging buffer (aligned for any texel), or
++ * UINT64_MAX if it would need a new batch (run the batch first). */
++static VkDeviceSize
++vkr_snap_xfer_alloc(struct vkr_snap_xfer *x, VkDeviceSize size)
++{
++   const VkDeviceSize at = ALIGN_POT(x->used, 256);
++   if (at + size > x->size)
++      return UINT64_MAX;
++   x->used = at + size;
++   return at;
++}
++
++static void
++vkr_snap_image_copy(struct vkr_snap_xfer *x,
++                    const struct vkr_image *img,
++                    const struct vkr_snap_region *r,
++                    VkDeviceSize offset,
++                    bool to_image)
++{
++   const VkBufferImageCopy copy = {
++      .bufferOffset = offset,
++      .imageSubresource = {
++         .aspectMask = r->aspect,
++         .mipLevel = r->level,
++         .baseArrayLayer = r->layer0,
++         .layerCount = r->layers,
++      },
++      .imageExtent = r->extent,
++   };
++   /* MoltenVK keeps no image layouts (Metal has none): GENERAL is as good
++    * as the one the app last moved the image to. */
++   if (to_image)
++      x->vk->CmdCopyBufferToImage(x->cmd, x->buf, img->base.handle.image,
++                                  VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
++   else
++      x->vk->CmdCopyImageToBuffer(x->cmd, img->base.handle.image, VK_IMAGE_LAYOUT_GENERAL,
++                                  x->buf, 1, &copy);
++}
++
++/* A buffer over all of a memory object, to copy device-local memory. */
++static VkBuffer
++vkr_snap_memory_buffer(struct vkr_device *dev, const struct vkr_device_memory *mem)
++{
++   struct vn_device_proc_table *vk = &dev->proc_table;
++   const VkDevice device = dev->base.handle.device;
++   VkDeviceSize size = mem->allocation_size;
++   for (int tries = 0; tries < 2 && size; tries++) {
++      const VkBufferCreateInfo info = {
++         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++         .size = size,
++         .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++      };
++      VkBuffer buf;
++      if (vk->CreateBuffer(device, &info, NULL, &buf) != VK_SUCCESS)
++         return VK_NULL_HANDLE;
++      VkMemoryRequirements reqs;
++      vk->GetBufferMemoryRequirements(device, buf, &reqs);
++      if (reqs.size <= mem->allocation_size &&
++          (reqs.memoryTypeBits >> mem->memory_type_index & 1) &&
++          vk->BindBufferMemory(device, buf, mem->base.handle.device_memory, 0) == VK_SUCCESS)
++         return buf;
++      vk->DestroyBuffer(device, buf, NULL);
++      if (!reqs.alignment || reqs.size <= mem->allocation_size)
++         break;
++      size = (mem->allocation_size - (reqs.size - mem->allocation_size)) & ~(reqs.alignment - 1);
++   }
++   return VK_NULL_HANDLE;
++}
++
++/* Copy a device-local memory object out (to_mem false) or in, through the
++ * staging buffer, in pieces.  `data` holds `size` bytes. */
++static bool
++vkr_snap_memory_copy(struct vkr_snap_xfer *x,
++                     const struct vkr_device_memory *mem,
++                     uint8_t *data,
++                     uint64_t size,
++                     bool to_mem)
++{
++   VkBuffer buf = vkr_snap_memory_buffer(x->dev, mem);
++   if (!buf)
++      return false;
++   bool ok = true;
++   for (uint64_t off = 0; off < size && ok; off += x->size) {
++      const VkDeviceSize n = MIN2(x->size, size - off);
++      ok = vkr_snap_xfer_run(x) && vkr_snap_xfer_begin(x);
++      if (!ok)
++         break;
++      const VkBufferCopy copy = { .srcOffset = to_mem ? 0 : off, .dstOffset = to_mem ? off : 0, .size = n };
++      if (to_mem) {
++         memcpy(x->ptr, data + off, n);
++         x->vk->CmdCopyBuffer(x->cmd, x->buf, buf, 1, &copy);
++      } else {
++         x->vk->CmdCopyBuffer(x->cmd, buf, x->buf, 1, &copy);
++      }
++      ok = vkr_snap_xfer_run(x);
++      if (ok && !to_mem)
++         memcpy(data + off, x->ptr, n);
++   }
++   x->vk->DestroyBuffer(x->device, buf, NULL);
++   return ok;
++}
++
++/* ---- the snapshot file ---- */
++
++struct vkr_snap_w {
++   uint8_t *p; /* NULL while counting */
++   uint64_t off;
++};
++
++struct vkr_snap_rec_head {
++   uint32_t tag;
++   uint32_t pad;
++   uint64_t len;
++};
++
++/* A record of `len` bytes; NULL while counting. */
++static uint8_t *
++vkr_snap_w_rec(struct vkr_snap_w *w, uint32_t tag, uint64_t len)
++{
++   uint8_t *out = NULL;
++   if (w->p) {
++      const struct vkr_snap_rec_head h = { .tag = tag, .len = len };
++      memcpy(w->p + w->off, &h, sizeof(h));
++      out = w->p + w->off + sizeof(h);
++   }
++   w->off += sizeof(struct vkr_snap_rec_head) + ALIGN_POT(len, 8);
++   return out;
++}
++
++struct vkr_snap_file_head {
++   uint32_t magic;
++   uint32_t version;
++   uint32_t flags;
++   uint32_t pad;
++};
++
++struct vkr_snap_mem_rec {
++   uint64_t id;
++   uint64_t size;
++   uint32_t valid;
++   uint32_t pad;
++};
++
++struct vkr_snap_img_rec {
++   uint64_t id;
++   uint32_t level, aspect, layer0, layers;
++   uint32_t width, height, depth;
++   uint32_t valid;
++   uint64_t bytes;
++};
++
++struct vkr_snap_state_rec {
++   uint64_t id;
++   uint32_t flag; /* fence signaled, event set, binary semaphore signaled */
++   uint32_t timeline;
++   uint64_t value;
++};
++
++struct vkr_snap_ring_rec {
++   uint64_t id;
++   uint32_t res_id;
++   uint32_t head;
++   uint64_t offset, size;
++   uint64_t head_offset, tail_offset, status_offset;
++   uint64_t buffer_offset, buffer_size, extra_offset, extra_size;
++   uint64_t idle_timeout;
++   uint64_t virtqueue_seqno;
++   uint32_t monitor_us;
++   int32_t prio;
++   uint32_t prio_valid;
++   uint32_t pad;
++};
++
++struct vkr_snap_enc_rec {
++   uint64_t ring_id; /* 0: the context's own */
++   uint32_t res_id;  /* 0: none set */
++   uint32_t pad;
++   uint64_t offset, size, pos;
++};
++
++/* an image copy waiting for its batch to run */
++struct vkr_snap_pending {
++   uint8_t *dst;
++   VkDeviceSize at;
++   uint64_t bytes;
++};
++
++/* what a snapshot looks at, gathered once */
++struct vkr_snap_objs {
++   struct vkr_device **devices;
++   uint32_t device_count;
++};
++
++static void
++vkr_snap_w_enc(struct vkr_snap_w *w, uint64_t ring_id, struct vkr_cs_encoder *enc)
++{
++   struct vkr_snap_enc_rec rec = { .ring_id = ring_id };
++   mtx_lock(&enc->mutex);
++   if (enc->stream.resource && enc->cur) {
++      rec.res_id = enc->stream.resource->res_id;
++      rec.offset = enc->stream.offset;
++      rec.size = enc->stream.size;
++      rec.pos = (uint64_t)(enc->cur - (enc->stream.resource->u.data + enc->stream.offset));
++   }
++   mtx_unlock(&enc->mutex);
++   uint8_t *p = vkr_snap_w_rec(w, VKR_SNAP_TAG_ENC, sizeof(rec));
++   if (p)
++      memcpy(p, &rec, sizeof(rec));
++}
++
++static void
++vkr_snap_w_rings(struct vkr_snap_w *w, struct vkr_context *ctx, bool with_encoders)
++{
++   mtx_lock(&ctx->ring_mutex);
++   list_for_each_entry (struct vkr_ring, ring, &ctx->rings, head) {
++      const VkRingCreateInfoMESA *info = &ring->snap_info;
++      struct vkr_snap_ring_rec rec = {
++         .id = ring->id,
++         .res_id = info->resourceId,
++         .head = vkr_ring_load_head(ring),
++         .offset = info->offset,
++         .size = info->size,
++         .head_offset = info->headOffset,
++         .tail_offset = info->tailOffset,
++         .status_offset = info->statusOffset,
++         .buffer_offset = info->bufferOffset,
++         .buffer_size = info->bufferSize,
++         .extra_offset = info->extraOffset,
++         .extra_size = info->extraSize,
++         .idle_timeout = info->idleTimeout,
++         .monitor_us = ring->snap_monitor_us,
++         .prio = ring->prio,
++         .prio_valid = ring->prio_valid,
++      };
++      mtx_lock(&ring->mutex);
++      rec.virtqueue_seqno = ring->virtqueue_seqno;
++      mtx_unlock(&ring->mutex);
++      uint8_t *p = vkr_snap_w_rec(w, VKR_SNAP_TAG_RING, sizeof(rec));
++      if (p)
++         memcpy(p, &rec, sizeof(rec));
++      if (with_encoders)
++         vkr_snap_w_enc(w, ring->id, &ring->encoder);
++   }
++   mtx_unlock(&ctx->ring_mutex);
++}
++
++/* Everything but rings, in restore order. */
++static void
++vkr_snap_w_state(struct vkr_snap_w *w,
++                 struct vkr_context *ctx,
++                 const struct vkr_snap_objs *objs,
++                 uint64_t staging)
++{
++   struct vkr_snap *snap = ctx->snap;
++
++   /* shm resources first: rings and reply streams live there */
++   hash_table_foreach (snap->shm_res, he) {
++      const uint32_t res_id = (uint32_t)((struct vkr_snap_id *)he->data)->id;
++      struct vkr_resource *res = vkr_context_get_resource(ctx, res_id);
++      if (!res || res->fd_type != VIRGL_RESOURCE_FD_SHM || !res->u.data)
++         continue;
++      struct vkr_snap_mem_rec rec = { .id = res_id, .size = res->size, .valid = 1 };
++      uint8_t *p = vkr_snap_w_rec(w, VKR_SNAP_TAG_SHM, sizeof(rec) + res->size);
++      if (p) {
++         memcpy(p, &rec, sizeof(rec));
++         memcpy(p + sizeof(rec), res->u.data, res->size);
++      }
++   }
++
++   for (uint32_t i = 0; i < snap->count; i++) {
++      const struct vkr_snap_entry *e = snap->entries[i];
++      uint8_t *p = vkr_snap_w_rec(w, VKR_SNAP_TAG_CMD, e->size);
++      if (p)
++         memcpy(p, e->ids + e->ncreates + e->nrefs + e->ndestroys, e->size);
++   }
++
++   for (uint32_t d = 0; d < objs->device_count; d++) {
++      struct vkr_device *dev = objs->devices[d];
++      struct vn_device_proc_table *vk = &dev->proc_table;
++      const VkDevice device = dev->base.handle.device;
++      struct vkr_snap_xfer x = { 0 };
++      if (w->p)
++         vkr_snap_xfer_init(&x, dev, staging);
++
++      list_for_each_entry (struct vkr_object, obj, &dev->objects, track_head) {
++         if (obj->type != VK_OBJECT_TYPE_DEVICE_MEMORY)
++            continue;
++         const struct vkr_device_memory *mem = (const struct vkr_device_memory *)obj;
++         const bool visible = mem->property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
++         const bool lazy = mem->property_flags & VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT;
++         /* device-local memory only buffers live in: images keep their
++          * contents apart (MoltenVK gives each its own texture) */
++         if (lazy || (!mem->shm && (visible || !mem->has_buffers)))
++            continue;
++         const uint64_t size = mem->shm ? mem->shm->size : mem->allocation_size;
++         struct vkr_snap_mem_rec rec = { .id = obj->id, .size = size };
++         uint8_t *p = vkr_snap_w_rec(w, VKR_SNAP_TAG_MEM, sizeof(rec) + size);
++         if (!p)
++            continue;
++         if (mem->shm) {
++            memcpy(p + sizeof(rec), mem->shm->ptr, size);
++            rec.valid = 1;
++         } else if (x.vk) {
++            rec.valid = vkr_snap_memory_copy(&x, mem, p + sizeof(rec), size, false);
++         }
++         memcpy(p, &rec, sizeof(rec));
++      }
++
++      list_for_each_entry (struct vkr_object, obj, &dev->objects, track_head) {
++         if (obj->type != VK_OBJECT_TYPE_IMAGE)
++            continue;
++         const struct vkr_image *img = (const struct vkr_image *)obj;
++         struct vkr_snap_region regions[64];
++         const uint32_t n = vkr_snap_image_regions(img, regions, ARRAY_SIZE(regions));
++         /* copies batched into the staging buffer, then read out */
++         struct vkr_snap_pending pending[64];
++         uint32_t npending = 0;
++         bool ok = x.vk != NULL;
++         for (uint32_t i = 0; i < n; i++) {
++            const struct vkr_snap_region *r = &regions[i];
++            struct vkr_snap_img_rec rec = {
++               .id = obj->id,
++               .level = r->level,
++               .aspect = r->aspect,
++               .layer0 = r->layer0,
++               .layers = r->layers,
++               .width = r->extent.width,
++               .height = r->extent.height,
++               .depth = r->extent.depth,
++               .bytes = r->bytes,
++            };
++            uint8_t *p = vkr_snap_w_rec(w, VKR_SNAP_TAG_IMG, sizeof(rec) + r->bytes);
++            if (!p)
++               continue;
++            VkDeviceSize at = UINT64_MAX;
++            if (ok && r->bytes <= x.size && vkr_snap_xfer_begin(&x)) {
++               at = vkr_snap_xfer_alloc(&x, r->bytes);
++               if (at == UINT64_MAX) {
++                  ok = vkr_snap_xfer_run(&x);
++                  for (uint32_t j = 0; ok && j < npending; j++)
++                     memcpy(pending[j].dst, x.ptr + pending[j].at, pending[j].bytes);
++                  npending = 0;
++                  if (ok && vkr_snap_xfer_begin(&x))
++                     at = vkr_snap_xfer_alloc(&x, r->bytes);
++               }
++               if (ok && at != UINT64_MAX) {
++                  vkr_snap_image_copy(&x, img, r, at, false);
++                  pending[npending++] = (struct vkr_snap_pending){ p + sizeof(rec), at, r->bytes };
++                  rec.valid = 1;
++               }
++            }
++            memcpy(p, &rec, sizeof(rec));
++         }
++         if (npending) {
++            if (vkr_snap_xfer_run(&x)) {
++               for (uint32_t j = 0; j < npending; j++)
++                  memcpy(pending[j].dst, x.ptr + pending[j].at, pending[j].bytes);
++            } else {
++               vkr_log("snapshot: image %" PRIu64 " contents lost", obj->id);
++            }
++         }
++      }
++      vkr_snap_xfer_fini(&x);
++
++      list_for_each_entry (struct vkr_object, obj, &dev->objects, track_head) {
++         struct vkr_snap_state_rec rec = { .id = obj->id };
++         uint32_t tag;
++         switch (obj->type) {
++         case VK_OBJECT_TYPE_FENCE:
++            tag = VKR_SNAP_TAG_FENCE;
++            rec.flag = vk->GetFenceStatus(device, obj->handle.fence) == VK_SUCCESS;
++            break;
++         case VK_OBJECT_TYPE_EVENT:
++            tag = VKR_SNAP_TAG_EVENT;
++            rec.flag = vk->GetEventStatus(device, obj->handle.event) == VK_EVENT_SET;
++            break;
++         case VK_OBJECT_TYPE_SEMAPHORE: {
++            const struct vkr_semaphore *sem = (const struct vkr_semaphore *)obj;
++            tag = VKR_SNAP_TAG_SEM;
++            rec.timeline = sem->timeline;
++            rec.flag = sem->signaled;
++            if (sem->timeline && w->p)
++               vk->GetSemaphoreCounterValue(device, obj->handle.semaphore, &rec.value);
++            break;
++         }
++         default:
++            continue;
++         }
++         uint8_t *p = vkr_snap_w_rec(w, tag, sizeof(rec));
++         if (p)
++            memcpy(p, &rec, sizeof(rec));
++      }
++   }
++
++   vkr_snap_w_enc(w, 0, &ctx->encoder);
++}
++
++static void
++vkr_snap_collect(struct vkr_context *ctx, struct vkr_snap_objs *objs, uint64_t *staging)
++{
++   memset(objs, 0, sizeof(*objs));
++   *staging = 0;
++   mtx_lock(&ctx->object_mutex);
++   hash_table_foreach (ctx->object_table, he) {
++      struct vkr_object *obj = he->data;
++      if (obj->type == VK_OBJECT_TYPE_DEVICE)
++         objs->device_count++;
++   }
++   objs->devices = calloc(MAX2(objs->device_count, 1), sizeof(*objs->devices));
++   uint32_t n = 0;
++   hash_table_foreach (ctx->object_table, he) {
++      struct vkr_object *obj = he->data;
++      if (obj->type == VK_OBJECT_TYPE_DEVICE && objs->devices)
++         objs->devices[n++] = (struct vkr_device *)obj;
++      if (obj->type == VK_OBJECT_TYPE_IMAGE) {
++         struct vkr_snap_region r[64];
++         const uint32_t count = vkr_snap_image_regions((struct vkr_image *)obj, r, 64);
++         for (uint32_t i = 0; i < count; i++)
++            *staging = MAX2(*staging, r[i].bytes);
++      }
++   }
++   if (!objs->devices)
++      objs->device_count = 0;
++   mtx_unlock(&ctx->object_mutex);
++}
++
++/* Wait for every queue of every device. */
++static bool
++vkr_snap_idle(const struct vkr_snap_objs *objs)
++{
++   bool ok = true;
++   for (uint32_t d = 0; d < objs->device_count; d++) {
++      struct vkr_device *dev = objs->devices[d];
++      struct vn_device_proc_table *vk = &dev->proc_table;
++      const VkDevice device = dev->base.handle.device;
++      list_for_each_entry (struct vkr_queue, queue, &dev->queues, base.track_head) {
++         VkFence fence;
++         const VkFenceCreateInfo info = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
++         if (vk->CreateFence(device, &info, NULL, &fence) != VK_SUCCESS)
++            return false;
++         mtx_lock(&queue->vk_mutex);
++         VkResult r = vk->QueueSubmit(queue->base.handle.queue, 0, NULL, fence);
++         mtx_unlock(&queue->vk_mutex);
++         if (r == VK_SUCCESS)
++            r = vk->WaitForFences(device, 1, &fence, VK_TRUE,
++                                  (uint64_t)VKR_SNAP_GPU_MS * 1000000);
++         vk->DestroyFence(device, fence, NULL);
++         if (r != VK_SUCCESS) {
++            vkr_log("snapshot: the GPU didn't finish (%d)", r);
++            ok = false;
++         }
++      }
++   }
++   return ok;
++}
++
++int
++vkr_snap_save(struct vkr_context *ctx, int *out_fd, uint64_t *out_size)
++{
++   struct vkr_snap *snap = ctx->snap;
++   *out_fd = -1;
++   *out_size = 0;
++   if (!snap)
++      return -1;
++
++   const bool quiet = vkr_snap_quiesce(snap);
++   bool lost = !quiet || vkr_context_get_fatal(ctx) || snap->broken;
++   if (!quiet)
++      vkr_log("snapshot: context %u didn't stop in time: saved as lost", ctx->ctx_id);
++   else if (lost)
++      vkr_log("snapshot: context %u saved as lost (%s)", ctx->ctx_id,
++              snap->broken ? snap->broken : "it had failed");
++
++   struct vkr_snap_objs objs = { 0 };
++   uint64_t staging = 0;
++   if (!lost) {
++      vkr_snap_collect(ctx, &objs, &staging);
++      if (!vkr_snap_idle(&objs))
++         lost = true;
++   }
++   if (!lost) {
++      mtx_lock(&snap->mutex);
++      vkr_snap_gc(snap);
++      mtx_unlock(&snap->mutex);
++   }
++
++   struct vkr_snap_file_head head = {
++      .magic = VKR_SNAP_MAGIC,
++      .version = VKR_SNAP_VERSION,
++      .flags = lost ? VKR_SNAP_FLAG_LOST : 0,
++   };
++   /* twice: sizes first, then the contents straight into the object */
++   struct vkr_snap_w w = { .off = sizeof(head) };
++   if (!lost)
++      vkr_snap_w_state(&w, ctx, &objs, staging);
++   vkr_snap_w_rings(&w, ctx, !lost);
++   const uint64_t size = w.off;
++
++   int ret = -1;
++   /* the name the worker's sandbox lets it make shared memory under */
++   int fd = os_create_anonymous_file(size, "vkr-shmem");
++   void *p = fd >= 0 ? mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) : MAP_FAILED;
++   if (p == MAP_FAILED)
++      vkr_log("snapshot: no shared memory of %" PRIu64 " bytes", size);
++   if (p != MAP_FAILED) {
++      w = (struct vkr_snap_w){ .p = p, .off = sizeof(head) };
++      memcpy(p, &head, sizeof(head));
++      if (!lost)
++         vkr_snap_w_state(&w, ctx, &objs, staging);
++      vkr_snap_w_rings(&w, ctx, !lost);
++      munmap(p, size);
++      if (w.off == size) {
++         *out_fd = fd;
++         *out_size = size;
++         fd = -1;
++         ret = lost ? 1 : 0;
++      } else {
++         vkr_log("snapshot: size changed while saving (%" PRIu64 " then %" PRIu64 ")", size,
++                 w.off);
++      }
++   }
++   if (fd >= 0)
++      close(fd);
++   free(objs.devices);
++
++   if (ret >= 0)
++      vkr_log("snapshot: context %u: %u commands, %" PRIu64 " KiB%s", ctx->ctx_id,
++              lost ? 0 : snap->count, size >> 10, lost ? ", lost" : "");
++   vkr_snap_unquiesce(snap);
++   return ret;
++}
++
++/* ---- restore ---- */
++
++struct vkr_snap_r {
++   const uint8_t *p;
++   uint64_t size, off;
++};
++
++static bool
++vkr_snap_r_next(struct vkr_snap_r *r, uint32_t *tag, const uint8_t **data, uint64_t *len)
++{
++   if (r->off == r->size)
++      return false;
++   struct vkr_snap_rec_head h;
++   if (r->size - r->off < sizeof(h))
++      goto bad;
++   memcpy(&h, r->p + r->off, sizeof(h));
++   const uint64_t room = r->size - r->off - sizeof(h);
++   if (h.len > room || ALIGN_POT(h.len, 8) > room)
++      goto bad;
++   *tag = h.tag;
++   *data = r->p + r->off + sizeof(h);
++   *len = h.len;
++   r->off += sizeof(h) + ALIGN_POT(h.len, 8);
++   return true;
++
++bad:
++   r->off = r->size;
++   *tag = 0;
++   return true;
++}
++
++static void *
++vkr_snap_find(struct vkr_context *ctx, uint64_t id, VkObjectType type)
++{
++   struct vkr_object *obj = vkr_context_get_object(ctx, id);
++   return obj && obj->type == type ? (void *)obj : NULL;
++}
++
++static struct vkr_device *
++vkr_snap_device_of(struct vkr_context *ctx, const struct vkr_object *target)
++{
++   struct vkr_device *found = NULL;
++   mtx_lock(&ctx->object_mutex);
++   hash_table_foreach (ctx->object_table, he) {
++      struct vkr_object *obj = he->data;
++      if (obj->type != VK_OBJECT_TYPE_DEVICE)
++         continue;
++      struct vkr_device *dev = (struct vkr_device *)obj;
++      list_for_each_entry (struct vkr_object, o, &dev->objects, track_head) {
++         if (o == target) {
++            found = dev;
++            break;
++         }
++      }
++      if (found)
++         break;
++   }
++   mtx_unlock(&ctx->object_mutex);
++   return found;
++}
++
++static bool
++vkr_snap_signal(struct vkr_device *dev, VkSemaphore sem, VkFence fence)
++{
++   if (list_is_empty(&dev->queues))
++      return false;
++   struct vkr_queue *queue = list_first_entry(&dev->queues, struct vkr_queue, base.track_head);
++   const VkSubmitInfo submit = {
++      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++      .signalSemaphoreCount = sem ? 1 : 0,
++      .pSignalSemaphores = &sem,
++   };
++   mtx_lock(&queue->vk_mutex);
++   const VkResult r =
++      dev->proc_table.QueueSubmit(queue->base.handle.queue, 1, &submit, fence);
++   mtx_unlock(&queue->vk_mutex);
++   return r == VK_SUCCESS;
++}
++
++static void
++vkr_snap_r_state(struct vkr_context *ctx, uint32_t tag, const struct vkr_snap_state_rec *rec)
++{
++   static const VkObjectType types[] = {
++      [VKR_SNAP_TAG_FENCE] = VK_OBJECT_TYPE_FENCE,
++      [VKR_SNAP_TAG_EVENT] = VK_OBJECT_TYPE_EVENT,
++      [VKR_SNAP_TAG_SEM] = VK_OBJECT_TYPE_SEMAPHORE,
++   };
++   struct vkr_object *obj = (struct vkr_object *)vkr_snap_find(ctx, rec->id, types[tag]);
++   if (!obj)
++      return;
++   struct vkr_device *dev = vkr_snap_device_of(ctx, obj);
++   if (!dev)
++      return;
++   struct vn_device_proc_table *vk = &dev->proc_table;
++   const VkDevice device = dev->base.handle.device;
++   switch (tag) {
++   case VKR_SNAP_TAG_FENCE: {
++      const bool now = vk->GetFenceStatus(device, obj->handle.fence) == VK_SUCCESS;
++      if (rec->flag && !now)
++         vkr_snap_signal(dev, VK_NULL_HANDLE, obj->handle.fence);
++      else if (!rec->flag && now)
++         vk->ResetFences(device, 1, &obj->handle.fence);
++      break;
++   }
++   case VKR_SNAP_TAG_EVENT:
++      if (rec->flag)
++         vk->SetEvent(device, obj->handle.event);
++      else
++         vk->ResetEvent(device, obj->handle.event);
++      break;
++   case VKR_SNAP_TAG_SEM: {
++      struct vkr_semaphore *sem = (struct vkr_semaphore *)obj;
++      if (sem->timeline != !!rec->timeline)
++         break;
++      if (sem->timeline) {
++         uint64_t now = 0;
++         vk->GetSemaphoreCounterValue(device, obj->handle.semaphore, &now);
++         if (rec->value > now) {
++            const VkSemaphoreSignalInfo info = {
++               .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO,
++               .semaphore = obj->handle.semaphore,
++               .value = rec->value,
++            };
++            vk->SignalSemaphore(device, &info);
++         }
++      } else if (rec->flag && !sem->signaled) {
++         if (vkr_snap_signal(dev, obj->handle.semaphore, VK_NULL_HANDLE))
++            sem->signaled = true;
++      }
++      break;
++   }
++   default:
++      break;
++   }
++}
++
++/* GPU copies of restored contents, per device, run when the device or the
++ * batch changes */
++struct vkr_snap_upload {
++   struct vkr_snap_xfer x;
++   uint64_t staging;
++};
++
++static void
++vkr_snap_r_mem(struct vkr_context *ctx,
++               struct vkr_snap_upload *up,
++               const uint8_t *data,
++               uint64_t len)
++{
++   struct vkr_snap_mem_rec rec;
++   if (len < sizeof(rec))
++      return;
++   memcpy(&rec, data, sizeof(rec));
++   if (!rec.valid || rec.size != len - sizeof(rec))
++      return;
++   struct vkr_device_memory *mem = vkr_snap_find(ctx, rec.id, VK_OBJECT_TYPE_DEVICE_MEMORY);
++   if (!mem)
++      return;
++   if (mem->shm) {
++      memcpy(mem->shm->ptr, data + sizeof(rec), MIN2(rec.size, mem->shm->size));
++      return;
++   }
++   if (rec.size != mem->allocation_size)
++      return;
++   struct vkr_device *dev = mem->device;
++   if (up->x.dev != dev) {
++      vkr_snap_xfer_run(&up->x);
++      vkr_snap_xfer_fini(&up->x);
++      if (!vkr_snap_xfer_init(&up->x, dev, up->staging))
++         return;
++   }
++   if (!vkr_snap_memory_copy(&up->x, mem, (uint8_t *)data + sizeof(rec), rec.size, true))
++      vkr_log("snapshot: memory %" PRIu64 " contents not restored", rec.id);
++}
++
++static void
++vkr_snap_r_img(struct vkr_context *ctx,
++               struct vkr_snap_upload *up,
++               const uint8_t *data,
++               uint64_t len)
++{
++   struct vkr_snap_img_rec rec;
++   if (len < sizeof(rec))
++      return;
++   memcpy(&rec, data, sizeof(rec));
++   if (!rec.valid || rec.bytes != len - sizeof(rec))
++      return;
++   struct vkr_image *img = (struct vkr_image *)vkr_snap_find(ctx, rec.id, VK_OBJECT_TYPE_IMAGE);
++   if (!img || !img->snap.device)
++      return;
++   /* the same split as when saved, or nothing */
++   struct vkr_snap_region regions[64];
++   const uint32_t n = vkr_snap_image_regions(img, regions, ARRAY_SIZE(regions));
++   const struct vkr_snap_region *r = NULL;
++   for (uint32_t i = 0; i < n; i++) {
++      if (regions[i].level == rec.level && regions[i].aspect == rec.aspect &&
++          regions[i].layer0 == rec.layer0 && regions[i].layers == rec.layers &&
++          regions[i].bytes == rec.bytes && regions[i].extent.width == rec.width &&
++          regions[i].extent.height == rec.height && regions[i].extent.depth == rec.depth) {
++         r = &regions[i];
++         break;
++      }
++   }
++   if (!r)
++      return;
++   struct vkr_device *dev = img->snap.device;
++   if (up->x.dev != dev) {
++      vkr_snap_xfer_run(&up->x);
++      vkr_snap_xfer_fini(&up->x);
++      if (!vkr_snap_xfer_init(&up->x, dev, up->staging))
++         return;
++   }
++   if (r->bytes > up->x.size || !vkr_snap_xfer_begin(&up->x))
++      return;
++   VkDeviceSize at = vkr_snap_xfer_alloc(&up->x, r->bytes);
++   if (at == UINT64_MAX) {
++      if (!vkr_snap_xfer_run(&up->x) || !vkr_snap_xfer_begin(&up->x))
++         return;
++      at = vkr_snap_xfer_alloc(&up->x, r->bytes);
++   }
++   if (at == UINT64_MAX)
++      return;
++   memcpy(up->x.ptr + at, data + sizeof(rec), r->bytes);
++   vkr_snap_image_copy(&up->x, img, r, at, true);
++}
++
++static struct vkr_ring *
++vkr_snap_r_ring(struct vkr_context *ctx, const struct vkr_snap_ring_rec *rec, bool lost)
++{
++   struct vkr_resource *res = vkr_context_get_resource(ctx, rec->res_id);
++   if (!res || res->fd_type != VIRGL_RESOURCE_FD_SHM || !res->u.data)
++      return NULL;
++   const VkRingCreateInfoMESA info = {
++      .sType = VK_STRUCTURE_TYPE_RING_CREATE_INFO_MESA,
++      .resourceId = rec->res_id,
++      .offset = rec->offset,
++      .size = rec->size,
++      .idleTimeout = rec->idle_timeout,
++      .headOffset = rec->head_offset,
++      .tailOffset = rec->tail_offset,
++      .statusOffset = rec->status_offset,
++      .bufferOffset = rec->buffer_offset,
++      .bufferSize = rec->buffer_size,
++      .extraOffset = rec->extra_offset,
++      .extraSize = rec->extra_size,
++   };
++   struct vkr_ring_layout layout;
++   if (!vkr_ring_layout_init(&layout, res, &info))
++      return NULL;
++   volatile atomic_uint *head = (volatile atomic_uint *)(res->u.data + layout.head.begin);
++   volatile atomic_uint *status = (volatile atomic_uint *)(res->u.data + layout.status.begin);
++   if (lost) {
++      /* the guest driver gives up on a fatal ring: its app sees the device
++       * lost, and nothing else does */
++      atomic_store(status, VK_RING_STATUS_FATAL_BIT_MESA);
++      return NULL;
++   }
++   /* made like a new ring, then put where the old one stood */
++   atomic_store(head, 0);
++   atomic_store(status, 0);
++   struct vkr_ring *ring = vkr_ring_create(&layout, ctx, info.idleTimeout);
++   if (!ring)
++      return NULL;
++   ring->id = rec->id;
++   ring->snap_info = info;
++   ring->snap_monitor_us = rec->monitor_us;
++   ring->monitor = rec->monitor_us != 0;
++   ring->prio_valid = rec->prio_valid;
++   ring->prio = rec->prio;
++   ring->buffer.cur = rec->head;
++   ring->virtqueue_seqno = rec->virtqueue_seqno;
++   atomic_store(head, rec->head);
++   mtx_lock(&ctx->ring_mutex);
++   list_addtail(&ring->head, &ctx->rings);
++   mtx_unlock(&ctx->ring_mutex);
++   return ring;
++}
++
++static void
++vkr_snap_r_enc(struct vkr_context *ctx, const struct vkr_snap_enc_rec *rec)
++{
++   struct vkr_cs_encoder *enc = &ctx->encoder;
++   if (rec->ring_id) {
++      enc = NULL;
++      mtx_lock(&ctx->ring_mutex);
++      list_for_each_entry (struct vkr_ring, ring, &ctx->rings, head) {
++         if (ring->id == rec->ring_id)
++            enc = &ring->encoder;
++      }
++      mtx_unlock(&ctx->ring_mutex);
++   }
++   if (!enc || !rec->res_id)
++      return;
++   struct vkr_resource *res = vkr_context_get_resource(ctx, rec->res_id);
++   if (!res || res->fd_type != VIRGL_RESOURCE_FD_SHM || !res->u.data)
++      return;
++   /* both check their arguments and set fatal on bad ones */
++   vkr_cs_encoder_set_stream(enc, res, rec->offset, rec->size);
++   vkr_cs_encoder_seek_stream(enc, rec->pos);
++   if (vkr_context_get_fatal(ctx)) {
++      vkr_log("snapshot: bad reply stream");
++      ctx->cs_fatal_error = false;
++      vkr_cs_encoder_set_stream(enc, NULL, 0, 0);
++   }
++}
++
++bool
++vkr_snap_restore(struct vkr_context *ctx, const uint8_t *data, uint64_t size)
++{
++   struct vkr_snap_file_head head;
++   if (size < sizeof(head))
++      return false;
++   memcpy(&head, data, sizeof(head));
++   if (head.magic != VKR_SNAP_MAGIC || head.version != VKR_SNAP_VERSION) {
++      vkr_log("snapshot: not one of ours (magic %x, version %u)", head.magic, head.version);
++      return false;
++   }
++   const bool lost = head.flags & VKR_SNAP_FLAG_LOST;
++
++   struct vkr_snap_r r = { .p = data, .size = size, .off = sizeof(head) };
++   struct vkr_snap_upload up = { 0 };
++   uint32_t tag;
++   const uint8_t *p;
++   uint64_t len;
++   uint32_t cmds = 0, failed = 0;
++   bool ok = true;
++   uint8_t *buf = NULL;
++   uint64_t buf_size = 0;
++
++   /* the largest region, for the staging buffer */
++   while (vkr_snap_r_next(&r, &tag, &p, &len)) {
++      if (tag == VKR_SNAP_TAG_IMG && len >= sizeof(struct vkr_snap_img_rec))
++         up.staging = MAX2(up.staging, len - sizeof(struct vkr_snap_img_rec));
++      if (!tag)
++         ok = false;
++   }
++   if (!ok) {
++      vkr_log("snapshot: bad record at %" PRIu64, r.off);
++      return false;
++   }
++   r.off = sizeof(head);
++
++   while (vkr_snap_r_next(&r, &tag, &p, &len)) {
++      switch (tag) {
++      case VKR_SNAP_TAG_SHM: {
++         struct vkr_snap_mem_rec rec;
++         if (lost || len < sizeof(rec))
++            break;
++         memcpy(&rec, p, sizeof(rec));
++         struct vkr_resource *res = vkr_context_get_resource(ctx, (uint32_t)rec.id);
++         if (res && res->fd_type == VIRGL_RESOURCE_FD_SHM && res->u.data &&
++             rec.size == len - sizeof(rec))
++            memcpy(res->u.data, p + sizeof(rec), MIN2(rec.size, res->size));
++         break;
++      }
++      case VKR_SNAP_TAG_CMD: {
++         if (lost || len < 8)
++            break;
++         if (len > buf_size) {
++            free(buf);
++            buf = malloc(len);
++            buf_size = buf ? len : 0;
++            if (!buf)
++               return false;
++         }
++         memcpy(buf, p, len);
++         /* nobody reads replies to these */
++         uint32_t flags;
++         memcpy(&flags, buf + 4, sizeof(flags));
++         flags &= ~VK_COMMAND_GENERATE_REPLY_BIT_EXT;
++         memcpy(buf + 4, &flags, sizeof(flags));
++         vkr_cs_decoder_set_buffer_stream(&ctx->decoder, buf, len);
++         vkr_snap_enter(ctx);
++         vkr_snap_dispatch(ctx, &ctx->dispatch);
++         vkr_snap_leave(ctx);
++         cmds++;
++         if (vkr_context_get_fatal(ctx)) {
++            /* the commands that needed it fail too; the rest goes on */
++            failed++;
++            ctx->cs_fatal_error = false;
++         }
++         vkr_cs_decoder_reset(&ctx->decoder);
++         break;
++      }
++      case VKR_SNAP_TAG_MEM:
++         if (!lost)
++            vkr_snap_r_mem(ctx, &up, p, len);
++         break;
++      case VKR_SNAP_TAG_IMG:
++         if (!lost)
++            vkr_snap_r_img(ctx, &up, p, len);
++         break;
++      case VKR_SNAP_TAG_FENCE:
++      case VKR_SNAP_TAG_EVENT:
++      case VKR_SNAP_TAG_SEM: {
++         if (lost || len < sizeof(struct vkr_snap_state_rec))
++            break;
++         /* contents first: GPU copies still batched go before states */
++         vkr_snap_xfer_run(&up.x);
++         struct vkr_snap_state_rec rec;
++         memcpy(&rec, p, sizeof(rec));
++         vkr_snap_r_state(ctx, tag, &rec);
++         break;
++      }
++      case VKR_SNAP_TAG_RING: {
++         struct vkr_snap_ring_rec rec;
++         if (len < sizeof(rec))
++            break;
++         memcpy(&rec, p, sizeof(rec));
++         vkr_snap_xfer_run(&up.x);
++         if (!vkr_snap_r_ring(ctx, &rec, lost) && !lost)
++            vkr_log("snapshot: ring %" PRIu64 " not made again", rec.id);
++         break;
++      }
++      case VKR_SNAP_TAG_ENC: {
++         struct vkr_snap_enc_rec rec;
++         if (lost || len < sizeof(rec))
++            break;
++         memcpy(&rec, p, sizeof(rec));
++         vkr_snap_r_enc(ctx, &rec);
++         break;
++      }
++      default:
++         ok = false;
++         break;
++      }
++   }
++   vkr_snap_xfer_run(&up.x);
++   vkr_snap_xfer_fini(&up.x);
++   free(buf);
++
++   if (failed)
++      vkr_log("snapshot: context %u: %u of %u commands failed again", ctx->ctx_id, failed,
++              cmds);
++   else
++      vkr_log("snapshot: context %u: %u commands replayed%s", ctx->ctx_id, cmds,
++              lost ? " (lost)" : "");
++   if (lost)
++      vkr_snap_note_broken(ctx->snap, "restored as lost");
++   return ok;
++}
++
++bool
++vkr_snap_resume(struct vkr_context *ctx)
++{
++   uint32_t monitor_us = 0;
++   mtx_lock(&ctx->ring_mutex);
++   list_for_each_entry (struct vkr_ring, ring, &ctx->rings, head) {
++      if (ring->snap_monitor_us)
++         monitor_us = monitor_us ? MIN2(monitor_us, ring->snap_monitor_us) : ring->snap_monitor_us;
++   }
++   mtx_unlock(&ctx->ring_mutex);
++   if (monitor_us && !ctx->ring_monitor.started &&
++       !vkr_context_ring_monitor_init(ctx, monitor_us))
++      return false;
++
++   mtx_lock(&ctx->ring_mutex);
++   list_for_each_entry (struct vkr_ring, ring, &ctx->rings, head) {
++      if (!ring->started)
++         vkr_ring_start(ring);
++   }
++   mtx_unlock(&ctx->ring_mutex);
++   return true;
++}
+--- /dev/null
++++ b/src/venus/vkr_snap.h
+@@ -0,0 +1,101 @@
++/*
++ * vroom: snapshots of a Venus context.
++ * SPDX-License-Identifier: MIT
++ */
++
++#ifndef VKR_SNAP_H
++#define VKR_SNAP_H
++
++#include "vkr_common.h"
++
++/* What a context needs to be built again after a snapshot.
++ *
++ * Every command the guest sends goes through vkr_snap_dispatch, which
++ * notes what the command looked up, created and destroyed.  Commands that
++ * create or destroy objects, bind memory, update descriptors or record
++ * command buffers are kept, as the guest encoded them.  Ids are the
++ * guest's own, so replaying the kept commands in a fresh context gives the
++ * same objects under the same ids.  Commands nothing alive needs any more
++ * are dropped now and then (vkr_snap_gc).
++ *
++ * A snapshot (vkr_snap_save) stops every thread at a command boundary,
++ * waits for the GPU, and writes the kept commands, the contents of device
++ * memory and images (read back through a staging buffer), the shared
++ * memory the context made (rings, reply streams), fence, event and
++ * semaphore states, and where each ring stands.  vkr_snap_restore does it
++ * all again in a new context; vkr_snap_resume starts its rings.
++ */
++
++struct vkr_snap;
++struct vkr_snap_cmd;
++struct vn_dispatch_context;
++struct vkr_ring;
++struct vkr_command_pool;
++
++/* the command being dispatched on this thread, if it is followed */
++extern _Thread_local struct vkr_snap_cmd *vkr_snap_tls;
++
++struct vkr_snap *
++vkr_snap_create(void);
++
++void
++vkr_snap_destroy(struct vkr_snap *snap);
++
++/* teardown: stop following */
++void
++vkr_snap_off(struct vkr_snap *snap);
++
++void
++vkr_snap_note_ref(vkr_object_id id, VkObjectType type);
++
++void
++vkr_snap_note_add(struct vkr_snap *snap, vkr_object_id id, VkObjectType type);
++
++void
++vkr_snap_note_remove(struct vkr_snap *snap, vkr_object_id id);
++
++/* shm resources the context made (blob id 0) */
++void
++vkr_snap_note_shm(struct vkr_snap *snap, uint32_t res_id, bool add);
++
++/* something used that a snapshot can't bring back: the context comes back
++ * lost (its rings marked fatal) */
++void
++vkr_snap_note_broken(struct vkr_snap *snap, const char *why);
++
++/* One command off the decoder, followed.  Call between vkr_snap_enter and
++ * vkr_snap_leave. */
++void
++vkr_snap_dispatch(struct vkr_context *ctx, struct vn_dispatch_context *dispatch);
++
++/* A thread runs commands between these; a snapshot waits for none to. */
++void
++vkr_snap_enter(struct vkr_context *ctx);
++
++void
++vkr_snap_leave(struct vkr_context *ctx);
++
++/* Around a blocking wait inside a command: a snapshot may go ahead (the
++ * command runs again from the start after a restore). */
++bool
++vkr_snap_wait_begin(struct vkr_context *ctx);
++
++void
++vkr_snap_wait_end(struct vkr_context *ctx, bool began);
++
++/* Snapshot of the context into a new shared memory object.  Returns 0 with
++ * everything, 1 with the rings only (the context comes back lost), -1 on
++ * errors. */
++int
++vkr_snap_save(struct vkr_context *ctx, int *out_fd, uint64_t *out_size);
++
++/* Into a fresh context whose shm resources the embedder made again, with
++ * the same ids.  False if the data is bad. */
++bool
++vkr_snap_restore(struct vkr_context *ctx, const uint8_t *data, uint64_t size);
++
++/* After restore and after the embedder made the memory blobs again. */
++bool
++vkr_snap_resume(struct vkr_context *ctx);
++
++#endif /* VKR_SNAP_H */
+--- a/src/venus/vkr_transport.c
++++ b/src/venus/vkr_transport.c
+@@ -80,7 +80,7 @@
+       }
+ 
+       while (vkr_cs_decoder_has_command(dec)) {
+-         vn_dispatch_command(dispatch);
++         vkr_snap_dispatch(ctx, dispatch);
+          if (vkr_context_get_fatal(ctx))
+             break;
+       }
+@@ -107,7 +107,7 @@
+    return NULL;
+ }
+ 
+-static bool
++bool
+ vkr_ring_layout_init(struct vkr_ring_layout *layout,
+                      const struct vkr_resource *res,
+                      const VkRingCreateInfoMESA *info)
+@@ -217,6 +217,8 @@
+    }
+ 
+    ring->id = args->ring;
++   ring->snap_info = *info;
++   ring->snap_info.pNext = NULL;
+ 
+    mtx_lock(&ctx->ring_mutex);
+    list_addtail(&ring->head, &ctx->rings);
+@@ -251,6 +253,7 @@
+       }
+ 
+       ring->monitor = true;
++      ring->snap_monitor_us = monitor_info->maxReportingPeriodMicroseconds;
+    }
+ 
+    const VkRingPriorityInfoMESA *priority_info =
+--- a/src/venus/vkr_transport.h
++++ b/src/venus/vkr_transport.h
+@@ -8,7 +8,18 @@
+ 
+ #include "vkr_common.h"
+ 
++#include "venus-protocol/vn_protocol_renderer_defines.h"
++
+ void
+ vkr_context_init_transport_dispatch(struct vkr_context *ctx);
+ 
++struct vkr_ring_layout;
++struct vkr_resource;
++
++/* vroom: checks a ring's layout in its resource (snapshots make rings too) */
++bool
++vkr_ring_layout_init(struct vkr_ring_layout *layout,
++                     const struct vkr_resource *res,
++                     const VkRingCreateInfoMESA *info);
++
+ #endif /* VKR_TRANSPORT_H */
+--- a/src/virglrenderer.c
++++ b/src/virglrenderer.c
+@@ -1772,3 +1772,41 @@
+    return 0;
+ }
+ #endif
++
++static struct virgl_context *
++virgl_renderer_snapshot_context(uint32_t ctx_id)
++{
++   struct virgl_context *ctx = virgl_context_lookup(ctx_id);
++   if (!ctx || ctx->capset_id != VIRTGPU_DRM_CAPSET_VENUS || !state.proxy_initialized)
++      return NULL;
++   return ctx;
++}
++
++int virgl_renderer_context_save(uint32_t ctx_id, int *out_fd, uint64_t *out_size)
++{
++   *out_fd = -1;
++   *out_size = 0;
++   struct virgl_context *ctx = virgl_renderer_snapshot_context(ctx_id);
++   if (!ctx)
++      return -EINVAL;
++   const int r = proxy_context_save(ctx, out_fd, out_size);
++   return r < 0 ? -EIO : r;
++}
++
++int virgl_renderer_context_restore(uint32_t ctx_id, int fd, uint64_t size)
++{
++   struct virgl_context *ctx = virgl_renderer_snapshot_context(ctx_id);
++   int r = -EINVAL;
++   if (ctx)
++      r = proxy_context_restore(ctx, fd, size) ? -EIO : 0;
++   close(fd);
++   return r;
++}
++
++int virgl_renderer_context_resume(uint32_t ctx_id)
++{
++   struct virgl_context *ctx = virgl_renderer_snapshot_context(ctx_id);
++   if (!ctx)
++      return -EINVAL;
++   return proxy_context_resume(ctx) ? -EIO : 0;
++}
+--- a/src/virglrenderer.h
++++ b/src/virglrenderer.h
+@@ -365,6 +365,21 @@
+                                                    uint32_t init_flags,
+                                                    const char *ctx_name);
+ 
++/* vroom: snapshots of Venus contexts (they run in render workers).
++ *
++ * save: every thread of the context stops at a command boundary and the GPU
++ * finishes; *out_fd is then a shm object of *out_size bytes holding what
++ * the context needs to be built again.  Returns 0 with everything, 1 with
++ * only what makes it come back lost (its app sees the device lost), a
++ * negative errno with nothing.
++ *
++ * restore: into a context just made, after its shm blobs (blob id 0) were
++ * made again with their old ids.  Takes fd.  Then make its memory blobs
++ * again and call resume, which starts its rings. */
++VIRGL_EXPORT int virgl_renderer_context_save(uint32_t ctx_id, int *out_fd, uint64_t *out_size);
++VIRGL_EXPORT int virgl_renderer_context_restore(uint32_t ctx_id, int fd, uint64_t size);
++VIRGL_EXPORT int virgl_renderer_context_resume(uint32_t ctx_id);
++
+ /* return information about a resource */
+ 
+ struct virgl_renderer_resource_info {

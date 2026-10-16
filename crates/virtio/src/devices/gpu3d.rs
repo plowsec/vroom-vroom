@@ -121,6 +121,23 @@ pub trait Renderer3d: Send {
     fn scanout_poll(&mut self, _out: &mut [u8], _wait: bool) -> Option<bool> {
         None
     }
+    /// Snapshots of a Vulkan (Venus) context: what it needs to be built
+    /// again, opaque here (only the renderer reads it back). `Some((true,
+    /// data))` with everything, `Some((false, data))` with only enough
+    /// that the app sees its device lost after a restore, None if the
+    /// renderer can't.
+    fn venus_save(&mut self, _ctx: u32) -> Option<(bool, Vec<u8>)> {
+        None
+    }
+    /// Build a context made a moment ago again from [`Renderer3d::venus_save`]'s
+    /// data, once its shared-memory blobs (blob id 0) are back.
+    fn venus_restore(&mut self, _ctx: u32, _data: &[u8]) -> bool {
+        false
+    }
+    /// Start a restored context, once its memory blobs are back too.
+    fn venus_resume(&mut self, _ctx: u32) -> bool {
+        false
+    }
     fn unref(&mut self, resource: u32);
 
     /// Fence on `ctx`'s timeline `ring`, or a global fence (ring None).

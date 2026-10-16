@@ -22,6 +22,10 @@ use std::os::unix::net::UnixStream;
 use vroom_memory::GuestMemory;
 use vroom_virtio::devices::gpu3d::{Blob, Box3d, Create3d, FenceDone, HostIov, Mapping, Renderer3d, Transfer3d};
 
+/// The largest Vulkan context snapshot taken from the GPU process (its
+/// device memory and images, read back).
+const MAX_VENUS_SNAPSHOT: u64 = 64 << 30;
+
 /// No call or answer is bigger (a frame of 16384² pixels is 1 GiB; GL
 /// scanouts are far smaller, snapshot levels are read in pieces).
 const MAX_FRAME: usize = 1 << 30;
@@ -55,6 +59,9 @@ enum Op {
     Reset,
     Remap,
     Frame,
+    VenusSave,
+    VenusRestore,
+    VenusResume,
 }
 
 impl Op {
@@ -87,6 +94,9 @@ impl Op {
             24 => Reset,
             25 => Remap,
             26 => Frame,
+            27 => VenusSave,
+            28 => VenusRestore,
+            29 => VenusResume,
             _ => return None,
         })
     }
@@ -239,6 +249,15 @@ fn map_fd(fd: RawFd, size: u64, write: bool) -> Option<*mut u8> {
 fn unmap(p: *mut u8, size: u64) {
     // SAFETY: a mapping we made with map_fd.
     unsafe { libc::munmap(p as *mut c_void, size as usize) };
+}
+
+/// The size of a shared memory object.
+#[allow(unsafe_code)]
+fn fd_size(fd: RawFd) -> Option<u64> {
+    // SAFETY: stat is plain old data; all zeroes is a valid value.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: fd is open; st is a valid out buffer.
+    (unsafe { libc::fstat(fd, &mut st) } == 0).then_some(st.st_size as u64)
 }
 
 /// Read a non-blocking fd until it is empty.
@@ -760,6 +779,56 @@ impl Renderer3d for Remote {
         out
     }
 
+    fn venus_save(&mut self, ctx: u32) -> Option<(bool, Vec<u8>)> {
+        let b = self.call(Op::VenusSave, |e| {
+            e.u32(ctx);
+        })?;
+        let mut d = Dec(&b);
+        let (status, size) = (d.u8()?, d.u64()?);
+        if status == 0 {
+            return None;
+        }
+        let fd = recv_fd(&self.sock).ok()?;
+        if size == 0 || size > MAX_VENUS_SNAPSHOT || fd_size(fd.as_raw_fd()) < Some(size) {
+            log::warn!("gpu: context {ctx}: bad snapshot from the GPU process ({size} bytes)");
+            return None;
+        }
+        let p = map_fd(fd.as_raw_fd(), size, false)?;
+        // SAFETY: our own read-only mapping of `size` bytes (at most the
+        // object's size, checked above).
+        #[allow(unsafe_code)]
+        let data = unsafe { std::slice::from_raw_parts(p, size as usize) }.to_vec();
+        unmap(p, size);
+        Some((status == 1, data))
+    }
+
+    fn venus_restore(&mut self, ctx: u32, data: &[u8]) -> bool {
+        if self.dead {
+            return false;
+        }
+        let Some((fd, size)) = crate::shm_with(data) else {
+            log::warn!("gpu: context {ctx}: no shared memory for its snapshot ({} bytes)", data.len());
+            return false;
+        };
+        let mut e = Enc::default();
+        e.u8(Op::VenusRestore as u8).u32(ctx).u64(size);
+        let r = write_frame(&mut self.sock, &e.0).and_then(|_| send_fd(&self.sock, fd.as_raw_fd())).and_then(|_| read_frame(&mut self.sock));
+        match r {
+            Ok(b) => b.first() == Some(&1),
+            Err(e) => {
+                log::error!("gpu: the GPU process is gone ({e}): no more 3D for this VM until it restarts");
+                self.dead = true;
+                false
+            }
+        }
+    }
+
+    fn venus_resume(&mut self, ctx: u32) -> bool {
+        self.ok(Op::VenusResume, |e| {
+            e.u32(ctx);
+        })
+    }
+
     fn reset(&mut self) {
         for (_, (p, n)) in self.maps.drain().chain(self.views.drain()) {
             unmap(p, n);
@@ -841,11 +910,25 @@ fn frame_slice<'a>(frame: Option<(*mut u8, u64)>, n: u64) -> Option<&'a mut [u8]
 pub trait Export {
     /// A blob's shared memory and its size.
     fn export(&mut self, resource: u32) -> Option<(OwnedFd, u64)>;
+    /// A Vulkan context's snapshot as shared memory: (complete, it, size).
+    fn save_context(&mut self, _ctx: u32) -> Option<(bool, OwnedFd, u64)> {
+        None
+    }
+    /// The way back; takes the fd.
+    fn restore_context(&mut self, _ctx: u32, _fd: OwnedFd, _size: u64) -> bool {
+        false
+    }
 }
 
 impl Export for crate::Virgl {
     fn export(&mut self, resource: u32) -> Option<(OwnedFd, u64)> {
         crate::Virgl::export(self, resource)
+    }
+    fn save_context(&mut self, ctx: u32) -> Option<(bool, OwnedFd, u64)> {
+        crate::Virgl::save_context(self, ctx)
+    }
+    fn restore_context(&mut self, ctx: u32, fd: OwnedFd, size: u64) -> bool {
+        crate::Virgl::restore_context(self, ctx, fd, size)
     }
 }
 
@@ -1111,6 +1194,28 @@ pub fn serve<R: Renderer3d + Export>(mut r: R, mut sock: UnixStream, mut events:
                     }
                     new.is_some()
                 };
+                ok(&mut out, b)
+            }
+            Op::VenusSave => match d.u32().and_then(|ctx| r.save_context(ctx)) {
+                Some((complete, fd, size)) => {
+                    out.u8(if complete { 1 } else { 2 }).u64(size);
+                    fd_after = Some(fd);
+                }
+                None => {
+                    out.u8(0).u64(0);
+                }
+            },
+            Op::VenusRestore => {
+                let (ctx, size) = (d.u32(), d.u64());
+                let fd = recv_fd(&sock)?;
+                let b = match (ctx, size) {
+                    (Some(ctx), Some(size)) => r.restore_context(ctx, fd, size),
+                    _ => false,
+                };
+                ok(&mut out, b)
+            }
+            Op::VenusResume => {
+                let b = d.u32().is_some_and(|ctx| r.venus_resume(ctx));
                 ok(&mut out, b)
             }
             Op::Remap => {

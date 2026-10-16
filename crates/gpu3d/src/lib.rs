@@ -142,6 +142,11 @@ struct Lib {
     /// and Direct3D in a thread of its own (an older build).
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     worker_main: Option<unsafe extern "C" fn(c_int, u32, u32, *const c_char) -> c_int>,
+    /// virgl_renderer_context_save/restore/resume (our patch 0010):
+    /// snapshots of Venus contexts.
+    ctx_save: Option<unsafe extern "C" fn(u32, *mut c_int, *mut u64) -> c_int>,
+    ctx_restore: Option<unsafe extern "C" fn(u32, c_int, u64) -> c_int>,
+    ctx_resume: Option<unsafe extern "C" fn(u32) -> c_int>,
 }
 
 // SAFETY: plain function pointers into a library that stays loaded.
@@ -281,6 +286,27 @@ fn open_lib(candidates: Vec<String>) -> Option<Lib> {
             let f = unsafe { libc::dlsym(handle, c.as_ptr()) };
             // SAFETY: signature from our patched virglrenderer.h.
             (!f.is_null()).then(|| unsafe { std::mem::transmute::<*mut c_void, unsafe extern "C" fn(c_int, u32, u32, *const c_char) -> c_int>(f) })
+        },
+        ctx_save: {
+            let c = CString::new("virgl_renderer_context_save").ok()?;
+            // SAFETY: valid handle and name.
+            let f = unsafe { libc::dlsym(handle, c.as_ptr()) };
+            // SAFETY: signature from our patched virglrenderer.h.
+            (!f.is_null()).then(|| unsafe { std::mem::transmute::<*mut c_void, unsafe extern "C" fn(u32, *mut c_int, *mut u64) -> c_int>(f) })
+        },
+        ctx_restore: {
+            let c = CString::new("virgl_renderer_context_restore").ok()?;
+            // SAFETY: valid handle and name.
+            let f = unsafe { libc::dlsym(handle, c.as_ptr()) };
+            // SAFETY: signature from our patched virglrenderer.h.
+            (!f.is_null()).then(|| unsafe { std::mem::transmute::<*mut c_void, unsafe extern "C" fn(u32, c_int, u64) -> c_int>(f) })
+        },
+        ctx_resume: {
+            let c = CString::new("virgl_renderer_context_resume").ok()?;
+            // SAFETY: valid handle and name.
+            let f = unsafe { libc::dlsym(handle, c.as_ptr()) };
+            // SAFETY: signature from our patched virglrenderer.h.
+            (!f.is_null()).then(|| unsafe { std::mem::transmute::<*mut c_void, unsafe extern "C" fn(u32) -> c_int>(f) })
         },
     })
 }
@@ -537,6 +563,21 @@ fn page_size() -> u64 {
     unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
 }
 
+/// Shared memory holding `data`, for a snapshot going back to a context.
+pub fn shm_with(data: &[u8]) -> Option<(OwnedFd, u64)> {
+    // whole pages (64 KiB covers every host page size)
+    let region = vroom_memory::MmapRegion::new_shared(data.len().max(1).next_multiple_of(1 << 16)).ok()?;
+    // SAFETY: our own fresh mapping, at least data.len() bytes.
+    unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), region.as_ptr(), data.len()) };
+    // SAFETY: dup of the region's fd; the copy is ours.
+    let fd = unsafe { libc::fcntl(region.shared_fd()?, libc::F_DUPFD_CLOEXEC, 3) };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: a fresh fd, ours from here on.
+    Some((unsafe { OwnedFd::from_raw_fd(fd) }, data.len() as u64))
+}
+
 /// Bind the GL context to the calling thread (see egl.rs). No-op without GL.
 fn enter() {
     #[cfg(target_os = "macos")]
@@ -658,6 +699,42 @@ impl Virgl {
             return None;
         }
         Some((fd, st.st_size as u64))
+    }
+
+    /// Snapshot of a Venus context: (complete, shared memory, its size).
+    /// Not complete: enough that its app sees the device lost after a
+    /// restore. None if the library can't (or the context has failed for
+    /// good).
+    pub fn save_context(&mut self, ctx: u32) -> Option<(bool, OwnedFd, u64)> {
+        let Some(save) = self.lib.ctx_save else {
+            log::warn!("gpu3d: this virglrenderer can't save Vulkan contexts (scripts/build-virglrenderer.sh)");
+            return None;
+        };
+        let (mut fd, mut size) = (-1 as c_int, 0u64);
+        // SAFETY: valid out pointers; a returned fd is ours to close.
+        let r = unsafe { save(ctx, &mut fd, &mut size) };
+        if r < 0 || fd < 0 {
+            log::warn!("gpu3d: context {ctx}: snapshot failed ({r})");
+            return None;
+        }
+        // SAFETY: a fresh fd, ours from here on.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        Some((r == 0, fd, size))
+    }
+
+    /// The way back (see `virgl_renderer_context_restore`). Takes `fd`.
+    pub fn restore_context(&mut self, ctx: u32, fd: OwnedFd, size: u64) -> bool {
+        use std::os::fd::IntoRawFd;
+        let Some(restore) = self.lib.ctx_restore else {
+            log::warn!("gpu3d: this virglrenderer can't restore Vulkan contexts");
+            return false;
+        };
+        // SAFETY: the library takes the fd (closes it in any case).
+        let r = unsafe { restore(ctx, fd.into_raw_fd(), size) };
+        if r != 0 {
+            log::warn!("gpu3d: context {ctx}: not built again from its snapshot ({r})");
+        }
+        r == 0
     }
 
     fn drop_view(&mut self, resource: u32) {
@@ -1016,6 +1093,31 @@ impl Renderer3d for Virgl {
             let _ = (out, wait);
             None
         }
+    }
+
+    fn venus_save(&mut self, ctx: u32) -> Option<(bool, Vec<u8>)> {
+        let (complete, fd, size) = self.save_context(ctx)?;
+        let len = usize::try_from(size).ok().filter(|&n| n > 0)?;
+        // SAFETY: a fresh read-only shared mapping of the whole object.
+        let p = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, fd.as_raw_fd(), 0) };
+        if p == libc::MAP_FAILED {
+            return None;
+        }
+        // SAFETY: the mapping is `len` bytes and stays until the munmap.
+        let data = unsafe { std::slice::from_raw_parts(p as *const u8, len) }.to_vec();
+        // SAFETY: the mapping made above, no longer used.
+        unsafe { libc::munmap(p, len) };
+        Some((complete, data))
+    }
+
+    fn venus_restore(&mut self, ctx: u32, data: &[u8]) -> bool {
+        let Some((fd, size)) = shm_with(data) else { return false };
+        self.restore_context(ctx, fd, size)
+    }
+
+    fn venus_resume(&mut self, ctx: u32) -> bool {
+        // SAFETY: plain call with an id.
+        self.lib.ctx_resume.is_some_and(|f| unsafe { f(ctx) } == 0)
     }
 
     fn unref(&mut self, resource: u32) {

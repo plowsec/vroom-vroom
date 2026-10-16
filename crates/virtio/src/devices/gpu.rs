@@ -88,8 +88,12 @@ const BIND_RENDER_TARGET: u32 = 1 << 1;
 const RESOURCE_FLAG_Y_0_TOP: u32 = 1;
 /// virgl's GL capset: a context made with capset 0 (classic virgl) uses it.
 const CAPSET_VIRGL2: u32 = 2;
+/// Vulkan (Venus).
+const CAPSET_VENUS: u32 = 4;
 /// Direct3D (Windows guests).
 const CAPSET_NEPTUNE: u32 = 7;
+/// VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE.
+const BLOB_FLAG_MAPPABLE: u32 = 1;
 
 const MAX_RESOURCE_BYTES: usize = 512 << 20;
 const MAX_RESOURCES: usize = 4096;
@@ -488,8 +492,11 @@ struct Res3d {
     create: Option<Create3d>,
     /// Its guest backing, as last attached.
     backing: Vec<(u64, u32)>,
-    /// A blob: memory the guest may map. Snapshots can't rebuild those.
+    /// A blob: memory the guest may map.
     blob: bool,
+    /// How a blob was made (a snapshot of a Vulkan context makes its
+    /// blobs again).
+    made: Option<Blob>,
 }
 
 /// What a snapshot needs to know about a renderer context.
@@ -566,6 +573,13 @@ struct Snap3d {
     /// Fenced commands not yet given back: (queue, head, len). The GPU is
     /// done with them by the time we have read everything back.
     pending: Vec<(usize, u16, u32)>,
+    /// Blobs of Vulkan contexts.
+    #[serde(default)]
+    blobs: Vec<SnapBlob>,
+    /// Scanouts showing a blob: (scanout, resource, x, y, w, h, format,
+    /// stride, offset).
+    #[serde(default)]
+    blob_scanouts: Vec<[u32; 9]>,
 }
 
 const SNAP3D_MAGIC: &[u8; 4] = b"VG3D";
@@ -584,6 +598,34 @@ struct SnapRes3d {
 struct SnapCtx {
     id: u32,
     info: CtxInfo,
+    /// A Vulkan context: where the renderer's snapshot of it is, after
+    /// the JSON: (offset, length, complete). Length 0: none was taken.
+    #[serde(default)]
+    venus: Option<(u64, u64, bool)>,
+}
+
+/// A blob of a Vulkan context, made again after its context.
+#[derive(Debug, Serialize, Deserialize)]
+struct SnapBlob {
+    id: u32,
+    ctx: u32,
+    mem: u32,
+    flags: u32,
+    blob_id: u64,
+    size: u64,
+    /// Guest memory blobs: the guest RAM behind it.
+    guest: Vec<(u64, u32)>,
+    /// Where the guest had it mapped, from the start of the window.
+    map: Option<u64>,
+}
+
+impl SnapBlob {
+    /// Shared memory the context makes (rings, reply streams), or guest
+    /// RAM: made before the context's own state comes back. The rest is
+    /// Vulkan device memory, which needs that state.
+    fn early(&self) -> bool {
+        self.mem == BLOB_MEM_GUEST || (self.blob_id == 0 && self.flags == BLOB_FLAG_MAPPABLE)
+    }
 }
 
 /// How a level of a classic 3D resource is laid out for a transfer.
@@ -1202,18 +1244,26 @@ impl GpuHandler {
             return bad;
         }
         let Some(entries) = Self::read_entries(mem, r, n) else { return bad };
-        let total: u64 = entries.iter().map(|e| e.1 as u64).sum();
-        if blob_mem != BLOB_MEM_HOST3D && total < size {
-            return bad;
-        }
-        let Some(iov) = Self::host_iov(mem, &entries) else { return bad };
         let blob = Blob { resource: id, ctx: hdr.ctx, mem: blob_mem, flags, id: blob_id, size };
-        if !t.r().create_blob(&blob, iov) {
-            return (ERR_UNSPEC, vec![]);
+        (self.make_blob(mem, t, blob, entries), vec![])
+    }
+
+    /// A blob, its guest RAM checked (`create_blob`, and snapshots).
+    fn make_blob(&mut self, mem: &GuestMemory, t: &ThreeD, blob: Blob, entries: Vec<(u64, u32)>) -> u32 {
+        let total: u64 = entries.iter().map(|e| e.1 as u64).sum();
+        if blob.mem != BLOB_MEM_HOST3D && total < blob.size {
+            return ERR_INVALID_PARAMETER;
         }
-        let guest = if blob_mem == BLOB_MEM_GUEST { entries } else { Vec::new() };
-        self.res3d.insert(id, Res3d { guest, blob: true, ..Default::default() });
-        (OK_NODATA, vec![])
+        if entries.len() > MAX_BACKING_ENTRIES as usize || entries.iter().any(|&(a, l)| !mem.check_range(GuestAddress(a), l as u64)) {
+            return ERR_INVALID_PARAMETER;
+        }
+        let Some(iov) = Self::host_iov(mem, &entries) else { return ERR_INVALID_PARAMETER };
+        if !t.r().create_blob(&blob, iov) {
+            return ERR_UNSPEC;
+        }
+        let guest = if blob.mem == BLOB_MEM_GUEST { entries } else { Vec::new() };
+        self.res3d.insert(blob.resource, Res3d { guest, blob: true, made: Some(blob), ..Default::default() });
+        OK_NODATA
     }
 
     fn map_blob(&mut self, t: &ThreeD, id: u32, offset: u64) -> (u32, Vec<u8>) {
@@ -1756,22 +1806,25 @@ impl GpuHandler {
         if self.ctx_info.values().any(|c| c.capset == CAPSET_NEPTUNE) {
             return Some("Windows draws with Direct3D, and Direct3D state can't be saved. With the display set to 2D, it can".into());
         }
-        if self.ctx_info.values().any(|c| c.gl.is_none()) {
-            return Some("a Vulkan app is running, and Vulkan state can't be saved".into());
-        }
-        // Host blobs no context uses any more are left out: a stopped
-        // driver (Windows, with its 3D device turned off for a suspend)
-        // leaves them behind, its last frame still set as the scanout, and
-        // never touches them again. Guests' own scanouts are attached to
-        // the context that made them, or in guest memory.
+        // Vulkan contexts are saved by the renderer, their blobs made again
+        // after them. Other host blobs no context uses any more are left
+        // out: a stopped driver (Windows, with its 3D device turned off for
+        // a suspend) leaves them behind, its last frame still set as the
+        // scanout, and never touches them again. Guests' own scanouts are
+        // attached to the context that made them, or in guest memory.
         let in_use = |id: u32, r: &Res3d| !r.guest.is_empty() || self.ctx_info.values().any(|c| c.attached.contains(&id));
-        if self.res3d.iter().any(|(&id, r)| r.blob && in_use(id, r)) {
+        if self.res3d.iter().any(|(&id, r)| r.blob && !self.venus_blob(r) && in_use(id, r)) {
             return Some("an app shares GPU memory with the guest (a blob), and that can't be saved".into());
         }
         if let Some(why) = self.ctx_info.values().find_map(|c| c.gl.as_ref().and_then(GlState::broken)) {
             return Some(format!("an OpenGL app did something vroom can't save ({why})"));
         }
         None
+    }
+
+    /// A blob a Vulkan context made, the context still there.
+    fn venus_blob(&self, r: &Res3d) -> bool {
+        r.made.is_some_and(|b| self.ctx_info.get(&b.ctx).is_some_and(|c| c.capset == CAPSET_VENUS))
     }
 
     fn has_3d_state(&self) -> bool {
@@ -1823,8 +1876,54 @@ impl GpuHandler {
             }
             resources.push(SnapRes3d { id, create: a, backing: r.backing.clone(), levels });
         }
-        let mut contexts: Vec<SnapCtx> = self.ctx_info.iter().map(|(&id, info)| SnapCtx { id, info: info.clone() }).collect();
+        let mut contexts: Vec<SnapCtx> = self.ctx_info.iter().map(|(&id, info)| SnapCtx { id, info: info.clone(), venus: None }).collect();
         contexts.sort_unstable_by_key(|c| c.id);
+        // Vulkan contexts: the renderer stops each at a command boundary,
+        // waits for the GPU and hands back all it needs.
+        for c in contexts.iter_mut().filter(|c| c.info.capset == CAPSET_VENUS) {
+            let started = std::time::Instant::now();
+            match t.r().venus_save(c.id) {
+                Some((complete, data)) => {
+                    log::info!(
+                        "gpu snapshot: Vulkan context {} ({}): {} KiB in {} ms{}",
+                        c.id,
+                        String::from_utf8_lossy(&c.info.name),
+                        data.len() >> 10,
+                        started.elapsed().as_millis(),
+                        if complete { "" } else { ", saved as lost" }
+                    );
+                    c.venus = Some((blob.len() as u64, data.len() as u64, complete));
+                    blob.extend_from_slice(&data);
+                }
+                None => {
+                    log::warn!("gpu snapshot: Vulkan context {} ({}) not saved: its app will see the device lost", c.id, String::from_utf8_lossy(&c.info.name));
+                    c.venus = Some((0, 0, false));
+                }
+            }
+        }
+        let base = t.shm_base.load(Ordering::Acquire);
+        let mut blobs: Vec<SnapBlob> = self
+            .res3d
+            .iter()
+            .filter(|(_, r)| self.venus_blob(r))
+            .filter_map(|(&id, r)| {
+                let b = r.made?;
+                let map = r.mapped.and_then(|(gpa, _)| gpa.checked_sub(base));
+                Some(SnapBlob { id, ctx: b.ctx, mem: b.mem, flags: b.flags, blob_id: b.id, size: b.size, guest: r.guest.clone(), map })
+            })
+            .collect();
+        blobs.sort_unstable_by_key(|b| b.id);
+        let blob_scanouts: Vec<[u32; 9]> = self
+            .scanouts
+            .iter()
+            .enumerate()
+            .filter_map(|(sid, s)| match *s {
+                Some(Scanout::Blob { id, view, format, stride, offset }) if blobs.iter().any(|b| b.id == id) => {
+                    Some([sid as u32, id, view.x, view.y, view.w, view.h, format, stride, offset])
+                }
+                _ => None,
+            })
+            .collect();
         let gl_scanout = match self.scanouts[0] {
             Some(Scanout::Gl { id, view, .. }) => Some((id, view.x, view.y, view.w, view.h)),
             _ => None,
@@ -1837,6 +1936,8 @@ impl GpuHandler {
             gl_scanout,
             gl_more,
             pending: self.pending.iter().map(|p| (p.q, p.head, p.len)).collect(),
+            blobs,
+            blob_scanouts,
         };
         // Hand GL back to the worker thread.
         t.r().release_thread();
@@ -1893,7 +1994,25 @@ impl GpuHandler {
                 }
             }
         }
-        for c in &snap.contexts {
+        if snap.blobs.len() > MAX_RESOURCES {
+            return Err(bad("too many objects"));
+        }
+        // Vulkan contexts first: GL contexts may use their blobs (windows).
+        for c in snap.contexts.iter().filter(|c| c.info.capset == CAPSET_VENUS) {
+            self.restore_venus(mem, &t, c, &snap.blobs, blob)?;
+        }
+        for b in &snap.blobs {
+            if !self.res3d.contains_key(&b.id) {
+                return Err(bad("a blob without its context"));
+            }
+            if let Some(off) = b.map {
+                // As the guest had it: checked like its own request.
+                if self.map_blob(&t, b.id, off).0 != OK_MAP_INFO {
+                    return Err(bad("can't map a blob where the guest had it"));
+                }
+            }
+        }
+        for c in snap.contexts.iter().filter(|c| c.info.capset != CAPSET_VENUS) {
             if c.id == 0 || self.contexts.contains(&c.id) || c.info.name.len() > 64 {
                 return Err(bad("bad context"));
             }
@@ -1930,11 +2049,98 @@ impl GpuHandler {
                 _ => return Err(bad("bad scanout")),
             }
         }
+        for &[sid, id, x, y, w, h, format, stride, offset] in &snap.blob_scanouts {
+            let view = Rect { x, y, w, h };
+            let sid = sid as usize;
+            let ok = self.res3d.get(&id).is_some_and(|r| r.blob)
+                && sid < self.scanouts.len()
+                && swizzle(format).is_some()
+                && w > 0
+                && h > 0
+                && w <= MAX_DIM
+                && h <= MAX_DIM
+                && view.inside(x.saturating_add(w), y.saturating_add(h))
+                && (stride as u64) >= (x as u64 + w as u64) * 4;
+            if !ok {
+                return Err(bad("bad scanout"));
+            }
+            self.scanouts[sid] = Some(Scanout::Blob { id, view, format, stride, offset });
+            self.set_mode(sid, w, h);
+        }
         if any {
             self.flush_all(mem);
         }
         t.r().release_thread();
         Ok(snap.pending)
+    }
+
+    /// A Vulkan context and its blobs, again (see `Snap3d::blobs`). A
+    /// context the renderer can't build again comes back empty, its blobs
+    /// plain shared memory: its app sees the device lost, nothing else
+    /// does.
+    fn restore_venus(&mut self, mem: &GuestMemory, t: &ThreeD, c: &SnapCtx, blobs: &[SnapBlob], data: &[u8]) -> Result<()> {
+        let bad = |m: &str| Error::Device(format!("gpu snapshot: {m}"));
+        if c.id == 0 || self.contexts.contains(&c.id) || c.info.name.len() > 64 {
+            return Err(bad("bad context"));
+        }
+        if !t.r().context_create(c.id, CAPSET_VENUS, &c.info.name) {
+            return Err(bad("can't make a context again"));
+        }
+        self.contexts.push(c.id);
+        self.ctx_info.insert(c.id, CtxInfo { capset: CAPSET_VENUS, name: c.info.name.clone(), attached: c.info.attached.clone(), gl: None });
+        let mine = || blobs.iter().filter(|b| b.ctx == c.id);
+        let check = |b: &SnapBlob| -> Result<Blob> {
+            if b.size == 0 || !matches!(b.mem, BLOB_MEM_GUEST | BLOB_MEM_HOST3D | BLOB_MEM_HOST3D_GUEST) {
+                return Err(bad("bad blob"));
+            }
+            Ok(Blob { resource: b.id, ctx: c.id, mem: b.mem, flags: b.flags, id: b.blob_id, size: b.size })
+        };
+        for b in mine().filter(|b| b.early()) {
+            if !self.id_free(b.id) || self.make_blob(mem, t, check(b)?, b.guest.clone()) != OK_NODATA {
+                return Err(bad("can't make a blob again"));
+            }
+        }
+        for &rid in c.info.attached.iter().filter(|r| self.res3d.contains_key(r)) {
+            t.r().context_attach(c.id, rid);
+        }
+        let name = String::from_utf8_lossy(&c.info.name).into_owned();
+        let state = c.venus.and_then(|(off, len, _)| {
+            let start = usize::try_from(off).ok()?;
+            data.get(start..start.checked_add(usize::try_from(len).ok()?)?)
+        });
+        let started = std::time::Instant::now();
+        let restored = match state {
+            Some(s) if !s.is_empty() => t.r().venus_restore(c.id, s),
+            _ => false,
+        };
+        if !restored {
+            log::warn!("gpu snapshot: Vulkan context {} ({name}) not built again: its app will see the device lost", c.id);
+        }
+        for b in mine().filter(|b| !b.early()) {
+            if !self.id_free(b.id) {
+                return Err(bad("bad blob"));
+            }
+            let blob = check(b)?;
+            if restored && self.make_blob(mem, t, blob, Vec::new()) == OK_NODATA {
+                continue;
+            }
+            // Plain shared memory where the guest maps it, so its pages
+            // stay backed.
+            let stand_in = Blob { mem: BLOB_MEM_HOST3D, flags: BLOB_FLAG_MAPPABLE, id: 0, ..blob };
+            if self.make_blob(mem, t, stand_in, Vec::new()) != OK_NODATA {
+                return Err(bad("can't make a blob again"));
+            }
+        }
+        if restored {
+            if !t.r().venus_resume(c.id) {
+                log::warn!("gpu snapshot: Vulkan context {} ({name}) didn't start again", c.id);
+            }
+            log::info!("gpu snapshot: Vulkan context {} ({name}) built again in {} ms", c.id, started.elapsed().as_millis());
+        }
+        for &rid in c.info.attached.iter().filter(|r| self.res3d.contains_key(r)) {
+            t.r().context_attach(c.id, rid);
+        }
+        Ok(())
     }
 
     /// Submit a command stream in pieces the renderer takes, split between
@@ -2388,15 +2594,141 @@ mod tests {
     }
 
     #[test]
-    fn vulkan_blocks_snapshots() {
+    fn direct3d_blocks_snapshots_vulkan_doesnt() {
         let log = Arc::new(Mutex::new(vec![]));
         let (gpu, _ctl) = Gpu::new(64, 64, Arc::new(Rec::default()));
         let gpu = gpu.with_3d(ThreeD::new(Box::new(FakeGl(log)), Arc::new(NoMap), 0));
         let mut h = gpu.handler();
-        h.ctx_info.insert(2, CtxInfo { capset: 4, name: vec![], attached: Default::default(), gl: None });
-        assert!(h.snapshot_blocker().unwrap().contains("Vulkan"));
+        h.ctx_info.insert(2, CtxInfo { capset: CAPSET_VENUS, name: vec![], attached: Default::default(), gl: None });
+        // A Vulkan context's blob, shown by a GL context (a window).
+        let blob = Blob { resource: 9, ctx: 2, mem: BLOB_MEM_HOST3D, flags: 1, id: 5, size: 4096 };
+        h.res3d.insert(9, Res3d { blob: true, made: Some(blob), ..Default::default() });
+        let mut attached = std::collections::BTreeSet::new();
+        attached.insert(9);
+        h.ctx_info.insert(1, CtxInfo { capset: 2, name: vec![], attached, gl: Some(GlState::default()) });
+        assert_eq!(h.snapshot_blocker(), None);
+        // Its context gone, nothing can make it again.
+        h.ctx_info.remove(&2);
+        assert!(h.snapshot_blocker().unwrap().contains("blob"));
         h.ctx_info.insert(3, CtxInfo { capset: CAPSET_NEPTUNE, name: vec![], attached: Default::default(), gl: None });
         assert!(h.snapshot_blocker().unwrap().contains("Direct3D"));
+    }
+
+    /// A Vulkan renderer that remembers what it was asked.
+    struct FakeVk {
+        log: Arc<Mutex<Vec<String>>>,
+        restores: bool,
+    }
+    impl Renderer3d for FakeVk {
+        fn capsets(&self) -> Vec<(u32, u32, u32)> {
+            vec![(CAPSET_VENUS, 0, 160)]
+        }
+        fn capset(&mut self, _: u32, _: u32) -> Option<Vec<u8>> {
+            None
+        }
+        fn context_create(&mut self, ctx: u32, capset: u32, _: &[u8]) -> bool {
+            self.log.lock().unwrap().push(format!("ctx {ctx} capset {capset}"));
+            true
+        }
+        fn context_destroy(&mut self, _: u32) {}
+        fn context_attach(&mut self, ctx: u32, res: u32) {
+            self.log.lock().unwrap().push(format!("attach {ctx} {res}"));
+        }
+        fn context_detach(&mut self, _: u32, _: u32) {}
+        fn submit(&mut self, _: u32, _: &mut [u8]) -> bool {
+            true
+        }
+        fn create_3d(&mut self, _: u32, _: &Create3d) -> bool {
+            false
+        }
+        fn attach_backing(&mut self, _: u32, _: crate::devices::gpu3d::HostIov) -> bool {
+            true
+        }
+        fn detach_backing(&mut self, _: u32) {}
+        fn transfer(&mut self, _: bool, _: u32, _: &Transfer3d) -> bool {
+            true
+        }
+        fn create_blob(&mut self, b: &Blob, _: crate::devices::gpu3d::HostIov) -> bool {
+            self.log.lock().unwrap().push(format!("blob {} ctx {} id {} flags {} size {}", b.resource, b.ctx, b.id, b.flags, b.size));
+            true
+        }
+        fn map_blob(&mut self, _: u32) -> Option<crate::devices::gpu3d::Mapping> {
+            None
+        }
+        fn unmap_blob(&mut self, _: u32) {}
+        fn read_mapped(&mut self, _: u32, _: u64, _: &mut [u8]) -> bool {
+            false
+        }
+        fn read_back(&mut self, _: u32, _: Box3d, _: u32, _: &mut [u8]) -> bool {
+            false
+        }
+        fn venus_save(&mut self, ctx: u32) -> Option<(bool, Vec<u8>)> {
+            Some((true, format!("state of {ctx}").into_bytes()))
+        }
+        fn venus_restore(&mut self, ctx: u32, data: &[u8]) -> bool {
+            self.log.lock().unwrap().push(format!("restore {ctx}: {}", String::from_utf8_lossy(data)));
+            self.restores
+        }
+        fn venus_resume(&mut self, ctx: u32) -> bool {
+            self.log.lock().unwrap().push(format!("resume {ctx}"));
+            true
+        }
+        fn unref(&mut self, _: u32) {}
+        fn create_fence(&mut self, _: u32, _: Option<u8>, _: u64) -> bool {
+            true
+        }
+        fn poll_fd(&self) -> Option<std::os::fd::RawFd> {
+            None
+        }
+        fn poll(&mut self) -> Vec<crate::devices::gpu3d::FenceDone> {
+            vec![]
+        }
+        fn reset(&mut self) {}
+    }
+
+    /// A Vulkan context with a ring (shared memory, blob id 0) and a
+    /// memory blob (blob id 9), saved, then built again in a fresh handler:
+    /// its shared memory first, then its state, then its memory, then it
+    /// starts. A context the renderer can't build again gets shared memory
+    /// where its memory was.
+    #[test]
+    fn vulkan_snapshot_order() {
+        for restores in [true, false] {
+            let mem = GuestMemory::new(&[(GuestAddress(0), 1 << 20)]).unwrap();
+            let log = Arc::new(Mutex::new(vec![]));
+            let vk = || ThreeD::new(Box::new(FakeVk { log: log.clone(), restores }), Arc::new(NoMap), 0);
+            let (gpu, _ctl) = Gpu::new(64, 64, Arc::new(Rec::default()));
+            let gpu = gpu.with_3d(vk());
+            let mut h = gpu.handler();
+            let mut create = vec![0u32, CAPSET_VENUS];
+            create.extend([0u32; 16]);
+            assert_eq!(run(&mut h, CTX_CREATE, 2, &create), OK_NODATA);
+            // id, mem, flags, entries, blob id (2 words), size (2 words)
+            assert_eq!(run(&mut h, RESOURCE_CREATE_BLOB, 2, &[3, BLOB_MEM_HOST3D, 1, 0, 0, 0, 65536, 0]), OK_NODATA);
+            assert_eq!(run(&mut h, RESOURCE_CREATE_BLOB, 2, &[4, BLOB_MEM_HOST3D, 1, 0, 9, 0, 4096, 0]), OK_NODATA);
+            assert_eq!(h.snapshot_blocker(), None);
+            let data = h.save_3d().unwrap();
+            log.lock().unwrap().clear();
+
+            let (gpu, _ctl) = Gpu::new(64, 64, Arc::new(Rec::default()));
+            let gpu = gpu.with_3d(vk());
+            let mut h = gpu.handler();
+            h.restore_3d(&mem, &data).unwrap();
+            let got = log.lock().unwrap().clone();
+            let mut want = vec![
+                "ctx 2 capset 4".to_string(),
+                "blob 3 ctx 2 id 0 flags 1 size 65536".into(),
+                "restore 2: state of 2".into(),
+            ];
+            if restores {
+                want.push("blob 4 ctx 2 id 9 flags 1 size 4096".into());
+                want.push("resume 2".into());
+            } else {
+                want.push("blob 4 ctx 2 id 0 flags 1 size 4096".into());
+            }
+            assert_eq!(got, want);
+            assert!(h.res3d.contains_key(&4) && h.ctx_info[&2].capset == CAPSET_VENUS);
+        }
     }
 
     #[test]
