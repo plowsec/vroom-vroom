@@ -5428,6 +5428,7 @@ dependencies = [
  "vroom-net",
  "vroom-sandbox",
  "vroom-usb",
+ "vroom-video",
  "vroom-vmm",
 ]
 
@@ -5633,6 +5634,10 @@ dependencies = [
  "libc",
  "log",
 ]
+
+[[package]]
+name = "vroom-video"
+version = "0.1.0"
 
 [[package]]
 name = "vroom-virtio"

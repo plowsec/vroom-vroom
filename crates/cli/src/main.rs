@@ -12,6 +12,9 @@ mod session;
 mod snap;
 mod term;
 mod usb;
+mod video;
+#[cfg(target_os = "macos")]
+mod vt;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -70,6 +73,12 @@ enum Cmd {
     #[cfg(unix)]
     #[command(hide = true)]
     GpuHelper(gpu::HelperArgs),
+    /// Video decoding helper started by the VMM (internal).
+    #[command(hide = true)]
+    VideoHelper {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// USB passthrough helper started by the VMM (internal).
     #[command(hide = true)]
     UsbHost(usb::HostArgs),
@@ -149,6 +158,7 @@ fn main() -> ExitCode {
         Cmd::CameraHelper => camera::helper(),
         #[cfg(unix)]
         Cmd::GpuHelper(a) => gpu::helper(a),
+        Cmd::VideoHelper { args } => video::helper(&args),
         Cmd::UsbHost(a) => usb::host(a),
         Cmd::Usb(c) => usb::run(c),
         Cmd::Check { config } => load(&config).and_then(|c| {
