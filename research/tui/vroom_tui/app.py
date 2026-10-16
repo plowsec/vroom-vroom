@@ -20,6 +20,7 @@ from textual.widgets import Button, DataTable, Footer, Header, Input, Label, Ric
 
 from .client import Client
 from .analysis import prepare_rva_image
+from .coverage import load_artifacts
 
 
 class KernelApp(App):
@@ -42,6 +43,9 @@ class KernelApp(App):
     #cfg-split { height: 1fr; }
     #cfg-blocks, #cfg-edges { width: 1fr; height: 1fr; background: #101720; }
     #cfg-edges { border-left: solid #2c4054; }
+    #coverage-functions { height: 1fr; background: #101720; }
+    #coverage-blocks { height: 1fr; background: #101720; }
+    #coverage-title { height: 1; padding: 0 1; color: #72d6cb; }
     #status.error { color: #ff8080; }
     #analysis-source { border: none; background: #234a64; }
     Screen.short #execution-toolbar { display: none; }
@@ -106,6 +110,10 @@ class KernelApp(App):
         self.watchpoints = []
         self.analysis_cache = {}
         self.cfg_cache = {}
+        self.coverage_functions = []
+        self.coverage_blocks = []
+        self.all_coverage_blocks = []
+        self.coverage_summary = None
         self.generation = 0
         self.view_revision = 0
         self.view_context = True
@@ -180,6 +188,10 @@ class KernelApp(App):
                         with Horizontal(id='cfg-split'):
                             yield DataTable(id='cfg-blocks', cursor_type='row')
                             yield DataTable(id='cfg-edges', cursor_type='row')
+                    with TabPane('Coverage', id='coverage-tab'):
+                        yield Static('Load a vroom-fuzz coverage.json with :coverage PATH', id='coverage-title')
+                        yield DataTable(id='coverage-functions', cursor_type='row')
+                        yield DataTable(id='coverage-blocks', cursor_type='row')
             with Vertical(id='register-pane'):
                 yield Label('REGISTERS', classes='section')
                 yield DataTable(id='registers', cursor_type='row', show_header=False, cell_padding=0)
@@ -194,6 +206,8 @@ class KernelApp(App):
         self.query_one('#breakpoints', DataTable).add_columns('Type', 'Address', 'Access', 'Scope')
         self.query_one('#cfg-blocks', DataTable).add_columns('Block', 'Size', 'Insns', 'In', 'Out')
         self.query_one('#cfg-edges', DataTable).add_columns('From', 'Kind', 'To')
+        self.query_one('#coverage-functions', DataTable).add_columns('Module / function', 'Blocks', 'Coverage', 'Hits')
+        self.query_one('#coverage-blocks', DataTable).add_columns('VA / GPA', 'Hits', 'Size', 'First input')
         self.query_one('#functions', DataTable).add_columns('Function', 'Address')
         self.query_one('#processes', DataTable).add_columns('PID', 'Image', 'Parent', 'EPROCESS')
         self.query_one('#peb', DataTable).add_columns('Field', 'Value')
@@ -656,6 +670,18 @@ class KernelApp(App):
             address = int(event.data_table.get_row(event.row_key)[2], 16)
             self.run_worker(self.show_address(address), group='browse', exclusive=True)
             return
+        if event.data_table.id == 'coverage-functions':
+            index = int(event.row_key.value)
+            self.show_coverage_blocks(self.coverage_functions[index])
+            return
+        if event.data_table.id == 'coverage-blocks':
+            row = self.coverage_blocks[int(event.row_key.value)]
+            address = row.get('va')
+            if address is None:
+                self.status(f"Block has no VA; GPA is 0x{int(row['gpa']):x}")
+            else:
+                self.run_worker(self.show_address(int(address)), group='browse', exclusive=True)
+            return
         if event.data_table.id == 'stack':
             address = int(event.data_table.get_row(event.row_key)[1],16)
             self.run_worker(self.show_address(address,context=False), group='browse', exclusive=True)
@@ -819,7 +845,11 @@ class KernelApp(App):
                     await self.show_memory(address, int(args[1],0) if len(args)>1 else 256, op == 'mem-phys')
             elif op == 'dump': self.log_message(await self.client.call('dump', cpu=self.cpu, address=await self.symbol_address(args[0]), length=int(args[1],0)))
             elif op == 'checkpoint': self.log_message(await self.client.call('checkpoint', path=args[0]))
-            else: self.log_message('reg NAME VALUE · write ADDRESS HEX · into/over/out · ps · process PID · peb · modules · symbols MODULE · functions MODULE PREFIX · next/prev · stack · bp/dis/mem/x SYMBOL · watch ADDRESS SIZE r/w/rw · bc/wc · dec/dec-file/dec-partial SYMBOL · cfg/xrefs [SYMBOL] · back/forward · image MODULE [PATH] · dump ADDRESS N · callbacks · event · cpu N · checkpoint PATH')
+            elif op == 'coverage':
+                if not args or len(args) > 2:
+                    raise RuntimeError('usage: coverage COVERAGE.json [BLOCKS.json]')
+                await self.load_coverage(args[0], args[1] if len(args) > 1 else None)
+            else: self.log_message('reg NAME VALUE · write ADDRESS HEX · into/over/out · ps · process PID · peb · modules · symbols MODULE · functions MODULE PREFIX · next/prev · stack · bp/dis/mem/x SYMBOL · watch ADDRESS SIZE r/w/rw · bc/wc · dec/dec-file/dec-partial SYMBOL · cfg/xrefs [SYMBOL] · coverage COVERAGE.json [BLOCKS.json] · back/forward · image MODULE [PATH] · dump ADDRESS N · callbacks · event · cpu N · checkpoint PATH')
         except Exception as error:
             self.status(str(error), error=True)
             self.log_message(error)
@@ -837,6 +867,52 @@ class KernelApp(App):
         if isinstance(table, DataTable) and table.id == 'cfg-blocks' and table.row_count:
             return int(table.ordered_rows[table.cursor_row].key.value)
         return self.address
+
+    async def load_coverage(self, coverage_path, blocks_path=None):
+        summary, functions, blocks = await asyncio.to_thread(
+            load_artifacts, coverage_path, blocks_path)
+        self.coverage_summary = summary
+        self.coverage_functions = functions
+        self.all_coverage_blocks = blocks
+        table = self.query_one('#coverage-functions', DataTable)
+        table.clear()
+        for index, row in enumerate(functions):
+            width = 12
+            filled = round(width * row.covered / row.total) if row.total else 0
+            color = 'green' if row.percent >= 70 else 'yellow' if row.percent >= 30 else 'red'
+            progress = Text('█' * filled + '·' * (width - filled), style=color)
+            progress.append(f' {row.percent:5.1f}%')
+            table.add_row(f'{row.module}!{row.name}', f'{row.covered}/{row.total}', progress,
+                          f'{row.hits:,}', key=str(index))
+        self.query_one('#coverage-title', Static).update(
+            f"{summary['covered_blocks']}/{summary['total_blocks']} blocks · "
+            f"{summary['executions']:,} runs · {summary['new_edges']:,} new edges · "
+            f"{len(functions)} functions · {coverage_path}")
+        if functions:
+            table.move_cursor(row=0)
+            self.show_coverage_blocks(functions[0])
+        else:
+            self.query_one('#coverage-blocks', DataTable).clear()
+        self.query_one(TabbedContent).active = 'coverage-tab'
+        self.status(f"Coverage loaded / {len(functions)} functions")
+
+    def show_coverage_blocks(self, function):
+        table = self.query_one('#coverage-blocks', DataTable)
+        table.clear()
+        selected = [block for block in self.all_coverage_blocks
+                    if (block.get('module') or '<unknown>') == function.module
+                    and (block.get('function') or '<unknown>') == function.name]
+        selected.sort(key=lambda block: (int(block.get('va') or block['gpa']), int(block['id'])))
+        indexes = []
+        for index, block in enumerate(selected):
+            va = block.get('va')
+            address = int(va if va is not None else block['gpa'])
+            first = block.get('first_input')
+            table.add_row(f"{address:016x}" + ('' if va is not None else ' GPA'),
+                          f"{int(block['hits']):,}", str(block['size']),
+                          first[:12] if first else '', key=str(index))
+            indexes.append(block)
+        self.coverage_blocks = indexes
 
     @work(group='cfg', exclusive=True)
     async def action_cfg(self):

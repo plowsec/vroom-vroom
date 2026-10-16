@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -103,8 +103,16 @@ impl Harness {
         if h.max_input == 0 {
             h.max_input = h.input_capacity;
         }
-        if h.max_input > h.input_capacity {
-            return Err(Error::Invalid("max_input exceeds input_capacity".into()));
+        let prefix_len = if h.ioctl_prefix { 4 } else { 0 };
+        if h.max_input < prefix_len {
+            return Err(Error::Invalid(format!(
+                "max_input must be at least {prefix_len} bytes for this harness"
+            )));
+        }
+        if h.max_input - prefix_len > h.input_capacity {
+            return Err(Error::Invalid(
+                "max_input payload exceeds input_capacity".into(),
+            ));
         }
         if h.ioctl_prefix && h.ioctl_register.is_none() {
             return Err(Error::Invalid("ioctl_prefix needs ioctl_register".into()));
@@ -121,6 +129,28 @@ impl Harness {
             return Err(Error::Invalid(
                 "coverage blocks must be aligned and non-empty".into(),
             ));
+        }
+        let mut ids = BTreeSet::new();
+        let mut gpas = BTreeSet::new();
+        let mut vas = BTreeSet::new();
+        for block in &h.coverage {
+            if !ids.insert(block.id) {
+                return Err(Error::Invalid(format!(
+                    "duplicate coverage block id {}",
+                    block.id
+                )));
+            }
+            if !gpas.insert(block.gpa) {
+                return Err(Error::Invalid(format!(
+                    "duplicate coverage GPA {:#x}",
+                    block.gpa
+                )));
+            }
+            if let Some(va) = block.va {
+                if !vas.insert(va) {
+                    return Err(Error::Invalid(format!("duplicate coverage VA {va:#x}")));
+                }
+            }
         }
         Ok(h)
     }
@@ -290,36 +320,55 @@ impl Mutator {
         self.state
     }
     pub fn mutate(&mut self, seed: &[u8]) -> Vec<u8> {
+        self.mutate_preserving_prefix(seed, 0)
+    }
+    pub fn mutate_preserving_prefix(&mut self, seed: &[u8], prefix_len: usize) -> Vec<u8> {
         let mut out = seed.to_vec();
-        if out.is_empty() {
+        if out.len() < prefix_len {
+            out.resize(prefix_len, 0);
+        } else if out.is_empty() {
             out.push(0);
         }
         let operations = 1 + (self.next() % 8) as usize;
         for _ in 0..operations {
+            let editable = out.len().saturating_sub(prefix_len);
             match self.next() % 5 {
-                0 => {
-                    let i = (self.next() as usize) % out.len();
+                0 if editable != 0 => {
+                    let i = prefix_len + (self.next() as usize) % editable;
                     out[i] ^= 1 << (self.next() % 8);
                 }
-                1 => {
-                    let i = (self.next() as usize) % out.len();
+                1 if editable != 0 => {
+                    let i = prefix_len + (self.next() as usize) % editable;
                     out[i] = self.next() as u8;
                 }
                 2 if out.len() < self.max_len => {
-                    let i = (self.next() as usize) % out.len();
+                    let i = prefix_len + (self.next() as usize) % (editable + 1);
                     out.insert(i, self.next() as u8);
                 }
-                3 if out.len() > 1 => {
-                    out.remove((self.next() as usize) % out.len());
+                3 if editable > 1 => {
+                    let i = prefix_len + (self.next() as usize) % editable;
+                    out.remove(i);
                 }
-                _ => {
-                    let i = (self.next() as usize) % out.len();
+                _ if editable != 0 => {
+                    let i = prefix_len + (self.next() as usize) % editable;
                     out[i] = out[i].wrapping_add((self.next() & 0xff) as u8);
                 }
+                _ => {}
             }
         }
         out.truncate(self.max_len);
+        if out.len() < prefix_len {
+            out.resize(prefix_len.min(self.max_len), 0);
+        }
         out
+    }
+
+    pub fn choose(&mut self, count: usize) -> usize {
+        if count == 0 {
+            0
+        } else {
+            (self.next() as usize) % count
+        }
     }
 }
 
@@ -359,6 +408,20 @@ impl CorpusStore {
             path,
         })
     }
+    pub fn load_inputs(&self) -> Result<Vec<Vec<u8>>> {
+        let mut paths = Vec::new();
+        for entry in fs::read_dir(self.root.join("inputs"))? {
+            let path = entry?.path();
+            if path.is_file() {
+                paths.push(path);
+            }
+        }
+        paths.sort();
+        paths
+            .into_iter()
+            .map(|path| fs::read(path).map_err(Error::from))
+            .collect()
+    }
     pub fn save_finding(&self, finding: &Finding, data: &[u8]) -> Result<PathBuf> {
         let hash = Self::hash(data);
         let path = self
@@ -383,11 +446,14 @@ pub struct Engine {
     pub vm: vroom_vmm::Vmm,
     pub harness: Harness,
     pub coverage: CoverageMap,
-    originals: BTreeMap<u64, u32>,
+    originals: HashMap<u64, u32>,
+    block_by_pc: HashMap<u64, usize>,
+    input_buffer: Vec<u8>,
 }
 
 impl Engine {
     pub fn open(harness: Harness) -> Result<Self> {
+        let input_capacity = harness.input_capacity;
         let config = vroom_config::VmConfig::load(&harness.config)
             .map_err(|e| Error::Config(e.to_string()))?;
         let hv = vroom_hv::default_hypervisor()?;
@@ -406,18 +472,24 @@ impl Engine {
             vm,
             harness,
             coverage: CoverageMap::default(),
-            originals: BTreeMap::new(),
+            originals: HashMap::new(),
+            block_by_pc: HashMap::new(),
+            input_buffer: vec![0; input_capacity],
         })
     }
 
     /// Patch each declared block with an ARM64 BRK before arming the COW
     /// baseline. The original words are kept for precise single stepping.
     pub fn instrument(&mut self) -> Result<()> {
-        for block in &self.harness.coverage {
+        for (index, block) in self.harness.coverage.iter().enumerate() {
             let mut bytes = [0u8; 4];
             self.vm.debug_read_physical(block.gpa, &mut bytes)?;
             let original = u32::from_le_bytes(bytes);
             self.originals.insert(block.gpa, original);
+            self.block_by_pc.insert(block.gpa, index);
+            if let Some(va) = block.va {
+                self.block_by_pc.insert(va, index);
+            }
             let trap = 0xd420_0000u32 | ((block.id as u32 & 0xffff) << 5);
             self.vm
                 .debug_write_physical(&[(block.gpa, &trap.to_le_bytes())])?;
@@ -449,10 +521,10 @@ impl Engine {
         if payload.len() > self.harness.input_capacity {
             return Err(Error::Invalid("payload exceeds input_capacity".into()));
         }
-        let mut padded = vec![0u8; self.harness.input_capacity];
-        padded[..payload.len()].copy_from_slice(payload);
+        self.input_buffer.fill(0);
+        self.input_buffer[..payload.len()].copy_from_slice(payload);
         self.vm
-            .debug_write_physical(&[(self.harness.input_gpa, &padded)])?;
+            .debug_write_physical(&[(self.harness.input_gpa, &self.input_buffer)])?;
         if let Some(value) = ioctl {
             let register = self
                 .harness
@@ -494,6 +566,7 @@ impl Engine {
         let start = Instant::now();
         let token = CorpusStore::hash(input);
         let mut new_blocks = 0;
+        let mut new_edges = 0;
         let mut finding = None;
         let mut previous_pc = None;
         loop {
@@ -512,13 +585,14 @@ impl Engine {
                         break;
                     }
                     let block = self
-                        .harness
-                        .coverage
-                        .iter()
-                        .find(|b| b.va == Some(stop.pc) || b.gpa == stop.pc);
+                        .block_by_pc
+                        .get(&stop.pc)
+                        .and_then(|index| self.harness.coverage.get(*index));
                     if let Some(block) = block {
                         if let Some(previous) = previous_pc {
-                            self.coverage.observe_edge(previous, block.id);
+                            if self.coverage.observe_edge(previous, block.id) {
+                                new_edges += 1;
+                            }
                         }
                         previous_pc = Some(block.id);
                         if self.coverage.observe(block, &token) {
@@ -589,6 +663,7 @@ impl Engine {
         Ok(RunResult {
             input_hash: token,
             new_blocks,
+            new_edges,
             finding,
             elapsed_us: start.elapsed().as_micros() as u64,
         })
@@ -599,6 +674,7 @@ impl Engine {
 pub struct RunResult {
     pub input_hash: String,
     pub new_blocks: usize,
+    pub new_edges: usize,
     pub finding: Option<Finding>,
     /// Wall-clock iteration time, including reset, instrumentation and guest
     /// execution. Keeping it beside coverage makes target comparisons

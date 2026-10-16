@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::Instant;
 use vroom_fuzz::{CorpusStore, CoverageBlock, CoverageMap, Engine, Harness, Mutator, Result};
@@ -79,17 +80,42 @@ fn main() -> Result<()> {
             let mut engine = Engine::open(h)?;
             engine.instrument()?;
             let seed = std::fs::read(seed)?;
+            if seed.len() > engine.harness.max_input {
+                return Err(vroom_fuzz::Error::Invalid("seed exceeds max_input".into()));
+            }
+            if engine.harness.ioctl_prefix && seed.len() < 4 {
+                return Err(vroom_fuzz::Error::Invalid(
+                    "IOCTL-prefixed seed is shorter than four bytes".into(),
+                ));
+            }
+            let mut corpus_inputs = store.load_inputs()?;
+            let prefix_len = if engine.harness.ioctl_prefix { 4 } else { 0 };
+            corpus_inputs.retain(|input| {
+                input.len() <= engine.harness.max_input && input.len() >= prefix_len
+            });
+            let mut corpus_hashes = corpus_inputs
+                .iter()
+                .map(|input| CorpusStore::hash(input))
+                .collect::<BTreeSet<_>>();
+            if corpus_hashes.insert(CorpusStore::hash(&seed)) {
+                store.save_input(&seed, 0)?;
+                corpus_inputs.push(seed.clone());
+            }
             let mut mutator = Mutator::new(0x7632_6f6f_6d_u64, engine.harness.max_input);
             let campaign_start = Instant::now();
             for i in 0..iterations {
                 let input = if i == 0 {
                     seed.clone()
                 } else {
-                    mutator.mutate(&seed)
+                    let parent = &corpus_inputs[mutator.choose(corpus_inputs.len())];
+                    mutator.mutate_preserving_prefix(parent, prefix_len)
                 };
                 let result = engine.run_input(&input)?;
-                if result.new_blocks != 0 {
-                    store.save_input(&input, result.new_blocks)?;
+                if result.new_blocks != 0 || result.new_edges != 0 {
+                    if corpus_hashes.insert(result.input_hash.clone()) {
+                        store.save_input(&input, result.new_blocks)?;
+                        corpus_inputs.push(input.clone());
+                    }
                 }
                 if let Some(finding) = &result.finding {
                     store.save_finding(finding, &input)?;

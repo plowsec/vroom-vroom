@@ -39,6 +39,10 @@ the Ghidra block exporter and a manifest verifier for HackSys Extreme
 Vulnerable Driver. Target source, driver binaries, checkpoints and generated
 coverage stay outside the repository.
 
+To inspect a completed campaign, run `coverage /path/to/state/fuzz/coverage.json`
+at the kernel TUI command bar. The Coverage tab shows per-function progress
+and block hit counts; selecting a block with a VA jumps to it in the debugger.
+
 ## run
 
 ```sh
