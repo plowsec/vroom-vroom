@@ -1,0 +1,24 @@
+[package]
+name = "vroom-fuzz"
+description = "Optional snapshot fuzzer and coverage laboratory for vroom"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vroom-fuzz"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+hex = "0.4"
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+thiserror.workspace = true
+vroom-config.workspace = true
+vroom-hv.workspace = true
+vroom-vmm = { workspace = true, features = ["research"] }
+
+[lints]
+workspace = true

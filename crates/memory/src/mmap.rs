@@ -12,6 +12,10 @@ pub struct MmapRegion {
     /// Shared memory behind it (another process maps it too: the GPU
     /// process), or None for private memory.
     shared: Option<std::sync::Mutex<std::os::fd::OwnedFd>>,
+    #[cfg(feature = "research")]
+    /// Immutable baseline behind a private mapping. Reset remaps the file so
+    /// pages dirtied by the guest are dropped without copying RAM.
+    cow: std::sync::Mutex<Option<std::os::fd::OwnedFd>>,
 }
 
 // SAFETY: the mapping is plain memory, owned by this struct; concurrent access
@@ -45,9 +49,8 @@ impl MmapRegion {
         }
         let base = (p as *mut u8).wrapping_add(guard);
         // SAFETY: [base, base+size) lies inside the mapping we just created.
-        let rc = unsafe {
-            libc::mprotect(base as *mut _, size, libc::PROT_READ | libc::PROT_WRITE)
-        };
+        let rc =
+            unsafe { libc::mprotect(base as *mut _, size, libc::PROT_READ | libc::PROT_WRITE) };
         if rc != 0 {
             let e = errno();
             // SAFETY: unmapping what we mapped above.
@@ -55,7 +58,14 @@ impl MmapRegion {
             return Err(Error::Mmap(e));
         }
         exclude_from_core_dump(base, size);
-        Ok(MmapRegion { base, size, guard, shared: None })
+        Ok(MmapRegion {
+            base,
+            size,
+            guard,
+            shared: None,
+            #[cfg(feature = "research")]
+            cow: std::sync::Mutex::new(None),
+        })
     }
 
     /// Like [`MmapRegion::new`], backed by a shared memory object that
@@ -72,14 +82,23 @@ impl MmapRegion {
     /// process to map. Changes when the region is discarded.
     pub fn shared_fd(&self) -> Option<std::os::fd::RawFd> {
         use std::os::fd::AsRawFd;
-        self.shared.as_ref().map(|f| f.lock().unwrap_or_else(|e| e.into_inner()).as_raw_fd())
+        self.shared
+            .as_ref()
+            .map(|f| f.lock().unwrap_or_else(|e| e.into_inner()).as_raw_fd())
     }
 
     fn map_shared(&self, fd: &std::os::fd::OwnedFd) -> Result<()> {
         use std::os::fd::AsRawFd;
         // SAFETY: replaces our own mapping in place with the object's pages.
         let p = unsafe {
-            libc::mmap(self.base as *mut _, self.size, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED | libc::MAP_FIXED, fd.as_raw_fd(), 0)
+            libc::mmap(
+                self.base as *mut _,
+                self.size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_FIXED,
+                fd.as_raw_fd(),
+                0,
+            )
         };
         if p == libc::MAP_FAILED {
             return Err(Error::Mmap(errno()));
@@ -127,7 +146,10 @@ impl MmapRegion {
     /// Release physical pages back to the host (balloon, reset). Reads return 0 after.
     pub fn discard(&self, off: usize, len: usize) -> Result<()> {
         let ps = page_size();
-        if !off.is_multiple_of(ps) || !len.is_multiple_of(ps) || off.checked_add(len).is_none_or(|e| e > self.size) {
+        if !off.is_multiple_of(ps)
+            || !len.is_multiple_of(ps)
+            || off.checked_add(len).is_none_or(|e| e > self.size)
+        {
             return Err(Error::Unaligned(ps));
         }
         if let Some(f) = &self.shared {
@@ -160,6 +182,92 @@ impl MmapRegion {
         }
         Ok(())
     }
+
+    #[cfg(feature = "research")]
+    pub fn can_snapshot_cow(&self) -> bool {
+        self.shared.is_none()
+    }
+
+    #[cfg(feature = "research")]
+    /// Freeze this mapping's current bytes as a file-backed private baseline.
+    pub fn snapshot_cow(&self) -> Result<()> {
+        if self.shared.is_some() {
+            return Err(Error::Cow("shared RAM cannot be snapshotted with COW"));
+        }
+        let fd = cow_object(self.size)?;
+        use std::os::fd::AsRawFd;
+        // Copy through a temporary shared mapping. `pwrite` is not portable
+        // for the anonymous shared-memory objects used on macOS.
+        let tmp = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                self.size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd.as_raw_fd(),
+                0,
+            )
+        };
+        if tmp == libc::MAP_FAILED {
+            return Err(Error::Mmap(errno()));
+        }
+        // SAFETY: both mappings cover `size` bytes and do not overlap.
+        unsafe { std::ptr::copy_nonoverlapping(self.base, tmp.cast(), self.size) };
+        // SAFETY: this is the temporary mapping returned above.
+        unsafe { libc::munmap(tmp, self.size) };
+
+        // MAP_FIXED is only used after removing our own central mapping. The
+        // guard pages stay intact, so host overrun checks remain effective.
+        let rc = unsafe { libc::munmap(self.base.cast(), self.size) };
+        if rc != 0 {
+            return Err(Error::Mmap(errno()));
+        }
+        let mapped = unsafe {
+            libc::mmap(
+                self.base.cast(),
+                self.size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_FIXED,
+                fd.as_raw_fd(),
+                0,
+            )
+        };
+        if mapped == libc::MAP_FAILED {
+            return Err(Error::Mmap(errno()));
+        }
+        *self.cow.lock().unwrap_or_else(|e| e.into_inner()) = Some(fd);
+        Ok(())
+    }
+
+    #[cfg(feature = "research")]
+    /// Drop guest-dirtied private pages so the frozen baseline is visible.
+    pub fn restore_cow(&self) -> Result<()> {
+        let held = self.cow.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(fd) = held.as_ref() else {
+            return Err(Error::Cow("no COW baseline is armed"));
+        };
+        use std::os::fd::AsRawFd;
+        // Remapping the same private file is portable: macOS treats
+        // MADV_DONTNEED as advisory and may retain dirty private pages.
+        let rc = unsafe { libc::munmap(self.base.cast(), self.size) };
+        if rc != 0 {
+            return Err(Error::Mmap(errno()));
+        }
+        let mapped = unsafe {
+            libc::mmap(
+                self.base.cast(),
+                self.size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_FIXED,
+                fd.as_raw_fd(),
+                0,
+            )
+        };
+        if mapped == libc::MAP_FAILED {
+            return Err(Error::Mmap(errno()));
+        }
+        Ok(())
+    }
 }
 
 impl Drop for MmapRegion {
@@ -179,12 +287,22 @@ fn shm_object(size: usize) -> Result<std::os::fd::OwnedFd> {
     use std::os::fd::FromRawFd;
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
     // Named only for a moment (unlinked at once); the pid in it is what
     // the VMM's sandbox lets it create.
-    let name = std::ffi::CString::new(format!("/vroom-ram-{}-{n:x}-{t:x}", std::process::id())).map_err(|_| Error::Mmap(libc::EINVAL))?;
+    let name = std::ffi::CString::new(format!("/vroom-ram-{}-{n:x}-{t:x}", std::process::id()))
+        .map_err(|_| Error::Mmap(libc::EINVAL))?;
     // SAFETY: valid C string; the fd is owned below.
-    let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, 0o600 as libc::c_uint) };
+    let fd = unsafe {
+        libc::shm_open(
+            name.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+            0o600 as libc::c_uint,
+        )
+    };
     if fd < 0 {
         return Err(Error::Mmap(errno()));
     }
@@ -201,6 +319,24 @@ fn shm_object(size: usize) -> Result<std::os::fd::OwnedFd> {
         return Err(Error::Mmap(errno()));
     }
     Ok(fd)
+}
+
+#[cfg(feature = "research")]
+fn cow_object(size: usize) -> Result<std::os::fd::OwnedFd> {
+    use std::os::fd::{FromRawFd, IntoRawFd};
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("vroom-cow-{}-{n:x}", std::process::id()));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|e| Error::Mmap(e.raw_os_error().unwrap_or(libc::EIO)))?;
+    let _ = std::fs::remove_file(&path);
+    file.set_len(size as u64)
+        .map_err(|e| Error::Mmap(e.raw_os_error().unwrap_or(libc::EIO)))?;
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(file.into_raw_fd()) })
 }
 
 fn errno() -> i32 {

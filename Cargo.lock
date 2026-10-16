@@ -5497,6 +5497,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "vroom-fuzz"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.21",
+ "vroom-config",
+ "vroom-hv",
+ "vroom-vmm",
+]
+
+[[package]]
 name = "vroom-gpu3d"
 version = "0.1.0"
 dependencies = [

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/*", "research/kernel"]
+members = ["crates/*", "research/kernel", "research/fuzz"]
 default-members = ["crates/cli", "crates/gui"]
 
 [workspace.package]

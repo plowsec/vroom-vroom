@@ -39,6 +39,8 @@ use std::time::{Duration, Instant};
 use vroom_config::VmConfig;
 use vroom_devices::pl011::Pl011;
 use vroom_hv::{BootRegs, Hypervisor, IrqChipState, Vm};
+#[cfg(feature = "research")]
+use vroom_hv::VcpuState;
 use vroom_memory::GuestMemory;
 use vroom_snapshot::Snapshottable;
 
@@ -141,6 +143,16 @@ pub struct Vmm {
     pristine_irqchip: Option<IrqChipState>,
     boot: machine::BootImage,
     state: RunState,
+    #[cfg(feature = "research")]
+    research_baseline: Option<ResearchBaseline>,
+}
+
+#[cfg(feature = "research")]
+struct ResearchBaseline {
+    devices: Vec<Vec<u8>>,
+    vcpus: Vec<VcpuState>,
+    irqchip: Option<IrqChipState>,
+    clock: u64,
 }
 
 impl std::fmt::Debug for Vmm {
@@ -198,6 +210,8 @@ impl Vmm {
             pristine_irqchip: None,
             boot: m.boot,
             state: RunState::Paused,
+            #[cfg(feature = "research")]
+            research_baseline: None,
         };
         vmm.pristine_irqchip = match vmm.vm.save_irqchip() {
             Ok(s) => Some(s),
@@ -242,6 +256,64 @@ impl Vmm {
 
     pub fn state(&self) -> RunState {
         self.state
+    }
+
+    #[cfg(feature = "research")]
+    /// Capture the paused machine for high-rate fuzz iterations.
+    pub fn research_arm(&mut self) -> Result<()> {
+        if self.state != RunState::Paused {
+            return Err(Error::Setup("research baseline requires a paused VM".into()));
+        }
+        if self.research_baseline.is_some() {
+            return Err(Error::Setup("research baseline is already armed".into()));
+        }
+        let mut devices = Vec::with_capacity(self.devices.len());
+        for d in &self.devices {
+            devices.push(d.lock().unwrap_or_else(|e| e.into_inner()).save()?);
+        }
+        let mut vcpus = Vec::with_capacity(self.vcpus.len());
+        for v in &self.vcpus {
+            let (tx, rx) = mpsc::channel();
+            v.peer.send(VcpuCmd::Save(tx))?;
+            vcpus.push(rx.recv_timeout(PAUSE_TIMEOUT).map_err(|_| Error::Timeout)??);
+        }
+        let irqchip = match self.vm.save_irqchip() {
+            Ok(s) => Some(s),
+            Err(vroom_hv::Error::Unsupported(_)) => None,
+            Err(e) => return Err(e.into()),
+        };
+        let clock = self.vm.clock();
+        self.mem.snapshot_cow()?;
+        self.research_baseline = Some(ResearchBaseline { devices, vcpus, irqchip, clock });
+        Ok(())
+    }
+
+    #[cfg(feature = "research")]
+    /// Restore the armed baseline without rebuilding the VM or its mappings.
+    pub fn research_reset(&mut self) -> Result<()> {
+        if self.state != RunState::Paused {
+            return Err(Error::Setup("research reset requires a paused VM".into()));
+        }
+        let Some(baseline) = &self.research_baseline else {
+            return Err(Error::Setup("research baseline is not armed".into()));
+        };
+        self.mem.restore_cow()?;
+        if let Some(irqchip) = &baseline.irqchip {
+            self.vm.restore_irqchip(irqchip)?;
+        }
+        self.vm.set_clock(baseline.clock);
+        for (d, state) in self.devices.iter().zip(&baseline.devices) {
+            d.lock().unwrap_or_else(|e| e.into_inner()).restore(state)?;
+        }
+        let mut cpus = self.shared.cpus.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        for (v, state) in self.vcpus.iter().zip(&baseline.vcpus) {
+            cpus.set_on(state.index as usize, state.powered_on);
+            let (tx, rx) = mpsc::channel();
+            v.peer.send(VcpuCmd::Restore(Box::new(state.clone()), state.powered_on, tx))?;
+            rx.recv_timeout(PAUSE_TIMEOUT).map_err(|_| Error::Timeout)??;
+        }
+        *self.shared.cpus.lock().unwrap_or_else(|e| e.into_inner()) = cpus;
+        Ok(())
     }
 
     /// Save the guest screen as PNG. Returns the mode.

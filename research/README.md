@@ -3,6 +3,35 @@
 Windows ARM64 · macOS/HVF · Linux ARM64/KVM · experimental. No KDNET or guest driver.
 Optional; excluded from normal vroom builds.
 
+## fuzz lab
+
+The fuzz runner is another optional research package. It keeps the VMM's
+snapshot primitive small and lets the campaign policy, detectors, corpus and
+coverage reports stay here.
+
+```sh
+cargo run -p vroom-fuzz -- check harness.json
+cargo run -p vroom-fuzz -- mutate seed.bin --count 16
+cargo run -p vroom-fuzz -- run harness.json seed.bin --iterations 1000
+cargo run -p vroom-fuzz -- coverage STATE/fuzz/coverage.json STATE/fuzz/blocks.json
+```
+
+The harness declares the checkpoint, input buffer, analysed basic blocks and
+detectors. Each run records block hits, edges, first-seen inputs, function
+coverage and findings as JSON. A campaign is auditable when the block manifest
+is tied to the disassembly or symbol evidence used to create it and the
+resulting `coverage.json` is kept with the corpus.
+
+The VMM side is opt-in:
+
+```sh
+cargo check -p vroom-vmm
+cargo check -p vroom-vmm --features research
+```
+
+The first command is the normal product build. The second enables private
+file-backed RAM baselines and the paused restore API used by `vroom-fuzz`.
+
 ## run
 
 ```sh
