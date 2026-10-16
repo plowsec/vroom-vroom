@@ -117,8 +117,13 @@ impl CameraHelper {
     /// Follow the guest and pass frames to the controller.
     pub fn run(self: &Arc<Self>, xhci: Arc<Mutex<Xhci>>) -> Result<()> {
         let me = self.clone();
+        let x = xhci.clone();
         std::thread::Builder::new().name("camera-ctl".into()).spawn(move || loop {
             me.feed.wait(Duration::from_millis(500));
+            // A guest waiting for a frame doesn't ask again until one comes
+            // (the camera may take seconds: macOS asking for permission):
+            // look at its queued transfer, which says it still wants them.
+            x.lock().unwrap_or_else(|e| e.into_inner()).camera_frame();
             me.update();
         })?;
         let me = self.clone();
