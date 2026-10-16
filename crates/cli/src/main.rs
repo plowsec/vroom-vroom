@@ -75,10 +75,42 @@ enum Cmd {
     Snapshot(snap::SnapCmd),
 }
 
+/// Apps started from the Dock or Finder get 256 open files. A Windows
+/// guest with 3D keeps one or more per Direct3D event and fence (DXMT,
+/// the render server), and runs out of them in minutes: fences then never
+/// finish and the guest hangs. Take what the system allows.
+fn raise_open_files() {
+    let mut r = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: valid out pointer.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut r) } != 0 {
+        return;
+    }
+    // macOS refuses more than kern.maxfilesperproc (and RLIM_INFINITY).
+    let mut cap: libc::rlim_t = 1 << 16;
+    #[cfg(target_os = "macos")]
+    {
+        let mut n: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>();
+        // SAFETY: a valid NUL-terminated name and out buffer of `len` bytes.
+        if unsafe { libc::sysctlbyname(c"kern.maxfilesperproc".as_ptr(), &mut n as *mut _ as *mut libc::c_void, &mut len, std::ptr::null_mut(), 0) } == 0 && n > 0 {
+            cap = cap.min(n as libc::rlim_t);
+        }
+    }
+    let want = cap.min(r.rlim_max);
+    if r.rlim_cur < want {
+        r.rlim_cur = want;
+        // SAFETY: valid rlimit; failing leaves the old limit.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &r) } != 0 {
+            log::warn!("can't raise the open file limit: {}", std::io::Error::last_os_error());
+        }
+    }
+}
+
 fn main() -> ExitCode {
     log_limit::Limited::install(env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).build());
     let r = match Cli::parse().cmd {
         Cmd::Run { config, restore, fresh, state_dir, host_clipboard_file, no_sandbox, ui_fd } => {
+            raise_open_files();
             load(&config).and_then(|cfg| {
                 for w in cfg.warnings() {
                     eprintln!("vroom: warning: {w}");
