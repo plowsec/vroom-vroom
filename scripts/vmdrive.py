@@ -9,6 +9,7 @@ Commands, one per line, on <state-dir>.cmd (a fifo):
   resize W H | focus 0|1 | clip TEXT | cmd N | quit
   coherence 0|1          Coherence on/off (windows show as "windows N: ...")
   win ID activate|minimize|close | win ID move X Y W H
+  startapp NAME          start a guest app by name (icons show as "icon ID ...")
   serial TEXT            to the serial console (\\n for Enter)
   drop X Y X2 Y2 PATH... drag files in at X,Y, move to X2,Y2, drop there
                          (what the app does when files come from Finder)
@@ -94,6 +95,14 @@ def reader():
                     out.append(f"{i:#x} {x},{y} {w}x{h} f{f} {pl[o + 26:o + 26 + tl].decode(errors='replace')!r}")
                     o += 26 + tl
                 ev.write(f"windows {n}: " + " | ".join(out) + "\n")
+            elif t == 18:
+                i, w, h = struct.unpack("<IHH", pl[:8])
+                png = f"{state}.icon-{i:x}.png"
+                if w:
+                    write_png(png, w, h, pl[8:])
+                ev.write(f"icon {i:#x} {w}x{h} {png if w else 'none'}\n")
+            elif t == 19:
+                ev.write(f"no coherence: {pl.decode(errors='replace')}\n")
             elif t == 7:
                 if pl[0] != 2:
                     ev.write("cursor " + ("unset", "hidden")[pl[0]] + "\n"); continue
@@ -251,6 +260,7 @@ if True:
                 elif c == "usbdetach": send(13, bytes([int(arg)]))
                 elif c == "quit": p.stdin.write(b"\x01x"); p.stdin.flush()
                 elif c == "coherence": send(14, bytes([int(arg)]))
+                elif c == "startapp": send(20, arg.strip().encode())
                 elif c == "win":
                     v = arg.split()
                     ops = {"activate": 1, "minimize": 2, "close": 3, "move": 4}

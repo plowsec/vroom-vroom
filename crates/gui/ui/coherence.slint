@@ -17,6 +17,9 @@ export struct CohChip {
     title: string,
     front: bool,
     minimized: bool,
+    // The app's icon, from the guest (checked for size; may be empty).
+    icon: image,
+    has-icon: bool,
 }
 
 export component CoherenceWindow inherits Window {
@@ -131,7 +134,13 @@ export component CoherenceBar inherits Window {
     in property <[CohChip]> chips;
     // Why there's nothing to show ("no windows", "nobody logged in").
     in property <string> note;
+    // The guest can start apps by name (the field shows).
+    in property <bool> can-start;
+    // The field has the keyboard: keys go to it, not to the guest.
+    out property <bool> typing: name.has-focus;
     callback start();
+    // Start the guest app with this name.
+    callback start-app(string);
     callback chip(int);
     callback exit();
     // Pressed where nothing else is: the bar follows the mouse.
@@ -181,6 +190,40 @@ export component CoherenceBar inherits Window {
             y: (parent.height - self.height) / 2;
             clicked => { root.start(); }
         }
+        Rectangle {
+            visible: root.can-start;
+            y: (parent.height - self.height) / 2;
+            width: root.can-start ? 150px : 0px;
+            height: 28px;
+            border-radius: Theme.r-sm;
+            background: name.has-focus ? Theme.field-focus : Theme.field;
+            border-width: 1px;
+            border-color: name.has-focus ? Theme.accent : Theme.border;
+            if name.text == "": Text {
+                x: 8px;
+                text: "Open an app...";
+                color: Theme.text-3;
+                font-size: Theme.fs-sm;
+                vertical-alignment: center;
+                height: parent.height;
+            }
+            name := TextInput {
+                x: 8px;
+                width: parent.width - 16px;
+                height: 100%;
+                vertical-alignment: center;
+                font-size: Theme.fs-sm;
+                color: Theme.text;
+                single-line: true;
+                selection-background-color: Theme.accent.with-alpha(0.35);
+                accepted => {
+                    if self.text != "" {
+                        root.start-app(self.text);
+                    }
+                    self.text = "";
+                }
+            }
+        }
         HorizontalLayout {
             horizontal-stretch: 1;
             spacing: 4px;
@@ -195,14 +238,23 @@ export component CoherenceBar inherits Window {
                 y: (parent.height - self.height) / 2;
                 height: 28px;
                 min-width: 40px;
-                preferred-width: min(180px, ct.preferred-width + 20px);
+                preferred-width: min(180px, ct.preferred-width + ct.x + 10px);
                 horizontal-stretch: 1;
                 max-width: 180px;
                 border-radius: Theme.r-sm;
                 background: c.front ? Theme.selected : cta.has-hover ? Theme.card-hover : transparent;
+                if c.has-icon: Image {
+                    x: 8px;
+                    y: (parent.height - self.height) / 2;
+                    width: 16px;
+                    height: 16px;
+                    source: c.icon;
+                    image-rendering: smooth;
+                    opacity: c.minimized ? 0.5 : 1;
+                }
                 ct := Text {
-                    x: 10px;
-                    width: parent.width - 20px;
+                    x: c.has-icon ? 30px : 10px;
+                    width: parent.width - self.x - 10px;
                     text: c.title;
                     color: c.minimized ? Theme.text-3 : Theme.text;
                     font-size: Theme.fs-sm;

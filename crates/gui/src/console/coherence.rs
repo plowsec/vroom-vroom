@@ -40,6 +40,11 @@ const MIN_SIDE: u32 = 4;
 const HANDS_OFF: Duration = Duration::from_millis(500);
 /// Focus changes we cause are not passed on to the guest for this long.
 const QUIET: Duration = Duration::from_millis(400);
+/// How often we look whether the bar went to another screen, or the
+/// screen changed (Dock, resolution, unplugged).
+const SCREENS_EVERY: Duration = Duration::from_secs(1);
+/// What of a window the user moves stays on the guest's screen (points).
+const KEEP: f64 = 40.0;
 
 /// A rectangle in Mac points: global, top left origin, y down (winit's
 /// logical coordinates on macOS).
@@ -119,6 +124,36 @@ impl Map {
         let f = |v: f64, n: u32| (v / n.saturating_sub(1).max(1) as f64 * POINTER_MAX as f64).round().clamp(0.0, POINTER_MAX as f64) as u16;
         (f(gx, self.mode.0), f(gy, self.mode.1))
     }
+}
+
+/// Where the user may put a window: mostly anywhere, but some of it (and
+/// all of its strip) stays on the guest's screen, or the guest would lose
+/// it off its edge.
+pub fn keep_on(r: Rect, area: Rect) -> Rect {
+    let x = r.x.clamp(area.x - r.w + KEEP, area.x + area.w - KEEP);
+    let y = r.y.clamp(area.y, (area.y + area.h - KEEP).max(area.y));
+    Rect { x, y, ..r }
+}
+
+/// The guest's screen inside a Mac screen's free area: room above for the
+/// top window's strip, below for our bar.
+pub fn area_in(free: Rect) -> Rect {
+    Rect { x: free.x, y: free.y + STRIP, w: free.w, h: (free.h - STRIP - BAR).max(200.0) }
+}
+
+/// Where the bar goes on a screen's free area: at the bottom, in the middle.
+pub fn bar_in(free: Rect) -> Rect {
+    let width = free.w.min(900.0);
+    Rect { x: free.x + (free.w - width) / 2.0, y: free.y + free.h - BAR, w: width, h: BAR }
+}
+
+/// A window icon from the guest as an image (sizes were checked by the
+/// protocol: at most 64 on a side, exactly that many pixels).
+fn icon_image(w: u32, h: u32, rgba: &[u8]) -> Option<slint::Image> {
+    if w == 0 || h == 0 || w > vroom_proto::ICON_MAX || h > vroom_proto::ICON_MAX || rgba.len() != (w * h * 4) as usize {
+        return None;
+    }
+    Some(slint::Image::from_rgba8(SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(rgba, w, h)))
 }
 
 /// The part of `w` on a `mode` screen, if it is worth a window.
@@ -334,6 +369,14 @@ pub struct Coherence {
     quiet_until: Instant,
     /// The guest's window in front.
     fg: Option<u32>,
+    /// App icons, by guest window (only of windows in the list).
+    icons: HashMap<u32, slint::Image>,
+    /// The Mac screen the guest's screen is on (its frame), and its free area.
+    screen: Rect,
+    free: Rect,
+    screens_at: Instant,
+    /// Where the bar was at the last look (it may be on its way somewhere).
+    bar_was: Option<(f64, f64)>,
 }
 
 impl Coherence {
@@ -412,12 +455,14 @@ fn winit_event(key: &str, io: &Rc<RefCell<Io>>, target: Target, ev: &WindowEvent
 impl Console {
     /// Why Coherence can't start now; empty if it can.
     pub(super) fn coherence_why(&self) -> &'static str {
-        if !self.windows_guest {
-            "Coherence works with Windows guests"
-        } else if self.features == 0 {
+        if self.features == 0 {
             "Coherence needs the guest tools (they aren't running)"
         } else if self.features & vroom_proto::features::COHERENCE == 0 {
-            "Coherence needs newer guest tools: run vroom-setup in the guest"
+            if self.windows_guest {
+                "Coherence needs newer guest tools: run vroom-setup in the guest"
+            } else {
+                "Coherence needs newer guest tools: install the current vroom-agent in the guest"
+            }
         } else if self.state != VmState::Running {
             "Coherence needs the VM running"
         } else {
@@ -448,19 +493,19 @@ impl Console {
             Some((p.x + s.width / 2.0, p.y + s.height / 2.0))
         });
         let (cx, cy) = center.flatten().unwrap_or((0.0, 0.0));
-        let free = match mac::screen_at(cx, cy) {
-            Some((_, v)) => v,
+        let (screen, free) = match mac::screen_at(cx, cy) {
+            Some(s) => s,
             None => {
                 let Some(m) = w.with_winit_window(|w| w.current_monitor()).flatten() else {
                     self.toast("Coherence: can't tell how big the screen is.");
                     return;
                 };
                 let (p, s) = (m.position().to_logical::<f64>(m.scale_factor()), m.size().to_logical::<f64>(m.scale_factor()));
-                Rect { x: p.x, y: p.y + 25.0, w: s.width, h: s.height - 25.0 }
+                let f = Rect { x: p.x, y: p.y, w: s.width, h: s.height };
+                (f, Rect { y: p.y + 25.0, h: s.height - 25.0, ..f })
             }
         };
-        // Room above for the top window's strip, below for our bar.
-        let area = Rect { x: free.x, y: free.y + STRIP, w: free.w, h: (free.h - STRIP - BAR).max(200.0) };
+        let area = area_in(free);
         let bar = match CoherenceBar::new() {
             Ok(b) => b,
             Err(e) => {
@@ -473,10 +518,10 @@ impl Console {
         bar.set_os(self.win.get_os());
         bar.set_chips(chips.clone().into());
         bar.set_note("Waiting for the guest's windows...".into());
+        bar.set_can_start(self.features & vroom_proto::features::START_APP != 0);
         self.wire_bar(&bar);
-        let width = free.w.min(900.0);
-        let bar_at = Rect { x: free.x + (free.w - width) / 2.0, y: free.y + free.h - BAR, w: width, h: BAR };
-        bar.window().set_size(slint::LogicalSize::new(width as f32, BAR as f32));
+        let bar_at = bar_in(free);
+        bar.window().set_size(slint::LogicalSize::new(bar_at.w as f32, BAR as f32));
         log::info!("{}: coherence on, guest screen {:.0}x{:.0} points at {:.0},{:.0}", self.name, area.w, area.h, area.x, area.y);
         // The guest's screen takes the free area, in pixels.
         let (width_px, height_px, scale) = super::guest_size((area.w * sf) as u32, (area.h * sf) as u32, sf as f32, self.hidpi);
@@ -499,6 +544,11 @@ impl Console {
             focus: None,
             quiet_until: Instant::now() + QUIET,
             fg: None,
+            icons: HashMap::new(),
+            screen,
+            free,
+            screens_at: Instant::now(),
+            bar_was: None,
         });
         let _ = self.win.hide();
         if let Some(c) = &self.coh {
@@ -570,6 +620,13 @@ impl Console {
         });
         let i = self.io.clone();
         bar.on_chip(move |id| i.borrow_mut().send(ToVmm::Window { id: id as u32, op: WindowOp::Activate }));
+        let i = self.io.clone();
+        bar.on_start_app(move |name| {
+            let name = name.trim();
+            if vroom_proto::line_ok(name) {
+                i.borrow_mut().send(ToVmm::StartApp(name.to_string()));
+            }
+        });
         let k = self.key.clone();
         bar.on_exit(move || {
             let k = k.clone();
@@ -585,16 +642,48 @@ impl Console {
             });
             slint::CloseRequestResponse::KeepWindowShown
         });
-        let (k, i) = (self.key.clone(), self.io.clone());
-        bar.window().on_winit_window_event(move |_w, ev| winit_event(&k, &i, Target::Bar, ev));
+        let (k, i, b) = (self.key.clone(), self.io.clone(), bar.as_weak());
+        bar.window().on_winit_window_event(move |_w, ev| {
+            // Typing an app's name: the keys are the field's, not the guest's.
+            let keys = matches!(ev, WindowEvent::KeyboardInput { .. } | WindowEvent::Ime(_));
+            if keys && b.upgrade().is_some_and(|b| b.get_typing()) {
+                return EventResult::Propagate;
+            }
+            winit_event(&k, &i, Target::Bar, ev)
+        });
     }
 
     /// A new window list from the guest.
     pub(super) fn coh_windows(&mut self, list: Vec<GuestWindow>) {
         let Some(c) = self.coh.as_mut() else { return };
         c.fg = list.iter().find(|w| w.flags & win_flags::FOREGROUND != 0).map(|w| w.id);
+        c.icons.retain(|id, _| list.iter().any(|w| w.id == *id));
         c.list = list;
         self.coh_layout();
+    }
+
+    /// App icons from the guest, for windows of the list.
+    pub(super) fn coh_icons(&mut self, icons: std::collections::BTreeMap<u32, (u32, u32, Vec<u8>)>) {
+        let Some(c) = self.coh.as_mut() else { return };
+        for (id, (w, h, rgba)) in icons {
+            if !c.list.iter().any(|g| g.id == id) {
+                continue;
+            }
+            match icon_image(w, h, &rgba) {
+                Some(i) => c.icons.insert(id, i),
+                None => c.icons.remove(&id),
+            };
+        }
+        self.coh_layout();
+    }
+
+    /// The guest says Coherence can't work there.
+    pub(super) fn coh_no(&mut self, why: &str) {
+        if self.coh.is_none() {
+            return;
+        }
+        self.coherence_stop();
+        self.toast(&format!("Coherence can't work in this guest: {}.", clean(why).trim_end_matches('.')));
     }
 
     /// Bring the Mac windows in line with the guest's list and screen:
@@ -691,9 +780,21 @@ impl Console {
             .iter()
             .filter_map(|id| apps.iter().find(|w| w.id == *id))
             .take(12)
-            .map(|w| CohChip { id: w.id as i32, title: title(&w.title).into(), front: c.fg == Some(w.id), minimized: w.flags & win_flags::MINIMIZED != 0 })
+            .map(|w| {
+                let icon = c.icons.get(&w.id).cloned();
+                CohChip {
+                    id: w.id as i32,
+                    title: title(&w.title).into(),
+                    front: c.fg == Some(w.id),
+                    minimized: w.flags & win_flags::MINIMIZED != 0,
+                    has_icon: icon.is_some(),
+                    icon: icon.unwrap_or_default(),
+                }
+            })
             .collect();
-        if c.chips.iter().ne(chips.iter().cloned()) {
+        let same = c.chips.row_count() == chips.len()
+            && c.chips.iter().zip(&chips).all(|(a, b)| (a.id, &a.title, a.front, a.minimized, a.has_icon) == (b.id, &b.title, b.front, b.minimized, b.has_icon) && a.icon == b.icon);
+        if !same {
             c.chips.set_vec(chips);
         }
         let note = if c.list.is_empty() { "No windows open in the guest (or nobody is logged in)" } else { "" };
@@ -833,7 +934,9 @@ impl Console {
             return;
         }
         w.user = Some(Instant::now());
-        let r = m.guest(now);
+        // Dragged to another screen, or off this one: the guest keeps it
+        // on its screen, and the window goes back there once let go.
+        let r = m.guest(keep_on(now, m.area));
         if w.sent == Some(r) {
             return;
         }
@@ -858,7 +961,51 @@ impl Console {
         }
         if self.state != VmState::Running && self.state != VmState::Paused {
             self.coherence_stop();
+            return;
         }
+        self.coh_screens();
+    }
+
+    /// The guest's screen follows the bar to another Mac screen, and the
+    /// screen's free area when it changes (the Dock moved or hid, another
+    /// resolution, the screen unplugged).
+    fn coh_screens(&mut self) {
+        let Some(c) = self.coh.as_mut() else { return };
+        if c.screens_at.elapsed() < SCREENS_EVERY {
+            return;
+        }
+        c.screens_at = Instant::now();
+        let bw = c.bar.window();
+        let at = bw
+            .with_winit_window(|w| {
+                let sf = w.scale_factor();
+                let p = w.outer_position().ok()?.to_logical::<f64>(sf);
+                let s = w.outer_size().to_logical::<f64>(sf);
+                Some((p.x + s.width / 2.0, p.y + s.height / 2.0))
+            })
+            .flatten();
+        let Some(at) = at else { return };
+        // Still on its way: wait until it stays put.
+        if c.bar_was.replace(at) != Some(at) {
+            return;
+        }
+        let Some((screen, free)) = mac::screen_at(at.0, at.1) else { return };
+        if screen == c.screen && free == c.free {
+            return;
+        }
+        let moved = screen != c.screen;
+        log::info!("{}: coherence: guest screen to {free:?} ({})", self.name, if moved { "another screen" } else { "the screen changed" });
+        let area = area_in(free);
+        (c.screen, c.free, c.area) = (screen, free, area);
+        let bar_at = bar_in(free);
+        bw.set_size(slint::LogicalSize::new(bar_at.w as f32, BAR as f32));
+        set_frame(bw, bar_at);
+        c.bar_was = None;
+        let sf = bw.scale_factor() as f64;
+        let (width_px, height_px, scale) = super::guest_size((area.w * sf) as u32, (area.h * sf) as u32, sf as f32, self.hidpi);
+        self.io.borrow_mut().send(ToVmm::Resize { width: width_px, height: height_px, scale });
+        // Placed again with the new mode (coh_mode); the map changes now.
+        self.coh_layout();
     }
 }
 
@@ -992,6 +1139,27 @@ mod tests {
         crop(&fb, 4, GRect { x: 2, y: 0, w: 2, h: 2 }, GRect { x: 3, y: 1, w: 1, h: 1 }, &mut out);
         assert_eq!(&out[12..16], &[0x11, 0x22, 0x33, 0xff]);
         assert_eq!(&out[..12], &[0; 12]);
+    }
+
+    #[test]
+    fn moved_windows_stay_on_the_guest_screen() {
+        let area = Rect { x: 0.0, y: 45.0, w: 1000.0, h: 700.0 };
+        let r = Rect { x: 100.0, y: 100.0, w: 300.0, h: 200.0 };
+        assert_eq!(keep_on(r, area), r, "inside: as it is");
+        // Dragged onto a screen to the right, or above the top.
+        assert_eq!(keep_on(Rect { x: 1500.0, y: -300.0, ..r }, area), Rect { x: 960.0, y: 45.0, ..r });
+        assert_eq!(keep_on(Rect { x: -2000.0, y: 2000.0, ..r }, area), Rect { x: -260.0, y: 705.0, ..r });
+        let free = Rect { x: 1728.0, y: 25.0, w: 2560.0, h: 1390.0 };
+        assert_eq!(area_in(free), Rect { x: 1728.0, y: 45.0, w: 2560.0, h: 1326.0 });
+        assert_eq!(bar_in(free), Rect { x: 1728.0 + 830.0, y: 25.0 + 1390.0 - BAR, w: 900.0, h: BAR });
+    }
+
+    #[test]
+    fn icons_are_checked_again() {
+        assert!(icon_image(2, 2, &[0; 16]).is_some());
+        assert!(icon_image(2, 2, &[0; 15]).is_none());
+        assert!(icon_image(65, 1, &[0; 260]).is_none());
+        assert!(icon_image(0, 0, &[]).is_none());
     }
 
     #[test]

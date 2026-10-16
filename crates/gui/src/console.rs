@@ -10,7 +10,7 @@
 //! clipboard rules from the VM file are enforced here too.
 
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
@@ -44,6 +44,8 @@ const WHEEL_STEP: f32 = 30.0;
 
 /// Status lines waiting for the UI thread; more are dropped.
 const MAX_STATUS: usize = 16;
+/// Window icons waiting for the UI thread (one per window); more are dropped.
+const MAX_ICONS: usize = 2 * vroom_proto::WINDOWS_MAX;
 /// Status lines are short; snapshot ones hold a path.
 const MAX_STATUS_LEN: usize = 4096;
 /// How much of the end of a VMM log we read for an error message.
@@ -76,6 +78,10 @@ struct Shared {
     features: Option<u64>,
     /// Coherence: the guest's latest window list.
     windows: Option<Vec<vroom_display::GuestWindow>>,
+    /// Coherence: window icons not yet shown, the latest per window.
+    icons: BTreeMap<u32, (u32, u32, Vec<u8>)>,
+    /// Coherence can't work in the guest, and why.
+    coh_no: Option<String>,
     posted: bool,
 }
 
@@ -123,6 +129,13 @@ impl Shared {
             ToViewer::Usb(l) => self.usb = Some(l),
             ToViewer::Agent { features } => self.features = Some(features),
             ToViewer::Windows(list) => self.windows = Some(list),
+            ToViewer::WindowIcon { id, w, h, rgba } => {
+                if self.icons.len() >= MAX_ICONS && !self.icons.contains_key(&id) {
+                    return false;
+                }
+                self.icons.insert(id, (w, h, rgba));
+            }
+            ToViewer::CoherenceNo(why) => self.coh_no = Some(why),
             ToViewer::Closed => return false,
         }
         !std::mem::replace(&mut self.posted, true)
@@ -1020,13 +1033,14 @@ impl Console {
 
     /// What the reader thread collected since the last wakeup.
     fn inbox(&mut self) {
-        let (frame, full, damage, status, clip, mic, cursor, drag, camera, usb, features, windows) = {
+        let (frame, full, damage, status, clip, mic, cursor, drag, camera, usb, features, windows, (icons, coh_no)) = {
             let mut s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
             s.posted = false;
             let f = (std::mem::take(&mut s.frame), std::mem::take(&mut s.full), s.damage.take());
             let t = (std::mem::take(&mut s.status), s.clipboard.take(), s.mic.take(), s.cursor.take(), std::mem::take(&mut s.drag));
             let c = (s.camera.take(), s.usb.take(), s.features.take(), s.windows.take());
-            (f.0, f.1, f.2, t.0, t.1, t.2, t.3, t.4, c.0, c.1, c.2, c.3)
+            let h = (std::mem::take(&mut s.icons), s.coh_no.take());
+            (f.0, f.1, f.2, t.0, t.1, t.2, t.3, t.4, c.0, c.1, c.2, c.3, h)
         };
         if let Some(on) = camera {
             self.camera(on);
@@ -1066,6 +1080,12 @@ impl Console {
         }
         if let Some(list) = windows {
             self.coh_windows(list);
+        }
+        if !icons.is_empty() {
+            self.coh_icons(icons);
+        }
+        if let Some(why) = coh_no {
+            self.coh_no(&why);
         }
     }
 
