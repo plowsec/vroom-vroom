@@ -9,11 +9,15 @@
 //! - Submit (1): `[ep u8][type u8][0 u16][length u32][setup 8][OUT data]`.
 //!   `length` is what an IN transfer wants, or the size of the OUT data.
 //! - Cancel (2): the transfer `id`. Reset (3): reset the device.
+//! - IsoSubmit (4): `[ep u8][0; 3][count u32][length u32 * count][OUT data]`,
+//!   an isochronous transfer: one packet per service interval.
 //!
 //! Helper -> VMM ([`Event`]):
 //! - Attached (0x81): `[speed u8][0 u8][vendor u16][product u16]`.
 //! - Detached (0x82).
 //! - Done (0x83): `[status u8][0; 3][actual u32][IN data]`.
+//! - IsoDone (0x84): `[status u8][0; 3][count u32][(status u8, 0; 3,
+//!   actual u32) * count][IN data]`, the packets' data back to back.
 
 use std::io::{self, Read, Write};
 
@@ -23,14 +27,22 @@ pub const MAX_DATA: usize = 1 << 20;
 pub const MAX_INFLIGHT: usize = 64;
 const HDR: usize = 12;
 const SUBMIT_HDR: usize = 16;
-const MAX_PAYLOAD: usize = SUBMIT_HDR + MAX_DATA;
+/// Isochronous: most packets in one transfer (Linux's usbfs takes 128),
+/// and the largest packet (SuperSpeedPlus moves up to 96 KiB per
+/// interval).
+pub const MAX_ISO_PACKETS: usize = 128;
+pub const MAX_ISO_PACKET: u32 = 128 << 10;
+const ISO_HDR: usize = 8;
+const MAX_PAYLOAD: usize = ISO_HDR + 8 * MAX_ISO_PACKETS + MAX_DATA;
 
 const K_SUBMIT: u8 = 1;
 const K_CANCEL: u8 = 2;
 const K_RESET: u8 = 3;
+const K_ISO_SUBMIT: u8 = 4;
 const K_ATTACHED: u8 = 0x81;
 const K_DETACHED: u8 = 0x82;
 const K_DONE: u8 = 0x83;
+const K_ISO_DONE: u8 = 0x84;
 
 /// Device speed, as the host saw it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,11 +82,12 @@ impl Speed {
     }
 }
 
-/// Endpoint transfer type (bmAttributes bits 0-1). Isochronous is not
-/// carried (yet).
+/// Endpoint transfer type (bmAttributes bits 0-1). Isochronous transfers
+/// go in their own message ([`IsoSubmit`]), never in a [`Submit`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum XferType {
     Control,
+    Iso,
     Bulk,
     Interrupt,
 }
@@ -83,6 +96,7 @@ impl XferType {
     fn wire(self) -> u8 {
         match self {
             XferType::Control => 0,
+            XferType::Iso => 1,
             XferType::Bulk => 2,
             XferType::Interrupt => 3,
         }
@@ -129,9 +143,39 @@ impl Submit {
     }
 }
 
+/// An isochronous transfer: `packets` are the lengths, one packet per
+/// service interval of the endpoint, in order. The host schedules it as
+/// soon as it can, right after what the endpoint already has queued.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IsoSubmit {
+    pub id: u32,
+    /// Endpoint address: number (not 0), bit 7 set for IN.
+    pub ep: u8,
+    pub packets: Vec<u32>,
+    /// OUT: the packets back to back (as long as their lengths add up
+    /// to). IN: empty.
+    pub data: Vec<u8>,
+}
+
+impl IsoSubmit {
+    pub fn is_in(&self) -> bool {
+        self.ep & 0x80 != 0
+    }
+
+    /// Bytes asked for, all packets.
+    pub fn len(&self) -> usize {
+        self.packets.iter().map(|&n| n as usize).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
     Submit(Submit),
+    IsoSubmit(IsoSubmit),
     Cancel { id: u32 },
     Reset,
 }
@@ -185,11 +229,43 @@ pub struct Done {
     pub data: Vec<u8>,
 }
 
+/// How one isochronous packet went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IsoPacket {
+    pub status: Status,
+    /// Bytes moved.
+    pub actual: u32,
+}
+
+/// An isochronous transfer is over. `status` is the transfer's own (not
+/// Ok: it never ran, `packets` may then be empty); each packet has its
+/// own result. IN data: each packet's `actual` bytes, back to back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IsoDone {
+    pub id: u32,
+    pub status: Status,
+    pub packets: Vec<IsoPacket>,
+    pub data: Vec<u8>,
+}
+
+impl IsoDone {
+    /// Failed as a whole.
+    pub fn failed(id: u32, status: Status) -> IsoDone {
+        IsoDone { id, status, packets: Vec::new(), data: Vec::new() }
+    }
+
+    /// Bytes moved, all packets.
+    pub fn actual(&self) -> usize {
+        self.packets.iter().map(|p| p.actual as usize).sum()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     Attached { speed: Speed, vendor: u16, product: u16 },
     Detached,
     Done(Done),
+    IsoDone(IsoDone),
 }
 
 fn bad(m: &str) -> io::Error {
@@ -215,6 +291,16 @@ impl Request {
                 p.extend_from_slice(&s.setup);
                 p.extend_from_slice(&s.data);
                 frame(K_SUBMIT, s.id, &p)
+            }
+            Request::IsoSubmit(s) => {
+                let mut p = Vec::with_capacity(ISO_HDR + 4 * s.packets.len() + s.data.len());
+                p.extend_from_slice(&[s.ep, 0, 0, 0]);
+                p.extend_from_slice(&(s.packets.len() as u32).to_le_bytes());
+                for n in &s.packets {
+                    p.extend_from_slice(&n.to_le_bytes());
+                }
+                p.extend_from_slice(&s.data);
+                frame(K_ISO_SUBMIT, s.id, &p)
             }
             Request::Cancel { id } => frame(K_CANCEL, *id, &[]),
             Request::Reset => frame(K_RESET, 0, &[]),
@@ -268,6 +354,28 @@ impl Request {
                 }
                 Ok(Request::Submit(s))
             }
+            K_ISO_SUBMIT => {
+                if p.len() < ISO_HDR || p[1..4] != [0, 0, 0] {
+                    return Err(bad("short isochronous submit"));
+                }
+                let ep = p[0];
+                if ep & 0x70 != 0 || ep & 0x0f == 0 {
+                    return Err(bad("endpoint address"));
+                }
+                let n = u32::from_le_bytes([p[4], p[5], p[6], p[7]]) as usize;
+                if n == 0 || n > MAX_ISO_PACKETS || p.len() < ISO_HDR + 4 * n {
+                    return Err(bad("isochronous packet count"));
+                }
+                let packets: Vec<u32> = p[ISO_HDR..ISO_HDR + 4 * n].chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                if packets.iter().any(|&l| l > MAX_ISO_PACKET) {
+                    return Err(bad("isochronous packet too large"));
+                }
+                let s = IsoSubmit { id, ep, packets, data: p[ISO_HDR + 4 * n..].to_vec() };
+                if s.len() > MAX_DATA || s.data.len() != if s.is_in() { 0 } else { s.len() } {
+                    return Err(bad("isochronous data length"));
+                }
+                Ok(Request::IsoSubmit(s))
+            }
             K_CANCEL if p.is_empty() => Ok(Request::Cancel { id }),
             K_RESET if p.is_empty() && id == 0 => Ok(Request::Reset),
             _ => Err(bad("unknown request")),
@@ -292,6 +400,17 @@ impl Event {
                 p.extend_from_slice(&d.data);
                 frame(K_DONE, d.id, &p)
             }
+            Event::IsoDone(d) => {
+                let mut p = Vec::with_capacity(ISO_HDR + 8 * d.packets.len() + d.data.len());
+                p.extend_from_slice(&[d.status.wire(), 0, 0, 0]);
+                p.extend_from_slice(&(d.packets.len() as u32).to_le_bytes());
+                for k in &d.packets {
+                    p.extend_from_slice(&[k.status.wire(), 0, 0, 0]);
+                    p.extend_from_slice(&k.actual.to_le_bytes());
+                }
+                p.extend_from_slice(&d.data);
+                frame(K_ISO_DONE, d.id, &p)
+            }
         }
     }
 
@@ -312,6 +431,27 @@ impl Event {
                     return Err(bad("completion length"));
                 }
                 Ok(Event::Done(Done { id, status, actual, data }))
+            }
+            K_ISO_DONE if p.len() >= ISO_HDR && p[1..4] == [0, 0, 0] => {
+                let status = Status::from_wire(p[0]).ok_or_else(|| bad("status"))?;
+                let n = u32::from_le_bytes([p[4], p[5], p[6], p[7]]) as usize;
+                if n > MAX_ISO_PACKETS || p.len() < ISO_HDR + 8 * n {
+                    return Err(bad("isochronous packet count"));
+                }
+                let mut packets = Vec::with_capacity(n);
+                for c in p[ISO_HDR..ISO_HDR + 8 * n].chunks_exact(8) {
+                    let status = Status::from_wire(c[0]).ok_or_else(|| bad("status"))?;
+                    let actual = u32::from_le_bytes([c[4], c[5], c[6], c[7]]);
+                    if c[1..4] != [0, 0, 0] || actual > MAX_ISO_PACKET {
+                        return Err(bad("isochronous packet"));
+                    }
+                    packets.push(IsoPacket { status, actual });
+                }
+                let d = IsoDone { id, status, packets, data: p[ISO_HDR + 8 * n..].to_vec() };
+                if !d.data.is_empty() && d.data.len() != d.actual() {
+                    return Err(bad("completion length"));
+                }
+                Ok(Event::IsoDone(d))
             }
             _ => Err(bad("unknown event")),
         }
@@ -390,6 +530,52 @@ mod tests {
         rt_ev(Event::Done(Done { id: 3, status: Status::Ok, actual: 2, data: vec![9, 9] }));
         rt_ev(Event::Done(Done { id: 4, status: Status::Stall, actual: 0, data: vec![] }));
         assert_eq!(read_request(&mut &[][..]).unwrap(), None);
+    }
+
+    #[test]
+    fn isochronous_round_trips() {
+        rt_req(Request::IsoSubmit(IsoSubmit { id: 11, ep: 0x82, packets: vec![96; 8], data: vec![] }));
+        rt_req(Request::IsoSubmit(IsoSubmit { id: 12, ep: 0x01, packets: vec![2, 0, 1], data: vec![1, 2, 3] }));
+        let pk = |status, actual| IsoPacket { status, actual };
+        rt_ev(Event::IsoDone(IsoDone { id: 11, status: Status::Ok, packets: vec![pk(Status::Ok, 2), pk(Status::Error, 0), pk(Status::Ok, 1)], data: vec![7, 8, 9] }));
+        rt_ev(Event::IsoDone(IsoDone { id: 12, status: Status::Ok, packets: vec![pk(Status::Ok, 2), pk(Status::Ok, 1)], data: vec![] }));
+        rt_ev(Event::IsoDone(IsoDone::failed(13, Status::NoDevice)));
+    }
+
+    #[test]
+    fn rejects_bad_isochronous() {
+        let enc = |s: IsoSubmit| Request::IsoSubmit(s).encode();
+        let iso = IsoSubmit { id: 1, ep: 0x01, packets: vec![2, 1], data: vec![1, 2, 3] };
+        let cases = [
+            // Data not adding up, IN with data, endpoint 0, reserved bits.
+            enc(IsoSubmit { data: vec![1, 2], ..iso.clone() }),
+            enc(IsoSubmit { ep: 0x81, ..iso.clone() }),
+            enc(IsoSubmit { ep: 0x00, ..iso.clone() }),
+            enc(IsoSubmit { ep: 0x21, ..iso.clone() }),
+            // No packets, too many, one too large.
+            enc(IsoSubmit { packets: vec![], data: vec![], ..iso.clone() }),
+            enc(IsoSubmit { ep: 0x81, packets: vec![1; MAX_ISO_PACKETS + 1], data: vec![], ..iso.clone() }),
+            enc(IsoSubmit { ep: 0x81, packets: vec![MAX_ISO_PACKET + 1], data: vec![], ..iso.clone() }),
+            // More in all than a transfer may carry.
+            enc(IsoSubmit { ep: 0x81, packets: vec![MAX_ISO_PACKET; 9], data: vec![], ..iso.clone() }),
+        ];
+        for c in cases {
+            assert!(read_request(&mut &c[..]).is_err(), "{c:?}");
+        }
+        // A count larger than what follows.
+        let mut b = enc(iso.clone());
+        b[HDR + 4] = 50;
+        assert!(read_request(&mut &b[..]).is_err());
+        // Plain submit claiming to be isochronous.
+        let mut b = Request::Submit(Submit { id: 1, ep: 0x01, kind: XferType::Bulk, setup: [0; 8], len: 0, data: vec![], zero_packet: false }).encode();
+        b[HDR + 1] = 1;
+        assert!(read_request(&mut &b[..]).is_err());
+        // Completions: data not matching the packets, a packet too large.
+        let pk = IsoPacket { status: Status::Ok, actual: 2 };
+        let d = Event::IsoDone(IsoDone { id: 1, status: Status::Ok, packets: vec![pk], data: vec![1, 2, 3] }).encode();
+        assert!(read_event(&mut &d[..]).is_err());
+        let d = Event::IsoDone(IsoDone { id: 1, status: Status::Ok, packets: vec![IsoPacket { status: Status::Ok, actual: MAX_ISO_PACKET + 1 }], data: vec![] }).encode();
+        assert!(read_event(&mut &d[..]).is_err());
     }
 
     #[test]
