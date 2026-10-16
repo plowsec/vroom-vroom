@@ -30,6 +30,56 @@ pub mod features {
     pub const GPU3D: u64 = 32;
     /// Files dropped on the VM window land in the guest (`DragEnter`...).
     pub const FILE_DROP: u64 = 64;
+    /// Coherence: the agent reports the guest's windows (`Windows`) and
+    /// acts on them (`WindowDo`).
+    pub const COHERENCE: u64 = 128;
+}
+
+/// Most windows one `Windows` list may carry, and the longest title (bytes).
+pub const WINDOWS_MAX: usize = 64;
+pub const TITLE_MAX: usize = 256;
+/// Window rectangles stay within this many pixels of the origin.
+pub const COORD_MAX: i32 = 1 << 16;
+
+/// One of the guest's top-level windows (Coherence).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestWindow {
+    /// The guest's name for it (Windows: the window handle). Unique in a list.
+    pub id: u32,
+    /// What can be seen of it, in guest screen pixels. May reach past the
+    /// screen's edges; never empty.
+    pub x: i32,
+    pub y: i32,
+    pub w: u32,
+    pub h: u32,
+    /// `win_flags`.
+    pub flags: u32,
+    pub title: String,
+}
+
+/// `GuestWindow::flags`.
+pub mod win_flags {
+    /// The window keyboard input goes to.
+    pub const FOREGROUND: u32 = 1;
+    /// Minimized: not on screen, listed so the host can bring it back.
+    pub const MINIMIZED: u32 = 2;
+    /// A main window of an app (it would have a taskbar button), not a
+    /// menu, tooltip or dialog.
+    pub const APP: u32 = 4;
+    pub const MAXIMIZED: u32 = 8;
+    pub const ALL: u32 = 15;
+}
+
+/// What the host asks of a guest window (Coherence).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowOp {
+    /// Bring it to the front with the keyboard (restoring it if minimized).
+    Activate,
+    Minimize,
+    /// Ask it to close, as its close button would.
+    Close,
+    /// Put what can be seen of it here (guest screen pixels).
+    Move { x: i32, y: i32, w: u32, h: u32 },
 }
 
 /// Longest relative path a drop may carry, and longest name in it.
@@ -83,6 +133,90 @@ pub enum Message {
     /// Guest -> host: the files are written. `place`: where they went
     /// when there was no live drag ("Desktop"), or why it failed.
     DropDone { id: u32, ok: bool, place: String },
+    /// Host -> guest: Coherence on (report windows, hide the taskbar and
+    /// give windows the whole screen) or off (put it all back).
+    Coherence { on: bool },
+    /// Guest -> host: the guest's windows, front to back, whenever they
+    /// change while Coherence is on.
+    Windows(Vec<GuestWindow>),
+    /// Host -> guest: do this to a window of the last list.
+    WindowDo { id: u32, op: WindowOp },
+}
+
+fn rect_ok(x: i32, y: i32, w: u32, h: u32) -> bool {
+    (-COORD_MAX..=COORD_MAX).contains(&x) && (-COORD_MAX..=COORD_MAX).contains(&y) && (1..=COORD_MAX as u32).contains(&w) && (1..=COORD_MAX as u32).contains(&h)
+}
+
+/// A window list as bytes (the agent and viewer protocols both carry it).
+pub fn encode_windows(list: &[GuestWindow]) -> Vec<u8> {
+    let mut p = (list.len() as u32).to_le_bytes().to_vec();
+    for w in list {
+        for v in [w.id, w.x as u32, w.y as u32, w.w, w.h, w.flags] {
+            p.extend_from_slice(&v.to_le_bytes());
+        }
+        p.extend_from_slice(&(w.title.len() as u16).to_le_bytes());
+        p.extend_from_slice(w.title.as_bytes());
+    }
+    p
+}
+
+/// The other way, checked: at most `WINDOWS_MAX` windows, unique ids,
+/// sane rectangles, known flags, titles of at most `TITLE_MAX` bytes of
+/// UTF-8. None if anything is off.
+pub fn decode_windows(p: &[u8]) -> Option<Vec<GuestWindow>> {
+    let u32_at = |o: usize| -> Option<u32> { Some(u32::from_le_bytes(p.get(o..o + 4)?.try_into().ok()?)) };
+    let n = u32_at(0)? as usize;
+    if n > WINDOWS_MAX {
+        return None;
+    }
+    let mut out: Vec<GuestWindow> = Vec::with_capacity(n);
+    let mut o = 4;
+    for _ in 0..n {
+        let (id, x, y, w, h, flags) = (u32_at(o)?, u32_at(o + 4)? as i32, u32_at(o + 8)? as i32, u32_at(o + 12)?, u32_at(o + 16)?, u32_at(o + 20)?);
+        let len = u16::from_le_bytes(p.get(o + 24..o + 26)?.try_into().ok()?) as usize;
+        if len > TITLE_MAX || !rect_ok(x, y, w, h) || flags & !win_flags::ALL != 0 || out.iter().any(|v| v.id == id) {
+            return None;
+        }
+        let title = std::str::from_utf8(p.get(o + 26..o + 26 + len)?).ok()?.replace('\0', "");
+        out.push(GuestWindow { id, x, y, w, h, flags, title });
+        o += 26 + len;
+    }
+    (o == p.len()).then_some(out)
+}
+
+impl WindowOp {
+    /// `op u8 [| x i32 | y i32 | w u32 | h u32]`.
+    pub fn encode(&self) -> Vec<u8> {
+        match *self {
+            WindowOp::Activate => vec![1],
+            WindowOp::Minimize => vec![2],
+            WindowOp::Close => vec![3],
+            WindowOp::Move { x, y, w, h } => {
+                let mut p = vec![4];
+                for v in [x as u32, y as u32, w, h] {
+                    p.extend_from_slice(&v.to_le_bytes());
+                }
+                p
+            }
+        }
+    }
+
+    pub fn decode(p: &[u8]) -> Option<WindowOp> {
+        let u32_at = |o: usize| -> Option<u32> { Some(u32::from_le_bytes(p.get(o..o + 4)?.try_into().ok()?)) };
+        Some(match (p.first()?, p.len()) {
+            (1, 1) => WindowOp::Activate,
+            (2, 1) => WindowOp::Minimize,
+            (3, 1) => WindowOp::Close,
+            (4, 17) => {
+                let (x, y, w, h) = (u32_at(1)? as i32, u32_at(5)? as i32, u32_at(9)?, u32_at(13)?);
+                if !rect_ok(x, y, w, h) {
+                    return None;
+                }
+                WindowOp::Move { x, y, w, h }
+            }
+            _ => return None,
+        })
+    }
 }
 
 /// Whether `p` is a path a drop may carry: relative, '/' between names,
@@ -131,6 +265,9 @@ const T_DROP_ENTRY: u8 = 13;
 const T_DROP_DATA: u8 = 14;
 const T_DROP_END: u8 = 15;
 const T_DROP_DONE: u8 = 16;
+const T_COHERENCE: u8 = 17;
+const T_WINDOWS: u8 = 18;
+const T_WINDOW_DO: u8 = 19;
 
 impl Message {
     pub fn encode(&self) -> Vec<u8> {
@@ -190,6 +327,13 @@ impl Message {
                 p.push(*ok as u8);
                 p.extend_from_slice(place.as_bytes());
                 (T_DROP_DONE, p)
+            }
+            Message::Coherence { on } => (T_COHERENCE, vec![*on as u8]),
+            Message::Windows(list) => (T_WINDOWS, encode_windows(list)),
+            Message::WindowDo { id, op } => {
+                let mut p = id.to_le_bytes().to_vec();
+                p.extend_from_slice(&op.encode());
+                (T_WINDOW_DO, p)
             }
         };
         let mut out = Vec::with_capacity(HDR + payload.len());
@@ -276,8 +420,11 @@ impl Message {
             T_DROP_DATA if p.len() >= 4 && p.len() - 4 <= DROP_CHUNK => Message::DropData { id: u32_at(0)?, data: p[4..].to_vec() },
             T_DROP_END if p.len() == 4 => Message::DropEnd { id: u32_at(0)? },
             T_DROP_DONE if p.len() >= 5 => Message::DropDone { id: u32_at(0)?, ok: p[4] != 0, place: text(&p[5..])?.chars().take(256).collect() },
+            T_COHERENCE if p.len() == 1 => Message::Coherence { on: p[0] != 0 },
+            T_WINDOWS => Message::Windows(decode_windows(p).ok_or(Error::Malformed)?),
+            T_WINDOW_DO if p.len() > 4 => Message::WindowDo { id: u32_at(0)?, op: WindowOp::decode(&p[4..]).ok_or(Error::Malformed)? },
             T_TIME | T_RES | T_SCALE | T_SHUTDOWN | T_PING | T_PONG | T_GPU3D | T_DRAG_READY | T_DRAG_CANCEL | T_DROP_ENTRY | T_DROP_DATA
-            | T_DROP_END | T_DROP_DONE => return Err(Error::Malformed),
+            | T_DROP_END | T_DROP_DONE | T_COHERENCE | T_WINDOW_DO => return Err(Error::Malformed),
             t => return Err(Error::Type(t)),
         })
     }
@@ -364,7 +511,46 @@ mod tests {
             Message::DropData { id: 3, data: Vec::new() },
             Message::DropEnd { id: 3 },
             Message::DropDone { id: 3, ok: true, place: "Desktop".into() },
+            Message::Coherence { on: true },
+            Message::Windows(Vec::new()),
+            Message::Windows(vec![
+                GuestWindow { id: 0x1234, x: -8, y: 0, w: 800, h: 600, flags: win_flags::APP | win_flags::FOREGROUND, title: "Notepad — é".into() },
+                GuestWindow { id: 7, x: 10, y: 20, w: 1, h: 1, flags: 0, title: String::new() },
+            ]),
+            Message::WindowDo { id: 0x1234, op: WindowOp::Activate },
+            Message::WindowDo { id: 1, op: WindowOp::Close },
+            Message::WindowDo { id: 1, op: WindowOp::Minimize },
+            Message::WindowDo { id: 1, op: WindowOp::Move { x: -5, y: 3, w: 640, h: 480 } },
         ]
+    }
+
+    #[test]
+    fn window_lists_are_checked() {
+        let w = |id: u32| GuestWindow { id, x: 0, y: 0, w: 10, h: 10, flags: 0, title: "t".into() };
+        let bad = |list: Vec<GuestWindow>| decode_windows(&encode_windows(&list)).is_none();
+        assert!(!bad(vec![w(1), w(2)]));
+        assert!(bad(vec![w(1), w(1)]), "same id twice");
+        assert!(bad((0..WINDOWS_MAX as u32 + 1).map(w).collect()), "too many");
+        assert!(bad(vec![GuestWindow { title: "x".repeat(TITLE_MAX + 1), ..w(1) }]));
+        assert!(bad(vec![GuestWindow { w: 0, ..w(1) }]));
+        assert!(bad(vec![GuestWindow { x: i32::MIN, ..w(1) }]));
+        assert!(bad(vec![GuestWindow { h: u32::MAX, ..w(1) }]));
+        assert!(bad(vec![GuestWindow { flags: 1 << 9, ..w(1) }]));
+        // Trailing bytes, a short list, a count that lies.
+        let mut p = encode_windows(&[w(1)]);
+        p.push(0);
+        assert!(decode_windows(&p).is_none());
+        let p = encode_windows(&[w(1)]);
+        assert!(decode_windows(&p[..p.len() - 1]).is_none());
+        let mut p = encode_windows(&[w(1)]);
+        p[0] = 2;
+        assert!(decode_windows(&p).is_none());
+        // Ops: sizes and rects.
+        assert_eq!(WindowOp::decode(&[1, 0]), None);
+        assert_eq!(WindowOp::decode(&[9]), None);
+        let mut m = WindowOp::Move { x: 0, y: 0, w: 1, h: 1 }.encode();
+        m[9..13].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(WindowOp::decode(&m), None);
     }
 
     #[test]

@@ -12,7 +12,7 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use vroom_display::{send_fd, Decoder, GuestCursor, SharedFb, ToViewer, ToVmm};
+use vroom_display::{send_fd, Decoder, GuestCursor, GuestWindow, SharedFb, ToViewer, ToVmm};
 use vroom_devices::usb::hid::HidEvent;
 use vroom_devices::usb::xhci::Xhci;
 use vroom_virtio::devices::gpu::{Cursor, DisplaySink};
@@ -36,6 +36,9 @@ pub(crate) struct ViewerTx {
     q: std::sync::mpsc::Sender<ToViewer>,
     /// x0, y0, x1, y1 not yet sent; Some means a marker is queued.
     damage: Arc<Mutex<Option<[u32; 4]>>>,
+    /// The guest's latest window list not yet sent (Coherence): like
+    /// damage, a guest that keeps changing it costs one queued message.
+    windows: Arc<Mutex<Option<Vec<GuestWindow>>>>,
     /// The viewer now, if any.
     sock: Arc<Mutex<Option<UnixStream>>>,
     sticky: Arc<Mutex<Sticky>>,
@@ -51,6 +54,8 @@ struct Sticky {
     state: Option<String>,
     /// "guest agent connected (...)".
     agent: Option<String>,
+    /// What the guest agent can do.
+    features: Option<u64>,
 }
 
 impl std::fmt::Debug for ViewerTx {
@@ -64,6 +69,8 @@ impl ViewerTx {
         let (q, rx) = std::sync::mpsc::channel::<ToViewer>();
         let damage = Arc::new(Mutex::new(None::<[u32; 4]>));
         let pending = damage.clone();
+        let windows = Arc::new(Mutex::new(None::<Vec<GuestWindow>>));
+        let pending_windows = windows.clone();
         let sock = Arc::new(Mutex::new(sock));
         let out = sock.clone();
         std::thread::Builder::new().name("viewer-tx".into()).spawn(move || {
@@ -71,6 +78,10 @@ impl ViewerTx {
                 if matches!(m, ToViewer::Damage { .. }) {
                     let Some([x0, y0, x1, y1]) = pending.lock().unwrap_or_else(|e| e.into_inner()).take() else { continue };
                     m = ToViewer::Damage { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+                }
+                if matches!(m, ToViewer::Windows(_)) {
+                    let Some(list) = pending_windows.lock().unwrap_or_else(|e| e.into_inner()).take() else { continue };
+                    m = ToViewer::Windows(list);
                 }
                 let mut s = out.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(v) = s.as_mut() {
@@ -80,7 +91,7 @@ impl ViewerTx {
                 }
             }
         })?;
-        Ok(ViewerTx { q, damage, sock, sticky: Arc::default() })
+        Ok(ViewerTx { q, damage, windows, sock, sticky: Arc::default() })
     }
 
     /// A viewer is connected.
@@ -106,6 +117,7 @@ impl ViewerTx {
         first.extend(st.cursor.clone().map(ToViewer::Cursor));
         first.extend(st.mic.map(ToViewer::Mic));
         first.extend(st.agent.clone().map(ToViewer::Status));
+        first.extend(st.features.map(|features| ToViewer::Agent { features }));
         first.extend(st.state.clone().map(ToViewer::Status));
         drop(st);
         for m in first {
@@ -125,6 +137,7 @@ impl ViewerTx {
                 st.state = Some(t.clone())
             }
             ToViewer::Status(t) if t.starts_with("guest agent connected") => st.agent = Some(t.clone()),
+            ToViewer::Agent { features } => st.features = Some(*features),
             _ => {}
         }
     }
@@ -140,6 +153,13 @@ impl ViewerTx {
                     // The rect is filled in when it goes out.
                     let _ = self.q.send(ToViewer::Damage { x: 0, y: 0, w: 0, h: 0 });
                 }
+            }
+            return;
+        }
+        if let ToViewer::Windows(list) = m {
+            if self.windows.lock().unwrap_or_else(|e| e.into_inner()).replace(list.clone()).is_none() {
+                // Filled in when it goes out.
+                let _ = self.q.send(ToViewer::Windows(Vec::new()));
             }
             return;
         }
@@ -497,6 +517,8 @@ fn serve(stream: UnixStream, c: &Serve) {
     }
     log::info!("viewer disconnected");
     c.tx.detach();
+    // Its Coherence windows are gone: the guest gets its taskbar back.
+    c.agent.send(AgentCmd::Coherence(false));
     if let Some(w) = &c.window {
         w(false);
     }
@@ -563,6 +585,8 @@ fn handle(
         }
         ToVmm::DragEnter { id, items } => agent.send(AgentCmd::DragEnter { id, items }),
         ToVmm::DragCancel { id } => agent.send(AgentCmd::DragCancel { id }),
+        ToVmm::Coherence(on) => agent.send(AgentCmd::Coherence(on)),
+        ToVmm::Window { id, op } => agent.send(AgentCmd::Window { id, op }),
         // serve() pairs it with its pipe.
         ToVmm::Drop { .. } => {}
     }

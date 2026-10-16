@@ -1,6 +1,7 @@
 //! Framed messages: type u8 | len u32 LE | payload.
 
 use crate::{Error, Result};
+pub use vroom_proto::{GuestWindow, WindowOp};
 
 /// Absolute pointer range (like a USB tablet).
 pub const POINTER_MAX: u16 = 32767;
@@ -37,6 +38,11 @@ pub enum ToViewer {
     /// The dropped files are in the guest (`ok`), or why not. `place`:
     /// where they went, without a live drag.
     DropDone { id: u32, ok: bool, place: String },
+    /// The guest agent said hello: what it can do (`vroom_proto::features`).
+    Agent { features: u64 },
+    /// Coherence: the guest's windows, front to back (checked like the
+    /// agent's message; the viewer still clips them to the screen).
+    Windows(Vec<GuestWindow>),
 }
 
 /// What the guest's pointer looks like.
@@ -91,6 +97,10 @@ pub enum ToVmm {
     /// Dropped: comes with a pipe (SCM_RIGHTS) the viewer writes the
     /// files into, as guest agent frames (DropEntry, DropData, DropEnd).
     Drop { id: u32 },
+    /// Coherence on or off (the guest agent shows and hides its taskbar).
+    Coherence(bool),
+    /// Coherence: do this to a guest window.
+    Window { id: u32, op: WindowOp },
 }
 
 fn frame(ty: u8, payload: &[u8]) -> Vec<u8> {
@@ -142,6 +152,8 @@ impl ToViewer {
                 p.extend_from_slice(place.as_bytes());
                 frame(9, &p)
             }
+            ToViewer::Agent { features } => frame(10, &features.to_le_bytes()),
+            ToViewer::Windows(list) => frame(11, &vroom_proto::encode_windows(list)),
         }
     }
 
@@ -172,6 +184,8 @@ impl ToViewer {
             }),
             8 if p.len() == 5 => ToViewer::DragReady { id: get_u32(p, 0)?, live: p[4] != 0 },
             9 if p.len() >= 5 => ToViewer::DropDone { id: get_u32(p, 0)?, ok: p[4] != 0, place: text(&p[5..])?.chars().take(256).collect() },
+            10 if p.len() == 8 => ToViewer::Agent { features: u64::from(get_u32(p, 0)?) | u64::from(get_u32(p, 1)?) << 32 },
+            11 => ToViewer::Windows(vroom_proto::decode_windows(p).ok_or(Error::Proto("windows"))?),
             _ => return Err(Error::Proto("unknown viewer message")),
         })
     }
@@ -199,6 +213,12 @@ impl ToVmm {
             }
             ToVmm::DragCancel { id } => frame(10, &id.to_le_bytes()),
             ToVmm::Drop { id } => frame(11, &id.to_le_bytes()),
+            ToVmm::Coherence(on) => frame(12, &[*on as u8]),
+            ToVmm::Window { id, op } => {
+                let mut p = id.to_le_bytes().to_vec();
+                p.extend_from_slice(&op.encode());
+                frame(13, &p)
+            }
         }
     }
 
@@ -249,6 +269,8 @@ impl ToVmm {
             }
             10 if p.len() == 4 => ToVmm::DragCancel { id: get_u32(p, 0)? },
             11 if p.len() == 4 => ToVmm::Drop { id: get_u32(p, 0)? },
+            12 if p.len() == 1 => ToVmm::Coherence(p[0] != 0),
+            13 if p.len() > 4 => ToVmm::Window { id: get_u32(p, 0)?, op: WindowOp::decode(&p[4..]).ok_or(Error::Proto("window op"))? },
             _ => return Err(Error::Proto("unknown vmm message")),
         })
     }
@@ -318,6 +340,9 @@ mod tests {
             ToVmm::DragEnter { id: 4, items: vec![("a.txt".into(), false), ("dir".into(), true)] },
             ToVmm::DragCancel { id: 4 },
             ToVmm::Drop { id: 4 },
+            ToVmm::Coherence(true),
+            ToVmm::Window { id: 9, op: WindowOp::Activate },
+            ToVmm::Window { id: 9, op: WindowOp::Move { x: -3, y: 4, w: 100, h: 50 } },
         ];
         let mut d = Decoder::default();
         for m in &vm {
@@ -336,6 +361,8 @@ mod tests {
             ToViewer::Cursor(GuestCursor::Unset),
             ToViewer::DragReady { id: 4, live: true },
             ToViewer::DropDone { id: 4, ok: false, place: "Desktop".into() },
+            ToViewer::Agent { features: 1 << 40 | 128 },
+            ToViewer::Windows(vec![GuestWindow { id: 1, x: 0, y: -2, w: 3, h: 4, flags: 4, title: "Paint".into() }]),
         ];
         for m in &v {
             d.push(&m.encode());

@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use vroom_config::Clipboard as ClipPolicy;
-use vroom_proto::{features, Decoder, Message, SCALE_MAX, SCALE_MIN};
+use vroom_proto::{features, Decoder, Message, WindowOp, SCALE_MAX, SCALE_MIN};
 use vroom_display::ToViewer;
 use vroom_virtio::devices::gpu::GpuControl;
 
@@ -50,6 +50,10 @@ pub enum AgentCmd {
     DragCancel { id: u32 },
     /// Dropped: the viewer writes them into this pipe, as agent frames.
     Drop { id: u32, from: std::os::fd::OwnedFd },
+    /// Coherence on or off: the guest's windows as windows of the host.
+    Coherence(bool),
+    /// Coherence: do this to a window of the guest's last list.
+    Window { id: u32, op: WindowOp },
     Stop,
 }
 
@@ -108,6 +112,10 @@ struct Service {
     /// was last sent at.
     mode: Vec<Message>,
     mode_sent: Option<u32>,
+    /// Coherence is on (the window asked), and the ids of the guest's
+    /// last window list: the only windows the window may act on.
+    coherence: bool,
+    win_ids: Vec<u32>,
 }
 
 /// The monitor whose size the window drives. Resizes go through the agent
@@ -154,6 +162,8 @@ pub fn spawn(stream: UnixStream, policy: ClipPolicy, clip: Option<Box<dyn Clipbo
         display: None,
         mode: Vec::new(),
         mode_sent: None,
+        coherence: false,
+        win_ids: Vec::new(),
     };
     std::thread::Builder::new().name("agent".into()).spawn(move || svc.run())?;
     Ok(Agent { tx, status })
@@ -230,6 +240,17 @@ impl Service {
                 }
                 // Now it may scale: give it the window's real size.
                 self.apply_display();
+                self.to_viewer(ToViewer::Agent { features });
+                // An agent that came back (guest reboot, new logon) while
+                // the window is in Coherence.
+                self.win_ids.clear();
+                if self.coherence && features & features::COHERENCE != 0 {
+                    self.send(&Message::Coherence { on: true });
+                }
+            }
+            Message::Windows(list) if self.coherence => {
+                self.win_ids = list.iter().map(|w| w.id).collect();
+                self.to_viewer(ToViewer::Windows(list));
             }
             Message::ClipboardText(t) => self.guest_clipboard(t),
             Message::Ping(v) => self.send(&Message::Pong(v)),
@@ -376,6 +397,20 @@ impl Service {
                 }
             }
             AgentCmd::DragCancel { id } => self.send(&Message::DragCancel { id }),
+            AgentCmd::Coherence(on) => {
+                let had = std::mem::replace(&mut self.coherence, on);
+                self.win_ids.clear();
+                let s = self.status();
+                if (on || had) && s.connected && s.features & features::COHERENCE != 0 {
+                    self.send(&Message::Coherence { on });
+                }
+            }
+            AgentCmd::Window { id, op } => {
+                // Only windows the guest listed last, only in Coherence.
+                if self.coherence && self.win_ids.contains(&id) {
+                    self.send(&Message::WindowDo { id, op });
+                }
+            }
             AgentCmd::Drop { id, from } => {
                 let out = self.out.clone();
                 let r = std::thread::Builder::new().name("agent-drop".into()).spawn(move || forward_drop(id, from, &out));

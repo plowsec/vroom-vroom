@@ -10,6 +10,7 @@ thiserror.workspace = true
 libc.workspace = true
 getrandom = "0.2"
 vroom-ipc.workspace = true
+vroom-proto.workspace = true
 
 [lints]
 workspace = true
