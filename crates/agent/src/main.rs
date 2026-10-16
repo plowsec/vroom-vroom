@@ -29,6 +29,9 @@ mod dragout;
 #[cfg(target_os = "linux")]
 mod dnd_x11;
 mod find;
+// Windows only; the decision is tested everywhere.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod gl_icd;
 mod layout;
 mod port;
 // Used by the service mode (Windows, Linux); built everywhere so it's

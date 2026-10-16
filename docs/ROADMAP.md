@@ -15,7 +15,7 @@ move to the docs (GUIDE, ARCHITECTURE) once they work.
 
 Where we are: Linux gets OpenGL 4.1 (virgl), Vulkan 1.3 in windows and
 off screen (Venus), and OpenGL 4.4 for the apps you start on Zink (below);
-Windows gets Direct3D 11. VMware Fusion gives Windows on Apple Silicon
+Windows gets Direct3D 11 and OpenGL 4.1 (virgl). VMware Fusion gives Windows on Apple Silicon
 Direct3D 11 and OpenGL 4.3, and Linux OpenGL 4.3.
 
 What we found (October 2026, macOS 15.6, MoltenVK 1.4.2, guest Mesa 25.2):
@@ -81,8 +81,15 @@ Windows guests:
 - **Direct3D 12**, the one most games since 2020 need. It is also the key
   to the next two: Microsoft's "OpenCL, OpenGL and Vulkan Compatibility
   Pack" runs OpenGL and Vulkan apps on top of Direct3D 12.
-- **OpenGL and Vulkan apps** (VMware has OpenGL 4.3): through that pack
-  once Direct3D 12 works, or our own driver path.
+- **OpenGL 4.3 and up** (VMware has 4.3; we have 4.1 through virgl,
+  see [GUIDE.md](GUIDE.md#opengl-in-windows-guests)): Zink over Venus, as
+  for Linux, from the same Mesa build. It needs Vulkan in the guest first.
+- **Vulkan apps**: the 3D driver package carries a Venus Vulkan driver,
+  but Windows' Vulkan loader doesn't load it (error 87: its manifest
+  names the DLL without a path).
+- **OpenGL without the copy**: frames go back to the guest and through
+  GDI. A texture both vrend and DXMT see (an IOSurface) would let the
+  compositor take them directly.
 
 ## Hardware video decoding
 

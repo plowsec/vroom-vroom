@@ -325,7 +325,15 @@ commands, virglrenderer's vrend replays them on macOS's OpenGL 4.1 (CGL),
 or with `opengl_host = "angle"` on OpenGL ES from ANGLE's Metal backend.
 Neptune: Windows' viogpu3d driver sends Direct3D 11 calls, virglrenderer
 (UTM's fork) replays them on DXMT, Direct3D on Metal. All capsets are
-offered; Mesa picks per API, Windows takes Neptune. Venus and Neptune go
+offered; Mesa picks per API, Windows takes Neptune for Direct3D and
+virgl for OpenGL: our OpenGL driver for Windows (`vroom_gl.dll`, Mesa's
+virgl built for Windows with a winsys of ours, `third_party/mesa/`) makes
+a virgl context through viogpu3d's escapes and sends its command streams
+in D3DKMT render packets. Its resources are the driver's 3D allocations,
+which get the guest pages behind them to the host when they have a GPU
+address and are resident. Each frame is read back into the window's
+buffer and drawn with GDI, since Windows' compositor runs on Neptune and
+can't see vrend's textures. Venus and Neptune go
 through virglrenderer's proxy to its render server: ours
 (`gpu3d/src/server.rs`, `vroom gpu-server`) starts one `vroom gpu-worker`
 per guest context, which runs that context with virglrenderer's own

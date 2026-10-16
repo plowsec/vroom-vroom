@@ -488,7 +488,10 @@ has the longer history of bugs, and on Windows, Direct3D 11 calls
 (Neptune, UTM's protocol) by virglrenderer's Neptune decoder and DXMT,
 which turns the guest's Direct3D shaders into Metal ones with its own
 LLVM-based converter. That is a large amount of young C and C++ code in
-reach of the guest. So none of it runs in the VMM.
+reach of the guest. So none of it runs in the VMM. Windows guests reach
+vrend too: the 3D driver makes virgl contexts for its own copies, and
+our OpenGL driver for Windows apps uses them like Linux's Mesa does
+(nothing new on the host: any guest code could already ask for one).
 
 ### The GPU process
 
