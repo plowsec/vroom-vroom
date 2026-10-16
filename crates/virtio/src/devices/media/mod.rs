@@ -487,6 +487,14 @@ impl Handler {
         if s.dead {
             return;
         }
+        if log::log_enabled!(log::Level::Trace) {
+            let what = match &m {
+                FromHelper::Picture { epoch, cookie, .. } => format!("picture {cookie} epoch {epoch} (ours {}, queued {})", s.epoch, s.cap_queue.len()),
+                FromHelper::Consumed { cookie, ok, .. } => format!("consumed {cookie} {ok}"),
+                m => format!("{m:?}"),
+            };
+            log::trace!("media: session {id}: helper: {what}");
+        }
         match m {
             FromHelper::Format { layout, visible, min_buffers, .. } => {
                 let old = s.layout.replace(layout);
@@ -667,8 +675,10 @@ impl Handler {
                     return Err(EINVAL);
                 }
                 b[8..].fill(0);
-                put_u32(&mut b, 8, 3); // stepwise
-                for (i, v) in [MIN_SIDE, MAX_SIDE, 16, MIN_SIDE, MAX_SIDE, 16].into_iter().enumerate() {
+                // Any size in between (1080 isn't a multiple of 16; the
+                // pictures' buffers are rounded up, not the stream).
+                put_u32(&mut b, 8, 2); // continuous
+                for (i, v) in [MIN_SIDE, MAX_SIDE, 1, MIN_SIDE, MAX_SIDE, 1].into_iter().enumerate() {
                     put_u32(&mut b, 12 + 4 * i, v);
                 }
                 Ok(b)
@@ -929,6 +939,7 @@ impl Handler {
 
     fn qbuf(&mut self, id: u32, d: Dir, index: u32, b: &[u8], planes: &[u8]) -> std::result::Result<(), u32> {
         let cookie = self.next_cookie;
+        log::trace!("media: session {id}: qbuf {d:?} {index}");
         let s = self.sessions.get_mut(&id).ok_or(EINVAL)?;
         if s.dead {
             return Err(EIO);
