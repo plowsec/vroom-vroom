@@ -12,6 +12,8 @@ fn err(e: impl std::fmt::Display) -> Error {
 #[derive(Debug)]
 pub struct Symbols {
     pub names: BTreeMap<String, u64>,
+    pub functions: Vec<(String, u64)>,
+    pub addresses: BTreeMap<u64, String>,
     pub types: BTreeMap<String, BTreeMap<String, u64>>,
     pub path: PathBuf,
     pub callback_slots: Option<u32>,
@@ -110,22 +112,27 @@ impl Symbols {
         let globals = pdb.global_symbols().map_err(err)?;
         let mut iter = globals.iter();
         let mut names = BTreeMap::new();
+        let mut functions = BTreeMap::new();
         let mut callback_array = None;
         while let Some(s) = iter.next().map_err(err)? {
-            let (offset, name) = match s.parse() {
-                Ok(pdb::SymbolData::Public(s)) => (s.offset, s.name),
+            let (offset, name, function) = match s.parse() {
+                Ok(pdb::SymbolData::Public(s)) => (s.offset, s.name, s.function),
                 Ok(pdb::SymbolData::Data(s)) => {
                     if s.name.to_string() == "PspCreateProcessNotifyRoutine" {
                         callback_array = Some(s.type_index);
                     }
-                    (s.offset, s.name)
+                    (s.offset, s.name, false)
                 }
-                Ok(pdb::SymbolData::Procedure(s)) => (s.offset, s.name),
+                Ok(pdb::SymbolData::Procedure(s)) => (s.offset, s.name, true),
                 _ => continue,
             };
             if let Some(rva) = offset.to_rva(&map) {
                 if let Some(address) = base.checked_add(rva.0 as u64) {
-                    names.insert(name.to_string().into_owned(), address);
+                    let name = name.to_string().into_owned();
+                    if function {
+                        functions.insert(name.clone(), address);
+                    }
+                    names.insert(name, address);
                 }
             }
         }
@@ -148,6 +155,12 @@ impl Symbols {
                             | "_LDR_DATA_TABLE_ENTRY"
                             | "_EPROCESS"
                             | "_KPROCESS"
+                            | "_PEB"
+                            | "_PEB_LDR_DATA"
+                            | "_RTL_USER_PROCESS_PARAMETERS"
+                            | "_ETHREAD"
+                            | "_KTHREAD"
+                            | "_TEB"
                             | "_PS_CREATE_NOTIFY_INFO"
                             | "_EX_CALLBACK_ROUTINE_BLOCK"
                     )
@@ -200,7 +213,9 @@ impl Symbols {
             .filter(|size| *size > 0 && *size <= 8192 && *size % 8 == 0)
             .map(|size| size / 8);
         Ok(Self {
+            addresses: names.iter().map(|(n, &a)| (a, n.clone())).collect(),
             names,
+            functions: functions.into_iter().collect(),
             types,
             path: path.into(),
             callback_slots,

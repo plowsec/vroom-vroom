@@ -1,7 +1,7 @@
 # kernel debugger
 
 Windows ARM64 · macOS/HVF · experimental. No KDNET or guest driver.
-Optional: normal vroom builds exclude this tool and its dependencies.
+Optional; excluded from normal vroom builds.
 
 ## run
 
@@ -9,77 +9,84 @@ Optional: normal vroom builds exclude this tool and its dependencies.
 research/run.sh /path/to/lab.toml
 research/run.sh /path/to/lab.toml --restore /path/to/checkpoint
 research/run.sh /path/to/lab.toml --atui /path/to/run-atui-macos.sh
-research/demo.sh CONFIG CHECKPOINT      # paused Ex callback
-research/build.sh                       # build + sign only
+research/demo.sh CONFIG CHECKPOINT       # paused Ex callback
+research/build.sh                        # build + sign
 ```
 
 Requires `uv`, QEMU firmware, swtpm. Nested virtualization off.
-Starts paused. F5 boots; F6 pauses; F4 loads Windows symbols.
-Ctrl+Q powers off. Save a checkpoint first.
+Use a disposable overlay. Separate state directory. Starts paused.
 
 ## keys
 
 | Key | Action |
 |---|---|
-| F2 | Toggle breakpoint |
+| F2 | Toggle execution breakpoint |
 | F4 | Kernel + symbols + modules |
-| F5 / F6 / F7 | Continue / pause / step |
-| F9 | Panels (narrow terminal) |
+| F5 / F6 / F7 | Continue / pause / instruction step |
+| F9 | Side panels |
 | : | Command |
 | Ctrl+Q | Power off + quit |
 
 ## commands
 
 ```text
-x nt!KeBugCheckEx               resolve symbol
+functions ntoskrnl Ps           prefix filter; Enter opens function
+next / prev                    function pages (200 rows)
+symbols ntdll                   download/cache matching PDB
+x nt!KeBugCheckEx               resolve
 dis nt!KeBugCheckEx             disassemble
-bp nt!KeBugCheckEx              breakpoint (4 slots, all CPUs)
-bc                             clear breakpoints
-cpu 1                          select CPU
-modules                        loaded kernel modules
+bp nt!KeBugCheckEx              execution breakpoint; 4 slots
+bc                             clear execution breakpoints
+watch ADDRESS 8 w              data watchpoint; r/w/rw; 2 slots
+wc                             clear watchpoints
+ps                             processes; Enter selects context
+process 1234                   select PID for memory/symbols
+process                        return to CPU memory context
+peb                            PEB, image path, command line
+modules                        kernel modules
+process 1234                   kernel + selected process modules
+functions ntdll NtCreate        user functions
+bp ntdll!NtCreateFile           process-scoped user breakpoint
+cpu 1                          select CPU registers/stepping
+stack                          selected CPU stack + symbols
+mem ADDRESS 256                virtual memory
+image ntoskrnl                  fetch verified full binary
+image example.sys /path/file    use matching local binary
+dec-file nt!KeGetCurrentIrql    full binary → angr_tui
+dec ADDRESS                    live image → angr_tui; strict
+dec-partial ADDRESS            allow missing pages; labelled
+dump ADDRESS 4096              raw memory file in state/exports
 callbacks                      process callback registrations
-event                          Ex/Ex2 arguments at callback entry
-mem 0xffff... 256               virtual memory
-dec 0xffff...                   angr_tui; complete image required
-dec-partial 0xffff...           allow missing pages; marked incomplete
+event                          Ex/Ex2 arguments at entry
 checkpoint /new/directory       save paused VM
 ```
 
-## status
+## semantics
 
-| Capability | State |
-|---|---|
-| Kernel PDB download/cache | GUID + age checked |
-| Named kernel symbols | Resolve, disassemble, break |
-| Modules / process callbacks | Live inspection |
-| Registers / memory / stepping | HVF; 4 KiB page tables |
-| angr_tui | RVA view; partial exports labelled |
-| Function search/browser | Missing |
-| Process selection / userland attach | Missing |
-| PEB / user modules / user symbols | Missing |
-| Stack unwind / watchpoints / dumps / KVM | Missing |
+- Process context: inspection; no guest injection. CPU registers stay CPU-local.
+- User execution breakpoints: selected address space. Kernel breakpoints/watchpoints: all CPUs.
+- Watch ranges: 1–8 bytes within one aligned 8-byte block.
+- Stack: ARM64 packed/xdata, partial prologs/epilogs. PAC stripped, not authenticated.
+- Unknown unwind records, trap/context frames, SVE, ARM64EC: stop with reason.
+- PDBs: GUID/age checked. Binaries: ARM64, timestamp, image size, GUID/age checked.
+- File analysis: original code/data; no live patches, resolved imports, or heap state.
+- Partial live images: absent/discarded pages. Full binaries may exist on Microsoft's server; local files work too.
+- Guest paging: resident pages only. No page-in injection, WOW64, KDNET, KVM debugging, or WinDbg dump reader.
+- Interrupts remain visible during stepping. No step-over/out or register/memory editing yet.
 
-Pending interrupts remain visible during stepping.
-Callback layouts: PDB types or recognized kernel instructions.
-Decompiler types are inferred. Missing pages/pointers limit analysis.
+## speed
 
-## disks
-
-Use a disposable overlay. Base and overlay in the same directory.
-
-```sh
-qemu-img create -f qcow2 -F qcow2 -b /absolute/base.qcow2 lab.qcow2
-# Point lab.toml at lab.qcow2. Separate state directory. No shares/network.
-python3 research/kernel/tools/stage_vm.py SOURCE.vmwarevm NEW.vmwarevm
-# Add --copy to stage a stopped VM. Source untouched; hashes checked.
-```
+32 MiB paused-state page cache. Invalidated before execution.
+Parsed PDBs cached. Function lookup: `O(log n + page)`.
+Unwind tables cached; binary search. Exports and decompilation reused while paused.
+Function filtering debounced; 200-row pages. Downloads/angr run outside TUI rendering.
 
 ## layout
 
 ```text
-research/kernel/     backend, PE/PDB, page tables
+research/kernel/     backend, PE/PDB, process inspection, unwind
 research/tui/        Textual, Capstone, optional angr_tui
-experiments/         ignored local work
+experiments/         ignored local scripts/captures
 *.state/             ignored symbols, exports, VM state
 ```
 

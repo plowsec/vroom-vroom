@@ -77,7 +77,7 @@ class Client:
             request = json.dumps({'id': ident, 'op': op, **arguments}).encode() + b'\n'
             self.process.stdin.write(request)
             await self.process.stdin.drain()
-            return await asyncio.wait_for(future, timeout=240 if op == 'symbols' else 30)
+            return await asyncio.wait_for(future, timeout=240 if op in ('symbols', 'image') else 30)
         finally:
             self.pending.pop(ident, None)
 

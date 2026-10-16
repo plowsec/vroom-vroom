@@ -12,6 +12,9 @@ const MDSCR: u16 = 0x8012;
 const BVR: u16 = 0x8004;
 const BCR: u16 = 0x8005;
 const DEBUG_SLOTS: usize = 4;
+const WATCH_SLOTS: usize = 2;
+const WVR: u16 = 0x8006;
+const WCR: u16 = 0x8007;
 const PSTATE_SS: u64 = 1 << 21;
 
 /// How long a WFI sleep may last before we re-check for SGIs sent by other
@@ -404,7 +407,11 @@ impl Vcpu for HvfVcpu {
         if config.breakpoints.len() > DEBUG_SLOTS || config.breakpoints.iter().any(|a| a & 3 != 0) {
             return Err(Error::Invalid("at most four aligned ARM64 breakpoints".into()));
         }
-        if !config.enabled && (config.single_step || !config.breakpoints.is_empty()) {
+        if config.watchpoints.len() > WATCH_SLOTS {
+            return Err(Error::Invalid("at most two hardware watchpoints".into()));
+        }
+        for watch in &config.watchpoints { watch.arm64_control()?; }
+        if !config.enabled && (config.single_step || !config.breakpoints.is_empty() || !config.watchpoints.is_empty()) {
             return Err(Error::Invalid("debug controls require enabled=true".into()));
         }
         if config.enabled && !self.debug.enabled {
@@ -417,6 +424,12 @@ impl Vcpu for HvfVcpu {
             for i in 0..DEBUG_SLOTS as u16 {
                 saved.push((BVR + i * 8, self.get_sys(BVR + i * 8)?));
                 saved.push((BCR + i * 8, self.get_sys(BCR + i * 8)?));
+            }
+            let count = ((self.get_sys(ffi::HV_SYS_REG_ID_AA64DFR0_EL1)? >> 20) & 15) + 1;
+            if count < WATCH_SLOTS as u64 { return Err(Error::Unsupported("fewer than two hardware watchpoints")); }
+            for i in 0..WATCH_SLOTS as u16 {
+                saved.push((WVR + i * 8, self.get_sys(WVR + i * 8)?));
+                saved.push((WCR + i * 8, self.get_sys(WCR + i * 8)?));
             }
             self.guest_debug = saved;
         }
@@ -432,6 +445,13 @@ impl Vcpu for HvfVcpu {
                     self.set_sys(BVR + i as u16 * 8, address)?;
                     // E=1, PMC=EL0+EL1, BAS=all four instruction bytes.
                     self.set_sys(BCR + i as u16 * 8, 1 | (3 << 1) | (15 << 5))?;
+                }
+            }
+            for i in 0..WATCH_SLOTS {
+                self.set_sys(WCR + i as u16 * 8, 0)?;
+                if let Some(watch) = config.watchpoints.get(i) {
+                    self.set_sys(WVR + i as u16 * 8, watch.address & !7)?;
+                    self.set_sys(WCR + i as u16 * 8, watch.arm64_control()?)?;
                 }
             }
             let guest = self.guest_debug[0].1;

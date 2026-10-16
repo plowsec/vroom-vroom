@@ -7,9 +7,29 @@ pub struct DebugConfig {
     pub single_step: bool,
     /// Execution addresses, applied to this CPU. ARM64 addresses must be aligned.
     pub breakpoints: Vec<u64>,
+    pub watchpoints: Vec<Watchpoint>,
     /// Stop on guest BRK instructions. Otherwise deliver them to the guest
     /// exception vector, so its own debug services keep working.
     pub trap_software_breakpoints: bool,
+}
+
+/// A byte range within one aligned 8-byte granule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Watchpoint {
+    pub address: u64,
+    pub size: u8,
+    pub read: bool,
+    pub write: bool,
+}
+impl Watchpoint {
+    pub fn arm64_control(&self) -> crate::Result<u64> {
+        if self.size == 0 || self.size > 8 || (self.address & 7) + self.size as u64 > 8
+            || (!self.read && !self.write) {
+            return Err(crate::Error::Invalid("watchpoint: 1..8 bytes within one 8-byte granule, read and/or write".into()));
+        }
+        let bas = ((1u64 << self.size) - 1) << (self.address & 7);
+        Ok(1 | (3 << 1) | (u64::from(self.read) << 3) | (u64::from(self.write) << 4) | (bas << 5))
+    }
 }
 
 /// Architectural AArch64 synchronous exception entry into EL1. Only the

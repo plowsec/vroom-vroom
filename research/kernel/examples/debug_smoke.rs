@@ -120,30 +120,109 @@ fn main() {
     config.single_step = true;
     for i in 1..=3 {
         cpu.configure_debug(&config).expect("arm instruction step");
-        let event = cpu.run().expect("step through guest debug-register accesses");
-        assert!(matches!(event, VcpuExit::Debug(DebugStop { pc, reason: DebugReason::SingleStep, .. }) if pc == base + i*4), "{event:?}");
+        let event = cpu
+            .run()
+            .expect("step through guest debug-register accesses");
+        assert!(
+            matches!(event, VcpuExit::Debug(DebugStop { pc, reason: DebugReason::SingleStep, .. }) if pc == base + i*4),
+            "{event:?}"
+        );
     }
     println!("single-step: emulated MSR/MRS each retire exactly one instruction");
     // A guest-owned BRK must reach the guest's normal EL1 exception vector.
     let mut guest = pristine.clone();
-    for (id,value) in &mut guest.regs {
-        if *id == 31 { *value = base+16; }
-        if *id == 0x1c600 { *value = base+0x8000; }
+    for (id, value) in &mut guest.regs {
+        if *id == 31 {
+            *value = base + 16;
+        }
+        if *id == 0x1c600 {
+            *value = base + 0x8000;
+        }
     }
-    for (i,word) in [0xd5385204_u32,0xd5384025,0xd5384006,0xd4000002].iter().enumerate() {
-        mem.write_obj(GuestAddress(base+0x8200+i as u64*4),word).expect("exception handler");
+    for (i, word) in [0xd5385204_u32, 0xd5384025, 0xd5384006, 0xd4000002]
+        .iter()
+        .enumerate()
+    {
+        mem.write_obj(GuestAddress(base + 0x8200 + i as u64 * 4), word)
+            .expect("exception handler");
     }
     cpu.restore_state(&guest).expect("install guest vectors");
     config.single_step = false;
     config.trap_software_breakpoints = false;
     cpu.configure_debug(&config).expect("forward guest BRK");
-    assert!(matches!(cpu.run().expect("guest exception handler"),VcpuExit::Hypercall {..}));
-    let state=cpu.save_state().expect("handler context");
-    let reg=|id|state.regs.iter().find(|r|r.0==id).expect("register").1;
-    assert_eq!(reg(4)&0xffff,0x123,"BRK immediate survives injection");
-    assert_eq!(reg(5),base+16,"ELR points at faulting instruction");
-    assert_eq!(reg(6),pristine.regs.iter().find(|r|r.0==34).expect("initial PSTATE").1);
+    assert!(matches!(
+        cpu.run().expect("guest exception handler"),
+        VcpuExit::Hypercall { .. }
+    ));
+    let state = cpu.save_state().expect("handler context");
+    let reg = |id| state.regs.iter().find(|r| r.0 == id).expect("register").1;
+    assert_eq!(reg(4) & 0xffff, 0x123, "BRK immediate survives injection");
+    assert_eq!(reg(5), base + 16, "ELR points at faulting instruction");
+    assert_eq!(
+        reg(6),
+        pristine
+            .regs
+            .iter()
+            .find(|r| r.0 == 34)
+            .expect("initial PSTATE")
+            .1
+    );
     println!("guest BRK: dispatched to EL1 with original ESR, ELR and SPSR");
+    // str x0,[x1]; ldr x2,[x1]; hvc #0. Verify both access directions.
+    for (i, word) in [0xf9000020_u32, 0xf9400022, 0xd4000002].iter().enumerate() {
+        mem.write_obj(GuestAddress(base + 0x100 + i as u64 * 4), word)
+            .expect("watch code");
+    }
+    let mut watch_state = pristine.clone();
+    for (id, value) in &mut watch_state.regs {
+        if *id == 31 {
+            *value = base + 0x100;
+        }
+        if *id == 0 {
+            *value = 0x1234;
+        }
+        if *id == 1 {
+            *value = base + 0x2000;
+        }
+    }
+    cpu.restore_state(&watch_state).expect("watch registers");
+    config.watchpoints = vec![Watchpoint {
+        address: base + 0x2000,
+        size: 8,
+        read: false,
+        write: true,
+    }];
+    cpu.configure_debug(&config).expect("write watchpoint");
+    let event = cpu.run().expect("watched store");
+    assert!(
+        matches!(event,VcpuExit::Debug(DebugStop {reason:DebugReason::Watchpoint,pc,..}) if pc==base+0x100),
+        "{event:?}"
+    );
+    config.watchpoints.clear();
+    config.single_step = true;
+    cpu.configure_debug(&config)
+        .expect("step past watched store");
+    assert!(matches!(
+        cpu.run().expect("watchpoint step"),
+        VcpuExit::Debug(DebugStop {
+            reason: DebugReason::SingleStep,
+            ..
+        })
+    ));
+    config.single_step = false;
+    config.watchpoints = vec![Watchpoint {
+        address: base + 0x2000,
+        size: 8,
+        read: true,
+        write: false,
+    }];
+    cpu.configure_debug(&config).expect("read watchpoint");
+    let event = cpu.run().expect("watched load");
+    assert!(
+        matches!(event,VcpuExit::Debug(DebugStop {reason:DebugReason::Watchpoint,pc,..}) if pc==base+0x104),
+        "{event:?}"
+    );
+    println!("watchpoints: store/load trap at exact PC; step-over retires store");
     cpu.configure_debug(&DebugConfig::default())
         .expect("detach");
     let _ = done_tx.send(());

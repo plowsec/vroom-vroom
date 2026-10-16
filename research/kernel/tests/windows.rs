@@ -189,6 +189,8 @@ fn callback_code_evidence_and_module_ownership() {
             ("PspCallProcessNotifyRoutines".into(), 0x4000),
             ("PspCreateProcessNotifyRoutine".into(), 0x5000),
         ]),
+        functions: Vec::new(),
+        addresses: BTreeMap::new(),
         types: BTreeMap::new(),
         path: Default::default(),
         callback_slots: None,
@@ -243,4 +245,88 @@ fn real_pdb_identity_and_windows_layouts() {
         ..identity
     };
     assert!(vroom_kernel::symbols::Symbols::load(&path, &wrong, 0).is_err());
+}
+
+#[test]
+fn disk_image_verifies_identity_and_rejects_overlapping_sections() {
+    use vroom_kernel::binary::DiskImage;
+    let mut m = pe();
+    w32(&mut m, 0x98 + 60, 4096);
+    let expected = Image::read(&m, 0).unwrap();
+    let (bytes, _) = expected.export(&m, false).unwrap();
+    let path = std::env::temp_dir().join(format!(
+        "vroom-pe-test-{}-{}.exe",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(&path, &bytes).unwrap();
+    let disk = DiskImage::load(&path, &expected).unwrap();
+    assert_eq!(
+        disk.image.pdb.unwrap().guid,
+        expected.pdb.as_ref().unwrap().guid
+    );
+    let wrong = Image {
+        timestamp: 1,
+        ..expected.clone()
+    };
+    assert!(DiskImage::load(&path, &wrong).is_err());
+    let mut corrupt = bytes.clone();
+    corrupt[0x504] ^= 1;
+    std::fs::write(&path, &corrupt).unwrap();
+    assert!(DiskImage::load(&path, &expected).is_err());
+    let mut corrupt = bytes;
+    corrupt[0x98 + 240 + 12..0x98 + 240 + 16].copy_from_slice(&0x800u32.to_le_bytes());
+    std::fs::write(&path, &corrupt).unwrap();
+    assert!(DiskImage::load(&path, &expected).is_err());
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn process_list_uses_pdb_fields_and_rejects_corrupt_links() {
+    use std::collections::BTreeMap;
+    use vroom_kernel::{process, symbols::Symbols};
+    let mut m = Memory(vec![0; 4096]);
+    let fields = |items: &[(&str, u64)]| items.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+    let symbols = Symbols {
+        names: BTreeMap::from([("PsActiveProcessHead".into(), 0x100)]),
+        functions: Default::default(),
+        addresses: Default::default(),
+        path: Default::default(),
+        callback_slots: None,
+        fast_ref_bits: None,
+        types: BTreeMap::from([
+            (
+                "_EPROCESS".into(),
+                fields(&[
+                    ("ActiveProcessLinks", 0x40),
+                    ("UniqueProcessId", 0x60),
+                    ("InheritedFromUniqueProcessId", 0x68),
+                    ("ImageFileName", 0x70),
+                    ("Peb", 0x80),
+                    ("Pcb", 0),
+                ]),
+            ),
+            ("_KPROCESS".into(), fields(&[("DirectoryTableBase", 0x20)])),
+        ]),
+    };
+    w64(&mut m, 0x100, 0x240);
+    w64(&mut m, 0x108, 0x240);
+    w64(&mut m, 0x240, 0x100);
+    w64(&mut m, 0x248, 0x100);
+    w64(&mut m, 0x260, 42);
+    w64(&mut m, 0x268, 4);
+    w64(&mut m, 0x220, 0x8000);
+    m.0[0x270..0x27b].copy_from_slice(b"example.exe");
+    let processes = process::list(&m, &symbols).unwrap();
+    assert_eq!(processes.len(), 1);
+    assert_eq!(processes[0].pid, 42);
+    assert_eq!(processes[0].name, "example.exe");
+    w64(&mut m, 0x240, 0x240);
+    assert!(process::list(&m, &symbols).is_err());
+    w64(&mut m, 0x240, 0x100);
+    w64(&mut m, 0x108, 0);
+    assert!(process::list(&m, &symbols).is_err());
 }

@@ -1,12 +1,15 @@
 //! Line-delimited JSON control endpoint; the Textual frontend owns this process.
 use clap::Parser;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
-use vroom_hv::debug::DebugConfig;
+use vroom_hv::debug::{DebugConfig, Watchpoint};
 use vroom_kernel::arm64::{AddressSpace, Registers};
+use vroom_kernel::cache::{CachedMemory, PageCache};
+use vroom_kernel::{process, symbols::Symbols, windows::Image};
 use vroom_vmm::{RunState, StartMode, VmEvent, Vmm, VmmOptions};
 
 #[derive(Debug, Parser)]
@@ -43,9 +46,20 @@ fn output(v: Value) -> Result<(), String> {
 struct Session {
     vm: Vmm,
     breakpoints: Vec<u64>,
+    breakpoint_contexts: BTreeMap<u64, process::Process>,
+    watchpoints: Vec<Watchpoint>,
+    watch_stopped: Option<usize>,
     step_cpu: Option<usize>,
     kernel: Option<vroom_kernel::windows::Image>,
     symbols: Option<vroom_kernel::symbols::Symbols>,
+    pages: PageCache,
+    process_cache: std::cell::RefCell<Option<Vec<process::Process>>>,
+    module_cache: std::cell::RefCell<Option<Vec<vroom_kernel::windows::Module>>>,
+    unwind: vroom_kernel::unwind::Tables,
+    export_cache: BTreeMap<String, Value>,
+    local_images: BTreeMap<(u64, u64), PathBuf>,
+    process: Option<process::Process>,
+    module_symbols: BTreeMap<(u64, u64), Symbols>,
     cache: PathBuf,
     exports: PathBuf,
     continue_cpus: std::collections::VecDeque<usize>,
@@ -54,15 +68,91 @@ struct Session {
 }
 
 impl Session {
+    fn registers(&self, cpu: usize, context: bool) -> Result<Registers, String> {
+        let state = self.vm.debug_registers(cpu).map_err(|e| e.to_string())?;
+        let mut regs = Registers::from_hvf(&state).map_err(|e| e.to_string())?;
+        if context {
+            if let Some(process) = &self.process {
+                let active = self
+                    .processes(cpu)?
+                    .into_iter()
+                    .find(|p| p.eprocess == process.eprocess && p.pid == process.pid)
+                    .ok_or("selected process exited; select a live process")?;
+                regs.ttbr0 = active.directory_table;
+                regs.tcr &= !(1 << 7); // Inspection may walk a stopped EL1 context's TTBR0.
+            }
+        }
+        Ok(regs)
+    }
+    fn processes(&self, cpu: usize) -> Result<Vec<process::Process>, String> {
+        if let Some(cached) = self.process_cache.borrow().as_ref() {
+            return Ok(cached.clone());
+        }
+        let regs = self.registers(cpu, false)?;
+        let space = AddressSpace {
+            memory: &CachedMemory {
+                memory: &self.vm,
+                cache: &self.pages,
+            },
+            registers: &regs,
+        };
+        let symbols = self.symbols.as_ref().ok_or("load kernel symbols first")?;
+        let rows = process::list(&space, symbols).map_err(|e| e.to_string())?;
+        *self.process_cache.borrow_mut() = Some(rows.clone());
+        Ok(rows)
+    }
+    fn kernel_modules(&self, cpu: usize) -> Result<Vec<vroom_kernel::windows::Module>, String> {
+        if let Some(cached) = self.module_cache.borrow().as_ref() {
+            return Ok(cached.clone());
+        }
+        let regs = self.registers(cpu, false)?;
+        let space = AddressSpace {
+            memory: &CachedMemory {
+                memory: &self.vm,
+                cache: &self.pages,
+            },
+            registers: &regs,
+        };
+        let symbols = self.symbols.as_ref().ok_or("load kernel symbols first")?;
+        let rows = vroom_kernel::windows::modules(
+            &space,
+            symbols
+                .resolve("PsLoadedModuleList")
+                .map_err(|e| e.to_string())?,
+            &symbols.module_layout().map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        *self.module_cache.borrow_mut() = Some(rows.clone());
+        Ok(rows)
+    }
+    fn selected_symbols(&self, base: Option<u64>) -> Result<&Symbols, String> {
+        match base {
+            None => self.symbols.as_ref(),
+            Some(base) if self.kernel.as_ref().is_some_and(|k| k.base == base) => {
+                self.symbols.as_ref()
+            }
+            Some(base) => self.module_symbols.get(&(
+                if base >> 63 != 0 {
+                    0
+                } else {
+                    self.process.as_ref().map_or(0, |p| p.eprocess)
+                },
+                base,
+            )),
+        }
+        .ok_or_else(|| "load matching symbols first".into())
+    }
+
     fn configure(&self) -> Result<(), String> {
         for cpu in 0..self.vm.config().cpus as usize {
             self.vm
                 .debug_configure(
                     cpu,
                     DebugConfig {
-                        enabled: !self.breakpoints.is_empty(),
+                        enabled: !self.breakpoints.is_empty() || !self.watchpoints.is_empty(),
                         single_step: false,
                         breakpoints: self.breakpoints.clone(),
+                        watchpoints: self.watchpoints.clone(),
                         trap_software_breakpoints: false,
                     },
                 )
@@ -74,6 +164,11 @@ impl Session {
     fn command(&mut self, request: &Value) -> Result<Value, String> {
         let cpu = request.get("cpu").map(number).transpose()?.unwrap_or(0) as usize;
         let op = request["op"].as_str().ok_or("missing op")?;
+        if !matches!(op, "status" | "pause" | "shutdown" | "key")
+            && self.vm.state() != RunState::Paused
+        {
+            return Err("pause the VM before inspection or control".into());
+        }
         match op {
             "status" => Ok(
                 json!({"state": format!("{:?}", self.vm.state()), "cpus": self.vm.config().cpus, "breakpoints": self.breakpoints}),
@@ -88,15 +183,34 @@ impl Session {
                 if self.vm.state() != RunState::Paused {
                     return Err("VM must be paused".into());
                 }
+                if !self.breakpoint_contexts.is_empty() {
+                    let active = self.processes(cpu)?;
+                    for process in self.breakpoint_contexts.values_mut() {
+                        *process = active
+                            .iter()
+                            .find(|p| p.eprocess == process.eprocess && p.pid == process.pid)
+                            .ok_or("breakpoint process exited; clear its breakpoint")?
+                            .clone();
+                    }
+                }
                 self.configure()?;
                 self.continue_cpus.clear();
                 for cpu in 0..self.vm.config().cpus as usize {
                     let state = self.vm.debug_registers(cpu).map_err(|e| e.to_string())?;
                     let regs = Registers::from_hvf(&state).map_err(|e| e.to_string())?;
-                    if state.powered_on && self.breakpoints.contains(&regs.pc) {
+                    if state.powered_on
+                        && (self.breakpoints.contains(&regs.pc) || self.watch_stopped == Some(cpu))
+                    {
                         self.continue_cpus.push_back(cpu);
                     }
                 }
+                self.watch_stopped = None;
+                self.pages.clear();
+                self.process_cache.borrow_mut().take();
+                self.module_cache.borrow_mut().take();
+                self.unwind.clear();
+                self.export_cache.clear();
+                self.module_symbols.clear();
                 self.continuing = true;
                 self.continue_next()?;
                 Ok(json!("running"))
@@ -109,7 +223,10 @@ impl Session {
                 let state = self.vm.debug_registers(cpu).map_err(|e| e.to_string())?;
                 let regs = Registers::from_hvf(&state).map_err(|e| e.to_string())?;
                 let space = AddressSpace {
-                    memory: &self.vm,
+                    memory: &CachedMemory {
+                        memory: &self.vm,
+                        cache: &self.pages,
+                    },
                     registers: &regs,
                 };
                 Ok(json!(vroom_kernel::windows::process_event(&space, &regs.x)
@@ -120,10 +237,18 @@ impl Session {
                 .debug_memory_regions()
                 .map_err(|e| e.to_string())?)),
             "kernel" => {
+                if let Some(image) = &self.kernel {
+                    return Ok(
+                        json!({"base":image.base,"size":image.size,"name":image.name,"pdb":image.pdb,"export_count":image.exports.len()}),
+                    );
+                }
                 let state = self.vm.debug_registers(cpu).map_err(|e| e.to_string())?;
                 let regs = Registers::from_hvf(&state).map_err(|e| e.to_string())?;
                 let space = AddressSpace {
-                    memory: &self.vm,
+                    memory: &CachedMemory {
+                        memory: &self.vm,
+                        cache: &self.pages,
+                    },
                     registers: &regs,
                 };
                 let image = vroom_kernel::windows::discover_kernel(&space, &[regs.vbar, regs.pc])
@@ -133,6 +258,37 @@ impl Session {
                 Ok(result)
             }
             "symbols" => {
+                let base = request.get("base").map(number).transpose()?;
+                if let Ok(symbols) = self.selected_symbols(base) {
+                    return Ok(
+                        json!({"path":symbols.path,"count":symbols.names.len(),"types":symbols.types,"cached":true}),
+                    );
+                }
+                if let Some(base) = base {
+                    let regs = self.registers(cpu, request["context"].as_bool().unwrap_or(true))?;
+                    let space = AddressSpace {
+                        memory: &CachedMemory {
+                            memory: &self.vm,
+                            cache: &self.pages,
+                        },
+                        registers: &regs,
+                    };
+                    let image = Image::read(&space, base).map_err(|e| e.to_string())?;
+                    let identity = image.pdb.as_ref().ok_or("image has no PDB identity")?;
+                    let path = vroom_kernel::symbols::fetch(&self.cache, identity)
+                        .map_err(|e| e.to_string())?;
+                    let symbols =
+                        Symbols::load(&path, identity, base).map_err(|e| e.to_string())?;
+                    let result =
+                        json!({"path":path,"count":symbols.names.len(),"types":symbols.types});
+                    let context = if base >> 63 != 0 {
+                        0
+                    } else {
+                        self.process.as_ref().map_or(0, |p| p.eprocess)
+                    };
+                    self.module_symbols.insert((context, base), symbols);
+                    return Ok(result);
+                }
                 let image = self.kernel.as_ref().ok_or("discover kernel first")?;
                 let identity = image
                     .pdb
@@ -146,9 +302,147 @@ impl Session {
                 self.symbols = Some(symbols);
                 Ok(result)
             }
+            "functions" => {
+                let symbols =
+                    self.selected_symbols(request.get("base").map(number).transpose()?)?;
+                let prefix = request["prefix"].as_str().unwrap_or("");
+                let offset = request
+                    .get("offset")
+                    .map(number)
+                    .transpose()?
+                    .unwrap_or(0)
+                    .min(1_000_000) as usize;
+                let limit = request
+                    .get("limit")
+                    .map(number)
+                    .transpose()?
+                    .unwrap_or(200)
+                    .min(1000) as usize;
+                // Sorted index + binary lower bound + constant-time slice skip:
+                // O(log n + page), including deep pages.
+                let start = symbols
+                    .functions
+                    .partition_point(|(name, _)| name.as_str() < prefix);
+                let mut iter = symbols
+                    .functions
+                    .iter()
+                    .skip(start.saturating_add(offset))
+                    .take_while(|(name, _)| name.starts_with(prefix));
+                let rows: Vec<_> = iter
+                    .by_ref()
+                    .take(limit)
+                    .map(|(name, address)| json!({"name":name,"address":address}))
+                    .collect();
+                Ok(json!({"rows":rows,"more":iter.next().is_some(),"offset":offset}))
+            }
+            "processes" | "process" | "peb" | "user_modules" => {
+                if op == "process" && request.get("pid").is_none() {
+                    self.process = None;
+                    return Ok(json!({"context":"cpu"}));
+                }
+                let symbols = self.symbols.as_ref().ok_or("load kernel symbols first")?;
+                let regs = self.registers(cpu, matches!(op, "peb" | "user_modules"))?;
+                let space = AddressSpace {
+                    memory: &CachedMemory {
+                        memory: &self.vm,
+                        cache: &self.pages,
+                    },
+                    registers: &regs,
+                };
+                if op == "peb" || op == "user_modules" {
+                    let selected = self.process.as_ref().ok_or("select a process first")?;
+                    let active = self
+                        .processes(cpu)?
+                        .into_iter()
+                        .find(|p| p.eprocess == selected.eprocess && p.pid == selected.pid)
+                        .ok_or("selected process exited")?;
+                    return if op == "peb" {
+                        process::peb(&space, symbols, &active).map(|v| json!(v))
+                    } else {
+                        process::modules(&space, symbols, &active).map(|v| json!(v))
+                    }
+                    .map_err(|e| e.to_string());
+                }
+                let processes = self.processes(cpu)?;
+                if op == "processes" {
+                    return Ok(json!(processes));
+                }
+                let pid = number(&request["pid"])?;
+                let process = processes
+                    .into_iter()
+                    .find(|p| p.pid == pid)
+                    .ok_or("PID not found")?;
+                let result = json!(process);
+                self.process = Some(process);
+                Ok(result)
+            }
+            "stack" => {
+                // CPU stack always uses the actual CPU address space, even when
+                // another process has been selected for memory inspection.
+                let regs = self.registers(cpu, false)?;
+                let space = AddressSpace {
+                    memory: &CachedMemory {
+                        memory: &self.vm,
+                        cache: &self.pages,
+                    },
+                    registers: &regs,
+                };
+                let symbols = self.symbols.as_ref().ok_or("load kernel symbols first")?;
+                let mut modules = self.kernel_modules(cpu)?;
+                let mut stack_process = 0;
+                if regs.pc >> 63 == 0 {
+                    let processes = self.processes(cpu)?;
+                    if let Some(process) = processes.iter().find(|p| {
+                        p.directory_table & 0x0000fffffffff000 == regs.ttbr0 & 0x0000fffffffff000
+                    }) {
+                        stack_process = process.eprocess;
+                        modules.extend(
+                            process::modules(&space, symbols, process)
+                                .map_err(|e| e.to_string())?,
+                        );
+                    }
+                }
+                let mut stack =
+                    vroom_kernel::unwind::walk(&space, &regs, &modules, &mut self.unwind);
+                for frame in &mut stack.frames {
+                    let module = modules
+                        .iter()
+                        .find(|m| frame.pc >= m.base && frame.pc - m.base < m.size as u64)
+                        .ok_or("stack frame module disappeared")?;
+                    let symbols = if self.kernel.as_ref().is_some_and(|k| k.base == module.base) {
+                        self.symbols.as_ref()
+                    } else {
+                        self.module_symbols.get(&(
+                            if module.base >> 63 != 0 {
+                                0
+                            } else {
+                                stack_process
+                            },
+                            module.base,
+                        ))
+                    };
+                    let found =
+                        symbols.and_then(|s| s.addresses.range(module.base..=frame.pc).next_back());
+                    frame.symbol = Some(match found {
+                        Some((&a, name)) => format!("{}!{}+{:#x}", module.name, name, frame.pc - a),
+                        None => format!("{}+{:#x}", module.name, frame.pc - module.base),
+                    });
+                }
+                Ok(json!(stack))
+            }
+            "cache" => Ok(
+                json!({"physical_pages":self.pages.pages(),"capacity_pages":8192,"module_pdbs":self.module_symbols.len()}),
+            ),
             "resolve" => {
                 let name = request["name"].as_str().ok_or("missing name")?;
-                if let Some(symbols) = &self.symbols {
+                let base = request.get("base").map(number).transpose()?;
+                if base.is_some() {
+                    return Ok(json!(self
+                        .selected_symbols(base)?
+                        .resolve(name)
+                        .map_err(|e| e.to_string())?));
+                }
+                if let Ok(symbols) = self.selected_symbols(None) {
                     return Ok(json!(symbols.resolve(name).map_err(|e| e.to_string())?));
                 }
                 self.kernel
@@ -157,18 +451,61 @@ impl Session {
                     .map(|&a| json!(a))
                     .ok_or_else(|| "symbol not found; load matching PDB symbols".into())
             }
-            "export" => {
+            "export" | "image" => {
                 let base = number(&request["base"])?;
-                let state = self.vm.debug_registers(cpu).map_err(|e| e.to_string())?;
-                let regs = Registers::from_hvf(&state).map_err(|e| e.to_string())?;
+                let cache_key = format!(
+                    "{op}:{cpu}:{base}:{}:{}:{}",
+                    self.process.as_ref().map_or(0, |p| p.eprocess),
+                    request["allow_missing"],
+                    request["path"]
+                );
+                if let Some(result) = self.export_cache.get(&cache_key) {
+                    return Ok(result.clone());
+                }
+                let regs = self.registers(cpu, true)?;
                 let space = AddressSpace {
-                    memory: &self.vm,
+                    memory: &CachedMemory {
+                        memory: &self.vm,
+                        cache: &self.pages,
+                    },
                     registers: &regs,
                 };
                 let image =
                     vroom_kernel::windows::Image::read(&space, base).map_err(|e| e.to_string())?;
                 let partial = request["allow_missing"].as_bool().unwrap_or(false);
-                let (bytes, missing) = image.export(&space, partial).map_err(|e| e.to_string())?;
+                let (bytes, missing, image, source) = if op == "image" {
+                    let context = (self.process.as_ref().map_or(0, |p| p.eprocess), base);
+                    let path = if let Some(path) = request["path"].as_str() {
+                        PathBuf::from(path)
+                    } else if let Some(path) = self.local_images.get(&context) {
+                        path.clone()
+                    } else {
+                        vroom_kernel::binary::fetch(&self.cache, &image)
+                            .map_err(|e| e.to_string())?
+                    };
+                    let disk = vroom_kernel::binary::DiskImage::load(&path, &image)
+                        .map_err(|e| e.to_string())?;
+                    if request["path"].is_string() {
+                        self.local_images.insert(context, path.clone());
+                    }
+                    let (bytes, missing) =
+                        disk.image.export(&disk, false).map_err(|e| e.to_string())?;
+                    (
+                        bytes,
+                        missing,
+                        disk.image,
+                        json!({"kind":"file","path":path,"runtime_base":base}),
+                    )
+                } else {
+                    let (bytes, missing) =
+                        image.export(&space, partial).map_err(|e| e.to_string())?;
+                    (
+                        bytes,
+                        missing,
+                        image,
+                        json!({"kind":"live","runtime_base":base}),
+                    )
+                };
                 std::fs::create_dir_all(&self.exports).map_err(|e| e.to_string())?;
                 let stamp = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -181,13 +518,29 @@ impl Session {
                     .open(&path)
                     .map_err(|e| e.to_string())?;
                 file.write_all(&bytes).map_err(|e| e.to_string())?;
-                let manifest = json!({"path":path,"image":image,"missing_page_rvas":missing,"layout":"reconstructed PE from paused guest memory; runtime image base; no relocations"});
+                let metadata_image = json!({"base":image.base,"size":image.size,"name":image.name,
+                    "timestamp":image.timestamp,"pdb":image.pdb,"relocation_directory":image.relocation_directory});
+                let manifest = json!({"path":path,"image":metadata_image,"missing_page_rvas":missing,"source":source,"layout":"flat PE; section file offsets equal RVAs; analysis only"});
                 let metadata = std::fs::OpenOptions::new()
                     .create_new(true)
                     .write(true)
                     .open(path.with_extension("json"))
                     .map_err(|e| e.to_string())?;
                 serde_json::to_writer_pretty(metadata, &manifest).map_err(|e| e.to_string())?;
+                if op == "image" {
+                    // A supplied local image becomes the default static source
+                    // for this module, including subsequent dec-file requests.
+                    for allow in [Value::Null, json!(false)] {
+                        let key = format!(
+                            "{op}:{cpu}:{base}:{}:{}:{}",
+                            self.process.as_ref().map_or(0, |p| p.eprocess),
+                            allow,
+                            Value::Null
+                        );
+                        self.export_cache.insert(key, manifest.clone());
+                    }
+                }
+                self.export_cache.insert(cache_key, manifest.clone());
                 Ok(manifest)
             }
             "modules" | "callbacks" => {
@@ -195,18 +548,16 @@ impl Session {
                     .symbols
                     .as_ref()
                     .ok_or("load matching kernel symbols first")?;
-                let head = symbols
-                    .resolve("PsLoadedModuleList")
-                    .map_err(|e| e.to_string())?;
-                let layout = symbols.module_layout().map_err(|e| e.to_string())?;
                 let state = self.vm.debug_registers(cpu).map_err(|e| e.to_string())?;
                 let regs = Registers::from_hvf(&state).map_err(|e| e.to_string())?;
                 let space = AddressSpace {
-                    memory: &self.vm,
+                    memory: &CachedMemory {
+                        memory: &self.vm,
+                        cache: &self.pages,
+                    },
                     registers: &regs,
                 };
-                let modules = vroom_kernel::windows::modules(&space, head, &layout)
-                    .map_err(|e| e.to_string())?;
+                let modules = self.kernel_modules(cpu)?;
                 if op == "callbacks" {
                     return Ok(json!(vroom_kernel::windows::process_callbacks(
                         &space, symbols, &modules
@@ -214,6 +565,56 @@ impl Session {
                     .map_err(|e| e.to_string())?));
                 }
                 Ok(json!(modules))
+            }
+            "dump" => {
+                let address = number(&request["address"])?;
+                let length = number(&request["length"])?;
+                if length == 0 || length > 64 * 1024 * 1024 || address.checked_add(length).is_none()
+                {
+                    return Err("dump length must be 1..64 MiB without address overflow".into());
+                }
+                let regs = self.registers(cpu, true)?;
+                let space = AddressSpace {
+                    memory: &CachedMemory {
+                        memory: &self.vm,
+                        cache: &self.pages,
+                    },
+                    registers: &regs,
+                };
+                std::fs::create_dir_all(&self.exports).map_err(|e| e.to_string())?;
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|e| e.to_string())?
+                    .as_nanos();
+                let path = self
+                    .exports
+                    .join(format!("memory-{address:016x}-{stamp}.bin"));
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                    .map_err(|e| e.to_string())?;
+                let result = (|| {
+                    let mut bytes = vec![0; 65536];
+                    let mut done = 0;
+                    while done < length {
+                        let n = (length - done).min(bytes.len() as u64) as usize;
+                        space
+                            .read(address + done, &mut bytes[..n])
+                            .map_err(|e| e.to_string())?;
+                        file.write_all(&bytes[..n]).map_err(|e| e.to_string())?;
+                        done += n as u64;
+                    }
+                    Ok::<_, String>(
+                        json!({"path":path,"address":address,"length":length,"cpu":cpu,
+                        "pid":self.process.as_ref().map(|p|p.pid),"format":"raw virtual memory"}),
+                    )
+                })();
+                if result.is_err() {
+                    drop(file);
+                    let _ = std::fs::remove_file(&path);
+                }
+                result
             }
             "translate" | "read_virtual" | "read_physical" => {
                 let address = number(&request["address"])?;
@@ -231,10 +632,12 @@ impl Session {
                         .debug_read_physical(address, &mut data)
                         .map_err(|e| e.to_string())?;
                 } else {
-                    let state = self.vm.debug_registers(cpu).map_err(|e| e.to_string())?;
-                    let regs = Registers::from_hvf(&state).map_err(|e| e.to_string())?;
+                    let regs = self.registers(cpu, request["context"].as_bool().unwrap_or(true))?;
                     let space = AddressSpace {
-                        memory: &self.vm,
+                        memory: &CachedMemory {
+                            memory: &self.vm,
+                            cache: &self.pages,
+                        },
                         registers: &regs,
                     };
                     if op == "translate" {
@@ -245,6 +648,42 @@ impl Session {
                 Ok(
                     json!({"address": address, "hex": data.iter().map(|b| format!("{b:02x}")).collect::<String>()}),
                 )
+            }
+            "watchpoints" => {
+                let watches = request["watches"]
+                    .as_array()
+                    .ok_or("expected watches array")?;
+                if watches.len() > 2 {
+                    return Err("at most two hardware watchpoints".into());
+                }
+                let watches = watches
+                    .iter()
+                    .map(|w| {
+                        let size = number(&w["size"])?;
+                        if size > 8 {
+                            return Err("watch size exceeds 8".to_owned());
+                        }
+                        let mode = w["mode"].as_str().ok_or("missing watch mode: r/w/rw")?;
+                        if !matches!(mode, "r" | "w" | "rw") {
+                            return Err("invalid watch mode".into());
+                        }
+                        let watch = Watchpoint {
+                            address: number(&w["address"])?,
+                            size: size as u8,
+                            read: mode.contains('r'),
+                            write: mode.contains('w'),
+                        };
+                        watch.arm64_control().map_err(|e| e.to_string())?;
+                        Ok(watch)
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                let old = std::mem::replace(&mut self.watchpoints, watches);
+                if let Err(error) = self.configure() {
+                    self.watchpoints = old;
+                    let rollback = self.configure();
+                    return Err(format!("{error}; rollback: {rollback:?}"));
+                }
+                Ok(json!(request["watches"]))
             }
             "breakpoints" => {
                 if self.vm.state() != RunState::Paused {
@@ -257,15 +696,33 @@ impl Session {
                 if addresses.len() > 4 || addresses.iter().any(|a| a & 3 != 0) {
                     return Err("at most four 4-byte-aligned addresses".into());
                 }
+                let mut contexts = BTreeMap::new();
+                for &address in &addresses {
+                    if address >> 63 == 0 {
+                        let process = self
+                            .breakpoint_contexts
+                            .get(&address)
+                            .or(self.process.as_ref())
+                            .ok_or("select a process before setting a user-address breakpoint")?;
+                        contexts.insert(address, process.clone());
+                    }
+                }
                 let old = std::mem::replace(&mut self.breakpoints, addresses);
                 if let Err(e) = self.configure() {
                     self.breakpoints = old;
                     let rollback = self.configure();
                     return Err(format!("{e}; rollback: {rollback:?}; VM remains paused"));
                 }
+                self.breakpoint_contexts = contexts;
                 Ok(json!(self.breakpoints))
             }
             "step" => {
+                self.pages.clear();
+                self.process_cache.borrow_mut().take();
+                self.module_cache.borrow_mut().take();
+                self.unwind.clear();
+                self.export_cache.clear();
+                self.module_symbols.clear();
                 self.configure()?;
                 // Temporarily remove breakpoints on the selected CPU so the
                 // stopped instruction can execute; rearm them at the stop.
@@ -400,7 +857,18 @@ fn run() -> Result<(), String> {
     let mut session = Session {
         vm,
         breakpoints: Vec::new(),
+        breakpoint_contexts: BTreeMap::new(),
+        watchpoints: Vec::new(),
+        watch_stopped: None,
         step_cpu: None,
+        pages: PageCache::default(),
+        process_cache: Default::default(),
+        module_cache: Default::default(),
+        unwind: Default::default(),
+        export_cache: BTreeMap::new(),
+        local_images: BTreeMap::new(),
+        process: None,
+        module_symbols: BTreeMap::new(),
         kernel: None,
         symbols: None,
         cache,
@@ -442,10 +910,26 @@ fn run() -> Result<(), String> {
                     session.vm.pause().map_err(|e| e.to_string())?;
                     session.configure()?;
                     session.step_cpu = None;
+                    session.watch_stopped = (stop.reason
+                        == vroom_hv::debug::DebugReason::Watchpoint)
+                        .then_some(stop.cpu as usize);
                     if session.continuing && stop.reason == vroom_hv::debug::DebugReason::SingleStep
                     {
                         session.continue_next()?;
                         continue;
+                    }
+                    if stop.reason == vroom_hv::debug::DebugReason::Breakpoint {
+                        if let Some(process) = session.breakpoint_contexts.get(&stop.pc) {
+                            let regs = session.registers(stop.cpu as usize, false)?;
+                            let mask = 0x0000_ffff_ffff_f000;
+                            if regs.ttbr0 & mask != process.directory_table & mask {
+                                session.continue_cpus.clear();
+                                session.continue_cpus.push_back(stop.cpu as usize);
+                                session.continuing = true;
+                                session.continue_next()?;
+                                continue;
+                            }
+                        }
                     }
                     session.continuing = false;
                     session.continue_cpus.clear();

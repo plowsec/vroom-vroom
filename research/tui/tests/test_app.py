@@ -120,3 +120,33 @@ async def test_narrow_terminal_preserves_code_space():
         await pilot.pause()
         assert app.query_one('#register-pane').display
         assert app.query_one('#center').size.width >= 50
+
+
+async def test_function_filter_process_selection_and_qualified_symbols():
+    class WindowsClient(FakeClient):
+        async def call(self, op, **args):
+            if op == 'functions':
+                self.calls.append((op, args))
+                return dict(rows=[dict(name='NtCreateFile', address=0x70001000)], more=False)
+            if op == 'processes':
+                return [dict(pid=42, parent_pid=4, name='example.exe', eprocess=0xffff800000009000)]
+            if op == 'process': return dict(pid=42, name='example.exe')
+            if op == 'user_modules': return [dict(name='ntdll.dll',base=0x70000000,size=0x20000)]
+            if op == 'peb': return dict(address=0x60000000, command_line='example.exe --test')
+            return await super().call(op, **args)
+    client = WindowsClient()
+    app = KernelApp(client=client)
+    client.app = app
+    async with app.run_test(size=(150,45)) as pilot:
+        await app.load_processes()
+        assert app.query_one('#processes',DataTable).get_row_at(0)[0] == '42'
+        await app.select_process(42)
+        assert app.query_one(TabbedContent).active == 'peb-tab'
+        assert app.query_one('#peb',DataTable).get_row_at(1)[1] == 'example.exe --test'
+        await app.symbol_address('ntdll!NtCreateFile')
+        assert ('resolve',dict(base=0x70000000,name='NtCreateFile')) in client.calls
+        app.query_one('#function-filter',Input).value = 'NtCreate'
+        await pilot.pause(.2)
+        await app.workers.wait_for_complete()
+        assert app.query_one('#functions',DataTable).get_row_at(0)[0] == 'NtCreateFile'
+        assert any(op=='functions' and args['prefix']=='NtCreate' for op,args in client.calls)

@@ -1,6 +1,10 @@
 //! Windows-specific policy stays outside the production VMM dependency tree.
 pub mod arm64;
+pub mod binary;
+pub mod cache;
+pub mod process;
 pub mod symbols;
+pub mod unwind;
 pub mod windows;
 
 #[derive(Debug, thiserror::Error)]

@@ -68,8 +68,14 @@ def prepare_rva_image(exported, *, allow_unrelocated=False):
         cursor += block_size
     struct.pack_into('<Q', data, pe+48, 0)
     destination = source.with_suffix('.rva.exe')
-    with destination.open('xb') as stream:
-        stream.write(data)
+    # Reuse an identical analysis copy. Fail if a different file already owns
+    # this path; cached exports are immutable for a stopped-VM generation.
+    if destination.exists():
+        if destination.read_bytes() != data:
+            raise ValueError('Existing RVA analysis copy differs from source')
+    else:
+        with destination.open('xb') as stream:
+            stream.write(data)
     provenance = {
         'source': str(source), 'runtime_base': base, 'analysis_base': 0,
         'relocated_internal_pointers': relocated, 'retained_other_pointers': retained,
@@ -77,6 +83,8 @@ def prepare_rva_image(exported, *, allow_unrelocated=False):
         'warning': relocation_warning,
         'purpose': 'analysis only; code addresses are RVAs; external pointers retain runtime values',
     }
-    with destination.with_suffix('.json').open('x') as stream:
-        json.dump(provenance, stream, indent=2)
+    metadata = destination.with_suffix('.json')
+    if not metadata.exists():
+        with metadata.open('x') as stream:
+            json.dump(provenance, stream, indent=2)
     return destination, provenance
