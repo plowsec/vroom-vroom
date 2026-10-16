@@ -31,10 +31,10 @@ The security design is better than the big three’s, at least on paper:
  │   ╚═══╤════════╤════════╤════════╤════════╤══╝                    │
  │       │        │        │        │        │                       │
  │   ╔═══╧═══╗╔═══╧═══╗╔═══╧═══╗╔═══╧═══╗╔═══╧═══╗   ┌──────────┐    │
- │   ║  GPU  ║║ audio ║║camera ║║  USB  ║║  TPM  ║   │   netd   │    │
+ │   ║  3D   ║║ audio ║║camera ║║  USB  ║║  TPM  ║   │   netd   │    │
  │   ╚═══╤═══╝╚═══╤═══╝╚═══╤═══╝╚═══╤═══╝╚═══════╝   │  (root)  │    │
  │       │        │        │        │                └────┬─────┘    │
- │     Metal   speaker   camera   device                  LAN        │
+ │      GPU    speaker   camera   device                  LAN        │
  │              (mic)                                                │
  └───────────────────────────────────────────────────────────────────┘
    ═══ own sandbox        ─── no sandbox        camera, mic: opt-in
