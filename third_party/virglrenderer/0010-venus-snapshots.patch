@@ -900,7 +900,7 @@
  struct vkr_ring *
 --- /dev/null
 +++ b/src/venus/vkr_snap.c
-@@ -0,0 +1,2002 @@
+@@ -0,0 +1,2012 @@
 +/*
 + * vroom: snapshots of a Venus context (see vkr_snap.h).
 + * SPDX-License-Identifier: MIT
@@ -1051,6 +1051,13 @@
 +      goto fail;
 +   }
 +   snap->gc_at = 1024;
++   /* for measuring what following costs: nothing is kept, and a snapshot
++    * brings the context back lost */
++   const char *env = getenv("VKR_SNAPSHOT");
++   if (env && !strcmp(env, "0")) {
++      snap->off = true;
++      snap->broken = "VKR_SNAPSHOT=0";
++   }
 +   return snap;
 +
 +fail:
@@ -2373,12 +2380,15 @@
 +      return -1;
 +
 +   const bool quiet = vkr_snap_quiesce(snap);
-+   bool lost = !quiet || vkr_context_get_fatal(ctx) || snap->broken;
++   /* VKR_SNAPSHOT_LOST=1 tries the way back for contexts we can't save */
++   const char *env = getenv("VKR_SNAPSHOT_LOST");
++   const bool asked = env && !strcmp(env, "1");
++   bool lost = !quiet || vkr_context_get_fatal(ctx) || snap->broken || asked;
 +   if (!quiet)
 +      vkr_log("snapshot: context %u didn't stop in time: saved as lost", ctx->ctx_id);
 +   else if (lost)
 +      vkr_log("snapshot: context %u saved as lost (%s)", ctx->ctx_id,
-+              snap->broken ? snap->broken : "it had failed");
++              snap->broken ? snap->broken : asked ? "VKR_SNAPSHOT_LOST=1" : "it had failed");
 +
 +   struct vkr_snap_objs objs = { 0 };
 +   uint64_t staging = 0;

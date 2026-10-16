@@ -2135,7 +2135,11 @@ impl GpuHandler {
             if !t.r().venus_resume(c.id) {
                 log::warn!("gpu snapshot: Vulkan context {} ({name}) didn't start again", c.id);
             }
-            log::info!("gpu snapshot: Vulkan context {} ({name}) built again in {} ms", c.id, started.elapsed().as_millis());
+            if c.venus.is_some_and(|v| v.2) {
+                log::info!("gpu snapshot: Vulkan context {} ({name}) built again in {} ms", c.id, started.elapsed().as_millis());
+            } else {
+                log::warn!("gpu snapshot: Vulkan context {} ({name}) came back lost: its app sees the device lost", c.id);
+            }
         }
         for &rid in c.info.attached.iter().filter(|r| self.res3d.contains_key(r)) {
             t.r().context_attach(c.id, rid);
