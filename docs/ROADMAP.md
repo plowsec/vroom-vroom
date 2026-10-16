@@ -176,6 +176,14 @@ A guest needs a driver and an API its players use. What exists:
   cards) not tried yet. The helper could tell the VMM why it gave up on
   a device, so the app shows it (today: the log only). A Developer ID
   signature would keep vroom-netd's permission across updates.
+- USB disks without passing the USB device: if Full Disk Access isn't
+  enough (macOS may want the `com.apple.vm.device-access` entitlement,
+  which only Apple grants), or for people who'd rather not give a root
+  helper that permission: unmount the disk on the Mac and hand the guest
+  the raw disk (`/dev/rdiskN`, opened by vroom-netd and passed to the VMM)
+  as an emulated USB stick or a hot-plugged disk. The guest sees a
+  plain disk, not the stick itself (no vendor tools), which is what most
+  people want from a USB disk anyway.
 - Things only a person at the Mac can try: bridged networking with real
   vmnet, a drag out of the guest to Finder, Mail or the Desktop with a
   real mouse, Coherence next to a window tiler, several monitors on
