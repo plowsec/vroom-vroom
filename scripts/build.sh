@@ -5,7 +5,8 @@ set -e
 cd "$(dirname "$0")/.."
 # macOS kills a process whose binary is rewritten: a VM started from
 # target/ would die mid-run (or mid-suspend).
-if pgrep -f "target/(debug|release)/vroom run" >/dev/null 2>&1; then
+# Only this checkout's binaries (other worktrees have their own target/).
+if pgrep -f "^($(pwd)/)?target/(debug|release)/vroom run" >/dev/null 2>&1; then
   echo "a VM is running from target/: stop or suspend it first (or set CARGO_TARGET_DIR)" >&2
   exit 1
 fi
