@@ -292,9 +292,11 @@ picks the right one by itself:
   guest kernel can put GPU buffers where it likes (macOS 15 has this only
   as a private call; without it, 16 KiB steps and the guest needs a 16 KiB
   page kernel, see `examples/ubuntu/kernel-16k.sh`). Memory speed in the
-  guest doesn't change measurably (fill and random reads, both ways). There is no swapchain
-  (`VK_KHR_swapchain` is missing, with or without OpenGL): Vulkan apps
-  can compute and render off screen, not show a window.
+  guest doesn't change measurably (fill and random reads, both ways).
+  The guest gets Vulkan 1.3, and Vulkan apps show their windows like
+  others (`vkcube` runs at about 730 frames a second in a 500x500 window
+  under Xorg; Weston and GNOME on Wayland work too). Each frame is copied
+  once on the Mac, from the Vulkan app's memory to the desktop's OpenGL.
 
 Two ways to run the guest's OpenGL, `[display] opengl_host`:
 
@@ -309,8 +311,8 @@ With `angle`, apps that need GL 3 won't start, and some that assume it
 crash (glmark2 does, on its framebuffer scenes). Most desktop Linux apps
 want GL 3.3 now, so `apple` is the default; see SECURITY.md for what
 the extra ANGLE checks buy. Neither gets past GL 4.1 (no compute
-shaders: that's GL 4.3, which macOS never had). `LIBGL_ALWAYS_SOFTWARE=1`
-runs one app on llvmpipe instead, which has GL 4.5.
+shaders: that's GL 4.3, which macOS never had). For more, run the app on
+Zink (below), or with `LIBGL_ALWAYS_SOFTWARE=1` on llvmpipe (GL 4.5, slow).
 
 `[display] opengl = false` keeps Vulkan only (the guest's GL then runs on
 llvmpipe). That keeps less host code in reach of the guest, and keeps
@@ -332,10 +334,26 @@ trip to the host, and the window shows a copy read back from the GPU.
 Anything with real work is many times faster, and the guest's CPUs stay
 free.
 
-Why virgl and not OpenGL on top of Vulkan (Zink): Zink needs Vulkan's
-`nullDescriptor` (robustness2), which MoltenVK can't offer on Metal.
-Faking it on the host would mean rewriting descriptor sets in
-virglrenderer's Venus decoder. virgl works with any guest kernel.
+### OpenGL 4.4 for one app (Zink)
+
+macOS's OpenGL stops at 4.1, so virgl can't give compute shaders (4.3).
+Mesa's Zink runs OpenGL on Vulkan, here on Venus, and gives OpenGL 4.4
+(core and compatibility) and OpenGL ES 3.1. Start the app with it:
+
+```bash
+MESA_LOADER_DRIVER_OVERRIDE=zink glxinfo -B   # zink Vulkan 1.3(Virtio-GPU Venus (Apple M3 Max) (MOLTENVK))
+```
+
+In an Xorg session add `LIBGL_KOPPER_DRI2=1` (Xorg's modesetting driver
+doesn't offer what Zink wants for windows there; Wayland sessions don't
+need it). The host fills in what MoltenVK lacks, and some of it only
+roughly, for Zink only: transform feedback is accepted but writes nothing
+(apps that read it back get zeros), and packed 10-bit vertex formats and
+RGB32 texel buffers, which Metal doesn't have, read wrong. Few apps use
+them. Zink is slower than virgl for ordinary drawing (glmark2's terrain:
+211 fps against 413), so keep virgl for the desktop and use Zink for apps
+that need more than 4.1. A compute shader test (1M invocations, 4096
+`sin` each) takes 9.4 ms on Zink, 3.1 s on llvmpipe.
 
 Snapshots and suspend work with OpenGL. GL state lives on the host GPU,
 so vroom keeps track of what each GL app set up (its shaders, states and

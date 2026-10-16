@@ -75,7 +75,7 @@ uses them, and the window says so. Details: [SECURITY.md](docs/SECURITY.md).
 
 - Ubuntu, Debian, Alpine, Windows 11 ARM64
 - Window with clipboard both ways and auto resolution, sharp on Retina
-- 3D: Vulkan (about 90% of native speed) and OpenGL 4.1 in Linux guests, Direct3D 11 in Windows guests
+- 3D: Vulkan 1.3 (about 90% of native speed, in windows too) and OpenGL 4.1 in Linux guests, OpenGL 4.4 per app through Zink, Direct3D 11 in Windows guests
 - Snapshots, suspend/resume, reset
 - NAT with port forwards, several network adapters. Bridged and host-only need a root helper.
 - Sound in Linux and Windows guests; microphone if you turn it on

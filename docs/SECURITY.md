@@ -315,6 +315,17 @@ Where vrend's GL calls go depends on `opengl_host`:
 
 `opengl = false` leaves vrend and both GL drivers out entirely.
 
+Our Venus patches add a little code in reach of the guest, all in the GPU
+process: filling null descriptors (they now never reach MoltenVK, which
+would follow a null pointer), empty submissions for sync fd imports, and
+for Zink a few format and feature substitutions. Without the semaphore
+emulation, a guest could already crash the GPU process by calling
+`vkWaitSemaphoreResourceMESA`, which MoltenVK has no function for. To show
+a Vulkan window on macOS's OpenGL, vrend maps the frame's shared memory
+read only and copies rows out of it; the row size, offset and height the
+guest gives are checked against the memory's size first. Nothing new is
+loaded and the sandbox rules don't change.
+
 Venus and Neptune run in virglrenderer's render server, a thread of the
 GPU process (contexts in processes of their own are a later step).
 libepoxy is built to load ANGLE only from virglrenderer's own directory,

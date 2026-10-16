@@ -209,3 +209,35 @@ macOS's OpenGL 4.1: multisample textures without `glTexStorage*Multisample`
 (GL 4.3), and shaders written at the host's GLSL version (4.10) instead of
 an older one plus `#extension` lines macOS's compiler rejects. virglrenderer
 logs through our logger (`virgl:` lines).
+
+What MoltenVK lacks, the Venus decoder makes up (patches 0007 and 0008):
+
+- `nullDescriptor`: the guest may leave a descriptor or vertex buffer
+  null. Each device gets, on first need, a 64 KiB buffer for reads, one
+  for writes, 1x1 images for sampling and storage, and views of them, all
+  cleared to zero once on the device's first queue; null handles in
+  descriptor writes, push descriptors and vertex buffer binds point there.
+- `VK_EXT_depth_clip_enable`: depth clip off becomes depth clamp.
+- Sync fd import into semaphores: `vkImportSemaphoreResourceMESA` (the
+  guest waited for the fd, mark the semaphore signaled) becomes an empty
+  submission that signals it, `vkWaitSemaphoreResourceMESA` one that waits
+  on it. The guest's Venus needs this for `VK_KHR_swapchain` and
+  `synchronization2`.
+- Images and buffers the guest may export as dma-bufs only see host
+  visible memory types: their memory is shm imported as host memory, which
+  device local memory can't be. A guest that picks device local anyway
+  gets host visible memory under it (it never maps it).
+- For Zink only (its instance says "mesa zink"): transform feedback taken
+  and dropped (queries of it are occlusion pools never started, results
+  zero), and packed 10-bit vertex formats and RGB32 texel buffers mapped
+  to the nearest Metal has. These are what lift Zink to OpenGL 4.4.
+
+A Vulkan window reaches the screen through the guest's compositor, which
+imports the frame's dma-buf with OpenGL (virgl, `PIPE_RESOURCE_SET_TYPE`).
+On macOS's OpenGL (no EGL, no memory objects) vrend makes a texture of its
+own, maps the Venus blob's shm read only (layout checked against its size)
+and copies it in with `glTexSubImage2D` the first time each command stream
+samples, blits or copies from it. ANGLE takes UTM's path instead (a Metal
+texture on the same memory, no copy). When a guest context goes away,
+commands still waiting on its fences go back to the guest: virglrenderer
+drops those fences.
