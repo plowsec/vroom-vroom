@@ -64,8 +64,8 @@ of its own (apps); video decoding, when on, gets one too. Details in
 - Import from VMware Fusion (ARM64 VMs)
 - USB devices from the host, connected from the VM window while it runs (needs libusb; devices macOS uses go through the root helper)
 - Drag and drop files from the Mac into the guest
-- USB devices from the host (those macOS has no driver for; needs libusb)
 - Drag and drop files between the Mac and the guest, both ways
+- Up to 4 guest monitors, a window each, full screen on several Mac screens
 - The Mac's camera as a webcam in the guest, if you turn it on
 - Fast disk and network I/O, measured against QEMU ([numbers](docs/PERFORMANCE.md))
 

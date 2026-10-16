@@ -1,6 +1,6 @@
 //! Framed messages: type u8 | len u32 LE | payload.
 
-use crate::{Error, Result};
+use crate::{Error, Result, MAX_HEADS};
 pub use vroom_proto::{GuestWindow, WindowOp};
 
 /// Absolute pointer range (like a USB tablet).
@@ -115,6 +115,12 @@ pub enum ToViewer {
     WindowIcon { id: u32, w: u32, h: u32, rgba: Vec<u8> },
     /// Coherence can't work in the guest's session, and why.
     CoherenceNo(String),
+    /// Another guest monitor's mode (`head` 1..MAX_HEADS; head 0 is
+    /// `Mode`). 0x0: the guest turned it off. Its pixels are in slot
+    /// `head` of the framebuffer.
+    HeadMode { head: u32, width: u32, height: u32 },
+    /// Pixels changed on another monitor.
+    HeadDamage { head: u32, x: u32, y: u32, w: u32, h: u32 },
 }
 
 /// What the guest's pointer looks like.
@@ -189,6 +195,11 @@ pub enum ToVmm {
     DragOutGet { id: u32, item: u32 },
     /// Start the guest app with this name (`vroom_proto::line_ok`).
     StartApp(String),
+    /// Another monitor's window changed size (as `Resize`, for monitor
+    /// `head` 1..MAX_HEADS). 0x0: its window is closed, unplug it.
+    HeadResize { head: u32, width: u32, height: u32, scale: u32 },
+    /// Absolute pointer on another monitor's window, 0..=POINTER_MAX.
+    HeadPointer { head: u32, x: u16, y: u16 },
 }
 
 fn frame(ty: u8, payload: &[u8]) -> Vec<u8> {
@@ -206,6 +217,15 @@ fn u32s(v: &[u32]) -> Vec<u8> {
 fn get_u32(p: &[u8], i: usize) -> Result<u32> {
     let b = p.get(i * 4..i * 4 + 4).ok_or(Error::Proto("short"))?;
     Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// A monitor other than the first.
+fn head(h: u32) -> Result<u32> {
+    if (1..MAX_HEADS as u32).contains(&h) {
+        Ok(h)
+    } else {
+        Err(Error::Proto("monitor"))
+    }
 }
 
 /// id u32, then dir u8 | len u16 | name for each item.
@@ -291,11 +311,17 @@ impl ToViewer {
             ToViewer::DragOutItems { id, items } => frame(14, &items_payload(*id, items)),
             ToViewer::WindowIcon { id, w, h, rgba } => frame(18, &vroom_proto::encode_icon(*id, *w, *h, rgba)),
             ToViewer::CoherenceNo(s) => frame(19, s.as_bytes()),
+            ToViewer::HeadMode { head, width, height } => frame(16, &u32s(&[*head, *width, *height])),
+            ToViewer::HeadDamage { head, x, y, w, h } => frame(17, &u32s(&[*head, *x, *y, *w, *h])),
         }
     }
 
     fn decode(ty: u8, p: &[u8]) -> Result<Self> {
         Ok(match ty {
+            16 if p.len() == 12 => ToViewer::HeadMode { head: head(get_u32(p, 0)?)?, width: get_u32(p, 1)?, height: get_u32(p, 2)? },
+            17 if p.len() == 20 => {
+                ToViewer::HeadDamage { head: head(get_u32(p, 0)?)?, x: get_u32(p, 1)?, y: get_u32(p, 2)?, w: get_u32(p, 3)?, h: get_u32(p, 4)? }
+            }
             1 => ToViewer::Mode { width: get_u32(p, 0)?, height: get_u32(p, 1)? },
             2 => ToViewer::Damage { x: get_u32(p, 0)?, y: get_u32(p, 1)?, w: get_u32(p, 2)?, h: get_u32(p, 3)? },
             3 => ToViewer::ClipboardSet(text(p)?),
@@ -389,6 +415,8 @@ impl ToVmm {
             }
             ToVmm::DragOutGet { id, item } => frame(17, &u32s(&[*id, *item])),
             ToVmm::StartApp(s) => frame(20, s.as_bytes()),
+            ToVmm::HeadResize { head, width, height, scale } => frame(18, &u32s(&[*head, *width, *height, *scale])),
+            ToVmm::HeadPointer { head, x, y } => frame(19, &u32s(&[*head, *x as u32, *y as u32])),
         }
     }
 
@@ -445,6 +473,20 @@ impl ToVmm {
             16 if p.len() == 5 => ToVmm::DragOut { id: get_u32(p, 0)?, end: p[4] != 0 },
             17 if p.len() == 8 => ToVmm::DragOutGet { id: get_u32(p, 0)?, item: get_u32(p, 1)? },
             20 => ToVmm::StartApp(line(p)?),
+            18 if p.len() == 16 => {
+                let (width, height, scale) = (get_u32(p, 1)?, get_u32(p, 2)?, get_u32(p, 3)?);
+                if scale != 0 && !(SCALE_MIN..=SCALE_MAX).contains(&scale) {
+                    return Err(Error::Proto("scale"));
+                }
+                if (width == 0) != (height == 0) {
+                    return Err(Error::Proto("size"));
+                }
+                ToVmm::HeadResize { head: head(get_u32(p, 0)?)?, width, height, scale }
+            }
+            19 if p.len() == 12 => {
+                let (x, y) = (small(get_u32(p, 1)?)?, small(get_u32(p, 2)?)?);
+                ToVmm::HeadPointer { head: head(get_u32(p, 0)?)?, x: x.min(POINTER_MAX), y: y.min(POINTER_MAX) }
+            }
             _ => return Err(Error::Proto("unknown vmm message")),
         })
     }
@@ -523,6 +565,9 @@ mod tests {
             ToVmm::DragOut { id: 5, end: true },
             ToVmm::DragOutGet { id: 5, item: 2 },
             ToVmm::StartApp("Paint".into()),
+            ToVmm::HeadResize { head: 1, width: 1920, height: 1080, scale: 200 },
+            ToVmm::HeadResize { head: 3, width: 0, height: 0, scale: 0 },
+            ToVmm::HeadPointer { head: 2, x: 5, y: 32767 },
         ];
         let mut d = Decoder::default();
         for m in &vm {
@@ -554,6 +599,9 @@ mod tests {
             ToViewer::WindowIcon { id: 1, w: 1, h: 1, rgba: vec![1, 2, 3, 4] },
             ToViewer::WindowIcon { id: 1, w: 0, h: 0, rgba: Vec::new() },
             ToViewer::CoherenceNo("a Wayland session".into()),
+            ToViewer::HeadMode { head: 1, width: 1024, height: 768 },
+            ToViewer::HeadMode { head: 3, width: 0, height: 0 },
+            ToViewer::HeadDamage { head: 2, x: 1, y: 2, w: 3, h: 4 },
         ];
         for m in &v {
             d.push(&m.encode());
@@ -592,6 +640,19 @@ mod tests {
         assert!(d.next_to_viewer().is_err());
         d.push(&img(2, 2, 1, 16));
         assert!(matches!(d.next_to_viewer().unwrap(), Some(ToViewer::Cursor(GuestCursor::Image { w: 2, h: 2, .. }))));
+        // Monitors: 1..MAX_HEADS only, sizes both or neither.
+        for h in [0, MAX_HEADS as u32, u32::MAX] {
+            d.push(&ToViewer::HeadMode { head: h, width: 1, height: 1 }.encode());
+            assert!(d.next_to_viewer().is_err(), "{h}");
+            d.push(&ToVmm::HeadPointer { head: h, x: 0, y: 0 }.encode());
+            assert!(d.next_to_vmm().is_err(), "{h}");
+        }
+        d.push(&ToVmm::HeadResize { head: 1, width: 0, height: 5, scale: 0 }.encode());
+        assert!(d.next_to_vmm().is_err());
+        d.push(&ToVmm::HeadResize { head: 1, width: 5, height: 5, scale: 7 }.encode());
+        assert!(d.next_to_vmm().is_err());
+        d.push(&frame(19, &u32s(&[1, 1 << 16, 0])));
+        assert!(d.next_to_vmm().is_err(), "pointer out of range");
     }
 
     #[test]

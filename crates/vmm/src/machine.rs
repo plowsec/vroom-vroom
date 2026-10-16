@@ -160,10 +160,11 @@ pub(crate) struct Machine {
     pub devices: Vec<StatefulDevice>,
     pub uart: Arc<Mutex<Pl011>>,
     pub agent: Agent,
-    /// The virtio-gpu's control handle (window size, Direct3D state).
-    pub gpu: Option<GpuControl>,
+    /// Each virtio-gpu's control handle (window size, Direct3D state).
+    pub gpus: Vec<GpuControl>,
     pub viewer: Option<ViewerTx>,
-    pub screen: Option<Arc<FbSink>>,
+    /// Every monitor, the first (with the firmware screen) first.
+    pub screens: Vec<Arc<FbSink>>,
     pub boot: BootImage,
 }
 
@@ -272,6 +273,10 @@ fn viewer_socket(state_dir: &std::path::Path) -> std::io::Result<std::os::unix::
 
 /// Host-visible window size for GPU buffers (address space, not memory).
 const GPU_SHM_SIZE: u64 = 8 << 30;
+/// Windows' extra GPUs: the most its 2D driver's framebuffer takes
+/// (16 MiB, `agent::WINDOWS_MAX_PIXELS`), with room. Only what the guest
+/// writes is ever memory.
+const EXTRA_GPU_VRAM: u64 = 32 << 20;
 
 /// Whether the renderer runs in the VMM (`VROOM_GPU_IN_PROCESS=1`, for
 /// debugging, and off macOS) rather than in a GPU process of its own.
@@ -664,24 +669,48 @@ pub(crate) fn build(
 
     // Display. UEFI always gets ramfb (firmware / installer screen);
     // virtio-gpu takes over once a guest driver drives it.
+    // Several monitors: Linux gets one GPU with a scanout each; Windows
+    // a GPU each (its drivers drive one scanout; the others 2D), added
+    // last so the other devices keep their PCI slots.
     let uefi = matches!(config.boot, Boot::Uefi { .. });
-    let screen = if config.display.gpu != Gpu::None || uefi {
-        Some(match &ui {
-            Some(ds) => ds.sink()?,
-            None => FbSink::headless()?,
-        })
-    } else {
-        None
-    };
-    let mut gpu_ctl = None;
-    if let (Some(fb), true) = (&screen, config.display.gpu != Gpu::None) {
-        let sink: Arc<dyn DisplaySink> = fb.clone();
-        let (mut gpu, ctl) = GpuDev::new(config.display.width, config.display.height, sink);
-        if config.display.gpu == Gpu::Virtio3d {
-            gpu = gpu.with_3d(three_d(&vm, config, &mem, &env.state_dir)?);
+    let monitors = if config.display.gpu == Gpu::None { 1 } else { config.display.monitors.clamp(1, vroom_config::MAX_MONITORS) as usize };
+    let screens: Vec<Arc<FbSink>> = if config.display.gpu != Gpu::None || uefi {
+        match &ui {
+            Some(ds) => ds.sinks(monitors)?,
+            None => FbSink::headless(monitors)?,
         }
-        board.add_virtio(Box::new(gpu))?;
-        gpu_ctl = Some(ctl);
+    } else {
+        Vec::new()
+    };
+    let screen = screens.first().cloned();
+    let mut gpus = Vec::new();
+    let mut heads: Vec<(GpuControl, usize)> = Vec::new();
+    let mut later_gpus = Vec::new();
+    if config.display.gpu != Gpu::None {
+        let size = (config.display.width, config.display.height);
+        let sinks: Vec<Arc<dyn DisplaySink>> = screens.iter().map(|s| s.clone() as Arc<dyn DisplaySink>).collect();
+        let per_gpu = if config.guest_os() == GuestOs::Windows { 1 } else { sinks.len() };
+        for (n, group) in sinks.chunks(per_gpu).enumerate() {
+            let (gpu, ctl) = GpuDev::with_heads(&vec![size; group.len()], group.to_vec());
+            let mut gpu = gpu.with_index(n as u16);
+            // Windows' extra GPUs stay 2D: Direct3D can't share frames
+            // between two 3D GPUs (cross-adapter surfaces), so Windows
+            // draws on the first and copies to the others.
+            if config.display.gpu == Gpu::Virtio3d && n == 0 {
+                gpu = gpu.with_3d(three_d(&vm, config, &mem, &env.state_dir)?);
+            }
+            if n > 0 {
+                // Room for the framebuffer Windows' 2D driver clears.
+                gpu = gpu.with_vram(Arc::new(VmShm { vm: vm.clone(), filler: Mutex::new(None) }), EXTRA_GPU_VRAM);
+            }
+            heads.extend((0..group.len()).map(|sid| (ctl.clone(), sid)));
+            gpus.push(ctl);
+            if n == 0 {
+                board.add_virtio(Box::new(gpu))?;
+            } else {
+                later_gpus.push(gpu);
+            }
+        }
     }
     // Hardware video decoding: a V4L2 decoder whose work happens in the
     // video helper (VideoToolbox, sandboxed on its own).
@@ -755,7 +784,7 @@ pub(crate) fn build(
     };
     let max_pixels = if config.guest_os() == GuestOs::Windows { agent::WINDOWS_MAX_PIXELS } else { 0 };
     let viewer = ui.as_ref().map(|d| d.tx());
-    let screen_ctl = agent::Screen { gpu: gpu_ctl.clone(), max_pixels, gpu3d: config.display.gpu == Gpu::Virtio3d, viewer: viewer.clone() };
+    let screen_ctl = agent::Screen { heads, max_pixels, gpu3d: config.display.gpu == Gpu::Virtio3d, viewer: viewer.clone() };
     let agent = agent::spawn(host_end, config.clipboard.clone(), clipboard, screen_ctl)?;
     if let Some(ds) = ui {
         if screen.is_none() {
@@ -778,15 +807,15 @@ pub(crate) fn build(
             }) as Box<dyn Fn(bool) + Send + Sync>
         });
         // A viewer can come back (the app crashed, then started again).
-        let listener = match (viewer_socket(&env.state_dir), &screen) {
-            (Ok(l), Some(fb)) => Some((l, fb.clone())),
-            (Err(e), _) => {
+        let listener = match viewer_socket(&env.state_dir) {
+            Ok(l) => Some(l),
+            Err(e) => {
                 log::warn!("display: no viewer socket in the state dir ({e}): a window lost can't be reopened");
                 None
             }
-            _ => None,
         };
-        ds.run(input, agent.clone(), events.clone(), window, listener, usb_ports)?;
+        let windows = config.guest_os() == GuestOs::Windows;
+        ds.run(input, agent.clone(), events.clone(), window, listener, screens.clone(), windows, usb_ports)?;
     }
     for (i, n) in config.nets.iter().enumerate() {
         let mac = match &n.mac {
@@ -795,6 +824,9 @@ pub(crate) fn build(
         };
         let (backend, mac) = net_backend(&config.name, ident, i, n, mac)?;
         board.add_virtio(Box::new(Net::new(&format!("eth{i}"), mac, backend)))?;
+    }
+    for gpu in later_gpus {
+        board.add_virtio(Box::new(gpu))?;
     }
     let need_pci = board.finish_pci(vendor_ids(&ident.pci_bridge_id)?)?;
     let Board { mut reg, fdt: mut fdt_devices, .. } = board;
@@ -899,7 +931,7 @@ pub(crate) fn build(
     let _ = shared.peers.set(vcpus.iter().map(|v| v.peer.clone()).collect());
     vm.finalize()?;
 
-    Ok(Machine { vm, mem, shared, vcpus, devices: reg.stateful, uart, agent, gpu: gpu_ctl, viewer, screen, boot })
+    Ok(Machine { vm, mem, shared, vcpus, devices: reg.stateful, uart, agent, gpus, viewer, screens, boot })
 }
 
 #[cfg(test)]

@@ -38,6 +38,9 @@ pub mod features {
     pub const DRAG_OUT: u64 = 256;
     /// The agent can start an app by name for the host (`StartApp`).
     pub const START_APP: u64 = 1024;
+    /// The agent arranges several monitors (`SetLayout`), and on Windows
+    /// moves the pointer over all of them (`Mouse`).
+    pub const MONITORS: u64 = 512;
 }
 
 /// Most windows one `Windows` list may carry, and the longest title (bytes).
@@ -89,6 +92,19 @@ pub enum WindowOp {
     Close,
     /// Put what can be seen of it here (guest screen pixels).
     Move { x: i32, y: i32, w: u32, h: u32 },
+}
+
+/// Most monitors a layout may hold.
+pub const LAYOUT_MAX: usize = 16;
+
+/// One monitor of a layout, in guest pixels on the guest's desktop. The
+/// first is the main one, at 0,0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Monitor {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
 }
 
 /// Longest relative path a drop may carry, and longest name in it.
@@ -144,6 +160,15 @@ pub enum Message {
     /// Guest -> host: the files are written. `place`: where they went
     /// when there was no live drag ("Desktop"), or why it failed.
     DropDone { id: u32, ok: bool, place: String },
+    /// Host -> guest: several monitors, each to this size and place; in
+    /// order (the host's first, second... GPU output); `None`: that one is
+    /// off. Sent instead of SetResolution when there is more than one.
+    SetLayout { monitors: Vec<Option<Monitor>> },
+    /// Host -> guest (Windows, several monitors): the pointer at `x`, `y`
+    /// on the whole desktop (0..=65535 each way), these buttons down
+    /// (bit 0 left, 1 right, 2 middle), wheel clicks. Windows maps the
+    /// USB tablet to its main monitor only.
+    Mouse { x: u16, y: u16, buttons: u8, wheel: i8 },
     /// Host -> guest: Coherence on (report windows, hide the taskbar and
     /// give windows the whole screen) or off (put it all back).
     Coherence { on: bool },
@@ -434,6 +459,8 @@ const T_DROP_ENTRY: u8 = 13;
 const T_DROP_DATA: u8 = 14;
 const T_DROP_END: u8 = 15;
 const T_DROP_DONE: u8 = 16;
+const T_LAYOUT: u8 = 25;
+const T_MOUSE: u8 = 26;
 const T_COHERENCE: u8 = 17;
 const T_WINDOWS: u8 = 18;
 const T_WINDOW_DO: u8 = 19;
@@ -534,6 +561,25 @@ impl Message {
                 p.extend_from_slice(place.as_bytes());
                 (T_DROP_DONE, p)
             }
+            Message::SetLayout { monitors } => {
+                let mut p = Vec::with_capacity(monitors.len() * 17);
+                for m in monitors {
+                    let m2 = m.unwrap_or(Monitor { x: 0, y: 0, width: 0, height: 0 });
+                    p.push(m.is_some() as u8);
+                    p.extend_from_slice(&m2.x.to_le_bytes());
+                    p.extend_from_slice(&m2.y.to_le_bytes());
+                    p.extend_from_slice(&m2.width.to_le_bytes());
+                    p.extend_from_slice(&m2.height.to_le_bytes());
+                }
+                (T_LAYOUT, p)
+            }
+            Message::Mouse { x, y, buttons, wheel } => {
+                let mut p = x.to_le_bytes().to_vec();
+                p.extend_from_slice(&y.to_le_bytes());
+                p.push(*buttons);
+                p.push(*wheel as u8);
+                (T_MOUSE, p)
+            }
             Message::Coherence { on } => (T_COHERENCE, vec![*on as u8]),
             Message::Windows(list) => (T_WINDOWS, encode_windows(list)),
             Message::WindowDo { id, op } => {
@@ -626,6 +672,22 @@ impl Message {
             T_DROP_DATA if p.len() >= 4 && p.len() - 4 <= DROP_CHUNK => Message::DropData { id: u32_at(0)?, data: p[4..].to_vec() },
             T_DROP_END if p.len() == 4 => Message::DropEnd { id: u32_at(0)? },
             T_DROP_DONE if p.len() >= 5 => Message::DropDone { id: u32_at(0)?, ok: p[4] != 0, place: text(&p[5..])?.chars().take(256).collect() },
+            T_LAYOUT if !p.is_empty() && p.len().is_multiple_of(17) && p.len() / 17 <= LAYOUT_MAX => {
+                let mut monitors = Vec::new();
+                for o in (0..p.len()).step_by(17) {
+                    let (on, x, y, w, h) = (p[o], u32_at(o + 1)? as i32, u32_at(o + 5)? as i32, u32_at(o + 9)?, u32_at(o + 13)?);
+                    let fits = |v: i32| (-65536..=65536).contains(&v);
+                    monitors.push(match on {
+                        0 => None,
+                        1 if w > 0 && h > 0 && w <= 16384 && h <= 16384 && fits(x) && fits(y) => Some(Monitor { x, y, width: w, height: h }),
+                        _ => return Err(Error::Malformed),
+                    });
+                }
+                Message::SetLayout { monitors }
+            }
+            T_MOUSE if p.len() == 6 && p[4] < 8 => {
+                Message::Mouse { x: u16::from_le_bytes([p[0], p[1]]), y: u16::from_le_bytes([p[2], p[3]]), buttons: p[4], wheel: p[5] as i8 }
+            }
             T_COHERENCE if p.len() == 1 => Message::Coherence { on: p[0] != 0 },
             T_WINDOWS => Message::Windows(decode_windows(p).ok_or(Error::Malformed)?),
             T_WINDOW_DO if p.len() > 4 => Message::WindowDo { id: u32_at(0)?, op: WindowOp::decode(&p[4..]).ok_or(Error::Malformed)? },
@@ -650,7 +712,7 @@ impl Message {
                 }
             }
             T_TIME | T_RES | T_SCALE | T_SHUTDOWN | T_PING | T_PONG | T_GPU3D | T_DRAG_READY | T_DRAG_CANCEL | T_DROP_ENTRY | T_DROP_DATA
-            | T_DROP_END | T_DROP_DONE | T_COHERENCE | T_WINDOW_DO | T_DRAG_OUT_QUERY | T_DRAG_OUT_GET | T_DRAG_OUT_END | T_DRAG_OUT_FAIL => {
+            | T_DROP_END | T_DROP_DONE | T_COHERENCE | T_WINDOW_DO | T_DRAG_OUT_QUERY | T_DRAG_OUT_GET | T_DRAG_OUT_END | T_DRAG_OUT_FAIL | T_LAYOUT | T_MOUSE => {
                 return Err(Error::Malformed)
             }
             t => return Err(Error::Type(t)),
@@ -739,6 +801,10 @@ mod tests {
             Message::DropData { id: 3, data: Vec::new() },
             Message::DropEnd { id: 3 },
             Message::DropDone { id: 3, ok: true, place: "Desktop".into() },
+            Message::SetLayout {
+                monitors: vec![Some(Monitor { x: 0, y: 0, width: 1280, height: 800 }), None, Some(Monitor { x: 1280, y: -5, width: 640, height: 480 })],
+            },
+            Message::Mouse { x: 65535, y: 3, buttons: 5, wheel: -2 },
             Message::Coherence { on: true },
             Message::Windows(Vec::new()),
             Message::Windows(vec![
@@ -760,6 +826,24 @@ mod tests {
             Message::StartApp("Notepad".into()),
             Message::CoherenceNo("a Wayland session".into()),
         ]
+    }
+
+    #[test]
+    fn layouts_are_checked() {
+        let bad = |m: Monitor| {
+            let mut d = Decoder::new(1024);
+            d.push(&Message::SetLayout { monitors: vec![Some(m)] }.encode());
+            d.next()
+        };
+        assert_eq!(bad(Monitor { x: 0, y: 0, width: 0, height: 5 }), Err(Error::Malformed));
+        assert_eq!(bad(Monitor { x: 0, y: 0, width: 16385, height: 5 }), Err(Error::Malformed));
+        assert_eq!(bad(Monitor { x: i32::MIN, y: 0, width: 5, height: 5 }), Err(Error::Malformed));
+        let mut d = Decoder::new(1024);
+        d.push(&Message::SetLayout { monitors: vec![None; LAYOUT_MAX + 1] }.encode());
+        assert_eq!(d.next(), Err(Error::Malformed));
+        let mut d = Decoder::new(1024);
+        d.push(&Message::SetLayout { monitors: vec![] }.encode());
+        assert_eq!(d.next(), Err(Error::Malformed));
     }
 
     #[test]

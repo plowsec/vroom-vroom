@@ -84,6 +84,11 @@ pub fn single_display() {
     if unsafe { GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut paths, &mut modes) } != 0 || paths <= 1 {
         return;
     }
+    // Several monitors of ours: the host's layout (SetLayout) says which
+    // are on, and takes the basic display off.
+    if crate::layout::our_displays() > 1 {
+        return;
+    }
     // SAFETY: no arrays: apply a stock topology.
     let r = unsafe { SetDisplayConfig(0, std::ptr::null(), 0, std::ptr::null(), SDC_APPLY | SDC_TOPOLOGY_INTERNAL) };
     log::info!("{paths} active displays; internal-only topology: {r}");
@@ -151,9 +156,14 @@ pub fn gpu3d(on: bool) -> Option<bool> {
                 log::warn!("3D display device: {}", std::io::Error::last_os_error());
             }
         }
-        result = Some(is_on());
-        log::info!("3D display device {}", if result == Some(true) { "on" } else { "off" });
-        break;
+        // Several (a GPU per monitor): it's done when every one is.
+        let now = is_on();
+        log::info!("3D display device {i} {}", if now { "on" } else { "off" });
+        result = Some(match result {
+            None => now,
+            Some(r) if on => r && now,
+            Some(r) => r || now,
+        });
     }
     // SAFETY: the list from above, not used after this.
     unsafe { SetupDiDestroyDeviceInfoList(set) };
@@ -164,3 +174,102 @@ pub fn gpu3d(on: bool) -> Option<bool> {
 pub fn gpu3d(_on: bool) -> Option<bool> {
     None
 }
+
+/// Windows: a monitor after the first comes on a GPU of its own, always
+/// a plain 2D one (Direct3D can't share frames between two 3D GPUs).
+/// Both virtio GPU drivers match every virtio GPU, and Windows picks one
+/// by its own ranking: the 3D one fails to start on a 2D GPU, and
+/// installing the 2D one on a GPU can make Windows move the first GPU to
+/// it too. So put the 2D driver (viogpudo, "DOD") on the extra GPUs and,
+/// with `first_3d` (the host has 3D), the 3D one on the first, when they
+/// are in the driver store, as choosing one in Device Manager does.
+/// Nothing happens for a GPU that has the right one already.
+#[cfg(windows)]
+pub fn gpu_drivers(first_3d: bool) {
+    use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
+        SetupDiBuildDriverInfoList, SetupDiCallClassInstaller, SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo, SetupDiEnumDriverInfoW,
+        SetupDiGetClassDevsW, SetupDiGetDeviceRegistryPropertyW, SetupDiSetSelectedDriverW, DIGCF_PRESENT, GUID_DEVCLASS_DISPLAY,
+        CM_Get_DevNode_Status, CR_SUCCESS, DIF_INSTALLDEVICE, SPDIT_COMPATDRIVER, SPDRP_DEVICEDESC, SPDRP_HARDWAREID, SP_DEVINFO_DATA, SP_DRVINFO_DATA_V2_W,
+    };
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    let text = |w: &[u16]| String::from_utf16_lossy(&w[..w.iter().position(|&c| c == 0).unwrap_or(w.len())]);
+    // SAFETY: a valid class GUID; the list is destroyed below.
+    let set = unsafe { SetupDiGetClassDevsW(&GUID_DEVCLASS_DISPLAY, std::ptr::null(), std::ptr::null_mut(), DIGCF_PRESENT) };
+    if set as isize == INVALID_HANDLE_VALUE as isize {
+        return;
+    }
+    for i in 0.. {
+        // SAFETY: plain data; all zeroes is valid once cbSize is set.
+        let mut d: SP_DEVINFO_DATA = unsafe { std::mem::zeroed() };
+        d.cbSize = std::mem::size_of::<SP_DEVINFO_DATA>() as u32;
+        // SAFETY: valid list and out pointer.
+        if unsafe { SetupDiEnumDeviceInfo(set, i, &mut d) } == 0 {
+            break;
+        }
+        let prop = |p| {
+            let mut buf = [0u16; 512];
+            let mut ty = 0u32;
+            // SAFETY: the buffer is valid for its size in bytes.
+            let ok = unsafe { SetupDiGetDeviceRegistryPropertyW(set, &d, p, &mut ty, buf.as_mut_ptr() as *mut u8, (buf.len() * 2) as u32, std::ptr::null_mut()) };
+            // A multi-string: its first is enough.
+            if ok != 0 { text(&buf) } else { String::new() }
+        };
+        let hwid = prop(SPDRP_HARDWAREID);
+        // The 3D driver on a GPU without 3D (the VM was set to 2D) fails
+        // to start: Windows would get its basic display (800x600).
+        let failed = || {
+            let (mut status, mut problem) = (0u32, 0u32);
+            // SAFETY: valid out pointers and a devnode from the list.
+            unsafe { CM_Get_DevNode_Status(&mut status, &mut problem, d.DevInst, 0) == CR_SUCCESS && problem != 0 }
+        };
+        let want = match crate::layout::gpu_head(&hwid) {
+            Some(0) if first_3d => "VirtIO GPU 3D",
+            Some(0) if prop(SPDRP_DEVICEDESC).contains("VirtIO GPU 3D") && failed() => "VirtIO GPU DOD",
+            Some(h) if h > 0 => "VirtIO GPU DOD",
+            _ => continue,
+        };
+        if prop(SPDRP_DEVICEDESC).contains(want) {
+            continue;
+        }
+        // SAFETY: valid list and device.
+        if unsafe { SetupDiBuildDriverInfoList(set, &mut d, SPDIT_COMPATDRIVER) } == 0 {
+            continue;
+        }
+        let mut chosen = None;
+        for j in 0.. {
+            // SAFETY: plain data; all zeroes is valid once cbSize is set.
+            let mut drv: SP_DRVINFO_DATA_V2_W = unsafe { std::mem::zeroed() };
+            drv.cbSize = std::mem::size_of::<SP_DRVINFO_DATA_V2_W>() as u32;
+            // SAFETY: valid list, device, out pointer.
+            if unsafe { SetupDiEnumDriverInfoW(set, &d, SPDIT_COMPATDRIVER, j, &mut drv) } == 0 {
+                break;
+            }
+            let desc = text(&{ drv.Description });
+            if desc.contains(want) {
+                // The newest such driver.
+                if chosen.as_ref().is_none_or(|c: &SP_DRVINFO_DATA_V2_W| { drv.DriverVersion } > { c.DriverVersion }) {
+                    chosen = Some(drv);
+                }
+            }
+        }
+        let Some(mut drv) = chosen else {
+            log::warn!("GPU {hwid}: no \"{want}\" driver in the driver store (2D: viogpudo from virtio-win, 3D: viogpu3d)");
+            continue;
+        };
+        // This device only: DiInstallDevice would put the driver on every
+        // GPU it matches as well (Windows' "secondary devices").
+        // SAFETY: valid list, device and a driver from its list.
+        let ok = unsafe { SetupDiSetSelectedDriverW(set, &mut d, &mut drv) != 0 && SetupDiCallClassInstaller(DIF_INSTALLDEVICE, set, &d) != 0 };
+        if ok {
+            log::info!("GPU {hwid}: \"{want}\" driver installed");
+        } else {
+            log::warn!("GPU {hwid}: \"{want}\" driver: {}", std::io::Error::last_os_error());
+        }
+    }
+    // SAFETY: the list from above, not used after this.
+    unsafe { SetupDiDestroyDeviceInfoList(set) };
+}
+
+#[cfg(not(windows))]
+#[allow(dead_code)]
+pub fn gpu_drivers(_first_3d: bool) {}

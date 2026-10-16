@@ -51,6 +51,8 @@ component VmBar inherits HorizontalLayout {
     in property <string> cpu-text;
     // "3D", "Direct3D 11"; empty without 3D.
     in property <string> gpu-text;
+    // The guest has more than one monitor (a window each).
+    in property <bool> monitors;
     // Spans the window: the indicators go to the right.
     in property <bool> wide;
     // The VM has a USB controller to plug host devices into; how many are.
@@ -209,6 +211,12 @@ component VmBar inherits HorizontalLayout {
     BarRule {
         y: (parent.height - self.height) / 2;
     }
+    if root.monitors: BarButton {
+        icon: Icons.display;
+        tip: "Show all displays";
+        y: (parent.height - self.height) / 2;
+        clicked => { root.act("displays"); }
+    }
     if root.usb-shown: Rectangle {
         width: 30px;
         height: 30px;
@@ -340,6 +348,7 @@ export component ConsoleWindow inherits Window {
     in property <string> suspend-error;
     in property <string> cpu-text;
     in property <string> gpu-text;
+    in property <bool> monitors;
     // Why Coherence can't start now (empty: it can).
     in property <string> coherence-why: "Coherence needs the guest tools";
     // Height of the bar above the guest screen (none in full screen).
@@ -605,6 +614,7 @@ export component ConsoleWindow inherits Window {
             camera-on: root.camera-on;
             cpu-text: root.cpu-text;
             gpu-text: root.gpu-text;
+            monitors: root.monitors;
             coherence-why: root.coherence-why;
             wide: true;
             usb-shown: root.usb-shown;
@@ -645,6 +655,7 @@ export component ConsoleWindow inherits Window {
             fullscreen: root.fullscreen;
             mic-on: root.mic-on;
             camera-on: root.camera-on;
+            monitors: root.monitors;
             wide: false;
             usb-shown: root.usb-shown;
             usb-count: root.usb-count;
@@ -870,6 +881,78 @@ export component ConsoleWindow inherits Window {
             color: #ffffff;
             font-size: Theme.fs-md;
             overflow: elide;
+        }
+    }
+}
+
+
+// Another guest monitor: its screen only. The VM's bar is on the first
+// monitor's window. Closing this one turns the monitor off in the guest
+// ("Show all displays" on the bar brings it back).
+export component MonitorWindow inherits Window {
+    in property <string> vm-name;
+    // 2, 3, 4.
+    in property <int> number;
+    in property <image> frame;
+    in property <int> mode-w;
+    in property <int> mode-h;
+    in property <bool> paused;
+    out property <length> screen-width: screen.width;
+    callback mouse-move(float, float);
+    callback button(int, bool);
+    callback wheel(length, length);
+    callback pointer-over(bool);
+
+    title: vm-name + " — display " + root.number;
+    icon: Icons.logo;
+    background: #000000;
+    preferred-width: 1024px;
+    preferred-height: 768px;
+    min-width: 320px;
+    min-height: 200px;
+
+    property <float> ar: mode-w > 0 && mode-h > 0 ? mode-w / mode-h : root.width / max(1px, root.height);
+
+    screen := Rectangle {
+        width: min(root.width, root.height * root.ar);
+        height: self.width / root.ar;
+        x: (root.width - self.width) / 2;
+        y: (root.height - self.height) / 2;
+        Image {
+            width: 100%;
+            height: 100%;
+            source: root.frame;
+            image-fit: fill;
+            image-rendering: smooth;
+        }
+        ta := TouchArea {
+            mouse-cursor: none;
+            changed has-hover => { root.pointer-over(self.has-hover); }
+            changed mouse-x => { root.mouse-move(self.mouse-x / self.width, self.mouse-y / self.height); }
+            changed mouse-y => { root.mouse-move(self.mouse-x / self.width, self.mouse-y / self.height); }
+            pointer-event(ev) => {
+                let code = ev.button == PointerEventButton.left ? 272 : ev.button == PointerEventButton.right ? 273 : ev.button == PointerEventButton.middle ? 274 : 0;
+                if code != 0 && ev.kind == PointerEventKind.down {
+                    root.button(code, true);
+                }
+                if code != 0 && ev.kind == PointerEventKind.up {
+                    root.button(code, false);
+                }
+            }
+            scroll-event(ev) => {
+                root.wheel(ev.delta-x, ev.delta-y);
+                accept
+            }
+        }
+    }
+
+    if root.mode-w == 0 || root.paused: Rectangle {
+        background: root.mode-w == 0 ? #000000 : #00000099;
+        Text {
+            text: root.mode-w == 0 ? "The guest isn't using display " + root.number + " yet" : "Paused";
+            color: #ffffffb0;
+            font-size: Theme.fs-lg;
+            font-weight: 600;
         }
     }
 }

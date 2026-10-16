@@ -655,6 +655,33 @@ guest has no way to reach it. To stop a VM that hangs, the app reads the
 pid the VMM wrote into its state lock and signals it only if that process
 is a `vroom` executable (the VMM can write that file).
 
+## Several monitors
+
+What changes with `[display] monitors`:
+
+- The shared framebuffer gets a slot per monitor (8K each, 4 at most);
+  every write and read is checked against its slot, so nothing written
+  for one monitor reaches another. The app maps what the file holds,
+  never more than 4 slots.
+- The viewer messages for the other monitors (mode, damage, window
+  size, pointer) name a monitor; numbers outside 1..3 are refused, sizes
+  come both or neither.
+- virtio-gpu takes up to 4 scanouts; every scanout id is checked, every
+  rect is clipped to its scanout's view, and a snapshot's scanouts are
+  checked like commands.
+- The guest agent gets the layout (sizes and places, bounded) and, on
+  Windows, the pointer on monitors the USB tablet doesn't reach. Both go
+  host to guest only; the agent's session helper injects that pointer
+  with SendInput, so it can't reach elevated windows or the secure
+  desktop (UAC), as with any app of the user.
+- Windows' extra GPUs carry 32 MiB of plain memory in BAR 0 (reserved,
+  only what the guest writes is ever memory): its 2D driver clears it
+  as a framebuffer. The device never reads it.
+- On Windows the agent's service picks a display driver per GPU from the
+  driver store (the 2D one on GPUs without 3D, the 3D one on the first
+  when the host has 3D), as Device Manager does. It only chooses between
+  drivers that are already installed.
+
 ## Guest agent (Windows)
 
 The VirtIO serial port only admits Administrators and SYSTEM, so the agent

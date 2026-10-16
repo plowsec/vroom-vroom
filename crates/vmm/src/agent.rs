@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use vroom_config::Clipboard as ClipPolicy;
-use vroom_proto::{features, Decoder, Message, WindowOp, SCALE_MAX, SCALE_MIN};
+use vroom_proto::{features, Decoder, Message, Monitor, WindowOp, SCALE_MAX, SCALE_MIN};
 use vroom_display::ToViewer;
 use vroom_virtio::devices::gpu::GpuControl;
 
@@ -36,11 +36,12 @@ pub enum AgentCmd {
     /// Copy the guest's latest clipboard to the host now.
     PullClipboard,
     SyncTime,
-    /// The window's size. `scale` 0: in guest pixels, the guest's UI
-    /// scale is left alone. Else (HiDPI) in physical pixels, with the
-    /// scale (percent) the guest's UI needs to look the same size; a
-    /// guest that can't scale gets the size divided by it instead.
-    Display { width: u32, height: u32, scale: u32 },
+    /// Monitor `head`'s window size. `scale` 0: in guest pixels, the
+    /// guest's UI scale is left alone. Else (HiDPI) in physical pixels,
+    /// with the scale (percent) the guest's UI needs to look the same
+    /// size; a guest that can't scale gets the size divided by it
+    /// instead. 0x0 (not the first monitor): its window is closed.
+    Display { head: usize, width: u32, height: u32, scale: u32 },
     Shutdown { reboot: bool },
     /// Turn the guest's 3D display device on or off (Windows, around a
     /// suspend: Direct3D state can't be saved).
@@ -63,6 +64,8 @@ pub enum AgentCmd {
     DragOutGet { id: u32, item: u32, to: std::os::fd::OwnedFd },
     /// Start a guest app by name (checked by the viewer protocol).
     StartApp(String),
+    /// The pointer on the whole desktop (see `Message::Mouse`).
+    Mouse { x: u16, y: u16, buttons: u8, wheel: i8 },
     Stop,
 }
 
@@ -99,6 +102,12 @@ impl Agent {
     pub fn status(&self) -> AgentStatus {
         self.status.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
+
+    /// The connected agent's features (0: none connected).
+    pub fn features(&self) -> u64 {
+        let s = self.status.lock().unwrap_or_else(|e| e.into_inner());
+        if s.connected { s.features } else { 0 }
+    }
 }
 
 struct Service {
@@ -117,8 +126,8 @@ struct Service {
     /// What we last saw on / wrote to the host clipboard (echo suppression).
     host_seen: Option<String>,
     screen: Screen,
-    /// The window's last size request, redone when an agent connects.
-    display: Option<(u32, u32, u32)>,
+    /// Each window's last size request, redone when an agent connects.
+    display: Vec<Option<(u32, u32, u32)>>,
     /// What the guest agent gets for it, sent once the GPU is ready (after
     /// a replug, see `GpuControl::replugs_done`), and the replug count it
     /// was last sent at.
@@ -151,11 +160,14 @@ struct Fetch {
     t0: Instant,
 }
 
-/// The monitor whose size the window drives. Resizes go through the agent
-/// service: whether the guest gets physical pixels depends on its agent.
+/// The monitors whose sizes the windows drive. Resizes go through the
+/// agent service: whether the guest gets physical pixels depends on its
+/// agent.
 #[derive(Debug, Clone, Default)]
 pub struct Screen {
-    pub gpu: Option<GpuControl>,
+    /// Each monitor's GPU and scanout on it, the first first. Linux
+    /// guests: one GPU, a scanout each. Windows: a GPU each.
+    pub heads: Vec<(GpuControl, usize)>,
     /// Largest mode (in pixels) the guest's driver takes; bigger windows
     /// get a smaller mode of the same shape. 0: no limit.
     pub max_pixels: u64,
@@ -193,8 +205,8 @@ pub fn spawn(stream: UnixStream, policy: ClipPolicy, clip: Option<Box<dyn Clipbo
         guest_clip: None,
         last_guest_update: None,
         host_seen: None,
+        display: vec![None; screen.heads.len().max(1)],
         screen,
-        display: None,
         mode: Vec::new(),
         mode_sent: None,
         coherence: false,
@@ -248,7 +260,8 @@ impl Service {
                     Err(TryRecvError::Empty) => break,
                 }
             }
-            if let Some(g) = &self.screen.gpu {
+            // Each GPU once (its first scanout).
+            for (g, _) in self.screen.heads.iter().filter(|h| h.1 == 0) {
                 g.tick();
             }
             self.send_mode();
@@ -330,25 +343,45 @@ impl Service {
     }
 
     fn apply_display(&mut self) {
-        let Some((w, h, scale)) = self.display else { return };
-        let (w, h, set_scale) = guest_display(w, h, scale, self.can_scale(), self.screen.max_pixels);
-        if let Some(g) = &self.screen.gpu {
-            g.resize(w, h);
+        let Some((w, h, scale)) = self.display[0] else { return };
+        let (can_scale, max) = (self.can_scale(), self.screen.max_pixels);
+        let (w, h, set_scale) = guest_display(w, h, scale, can_scale, max);
+        if let Some((g, sid)) = self.screen.heads.first() {
+            g.resize_head(*sid, w, h);
         }
-        self.mode = vec![Message::SetResolution { width: w, height: h }];
+        let mut sizes = vec![Some((w, h))];
+        for (i, (g, sid)) in self.screen.heads.iter().enumerate().skip(1) {
+            let size = match self.display.get(i).copied().flatten() {
+                Some((0, _, _)) => None,
+                Some((w, h, s)) => {
+                    let (w, h, _) = guest_display(w, h, s, can_scale, max);
+                    Some((w, h))
+                }
+                // No window yet: what the GPU offers.
+                None => g.head_size(*sid),
+            };
+            g.resize_head(*sid, size.map_or(0, |s| s.0), size.map_or(0, |s| s.1));
+            sizes.push(size);
+        }
+        self.mode = if sizes.len() > 1 && self.status().features & features::MONITORS != 0 {
+            vec![Message::SetLayout { monitors: layout(&sizes) }]
+        } else {
+            vec![Message::SetResolution { width: w, height: h }]
+        };
         self.mode.extend(set_scale.map(|p| Message::SetScale { percent: p }));
         self.mode_sent = None;
         self.send_mode();
     }
 
     fn send_mode(&mut self) {
-        let n = match &self.screen.gpu {
-            Some(g) => match g.replugs_done() {
-                Some(n) => n,
+        // Every GPU's replugs (each once), once none is in the middle of one.
+        let mut n = 0u32;
+        for (g, _) in self.screen.heads.iter().filter(|h| h.1 == 0) {
+            match g.replugs_done() {
+                Some(r) => n = n.wrapping_add(r),
                 None => return,
-            },
-            None => 0,
-        };
+            }
+        }
         if self.mode.is_empty() || self.mode_sent == Some(n) {
             return;
         }
@@ -423,11 +456,13 @@ impl Service {
                 }
             }
             AgentCmd::SyncTime => self.sync_time(),
-            AgentCmd::Display { width, height, scale } => {
-                if width == 0 || height == 0 || (scale != 0 && !(SCALE_MIN..=SCALE_MAX).contains(&scale)) {
+            AgentCmd::Display { head, width, height, scale } => {
+                let off = head > 0 && width == 0 && height == 0;
+                if (!off && (width == 0 || height == 0)) || (scale != 0 && !(SCALE_MIN..=SCALE_MAX).contains(&scale)) {
                     return;
                 }
-                self.display = Some((width, height, scale));
+                let Some(d) = self.display.get_mut(head) else { return };
+                *d = Some((width, height, scale));
                 self.apply_display();
             }
             AgentCmd::Shutdown { reboot } => self.send(&Message::Shutdown { reboot }),
@@ -471,6 +506,7 @@ impl Service {
                     self.send(&Message::StartApp(name));
                 }
             }
+            AgentCmd::Mouse { x, y, buttons, wheel } => self.send(&Message::Mouse { x, y, buttons, wheel }),
             AgentCmd::Drop { id, from } => {
                 let out = self.out.clone();
                 let r = std::thread::Builder::new().name("agent-drop".into()).spawn(move || forward_drop(id, from, &out));
@@ -626,6 +662,22 @@ fn forward_drop(id: u32, from: std::os::fd::OwnedFd, out: &Mutex<UnixStream>) {
     let _ = send(&Message::DragCancel { id });
 }
 
+/// Monitors side by side, top edges lined up, in order: what the display
+/// server maps the pointer for.
+fn layout(sizes: &[Option<(u32, u32)>]) -> Vec<Option<Monitor>> {
+    let mut x = 0i32;
+    sizes
+        .iter()
+        .map(|s| {
+            s.map(|(w, h)| {
+                let m = Monitor { x, y: 0, width: w, height: h };
+                x = x.saturating_add(w as i32);
+                m
+            })
+        })
+        .collect()
+}
+
 /// What the guest gets for a window of `w` x `h` at `scale`: its size,
 /// and the scale message for its agent, if any.
 fn guest_display(w: u32, h: u32, scale: u32, can_scale: bool, max_pixels: u64) -> (u32, u32, Option<u32>) {
@@ -704,8 +756,8 @@ mod tests {
         let (host, mut guest) = UnixStream::pair().unwrap();
         let a = spawn(host, ClipPolicy::default(), None, Screen::default()).unwrap();
         let mut d = Decoder::new(1 << 20);
-        a.send(AgentCmd::Display { width: 3456, height: 2234, scale: 200 });
-        a.send(AgentCmd::Display { width: 10, height: 10, scale: 7 }); // ignored
+        a.send(AgentCmd::Display { head: 0, width: 3456, height: 2234, scale: 200 });
+        a.send(AgentCmd::Display { head: 0, width: 10, height: 10, scale: 7 }); // ignored
         let m = read_msgs(&mut guest, &mut d);
         assert!(m.contains(&Message::SetResolution { width: 1728, height: 1117 }), "{m:?}");
         assert!(!m.iter().any(|m| matches!(m, Message::SetScale { .. })), "{m:?}");
@@ -715,6 +767,41 @@ mod tests {
         assert!(m.contains(&Message::SetResolution { width: 3456, height: 2234 }), "{m:?}");
         assert!(m.contains(&Message::SetScale { percent: 200 }), "{m:?}");
         a.send(AgentCmd::Stop);
+    }
+
+    #[test]
+    fn monitors_get_a_layout() {
+        assert_eq!(
+            layout(&[Some((1280, 800)), None, Some((800, 600))]),
+            vec![Some(Monitor { x: 0, y: 0, width: 1280, height: 800 }), None, Some(Monitor { x: 1280, y: 0, width: 800, height: 600 })]
+        );
+        let (gpu, ctl) = vroom_virtio::devices::gpu::Gpu::with_heads(&[(1024, 768), (1024, 768)], vec![Arc::new(NoSink), Arc::new(NoSink)]);
+        drop(gpu);
+        let screen = Screen { heads: vec![(ctl.clone(), 0), (ctl.clone(), 1)], ..Default::default() };
+        let (host, mut guest) = UnixStream::pair().unwrap();
+        let a = spawn(host, ClipPolicy::default(), None, screen).unwrap();
+        let mut d = Decoder::new(1 << 20);
+        guest.write_all(&Message::Hello { features: features::RESOLUTION | features::MONITORS, agent: "t".into() }.encode()).unwrap();
+        a.send(AgentCmd::Display { head: 0, width: 1280, height: 800, scale: 0 });
+        let m = read_msgs(&mut guest, &mut d);
+        let second = Some(Monitor { x: 1280, y: 0, width: 1024, height: 768 });
+        assert!(m.contains(&Message::SetLayout { monitors: vec![Some(Monitor { x: 0, y: 0, width: 1280, height: 800 }), second] }), "{m:?}");
+        // The second window closes: that monitor goes.
+        a.send(AgentCmd::Display { head: 1, width: 0, height: 0, scale: 0 });
+        let m = read_msgs(&mut guest, &mut d);
+        assert!(m.iter().any(|m| matches!(m, Message::SetLayout { monitors } if monitors[1].is_none())), "{m:?}");
+        assert_eq!(ctl.head_size(1), None);
+        a.send(AgentCmd::Display { head: 1, width: 640, height: 480, scale: 0 });
+        a.send(AgentCmd::Display { head: 5, width: 640, height: 480, scale: 0 }); // no such monitor
+        read_msgs(&mut guest, &mut d);
+        assert_eq!(ctl.head_size(1), Some((640, 480)));
+        a.send(AgentCmd::Stop);
+    }
+
+    struct NoSink;
+    impl vroom_virtio::devices::gpu::DisplaySink for NoSink {
+        fn set_mode(&self, _: u32, _: u32) {}
+        fn flush(&self, _: u32, _: u32, _: u32, _: u32, _: &[u8], _: usize) {}
     }
 
     #[test]

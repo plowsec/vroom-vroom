@@ -29,6 +29,7 @@ mod dragout;
 #[cfg(target_os = "linux")]
 mod dnd_x11;
 mod find;
+mod layout;
 mod port;
 // Used by the service mode (Windows, Linux); built everywhere so it's
 // tested everywhere.
@@ -282,7 +283,7 @@ enum In {
 fn hello() -> Message {
     let mut features = features::CLIPBOARD_TEXT | features::TIME_SYNC | features::SHUTDOWN | features::SCALE | features::FILE_DROP;
     if cfg!(any(windows, target_os = "linux")) {
-        features |= features::DRAG_OUT;
+        features |= features::DRAG_OUT | features::MONITORS;
     }
     if cfg!(windows) {
         features |= features::GPU3D;
@@ -326,7 +327,16 @@ fn handle(m: Message, system: bool, w: &mut dyn Write, clip: &mut dyn clip::Clip
                 log::debug!("resolution {width}x{height}: {e}");
             }
         }
+        Message::SetLayout { monitors } => {
+            if let Some(Some(m)) = monitors.first() {
+                scale::note_resolution(m.width, m.height);
+            }
+            if let Err(e) = layout::apply(&monitors) {
+                log::info!("monitors: {e}");
+            }
+        }
         Message::SetScale { percent } => scale::set(percent),
+        Message::Mouse { x, y, buttons, wheel } => layout::mouse(x, y, buttons, wheel),
         Message::Ping(v) => w.write_all(&Message::Pong(v).encode())?,
         // Windows' service handles it (relay); nothing to turn off here.
         Message::Gpu3d { .. } | Message::Pong(_) => {}

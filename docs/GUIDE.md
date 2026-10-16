@@ -379,6 +379,47 @@ administrator.
 Until the agent runs, Windows may show two monitors (firmware framebuffer
 and virtio-gpu). The window shows whichever one Windows last drew on.
 
+## Several monitors
+
+```toml
+[display]
+gpu = "virtio3d"     # or virtio2d
+monitors = 2         # up to 4
+```
+
+The app opens a window per guest monitor once the guest uses it. The
+first has the VM's bar; the others only the screen ("<VM> — display 2").
+Each can be resized on its own, and the guest follows with the agent.
+The guest's desktop has them side by side, top edges lined up, in order
+(the agent arranges that); the pointer goes where the mouse is.
+
+- Full screen (the bar's button, or Ctrl+Alt+Shift+F) also puts the
+  other monitors' windows full screen, one per Mac screen, while there
+  are screens ("use all displays"). With one Mac screen they stay
+  windows.
+- Closing a monitor's window turns that monitor off in the guest.
+  "Show all displays" on the bar brings it back.
+- The firmware and boot screens are on the first monitor only.
+- Linux (GNOME, X11 or Wayland) gets one GPU with several outputs
+  (`Virtual-1`, `Virtual-2`...). GNOME turns them on by itself; the agent
+  sets sizes and places (xrandr, or Mutter on Wayland). 3D works on all
+  of them.
+- Windows' virtio-gpu drivers drive one monitor each, so Windows gets one
+  GPU per monitor. Only the first does Direct3D: Direct3D can't share
+  frames between two GPUs, so Windows draws everything there and copies
+  the other monitors' pictures to their (2D) GPUs. Both drivers must be
+  installed (viogpudo from virtio-win, and viogpu3d for 3D): they match
+  the same devices, and the agent picks the right one for each GPU (as
+  you would in Device Manager). The first time, Windows may show its
+  basic display for a moment while it switches.
+- Windows maps the USB tablet to its main monitor only. On the other
+  monitors the agent moves the pointer (as SPICE's agent does), so
+  before logging in only the first monitor has a pointer.
+- One UI scale for all monitors: the first window's.
+- Coherence uses the first monitor only: while it is on, the others are
+  off in the guest (their windows hide, and the guest gathers its
+  windows on one screen); they come back when Coherence ends.
+
 ## Retina screens
 
 With `[display] hidpi = true` (the default; "Full resolution on Retina"
@@ -397,7 +438,7 @@ switched while the VM runs.
   restarted.
 - Windows' display driver (viogpudo) has a 16 MiB framebuffer: modes up
   to about 4 million pixels (2560x1600). A bigger window gets the largest
-  mode of the same shape that fits, scaled up a little.
+  mode of the same shape that fits, scaled up a little. (Per monitor.)
 - Turning `hidpi` off puts the guest's own scale back.
 
 ## 3D acceleration (Linux guests)
@@ -572,8 +613,10 @@ What works and what doesn't (Windows 11 24H2, M3 Max):
   windows stay where they were. At the login screen Windows uses its UI
   scale from before (100%), so with `hidpi` text there is small until you
   log in.
-- With the 3D driver installed, `gpu = "virtio2d"` gets Windows' basic
-  display driver (800x600, no resizing); install viogpudo again to use 2D.
+- With both drivers installed, the agent puts the 2D one (viogpudo) on a
+  GPU without 3D (`gpu = "virtio2d"`) and the 3D one back when 3D is on
+  again. Without the agent, or with only the 3D driver installed,
+  `virtio2d` gets Windows' basic display (800x600, no resizing).
 - No Direct3D 12, no Vulkan or OpenGL for Windows apps.
 - Suspend and snapshots work, a few seconds slower than without 3D.
   Direct3D's state lives on the Mac's GPU and can't be saved, so vroom

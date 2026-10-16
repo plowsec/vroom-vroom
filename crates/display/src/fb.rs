@@ -10,15 +10,20 @@ use crate::{Error, Result};
 /// reallocate.
 pub const MAX_WIDTH: u32 = 7680;
 pub const MAX_HEIGHT: u32 = 4320;
+/// Most guest monitors one buffer holds: one slot of the size above each,
+/// back to back.
+pub const MAX_HEADS: usize = 4;
 const BPP: usize = 4;
 
-/// A mapped framebuffer. Accesses are raw copies: the other process may
-/// write concurrently (tearing is fine, UB is not).
+/// A mapped framebuffer: one slot per guest monitor (head). Accesses are
+/// raw copies: the other process may write concurrently (tearing is fine,
+/// UB is not). Nothing written to one slot reaches another.
 #[derive(Debug)]
 pub struct SharedFb {
     fd: OwnedFd,
     ptr: *mut u8,
     len: usize,
+    heads: usize,
 }
 
 // SAFETY: plain shared memory; all access is via raw copies.
@@ -72,10 +77,18 @@ fn map(fd: &OwnedFd, len: usize) -> Result<*mut u8> {
 }
 
 impl SharedFb {
-    /// VMM side: create and map.
+    /// VMM side: create and map, one monitor.
     pub fn create() -> Result<Self> {
+        Self::create_heads(1)
+    }
+
+    /// VMM side: create and map, `heads` monitors (1..=MAX_HEADS).
+    pub fn create_heads(heads: usize) -> Result<Self> {
+        if !(1..=MAX_HEADS).contains(&heads) {
+            return Err(Error::Proto("monitors"));
+        }
         let fd = anon_shm()?;
-        let len = max_len();
+        let len = max_len() * heads;
         // SAFETY: valid fd.
         if unsafe { libc::ftruncate(fd.as_raw_fd(), len as libc::off_t) } != 0 {
             return Err(Error::Io(std::io::Error::last_os_error()));
@@ -86,7 +99,7 @@ impl SharedFb {
             libc::fcntl(fd.as_raw_fd(), libc::F_ADD_SEALS, libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL);
         }
         let ptr = map(&fd, len)?;
-        Ok(SharedFb { fd, ptr, len })
+        Ok(SharedFb { fd, ptr, len, heads })
     }
 
     /// Viewer side: map an fd received from the VMM.
@@ -97,10 +110,12 @@ impl SharedFb {
         if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
             return Err(Error::Io(std::io::Error::last_os_error()));
         }
-        let len = max_len();
-        if (st.st_size as u64) < len as u64 {
+        // As many whole slots as it holds, at most MAX_HEADS.
+        let heads = ((st.st_size.max(0) as u64) / max_len() as u64).min(MAX_HEADS as u64) as usize;
+        if heads == 0 {
             return Err(Error::Proto("framebuffer too small"));
         }
+        let len = max_len() * heads;
         // A VMM that shrinks the memory under our mapping would crash us
         // (SIGBUS): Linux memfds must be sealed against that. (macOS POSIX
         // shm can't be resized once sized.)
@@ -113,7 +128,21 @@ impl SharedFb {
             }
         }
         let ptr = map(&fd, len)?;
-        Ok(SharedFb { fd, ptr, len })
+        Ok(SharedFb { fd, ptr, len, heads })
+    }
+
+    /// Monitors it has room for.
+    pub fn heads(&self) -> usize {
+        self.heads
+    }
+
+    /// Start of `head`'s slot, if there is one.
+    fn slot(&self, head: usize) -> Option<(*mut u8, usize)> {
+        (head < self.heads).then(|| {
+            let n = max_len();
+            // SAFETY: head < heads: the slot is inside the mapping.
+            (unsafe { self.ptr.add(head * n) }, n)
+        })
     }
 
     pub fn fd(&self) -> &OwnedFd {
@@ -133,16 +162,26 @@ impl SharedFb {
     /// Write rows of a rect. `src` holds `h` rows of `w*4` bytes with `src_stride`.
     #[allow(clippy::too_many_arguments)]
     pub fn write_rect(&self, fb_width: u32, x: u32, y: u32, w: u32, h: u32, src: &[u8], src_stride: usize) {
+        self.write_rect_on(0, fb_width, x, y, w, h, src, src_stride)
+    }
+
+    /// [`write_rect`] on monitor `head`'s slot.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_rect_on(&self, head: usize, fb_width: u32, x: u32, y: u32, w: u32, h: u32, src: &[u8], src_stride: usize) {
+        let Some((base, len)) = self.slot(head) else { return };
         let stride = Self::stride(fb_width);
         let row = w as usize * BPP;
+        if x.saturating_add(w) > fb_width {
+            return;
+        }
         for r in 0..h as usize {
             let so = r * src_stride;
             let dof = (y as usize + r) * stride + x as usize * BPP;
-            if so + row > src.len() || dof + row > self.len {
+            if so + row > src.len() || dof + row > len {
                 return;
             }
             // SAFETY: bounds checked against both buffers above.
-            unsafe { std::ptr::copy_nonoverlapping(src.as_ptr().add(so), self.ptr.add(dof), row) };
+            unsafe { std::ptr::copy_nonoverlapping(src.as_ptr().add(so), base.add(dof), row) };
         }
     }
 
@@ -151,6 +190,13 @@ impl SharedFb {
     /// either buffer are skipped.
     #[allow(clippy::too_many_arguments)]
     pub fn read_rect(&self, fb_width: u32, x: u32, y: u32, w: u32, h: u32, dst: &mut [u8], dst_stride: usize) {
+        self.read_rect_on(0, fb_width, x, y, w, h, dst, dst_stride)
+    }
+
+    /// [`read_rect`] from monitor `head`'s slot.
+    #[allow(clippy::too_many_arguments)]
+    pub fn read_rect_on(&self, head: usize, fb_width: u32, x: u32, y: u32, w: u32, h: u32, dst: &mut [u8], dst_stride: usize) {
+        let Some((base, len)) = self.slot(head) else { return };
         let stride = Self::stride(fb_width);
         let row = w as usize * BPP;
         if x.saturating_add(w) > fb_width {
@@ -159,22 +205,28 @@ impl SharedFb {
         for r in 0..h as usize {
             let so = (y as usize + r) * stride + x as usize * BPP;
             let d = r * dst_stride;
-            if so + row > self.len || d + row > dst.len() {
+            if so + row > len || d + row > dst.len() {
                 return;
             }
             // SAFETY: bounds checked against both buffers above.
-            unsafe { std::ptr::copy_nonoverlapping(self.ptr.add(so), dst.as_mut_ptr().add(d), row) };
+            unsafe { std::ptr::copy_nonoverlapping(base.add(so), dst.as_mut_ptr().add(d), row) };
         }
     }
 
     /// Copy the visible w x h image into `dst` (one u32 per pixel, 0RGB).
     pub fn read_into(&self, width: u32, height: u32, dst: &mut [u32]) {
+        self.read_into_on(0, width, height, dst)
+    }
+
+    /// [`read_into`] from monitor `head`'s slot.
+    pub fn read_into_on(&self, head: usize, width: u32, height: u32, dst: &mut [u32]) {
+        let Some((base, len)) = self.slot(head) else { return };
         let n = (width as usize * height as usize).min(dst.len());
-        if n * BPP > self.len {
+        if n * BPP > len {
             return;
         }
-        // SAFETY: n*4 bytes are inside the mapping; dst has room for n u32s.
-        unsafe { std::ptr::copy_nonoverlapping(self.ptr as *const u32, dst.as_mut_ptr(), n) };
+        // SAFETY: n*4 bytes are inside the slot; dst has room for n u32s.
+        unsafe { std::ptr::copy_nonoverlapping(base as *const u32, dst.as_mut_ptr(), n) };
     }
 }
 
@@ -217,5 +269,33 @@ mod tests {
         let mut r = [0u8; 4];
         b.read_rect(MAX_WIDTH, MAX_WIDTH - 1, MAX_HEIGHT - 1, 1, 1, &mut r, 4);
         assert_eq!(r, [7; 4]);
+        assert_eq!(b.heads(), 1);
+    }
+
+    #[test]
+    fn monitors_have_slots_of_their_own() {
+        assert!(SharedFb::create_heads(0).is_err() && SharedFb::create_heads(MAX_HEADS + 1).is_err());
+        let a = SharedFb::create_heads(2).unwrap();
+        let b = SharedFb::from_fd(a.fd().try_clone().unwrap()).unwrap();
+        assert_eq!(b.heads(), 2);
+        a.write_rect_on(1, 4, 0, 0, 1, 1, &[9, 9, 9, 0], 4);
+        let mut r = [0u8; 4];
+        b.read_rect_on(1, 4, 0, 0, 1, 1, &mut r, 4);
+        assert_eq!(r, [9, 9, 9, 0]);
+        b.read_rect_on(0, 4, 0, 0, 1, 1, &mut r, 4);
+        assert_eq!(r, [0; 4], "head 0 untouched");
+        // The last row of a slot doesn't spill into the next one.
+        a.write_rect_on(0, MAX_WIDTH, 0, MAX_HEIGHT - 1, 1, 2, &[5; 8], 4);
+        b.read_rect_on(1, MAX_WIDTH, 0, 0, 1, 1, &mut r, 4);
+        assert_eq!(r, [9, 9, 9, 0]);
+        // No such head: nothing happens.
+        a.write_rect_on(2, 4, 0, 0, 1, 1, &[1; 4], 4);
+        let mut px = [7u32; 1];
+        b.read_into_on(3, 1, 1, &mut px);
+        assert_eq!(px, [7]);
+        // A rect wider than the image is refused (it would wrap rows).
+        a.write_rect_on(1, 4, 3, 0, 2, 1, &[1; 8], 8);
+        b.read_rect_on(1, 4, 3, 0, 1, 1, &mut r, 4);
+        assert_eq!(r, [0; 4]);
     }
 }

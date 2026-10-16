@@ -7,10 +7,10 @@ import { VmItem, VmState, VmSettings, SnapRow, CardVis, HostInfo, Toast, Palette
 import { Sidebar, VmPage, EmptyState, States } from "library.slint";
 import { NewVmSheet, CommandPalette, ConfirmDialog, ConfirmInfo, Toasts } from "sheets.slint";
 import { Icon } from "controls.slint";
-import { ConsoleWindow } from "console.slint";
+import { ConsoleWindow, MonitorWindow } from "console.slint";
 import { CoherenceWindow, CoherenceBar, CohChip } from "coherence.slint";
 
-export { Theme, Bus, VmState, ConsoleWindow, CoherenceWindow, CoherenceBar, CohChip }
+export { Theme, Bus, VmState, ConsoleWindow, MonitorWindow, CoherenceWindow, CoherenceBar, CohChip }
 
 export component AppWindow inherits Window {
     in property <[VmItem]> vms;

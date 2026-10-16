@@ -171,6 +171,10 @@ A guest needs a driver and an API its players use. What exists:
   install from, updates, crash reports.
 - Drag and drop in Wayland guests (no live drag either way: an outside
   program can't take part in a Wayland drag; files land on the Desktop).
+- Several monitors: one UI scale for all of them (a window per Mac
+  screen with its own scale would want per-monitor scales), Direct3D on
+  Windows' first monitor only (the others are copied to 2D GPUs),
+  Coherence on the first monitor only (the others are off meanwhile).
 - Rosetta for Linux guests (x86_64 Linux programs). Apple only offers it
   through its Virtualization framework; we'd have to look like it.
 - Benchmarks against VMware Fusion and Parallels on the same Mac, the

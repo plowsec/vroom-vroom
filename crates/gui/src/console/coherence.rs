@@ -356,6 +356,9 @@ struct CohWin {
 pub struct Coherence {
     /// The guest's screen on the Mac (points); the mode once known.
     area: Rect,
+    /// The other guest monitors, off while Coherence is on: the guest
+    /// has one screen then (its windows gather there).
+    extras: Vec<usize>,
     map: Option<Map>,
     pub(super) bar: CoherenceBar,
     chips: Rc<VecModel<CohChip>>,
@@ -532,8 +535,10 @@ impl Console {
             io.send(ToVmm::Coherence(true));
         }
         self.pending_resize = None;
+        let extras = self.extras_pause();
         self.coh = Some(Coherence {
             area,
+            extras,
             map: (self.mode != (0, 0)).then_some(Map { area, mode: self.mode }),
             bar,
             chips,
@@ -600,6 +605,7 @@ impl Console {
         self.win.window().with_winit_window(|w| w.focus_window());
         // The guest goes back to the VM window's size.
         self.pending_resize = Some(Instant::now());
+        self.extras_resume(&c.extras);
     }
 
     fn wire_bar(&self, bar: &CoherenceBar) {
@@ -857,7 +863,7 @@ impl Console {
     fn coh_over(&mut self, id: u32, over: bool) {
         let draws = self.draws_pointer;
         let cursor = self.cursor.clone();
-        let host = self.host_cursor.as_ref().map(|(_, _, c)| c.clone());
+        let host = self.host_cursors.last().map(|(_, _, c)| c.clone());
         let Some(c) = self.coh.as_ref() else { return };
         let Some(w) = c.wins.get(&id) else { return };
         if !over {

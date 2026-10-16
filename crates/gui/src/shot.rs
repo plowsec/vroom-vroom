@@ -1,7 +1,8 @@
 //! `VROOM_SHOT=out.png vroom-gui`: render the library window to a PNG and
 //! quit. `VROOM_SHOT_DO="act;act"` runs UI actions first ("newvm",
 //! "palette", "search:net", "select:1", "set:cpus=2", "wait:30" seconds,
-//! "console:suspend" to a VM window, "vmkey:57" a key to the guest (evdev
+//! "console:suspend" to a VM window, "monshot:2:out.png" a picture of a
+//! VM's second monitor window, "vmkey:57" a key to the guest (evdev
 //! code; "vmkey:125+19" a combination), "vmtype:notepad" text,
 //! "cohclick:X,Y[,title]" a click on a Coherence window, "vmmove:X,Y"
 //! the mouse to a VM window's point, "shot:out.png" a
@@ -71,6 +72,16 @@ fn run(acts: Vec<String>, i: usize, out: PathBuf, delay: f64) {
             crate::console::move_any(x.parse().unwrap_or(0.0), y.parse().unwrap_or(0.0));
         } else if let Some(p) = a.strip_prefix("shot:") {
             picture(&PathBuf::from(p));
+        } else if let Some((n, p)) = a.strip_prefix("monshot:").and_then(|s| s.split_once(':')) {
+            // Another monitor's window (2, 3...).
+            match crate::console::snapshot_monitor(n.parse().unwrap_or(0)) {
+                Some(Ok(buf)) => {
+                    if let Err(e) = crate::console::write_png(std::path::Path::new(p), &buf, buf.width(), buf.height()) {
+                        eprintln!("shot: {e}");
+                    }
+                }
+                _ => eprintln!("shot: no window for monitor {n}"),
+            }
         } else if let Some(n) = a.strip_prefix("cohstart:") {
             crate::console::coh_start_any(n);
         } else if let Some(p) = a.strip_prefix("barshot:") {

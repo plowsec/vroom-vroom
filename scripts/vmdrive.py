@@ -5,8 +5,11 @@ Commands, one per line, on <state-dir>.cmd (a fifo):
   click X Y | rclick X Y | dclick X Y | move X Y   (guest pixels)
   key CODE[+CODE...]     press in order, release in reverse (evdev codes)
   type TEXT              US layout
-  shot                   screendump (path shows in <state-dir>.log)
+  shot                   screendump (path shows in <state-dir>.log; other
+                         monitors next to it, as -2.png, -3.png...)
   resize W H | focus 0|1 | clip TEXT | cmd N | quit
+  hmove N X Y | hclick N X Y   on monitor N (2, 3...), its guest pixels
+  hresize N W H          monitor N's window size (0 0: closed)
   coherence 0|1          Coherence on/off (windows show as "windows N: ...")
   win ID activate|minimize|close | win ID move X Y W H
   startapp NAME          start a guest app by name (icons show as "icon ID ...")
@@ -39,6 +42,7 @@ p = subprocess.Popen([vroom, "run", cfg, "--ui-fd", str(b.fileno()), "--state-di
 b.close()
 socket.recv_fds(a, 1, 1)  # framebuffer shm; we use screendumps instead
 mode = [800, 600]
+hmodes = {}
 cursors = [0]
 ev = open(evp, "a", buffering=1)
 
@@ -64,6 +68,8 @@ def reader():
             pl, buf = buf[5:5 + n], buf[5 + n:]
             if t == 1:
                 mode[:] = struct.unpack("<II", pl); ev.write(f"mode {mode[0]}x{mode[1]}\n")
+            elif t == 16:
+                h, w, hh = struct.unpack("<III", pl); hmodes[h] = (w, hh); ev.write(f"mode{h + 1} {w}x{hh}\n")
             elif t == 3:
                 ev.write("clipboard " + pl.decode(errors="replace").replace("\n", "\\n") + "\n")
             elif t == 4:
@@ -133,6 +139,9 @@ def key(code, down):
     send(1, u32s(code, int(down))); time.sleep(0.03)
 def move(x, y):
     send(2, u32s(int(x * 32767 / max(mode[0] - 1, 1)), int(y * 32767 / max(mode[1] - 1, 1)))); time.sleep(0.05)
+def hmove(n, x, y):
+    w, h = hmodes.get(n - 1, (800, 600))
+    send(19, u32s(n - 1, int(x * 32767 / max(w - 1, 1)), int(y * 32767 / max(h - 1, 1)))); time.sleep(0.05)
 def button(code, down):
     send(3, u32s(code, int(down))); time.sleep(0.05)
 def click(x, y, btn=0x110, n=1):
@@ -308,6 +317,14 @@ if True:
                     x, y = map(int, arg.split())
                     if c == "move": move(x, y)
                     else: click(x, y, 0x111 if c == "rclick" else 0x110, 2 if c == "dclick" else 1)
+                elif c in ("hmove", "hclick"):
+                    n, x, y = map(int, arg.split())
+                    hmove(n, x, y)
+                    if c == "hclick":
+                        button(0x110, True); button(0x110, False)
+                elif c == "hresize":
+                    n, w, h = map(int, arg.split())
+                    send(18, u32s(n - 1, w, h, 0))
                 elif c == "key":
                     codes = [int(k) for k in arg.split("+")]
                     for k in codes: key(k, True)
