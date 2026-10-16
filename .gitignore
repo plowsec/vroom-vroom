@@ -21,3 +21,39 @@
 *.dmp
 *.pdb
 *.atui
+
+# Guest binaries, traces, and crash artifacts.
+*.exe
+*.dll
+*.sys
+*.evtx
+*.etl
+*.pcap
+*.pcapng
+*.core
+
+# Additional VM disks and saved-state files.
+*.iso
+*.raw
+*.vhd
+*.vhdx
+*.vdi
+*.vmss
+*.vmsd
+*.nvram
+*.vmxf
+*.vmrs
+
+# Local debugger configs, captures, and checkpoints.
+/research/*.local.toml
+/research/captures/
+/research/checkpoints/
+
+# Local credentials.
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
