@@ -10,6 +10,9 @@
 
 mod clip;
 #[cfg(windows)]
+mod coh_win;
+mod coherence;
+#[cfg(windows)]
 mod dnd_win;
 // The session side; built everywhere so it's tested everywhere.
 #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
@@ -204,14 +207,17 @@ fn session(args: &Args) -> std::io::Result<()> {
     let mut dec = Decoder::new(MAX_CLIP + 64);
     let mut last = clip.get();
     let mut drops = drop::Drops::new();
+    // Dropped (taskbar back) when the session ends.
+    let mut coh = coherence::Coherence::new();
+    let mut clip_at = std::time::Instant::now();
     loop {
-        match rx.recv_timeout(POLL) {
+        match rx.recv_timeout(coh.wait().unwrap_or(POLL)) {
             Ok(bytes) => {
                 dec.push(&bytes);
                 loop {
                     match dec.next() {
                         Ok(Some(m)) => {
-                            if !drops.handle(&m, &mut writer)? {
+                            if !drops.handle(&m, &mut writer)? && !coh.handle(&m, &mut writer)? {
                                 handle(m, system, &mut writer, clip.as_mut(), &mut last)?
                             }
                         }
@@ -225,6 +231,11 @@ fn session(args: &Args) -> std::io::Result<()> {
                 return Err(std::io::Error::other("port closed"));
             }
         }
+        coh.tick(&mut writer)?;
+        if clip_at.elapsed() < POLL {
+            continue;
+        }
+        clip_at = std::time::Instant::now();
         // Local copy happened? Tell the host.
         let now = clip.get();
         if now.is_some() && now != last {
@@ -242,6 +253,9 @@ fn hello() -> Message {
     let mut features = features::CLIPBOARD_TEXT | features::TIME_SYNC | features::SHUTDOWN | features::SCALE | features::FILE_DROP;
     if cfg!(windows) {
         features |= features::GPU3D;
+    }
+    if coherence::Coherence::supported() {
+        features |= features::COHERENCE;
     }
     Message::Hello { features, agent: format!("vroom-agent {}", env!("CARGO_PKG_VERSION")) }
 }
@@ -280,14 +294,18 @@ fn handle(m: Message, system: bool, w: &mut port::Writer, clip: &mut dyn clip::C
         Message::Ping(v) => w.write_all(&Message::Pong(v).encode())?,
         // Windows' service handles it (relay); nothing to turn off here.
         Message::Gpu3d { .. } | Message::Pong(_) => {}
-        // Drops are drop.rs's; the rest is guest -> host.
+        // Drops are drop.rs's, Coherence coherence.rs's; the rest is
+        // guest -> host.
         Message::DragEnter { .. }
         | Message::DragCancel { .. }
         | Message::DropEntry { .. }
         | Message::DropData { .. }
         | Message::DropEnd { .. }
         | Message::DragReady { .. }
-        | Message::DropDone { .. } => {}
+        | Message::DropDone { .. }
+        | Message::Coherence { .. }
+        | Message::WindowDo { .. }
+        | Message::Windows(_) => {}
     }
     Ok(())
 }

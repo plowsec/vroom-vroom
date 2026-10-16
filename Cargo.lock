@@ -5463,6 +5463,7 @@ dependencies = [
  "libc",
  "thiserror 2.0.21",
  "vroom-ipc",
+ "vroom-proto",
 ]
 
 [[package]]

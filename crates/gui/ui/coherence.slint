@@ -1,0 +1,237 @@
+// Coherence: each guest window as a window of its own on the Mac.
+//
+// A guest window gets a frameless window with a strip on top that we draw
+// (the guest can't): the VM's name, then the window's title. It marks the
+// window as the VM's, whatever the guest draws below it, and moves it.
+// The guest's picture fills the rest; input there goes to the guest.
+//
+// The Coherence bar stands in for the guest's taskbar: Start, its app
+// windows (minimized ones too), and the way back to the VM window.
+
+import { Theme } from "theme.slint";
+import { Icons } from "icons.slint";
+import { Button, Icon, OsBadge } from "controls.slint";
+
+export struct CohChip {
+    id: int,
+    title: string,
+    front: bool,
+    minimized: bool,
+}
+
+export component CoherenceWindow inherits Window {
+    in property <string> vm-name;
+    in property <string> os;
+    in property <string> win-title;
+    in property <image> frame;
+    // The window has the keyboard (in the guest).
+    in property <bool> front;
+    // Height of the strip; Rust places the window with it.
+    out property <length> strip: 20px;
+    // Mouse over the picture, in logical pixels from its top left.
+    callback mouse-move(length, length);
+    callback button(int, bool);
+    callback wheel(length, length);
+    callback pointer-over(bool);
+    // The strip was pressed: the window follows the mouse.
+    callback drag();
+
+    title: root.vm-name + ": " + root.win-title;
+    icon: Icons.logo;
+    no-frame: true;
+    background: Theme.sidebar;
+    min-width: 40px;
+    min-height: root.strip + 8px;
+
+    Rectangle {
+        y: 0;
+        height: root.strip;
+        background: root.front ? Theme.card-strong : Theme.sidebar;
+        HorizontalLayout {
+            padding-left: 4px;
+            padding-right: 8px;
+            spacing: 6px;
+            OsBadge {
+                os: root.os;
+                size: 14px;
+                y: (parent.height - self.height) / 2;
+            }
+            Text {
+                text: root.vm-name;
+                color: Theme.text;
+                font-size: Theme.fs-xs;
+                font-weight: 650;
+                vertical-alignment: center;
+                horizontal-stretch: 0;
+            }
+            Text {
+                text: root.win-title;
+                color: Theme.text-2;
+                font-size: Theme.fs-xs;
+                vertical-alignment: center;
+                overflow: elide;
+                horizontal-stretch: 1;
+            }
+        }
+        TouchArea {
+            pointer-event(ev) => {
+                if ev.button == PointerEventButton.left && ev.kind == PointerEventKind.down {
+                    root.drag();
+                }
+            }
+        }
+    }
+    Rectangle {
+        y: root.strip - 1px;
+        height: 1px;
+        background: Theme.border-strong;
+    }
+
+    content := Rectangle {
+        y: root.strip;
+        height: root.height - root.strip;
+        Image {
+            width: 100%;
+            height: 100%;
+            source: root.frame;
+            image-fit: fill;
+            image-rendering: smooth;
+        }
+        ta := TouchArea {
+            // Rust sets the pointer here, as in the VM window.
+            mouse-cursor: none;
+            changed has-hover => { root.pointer-over(self.has-hover); }
+            changed mouse-x => { root.mouse-move(self.mouse-x, self.mouse-y); }
+            changed mouse-y => { root.mouse-move(self.mouse-x, self.mouse-y); }
+            pointer-event(ev) => {
+                let code = ev.button == PointerEventButton.left ? 272 : ev.button == PointerEventButton.right ? 273 : ev.button == PointerEventButton.middle ? 274 : 0;
+                if code != 0 && ev.kind == PointerEventKind.down {
+                    root.button(code, true);
+                }
+                if code != 0 && ev.kind == PointerEventKind.up {
+                    root.button(code, false);
+                }
+            }
+            scroll-event(ev) => {
+                root.wheel(ev.delta-x, ev.delta-y);
+                accept
+            }
+        }
+    }
+    // A line around it all: where the VM's window ends.
+    Rectangle {
+        border-width: 1px;
+        border-color: Theme.border-strong;
+    }
+}
+
+export component CoherenceBar inherits Window {
+    in property <string> vm-name;
+    in property <string> os;
+    in property <[CohChip]> chips;
+    // Why there's nothing to show ("no windows", "nobody logged in").
+    in property <string> note;
+    callback start();
+    callback chip(int);
+    callback exit();
+    // Pressed where nothing else is: the bar follows the mouse.
+    callback drag();
+
+    title: root.vm-name + " (Coherence)";
+    icon: Icons.logo;
+    no-frame: true;
+    background: Theme.bg;
+    preferred-width: 640px;
+    min-width: 320px;
+    height: 44px;
+
+    TouchArea {
+        pointer-event(ev) => {
+            if ev.button == PointerEventButton.left && ev.kind == PointerEventKind.down {
+                root.drag();
+            }
+        }
+    }
+    Rectangle {
+        border-width: 1px;
+        border-color: Theme.border-strong;
+    }
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 8px;
+        spacing: 8px;
+        OsBadge {
+            os: root.os;
+            size: 24px;
+            y: (parent.height - self.height) / 2;
+        }
+        Text {
+            text: root.vm-name;
+            color: Theme.text;
+            font-size: Theme.fs-md;
+            font-weight: 650;
+            vertical-alignment: center;
+            overflow: elide;
+            max-width: 160px;
+        }
+        Button {
+            small: true;
+            horizontal-stretch: 0;
+            text: "Start";
+            y: (parent.height - self.height) / 2;
+            clicked => { root.start(); }
+        }
+        HorizontalLayout {
+            horizontal-stretch: 1;
+            spacing: 4px;
+            if root.chips.length == 0: Text {
+                text: root.note;
+                color: Theme.text-3;
+                font-size: Theme.fs-sm;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+            for c in root.chips: Rectangle {
+                y: (parent.height - self.height) / 2;
+                height: 28px;
+                min-width: 40px;
+                preferred-width: min(180px, ct.preferred-width + 20px);
+                horizontal-stretch: 1;
+                max-width: 180px;
+                border-radius: Theme.r-sm;
+                background: c.front ? Theme.selected : cta.has-hover ? Theme.card-hover : transparent;
+                ct := Text {
+                    x: 10px;
+                    width: parent.width - 20px;
+                    text: c.title;
+                    color: c.minimized ? Theme.text-3 : Theme.text;
+                    font-size: Theme.fs-sm;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+                if c.front: Rectangle {
+                    x: 8px;
+                    y: parent.height - 2px;
+                    width: parent.width - 16px;
+                    height: 2px;
+                    border-radius: 1px;
+                    background: Theme.text-2;
+                }
+                cta := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.chip(c.id); }
+                }
+            }
+        }
+        Button {
+            small: true;
+            horizontal-stretch: 0;
+            kind: "ghost";
+            text: "Leave Coherence";
+            icon: Icons.window;
+            has-icon: true;
+            y: (parent.height - self.height) / 2;
+            clicked => { root.exit(); }
+        }
+    }
+}

@@ -40,7 +40,7 @@ pause, snapshot, suspend, the power menu (shut down, restart, force power
 off) and, for Windows, Ctrl+Alt+Del. On the right: how busy the VM is
 (the host CPU time it uses, out of what its CPUs could use), "3D" or
 "Direct3D 11" when 3D is on, USB devices (see [USB devices](#usb-devices)),
-the settings (the VM's page in the app),
+Coherence (below), the settings (the VM's page in the app),
 full screen, and the VM list. The guest gets the rest of the window: a
 guest with the agent takes exactly that size. In full screen the bar
 goes away and slides in when the mouse touches the top edge.
@@ -76,6 +76,35 @@ the names, so it can get ready. Then a bar shows the copy's progress.
 Names Windows can't take (`:` `?` `*` and the like) get a `_` instead.
 Links inside dropped folders are left out. Dragging from the guest to the
 Mac isn't there yet.
+
+### Coherence (Windows guests)
+
+Coherence shows each Windows app as a window of its own on your Mac,
+without the Windows desktop and taskbar around it. VMware calls it Unity.
+Needs the guest tools of this version or later.
+
+- Turn it on with the window button in the VM's bar, or
+  `Ctrl+Alt+Shift+C`. The VM window goes away; each Windows window gets a
+  Mac window where it was on the Windows screen.
+- Windows' screen takes the size of your Mac screen (less the menu bar,
+  the Dock and the bar below), so a maximized Windows app fills the screen.
+- Every such window has a thin strip on top with the VM's name and the
+  window's title. Drag the strip to move the window; drag its edges to
+  resize it. The Windows app follows. Moving it by its own title bar works
+  too.
+- A bar at the bottom stands in for the taskbar: **Start** opens the Start
+  menu, then one button per app window (minimized ones too: click to bring
+  one back), and **Leave Coherence**. The bar can be dragged anywhere.
+- `Cmd+W` on a Coherence window asks the Windows app to close (it may ask
+  to save first).
+- Leaving (the bar, the VM's shortcut, or closing the bar) brings back the
+  VM window, the taskbar and the VM's old size. A VM that stops, suspends,
+  or whose guest tools go away leaves Coherence too.
+
+Not there yet: Linux guests, several Mac screens (the Windows screen sits
+on the screen the VM window was on), app icons in the bar and the Dock.
+A window tiling tool (Amethyst, yabai) moves Coherence windows like any
+other, and the Windows apps follow it: tell it to leave `vroom-gui` alone.
 
 ### When the app crashes, or a VM stops answering
 

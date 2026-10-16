@@ -57,6 +57,8 @@ component VmBar inherits HorizontalLayout {
     in property <bool> usb-shown;
     in property <int> usb-count;
     in property <bool> usb-open;
+    // Coherence: why it can't start (empty: it can).
+    in property <string> coherence-why;
     out property <bool> power-open: false;
     callback act(string);
     // The USB button was clicked: where its bottom right corner is.
@@ -243,6 +245,13 @@ component VmBar inherits HorizontalLayout {
         clicked => { root.act("settings"); }
     }
     BarButton {
+        icon: Icons.window;
+        tip: root.coherence-why == "" ? "Coherence: the VM's windows on your desktop" : root.coherence-why;
+        dim: root.coherence-why != "";
+        y: (parent.height - self.height) / 2;
+        clicked => { root.act("coherence"); }
+    }
+    BarButton {
         icon: Icons.maximize;
         tip: root.fullscreen ? "Leave full screen" : "Full screen";
         y: (parent.height - self.height) / 2;
@@ -331,6 +340,8 @@ export component ConsoleWindow inherits Window {
     in property <string> suspend-error;
     in property <string> cpu-text;
     in property <string> gpu-text;
+    // Why Coherence can't start now (empty: it can).
+    in property <string> coherence-why: "Coherence needs the guest tools";
     // Height of the bar above the guest screen (none in full screen).
     // Rust takes it off the size it asks the guest for.
     out property <length> bar-height: root.fullscreen ? 0px : 38px;
@@ -594,6 +605,7 @@ export component ConsoleWindow inherits Window {
             camera-on: root.camera-on;
             cpu-text: root.cpu-text;
             gpu-text: root.gpu-text;
+            coherence-why: root.coherence-why;
             wide: true;
             usb-shown: root.usb-shown;
             usb-count: root.usb-count;
@@ -641,6 +653,7 @@ export component ConsoleWindow inherits Window {
                 root.usb-x = x;
                 root.usb-y = y;
             }
+            coherence-why: root.coherence-why;
             act(a) => { root.act(a); }
         }
     }

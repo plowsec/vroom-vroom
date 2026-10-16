@@ -7,6 +7,8 @@ Commands, one per line, on <state-dir>.cmd (a fifo):
   type TEXT              US layout
   shot                   screendump (path shows in <state-dir>.log)
   resize W H | focus 0|1 | clip TEXT | cmd N | quit
+  coherence 0|1          Coherence on/off (windows show as "windows N: ...")
+  win ID activate|minimize|close | win ID move X Y W H
   serial TEXT            to the serial console (\\n for Enter)
   drop X Y X2 Y2 PATH... drag files in at X,Y, move to X2,Y2, drop there
                          (what the app does when files come from Finder)
@@ -81,6 +83,17 @@ def reader():
                         ln = struct.unpack("<H", pl[o:o + 2])[0]; f.append(pl[o + 2:o + 2 + ln].decode()); o += 2 + ln
                     out.append(f"{port}:{f[0]}{'' if flags & 1 else '(away)'}{'(always)' if flags & 2 else ''}")
                 ev.write("usb " + " ".join(out) + "\n")
+            elif t == 10:
+                ev.write(f"camera {pl[0]}\n")
+            elif t == 12:
+                ev.write(f"agent features {struct.unpack('<Q', pl)[0]:#x}\n")
+            elif t == 13:
+                n, o, out = struct.unpack("<I", pl[:4])[0], 4, []
+                for _ in range(n):
+                    i, x, y, w, h, f, tl = struct.unpack("<IiiIIIH", pl[o:o + 26])
+                    out.append(f"{i:#x} {x},{y} {w}x{h} f{f} {pl[o + 26:o + 26 + tl].decode(errors='replace')!r}")
+                    o += 26 + tl
+                ev.write(f"windows {n}: " + " | ".join(out) + "\n")
             elif t == 7:
                 if pl[0] != 2:
                     ev.write("cursor " + ("unset", "hidden")[pl[0]] + "\n"); continue
@@ -237,6 +250,14 @@ if True:
                 elif c == "usb": usb_attach(*arg.split())
                 elif c == "usbdetach": send(13, bytes([int(arg)]))
                 elif c == "quit": p.stdin.write(b"\x01x"); p.stdin.flush()
+                elif c == "coherence": send(14, bytes([int(arg)]))
+                elif c == "win":
+                    v = arg.split()
+                    ops = {"activate": 1, "minimize": 2, "close": 3, "move": 4}
+                    pl = u32s(int(v[0], 0)) + bytes([ops[v[1]]])
+                    if v[1] == "move":
+                        pl += u32s(*[int(x) for x in v[2:6]])
+                    send(15, pl)
             except Exception as e:
                 ev.write(f"error {line.strip()}: {e}\n")
 p.wait()

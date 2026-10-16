@@ -1,6 +1,7 @@
 //! Framed messages: type u8 | len u32 LE | payload.
 
 use crate::{Error, Result};
+pub use vroom_proto::{GuestWindow, WindowOp};
 
 /// Absolute pointer range (like a USB tablet).
 pub const POINTER_MAX: u16 = 32767;
@@ -99,6 +100,11 @@ pub enum ToViewer {
     /// The host USB devices the VM has now. Sent once the VM has a USB
     /// controller to plug them into, and whenever the list changes.
     Usb(Vec<UsbPort>),
+    /// The guest agent said hello: what it can do (`vroom_proto::features`).
+    Agent { features: u64 },
+    /// Coherence: the guest's windows, front to back (checked like the
+    /// agent's message; the viewer still clips them to the screen).
+    Windows(Vec<GuestWindow>),
 }
 
 /// What the guest's pointer looks like.
@@ -159,6 +165,10 @@ pub enum ToVmm {
     UsbAttach(UsbDev),
     /// Pull the device on this port pair out; its helper is told to go.
     UsbDetach { port: u8 },
+    /// Coherence on or off (the guest agent shows and hides its taskbar).
+    Coherence(bool),
+    /// Coherence: do this to a guest window.
+    Window { id: u32, op: WindowOp },
 }
 
 fn frame(ty: u8, payload: &[u8]) -> Vec<u8> {
@@ -220,6 +230,8 @@ impl ToViewer {
                 }
                 frame(11, &p)
             }
+            ToViewer::Agent { features } => frame(12, &features.to_le_bytes()),
+            ToViewer::Windows(list) => frame(13, &vroom_proto::encode_windows(list)),
         }
     }
 
@@ -269,6 +281,8 @@ impl ToViewer {
                 }
                 ToViewer::Usb(ports)
             }
+            12 if p.len() == 8 => ToViewer::Agent { features: u64::from(get_u32(p, 0)?) | u64::from(get_u32(p, 1)?) << 32 },
+            13 => ToViewer::Windows(vroom_proto::decode_windows(p).ok_or(Error::Proto("windows"))?),
             _ => return Err(Error::Proto("unknown viewer message")),
         })
     }
@@ -302,6 +316,12 @@ impl ToVmm {
                 frame(12, &p)
             }
             ToVmm::UsbDetach { port } => frame(13, &[*port]),
+            ToVmm::Coherence(on) => frame(14, &[*on as u8]),
+            ToVmm::Window { id, op } => {
+                let mut p = id.to_le_bytes().to_vec();
+                p.extend_from_slice(&op.encode());
+                frame(15, &p)
+            }
         }
     }
 
@@ -361,6 +381,8 @@ impl ToVmm {
                 ToVmm::UsbAttach(d)
             }
             13 if p.len() == 1 => ToVmm::UsbDetach { port: p[0] },
+            14 if p.len() == 1 => ToVmm::Coherence(p[0] != 0),
+            15 if p.len() > 4 => ToVmm::Window { id: get_u32(p, 0)?, op: WindowOp::decode(&p[4..]).ok_or(Error::Proto("window op"))? },
             _ => return Err(Error::Proto("unknown vmm message")),
         })
     }
@@ -432,6 +454,9 @@ mod tests {
             ToVmm::Drop { id: 4 },
             ToVmm::UsbAttach(UsbDev { id: "1209:000a".into(), serial: "A1".into(), name: "dev board".into() }),
             ToVmm::UsbDetach { port: 3 },
+            ToVmm::Coherence(true),
+            ToVmm::Window { id: 9, op: WindowOp::Activate },
+            ToVmm::Window { id: 9, op: WindowOp::Move { x: -3, y: 4, w: 100, h: 50 } },
         ];
         let mut d = Decoder::default();
         for m in &vm {
@@ -456,6 +481,8 @@ mod tests {
                 UsbPort { port: 0, dev: UsbDev { id: "1209:000a".into(), serial: String::new(), name: "x".into() }, here: true, always: true },
                 UsbPort { port: 5, dev: UsbDev { id: "05ac:12a8".into(), serial: "s".into(), name: String::new() }, here: false, always: false },
             ]),
+            ToViewer::Agent { features: 1 << 40 | 128 },
+            ToViewer::Windows(vec![GuestWindow { id: 1, x: 0, y: -2, w: 3, h: 4, flags: 4, title: "Paint".into() }]),
         ];
         for m in &v {
             d.push(&m.encode());
