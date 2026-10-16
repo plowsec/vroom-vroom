@@ -21,8 +21,7 @@ and every virtual device treats the guest as hostile.
 - USB devices from the host (those macOS has no driver for; needs libusb)
 - Fast disk and network I/O, measured against QEMU ([numbers](docs/PERFORMANCE.md))
 
-Not yet: x86_64 hosts (it builds, can't run VMs yet), Secure Boot, and
-suspend of Windows guests with 3D on.
+Not yet: x86_64 hosts (it builds, can't run VMs yet) and Secure Boot.
 
 ## Try it
 

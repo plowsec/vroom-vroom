@@ -275,6 +275,11 @@ DXMT's shader cache (Metal versions of guest shaders) is allowed next to
 Metal's, in the per-user cache folder; both are shared by every VM of the
 user.
 
+With 3D, the GPU's host-visible window (8 GiB of guest address space) is
+backed by reserved memory where no buffer is mapped, as a real card's
+memory would be. Pages the guest writes there become real host memory: a
+guest can grow the VMM by up to 8 GiB that way, on top of its RAM.
+
 Snapshots with GL in them hold the guest's GPU contents (textures read
 back, so whatever was on screen) next to its RAM, in the state dir. On
 restore, the GL state goes back through virglrenderer's checks like any

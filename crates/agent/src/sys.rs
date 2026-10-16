@@ -91,3 +91,76 @@ pub fn single_display() {
 
 #[cfg(not(windows))]
 pub fn single_display() {}
+
+/// Turn Windows' 3D display device (UTM's viogpu3d, service VioGpu3D) off
+/// or on, as Device Manager does. Off, Windows falls back to its basic
+/// display and drops every Direct3D object, which the host can't save in
+/// a suspend. Whether it is on afterwards; None without such a device.
+#[cfg(windows)]
+pub fn gpu3d(on: bool) -> Option<bool> {
+    use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
+        CM_Get_DevNode_Status, SetupDiCallClassInstaller, SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo, SetupDiGetClassDevsW,
+        SetupDiGetDeviceRegistryPropertyW, SetupDiSetClassInstallParamsW, CM_PROB_DISABLED, CR_SUCCESS, DICS_DISABLE, DICS_ENABLE,
+        DICS_FLAG_GLOBAL, DIF_PROPERTYCHANGE, DIGCF_PRESENT, GUID_DEVCLASS_DISPLAY, SPDRP_SERVICE, SP_CLASSINSTALL_HEADER, SP_DEVINFO_DATA,
+        SP_PROPCHANGE_PARAMS,
+    };
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    // SAFETY: a valid class GUID; the list is destroyed below.
+    let set = unsafe { SetupDiGetClassDevsW(&GUID_DEVCLASS_DISPLAY, std::ptr::null(), std::ptr::null_mut(), DIGCF_PRESENT) };
+    if set as isize == INVALID_HANDLE_VALUE as isize {
+        return None;
+    }
+    let mut result = None;
+    for i in 0.. {
+        // SAFETY: plain data; all zeroes is valid once cbSize is set.
+        let mut d: SP_DEVINFO_DATA = unsafe { std::mem::zeroed() };
+        d.cbSize = std::mem::size_of::<SP_DEVINFO_DATA>() as u32;
+        // SAFETY: valid list and out pointer.
+        if unsafe { SetupDiEnumDeviceInfo(set, i, &mut d) } == 0 {
+            break;
+        }
+        let mut name = [0u16; 64];
+        let mut ty = 0u32;
+        // SAFETY: the buffer is valid for its size in bytes.
+        let got = unsafe {
+            SetupDiGetDeviceRegistryPropertyW(set, &d, SPDRP_SERVICE, &mut ty, name.as_mut_ptr() as *mut u8, (name.len() * 2) as u32, std::ptr::null_mut())
+        };
+        let n = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+        if got == 0 || !String::from_utf16_lossy(&name[..n]).eq_ignore_ascii_case("VioGpu3D") {
+            continue;
+        }
+        let is_on = || {
+            let (mut status, mut problem) = (0u32, 0u32);
+            // SAFETY: valid out pointers and a devnode from the list.
+            let r = unsafe { CM_Get_DevNode_Status(&mut status, &mut problem, d.DevInst, 0) };
+            r == CR_SUCCESS && problem != CM_PROB_DISABLED
+        };
+        if is_on() != on {
+            let p = SP_PROPCHANGE_PARAMS {
+                ClassInstallHeader: SP_CLASSINSTALL_HEADER { cbSize: std::mem::size_of::<SP_CLASSINSTALL_HEADER>() as u32, InstallFunction: DIF_PROPERTYCHANGE },
+                StateChange: if on { DICS_ENABLE } else { DICS_DISABLE },
+                Scope: DICS_FLAG_GLOBAL,
+                HwProfile: 0,
+            };
+            // SAFETY: valid list, device and parameters of the size given.
+            let ok = unsafe {
+                SetupDiSetClassInstallParamsW(set, &d, &p.ClassInstallHeader, std::mem::size_of::<SP_PROPCHANGE_PARAMS>() as u32) != 0
+                    && SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, set, &d) != 0
+            };
+            if !ok {
+                log::warn!("3D display device: {}", std::io::Error::last_os_error());
+            }
+        }
+        result = Some(is_on());
+        log::info!("3D display device {}", if result == Some(true) { "on" } else { "off" });
+        break;
+    }
+    // SAFETY: the list from above, not used after this.
+    unsafe { SetupDiDestroyDeviceInfoList(set) };
+    result
+}
+
+#[cfg(not(windows))]
+pub fn gpu3d(_on: bool) -> Option<bool> {
+    None
+}

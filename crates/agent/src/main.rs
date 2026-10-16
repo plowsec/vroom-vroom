@@ -229,7 +229,10 @@ fn session(args: &Args) -> std::io::Result<()> {
 }
 
 fn hello() -> Message {
-    let features = features::CLIPBOARD_TEXT | features::TIME_SYNC | features::SHUTDOWN | features::SCALE;
+    let mut features = features::CLIPBOARD_TEXT | features::TIME_SYNC | features::SHUTDOWN | features::SCALE;
+    if cfg!(windows) {
+        features |= features::GPU3D;
+    }
     Message::Hello { features, agent: format!("vroom-agent {}", env!("CARGO_PKG_VERSION")) }
 }
 
@@ -265,7 +268,8 @@ fn handle(m: Message, system: bool, w: &mut port::Writer, clip: &mut dyn clip::C
         }
         Message::SetScale { percent } => scale::set(percent),
         Message::Ping(v) => w.write_all(&Message::Pong(v).encode())?,
-        Message::Pong(_) => {}
+        // Windows' service handles it (relay); nothing to turn off here.
+        Message::Gpu3d { .. } | Message::Pong(_) => {}
     }
     Ok(())
 }

@@ -31,7 +31,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use vroom_config::VmConfig;
 use vroom_devices::pl011::Pl011;
@@ -66,6 +66,9 @@ pub enum Error {
     Timeout,
     #[error("virtio: {0}")]
     Virtio(#[from] vroom_virtio::Error),
+    /// The guest isn't in a state we can save, in words for people.
+    #[error("{0}")]
+    CantSave(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -121,6 +124,7 @@ pub struct Vmm {
     devices: Vec<StatefulDevice>,
     uart: Arc<Mutex<Pl011>>,
     agent: agent::Agent,
+    gpu: Option<vroom_virtio::devices::gpu::GpuControl>,
     disks: disks::DiskSet,
     viewer: Option<display::ViewerTx>,
     screen: Option<Arc<display::FbSink>>,
@@ -140,6 +144,10 @@ impl std::fmt::Debug for Vmm {
 
 /// How long we wait for every vCPU to acknowledge a pause.
 const PAUSE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long Windows gets to turn its 3D display off before a save, and
+/// to settle on its basic display afterwards.
+const PARK_TIMEOUT: Duration = Duration::from_secs(20);
+const PARK_SETTLE: Duration = Duration::from_millis(1500);
 
 impl Vmm {
     /// Build the machine and start it.
@@ -175,6 +183,7 @@ impl Vmm {
             devices: m.devices,
             uart: m.uart,
             agent: m.agent,
+            gpu: m.gpu,
             disks,
             viewer: m.viewer,
             screen: m.screen,
@@ -335,13 +344,48 @@ impl Vmm {
 
     /// Save a full snapshot. The VM keeps running afterwards.
     pub fn snapshot(&mut self, dir: &Path, description: &str) -> Result<()> {
+        let parked = self.park_direct3d()?;
         let was_running = self.state == RunState::Running;
         self.pause()?;
         let r = snapshot::save(self, dir, description, snapshot::Kind::Snapshot);
         if was_running {
             self.resume()?;
         }
+        if parked {
+            self.agent.send(agent::AgentCmd::Gpu3d(true));
+        }
         r
+    }
+
+    /// Windows' Direct3D state lives on the host GPU and can't be saved.
+    /// Have the guest agent turn the 3D display device off first, as in
+    /// Device Manager: Windows goes on with its basic display and drops
+    /// every Direct3D object; the agent turns it back on when it next
+    /// connects, or right after a snapshot. Whether it was parked.
+    fn park_direct3d(&mut self) -> Result<bool> {
+        let Some(gpu) = self.gpu.clone() else { return Ok(false) };
+        if !gpu.direct3d() || self.state != RunState::Running {
+            return Ok(false);
+        }
+        let s = self.agent.status();
+        if !s.connected || s.features & vroom_proto::features::GPU3D == 0 {
+            return Err(Error::CantSave(
+                "Windows draws with Direct3D, and its vroom agent can't turn 3D off for the save (not running, or too old). Update the vroom tools in Windows".into(),
+            ));
+        }
+        log::info!("turning the guest's 3D display off for the save");
+        self.agent.send(agent::AgentCmd::Gpu3d(false));
+        let deadline = Instant::now() + PARK_TIMEOUT;
+        while gpu.direct3d() || self.agent.status().gpu3d != Some(false) {
+            if Instant::now() > deadline {
+                self.agent.send(agent::AgentCmd::Gpu3d(true));
+                return Err(Error::CantSave("Windows didn't turn its 3D display off in time".into()));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Let Windows finish moving to its basic display before we freeze it.
+        std::thread::sleep(PARK_SETTLE);
+        Ok(true)
     }
 
     /// Snapshot then stop: the VM can be resumed later with
@@ -353,8 +397,15 @@ impl Vmm {
     /// Like [`suspend`], for callers that keep the handle. On error the
     /// VM is left paused, not stopped, so nothing is lost.
     pub fn suspend_in_place(&mut self, dir: &Path) -> Result<()> {
+        let parked = self.park_direct3d()?;
         self.pause()?;
-        snapshot::save(self, dir, "suspend", snapshot::Kind::Suspend)?;
+        if let Err(e) = snapshot::save(self, dir, "suspend", snapshot::Kind::Suspend) {
+            if parked {
+                // Delivered once the VM runs again.
+                self.agent.send(agent::AgentCmd::Gpu3d(true));
+            }
+            return Err(e);
+        }
         self.shutdown();
         Ok(())
     }

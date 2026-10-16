@@ -28,6 +28,8 @@ pub enum Ev {
 pub trait System {
     fn set_time(&mut self, secs: u64, nanos: u32);
     fn shutdown(&mut self, reboot: bool);
+    /// Turn the 3D display device on or off; whether it is on now.
+    fn gpu3d(&mut self, on: bool) -> Option<bool>;
 }
 
 pub struct RealSystem;
@@ -40,6 +42,9 @@ impl System for RealSystem {
     }
     fn shutdown(&mut self, reboot: bool) {
         crate::sys::shutdown(reboot);
+    }
+    fn gpu3d(&mut self, on: bool) -> Option<bool> {
+        crate::sys::gpu3d(on)
     }
 }
 
@@ -111,6 +116,11 @@ impl<S: System> Relay<S> {
                 self.send_helper(&m);
             }
             m @ Message::ClipboardText(_) => self.send_helper(&m),
+            Message::Gpu3d { on } => {
+                if let Some(on) = self.sys.gpu3d(on) {
+                    host.write_all(&Message::Gpu3d { on }.encode())?;
+                }
+            }
             Message::Pong(_) => {}
         }
         Ok(())
@@ -158,6 +168,7 @@ mod tests {
     struct Seen {
         time: Vec<u64>,
         shutdown: Vec<bool>,
+        gpu3d: Vec<bool>,
     }
     struct Fake(Arc<Mutex<Seen>>);
     impl System for Fake {
@@ -166,6 +177,10 @@ mod tests {
         }
         fn shutdown(&mut self, reboot: bool) {
             self.0.lock().unwrap().shutdown.push(reboot);
+        }
+        fn gpu3d(&mut self, on: bool) -> Option<bool> {
+            self.0.lock().unwrap().gpu3d.push(on);
+            Some(on)
         }
     }
 
@@ -205,6 +220,15 @@ mod tests {
 
     fn host(m: Message) -> Ev {
         Ev::Host(m.encode())
+    }
+
+    #[test]
+    fn gpu3d_is_switched_by_the_service_and_answered() {
+        let helper = Sink::default();
+        let (out, seen) = run(vec![Ev::HelperUp(1, Box::new(helper.clone())), host(Message::Gpu3d { on: false }), host(Message::Gpu3d { on: true })]);
+        assert_eq!(seen.lock().unwrap().gpu3d, vec![false, true]);
+        assert_eq!(out[1..], [Message::Gpu3d { on: false }, Message::Gpu3d { on: true }]);
+        assert!(helper.msgs().is_empty());
     }
 
     #[test]

@@ -25,6 +25,9 @@ pub mod features {
     pub const SHUTDOWN: u64 = 8;
     /// The agent can change the desktop's UI scale (HiDPI host windows).
     pub const SCALE: u64 = 16;
+    /// The agent can turn the 3D display device off and on (Windows:
+    /// Direct3D state can't be saved, so a suspend parks it).
+    pub const GPU3D: u64 = 32;
 }
 
 /// UI scales a host may ask for, in percent. 0 = "the host no longer
@@ -48,6 +51,9 @@ pub enum Message {
     Shutdown { reboot: bool },
     Ping(u64),
     Pong(u64),
+    /// Host -> guest: turn the 3D display device off (before a suspend)
+    /// or on. Guest -> host: whether it is on now.
+    Gpu3d { on: bool },
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -72,6 +78,7 @@ const T_SHUTDOWN: u8 = 5;
 const T_PING: u8 = 6;
 const T_PONG: u8 = 7;
 const T_SCALE: u8 = 8;
+const T_GPU3D: u8 = 9;
 
 impl Message {
     pub fn encode(&self) -> Vec<u8> {
@@ -96,6 +103,7 @@ impl Message {
             Message::Shutdown { reboot } => (T_SHUTDOWN, vec![*reboot as u8]),
             Message::Ping(v) => (T_PING, v.to_le_bytes().to_vec()),
             Message::Pong(v) => (T_PONG, v.to_le_bytes().to_vec()),
+            Message::Gpu3d { on } => (T_GPU3D, vec![*on as u8]),
         };
         let mut out = Vec::with_capacity(HDR + payload.len());
         out.extend_from_slice(&MAGIC);
@@ -146,7 +154,8 @@ impl Message {
             T_SHUTDOWN if p.len() == 1 => Message::Shutdown { reboot: p[0] != 0 },
             T_PING if p.len() == 8 => Message::Ping(u64_at(0)?),
             T_PONG if p.len() == 8 => Message::Pong(u64_at(0)?),
-            T_TIME | T_RES | T_SCALE | T_SHUTDOWN | T_PING | T_PONG => return Err(Error::Malformed),
+            T_GPU3D if p.len() == 1 => Message::Gpu3d { on: p[0] != 0 },
+            T_TIME | T_RES | T_SCALE | T_SHUTDOWN | T_PING | T_PONG | T_GPU3D => return Err(Error::Malformed),
             t => return Err(Error::Type(t)),
         })
     }
@@ -222,6 +231,8 @@ mod tests {
             Message::Shutdown { reboot: true },
             Message::Ping(42),
             Message::Pong(42),
+            Message::Gpu3d { on: false },
+            Message::Gpu3d { on: true },
         ]
     }
 

@@ -284,8 +284,8 @@ multisampled buffers, and depth buffers with `opengl_host = "angle"`
 Refused, with the reason shown: a running Vulkan app (Vulkan state isn't
 tracked), and GPU memory shared with the guest (blobs). Closing the window
 then leaves the VM paused with "Can't save this VM's state"; keep it
-running, or shut it down from the guest. Windows guests with 3D can't be
-saved at all (see below).
+running, or shut it down from the guest. Windows guests with 3D are saved
+another way (see below).
 
 The build: `build-virglrenderer.sh` builds UTM's fork of virglrenderer
 (the one with Direct3D for Windows, below), pinned by hash, with our
@@ -334,9 +334,17 @@ What works and what doesn't (Windows 11 24H2, M3 Max):
   didn't just redraw (pointing at it brought it back). Not seen again in
   later runs; if it happens, closing and reopening the app fixes it.
 - No Direct3D 12, no Vulkan or OpenGL for Windows apps.
-- Suspend and snapshots are refused while Windows draws with Direct3D
-  (it always does once logged in): Direct3D state lives on the host and
-  vroom can't save it yet. With `gpu = "virtio2d"` they work.
+- Suspend and snapshots work, a few seconds slower than without 3D.
+  Direct3D's state lives on the Mac's GPU and can't be saved, so vroom
+  first has the guest agent turn the 3D display device off, as in Device
+  Manager: Windows goes on with its basic display for a moment and lets
+  go of all its Direct3D objects. After the save (snapshot) or on resume
+  (suspend), the agent turns it back on and Windows redraws in 3D. Your
+  apps and session stay as they were; a game or 3D app that was running
+  loses its GPU state (most rebuild it, like after a driver update).
+  Measured: suspend 8 s, resume 6 s, with 8 GB of guest memory. Needs the
+  current vroom tools in Windows (re-run `vroom-setup.cmd`); with older
+  ones vroom says so and doesn't save.
 - DXMT keeps the Metal versions of the shaders it has converted in
   macOS's cache folder (`$(getconf DARWIN_USER_CACHE_DIR)dxmt`), so apps start faster the second time.
 
@@ -559,8 +567,8 @@ flushes a lot). `"none"` ignores flushes: scratch disks only.
 - Windows 11 is installed with its hardware checks bypassed (no Secure
   Boot); `tpm = true` (needs `brew install swtpm`) gives it a real TPM 2.0,
   which Windows sees and uses.
-- Windows guests: 3D is Direct3D 11 only and can't be suspended (see
-  above). Shared folders need WinFsp (see above).
+- Windows guests: 3D is Direct3D 11 only (see above). Shared folders need
+  WinFsp (see above).
 - 3D snapshots: not while a Vulkan app runs. Guest OpenGL stops at 4.1
   (2.1 with `opengl_host = "angle"`).
 - NAT connections don't survive suspend/resume (the guest reconnects).

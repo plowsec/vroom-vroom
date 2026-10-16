@@ -112,6 +112,8 @@ struct Shared {
     height: u32,
     events_read: u32,
     irq: Option<Arc<dyn VirtioInterrupt>>,
+    /// The guest has Direct3D contexts (Windows), which can't be saved.
+    direct3d: bool,
 }
 
 impl std::fmt::Debug for Shared {
@@ -140,6 +142,11 @@ impl GpuControl {
         if let Some(irq) = &s.irq {
             irq.signal_config_changed();
         }
+    }
+
+    /// Whether the guest draws with Direct3D now (see [`Shared`]).
+    pub fn direct3d(&self) -> bool {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).direct3d
     }
 }
 
@@ -188,7 +195,7 @@ impl std::fmt::Debug for Gpu {
 
 impl Gpu {
     pub fn new(width: u32, height: u32, sink: Arc<dyn DisplaySink>) -> (Self, GpuControl) {
-        let shared = Arc::new(Mutex::new(Shared { width, height, events_read: 0, irq: None }));
+        let shared = Arc::new(Mutex::new(Shared { width, height, events_read: 0, irq: None, direct3d: false }));
         (Gpu { shared: shared.clone(), sink, three_d: None, worker: WorkerSlot::default() }, GpuControl(shared))
     }
 
@@ -625,6 +632,7 @@ impl GpuHandler {
                 self.contexts.push(hdr.ctx);
                 let gl = (capset == 1 || capset == CAPSET_VIRGL2).then(GlState::default);
                 self.ctx_info.insert(hdr.ctx, CtxInfo { capset, name: name[..n].to_vec(), attached: Default::default(), gl });
+                self.note_direct3d();
                 (OK_NODATA, vec![])
             }
             CTX_DESTROY => {
@@ -637,6 +645,7 @@ impl GpuHandler {
                         self.contexts.swap_remove(i);
                         self.ctx_info.remove(&hdr.ctx);
                         t.r().context_destroy(hdr.ctx);
+                        self.note_direct3d();
                         (OK_NODATA, vec![])
                     }
                     None => (ERR_INVALID_CONTEXT_ID, vec![]),
@@ -741,6 +750,11 @@ impl GpuHandler {
             SET_SCANOUT_BLOB => (self.set_scanout_blob(r), vec![]),
             _ => (ERR_UNSPEC, vec![]),
         }
+    }
+
+    fn note_direct3d(&self) {
+        let on = self.ctx_info.values().any(|c| c.capset == CAPSET_NEPTUNE);
+        self.shared.lock().unwrap_or_else(|e| e.into_inner()).direct3d = on;
     }
 
     fn id_free(&self, id: u32) -> bool {
@@ -1289,7 +1303,13 @@ impl GpuHandler {
         if self.ctx_info.values().any(|c| c.gl.is_none()) {
             return Some("a Vulkan app is running, and Vulkan state can't be saved".into());
         }
-        if self.res3d.values().any(|r| r.blob) {
+        // Host blobs no context uses any more are left out: a stopped
+        // driver (Windows, with its 3D device turned off for a suspend)
+        // leaves them behind, its last frame still set as the scanout, and
+        // never touches them again. Guests' own scanouts are attached to
+        // the context that made them, or in guest memory.
+        let in_use = |id: u32, r: &Res3d| !r.guest.is_empty() || self.ctx_info.values().any(|c| c.attached.contains(&id));
+        if self.res3d.iter().any(|(&id, r)| r.blob && in_use(id, r)) {
             return Some("an app shares GPU memory with the guest (a blob), and that can't be saved".into());
         }
         if let Some(why) = self.ctx_info.values().find_map(|c| c.gl.as_ref().and_then(GlState::broken)) {
@@ -1596,6 +1616,7 @@ impl VirtioDevice for Gpu {
     fn set_shm_base(&mut self, id: u8, gpa: u64) {
         if let (SHM_HOST_VISIBLE, Some(t)) = (id, &self.three_d) {
             t.shm_base.store(gpa, Ordering::Release);
+            t.mapper.place(gpa, t.shm_size);
         }
     }
     fn activate(&mut self, ctx: ActivateContext) -> Result<()> {
@@ -1608,7 +1629,10 @@ impl VirtioDevice for Gpu {
     }
     fn reset(&mut self) {
         self.worker.stop();
-        self.shared.lock().unwrap_or_else(|e| e.into_inner()).irq = None;
+        let mut s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        s.irq = None;
+        s.direct3d = false;
+        drop(s);
         self.sink.set_mode(0, 0);
     }
     fn pause(&mut self) {
@@ -1860,6 +1884,27 @@ mod tests {
         assert!(h.snapshot_blocker().unwrap().contains("Vulkan"));
         h.ctx_info.insert(3, CtxInfo { capset: CAPSET_NEPTUNE, name: vec![], attached: Default::default(), gl: None });
         assert!(h.snapshot_blocker().unwrap().contains("Direct3D"));
+    }
+
+    #[test]
+    fn only_blobs_in_use_block_snapshots() {
+        let log = Arc::new(Mutex::new(vec![]));
+        let (gpu, _ctl) = Gpu::new(64, 64, Arc::new(Rec::default()));
+        let gpu = gpu.with_3d(ThreeD::new(Box::new(FakeGl(log)), Arc::new(NoMap), 0));
+        let mut h = gpu.handler();
+        // Left behind by a driver that stopped: no context, not ours to keep.
+        h.res3d.insert(9, Res3d { blob: true, ..Default::default() });
+        h.scanout = Some(Scanout::Blob { id: 9, view: Rect { x: 0, y: 0, w: 8, h: 8 }, format: 1, stride: 32, offset: 0 });
+        assert_eq!(h.snapshot_blocker(), None);
+        // A context still uses it.
+        let mut attached = std::collections::BTreeSet::new();
+        attached.insert(9);
+        h.ctx_info.insert(2, CtxInfo { capset: 2, name: vec![], attached, gl: Some(GlState::default()) });
+        assert!(h.snapshot_blocker().unwrap().contains("blob"));
+        h.ctx_info.clear();
+        // In guest memory: a guest's own scanout.
+        h.res3d.insert(10, Res3d { blob: true, guest: vec![(0x1000, 4096)], ..Default::default() });
+        assert!(h.snapshot_blocker().unwrap().contains("blob"));
     }
 
     #[test]

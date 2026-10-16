@@ -145,4 +145,9 @@ pub trait ShmMapper: Send + Sync {
     fn granule(&self) -> u64 {
         vroom_memory::page_size() as u64
     }
+    /// The window now starts at `gpa` (the guest placed the BAR). Where no
+    /// buffer is mapped, the window should read and write like memory,
+    /// as on real hardware: a guest still touching a buffer it gave back
+    /// must not stop the VM.
+    fn place(&self, _gpa: u64, _size: u64) {}
 }

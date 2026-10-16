@@ -132,6 +132,17 @@ the worker goes on. Windows' Direct3D frames are blobs in the render
 server's shared memory that the guest never maps: a flush reads them
 through a read-only mapping of that memory, made on first use.
 
+Direct3D state can't be saved. A suspend or snapshot of a Windows guest
+using it first asks the guest agent to turn the 3D display device off
+(SetupAPI, like Device Manager); the VMM waits until the guest has no
+Direct3D context left and the agent confirms, saves, and asks for the
+device back on (after a snapshot, and whenever an agent connects, so a
+resumed or killed VM gets it back). A stopped driver leaves blobs behind;
+host blobs no context uses are left out of the save. Where no buffer is
+mapped, the host-visible window is backed by reserved anonymous memory,
+so a guest touching a buffer it already gave back reads memory instead of
+stopping the VM.
+
 With GL on, 2D resources (dumb buffers) live in virglrenderer too, as in
 QEMU: Xorg's glamor draws into them with GL, and a context that touches
 a resource virglrenderer doesn't know is marked broken for good (every

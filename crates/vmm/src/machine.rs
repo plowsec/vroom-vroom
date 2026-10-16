@@ -20,7 +20,7 @@ use vroom_config::NetMode;
 use vroom_net::nat::{Nat, NatConfig, NatPolicy, TcpForward};
 use vroom_net::socket::FrameSocket;
 use vroom_net::{netd, NetBackend};
-use vroom_virtio::devices::gpu::{DisplaySink, Gpu as GpuDev, ThreeD};
+use vroom_virtio::devices::gpu::{DisplaySink, Gpu as GpuDev, GpuControl, ThreeD};
 use vroom_virtio::devices::gpu3d::{Mapping, Renderer3d, ShmMapper};
 use vroom_virtio::devices::input::{Input, InputKind};
 use vroom_virtio::devices::{block::Block, console::Console, fs::Fs, net::Net, rng::Rng};
@@ -160,6 +160,8 @@ pub(crate) struct Machine {
     pub devices: Vec<StatefulDevice>,
     pub uart: Arc<Mutex<Pl011>>,
     pub agent: Agent,
+    /// The virtio-gpu's control handle (window size, Direct3D state).
+    pub gpu: Option<GpuControl>,
     pub viewer: Option<ViewerTx>,
     pub screen: Option<Arc<FbSink>>,
     pub boot: BootImage,
@@ -262,33 +264,93 @@ fn three_d(vm: &Arc<dyn Vm>, config: &VmConfig) -> Result<ThreeD> {
     if config.display.opengl && !r.capsets().iter().any(|c| c.0 == 2) {
         log::warn!("gpu: no OpenGL for the guest (opengl_host = \"angle\" needs ANGLE next to virglrenderer: scripts/build-angle.sh); Vulkan only");
     }
-    Ok(ThreeD::new(Box::new(r), Arc::new(VmShm(vm.clone())), GPU_SHM_SIZE))
+    Ok(ThreeD::new(Box::new(r), Arc::new(VmShm { vm: vm.clone(), filler: Mutex::new(None) }), GPU_SHM_SIZE))
 }
 
 /// Maps GPU buffers into the guest with the hypervisor.
-struct VmShm(Arc<dyn Vm>);
+/// Where no buffer is, the window is backed by anonymous memory of ours
+/// (reserved, only what the guest touches is real), so it behaves like a
+/// card's memory: Windows reads and writes buffers it already gave back
+/// (when its 3D driver stops, for one), and a hole there stopped the VM.
+struct VmShm {
+    vm: Arc<dyn Vm>,
+    /// (window base, host memory, size) once the guest placed the window.
+    filler: Mutex<Option<(u64, usize, u64)>>,
+}
+
+impl VmShm {
+    /// Put the filler back under `gpa..gpa + size` (inside the window).
+    fn fill(&self, gpa: u64, size: u64) {
+        let Some((base, host, len)) = *self.filler.lock().unwrap_or_else(|e| e.into_inner()) else { return };
+        if gpa < base || gpa.saturating_add(size) > base.saturating_add(len) {
+            return;
+        }
+        let ptr = (host + (gpa - base) as usize) as *mut u8;
+        // SAFETY: a range of our own reservation, kept for the VM's life.
+        if let Err(e) = unsafe { self.vm.map_host(gpa, ptr, size) } {
+            log::warn!("gpu: window {gpa:#x}: {e}");
+        }
+    }
+}
 
 impl ShmMapper for VmShm {
     fn map(&self, gpa: u64, m: &Mapping) -> bool {
+        // The filler goes first (an unmapped range is fine to unmap).
+        let _ = self.vm.unmap_host(gpa, m.size);
         // SAFETY: the renderer keeps the buffer mapped until unmap_blob,
         // which the GPU device only calls after `unmap` below.
-        match unsafe { self.0.map_host(gpa, m.ptr, m.size) } {
+        match unsafe { self.vm.map_host(gpa, m.ptr, m.size) } {
             Ok(()) => true,
             Err(e) => {
                 log::warn!("gpu: map {gpa:#x}: {e}");
+                self.fill(gpa, m.size);
                 false
             }
         }
     }
 
     fn unmap(&self, gpa: u64, size: u64) {
-        if let Err(e) = self.0.unmap_host(gpa, size) {
+        if let Err(e) = self.vm.unmap_host(gpa, size) {
             log::warn!("gpu: unmap {gpa:#x}: {e}");
         }
+        self.fill(gpa, size);
     }
 
     fn granule(&self) -> u64 {
-        self.0.map_granule()
+        self.vm.map_granule()
+    }
+
+    fn place(&self, gpa: u64, size: u64) {
+        // A BAR sits at a multiple of its size. Anything else is the
+        // firmware sizing it (all ones) or halfway through moving it.
+        if gpa == 0 || size == 0 || !gpa.is_multiple_of(size) || gpa.checked_add(size).is_none() {
+            return;
+        }
+        let mut f = self.filler.lock().unwrap_or_else(|e| e.into_inner());
+        let host = match *f {
+            Some((old, host, len)) if len == size => {
+                if old == gpa {
+                    return;
+                }
+                let _ = self.vm.unmap_host(old, len);
+                host
+            }
+            Some(_) => return,
+            None => {
+                // SAFETY: a fresh private reservation; nothing else uses it.
+                let p = unsafe {
+                    libc::mmap(std::ptr::null_mut(), size as usize, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE, -1, 0)
+                };
+                if p == libc::MAP_FAILED {
+                    log::warn!("gpu: can't reserve the window's backing: {}", std::io::Error::last_os_error());
+                    return;
+                }
+                p as usize
+            }
+        };
+        *f = Some((gpa, host, size));
+        drop(f);
+        self.fill(gpa, size);
     }
 }
 
@@ -589,7 +651,7 @@ pub(crate) fn build(
         None => clipboard,
     };
     let max_pixels = if config.guest_os() == GuestOs::Windows { agent::WINDOWS_MAX_PIXELS } else { 0 };
-    let agent = agent::spawn(host_end, config.clipboard.clone(), clipboard, agent::Screen { gpu: gpu_ctl, max_pixels })?;
+    let agent = agent::spawn(host_end, config.clipboard.clone(), clipboard, agent::Screen { gpu: gpu_ctl.clone(), max_pixels, gpu3d: config.display.gpu == Gpu::Virtio3d })?;
     let viewer = ui.as_ref().map(|d| d.tx());
     if let Some(ds) = ui {
         if screen.is_none() {
@@ -710,7 +772,7 @@ pub(crate) fn build(
     let _ = shared.peers.set(vcpus.iter().map(|v| v.peer.clone()).collect());
     vm.finalize()?;
 
-    Ok(Machine { vm, mem, shared, vcpus, devices: reg.stateful, uart, agent, viewer, screen, boot })
+    Ok(Machine { vm, mem, shared, vcpus, devices: reg.stateful, uart, agent, gpu: gpu_ctl, viewer, screen, boot })
 }
 
 #[cfg(test)]

@@ -41,6 +41,9 @@ pub enum AgentCmd {
     /// guest that can't scale gets the size divided by it instead.
     Display { width: u32, height: u32, scale: u32 },
     Shutdown { reboot: bool },
+    /// Turn the guest's 3D display device on or off (Windows, around a
+    /// suspend: Direct3D state can't be saved).
+    Gpu3d(bool),
     Stop,
 }
 
@@ -52,6 +55,8 @@ pub struct AgentStatus {
     pub features: u64,
     /// Hellos seen: goes up on every (re)connect, e.g. after a guest reboot.
     pub sessions: u32,
+    /// Whether the guest says its 3D display device is on (after we asked).
+    pub gpu3d: Option<bool>,
 }
 
 const POLL: Duration = Duration::from_millis(250);
@@ -100,6 +105,10 @@ pub struct Screen {
     /// Largest mode (in pixels) the guest's driver takes; bigger windows
     /// get a smaller mode of the same shape. 0: no limit.
     pub max_pixels: u64,
+    /// The VM has 3D: an agent that can switch the guest's 3D display
+    /// device is asked to have it on whenever it connects (a suspend
+    /// turned it off, and the VM may have been resumed, or killed).
+    pub gpu3d: bool,
 }
 
 /// Windows' virtio-gpu driver (viogpudo) sizes its framebuffer when it
@@ -180,8 +189,11 @@ impl Service {
                 log::info!("guest agent connected: {agent}");
                 let mut s = self.status.lock().unwrap_or_else(|e| e.into_inner());
                 let sessions = s.sessions.wrapping_add(1);
-                *s = AgentStatus { connected: true, agent, features, sessions };
+                *s = AgentStatus { connected: true, agent, features, sessions, gpu3d: None };
                 drop(s);
+                if self.screen.gpu3d && features & features::GPU3D != 0 {
+                    self.send(&Message::Gpu3d { on: true });
+                }
                 // A fresh agent: boot, or a guest that slept. Set its clock
                 // (Windows also reads the RTC as local time until told).
                 if features & vroom_proto::features::TIME_SYNC != 0 {
@@ -192,6 +204,10 @@ impl Service {
             }
             Message::ClipboardText(t) => self.guest_clipboard(t),
             Message::Ping(v) => self.send(&Message::Pong(v)),
+            Message::Gpu3d { on } => {
+                log::info!("guest: 3D display device {}", if on { "on" } else { "off" });
+                self.status.lock().unwrap_or_else(|e| e.into_inner()).gpu3d = Some(on);
+            }
             // Host-bound only; a guest sending these is ignored.
             _ => {}
         }
@@ -287,6 +303,10 @@ impl Service {
                 self.apply_display();
             }
             AgentCmd::Shutdown { reboot } => self.send(&Message::Shutdown { reboot }),
+            AgentCmd::Gpu3d(on) => {
+                self.status.lock().unwrap_or_else(|e| e.into_inner()).gpu3d = None;
+                self.send(&Message::Gpu3d { on });
+            }
             AgentCmd::Stop => {}
         }
     }
