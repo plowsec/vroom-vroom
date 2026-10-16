@@ -99,6 +99,7 @@ enum GlCtxParam {}
 /// Resolved entry points.
 struct Lib {
     /// The directory it was loaded from (ANGLE must sit there too).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     dir: Option<PathBuf>,
     init: unsafe extern "C" fn(*mut c_void, c_int, *mut Callbacks) -> c_int,
     poll: unsafe extern "C" fn(),
@@ -333,8 +334,26 @@ extern "C" fn on_context_fence(_cookie: *mut c_void, ctx: u32, ring: u32, fence:
     signal(FenceDone { ctx, ring: Some(ring as u8), fence });
 }
 
-/// Size to map for a host buffer: `size` rounded up to the host page, but
-/// only when the tail of the last page provably belongs to the same
+/// The step the VMM maps guest memory in (0: the host page). With 4 KiB
+/// pages (`VmParams::small_pages`), buffers are rounded to 4 KiB: a whole
+/// host page could reach into the next buffer's place in the guest.
+static MAP_GRANULE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// See [`MAP_GRANULE`]. Call before mapping anything.
+pub fn set_map_granule(bytes: u64) {
+    MAP_GRANULE.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(target_os = "macos")]
+fn map_granule() -> u64 {
+    match MAP_GRANULE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => page_size(),
+        g => g,
+    }
+}
+
+/// Size to map for a host buffer: `size` rounded up to the mapping
+/// granule, but only when the tail provably belongs to the same
 /// page-granular allocation (anonymous mmap, Metal/IOKit buffers). Never
 /// for malloc zones: the slack there may be someone else's heap data.
 #[cfg(target_os = "macos")]
@@ -366,7 +385,7 @@ fn safe_map_size(ptr: *mut u8, size: u64) -> u64 {
         ) -> c_int;
     }
     const VM_REGION_EXTENDED_INFO: c_int = 13;
-    let ps = page_size();
+    let ps = map_granule();
     let rounded = size.next_multiple_of(ps);
     if rounded == size || (ptr as u64) % ps != 0 {
         return size;

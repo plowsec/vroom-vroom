@@ -82,6 +82,11 @@ pub struct VmParams {
     pub irqchip: IrqChipConfig,
     /// Run the guest at EL2 so it can host its own VMs (ARM nested virt).
     pub nested: bool,
+    /// Map guest memory in 4 KiB steps, not the host's 16 KiB (macOS on
+    /// Apple Silicon): a 4 KiB-page guest kernel can then put GPU buffers
+    /// anywhere it likes in the shared window (Vulkan). Ignored where the
+    /// host already maps 4 KiB.
+    pub small_pages: bool,
 }
 
 /// Entry point to a hypervisor backend.
@@ -111,6 +116,11 @@ pub trait Vm: Send + Sync {
 
     fn unmap_host(&self, _gpa: u64, _size: u64) -> Result<()> {
         Err(Error::Unsupported("mapping host buffers into the guest"))
+    }
+
+    /// The step `map_host` works in: addresses and sizes are multiples.
+    fn map_granule(&self) -> u64 {
+        vroom_memory::page_size() as u64
     }
 
     /// Zero (and free) all of `mem`, already mapped with `map_memory`.

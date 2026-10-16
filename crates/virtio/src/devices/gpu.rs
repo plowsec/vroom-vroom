@@ -891,7 +891,7 @@ impl GpuHandler {
         if res.mapped.is_some() {
             return bad;
         }
-        let ps = vroom_memory::page_size() as u64;
+        let ps = t.mapper.granule();
         let base = t.shm_base.load(Ordering::Acquire);
         if base == 0 || !offset.is_multiple_of(ps) {
             return bad;

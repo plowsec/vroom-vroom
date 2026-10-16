@@ -256,6 +256,7 @@ fn three_d(vm: &Arc<dyn Vm>, config: &VmConfig) -> Result<ThreeD> {
             "gpu = \"virtio3d\" needs virglrenderer with Venus (scripts/build-virglrenderer.sh, or brew install slp/krunkit/virglrenderer)".into(),
         ));
     }
+    vroom_gpu3d::set_map_granule(vm.map_granule());
     let r = vroom_gpu3d::Virgl::new(config.identity.gl_renderer.clone())
         .ok_or_else(|| Error::Setup("virglrenderer: Venus init failed (no Vulkan driver?)".into()))?;
     if config.display.opengl && !r.capsets().iter().any(|c| c.0 == 2) {
@@ -284,6 +285,10 @@ impl ShmMapper for VmShm {
         if let Err(e) = self.0.unmap_host(gpa, size) {
             log::warn!("gpu: unmap {gpa:#x}: {e}");
         }
+    }
+
+    fn granule(&self) -> u64 {
+        self.0.map_granule()
     }
 }
 
@@ -453,6 +458,9 @@ pub(crate) fn build(
             msi: Some(msi),
         },
         nested: config.nested,
+        // Venus maps GPU buffers wherever the guest kernel puts them, in
+        // its own page size: 4 KiB for stock kernels.
+        small_pages: config.display.gpu == Gpu::Virtio3d,
     })?;
 
     let mem = GuestMemory::new(&[(GuestAddress(layout::RAM_BASE), ram_size)])?;

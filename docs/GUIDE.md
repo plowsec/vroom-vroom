@@ -221,12 +221,14 @@ picks the right one by itself:
 - **OpenGL** (virgl): Mesa's virgl driver sends GL work to the host,
   where virglrenderer replays it on the Mac's GPU. Stock Ubuntu works as
   it is (any kernel, Mesa from the archive), in Wayland and X11 sessions.
-- **Vulkan** (Venus): needs `mesa-vulkan-drivers` (Mesa ≥ 24), the user
-  in the `render` group, and on macOS hosts a kernel with **16 KiB pages**
-  (HVF maps guest memory at 16 KiB granularity). Ubuntu ships no such
-  kernel; build one from Ubuntu's config with `CONFIG_ARM64_16K_PAGES=y`
-  (see `examples/ubuntu/kernel-16k.sh`). `vulkaninfo --summary` should
-  show `Virtio-GPU Venus (Apple M…)`. There is no swapchain
+- **Vulkan** (Venus): needs `mesa-vulkan-drivers` (Mesa ≥ 24) and the
+  user in the `render` group; stock Ubuntu kernels work. `vulkaninfo
+  --summary` should show `Virtio-GPU Venus (Apple M…)`. With 3D on, vroom
+  maps guest memory in 4 KiB steps instead of the Mac's 16 KiB, so the
+  guest kernel can put GPU buffers where it likes (macOS 15 has this only
+  as a private call; without it, 16 KiB steps and the guest needs a 16 KiB
+  page kernel, see `examples/ubuntu/kernel-16k.sh`). Memory speed in the
+  guest doesn't change measurably (fill and random reads, both ways). There is no swapchain
   (`VK_KHR_swapchain` is missing, with or without OpenGL): Vulkan apps
   can compute and render off screen, not show a window.
 

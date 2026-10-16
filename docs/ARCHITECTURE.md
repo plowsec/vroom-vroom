@@ -130,8 +130,11 @@ QEMU: Xorg's glamor draws into them with GL, and a context that touches
 a resource virglrenderer doesn't know is marked broken for good (every
 window turns black). Without GL they stay plain CPU buffers.
 
-macOS constraints: HVF maps at 16 KiB granularity, so guests need a 16 KiB
-page kernel (or blob sizes that are 16 KiB multiples), and MoltenVK lacks
+macOS constraints: HVF maps at the host's 16 KiB by default; a 4 KiB-page
+guest kernel places GPU buffers at 4 KiB steps, which can't be mapped that
+way. With 3D, the VM asks for 4 KiB stage-2 pages
+(`_hv_vm_config_set_ipa_granule`, private on macOS 15, public from 26),
+and GPU mappings round to that. MoltenVK lacks
 `VK_KHR_external_memory_fd`, which Mesa requires; our virglrenderer patch
 advertises it and shares mappings by pointer instead
 (`third_party/virglrenderer/`). Two more patches there make vrend work on

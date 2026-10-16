@@ -89,6 +89,8 @@ impl Hypervisor for Hvf {
 }
 
 pub struct HvfVm {
+    /// Stage-2 page size: the host's, or 4 KiB with `small_pages`.
+    granule: u64,
     /// Keeps RAM alive while mapped.
     memory: Mutex<Vec<GuestMemory>>,
     roms: Mutex<Vec<Arc<MmapRegion>>>,
@@ -133,6 +135,18 @@ impl HvfVm {
             // SAFETY: cfg is a valid config object.
             check("hv_vm_config_set_el2_enabled", unsafe { ffi::hv_vm_config_set_el2_enabled(cfg.0, true) })?;
         }
+        let host_page = vroom_memory::page_size() as u64;
+        let granule = match params.small_pages && host_page > 4096 {
+            true => match set_ipa_granule(&cfg, 4096) {
+                Ok(()) => 4096,
+                Err(e) => {
+                    // Still runs; Vulkan then needs a 16 KiB-page guest kernel.
+                    log::warn!("hvf: no 4 KiB guest pages ({e}): Vulkan needs a 16 KiB-page guest kernel");
+                    host_page
+                }
+            },
+            false => host_page,
+        };
         // SAFETY: cfg valid; one VM per process enforced by caller.
         check("hv_vm_create", unsafe { ffi::hv_vm_create(cfg.0) })?;
 
@@ -170,11 +184,13 @@ impl HvfVm {
         }
         std::mem::forget(vm_guard);
         log::info!(
-            "hvf: vm created, ipa {ipa} bits, SPIs {}..{}",
+            "hvf: vm created, ipa {ipa} bits, {} KiB pages, SPIs {}..{}",
+            granule >> 10,
             info.spi_base,
             info.spi_base + info.spi_count
         );
         Ok(HvfVm {
+            granule,
             memory: Mutex::new(Vec::new()),
             roms: Mutex::new(Vec::new()),
             kickers: Mutex::new(Vec::new()),
@@ -199,6 +215,21 @@ impl HvfVm {
             k.wake();
         }
     }
+}
+
+/// Stage-2 pages of `bytes` (4096). macOS 15 has this only as a private
+/// call taking the size; macOS 26 makes it public (with an enum), and
+/// keeps the private one.
+fn set_ipa_granule(cfg: &ffi::OsObject, bytes: u32) -> Result<()> {
+    type SetGranule = unsafe extern "C" fn(*mut c_void, u32) -> ffi::hv_return_t;
+    // SAFETY: dlsym with a valid C string; RTLD_DEFAULT searches loaded images.
+    let f = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"_hv_vm_config_set_ipa_granule".as_ptr()) };
+    if f.is_null() {
+        return Err(Error::Unsupported("4 KiB guest pages: this macOS has no way to set them"));
+    }
+    // SAFETY: the symbol has this signature (config, granule in bytes);
+    // cfg is a live config object.
+    check("hv_vm_config_set_ipa_granule", unsafe { std::mem::transmute::<*mut c_void, SetGranule>(f)(cfg.0, bytes) })
 }
 
 /// Destroys the VM if creation fails half way.
@@ -230,12 +261,16 @@ impl Vm for HvfVm {
     }
 
     unsafe fn map_host(&self, gpa: u64, ptr: *mut u8, size: u64) -> Result<()> {
-        // HVF wants host pointer, IPA and size aligned to the host page.
-        let ps = vroom_memory::page_size() as u64;
+        // HVF wants host pointer, IPA and size aligned to its granule.
+        let ps = self.granule;
         if !gpa.is_multiple_of(ps) || !(ptr as u64).is_multiple_of(ps) || !size.is_multiple_of(ps) || size == 0 {
             return Err(Error::Invalid(format!("unaligned host map {gpa:#x} {ptr:p} {size:#x}")));
         }
         self.map(ptr, gpa, size as usize, ffi::HV_MEMORY_READ | ffi::HV_MEMORY_WRITE)
+    }
+
+    fn map_granule(&self) -> u64 {
+        self.granule
     }
 
     fn unmap_host(&self, gpa: u64, size: u64) -> Result<()> {

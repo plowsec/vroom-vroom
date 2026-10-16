@@ -141,4 +141,8 @@ pub trait Renderer3d: Send {
 pub trait ShmMapper: Send + Sync {
     fn map(&self, gpa: u64, m: &Mapping) -> bool;
     fn unmap(&self, gpa: u64, size: u64);
+    /// What mappings are made of: addresses and sizes are multiples.
+    fn granule(&self) -> u64 {
+        vroom_memory::page_size() as u64
+    }
 }
