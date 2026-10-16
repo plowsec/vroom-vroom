@@ -61,6 +61,8 @@ pub enum AgentCmd {
     DragOutEnd { id: u32 },
     /// The Mac drop wants item `item`: write it into this pipe, checked.
     DragOutGet { id: u32, item: u32, to: std::os::fd::OwnedFd },
+    /// Start a guest app by name (checked by the viewer protocol).
+    StartApp(String),
     Stop,
 }
 
@@ -287,6 +289,15 @@ impl Service {
                 self.win_ids = list.iter().map(|w| w.id).collect();
                 self.to_viewer(ToViewer::Windows(list));
             }
+            // Only for windows of the last list (and checked for size by
+            // the decoder).
+            Message::WindowIcon { id, w, h, rgba } if self.coherence && self.win_ids.contains(&id) => {
+                self.to_viewer(ToViewer::WindowIcon { id, w, h, rgba });
+            }
+            Message::CoherenceNo(why) if self.coherence => {
+                log::info!("guest: no coherence here: {why}");
+                self.to_viewer(ToViewer::CoherenceNo(why));
+            }
             Message::ClipboardText(t) => self.guest_clipboard(t),
             Message::Ping(v) => self.send(&Message::Pong(v)),
             Message::Gpu3d { on } => {
@@ -453,6 +464,11 @@ impl Service {
                 // Only windows the guest listed last, only in Coherence.
                 if self.coherence && self.win_ids.contains(&id) {
                     self.send(&Message::WindowDo { id, op });
+                }
+            }
+            AgentCmd::StartApp(name) => {
+                if self.status().features & features::START_APP != 0 && vroom_proto::line_ok(&name) {
+                    self.send(&Message::StartApp(name));
                 }
             }
             AgentCmd::Drop { id, from } => {

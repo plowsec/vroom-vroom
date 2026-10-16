@@ -45,10 +45,18 @@ pub(crate) struct ViewerTx {
     /// The guest's latest window list not yet sent (Coherence): like
     /// damage, a guest that keeps changing it costs one queued message.
     windows: Arc<Mutex<Option<Vec<GuestWindow>>>>,
+    /// Window icons not yet sent, by window: the latest of each, at most
+    /// `ICONS_PENDING` windows.
+    icons: Arc<Mutex<Icons>>,
     /// The viewer now, if any.
     sock: Arc<Mutex<Option<UnixStream>>>,
     sticky: Arc<Mutex<Sticky>>,
 }
+
+type Icons = std::collections::BTreeMap<u32, (u32, u32, Vec<u8>)>;
+
+/// Most window icons waiting for a slow viewer (16 KiB each at most).
+const ICONS_PENDING: usize = 2 * vroom_proto::WINDOWS_MAX;
 
 /// The last word on each thing a viewer shows: a new one gets these first.
 #[derive(Default)]
@@ -82,6 +90,8 @@ impl ViewerTx {
         let pending = damage.clone();
         let windows = Arc::new(Mutex::new(None::<Vec<GuestWindow>>));
         let pending_windows = windows.clone();
+        let icons = Arc::new(Mutex::new(Icons::new()));
+        let pending_icons = icons.clone();
         let sock = Arc::new(Mutex::new(sock));
         let out = sock.clone();
         std::thread::Builder::new().name("viewer-tx".into()).spawn(move || {
@@ -89,7 +99,7 @@ impl ViewerTx {
                 // Damage and window markers take the state as it is now:
                 // fine for any viewer. Anything else from before the
                 // viewer attached is old news.
-                let marker = matches!(m, ToViewer::Damage { .. } | ToViewer::Windows(_));
+                let marker = matches!(m, ToViewer::Damage { .. } | ToViewer::Windows(_) | ToViewer::WindowIcon { .. });
                 if matches!(m, ToViewer::Damage { .. }) {
                     let Some([x0, y0, x1, y1]) = pending.lock().unwrap_or_else(|e| e.into_inner()).take() else { continue };
                     m = ToViewer::Damage { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
@@ -98,19 +108,26 @@ impl ViewerTx {
                     let Some(list) = pending_windows.lock().unwrap_or_else(|e| e.into_inner()).take() else { continue };
                     m = ToViewer::Windows(list);
                 }
+                let mut batch = vec![m];
+                if matches!(batch[0], ToViewer::WindowIcon { .. }) {
+                    let all = std::mem::take(&mut *pending_icons.lock().unwrap_or_else(|e| e.into_inner()));
+                    batch = all.into_iter().map(|(id, (w, h, rgba))| ToViewer::WindowIcon { id, w, h, rgba }).collect();
+                }
                 let mut s = out.lock().unwrap_or_else(|e| e.into_inner());
                 // Checked under the lock attach() holds while it replays.
                 if !marker && g < now.load(std::sync::atomic::Ordering::Acquire) {
                     continue;
                 }
-                if let Some(v) = s.as_mut() {
-                    if v.write_all(&m.encode()).is_err() {
-                        *s = None;
+                for m in batch {
+                    if let Some(v) = s.as_mut() {
+                        if v.write_all(&m.encode()).is_err() {
+                            *s = None;
+                        }
                     }
                 }
             }
         })?;
-        Ok(ViewerTx { q, gen, damage, windows, sock, sticky: Arc::default() })
+        Ok(ViewerTx { q, gen, damage, windows, icons, sock, sticky: Arc::default() })
     }
 
     /// A viewer is connected.
@@ -193,9 +210,26 @@ impl ViewerTx {
             }
             return;
         }
+        if let ToViewer::WindowIcon { id, w, h, rgba } = m {
+            if hold(&mut self.icons.lock().unwrap_or_else(|e| e.into_inner()), *id, (*w, *h, rgba.clone())) {
+                // All waiting icons go out with it.
+                let _ = self.q.send((self.gen(), ToViewer::WindowIcon { id: 0, w: 0, h: 0, rgba: Vec::new() }));
+            }
+            return;
+        }
         self.remember(m);
         let _ = self.q.send((self.gen(), m.clone()));
     }
+}
+
+/// Keep a window's icon until it goes out (the latest per window, up to
+/// `ICONS_PENDING` windows). True if it is the first one waiting.
+fn hold(icons: &mut Icons, id: u32, icon: (u32, u32, Vec<u8>)) -> bool {
+    let first = icons.is_empty();
+    if icons.len() < ICONS_PENDING || icons.contains_key(&id) {
+        icons.insert(id, icon);
+    }
+    first
 }
 
 fn union(a: [u32; 4], b: [u32; 4]) -> [u32; 4] {
@@ -649,6 +683,7 @@ fn handle(
         ToVmm::Window { id, op } => agent.send(AgentCmd::Window { id, op }),
         ToVmm::DragOut { id, end: false } => agent.send(AgentCmd::DragOut { id }),
         ToVmm::DragOut { id, end: true } => agent.send(AgentCmd::DragOutEnd { id }),
+        ToVmm::StartApp(name) => agent.send(AgentCmd::StartApp(name)),
     }
 }
 
@@ -732,6 +767,17 @@ mod tests {
             }
         }
         assert_eq!(got, Some([10, 5, 308, 408]));
+    }
+
+    #[test]
+    fn icons_wait_one_per_window() {
+        // A viewer that doesn't keep up: icons pile up, one per window, capped.
+        let mut icons = Icons::new();
+        let firsts = (0..ICONS_PENDING as u32 + 10).filter(|i| hold(&mut icons, *i, (1, 1, vec![0; 4]))).count();
+        assert_eq!(firsts, 1, "one message queued for them all");
+        hold(&mut icons, 3, (1, 1, vec![9; 4]));
+        assert_eq!(icons.len(), ICONS_PENDING);
+        assert_eq!(icons[&3].2, vec![9; 4], "the latest wins");
     }
 
     #[test]

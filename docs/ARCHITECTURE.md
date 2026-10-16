@@ -161,34 +161,68 @@ and the app under the pointer takes the files. Leaving the window sends
 
 The app asks the guest for a screen the size of the Mac screen's free
 area (`ToVmm::Resize`, the usual path) and sends `ToVmm::Coherence(true)`;
-the VMM's agent service passes `Message::Coherence` on, the Windows
-service hands it to the session helper (`agent/src/coherence.rs`,
-`coh_win.rs`). The helper hides the taskbar, makes the whole screen the
-work area, and every 40 ms walks the windows front to back
-(`GetTopWindow`/`GW_HWNDNEXT`: `EnumWindows` leaves out Store apps and the
-Start menu), with per-monitor DPI awareness so it reads real pixels. When
-the list changes it sends `Message::Windows`: id (the window handle),
-what can be seen of it (DWM's frame bounds), flags (in front, minimized,
-app window, maximized), title. Back come `WindowDo` requests: activate
-(joining the foreground thread's input, as for drag and drop), minimize,
-close (`SC_CLOSE`), move (to the visible bounds, borders added back).
+the VMM's agent service passes `Message::Coherence` on, the guest's
+service hands it to the session helper (`agent/src/coherence.rs`, with
+`coh_win.rs` for Windows and `coh_x11.rs` for X11).
+
+The helper looks at the windows when its desktop says they changed, at
+most every 10 ms, and every 500 ms anyway in case an event got lost:
+
+- Windows: `SetWinEventHook` (out of context, on a thread of its own with
+  a message loop) for foreground, menus, move and size, minimize, and
+  top-level windows created, destroyed, shown, hidden, moved, renamed,
+  cloaked. The callback only sets a flag and wakes the session loop.
+  The helper hides the taskbar, makes the whole screen the work area,
+  and walks the windows front to back (`GetTopWindow`/`GW_HWNDNEXT`:
+  `EnumWindows` leaves out Store apps and the Start menu), with
+  per-monitor DPI awareness so it reads real pixels.
+- X11: a second connection selects structure and property events on the
+  root and on every managed window. The list is `_NET_CLIENT_LIST`, put
+  in the order of the root's children (the window manager's frames), plus
+  override-redirect windows above the lowest frame (menus, tooltips).
+  What can be seen of a window is the client area, plus
+  `_NET_FRAME_EXTENTS`, less `_GTK_FRAME_EXTENTS` (GTK's shadows).
+  Windows of other workspaces, the desktop and docks are left out.
+  Actions are the client messages a taskbar sends (`_NET_ACTIVE_WINDOW`,
+  `WM_CHANGE_STATE`, `_NET_CLOSE_WINDOW`, `_NET_MOVERESIZE_WINDOW` with
+  static gravity). Ubuntu's dock is set to hide (`gsettings`, put back
+  after; what it was is noted in `$XDG_RUNTIME_DIR` for a helper that
+  died). On Wayland the helper answers `CoherenceNo` with the reason.
+
+When the list changes the helper sends `Message::Windows`: id (window
+handle or X window), what can be seen of it, flags (in front, minimized,
+app window, maximized), title. App windows' icons go as `WindowIcon`
+(32x32 RGBA) when new and when they change (looked at every 2 s):
+Windows draws the window's icon (`WM_GETICON`, the class icon, or its
+program's) twice, on black and on white, which gives the alpha of any
+kind of icon; X11 takes the size nearest 32 of `_NET_WM_ICON`. Back come
+`WindowDo` requests: activate, minimize, close (`SC_CLOSE` /
+`_NET_CLOSE_WINDOW`), move (to the visible bounds, borders added back).
 Only windows of the last list are touched, in the VMM and the agent.
+`StartApp` (Windows) presses the Windows key, types the name as
+characters (`KEYEVENTF_UNICODE`, any keyboard layout) and Enter.
 
 The VMM forwards the list to the app coalesced (`ToViewer::Windows`, like
-damage: a busy guest costs one queued list). The app
-(`gui/src/console/coherence.rs`) keeps one frameless Slint window per
-guest window on screen (`ui/coherence.slint`): our strip on top, then the
-guest window's part of the shared framebuffer, copied where damage
-touches it. Guest pixels and Mac points convert through `Map` (the free
-area and the guest's mode, which may be smaller than asked: Windows'
-driver caps it). Pointer events map back through the picture's own size.
-Moves either way: the guest's list places the Mac windows; a Mac window
-moved or resized by the user sends `WindowDo::Move` and is left alone by
-guest reports for half a second. The guest's order is applied with
-`orderFront:` while vroom is the active app; new windows open behind
-other apps' windows when it isn't. The guest's window in front gets the
-keyboard on the Mac while one of ours has it. The bar (`CoherenceBar`)
-lists app windows and sends the Windows key for Start. Leaving sends
+damage: a busy guest costs one queued list), icons the same way per
+window (at most 128 waiting). The app (`gui/src/console/coherence.rs`)
+keeps one frameless Slint window per guest window on screen
+(`ui/coherence.slint`): our strip on top, then the guest window's part
+of the shared framebuffer, copied where damage touches it. Guest pixels
+and Mac points convert through `Map` (the free area and the guest's
+mode, which may be smaller than asked: Windows' driver caps it). Pointer
+events map back through the picture's own size. Moves either way: the
+guest's list places the Mac windows; a Mac window moved or resized by
+the user sends `WindowDo::Move` (kept on the guest's screen) and is left
+alone by guest reports for half a second. The guest's order is applied
+with `orderFront:` while vroom is the active app; new windows open
+behind other apps' windows when it isn't. The guest's window in front
+gets the keyboard on the Mac while one of ours has it. The bar
+(`CoherenceBar`) lists app windows with their icons, sends the Windows
+key for Start, and has the app field (its keys stay in the bar while it
+has focus). Once a second the app looks at which screen the bar is on
+and at that screen's free area; if either changed (the bar dragged to
+another screen, the Dock moved, a screen unplugged), the guest's screen
+moves there: new area, a resize, the bar at the bottom. Leaving sends
 `Coherence(false)` and the VM window's size; a viewer that goes away
 (the app crashed) turns Coherence off in the VMM, and the agent puts the
 taskbar back when its session ends or it starts again.
@@ -211,6 +245,8 @@ guest's DropEntry, DropData and DropEnd frames on, checked, with the
 drag's id. The app writes the item where the promise says. When all are
 written (or the drag ends with no drop) the app sends `DragOut` with
 `end`, and the agent forgets the paths.
+taskbar back when its session ends or it starts again. A session helper
+replaced by another (started twice) is told to leave Coherence first.
 
 ## 3D
 

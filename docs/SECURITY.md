@@ -145,6 +145,13 @@ where, and with what title. That is the guest's word, so:
   most 24. Titles lose control and direction-changing characters and are
   cut to 80 characters. A guest that floods lists costs one queued list
   in the VMM and one in the app.
+- App icons are the guest's pictures: raw RGBA, at most 64x64, exactly
+  that many bytes, checked by the VMM's and the app's decoders and once
+  more before they become an image. No image format is decoded on the
+  Mac. Only icons of windows in the last list are passed on; a guest
+  that floods them costs one waiting icon per window (at most 128) in the
+  VMM and in the app. Icons show in our bar next to the title, never in
+  the strip, the Dock or the menu bar.
 - Every Coherence window carries a strip the app draws above the guest's
   picture, with the VM's name and the window's title; the guest can't draw
   over it, and has no way to open a window without it. Its macOS window
@@ -164,6 +171,22 @@ where, and with what title. That is the guest's word, so:
   politely (`SC_CLOSE`, the app may refuse) or move them.
 - The clipboard rules don't change: sync only while one of the VM's
   windows (or the bar) has the keyboard.
+- The bar's app field sends the name to the guest (one line of plain
+  text, at most 256 bytes, checked by the viewer protocol, the VMM and
+  the agent); the guest types it into its own Start menu. Nothing on the
+  Mac is started. Keys typed in the field stay out of the guest until
+  Enter.
+- "Coherence can't work here" from the guest (Wayland) is one line of
+  plain text, cleaned again before the app shows it.
+- The guest's screen follows the bar to another Mac screen, never on the
+  guest's say: only where the user put the bar. Windows the user drags
+  off the guest's screen stay on it in the guest.
+- In the guest, window events (Windows hooks, X11 events) only wake the
+  helper, at most every 10 ms: a guest app that moves windows all the
+  time costs the helper's CPU and a list per look, coalesced as above.
+- X11: the helper acts on windows as a taskbar does (client messages to
+  the window manager) and only on windows of its last list. It may hide
+  Ubuntu's dock (a user setting, put back after).
 
 What's left: a guest app can still draw anything below the strip,
 including something that looks like a Mac dialog. The strip says whose
