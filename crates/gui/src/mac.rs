@@ -15,7 +15,7 @@ mod objc {
     use std::path::PathBuf;
 
     pub type Id = *mut c_void;
-    pub type Sel = *const c_void;
+    pub type Sel = *mut c_void;
 
     #[link(name = "objc")]
     extern "C" {
