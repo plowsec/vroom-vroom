@@ -1,5 +1,6 @@
 //! `vroom` command line.
 
+mod camera;
 mod clip;
 mod disk;
 #[cfg(unix)]
@@ -62,6 +63,9 @@ enum Cmd {
         #[arg(long)]
         input: bool,
     },
+    /// Camera helper started by the VMM (internal).
+    #[command(hide = true)]
+    CameraHelper,
     /// GPU process started by the VMM for 3D (internal).
     #[cfg(unix)]
     #[command(hide = true)]
@@ -142,6 +146,7 @@ fn main() -> ExitCode {
         Cmd::New(a) => new::run(a, load),
         Cmd::Import(a) => import::run(a),
         Cmd::AudioOut { input } => audio_out(input),
+        Cmd::CameraHelper => camera::helper(),
         #[cfg(unix)]
         Cmd::GpuHelper(a) => gpu::helper(a),
         Cmd::UsbHost(a) => usb::host(a),

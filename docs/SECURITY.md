@@ -188,6 +188,21 @@ There is a microphone path now, off by default. How it works:
   (sizes, whole frames, a generation number so audio from an earlier
   request is dropped), and at most a quarter second is buffered.
 
+### Camera
+
+Off unless `camera = true`; then there is a USB camera in the guest and a
+helper process (`vroom camera-helper`) with a Seatbelt profile of its
+own: the camera, the system's camera services and frame buffers
+(IOSurface), reading the system's libraries; no files of the user's, no
+writes, no network, no exec. The VMM never touches the camera. It asks
+the helper for frames only while a window is open and the guest reads
+them (two seconds after the guest stops, the camera goes off), and the
+window shows "Camera in use" whenever it asked. The same limit as the
+microphone applies: a guest that broke out into the VMM could ask for the
+camera while the VM runs without telling the window; macOS's green
+camera light can't be faked by it. Frames from the helper are checked
+like guest input (size, a whole frame) before they reach the guest.
+
 ## USB devices
 
 Off unless the VM file lists `[[usb]]` devices. The VM process never

@@ -23,6 +23,7 @@ use vroom_usb::proto::{Done, Event, Request, Speed, Status, Submit, XferType, MA
 use serde::{Deserialize, Serialize};
 
 use super::hid::{HidEvent, Keyboard, Tablet, UsbIds};
+use super::uvc::Camera;
 use super::{Setup, UsbDevice};
 use crate::pci::{BarSpec, ConfigSpace, Intx, MsiSender, Msix, PciDevice, PciId, VendorIds};
 use crate::{get_le, put_le};
@@ -195,6 +196,8 @@ impl Passthrough {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PortKind {
     Hid,
+    /// The camera (UVC), after the HID ports.
+    Camera,
     /// Passthrough device, on its USB 2 or USB 3 port.
     Pass(usize, bool),
 }
@@ -250,6 +253,8 @@ struct Snap {
     slots: Vec<Option<Slot>>,
     kbd: Vec<u8>,
     tablet: Vec<u8>,
+    #[serde(default)]
+    camera: Vec<u8>,
 }
 
 pub struct Xhci {
@@ -267,6 +272,7 @@ pub struct Xhci {
     slots: Vec<Option<Slot>>,
     kbd: Keyboard,
     tablet: Tablet,
+    camera: Option<Camera>,
     pass: Vec<Passthrough>,
     paused: bool,
     deferred: VecDeque<HidEvent>,
@@ -311,6 +317,7 @@ impl Xhci {
             slots: vec![None; MAX_SLOTS + 1],
             kbd: Keyboard::default(),
             tablet: Tablet::default(),
+            camera: None,
             pass: Vec::new(),
             paused: false,
             deferred: VecDeque::new(),
@@ -326,7 +333,6 @@ impl Xhci {
     /// to `links[i]`, its events come back through `usb_event(i, ..)`.
     /// Each gets a USB 2 and a USB 3 root port, and a device slot.
     pub fn with_passthrough(mut self, links: Vec<Sender<Request>>) -> Self {
-        let n = links.len();
         self.pass = links
             .into_iter()
             .map(|link| Passthrough {
@@ -340,10 +346,41 @@ impl Xhci {
                 warned_iso: false,
             })
             .collect();
-        self.ports = vec![0; HID_PORTS + 2 * n];
-        self.slots = vec![None; MAX_SLOTS.max(HID_PORTS + n) + 1];
-        self.hc_reset();
+        self.layout();
         self
+    }
+
+    /// A camera on a USB 2 port of its own, after the HID ports.
+    pub fn with_camera(mut self, cam: Camera) -> Self {
+        self.camera = Some(cam);
+        self.layout();
+        self
+    }
+
+    /// Ports and slots for what is plugged in.
+    fn layout(&mut self) {
+        let (e, n) = (self.emu(), self.pass.len());
+        self.ports = vec![0; e + 2 * n];
+        self.slots = vec![None; MAX_SLOTS.max(e + n) + 1];
+        self.hc_reset();
+    }
+
+    /// Ports of our own devices (HID, camera), before passthrough ones.
+    fn emu(&self) -> usize {
+        HID_PORTS + self.camera.is_some() as usize
+    }
+
+    /// A new frame from the camera: hand it to a transfer that waits.
+    pub fn camera_frame(&mut self) {
+        if self.paused || self.camera.is_none() {
+            return;
+        }
+        let port = HID_PORTS as u8 + 1;
+        let ids: Vec<usize> = (1..=self.max_slots()).filter(|&i| self.slots[i].as_ref().is_some_and(|s| s.port == port)).collect();
+        for id in ids {
+            // EP1 IN.
+            self.run_interrupt_in(id, 3);
+        }
     }
 
     fn max_slots(&self) -> usize {
@@ -352,18 +389,19 @@ impl Xhci {
 
     fn port_kind(&self, port: u8) -> Option<PortKind> {
         let p = (port as usize).checked_sub(1)?;
-        let n = self.pass.len();
+        let (e, n) = (self.emu(), self.pass.len());
         match p {
             _ if p < HID_PORTS => Some(PortKind::Hid),
-            _ if p < HID_PORTS + n => Some(PortKind::Pass(p - HID_PORTS, false)),
-            _ if p < HID_PORTS + 2 * n => Some(PortKind::Pass(p - HID_PORTS - n, true)),
+            _ if p < e => Some(PortKind::Camera),
+            _ if p < e + n => Some(PortKind::Pass(p - e, false)),
+            _ if p < e + 2 * n => Some(PortKind::Pass(p - e - n, true)),
             _ => None,
         }
     }
 
     /// Index into `ports` of passthrough device `i`'s USB 2 / USB 3 port.
     fn pass_port(&self, i: usize, usb3: bool) -> usize {
-        HID_PORTS + i + if usb3 { self.pass.len() } else { 0 }
+        self.emu() + i + if usb3 { self.pass.len() } else { 0 }
     }
 
     /// PORTSC of a passthrough port with (Some) or without a device.
@@ -393,6 +431,7 @@ impl Xhci {
         match port {
             1 => Some(&mut self.kbd),
             2 => Some(&mut self.tablet),
+            3 => self.camera.as_mut().map(|c| c as &mut dyn UsbDevice),
             _ => None,
         }
     }
@@ -402,9 +441,10 @@ impl Xhci {
         self.intr = Intr::default();
         self.cmd = Ring::default();
         self.slots = vec![None; self.max_slots() + 1];
-        for p in 0..HID_PORTS {
+        for p in 0..self.emu() {
             // Device attached, powered, waiting for a port reset.
-            self.ports[p] = PS_CCS | PS_PP | PS_CSC | PLS_POLLING << PS_PLS_SHIFT | (super::SPEED_FULL as u32) << PS_SPEED_SHIFT;
+            let speed = if p < HID_PORTS { super::SPEED_FULL } else { super::SPEED_HIGH };
+            self.ports[p] = PS_CCS | PS_PP | PS_CSC | PLS_POLLING << PS_PLS_SHIFT | (speed as u32) << PS_SPEED_SHIFT;
         }
         for i in 0..self.pass.len() {
             self.pass_forget(i);
@@ -423,6 +463,9 @@ impl Xhci {
         }
         self.kbd.reset();
         self.tablet.reset();
+        if let Some(c) = &mut self.camera {
+            c.reset();
+        }
         self.intx.set(false);
     }
 
@@ -947,8 +990,9 @@ impl Xhci {
             let Some((r, td)) = self.gather_td(ep.ring, false, TD_TRBS) else { return };
             // TDs with a data buffer wait for a report; pure No-op /
             // Event Data TDs complete right away.
+            let room: usize = td.iter().filter(|(_, t)| trb_type(t) == T_NORMAL).map(|(_, t)| (t[2] & 0x1ffff) as usize).sum();
             let report = if td.iter().any(|(_, t)| trb_type(t) == T_NORMAL) {
-                match self.dev(port).and_then(|d| d.poll_in(epnum)) {
+                match self.dev(port).and_then(|d| d.poll_in_max(epnum, room)) {
                     Some(r) => r,
                     None => return,
                 }
@@ -1271,10 +1315,10 @@ impl Xhci {
             // passthrough device), then USB 3.0 if there are any.
             o if o == XECP => 0x0200_0002 | if n > 0 { 4 << 8 } else { 0 },
             o if o == XECP + 4 => 0x2042_5355, // "USB "
-            o if o == XECP + 8 => (HID_PORTS as u32 + n) << 8 | 1,
+            o if o == XECP + 8 => (self.emu() as u32 + n) << 8 | 1,
             o if o == XECP + 0x10 && n > 0 => 0x0300_0002,
             o if o == XECP + 0x14 && n > 0 => 0x2042_5355,
-            o if o == XECP + 0x18 && n > 0 => n << 8 | (HID_PORTS as u32 + n + 1),
+            o if o == XECP + 0x18 && n > 0 => n << 8 | (self.emu() as u32 + n + 1),
             _ => 0,
         }
     }
@@ -1558,6 +1602,7 @@ impl PciDevice for Xhci {
             slots: self.slots.clone(),
             kbd: self.kbd.save(),
             tablet: self.tablet.save(),
+            camera: self.camera.as_ref().map(|c| c.save()).unwrap_or_default(),
         })
     }
 
@@ -1589,6 +1634,9 @@ impl PciDevice for Xhci {
         self.slots = s.slots;
         self.kbd.restore(&s.kbd);
         self.tablet.restore(&s.tablet);
+        if let Some(c) = &mut self.camera {
+            c.restore(&s.camera);
+        }
         // Passthrough devices can't be saved: what the guest had is
         // gone. It sees the device leave, and come back if it is here.
         for i in 0..self.pass.len() {

@@ -687,7 +687,7 @@ export component SettingsPanel inherits Rectangle {
 
                 if root.vis.sound: SectionCard {
                     icon: Icons.speaker;
-                    title: "Sound";
+                    title: "Sound and camera";
                     summary: root.s.sum-sound;
                     force-open: root.open-all;
                     Row {
@@ -712,6 +712,19 @@ export component SettingsPanel inherits Rectangle {
                             danger: true;
                             enabled: !root.lk;
                             toggled(v) => { Bus.set("audio.in", v ? "true" : "false"); }
+                        }
+                    }
+                    Row {
+                        label: "Camera";
+                        hint: root.s.camera ? "The guest sees this Mac's camera as a USB webcam while its window is open and an app uses it. The window shows when." : "For video calls. Off: the guest has no camera.";
+                        key: "camera";
+                        warn: root.s.camera;
+                        Toggle {
+                            y: (parent.height - self.height) / 2;
+                            checked: root.s.camera;
+                            danger: true;
+                            enabled: !root.lk;
+                            toggled(v) => { Bus.set("camera", v ? "true" : "false"); }
                         }
                     }
                 }

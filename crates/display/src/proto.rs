@@ -28,6 +28,8 @@ pub enum ToViewer {
     Closed,
     /// The guest is recording from the host microphone (true) or stopped.
     Mic(bool),
+    /// The host camera is on for the guest (true) or off.
+    Camera(bool),
     /// The guest's pointer, for the viewer to show as its own.
     Cursor(GuestCursor),
     /// The guest is ready for files dragged over the window (`DragEnter`).
@@ -131,6 +133,7 @@ impl ToViewer {
                 p.extend_from_slice(rgba);
                 frame(7, &p)
             }
+            ToViewer::Camera(on) => frame(10, &[*on as u8]),
             ToViewer::DragReady { id, live } => {
                 let mut p = id.to_le_bytes().to_vec();
                 p.push(*live as u8);
@@ -170,6 +173,7 @@ impl ToViewer {
                 }
                 _ => return Err(Error::Proto("unknown cursor")),
             }),
+            10 => ToViewer::Camera(*p.first().ok_or(Error::Proto("short"))? != 0),
             8 if p.len() == 5 => ToViewer::DragReady { id: get_u32(p, 0)?, live: p[4] != 0 },
             9 if p.len() >= 5 => ToViewer::DropDone { id: get_u32(p, 0)?, ok: p[4] != 0, place: text(&p[5..])?.chars().take(256).collect() },
             _ => return Err(Error::Proto("unknown viewer message")),
@@ -335,6 +339,7 @@ mod tests {
             ToViewer::Cursor(GuestCursor::Image { w: 2, h: 1, hot_x: 1, hot_y: 0, rgba: vec![1, 2, 3, 4, 5, 6, 7, 8] }),
             ToViewer::Cursor(GuestCursor::Unset),
             ToViewer::DragReady { id: 4, live: true },
+            ToViewer::Camera(true),
             ToViewer::DropDone { id: 4, ok: false, place: "Desktop".into() },
         ];
         for m in &v {

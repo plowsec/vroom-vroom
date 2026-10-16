@@ -18,6 +18,7 @@ picks up the change.
 | `memory_mib` | 2048 | RAM in MiB. |
 | `tpm` | false | TPM 2.0 (needs `swtpm`). Windows 11 wants it. |
 | `nested` | false | Let the guest run its own VMs. M3 or newer, macOS 15+. No snapshots then. |
+| `camera` | false | The Mac's camera, as a USB webcam in the guest (video calls). On only while the VM's window is open and an app in the guest uses it; the window shows when. See [GUIDE.md](GUIDE.md#camera). |
 | `virtio_transport` | `auto` | `auto` (MMIO for kernel boot, PCI for UEFI), `mmio`, `pci`. |
 
 ## `[boot]`

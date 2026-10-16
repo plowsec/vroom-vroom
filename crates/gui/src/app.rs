@@ -645,6 +645,7 @@ impl App {
             usb_host: model(usb_host),
             audio: c.audio.output,
             audio_in: c.audio.input,
+            camera: c.camera,
             clip_in: c.clipboard.host_to_guest,
             clip_out: c.clipboard.guest_to_host,
             clip_max_kib: s((c.clipboard.max_bytes / 1024).to_string()),
@@ -722,12 +723,16 @@ impl App {
                 (0, _) => "Nothing shared".to_string(),
                 (n, w) => format!("{n} folder{}{}", if n == 1 { "" } else { "s" }, if w { ", guest can write" } else { ", read-only" }),
             }),
-            sum_sound: s(match (c.audio.output, c.audio.input) {
-                (false, false) => "Off",
-                (true, false) => "Plays through this machine's speakers",
-                (false, true) => "Microphone only",
-                (true, true) => "Speakers and microphone",
-            }),
+            sum_sound: s(format!(
+                "{}{}",
+                match (c.audio.output, c.audio.input) {
+                    (false, false) => "Off",
+                    (true, false) => "Plays through this machine's speakers",
+                    (false, true) => "Microphone only",
+                    (true, true) => "Speakers and microphone",
+                },
+                if c.camera { ", camera" } else { "" }
+            )),
             sum_clip: s(match (c.clipboard.host_to_guest, c.clipboard.guest_to_host) {
                 (true, true) => "Both ways",
                 (true, false) => "To the guest only",
@@ -764,7 +769,7 @@ impl App {
             net: any || hit("network net nat bridged host-only hostonly port forward forwarding ssh mac address interface internet lan localhost loopback adapter"),
             share: any || hit("shared folders share folder virtiofs mount files tag"),
             usb: any || hit("usb devices device passthrough serial adapter security key phone dongle"),
-            sound: any || hit("sound audio speakers music output microphone mic input"),
+            sound: any || hit("sound audio speakers music output microphone mic input camera webcam video call"),
             clip: any || hit("clipboard copy paste"),
             security: any || hit("security sandbox tpm transport mmio pci serial console identity fingerprint hardware maker vendor model product smbios acpi hide vm detection"),
             boot: any || hit("boot uefi firmware kernel initrd cmdline command line nvram efi"),

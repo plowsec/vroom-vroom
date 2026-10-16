@@ -61,6 +61,8 @@ struct Shared {
     clipboard: Option<String>,
     /// The guest records from the microphone (latest word from the VMM).
     mic: Option<bool>,
+    /// The guest has the camera on (latest word).
+    camera: Option<bool>,
     /// The guest's pointer, the latest.
     cursor: Option<GuestCursor>,
     /// Answers about files dragged over the window, in order.
@@ -101,6 +103,7 @@ impl Shared {
                 self.status.push_back(t);
             }
             ToViewer::Mic(on) => self.mic = Some(on),
+            ToViewer::Camera(on) => self.camera = Some(on),
             ToViewer::Cursor(c) => self.cursor = Some(c),
             m @ (ToViewer::DragReady { .. } | ToViewer::DropDone { .. }) => {
                 if self.drag.len() >= MAX_STATUS {
@@ -927,12 +930,15 @@ impl Console {
 
     /// What the reader thread collected since the last wakeup.
     fn inbox(&mut self) {
-        let (frame, full, damage, status, clip, mic, cursor, drag) = {
+        let (frame, full, damage, status, clip, mic, cursor, drag, camera) = {
             let mut s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
             s.posted = false;
             let f = (std::mem::take(&mut s.frame), std::mem::take(&mut s.full), s.damage.take());
-            (f.0, f.1, f.2, std::mem::take(&mut s.status), s.clipboard.take(), s.mic.take(), s.cursor.take(), std::mem::take(&mut s.drag))
+            (f.0, f.1, f.2, std::mem::take(&mut s.status), s.clipboard.take(), s.mic.take(), s.cursor.take(), std::mem::take(&mut s.drag), s.camera.take())
         };
+        if let Some(on) = camera {
+            self.camera(on);
+        }
         for m in drag {
             match m {
                 ToViewer::DragReady { id, live } => self.drag_ready(id, live),
@@ -998,6 +1004,21 @@ impl Console {
             return;
         }
         self.win.set_mic_on(on);
+        if on {
+            self.win.set_bar_pinned(true);
+            let k = self.key.clone();
+            slint::Timer::single_shot(Duration::from_secs(3), move || {
+                with(&k, |c| c.win.set_bar_pinned(false));
+            });
+        }
+    }
+
+    /// Camera indicator; like the microphone's.
+    fn camera(&mut self, on: bool) {
+        if on == self.win.get_camera_on() {
+            return;
+        }
+        self.win.set_camera_on(on);
         if on {
             self.win.set_bar_pinned(true);
             let k = self.key.clone();

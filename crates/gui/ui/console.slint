@@ -30,6 +30,7 @@ component VmBar inherits HorizontalLayout {
     in property <bool> captured;
     in property <bool> fullscreen;
     in property <bool> mic-on;
+    in property <bool> camera-on;
     // Host CPU time the VM uses ("12%"; empty: unknown).
     in property <string> cpu-text;
     // "3D", "Direct3D 11"; empty without 3D.
@@ -116,7 +117,7 @@ component VmBar inherits HorizontalLayout {
     if root.wide: Rectangle {
         horizontal-stretch: 1;
     }
-    if root.mic-on: Rectangle {
+    if root.mic-on || root.camera-on: Rectangle {
         y: (parent.height - self.height) / 2;
         height: 22px;
         width: ml.preferred-width;
@@ -133,7 +134,7 @@ component VmBar inherits HorizontalLayout {
                 tint: #ef4444;
             }
             Text {
-                text: "Microphone in use";
+                text: root.mic-on && root.camera-on ? "Camera and microphone in use" : root.camera-on ? "Camera in use" : "Microphone in use";
                 color: #ffffffd0;
                 font-size: Theme.fs-xs;
                 vertical-alignment: center;
@@ -271,6 +272,8 @@ export component ConsoleWindow inherits Window {
     in property <bool> fullscreen;
     // The guest is recording from the host microphone.
     in property <bool> mic-on;
+    // The guest has the host camera on.
+    in property <bool> camera-on;
     // Rust keeps the full-screen bar out for a moment after going full screen.
     in property <bool> bar-pinned;
     // Set when saving the VM's state failed (why, from the VMM).
@@ -426,7 +429,7 @@ export component ConsoleWindow inherits Window {
 
     // Microphone in use, in full screen while the bar is away: a small
     // pill where it would be, so it never goes unnoticed.
-    if root.mic-on && root.fullscreen && !root.float-out: Rectangle {
+    if (root.mic-on || root.camera-on) && root.fullscreen && !root.float-out: Rectangle {
         x: (root.width - self.width) / 2;
         y: 8px;
         width: mpl.preferred-width;
@@ -446,7 +449,7 @@ export component ConsoleWindow inherits Window {
                 tint: #ef4444;
             }
             Text {
-                text: "Mic";
+                text: root.mic-on && root.camera-on ? "Cam, mic" : root.camera-on ? "Cam" : "Mic";
                 color: #ffffffd0;
                 font-size: 10px;
                 vertical-alignment: center;
@@ -523,6 +526,7 @@ export component ConsoleWindow inherits Window {
             captured: root.captured;
             fullscreen: root.fullscreen;
             mic-on: root.mic-on;
+            camera-on: root.camera-on;
             cpu-text: root.cpu-text;
             gpu-text: root.gpu-text;
             wide: true;
@@ -556,6 +560,7 @@ export component ConsoleWindow inherits Window {
             captured: root.captured;
             fullscreen: root.fullscreen;
             mic-on: root.mic-on;
+            camera-on: root.camera-on;
             wide: false;
             act(a) => { root.act(a); }
         }

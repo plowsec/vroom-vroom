@@ -1,8 +1,10 @@
 //! USB: device-side model (descriptors, standard requests) and the xHCI
-//! host controller. Devices: HID boot keyboard and absolute tablet.
+//! host controller. Devices: HID boot keyboard and absolute tablet, a
+//! camera (UVC).
 
 pub mod hid;
 mod keymap;
+pub mod uvc;
 pub mod xhci;
 
 use serde::{Deserialize, Serialize};
@@ -42,6 +44,7 @@ pub struct Stall;
 
 /// Port speed as xHCI encodes it in PORTSC.
 pub const SPEED_FULL: u8 = 1;
+pub const SPEED_HIGH: u8 = 3;
 
 /// A USB function plugged into a root port.
 pub trait UsbDevice: Send {
@@ -52,6 +55,12 @@ pub trait UsbDevice: Send {
     fn control(&mut self, setup: Setup, out: &[u8]) -> ControlResult;
     /// Next report for interrupt IN endpoint `ep` (1-based number).
     fn poll_in(&mut self, ep: u8) -> Option<Vec<u8>>;
+    /// Next data for IN endpoint `ep`, at most `max` bytes (the transfer
+    /// the guest queued). Bulk endpoints use this.
+    fn poll_in_max(&mut self, ep: u8, max: usize) -> Option<Vec<u8>> {
+        let _ = max;
+        self.poll_in(ep)
+    }
     fn reset(&mut self);
     fn save(&self) -> Vec<u8>;
     fn restore(&mut self, data: &[u8]);
