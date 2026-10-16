@@ -255,6 +255,9 @@ struct Snap {
     tablet: Vec<u8>,
     #[serde(default)]
     camera: Vec<u8>,
+    /// The layout had a camera port (older saves: no).
+    #[serde(default)]
+    camera_port: bool,
 }
 
 pub struct Xhci {
@@ -273,6 +276,11 @@ pub struct Xhci {
     kbd: Keyboard,
     tablet: Tablet,
     camera: Option<Camera>,
+    /// A camera port in the layout. Usually "there is a camera", but a
+    /// resumed VM keeps the layout it was saved with (the guest read the
+    /// port count when it started): the port may be empty, or the camera
+    /// portless until the next start.
+    camera_port: bool,
     pass: Vec<Passthrough>,
     paused: bool,
     deferred: VecDeque<HidEvent>,
@@ -318,6 +326,7 @@ impl Xhci {
             kbd: Keyboard::default(),
             tablet: Tablet::default(),
             camera: None,
+            camera_port: false,
             pass: Vec::new(),
             paused: false,
             deferred: VecDeque::new(),
@@ -353,6 +362,7 @@ impl Xhci {
     /// A camera on a USB 2 port of its own, after the HID ports.
     pub fn with_camera(mut self, cam: Camera) -> Self {
         self.camera = Some(cam);
+        self.camera_port = true;
         self.layout();
         self
     }
@@ -367,12 +377,12 @@ impl Xhci {
 
     /// Ports of our own devices (HID, camera), before passthrough ones.
     fn emu(&self) -> usize {
-        HID_PORTS + self.camera.is_some() as usize
+        HID_PORTS + self.camera_port as usize
     }
 
     /// A new frame from the camera: hand it to a transfer that waits.
     pub fn camera_frame(&mut self) {
-        if self.paused || self.camera.is_none() {
+        if self.paused || self.camera.is_none() || !self.camera_port {
             return;
         }
         let port = HID_PORTS as u8 + 1;
@@ -431,7 +441,7 @@ impl Xhci {
         match port {
             1 => Some(&mut self.kbd),
             2 => Some(&mut self.tablet),
-            3 => self.camera.as_mut().map(|c| c as &mut dyn UsbDevice),
+            3 if self.camera_port => self.camera.as_mut().map(|c| c as &mut dyn UsbDevice),
             _ => None,
         }
     }
@@ -445,6 +455,10 @@ impl Xhci {
             // Device attached, powered, waiting for a port reset.
             let speed = if p < HID_PORTS { super::SPEED_FULL } else { super::SPEED_HIGH };
             self.ports[p] = PS_CCS | PS_PP | PS_CSC | PLS_POLLING << PS_PLS_SHIFT | (speed as u32) << PS_SPEED_SHIFT;
+            if p >= HID_PORTS && self.camera.is_none() {
+                // An empty camera port (see `camera_port`).
+                self.ports[p] = PS_PP | PLS_RXDETECT << PS_PLS_SHIFT;
+            }
         }
         for i in 0..self.pass.len() {
             self.pass_forget(i);
@@ -1603,16 +1617,20 @@ impl PciDevice for Xhci {
             kbd: self.kbd.save(),
             tablet: self.tablet.save(),
             camera: self.camera.as_ref().map(|c| c.save()).unwrap_or_default(),
+            camera_port: self.camera_port,
         })
     }
 
     fn restore(&mut self, data: &[u8]) -> vroom_snapshot::Result<()> {
         let s: Snap = decode(data)?;
         let mut cfg = s.cfg;
+        // The saved layout wins on the camera port (the guest knows its
+        // port count); the rest must match.
+        let saved_ports = HID_PORTS + s.camera_port as usize + 2 * self.pass.len();
         if !cfg.rebuild_masks(&self.cfg)
             || s.msix.vectors() != self.msix.vectors()
             || s.slots.len() != self.slots.len()
-            || s.ports.len() != self.ports.len()
+            || s.ports.len() != saved_ports
         {
             return Err(vroom_snapshot::Error::Invalid("xhci layout".into()));
         }
@@ -1630,12 +1648,24 @@ impl PciDevice for Xhci {
         self.intr = s.intr;
         self.intr.erstsz = self.intr.erstsz.min(16);
         self.cmd = s.cmd;
+        self.camera_port = s.camera_port;
         self.ports = s.ports;
         self.slots = s.slots;
         self.kbd.restore(&s.kbd);
         self.tablet.restore(&s.tablet);
         if let Some(c) = &mut self.camera {
             c.restore(&s.camera);
+        }
+        if self.camera.is_some() && !self.camera_port {
+            log::info!("usb camera: added while the VM was saved; there from its next start");
+        }
+        if self.camera_port && self.camera.is_none() {
+            // Removed while saved: the guest sees it unplugged.
+            let p = HID_PORTS;
+            if self.ports[p] & PS_CCS != 0 {
+                self.ports[p] = PS_PP | PLS_RXDETECT << PS_PLS_SHIFT | PS_CSC;
+                self.port_events_due = true;
+            }
         }
         // Passthrough devices can't be saved: what the guest had is
         // gone. It sees the device leave, and come back if it is here.
@@ -1677,6 +1707,38 @@ mod tests {
     struct NoMsi;
     impl MsiSender for NoMsi {
         fn send(&self, _a: u64, _d: u32) {}
+    }
+
+    #[test]
+    fn a_saved_vm_keeps_its_camera_port() {
+        let mem = GuestMemory::new(&[(GuestAddress(RAM), 1 << 20)]).unwrap();
+        let mk = |cam: bool| {
+            let r = IntxRouter::new((0..4).map(|_| Arc::new(NoIrq) as Arc<dyn crate::IrqLine>).collect());
+            let x = Xhci::new(6, mem.clone(), r.pin(6, 1), Arc::new(NoMsi));
+            if cam {
+                x.with_camera(Camera::new(&UsbIds::default(), Arc::new(super::super::uvc::CameraFeed::default())))
+            } else {
+                x
+            }
+        };
+        let (mut with, mut without) = (mk(true), mk(false));
+        let saved_with = with.save().unwrap();
+        let saved_without = without.save().unwrap();
+        // Camera turned off while saved: the port stays, empty, and the
+        // guest is told it changed.
+        let mut x = mk(false);
+        x.restore(&saved_with).unwrap();
+        assert_eq!(x.ports.len(), HID_PORTS + 1);
+        assert_eq!(x.ports[HID_PORTS] & (PS_CCS | PS_CSC), PS_CSC);
+        assert!(x.dev(3).is_none());
+        // Turned on while saved: no port until the next start.
+        let mut x = mk(true);
+        x.restore(&saved_without).unwrap();
+        assert_eq!(x.ports.len(), HID_PORTS);
+        assert!(x.dev(3).is_none());
+        // Unchanged: as before.
+        with.restore(&saved_with).unwrap();
+        assert!(with.dev(3).is_some());
     }
 
     const RAM: u64 = 0x4000_0000;
