@@ -12,6 +12,7 @@ mod host;
 mod hostusb;
 mod keymap;
 mod library;
+mod mac;
 mod msg;
 mod paths;
 mod rootd;
@@ -56,18 +57,23 @@ pub fn fallback(m: msg::Msg) {
                 let _ = slint::quit_event_loop();
             }
         }
+        Msg::Open(p) => match app::launch() {
+            Ok(()) => msg::send(Msg::Open(p)),
+            Err(e) => eprintln!("vroom-gui: {e}"),
+        },
         Msg::Toast { text, .. } => eprintln!("vroom-gui: {text}"),
         _ => {}
     }
 }
 
 fn main() {
+    mac::log_to_file_if_detached();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     if let Err(e) = slint::BackendSelector::new().backend_name("winit".into()).select() {
         eprintln!("vroom-gui: {e}");
         std::process::exit(1);
     }
-    let mut args = std::env::args().skip(1);
+    let mut args = std::env::args().skip(1).filter(|a| !mac::is_finder_arg(a));
     let r = match args.next() {
         None => app::launch(),
         Some(a) if a == "-h" || a == "--help" => {
@@ -105,6 +111,8 @@ fn main() {
         eprintln!("vroom-gui: {e}");
         std::process::exit(1);
     }
+    // Files opened from Finder and the Dock icon.
+    mac::install();
     if let Some(shot) = std::env::var_os("VROOM_SHOT") {
         shot::schedule(std::path::PathBuf::from(shot));
     }

@@ -68,13 +68,17 @@ Not yet: x86_64 hosts (it builds, can't run VMs yet) and Secure Boot.
 
 ```bash
 brew install qemu            # only for its UEFI firmware file
-scripts/build.sh --release   # builds and signs vroom + vroom-gui
-target/release/vroom-gui     # the app: New VM, pick the ISO, Start
+scripts/app.sh --install     # builds vroom.app and copies it to /Applications
 ```
+
+Then open vroom from Applications or Spotlight: New VM, pick the ISO,
+Start. Without `--install` the app is in `target/dist/vroom.app`. 3D needs
+its libraries built first ([GUIDE.md](docs/GUIDE.md#the-mac-app)).
 
 Or from the terminal:
 
 ```bash
+scripts/build.sh --release   # builds and signs vroom + vroom-gui
 target/release/vroom new dev --os linux --disk 32G --iso ubuntu-24.04-desktop-arm64.iso
 target/release/vroom-gui dev.toml
 ```

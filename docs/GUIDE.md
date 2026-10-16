@@ -4,11 +4,64 @@
 
 ```bash
 brew install qemu            # only for the EDK2 firmware files and qemu-img
-scripts/build.sh
+scripts/app.sh --install     # vroom.app, in /Applications
 ```
 
 `qemu` is not used to run anything: vroom only reads
 `/opt/homebrew/share/qemu/edk2-aarch64-code.fd` (UEFI) from it.
+`scripts/build.sh` builds just the two programs, in `target/debug`
+(`--release`: `target/release`), for use from the terminal.
+
+## The Mac app
+
+`scripts/app.sh` builds `target/dist/vroom.app`; `--install` also copies
+it to `/Applications` (it refuses while VMs run from the copy there).
+You can also drag it there yourself. Then vroom starts like any Mac app:
+from Finder, Launchpad, Spotlight, or the Dock once you keep it there.
+
+Build the 3D libraries before the app if you want 3D in its VMs
+(`scripts/build-virglrenderer.sh`, then `scripts/build-dxmt.sh` for
+Windows guests, see below). `app.sh` puts whatever was built in the app.
+
+What it does that the bare `vroom-gui` doesn't:
+
+- Open a VM file with it (right-click, Open With, vroom, or drop it on
+  the Dock icon): the VM starts, as with `vroom-gui vm.toml`. vroom
+  doesn't make itself the default app for `.toml` files; to double-click
+  VM files, pick vroom in Finder's Get Info, "Open with", for that file.
+- Drop an ISO on the Dock icon: New VM, with that installer. A VMware VM
+  (`.vmwarevm`): the import.
+- Camera and microphone questions name vroom, not Terminal.
+- Its own messages go to `~/Library/Application Support/vroom/logs/vroom-gui.log`
+  (there is no terminal to print to). Each VM's last run log is in
+  `logs/` there too (`⋯` → Show log).
+
+The terminal still works: `/Applications/vroom.app/Contents/MacOS/vroom`
+is the VMM with all its commands (a symlink to it in your `PATH` is fine).
+
+Inside the app:
+
+```text
+vroom.app/Contents/
+  MacOS/vroom-gui        the app
+  MacOS/vroom            the VMM, started by the app
+  Frameworks/*.dylib     3D: virglrenderer, MoltenVK, DXMT, ANGLE
+  Resources/vroom.icns   the icon (packaging/macos/)
+  Info.plist             packaging/macos/Info.plist
+```
+
+The app is signed ad hoc: the VMM with the hypervisor entitlement, then
+the bundle. That is enough on the Mac that built it. It isn't enough to
+give it to other people: their Mac blocks it ("not from an identified
+developer") until they allow it in System Settings, Privacy & Security.
+A proper release needs an Apple Developer ID certificate, signing with
+the hardened runtime (and then the camera and microphone entitlements,
+`com.apple.security.device.camera` and `...device.audio-input`, next to
+the hypervisor one), and Apple's notarization. None of that is set up.
+
+macOS remembers the camera and microphone answers for the app's
+signature. An ad hoc signature changes with each build, so after a
+rebuild macOS may ask again.
 
 ## The app
 
@@ -391,7 +444,8 @@ release uses, with Google's depot_tools, about 3 GB while it builds
 when the VMM asks for it) into virglrenderer (3.4 MB), with our patches
 from `third_party/virglrenderer/` (two of them make it work on macOS's
 OpenGL 4.1). Both copy their results next to `target/*/vroom`, where the
-VMM looks; ship the dylibs with the binary (`scripts/dist.sh` does): virglrenderer
+VMM looks; in vroom.app they go in `Contents/Frameworks`, where the VMM
+looks too (`scripts/app.sh` and `scripts/dist.sh` do that). virglrenderer
 and MoltenVK always, ANGLE's two only for `opengl_host = "angle"`,
 DXMT's only for Windows guests.
 
@@ -709,13 +763,14 @@ orange dot in the menu bar too. Focus doesn't matter: a call keeps going while
 you work in another window, the way a native app would.
 
 The first time a guest records, macOS asks for the microphone
-permission. It asks for the app that started vroom, not vroom itself:
-Terminal (or iTerm, VS Code...) for `vroom run` and for `vroom-gui`
-started from a terminal. Saying yes lets everything started from that
-app use the microphone. If you said no, or never saw the question, the
-guest records silence and the window says so after two seconds; turn
-the app on in System Settings, Privacy & Security, Microphone (or reset
-the question with `tccutil reset Microphone com.apple.Terminal`).
+permission, for the app that started vroom: "vroom" when you use
+vroom.app, Terminal (or iTerm, VS Code...) for `vroom run` and for
+`vroom-gui` started from a terminal. Saying yes to Terminal lets
+everything started from it use the microphone. If you said no, or never
+saw the question, the guest records silence and the window says so after
+two seconds; turn the app on in System Settings, Privacy & Security,
+Microphone (or reset the question with `tccutil reset Microphone
+org.vroom.app`, or `com.apple.Terminal`).
 Sound input in the guest follows the Mac's default input device (System
 Settings, Sound, Input).
 
@@ -745,9 +800,9 @@ second, uncompressed. The Mac's picture (16:9) is cropped to the shape the
 guest asked for, around its middle, then scaled.
 
 The first time, macOS asks for the camera permission for the app that
-started vroom (Terminal, iTerm...), as for the microphone. If you said
-no, the window says so; turn the app on in System Settings, Privacy &
-Security, Camera.
+started vroom (vroom with vroom.app; Terminal, iTerm... from a
+terminal), as for the microphone. If you said no, the window says so;
+turn the app on in System Settings, Privacy & Security, Camera.
 
 Testing without a camera: `VROOM_CAMERA_TEST=1 vroom run ...` sends
 moving color bars instead.

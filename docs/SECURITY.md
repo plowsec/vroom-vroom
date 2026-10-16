@@ -429,7 +429,10 @@ Where vrend's GL calls go depends on `opengl_host`:
 
 `opengl = false` leaves vrend and both GL drivers out entirely.
 
-Venus and Neptune run in virglrenderer's render server, a thread of the
+The GPU process loads virglrenderer by full path from its own directory
+(next to `vroom`, or `Contents/Frameworks` when it is
+`vroom.app/Contents/MacOS/vroom`, symlinks resolved), and only if it isn't
+there from Homebrew's prefix, then dyld's search path. Venus and Neptune run in virglrenderer's render server, a thread of the
 GPU process (contexts in processes of their own are a later step).
 libepoxy is built to load ANGLE only from virglrenderer's own directory,
 and Apple's OpenGL only by its system path, when the GPU process made a

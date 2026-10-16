@@ -29,6 +29,8 @@ pub enum Msg {
     ConsoleGone { key: String, error: Option<String> },
     /// The library window, on this VM (its key) if given.
     ShowLibrary(Option<String>),
+    /// A file opened from Finder or dropped on the Dock icon.
+    Open(PathBuf),
     // From background jobs.
     Toast { text: String, kind: i32, action: String },
     Refresh,

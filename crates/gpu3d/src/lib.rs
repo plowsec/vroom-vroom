@@ -152,8 +152,13 @@ fn candidates() -> Vec<String> {
     // Our patched build (scripts/build-virglrenderer.sh) ships next to the
     // binary; whoever can write there can replace the binary anyway.
     let lib = if cfg!(target_os = "macos") { "libvirglrenderer.1.dylib" } else { "libvirglrenderer.so.1" };
-    if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.to_path_buf())) {
+    if let Some(dir) = std::env::current_exe().and_then(std::fs::canonicalize).ok().and_then(|e| e.parent().map(|d| d.to_path_buf())) {
         v.push(dir.join(lib).to_string_lossy().into_owned());
+        // In vroom.app the libraries are in Contents/Frameworks, next to
+        // Contents/MacOS: still our own bundle, not a search path.
+        if let Some(fw) = bundle_frameworks(&dir) {
+            v.push(fw.join(lib).to_string_lossy().into_owned());
+        }
     }
     if cfg!(target_os = "macos") {
         v.extend(
@@ -164,6 +169,16 @@ fn candidates() -> Vec<String> {
         v.push("libvirglrenderer.so.1".into());
     }
     v
+}
+
+/// `X.app/Contents/Frameworks` for a binary in `X.app/Contents/MacOS`.
+fn bundle_frameworks(exe_dir: &std::path::Path) -> Option<PathBuf> {
+    let contents = exe_dir.parent()?;
+    let app = contents.parent()?;
+    let is_bundle = exe_dir.file_name()? == "MacOS"
+        && contents.file_name()? == "Contents"
+        && app.extension().is_some_and(|e| e == "app");
+    is_bundle.then(|| contents.join("Frameworks"))
 }
 
 fn open_lib() -> Option<Lib> {
@@ -992,5 +1007,20 @@ impl Renderer3d for Virgl {
 
     fn release_thread(&mut self) {
         leave();
+    }
+}
+
+#[cfg(test)]
+mod bundle_tests {
+    use super::bundle_frameworks;
+    use std::path::Path;
+
+    #[test]
+    fn frameworks_only_inside_an_app() {
+        let fw = bundle_frameworks(Path::new("/Applications/vroom.app/Contents/MacOS"));
+        assert_eq!(fw.as_deref(), Some(Path::new("/Applications/vroom.app/Contents/Frameworks")));
+        assert_eq!(bundle_frameworks(Path::new("/x/target/release")), None);
+        assert_eq!(bundle_frameworks(Path::new("/x/Contents/MacOS")), None);
+        assert_eq!(bundle_frameworks(Path::new("/MacOS")), None);
     }
 }

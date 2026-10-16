@@ -246,6 +246,7 @@ impl App {
                 }
             }
             Msg::Drop(p) => self.dropped(&p),
+            Msg::Open(p) => self.opened(&p),
             Msg::DropHover(b) => self.ui.set_drop_hover(b),
             Msg::PaletteKey(k) => self.palette_key(k),
             Msg::Tick => self.tick(),
@@ -1488,6 +1489,19 @@ impl App {
         }
     }
 
+    /// From Finder: a VM file starts (as `vroom-gui vm.toml` does), the
+    /// rest is a drop on the library.
+    fn opened(&mut self, p: &Path) {
+        let vm = p.extension().is_some_and(|e| e.eq_ignore_ascii_case("toml")) && VmConfig::load_raw(p).is_ok();
+        if vm {
+            self.add_vm(p);
+            self.start_current(&[]);
+        } else {
+            self.update(Msg::ShowLibrary(None));
+            self.dropped(p);
+        }
+    }
+
     fn dropped(&mut self, p: &Path) {
         let ext = p.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
         match ext.as_str() {
@@ -1735,7 +1749,7 @@ fn plain_error(e: &str) -> String {
 
 fn open_text(p: &Path) {
     let r = if cfg!(target_os = "macos") {
-        std::process::Command::new("open").arg("-t").arg(p).status()
+        std::process::Command::new("/usr/bin/open").arg("-t").arg(p).status()
     } else {
         std::process::Command::new("xdg-open").arg(p).status()
     };
@@ -1746,7 +1760,7 @@ fn open_text(p: &Path) {
 
 fn reveal(p: &Path) {
     let r = if cfg!(target_os = "macos") {
-        std::process::Command::new("open").arg("-R").arg(p).status()
+        std::process::Command::new("/usr/bin/open").arg("-R").arg(p).status()
     } else {
         std::process::Command::new("xdg-open").arg(p.parent().unwrap_or(p)).status()
     };

@@ -56,7 +56,9 @@ Windows guests:
 - USB passthrough with real devices, bridged networking with real
   vmnet, and vroom-netd as root taking devices from macOS drivers
   (the app sets it up; not tried as root yet).
-- A signed, notarized app with an installer and updates; crash reports.
+- Signing and notarizing vroom.app (`scripts/app.sh` builds it, signed
+  ad hoc: needs a Developer ID and the hardened runtime), a disk image
+  to install from, updates, crash reports.
 - Multiple monitors, drag and drop from the guest to the Mac (Mac to
   guest works), a live drag in Linux guests (they get files on the
   Desktop for now).
