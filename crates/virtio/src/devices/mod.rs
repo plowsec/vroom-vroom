@@ -11,3 +11,4 @@ pub mod gpu3d;
 #[doc(hidden)]
 pub mod virgl_state;
 pub mod input;
+pub mod media;

@@ -28,6 +28,7 @@ mod snapshot;
 mod tpm;
 mod usb;
 mod vcpu;
+mod video;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};

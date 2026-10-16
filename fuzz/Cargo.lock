@@ -587,6 +587,7 @@ dependencies = [
  "vroom-net",
  "vroom-proto",
  "vroom-usb",
+ "vroom-video",
  "vroom-virtio",
 ]
 
@@ -650,6 +651,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "vroom-video"
+version = "0.1.0"
+
+[[package]]
 name = "vroom-virtio"
 version = "0.1.0"
 dependencies = [
@@ -665,6 +670,7 @@ dependencies = [
  "vroom-memory",
  "vroom-net",
  "vroom-snapshot",
+ "vroom-video",
 ]
 
 [[package]]

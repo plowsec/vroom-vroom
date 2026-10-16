@@ -694,6 +694,11 @@ pub struct Display {
     /// What runs the guest's OpenGL on the host (see [`OpenglHost`]).
     #[serde(default)]
     pub opengl_host: OpenglHost,
+    /// Hardware video decoding: a V4L2 decoder in the guest (H.264, HEVC)
+    /// backed by the Mac's VideoToolbox, in a helper process. Linux guests
+    /// with the virtio-media driver. Off by default for now.
+    #[serde(default)]
+    pub video_decode: bool,
     /// Guest monitors, 1 to [`MAX_MONITORS`]: the app shows each in a
     /// window of its own. Linux guests get one GPU with that many
     /// outputs; Windows guests one GPU per monitor (its drivers drive one
@@ -731,7 +736,7 @@ fn default_h() -> u32 {
 
 impl Default for Display {
     fn default() -> Self {
-        Display { gpu: Gpu::None, width: default_w(), height: default_h(), hidpi: true, opengl: true, opengl_host: OpenglHost::Apple, monitors: 1 }
+        Display { gpu: Gpu::None, width: default_w(), height: default_h(), hidpi: true, opengl: true, opengl_host: OpenglHost::Apple, video_decode: false, monitors: 1 }
     }
 }
 
