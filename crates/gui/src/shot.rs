@@ -6,8 +6,10 @@
 //! code; "vmkey:125+19" a combination), "vmtype:notepad" text,
 //! "cohclick:X,Y[,title]" a click on a Coherence window, "vmmove:X,Y"
 //! the mouse to a VM window's point, "shot:out.png" a
-//! picture now, "barshot:out.png" one of the Coherence bar, "cohstart:Calculator" a
-//! name in its app field). `VROOM_SHOT_VM=1`: picture the VM window instead. Used
+//! picture now, "libshot:out.png" one of the library window, "barshot:out.png"
+//! one of the Coherence bar, "cohstart:Calculator" a name in its app field;
+//! "console:net-menu", "console:net.toggle.N" and "console:net.mode.N.M" work
+//! the network menu). `VROOM_SHOT_VM=1`: picture the VM window instead. Used
 //! for the README pictures and
 //! to check the UI without a person at the screen.
 
@@ -72,6 +74,11 @@ fn run(acts: Vec<String>, i: usize, out: PathBuf, delay: f64) {
             crate::console::move_any(x.parse().unwrap_or(0.0), y.parse().unwrap_or(0.0));
         } else if let Some(p) = a.strip_prefix("shot:") {
             picture(&PathBuf::from(p));
+        } else if let Some(p) = a.strip_prefix("libshot:") {
+            // The library window, whatever VROOM_SHOT_VM says.
+            if let Some(Ok(buf)) = TARGET.with(|t| t.borrow().as_ref().map(|ui| ui.window().take_snapshot())) {
+                let _ = crate::console::write_png(std::path::Path::new(p), &buf, buf.width(), buf.height());
+            }
         } else if let Some((n, p)) = a.strip_prefix("monshot:").and_then(|s| s.split_once(':')) {
             // Another monitor's window (2, 3...).
             match crate::console::snapshot_monitor(n.parse().unwrap_or(0)) {

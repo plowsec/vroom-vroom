@@ -24,6 +24,25 @@ export struct UsbMenuRow {
     enabled: bool,
 }
 
+// One network adapter in the VM window's network menu.
+export struct NetMenuRow {
+    // "Adapter 1 · NAT"
+    label: string,
+    // Connected, cable out, switching, why not.
+    note: string,
+    // The cable is in.
+    on: bool,
+    // Being switched.
+    busy: bool,
+    // 0 NAT, 1 bridged, 2 host-only.
+    mode: int,
+    // NAT can be picked (the VM started with a NAT adapter).
+    nat-ok: bool,
+    // Taken out of the VM file: it stays, unplugged, until the next start.
+    removed: bool,
+    warn: bool,
+}
+
 component BarButton inherits IconButton {
     tint: #ffffffd0;
     size: 30px;
@@ -59,12 +78,18 @@ component VmBar inherits HorizontalLayout {
     in property <bool> usb-shown;
     in property <int> usb-count;
     in property <bool> usb-open;
+    // The VM has network adapters; how many have their cable out.
+    in property <bool> net-shown;
+    in property <int> net-off;
+    in property <bool> net-open;
     // Coherence: why it can't start (empty: it can).
     in property <string> coherence-why;
     out property <bool> power-open: false;
     callback act(string);
     // The USB button was clicked: where its bottom right corner is.
     callback usb-at(length, length);
+    // The same for the network button.
+    callback net-at(length, length);
 
     padding-left: 8px;
     padding-right: 6px;
@@ -216,6 +241,29 @@ component VmBar inherits HorizontalLayout {
         tip: "Show all displays";
         y: (parent.height - self.height) / 2;
         clicked => { root.act("displays"); }
+    }
+    if root.net-shown: Rectangle {
+        width: 30px;
+        height: 30px;
+        y: (parent.height - self.height) / 2;
+        BarButton {
+            icon: Icons.network;
+            tip: root.net-open ? "" : root.net-off == 0 ? "Network" : root.net-off == 1 ? "Network: 1 adapter unplugged" : "Network: " + root.net-off + " adapters unplugged";
+            active: root.net-open;
+            clicked => {
+                root.net-at(self.absolute-position.x + self.width, self.absolute-position.y + self.height);
+                root.act("net-menu");
+            }
+        }
+        // A cable is out: a small mark on the icon's corner.
+        if root.net-off > 0: Rectangle {
+            x: parent.width - self.width - 4px;
+            y: 4px;
+            width: 8px;
+            height: 8px;
+            border-radius: 4px;
+            background: #fbbf24;
+        }
     }
     if root.usb-shown: Rectangle {
         width: 30px;
@@ -379,6 +427,13 @@ export component ConsoleWindow inherits Window {
     // Where the menu hangs from (the USB button's bottom right corner).
     in-out property <length> usb-x: root.width - 120px;
     in-out property <length> usb-y: root.bar-height;
+    // Network adapters: the button, the menu and what is in it.
+    in property <bool> net-shown;
+    in property <int> net-off;
+    in-out property <bool> net-open;
+    in property <[NetMenuRow]> net-rows;
+    in-out property <length> net-x: root.width - 150px;
+    in-out property <length> net-y: root.bar-height;
     callback mouse-move(float, float);
     callback button(int, bool);
     callback wheel(length, length);
@@ -398,7 +453,7 @@ export component ConsoleWindow inherits Window {
     property <float> ar: mode-w > 0 && mode-h > 0 ? mode-w / mode-h : 1.6;
     property <length> avail-h: root.height - root.bar-height;
     property <bool> near-top: screen-ta.has-hover && screen-ta.mouse-y + screen.y < 8px;
-    property <bool> float-out: root.fullscreen && (root.bar-pinned || root.near-top || float-ta.has-hover || float-bar.power-open || root.usb-open || root.state != VmState.running);
+    property <bool> float-out: root.fullscreen && (root.bar-pinned || root.near-top || float-ta.has-hover || float-bar.power-open || root.usb-open || root.net-open || root.state != VmState.running);
 
     screen := Rectangle {
         width: min(root.width, root.avail-h * root.ar);
@@ -624,6 +679,13 @@ export component ConsoleWindow inherits Window {
                 root.usb-x = x;
                 root.usb-y = y;
             }
+            net-shown: root.net-shown;
+            net-off: root.net-off;
+            net-open: root.net-open;
+            net-at(x, y) => {
+                root.net-x = x;
+                root.net-y = y;
+            }
             act(a) => { root.act(a); }
         }
     }
@@ -663,6 +725,13 @@ export component ConsoleWindow inherits Window {
             usb-at(x, y) => {
                 root.usb-x = x;
                 root.usb-y = y;
+            }
+            net-shown: root.net-shown;
+            net-off: root.net-off;
+            net-open: root.net-open;
+            net-at(x, y) => {
+                root.net-x = x;
+                root.net-y = y;
             }
             coherence-why: root.coherence-why;
             act(a) => { root.act(a); }
@@ -857,6 +926,132 @@ export component ConsoleWindow inherits Window {
                             busy: root.usb-setup-busy;
                             clicked => { root.act("usb.setup"); }
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    // Network adapters, under the bar's network button: plug a cable in
+    // or out, put an adapter on another network. A click outside closes it.
+    if root.net-open: TouchArea {
+        clicked => { root.net-open = false; }
+    }
+    if root.net-open: Rectangle {
+        width: min(340px, root.width - 16px);
+        height: nl2.preferred-height;
+        x: clamp(root.net-x - self.width, 8px, root.width - self.width - 8px);
+        y: root.net-y + 4px;
+        background: #242427f2;
+        border-radius: Theme.r-lg;
+        border-width: 1px;
+        border-color: #ffffff24;
+        TouchArea { }
+        nl2 := VerticalLayout {
+            padding: 5px;
+            spacing: 0px;
+            Text {
+                text: "Network adapters";
+                color: #ffffff80;
+                font-size: Theme.fs-xs;
+                font-weight: 600;
+                height: 26px;
+                vertical-alignment: center;
+                x: 10px;
+            }
+            for it[i] in root.net-rows: VerticalLayout {
+                Rectangle {
+                    height: 44px;
+                    border-radius: Theme.r-sm;
+                    background: nta.has-hover && !it.busy ? #ffffff14 : transparent;
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        spacing: 10px;
+                        Rectangle {
+                            width: 16px;
+                            if it.busy: Spinner {
+                                tint: #ffffffb0;
+                                y: (parent.height - self.height) / 2;
+                            }
+                            if it.on && !it.busy: Icon {
+                                source: Icons.check;
+                                width: 16px;
+                                height: 16px;
+                                y: (parent.height - self.height) / 2;
+                                tint: Theme.accent;
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 2px;
+                            Text {
+                                text: it.label;
+                                color: #ffffff;
+                                font-size: Theme.fs-md;
+                                overflow: elide;
+                            }
+                            Text {
+                                text: it.note;
+                                color: it.warn ? #fbbf24 : #ffffff80;
+                                font-size: Theme.fs-xs;
+                                overflow: elide;
+                            }
+                        }
+                    }
+                    nta := TouchArea {
+                        enabled: !it.busy;
+                        mouse-cursor: pointer;
+                        clicked => { root.act("net.toggle." + i); }
+                    }
+                }
+                // What the cable is plugged into.
+                if !it.removed: HorizontalLayout {
+                    height: 30px;
+                    padding-left: 36px;
+                    padding-right: 10px;
+                    spacing: 4px;
+                    alignment: start;
+                    for m[j] in ["NAT", "Bridged", "Host-only"]: Rectangle {
+                        width: mt.preferred-width + 16px;
+                        height: 22px;
+                        y: (parent.height - self.height) / 2;
+                        border-radius: 11px;
+                        background: it.mode == j ? Theme.accent : mta.has-hover ? #ffffff24 : #ffffff10;
+                        opacity: j == 0 && !it.nat-ok && it.mode != 0 ? 0.4 : 1;
+                        mt := Text {
+                            text: m;
+                            color: it.mode == j ? #ffffff : #ffffffc0;
+                            font-size: Theme.fs-xs;
+                        }
+                        mta := TouchArea {
+                            enabled: !it.busy && it.mode != j;
+                            mouse-cursor: pointer;
+                            clicked => { root.act("net.mode." + i + "." + j); }
+                        }
+                    }
+                }
+            }
+            Rectangle {
+                height: 1px;
+                background: #ffffff14;
+            }
+            Rectangle {
+                height: 34px;
+                border-radius: Theme.r-sm;
+                background: sta.has-hover ? #ffffff14 : transparent;
+                Text {
+                    x: 36px;
+                    text: "Network settings...";
+                    color: #ffffffb0;
+                    font-size: Theme.fs-sm;
+                    vertical-alignment: center;
+                }
+                sta := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => {
+                        root.net-open = false;
+                        root.act("settings");
                     }
                 }
             }

@@ -499,18 +499,29 @@ impl App {
         // Not a full listing: this runs every tick, and each snapshot's
         // manifest can be megabytes.
         let has_snaps = std::fs::read_dir(v.state_dir().join("snapshots")).is_ok_and(|mut d| d.next().is_some());
-        let (locked, lock_reason) = match state {
-            VmState::Off => (false, ""),
+        let (locked, lock_reason, lock_why) = match state {
+            VmState::Off => (false, "", ""),
             VmState::Suspended => (
                 true,
-                "Suspended. Hardware settings apply after a fresh boot: resume and shut down, or discard the saved state (⋯ menu).",
+                "Suspended. Network and USB changes apply when it resumes. Other hardware changes after a fresh boot: resume and shut down, or discard the saved state (⋯ menu).",
+                "The VM was saved with this hardware: it changes after a fresh boot.",
             ),
-            _ if !console::is_running(&v.key) && console::viewer_socket(&v.state_dir()).is_some() => {
-                (true, "Running without a window. Show brings it back; shut it down to change hardware.")
+            _ if !console::is_running(&v.key) && console::viewer_socket(&v.state_dir()).is_some() => (
+                true,
+                "Running without a window. Show brings it back; shut it down to change hardware.",
+                "Can't change while the VM runs without a window.",
+            ),
+            _ if !console::is_running(&v.key) => {
+                (true, "Running from a terminal (vroom run). Stop it there to change settings.", "Can't change while the VM runs from a terminal.")
             }
-            _ if !console::is_running(&v.key) => (true, "Running from a terminal (vroom run). Stop it there to change settings."),
-            _ => (true, "Running. Shut it down to change hardware. Clipboard settings apply right away."),
+            _ => (
+                true,
+                "Running. Network, USB devices and the clipboard change right away; the rest needs the VM shut down.",
+                "The guest found this hardware when it started: shut the VM down to change it.",
+            ),
         };
+        let live = self.live_now(v);
+        let (net_notes, net_note) = self.net_notes(v, c, state);
 
         let disks: Vec<DiskRow> = c
             .disks
@@ -542,7 +553,8 @@ impl App {
         let nets: Vec<NetRow> = c
             .nets
             .iter()
-            .map(|n| NetRow {
+            .zip(net_notes)
+            .map(|(n, note)| NetRow {
                 mode: match n.mode {
                     NetKind::Nat => 0,
                     NetKind::Bridged => 1,
@@ -565,6 +577,8 @@ impl App {
                 block_private: n.block_private,
                 mac: s(n.mac.clone().unwrap_or_default()),
                 summary: s(net_summary(n)),
+                connected: n.connected,
+                note: s(note),
             })
             .collect();
         let shares: Vec<ShareRow> = c
@@ -709,6 +723,10 @@ impl App {
             warnings: model(warnings),
             locked,
             lock_reason: s(lock_reason),
+            lock_why: s(lock_why),
+            live,
+            net_note: s(net_note),
+            usb_note: s(if state == VmState::Suspended && live { "Changes apply when the VM resumes." } else { "" }),
             config_path: s(paths::tilde(&v.path)),
             state_path: s(paths::tilde(&v.state_dir())),
             snapshots_cpu_mem: s(if has_snaps { "Snapshots only restore with the CPUs and memory they were taken with." } else { "" }),
@@ -906,17 +924,107 @@ impl App {
         locked
     }
 
+    /// Network and USB devices can change now: the VM is off, suspended
+    /// (they apply when it resumes) or runs in a window of ours (they
+    /// apply right away, as far as they can).
+    fn live_now(&self, v: &Vm) -> bool {
+        match self.state_of(v) {
+            VmState::Off | VmState::Suspended => true,
+            _ => console::is_running(&v.key),
+        }
+    }
+
+    /// `live_now` for the selected VM; says why not if not.
+    fn live_ok(&mut self) -> bool {
+        let ok = self.cur().is_none_or(|v| self.live_now(v));
+        if !ok {
+            self.toast("This VM runs without a window here: show it (or stop it) first.", 0);
+        }
+        ok
+    }
+
+    /// Per adapter of `c` (the VM file), what waits and why; and a line
+    /// for the whole card.
+    fn net_notes(&self, v: &Vm, c: &VmConfig, state: VmState) -> (Vec<String>, String) {
+        let mut notes = vec![String::new(); c.nets.len()];
+        let mac = |n: &vroom_config::Net| n.mac.as_deref().map(|m| m.to_ascii_lowercase());
+        match state {
+            VmState::Suspended => {
+                let Some(saved) = vm::suspended_config(&v.state_dir()) else { return (notes, String::new()) };
+                for (i, n) in c.nets.iter().enumerate() {
+                    notes[i] = match saved.nets.get(i) {
+                        None => "Added: it comes when the VM next starts (a resumed VM keeps the adapters it was saved with).".into(),
+                        Some(o) if mac(o) != mac(n) => "The new MAC address applies when the VM next starts.".into(),
+                        Some(o) if o != n => "Applies when the VM resumes.".into(),
+                        Some(_) => String::new(),
+                    };
+                }
+                let gone = saved.nets.len().saturating_sub(c.nets.len());
+                let card = match gone {
+                    0 => String::new(),
+                    1 => "1 adapter removed: the VM keeps it, unplugged, until it next starts.".into(),
+                    n => format!("{n} adapters removed: the VM keeps them, unplugged, until it next starts."),
+                };
+                (notes, card)
+            }
+            VmState::Off => (notes, String::new()),
+            _ => {
+                let Some(view) = console::net_view(&v.key) else { return (notes, String::new()) };
+                for (i, n) in c.nets.iter().enumerate() {
+                    let Some(Some(nic)) = view.map.get(i) else {
+                        notes[i] = "Added: it comes when the VM next starts.".into();
+                        continue;
+                    };
+                    let (Some(p), Some(want)) = (view.ports.iter().find(|p| p.nic == *nic), console::net_live_of(n)) else { continue };
+                    let started = view.start.get(*nic as usize);
+                    notes[i] = if want.kind != p.live.kind || want.name != p.live.name {
+                        if want.kind == vroom_display::NetKind::Nat && !view.nat_ok {
+                            "NAT applies when the VM next starts: it started without a NAT adapter, so its sandbox allows no connections out.".into()
+                        } else {
+                            format!("Still {}: switching, or it couldn't (see the VM window).", console::net_mode_text(&p.live))
+                        }
+                    } else if want.kind == vroom_display::NetKind::Nat && want.loopback && !p.live.loopback {
+                        "Reaching this Mac's localhost applies when the VM next starts (its sandbox allows it only then).".into()
+                    } else if want.kind == vroom_display::NetKind::Nat && want.forwards != p.live.forwards {
+                        "Port forward changes apply when the VM next starts.".into()
+                    } else if started.is_some_and(|o| mac(o) != mac(n)) {
+                        "The new MAC address applies when the VM next starts.".into()
+                    } else {
+                        String::new()
+                    };
+                }
+                let gone = view.ports.iter().filter(|p| !view.map.contains(&Some(p.nic))).count();
+                let card = match gone {
+                    0 => String::new(),
+                    1 => "1 adapter removed: unplugged now, gone when the VM next starts.".into(),
+                    n => format!("{n} adapters removed: unplugged now, gone when the VM next starts."),
+                };
+                (notes, card)
+            }
+        }
+    }
+
     fn set(&mut self, key: &str, v: &str) {
         if let Some(k) = key.strip_prefix("newvm.") {
             return self.newvm_set(k, v);
         }
         let locked = self.cur().is_some_and(|vm| self.state_of(vm) != VmState::Off);
-        // Not hardware: these apply to a running VM's window.
-        if locked && !key.starts_with("clip.") && key != "hidpi" {
+        // Not hardware: these apply to a running VM's window. Network
+        // adapters apply to it too (or when it resumes).
+        let net = key.strip_prefix("net.").and_then(|r| r.split('.').next()).and_then(|i| i.parse::<usize>().ok());
+        if locked && !key.starts_with("clip.") && key != "hidpi" && !(net.is_some() && self.live_ok()) {
             return;
         }
         let iface = self.host_ifaces.first().cloned();
-        self.change(|c| edit::set(c, key, v, iface.as_deref()));
+        let vm = self.cur().map(|v| v.key.clone()).unwrap_or_default();
+        let saved = match (net, key.ends_with(".mode"), v.parse::<usize>()) {
+            // Port forwards set aside while on another network come back.
+            (Some(i), true, Ok(m)) => self.change(|c| console::net_set_mode(&vm, c, i, m, iface.as_deref())),
+            _ => self.change(|c| edit::set(c, key, v, iface.as_deref())),
+        };
+        if let (true, Some(i)) = (saved, net) {
+            console::net_apply(&vm, i);
+        }
     }
 
     fn act(&mut self, a: &str) {
@@ -1144,7 +1252,8 @@ impl App {
                     self.push_all();
                 }
             }
-            "share.add" | "disk.add-iso" | "disk.add-existing" | "disk.add-new" | "usb.add" if self.hw_locked() => {}
+            "share.add" | "disk.add-iso" | "disk.add-existing" | "disk.add-new" if self.hw_locked() => {}
+            "usb.add" if !self.live_ok() => {}
             "usb.add" => {
                 // Open or close the list of what's plugged in.
                 self.usb_picking = !self.usb_picking;
@@ -1153,11 +1262,16 @@ impl App {
             }
             _ if a.starts_with("usb.pick.") => {
                 let j: usize = a["usb.pick.".len()..].parse().unwrap_or(usize::MAX);
-                if self.hw_locked() {
+                if !self.live_ok() {
                     return;
                 }
                 if let Some(d) = self.usb_host.get(j).cloned() {
-                    self.change(|c| edit::add_usb(c, &d.id(), d.serial.as_deref(), Some(&d.label())));
+                    // A running VM gets it now too, as from its USB menu.
+                    if self.change(|c| edit::add_usb(c, &d.id(), d.serial.as_deref(), Some(&d.label()))) {
+                        if let Some(v) = self.cur() {
+                            console::usb_plug(&v.key, crate::hostusb::dev_of(&d));
+                        }
+                    }
                 }
             }
             "share.add" => {
@@ -1203,11 +1317,32 @@ impl App {
                         _ => {}
                     }
                 }
-                if self.hw_locked() {
+                // Network adapters and USB devices change while the VM
+                // runs (or is suspended) too.
+                let live = a.starts_with("net.") || a.starts_with("usb.");
+                if if live { !self.live_ok() } else { self.hw_locked() } {
                     return;
                 }
+                let gone_usb = a
+                    .strip_prefix("usb.")
+                    .and_then(|r| r.strip_suffix(".remove"))
+                    .and_then(|i| i.parse::<usize>().ok())
+                    .and_then(|i| self.cur().and_then(|v| v.raw.as_ref()).and_then(|c| c.usb.get(i).cloned()));
                 let a = a.to_string();
-                self.change(|c| edit::act(c, &a));
+                if !self.change(|c| edit::act(c, &a)) {
+                    return;
+                }
+                let Some(key) = self.cur().map(|v| v.key.clone()) else { return };
+                let parts: Vec<&str> = a.split('.').collect();
+                match parts.as_slice() {
+                    ["net", "add"] => console::net_added(&key),
+                    ["net", i, "remove"] => console::net_removed(&key, i.parse().unwrap_or(usize::MAX)),
+                    ["net", i, ..] => console::net_apply(&key, i.parse().unwrap_or(usize::MAX)),
+                    _ => {}
+                }
+                if let Some(u) = gone_usb {
+                    console::usb_unplug(&key, &u.id, u.serial.as_deref());
+                }
             }
         }
     }
@@ -1880,12 +2015,17 @@ mod tests {
         a.update(Msg::Refresh);
         assert!(a.ui.get_settings().locked);
         let before = std::fs::read_to_string(&file).unwrap();
-        for k in ["net.add", "net.0.remove", "net.0.fwd.add", "identity.random", "disk.add-new", "disk.0.compact"] {
+        for k in ["identity.random", "disk.add-new", "disk.0.compact"] {
             act(&mut a, k);
             assert_eq!(std::fs::read_to_string(&file).unwrap(), before, "{k}");
         }
         a.update(Msg::Set("cpus".into(), "4".into()));
         assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
+        // Network adapters apply when it resumes (or wait for the next
+        // start, which the card says).
+        assert!(a.ui.get_settings().live);
+        act(&mut a, "net.add");
+        assert_ne!(std::fs::read_to_string(&file).unwrap(), before);
         // Clipboard rules aren't hardware.
         a.update(Msg::Set("clip.out".into(), "false".into()));
         assert!(std::fs::read_to_string(&file).unwrap().contains("guest_to_host = false"));

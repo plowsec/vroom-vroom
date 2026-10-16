@@ -23,6 +23,27 @@ component SubCard inherits Rectangle {
     }
 }
 
+// A line under a card's title: why it can't change now, or what waits.
+component Note inherits HorizontalLayout {
+    in property <string> text;
+    in property <image> icon: Icons.info;
+    spacing: 8px;
+    Icon {
+        source: root.icon;
+        width: 14px;
+        height: 14px;
+        y: 2px;
+        tint: Theme.text-3;
+    }
+    Text {
+        horizontal-stretch: 1;
+        text: root.text;
+        font-size: Theme.fs-xs;
+        color: Theme.text-2;
+        wrap: word-wrap;
+    }
+}
+
 component Value inherits Text {
     font-size: Theme.fs-md;
     font-weight: 600;
@@ -69,6 +90,21 @@ component NetCard inherits SubCard {
         font-size: Theme.fs-xs;
         color: Theme.text-3;
         wrap: word-wrap;
+    }
+    Row {
+        label: "Connected";
+        hint: root.net.connected ? "The cable is in." : "Cable out: the guest sees no network on this adapter.";
+        key: "connected";
+        Toggle {
+            y: (parent.height - self.height) / 2;
+            checked: root.net.connected;
+            enabled: !root.locked;
+            toggled(v) => { Bus.set(root.k + ".connected", v ? "true" : "false"); }
+        }
+    }
+    if root.net.note != "": Note {
+        text: root.net.note;
+        icon: Icons.history;
     }
     // Bridged and host-only go through vroom-netd, which runs as root.
     if root.net.mode != 0 && root.host.netd == "ready": HorizontalLayout {
@@ -286,6 +322,10 @@ export component SettingsPanel inherits Rectangle {
                     title: "Processor and memory";
                     summary: root.s.sum-hw;
                     force-open: root.open-all;
+                    if root.lk: Note {
+                        text: root.s.lock-why;
+                        icon: Icons.lock;
+                    }
                     Row {
                         label: "CPUs";
                         key: "cpus";
@@ -345,6 +385,10 @@ export component SettingsPanel inherits Rectangle {
                     title: "Display";
                     summary: root.s.sum-display;
                     force-open: root.open-all;
+                    if root.lk: Note {
+                        text: root.s.lock-why;
+                        icon: Icons.lock;
+                    }
                     Segmented {
                         options: ["None", "2D", "3D"];
                         selected: root.s.gpu;
@@ -444,6 +488,10 @@ export component SettingsPanel inherits Rectangle {
                     title: "Storage";
                     summary: root.s.sum-storage;
                     force-open: root.open-all;
+                    if root.lk: Note {
+                        text: root.s.lock-why;
+                        icon: Icons.lock;
+                    }
                     for d[i] in root.s.disks: SubCard {
                         HorizontalLayout {
                             spacing: 10px;
@@ -569,11 +617,19 @@ export component SettingsPanel inherits Rectangle {
                     title: "Network";
                     summary: root.s.sum-net;
                     force-open: root.open-all;
+                    if !root.s.live: Note {
+                        text: root.s.lock-why;
+                        icon: Icons.lock;
+                    }
+                    if root.s.net-note != "": Note {
+                        text: root.s.net-note;
+                        icon: Icons.history;
+                    }
                     for n[i] in root.s.nets: NetCard {
                         net: n;
                         index: i;
                         host: root.host;
-                        locked: root.lk;
+                        locked: !root.s.live;
                     }
                     HorizontalLayout {
                         alignment: start;
@@ -583,7 +639,7 @@ export component SettingsPanel inherits Rectangle {
                             text: "Add adapter";
                             icon: Icons.plus;
                             has-icon: true;
-                            enabled: !root.lk;
+                            enabled: root.s.live;
                             clicked => { Bus.act("net.add"); }
                         }
                     }
@@ -594,6 +650,10 @@ export component SettingsPanel inherits Rectangle {
                     title: "Shared folders";
                     summary: root.s.sum-share;
                     force-open: root.open-all;
+                    if root.lk: Note {
+                        text: root.s.lock-why;
+                        icon: Icons.lock;
+                    }
                     for sh[i] in root.s.shares: SubCard {
                         HorizontalLayout {
                             spacing: 10px;
@@ -686,6 +746,14 @@ export component SettingsPanel inherits Rectangle {
                     title: "USB devices";
                     summary: root.s.sum-usb;
                     force-open: root.open-all || root.s.usb-picking;
+                    if !root.s.live: Note {
+                        text: root.s.lock-why;
+                        icon: Icons.lock;
+                    }
+                    if root.s.usb-note != "": Note {
+                        text: root.s.usb-note;
+                        icon: Icons.history;
+                    }
                     for u[i] in root.s.usb: Row {
                         label: u.label;
                         hint: u.note;
@@ -696,7 +764,7 @@ export component SettingsPanel inherits Rectangle {
                             tip: "Remove";
                             size: 28px;
                             y: (parent.height - self.height) / 2;
-                            enabled: !root.lk;
+                            enabled: root.s.live;
                             clicked => { Bus.act("usb." + i + ".remove"); }
                         }
                     }
@@ -709,7 +777,7 @@ export component SettingsPanel inherits Rectangle {
                             small: true;
                             text: h.taken ? "Added" : "Add";
                             y: (parent.height - self.height) / 2;
-                            enabled: !h.taken && !root.lk;
+                            enabled: !h.taken && root.s.live;
                             clicked => { Bus.act("usb.pick." + j); }
                         }
                     }
@@ -724,7 +792,7 @@ export component SettingsPanel inherits Rectangle {
                             icon: root.s.usb-picking ? Icons.check : Icons.plus;
                             has-icon: true;
                             y: (parent.height - self.height) / 2;
-                            enabled: !root.lk;
+                            enabled: root.s.live;
                             clicked => { Bus.act("usb.add"); }
                         }
                     }
@@ -735,6 +803,10 @@ export component SettingsPanel inherits Rectangle {
                     title: "Sound and camera";
                     summary: root.s.sum-sound;
                     force-open: root.open-all;
+                    if root.lk: Note {
+                        text: root.s.lock-why;
+                        icon: Icons.lock;
+                    }
                     Row {
                         label: "Play guest sound";
                         hint: "Through this Mac's speakers.";
@@ -821,6 +893,10 @@ export component SettingsPanel inherits Rectangle {
                     summary: root.s.sum-security;
                     warn: !root.s.sandbox;
                     force-open: root.open-all;
+                    if root.lk: Note {
+                        text: root.s.lock-why;
+                        icon: Icons.lock;
+                    }
                     Row {
                         label: "Sandbox";
                         hint: root.s.sandbox ? "The VM process can only touch its own files." : "Off: a guest that breaks out gets your user's access.";
@@ -928,6 +1004,10 @@ export component SettingsPanel inherits Rectangle {
                     title: "Boot";
                     summary: root.s.sum-boot;
                     force-open: root.open-all;
+                    if root.lk: Note {
+                        text: root.s.lock-why;
+                        icon: Icons.lock;
+                    }
                     Segmented {
                         options: ["UEFI firmware", "Linux kernel"];
                         selected: root.s.boot-kernel ? 1 : 0;

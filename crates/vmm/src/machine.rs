@@ -162,6 +162,9 @@ pub(crate) struct Machine {
     /// Every monitor, the first (with the firmware screen) first.
     pub screens: Vec<Arc<FbSink>>,
     pub boot: BootImage,
+    /// The network adapters built (a resumed VM: the ones it was saved
+    /// with), as the VM file had them: what a later save records.
+    pub nets: Vec<vroom_config::Net>,
 }
 
 /// Registers MMIO devices on the bus and in the snapshot list in one go,
@@ -736,14 +739,17 @@ pub(crate) fn build(
     let agent = agent::spawn(host_end, config.clipboard.clone(), clipboard, screen_ctl)?;
     // Network adapters (right after the console: the device order is the
     // guest's layout). The viewer can change them while the VM runs.
-    let reach = crate::net::Reach::of(config, env.sandbox);
+    let planned = crate::net::plan(config, env.saved.as_ref())?;
+    let reach = crate::net::Reach::of(planned.iter().map(|p| &p.net), env.sandbox);
     let mut nics = Vec::new();
-    for (i, p) in crate::net::plan(config, env.saved.as_ref())?.into_iter().enumerate() {
+    let mut nets = Vec::new();
+    for (i, p) in planned.into_iter().enumerate() {
         let (backend, mac) = crate::net::boot_backend(&config.name, ident, i, &p.net, p.mac, reach.dns)?;
         let live = crate::net::live_of(&p.net)?;
         let dev = Net::with_link(&format!("eth{i}"), mac, backend, &crate::net::label(&live), p.net.connected && !p.removed);
         nics.push(crate::net::Nic::new(dev.control(), live));
         board.add_virtio(Box::new(dev))?;
+        nets.push(p.net);
     }
     let net_ports = crate::net::NetPorts::new(nics, viewer.clone(), reach, ident.clone());
     if let Some(ds) = ui {
@@ -883,7 +889,7 @@ pub(crate) fn build(
     let _ = shared.peers.set(vcpus.iter().map(|v| v.peer.clone()).collect());
     vm.finalize()?;
 
-    Ok(Machine { vm, mem, shared, vcpus, devices: reg.stateful, uart, agent, gpus, viewer, screens, boot })
+    Ok(Machine { vm, mem, shared, vcpus, devices: reg.stateful, uart, agent, gpus, viewer, screens, boot, nets })
 }
 
 #[cfg(test)]

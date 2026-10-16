@@ -181,9 +181,13 @@ impl Vmm {
             state_dir: opts.state_dir.clone(),
             resuming: matches!(opts.start, StartMode::Restore(_)),
             saved,
-            sandbox: opts.sandbox,
+            sandbox: opts.sandbox && config.security.sandbox,
         };
         let m = machine::build(&config, hv.as_ref(), opts.serial_out, opts.clipboard, ui, &disks, ev_tx, &env)?;
+        // A save records the hardware the guest has: a resumed VM keeps
+        // the network adapters it was saved with until it restarts.
+        let mut config = config;
+        config.nets = m.nets;
         let mut vmm = Vmm {
             _lock: lock,
             config,

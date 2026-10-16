@@ -171,9 +171,10 @@ pub(crate) struct Reach {
 }
 
 impl Reach {
-    /// What `config`'s sandbox allows (the CLI builds it the same way).
-    pub fn of(config: &VmConfig, sandbox: bool) -> Reach {
-        let nat = |f: fn(&vroom_config::Net) -> bool| !sandbox || config.nets.iter().any(|n| n.mode == ConfigKind::Nat && f(n));
+    /// What the sandbox of a VM with these adapters allows (the CLI
+    /// builds it the same way).
+    pub fn of<'a>(nets: impl Iterator<Item = &'a vroom_config::Net> + Clone, sandbox: bool) -> Reach {
+        let nat = |f: fn(&vroom_config::Net) -> bool| !sandbox || nets.clone().any(|n| n.mode == ConfigKind::Nat && f(n));
         Reach { nat: nat(|_| true), loopback: nat(|n| n.allow_host_loopback), dns: vroom_net::nat::host_dns() }
     }
 }
@@ -313,8 +314,8 @@ mod tests {
         let c = cfg("[[net]]\nmode = \"host-only\"\nnetwork = \"lab\"\n");
         assert_eq!(label(&live_of(&c.nets[0]).unwrap()), "host-only:lab");
         // A VM with only host-only can't make a NAT later.
-        let r = Reach::of(&c, true);
+        let r = Reach::of(c.nets.iter(), true);
         assert!(!r.nat && !r.loopback);
-        assert!(Reach::of(&c, false).nat, "no sandbox: no limit");
+        assert!(Reach::of(c.nets.iter(), false).nat, "no sandbox: no limit");
     }
 }
