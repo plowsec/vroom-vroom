@@ -13,23 +13,60 @@ move to the docs (GUIDE, ARCHITECTURE) once they work.
 
 ## 3D: catching up with VMware and Parallels
 
-Where we are: Linux gets OpenGL 4.1 and Vulkan (off screen only);
+Where we are: Linux gets OpenGL 4.1 (virgl), Vulkan 1.3 in windows and
+off screen (Venus), and OpenGL 4.4 for the apps you start on Zink (below);
 Windows gets Direct3D 11. VMware Fusion gives Windows on Apple Silicon
 Direct3D 11 and OpenGL 4.3, and Linux OpenGL 4.3.
 
-Linux guests:
+What we found (October 2026, macOS 15.6, MoltenVK 1.4.2, guest Mesa 25.2):
 
-- **OpenGL 4.3 and up** (compute shaders). macOS's own OpenGL stops at
-  4.1 and never moves. The way past it is OpenGL on top of Vulkan in the
-  guest (Mesa's Zink), over Venus. Zink needs a Vulkan feature MoltenVK
-  doesn't have (`nullDescriptor`). Paths: LunarG's KosmicKrisp (a newer
-  Vulkan-on-Metal driver in Mesa) if it has it, a MoltenVK patch, or
-  faking it in virglrenderer's Venus decoder. That gives OpenGL 4.6.
-- **Vulkan apps showing a window** (`VK_KHR_swapchain`), which also
-  unlocks Proton/DXVK games. The guest's Venus driver needs buffers it
-  can hand to the guest's display (DRM format modifiers), which MoltenVK
-  doesn't offer either; same paths as above, plus our side of blob
-  scanout.
+- macOS's own OpenGL stops at 4.1. The only way past it is OpenGL on top
+  of Vulkan in the guest (Mesa's Zink) over Venus. Zink needs more from
+  Vulkan than `nullDescriptor`. With only that, it gave OpenGL 2.1:
+  MoltenVK also has no transform feedback (needed from OpenGL 3.0), no
+  depth clip control (3.2), no packed 10-bit vertex formats (3.3) and no
+  RGB32 texel buffers (4.0). 4.5 needs cull distances, which Metal lacks.
+- LunarG's KosmicKrisp (Vulkan on Metal, in Mesa since late 2025, Vulkan
+  1.4 conformant) has all of the above, but it is built on Metal 4 and so
+  needs macOS 26. It can't run on macOS 15. MoltenVK's main branch still
+  says `nullDescriptor = false`.
+- So we fill the gaps in virglrenderer's Venus decoder
+  (`third_party/virglrenderer/0007-venus-what-zink-needs.patch`):
+  null descriptors become small zeroed objects of our own, depth clip off
+  becomes depth clamp (what Metal does anyway), and, for Zink only (it
+  names itself when it starts), transform feedback is accepted but not
+  captured, and the missing formats are read through the nearest one.
+  Zink then reports OpenGL 4.4 core and compatibility, and OpenGL ES 3.1.
+  A GL 4.3 compute shader test gives the right results, 330 times faster
+  than llvmpipe.
+- Vulkan windows: the guest's Venus driver only offers `VK_KHR_swapchain`
+  when the host can import sync fds into semaphores, which MoltenVK can't.
+  The guest has always waited for the fd itself; the host just has to mark
+  the semaphore signaled, which an empty submission does. Window images
+  must live in memory the host can share, so they now get host visible
+  memory. The guest's compositor (Xorg's glamor, Weston, GNOME Shell) then
+  shows the frame with OpenGL through virgl, and macOS's OpenGL can't
+  share memory with Vulkan: vrend copies the frame into a texture when
+  the compositor uses it (`0008-venus-swapchain.patch`). The same fix
+  gives the guest Vulkan 1.3 (it lacked `synchronization2`). Proton and
+  DXVK still can't run: they need geometry shaders, which neither MoltenVK
+  nor KosmicKrisp has.
+
+Linux guests, next:
+
+- **Transform feedback for real** (Zink, and Vulkan apps). Today it is
+  accepted and nothing is written, which is wrong for the few apps that
+  use it (some games' particles, some CAD). It would rewrite the vertex
+  shader to store its outputs into the buffers, and is only simple for
+  non-indexed draws.
+- **KosmicKrisp on macOS 26**: load it instead of MoltenVK when the Mac
+  has Metal 4. Zink then gets most of what we emulate for real, and its
+  speed should be checked against MoltenVK.
+- **Zink speed and gaps**: about half virgl's speed on glmark2's terrain,
+  and glmark2's refract scene fails (a depth render target Zink can't
+  make on MoltenVK). virgl stays the default; Zink is per app.
+- **No copy for Vulkan windows**: an IOSurface shared by Metal and
+  OpenGL instead of copying each frame. The copy is fine at 1280x800.
 - **Snapshots and suspend while a Vulkan app runs.** Vulkan state lives
   on the Mac's GPU. Like we do for OpenGL, we'd follow what each Vulkan
   app creates and rebuild it on resume; Vulkan has far more kinds of
@@ -37,6 +74,10 @@ Linux guests:
 - **Hardware video decoding** (H.264, HEVC, VP9, AV1 in browsers and
   players): a virtio video device decoding with the Mac's VideoToolbox,
   and the guest's VA-API on top of it.
+- **Xwayland under GNOME on virgl**: its GL context breaks at login
+  (`vrend_clear_surface: ... Illegal surface 0`), so X11 apps in a
+  GNOME Wayland session show nothing. Not new; seen with the old library
+  too.
 
 Windows guests:
 
