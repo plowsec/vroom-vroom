@@ -6,6 +6,17 @@ and every virtual device treats the guest as hostile.
 
 ![The app](docs/img/app.png)
 
+## Security
+
+
+The security design is better than the big three’s, at least on paper:
+
+- a sandboxed VMM written in Rust;
+- a separate sandboxed GPU process;
+- per-VM shared memory;
+- guest code can’t reach your files, other apps or the network stack.
+
+
 ## What works
 
 - Ubuntu, Debian, Alpine, Windows 11 ARM64
