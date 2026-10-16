@@ -75,7 +75,6 @@ pub fn profile(p: &Policy) -> Result<String> {
     }
     if p.clipboard {
         s += "(allow mach-lookup (global-name \"com.apple.pasteboard.1\") (global-name \"com.apple.distributed_notifications@Uv3\"))\n";
-        s += "(allow ipc-posix-shm-read-data ipc-posix-shm-write-data)\n";
     }
     if p.gpu {
         s += GPU_RULES;
@@ -87,13 +86,11 @@ pub fn profile(p: &Policy) -> Result<String> {
             std::process::id()
         );
         if let Some(cache) = user_cache_dir() {
-            // Metal's shader cache, and DXMT's (Direct3D shaders already
-            // turned into Metal ones).
-            s += &format!(
-                "(allow file-read* file-write* (subpath {}) (subpath {}))\n",
-                q(&cache.join("com.apple.metal"))?,
-                q(&cache.join("dxmt"))?
-            );
+            // Metal's shader cache, shared by the user's apps: read only,
+            // so a VMM taken over can't plant GPU code for them (Metal's
+            // compiler service fills it). DXMT's cache is per VM, in the
+            // state dir (DXMT_SHADER_CACHE_PATH).
+            s += &format!("(allow file-read* (subpath {}))\n", q(&cache.join("com.apple.metal"))?);
         }
     }
     Ok(s)
@@ -199,7 +196,6 @@ const GPU_RULES: &str = r#"(allow file-read* (subpath "/System/Library/Extension
 (allow iokit-get-properties)
 (allow mach-lookup (global-name "com.apple.MTLCompilerService") (xpc-service-name "com.apple.MTLCompilerService")
   (global-name "com.apple.gpumemd.source") (global-name "com.apple.PowerManagement.control"))
-(allow ipc-posix-shm-read-data ipc-posix-shm-write-data)
 "#;
 
 /// confstr(_CS_DARWIN_USER_CACHE_DIR), e.g. /var/folders/xx/yyy/C/.

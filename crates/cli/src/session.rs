@@ -88,17 +88,42 @@ fn lock_down(cfg: &VmConfig, state_dir: &Path, clipboard: bool, helpers: Vec<u32
     vroom_sandbox::apply(&p).map_err(|e| e.to_string())?;
     log::info!("sandbox applied");
     if std::env::var_os("VROOM_SANDBOX_SELFTEST").is_some() {
-        selftest();
+        selftest(clipboard);
     }
     Ok(())
 }
 
-fn selftest() {
+fn selftest(clipboard: bool) {
     let probe = |path: &str| match std::fs::read(path) {
         Ok(_) => eprintln!("sandbox selftest: {path} READABLE (bad)"),
         Err(e) => eprintln!("sandbox selftest: {path} blocked ({e})"),
     };
     probe("/etc/passwd");
+    // Another process's shared memory (notifyd's, there on every Mac).
+    #[cfg(target_os = "macos")]
+    {
+        let name = c"apple.shm.notification_center";
+        // SAFETY: valid C string; the fd, if any, is closed right away.
+        #[allow(unsafe_code)]
+        let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY) };
+        if fd >= 0 {
+            eprintln!("sandbox selftest: foreign shared memory OPENED (bad)");
+            // SAFETY: an fd we just got.
+            #[allow(unsafe_code)]
+            unsafe {
+                libc::close(fd)
+            };
+        } else {
+            eprintln!("sandbox selftest: foreign shared memory blocked ({})", std::io::Error::last_os_error());
+        }
+    }
+    if clipboard {
+        // Read only: the user's clipboard isn't ours to change, nor to print.
+        match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+            Ok(_) | Err(arboard::Error::ContentNotAvailable) => eprintln!("sandbox selftest: clipboard readable"),
+            Err(e) => eprintln!("sandbox selftest: clipboard FAILED ({e})"),
+        }
+    }
     probe(&format!("{}/.ssh/known_hosts", std::env::var("HOME").unwrap_or_default()));
     match std::process::Command::new("/bin/echo").arg("x").output() {
         Ok(_) => eprintln!("sandbox selftest: exec ALLOWED (bad)"),
@@ -309,6 +334,12 @@ fn escape_action(b: u8) -> Option<Action> {
 
 pub fn run(o: RunOpts) -> Result<(), String> {
     std::fs::create_dir_all(&o.state_dir).map_err(|e| format!("{}: {e}", o.state_dir.display()))?;
+    if o.config.display.gpu == vroom_config::Gpu::Virtio3d {
+        // DXMT keeps the Metal versions of Direct3D shaders: per VM, so
+        // one guest can't plant them for another. Set before any thread
+        // (DXMT reads it when Windows first draws).
+        std::env::set_var("DXMT_SHADER_CACHE_PATH", o.state_dir.join("shaders"));
+    }
     let suspend = o.state_dir.join("suspend");
     if suspend.is_dir() && !suspend.join("manifest.json").exists() {
         // Killed while suspending: the image is incomplete. The disks are

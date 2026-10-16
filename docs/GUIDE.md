@@ -397,8 +397,8 @@ What works and what doesn't (Windows 11 24H2, M3 Max):
   Measured: suspend 8 s, resume 6 s, with 8 GB of guest memory. Needs the
   current vroom tools in Windows (re-run `vroom-setup.cmd`); with older
   ones vroom says so and doesn't save.
-- DXMT keeps the Metal versions of the shaders it has converted in
-  macOS's cache folder (`$(getconf DARWIN_USER_CACHE_DIR)dxmt`), so apps start faster the second time.
+- DXMT keeps the Metal versions of the shaders it has converted in the
+  VM's state folder (`shaders/`), so apps start faster the second time.
 
 ## Shared folders
 

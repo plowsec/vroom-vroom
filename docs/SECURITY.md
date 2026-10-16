@@ -261,7 +261,7 @@ a process of its own: it has the VMM's sandbox, nothing stricter.
 The sandbox keeps working but has to allow the GPU: three IOKit user
 clients (`AGXDeviceUserClient`, `AGXSharedUserClient`,
 `IOSurfaceRootUserClient`), the Metal compiler service, framework reads
-and the Metal shader cache. OpenGL needed nothing more: ANGLE and Apple's
+and reading the Metal shader cache. OpenGL needed nothing more: ANGLE and Apple's
 OpenGL (on Apple Silicon it runs on Metal too) are loaded, with a first
 context, before the sandbox goes up. libepoxy is built to load ANGLE only
 from virglrenderer's own directory, and Apple's OpenGL only by its system
@@ -270,10 +270,13 @@ DXMT (LGPL, a separate dylib) is loaded from the same directory before
 the sandbox goes up, and virglrenderer is patched to look for it only
 there. The render server passes buffers as POSIX shared memory: the
 sandbox lets the VMM create, map and unlink shared memory only under
-names carrying its own process id and the render server's prefixes.
-DXMT's shader cache (Metal versions of guest shaders) is allowed next to
-Metal's, in the per-user cache folder; both are shared by every VM of the
-user.
+names carrying its own process id and the render server's prefixes, and
+open no other (not even read: another app's shared memory is out of
+reach; `VROOM_SANDBOX_SELFTEST=1` checks). Metal's shader cache, which
+the user's other apps share, is read only for the VMM, so a VMM taken
+over can't plant GPU code for them. DXMT's cache (Metal versions of
+guest shaders) is per VM, in its state dir: one guest can't plant
+shaders for another.
 
 With 3D, the GPU's host-visible window (8 GiB of guest address space) is
 backed by reserved memory where no buffer is mapped, as a real card's
