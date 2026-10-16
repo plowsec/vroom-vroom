@@ -15,6 +15,7 @@ pub mod ioc {
     pub const STREAMOFF: u32 = 19;
     pub const G_CTRL: u32 = 27;
     pub const QUERYCTRL: u32 = 36;
+    pub const QUERYMENU: u32 = 37;
     pub const TRY_FMT: u32 = 64;
     pub const ENUM_FRAMESIZES: u32 = 74;
     pub const SUBSCRIBE_EVENT: u32 = 90;
@@ -64,7 +65,14 @@ pub const DEC_CMD_START: u32 = 0;
 pub const DEC_CMD_STOP: u32 = 1;
 
 pub const CID_MIN_BUFFERS_FOR_CAPTURE: u32 = 0x0098_0927;
+pub const CID_H264_LEVEL: u32 = 0x0099_0a67;
+pub const CID_H264_PROFILE: u32 = 0x0099_0a6b;
+pub const CID_HEVC_PROFILE: u32 = 0x0099_0b67;
+pub const CID_HEVC_LEVEL: u32 = 0x0099_0b68;
 pub const CTRL_TYPE_INTEGER: u32 = 1;
+pub const CTRL_TYPE_MENU: u32 = 3;
+pub const CTRL_FLAG_NEXT_CTRL: u32 = 0x8000_0000;
+pub const CTRL_FLAG_NEXT_COMPOUND: u32 = 0x4000_0000;
 pub const CTRL_FLAG_READ_ONLY: u32 = 0x4;
 pub const CTRL_FLAG_VOLATILE: u32 = 0x80;
 
@@ -96,6 +104,7 @@ pub const SELECTION_SIZE: usize = 64;
 pub const DECODER_CMD_SIZE: usize = 72;
 pub const CONTROL_SIZE: usize = 8;
 pub const QUERYCTRL_SIZE: usize = 68;
+pub const QUERYMENU_SIZE: usize = 44;
 
 pub fn get_u32(b: &[u8], at: usize) -> u32 {
     b.get(at..at + 4).map_or(0, |s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))

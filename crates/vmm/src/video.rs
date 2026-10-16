@@ -40,6 +40,11 @@ impl Helper {
     pub fn spawn() -> Result<Arc<Helper>> {
         let exe = std::env::current_exe().map_err(|e| Error::Setup(format!("video: {e}")))?;
         let (ours, theirs) = UnixStream::pair()?;
+        // Unix sockets on macOS buffer 8 KiB: a 3 MB picture would cross
+        // in hundreds of steps.
+        for s in [&ours, &theirs] {
+            socket_buffers(s);
+        }
         let child = command(&exe)?
             .arg("video-helper")
             .stdin(Stdio::from(OwnedFd::from(theirs)))
@@ -122,6 +127,21 @@ impl Drop for Helper {
     fn drop(&mut self) {
         let _ = self.sock.lock().unwrap_or_else(|e| e.into_inner()).shutdown(std::net::Shutdown::Both);
         let _ = self.child.lock().unwrap_or_else(|e| e.into_inner()).try_wait();
+    }
+}
+
+/// Ask for 4 MiB socket buffers each way (best effort).
+fn socket_buffers(s: &UnixStream) {
+    use std::os::fd::AsRawFd;
+    let v: libc::c_int = 4 << 20;
+    for opt in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+        // SAFETY: a valid socket and a c_int option value of its size.
+        let r = unsafe {
+            libc::setsockopt(s.as_raw_fd(), libc::SOL_SOCKET, opt, &v as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t)
+        };
+        if r != 0 {
+            log::debug!("video: socket buffer: {}", std::io::Error::last_os_error());
+        }
     }
 }
 

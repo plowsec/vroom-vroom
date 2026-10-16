@@ -39,6 +39,7 @@ const MIN_BITSTREAM: u32 = 64 << 10;
 const DEFAULT_BITSTREAM: u32 = 2 << 20;
 /// Bitstream bytes at the helper per session; the rest waits here.
 const MAX_IN_FLIGHT: usize = 16 << 20;
+const MAX_IN_FLIGHT_BUFS: usize = 32;
 /// Events waiting for the guest to give us event buffers.
 const MAX_EVENTS: usize = 1024;
 
@@ -189,7 +190,8 @@ struct Session {
     /// The helper has this session open (with `codec`).
     open: Option<Codec>,
     pending: VecDeque<Input>,
-    in_flight: BTreeMap<u32, (u32, usize)>,
+    /// Bitstream at the helper: cookie -> bytes.
+    in_flight: BTreeMap<u32, usize>,
     in_flight_bytes: usize,
     stamps: VecDeque<(u32, [u8; 16])>,
     cap_queue: VecDeque<u32>,
@@ -305,6 +307,7 @@ impl Handler {
     }
 
     fn v4l2_event(&mut self, session: u32, kind: u32, changes: u32) {
+        log::debug!("media: session {session}: event {kind}");
         let mut ev = vec![0u8; 8 + EVENT_SIZE];
         put_u32(&mut ev, 0, EVT_EVENT);
         put_u32(&mut ev, 4, session);
@@ -326,6 +329,7 @@ impl Handler {
         let Some(s) = self.sessions.get_mut(&session) else { return };
         let Some(b) = s.bufs(d).get_mut(index as usize) else { return };
         b.queued = false;
+        log::trace!("media: session {session}: {d:?} buffer {index} back, {} bytes, flags {flags:#x}", b.bytesused);
         let mut ev = vec![0u8; 8 + BUFFER_SIZE + MAX_PLANES * PLANE_SIZE];
         put_u32(&mut ev, 0, EVT_DQBUF);
         put_u32(&mut ev, 4, session);
@@ -448,7 +452,7 @@ impl Handler {
                 return;
             }
             let Some(inp) = s.pending.front().cloned() else { break };
-            if !s.in_flight.is_empty() && s.in_flight_bytes + inp.len as usize > MAX_IN_FLIGHT {
+            if !s.in_flight.is_empty() && (s.in_flight_bytes + inp.len as usize > MAX_IN_FLIGHT || s.in_flight.len() >= MAX_IN_FLIGHT_BUFS) {
                 return;
             }
             s.pending.pop_front();
@@ -458,13 +462,17 @@ impl Handler {
                 data.clear();
             }
             let ts = b.ts;
-            s.in_flight.insert(inp.cookie, (inp.index, data.len()));
+            s.in_flight.insert(inp.cookie, data.len());
             s.in_flight_bytes += data.len();
             s.stamps.push_back((inp.cookie, ts));
-            while s.stamps.len() > 64 {
+            while s.stamps.len() > 128 {
                 s.stamps.pop_front();
             }
             self.send(&ToHelper::Decode { session: id, cookie: inp.cookie, data });
+            // We have our copy: the guest may fill the buffer again. (A
+            // player that finds every bitstream buffer busy at the end of
+            // its input can mistake a free one for "no more pictures".)
+            self.dqbuf_event(id, Dir::Output, inp.index, 0, 0);
         }
         let Some(s) = self.sessions.get_mut(&id) else { return };
         if s.draining && !s.drain_sent && s.pending.is_empty() {
@@ -522,12 +530,15 @@ impl Handler {
                 self.dqbuf_event(id, Dir::Capture, index, 0, seq);
             }
             FromHelper::Consumed { cookie, ok, .. } => {
-                let Some((index, len)) = s.in_flight.remove(&cookie) else { return };
+                let Some(len) = s.in_flight.remove(&cookie) else { return };
                 s.in_flight_bytes -= len;
-                self.dqbuf_event(id, Dir::Output, index, if ok { 0 } else { BUF_FLAG_ERROR }, 0);
+                if !ok {
+                    log::debug!("media: session {id}: a buffer didn't decode");
+                }
                 self.pump(id);
             }
             FromHelper::DrainDone { .. } => {
+                log::debug!("media: session {id}: drained");
                 if s.draining {
                     s.draining = false;
                     s.drain_sent = false;
@@ -671,10 +682,16 @@ impl Handler {
                     match d {
                         Dir::Output => {
                             let codec = if get_u32(&b, fmt::PIXELFORMAT) == PIX_HEVC { Codec::Hevc } else { Codec::H264 };
+                            // A buffer must take a whole access unit: at least
+                            // what the guest asks, and no less than a raw
+                            // picture of that size (an intra picture can come
+                            // close), within the caps.
+                            let raw = w.clamp(MIN_SIDE, MAX_SIDE) * h.clamp(MIN_SIDE, MAX_SIDE) * 3 / 2;
                             let size = match get_u32(&b, fmt::SIZEIMAGE) {
-                                0 => DEFAULT_BITSTREAM,
-                                n => n.clamp(MIN_BITSTREAM, MAX_BITSTREAM),
-                            };
+                                0 => DEFAULT_BITSTREAM.max(raw),
+                                n => n.max(raw),
+                            }
+                            .clamp(MIN_BITSTREAM, MAX_BITSTREAM);
                             if code == ioc::S_FMT {
                                 if s.out_streaming {
                                     return Err(EBUSY);
@@ -857,23 +874,41 @@ impl Handler {
             }
             ioc::G_CTRL => {
                 let mut b = read_payload(r, CONTROL_SIZE)?;
-                if get_u32(&b, 0) != CID_MIN_BUFFERS_FOR_CAPTURE {
-                    return Err(EINVAL);
-                }
-                put_u32(&mut b, 4, self.sessions.get(&id).map_or(4, |s| s.min_buffers));
+                let c = control(get_u32(&b, 0)).ok_or(EINVAL)?;
+                let v = if c.id == CID_MIN_BUFFERS_FOR_CAPTURE { self.sessions.get(&id).map_or(4, |s| s.min_buffers) } else { c.default };
+                put_u32(&mut b, 4, v);
                 Ok(b)
             }
             ioc::QUERYCTRL => {
                 let mut b = read_payload(r, QUERYCTRL_SIZE)?;
-                if get_u32(&b, 0) != CID_MIN_BUFFERS_FOR_CAPTURE {
-                    return Err(EINVAL);
+                let want = get_u32(&b, 0);
+                let c = if want & CTRL_FLAG_NEXT_CTRL != 0 {
+                    let after = want & !(CTRL_FLAG_NEXT_CTRL | CTRL_FLAG_NEXT_COMPOUND);
+                    CONTROLS.iter().find(|c| c.id > after)
+                } else {
+                    control(want)
                 }
-                b[4..].fill(0);
-                put_u32(&mut b, 4, CTRL_TYPE_INTEGER);
-                put_str(&mut b, 8, 32, "Min Number of Capture Buffers");
-                for (i, v) in [1u32, 32, 1, 4, CTRL_FLAG_READ_ONLY | CTRL_FLAG_VOLATILE].into_iter().enumerate() {
+                .ok_or(EINVAL)?;
+                b.fill(0);
+                put_u32(&mut b, 0, c.id);
+                put_u32(&mut b, 4, if c.menu.is_empty() { CTRL_TYPE_INTEGER } else { CTRL_TYPE_MENU });
+                put_str(&mut b, 8, 32, c.name);
+                let flags = if c.id == CID_MIN_BUFFERS_FOR_CAPTURE { CTRL_FLAG_READ_ONLY | CTRL_FLAG_VOLATILE } else { 0 };
+                for (i, v) in [c.min, c.max, 1, c.default, flags].into_iter().enumerate() {
                     put_u32(&mut b, 40 + 4 * i, v);
                 }
+                Ok(b)
+            }
+            ioc::QUERYMENU => {
+                let mut b = read_payload(r, QUERYMENU_SIZE)?;
+                let c = control(get_u32(&b, 0)).ok_or(EINVAL)?;
+                let index = get_u32(&b, 4);
+                if index < c.min || index > c.max {
+                    return Err(EINVAL);
+                }
+                let name = c.menu.get(index as usize).copied().ok_or(EINVAL)?;
+                put_str(&mut b, 8, 32, name);
+                put_u32(&mut b, 40, 0);
                 Ok(b)
             }
             ioc::DECODER_CMD | ioc::TRY_DECODER_CMD => {
@@ -934,6 +969,7 @@ impl Handler {
     }
 
     fn streamoff(&mut self, id: u32, d: Dir) {
+        log::debug!("media: session {id}: {d:?} stream off");
         let Some(s) = self.sessions.get_mut(&id) else { return };
         for b in s.bufs(d).iter_mut() {
             b.queued = false;
@@ -964,6 +1000,7 @@ impl Handler {
     }
 
     fn decoder_cmd(&mut self, id: u32, cmd: u32) {
+        log::debug!("media: session {id}: decoder command {cmd}");
         let Some(s) = self.sessions.get_mut(&id) else { return };
         if cmd == DEC_CMD_START {
             s.draining = false;
@@ -993,6 +1030,53 @@ impl Handler {
             self.lost();
         }
     }
+}
+
+/// A control the decoder has: read-only, the stream decides.
+#[derive(Debug)]
+struct Control {
+    id: u32,
+    name: &'static str,
+    min: u32,
+    max: u32,
+    default: u32,
+    /// Menu entries by value (empty: an integer).
+    menu: &'static [&'static str],
+}
+
+/// What VideoToolbox decodes: H.264 up to High, level 5.2; HEVC Main,
+/// level 5.1. Players read these to decide what to send.
+const CONTROLS: &[Control] = &[
+    Control { id: CID_MIN_BUFFERS_FOR_CAPTURE, name: "Min Number of Capture Buffers", min: 1, max: 32, default: 4, menu: &[] },
+    Control {
+        id: CID_H264_LEVEL,
+        name: "H264 Level",
+        min: 0,
+        max: 16,
+        default: 11,
+        menu: &["1", "1b", "1.1", "1.2", "1.3", "2", "2.1", "2.2", "3", "3.1", "3.2", "4", "4.1", "4.2", "5", "5.1", "5.2"],
+    },
+    Control {
+        id: CID_H264_PROFILE,
+        name: "H264 Profile",
+        min: 0,
+        max: 4,
+        default: 4,
+        menu: &["Baseline", "Constrained Baseline", "Main", "Extended", "High"],
+    },
+    Control { id: CID_HEVC_PROFILE, name: "HEVC Profile", min: 0, max: 1, default: 0, menu: &["Main", "Main Still Picture"] },
+    Control {
+        id: CID_HEVC_LEVEL,
+        name: "HEVC Level",
+        min: 0,
+        max: 8,
+        default: 8,
+        menu: &["1", "2", "2.1", "3", "3.1", "4", "4.1", "5", "5.1"],
+    },
+];
+
+fn control(id: u32) -> Option<&'static Control> {
+    CONTROLS.iter().find(|c| c.id == id)
 }
 
 fn output_format(mut b: Vec<u8>, codec: Codec, w: u32, h: u32, size: u32) -> Vec<u8> {
@@ -1126,3 +1210,5 @@ impl VirtioDevice for Media {
     }
 }
 
+#[cfg(test)]
+mod tests;
