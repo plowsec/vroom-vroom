@@ -1,11 +1,14 @@
 //! xHCI host controller with a keyboard on port 1 and a tablet on port 2.
 //! Enough for Windows setup, UEFI and Linux.
 //!
-//! Host devices passed through (`with_passthrough`) get a USB 2 and a
-//! USB 3 root port each, after the HID ones; the device shows up on the
-//! one that fits its speed. Their transfers are asynchronous: a TD goes
-//! to the device's helper process as a request and completes when the
-//! answer comes back (`usb_event`).
+//! Host devices passed through sit on `PASS_PORTS` pairs of root ports
+//! (a USB 2 and a USB 3 port each), after the HID ones; the device shows
+//! up on the one that fits its speed. The pairs are always there, so a
+//! device can be plugged in while the VM runs (`pass_plug`) and pulled
+//! out again (`pass_unplug`), with the port change events a real
+//! controller sends. Their transfers are asynchronous: a TD goes to the
+//! device's helper process as a request and completes when the answer
+//! comes back (`usb_event`).
 //!
 //! Rings live in guest memory and the guest controls them: walks are
 //! bounded, Link TRB chains are capped, and every address is checked by
@@ -39,6 +42,10 @@ const XECP: u64 = 0x100;
 const MAX_SLOTS: usize = 8;
 /// Keyboard and tablet.
 const HID_PORTS: usize = 2;
+/// Root port pairs for host devices: the VM file's first, the others
+/// free for devices plugged in while the VM runs. Fixed, so the guest
+/// sees the same controller whatever is plugged in (and snapshots fit).
+pub const PASS_PORTS: usize = 8;
 /// Most TRBs handled per doorbell / ring walk.
 const WALK_LIMIT: usize = 256;
 const LINK_LIMIT: usize = 8;
@@ -174,13 +181,38 @@ struct Passthrough {
     /// Show it connected once the guest has seen the disconnect.
     reconnect: bool,
     next_id: u32,
+    /// A helper is plugged into this pair.
+    used: bool,
+    /// Bumped on each plug and unplug: events from an earlier helper are
+    /// dropped.
+    gen: u64,
     pending: BTreeMap<u32, Pending>,
     /// Transfers per (slot, dci), oldest first: completed in this order.
     queues: BTreeMap<(usize, u8), VecDeque<u32>>,
     warned_iso: bool,
 }
 
+/// A link nobody listens on: what an empty port pair has.
+fn no_link() -> Sender<Request> {
+    std::sync::mpsc::channel().0
+}
+
 impl Passthrough {
+    fn new(link: Option<Sender<Request>>) -> Passthrough {
+        Passthrough {
+            used: link.is_some(),
+            link: link.unwrap_or_else(no_link),
+            speed: None,
+            addressed: false,
+            reconnect: false,
+            next_id: 0,
+            gen: 0,
+            pending: BTreeMap::new(),
+            queues: BTreeMap::new(),
+            warned_iso: false,
+        }
+    }
+
     fn alloc_id(&mut self) -> u32 {
         loop {
             self.next_id = self.next_id.wrapping_add(1);
@@ -270,7 +302,8 @@ pub struct Xhci {
     pass: Vec<Passthrough>,
     paused: bool,
     deferred: VecDeque<HidEvent>,
-    deferred_usb: VecDeque<(usize, Event)>,
+    /// (pair, its generation then, event).
+    deferred_usb: VecDeque<(usize, u64, Event)>,
     /// Port changes to report once running again (after a restore).
     port_events_due: bool,
     epoch: Instant,
@@ -322,24 +355,14 @@ impl Xhci {
         x
     }
 
-    /// Host devices behind helper processes: requests for device `i` go
-    /// to `links[i]`, its events come back through `usb_event(i, ..)`.
-    /// Each gets a USB 2 and a USB 3 root port, and a device slot.
+    /// Root ports for host devices behind helper processes, `PASS_PORTS`
+    /// pairs (more if `links` has more). Requests for device `i` go to
+    /// `links[i]`, its events come back through `usb_event(i, ..)`. The
+    /// pairs past `links` are free for `pass_plug`.
     pub fn with_passthrough(mut self, links: Vec<Sender<Request>>) -> Self {
-        let n = links.len();
-        self.pass = links
-            .into_iter()
-            .map(|link| Passthrough {
-                link,
-                speed: None,
-                addressed: false,
-                reconnect: false,
-                next_id: 0,
-                pending: BTreeMap::new(),
-                queues: BTreeMap::new(),
-                warned_iso: false,
-            })
-            .collect();
+        let n = links.len().max(PASS_PORTS);
+        let mut links = links.into_iter();
+        self.pass = (0..n).map(|_| Passthrough::new(links.next())).collect();
         self.ports = vec![0; HID_PORTS + 2 * n];
         self.slots = vec![None; MAX_SLOTS.max(HID_PORTS + n) + 1];
         self.hc_reset();
@@ -1083,7 +1106,7 @@ impl Xhci {
         }
         if self.paused {
             if self.deferred_usb.len() < MAX_DEFERRED_USB {
-                self.deferred_usb.push_back((dev, ev));
+                self.deferred_usb.push_back((dev, self.pass[dev].gen, ev));
             } else {
                 log::warn!("usb: too many events while paused, dropping one");
             }
@@ -1100,6 +1123,51 @@ impl Xhci {
             }
             Event::Done(d) => self.pass_done(dev, d),
         }
+    }
+
+    /// A port pair with nothing plugged in, for a device plugged in now.
+    pub fn pass_free(&self) -> Option<usize> {
+        // One the guest hasn't seen go yet is fine: a new device shows
+        // once it has (as for a replug).
+        (0..self.pass.len()).find(|&i| !self.pass[i].used && self.pass[i].speed.is_none())
+    }
+
+    /// Plug a device's helper into pair `i` (see `pass_free`). The guest
+    /// sees the device once the helper says it is there (`Attached`).
+    /// Returns the generation its events must carry (`pass_event`).
+    pub fn pass_plug(&mut self, i: usize, link: Sender<Request>) -> Option<u64> {
+        let p = self.pass.get_mut(i).filter(|p| !p.used)?;
+        p.used = true;
+        p.link = link;
+        p.gen += 1;
+        Some(p.gen)
+    }
+
+    /// An event from the helper plugged in as generation `gen`; one from
+    /// a helper since unplugged is dropped.
+    pub fn pass_event(&mut self, i: usize, gen: u64, ev: Event) {
+        if self.pass.get(i).is_some_and(|p| p.gen == gen) {
+            self.usb_event(i, ev);
+        }
+    }
+
+    /// Pull the device of generation `gen` out of pair `i`: the guest
+    /// sees it go (a port change event), transfers in flight end, and
+    /// the pair is free again once the guest has seen that.
+    pub fn pass_unplug(&mut self, i: usize, gen: u64) -> bool {
+        let Some(p) = self.pass.get_mut(i).filter(|p| p.used && p.gen == gen) else { return false };
+        p.gen += 1;
+        p.used = false;
+        let gen = p.gen;
+        // Cancels go nowhere: the helper is on its way out.
+        self.pass_event(i, gen, Event::Detached);
+        self.pass[i].link = no_link();
+        true
+    }
+
+    /// Pairs with a helper plugged in.
+    pub fn pass_used(&self, i: usize) -> bool {
+        self.pass.get(i).is_some_and(|p| p.used)
     }
 
     fn running(&self) -> bool {
@@ -1542,8 +1610,8 @@ impl PciDevice for Xhci {
         while let Some(e) = self.deferred.pop_front() {
             self.input(e);
         }
-        while let Some((i, e)) = self.deferred_usb.pop_front() {
-            self.usb_event(i, e);
+        while let Some((i, gen, e)) = self.deferred_usb.pop_front() {
+            self.pass_event(i, gen, e);
         }
     }
 
@@ -1562,18 +1630,42 @@ impl PciDevice for Xhci {
     }
 
     fn restore(&mut self, data: &[u8]) -> vroom_snapshot::Result<()> {
-        let s: Snap = decode(data)?;
+        let mut s: Snap = decode(data)?;
         let mut cfg = s.cfg;
-        if !cfg.rebuild_masks(&self.cfg)
-            || s.msix.vectors() != self.msix.vectors()
-            || s.slots.len() != self.slots.len()
-            || s.ports.len() != self.ports.len()
-        {
+        // Snapshots from before the fixed port pairs had one pair per
+        // device in the VM file: their ports move to where they are now.
+        let old_n = s.ports.len().checked_sub(HID_PORTS).filter(|n| n % 2 == 0).map(|n| n / 2);
+        if !cfg.rebuild_masks(&self.cfg) || s.msix.vectors() != self.msix.vectors() || s.slots.len() > self.slots.len() || old_n.is_none_or(|n| n > self.pass.len()) {
             return Err(vroom_snapshot::Error::Invalid("xhci layout".into()));
         }
-        if s.slots.iter().flatten().any(|sl| sl.port as usize > self.ports.len() || sl.eps.keys().any(|&d| d == 0 || d > 31)) {
+        if s.slots.iter().flatten().any(|sl| sl.port as usize > s.ports.len() || sl.eps.keys().any(|&d| d == 0 || d > 31)) {
             return Err(vroom_snapshot::Error::Invalid("xhci slots".into()));
         }
+        let old_n = old_n.unwrap_or(0);
+        if old_n != self.pass.len() {
+            let n = self.pass.len();
+            let at = |p: usize| match p.checked_sub(HID_PORTS) {
+                None => p,
+                Some(q) if q < old_n => HID_PORTS + q,
+                Some(q) => HID_PORTS + n + (q - old_n),
+            };
+            let mut ports = vec![0; self.ports.len()];
+            for (p, v) in s.ports.iter().enumerate() {
+                ports[at(p)] = *v;
+            }
+            for i in old_n..n {
+                for usb3 in [false, true] {
+                    ports[self.pass_port(i, usb3)] = Self::pass_portsc(None, usb3);
+                }
+            }
+            s.ports = ports;
+            for sl in s.slots.iter_mut().flatten() {
+                if sl.port > 0 {
+                    sl.port = (at(sl.port as usize - 1) + 1) as u8;
+                }
+            }
+        }
+        s.slots.resize(self.slots.len(), None);
         let sender = self.msix.sender();
         self.cfg = cfg;
         self.msix = s.msix;
@@ -1962,7 +2054,7 @@ mod tests {
         h.x.usb_event(0, Event::Detached);
         h.w(PASS_PORT, (PS_PP | PS_CSC) as u64);
         h.x.usb_event(0, Event::Attached { speed: Speed::Super, vendor: 0x1209, product: 0x000a });
-        let usb3 = PASS_PORT + 0x10;
+        let usb3 = PASS_PORT + 0x10 * PASS_PORTS as u64;
         let ps = portsc(&mut h, usb3);
         assert_eq!((ps & (PS_CCS | PS_PED), (ps >> PS_SPEED_SHIFT) & 0xf), (PS_CCS | PS_PED, 4));
     }
@@ -1998,6 +2090,144 @@ mod tests {
         // Unknown ids and other devices are ignored.
         h.x.usb_event(0, Event::Done(Done { id: 999, status: Status::Ok, actual: 0, data: vec![] }));
         h.x.usb_event(5, Event::Detached);
+        h.x.usb_event(99, Event::Detached);
         assert!(h.events().is_empty());
+    }
+
+    fn bare_host() -> Host {
+        let mem = GuestMemory::new(&[(GuestAddress(RAM), 1 << 20)]).unwrap();
+        let r = IntxRouter::new((0..4).map(|_| Arc::new(NoIrq) as Arc<dyn crate::IrqLine>).collect());
+        let x = Xhci::new(6, mem.clone(), r.pin(6, 1), Arc::new(NoMsi)).with_passthrough(Vec::new());
+        let mut h = Host::with(x, mem);
+        assert_eq!(h.events().len(), HID_PORTS);
+        h
+    }
+
+    #[test]
+    fn the_port_pairs_are_always_there() {
+        let mut h = bare_host();
+        let mut d = [0u8; 4];
+        h.x.bar_read(0, 0x04, &mut d);
+        assert_eq!(u32::from_le_bytes(d) >> 24, (HID_PORTS + 2 * PASS_PORTS) as u32);
+        // USB 2: the HID ports and one per pair; USB 3: one per pair.
+        h.x.bar_read(0, XECP + 8, &mut d);
+        assert_eq!(u32::from_le_bytes(d), ((HID_PORTS + PASS_PORTS) as u32) << 8 | 1);
+        h.x.bar_read(0, XECP + 0x18, &mut d);
+        assert_eq!(u32::from_le_bytes(d), (PASS_PORTS as u32) << 8 | (HID_PORTS + PASS_PORTS + 1) as u32);
+        assert_eq!(portsc(&mut h, PASS_PORT) & PS_CCS, 0);
+    }
+
+    #[test]
+    fn plug_and_unplug_while_running() {
+        let mut h = bare_host();
+        let i = h.x.pass_free().unwrap();
+        assert_eq!(i, 0);
+        let (mut helper, link) = FakeHelper::new();
+        let gen = h.x.pass_plug(i, link).unwrap();
+        assert!(h.x.pass_plug(i, no_link()).is_none(), "taken");
+        assert_eq!(h.x.pass_free(), Some(1));
+        assert!(h.events().is_empty(), "nothing shows before the helper says so");
+        h.x.pass_event(i, gen, Event::Attached { speed: Speed::High, vendor: 0x1209, product: 0x000a });
+        let ev = h.events();
+        assert_eq!((ev.len(), trb_type(&ev[0]), ev[0][0] >> 24), (1, E_PORT, HID_PORTS as u32 + 1));
+        let ps = portsc(&mut h, PASS_PORT);
+        assert_eq!((ps & (PS_CCS | PS_CSC), (ps >> PS_SPEED_SHIFT) & 0xf), (PS_CCS | PS_CSC, 3));
+        // The guest resets the port and talks to the device.
+        h.w(PASS_PORT, (PS_PP | PS_PR | PS_CSC) as u64);
+        assert_eq!(trb_type(&h.events()[0]), E_PORT);
+        h.command([0, 0, 0, C_ENABLE_SLOT << 10]);
+        let mut input = [0u32; 3 * 8];
+        input[1] = 3;
+        input[8 + 1] = (HID_PORTS as u32 + 1) << 16;
+        input[16 + 1] = 64 << 16 | (EPT_CONTROL as u32) << 3;
+        input[16 + 2] = EP0 as u32 | 1;
+        h.write_u32s(INPUT, &input);
+        h.command([INPUT as u32, (INPUT >> 32) as u32, 0, C_ADDRESS << 10 | 1 << 24]);
+        let setup: u64 = 0x80 | 6 << 8 | 0x0100 << 16 | 18 << 48;
+        h.put_trb(EP0, [setup as u32, (setup >> 32) as u32, 8, T_SETUP << 10 | TRB_IDT | 3 << 16 | 1]);
+        h.put_trb(EP0 + 16, [BUF as u32, 0, 18, T_DATA << 10 | 1 << 16 | 1]);
+        h.put_trb(EP0 + 32, [0, 0, 0, T_STATUS << 10 | TRB_IOC | 1]);
+        h.w(DB + 4, 1);
+        let pump = |h: &mut Host, helper: &mut FakeHelper| loop {
+            let mut busy = false;
+            while let Ok(r) = helper.rx.try_recv() {
+                helper.session.request(Some(&mut helper.dev), r);
+                busy = true;
+            }
+            while let Ok(e) = helper.events.try_recv() {
+                h.x.pass_event(i, gen, e);
+                busy = true;
+            }
+            if !busy {
+                break;
+            }
+        };
+        pump(&mut h, &mut helper);
+        assert_eq!(h.events()[0][2] >> 24, CC_SUCCESS);
+        // A transfer in flight, then the device is pulled out.
+        h.put_trb(EP0 + 48, [setup as u32, (setup >> 32) as u32, 8, T_SETUP << 10 | TRB_IDT | 3 << 16 | 1]);
+        h.put_trb(EP0 + 64, [BUF as u32, 0, 18, T_DATA << 10 | 1 << 16 | 1]);
+        h.put_trb(EP0 + 80, [0, 0, 0, T_STATUS << 10 | TRB_IOC | 1]);
+        h.w(DB + 4, 1);
+        assert_eq!(h.x.pass[i].pending.len(), 1);
+        assert!(h.x.pass_unplug(i, gen));
+        assert!(h.x.pass[i].pending.is_empty());
+        let ev = h.events();
+        assert_eq!((ev.len(), trb_type(&ev[0]), ev[0][0] >> 24), (1, E_PORT, HID_PORTS as u32 + 1));
+        assert_eq!(portsc(&mut h, PASS_PORT) & (PS_CCS | PS_CSC), PS_CSC);
+        // What the old helper still says goes nowhere.
+        pump(&mut h, &mut helper);
+        h.x.pass_event(i, gen, Event::Attached { speed: Speed::High, vendor: 0x1209, product: 0x000a });
+        assert!(h.events().is_empty());
+        assert!(!h.x.pass_unplug(i, gen), "once");
+        assert_eq!(h.x.pass_free(), Some(0));
+        // Another device on the same pair: it shows once the guest has
+        // seen the last one go.
+        let (_other, link) = FakeHelper::new();
+        let g2 = h.x.pass_plug(0, link).unwrap();
+        h.x.pass_event(0, g2, Event::Attached { speed: Speed::Full, vendor: 0x1209, product: 0x000b });
+        assert!(h.events().is_empty());
+        h.w(PASS_PORT, (PS_PP | PS_CSC) as u64);
+        assert_eq!(trb_type(&h.events()[0]), E_PORT);
+        assert_eq!(portsc(&mut h, PASS_PORT) & (PS_CCS | PS_CSC), PS_CCS | PS_CSC);
+    }
+
+    #[test]
+    fn unplug_while_paused_shows_on_resume() {
+        let (mut h, _helper) = pass_host();
+        let gen = h.x.pass_plug(1, no_link()).unwrap();
+        h.x.pass_event(1, gen, Event::Attached { speed: Speed::Super, vendor: 1, product: 2 });
+        let usb3 = PASS_PORT + 0x10 * (PASS_PORTS as u64 + 1);
+        assert_eq!(portsc(&mut h, usb3) & PS_CCS, PS_CCS);
+        h.events();
+        h.x.pause();
+        assert!(h.x.pass_unplug(1, gen));
+        assert_eq!(portsc(&mut h, usb3) & PS_CCS, PS_CCS, "nothing moves while paused");
+        assert_ne!(h.x.pass_free(), Some(1));
+        h.x.resume();
+        assert_eq!(trb_type(&h.events()[0]), E_PORT);
+        assert_eq!(portsc(&mut h, usb3) & (PS_CCS | PS_CSC), PS_CSC);
+    }
+
+    #[test]
+    fn snapshots_from_before_the_fixed_pairs_restore() {
+        let (mut h, _helper) = pass_host();
+        h.x.pause();
+        let mut snap: Snap = decode(&h.x.save().unwrap()).unwrap();
+        // One pair, as a VM with one [[usb]] device had: USB 2 port 3,
+        // USB 3 port 4; a slot on the USB 3 one.
+        let ports = snap.ports.clone();
+        snap.ports = vec![ports[0], ports[1], ports[HID_PORTS], ports[HID_PORTS + PASS_PORTS]];
+        snap.slots.truncate(MAX_SLOTS + 1);
+        snap.slots[1].as_mut().unwrap().port = 4;
+        h.x.restore(&encode(&snap).unwrap()).unwrap();
+        assert_eq!(h.x.ports.len(), HID_PORTS + 2 * PASS_PORTS);
+        assert_eq!(h.x.slots[1].as_ref().unwrap().port as usize, HID_PORTS + PASS_PORTS + 1);
+        h.x.resume();
+        assert_eq!(portsc(&mut h, PASS_PORT) & (PS_CCS | PS_CSC), PS_CSC, "the device left");
+        // A layout with more pairs than there are: refused.
+        let mut big: Snap = decode(&h.x.save().unwrap()).unwrap();
+        big.ports = vec![0; HID_PORTS + 2 * (PASS_PORTS + 1)];
+        assert!(h.x.restore(&encode(&big).unwrap()).is_err());
     }
 }
