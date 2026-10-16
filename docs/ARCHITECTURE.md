@@ -106,12 +106,16 @@ in-flight buffers before saving.
 
 ## 3D
 
-`gpu = "virtio3d"` adds two protocols to virtio-gpu. Venus: guest Vulkan
+`gpu = "virtio3d"` adds three protocols to virtio-gpu. Venus: guest Vulkan
 (Mesa's venus driver) serializes commands, virglrenderer replays them on
 MoltenVK. virgl: guest OpenGL (Mesa's virgl driver) sends Gallium
 commands, virglrenderer's vrend replays them on macOS's OpenGL 4.1 (CGL),
 or with `opengl_host = "angle"` on OpenGL ES from ANGLE's Metal backend.
-Both capsets are offered; Mesa picks per API. Guest memory a renderer may
+Neptune: Windows' viogpu3d driver sends Direct3D 11 calls, virglrenderer
+(UTM's fork) replays them on DXMT, Direct3D on Metal. All capsets are
+offered; Mesa picks per API, Windows takes Neptune. Venus and Neptune run
+in virglrenderer's render server, a thread of the VMM; their buffers are
+shared memory it creates. Guest memory a renderer may
 touch is passed as host iovecs; host-visible buffers are
 mapped into the guest's shared memory window with the hypervisor.
 
@@ -121,9 +125,12 @@ one bound on whichever thread calls in (setup thread, then the GPU
 worker, which changes on device reset). GL fences have no completion thread (ANGLE
 serializes a share group's contexts, so a thread blocked on a fence
 would stall submits): the worker polls them every millisecond while any
-is pending. A GL scanout is copied back on flush: from a context of our
+is pending. With GL on, the render server's fences are polled the same
+way (it only has a fence thread of its own with GL off). A GL scanout is copied back on flush: from a context of our
 own, into a pixel buffer on the GPU, and shown when the copy lands while
-the worker goes on.
+the worker goes on. Windows' Direct3D frames are blobs in the render
+server's shared memory that the guest never maps: a flush reads them
+through a read-only mapping of that memory, made on first use.
 
 With GL on, 2D resources (dumb buffers) live in virglrenderer too, as in
 QEMU: Xorg's glamor draws into them with GL, and a context that touches

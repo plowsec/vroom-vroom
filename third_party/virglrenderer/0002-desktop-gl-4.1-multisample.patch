@@ -1,6 +1,8 @@
---- a/src/vrend_formats.c	2025-10-28 11:45:33
-+++ b/src/vrend_formats.c	2026-10-15 23:00:19
-@@ -652,8 +652,10 @@
+diff --git a/src/vrend/vrend_formats.c b/src/vrend/vrend_formats.c
+index 40ed4d5..5082341 100644
+--- a/src/vrend/vrend_formats.c
++++ b/src/vrend/vrend_formats.c
+@@ -650,8 +650,10 @@ void vrend_check_texture_multisample(struct vrend_format_table *table,
  {
     bool is_desktop_gl = epoxy_is_desktop_gl();
     for (int i = 0; i < VIRGL_FORMAT_MAX_EXTENDED; i++) {
@@ -13,7 +15,7 @@
  
        if (table[i].internalformat != 0 &&
            !(table[i].flags & VIRGL_TEXTURE_CAN_MULTISAMPLE) &&
-@@ -661,7 +663,7 @@
+@@ -659,7 +661,7 @@ void vrend_check_texture_multisample(struct vrend_format_table *table,
           GLuint tex_id;
           glGenTextures(1, &tex_id);
           glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, tex_id);
@@ -22,16 +24,17 @@
              glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 2,
                                        table[i].internalformat, 32, 32, GL_TRUE);
           } else {
---- a/src/vrend_renderer.c	2025-10-28 11:45:33
-+++ b/src/vrend_renderer.c	2026-10-15 23:00:19
-@@ -8438,7 +8438,9 @@
-       }
- 
-       if (pr->nr_samples > 1) {
--         if (format_can_texture_storage) {
-+         /* See vrend_check_texture_multisample: GL 4.1 has no
-+          * glTexStorage*Multisample. */
-+         if (format_can_texture_storage && has_feature(feat_storage_multisample)) {
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 7ea111b..7b3bef8 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -8962,7 +8962,8 @@ static int vrend_resource_alloc_texture(struct vrend_resource *gr,
+                         pr->nr_samples, gr->target);
+             gr->target = (gr->target == GL_TEXTURE_2D_MULTISAMPLE) ? GL_TEXTURE_2D : GL_TEXTURE_2D_ARRAY;
+             pr->nr_samples = 0;
+-         } else if (format_can_texture_storage) {
++         } else if (format_can_texture_storage && has_feature(feat_storage_multisample)) {
++            /* GL 4.1 (macOS) has no glTexStorage*Multisample. */
              if (gr->target == GL_TEXTURE_2D_MULTISAMPLE) {
                 glTexStorage2DMultisample(gr->target, pr->nr_samples,
                                           internalformat, pr->width0, pr->height0,

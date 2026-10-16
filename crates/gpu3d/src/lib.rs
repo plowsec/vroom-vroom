@@ -258,18 +258,19 @@ pub fn load(gl: Option<GlHost>) -> bool {
         GL.get_or_init(|| load_gl(lib, host));
     }
     if let Some(dir) = &lib.dir {
-        preload_dxmt(dir);
+        preload(dir, "libMoltenVK.dylib", "Vulkan");
+        preload(dir, "libdxmt-native.dylib", "Direct3D 11 for Windows guests");
     }
     true
 }
 
-/// Direct3D 11 for Windows guests (Neptune) runs on DXMT, which the
-/// library loads from its own directory when a guest first asks. That is
-/// after the sandbox is up, so load it now: the later dlopen finds it
-/// already there and opens nothing.
+/// The render server (Venus, and Direct3D 11 for Windows guests) loads
+/// MoltenVK and DXMT from the library's own directory when a guest first
+/// asks. That is after the sandbox is up, so load them now: the later
+/// dlopen finds them already there and opens nothing.
 #[cfg(target_os = "macos")]
-fn preload_dxmt(dir: &std::path::Path) {
-    let path = dir.join("libdxmt-native.dylib");
+fn preload(dir: &std::path::Path, name: &str, what: &str) {
+    let path = dir.join(name);
     if !path.exists() {
         return;
     }
@@ -277,9 +278,9 @@ fn preload_dxmt(dir: &std::path::Path) {
     // SAFETY: dlopen with a valid C string; the handle is kept for good.
     let h = unsafe { libc::dlopen(c.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
     if h.is_null() {
-        log::warn!("gpu3d: can't load {}: no Direct3D for Windows guests", path.display());
+        log::warn!("gpu3d: can't load {}: no {what}", path.display());
     } else {
-        log::info!("gpu3d: loaded {} (Direct3D 11 for Windows guests)", path.display());
+        log::info!("gpu3d: loaded {} ({what})", path.display());
     }
 }
 

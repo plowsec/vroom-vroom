@@ -248,6 +248,16 @@ GL calls go depends on `opengl_host`:
 
 `opengl = false` leaves vrend and both GL drivers out entirely.
 
+Windows guests with the viogpu3d driver send Direct3D 11 calls (Neptune,
+UTM's protocol). They go through virglrenderer's Neptune decoder to DXMT,
+which turns the guest's Direct3D shaders into Metal ones with its own
+LLVM-based converter and runs everything on Metal. That is a large amount
+of young C and C++ code in reach of the guest, with no browser-grade
+checks in front of Metal, so a Windows guest with 3D should be one you
+trust about as much as an app you run on the Mac. Venus and Neptune run
+in virglrenderer's render server, which here is a thread of the VMM, not
+a process of its own: it has the VMM's sandbox, nothing stricter.
+
 The sandbox keeps working but has to allow the GPU: three IOKit user
 clients (`AGXDeviceUserClient`, `AGXSharedUserClient`,
 `IOSurfaceRootUserClient`), the Metal compiler service, framework reads
@@ -256,6 +266,14 @@ OpenGL (on Apple Silicon it runs on Metal too) are loaded, with a first
 context, before the sandbox goes up. libepoxy is built to load ANGLE only
 from virglrenderer's own directory, and Apple's OpenGL only by its system
 path, when the VMM made a CGL context current first; never a search path.
+DXMT (LGPL, a separate dylib) is loaded from the same directory before
+the sandbox goes up, and virglrenderer is patched to look for it only
+there. The render server passes buffers as POSIX shared memory: the
+sandbox lets the VMM create, map and unlink shared memory only under
+names carrying its own process id and the render server's prefixes.
+DXMT's shader cache (Metal versions of guest shaders) is allowed next to
+Metal's, in the per-user cache folder; both are shared by every VM of the
+user.
 
 Snapshots with GL in them hold the guest's GPU contents (textures read
 back, so whatever was on screen) next to its RAM, in the state dir. On
@@ -327,8 +345,9 @@ running VM's images, even with `-U`.
 - The Windows agent split is new; installs from before it run the
   all-in-one agent elevated (re-run `vroom-setup.cmd` to upgrade).
 - x86_64 isn't implemented, so none of this is tested there.
-- Fuzzing doesn't cover Venus or virgl (3D) command streams: that is
-  virglrenderer's C code, which runs in the VMM process when 3D is on.
+- Fuzzing doesn't cover Venus, virgl or Neptune (3D) command streams:
+  that is virglrenderer's C code (and DXMT's C++ for Neptune), which runs
+  in the VMM process when 3D is on.
 
 ## What the guest can tell
 
@@ -367,7 +386,8 @@ Still visible, whatever the config says:
   screen; with `[display] hidpi` the guest also learns its pixel density
   (the scale its agent is asked for).
 - The display: ramfb, then virtio-gpu with no EDID. With 3D, Vulkan shows
-  the host GPU (MoltenVK on Apple). OpenGL's renderer name follows
+  the host GPU (MoltenVK on Apple). Windows guests with 3D see a "Red Hat
+  VirtIO GPU 3D controller" whose Direct3D runs on Metal underneath. OpenGL's renderer name follows
   `gl_renderer`, but its limits (GL 4.1 with `apple`, GL 2.1 and ES 3.0
   with `angle`, texture sizes, formats) still give the host driver away.
 - CPU ID registers come from the host CPU (an Apple core on a Mac), and

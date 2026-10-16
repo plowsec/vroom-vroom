@@ -3,6 +3,7 @@
 # the signed VMM and GUI, guest agents and helpers that were built, and the
 # docs. Build the optional parts first if you want them in:
 #   scripts/build-virglrenderer.sh          (3D; macOS)
+#   scripts/build-dxmt.sh                   (Direct3D for Windows guests)
 #   cargo xwin build --release -p vroom-agent --target aarch64-pc-windows-msvc
 #   cargo build --release -p vroom-agent --target aarch64-unknown-linux-musl
 set -e
@@ -17,8 +18,17 @@ mkdir -p "$d"
 cp target/release/vroom target/release/vroom-gui "$d/"
 note=""
 if [ -f target/release/libvirglrenderer.1.dylib ]; then
-  cp target/release/libvirglrenderer.1.dylib "$d/"
-  note="3D (gpu = \"virtio3d\") needs: brew install molten-vk libepoxy"
+  # virglrenderer, and what it loads from its own directory: MoltenVK
+  # (Vulkan), DXMT (Direct3D for Windows guests), ANGLE (opengl_host =
+  # "angle"), each if built.
+  for l in libvirglrenderer.1 libMoltenVK libdxmt-native libEGL libGLESv2; do
+    [ -f "target/release/$l.dylib" ] && cp "target/release/$l.dylib" "$d/"
+  done
+  if [ -f target/dxmt-build/src/COPYING.LIB ]; then
+    mkdir -p "$d/licenses"
+    cp target/dxmt-build/src/COPYING.LIB "$d/licenses/dxmt-COPYING.LIB"
+  fi
+  note="3D (gpu = \"virtio3d\"): keep the .dylib files next to vroom."
 fi
 win=target/aarch64-pc-windows-msvc/release/vroom-agent.exe
 lin=target/aarch64-unknown-linux-musl/release/vroom-agent

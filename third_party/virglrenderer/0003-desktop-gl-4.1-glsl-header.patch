@@ -1,10 +1,11 @@
---- a/src/vrend_shader.c	2025-10-28 11:45:33
-+++ b/src/vrend_shader.c	2026-10-15 23:28:15
-@@ -6139,7 +6139,71 @@
- {
+diff --git a/src/vrend/vrend_shader.c b/src/vrend/vrend_shader.c
+index fe870b6..28522d3 100644
+--- a/src/vrend/vrend_shader.c
++++ b/src/vrend/vrend_shader.c
+@@ -6234,6 +6234,70 @@ static void emit_ext(struct vrend_glsl_strbufs *glsl_strbufs, const char *name,
     emit_ver_extf(glsl_strbufs, "#extension GL_%s : %s\n", name, verb);
  }
-+
+ 
 +/* Extensions a GLSL version has built in. */
 +static const struct {
 +   const char *name;
@@ -28,7 +29,7 @@
 +   { "ARB_ES3_1_compatibility", 450 }, { "ARB_shader_draw_parameters", 460 },
 +   { "ARB_shader_group_vote", 460 }, { "ARB_shader_atomic_counter_ops", 460 },
 +};
- 
++
 +/* macOS's GLSL compiler (OpenGL 4.1) rejects #extension lines it doesn't
 + * list, even for what its own version has built in. Rewrite the header
 + * at the host's version, without those extensions. */
@@ -72,7 +73,7 @@
  static void emit_header(const struct dump_ctx *ctx, struct vrend_glsl_strbufs *glsl_strbufs)
  {
     if (ctx->cfg->use_gles) {
-@@ -6290,6 +6354,11 @@
+@@ -6390,6 +6454,11 @@ static void emit_header(const struct dump_ctx *ctx, struct vrend_glsl_strbufs *g
              emit_ext(glsl_strbufs, shader_req_table[i].string, "require");
           }
        }

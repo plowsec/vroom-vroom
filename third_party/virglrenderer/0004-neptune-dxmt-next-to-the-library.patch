@@ -1,0 +1,34 @@
+diff --git a/src/neptune/npt_library_names.h b/src/neptune/npt_library_names.h
+index c8ba978..05b813f 100644
+--- a/src/neptune/npt_library_names.h
++++ b/src/neptune/npt_library_names.h
+@@ -23,9 +23,10 @@
+ #define NPT_D3D12_LIBRARY_ENV "NPT_D3D12_LIBRARY_PATH"
+ 
+ #if defined(__APPLE__) && defined(__aarch64__)
+-#define NPT_D3D11_LIBRARY_DEFAULT "libdxmt-native.dylib"
+-#define NPT_DXGI_LIBRARY_DEFAULT  "libdxmt-native.dylib"
+-#define NPT_D3D12_LIBRARY_DEFAULT "libdxmt-native.dylib"
++/* Next to this library, never a search path (vroom). */
++#define NPT_D3D11_LIBRARY_DEFAULT "@loader_path/libdxmt-native.dylib"
++#define NPT_DXGI_LIBRARY_DEFAULT  "@loader_path/libdxmt-native.dylib"
++#define NPT_D3D12_LIBRARY_DEFAULT "@loader_path/libdxmt-native.dylib"
+ #elif defined(__APPLE__)
+ #define NPT_D3D11_LIBRARY_DEFAULT "libd3dmetal-native.dylib"
+ #define NPT_DXGI_LIBRARY_DEFAULT  "libd3dmetal-native.dylib"
+diff --git a/src/neptune/npt_renderer.c b/src/neptune/npt_renderer.c
+index a70af01..1e8392c 100644
+--- a/src/neptune/npt_renderer.c
++++ b/src/neptune/npt_renderer.c
+@@ -80,6 +80,11 @@ static uint32_t
+ npt_capset_backend_caps(void)
+ {
+    const char *backend = getenv("NPT_BACKEND");
++#if defined(__APPLE__) && defined(__aarch64__)
++   /* vroom: native arm64 means DXMT unless told otherwise. */
++   if (!backend)
++      backend = "dxmt";
++#endif
+    if (backend && !strcmp(backend, "dxmt")) {
+       /* Not EXTENDED_RESOURCE_SHARING: DXMT reports the cap but fails
+        * every SHARED_NTHANDLE texture create, so advertising it would

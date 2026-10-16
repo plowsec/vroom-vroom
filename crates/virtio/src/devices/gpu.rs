@@ -84,6 +84,8 @@ const BIND_RENDER_TARGET: u32 = 1 << 1;
 const RESOURCE_FLAG_Y_0_TOP: u32 = 1;
 /// virgl's GL capset: a context made with capset 0 (classic virgl) uses it.
 const CAPSET_VIRGL2: u32 = 2;
+/// Direct3D (Windows guests).
+const CAPSET_NEPTUNE: u32 = 7;
 
 const MAX_RESOURCE_BYTES: usize = 512 << 20;
 const MAX_RESOURCES: usize = 4096;
@@ -1281,6 +1283,9 @@ impl GpuHandler {
 
     /// Why a snapshot can't capture the GPU right now, if it can't.
     fn snapshot_blocker(&self) -> Option<String> {
+        if self.ctx_info.values().any(|c| c.capset == CAPSET_NEPTUNE) {
+            return Some("Windows draws with Direct3D, and Direct3D state can't be saved. With the display set to 2D, it can".into());
+        }
         if self.ctx_info.values().any(|c| c.gl.is_none()) {
             return Some("a Vulkan app is running, and Vulkan state can't be saved".into());
         }
@@ -1853,6 +1858,8 @@ mod tests {
         let mut h = gpu.handler();
         h.ctx_info.insert(2, CtxInfo { capset: 4, name: vec![], attached: Default::default(), gl: None });
         assert!(h.snapshot_blocker().unwrap().contains("Vulkan"));
+        h.ctx_info.insert(3, CtxInfo { capset: CAPSET_NEPTUNE, name: vec![], attached: Default::default(), gl: None });
+        assert!(h.snapshot_blocker().unwrap().contains("Direct3D"));
     }
 
     #[test]

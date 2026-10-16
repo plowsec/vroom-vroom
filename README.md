@@ -10,7 +10,7 @@ and every virtual device treats the guest as hostile.
 
 - Ubuntu, Debian, Alpine, Windows 11 ARM64
 - Window with clipboard both ways and auto resolution, sharp on Retina
-- 3D for Linux guests: Vulkan (about 90% of native speed) and OpenGL 4.1
+- 3D: Vulkan (about 90% of native speed) and OpenGL 4.1 in Linux guests, Direct3D 11 in Windows guests
 - Snapshots, suspend/resume, reset
 - NAT with port forwards, several network adapters. Bridged and host-only need a root helper.
 - Sound in Linux and Windows guests; microphone if you turn it on
@@ -22,7 +22,7 @@ and every virtual device treats the guest as hostile.
 - Fast disk and network I/O, measured against QEMU ([numbers](docs/PERFORMANCE.md))
 
 Not yet: x86_64 hosts (it builds, can't run VMs yet), Secure Boot, and
-3D in Windows guests.
+suspend of Windows guests with 3D on.
 
 ## Try it
 

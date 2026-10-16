@@ -1,0 +1,14 @@
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 7ea111b..7b3bef8 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -13019,7 +13020,7 @@ angle_generic:
+    strncpy(caps->v2.renderer, "Generic Renderer", sizeof(caps->v2.renderer) - 1);
+    caps->v2.renderer[sizeof(caps->v2.renderer) - 1] = '\0';
+ 
+-angle_done:
++angle_done:;
+ 
+    /* glamor reject llvmpipe, and since the renderer string is
+     * composed of "virgl" and this renderer string we have to
+

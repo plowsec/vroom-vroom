@@ -284,10 +284,12 @@ multisampled buffers, and depth buffers with `opengl_host = "angle"`
 Refused, with the reason shown: a running Vulkan app (Vulkan state isn't
 tracked), and GPU memory shared with the guest (blobs). Closing the window
 then leaves the VM paused with "Can't save this VM's state"; keep it
-running, or shut it down from the guest. Windows guests are not covered:
-Windows has no virgl or Venus driver.
+running, or shut it down from the guest. Windows guests with 3D can't be
+saved at all (see below).
 
-The build: `build-angle.sh` fetches ANGLE at the commit Chrome's stable
+The build: `build-virglrenderer.sh` builds UTM's fork of virglrenderer
+(the one with Direct3D for Windows, below), pinned by hash, with our
+patches. `build-angle.sh` fetches ANGLE at the commit Chrome's stable
 release uses, with Google's depot_tools, about 3 GB while it builds
 (removed afterwards), and leaves `libEGL.dylib` and `libGLESv2.dylib`
 (6 MB) in `target/angle`. `build-virglrenderer.sh` builds libepoxy 1.5.10
@@ -295,8 +297,48 @@ release uses, with Google's depot_tools, about 3 GB while it builds
 when the VMM asks for it) into virglrenderer (3.4 MB), with our patches
 from `third_party/virglrenderer/` (two of them make it work on macOS's
 OpenGL 4.1). Both copy their results next to `target/*/vroom`, where the
-VMM looks; ship the dylibs with the binary (ANGLE's two only for
-`opengl_host = "angle"`).
+VMM looks; ship the dylibs with the binary (`scripts/dist.sh` does): virglrenderer
+and MoltenVK always, ANGLE's two only for `opengl_host = "angle"`,
+DXMT's only for Windows guests.
+
+## 3D in Windows guests (Direct3D 11)
+
+```bash
+brew install meson ninja molten-vk llvm@15
+scripts/build-virglrenderer.sh
+scripts/build-dxmt.sh             # Direct3D 11 on Metal (about a minute)
+```
+
+In the guest, the 3D driver replaces the plain display driver:
+`viogpu3d-arm64x-signed.zip` from the
+[releases of osy/kvm-guest-drivers-windows](https://github.com/osy/kvm-guest-drivers-windows/releases)
+(UTM's author; Microsoft-signed, no test mode needed). Unpack it where
+Windows can read it (a shared folder, or a small disk), then as
+administrator:
+
+```bat
+pnputil /add-driver viogpu3d.inf /install
+```
+
+Shut down, set `[display] gpu = "virtio3d"`, start again. Windows then
+draws its desktop with Direct3D 11 on the Mac's GPU: the guest driver
+sends Direct3D calls to the host, where virglrenderer hands them to DXMT,
+which runs them on Metal. Device Manager shows "Red Hat VirtIO GPU 3D
+controller", and apps get Direct3D feature level 11_1.
+
+What works and what doesn't (Windows 11 24H2, M3 Max):
+
+- The lock screen, the desktop, Explorer and Settings draw, and windows
+  move smoothly.
+- Some app windows (Settings is one) lose their text in parts they
+  didn't just redraw; pointing at it brings it back. This happens in the
+  Direct3D layer (UTM's code), not in the window vroom shows.
+- No Direct3D 12, no Vulkan or OpenGL for Windows apps.
+- Suspend and snapshots are refused while Windows draws with Direct3D
+  (it always does once logged in): Direct3D state lives on the host and
+  vroom can't save it yet. With `gpu = "virtio2d"` they work.
+- DXMT keeps the Metal versions of the shaders it has converted in
+  macOS's cache folder (`$(getconf DARWIN_USER_CACHE_DIR)dxmt`), so apps start faster the second time.
 
 ## Shared folders
 
@@ -517,8 +559,9 @@ flushes a lot). `"none"` ignores flushes: scratch disks only.
 - Windows 11 is installed with its hardware checks bypassed (no Secure
   Boot); `tpm = true` (needs `brew install swtpm`) gives it a real TPM 2.0,
   which Windows sees and uses.
-- Windows guests: no 3D (no Venus or virgl driver). Shared folders need
-  WinFsp (see above).
+- Windows guests: 3D is Direct3D 11 only, can't be suspended, and some
+  windows lose text until redrawn (see above). Shared folders need WinFsp
+  (see above).
 - 3D snapshots: not while a Vulkan app runs. Guest OpenGL stops at 4.1
   (2.1 with `opengl_host = "angle"`).
 - NAT connections don't survive suspend/resume (the guest reconnects).

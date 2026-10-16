@@ -1,0 +1,16 @@
+diff --git a/src/venus/vkr_library.c b/src/venus/vkr_library.c
+index dc1f42c..d9e5732 100644
+--- a/src/venus/vkr_library.c
++++ b/src/venus/vkr_library.c
+@@ -43,7 +43,10 @@ vkr_library_load(struct vulkan_library *lib)
+       return true;
+ 
+ #ifdef __APPLE__
+-   lib->handle = dlopen("libvulkan.dylib", RTLD_NOW | RTLD_LOCAL);
++   /* vroom: MoltenVK next to this library first, never only a search path. */
++   lib->handle = dlopen("@loader_path/libMoltenVK.dylib", RTLD_NOW | RTLD_LOCAL);
++   if (lib->handle == NULL)
++      lib->handle = dlopen("libvulkan.dylib", RTLD_NOW | RTLD_LOCAL);
+    if (lib->handle == NULL)
+       lib->handle = dlopen("libvulkan.1.dylib", RTLD_NOW | RTLD_LOCAL);
+    if (lib->handle == NULL)
