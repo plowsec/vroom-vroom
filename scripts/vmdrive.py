@@ -20,6 +20,8 @@ Commands, one per line, on <state-dir>.cmd (a fifo):
                          `vroom usb-host` for it, hand the VMM its socket
                          (VROOM_USB_FAKE=acm in our environment: a pretend
                          serial port)
+  usbnetd ID [SERIAL]    the same through vroom-netd's root helper (what the
+                         app does for a device a macOS driver holds)
   usbdetach PORT         pull out the device on that port pair
   dragout X Y X2 Y2 DIR  press at X,Y, drag to X2,Y2 (an edge), ask the guest
                          what it drags out (as the app does when the mouse
@@ -230,6 +232,25 @@ def usb_attach(id_, serial=""):
     w.close()
     pl = b"".join(struct.pack("<H", len(x.encode())) + x.encode() for x in (id_, serial, "test " + id_))
     socket.send_fds(a, [struct.pack("<BI", 12, len(pl)) + pl], [r.fileno()]); r.close()
+def usb_netd(id_, serial=""):
+    import json
+    c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    c.connect("/var/run/vroom/netd.sock")
+    req = {"version": 1, "vm": "vmdrive", "usb": {"id": id_, "serial": serial or None}}
+    c.sendall((json.dumps(req) + "\n").encode())
+    line = b""
+    while not line.endswith(b"\n"):
+        ch = c.recv(1)
+        if not ch:
+            break
+        line += ch
+    resp = json.loads(line or b"{}")
+    if not resp.get("ok"):
+        ev.write(f"usbnetd {id_}: {resp.get('error', 'no answer')}\n")
+        return
+    _, fds, _, _ = socket.recv_fds(c, 16, 1)
+    pl = b"".join(struct.pack("<H", len(x.encode())) + x.encode() for x in (id_, serial, "netd " + id_))
+    socket.send_fds(a, [struct.pack("<BI", 12, len(pl)) + pl], [fds[0]]); os.close(fds[0])
 def fetch(i, idx, into):
     r, w = socket.socketpair()
     socket.send_fds(a, [struct.pack("<BI", 17, 8) + u32s(i, idx)], [w.fileno()]); w.close()
@@ -340,6 +361,7 @@ if True:
                     v = arg.split(" ", 4)
                     drop(int(v[0]), int(v[1]), int(v[2]), int(v[3]), v[4].split("|"))
                 elif c == "usb": usb_attach(*arg.split())
+                elif c == "usbnetd": usb_netd(*arg.split())
                 elif c == "usbdetach": send(13, bytes([int(arg)]))
                 elif c == "dragout":
                     v = arg.split(" ", 4)

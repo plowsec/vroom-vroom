@@ -4,6 +4,7 @@
 //!   their stock ACM driver (`/dev/ttyACM0` on Linux).
 //! - `VROOM_USB_FAKE=audio`: a USB sound card (isochronous in and out).
 //!   Guests drive it with their stock USB audio driver.
+//! - `VROOM_USB_FAKE=disk`: a USB stick ([`crate::fake_disk`]).
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -218,6 +219,8 @@ impl Device for Acm {
 pub enum FakeKind {
     Acm,
     Audio,
+    /// A USB stick; `broken`: every bulk transfer fails.
+    Disk { broken: bool },
 }
 
 /// Opens the fake device. `unplug_after`: pull it out once after that
@@ -252,8 +255,10 @@ impl Opener for FakeOpener {
         let dev: Box<dyn Device> = match self.kind {
             FakeKind::Acm => Box::new(Acm::new(sink.clone(), self.vendor, self.product)),
             FakeKind::Audio => Box::new(Audio::new(sink.clone(), self.vendor, self.product, true)),
+            FakeKind::Disk { broken } => Box::new(crate::fake_disk::Disk::new(sink.clone(), self.vendor, self.product, broken)),
         };
-        Some((dev, Speed::Full, self.vendor, self.product))
+        let speed = if matches!(self.kind, FakeKind::Disk { .. }) { Speed::High } else { Speed::Full };
+        Some((dev, speed, self.vendor, self.product))
     }
 
     fn present(&mut self) -> bool {
@@ -261,7 +266,7 @@ impl Opener for FakeOpener {
     }
 }
 
-fn string_desc(s: &str) -> Vec<u8> {
+pub(crate) fn string_desc(s: &str) -> Vec<u8> {
     let mut v = vec![0, 3];
     for u in s.encode_utf16() {
         v.extend_from_slice(&u.to_le_bytes());
