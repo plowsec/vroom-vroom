@@ -6,6 +6,13 @@ use super::ffi::{self, check};
 use super::BACKEND;
 use crate::aarch64::{self, DataAbort, ExceptionClass};
 use crate::{BootRegs, Error, Result, Vcpu, VcpuExit, VcpuKicker, VcpuState};
+use crate::debug::{arm64_reason, arm64_el1_exception_entry, DebugConfig, DebugReason, DebugStop};
+
+const MDSCR: u16 = 0x8012;
+const BVR: u16 = 0x8004;
+const BCR: u16 = 0x8005;
+const DEBUG_SLOTS: usize = 4;
+const PSTATE_SS: u64 = 1 << 21;
 
 /// How long a WFI sleep may last before we re-check for SGIs sent by other
 /// vCPUs. HVF delivers those in-kernel and gives us no wakeup signal.
@@ -52,6 +59,11 @@ pub struct HvfVcpu {
     vtimer_offset: Arc<AtomicU64>,
     /// Guest runs at EL2 (nested virtualization).
     el2: bool,
+    debug: DebugConfig,
+    /// Guest debug state while the host owns the hardware registers.
+    guest_debug: Vec<(u16, u64)>,
+    /// An emulated instruction retired; stop before executing its successor.
+    pending_debug_step: bool,
 }
 
 impl HvfVcpu {
@@ -78,6 +90,9 @@ impl HvfVcpu {
             vtimer_masked: false,
             vtimer_offset,
             el2,
+            debug: DebugConfig::default(),
+            guest_debug: Vec::new(),
+            pending_debug_step: false,
         };
         v.set_sys(ffi::HV_SYS_REG_MPIDR_EL1, mpidr)?;
         v.apply_vm_clock()?;
@@ -242,6 +257,35 @@ impl HvfVcpu {
     }
 
     fn handle_exception(&mut self, esr: u64, ipa: u64) -> Result<Option<VcpuExit>> {
+        if self.debug.enabled {
+            if let Some(reason) = arm64_reason(esr) {
+                if reason == DebugReason::SoftwareBreakpoint && !self.debug.trap_software_breakpoints {
+                    let pc = self.get(ffi::HV_REG_PC)?;
+                    let ps = self.get(ffi::HV_REG_CPSR)?;
+                    let sctlr = self.get_sys(0xc080)?;
+                    let vbar = self.get_sys(0xc600)?;
+                    let pan = (self.get_sys(0xc039)? >> 20) & 15 != 0;
+                    let mte = (self.get_sys(0xc021)? >> 8) & 15 != 0;
+                    let (vector, new_ps) = arm64_el1_exception_entry(ps,sctlr,vbar,pan,mte)?;
+                    self.set_sys(0xc200,ps)?; // SPSR_EL1: exact pre-exception state
+                    self.set_sys(0xc201,pc)?; // ELR_EL1: BRK itself, not PC+4
+                    self.set_sys(0xc290,esr)?; // ESR_EL1: preserve the BRK immediate
+                    self.set(ffi::HV_REG_CPSR,new_ps)?;
+                    self.set(ffi::HV_REG_PC,vector)?;
+                    if self.debug.single_step { self.pending_debug_step = true; }
+                    return Ok(None);
+                }
+                return Ok(Some(VcpuExit::Debug(DebugStop {
+                    cpu: self.index, pc: self.get(ffi::HV_REG_PC)?, syndrome: esr, reason,
+                })));
+            }
+        }
+        if self.debug.single_step && matches!(aarch64::exception_class(esr),
+            ExceptionClass::DataAbortLower | ExceptionClass::WfxTrap |
+            ExceptionClass::Hvc64 | ExceptionClass::Smc64 | ExceptionClass::SysReg)
+        {
+            self.pending_debug_step = true;
+        }
         match aarch64::exception_class(esr) {
             ExceptionClass::DataAbortLower => {
                 let Some(da) = aarch64::decode_data_abort(esr) else {
@@ -262,6 +306,9 @@ impl HvfVcpu {
             }
             ExceptionClass::WfxTrap => {
                 self.advance_pc()?;
+                if self.debug.single_step {
+                    return Ok(None);
+                }
                 if esr & 1 == 1 {
                     // WFE: just yield.
                     std::thread::yield_now();
@@ -282,6 +329,19 @@ impl HvfVcpu {
             ExceptionClass::SysReg => {
                 let s = aarch64::decode_sysreg(esr);
                 let key = s.key() as u16;
+                // Guest context switches must not overwrite host breakpoints.
+                // Emulate reads/writes against the guest's saved registers.
+                if self.debug.enabled {
+                    if let Some(pos) = self.guest_debug.iter().position(|(r, _)| *r == key) {
+                        if s.read {
+                            self.set_x(s.reg, self.guest_debug[pos].1)?;
+                        } else {
+                            self.guest_debug[pos].1 = self.get_x(s.reg)?;
+                        }
+                        self.advance_pc()?;
+                        return Ok(None);
+                    }
+                }
                 // Registers HVF can hold but doesn't handle on trap (EL2
                 // state of nested guests, e.g. CNTHCTL_EL2): forward.
                 // Everything else (debug/PMU/OS lock...): RAZ/WI.
@@ -337,12 +397,68 @@ impl Drop for HvfVcpu {
 }
 
 impl Vcpu for HvfVcpu {
+    fn configure_debug(&mut self, config: &DebugConfig) -> Result<()> {
+        if self.el2 {
+            return Err(Error::Unsupported("debugging nested EL2 guests"));
+        }
+        if config.breakpoints.len() > DEBUG_SLOTS || config.breakpoints.iter().any(|a| a & 3 != 0) {
+            return Err(Error::Invalid("at most four aligned ARM64 breakpoints".into()));
+        }
+        if !config.enabled && (config.single_step || !config.breakpoints.is_empty()) {
+            return Err(Error::Invalid("debug controls require enabled=true".into()));
+        }
+        if config.enabled && !self.debug.enabled {
+            // Query before changing anything, and retain guest state for detach.
+            let count = ((self.get_sys(ffi::HV_SYS_REG_ID_AA64DFR0_EL1)? >> 12) & 15) + 1;
+            if count < DEBUG_SLOTS as u64 {
+                return Err(Error::Unsupported("fewer than four hardware breakpoints"));
+            }
+            let mut saved = vec![(MDSCR, self.get_sys(MDSCR)?)];
+            for i in 0..DEBUG_SLOTS as u16 {
+                saved.push((BVR + i * 8, self.get_sys(BVR + i * 8)?));
+                saved.push((BCR + i * 8, self.get_sys(BCR + i * 8)?));
+            }
+            self.guest_debug = saved;
+        }
+        // SAFETY: all configuration is on this vCPU's owning thread.
+        check("trap debug exceptions", unsafe { ffi::hv_vcpu_set_trap_debug_exceptions(self.id, config.enabled) })?;
+        // Keep guest accesses virtualized while host breakpoints are installed.
+        // SAFETY: owning thread, live vCPU.
+        check("trap debug registers", unsafe { ffi::hv_vcpu_set_trap_debug_reg_accesses(self.id, config.enabled) })?;
+        if config.enabled {
+            for i in 0..DEBUG_SLOTS {
+                self.set_sys(BCR + i as u16 * 8, 0)?;
+                if let Some(&address) = config.breakpoints.get(i) {
+                    self.set_sys(BVR + i as u16 * 8, address)?;
+                    // E=1, PMC=EL0+EL1, BAS=all four instruction bytes.
+                    self.set_sys(BCR + i as u16 * 8, 1 | (3 << 1) | (15 << 5))?;
+                }
+            }
+            let guest = self.guest_debug[0].1;
+            self.set_sys(MDSCR, (guest & !1) | (1 << 13) | (1 << 15) | u64::from(config.single_step))?;
+        } else if self.debug.enabled {
+            for &(reg, value) in &self.guest_debug { self.set_sys(reg, value)?; }
+            self.guest_debug.clear();
+        }
+        let ps = self.get(ffi::HV_REG_CPSR)?;
+        self.set(ffi::HV_REG_CPSR, (ps & !PSTATE_SS) | if config.single_step { PSTATE_SS } else { 0 })?;
+        self.debug = config.clone();
+        self.pending_debug_step = false;
+        Ok(())
+    }
+
     fn index(&self) -> u32 {
         self.index
     }
 
     fn run(&mut self) -> Result<VcpuExit> {
         loop {
+            if std::mem::take(&mut self.pending_debug_step) {
+                return Ok(VcpuExit::Debug(DebugStop {
+                    cpu: self.index, pc: self.get(ffi::HV_REG_PC)?, syndrome: 0,
+                    reason: crate::debug::DebugReason::SingleStep,
+                }));
+            }
             if self.kicker.take_kick() {
                 return Ok(VcpuExit::Kicked);
             }
@@ -458,6 +574,12 @@ impl Vcpu for HvfVcpu {
                 if !ffi::SNAPSHOT_SYS_REGS.contains(&r) {
                     return Err(Error::Invalid(format!("unknown sysreg {r:#x} in snapshot")));
                 }
+                if self.debug.enabled {
+                    if let Some(entry) = self.guest_debug.iter_mut().find(|(id, _)| *id == r) {
+                        entry.1 = v;
+                        continue;
+                    }
+                }
                 self.set_sys(r, v)?;
             } else if id <= ffi::HV_REG_CPSR {
                 self.set(id, v)?;
@@ -484,6 +606,9 @@ impl Vcpu for HvfVcpu {
         self.apply_vm_clock()?;
         self.mpidr = self.get_sys(ffi::HV_SYS_REG_MPIDR_EL1)?;
         self.pending_read = None;
+        if self.debug.enabled {
+            self.configure_debug(&self.debug.clone())?;
+        }
         Ok(())
     }
 }

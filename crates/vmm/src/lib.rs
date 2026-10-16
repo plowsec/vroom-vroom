@@ -6,6 +6,7 @@
 
 pub mod agent;
 mod audio;
+mod debug;
 mod disks;
 
 /// Helper processes we started (swtpm, audio): the only processes the
@@ -79,8 +80,12 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum StartMode {
     /// Cold boot from the configured kernel/firmware.
     Boot,
+    /// Cold boot with CPUs parked before the first guest instruction.
+    BootPaused,
     /// Resume from a snapshot directory.
     Restore(PathBuf),
+    /// Restore without executing guest instructions until explicitly resumed.
+    RestorePaused(PathBuf),
 }
 
 /// Host-side wiring the frontend provides.
@@ -161,15 +166,15 @@ impl Vmm {
         };
         let lock = state::StateLock::acquire(&opts.state_dir)?;
         let layers = match &opts.start {
-            StartMode::Restore(dir) => snapshot::disk_plan(dir)?,
-            StartMode::Boot => Default::default(),
+            StartMode::Restore(dir) | StartMode::RestorePaused(dir) => snapshot::disk_plan(dir)?,
+            StartMode::Boot | StartMode::BootPaused => Default::default(),
         };
         let disks = disks::DiskSet::open(&config, &opts.state_dir, &layers)?;
         let uuid = machine_uuid(&opts.state_dir)?;
         let env = machine::BuildEnv {
             uuid,
             state_dir: opts.state_dir.clone(),
-            resuming: matches!(opts.start, StartMode::Restore(_)),
+            resuming: matches!(opts.start, StartMode::Restore(_) | StartMode::RestorePaused(_)),
         };
         let m = machine::build(&config, hv.as_ref(), opts.serial_out, opts.clipboard, ui, &disks, ev_tx, &env)?;
         let mut vmm = Vmm {
@@ -205,8 +210,13 @@ impl Vmm {
             let s = d.lock().unwrap_or_else(|e| e.into_inner()).save()?;
             vmm.pristine_devices.push(s);
         }
+        let start_paused = matches!(opts.start, StartMode::BootPaused | StartMode::RestorePaused(_));
+        // Restore marks each CPU runnable. Park every CPU before loading any
+        // state so none can execute against partially restored RAM/devices.
+        vmm.state = RunState::Running;
+        vmm.pause()?;
         match opts.start {
-            StartMode::Boot => {
+            StartMode::Boot | StartMode::BootPaused => {
                 let regs = vmm.boot.load(&vmm.mem)?;
                 vmm.vcpus[0].peer.send(VcpuCmd::PowerOn(regs))?;
                 // In-kernel PSCI: secondaries wait inside KVM_RUN for CPU_ON.
@@ -215,17 +225,13 @@ impl Vmm {
                     v.peer.send(VcpuCmd::Start)?;
                 }
             }
-            StartMode::Restore(dir) => {
+            StartMode::Restore(dir) | StartMode::RestorePaused(dir) => {
                 snapshot::restore(&mut vmm, &dir)?;
-                // Restored workers start parked; let them go with the vCPUs.
-                for d in &vmm.devices {
-                    d.lock().unwrap_or_else(|e| e.into_inner()).resume();
-                }
                 // Guest wall clock is stuck at snapshot time; fix it.
                 vmm.agent.send(agent::AgentCmd::SyncTime);
             }
         }
-        vmm.state = RunState::Running;
+        if !start_paused { vmm.resume()?; }
         Ok(vmm)
     }
 
