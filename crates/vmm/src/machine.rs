@@ -728,8 +728,9 @@ pub(crate) fn build(
         None => clipboard,
     };
     let max_pixels = if config.guest_os() == GuestOs::Windows { agent::WINDOWS_MAX_PIXELS } else { 0 };
-    let agent = agent::spawn(host_end, config.clipboard.clone(), clipboard, agent::Screen { gpu: gpu_ctl.clone(), max_pixels, gpu3d: config.display.gpu == Gpu::Virtio3d })?;
     let viewer = ui.as_ref().map(|d| d.tx());
+    let screen_ctl = agent::Screen { gpu: gpu_ctl.clone(), max_pixels, gpu3d: config.display.gpu == Gpu::Virtio3d, viewer: viewer.clone() };
+    let agent = agent::spawn(host_end, config.clipboard.clone(), clipboard, screen_ctl)?;
     if let Some(ds) = ui {
         if screen.is_none() {
             return Err(Error::Setup("a viewer needs a display (display.gpu or UEFI boot)".into()));

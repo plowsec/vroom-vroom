@@ -17,6 +17,11 @@ pub fn send_fd(sock: &std::os::unix::net::UnixStream, fd: std::os::fd::RawFd) ->
     vroom_ipc::send_fd(sock, fd).map_err(ipc_err)
 }
 
+/// Send `payload` with `fd` attached.
+pub fn send_fd_with(sock: &std::os::unix::net::UnixStream, payload: &[u8], fd: std::os::fd::RawFd) -> Result<()> {
+    vroom_ipc::send_fd_with(sock, payload, fd).map_err(ipc_err)
+}
+
 pub fn recv_fd(sock: &std::os::unix::net::UnixStream) -> Result<std::os::fd::OwnedFd> {
     vroom_ipc::recv_fd(sock).map_err(ipc_err)
 }
@@ -27,7 +32,7 @@ fn ipc_err(e: vroom_ipc::Error) -> Error {
         vroom_ipc::Error::Proto(m) => Error::Proto(m),
     }
 }
-pub use proto::{Command, Decoder, GuestCursor, ToViewer, ToVmm, CURSOR_MAX, POINTER_MAX, SCALE_MAX, SCALE_MIN};
+pub use proto::{Command, Decoder, GuestCursor, ToViewer, ToVmm, CURSOR_MAX, DRAG_ITEMS_MAX, POINTER_MAX, SCALE_MAX, SCALE_MIN};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

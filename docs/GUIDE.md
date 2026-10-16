@@ -55,6 +55,27 @@ The mouse pointer over the guest is one pointer, the guest's:
   It's hidden during boot too, when Windows shows none.
 - Any other guest that gives no pointer keeps the Mac's arrow.
 
+### Drag and drop
+
+Drag files or folders from Finder onto the VM window to copy them into
+the guest. Needs the guest tools (the agent) of this version or later.
+
+- **Windows:** the drop lands wherever you let go, as if you had dragged
+  the files inside Windows: into an Explorer folder, onto the desktop, into
+  a mail as an attachment, onto an app. While you hover, Windows shows
+  its own drag picture and "Copy to Documents".
+- **Linux:** the files go to the Desktop (a name that is taken gets a
+  number: `photo (2).jpg`), and the desktop shows a notification.
+
+While the files hover, the window's edge lights up and a line at the
+bottom says what a drop does (or why the guest can't take them: no guest
+tools, nobody logged in). Nothing reaches the guest until you drop: only
+the names, so it can get ready. Then a bar shows the copy's progress.
+
+Names Windows can't take (`:` `?` `*` and the like) get a `_` instead.
+Links inside dropped folders are left out. Dragging from the guest to the
+Mac isn't there yet.
+
 ### When the app crashes, or a VM stops answering
 
 Each VM runs in a process of its own, so a crash of the app doesn't stop

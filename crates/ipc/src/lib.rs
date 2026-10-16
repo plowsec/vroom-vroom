@@ -88,10 +88,77 @@ pub fn recv_fd(sock: &UnixStream) -> Result<OwnedFd> {
     }
 }
 
+/// Most fds one read may bring.
+const MAX_FDS: usize = 4;
+
+/// Read like `read`, and keep any fds that came with the bytes.
+pub fn read_with_fds(sock: &UnixStream, buf: &mut [u8], fds: &mut Vec<OwnedFd>) -> std::io::Result<usize> {
+    let mut iov = libc::iovec { iov_base: buf.as_mut_ptr() as *mut _, iov_len: buf.len() };
+    // SAFETY: pure computation.
+    let space = unsafe { libc::CMSG_SPACE((MAX_FDS * std::mem::size_of::<RawFd>()) as u32) } as usize;
+    let mut cbuf = vec![0u8; space];
+    // SAFETY: zeroed msghdr is valid.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cbuf.as_mut_ptr() as *mut _;
+    msg.msg_controllen = space as _;
+    let n = loop {
+        // SAFETY: msg describes valid buffers.
+        let n = unsafe { libc::recvmsg(sock.as_raw_fd(), &mut msg, 0) };
+        if n >= 0 {
+            break n as usize;
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    };
+    // SAFETY: walking the control buffer recvmsg filled; each fd is ours.
+    unsafe {
+        let mut c = libc::CMSG_FIRSTHDR(&msg);
+        while !c.is_null() {
+            if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
+                let data = libc::CMSG_DATA(c) as *const RawFd;
+                let count = ((*c).cmsg_len as usize - (data as usize - c as usize)) / std::mem::size_of::<RawFd>();
+                for i in 0..count {
+                    let fd = std::ptr::read_unaligned(data.add(i));
+                    if fd >= 0 {
+                        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                        fds.push(OwnedFd::from_raw_fd(fd));
+                    }
+                }
+            }
+            c = libc::CMSG_NXTHDR(&msg, c);
+        }
+    }
+    Ok(n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+
+    #[test]
+    fn fds_come_with_the_bytes_around_them() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let (x, _y) = UnixStream::pair().unwrap();
+        (&a).write_all(b"before").unwrap();
+        send_fd_with(&a, b"with", x.as_raw_fd()).unwrap();
+        (&a).write_all(b"after").unwrap();
+        drop(a);
+        let (mut got, mut fds, mut buf) = (Vec::new(), Vec::new(), [0u8; 64]);
+        loop {
+            let n = read_with_fds(&b, &mut buf, &mut fds).unwrap();
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(got, b"beforewithafter");
+        assert_eq!(fds.len(), 1);
+    }
 
     #[test]
     fn pass_pipe_end() {

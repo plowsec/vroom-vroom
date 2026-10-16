@@ -280,8 +280,17 @@ export component ConsoleWindow inherits Window {
     // Height of the bar above the guest screen (none in full screen).
     // Rust takes it off the size it asks the guest for.
     out property <length> bar-height: root.fullscreen ? 0px : 38px;
-    // The guest screen's width on the window (for the pointer's size).
+    // The guest screen's place on the window (the pointer's size; where a
+    // drag is over the guest).
     out property <length> screen-width: screen.width;
+    out property <length> screen-height: screen.height;
+    out property <length> screen-x: screen.x;
+    out property <length> screen-y: screen.y;
+    // Files dragged over the window: outline the screen, say what a drop
+    // does; while copying, how far along (0..1, or -1 for no bar).
+    in property <bool> drop-over;
+    in property <string> drop-text;
+    in property <float> drop-progress: -1;
     callback mouse-move(float, float);
     callback button(int, bool);
     callback wheel(length, length);
@@ -549,6 +558,51 @@ export component ConsoleWindow inherits Window {
             mic-on: root.mic-on;
             wide: false;
             act(a) => { root.act(a); }
+        }
+    }
+
+    if root.drop-over: Rectangle {
+        x: screen.x;
+        y: screen.y;
+        width: screen.width;
+        height: screen.height;
+        border-width: 2px;
+        border-color: Theme.accent;
+    }
+
+    // What a drop does, then how the copy goes.
+    if root.drop-text != "": Rectangle {
+        x: (root.width - self.width) / 2;
+        y: root.height - self.height - (root.toast != "" ? 66px : 22px);
+        width: min(root.width - 40px, max(dt.preferred-width + 32px, root.drop-progress >= 0 ? 260px : 0px));
+        height: root.drop-progress >= 0 ? 44px : 36px;
+        border-radius: 18px;
+        background: #1c1c1ee6;
+        border-width: 1px;
+        border-color: #ffffff24;
+        clip: true;
+        dt := Text {
+            y: root.drop-progress >= 0 ? 8px : (parent.height - self.height) / 2;
+            x: (parent.width - self.width) / 2;
+            text: root.drop-text;
+            color: #ffffff;
+            font-size: Theme.fs-md;
+            overflow: elide;
+        }
+        if root.drop-progress >= 0: Rectangle {
+            x: 16px;
+            y: parent.height - 12px;
+            width: parent.width - 32px;
+            height: 4px;
+            border-radius: 2px;
+            background: #ffffff24;
+            Rectangle {
+                x: 0;
+                width: parent.width * clamp(root.drop-progress, 0, 1);
+                height: 100%;
+                border-radius: 2px;
+                background: Theme.accent;
+            }
         }
     }
 

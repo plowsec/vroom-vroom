@@ -5,6 +5,7 @@
 
 mod app;
 mod console;
+mod dnd;
 mod edit;
 mod fmt;
 mod host;

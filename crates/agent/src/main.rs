@@ -9,6 +9,11 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod clip;
+#[cfg(windows)]
+mod dnd_win;
+// The session side; built everywhere so it's tested everywhere.
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+mod drop;
 mod find;
 mod port;
 // Used by the service mode (Windows, Linux); built everywhere so it's
@@ -198,13 +203,18 @@ fn session(args: &Args) -> std::io::Result<()> {
 
     let mut dec = Decoder::new(MAX_CLIP + 64);
     let mut last = clip.get();
+    let mut drops = drop::Drops::new();
     loop {
         match rx.recv_timeout(POLL) {
             Ok(bytes) => {
                 dec.push(&bytes);
                 loop {
                     match dec.next() {
-                        Ok(Some(m)) => handle(m, system, &mut writer, clip.as_mut(), &mut last)?,
+                        Ok(Some(m)) => {
+                            if !drops.handle(&m, &mut writer)? {
+                                handle(m, system, &mut writer, clip.as_mut(), &mut last)?
+                            }
+                        }
                         Ok(None) => break,
                         Err(e) => log::warn!("bad message from host: {e}"),
                     }
@@ -229,7 +239,7 @@ fn session(args: &Args) -> std::io::Result<()> {
 }
 
 fn hello() -> Message {
-    let mut features = features::CLIPBOARD_TEXT | features::TIME_SYNC | features::SHUTDOWN | features::SCALE;
+    let mut features = features::CLIPBOARD_TEXT | features::TIME_SYNC | features::SHUTDOWN | features::SCALE | features::FILE_DROP;
     if cfg!(windows) {
         features |= features::GPU3D;
     }
@@ -270,6 +280,14 @@ fn handle(m: Message, system: bool, w: &mut port::Writer, clip: &mut dyn clip::C
         Message::Ping(v) => w.write_all(&Message::Pong(v).encode())?,
         // Windows' service handles it (relay); nothing to turn off here.
         Message::Gpu3d { .. } | Message::Pong(_) => {}
+        // Drops are drop.rs's; the rest is guest -> host.
+        Message::DragEnter { .. }
+        | Message::DragCancel { .. }
+        | Message::DropEntry { .. }
+        | Message::DropData { .. }
+        | Message::DropEnd { .. }
+        | Message::DragReady { .. }
+        | Message::DropDone { .. } => {}
     }
     Ok(())
 }

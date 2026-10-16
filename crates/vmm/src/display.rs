@@ -5,7 +5,7 @@
 //! virtio-input devices, resize, focus + clipboard to the agent (which
 //! also drives the GPU's size), lifecycle commands to the main loop.
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use std::sync::mpsc::Sender;
@@ -51,6 +51,12 @@ struct Sticky {
     state: Option<String>,
     /// "guest agent connected (...)".
     agent: Option<String>,
+}
+
+impl std::fmt::Debug for ViewerTx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ViewerTx").field("attached", &self.attached()).finish()
+    }
 }
 
 impl ViewerTx {
@@ -463,17 +469,23 @@ struct Serve {
 }
 
 /// Read one viewer's input until it goes away.
-fn serve(mut stream: UnixStream, c: &Serve) {
+fn serve(stream: UnixStream, c: &Serve) {
     let mut dec = Decoder::default();
     let mut buf = vec![0u8; 64 << 10];
+    // Fds that came with the bytes (a drop's pipe), in order.
+    let mut fds = Vec::new();
     loop {
-        let n = match stream.read(&mut buf) {
+        let n = match vroom_ipc::read_with_fds(&stream, &mut buf, &mut fds) {
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
         dec.push(&buf[..n]);
         loop {
             match dec.next_to_vmm() {
+                Ok(Some(ToVmm::Drop { id })) => match (!fds.is_empty()).then(|| fds.remove(0)) {
+                    Some(from) => c.agent.send(AgentCmd::Drop { id, from }),
+                    None => log::warn!("display: a drop without its pipe"),
+                },
                 Ok(Some(m)) => handle(m, c.input.as_ref(), &c.agent, &c.events, &c.latest),
                 Ok(None) => break,
                 Err(e) => {
@@ -549,12 +561,17 @@ fn handle(
         ToVmm::Command(c) => {
             let _ = events.send(VmEvent::Ui(c));
         }
+        ToVmm::DragEnter { id, items } => agent.send(AgentCmd::DragEnter { id, items }),
+        ToVmm::DragCancel { id } => agent.send(AgentCmd::DragCancel { id }),
+        // serve() pairs it with its pipe.
+        ToVmm::Drop { .. } => {}
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
 
     fn px(sink: &FbSink) -> u32 {
         let (w, h) = *sink.mode.lock().unwrap();
