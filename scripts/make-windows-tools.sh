@@ -1,6 +1,7 @@
 #!/bin/sh
 # Build a small "tools" disk for Windows guests: vroom-agent.exe and
 # vroom-setup.cmd on FAT32 with an MBR (Windows mounts it as D: or so).
+# The OpenGL driver goes on it too when scripts/build-windows-gl.sh made it.
 # With the virtio-win ISO, its ARM64 drivers go on it too (an installed
 # Windows can't read the ISO itself on NVMe). So does a WinFsp MSI if
 # WINFSP_MSI names one (else setup downloads it).
@@ -19,13 +20,16 @@ cleanup() {
   rm -rf "$tmp"
 }
 trap cleanup EXIT
-hdiutil create -quiet -size 64m -layout MBRSPUD -fs "MS-DOS FAT32" -volname VRTOOLS "$tmp/t.dmg"
+hdiutil create -quiet -size 96m -layout MBRSPUD -fs "MS-DOS FAT32" -volname VRTOOLS "$tmp/t.dmg"
 hdiutil convert -quiet "$tmp/t.dmg" -format UDTO -o "$tmp/t"
 # Windows ignores MBR disks whose signature is zero.
 printf 'VRT1' | dd of="$tmp/t.cdr" bs=1 seek=440 conv=notrunc 2>/dev/null
 mkdir "$tmp/mnt"
 hdiutil attach -quiet -imagekey diskimage-class=CRawDiskImage "$tmp/t.cdr" -mountpoint "$tmp/mnt"
 cp "$exe" examples/windows/vroom-setup.cmd "$tmp/mnt/"
+if [ -f target/windows-gl/vroom_gl.dll ]; then
+  cp target/windows-gl/vroom_gl.dll target/windows-gl/vroom_gl_arm64.dll target/windows-gl/vroom_gl_x64.dll "$tmp/mnt/"
+fi
 if [ -n "$vw" ]; then
   mkdir "$tmp/vw"
   hdiutil attach -quiet -nobrowse -readonly -mountpoint "$tmp/vw" "$vw"

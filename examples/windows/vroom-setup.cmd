@@ -35,6 +35,9 @@ if exist "%~dp0vroom-agent.exe" (
   rmdir /s /q "%ProgramFiles%\Bulwark" 2>nul
   mkdir "%ProgramFiles%\Vroom" 2>nul
   copy /y "%~dp0vroom-agent.exe" "%ProgramFiles%\Vroom\" || (echo vroom: could not copy the agent & exit /b 1)
+  rem OpenGL for apps (3D display only): the agent registers it with the
+  rem 3D display device when it starts.
+  if exist "%~dp0vroom_gl.dll" copy /y "%~dp0vroom_gl*.dll" "%ProgramFiles%\Vroom\" >nul
   sc query VroomAgent >nul 2>&1 || sc create VroomAgent binPath= "\"%ProgramFiles%\Vroom\vroom-agent.exe\" --service" start= auto obj= LocalSystem DisplayName= "Vroom guest agent"
   sc description VroomAgent "Host channel for the vroom VMM: clock sync, clean shutdown, relays clipboard and resolution to the session helper."
   sc failure VroomAgent reset= 86400 actions= restart/5000/restart/5000/restart/30000

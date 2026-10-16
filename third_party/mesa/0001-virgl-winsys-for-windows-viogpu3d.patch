@@ -1,0 +1,1120 @@
+diff --git a/src/gallium/meson.build b/src/gallium/meson.build
+--- a/src/gallium/meson.build
++++ b/src/gallium/meson.build
+@@ -173,10 +173,15 @@
+   if not with_platform_windows
+     subdir('winsys/virgl/drm')
+     subdir('winsys/virgl/vtest')
++  else
++    subdir('winsys/virgl/win32')
+   endif
+   subdir('drivers/virgl')
+ else
+   driver_virgl = declare_dependency()
++endif
++if not (with_gallium_virgl and with_platform_windows)
++  winsys_virgl_win32 = declare_dependency()
+ endif
+ if with_gallium_lima
+   subdir('winsys/lima/drm')
+diff --git a/src/gallium/targets/wgl/meson.build b/src/gallium/targets/wgl/meson.build
+--- a/src/gallium/targets/wgl/meson.build
++++ b/src/gallium/targets/wgl/meson.build
+@@ -24,7 +24,7 @@
+   ],
+   dependencies : [
+     dep_ws2_32, idep_nir, idep_mesautil, driver_swrast,
+-    driver_d3d12, driver_zink, winsys_d3d12_wgl
++    driver_d3d12, driver_zink, winsys_d3d12_wgl, driver_virgl, winsys_virgl_win32
+   ],
+   link_args : gallium_wgl_link_args,
+   name_prefix : '',
+diff --git a/src/gallium/targets/wgl/wgl.c b/src/gallium/targets/wgl/wgl.c
+--- a/src/gallium/targets/wgl/wgl.c
++++ b/src/gallium/targets/wgl/wgl.c
+@@ -63,6 +63,11 @@
+ #include "zink/zink_public.h"
+ #endif
+ 
++#ifdef GALLIUM_VIRGL
++#include "virgl/win32/virgl_win32_public.h"
++static bool use_virgl = false;
++#endif
++
+ #ifdef GALLIUM_LLVMPIPE
+ static bool use_llvmpipe = false;
+ #endif
+@@ -80,6 +85,13 @@
+ {
+    struct pipe_screen* screen = NULL;
+ 
++#ifdef GALLIUM_VIRGL
++   if (strcmp(driver, "virgl") == 0) {
++      screen = virgl_win32_screen_create();
++      if (screen)
++         use_virgl = true;
++   }
++#endif
+ #ifdef GALLIUM_LLVMPIPE
+    if (strcmp(driver, "llvmpipe") == 0) {
+       screen = llvmpipe_create_screen(winsys);
+@@ -122,6 +134,9 @@
+ 
+    const char *const drivers[] = {
+       debug_get_option("GALLIUM_DRIVER", ""),
++#ifdef GALLIUM_VIRGL
++      sw_only ? "" : "virgl",
++#endif
+ #ifdef GALLIUM_D3D12
+       sw_only ? "" : "d3d12",
+ #endif
+@@ -173,6 +188,13 @@
+ #if defined(HAVE_SWRAST)
+    struct sw_winsys *winsys = NULL;
+    struct sw_displaytarget *dt = NULL;
++#endif
++
++#ifdef GALLIUM_VIRGL
++   if (use_virgl) {
++      screen->flush_frontbuffer(screen, ctx, res, 0, 0, hDC, 0, NULL);
++      return;
++   }
+ #endif
+ 
+ #ifdef GALLIUM_LLVMPIPE
+diff --git a/src/gallium/winsys/virgl/win32/meson.build b/src/gallium/winsys/virgl/win32/meson.build
+--- a/src/gallium/winsys/virgl/win32/meson.build
++++ b/src/gallium/winsys/virgl/win32/meson.build
+@@ -0,0 +1,15 @@
++# Copyright 2026 vroom authors
++# SPDX-License-Identifier: MIT
++
++libvirglwin32 = static_library(
++  'virglwin32',
++  'virgl_win32_winsys.c',
++  include_directories : [inc_include, inc_src, inc_gallium, inc_gallium_aux, inc_gallium_drivers, inc_virtio],
++  dependencies : [dep_libvirglcommon, idep_mesautil, idep_nir_headers],
++  gnu_symbol_visibility : 'hidden',
++)
++
++winsys_virgl_win32 = declare_dependency(
++  link_with : [libvirglwin32],
++  dependencies : [cc.find_library('gdi32')],
++)
+diff --git a/src/gallium/winsys/virgl/win32/virgl_win32_public.h b/src/gallium/winsys/virgl/win32/virgl_win32_public.h
+--- a/src/gallium/winsys/virgl/win32/virgl_win32_public.h
++++ b/src/gallium/winsys/virgl/win32/virgl_win32_public.h
+@@ -0,0 +1,14 @@
++/*
++ * Copyright 2026 vroom authors
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef VIRGL_WIN32_PUBLIC_H
++#define VIRGL_WIN32_PUBLIC_H
++
++struct pipe_screen;
++
++/* A virgl screen on the Windows virtio-gpu 3D driver (viogpu3d), for an
++ * OpenGL ICD. NULL when no adapter offers a virgl context. */
++struct pipe_screen *virgl_win32_screen_create(void);
++
++#endif
+diff --git a/src/gallium/winsys/virgl/win32/virgl_win32_winsys.c b/src/gallium/winsys/virgl/win32/virgl_win32_winsys.c
+--- a/src/gallium/winsys/virgl/win32/virgl_win32_winsys.c
++++ b/src/gallium/winsys/virgl/win32/virgl_win32_winsys.c
+@@ -0,0 +1,995 @@
++/*
++ * Copyright 2026 vroom authors
++ * SPDX-License-Identifier: MIT
++ *
++ * virgl on Windows' virtio-gpu 3D kernel driver (viogpu3d), from an OpenGL
++ * ICD loaded in an application's process. The KMD gives each D3DKMT device
++ * one virtio context; we ask for a virgl one (capset VIRGL2) with its
++ * CTX_INIT escape, then send virgl command streams and transfers in legacy
++ * D3DKMTRender packets (VIOGPU_COMMAND_HDR + body), the way the Venus ICD
++ * of the same driver does. Resources are 3D allocations the KMD creates on
++ * the host (RESOURCE_CREATE_3D) and backs with guest pages.
++ *
++ * Presenting: the frame is read back into the back buffer's guest pages
++ * (TRANSFER_FROM_HOST) and drawn into the window with GDI. Windows' desktop
++ * compositor runs on the Direct3D driver (Neptune), which can't see virgl's
++ * textures, so this copy is the bridge.
++ */
++
++#include <stdarg.h>
++#include <stdio.h>
++#include <windows.h>
++#include <winternl.h>
++#include <d3dkmthk.h>
++
++#include "util/format/u_format.h"
++#include "util/os_time.h"
++#include "util/simple_mtx.h"
++#include "util/u_debug.h"
++#include "util/u_inlines.h"
++#include "util/u_memory.h"
++#include "util/u_thread.h"
++
++#include "virgl/virgl_public.h"
++#include "virgl/virgl_winsys.h"
++#include "virgl_resource_cache.h"
++#include "virtio-gpu/virgl_hw.h"
++#include "virtio-gpu/wddm_hw.h"
++
++#include "virgl_win32_public.h"
++
++#define VIOGPU_CAPSET_VIRGL2 2
++
++/* Errors go to the file VROOM_GL_LOG names, if set: an ICD has no console. */
++static FILE *ws_log_file;
++static bool ws_log_init;
++static void
++ws_log(const char *fmt, ...)
++{
++   if (!ws_log_init) {
++      const char *path = getenv("VROOM_GL_LOG");
++      ws_log_file = path ? fopen(path, "a") : NULL;
++      ws_log_init = true;
++   }
++   if (!ws_log_file)
++      return;
++   va_list ap;
++   va_start(ap, fmt);
++   vfprintf(ws_log_file, fmt, ap);
++   va_end(ap);
++   fflush(ws_log_file);
++}
++
++struct virgl_win32_fence {
++   struct pipe_reference reference;
++   HANDLE event;
++};
++
++struct virgl_hw_res {
++   struct pipe_reference reference;
++   uint32_t res_handle;            /* virtio resource id */
++   D3DKMT_HANDLE hresource;
++   D3DKMT_HANDLE halloc;
++   uint32_t size;
++   uint32_t bind;
++   enum pipe_format format;
++   uint32_t width, height, stride;
++
++   void *ptr;                      /* D3DKMTLock mapping, kept until destroy */
++   int num_cs_references;
++   struct virgl_win32_fence *fence; /* last submission that used it */
++
++   struct virgl_resource_cache_entry cache_entry;
++};
++
++struct virgl_win32_cmd_buf {
++   struct virgl_cmd_buf base;
++   struct virgl_winsys *ws;
++   uint32_t *buf;
++   unsigned nres, cres;
++   struct virgl_hw_res **res_bo;
++};
++
++struct virgl_win32_winsys {
++   struct virgl_winsys base;
++
++   D3DKMT_HANDLE adapter;
++   D3DKMT_HANDLE device;
++   D3DKMT_HANDLE paging_queue;
++   D3DKMT_HANDLE paging_fence;
++
++   /* One D3DKMT context carries everything: the host context is per
++    * device anyway, and one queue keeps submissions and transfers in
++    * order. */
++   simple_mtx_t submit_mtx;
++   D3DKMT_HANDLE context;
++   void *cmd;
++   UINT cmd_size;
++
++   struct virgl_resource_cache cache;
++   bool cache_ready;
++   simple_mtx_t cache_mtx;
++};
++
++static inline struct virgl_win32_winsys *
++virgl_win32_winsys(struct virgl_winsys *vws)
++{
++   return (struct virgl_win32_winsys *)vws;
++}
++
++static inline struct virgl_win32_cmd_buf *
++virgl_win32_cmd_buf(struct virgl_cmd_buf *cbuf)
++{
++   return (struct virgl_win32_cmd_buf *)cbuf;
++}
++
++#define cache_entry_container_res(ptr) \
++   (struct virgl_hw_res *)((char *)ptr - offsetof(struct virgl_hw_res, cache_entry))
++
++/* ---- fences ---- */
++
++static void
++fence_ref(struct virgl_win32_fence **dst, struct virgl_win32_fence *src)
++{
++   struct virgl_win32_fence *old = *dst;
++   if (pipe_reference(old ? &old->reference : NULL, src ? &src->reference : NULL)) {
++      CloseHandle(old->event);
++      FREE(old);
++   }
++   *dst = src;
++}
++
++static bool
++fence_done(struct virgl_win32_fence *f, DWORD ms)
++{
++   return !f || WaitForSingleObject(f->event, ms) == WAIT_OBJECT_0;
++}
++
++/* Everything submitted so far on the context; called with submit_mtx. */
++static struct virgl_win32_fence *
++fence_create_locked(struct virgl_win32_winsys *ws)
++{
++   struct virgl_win32_fence *f = CALLOC_STRUCT(virgl_win32_fence);
++   if (!f)
++      return NULL;
++   f->event = CreateEventA(NULL, TRUE, FALSE, NULL);
++   if (!f->event) {
++      FREE(f);
++      return NULL;
++   }
++   D3DKMT_SIGNALSYNCHRONIZATIONOBJECT2 sig = {
++      .hContext = ws->context,
++      .ObjectCount = 0,
++      .Flags = { .EnqueueCpuEvent = 1 },
++      .CpuEventHandle = f->event,
++   };
++   NTSTATUS st = D3DKMTSignalSynchronizationObject2(&sig);
++   if (!NT_SUCCESS(st)) {
++      ws_log("virgl/win32: signal failed: 0x%lx\n", st);
++      /* Nothing to wait for that we could name: treat it as done. */
++      SetEvent(f->event);
++   }
++   pipe_reference_init(&f->reference, 1);
++   return f;
++}
++
++/* ---- the D3DKMT queue ---- */
++
++static bool
++render_locked(struct virgl_win32_winsys *ws, UINT length, UINT new_cmd_size)
++{
++   D3DKMT_RENDER r = {
++      .hContext = ws->context,
++      .CommandOffset = 0,
++      .CommandLength = length,
++   };
++   if (new_cmd_size) {
++      r.Flags.ResizeCommandBuffer = 1;
++      r.NewCommandBufferSize = new_cmd_size;
++   }
++   NTSTATUS st = D3DKMTRender(&r);
++   if (r.pNewCommandBuffer) {
++      ws->cmd = r.pNewCommandBuffer;
++      ws->cmd_size = r.NewCommandBufferSize;
++   }
++   if (!NT_SUCCESS(st)) {
++      ws_log("virgl/win32: render failed: 0x%lx\n", st);
++      return false;
++   }
++   return true;
++}
++
++/* Grow the command buffer with an empty packet. */
++static bool
++reserve_locked(struct virgl_win32_winsys *ws, UINT cmd_bytes)
++{
++   UINT need = cmd_bytes + sizeof(VIOGPU_COMMAND_HDR);
++   if (ws->cmd_size >= need)
++      return true;
++   VIOGPU_COMMAND_HDR *hdr = ws->cmd;
++   memset(hdr, 0, sizeof(*hdr)); /* VIOGPU_CMD_NOP */
++   if (!render_locked(ws, sizeof(*hdr), align(need, 4096)))
++      return false;
++   return ws->cmd_size >= need;
++}
++
++/* Send one packet: a header of `type`, `body`, and the resources it uses.
++ * Returns the fence of everything up to it, or NULL on failure. */
++static struct virgl_win32_fence *
++submit_locked(struct virgl_win32_winsys *ws, UINT type, const void *body,
++              UINT body_size, struct virgl_hw_res **res, unsigned nres)
++{
++   if (!reserve_locked(ws, body_size))
++      return NULL;
++
++   VIOGPU_COMMAND_HDR *hdr = ws->cmd;
++   hdr->type = type;
++   hdr->size = body_size;
++   hdr->flags = 0;
++   hdr->ring_idx = 0;
++   memcpy(hdr + 1, body, body_size);
++   /* No allocation list: the KMD's WDDM 2 (GpuMmu) model takes none in a
++    * render. Every resource was made resident when it was created and
++    * the host names it by id; the fences below say when it's free. */
++   if (!render_locked(ws, sizeof(*hdr) + body_size, 0))
++      return NULL;
++
++   struct virgl_win32_fence *f = fence_create_locked(ws);
++   for (unsigned i = 0; i < nres; i++)
++      fence_ref(&res[i]->fence, f);
++   return f;
++}
++
++static NTSTATUS
++escape(struct virgl_win32_winsys *ws, VIOGPU_ESCAPE *e)
++{
++   D3DKMT_ESCAPE esc = {
++      .hAdapter = ws->adapter,
++      .hDevice = ws->device,
++      .Type = D3DKMT_ESCAPE_DRIVERPRIVATE,
++      .pPrivateDriverData = e,
++      .PrivateDriverDataSize = sizeof(*e),
++   };
++   return D3DKMTEscape(&esc);
++}
++
++/* ---- resources ---- */
++
++static void
++virgl_hw_res_destroy(struct virgl_win32_winsys *ws, struct virgl_hw_res *res)
++{
++   /* dxgkrnl doesn't know our packets use it (no allocation lists). */
++   fence_done(res->fence, INFINITE);
++   if (res->ptr) {
++      D3DKMT_UNLOCK u = {
++         .hDevice = ws->device,
++         .NumAllocations = 1,
++         .phAllocations = &res->halloc,
++      };
++      D3DKMTUnlock(&u);
++   }
++   D3DKMT_DESTROYALLOCATION d = {
++      .hDevice = ws->device,
++      .hResource = res->hresource,
++      .phAllocationList = res->hresource ? NULL : &res->halloc,
++      .AllocationCount = res->hresource ? 0 : 1,
++   };
++   NTSTATUS st = D3DKMTDestroyAllocation(&d);
++   if (!NT_SUCCESS(st))
++      ws_log("virgl/win32: destroy allocation failed: 0x%lx\n", st);
++   fence_ref(&res->fence, NULL);
++   FREE(res);
++}
++
++static bool
++virgl_win32_resource_is_busy(struct virgl_winsys *vws, struct virgl_hw_res *res)
++{
++   struct virgl_win32_winsys *ws = virgl_win32_winsys(vws);
++   struct virgl_win32_fence *f = NULL;
++   simple_mtx_lock(&ws->submit_mtx);
++   fence_ref(&f, res->fence);
++   simple_mtx_unlock(&ws->submit_mtx);
++   bool busy = !fence_done(f, 0);
++   fence_ref(&f, NULL);
++   return busy;
++}
++
++static void
++virgl_win32_resource_wait(struct virgl_winsys *vws, struct virgl_hw_res *res)
++{
++   struct virgl_win32_winsys *ws = virgl_win32_winsys(vws);
++   struct virgl_win32_fence *f = NULL;
++   simple_mtx_lock(&ws->submit_mtx);
++   fence_ref(&f, res->fence);
++   simple_mtx_unlock(&ws->submit_mtx);
++   fence_done(f, INFINITE);
++   fence_ref(&f, NULL);
++}
++
++static inline bool
++can_cache_resource(uint32_t bind)
++{
++   return bind == VIRGL_BIND_CONSTANT_BUFFER ||
++          bind == VIRGL_BIND_INDEX_BUFFER ||
++          bind == VIRGL_BIND_VERTEX_BUFFER ||
++          bind == VIRGL_BIND_CUSTOM ||
++          bind == VIRGL_BIND_STAGING;
++}
++
++static void
++virgl_win32_resource_reference(struct virgl_winsys *vws,
++                               struct virgl_hw_res **dres,
++                               struct virgl_hw_res *sres)
++{
++   struct virgl_win32_winsys *ws = virgl_win32_winsys(vws);
++   struct virgl_hw_res *old = *dres;
++
++   if (pipe_reference(old ? &old->reference : NULL, sres ? &sres->reference : NULL)) {
++      if (!can_cache_resource(old->bind)) {
++         virgl_hw_res_destroy(ws, old);
++      } else {
++         simple_mtx_lock(&ws->cache_mtx);
++         virgl_resource_cache_add(&ws->cache, &old->cache_entry);
++         simple_mtx_unlock(&ws->cache_mtx);
++      }
++   }
++   *dres = sres;
++}
++
++static NTSTATUS
++wait_paging(struct virgl_win32_winsys *ws, NTSTATUS st, UINT64 value)
++{
++   if (st != STATUS_PENDING)
++      return st;
++   D3DKMT_WAITFORSYNCHRONIZATIONOBJECTFROMCPU w = {
++      .hDevice = ws->device,
++      .ObjectCount = 1,
++      .ObjectHandleArray = &ws->paging_fence,
++      .FenceValueArray = &value,
++   };
++   return D3DKMTWaitForSynchronizationObjectFromCpu(&w);
++}
++
++/* The KMD hands a 3D resource's guest pages to the host when VidMm writes
++ * its GPU page table entries (WDDM 2, GpuMmu), so each allocation gets a GPU
++ * virtual address and stays resident. Nothing reads that address. */
++static bool
++make_resident(struct virgl_win32_winsys *ws, D3DKMT_HANDLE alloc, uint32_t size)
++{
++   D3DDDI_MAPGPUVIRTUALADDRESS mv = {
++      .hPagingQueue = ws->paging_queue,
++      .hAllocation = alloc,
++      .SizeInPages = size / 4096,
++      .Protection = { .Write = 1 },
++   };
++   NTSTATUS st = wait_paging(ws, D3DKMTMapGpuVirtualAddress(&mv), mv.PagingFenceValue);
++   if (!NT_SUCCESS(st)) {
++      ws_log("virgl/win32: map gpu va failed: 0x%lx\n", st);
++      return false;
++   }
++
++   D3DDDI_MAKERESIDENT mr = {
++      .hPagingQueue = ws->paging_queue,
++      .NumAllocations = 1,
++      .AllocationList = &alloc,
++      .Flags = { .CantTrimFurther = 1 },
++   };
++   st = D3DKMTMakeResident(&mr);
++   st = wait_paging(ws, st, mr.PagingFenceValue);
++   if (!NT_SUCCESS(st)) {
++      ws_log("virgl/win32: make resident failed: 0x%lx\n", st);
++      return false;
++   }
++   return true;
++}
++
++static struct virgl_hw_res *
++virgl_win32_resource_create(struct virgl_winsys *vws,
++                            enum pipe_texture_target target,
++                            const void *map_front_private,
++                            uint32_t format, uint32_t bind,
++                            uint32_t width, uint32_t height, uint32_t depth,
++                            uint32_t array_size, uint32_t last_level,
++                            uint32_t nr_samples, uint32_t flags, uint32_t size)
++{
++   struct virgl_win32_winsys *ws = virgl_win32_winsys(vws);
++   uint32_t stride = 0;
++
++   /* Window buffers are read back into their own pages to present them,
++    * even when virgl itself would use a staging buffer. */
++   if (bind & (VIRGL_BIND_DISPLAY_TARGET | VIRGL_BIND_SCANOUT)) {
++      stride = util_format_get_stride(format, width);
++      size = MAX2(size, util_format_get_2d_size(format, stride, height));
++   }
++
++   VIOGPU_CREATE_ALLOCATION_EXCHANGE ex;
++   memset(&ex, 0, sizeof(ex));
++   ex.Type = VIOGPU_RESOURCE_TYPE_3D;
++   ex.Options3D.target = target;
++   ex.Options3D.format = pipe_to_virgl_format(format);
++   ex.Options3D.bind = bind;
++   ex.Options3D.width = width;
++   ex.Options3D.height = height;
++   ex.Options3D.depth = depth;
++   ex.Options3D.array_size = array_size;
++   ex.Options3D.last_level = last_level;
++   ex.Options3D.nr_samples = nr_samples;
++   ex.Options3D.flags = flags;
++   ex.Size = align(MAX2(size, 1), 4096);
++
++   VIOGPU_CREATE_RESOURCE_EXCHANGE res_ex = { 0 };
++   D3DDDI_ALLOCATIONINFO ai = {
++      .pPrivateDriverData = &ex,
++      .PrivateDriverDataSize = sizeof(ex),
++   };
++   D3DKMT_CREATEALLOCATION ca = {
++      .hDevice = ws->device,
++      .pPrivateDriverData = &res_ex,
++      .PrivateDriverDataSize = sizeof(res_ex),
++      .NumAllocations = 1,
++      .pAllocationInfo = &ai,
++      .Flags = { .CreateResource = 1 },
++   };
++   NTSTATUS st = D3DKMTCreateAllocation(&ca);
++   if (!NT_SUCCESS(st)) {
++      ws_log("virgl/win32: create allocation failed: 0x%lx\n", st);
++      return NULL;
++   }
++
++   VIOGPU_ESCAPE info;
++   memset(&info, 0, sizeof(info));
++   info.Type = VIOGPU_RES_INFO;
++   info.DataLength = sizeof(info.ResourceInfo);
++   info.ResourceInfo.ResHandle = ai.hAllocation;
++   st = escape(ws, &info);
++   if (!NT_SUCCESS(st) || info.ResourceInfo.Id == 0) {
++      ws_log("virgl/win32: resource info failed: 0x%lx\n", st);
++      D3DKMT_DESTROYALLOCATION d = { .hDevice = ws->device, .hResource = ca.hResource };
++      D3DKMTDestroyAllocation(&d);
++      return NULL;
++   }
++
++   struct virgl_hw_res *res = make_resident(ws, ai.hAllocation, (uint32_t)ex.Size) ?
++                              CALLOC_STRUCT(virgl_hw_res) : NULL;
++   if (!res) {
++      D3DKMT_DESTROYALLOCATION d = { .hDevice = ws->device, .hResource = ca.hResource };
++      D3DKMTDestroyAllocation(&d);
++      return NULL;
++   }
++   res->res_handle = info.ResourceInfo.Id;
++   res->hresource = ca.hResource;
++   res->halloc = ai.hAllocation;
++   res->size = ex.Size;
++   res->bind = bind;
++   res->format = format;
++   res->width = width;
++   res->height = height;
++   res->stride = stride;
++   pipe_reference_init(&res->reference, 1);
++   p_atomic_set(&res->num_cs_references, 0);
++
++   struct virgl_resource_params params = {
++      .size = size, .bind = bind, .format = format, .flags = 0,
++      .nr_samples = nr_samples, .width = width, .height = height,
++      .depth = depth, .array_size = array_size, .last_level = last_level,
++      .target = target,
++   };
++   virgl_resource_cache_entry_init(&res->cache_entry, params);
++   return res;
++}
++
++static struct virgl_hw_res *
++virgl_win32_resource_cache_create(struct virgl_winsys *vws,
++                                  enum pipe_texture_target target,
++                                  const void *map_front_private,
++                                  uint32_t format, uint32_t bind,
++                                  uint32_t width, uint32_t height,
++                                  uint32_t depth, uint32_t array_size,
++                                  uint32_t last_level, uint32_t nr_samples,
++                                  uint32_t flags, uint32_t size)
++{
++   struct virgl_win32_winsys *ws = virgl_win32_winsys(vws);
++   struct virgl_resource_params params = {
++      .size = size, .bind = bind, .format = format, .flags = 0,
++      .nr_samples = nr_samples, .width = width, .height = height,
++      .depth = depth, .array_size = array_size, .last_level = last_level,
++      .target = target,
++   };
++
++   if (can_cache_resource(bind)) {
++      simple_mtx_lock(&ws->cache_mtx);
++      struct virgl_resource_cache_entry *entry =
++         virgl_resource_cache_remove_compatible(&ws->cache, params);
++      simple_mtx_unlock(&ws->cache_mtx);
++      if (entry) {
++         struct virgl_hw_res *res = cache_entry_container_res(entry);
++         pipe_reference_init(&res->reference, 1);
++         return res;
++      }
++   }
++   return virgl_win32_resource_create(vws, target, map_front_private, format,
++                                      bind, width, height, depth, array_size,
++                                      last_level, nr_samples, flags, size);
++}
++
++static void *
++virgl_win32_resource_map(struct virgl_winsys *vws, struct virgl_hw_res *res)
++{
++   struct virgl_win32_winsys *ws = virgl_win32_winsys(vws);
++   if (res->ptr)
++      return res->ptr;
++
++   /* Synchronization is ours (fences), so don't let the lock wait. */
++   D3DKMT_LOCK lk = {
++      .hDevice = ws->device,
++      .hAllocation = res->halloc,
++      .Flags = { .LockEntire = 1, .IgnoreSync = 1 },
++   };
++   NTSTATUS st = D3DKMTLock(&lk);
++   if (!NT_SUCCESS(st)) {
++      ws_log("virgl/win32: lock failed: 0x%lx\n", st);
++      return NULL;
++   }
++   res->ptr = lk.pData;
++   return res->ptr;
++}
++
++static uint32_t
++virgl_win32_resource_get_storage_size(struct virgl_winsys *vws,
++                                      struct virgl_hw_res *res)
++{
++   return res->size;
++}
++
++/* ---- transfers ---- */
++
++static int
++transfer(struct virgl_winsys *vws, UINT type, struct virgl_hw_res *res,
++         const struct pipe_box *box, uint32_t stride, uint32_t layer_stride,
++         uint32_t buf_offset, uint32_t level, struct virgl_win32_fence **out)
++{
++   struct virgl_win32_winsys *ws = virgl_win32_winsys(vws);
++   VIOGPU_TRANSFER_CMD t = {
++      .res_id = res->res_handle,
++      .box = { box->x, box->y, box->z, box->width, box->height, box->depth },
++      .offset = buf_offset,
++      .level = level,
++      .stride = stride,
++      .layer_stride = layer_stride,
++   };
++   simple_mtx_lock(&ws->submit_mtx);
++   struct virgl_win32_fence *f = submit_locked(ws, type, &t, sizeof(t), &res, 1);
++   simple_mtx_unlock(&ws->submit_mtx);
++   if (!f)
++      return -1;
++   if (out)
++      *out = f;
++   else
++      fence_ref(&f, NULL);
++   return 0;
++}
++
++static int
++virgl_win32_transfer_put(struct virgl_winsys *vws, struct virgl_hw_res *res,
++                         const struct pipe_box *box, uint32_t stride,
++                         uint32_t layer_stride, uint32_t buf_offset,
++                         uint32_t level)
++{
++   return transfer(vws, VIOGPU_CMD_TRANSFER_TO_HOST, res, box, stride,
++                   layer_stride, buf_offset, level, NULL);
++}
++
++static int
++virgl_win32_transfer_get(struct virgl_winsys *vws, struct virgl_hw_res *res,
++                         const struct pipe_box *box, uint32_t stride,
++                         uint32_t layer_stride, uint32_t buf_offset,
++                         uint32_t level)
++{
++   return transfer(vws, VIOGPU_CMD_TRANSFER_FROM_HOST, res, box, stride,
++                   layer_stride, buf_offset, level, NULL);
++}
++
++/* ---- command buffers ---- */
++
++static struct virgl_cmd_buf *
++virgl_win32_cmd_buf_create(struct virgl_winsys *vws, uint32_t size)
++{
++   struct virgl_win32_cmd_buf *cbuf = CALLOC_STRUCT(virgl_win32_cmd_buf);
++   if (!cbuf)
++      return NULL;
++   cbuf->ws = vws;
++   cbuf->nres = 512;
++   cbuf->res_bo = CALLOC(cbuf->nres, sizeof(*cbuf->res_bo));
++   cbuf->buf = CALLOC(size, sizeof(uint32_t));
++   if (!cbuf->res_bo || !cbuf->buf) {
++      FREE(cbuf->res_bo);
++      FREE(cbuf->buf);
++      FREE(cbuf);
++      return NULL;
++   }
++   cbuf->base.buf = cbuf->buf;
++   return &cbuf->base;
++}
++
++static void
++release_all_res(struct virgl_win32_cmd_buf *cbuf)
++{
++   for (unsigned i = 0; i < cbuf->cres; i++) {
++      p_atomic_dec(&cbuf->res_bo[i]->num_cs_references);
++      virgl_win32_resource_reference(cbuf->ws, &cbuf->res_bo[i], NULL);
++   }
++   cbuf->cres = 0;
++}
++
++static void
++virgl_win32_cmd_buf_destroy(struct virgl_cmd_buf *_cbuf)
++{
++   struct virgl_win32_cmd_buf *cbuf = virgl_win32_cmd_buf(_cbuf);
++   release_all_res(cbuf);
++   FREE(cbuf->res_bo);
++   FREE(cbuf->buf);
++   FREE(cbuf);
++}
++
++static void
++virgl_win32_emit_res(struct virgl_winsys *vws, struct virgl_cmd_buf *_cbuf,
++                     struct virgl_hw_res *res, bool write_buf)
++{
++   struct virgl_win32_cmd_buf *cbuf = virgl_win32_cmd_buf(_cbuf);
++
++   if (write_buf)
++      cbuf->base.buf[cbuf->base.cdw++] = res->res_handle;
++
++   for (unsigned i = 0; i < cbuf->cres; i++) {
++      if (cbuf->res_bo[i] == res)
++         return;
++   }
++   if (cbuf->cres >= cbuf->nres) {
++      unsigned n = cbuf->nres + 256;
++      struct virgl_hw_res **bo = REALLOC(cbuf->res_bo,
++                                         cbuf->nres * sizeof(*bo),
++                                         n * sizeof(*bo));
++      if (!bo)
++         return;
++      cbuf->res_bo = bo;
++      cbuf->nres = n;
++   }
++   cbuf->res_bo[cbuf->cres] = NULL;
++   virgl_win32_resource_reference(vws, &cbuf->res_bo[cbuf->cres], res);
++   p_atomic_inc(&res->num_cs_references);
++   cbuf->cres++;
++}
++
++static bool
++virgl_win32_res_is_ref(struct virgl_winsys *vws, struct virgl_cmd_buf *cbuf,
++                       struct virgl_hw_res *res)
++{
++   return p_atomic_read(&res->num_cs_references) != 0;
++}
++
++static int
++virgl_win32_submit_cmd(struct virgl_winsys *vws, struct virgl_cmd_buf *_cbuf,
++                       struct pipe_fence_handle **fence)
++{
++   struct virgl_win32_winsys *ws = virgl_win32_winsys(vws);
++   struct virgl_win32_cmd_buf *cbuf = virgl_win32_cmd_buf(_cbuf);
++   int ret = 0;
++
++   if (cbuf->base.cdw == 0) {
++      if (fence) {
++         simple_mtx_lock(&ws->submit_mtx);
++         *fence = (struct pipe_fence_handle *)fence_create_locked(ws);
++         simple_mtx_unlock(&ws->submit_mtx);
++      }
++      return 0;
++   }
++
++   simple_mtx_lock(&ws->submit_mtx);
++   struct virgl_win32_fence *f =
++      submit_locked(ws, VIOGPU_CMD_SUBMIT, cbuf->base.buf, cbuf->base.cdw * 4,
++                    cbuf->res_bo, cbuf->cres);
++   simple_mtx_unlock(&ws->submit_mtx);
++   if (!f)
++      ret = -1;
++   if (fence)
++      *fence = (struct pipe_fence_handle *)f;
++   else
++      fence_ref(&f, NULL);
++
++   release_all_res(cbuf);
++   cbuf->base.cdw = 0;
++   return ret;
++}
++
++/* ---- fences for virgl ---- */
++
++static bool
++virgl_win32_fence_wait(struct virgl_winsys *vws, struct pipe_fence_handle *fence,
++                       uint64_t timeout)
++{
++   struct virgl_win32_fence *f = (struct virgl_win32_fence *)fence;
++   DWORD ms;
++   if (timeout == OS_TIMEOUT_INFINITE)
++      ms = INFINITE;
++   else
++      ms = (DWORD)MIN2(DIV_ROUND_UP(timeout, 1000000), INFINITE - 1);
++   return fence_done(f, ms);
++}
++
++static void
++virgl_win32_fence_reference(struct virgl_winsys *vws,
++                            struct pipe_fence_handle **dst,
++                            struct pipe_fence_handle *src)
++{
++   fence_ref((struct virgl_win32_fence **)dst, (struct virgl_win32_fence *)src);
++}
++
++/* ---- caps ---- */
++
++static int
++virgl_win32_get_caps(struct virgl_winsys *vws, struct virgl_drm_caps *caps)
++{
++   struct virgl_win32_winsys *ws = virgl_win32_winsys(vws);
++   virgl_ws_fill_new_caps_defaults(caps);
++
++   VIOGPU_ESCAPE e;
++   memset(&e, 0, sizeof(e));
++   e.Type = VIOGPU_GET_CAPS;
++   e.DataLength = sizeof(e.Capset);
++   e.Capset.CapsetId = VIOGPU_CAPSET_VIRGL2;
++   e.Capset.Version = 0;
++   e.Capset.Size = sizeof(union virgl_caps);
++   e.Capset.Capset = VioGpuUmPtr(&caps->caps);
++   NTSTATUS st = escape(ws, &e);
++   if (!NT_SUCCESS(st)) {
++      ws_log("virgl/win32: capset query failed: 0x%lx\n", st);
++      return -1;
++   }
++   return 0;
++}
++
++/* ---- presenting ---- */
++
++static void
++virgl_win32_flush_frontbuffer(struct virgl_winsys *vws,
++                              struct virgl_cmd_buf *cbuf,
++                              struct virgl_hw_res *res,
++                              unsigned level, unsigned layer,
++                              void *winsys_drawable_handle,
++                              struct pipe_box *sub_box)
++{
++   HDC hdc = winsys_drawable_handle;
++   if (!res->stride || !hdc)
++      return;
++   /* What GDI takes as it is. */
++   if (res->format != PIPE_FORMAT_B8G8R8A8_UNORM &&
++       res->format != PIPE_FORMAT_B8G8R8X8_UNORM &&
++       res->format != PIPE_FORMAT_B8G8R8A8_SRGB &&
++       res->format != PIPE_FORMAT_B8G8R8X8_SRGB &&
++       res->format != PIPE_FORMAT_B5G6R5_UNORM) {
++      ws_log("virgl/win32: can't present format %s\n", util_format_name(res->format));
++      return;
++   }
++
++   /* The whole buffer: GDI wants it in one piece anyway. */
++   struct pipe_box box;
++   u_box_3d(0, 0, layer, res->width, res->height, 1, &box);
++   struct virgl_win32_fence *f = NULL;
++   if (transfer(vws, VIOGPU_CMD_TRANSFER_FROM_HOST, res, &box, res->stride,
++                0, 0, level, &f))
++      return;
++   fence_done(f, INFINITE);
++   fence_ref(&f, NULL);
++
++   void *ptr = virgl_win32_resource_map(vws, res);
++   if (!ptr)
++      return;
++
++   struct {
++      BITMAPINFOHEADER h;
++      DWORD masks[3];
++   } bmi;
++   memset(&bmi, 0, sizeof(bmi));
++   bmi.h.biSize = sizeof(bmi.h);
++   bmi.h.biWidth = res->stride / util_format_get_blocksize(res->format);
++   bmi.h.biHeight = -(LONG)res->height; /* top-down */
++   bmi.h.biPlanes = 1;
++   bmi.h.biBitCount = util_format_get_blocksizebits(res->format);
++   bmi.h.biCompression = BI_RGB;
++   if (res->format == PIPE_FORMAT_B5G6R5_UNORM) {
++      bmi.h.biCompression = BI_BITFIELDS;
++      bmi.masks[0] = 0xf800;
++      bmi.masks[1] = 0x07e0;
++      bmi.masks[2] = 0x001f;
++   }
++
++   SetDIBitsToDevice(hdc, 0, 0, res->width, res->height, 0, 0, 0,
++                     res->height, ptr, (BITMAPINFO *)&bmi, DIB_RGB_COLORS);
++}
++
++/* ---- setup ---- */
++
++static void
++virgl_win32_winsys_destroy(struct virgl_winsys *vws)
++{
++   struct virgl_win32_winsys *ws = virgl_win32_winsys(vws);
++
++   if (ws->cache_ready)
++      virgl_resource_cache_flush(&ws->cache);
++   if (ws->context) {
++      D3DKMT_DESTROYCONTEXT dc = { .hContext = ws->context };
++      D3DKMTDestroyContext(&dc);
++   }
++   if (ws->device) {
++      D3DKMT_DESTROYDEVICE dd = { .hDevice = ws->device };
++      D3DKMTDestroyDevice(&dd);
++   }
++   if (ws->adapter) {
++      D3DKMT_CLOSEADAPTER ca = { .hAdapter = ws->adapter };
++      D3DKMTCloseAdapter(&ca);
++   }
++   simple_mtx_destroy(&ws->submit_mtx);
++   simple_mtx_destroy(&ws->cache_mtx);
++   FREE(ws);
++}
++
++static bool
++virgl_win32_resource_cache_entry_is_busy(struct virgl_resource_cache_entry *entry,
++                                         void *user_data)
++{
++   struct virgl_win32_winsys *ws = user_data;
++   return virgl_win32_resource_is_busy(&ws->base, cache_entry_container_res(entry));
++}
++
++static void
++virgl_win32_resource_cache_entry_release(struct virgl_resource_cache_entry *entry,
++                                         void *user_data)
++{
++   virgl_hw_res_destroy(user_data, cache_entry_container_res(entry));
++}
++
++/* The first adapter whose driver is viogpu3d with 3D and a virgl capset. */
++static bool
++open_adapter(struct virgl_win32_winsys *ws)
++{
++   D3DKMT_ENUMADAPTERS2 ea = { 0 };
++   if (!NT_SUCCESS(D3DKMTEnumAdapters2(&ea)) || ea.NumAdapters == 0)
++      return false;
++   D3DKMT_ADAPTERINFO *infos = CALLOC(ea.NumAdapters, sizeof(*infos));
++   if (!infos)
++      return false;
++   ea.pAdapters = infos;
++   if (!NT_SUCCESS(D3DKMTEnumAdapters2(&ea))) {
++      FREE(infos);
++      return false;
++   }
++
++   for (ULONG i = 0; i < ea.NumAdapters; i++) {
++      D3DKMT_HANDLE a = infos[i].hAdapter;
++      VIOGPU_ADAPTERINFO vi;
++      memset(&vi, 0, sizeof(vi));
++      D3DKMT_QUERYADAPTERINFO q = {
++         .hAdapter = a,
++         .Type = KMTQAITYPE_UMDRIVERPRIVATE,
++         .pPrivateDriverData = &vi,
++         .PrivateDriverDataSize = sizeof(vi),
++      };
++      bool ok = !ws->adapter && NT_SUCCESS(D3DKMTQueryAdapterInfo(&q)) &&
++                vi.IamVioGPU == VIOGPU_IAM && vi.Flags.Supports3d &&
++                (vi.SupportedCapsetIDs & (1ull << VIOGPU_CAPSET_VIRGL2));
++      if (ok) {
++         ws->adapter = a;
++      } else {
++         D3DKMT_CLOSEADAPTER c = { .hAdapter = a };
++         D3DKMTCloseAdapter(&c);
++      }
++   }
++   FREE(infos);
++   return ws->adapter != 0;
++}
++
++static bool
++open_device(struct virgl_win32_winsys *ws)
++{
++   D3DKMT_CREATEDEVICE cd = { .hAdapter = ws->adapter };
++   NTSTATUS st = D3DKMTCreateDevice(&cd);
++   if (!NT_SUCCESS(st)) {
++      ws_log("virgl/win32: create device failed: 0x%lx\n", st);
++      return false;
++   }
++   ws->device = cd.hDevice;
++
++   VIOGPU_ESCAPE e;
++   memset(&e, 0, sizeof(e));
++   e.Type = VIOGPU_CTX_INIT;
++   e.DataLength = sizeof(e.CtxInit);
++   e.CtxInit.CapsetID = VIOGPU_CAPSET_VIRGL2;
++   e.CtxInit.NumRings = 0;
++   memcpy(e.CtxInit.DebugName, "virgl-wgl", sizeof("virgl-wgl"));
++   st = escape(ws, &e);
++   if (!NT_SUCCESS(st)) {
++      ws_log("virgl/win32: virgl context failed: 0x%lx\n", st);
++      return false;
++   }
++
++   D3DKMT_CREATEPAGINGQUEUE pq = {
++      .hDevice = ws->device,
++      .Priority = D3DDDI_PAGINGQUEUE_PRIORITY_NORMAL,
++   };
++   st = D3DKMTCreatePagingQueue(&pq);
++   if (!NT_SUCCESS(st)) {
++      ws_log("virgl/win32: create paging queue failed: 0x%lx\n", st);
++      return false;
++   }
++   ws->paging_queue = pq.hPagingQueue;
++   ws->paging_fence = pq.hSyncObject;
++
++   D3DKMT_CREATECONTEXT cc = {
++      .hDevice = ws->device,
++      .ClientHint = D3DKMT_CLIENTHINT_OPENGL,
++   };
++   st = D3DKMTCreateContext(&cc);
++   if (!NT_SUCCESS(st)) {
++      ws_log("virgl/win32: create context failed: 0x%lx\n", st);
++      return false;
++   }
++   ws->context = cc.hContext;
++   ws->cmd = cc.pCommandBuffer;
++   ws->cmd_size = cc.CommandBufferSize;
++   return true;
++}
++
++static struct virgl_winsys *
++virgl_win32_winsys_create(void)
++{
++   struct virgl_win32_winsys *ws = CALLOC_STRUCT(virgl_win32_winsys);
++   if (!ws)
++      return NULL;
++   simple_mtx_init(&ws->submit_mtx, mtx_plain);
++   simple_mtx_init(&ws->cache_mtx, mtx_plain);
++
++   if (!open_adapter(ws) || !open_device(ws)) {
++      virgl_win32_winsys_destroy(&ws->base);
++      return NULL;
++   }
++
++   virgl_resource_cache_init(&ws->cache, 1000000,
++                             virgl_win32_resource_cache_entry_is_busy,
++                             virgl_win32_resource_cache_entry_release, ws);
++   ws->cache_ready = true;
++
++   ws->base.destroy = virgl_win32_winsys_destroy;
++   ws->base.transfer_put = virgl_win32_transfer_put;
++   ws->base.transfer_get = virgl_win32_transfer_get;
++   ws->base.resource_create = virgl_win32_resource_cache_create;
++   ws->base.resource_reference = virgl_win32_resource_reference;
++   ws->base.resource_map = virgl_win32_resource_map;
++   ws->base.resource_wait = virgl_win32_resource_wait;
++   ws->base.resource_is_busy = virgl_win32_resource_is_busy;
++   ws->base.resource_get_storage_size = virgl_win32_resource_get_storage_size;
++   ws->base.cmd_buf_create = virgl_win32_cmd_buf_create;
++   ws->base.cmd_buf_destroy = virgl_win32_cmd_buf_destroy;
++   ws->base.submit_cmd = virgl_win32_submit_cmd;
++   ws->base.emit_res = virgl_win32_emit_res;
++   ws->base.res_is_referenced = virgl_win32_res_is_ref;
++   ws->base.get_caps = virgl_win32_get_caps;
++   ws->base.fence_wait = virgl_win32_fence_wait;
++   ws->base.fence_reference = virgl_win32_fence_reference;
++   ws->base.flush_frontbuffer = virgl_win32_flush_frontbuffer;
++   ws->base.supports_fences = 0;
++   ws->base.supports_encoded_transfers = 1;
++   ws->base.supports_coherent = 0;
++   return &ws->base;
++}
++
++struct pipe_screen *
++virgl_win32_screen_create(void)
++{
++   struct virgl_winsys *vws = virgl_win32_winsys_create();
++   if (!vws)
++      return NULL;
++   struct pipe_screen *screen = virgl_create_screen(vws, NULL);
++   if (!screen)
++      vws->destroy(vws);
++   return screen;
++}

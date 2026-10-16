@@ -617,7 +617,7 @@ What works and what doesn't (Windows 11 24H2, M3 Max):
   GPU without 3D (`gpu = "virtio2d"`) and the 3D one back when 3D is on
   again. Without the agent, or with only the 3D driver installed,
   `virtio2d` gets Windows' basic display (800x600, no resizing).
-- No Direct3D 12, no Vulkan or OpenGL for Windows apps.
+- No Direct3D 12 and no Vulkan for Windows apps. OpenGL: next section.
 - Suspend and snapshots work, a few seconds slower than without 3D.
   Direct3D's state lives on the Mac's GPU and can't be saved, so vroom
   first has the guest agent turn the 3D display device off, as in Device
@@ -631,6 +631,49 @@ What works and what doesn't (Windows 11 24H2, M3 Max):
   ones vroom says so and doesn't save.
 - DXMT keeps the Metal versions of the shaders it has converted in the
   VM's state folder (`shaders/`), so apps start faster the second time.
+
+## OpenGL in Windows guests
+
+```bash
+brew install meson ninja bison llvm
+scripts/build-windows-gl.sh       # about 2 minutes
+scripts/make-windows-tools.sh     # puts it on the tools disk
+```
+
+The 3D driver above has no OpenGL of its own, so Windows apps only get
+Microsoft's software OpenGL 1.1. vroom brings an OpenGL driver: Mesa's
+OpenGL with its virgl driver, built for Windows, talking to the same 3D
+driver. The guest's OpenGL then runs in virglrenderer on the Mac's
+OpenGL, as for Linux guests. `vroom-setup.cmd` installs it in
+`C:\Program Files\Vroom`, and the agent registers it with the 3D display
+device (the screen goes black for a second, once).
+
+Apps then see:
+
+```
+GL_VENDOR   Mesa
+GL_RENDERER virgl (Apple M3 Max)
+GL_VERSION  4.1 (Compatibility Profile) Mesa 26.1.0-devel
+core profile: 4.1, GLSL 4.10, 154 extensions
+```
+
+- ARM64 and x64 apps both work: `vroom_gl.dll` is an ARM64X file that
+  sends each kind of process to its own build (`vroom_gl_arm64.dll`,
+  `vroom_gl_x64.dll`, the x64 one emulated like the app). 32-bit apps get
+  Microsoft's OpenGL 1.1.
+- Direct3D apps and the desktop go on as before, side by side with
+  OpenGL ones.
+- OpenGL 4.1, not VMware's 4.3: macOS's OpenGL stops at 4.1. Apps that
+  need 4.3 (Blender 4.x) don't start.
+- Each frame is read back from the Mac and drawn into the window with
+  GDI (the desktop compositor runs on Direct3D and can't see OpenGL's
+  textures). A small window runs at a few hundred frames per second
+  (about 220 at 624x441 for a spinning-gears test); big windows are
+  slower.
+- Like Direct3D apps, an OpenGL app loses its GPU when the VM suspends or
+  takes a snapshot.
+- `VROOM_GL_LOG=C:\path\gl.log` in an app's environment logs the
+  driver's errors there.
 
 ## Video decoding
 
