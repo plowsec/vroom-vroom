@@ -270,6 +270,9 @@ unsafe extern "C" fn on_output(
     } else {
         None
     };
+    if data.is_none() {
+        log::info!("video: a picture failed to decode ({status})");
+    }
     sink.out.lock().unwrap_or_else(|e| e.into_inner()).push_back(Decoded { tag: frame_refcon as u64, data });
 }
 

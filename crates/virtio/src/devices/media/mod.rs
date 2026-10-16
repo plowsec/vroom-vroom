@@ -30,7 +30,7 @@ use crate::{types, ActivateContext, DeviceState, Reader, Result, VirtioDevice, W
 use v4l2::*;
 
 /// The shared memory window holding every buffer of every session.
-pub const WINDOW: u64 = 512 << 20;
+pub const WINDOW: u64 = 1 << 30;
 /// Buffers start at multiples of this in the window.
 const BUF_ALIGN: u64 = 64 << 10;
 const MAX_OUTPUT_BUFS: u32 = 16;
@@ -517,6 +517,7 @@ impl Handler {
             }
             FromHelper::Picture { epoch, cookie, data, .. } => {
                 if epoch != s.epoch {
+                    log::debug!("media: session {id}: stale picture dropped");
                     return;
                 }
                 let Some(layout) = s.layout else { return };
@@ -524,7 +525,10 @@ impl Handler {
                     log::warn!("media: picture of the wrong size from the helper");
                     return;
                 }
-                let Some(index) = s.cap_queue.pop_front() else { return };
+                let Some(index) = s.cap_queue.pop_front() else {
+                    log::info!("media: session {id}: a picture came without a buffer for it");
+                    return;
+                };
                 s.granted = s.granted.saturating_sub(1);
                 let ts = s.stamps.iter().find(|(c, _)| *c == cookie).map_or([0; 16], |&(_, t)| t);
                 let seq = s.sequence;
@@ -1154,6 +1158,13 @@ impl QueueHandler for Handler {
 
     fn attach(&mut self, poker: Poker) {
         self.link.set_poker(poker);
+    }
+
+    /// The VM pauses (snapshot, suspend): answer every command the guest
+    /// is waiting on first. Its driver gives up on a command after 5
+    /// seconds of guest time, and a snapshot can take longer than that.
+    fn quiesce(&mut self, ctx: &mut QueueCtx) {
+        self.process_queue(ctx, 0);
     }
 }
 

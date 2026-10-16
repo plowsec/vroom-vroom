@@ -290,7 +290,7 @@ fn the_window_runs_out_cleanly() {
     while a.alloc(30 << 20).is_some() {
         n += 1;
     }
-    assert_eq!(n, 17);
+    assert_eq!(n, 34);
     let first = *a.used.keys().next().unwrap();
     a.free(first);
     assert_eq!(a.alloc(1), Some(first));
