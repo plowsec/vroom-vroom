@@ -1,0 +1,74 @@
+--- a/src/venus/vkr_physical_device.c
++++ b/src/venus/vkr_physical_device.c
+@@ -734,12 +734,46 @@
+    }
+ }
+ 
++/* MoltenVK keeps depth and stencil images in private Metal storage, which
++ * no host visible memory type can back, yet it offers host image copy for
++ * them: such an image gets memoryTypeBits 0 and can't be bound. Mesa's zink
++ * avoids this when it runs on MoltenVK itself, not through Venus, so here
++ * every depth texture failed (GL_OUT_OF_MEMORY; glmark2's refract). Don't
++ * offer host image copy for these formats. */
++static bool
++vkr_format_is_depth_stencil(VkFormat format)
++{
++   switch (format) {
++   case VK_FORMAT_D16_UNORM:
++   case VK_FORMAT_X8_D24_UNORM_PACK32:
++   case VK_FORMAT_D32_SFLOAT:
++   case VK_FORMAT_S8_UINT:
++   case VK_FORMAT_D16_UNORM_S8_UINT:
++   case VK_FORMAT_D24_UNORM_S8_UINT:
++   case VK_FORMAT_D32_SFLOAT_S8_UINT:
++      return true;
++   default:
++      return false;
++   }
++}
++
++static bool
++vkr_image_usage_unbindable(VkFormat format, VkImageUsageFlags usage)
++{
++   return vkr_format_is_depth_stencil(format) &&
++          (usage & VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT);
++}
++
+ static void
+ vkr_physical_device_fake_format(const struct vkr_physical_device *physical_dev,
+                                 VkFormat format,
+                                 VkFormatProperties *props,
+                                 VkFormatProperties3 *props3)
+ {
++   if (props3 && vkr_format_is_depth_stencil(format)) {
++      props3->linearTilingFeatures &= ~VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT;
++      props3->optimalTilingFeatures &= ~VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT;
++   }
+    if (!physical_dev->zink)
+       return;
+    VkFormatFeatureFlags add = 0;
+@@ -776,6 +810,11 @@
+       vkr_physical_device_from_handle(args->physicalDevice);
+    struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
+ 
++   if (vkr_image_usage_unbindable(args->format, args->usage)) {
++      args->ret = VK_ERROR_FORMAT_NOT_SUPPORTED;
++      return;
++   }
++
+    vn_replace_vkGetPhysicalDeviceImageFormatProperties_args_handle(args);
+    args->ret = vk->GetPhysicalDeviceImageFormatProperties(
+       args->physicalDevice, args->format, args->type, args->tiling, args->usage,
+@@ -947,6 +986,12 @@
+       vkr_physical_device_from_handle(args->physicalDevice);
+    struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
+ 
++   if (vkr_image_usage_unbindable(args->pImageFormatInfo->format,
++                                  args->pImageFormatInfo->usage)) {
++      args->ret = VK_ERROR_FORMAT_NOT_SUPPORTED;
++      return;
++   }
++
+    /* filter unsupported drm format modifiers */
+    if (!physical_dev->EXT_image_drm_format_modifier) {
+       VkPhysicalDeviceImageFormatInfo2 *pImageFormatInfo =
