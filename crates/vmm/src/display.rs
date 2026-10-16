@@ -34,7 +34,12 @@ use crate::vcpu::VmEvent;
 /// what a newcomer needs to catch up is kept (`Sticky`).
 #[derive(Clone)]
 pub(crate) struct ViewerTx {
-    q: std::sync::mpsc::Sender<ToViewer>,
+    /// Messages, with the viewer generation they were sent in.
+    q: std::sync::mpsc::Sender<(u64, ToViewer)>,
+    /// Goes up with each viewer that attaches: what was queued before it
+    /// is stale (the catch-up replay told it the current state), so it is
+    /// dropped, not sent after the replay.
+    gen: Arc<std::sync::atomic::AtomicU64>,
     /// x0, y0, x1, y1 not yet sent; Some means a marker is queued.
     damage: Arc<Mutex<Option<[u32; 4]>>>,
     /// The guest's latest window list not yet sent (Coherence): like
@@ -70,7 +75,9 @@ impl std::fmt::Debug for ViewerTx {
 
 impl ViewerTx {
     fn spawn(sock: Option<UnixStream>) -> std::io::Result<Self> {
-        let (q, rx) = std::sync::mpsc::channel::<ToViewer>();
+        let (q, rx) = std::sync::mpsc::channel::<(u64, ToViewer)>();
+        let gen = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let now = gen.clone();
         let damage = Arc::new(Mutex::new(None::<[u32; 4]>));
         let pending = damage.clone();
         let windows = Arc::new(Mutex::new(None::<Vec<GuestWindow>>));
@@ -78,7 +85,11 @@ impl ViewerTx {
         let sock = Arc::new(Mutex::new(sock));
         let out = sock.clone();
         std::thread::Builder::new().name("viewer-tx".into()).spawn(move || {
-            while let Ok(mut m) = rx.recv() {
+            while let Ok((g, mut m)) = rx.recv() {
+                // Damage and window markers take the state as it is now:
+                // fine for any viewer. Anything else from before the
+                // viewer attached is old news.
+                let marker = matches!(m, ToViewer::Damage { .. } | ToViewer::Windows(_));
                 if matches!(m, ToViewer::Damage { .. }) {
                     let Some([x0, y0, x1, y1]) = pending.lock().unwrap_or_else(|e| e.into_inner()).take() else { continue };
                     m = ToViewer::Damage { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
@@ -88,6 +99,10 @@ impl ViewerTx {
                     m = ToViewer::Windows(list);
                 }
                 let mut s = out.lock().unwrap_or_else(|e| e.into_inner());
+                // Checked under the lock attach() holds while it replays.
+                if !marker && g < now.load(std::sync::atomic::Ordering::Acquire) {
+                    continue;
+                }
                 if let Some(v) = s.as_mut() {
                     if v.write_all(&m.encode()).is_err() {
                         *s = None;
@@ -95,7 +110,7 @@ impl ViewerTx {
                 }
             }
         })?;
-        Ok(ViewerTx { q, damage, windows, sock, sticky: Arc::default() })
+        Ok(ViewerTx { q, gen, damage, windows, sock, sticky: Arc::default() })
     }
 
     /// A viewer is connected.
@@ -109,8 +124,15 @@ impl ViewerTx {
 
     /// A new viewer: the framebuffer first (as at start), then what it
     /// missed, then everything from here on.
+    fn gen(&self) -> u64 {
+        self.gen.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     fn attach(&self, mut v: UnixStream, fb: RawFd) -> std::io::Result<()> {
         let mut s = self.sock.lock().unwrap_or_else(|e| e.into_inner());
+        // What is queued now is in the replay below (sticky is updated
+        // before a message is queued): drop the queued copies.
+        self.gen.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         send_fd(&v, fb).map_err(|e| std::io::Error::other(e.to_string()))?;
         let st = self.sticky.lock().unwrap_or_else(|e| e.into_inner());
         let mut first = Vec::new();
@@ -159,7 +181,7 @@ impl ViewerTx {
                 None => {
                     *d = Some(r);
                     // The rect is filled in when it goes out.
-                    let _ = self.q.send(ToViewer::Damage { x: 0, y: 0, w: 0, h: 0 });
+                    let _ = self.q.send((self.gen(), ToViewer::Damage { x: 0, y: 0, w: 0, h: 0 }));
                 }
             }
             return;
@@ -167,12 +189,12 @@ impl ViewerTx {
         if let ToViewer::Windows(list) = m {
             if self.windows.lock().unwrap_or_else(|e| e.into_inner()).replace(list.clone()).is_none() {
                 // Filled in when it goes out.
-                let _ = self.q.send(ToViewer::Windows(Vec::new()));
+                let _ = self.q.send((self.gen(), ToViewer::Windows(Vec::new())));
             }
             return;
         }
         self.remember(m);
-        let _ = self.q.send(m.clone());
+        let _ = self.q.send((self.gen(), m.clone()));
     }
 }
 
