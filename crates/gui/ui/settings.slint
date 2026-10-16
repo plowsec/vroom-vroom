@@ -93,12 +93,14 @@ component NetCard inherits SubCard {
         text: root.host.netd == "stopped" ? "vroom-netd, the helper this needs (it runs as root), is installed but doesn't answer. Setting it up again starts it; macOS asks for an admin password."
             : root.host.netd == "old" ? "vroom-netd, the helper this needs (it runs as root), is from an older vroom. Set it up again; macOS asks for an admin password."
             : "This needs vroom-netd, a small helper that runs as root. It's set up once; macOS asks for an admin password.";
+    }
+    if root.net.mode != 0 && root.host.netd != "ready" && root.host.netd != "": HorizontalLayout {
+        alignment: start;
         Button {
             small: true;
             kind: "primary";
-            text: root.host.netd-busy ? "Waiting..." : "Set up (asks for your password)";
+            text: root.host.netd-busy ? "Waiting for your password..." : "Set up (asks for your password)";
             busy: root.host.netd-busy;
-            y: (parent.height - self.height) / 2;
             clicked => { Bus.act("netd.setup"); }
         }
     }
