@@ -168,6 +168,31 @@ pub fn camera_profile(exe: &Path) -> Result<String> {
     ))
 }
 
+/// Profile for the video helper: VideoToolbox's client side. The
+/// decoding itself runs in Apple's own decoder service (an XPC service,
+/// sandboxed by macOS); we may reach that service and the frame buffers
+/// (IOSurface) it hands back, nothing else: no files beyond the system,
+/// no network, no exec, no GPU, no writes.
+pub fn video_profile(exe: &Path) -> Result<String> {
+    let exe_real = exe.canonicalize().unwrap_or_else(|_| exe.to_path_buf());
+    Ok(format!(
+        r#"(version 1)
+(deny default)
+(allow process-exec (literal {exe}))
+(allow file-read* (literal {exe}) (subpath "/usr/lib") (subpath "/System") (subpath "/Library/Apple")
+  (literal "/dev/urandom") (literal "/dev/null") (literal "/private/etc/localtime") (subpath "/private/var/db/timezone"))
+(allow file-read-metadata)
+(allow file-read-data (literal "/"))
+(allow sysctl-read)
+(allow signal (target self))
+(allow mach-task-name (target self))
+(allow mach-lookup (xpc-service-name "com.apple.coremedia.videodecoder"))
+(allow iokit-open (iokit-user-client-class "IOSurfaceRootUserClient"))
+"#,
+        exe = q(&exe_real)?,
+    ))
+}
+
 /// Profile for the USB helper: libusb (from Homebrew or /usr/local), the
 /// IOKit registry, and the USB device and interface user clients. No
 /// files beyond the system and libusb, no network, no exec, no other

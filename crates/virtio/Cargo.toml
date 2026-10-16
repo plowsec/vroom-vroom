@@ -18,6 +18,7 @@ vroom-devices.workspace = true
 vroom-snapshot.workspace = true
 vroom-block.workspace = true
 vroom-net.workspace = true
+vroom-video.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

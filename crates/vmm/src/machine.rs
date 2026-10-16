@@ -678,6 +678,13 @@ pub(crate) fn build(
         board.add_virtio(Box::new(gpu))?;
         gpu_ctl = Some(ctl);
     }
+    // Hardware video decoding: a V4L2 decoder whose work happens in the
+    // video helper (VideoToolbox, sandboxed on its own).
+    if config.display.video_decode {
+        let helper = crate::video::Helper::spawn()?;
+        let (window, window_mem) = crate::video::Window::new(vm.clone())?;
+        board.add_virtio(Box::new(vroom_virtio::devices::media::Media::new(helper, window_mem, window, "Video decoder")))?;
+    }
     // Input: virtio-input for direct-boot Linux, USB HID otherwise (UEFI,
     // Windows setup: works with zero drivers). Never both: no doubled keys.
     // The xHCI also carries passthrough devices, each behind its own

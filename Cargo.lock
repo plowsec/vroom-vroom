@@ -5656,6 +5656,7 @@ dependencies = [
  "vroom-memory",
  "vroom-net",
  "vroom-snapshot",
+ "vroom-video",
 ]
 
 [[package]]
@@ -5685,6 +5686,7 @@ dependencies = [
  "vroom-snapshot",
  "vroom-state",
  "vroom-usb",
+ "vroom-video",
  "vroom-virtio",
 ]
 
