@@ -20,6 +20,10 @@ pub struct HostDevice {
     /// (a VM can't use those without root).
     pub interface_classes: Vec<u8>,
     pub claimed_by: Vec<String>,
+    /// macOS: taken from macOS's drivers by a root helper (libusb's
+    /// "capture") and not given back. Until it is re-enumerated (a root
+    /// helper's reset, or unplugging it) only root can open it.
+    pub captured: bool,
 }
 
 impl HostDevice {
@@ -41,6 +45,13 @@ impl HostDevice {
             (_, Some(n)) => n.clone(),
             _ => self.id(),
         }
+    }
+
+    /// Only a root helper (vroom-netd's) can take it: a macOS driver
+    /// holds it, or an earlier root helper captured it. Linux: never (the
+    /// helper detaches kernel drivers itself).
+    pub fn needs_root(&self) -> bool {
+        cfg!(target_os = "macos") && (!self.claimed_by.is_empty() || self.captured)
     }
 
     /// A hub, keyboard, mouse or disk: the things the host itself needs.
@@ -103,6 +114,8 @@ mod mac {
         fn CFStringGetTypeID() -> usize;
         fn CFNumberGetValue(n: CFTypeRef, ty: isize, out: *mut c_void) -> u8;
         fn CFStringGetCString(s: CFTypeRef, buf: *mut c_char, size: isize, enc: u32) -> u8;
+        fn CFBooleanGetTypeID() -> usize;
+        fn CFBooleanGetValue(b: CFTypeRef) -> u8;
     }
 
     /// An owned CF object.
@@ -151,6 +164,12 @@ mod mac {
             let mut out = 0i64;
             (CFNumberGetValue(v.0, SINT64, (&mut out as *mut i64).cast()) != 0).then_some(out)
         }
+    }
+
+    fn flag(entry: u32, key: &str) -> bool {
+        let Some(v) = prop(entry, key) else { return false };
+        // SAFETY: v is a live CF object; its type is checked first.
+        unsafe { CFGetTypeID(v.0) == CFBooleanGetTypeID() && CFBooleanGetValue(v.0) != 0 }
     }
 
     fn string(entry: u32, key: &str) -> Option<String> {
@@ -255,6 +274,9 @@ mod mac {
                 ports,
                 interface_classes: Vec::new(),
                 claimed_by: Vec::new(),
+                // Set on a device re-enumerated with capture: only root
+                // or Apple's VM entitlement may open it from then on.
+                captured: flag(d.0, "NeedsDeviceAccessEntitlement"),
             };
             interfaces(d.0, &mut dev.interface_classes, &mut dev.claimed_by, 0);
             out.push(dev);
@@ -329,6 +351,7 @@ mod linux {
                 ports,
                 interface_classes: Vec::new(),
                 claimed_by: Vec::new(),
+                captured: false,
             };
             if let Ok(ifs) = std::fs::read_dir(&p) {
                 for i in ifs.flatten() {

@@ -53,8 +53,8 @@ pub(crate) fn spawn(vm: &str, dev: &Usb) -> Result<(UsbHelper, Sender<Request>)>
         let (tx, rx) = mpsc::channel();
         let sock = via_netd(vm, dev).map_err(|why| {
             Error::Setup(format!(
-                "usb {}: macOS's driver ({}) holds it, and only the root helper can take it: {why}. \
-                 Set the helper up in the app (Settings, Network or USB), or unmount the device",
+                "usb {}: held by {}, and only the root helper can take it: {why}. \
+                 Set the helper up in the app (Settings, Network or USB)",
                 dev.id,
                 drivers.join(", ")
             ))
@@ -81,15 +81,17 @@ pub(crate) fn spawn(vm: &str, dev: &Usb) -> Result<(UsbHelper, Sender<Request>)>
     Ok((UsbHelper { dev: d, sock: ours, child: Some(child), rx }, tx))
 }
 
-/// The macOS drivers holding `dev`'s interfaces, if any (we'd need root).
+/// Why only root can take `dev`, if so: the macOS drivers holding its
+/// interfaces, or an earlier root helper's capture (macOS then lets only
+/// root open it, until it is re-enumerated).
 fn held_by_macos(dev: &Usb) -> Option<Vec<String>> {
-    if !cfg!(target_os = "macos") {
-        return None;
-    }
     let h = vroom_usb::list::list().into_iter().find(|h| {
         h.id() == dev.id && dev.serial.as_ref().is_none_or(|s| h.serial.as_deref() == Some(s.as_str()))
     })?;
-    (!h.claimed_by.is_empty()).then_some(h.claimed_by)
+    if !h.needs_root() {
+        return None;
+    }
+    Some(if h.claimed_by.is_empty() { vec!["an earlier root helper's capture".into()] } else { h.claimed_by })
 }
 
 /// netd's root helper for `dev`: its socket.
@@ -279,13 +281,18 @@ impl UsbPorts {
             let _ = r.get_ref().shutdown(std::net::Shutdown::Both);
             self.gone(i, gen);
             if let Some(mut child) = child {
-                let _ = child.kill();
-                for _ in 0..50 {
+                // It ends by itself once its socket is closed, after giving
+                // the device back to the host's drivers (a re-enumeration
+                // on macOS takes a moment): killed only if it hangs.
+                for _ in 0..500 {
                     if !matches!(child.try_wait(), Ok(None)) {
                         return;
                     }
                     std::thread::sleep(Duration::from_millis(20));
                 }
+                log::warn!("usb: helper on port pair {i} didn't end, killing it");
+                let _ = child.kill();
+                let _ = child.wait();
             }
         })?;
         Ok(())

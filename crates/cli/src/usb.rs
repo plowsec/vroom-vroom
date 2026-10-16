@@ -7,6 +7,15 @@ use vroom_usb::proto::Speed;
 pub enum UsbCmd {
     /// List the host's USB devices, with the `id` a `[[usb]]` entry takes.
     List,
+    /// Reset a device through vroom-netd's root helper: macOS
+    /// re-enumerates it and its drivers take it back (a USB stick mounts
+    /// again). For a device a VM left taken from macOS.
+    Reset {
+        /// vendor:product
+        id: String,
+        #[arg(long)]
+        serial: Option<String>,
+    },
 }
 
 #[derive(clap::Args, Debug)]
@@ -36,6 +45,8 @@ fn line(d: &HostDevice) -> String {
     }
     if !d.claimed_by.is_empty() {
         s += &format!("\n           in use by {} (a VM can't take it without root)", d.claimed_by.join(", "));
+    } else if d.captured {
+        s += "\n           taken from macOS by a root helper earlier and not given back (root only; unplug it to reset)";
     }
     s
 }
@@ -54,7 +65,32 @@ pub fn run(c: UsbCmd) -> Result<(), String> {
             }
             Ok(())
         }
+        UsbCmd::Reset { id, serial } => reset(&id, serial),
     }
+}
+
+/// Have netd's root helper open the device and reset it, then let it go.
+fn reset(id: &str, serial: Option<String>) -> Result<(), String> {
+    use std::io::Write;
+    use vroom_net::netd;
+    use vroom_usb::proto::{read_event, Event, Request};
+    let req = netd::UsbRequest { version: netd::VERSION, vm: "reset".into(), usb: netd::UsbWanted { id: id.into(), serial } };
+    let mut sock = netd::usb(std::path::Path::new(netd::DEFAULT_SOCKET), &req).map_err(|e| e.to_string())?;
+    sock.set_read_timeout(Some(std::time::Duration::from_secs(10))).map_err(|e| e.to_string())?;
+    let mut r = std::io::BufReader::new(sock.try_clone().map_err(|e| e.to_string())?);
+    match read_event(&mut r) {
+        Ok(Some(Event::Attached { .. })) => {}
+        Ok(_) => return Err("the helper didn't find the device".into()),
+        Err(e) => return Err(format!("the helper didn't answer: {e}")),
+    }
+    sock.write_all(&Request::Reset.encode()).map_err(|e| e.to_string())?;
+    // The reset takes a moment (a re-enumeration); then we hang up and
+    // the helper gives the device back as it ends.
+    sock.set_read_timeout(Some(std::time::Duration::from_secs(3))).map_err(|e| e.to_string())?;
+    while let Ok(Some(_)) = read_event(&mut r) {}
+    drop(sock);
+    println!("{id}: reset; macOS takes it back in a few seconds");
+    Ok(())
 }
 
 /// The helper: the VMM hands us a stream socket as stdin.
