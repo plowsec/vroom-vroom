@@ -1,0 +1,1156 @@
+diff --git a/src/venus/vkr_buffer.c b/src/venus/vkr_buffer.c
+index c10503d..33ecdba 100644
+--- a/src/venus/vkr_buffer.c
++++ b/src/venus/vkr_buffer.c
+@@ -31,6 +31,11 @@ vkr_dispatch_vkCreateBuffer(struct vn_dispatch_context *dispatch,
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+ 
+    vkr_buffer_fix_create_info(dev, (VkBufferCreateInfo *)args->pCreateInfo);
++   if (dev->fake_xfb) {
++      ((VkBufferCreateInfo *)args->pCreateInfo)->usage &=
++         ~(VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT |
++           VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT);
++   }
+ 
+    /* XXX If VkExternalMemoryBufferCreateInfo is chained by the app, all is
+     * good.  If it is not chained, we might still bind an external memory to
+@@ -141,6 +146,9 @@ static void
+ vkr_dispatch_vkCreateBufferView(struct vn_dispatch_context *dispatch,
+                                 struct vn_command_vkCreateBufferView *args)
+ {
++   struct vkr_device *dev = vkr_device_from_handle(args->device);
++   VkBufferViewCreateInfo *info = (VkBufferViewCreateInfo *)args->pCreateInfo;
++   info->format = vkr_physical_device_nearest_format(dev->physical_device, info->format, false);
+    vkr_buffer_view_create_and_add(dispatch->data, args);
+ }
+ 
+diff --git a/src/venus/vkr_command_buffer.c b/src/venus/vkr_command_buffer.c
+index dc42c5a..7a08676 100644
+--- a/src/venus/vkr_command_buffer.c
++++ b/src/venus/vkr_command_buffer.c
+@@ -6,11 +6,24 @@
+ #include "vkr_command_buffer.h"
+ 
+ #include "vkr_command_buffer_gen.h"
++#include "vkr_device.h"
++#include "vkr_query_pool.h"
+ 
+ #ifdef __clang__
+ #pragma clang diagnostic ignored "-Wgnu-zero-variadic-macro-arguments"
+ #endif
+ 
++/* transform feedback taken and ignored (vkr_physical_device.h) */
++#define VKR_CMD_FAKE_XFB(args)                                                            \
++   (vkr_command_buffer_from_handle(args->commandBuffer)->device->fake_xfb)
++
++static inline bool
++vkr_query_pool_is_fake(VkQueryPool handle)
++{
++   const struct vkr_query_pool *pool = vkr_query_pool_from_handle(handle);
++   return pool && pool->fake_xfb;
++}
++
+ #define VKR_CMD_CALL(cmd_name, args, ...)                                                \
+    do {                                                                                  \
+       struct vkr_command_buffer *_cmd =                                                  \
+@@ -234,8 +247,13 @@ static void
+ vkr_dispatch_vkCmdBindVertexBuffers(UNUSED struct vn_dispatch_context *dispatch,
+                                     struct vn_command_vkCmdBindVertexBuffers *args)
+ {
+-   VKR_CMD_CALL(CmdBindVertexBuffers, args, args->firstBinding, args->bindingCount,
+-                args->pBuffers, args->pOffsets);
++   struct vkr_command_buffer *cmd = vkr_command_buffer_from_handle(args->commandBuffer);
++   vn_replace_vkCmdBindVertexBuffers_args_handle(args);
++   vkr_device_fill_null_vertex_buffers(cmd->device, args->bindingCount, args->pBuffers,
++                                       args->pOffsets, NULL);
++   cmd->device->proc_table.CmdBindVertexBuffers(args->commandBuffer, args->firstBinding,
++                                                args->bindingCount, args->pBuffers,
++                                                args->pOffsets);
+ }
+ 
+ static void
+@@ -454,6 +472,8 @@ static void
+ vkr_dispatch_vkCmdBeginQuery(UNUSED struct vn_dispatch_context *dispatch,
+                              struct vn_command_vkCmdBeginQuery *args)
+ {
++   if (vkr_query_pool_is_fake(args->queryPool))
++      return;
+    VKR_CMD_CALL(CmdBeginQuery, args, args->queryPool, args->query, args->flags);
+ }
+ 
+@@ -461,6 +481,8 @@ static void
+ vkr_dispatch_vkCmdEndQuery(UNUSED struct vn_dispatch_context *dispatch,
+                            struct vn_command_vkCmdEndQuery *args)
+ {
++   if (vkr_query_pool_is_fake(args->queryPool))
++      return;
+    VKR_CMD_CALL(CmdEndQuery, args, args->queryPool, args->query);
+ }
+ 
+@@ -484,6 +506,13 @@ static void
+ vkr_dispatch_vkCmdCopyQueryPoolResults(UNUSED struct vn_dispatch_context *dispatch,
+                                        struct vn_command_vkCmdCopyQueryPoolResults *args)
+ {
++   if (vkr_query_pool_is_fake(args->queryPool)) {
++      struct vkr_command_buffer *cmd = vkr_command_buffer_from_handle(args->commandBuffer);
++      vn_replace_vkCmdCopyQueryPoolResults_args_handle(args);
++      vkr_query_pool_fake_copy(cmd->device, args->commandBuffer, args->queryCount,
++                               args->dstBuffer, args->dstOffset, args->stride, args->flags);
++      return;
++   }
+    VKR_CMD_CALL(CmdCopyQueryPoolResults, args, args->queryPool, args->firstQuery,
+                 args->queryCount, args->dstBuffer, args->dstOffset, args->stride,
+                 args->flags);
+@@ -595,6 +624,8 @@ vkr_dispatch_vkCmdBindTransformFeedbackBuffersEXT(
+    UNUSED struct vn_dispatch_context *dispatch,
+    struct vn_command_vkCmdBindTransformFeedbackBuffersEXT *args)
+ {
++   if (VKR_CMD_FAKE_XFB(args))
++      return;
+    VKR_CMD_CALL(CmdBindTransformFeedbackBuffersEXT, args, args->firstBinding,
+                 args->bindingCount, args->pBuffers, args->pOffsets, args->pSizes);
+ }
+@@ -604,6 +635,8 @@ vkr_dispatch_vkCmdBeginTransformFeedbackEXT(
+    UNUSED struct vn_dispatch_context *dispatch,
+    struct vn_command_vkCmdBeginTransformFeedbackEXT *args)
+ {
++   if (VKR_CMD_FAKE_XFB(args))
++      return;
+    VKR_CMD_CALL(CmdBeginTransformFeedbackEXT, args, args->firstCounterBuffer,
+                 args->counterBufferCount, args->pCounterBuffers,
+                 args->pCounterBufferOffsets);
+@@ -614,6 +647,8 @@ vkr_dispatch_vkCmdEndTransformFeedbackEXT(
+    UNUSED struct vn_dispatch_context *dispatch,
+    struct vn_command_vkCmdEndTransformFeedbackEXT *args)
+ {
++   if (VKR_CMD_FAKE_XFB(args))
++      return;
+    VKR_CMD_CALL(CmdEndTransformFeedbackEXT, args, args->firstCounterBuffer,
+                 args->counterBufferCount, args->pCounterBuffers,
+                 args->pCounterBufferOffsets);
+@@ -623,6 +658,15 @@ static void
+ vkr_dispatch_vkCmdBeginQueryIndexedEXT(UNUSED struct vn_dispatch_context *dispatch,
+                                        struct vn_command_vkCmdBeginQueryIndexedEXT *args)
+ {
++   if (VKR_CMD_FAKE_XFB(args)) {
++      if (vkr_query_pool_is_fake(args->queryPool) || args->index)
++         return;
++      struct vkr_command_buffer *cmd = vkr_command_buffer_from_handle(args->commandBuffer);
++      vn_replace_vkCmdBeginQueryIndexedEXT_args_handle(args);
++      cmd->device->proc_table.CmdBeginQuery(args->commandBuffer, args->queryPool, args->query,
++                                            args->flags);
++      return;
++   }
+    VKR_CMD_CALL(CmdBeginQueryIndexedEXT, args, args->queryPool, args->query, args->flags,
+                 args->index);
+ }
+@@ -631,6 +675,14 @@ static void
+ vkr_dispatch_vkCmdEndQueryIndexedEXT(UNUSED struct vn_dispatch_context *dispatch,
+                                      struct vn_command_vkCmdEndQueryIndexedEXT *args)
+ {
++   if (VKR_CMD_FAKE_XFB(args)) {
++      if (vkr_query_pool_is_fake(args->queryPool) || args->index)
++         return;
++      struct vkr_command_buffer *cmd = vkr_command_buffer_from_handle(args->commandBuffer);
++      vn_replace_vkCmdEndQueryIndexedEXT_args_handle(args);
++      cmd->device->proc_table.CmdEndQuery(args->commandBuffer, args->queryPool, args->query);
++      return;
++   }
+    VKR_CMD_CALL(CmdEndQueryIndexedEXT, args, args->queryPool, args->query, args->index);
+ }
+ 
+@@ -639,6 +691,8 @@ vkr_dispatch_vkCmdDrawIndirectByteCountEXT(
+    UNUSED struct vn_dispatch_context *dispatch,
+    struct vn_command_vkCmdDrawIndirectByteCountEXT *args)
+ {
++   if (VKR_CMD_FAKE_XFB(args))
++      return;
+    VKR_CMD_CALL(CmdDrawIndirectByteCountEXT, args, args->instanceCount,
+                 args->firstInstance, args->counterBuffer, args->counterBufferOffset,
+                 args->counterOffset, args->vertexStride);
+@@ -648,8 +702,13 @@ static void
+ vkr_dispatch_vkCmdBindVertexBuffers2(UNUSED struct vn_dispatch_context *dispatch,
+                                      struct vn_command_vkCmdBindVertexBuffers2 *args)
+ {
+-   VKR_CMD_CALL(CmdBindVertexBuffers2, args, args->firstBinding, args->bindingCount,
+-                args->pBuffers, args->pOffsets, args->pSizes, args->pStrides);
++   struct vkr_command_buffer *cmd = vkr_command_buffer_from_handle(args->commandBuffer);
++   vn_replace_vkCmdBindVertexBuffers2_args_handle(args);
++   vkr_device_fill_null_vertex_buffers(cmd->device, args->bindingCount, args->pBuffers,
++                                       args->pOffsets, args->pSizes);
++   cmd->device->proc_table.CmdBindVertexBuffers2(
++      args->commandBuffer, args->firstBinding, args->bindingCount, args->pBuffers,
++      args->pOffsets, args->pSizes, args->pStrides);
+ }
+ 
+ static void
+@@ -864,8 +923,14 @@ static void
+ vkr_dispatch_vkCmdPushDescriptorSet(UNUSED struct vn_dispatch_context *dispatch,
+                                     struct vn_command_vkCmdPushDescriptorSet *args)
+ {
+-   VKR_CMD_CALL(CmdPushDescriptorSet, args, args->pipelineBindPoint, args->layout,
+-                args->set, args->descriptorWriteCount, args->pDescriptorWrites);
++   struct vkr_command_buffer *cmd = vkr_command_buffer_from_handle(args->commandBuffer);
++   vn_replace_vkCmdPushDescriptorSet_args_handle(args);
++   vkr_device_fill_null_descriptors(cmd->device, args->descriptorWriteCount,
++                                    args->pDescriptorWrites);
++   cmd->device->proc_table.CmdPushDescriptorSet(args->commandBuffer, args->pipelineBindPoint,
++                                                args->layout, args->set,
++                                                args->descriptorWriteCount,
++                                                args->pDescriptorWrites);
+ }
+ 
+ static void
+@@ -1106,7 +1171,15 @@ static void
+ vkr_dispatch_vkCmdPushDescriptorSet2(UNUSED struct vn_dispatch_context *dispatch,
+                                      struct vn_command_vkCmdPushDescriptorSet2 *args)
+ {
+-   VKR_CMD_CALL(CmdPushDescriptorSet2, args, args->pPushDescriptorSetInfo);
++   struct vkr_command_buffer *cmd = vkr_command_buffer_from_handle(args->commandBuffer);
++   vn_replace_vkCmdPushDescriptorSet2_args_handle(args);
++   if (args->pPushDescriptorSetInfo) {
++      vkr_device_fill_null_descriptors(cmd->device,
++                                       args->pPushDescriptorSetInfo->descriptorWriteCount,
++                                       args->pPushDescriptorSetInfo->pDescriptorWrites);
++   }
++   cmd->device->proc_table.CmdPushDescriptorSet2(args->commandBuffer,
++                                                 args->pPushDescriptorSetInfo);
+ }
+ 
+ static void
+diff --git a/src/venus/vkr_descriptor_set.c b/src/venus/vkr_descriptor_set.c
+index 5ec209f..fe6ba36 100644
+--- a/src/venus/vkr_descriptor_set.c
++++ b/src/venus/vkr_descriptor_set.c
+@@ -140,6 +140,8 @@ vkr_dispatch_vkUpdateDescriptorSets(UNUSED struct vn_dispatch_context *dispatch,
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
+    vn_replace_vkUpdateDescriptorSets_args_handle(args);
++   vkr_device_fill_null_descriptors(dev, args->descriptorWriteCount,
++                                    args->pDescriptorWrites);
+    vk->UpdateDescriptorSets(args->device, args->descriptorWriteCount,
+                             args->pDescriptorWrites, args->descriptorCopyCount,
+                             args->pDescriptorCopies);
+diff --git a/src/venus/vkr_device.c b/src/venus/vkr_device.c
+index 81c694c..17d2173 100644
+--- a/src/venus/vkr_device.c
++++ b/src/venus/vkr_device.c
+@@ -132,7 +132,10 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+     */
+    const bool drop_emulated =
+       physical_dev->is_dma_buf_emulated || !physical_dev->EXT_image_drm_format_modifier ||
+-      !physical_dev->EXT_queue_family_foreign;
++      !physical_dev->EXT_queue_family_foreign || physical_dev->emulate_depth_clip ||
++      physical_dev->emulate_xfb;
++
++   bool dev_xfb = false;
+ 
+    /* append extensions for our own use */
+    const char **exts = NULL;
+@@ -166,6 +169,14 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+          if (!physical_dev->EXT_queue_family_foreign &&
+              !strcmp(name, VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME))
+             continue;
++         if (physical_dev->emulate_depth_clip &&
++             !strcmp(name, VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME))
++            continue;
++         if (physical_dev->emulate_xfb &&
++             !strcmp(name, VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME)) {
++            dev_xfb = true;
++            continue;
++         }
+ 
+          exts[ext_count++] = name;
+       }
+@@ -185,6 +196,17 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+       ((VkDeviceCreateInfo *)args->pCreateInfo)->enabledExtensionCount = ext_count;
+    }
+ 
++   /* nullDescriptor is ours to emulate: the host would refuse it */
++   bool null_desc = false;
++   if (physical_dev->emulate_null_descriptor) {
++      VkPhysicalDeviceRobustness2FeaturesEXT *rb2 = vkr_find_struct(
++         args->pCreateInfo->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT);
++      if (rb2 && rb2->nullDescriptor) {
++         rb2->nullDescriptor = VK_FALSE;
++         null_desc = true;
++      }
++   }
++
+    struct vkr_device *dev =
+       vkr_context_alloc_object(ctx, sizeof(*dev), VK_OBJECT_TYPE_DEVICE, args->pDevice);
+    if (!dev) {
+@@ -192,6 +214,8 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+       free(exts);
+       return;
+    }
++   dev->null_desc.enabled = null_desc;
++   dev->fake_xfb = dev_xfb;
+ 
+    vn_replace_vkCreateDevice_args_handle(args);
+    args->ret = vk->CreateDevice(args->physicalDevice, args->pCreateInfo, NULL,
+@@ -345,6 +369,363 @@ vkr_device_object_destroy(struct vkr_context *ctx,
+    vkr_device_remove_object(ctx, dev, obj);
+ }
+ 
++/* robustness2 nullDescriptor on a host without it (MoltenVK).  Zink, Mesa's
++ * OpenGL on Vulkan, needs it.  A null image view, buffer or buffer view in a
++ * descriptor becomes one of a few small objects, cleared to zero once, so
++ * reads give zeros as the spec asks.  Shaders can't write the read-only
++ * ones; writes to the storage ones land there instead of nowhere.
++ */
++#define VKR_NULL_BUFFER_SIZE (64 * 1024)
++
++static void
++vkr_device_destroy_null_descriptors(struct vkr_device *dev)
++{
++   struct vn_device_proc_table *vk = &dev->proc_table;
++   VkDevice device = dev->base.handle.device;
++   struct vkr_null_descriptors *n = &dev->null_desc;
++
++   if (n->image_view)
++      vk->DestroyImageView(device, n->image_view, NULL);
++   if (n->storage_image_view)
++      vk->DestroyImageView(device, n->storage_image_view, NULL);
++   if (n->texel_view)
++      vk->DestroyBufferView(device, n->texel_view, NULL);
++   if (n->storage_texel_view)
++      vk->DestroyBufferView(device, n->storage_texel_view, NULL);
++   if (n->image)
++      vk->DestroyImage(device, n->image, NULL);
++   if (n->storage_image)
++      vk->DestroyImage(device, n->storage_image, NULL);
++   if (n->buffer)
++      vk->DestroyBuffer(device, n->buffer, NULL);
++   if (n->storage_buffer)
++      vk->DestroyBuffer(device, n->storage_buffer, NULL);
++   for (uint32_t i = 0; i < ARRAY_SIZE(n->memory); i++) {
++      if (n->memory[i])
++         vk->FreeMemory(device, n->memory[i], NULL);
++   }
++   const bool enabled = n->enabled;
++   memset(n, 0, sizeof(*n));
++   n->enabled = enabled;
++}
++
++static bool
++vkr_device_null_memory(struct vkr_device *dev,
++                       const VkMemoryRequirements *req,
++                       VkDeviceMemory *mem)
++{
++   struct vn_device_proc_table *vk = &dev->proc_table;
++   const VkPhysicalDeviceMemoryProperties *props =
++      &dev->physical_device->memory_properties;
++   uint32_t type = UINT32_MAX;
++
++   /* device local first */
++   for (uint32_t pass = 0; pass < 2 && type == UINT32_MAX; pass++) {
++      for (uint32_t i = 0; i < props->memoryTypeCount; i++) {
++         const VkMemoryPropertyFlags f = props->memoryTypes[i].propertyFlags;
++         if (!(req->memoryTypeBits & (1u << i)) ||
++             (f & VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT))
++            continue;
++         if (pass == 0 && !(f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
++            continue;
++         type = i;
++         break;
++      }
++   }
++   if (type == UINT32_MAX)
++      return false;
++
++   const VkMemoryAllocateInfo info = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .allocationSize = req->size,
++      .memoryTypeIndex = type,
++   };
++   return vk->AllocateMemory(dev->base.handle.device, &info, NULL, mem) == VK_SUCCESS;
++}
++
++static bool
++vkr_device_null_buffer(struct vkr_device *dev,
++                       VkBufferUsageFlags usage,
++                       VkBuffer *buf,
++                       VkDeviceMemory *mem,
++                       VkBufferView *view)
++{
++   struct vn_device_proc_table *vk = &dev->proc_table;
++   VkDevice device = dev->base.handle.device;
++
++   const VkBufferCreateInfo info = {
++      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++      .size = VKR_NULL_BUFFER_SIZE,
++      .usage = usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++   };
++   if (vk->CreateBuffer(device, &info, NULL, buf) != VK_SUCCESS)
++      return false;
++   VkMemoryRequirements req;
++   vk->GetBufferMemoryRequirements(device, *buf, &req);
++   if (!vkr_device_null_memory(dev, &req, mem) ||
++       vk->BindBufferMemory(device, *buf, *mem, 0) != VK_SUCCESS)
++      return false;
++
++   const VkBufferViewCreateInfo view_info = {
++      .sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO,
++      .buffer = *buf,
++      .format = VK_FORMAT_R8G8B8A8_UNORM,
++      .offset = 0,
++      .range = VK_WHOLE_SIZE,
++   };
++   return vk->CreateBufferView(device, &view_info, NULL, view) == VK_SUCCESS;
++}
++
++static bool
++vkr_device_null_image(struct vkr_device *dev,
++                      VkImageUsageFlags usage,
++                      VkImage *img,
++                      VkDeviceMemory *mem,
++                      VkImageView *view)
++{
++   struct vn_device_proc_table *vk = &dev->proc_table;
++   VkDevice device = dev->base.handle.device;
++
++   const VkImageCreateInfo info = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
++      .imageType = VK_IMAGE_TYPE_2D,
++      .format = VK_FORMAT_R8G8B8A8_UNORM,
++      .extent = { 1, 1, 1 },
++      .mipLevels = 1,
++      .arrayLayers = 1,
++      .samples = VK_SAMPLE_COUNT_1_BIT,
++      .tiling = VK_IMAGE_TILING_OPTIMAL,
++      .usage = usage | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
++      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++   };
++   if (vk->CreateImage(device, &info, NULL, img) != VK_SUCCESS)
++      return false;
++   VkMemoryRequirements req;
++   vk->GetImageMemoryRequirements(device, *img, &req);
++   if (!vkr_device_null_memory(dev, &req, mem) ||
++       vk->BindImageMemory(device, *img, *mem, 0) != VK_SUCCESS)
++      return false;
++
++   const VkImageViewCreateInfo view_info = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
++      .image = *img,
++      .viewType = VK_IMAGE_VIEW_TYPE_2D,
++      .format = VK_FORMAT_R8G8B8A8_UNORM,
++      .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
++   };
++   return vk->CreateImageView(device, &view_info, NULL, view) == VK_SUCCESS;
++}
++
++/* Zero the objects once, on the device's first queue, and wait. */
++static bool
++vkr_device_null_clear(struct vkr_device *dev)
++{
++   struct vn_device_proc_table *vk = &dev->proc_table;
++   VkDevice device = dev->base.handle.device;
++   struct vkr_null_descriptors *n = &dev->null_desc;
++
++   if (list_is_empty(&dev->queues))
++      return false;
++   struct vkr_queue *queue =
++      list_first_entry(&dev->queues, struct vkr_queue, base.track_head);
++
++   VkCommandPool pool = VK_NULL_HANDLE;
++   VkCommandBuffer cmd = VK_NULL_HANDLE;
++   VkFence fence = VK_NULL_HANDLE;
++   bool ok = false;
++
++   const VkCommandPoolCreateInfo pool_info = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
++      .queueFamilyIndex = queue->family,
++   };
++   const VkFenceCreateInfo fence_info = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
++   if (vk->CreateCommandPool(device, &pool_info, NULL, &pool) != VK_SUCCESS)
++      return false;
++   if (vk->CreateFence(device, &fence_info, NULL, &fence) != VK_SUCCESS)
++      goto out;
++   const VkCommandBufferAllocateInfo alloc_info = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
++      .commandPool = pool,
++      .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
++      .commandBufferCount = 1,
++   };
++   if (vk->AllocateCommandBuffers(device, &alloc_info, &cmd) != VK_SUCCESS)
++      goto out;
++   const VkCommandBufferBeginInfo begin = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++      .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
++   };
++   if (vk->BeginCommandBuffer(cmd, &begin) != VK_SUCCESS)
++      goto out;
++
++   const VkImageSubresourceRange range = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
++   const VkImage images[2] = { n->image, n->storage_image };
++   VkImageMemoryBarrier barriers[2];
++   for (uint32_t i = 0; i < 2; i++) {
++      barriers[i] = (VkImageMemoryBarrier){
++         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++         .srcAccessMask = 0,
++         .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++         .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++         .newLayout = VK_IMAGE_LAYOUT_GENERAL,
++         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++         .image = images[i],
++         .subresourceRange = range,
++      };
++   }
++   vk->CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 2,
++                          barriers);
++   const VkClearColorValue zero = { .uint32 = { 0, 0, 0, 0 } };
++   for (uint32_t i = 0; i < 2; i++)
++      vk->CmdClearColorImage(cmd, images[i], VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
++   vk->CmdFillBuffer(cmd, n->buffer, 0, VK_WHOLE_SIZE, 0);
++   vk->CmdFillBuffer(cmd, n->storage_buffer, 0, VK_WHOLE_SIZE, 0);
++   const VkMemoryBarrier done = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++      .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++      .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
++   };
++   vk->CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &done, 0, NULL, 0,
++                          NULL);
++   if (vk->EndCommandBuffer(cmd) != VK_SUCCESS)
++      goto out;
++
++   const VkSubmitInfo submit = {
++      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++      .commandBufferCount = 1,
++      .pCommandBuffers = &cmd,
++   };
++   mtx_lock(&queue->vk_mutex);
++   VkResult result = vk->QueueSubmit(queue->base.handle.queue, 1, &submit, fence);
++   mtx_unlock(&queue->vk_mutex);
++   if (result == VK_SUCCESS)
++      ok = vk->WaitForFences(device, 1, &fence, VK_TRUE, 5000000000ull) == VK_SUCCESS;
++
++out:
++   if (fence)
++      vk->DestroyFence(device, fence, NULL);
++   vk->DestroyCommandPool(device, pool, NULL);
++   return ok;
++}
++
++static bool
++vkr_device_null_ready(struct vkr_device *dev)
++{
++   struct vkr_null_descriptors *n = &dev->null_desc;
++   if (n->tried)
++      return n->ok;
++
++   const bool ok =
++      vkr_device_null_buffer(dev,
++                             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
++                                VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT |
++                                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
++                                VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
++                             &n->buffer, &n->memory[0], &n->texel_view) &&
++      vkr_device_null_buffer(dev,
++                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
++                                VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT,
++                             &n->storage_buffer, &n->memory[1], &n->storage_texel_view) &&
++      vkr_device_null_image(dev, 0, &n->image, &n->memory[2], &n->image_view) &&
++      vkr_device_null_image(dev, VK_IMAGE_USAGE_STORAGE_BIT, &n->storage_image,
++                            &n->memory[3], &n->storage_image_view) &&
++      vkr_device_null_clear(dev);
++   if (!ok) {
++      vkr_log("cannot emulate null descriptors: they stay null");
++      vkr_device_destroy_null_descriptors(dev);
++   }
++   n->tried = true;
++   n->ok = ok;
++   return ok;
++}
++
++void
++vkr_device_fill_null_descriptors(struct vkr_device *dev,
++                                 uint32_t count,
++                                 const VkWriteDescriptorSet *writes)
++{
++   if (!dev->null_desc.enabled || !writes)
++      return;
++
++   for (uint32_t i = 0; i < count; i++) {
++      const VkWriteDescriptorSet *w = &writes[i];
++
++      switch (w->descriptorType) {
++      case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
++      case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
++      case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE: {
++         VkDescriptorImageInfo *info = (VkDescriptorImageInfo *)w->pImageInfo;
++         const bool storage = w->descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
++         for (uint32_t j = 0; info && j < w->descriptorCount; j++) {
++            if (info[j].imageView || !vkr_device_null_ready(dev))
++               continue;
++            info[j].imageView =
++               storage ? dev->null_desc.storage_image_view : dev->null_desc.image_view;
++            info[j].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
++         }
++         break;
++      }
++      case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
++      case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER: {
++         VkBufferView *views = (VkBufferView *)w->pTexelBufferView;
++         const bool storage = w->descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
++         for (uint32_t j = 0; views && j < w->descriptorCount; j++) {
++            if (views[j] || !vkr_device_null_ready(dev))
++               continue;
++            views[j] =
++               storage ? dev->null_desc.storage_texel_view : dev->null_desc.texel_view;
++         }
++         break;
++      }
++      case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
++      case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
++      case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
++      case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC: {
++         VkDescriptorBufferInfo *info = (VkDescriptorBufferInfo *)w->pBufferInfo;
++         const bool storage =
++            w->descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ||
++            w->descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
++         for (uint32_t j = 0; info && j < w->descriptorCount; j++) {
++            if (info[j].buffer || !vkr_device_null_ready(dev))
++               continue;
++            info[j].buffer = storage ? dev->null_desc.storage_buffer : dev->null_desc.buffer;
++            info[j].offset = 0;
++            info[j].range = VK_WHOLE_SIZE;
++         }
++         break;
++      }
++      default:
++         break;
++      }
++   }
++}
++
++void
++vkr_device_fill_null_vertex_buffers(struct vkr_device *dev,
++                                    uint32_t count,
++                                    const VkBuffer *buffers,
++                                    const VkDeviceSize *offsets,
++                                    const VkDeviceSize *sizes)
++{
++   if (!dev->null_desc.enabled || !buffers)
++      return;
++
++   for (uint32_t i = 0; i < count; i++) {
++      if (buffers[i] || !vkr_device_null_ready(dev))
++         continue;
++      ((VkBuffer *)buffers)[i] = dev->null_desc.buffer;
++      if (offsets)
++         ((VkDeviceSize *)offsets)[i] = 0;
++      if (sizes)
++         ((VkDeviceSize *)sizes)[i] = VK_WHOLE_SIZE;
++   }
++}
++
+ void
+ vkr_device_destroy(struct vkr_context *ctx, struct vkr_device *dev, bool destroy_vk)
+ {
+@@ -378,8 +759,10 @@ vkr_device_destroy(struct vkr_context *ctx, struct vkr_device *dev, bool destroy
+ 
+    mtx_destroy(&dev->free_sync_mutex);
+ 
+-   if (destroy_vk || ctx->on_worker_thread)
++   if (destroy_vk || ctx->on_worker_thread) {
++      vkr_device_destroy_null_descriptors(dev);
+       vk->DestroyDevice(device, NULL);
++   }
+ 
+    list_del(&dev->base.track_head);
+ 
+diff --git a/src/venus/vkr_device.h b/src/venus/vkr_device.h
+index 3c4b875..fac10c4 100644
+--- a/src/venus/vkr_device.h
++++ b/src/venus/vkr_device.h
+@@ -12,6 +12,21 @@
+ 
+ #include "vkr_context.h"
+ 
++struct vkr_null_descriptors {
++   bool enabled; /* the guest asked for it */
++   bool tried;   /* objects made (or failed: then nulls stay null) */
++   bool ok;
++   VkDeviceMemory memory[4];
++   VkBuffer buffer;         /* read only: uniform, vertex, uniform texel */
++   VkBuffer storage_buffer; /* storage, storage texel */
++   VkBufferView texel_view;
++   VkBufferView storage_texel_view;
++   VkImage image;
++   VkImage storage_image;
++   VkImageView image_view;
++   VkImageView storage_image_view;
++};
++
+ struct vkr_device {
+    struct vkr_object base;
+ 
+@@ -29,6 +44,13 @@ struct vkr_device {
+ 
+    /* set when the physical device emulates dma_buf on top of host memory */
+    PFN_vkGetMemoryHostPointerPropertiesEXT GetMemoryHostPointerPropertiesEXT;
++
++   /* robustness2 nullDescriptor, emulated: what null descriptors become */
++   struct vkr_null_descriptors null_desc;
++
++   /* VK_EXT_transform_feedback taken and ignored (zink only, see
++    * vkr_physical_device.h) */
++   bool fake_xfb;
+ };
+ VKR_DEFINE_OBJECT_CAST(device, VK_OBJECT_TYPE_DEVICE, VkDevice)
+ 
+@@ -38,6 +60,18 @@ vkr_context_init_device_dispatch(struct vkr_context *ctx);
+ void
+ vkr_device_destroy(struct vkr_context *ctx, struct vkr_device *dev, bool destroy_vk);
+ 
++void
++vkr_device_fill_null_descriptors(struct vkr_device *dev,
++                                 uint32_t count,
++                                 const VkWriteDescriptorSet *writes);
++
++void
++vkr_device_fill_null_vertex_buffers(struct vkr_device *dev,
++                                    uint32_t count,
++                                    const VkBuffer *buffers,
++                                    const VkDeviceSize *offsets,
++                                    const VkDeviceSize *sizes);
++
+ static inline bool
+ vkr_device_should_track_object(const struct vkr_object *obj)
+ {
+diff --git a/src/venus/vkr_instance.c b/src/venus/vkr_instance.c
+index 27bf2dc..f53ef35 100644
+--- a/src/venus/vkr_instance.c
++++ b/src/venus/vkr_instance.c
+@@ -213,6 +213,8 @@ vkr_dispatch_vkCreateInstance(struct vn_dispatch_context *dispatch,
+    }
+ 
+    instance->api_version = app_info.apiVersion;
++   instance->engine_is_zink =
++      app_info.pEngineName && !strcmp(app_info.pEngineName, "mesa zink");
+ 
+    vn_replace_vkCreateInstance_args_handle(args);
+    args->ret = vk->CreateInstance(create_info, NULL, &instance->base.handle.instance);
+diff --git a/src/venus/vkr_instance.h b/src/venus/vkr_instance.h
+index e742124..81b08f4 100644
+--- a/src/venus/vkr_instance.h
++++ b/src/venus/vkr_instance.h
+@@ -17,6 +17,8 @@ struct vkr_instance {
+    struct vn_instance_proc_table proc_table;
+ 
+    uint32_t api_version;
++   /* Mesa's OpenGL on Vulkan: gets the extensions we can only half emulate */
++   bool engine_is_zink;
+    PFN_vkCreateDebugUtilsMessengerEXT create_debug_utils_messenger;
+    PFN_vkDestroyDebugUtilsMessengerEXT destroy_debug_utils_messenger;
+    VkDebugUtilsMessengerEXT validation_messenger;
+diff --git a/src/venus/vkr_physical_device.c b/src/venus/vkr_physical_device.c
+index 774705e..5580a08 100644
+--- a/src/venus/vkr_physical_device.c
++++ b/src/venus/vkr_physical_device.c
+@@ -273,9 +273,16 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
+    }
+ 
+    uint32_t advertised_count = 0;
++   physical_dev->emulate_depth_clip = true;
++   physical_dev->emulate_xfb = physical_dev->zink;
+    for (uint32_t i = 0; i < count; i++) {
+       VkExtensionProperties *props = &exts[i];
+ 
++      if (!strcmp(props->extensionName, "VK_EXT_depth_clip_enable"))
++         physical_dev->emulate_depth_clip = false;
++      else if (!strcmp(props->extensionName, "VK_EXT_transform_feedback"))
++         physical_dev->emulate_xfb = false;
++
+       if (!strcmp(props->extensionName, "VK_KHR_external_memory_fd"))
+          physical_dev->KHR_external_memory_fd = true;
+       else if (!strcmp(props->extensionName, "VK_EXT_external_memory_dma_buf"))
+@@ -315,7 +322,19 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
+    emulated_count += 2 * physical_dev->is_dma_buf_emulated;
+    emulated_count += !physical_dev->EXT_image_drm_format_modifier;
+    emulated_count += !physical_dev->EXT_queue_family_foreign;
++   emulated_count += physical_dev->emulate_depth_clip;
++   emulated_count += physical_dev->emulate_xfb;
+    exts = realloc(exts, sizeof(*exts) * (advertised_count + emulated_count));
++   if (physical_dev->emulate_depth_clip) {
++      strcpy(prop.extensionName, VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
++      prop.specVersion = vkr_extension_get_spec_version(prop.extensionName);
++      exts[advertised_count++] = prop;
++   }
++   if (physical_dev->emulate_xfb) {
++      strcpy(prop.extensionName, VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME);
++      prop.specVersion = vkr_extension_get_spec_version(prop.extensionName);
++      exts[advertised_count++] = prop;
++   }
+    if (physical_dev->is_dma_buf_emulated) {
+       strcpy(prop.extensionName, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+       prop.specVersion = vkr_extension_get_spec_version(prop.extensionName);
+@@ -352,6 +371,26 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
+ 
+    physical_dev->extensions = realloc(exts, sizeof(*exts) * advertised_count);
+    physical_dev->extension_count = advertised_count;
++
++   /* Zink (OpenGL on Vulkan) needs robustness2's nullDescriptor, which
++    * MoltenVK lacks.  The device fills null descriptors in (vkr_device.c). */
++   bool robustness2 = false;
++   for (uint32_t i = 0; i < advertised_count; i++) {
++      if (!strcmp(physical_dev->extensions[i].extensionName, "VK_EXT_robustness2") ||
++          !strcmp(physical_dev->extensions[i].extensionName, "VK_KHR_robustness2"))
++         robustness2 = true;
++   }
++   if (robustness2 && vk->GetPhysicalDeviceFeatures2) {
++      VkPhysicalDeviceRobustness2FeaturesEXT rb2 = {
++         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT,
++      };
++      VkPhysicalDeviceFeatures2 feats = {
++         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
++         .pNext = &rb2,
++      };
++      vk->GetPhysicalDeviceFeatures2(handle, &feats);
++      physical_dev->emulate_null_descriptor = !rb2.nullDescriptor;
++   }
+ }
+ 
+ static void
+@@ -466,6 +505,7 @@ vkr_dispatch_vkEnumeratePhysicalDevices(struct vn_dispatch_context *dispatch,
+       }
+ 
+       physical_dev->base.handle.physical_device = instance->physical_device_handles[i];
++      physical_dev->zink = instance->engine_is_zink;
+ 
+       vkr_physical_device_init_proc_table(physical_dev, instance);
+       vkr_physical_device_init_properties(physical_dev);
+@@ -650,6 +690,59 @@ vkr_dispatch_vkGetPhysicalDeviceMemoryProperties(
+    *args->pMemoryProperties = physical_dev->memory_properties;
+ }
+ 
++/* Formats Metal lacks that zink needs for OpenGL 3.3 and 4.0 (see
++ * vkr_physical_device.h): offered, and read through the nearest one. */
++VkFormat
++vkr_physical_device_nearest_format(const struct vkr_physical_device *physical_dev,
++                                   VkFormat format,
++                                   bool vertex)
++{
++   if (!physical_dev->zink)
++      return format;
++   if (vertex) {
++      switch (format) {
++      case VK_FORMAT_A2B10G10R10_USCALED_PACK32:
++      case VK_FORMAT_A2R10G10B10_USCALED_PACK32:
++      case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
++         return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
++      case VK_FORMAT_A2B10G10R10_SSCALED_PACK32:
++      case VK_FORMAT_A2R10G10B10_SSCALED_PACK32:
++      case VK_FORMAT_A2R10G10B10_SNORM_PACK32:
++         return VK_FORMAT_A2B10G10R10_SNORM_PACK32;
++      default:
++         return format;
++      }
++   }
++   switch (format) {
++   case VK_FORMAT_R32G32B32_SFLOAT:
++      return VK_FORMAT_R32G32B32A32_SFLOAT;
++   case VK_FORMAT_R32G32B32_UINT:
++      return VK_FORMAT_R32G32B32A32_UINT;
++   case VK_FORMAT_R32G32B32_SINT:
++      return VK_FORMAT_R32G32B32A32_SINT;
++   default:
++      return format;
++   }
++}
++
++static void
++vkr_physical_device_fake_format(const struct vkr_physical_device *physical_dev,
++                                VkFormat format,
++                                VkFormatProperties *props,
++                                VkFormatProperties3 *props3)
++{
++   if (!physical_dev->zink)
++      return;
++   VkFormatFeatureFlags add = 0;
++   if (vkr_physical_device_nearest_format(physical_dev, format, true) != format)
++      add |= VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT;
++   if (vkr_physical_device_nearest_format(physical_dev, format, false) != format)
++      add |= VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT;
++   props->bufferFeatures |= add;
++   if (props3)
++      props3->bufferFeatures |= add;
++}
++
+ static void
+ vkr_dispatch_vkGetPhysicalDeviceFormatProperties(
+    UNUSED struct vn_dispatch_context *dispatch,
+@@ -662,6 +755,7 @@ vkr_dispatch_vkGetPhysicalDeviceFormatProperties(
+    vn_replace_vkGetPhysicalDeviceFormatProperties_args_handle(args);
+    vk->GetPhysicalDeviceFormatProperties(args->physicalDevice, args->format,
+                                          args->pFormatProperties);
++   vkr_physical_device_fake_format(physical_dev, args->format, args->pFormatProperties, NULL);
+ }
+ 
+ static void
+@@ -705,6 +799,28 @@ vkr_dispatch_vkGetPhysicalDeviceFeatures2(
+ 
+    vn_replace_vkGetPhysicalDeviceFeatures2_args_handle(args);
+    vk->GetPhysicalDeviceFeatures2(args->physicalDevice, args->pFeatures);
++
++   if (physical_dev->emulate_depth_clip) {
++      VkPhysicalDeviceDepthClipEnableFeaturesEXT *clip = vkr_find_struct(
++         args->pFeatures->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT);
++      if (clip)
++         clip->depthClipEnable = VK_TRUE;
++   }
++   if (physical_dev->emulate_xfb) {
++      VkPhysicalDeviceTransformFeedbackFeaturesEXT *xfb = vkr_find_struct(
++         args->pFeatures->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT);
++      if (xfb) {
++         xfb->transformFeedback = VK_TRUE;
++         xfb->geometryStreams = VK_FALSE;
++      }
++   }
++
++   if (physical_dev->emulate_null_descriptor) {
++      VkPhysicalDeviceRobustness2FeaturesEXT *rb2 = vkr_find_struct(
++         args->pFeatures->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT);
++      if (rb2)
++         rb2->nullDescriptor = VK_TRUE;
++   }
+ }
+ 
+ static void
+@@ -718,6 +834,24 @@ vkr_dispatch_vkGetPhysicalDeviceProperties2(
+ 
+    vn_replace_vkGetPhysicalDeviceProperties2_args_handle(args);
+    vk->GetPhysicalDeviceProperties2(args->physicalDevice, args->pProperties);
++
++   if (physical_dev->emulate_xfb) {
++      VkPhysicalDeviceTransformFeedbackPropertiesEXT *xfb = vkr_find_struct(
++         args->pProperties->pNext,
++         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_PROPERTIES_EXT);
++      if (xfb) {
++         xfb->maxTransformFeedbackStreams = 1;
++         xfb->maxTransformFeedbackBuffers = 4;
++         xfb->maxTransformFeedbackBufferSize = 1u << 30;
++         xfb->maxTransformFeedbackStreamDataSize = 512;
++         xfb->maxTransformFeedbackBufferDataSize = 512;
++         xfb->maxTransformFeedbackBufferDataStride = 2048;
++         xfb->transformFeedbackQueries = VK_TRUE;
++         xfb->transformFeedbackStreamsLinesTriangles = VK_FALSE;
++         xfb->transformFeedbackRasterizationStreamSelect = VK_FALSE;
++         xfb->transformFeedbackDraw = VK_TRUE;
++      }
++   }
+ }
+ 
+ static void
+@@ -768,6 +902,9 @@ vkr_dispatch_vkGetPhysicalDeviceFormatProperties2(
+    vn_replace_vkGetPhysicalDeviceFormatProperties2_args_handle(args);
+    vk->GetPhysicalDeviceFormatProperties2(args->physicalDevice, args->format,
+                                           args->pFormatProperties);
++   vkr_physical_device_fake_format(
++      physical_dev, args->format, &args->pFormatProperties->formatProperties,
++      vkr_find_struct(args->pFormatProperties->pNext, VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3));
+ 
+    /* emulate support for drm format modifiers */
+    if (!physical_dev->EXT_image_drm_format_modifier) {
+diff --git a/src/venus/vkr_physical_device.h b/src/venus/vkr_physical_device.h
+index d51c9f4..3a4f0a1 100644
+--- a/src/venus/vkr_physical_device.h
++++ b/src/venus/vkr_physical_device.h
+@@ -31,6 +31,20 @@ struct vkr_physical_device {
+ 
+    bool EXT_external_memory_host;
+ 
++   /* robustness2 without nullDescriptor (MoltenVK): we offer it and put
++    * small zeroed objects where the guest leaves a null descriptor */
++   bool emulate_null_descriptor;
++
++   /* VK_EXT_depth_clip_enable on depth clamp (Metal's clamp mode does both) */
++   bool emulate_depth_clip;
++
++   /* For zink only, so it offers OpenGL 4.3: VK_EXT_transform_feedback taken
++    * but not captured (nothing is written, queries count zero), and packed
++    * 10-bit vertex formats and RGB32 texel buffers Metal lacks, read through
++    * the nearest format it has.  Wrong for the few apps using those. */
++   bool zink;
++   bool emulate_xfb;
++
+    VkPhysicalDeviceMemoryProperties memory_properties;
+    VkPhysicalDeviceIDProperties id_properties;
+    bool is_dma_buf_fd_export_supported;
+@@ -49,6 +63,11 @@ VKR_DEFINE_OBJECT_CAST(physical_device, VK_OBJECT_TYPE_PHYSICAL_DEVICE, VkPhysic
+ void
+ vkr_context_init_physical_device_dispatch(struct vkr_context *ctx);
+ 
++VkFormat
++vkr_physical_device_nearest_format(const struct vkr_physical_device *physical_dev,
++                                   VkFormat format,
++                                   bool vertex);
++
+ void
+ vkr_physical_device_destroy(struct vkr_context *ctx,
+                             struct vkr_physical_device *physical_dev);
+diff --git a/src/venus/vkr_pipeline.c b/src/venus/vkr_pipeline.c
+index 76709b9..db60ff6 100644
+--- a/src/venus/vkr_pipeline.c
++++ b/src/venus/vkr_pipeline.c
+@@ -5,6 +5,8 @@
+ 
+ #include "vkr_pipeline.h"
+ 
++#include "vkr_physical_device.h"
++
+ #include "vkr_pipeline_gen.h"
+ 
+ static void
+@@ -105,6 +107,33 @@ vkr_dispatch_vkMergePipelineCaches(UNUSED struct vn_dispatch_context *dispatch,
+                                        args->pSrcCaches);
+ }
+ 
++/* What the host lacks and we emulate, before it sees the pipeline. */
++static void
++vkr_pipeline_fix_graphics(struct vkr_device *dev, const VkGraphicsPipelineCreateInfo *info)
++{
++   const struct vkr_physical_device *physical_dev = dev->physical_device;
++
++   /* VK_EXT_depth_clip_enable: no depth clip is depth clamp (Metal clamps
++    * and stops clipping at once, as OpenGL's GL_DEPTH_CLAMP does) */
++   VkPipelineRasterizationStateCreateInfo *rast =
++      (VkPipelineRasterizationStateCreateInfo *)info->pRasterizationState;
++   if (physical_dev->emulate_depth_clip && rast) {
++      const VkPipelineRasterizationDepthClipStateCreateInfoEXT *clip = vkr_find_struct(
++         rast->pNext, VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_DEPTH_CLIP_STATE_CREATE_INFO_EXT);
++      if (clip && !clip->depthClipEnable)
++         rast->depthClampEnable = VK_TRUE;
++   }
++
++   const VkPipelineVertexInputStateCreateInfo *vi = info->pVertexInputState;
++   if (physical_dev->zink && vi && vi->pVertexAttributeDescriptions) {
++      VkVertexInputAttributeDescription *attrs =
++         (VkVertexInputAttributeDescription *)vi->pVertexAttributeDescriptions;
++      for (uint32_t i = 0; i < vi->vertexAttributeDescriptionCount; i++)
++         attrs[i].format =
++            vkr_physical_device_nearest_format(physical_dev, attrs[i].format, true);
++   }
++}
++
+ static void
+ vkr_dispatch_vkCreateGraphicsPipelines(struct vn_dispatch_context *dispatch,
+                                        struct vn_command_vkCreateGraphicsPipelines *args)
+@@ -114,6 +143,9 @@ vkr_dispatch_vkCreateGraphicsPipelines(struct vn_dispatch_context *dispatch,
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct object_array arr;
+ 
++   for (uint32_t i = 0; i < args->createInfoCount; i++)
++      vkr_pipeline_fix_graphics(dev, &args->pCreateInfos[i]);
++
+    if (vkr_graphics_pipeline_create_array(ctx, args, &arr) < VK_SUCCESS)
+       return;
+ 
+diff --git a/src/venus/vkr_query_pool.c b/src/venus/vkr_query_pool.c
+index eb77fe4..e02e004 100644
+--- a/src/venus/vkr_query_pool.c
++++ b/src/venus/vkr_query_pool.c
+@@ -11,7 +11,56 @@ static void
+ vkr_dispatch_vkCreateQueryPool(struct vn_dispatch_context *dispatch,
+                                struct vn_command_vkCreateQueryPool *args)
+ {
+-   vkr_query_pool_create_and_add(dispatch->data, args);
++   struct vkr_device *dev = vkr_device_from_handle(args->device);
++   VkQueryPoolCreateInfo *info = (VkQueryPoolCreateInfo *)args->pCreateInfo;
++   const bool fake =
++      dev->fake_xfb && info->queryType == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT;
++   if (fake)
++      info->queryType = VK_QUERY_TYPE_OCCLUSION;
++
++   struct vkr_query_pool *pool = vkr_query_pool_create_and_add(dispatch->data, args);
++   if (pool)
++      pool->fake_xfb = fake;
++}
++
++/* Two values per query (written, needed), then availability if asked. */
++static void
++vkr_query_pool_fake_results(uint32_t count,
++                            size_t size,
++                            uint8_t *data,
++                            VkDeviceSize stride,
++                            VkQueryResultFlags flags)
++{
++   const size_t word = (flags & VK_QUERY_RESULT_64_BIT) ? 8 : 4;
++   const size_t words = 2 + !!(flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
++   for (uint32_t i = 0; i < count; i++) {
++      const uint64_t at = (uint64_t)i * stride;
++      if (at + words * word > size)
++         break;
++      memset(data + at, 0, words * word);
++      if (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT)
++         data[at + 2 * word] = 1;
++   }
++}
++
++void
++vkr_query_pool_fake_copy(struct vkr_device *dev,
++                         VkCommandBuffer cmd,
++                         uint32_t count,
++                         VkBuffer buffer,
++                         VkDeviceSize offset,
++                         VkDeviceSize stride,
++                         VkQueryResultFlags flags)
++{
++   const size_t word = (flags & VK_QUERY_RESULT_64_BIT) ? 8 : 4;
++   const size_t words = 2 + !!(flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
++   uint8_t data[24] = { 0 };
++   if (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT)
++      data[2 * word] = 1;
++   for (uint32_t i = 0; i < count; i++) {
++      dev->proc_table.CmdUpdateBuffer(cmd, buffer, offset + (VkDeviceSize)i * stride,
++                                      words * word, data);
++   }
+ }
+ 
+ static void
+@@ -28,6 +77,15 @@ vkr_dispatch_vkGetQueryPoolResults(UNUSED struct vn_dispatch_context *dispatch,
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
++   struct vkr_query_pool *pool = vkr_query_pool_from_handle(args->queryPool);
++   if (pool && pool->fake_xfb) {
++      if (args->pData)
++         vkr_query_pool_fake_results(args->queryCount, args->dataSize, args->pData,
++                                     args->stride, args->flags);
++      args->ret = VK_SUCCESS;
++      return;
++   }
++
+    vn_replace_vkGetQueryPoolResults_args_handle(args);
+    args->ret = vk->GetQueryPoolResults(args->device, args->queryPool, args->firstQuery,
+                                        args->queryCount, args->dataSize, args->pData,
+diff --git a/src/venus/vkr_query_pool.h b/src/venus/vkr_query_pool.h
+index 6bee13d..f8ead89 100644
+--- a/src/venus/vkr_query_pool.h
++++ b/src/venus/vkr_query_pool.h
+@@ -10,7 +10,19 @@
+ 
+ struct vkr_query_pool {
+    struct vkr_object base;
++   /* a VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT pool the host can't make:
++    * an occlusion pool stands in, never started, and results are zero */
++   bool fake_xfb;
+ };
++
++void
++vkr_query_pool_fake_copy(struct vkr_device *dev,
++                         VkCommandBuffer cmd,
++                         uint32_t count,
++                         VkBuffer buffer,
++                         VkDeviceSize offset,
++                         VkDeviceSize stride,
++                         VkQueryResultFlags flags);
+ VKR_DEFINE_OBJECT_CAST(query_pool, VK_OBJECT_TYPE_QUERY_POOL, VkQueryPool)
+ 
+ void
