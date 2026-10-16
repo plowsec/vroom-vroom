@@ -12,6 +12,63 @@ const MAX_MSG: usize = 16 << 20;
 pub const DRAG_ITEMS_MAX: usize = 4096;
 /// Biggest guest pointer picture, in pixels on a side.
 pub const CURSOR_MAX: u32 = 256;
+/// Most host USB devices a VM lists (its port pairs).
+pub const USB_PORTS_MAX: usize = 16;
+
+/// A host USB device, as the viewer names it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UsbDev {
+    /// "vendor:product", 4 hex digits each.
+    pub id: String,
+    /// Empty: none.
+    pub serial: String,
+    /// A label for people.
+    pub name: String,
+}
+
+impl UsbDev {
+    /// Plain text only, and short: these end up in the VM file and on
+    /// screen.
+    pub fn valid(&self) -> bool {
+        let hex = |s: &str| s.len() == 4 && s.bytes().all(|b| b.is_ascii_hexdigit());
+        let id = self.id.split_once(':').is_some_and(|(v, p)| hex(v) && hex(p));
+        let text = |s: &str, max: usize| s.len() <= max && !s.chars().any(char::is_control);
+        id && text(&self.serial, 126) && text(&self.name, 128)
+    }
+
+    fn encode(&self, p: &mut Vec<u8>) {
+        for s in [&self.id, &self.serial, &self.name] {
+            p.extend_from_slice(&(s.len() as u16).to_le_bytes());
+            p.extend_from_slice(s.as_bytes());
+        }
+    }
+
+    fn decode(p: &[u8], o: &mut usize) -> Result<UsbDev> {
+        let mut f = || -> Result<String> {
+            let len = u16::from_le_bytes(p.get(*o..*o + 2).ok_or(Error::Proto("short"))?.try_into().map_err(|_| Error::Proto("short"))?) as usize;
+            let s = text(p.get(*o + 2..*o + 2 + len).ok_or(Error::Proto("short"))?)?;
+            *o += 2 + len;
+            Ok(s)
+        };
+        let d = UsbDev { id: f()?, serial: f()?, name: f()? };
+        if !d.valid() {
+            return Err(Error::Proto("usb device"));
+        }
+        Ok(d)
+    }
+}
+
+/// A host device on one of the VM's USB port pairs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsbPort {
+    pub port: u8,
+    pub dev: UsbDev,
+    /// Its helper has it open (else it was unplugged from the Mac, or
+    /// not found yet).
+    pub here: bool,
+    /// From the VM file (`[[usb]]`), connected at every start.
+    pub always: bool,
+}
 
 /// VMM -> viewer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +94,9 @@ pub enum ToViewer {
     /// The dropped files are in the guest (`ok`), or why not. `place`:
     /// where they went, without a live drag.
     DropDone { id: u32, ok: bool, place: String },
+    /// The host USB devices the VM has now. Sent once the VM has a USB
+    /// controller to plug them into, and whenever the list changes.
+    Usb(Vec<UsbPort>),
 }
 
 /// What the guest's pointer looks like.
@@ -91,6 +151,12 @@ pub enum ToVmm {
     /// Dropped: comes with a pipe (SCM_RIGHTS) the viewer writes the
     /// files into, as guest agent frames (DropEntry, DropData, DropEnd).
     Drop { id: u32 },
+    /// Plug a host USB device in: comes with the socket of the helper the
+    /// viewer started for it (SCM_RIGHTS), which the VMM talks to as it
+    /// does to the helpers it starts itself.
+    UsbAttach(UsbDev),
+    /// Pull the device on this port pair out; its helper is told to go.
+    UsbDetach { port: u8 },
 }
 
 fn frame(ty: u8, payload: &[u8]) -> Vec<u8> {
@@ -142,6 +208,15 @@ impl ToViewer {
                 p.extend_from_slice(place.as_bytes());
                 frame(9, &p)
             }
+            ToViewer::Usb(ports) => {
+                let mut p = vec![ports.len() as u8];
+                for u in ports {
+                    p.push(u.port);
+                    p.push(u.here as u8 | (u.always as u8) << 1);
+                    u.dev.encode(&mut p);
+                }
+                frame(10, &p)
+            }
         }
     }
 
@@ -172,6 +247,24 @@ impl ToViewer {
             }),
             8 if p.len() == 5 => ToViewer::DragReady { id: get_u32(p, 0)?, live: p[4] != 0 },
             9 if p.len() >= 5 => ToViewer::DropDone { id: get_u32(p, 0)?, ok: p[4] != 0, place: text(&p[5..])?.chars().take(256).collect() },
+            10 => {
+                let n = *p.first().ok_or(Error::Proto("short"))? as usize;
+                if n > USB_PORTS_MAX {
+                    return Err(Error::Proto("usb ports"));
+                }
+                let mut o = 1;
+                let mut ports = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let (port, flags) = (*p.get(o).ok_or(Error::Proto("short"))?, *p.get(o + 1).ok_or(Error::Proto("short"))?);
+                    o += 2;
+                    let dev = UsbDev::decode(p, &mut o)?;
+                    ports.push(UsbPort { port, dev, here: flags & 1 != 0, always: flags & 2 != 0 });
+                }
+                if o != p.len() {
+                    return Err(Error::Proto("usb ports"));
+                }
+                ToViewer::Usb(ports)
+            }
             _ => return Err(Error::Proto("unknown viewer message")),
         })
     }
@@ -199,6 +292,12 @@ impl ToVmm {
             }
             ToVmm::DragCancel { id } => frame(10, &id.to_le_bytes()),
             ToVmm::Drop { id } => frame(11, &id.to_le_bytes()),
+            ToVmm::UsbAttach(d) => {
+                let mut p = Vec::new();
+                d.encode(&mut p);
+                frame(12, &p)
+            }
+            ToVmm::UsbDetach { port } => frame(13, &[*port]),
         }
     }
 
@@ -249,6 +348,15 @@ impl ToVmm {
             }
             10 if p.len() == 4 => ToVmm::DragCancel { id: get_u32(p, 0)? },
             11 if p.len() == 4 => ToVmm::Drop { id: get_u32(p, 0)? },
+            12 => {
+                let mut o = 0;
+                let d = UsbDev::decode(p, &mut o)?;
+                if o != p.len() {
+                    return Err(Error::Proto("usb device"));
+                }
+                ToVmm::UsbAttach(d)
+            }
+            13 if p.len() == 1 => ToVmm::UsbDetach { port: p[0] },
             _ => return Err(Error::Proto("unknown vmm message")),
         })
     }
@@ -318,6 +426,8 @@ mod tests {
             ToVmm::DragEnter { id: 4, items: vec![("a.txt".into(), false), ("dir".into(), true)] },
             ToVmm::DragCancel { id: 4 },
             ToVmm::Drop { id: 4 },
+            ToVmm::UsbAttach(UsbDev { id: "1209:000a".into(), serial: "A1".into(), name: "dev board".into() }),
+            ToVmm::UsbDetach { port: 3 },
         ];
         let mut d = Decoder::default();
         for m in &vm {
@@ -336,6 +446,11 @@ mod tests {
             ToViewer::Cursor(GuestCursor::Unset),
             ToViewer::DragReady { id: 4, live: true },
             ToViewer::DropDone { id: 4, ok: false, place: "Desktop".into() },
+            ToViewer::Usb(vec![]),
+            ToViewer::Usb(vec![
+                UsbPort { port: 0, dev: UsbDev { id: "1209:000a".into(), serial: String::new(), name: "x".into() }, here: true, always: true },
+                UsbPort { port: 5, dev: UsbDev { id: "05ac:12a8".into(), serial: "s".into(), name: String::new() }, here: false, always: false },
+            ]),
         ];
         for m in &v {
             d.push(&m.encode());
@@ -374,5 +489,28 @@ mod tests {
         assert!(d.next_to_viewer().is_err());
         d.push(&img(2, 2, 1, 16));
         assert!(matches!(d.next_to_viewer().unwrap(), Some(ToViewer::Cursor(GuestCursor::Image { w: 2, h: 2, .. }))));
+    }
+
+    #[test]
+    fn usb_devices_are_checked() {
+        let dev = |id: &str, serial: &str, name: &str| UsbDev { id: id.into(), serial: serial.into(), name: name.into() };
+        let mut d = Decoder::default();
+        for bad in [dev("1209:0a", "", ""), dev("1209:000g", "", ""), dev("1209000a", "", ""), dev("1209:000a", "a\nb", ""), dev("1209:000a", "", &"n".repeat(129))] {
+            assert!(!bad.valid(), "{bad:?}");
+            d.push(&ToVmm::UsbAttach(bad).encode());
+            assert!(d.next_to_vmm().is_err());
+        }
+        // Trailing bytes, a list longer than it says, too many ports.
+        let mut p = Vec::new();
+        dev("1209:000a", "", "").encode(&mut p);
+        p.push(0);
+        d.push(&frame(12, &p));
+        assert!(d.next_to_vmm().is_err());
+        d.push(&frame(10, &[1]));
+        assert!(d.next_to_viewer().is_err());
+        d.push(&frame(10, &[USB_PORTS_MAX as u8 + 1]));
+        assert!(d.next_to_viewer().is_err());
+        d.push(&frame(13, &[1, 2]));
+        assert!(d.next_to_vmm().is_err());
     }
 }

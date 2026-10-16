@@ -19,6 +19,7 @@ use vroom_virtio::devices::gpu::{Cursor, DisplaySink};
 use vroom_virtio::devices::input::{self as ev, event};
 
 use crate::agent::{Agent, AgentCmd, ClipboardProvider};
+use crate::usb::UsbPorts;
 use crate::vcpu::VmEvent;
 
 /// Sends to the viewer without ever blocking the caller.
@@ -51,6 +52,8 @@ struct Sticky {
     state: Option<String>,
     /// "guest agent connected (...)".
     agent: Option<String>,
+    /// Host USB devices plugged in (once there is a USB controller).
+    usb: Option<Vec<vroom_display::UsbPort>>,
 }
 
 impl std::fmt::Debug for ViewerTx {
@@ -107,6 +110,7 @@ impl ViewerTx {
         first.extend(st.mic.map(ToViewer::Mic));
         first.extend(st.agent.clone().map(ToViewer::Status));
         first.extend(st.state.clone().map(ToViewer::Status));
+        first.extend(st.usb.clone().map(ToViewer::Usb));
         drop(st);
         for m in first {
             v.write_all(&m.encode())?;
@@ -125,6 +129,7 @@ impl ViewerTx {
                 st.state = Some(t.clone())
             }
             ToViewer::Status(t) if t.starts_with("guest agent connected") => st.agent = Some(t.clone()),
+            ToViewer::Usb(l) => st.usb = Some(l.clone()),
             _ => {}
         }
     }
@@ -425,8 +430,9 @@ impl DisplayServer {
         events: Sender<VmEvent>,
         window: Option<Box<dyn Fn(bool) + Send + Sync>>,
         listener: Option<(UnixListener, Arc<FbSink>)>,
+        usb: Option<Arc<UsbPorts>>,
     ) -> std::io::Result<()> {
-        let ctx = Arc::new(Serve { input, agent, events, window, latest: self.clip_latest, tx: self.tx });
+        let ctx = Arc::new(Serve { input, agent, events, window, latest: self.clip_latest, tx: self.tx, usb });
         let c = ctx.clone();
         let first = self.stream;
         std::thread::Builder::new().name("display".into()).spawn(move || serve(first, &c))?;
@@ -466,13 +472,17 @@ struct Serve {
     window: Option<Box<dyn Fn(bool) + Send + Sync>>,
     latest: Arc<Mutex<Option<String>>>,
     tx: ViewerTx,
+    /// Host USB devices plugged in while the VM runs (if it has a USB
+    /// controller).
+    usb: Option<Arc<UsbPorts>>,
 }
 
 /// Read one viewer's input until it goes away.
 fn serve(stream: UnixStream, c: &Serve) {
     let mut dec = Decoder::default();
     let mut buf = vec![0u8; 64 << 10];
-    // Fds that came with the bytes (a drop's pipe), in order.
+    // Fds that came with the bytes (a drop's pipe, a USB helper's
+    // socket), in order.
     let mut fds = Vec::new();
     loop {
         let n = match vroom_ipc::read_with_fds(&stream, &mut buf, &mut fds) {
@@ -486,6 +496,25 @@ fn serve(stream: UnixStream, c: &Serve) {
                     Some(from) => c.agent.send(AgentCmd::Drop { id, from }),
                     None => log::warn!("display: a drop without its pipe"),
                 },
+                Ok(Some(ToVmm::UsbAttach(dev))) => {
+                    let Some(fd) = (!fds.is_empty()).then(|| fds.remove(0)) else {
+                        log::warn!("display: a USB device without its helper");
+                        continue;
+                    };
+                    let r = match &c.usb {
+                        Some(u) => u.attach(dev, UnixStream::from(fd)),
+                        None => Err("this VM has no USB controller".into()),
+                    };
+                    if let Err(e) = r {
+                        log::warn!("usb: {e}");
+                        c.tx.send(&ToViewer::Status(format!("USB: {e}")));
+                    }
+                }
+                Ok(Some(ToVmm::UsbDetach { port })) => {
+                    if let Some(u) = &c.usb {
+                        u.detach(port);
+                    }
+                }
                 Ok(Some(m)) => handle(m, c.input.as_ref(), &c.agent, &c.events, &c.latest),
                 Ok(None) => break,
                 Err(e) => {
@@ -563,8 +592,8 @@ fn handle(
         }
         ToVmm::DragEnter { id, items } => agent.send(AgentCmd::DragEnter { id, items }),
         ToVmm::DragCancel { id } => agent.send(AgentCmd::DragCancel { id }),
-        // serve() pairs it with its pipe.
-        ToVmm::Drop { .. } => {}
+        // serve() pairs these with their fds.
+        ToVmm::Drop { .. } | ToVmm::UsbAttach(_) | ToVmm::UsbDetach { .. } => {}
     }
 }
 

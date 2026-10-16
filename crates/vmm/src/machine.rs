@@ -684,6 +684,7 @@ pub(crate) fn build(
     // helper process (started here, before the sandbox).
     let mut input = None;
     let mut xhci = None;
+    let mut usb_ports = None;
     if (screen.is_some() && board.use_pci) || !config.usb.is_empty() {
         let mut helpers = Vec::new();
         let mut links = Vec::new();
@@ -702,9 +703,8 @@ pub(crate) fn build(
             x
         })?;
         if let Some(x) = &xhci {
-            for (i, h) in helpers.into_iter().enumerate() {
-                h.run(i, x.clone())?;
-            }
+            let viewer = ui.as_ref().map(|d| d.tx());
+            usb_ports = Some(crate::usb::UsbPorts::new(x.clone(), helpers, viewer)?);
         }
     }
     if screen.is_some() {
@@ -746,7 +746,7 @@ pub(crate) fn build(
             }
             _ => None,
         };
-        ds.run(input, agent.clone(), events.clone(), window, listener)?;
+        ds.run(input, agent.clone(), events.clone(), window, listener, usb_ports)?;
     }
     for (i, n) in config.nets.iter().enumerate() {
         let mac = match &n.mac {

@@ -10,6 +10,11 @@ Commands, one per line, on <state-dir>.cmd (a fifo):
   serial TEXT            to the serial console (\\n for Enter)
   drop X Y X2 Y2 PATH... drag files in at X,Y, move to X2,Y2, drop there
                          (what the app does when files come from Finder)
+  usb ID [SERIAL]        plug a host USB device in, as the app does: start
+                         `vroom usb-host` for it, hand the VMM its socket
+                         (VROOM_USB_FAKE=acm in our environment: a pretend
+                         serial port)
+  usbdetach PORT         pull out the device on that port pair
 Viewer events (mode, clipboard, status, mic, guest pointer: its picture as
 <state-dir>.cursor-N.png) go to <state-dir>.events.
 """
@@ -67,6 +72,15 @@ def reader():
                 i, ok = struct.unpack("<IB", pl[:5]); place = pl[5:].decode(errors="replace")
                 ev.write(f"dropdone {i} {ok} {place}\n")
                 drag_ev.append(("done", i, ok)); drag_cv.set()
+            elif t == 10:
+                n, o, out = pl[0], 1, []
+                for _ in range(n):
+                    port, flags = pl[o], pl[o + 1]; o += 2
+                    f = []
+                    for _ in range(3):
+                        ln = struct.unpack("<H", pl[o:o + 2])[0]; f.append(pl[o + 2:o + 2 + ln].decode()); o += 2 + ln
+                    out.append(f"{port}:{f[0]}{'' if flags & 1 else '(away)'}{'(always)' if flags & 2 else ''}")
+                ev.write("usb " + " ".join(out) + "\n")
             elif t == 7:
                 if pl[0] != 2:
                     ev.write("cursor " + ("unset", "hidden")[pl[0]] + "\n"); continue
@@ -165,6 +179,16 @@ def drop(x, y, x2, y2, paths):
     if live:
         button(0x110, False)
 
+helpers = []
+def usb_attach(id_, serial=""):
+    r, w = socket.socketpair()
+    args = [vroom, "usb-host", "--id", id_] + (["--serial", serial] if serial else [])
+    helpers.append(subprocess.Popen(args, stdin=w.fileno(), stdout=subprocess.DEVNULL,
+                                    stderr=open(state + ".log", "ab")))
+    w.close()
+    pl = b"".join(struct.pack("<H", len(x.encode())) + x.encode() for x in (id_, serial, "test " + id_))
+    socket.send_fds(a, [struct.pack("<BI", 12, len(pl)) + pl], [r.fileno()]); r.close()
+
 send(6, b"\x01")  # focused: lets clipboard flow
 import select
 def lines():
@@ -210,6 +234,8 @@ if True:
                 elif c == "drop":
                     v = arg.split(" ", 4)
                     drop(int(v[0]), int(v[1]), int(v[2]), int(v[3]), v[4].split("|"))
+                elif c == "usb": usb_attach(*arg.split())
+                elif c == "usbdetach": send(13, bytes([int(arg)]))
                 elif c == "quit": p.stdin.write(b"\x01x"); p.stdin.flush()
             except Exception as e:
                 ev.write(f"error {line.strip()}: {e}\n")
