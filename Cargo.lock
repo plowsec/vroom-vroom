@@ -5365,6 +5365,7 @@ dependencies = [
  "serde_json",
  "vroom-proto",
  "windows-sys 0.59.0",
+ "x11rb",
 ]
 
 [[package]]

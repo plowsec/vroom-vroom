@@ -33,6 +33,8 @@ pub mod features {
     /// Coherence: the agent reports the guest's windows (`Windows`) and
     /// acts on them (`WindowDo`).
     pub const COHERENCE: u64 = 128;
+    /// The agent can start an app by name for the host (`StartApp`).
+    pub const START_APP: u64 = 1024;
 }
 
 /// Most windows one `Windows` list may carry, and the longest title (bytes).
@@ -40,6 +42,10 @@ pub const WINDOWS_MAX: usize = 64;
 pub const TITLE_MAX: usize = 256;
 /// Window rectangles stay within this many pixels of the origin.
 pub const COORD_MAX: i32 = 1 << 16;
+/// Biggest window icon, in pixels on a side.
+pub const ICON_MAX: u32 = 64;
+/// Longest app name `StartApp` carries, and longest reason in `CoherenceNo`.
+pub const START_MAX: usize = 256;
 
 /// One of the guest's top-level windows (Coherence).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,6 +147,42 @@ pub enum Message {
     Windows(Vec<GuestWindow>),
     /// Host -> guest: do this to a window of the last list.
     WindowDo { id: u32, op: WindowOp },
+    /// Guest -> host: the app icon of a window of the last list, `w` x
+    /// `h` RGBA (not premultiplied), at most `ICON_MAX` on a side; 0 x 0:
+    /// it has none. Sent when it changes.
+    WindowIcon { id: u32, w: u32, h: u32, rgba: Vec<u8> },
+    /// Host -> guest: start the app with this name, as typing it in the
+    /// Start menu (Windows) would. Plain text, at most `START_MAX` bytes.
+    StartApp(String),
+    /// Guest -> host: Coherence can't work in this session, and why
+    /// ("a Wayland session"). Short plain text.
+    CoherenceNo(String),
+}
+
+/// Whether `s` is fit for `StartApp` / `CoherenceNo`: short, one line.
+pub fn line_ok(s: &str) -> bool {
+    !s.is_empty() && s.len() <= START_MAX && !s.chars().any(char::is_control)
+}
+
+/// A window icon as bytes: `id u32 | w u16 | h u16 | rgba`.
+pub fn encode_icon(id: u32, w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
+    let mut p = id.to_le_bytes().to_vec();
+    p.extend_from_slice(&(w as u16).to_le_bytes());
+    p.extend_from_slice(&(h as u16).to_le_bytes());
+    p.extend_from_slice(rgba);
+    p
+}
+
+/// The other way, checked: sides of at most `ICON_MAX` (both 0 or
+/// neither), exactly `w * h * 4` bytes of pixels.
+pub fn decode_icon(p: &[u8]) -> Option<(u32, u32, u32, Vec<u8>)> {
+    let id = u32::from_le_bytes(p.get(0..4)?.try_into().ok()?);
+    let w = u16::from_le_bytes(p.get(4..6)?.try_into().ok()?) as u32;
+    let h = u16::from_le_bytes(p.get(6..8)?.try_into().ok()?) as u32;
+    if w > ICON_MAX || h > ICON_MAX || (w == 0) != (h == 0) || p.len() - 8 != (w * h * 4) as usize {
+        return None;
+    }
+    Some((id, w, h, p[8..].to_vec()))
 }
 
 fn rect_ok(x: i32, y: i32, w: u32, h: u32) -> bool {
@@ -268,6 +310,9 @@ const T_DROP_DONE: u8 = 16;
 const T_COHERENCE: u8 = 17;
 const T_WINDOWS: u8 = 18;
 const T_WINDOW_DO: u8 = 19;
+const T_WINDOW_ICON: u8 = 28;
+const T_START_APP: u8 = 29;
+const T_COHERENCE_NO: u8 = 30;
 
 impl Message {
     pub fn encode(&self) -> Vec<u8> {
@@ -335,6 +380,9 @@ impl Message {
                 p.extend_from_slice(&op.encode());
                 (T_WINDOW_DO, p)
             }
+            Message::WindowIcon { id, w, h, rgba } => (T_WINDOW_ICON, encode_icon(*id, *w, *h, rgba)),
+            Message::StartApp(s) => (T_START_APP, s.as_bytes().to_vec()),
+            Message::CoherenceNo(s) => (T_COHERENCE_NO, s.as_bytes().to_vec()),
         };
         let mut out = Vec::with_capacity(HDR + payload.len());
         out.extend_from_slice(&MAGIC);
@@ -423,6 +471,21 @@ impl Message {
             T_COHERENCE if p.len() == 1 => Message::Coherence { on: p[0] != 0 },
             T_WINDOWS => Message::Windows(decode_windows(p).ok_or(Error::Malformed)?),
             T_WINDOW_DO if p.len() > 4 => Message::WindowDo { id: u32_at(0)?, op: WindowOp::decode(&p[4..]).ok_or(Error::Malformed)? },
+            T_WINDOW_ICON => {
+                let (id, w, h, rgba) = decode_icon(p).ok_or(Error::Malformed)?;
+                Message::WindowIcon { id, w, h, rgba }
+            }
+            T_START_APP | T_COHERENCE_NO => {
+                let s = std::str::from_utf8(p).map_err(|_| Error::Malformed)?;
+                if !line_ok(s) {
+                    return Err(Error::Malformed);
+                }
+                if ty == T_START_APP {
+                    Message::StartApp(s.to_string())
+                } else {
+                    Message::CoherenceNo(s.to_string())
+                }
+            }
             T_TIME | T_RES | T_SCALE | T_SHUTDOWN | T_PING | T_PONG | T_GPU3D | T_DRAG_READY | T_DRAG_CANCEL | T_DROP_ENTRY | T_DROP_DATA
             | T_DROP_END | T_DROP_DONE | T_COHERENCE | T_WINDOW_DO => return Err(Error::Malformed),
             t => return Err(Error::Type(t)),
@@ -521,6 +584,10 @@ mod tests {
             Message::WindowDo { id: 1, op: WindowOp::Close },
             Message::WindowDo { id: 1, op: WindowOp::Minimize },
             Message::WindowDo { id: 1, op: WindowOp::Move { x: -5, y: 3, w: 640, h: 480 } },
+            Message::WindowIcon { id: 0x1234, w: 2, h: 1, rgba: vec![1, 2, 3, 4, 5, 6, 7, 8] },
+            Message::WindowIcon { id: 9, w: 0, h: 0, rgba: Vec::new() },
+            Message::StartApp("Notepad".into()),
+            Message::CoherenceNo("a Wayland session".into()),
         ]
     }
 
@@ -551,6 +618,26 @@ mod tests {
         let mut m = WindowOp::Move { x: 0, y: 0, w: 1, h: 1 }.encode();
         m[9..13].copy_from_slice(&0u32.to_le_bytes());
         assert_eq!(WindowOp::decode(&m), None);
+    }
+
+    #[test]
+    fn icons_and_names_are_checked() {
+        let bad = |p: Vec<u8>| decode_icon(&p).is_none();
+        assert!(!bad(encode_icon(1, ICON_MAX, ICON_MAX, &vec![0; (ICON_MAX * ICON_MAX * 4) as usize])));
+        assert!(bad(encode_icon(1, ICON_MAX + 1, 1, &vec![0; ((ICON_MAX + 1) * 4) as usize])), "too wide");
+        assert!(bad(encode_icon(1, 2, 2, &[0; 15])), "short");
+        assert!(bad(encode_icon(1, 2, 2, &[0; 17])), "long");
+        assert!(bad(encode_icon(1, 0, 2, &[])), "half empty");
+        assert!(bad(vec![1, 0, 0]), "no header");
+        for s in ["", "a\nb", "\u{7}", &"x".repeat(START_MAX + 1)] {
+            let mut d = Decoder::new(1 << 20);
+            let f = Message::StartApp("x".into()).encode();
+            let mut f = f[..4].to_vec();
+            f.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            f.extend_from_slice(s.as_bytes());
+            d.push(&f);
+            assert_eq!(d.next(), Err(Error::Malformed), "{s:?}");
+        }
     }
 
     #[test]

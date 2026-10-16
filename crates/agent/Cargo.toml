@@ -23,9 +23,11 @@ libc.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 # Reads Mutter's display state (busctl --json) to set the scale on Wayland.
 serde_json.workspace = true
+# Coherence on X11 (already in the tree through arboard).
+x11rb = "0.13"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_System_SystemInformation", "Win32_System_Time", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading", "Win32_Devices_Display", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Services", "Win32_System_Pipes", "Win32_System_RemoteDesktop", "Win32_Devices_DeviceAndDriverInstallation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_System_Ole", "Win32_System_Com", "Win32_System_LibraryLoader", "Win32_Graphics_Dwm", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Com_StructuredStorage", "Win32_UI_HiDpi"] }
+windows-sys = { version = "0.59", features = ["Win32_System_SystemInformation", "Win32_System_Time", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading", "Win32_Devices_Display", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Services", "Win32_System_Pipes", "Win32_System_RemoteDesktop", "Win32_Devices_DeviceAndDriverInstallation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_System_Ole", "Win32_System_Com", "Win32_System_LibraryLoader", "Win32_Graphics_Dwm", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Com_StructuredStorage", "Win32_UI_HiDpi", "Win32_UI_Accessibility", "Win32_UI_Input_KeyboardAndMouse"] }
 
 [lints]
 workspace = true

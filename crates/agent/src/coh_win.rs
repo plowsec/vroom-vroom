@@ -9,10 +9,26 @@
 
 #![allow(unsafe_code)]
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::c_void;
+use std::time::Duration;
 
 use vroom_proto::{win_flags, GuestWindow, WindowOp};
-use windows_sys::Win32::Foundation::{HWND, RECT};
+use windows_sys::Win32::Foundation::{CloseHandle, HWND, RECT};
+use windows_sys::Win32::Graphics::Gdi::{
+    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GdiFlush, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
+};
+use windows_sys::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
+use windows_sys::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VK_LWIN, VK_RETURN};
+use windows_sys::Win32::UI::Shell::ExtractIconExW;
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    DestroyIcon, DispatchMessageW, DrawIconEx, FindWindowExW, GetClassLongPtrW, GetMessageW, PostThreadMessageW, SendMessageTimeoutW, TranslateMessage,
+    CHILDID_SELF, DI_NORMAL, EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_UNCLOAKED, EVENT_SYSTEM_FOREGROUND,
+    EVENT_SYSTEM_MINIMIZEEND, GCLP_HICON, GCLP_HICONSM, HICON, ICON_BIG, ICON_SMALL, ICON_SMALL2, OBJID_WINDOW, SMTO_ABORTIFHUNG, WINEVENT_OUTOFCONTEXT,
+    WINEVENT_SKIPOWNPROCESS, WM_GETICON, WM_QUIT,
+};
 use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId};
 use windows_sys::Win32::UI::HiDpi::{SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
@@ -31,6 +47,12 @@ const SKIP: &[&str] = &["Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryT
 pub struct WinDesktop {
     /// The handles of the last list (the host may only touch those).
     listed: Vec<isize>,
+    /// Icons made, by window: the icon handle they were made from.
+    icons: HashMap<isize, (isize, Option<crate::coherence::Icon>)>,
+    /// Icons of programs (Store apps' windows have none of their own).
+    exe_icons: HashMap<String, Option<crate::coherence::Icon>>,
+    /// The thread with the window event hooks, and its id.
+    hook: Option<(u32, std::thread::JoinHandle<()>)>,
     /// The taskbar may be hidden (by us, or by an agent that crashed).
     hidden: bool,
     /// This process hid it.
@@ -188,7 +210,7 @@ impl WinDesktop {
             PeekMessageW(&mut m, std::ptr::null_mut(), 0, 0, PM_NOREMOVE);
         }
         // Not ours yet; shell(false) at start shows it if a crashed agent hid it.
-        WinDesktop { listed: Vec::new(), hidden: true, ours: false, fg_seen: 0, explain: false }
+        WinDesktop { listed: Vec::new(), icons: HashMap::new(), exe_icons: HashMap::new(), hook: None, hidden: true, ours: false, fg_seen: 0, explain: false }
     }
 
     fn list(&mut self) -> Vec<GuestWindow> {
@@ -291,6 +313,87 @@ impl crate::coherence::Desktop for WinDesktop {
         real_pixels(|| self.list())
     }
 
+    fn icon(&mut self, id: u32) -> Option<crate::coherence::Icon> {
+        let h = hwnd(id);
+        if !self.listed.contains(&(h as isize)) {
+            return None;
+        }
+        let listed = &self.listed;
+        self.icons.retain(|w, _| listed.contains(w));
+        let size = crate::coherence::ICON_SIZE as i32;
+        if let Some(hi) = window_icon(h) {
+            if let Some((was, icon)) = self.icons.get(&(h as isize)) {
+                if *was == hi as isize {
+                    return icon.clone();
+                }
+            }
+            let icon = render(hi, size);
+            self.icons.insert(h as isize, (hi as isize, icon.clone()));
+            return icon;
+        }
+        // No icon of its own: its program's (a Store app's window shows
+        // the app's, not the frame host's).
+        let path = exe_of(app_window(h))?;
+        if self.exe_icons.len() > 64 {
+            self.exe_icons.clear();
+        }
+        if let Some(i) = self.exe_icons.get(&path) {
+            return i.clone();
+        }
+        let w = wide(&path);
+        let mut big: HICON = std::ptr::null_mut();
+        // SAFETY: a NUL-terminated path; one icon asked, ours to destroy.
+        let icon = unsafe {
+            if ExtractIconExW(w.as_ptr(), 0, &mut big, std::ptr::null_mut(), 1) > 0 && !big.is_null() {
+                let i = render(big, size);
+                DestroyIcon(big);
+                i
+            } else {
+                None
+            }
+        };
+        self.exe_icons.insert(path, icon.clone());
+        icon
+    }
+
+    fn watch(&mut self, poke: Option<crate::coherence::Poke>) -> bool {
+        if let Some((tid, t)) = self.hook.take() {
+            // SAFETY: a plain call; the thread ends its message loop.
+            unsafe { PostThreadMessageW(tid, WM_QUIT, 0, 0) };
+            let _ = t.join();
+        }
+        let Some(poke) = poke else { return true };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = std::thread::Builder::new().name("coherence-events".into()).spawn(move || events(poke, tx));
+        let Ok(t) = t else { return false };
+        match rx.recv() {
+            Ok((tid, true)) => {
+                self.hook = Some((tid, t));
+                true
+            }
+            _ => {
+                log::warn!("coherence: no window events, looking every {:?}", crate::coherence::EVERY);
+                let _ = t.join();
+                false
+            }
+        }
+    }
+
+    fn start(&mut self, name: &str) {
+        // As a user would: the Start menu, the name in its search, Enter.
+        // Typed as characters, whatever the keyboard layout. On a thread:
+        // Start takes a moment to open and to search.
+        let name: Vec<u16> = name.encode_utf16().collect();
+        let _ = std::thread::Builder::new().name("start-app".into()).spawn(move || {
+            send_keys(&[key(VK_LWIN, false), key(VK_LWIN, true)]);
+            std::thread::sleep(Duration::from_millis(700));
+            let typed: Vec<INPUT> = name.iter().flat_map(|&u| [unicode(u, false), unicode(u, true)]).collect();
+            send_keys(&typed);
+            std::thread::sleep(Duration::from_millis(900));
+            send_keys(&[key(VK_RETURN, false), key(VK_RETURN, true)]);
+        });
+    }
+
     fn act(&mut self, id: u32, op: WindowOp) {
         let h = hwnd(id);
         if !self.listed.contains(&(h as isize)) {
@@ -356,4 +459,190 @@ impl crate::coherence::Desktop for WinDesktop {
             }
         });
     }
+}
+
+thread_local! {
+    /// The event thread's poke (hook callbacks have no context pointer).
+    static POKE: RefCell<Option<crate::coherence::Poke>> = const { RefCell::new(None) };
+}
+
+/// The event thread: window event hooks (out of context: Windows calls
+/// us on this thread, from its message loop) until WM_QUIT.
+fn events(poke: crate::coherence::Poke, ready: std::sync::mpsc::Sender<(u32, bool)>) {
+    POKE.with(|p| *p.borrow_mut() = Some(poke));
+    // SAFETY: plain calls; the hooks are removed before the thread ends.
+    unsafe {
+        let mut m: MSG = std::mem::zeroed();
+        PeekMessageW(&mut m, std::ptr::null_mut(), 0, 0, PM_NOREMOVE);
+        let flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
+        // System events (foreground, menus, move and size, minimize),
+        // then object events (create .. uncloaked).
+        let a = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, std::ptr::null_mut(), Some(on_event), 0, 0, flags);
+        let b = SetWinEventHook(EVENT_OBJECT_CREATE, EVENT_OBJECT_UNCLOAKED, std::ptr::null_mut(), Some(on_event), 0, 0, flags);
+        let ok = !a.is_null() && !b.is_null();
+        let _ = ready.send((GetCurrentThreadId(), ok));
+        if ok {
+            while GetMessageW(&mut m, std::ptr::null_mut(), 0, 0) > 0 {
+                TranslateMessage(&m);
+                DispatchMessageW(&m);
+            }
+        }
+        for h in [a, b] {
+            if !h.is_null() {
+                UnhookWinEvent(h);
+            }
+        }
+    }
+}
+
+unsafe extern "system" fn on_event(_hook: HWINEVENTHOOK, event: u32, h: HWND, obj: i32, child: i32, _thread: u32, _time: u32) {
+    let wanted = if event < EVENT_OBJECT_CREATE {
+        true
+    } else {
+        // Top-level windows only (a destroyed or hidden one may have no
+        // root any more). Not the caret, the pointer, controls inside
+        // windows: they come by the thousand.
+        // SAFETY: a plain call; a stale handle makes it return null.
+        let root = unsafe { GetAncestor(h, GA_ROOT) };
+        let gone = matches!(event, EVENT_OBJECT_DESTROY | EVENT_OBJECT_HIDE) && root.is_null();
+        obj == OBJID_WINDOW && child == CHILDID_SELF as i32 && !h.is_null() && (root == h || gone)
+    };
+    if wanted {
+        POKE.with(|p| {
+            if let Some(p) = p.borrow().as_ref() {
+                p();
+            }
+        });
+    }
+}
+
+/// A window's icon handle (not ours to destroy), if it has one.
+fn window_icon(h: HWND) -> Option<HICON> {
+    let mut r: usize = 0;
+    for which in [ICON_BIG, ICON_SMALL2, ICON_SMALL] {
+        // SAFETY: a plain call; a hung app makes it give up after 50 ms.
+        let ok = unsafe { SendMessageTimeoutW(h, WM_GETICON, which as usize, 0, SMTO_ABORTIFHUNG, 50, &mut r) };
+        if ok != 0 && r != 0 {
+            return Some(r as HICON);
+        }
+    }
+    for which in [GCLP_HICON, GCLP_HICONSM] {
+        // SAFETY: a plain call.
+        let c = unsafe { GetClassLongPtrW(h, which) };
+        if c != 0 {
+            return Some(c as HICON);
+        }
+    }
+    None
+}
+
+/// The window whose program a window shows: a Store app's frame holds
+/// the app's own window.
+fn app_window(h: HWND) -> HWND {
+    if class(h) != "ApplicationFrameWindow" {
+        return h;
+    }
+    let core = wide("Windows.UI.Core.CoreWindow");
+    // SAFETY: a NUL-terminated class name.
+    let c = unsafe { FindWindowExW(h, std::ptr::null_mut(), core.as_ptr(), std::ptr::null()) };
+    if c.is_null() {
+        h
+    } else {
+        c
+    }
+}
+
+/// The program a window belongs to (full path).
+fn exe_of(h: HWND) -> Option<String> {
+    let mut pid = 0u32;
+    // SAFETY: out pointer; the process handle is closed below.
+    unsafe {
+        GetWindowThreadProcessId(h, &mut pid);
+        if pid == 0 {
+            return None;
+        }
+        let p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if p.is_null() {
+            return None;
+        }
+        let mut b = [0u16; 1024];
+        let mut n = b.len() as u32;
+        let ok = QueryFullProcessImageNameW(p, PROCESS_NAME_WIN32, b.as_mut_ptr(), &mut n);
+        CloseHandle(p);
+        (ok != 0).then(|| String::from_utf16_lossy(&b[..n as usize]))
+    }
+}
+
+/// An icon as `size` x `size` RGBA. Drawn twice, on black and on white:
+/// how much the two differ is how transparent a pixel is, whatever kind of
+/// icon it is (with an alpha channel or a mask).
+fn render(icon: HICON, size: i32) -> Option<crate::coherence::Icon> {
+    let n = (size * size) as usize;
+    let draw = |fill: u8| -> Option<Vec<u8>> {
+        // SAFETY: a DIB section of `n` 32-bit pixels, top-down, selected
+        // into a memory DC; everything is freed before returning.
+        unsafe {
+            let dc = CreateCompatibleDC(std::ptr::null_mut());
+            if dc.is_null() {
+                return None;
+            }
+            let mut bi: BITMAPINFO = std::mem::zeroed();
+            bi.bmiHeader = BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: size,
+                biHeight: -size,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB,
+                ..std::mem::zeroed()
+            };
+            let mut bits: *mut c_void = std::ptr::null_mut();
+            let bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0);
+            let mut out = None;
+            if !bmp.is_null() && !bits.is_null() {
+                let old = SelectObject(dc, bmp);
+                let px = std::slice::from_raw_parts_mut(bits as *mut u8, n * 4);
+                px.fill(fill);
+                if DrawIconEx(dc, 0, 0, icon, size, size, 0, std::ptr::null_mut(), DI_NORMAL) != 0 {
+                    GdiFlush();
+                    out = Some(px.to_vec());
+                }
+                SelectObject(dc, old);
+                DeleteObject(bmp);
+            }
+            DeleteDC(dc);
+            out
+        }
+    };
+    let (black, white) = (draw(0)?, draw(255)?);
+    let mut rgba = vec![0u8; n * 4];
+    for i in 0..n {
+        let (b, w) = (&black[i * 4..i * 4 + 3], &white[i * 4..i * 4 + 3]);
+        let diff = (0..3).map(|c| w[c].saturating_sub(b[c])).max().unwrap_or(255);
+        let a = 255 - diff as u32;
+        if a == 0 {
+            continue;
+        }
+        // On black the colour came out times alpha: undo that (BGR in, RGB out).
+        let un = |v: u8| ((v as u32 * 255 + a / 2) / a).min(255) as u8;
+        rgba[i * 4..i * 4 + 4].copy_from_slice(&[un(b[2]), un(b[1]), un(b[0]), a as u8]);
+    }
+    rgba.chunks(4).any(|p| p[3] != 0).then_some(crate::coherence::Icon { w: size as u32, h: size as u32, rgba })
+}
+
+fn key(vk: u16, up: bool) -> INPUT {
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: vk, wScan: 0, dwFlags: if up { KEYEVENTF_KEYUP } else { 0 }, time: 0, dwExtraInfo: 0 } },
+    }
+}
+
+fn unicode(u: u16, up: bool) -> INPUT {
+    let f = KEYEVENTF_UNICODE | if up { KEYEVENTF_KEYUP } else { 0 };
+    INPUT { r#type: INPUT_KEYBOARD, Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: 0, wScan: u, dwFlags: f, time: 0, dwExtraInfo: 0 } } }
+}
+
+fn send_keys(k: &[INPUT]) {
+    // SAFETY: a slice of INPUTs and their size.
+    unsafe { SendInput(k.len() as u32, k.as_ptr(), std::mem::size_of::<INPUT>() as i32) };
 }

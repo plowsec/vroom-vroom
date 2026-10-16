@@ -105,6 +105,12 @@ pub enum ToViewer {
     /// Coherence: the guest's windows, front to back (checked like the
     /// agent's message; the viewer still clips them to the screen).
     Windows(Vec<GuestWindow>),
+    /// Coherence: the app icon of a guest window, `w` x `h` RGBA (not
+    /// premultiplied), at most `vroom_proto::ICON_MAX` on a side; 0 x 0:
+    /// none. Checked like the agent's message.
+    WindowIcon { id: u32, w: u32, h: u32, rgba: Vec<u8> },
+    /// Coherence can't work in the guest's session, and why.
+    CoherenceNo(String),
 }
 
 /// What the guest's pointer looks like.
@@ -169,6 +175,8 @@ pub enum ToVmm {
     Coherence(bool),
     /// Coherence: do this to a guest window.
     Window { id: u32, op: WindowOp },
+    /// Start the guest app with this name (`vroom_proto::line_ok`).
+    StartApp(String),
 }
 
 fn frame(ty: u8, payload: &[u8]) -> Vec<u8> {
@@ -190,6 +198,15 @@ fn get_u32(p: &[u8], i: usize) -> Result<u32> {
 
 fn text(p: &[u8]) -> Result<String> {
     std::str::from_utf8(p).map(|s| s.to_string()).map_err(|_| Error::Proto("utf-8"))
+}
+
+/// One short line of plain text (`vroom_proto::line_ok`).
+fn line(p: &[u8]) -> Result<String> {
+    let s = text(p)?;
+    if !vroom_proto::line_ok(&s) {
+        return Err(Error::Proto("line"));
+    }
+    Ok(s)
 }
 
 impl ToViewer {
@@ -232,6 +249,8 @@ impl ToViewer {
             }
             ToViewer::Agent { features } => frame(12, &features.to_le_bytes()),
             ToViewer::Windows(list) => frame(13, &vroom_proto::encode_windows(list)),
+            ToViewer::WindowIcon { id, w, h, rgba } => frame(18, &vroom_proto::encode_icon(*id, *w, *h, rgba)),
+            ToViewer::CoherenceNo(s) => frame(19, s.as_bytes()),
         }
     }
 
@@ -283,6 +302,11 @@ impl ToViewer {
             }
             12 if p.len() == 8 => ToViewer::Agent { features: u64::from(get_u32(p, 0)?) | u64::from(get_u32(p, 1)?) << 32 },
             13 => ToViewer::Windows(vroom_proto::decode_windows(p).ok_or(Error::Proto("windows"))?),
+            18 => {
+                let (id, w, h, rgba) = vroom_proto::decode_icon(p).ok_or(Error::Proto("window icon"))?;
+                ToViewer::WindowIcon { id, w, h, rgba }
+            }
+            19 => ToViewer::CoherenceNo(line(p)?),
             _ => return Err(Error::Proto("unknown viewer message")),
         })
     }
@@ -322,6 +346,7 @@ impl ToVmm {
                 p.extend_from_slice(&op.encode());
                 frame(15, &p)
             }
+            ToVmm::StartApp(s) => frame(20, s.as_bytes()),
         }
     }
 
@@ -383,6 +408,7 @@ impl ToVmm {
             13 if p.len() == 1 => ToVmm::UsbDetach { port: p[0] },
             14 if p.len() == 1 => ToVmm::Coherence(p[0] != 0),
             15 if p.len() > 4 => ToVmm::Window { id: get_u32(p, 0)?, op: WindowOp::decode(&p[4..]).ok_or(Error::Proto("window op"))? },
+            20 => ToVmm::StartApp(line(p)?),
             _ => return Err(Error::Proto("unknown vmm message")),
         })
     }
@@ -457,6 +483,7 @@ mod tests {
             ToVmm::Coherence(true),
             ToVmm::Window { id: 9, op: WindowOp::Activate },
             ToVmm::Window { id: 9, op: WindowOp::Move { x: -3, y: 4, w: 100, h: 50 } },
+            ToVmm::StartApp("Paint".into()),
         ];
         let mut d = Decoder::default();
         for m in &vm {
@@ -483,6 +510,9 @@ mod tests {
             ]),
             ToViewer::Agent { features: 1 << 40 | 128 },
             ToViewer::Windows(vec![GuestWindow { id: 1, x: 0, y: -2, w: 3, h: 4, flags: 4, title: "Paint".into() }]),
+            ToViewer::WindowIcon { id: 1, w: 1, h: 1, rgba: vec![1, 2, 3, 4] },
+            ToViewer::WindowIcon { id: 1, w: 0, h: 0, rgba: Vec::new() },
+            ToViewer::CoherenceNo("a Wayland session".into()),
         ];
         for m in &v {
             d.push(&m.encode());
@@ -544,5 +574,20 @@ mod tests {
         assert!(d.next_to_viewer().is_err());
         d.push(&frame(13, &[1, 2]));
         assert!(d.next_to_vmm().is_err());
+    }
+
+    #[test]
+    fn icons_and_lines_are_checked() {
+        let mut d = Decoder::default();
+        d.push(&frame(18, &vroom_proto::encode_icon(1, 2, 2, &[0; 12])));
+        assert!(d.next_to_viewer().is_err());
+        d.push(&frame(18, &vroom_proto::encode_icon(1, 65, 1, &[0; 260])));
+        assert!(d.next_to_viewer().is_err());
+        for bad in ["", "a\nb", &"x".repeat(vroom_proto::START_MAX + 1)] {
+            d.push(&frame(20, bad.as_bytes()));
+            assert!(d.next_to_vmm().is_err(), "{bad:?}");
+            d.push(&frame(19, bad.as_bytes()));
+            assert!(d.next_to_viewer().is_err(), "{bad:?}");
+        }
     }
 }

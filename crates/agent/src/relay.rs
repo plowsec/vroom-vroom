@@ -149,8 +149,8 @@ impl<S: System> Relay<S> {
                 }
                 self.send_helper(&m);
             }
-            m @ Message::WindowDo { .. } => self.send_helper(&m),
-            Message::Pong(_) | Message::DragReady { .. } | Message::DropDone { .. } | Message::Windows(_) => {}
+            m @ (Message::WindowDo { .. } | Message::StartApp(_)) => self.send_helper(&m),
+            Message::Pong(_) | Message::DragReady { .. } | Message::DropDone { .. } | Message::Windows(_) | Message::WindowIcon { .. } | Message::CoherenceNo(_) => {}
         }
         Ok(())
     }
@@ -177,7 +177,7 @@ impl<S: System> Relay<S> {
                 }
                 Ok(Some(m @ (Message::DragReady { .. } | Message::DropDone { .. }))) => host.write_all(&m.encode())?,
                 // Checked by the decoder (count, sizes); the host checks again.
-                Ok(Some(m @ Message::Windows(_))) if self.coherence => host.write_all(&m.encode())?,
+                Ok(Some(m @ (Message::Windows(_) | Message::WindowIcon { .. } | Message::CoherenceNo(_)))) if self.coherence => host.write_all(&m.encode())?,
                 Ok(Some(_)) => log::debug!("session helper {id}: ignoring a message it may not send"),
                 Ok(None) => return Ok(()),
                 Err(e) => {
@@ -351,11 +351,12 @@ mod tests {
             host(Message::Coherence { on: true }),
             host(Message::WindowDo { id: 5, op: vroom_proto::WindowOp::Close }),
             Ev::Helper(1, Message::Windows(vec![w.clone()]).encode()),
+            Ev::Helper(1, Message::WindowIcon { id: 5, w: 0, h: 0, rgba: Vec::new() }.encode()),
             // Logged off: the windows went; the next helper starts in Coherence.
             Ev::HelperGone(1),
             Ev::HelperUp(2, Box::new(h2.clone())),
         ]);
-        assert_eq!(out[1..], [Message::Windows(vec![w]), Message::Windows(Vec::new())]);
+        assert_eq!(out[1..], [Message::Windows(vec![w]), Message::WindowIcon { id: 5, w: 0, h: 0, rgba: Vec::new() }, Message::Windows(Vec::new())]);
         assert_eq!(h1.msgs(), vec![Message::Coherence { on: true }, Message::WindowDo { id: 5, op: vroom_proto::WindowOp::Close }]);
         assert_eq!(h2.msgs(), vec![Message::Coherence { on: true }]);
     }

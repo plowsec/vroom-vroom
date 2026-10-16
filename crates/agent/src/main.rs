@@ -11,7 +11,12 @@
 mod clip;
 #[cfg(windows)]
 mod coh_win;
+#[cfg(target_os = "linux")]
+mod coh_x11;
 mod coherence;
+// X11 arithmetic for coh_x11; built everywhere so it's tested everywhere.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod ewmh;
 #[cfg(windows)]
 mod dnd_win;
 // The session side; built everywhere so it's tested everywhere.
@@ -194,25 +199,33 @@ fn session(args: &Args) -> std::io::Result<()> {
     log::info!("connected to {path}");
 
     // Blocking reads on their own thread; main loop polls the clipboard.
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    // Coherence's window events wake it too.
+    let (tx, rx) = mpsc::channel::<In>();
+    let wake = std::sync::Mutex::new(tx.clone());
     std::thread::spawn(move || {
         let mut buf = vec![0u8; 64 << 10];
         while let Ok(n) = reader.read(&mut buf) {
-            if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+            if n == 0 || tx.send(In::Host(buf[..n].to_vec())).is_err() {
                 break;
             }
         }
+        let _ = tx.send(In::Closed);
     });
 
     let mut dec = Decoder::new(MAX_CLIP + 64);
     let mut last = clip.get();
     let mut drops = drop::Drops::new();
     // Dropped (taskbar back) when the session ends.
-    let mut coh = coherence::Coherence::new();
+    let mut coh = coherence::Coherence::new(std::sync::Arc::new(move || {
+        let _ = wake.lock().unwrap_or_else(|e| e.into_inner()).send(In::Wake);
+    }));
     let mut clip_at = std::time::Instant::now();
     loop {
-        match rx.recv_timeout(coh.wait().unwrap_or(POLL)) {
-            Ok(bytes) => {
+        match rx.recv_timeout(coh.wait().unwrap_or(POLL).min(POLL)) {
+            // Coherence: something changed on screen.
+            Ok(In::Wake) => {}
+            Ok(In::Closed) => return Err(std::io::Error::other("port closed")),
+            Ok(In::Host(bytes)) => {
                 dec.push(&bytes);
                 loop {
                     match dec.next() {
@@ -249,6 +262,15 @@ fn session(args: &Args) -> std::io::Result<()> {
     }
 }
 
+/// What wakes the session loop.
+enum In {
+    Host(Vec<u8>),
+    /// The host link is gone.
+    Closed,
+    /// Coherence: the windows changed.
+    Wake,
+}
+
 fn hello() -> Message {
     let mut features = features::CLIPBOARD_TEXT | features::TIME_SYNC | features::SHUTDOWN | features::SCALE | features::FILE_DROP;
     if cfg!(windows) {
@@ -256,6 +278,9 @@ fn hello() -> Message {
     }
     if coherence::Coherence::supported() {
         features |= features::COHERENCE;
+    }
+    if coherence::Coherence::starts_apps() {
+        features |= features::START_APP;
     }
     Message::Hello { features, agent: format!("vroom-agent {}", env!("CARGO_PKG_VERSION")) }
 }
@@ -305,6 +330,9 @@ fn handle(m: Message, system: bool, w: &mut port::Writer, clip: &mut dyn clip::C
         | Message::DropDone { .. }
         | Message::Coherence { .. }
         | Message::WindowDo { .. }
+        | Message::StartApp(_)
+        | Message::WindowIcon { .. }
+        | Message::CoherenceNo(_)
         | Message::Windows(_) => {}
     }
     Ok(())
