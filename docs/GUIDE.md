@@ -328,11 +328,11 @@ controller", and apps get Direct3D feature level 11_1.
 
 What works and what doesn't (Windows 11 24H2, M3 Max):
 
-- The lock screen, the desktop, Explorer and Settings draw, and windows
-  move smoothly.
-- Some app windows (Settings is one) lose their text in parts they
-  didn't just redraw; pointing at it brings it back. This happens in the
-  Direct3D layer (UTM's code), not in the window vroom shows.
+- The lock screen, the desktop, the Start menu (with its blur), Explorer,
+  Settings and Task Manager draw, and windows move smoothly.
+- Once, on the first boot with 3D, Settings lost its text in parts it
+  didn't just redraw (pointing at it brought it back). Not seen again in
+  later runs; if it happens, closing and reopening the app fixes it.
 - No Direct3D 12, no Vulkan or OpenGL for Windows apps.
 - Suspend and snapshots are refused while Windows draws with Direct3D
   (it always does once logged in): Direct3D state lives on the host and
@@ -559,9 +559,8 @@ flushes a lot). `"none"` ignores flushes: scratch disks only.
 - Windows 11 is installed with its hardware checks bypassed (no Secure
   Boot); `tpm = true` (needs `brew install swtpm`) gives it a real TPM 2.0,
   which Windows sees and uses.
-- Windows guests: 3D is Direct3D 11 only, can't be suspended, and some
-  windows lose text until redrawn (see above). Shared folders need WinFsp
-  (see above).
+- Windows guests: 3D is Direct3D 11 only and can't be suspended (see
+  above). Shared folders need WinFsp (see above).
 - 3D snapshots: not while a Vulkan app runs. Guest OpenGL stops at 4.1
   (2.1 with `opengl_host = "angle"`).
 - NAT connections don't survive suspend/resume (the guest reconnects).

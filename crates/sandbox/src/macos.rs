@@ -212,7 +212,9 @@ fn user_cache_dir() -> Option<std::path::PathBuf> {
         return None;
     }
     let s = CStr::from_bytes_until_nul(&buf).ok()?.to_str().ok()?;
-    Some(std::path::PathBuf::from(s))
+    // Rules match real paths: this is under /var, a link to /private/var.
+    let p = std::path::PathBuf::from(s);
+    Some(p.canonicalize().unwrap_or(p))
 }
 
 pub fn apply(p: &Policy) -> Result<()> {
