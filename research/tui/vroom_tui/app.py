@@ -1,6 +1,7 @@
 """Windows kernel workspace: live state, modules and callback ownership."""
 import argparse
 import asyncio
+import json
 import shlex
 import os
 import signal
@@ -37,6 +38,10 @@ class KernelApp(App):
     #execution-toolbar Button:disabled { color: #526272; }
     #module-filter { height: 3; border: solid #2c4054; }
     #memory-table, #breakpoints { height: 1fr; background: #101720; }
+    #cfg-title { height: 1; padding: 0 1; color: #72d6cb; }
+    #cfg-split { height: 1fr; }
+    #cfg-blocks, #cfg-edges { width: 1fr; height: 1fr; background: #101720; }
+    #cfg-edges { border-left: solid #2c4054; }
     #status.error { color: #ff8080; }
     #analysis-source { border: none; background: #234a64; }
     Screen.short #execution-toolbar { display: none; }
@@ -77,6 +82,8 @@ class KernelApp(App):
         Binding('f2', 'breakpoint', 'BP'), Binding('colon', 'command', 'Command'),
         Binding('f9', 'panels', 'Panels'),
         Binding('f3', 'decompile', 'Decompile'), Binding('f10', 'code_focus', 'Code focus'),
+        Binding('u', 'navigation_back', 'Back'), Binding('shift+u', 'navigation_forward', 'Forward'),
+        Binding('x', 'xrefs', 'Xrefs'), Binding('ctrl+g', 'cfg', 'CFG', show=False),
         Binding('ctrl+q', 'poweroff', 'Quit'),
         Binding('up', 'history_previous', show=False), Binding('down', 'history_next', show=False),
     ]
@@ -98,6 +105,7 @@ class KernelApp(App):
         self.context = None
         self.watchpoints = []
         self.analysis_cache = {}
+        self.cfg_cache = {}
         self.generation = 0
         self.view_revision = 0
         self.view_context = True
@@ -112,6 +120,8 @@ class KernelApp(App):
         self.memory_physical = False
         self.history = []
         self.history_index = 0
+        self.navigation_history = []
+        self.navigation_position = -1
         self.execution_lock = asyncio.Lock()
         self.command_lock = asyncio.Lock()
         self.running = False
@@ -165,6 +175,11 @@ class KernelApp(App):
                         yield DataTable(id='memory-table', cursor_type='row')
                     with TabPane('Breakpoints', id='breakpoints-tab'):
                         yield DataTable(id='breakpoints', cursor_type='row')
+                    with TabPane('CFG', id='cfg-tab'):
+                        yield Static('', id='cfg-title')
+                        with Horizontal(id='cfg-split'):
+                            yield DataTable(id='cfg-blocks', cursor_type='row')
+                            yield DataTable(id='cfg-edges', cursor_type='row')
             with Vertical(id='register-pane'):
                 yield Label('REGISTERS', classes='section')
                 yield DataTable(id='registers', cursor_type='row', show_header=False, cell_padding=0)
@@ -177,6 +192,8 @@ class KernelApp(App):
         self.query_one('#registers', DataTable).add_column('Value', width=16)
         self.query_one('#memory-table', DataTable).add_columns('Address', 'Bytes', 'ASCII')
         self.query_one('#breakpoints', DataTable).add_columns('Type', 'Address', 'Access', 'Scope')
+        self.query_one('#cfg-blocks', DataTable).add_columns('Block', 'Size', 'Insns', 'In', 'Out')
+        self.query_one('#cfg-edges', DataTable).add_columns('From', 'Kind', 'To')
         self.query_one('#functions', DataTable).add_columns('Function', 'Address')
         self.query_one('#processes', DataTable).add_columns('PID', 'Image', 'Parent', 'EPROCESS')
         self.query_one('#peb', DataTable).add_columns('Field', 'Value')
@@ -262,6 +279,7 @@ class KernelApp(App):
             self.invalidate_code()
             self.generation += 1
             self.analysis_cache.clear()
+            self.cfg_cache.clear()
             self.query_one('#memory-table', DataTable).clear()
             self.memory_address = None
             self.ready = True
@@ -322,7 +340,7 @@ class KernelApp(App):
             if revision != self.view_revision: return
             self.render_registers(regs)
             self.cpu_ttbr0 = regs.get('ttbr0')
-            await self.show_address(regs['pc'], context=False, activate=False)
+            await self.show_address(regs['pc'], context=False, activate=False, record=False)
         except Exception as error:
             self.log_message(error)
 
@@ -425,6 +443,30 @@ class KernelApp(App):
             self.history_index = min(len(self.history), self.history_index+1)
             self.edit_command(self.history[self.history_index] if self.history_index < len(self.history) else '')
 
+    def remember_address(self, address, context):
+        entry = (address, context)
+        if self.navigation_position >= 0 and self.navigation_history[self.navigation_position] == entry:
+            return
+        del self.navigation_history[self.navigation_position + 1:]
+        self.navigation_history.append(entry)
+        self.navigation_history = self.navigation_history[-128:]
+        self.navigation_position = len(self.navigation_history) - 1
+
+    def navigate_history(self, delta):
+        position = self.navigation_position + delta
+        if not 0 <= position < len(self.navigation_history):
+            return
+        self.navigation_position = position
+        address, context = self.navigation_history[position]
+        self.run_worker(self.show_address(address, context=context, record=False),
+                        group='browse', exclusive=True)
+
+    def action_navigation_back(self):
+        self.navigate_history(-1)
+
+    def action_navigation_forward(self):
+        self.navigate_history(1)
+
     def render_breakpoints(self):
         table = self.query_one('#breakpoints', DataTable)
         table.clear()
@@ -488,6 +530,8 @@ class KernelApp(App):
     async def select_process(self, pid=None):
         try:
             self.invalidate_code()
+            self.navigation_history.clear()
+            self.navigation_position = -1
             self.query_one('#memory-table', DataTable).clear()
             self.memory_address = None
             self.context = await self.client.call('process', cpu=self.cpu, **({'pid':pid} if pid is not None else {}))
@@ -604,6 +648,14 @@ class KernelApp(App):
             kind = event.data_table.get_row(event.row_key)[0]
             self.edit_command(f"{'wc' if str(kind).startswith('Data') else 'bc'} 0x{address:x}")
             return
+        if event.data_table.id == 'cfg-blocks':
+            address = int(event.row_key.value)
+            self.run_worker(self.show_address(address), group='browse', exclusive=True)
+            return
+        if event.data_table.id == 'cfg-edges':
+            address = int(event.data_table.get_row(event.row_key)[2], 16)
+            self.run_worker(self.show_address(address), group='browse', exclusive=True)
+            return
         if event.data_table.id == 'stack':
             address = int(event.data_table.get_row(event.row_key)[1],16)
             self.run_worker(self.show_address(address,context=False), group='browse', exclusive=True)
@@ -648,10 +700,15 @@ class KernelApp(App):
             self.status(str(error), error=True)
             self.log_message(error)
 
-    async def show_address(self, address, context=True, activate=True, analyze=True, allow_missing=True, file_image=None):
+    async def show_address(self, address, context=True, activate=True, analyze=True, allow_missing=True,
+                           file_image=None, record=True):
         self.invalidate_code()
         revision = self.view_revision
         self.address, self.view_context = address, context
+        if record:
+            self.remember_address(address, context)
+        elif not self.navigation_history:
+            self.remember_address(address, context)
         if activate: self.query_one(TabbedContent).active = 'code-tab'
         self.query_one('#code-scroll', VerticalScroll).scroll_home(animate=False)
         self.query_one('#decompiler-scroll', VerticalScroll).scroll_home(animate=False)
@@ -693,6 +750,7 @@ class KernelApp(App):
                         await self.client.call('write_physical' if op == 'write-phys' else 'write_virtual', cpu=self.cpu, address=address, hex=data.hex())
                     self.generation += 1
                     self.analysis_cache.clear()
+                    self.cfg_cache.clear()
                     self.invalidate_code()
                     if op == 'reg': await self.show_address(regs['pc'], context=False)
                     elif self.memory_address is not None: await self.show_memory(self.memory_address,self.memory_length,self.memory_physical)
@@ -744,6 +802,14 @@ class KernelApp(App):
                 self.analysis_mode = 'file' if op == 'dec-file' else 'live'
                 self.query_one('#analysis-source', Button).label = self.analysis_mode.title()
                 await self.show_address(address, allow_missing=op != 'dec', file_image=op == 'dec-file')
+            elif op == 'cfg':
+                address = await self.symbol_address(args[0]) if args else self.address
+                await self.show_cfg(address)
+            elif op in ('back', 'forward'):
+                self.navigate_history(-1 if op == 'back' else 1)
+            elif op == 'xrefs':
+                address = await self.symbol_address(args[0]) if args else self.address
+                await self.show_cfg(address, xrefs=True)
             elif op in ('bp', 'dis', 'mem', 'mem-phys', 'x'):
                 address = await self.symbol_address(args[0])
                 if op == 'bp': await self.toggle_breakpoint(address)
@@ -753,7 +819,7 @@ class KernelApp(App):
                     await self.show_memory(address, int(args[1],0) if len(args)>1 else 256, op == 'mem-phys')
             elif op == 'dump': self.log_message(await self.client.call('dump', cpu=self.cpu, address=await self.symbol_address(args[0]), length=int(args[1],0)))
             elif op == 'checkpoint': self.log_message(await self.client.call('checkpoint', path=args[0]))
-            else: self.log_message('reg NAME VALUE · write ADDRESS HEX · into/over/out · ps · process PID · peb · modules · symbols MODULE · functions MODULE PREFIX · next/prev · stack · bp/dis/mem/x SYMBOL · watch ADDRESS SIZE r/w/rw · bc/wc · dec/dec-file/dec-partial SYMBOL · image MODULE [PATH] · dump ADDRESS N · callbacks · event · cpu N · checkpoint PATH')
+            else: self.log_message('reg NAME VALUE · write ADDRESS HEX · into/over/out · ps · process PID · peb · modules · symbols MODULE · functions MODULE PREFIX · next/prev · stack · bp/dis/mem/x SYMBOL · watch ADDRESS SIZE r/w/rw · bc/wc · dec/dec-file/dec-partial SYMBOL · cfg/xrefs [SYMBOL] · back/forward · image MODULE [PATH] · dump ADDRESS N · callbacks · event · cpu N · checkpoint PATH')
         except Exception as error:
             self.status(str(error), error=True)
             self.log_message(error)
@@ -766,10 +832,139 @@ class KernelApp(App):
     async def on_unmount(self):
         await self.client.close()
 
-    async def run_angr(self, path, rva):
+    def cfg_address(self):
+        table = self.focused
+        if isinstance(table, DataTable) and table.id == 'cfg-blocks' and table.row_count:
+            return int(table.ordered_rows[table.cursor_row].key.value)
+        return self.address
+
+    @work(group='cfg', exclusive=True)
+    async def action_cfg(self):
+        await self.show_cfg(self.cfg_address())
+
+    @work(group='cfg', exclusive=True)
+    async def action_xrefs(self):
+        await self.show_cfg(self.cfg_address(), xrefs=True)
+
+    async def run_angr_cfg(self, path, rva):
+        output = await self.run_atui(path, '--pd', hex(rva), '--json')
+        try:
+            cfg = json.loads(output)
+        except json.JSONDecodeError as error:
+            raise RuntimeError('angr returned invalid CFG data') from error
+        if not isinstance(cfg, dict) or not isinstance(cfg.get('blocks'), list) or not isinstance(cfg.get('edges'), list):
+            raise RuntimeError('angr returned incomplete CFG data')
+        if len(cfg['blocks']) > 100_000 or len(cfg['edges']) > 500_000:
+            raise RuntimeError('angr CFG is too large to display')
+        return cfg
+
+    def cached_cfg(self, module, address, context, file_image):
+        prefix = (self.generation, (self.context or {}).get('pid'), self.cpu,
+                  context, module['base'], file_image)
+        for key, cfg in self.cfg_cache.items():
+            if key[:6] != prefix:
+                continue
+            rva = address - module['base']
+            if any(block['addr'] <= rva < block['addr'] + max(1, block['size'])
+                   for block in cfg['blocks']):
+                return cfg
+        return None
+
+    async def show_cfg(self, address, xrefs=False, context=None, file_image=None):
+        if context is None:
+            context = self.view_context
+        if file_image is None:
+            file_image = self.analysis_mode == 'file'
+        generation, pid, cpu = self.generation, (self.context or {}).get('pid'), self.cpu
+        module = self.owner(address, context)
+        if not self.atui:
+            self.status('angr unavailable / --atui PATH', error=True)
+            return
+        if not module:
+            self.status('No module in this context', error=True)
+            return
+
+        def current():
+            return (generation == self.generation and pid == (self.context or {}).get('pid')
+                    and cpu == self.cpu and self.ready and not self.running)
+
+        self.status('CFG / analyzing…')
+        try:
+            async with self.analysis_lock:
+                cfg = self.cached_cfg(module, address, context, file_image)
+                if cfg is None:
+                    exported = await self.client.call('image' if file_image else 'export', cpu=cpu,
+                                                      base=module['base'], allow_missing=True)
+                    if not current(): return
+                    rva = address - module['base']
+                    if (rva & ~4095) in exported['missing_page_rvas']:
+                        raise RuntimeError('Function page absent · select File')
+                    analysis_path, _ = await asyncio.to_thread(
+                        prepare_rva_image, exported,
+                        allow_unrelocated=not file_image)
+                    if not current(): return
+                    cfg = await self.run_angr_cfg(analysis_path, rva)
+                    if not current(): return
+                    key = (generation, pid, cpu, context, module['base'], file_image, cfg.get('addr', rva))
+                    if len(self.cfg_cache) >= 128:
+                        self.cfg_cache.pop(next(iter(self.cfg_cache)))
+                    self.cfg_cache[key] = cfg
+            if not current(): return
+            self.render_cfg(module, cfg, address, xrefs)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            if current():
+                self.status(str(error), error=True)
+                self.log_message(error)
+
+    def render_cfg(self, module, cfg, address, xrefs=False):
+        base = module['base']
+        rva = address - base
+        selected = next((block for block in cfg['blocks']
+                         if block['addr'] <= rva < block['addr'] + max(1, block['size'])), None)
+        selected_rva = selected['addr'] if selected else cfg.get('addr', rva)
+        incoming, outgoing = {}, {}
+        for edge in cfg['edges']:
+            incoming[edge['dst']] = incoming.get(edge['dst'], 0) + 1
+            outgoing[edge['src']] = outgoing.get(edge['src'], 0) + 1
+
+        blocks = self.query_one('#cfg-blocks', DataTable)
+        blocks.clear()
+        selected_row = 0
+        for row, block in enumerate(sorted(cfg['blocks'], key=lambda item: item['addr'])):
+            runtime = base + block['addr']
+            blocks.add_row(f'{runtime:016x}', str(block['size']), str(len(block.get('insns', ()))),
+                           str(incoming.get(block['addr'], 0)), str(outgoing.get(block['addr'], 0)),
+                           key=str(runtime))
+            if block['addr'] == selected_rva:
+                selected_row = row
+        blocks.move_cursor(row=selected_row)
+
+        edges = self.query_one('#cfg-edges', DataTable)
+        edges.clear()
+        visible = [edge for edge in cfg['edges'] if not xrefs or edge['dst'] == selected_rva]
+        for row, edge in enumerate(sorted(visible, key=lambda item: (item['src'], item['dst'], item['kind']))):
+            edges.add_row(f"{base + edge['src']:016x}", str(edge['kind']),
+                          f"{base + edge['dst']:016x}", key=str(row))
+        name = cfg.get('name') or f"sub_{cfg.get('addr', rva):x}"
+        mode = f' · XREFS {len(visible)}' if xrefs else ''
+        size = sum(block['size'] for block in cfg['blocks'])
+        instructions = sum(len(block.get('insns', ())) for block in cfg['blocks'])
+        unresolved = len(cfg.get('unresolved', ()))
+        detail = (f"{module['name']}!{name} · {size}B · {instructions} insns · "
+                  f"{len(cfg['blocks'])} blocks · {len(cfg['edges'])} edges")
+        if unresolved:
+            detail += f' · {unresolved} unresolved'
+        self.query_one('#cfg-title', Static).update(Text(detail + mode))
+        self.query_one(TabbedContent).active = 'cfg-tab'
+        self.call_after_refresh((edges if xrefs and visible else blocks).focus)
+        self.status(f"CFG / {module['name']}+0x{cfg.get('addr', rva):x}")
+
+    async def run_atui(self, path, *arguments):
         process = None
         try:
-            process = await asyncio.create_subprocess_exec(str(self.atui), str(path), '--dec', hex(rva),
+            process = await asyncio.create_subprocess_exec(str(self.atui), str(path), *arguments,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, start_new_session=True)
             stdout, stderr = await asyncio.wait_for(process.communicate(), 180)
             if process.returncode:
@@ -777,8 +972,6 @@ class KernelApp(App):
             return stdout.decode(errors='replace')
         finally:
             if process and process.returncode is None:
-                # The launcher may have children. Stop the entire analysis job,
-                # then reap it before allowing another job to acquire the lock.
                 try: os.killpg(process.pid, signal.SIGTERM)
                 except ProcessLookupError: pass
                 try:
@@ -787,6 +980,9 @@ class KernelApp(App):
                     try: os.killpg(process.pid, signal.SIGKILL)
                     except ProcessLookupError: pass
                     await process.wait()
+
+    async def run_angr(self, path, rva):
+        return await self.run_atui(path, '--dec', hex(rva))
 
     async def decompile(self, address, allow_missing=False, file_image=False, revision=None, context=True):
         if revision is None:

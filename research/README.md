@@ -30,6 +30,8 @@ Use a disposable overlay. Separate state directory. Starts paused.
 | F8 / Shift+F8 | Step over / out |
 | F9 | Side panels |
 | F10 | Expand Code view |
+| u / U | Address back / forward |
+| x / Ctrl+G | Xrefs / CFG |
 | : / ↑ / ↓ | Command / history |
 | Ctrl+Q | Power off + quit |
 
@@ -72,6 +74,9 @@ image example.sys /path/file    use matching local binary
 dec-file nt!KeGetCurrentIrql    full binary → angr_tui
 dec ADDRESS                    live image → angr_tui; strict
 dec-partial ADDRESS            allow missing pages; labelled
+cfg [SYMBOL]                   function blocks + edges
+xrefs [SYMBOL]                 incoming CFG edges
+back / forward                 address history
 dump ADDRESS 4096              raw memory file in state/exports
 callbacks                      process callback registrations
 event                          Ex/Ex2 arguments at entry
