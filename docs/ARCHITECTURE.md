@@ -12,8 +12,10 @@ vroom run <vm.toml>   one process per VM, sandboxed after setup ◄───┘
    ├─ optional: unix socket to vroom-netd (root) for bridged/host-only
    ├─ optional: swtpm (vTPM), own sandbox, control + data socketpairs
    ├─ optional: vroom audio-out (sound, microphone), own sandbox, datagram socket
-   └─ optional: vroom usb-host (one per [[usb]] device), own sandbox,
-      stream socket: transfer requests in, results and plug events out
+   ├─ optional: vroom usb-host (one per [[usb]] device), own sandbox,
+   │  stream socket: transfer requests in, results and plug events out
+   └─ optional: vroom video-helper (video_decode), own sandbox, stream
+      socket: bitstreams and credits in, pictures out (VideoToolbox)
 
 vroom-gui ── starts vroom usb-host for a device connected from the VM
              window, or asks vroom-netd to start it as root; passes its
@@ -62,8 +64,9 @@ had one pair per device in the VM file.
 | `memory` | Guest RAM as guarded mmaps; every access bounds-checked (`GuestMemory`). |
 | `arch` | Board layout (QEMU-virt compatible), FDT, ACPI tables (own AML encoder), SMBIOS, kernel image loader (Image, gzip, EFI zboot). |
 | `devices` | Bus, PL011, PL031, fw_cfg (+DMA), CFI flash (NVRAM), PCI host (ECAM, MSI, MSI-X, INTx), NVMe, xHCI + USB HID (8 USB 2 + USB 3 port pairs for passthrough devices, plugged in and out while the VM runs; asynchronous transfers; isochronous TDs go out in batches, a few batches ahead), Intel HD Audio (controller + codec, streams moved by a timer thread). Parses hostile input only; `forbid(unsafe_code)`. |
+| `video` | Hardware video decoding, shared by the VMM and `vroom video-helper`: their protocol (credits, epochs), H.264/HEVC NAL unit, access unit and parameter set parsing, picture order counts. Parses hostile input only; `forbid(unsafe_code)`. |
 | `usb` | USB passthrough: the VMM/helper protocol, the helper's request checks, libusb (loaded with `dlopen`, helper only; the root helper only from its own copy), host device listing (IOKit registry / sysfs), a pretend serial port and sound card for tests. |
-| `virtio` | Split-queue handling (hardened), MMIO and modern PCI transports, devices (blk, net, console, rng, gpu, input, fs, sound), a pausable worker per device. `forbid(unsafe_code)`. |
+| `virtio` | Split-queue handling (hardened), MMIO and modern PCI transports, devices (blk, net, console, rng, gpu, input, fs, sound, media), a pausable worker per device. `forbid(unsafe_code)`. |
 | `fs` | Host side of shared folders: component-wise `openat(O_NOFOLLOW)` walks from a root fd, Linux errno mapping. The virtio-fs FUSE server lives in `virtio`; it serves Linux and virtio-win's virtiofs.exe (Windows), telling them apart by their INIT flags. |
 | `audio` | Sound helper: datagram protocol, ring buffer, CoreAudio (macOS) / ALSA (Linux, `dlopen`) playback and recording, WAV test files. |
 | `gpu3d` | virglrenderer loaded with `dlopen`, behind the `Renderer3d` trait the virtio crate defines. The one place with GPU FFI. `remote`: the same trait over a socket to the GPU process, and that process's loop. |
@@ -157,6 +160,26 @@ its own. When the guest says `DropDone`, the app lets go of the button
 and the app under the pointer takes the files. Leaving the window sends
 `DragCancel`, Escape and the button up.
 
+The other way (guest to Mac, `gui/src/dragout.rs`): when the mouse
+leaves the guest screen with the guest's button held since a press on
+it, the app asks once (`ToVmm::DragOut`, agent `DragOutQuery`). The
+agent (`agent/src/dragout.rs`) puts a small window under the guest's
+pointer, now at the screen edge, and makes it a drop target: an OLE
+`IDropTarget` on Windows, an `XdndAware` window on X11. It nudges the
+pointer so the drag going on finds it; if that drag carries files
+(CF_HDROP, or `text/uri-list` with file URIs), it learns their paths and
+answers their names (`DragOutItems`, `ToViewer::DragOutItems`). The app
+then starts an AppKit drag of file promises (`dragout_mac.rs`) from the
+VM window while the Mac's button is still down, and gives up the guest's
+drag (Escape, button up: the guest drops nothing). When something takes
+the drop, AppKit asks each promise where to write; for each item the app
+sends a pipe to the VMM (`ToVmm::DragOutGet`, SCM_RIGHTS), the VMM asks
+the guest (`DragOutGet` with a stream number of its own) and passes the
+guest's DropEntry, DropData and DropEnd frames on, checked, with the
+drag's id. The app writes the item where the promise says. When all are
+written (or the drag ends with no drop) the app sends `DragOut` with
+`end`, and the agent forgets the paths.
+
 ## Coherence
 
 The app asks the guest for a screen the size of the Mac screen's free
@@ -225,28 +248,41 @@ another screen, the Dock moved, a screen unplugged), the guest's screen
 moves there: new area, a resize, the bar at the bottom. Leaving sends
 `Coherence(false)` and the VM window's size; a viewer that goes away
 (the app crashed) turns Coherence off in the VMM, and the agent puts the
-taskbar back when its session ends or it starts again.
-The other way (guest to Mac, `gui/src/dragout.rs`): when the mouse
-leaves the guest screen with the guest's button held since a press on
-it, the app asks once (`ToVmm::DragOut`, agent `DragOutQuery`). The
-agent (`agent/src/dragout.rs`) puts a small window under the guest's
-pointer, now at the screen edge, and makes it a drop target: an OLE
-`IDropTarget` on Windows, an `XdndAware` window on X11. It nudges the
-pointer so the drag going on finds it; if that drag carries files
-(CF_HDROP, or `text/uri-list` with file URIs), it learns their paths and
-answers their names (`DragOutItems`, `ToViewer::DragOutItems`). The app
-then starts an AppKit drag of file promises (`dragout_mac.rs`) from the
-VM window while the Mac's button is still down, and gives up the guest's
-drag (Escape, button up: the guest drops nothing). When something takes
-the drop, AppKit asks each promise where to write; for each item the app
-sends a pipe to the VMM (`ToVmm::DragOutGet`, SCM_RIGHTS), the VMM asks
-the guest (`DragOutGet` with a stream number of its own) and passes the
-guest's DropEntry, DropData and DropEnd frames on, checked, with the
-drag's id. The app writes the item where the promise says. When all are
-written (or the drag ends with no drop) the app sends `DragOut` with
-`end`, and the agent forgets the paths.
 taskbar back when its session ends or it starts again. A session helper
 replaced by another (started twice) is told to leave Coherence first.
+
+## Video decoding
+
+`video_decode = true` (app: Settings, Display, Hardware video decoding) adds a virtio-media device (`virtio/src/devices/media`):
+V4L2 carried over virtio, the guest's kernel forwarding each ioctl of
+its `/dev/videoN` on the command queue. The device plays a V4L2 stateful
+decoder: H.264 or HEVC buffers in (OUTPUT queue), NV12 pictures out
+(CAPTURE queue), with the source-change event, the LAST buffer and
+decoder STOP/START the V4L2 decoder interface describes. Buffers are
+allocated in one shared memory window (region 0, 1 GiB, mapped into the
+guest where the guest puts it; `vmm/src/video.rs`), and the guest maps
+them with virtio-media's MMAP command.
+
+The decoding happens in `vroom video-helper` (`cli/src/video.rs`,
+`cli/src/vt.rs`). The VMM copies each bitstream buffer out of the window
+and sends it; the helper splits it into access units and parameter sets
+(`video/src/nal.rs`), makes a VideoToolbox decompression session for
+the parameter sets (a new one when the size changes, announced to the
+VMM before its first picture), decodes, and puts the pictures back in
+display order: VideoToolbox hands them out in decoding order, so the
+helper works out each picture's order count from its slice header, as
+the standards define it, and holds as many as the stream's SPS says it
+may reorder (`video/src/poc.rs`). Pictures go back only against credits:
+one per picture buffer the guest has queued, under an epoch the VMM bumps
+when those buffers change (size change, seek, stream off); the VMM drops
+pictures from an older epoch. The VMM then copies the picture into the
+guest's buffer and returns it with the timestamp of the bitstream buffer
+it came from. Bitstream buffers go back to the guest as soon as they are
+copied out.
+
+A pause (snapshot) first answers every command the guest waits on (its
+driver gives up after 5 seconds). Decoders don't survive a restore: the
+device saves only which sessions were open and fails them afterwards.
 
 ## 3D
 

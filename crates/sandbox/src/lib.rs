@@ -75,6 +75,12 @@ pub fn camera_profile(exe: &std::path::Path) -> Result<String> {
     macos::camera_profile(exe)
 }
 
+/// Seatbelt profile for the video decoding helper (macOS).
+#[cfg(target_os = "macos")]
+pub fn video_profile(exe: &std::path::Path) -> Result<String> {
+    macos::video_profile(exe)
+}
+
 /// Seatbelt profile for the USB passthrough helper (macOS).
 #[cfg(target_os = "macos")]
 pub fn usb_profile(exe: &std::path::Path) -> Result<String> {

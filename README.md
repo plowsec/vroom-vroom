@@ -28,22 +28,23 @@ The security design is better than the big three’s, at least on paper:
  │   ║   ┌──────────── guest ──────────────┐    ╟──── shared folders │
  │   ║   │  Linux / Windows      (hostile) │    ╟──── NAT            │
  │   ║   └─────────────────────────────────┘    ║                    │
- │   ╚═══╤════════╤════════╤════════╤════════╤══╝                    │
- │       │        │        │        │        │                       │
- │   ╔═══╧═══╗╔═══╧═══╗╔═══╧═══╗╔═══╧═══╗╔═══╧═══╗   ┌──────────┐    │
- │   ║  3D   ║║ audio ║║camera ║║  USB  ║║  TPM  ║   │   netd   │    │
- │   ╚═══╤═══╝╚═══╤═══╝╚═══╤═══╝╚═══╤═══╝╚═══════╝   │  (root)  │    │
- │   ╔═══╧═══╗    │        │        │                └────┬─────┘    │
- │   ║app·app║ speaker   camera   device                  LAN        │
- │   ╚═══╤═══╝  (mic)                                                │
- │      GPU                                                          │
+ │   ╚═╤═══════╤═══════╤═══════╤═══════╤═══════╤╝                    │
+ │     │       │       │       │       │       │                     │
+ │  ╔══╧═══╗╔══╧═══╗╔══╧═══╗╔══╧═══╗╔══╧═══╗╔══╧═══╗  ┌──────────┐   │
+ │  ║  3D  ║║audio ║║camera║║video ║║ USB  ║║ TPM  ║  │   netd   │   │
+ │  ╚══╤═══╝╚══╤═══╝╚══╤═══╝╚══╤═══╝╚══╤═══╝╚══════╝  │  (root)  │   │
+ │  ╔══╧═══╗ sound  camera  decoder device            └────┬─────┘   │
+ │  ║ apps ║ (mic)                                        LAN        │
+ │  ╚══╤═══╝                                                         │
+ │    GPU                                                            │
  └───────────────────────────────────────────────────────────────────┘
-   ═══ own sandbox        ─── no sandbox        camera, mic: opt-in
+   ═══ own sandbox     ─── no sandbox     camera, mic, video: opt-in
 ```
 
 A guest that breaks out lands in the VMM's sandbox: its own disks, nothing
 else of yours. Each Vulkan or Direct3D app in the guest gets a 3D process
-of its own (app·app). Details in [SECURITY.md](docs/SECURITY.md).
+of its own (apps); video decoding, when on, gets one too. Details in
+[SECURITY.md](docs/SECURITY.md).
 
 
 ## What works

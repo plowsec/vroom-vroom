@@ -1,0 +1,11 @@
+[package]
+name = "vroom-video"
+description = "Hardware video decoding: the VMM <-> video helper protocol and bitstream parsing."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true
