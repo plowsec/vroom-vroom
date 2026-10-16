@@ -441,7 +441,8 @@ pub fn start(path: &Path, cfg: &VmConfig, extra: &[String]) -> Result<String, St
     unsafe {
         libc::fcntl(theirs.as_raw_fd(), libc::F_SETFD, 0)
     };
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    // Through a symlink (in /usr/local/bin, say): the real one's folder.
+    let exe = std::env::current_exe().and_then(std::fs::canonicalize).map_err(|e| e.to_string())?;
     let vmm = exe.with_file_name("vroom");
     let child = Proc::new(&vmm)
         .arg("run")
