@@ -45,6 +45,40 @@ pub(super) struct UsbMenu {
     setup_busy: bool,
     /// The devices the VM file connects at every start.
     always: Vec<(String, Option<String>)>,
+    /// Connected for this run only, before a suspend: plugged back in
+    /// once the resumed VM has its USB controller.
+    resume: Option<Vec<UsbDev>>,
+}
+
+/// Where a VM's devices connected for this run only are kept: a resumed
+/// VM gets them back. One line each: id, serial, name (tab-separated).
+fn session_file(key: &str) -> std::path::PathBuf {
+    crate::paths::data_dir().join("usb-session").join(key)
+}
+
+fn read_session(key: &str) -> Vec<UsbDev> {
+    let s = std::fs::read_to_string(session_file(key)).unwrap_or_default();
+    s.lines()
+        .take(16)
+        .filter_map(|l| {
+            let mut f = l.splitn(3, '\t');
+            let d = UsbDev { id: f.next()?.into(), serial: f.next()?.into(), name: f.next().unwrap_or("").into() };
+            d.valid().then_some(d)
+        })
+        .collect()
+}
+
+fn write_session(key: &str, devs: &[UsbDev]) {
+    let p = session_file(key);
+    if devs.is_empty() {
+        let _ = std::fs::remove_file(&p);
+        return;
+    }
+    let text: String = devs.iter().map(|d| format!("{}\t{}\t{}\n", d.id, d.serial, d.name)).collect();
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = crate::library::write_atomic(&p, text.as_bytes());
 }
 
 #[derive(Clone)]
@@ -96,9 +130,33 @@ fn used_as(drivers: &[String]) -> String {
 }
 
 impl Console {
+    /// Starting the VM: if it resumes from a suspend, the devices it had
+    /// for that run come back; else that list is stale.
+    pub(super) fn usb_prepare(&mut self, resuming: bool) {
+        if resuming {
+            let l = read_session(&self.key);
+            self.usb.resume = (!l.is_empty()).then_some(l);
+        } else {
+            write_session(&self.key, &[]);
+        }
+    }
+
     /// The VMM's list of what it has plugged in.
     pub(super) fn usb_list(&mut self, l: Vec<UsbPort>) {
         TAKEN.with(|t| t.borrow_mut().insert(self.key.clone(), (self.name.clone(), l.clone())));
+        // Remember what this run connected beyond the VM file's devices.
+        let always: Vec<(String, Option<String>)> =
+            vroom_config::VmConfig::load_raw(&self.path).map(|c| c.usb.into_iter().map(|u| (u.id, u.serial)).collect()).unwrap_or_default();
+        let session: Vec<UsbDev> = l
+            .iter()
+            .filter(|p| !always.iter().any(|(id, serial)| *id == p.dev.id && !serial.as_deref().is_some_and(|s| s != p.dev.serial)))
+            .map(|p| p.dev.clone())
+            .collect();
+        // Not before the resume put them back: an empty first list would
+        // forget them.
+        if self.usb.resume.is_none() {
+            write_session(&self.key, &session);
+        }
         let m = &mut self.usb;
         m.ports = Some(l);
         // It has the sockets it got (or refused them): let ours go.
@@ -106,6 +164,19 @@ impl Console {
         m.busy.clear();
         self.win.set_usb_shown(true);
         self.win.set_usb_count(self.usb.ports.as_ref().map_or(0, |p| p.len()) as i32);
+        if let Some(want) = self.usb.resume.take() {
+            let host = hostusb::host_list();
+            let have = self.usb.ports.clone().unwrap_or_default();
+            for d in want {
+                if have.iter().any(|p| same(&p.dev, &d)) {
+                    continue;
+                }
+                match host.iter().find(|h| same(&hostusb::dev_of(h), &d)) {
+                    Some(h) => self.usb_connect(hostusb::dev_of(h), Some(h.clone())),
+                    None => self.toast(&format!("{}: not plugged into the Mac, not connected again", if d.name.is_empty() { &d.id } else { &d.name })),
+                }
+            }
+        }
         if self.win.get_usb_open() {
             self.usb_rows();
         }
@@ -258,16 +329,26 @@ impl Console {
             self.io.borrow_mut().send(ToVmm::UsbDetach { port });
             return self.usb_rows();
         }
-        let root = t.host.as_ref().is_some_and(hostusb::needs_root);
+        self.usb_connect(t.dev, t.host);
+    }
+
+    /// Start `dev`'s helper (as root through vroom-netd if a macOS driver
+    /// holds it), then hand the VMM its socket.
+    fn usb_connect(&mut self, dev: UsbDev, host: Option<HostDevice>) {
+        let k = key_of(&dev);
+        let root = host.as_ref().is_some_and(hostusb::needs_root);
         if root {
+            if self.usb.helper == Helper::Unknown {
+                self.usb.helper = rootd::state();
+            }
             if let Err(why) = self.usb.helper.usb() {
-                self.toast(&format!("{}: {why}", t.dev.name));
+                self.toast(&format!("{}: {why}", dev.name));
                 return;
             }
         }
         self.usb.busy.insert(k, Instant::now());
         self.usb_rows();
-        let (key, vm, dev) = (self.key.clone(), self.name.clone(), t.dev.clone());
+        let (key, vm) = (self.key.clone(), self.name.clone());
         std::thread::spawn(move || {
             let r = if root { hostusb::via_netd(&vm, &dev).map(|s| (None, s)) } else { hostusb::spawn_local(&dev).map(|(c, s)| (Some(c), s)) };
             let _ = slint::invoke_from_event_loop(move || {
@@ -356,5 +437,21 @@ mod tests {
         assert_eq!(used_as(&["AppleUserUSBHostHIDDevice".into()]), "a keyboard, mouse or similar");
         assert_eq!(used_as(&["AppleUSBCDCACMData".into()]), "a serial port");
         assert_eq!(used_as(&["SomethingElse".into()]), "SomethingElse");
+    }
+
+    #[test]
+    fn devices_of_a_run_are_kept_for_its_resume() {
+        let t = tempfile::tempdir().unwrap();
+        crate::paths::TEST_HOME.with(|h| *h.borrow_mut() = Some(t.path().to_path_buf()));
+        let d = |id: &str, s: &str, n: &str| UsbDev { id: id.into(), serial: s.into(), name: n.into() };
+        let devs = vec![d("1209:000a", "A1", "dev board"), d("0781:5583", "", "")];
+        write_session("k", &devs);
+        assert_eq!(read_session("k"), devs);
+        // A hand-edited or damaged file: bad lines are skipped.
+        std::fs::write(session_file("k"), "1209:000a\tA1\tok\nnot a device\n../../x\t\t\n").unwrap();
+        assert_eq!(read_session("k"), vec![d("1209:000a", "A1", "ok")]);
+        write_session("k", &[]);
+        assert!(!session_file("k").exists());
+        assert!(read_session("nothing").is_empty());
     }
 }

@@ -491,6 +491,15 @@ pub fn start(path: &Path, cfg: &VmConfig, extra: &[String]) -> Result<String, St
         show(&key);
         return Ok(key);
     }
+    // Read before the VMM starts: it removes the suspend image once it
+    // has resumed from it.
+    let state_dir = extra
+        .iter()
+        .position(|a| a == "--state-dir")
+        .and_then(|i| extra.get(i + 1))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| cfg.default_state_dir(path));
+    let resuming = state_dir.join("suspend").join("manifest.json").is_file() && !extra.iter().any(|a| a == "--fresh");
     let log = crate::paths::log_file(&key);
     if let Some(d) = log.parent() {
         std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
@@ -520,7 +529,9 @@ pub fn start(path: &Path, cfg: &VmConfig, extra: &[String]) -> Result<String, St
         .map_err(|e| format!("start {}: {e}", vmm.display()))?;
     drop(theirs);
     let pid = child.id();
-    open(key, path, cfg, ours, Some(child), pid, VmState::Starting)
+    let key = open(key, path, cfg, ours, Some(child), pid, VmState::Starting)?;
+    with(&key, |c| c.usb_prepare(resuming));
+    Ok(key)
 }
 
 /// How long a VMM we reattach to gets to send its screen.

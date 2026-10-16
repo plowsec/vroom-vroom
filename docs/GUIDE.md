@@ -586,7 +586,8 @@ Click one to connect it to the VM, click it again to give it back to
 the Mac, like VMware's "Connect (Disconnect from Host)". A connected
 device has "Always connect to this VM" under it: tick it and it goes in
 the VM file, so the VM takes it at every start. Without the tick it is
-only for this run.
+only for this run; a suspended VM gets it back when it resumes, if it is
+still plugged into the Mac.
 
 From the terminal, the same thing for every start:
 
