@@ -92,6 +92,8 @@ export component IconButton inherits Rectangle {
     in property <string> tip;
     in property <bool> enabled: true;
     in property <bool> active: false;
+    // Looks off but still clicks and shows its tip (why it is off).
+    in property <bool> dim: false;
     in property <color> tint: Theme.text-2;
     in property <length> size: 34px;
     callback clicked;
@@ -100,7 +102,7 @@ export component IconButton inherits Rectangle {
     border-radius: Theme.r-md;
     background: active || ta.has-hover ? Theme.selected : transparent;
     animate background { duration: 120ms; }
-    opacity: enabled ? 1 : 0.35;
+    opacity: enabled && !dim ? 1 : 0.35;
     Icon {
         source: root.icon;
         width: root.size * 0.5;

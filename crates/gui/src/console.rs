@@ -32,6 +32,8 @@ use vroom_display::{recv_fd, Command, Decoder, GuestCursor, SharedFb, ToViewer, 
 use crate::msg::{self, Msg};
 use crate::{ConsoleWindow, VmState};
 
+mod coherence;
+
 const CLIP_POLL: Duration = Duration::from_millis(500);
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(300);
 const THUMB_EVERY: Duration = Duration::from_secs(2);
@@ -65,6 +67,10 @@ struct Shared {
     cursor: Option<GuestCursor>,
     /// Answers about files dragged over the window, in order.
     drag: VecDeque<ToViewer>,
+    /// What the guest agent can do, when it (re)connects.
+    features: Option<u64>,
+    /// Coherence: the guest's latest window list.
+    windows: Option<Vec<vroom_display::GuestWindow>>,
     posted: bool,
 }
 
@@ -108,6 +114,8 @@ impl Shared {
                 }
                 self.drag.push_back(m);
             }
+            ToViewer::Agent { features } => self.features = Some(features),
+            ToViewer::Windows(list) => self.windows = Some(list),
             ToViewer::Closed => return false,
         }
         !std::mem::replace(&mut self.posted, true)
@@ -206,6 +214,11 @@ pub struct Console {
     drag: Option<Drag>,
     drag_seq: u32,
     drag_timer: slint::Timer,
+    /// What the guest agent says it can do (0: none connected yet).
+    features: u64,
+    windows_guest: bool,
+    /// In Coherence: the guest's windows as Mac windows.
+    coh: Option<coherence::Coherence>,
 }
 
 /// Files from the Mac over the window (see dnd.rs).
@@ -312,15 +325,42 @@ pub fn command_any(cmd: &str) {
     });
 }
 
-/// A key press to every VM's guest (for `VROOM_SHOT`).
-pub fn key_any(code: u16) {
+/// Keys to every VM's guest (for `VROOM_SHOT`), pressed in order and let
+/// go the other way (Win+R: [125, 19]).
+pub fn keys_any(codes: &[u16]) {
     CONSOLES.with(|c| {
         for con in c.borrow().values() {
             let mut io = con.io.borrow_mut();
-            io.key(code, true);
-            io.key(code, false);
+            for &k in codes {
+                io.key(k, true);
+            }
+            for &k in codes.iter().rev() {
+                io.key(k, false);
+            }
         }
     });
+}
+
+/// Text typed on the guest's (US) keyboard, for `VROOM_SHOT`: letters,
+/// digits, space and a few signs; anything else is skipped.
+pub fn type_any(text: &str) {
+    const ROWS: [(&str, u16); 4] = [("1234567890-=", 2), ("qwertyuiop[]", 16), ("asdfghjkl;'", 30), ("zxcvbnm,./", 44)];
+    for ch in text.chars() {
+        let lower = ch.to_ascii_lowercase();
+        let code = match lower {
+            ' ' => Some(57),
+            '\\' => Some(43),
+            ':' => Some(39),
+            '"' => Some(40),
+            _ => ROWS.iter().find_map(|(row, base)| row.find(lower).map(|i| base + i as u16)),
+        };
+        let Some(code) = code else { continue };
+        if ch.is_ascii_uppercase() || ch == ':' || ch == '"' {
+            keys_any(&[42, code]);
+        } else {
+            keys_any(&[code]);
+        }
+    }
 }
 
 /// The mouse to a point of every VM window, as if moved there (for
@@ -330,6 +370,21 @@ pub fn move_any(x: f32, y: f32) {
     for w in wins {
         let position = slint::LogicalPosition::new(x, y);
         w.window().dispatch_event(slint::platform::WindowEvent::PointerMoved { position });
+    }
+}
+
+/// A click at a point of the Coherence window in front (for `VROOM_SHOT`):
+/// goes through the window like a real one. `title`: the window whose
+/// title has it, else the guest's window in front.
+pub fn coh_click_any(x: f32, y: f32, title: &str) {
+    use slint::platform::{PointerEventButton, WindowEvent as SlintEvent};
+    let wins: Vec<crate::CoherenceWindow> = CONSOLES.with(|c| c.borrow().values().filter_map(|c| c.coh_window(title)).collect());
+    for w in wins {
+        let position = slint::LogicalPosition::new(x, y);
+        let win = w.window();
+        win.dispatch_event(SlintEvent::PointerMoved { position });
+        win.dispatch_event(SlintEvent::PointerPressed { position, button: PointerEventButton::Left });
+        win.dispatch_event(SlintEvent::PointerReleased { position, button: PointerEventButton::Left });
     }
 }
 
@@ -557,6 +612,9 @@ fn open(key: String, cfg: &VmConfig, ours: UnixStream, child: Option<Child>, pid
         drag: None,
         drag_seq: 0,
         drag_timer: slint::Timer::default(),
+        features: 0,
+        windows_guest: os == GuestOs::Windows,
+        coh: None,
     };
     CONSOLES.with(|m| m.borrow_mut().insert(key.clone(), c));
     ensure_timer();
@@ -579,18 +637,7 @@ fn wire(win: &ConsoleWindow, key: &str, io: &Rc<RefCell<Io>>) {
     }
     {
         let io = io.clone();
-        win.on_wheel(move |dx, dy| {
-            let mut io = io.borrow_mut();
-            io.wheel.0 += dx;
-            io.wheel.1 += dy;
-            let sx = (io.wheel.0 / WHEEL_STEP).trunc();
-            let sy = (io.wheel.1 / WHEEL_STEP).trunc();
-            if sx != 0.0 || sy != 0.0 {
-                io.wheel.0 -= sx * WHEEL_STEP;
-                io.wheel.1 -= sy * WHEEL_STEP;
-                io.send(ToVmm::Wheel { dx: sx as i16, dy: sy as i16 });
-            }
-        });
+        win.on_wheel(move |dx, dy| wheel(&io, dx, dy));
     }
     {
         let k = key.to_string();
@@ -627,29 +674,27 @@ fn wire(win: &ConsoleWindow, key: &str, io: &Rc<RefCell<Io>>) {
     win.window().on_winit_window_event(move |_w, ev| winit_event(&k, &io, ev));
 }
 
-/// Keys as physical key codes (what the guest's keyboard sends), focus,
-/// resizes. Text input never goes through here.
-fn winit_event(key: &str, io: &Rc<RefCell<Io>>, ev: &WindowEvent) -> EventResult {
+/// Scrolling (logical pixels) as wheel clicks for the guest.
+fn wheel(io: &Rc<RefCell<Io>>, dx: f32, dy: f32) {
+    let mut io = io.borrow_mut();
+    io.wheel.0 += dx;
+    io.wheel.1 += dy;
+    let sx = (io.wheel.0 / WHEEL_STEP).trunc();
+    let sy = (io.wheel.1 / WHEEL_STEP).trunc();
+    if sx != 0.0 || sy != 0.0 {
+        io.wheel.0 -= sx * WHEEL_STEP;
+        io.wheel.1 -= sy * WHEEL_STEP;
+        io.send(ToVmm::Wheel { dx: sx as i16, dy: sy as i16 });
+    }
+}
+
+/// Keys as physical key codes (what the guest's keyboard sends); the
+/// host's own shortcuts (Ctrl+Alt+Shift+key) never reach it. For the VM
+/// window and its Coherence windows alike.
+fn input_event(key: &str, io: &Rc<RefCell<Io>>, ev: &WindowEvent) -> EventResult {
     match ev {
         WindowEvent::ModifiersChanged(m) => {
             io.borrow_mut().mods = m.state();
-            EventResult::Propagate
-        }
-        WindowEvent::Focused(f) => {
-            let mut i = io.borrow_mut();
-            i.focused = *f;
-            if !*f {
-                i.release_all();
-            }
-            i.send(ToVmm::Focus(*f));
-            drop(i);
-            if *f {
-                // Can arrive from inside show(): don't touch the registry now.
-                let key = key.to_string();
-                slint::Timer::single_shot(Duration::ZERO, move || {
-                    with(&key, |c| c.clip_seen = None);
-                });
-            }
             EventResult::Propagate
         }
         WindowEvent::KeyboardInput { event, .. } => {
@@ -670,6 +715,32 @@ fn winit_event(key: &str, io: &Rc<RefCell<Io>>, ev: &WindowEvent) -> EventResult
                 io.borrow_mut().key(code, down);
             }
             EventResult::PreventDefault
+        }
+        _ => EventResult::Propagate,
+    }
+}
+
+/// The VM window's events: keys (above), focus, files from Finder, resizes.
+/// Text input never goes through here.
+fn winit_event(key: &str, io: &Rc<RefCell<Io>>, ev: &WindowEvent) -> EventResult {
+    match ev {
+        WindowEvent::ModifiersChanged(_) | WindowEvent::KeyboardInput { .. } => input_event(key, io, ev),
+        WindowEvent::Focused(f) => {
+            let mut i = io.borrow_mut();
+            i.focused = *f;
+            if !*f {
+                i.release_all();
+            }
+            i.send(ToVmm::Focus(*f));
+            drop(i);
+            if *f {
+                // Can arrive from inside show(): don't touch the registry now.
+                let key = key.to_string();
+                slint::Timer::single_shot(Duration::ZERO, move || {
+                    with(&key, |c| c.clip_seen = None);
+                });
+            }
+            EventResult::Propagate
         }
         // Files from the Mac: one event per file, all at once.
         WindowEvent::HoveredFile(p) => {
@@ -716,6 +787,7 @@ fn host_shortcut(k: KeyCode) -> Option<&'static str> {
         KeyCode::KeyZ => "suspend",
         KeyCode::KeyF => "fullscreen",
         KeyCode::KeyL => "library",
+        KeyCode::KeyC => "coherence",
         _ => return None,
     })
 }
@@ -783,6 +855,7 @@ fn ready(key: &str, fd: OwnedFd) {
 fn closed(key: &str) {
     let Some(mut c) = CONSOLES.with(|m| m.borrow_mut().remove(key)) else { return };
     c.save_thumb(None);
+    c.coh_close();
     let _ = c.win.hide();
     let Some(mut child) = c.child.take() else {
         // Reattached: not ours to reap. Never got going: it hangs.
@@ -903,6 +976,7 @@ impl Console {
                     io.send(ToVmm::Key { code, down: false });
                 }
             }
+            "fullscreen" if self.coh.is_some() => {}
             "fullscreen" => {
                 let w = self.win.window();
                 let fs = !w.is_fullscreen();
@@ -919,6 +993,7 @@ impl Console {
                     });
                 }
             }
+            "coherence" => self.coherence_toggle(),
             "library" => msg::send(Msg::ShowLibrary(None)),
             "settings" => msg::send(Msg::ShowLibrary(Some(self.key.clone()))),
             _ => {}
@@ -927,12 +1002,17 @@ impl Console {
 
     /// What the reader thread collected since the last wakeup.
     fn inbox(&mut self) {
-        let (frame, full, damage, status, clip, mic, cursor, drag) = {
+        let (frame, full, damage, status, clip, mic, cursor, drag, features, windows) = {
             let mut s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
             s.posted = false;
             let f = (std::mem::take(&mut s.frame), std::mem::take(&mut s.full), s.damage.take());
-            (f.0, f.1, f.2, std::mem::take(&mut s.status), s.clipboard.take(), s.mic.take(), s.cursor.take(), std::mem::take(&mut s.drag))
+            let c = (s.features.take(), s.windows.take());
+            (f.0, f.1, f.2, std::mem::take(&mut s.status), s.clipboard.take(), s.mic.take(), s.cursor.take(), std::mem::take(&mut s.drag), c.0, c.1)
         };
+        if let Some(f) = features {
+            self.features = f;
+            self.win.set_coherence_why(self.coherence_why().into());
+        }
         for m in drag {
             match m {
                 ToViewer::DragReady { id, live } => self.drag_ready(id, live),
@@ -958,6 +1038,9 @@ impl Console {
         }
         if frame {
             self.frame(full, damage);
+        }
+        if let Some(list) = windows {
+            self.coh_windows(list);
         }
     }
 
@@ -1052,6 +1135,8 @@ impl Console {
             }
         }
         self.win.set_captured(self.io.borrow().focused && self.state == VmState::Running);
+        self.win.set_coherence_why(self.coherence_why().into());
+        self.coh_tick();
     }
 
     /// A file is dragged over the window (several come at once).
@@ -1337,6 +1422,7 @@ impl Console {
             self.mode = (0, 0);
             self.win.set_mode_w(0);
             self.win.set_mode_h(0);
+            self.coh_mode();
             return;
         }
         let fresh = full || self.mode != mode || self.img.as_ref().is_none_or(|b| (b.width(), b.height()) != mode);
@@ -1360,12 +1446,16 @@ impl Console {
         }
         if self.mode != mode {
             // Ask the guest to match the window on the first frame.
-            if self.mode == (0, 0) {
+            if self.mode == (0, 0) && self.coh.is_none() {
                 self.pending_resize = Some(Instant::now());
             }
             self.mode = mode;
             self.win.set_mode_w(w as i32);
             self.win.set_mode_h(h as i32);
+            // Coherence windows sit by the new size; their pictures follow.
+            self.coh_mode();
+        } else {
+            self.coh_pictures(if fresh { None } else { damage });
         }
         if self.state == VmState::Starting {
             self.ever_ran = true;

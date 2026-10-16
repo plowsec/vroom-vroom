@@ -36,6 +36,8 @@ component VmBar inherits HorizontalLayout {
     in property <string> gpu-text;
     // Spans the window: the indicators go to the right.
     in property <bool> wide;
+    // Coherence: why it can't start (empty: it can).
+    in property <string> coherence-why;
     out property <bool> power-open: false;
     callback act(string);
 
@@ -191,6 +193,13 @@ component VmBar inherits HorizontalLayout {
         clicked => { root.act("settings"); }
     }
     BarButton {
+        icon: Icons.window;
+        tip: root.coherence-why == "" ? "Coherence: the VM's windows on your desktop" : root.coherence-why;
+        dim: root.coherence-why != "";
+        y: (parent.height - self.height) / 2;
+        clicked => { root.act("coherence"); }
+    }
+    BarButton {
         icon: Icons.maximize;
         tip: root.fullscreen ? "Leave full screen" : "Full screen";
         y: (parent.height - self.height) / 2;
@@ -277,6 +286,8 @@ export component ConsoleWindow inherits Window {
     in property <string> suspend-error;
     in property <string> cpu-text;
     in property <string> gpu-text;
+    // Why Coherence can't start now (empty: it can).
+    in property <string> coherence-why: "Coherence needs the guest tools";
     // Height of the bar above the guest screen (none in full screen).
     // Rust takes it off the size it asks the guest for.
     out property <length> bar-height: root.fullscreen ? 0px : 38px;
@@ -525,6 +536,7 @@ export component ConsoleWindow inherits Window {
             mic-on: root.mic-on;
             cpu-text: root.cpu-text;
             gpu-text: root.gpu-text;
+            coherence-why: root.coherence-why;
             wide: true;
             act(a) => { root.act(a); }
         }
@@ -557,6 +569,7 @@ export component ConsoleWindow inherits Window {
             fullscreen: root.fullscreen;
             mic-on: root.mic-on;
             wide: false;
+            coherence-why: root.coherence-why;
             act(a) => { root.act(a); }
         }
     }

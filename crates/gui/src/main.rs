@@ -76,7 +76,17 @@ fn main() {
         Some(config) => {
             let extra: Vec<String> = args.collect();
             let p = std::path::PathBuf::from(config);
-            vroom_config::VmConfig::load(&p).map_err(|e| e.to_string()).and_then(|cfg| console::start(&p, &cfg, &extra).map(|_| ()))
+            vroom_config::VmConfig::load(&p).map_err(|e| e.to_string()).and_then(|cfg| {
+                // Running without a window (the app crashed): show it again.
+                let dir = cfg.default_state_dir(&p);
+                match console::viewer_socket(&dir) {
+                    Some(sock) if vroom_state::StateLock::in_use(&dir) => {
+                        let pid = vroom_state::StateLock::holder(&dir).unwrap_or(0);
+                        console::attach(&p, &cfg, &sock, pid).map(|_| ())
+                    }
+                    _ => console::start(&p, &cfg, &extra).map(|_| ()),
+                }
+            })
         }
     };
     if let Err(e) = r {

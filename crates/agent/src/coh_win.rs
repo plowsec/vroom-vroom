@@ -37,6 +37,8 @@ pub struct WinDesktop {
     ours: bool,
     /// The last window in front we said we leave out (logs).
     fg_seen: isize,
+    /// Log what the next list leaves out (Coherence just went on).
+    explain: bool,
 }
 
 /// Runs `f` with per-monitor DPI awareness on this thread.
@@ -186,7 +188,7 @@ impl WinDesktop {
             PeekMessageW(&mut m, std::ptr::null_mut(), 0, 0, PM_NOREMOVE);
         }
         // Not ours yet; shell(false) at start shows it if a crashed agent hid it.
-        WinDesktop { listed: Vec::new(), hidden: true, ours: false, fg_seen: 0 }
+        WinDesktop { listed: Vec::new(), hidden: true, ours: false, fg_seen: 0, explain: false }
     }
 
     fn list(&mut self) -> Vec<GuestWindow> {
@@ -221,7 +223,7 @@ impl WinDesktop {
                 }
                 // The first list after Coherence goes on: what's left out
                 // and why (only windows with a title, the rest is noise).
-                Err(why) if self.listed.is_empty() && why != "hidden" && !title(h).is_empty() => {
+                Err(why) if self.explain && why != "hidden" && !title(h).is_empty() => {
                     log::info!("coherence: {:#x} ({}, {:?}) left out: {why}", h as isize, class(h), title(h));
                 }
                 Err(_) => {}
@@ -231,6 +233,7 @@ impl WinDesktop {
             }
         }
         self.listed = out.iter().map(|w| hwnd(w.id) as isize).collect();
+        self.explain = false;
         out
     }
 
@@ -310,7 +313,7 @@ impl crate::coherence::Desktop for WinDesktop {
                     self.hidden = true;
                     if !std::mem::replace(&mut self.ours, true) {
                         // Just turned on (logs say what's left out).
-                        self.listed.clear();
+                        self.explain = true;
                     }
                     // Windows puts the taskbar's share back on screen changes.
                     let s = screen();
