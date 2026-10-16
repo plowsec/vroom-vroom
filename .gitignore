@@ -6,3 +6,18 @@
 .DS_Store
 *.state/
 .claude/worktrees/
+# Local investigations and generated research state are never release source.
+/experiments/
+/examples/test.md
+/research-state/
+**/.venv/
+**/__pycache__/
+**/.pytest_cache/
+**/.ruff_cache/
+*.vmwarevm/
+*.vmdk
+*.vmem
+*.vmsn
+*.dmp
+*.pdb
+*.atui

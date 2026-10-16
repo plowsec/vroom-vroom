@@ -1,0 +1,22 @@
+[project]
+name = "vroom-kernel-tui"
+version = "0.1.0"
+description = "Optional Windows kernel debugger frontend for vroom-lab"
+requires-python = ">=3.12"
+dependencies = ["textual>=6.0,<7", "capstone>=5,<6"]
+
+[project.scripts]
+vroom-kernel = "vroom_tui.app:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["vroom_tui"]
+
+[dependency-groups]
+dev = ["pytest", "pytest-asyncio"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

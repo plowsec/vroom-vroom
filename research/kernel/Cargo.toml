@@ -1,0 +1,25 @@
+[package]
+name = "vroom-kernel"
+description = "Optional Windows ARM64 kernel debugger"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vroom-lab"
+path = "src/main.rs"
+
+[dependencies]
+vroom-hv.workspace = true
+vroom-memory.workspace = true
+vroom-vmm.workspace = true
+vroom-config.workspace = true
+vroom-display.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+pdb = "0.8"
+
+[lints]
+workspace = true
