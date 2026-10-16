@@ -332,7 +332,6 @@ component Hero inherits Rectangle {
                 }
                 if !States.busy(root.vm.state): Icon {
                     source: Icons.play;
-                    x: (parent.width - self.width) / 2 + 3px;
                     width: parent.width * 0.38;
                     height: self.width;
                     tint: root.vm.has-thumb ? #ffffff : Theme.text;
