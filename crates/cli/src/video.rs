@@ -85,6 +85,9 @@ struct Stream {
     reorder: Reorder<(u32, Vec<u8>)>,
     out: VecDeque<Out>,
     epoch: u32,
+    /// The epoch we last sent a new size under: credits still coming for
+    /// it were granted for buffers of the old size.
+    closed: Option<u32>,
     credits: u32,
     draining: bool,
     tag: u64,
@@ -104,6 +107,7 @@ impl Stream {
             reorder: Reorder::default(),
             out: VecDeque::new(),
             epoch: 0,
+            closed: None,
             credits: 0,
             draining: false,
             tag: 0,
@@ -319,6 +323,9 @@ fn handle(streams: &mut BTreeMap<u32, Stream>, link: &mut Link, m: ToHelper) {
         },
         ToHelper::Credit { session, epoch, n } => {
             if let Some(s) = streams.get_mut(&session) {
+                if s.closed == Some(epoch) {
+                    return;
+                }
                 if epoch != s.epoch {
                     s.epoch = epoch;
                     s.credits = 0;
@@ -368,8 +375,10 @@ fn work(session: u32, s: &mut Stream, link: &mut Link) {
         match o {
             Out::Format { layout, visible } => {
                 link.send(FromHelper::Format { session, layout: *layout, visible: *visible, min_buffers: MIN_BUFFERS });
-                // New buffers for the new size: the VMM grants again.
+                // New buffers for the new size: the VMM grants again, under
+                // a new epoch.
                 s.credits = 0;
+                s.closed = Some(s.epoch);
             }
             Out::Picture { .. } if s.credits == 0 => break,
             Out::Picture { .. } => {}

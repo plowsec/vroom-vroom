@@ -507,10 +507,12 @@ impl Handler {
                 }
                 let sub = s.sub_src;
                 self.new_epoch(id);
-                self.deliver_last(id);
+                // The event first: a player that sees the empty LAST
+                // buffer before it knows why may take it for the end.
                 if sub {
                     self.v4l2_event(id, EVENT_SOURCE_CHANGE, SRC_CH_RESOLUTION);
                 }
+                self.deliver_last(id);
                 self.grant(id);
             }
             FromHelper::Picture { epoch, cookie, data, .. } => {

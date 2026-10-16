@@ -227,7 +227,7 @@ fn a_size_change_mid_stream_needs_new_buffers() {
     // Bigger than the buffers: the next one goes back empty and LAST, and
     // no credit until the guest makes new buffers.
     t.reply(FromHelper::Format { session: 0, layout: Layout { width: 4096, height: 2304 }, visible: (4096, 2304), min_buffers: 4 });
-    assert_eq!(t.events(), vec![(EVT_DQBUF, CAPTURE_MPLANE, 0, BUF_FLAG_LAST | BUF_FLAG_TIMESTAMP_COPY, 0), (EVT_EVENT, EVENT_SOURCE_CHANGE, 0, 0, 0)]);
+    assert_eq!(t.events(), vec![(EVT_EVENT, EVENT_SOURCE_CHANGE, 0, 0, 0), (EVT_DQBUF, CAPTURE_MPLANE, 0, BUF_FLAG_LAST | BUF_FLAG_TIMESTAMP_COPY, 0)]);
     assert!(!t.sent().iter().any(|m| matches!(m, ToHelper::Credit { n, .. } if *n > 0)));
     t.stream(ioc::STREAMOFF, CAPTURE_MPLANE);
     assert_eq!(t.reqbufs(CAPTURE_MPLANE, 2), 2);
