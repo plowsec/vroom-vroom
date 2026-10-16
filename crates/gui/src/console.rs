@@ -1248,6 +1248,13 @@ impl Console {
             let io = self.io.borrow();
             let tx = io.tx.as_ref().ok_or_else(|| std::io::Error::other("the VM is gone"))?;
             vroom_display::send_fd_with(tx, &ToVmm::Drop { id }.encode(), theirs.as_raw_fd()).map_err(|e| std::io::Error::other(e.to_string()))?;
+            // Not closed at once: macOS can hand over a socket already
+            // disconnected when the sender's copy closes while it is in
+            // flight (about 1 in 10 here). The VMM has it within moments.
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(3));
+                drop(theirs);
+            });
             Ok(ours)
         });
         match sent.and_then(|ours| std::thread::Builder::new().name("drop".into()).spawn(move || crate::dnd::send(id, paths, ours, progress))) {
