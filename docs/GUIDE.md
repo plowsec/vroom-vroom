@@ -325,6 +325,14 @@ mode = "nat"
 
 `target/debug/vroom-gui desktop.toml`. The guest follows window resizes.
 
+Ubuntu 22.04's desktop shows "an application has crashed" for
+`tracker-extract-3` (GNOME's file indexer) a minute or two after login,
+then again and again. That is a tracker bug, not the VM: its own sandbox
+kills it when a library sends it a signal (`rt_sigreturn` is missing
+from its list of allowed calls; fixed upstream, tracker-miners merge
+request 514). It does no harm. In an installed system, updates may fix it; otherwise
+`systemctl --user mask tracker-extract-3` stops it.
+
 ## Windows 11 ARM64
 
 1. Get a Windows 11 ARM64 ISO (e.g. via UUP dump) and the virtio-win ISO.
