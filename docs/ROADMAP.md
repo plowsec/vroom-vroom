@@ -8,8 +8,8 @@ move to the docs (GUIDE, ARCHITECTURE) once they work.
 
 - **A webcam for the guest** (Google Meet, Teams, Zoom): a virtual USB
   camera fed by the Mac's camera, from a sandboxed helper like the
-  microphone. Needs isochronous transfers in our USB controller, which
-  also lets passed-through USB audio and video devices stream.
+  microphone. Our USB controller does isochronous transfers now
+  (passed-through sound cards and webcams stream).
 - **Coherence** (VMware: Unity): each guest app window as a window of its
   own on the Mac desktop, without the guest's desktop around it.
 
