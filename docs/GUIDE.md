@@ -454,7 +454,8 @@ picks the right one by itself:
 
 - **OpenGL** (virgl): Mesa's virgl driver sends GL work to the host,
   where virglrenderer replays it on the Mac's GPU. Stock Ubuntu works as
-  it is (any kernel, Mesa from the archive), in Wayland and X11 sessions.
+  it is (any kernel, Mesa from the archive), in Wayland and X11 sessions,
+  and X11 apps in a Wayland session (Xwayland) are accelerated too.
 - **Vulkan** (Venus): needs `mesa-vulkan-drivers` (Mesa ≥ 24) and the
   user in the `render` group; stock Ubuntu kernels work. `vulkaninfo
   --summary` should show `Virtio-GPU Venus (Apple M…)`. If every Vulkan

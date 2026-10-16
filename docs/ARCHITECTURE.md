@@ -412,8 +412,13 @@ advertises it and shares mappings by pointer instead
 (`third_party/virglrenderer/`). Two more patches there make vrend work on
 macOS's OpenGL 4.1: multisample textures without `glTexStorage*Multisample`
 (GL 4.3), and shaders written at the host's GLSL version (4.10) instead of
-an older one plus `#extension` lines macOS's compiler rejects. virglrenderer
-logs through our logger (`virgl:` lines).
+an older one plus `#extension` lines macOS's compiler rejects. A third
+(0011) clears textures without `glClearTexSubImage` (GL 4.4): it uploads
+the guest's texel over the box, 4 MiB of rows at a time, through vrend's
+normal upload path. Without it, the guest's Mesa 25.2 clears through a
+surface the host never saw (handle 0), vrend puts the whole context in
+error, and Xwayland under GNOME on Wayland drew nothing (its glamor clears
+pixmaps this way). virglrenderer logs through our logger (`virgl:` lines).
 
 What MoltenVK lacks, the Venus decoder makes up (patches 0007 and 0008):
 

@@ -71,10 +71,6 @@ Linux guests, next:
   on the Mac's GPU. Like we do for OpenGL, we'd follow what each Vulkan
   app creates and rebuild it on resume; Vulkan has far more kinds of
   objects, so this is the biggest of these items.
-- **Xwayland under GNOME on virgl**: its GL context breaks at login
-  (`vrend_clear_surface: ... Illegal surface 0`), so X11 apps in a
-  GNOME Wayland session show nothing. Not new; seen with the old library
-  too.
 
 Windows guests:
 

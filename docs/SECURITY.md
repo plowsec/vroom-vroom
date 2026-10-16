@@ -553,6 +553,12 @@ read only and copies rows out of it; the row size, offset and height the
 guest gives are checked against the memory's size first. Nothing new is
 loaded and the sandbox rules don't change.
 
+On the GL side, texture clears (`VIRGL_CCMD_CLEAR_TEXTURE`) now reach the
+host on macOS's OpenGL and ANGLE too, which lack the GL call: vrend checks
+the box against the texture's level first, then uploads the texel through
+its normal upload path from a scratch buffer of at most 4 MiB (one band of
+rows), so a huge box costs time, not memory.
+
 ### A process per Vulkan and Direct3D context
 
 Each Vulkan (Venus) and Direct3D (Neptune) context of the guest, roughly
