@@ -10,8 +10,10 @@ move to the docs (GUIDE, ARCHITECTURE) once they work.
   camera fed by the Mac's camera, from a sandboxed helper like the
   microphone. Needs isochronous transfers in our USB controller, which
   also lets passed-through USB audio and video devices stream.
-- **Coherence** (VMware: Unity): each guest app window as a window of its
-  own on the Mac desktop, without the guest's desktop around it.
+- **Coherence, next steps** (Windows guests have a first version, see
+  GUIDE.md): Linux guests (X11 first), app icons in the bar and the Dock,
+  several Mac screens, smoother window drags (window events from the
+  guest instead of a 40 ms look), starting a guest app from the Mac.
 
 ## 3D: catching up with VMware and Parallels
 

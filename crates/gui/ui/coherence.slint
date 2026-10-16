@@ -176,6 +176,7 @@ export component CoherenceBar inherits Window {
         }
         Button {
             small: true;
+            horizontal-stretch: 0;
             text: "Start";
             y: (parent.height - self.height) / 2;
             clicked => { root.start(); }
@@ -224,6 +225,7 @@ export component CoherenceBar inherits Window {
         }
         Button {
             small: true;
+            horizontal-stretch: 0;
             kind: "ghost";
             text: "Leave Coherence";
             icon: Icons.window;

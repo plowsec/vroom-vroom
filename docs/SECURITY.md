@@ -113,6 +113,42 @@ folder of the logged-in user (their temp folder on Windows, their cache
 folder on Linux), then go where the drop lands. The drag window the agent
 puts under the pointer on Windows only starts a drag of those files.
 
+## Coherence
+
+In Coherence the guest decides what windows appear on the Mac desktop,
+where, and with what title. That is the guest's word, so:
+
+- The list is checked three times (agent protocol in the VMM, viewer
+  protocol in the app, then the app itself): at most 64 windows, ids
+  unique, titles of at most 256 bytes of UTF-8, sizes within 65536
+  pixels. The app clips every window to the guest's screen and shows at
+  most 24. Titles lose control and direction-changing characters and are
+  cut to 80 characters. A guest that floods lists costs one queued list
+  in the VMM and one in the app.
+- Every Coherence window carries a strip the app draws above the guest's
+  picture, with the VM's name and the window's title; the guest can't draw
+  over it, and has no way to open a window without it. Its macOS window
+  title starts with the VM's name too (Mission Control, the Window menu).
+- The guest's screen is placed inside the Mac screen's free area: guest
+  windows can't cover the menu bar, the Dock or the Coherence bar, and
+  they sit at the normal window level (never above other apps' windows by
+  level).
+- New guest windows open behind other apps' windows while vroom isn't the
+  app in front, and the guest's window order is only applied while it is:
+  a guest can't pop windows over what the user is working on. It still
+  can while the user works in one of its windows.
+- Clicking a Mac window activates its guest window; menus and other
+  windows without a title are never activated. The guest is asked to
+  act only on windows of its last list (the VMM and the agent both
+  check), and only to bring them to the front, minimize, close them
+  politely (`SC_CLOSE`, the app may refuse) or move them.
+- The clipboard rules don't change: sync only while one of the VM's
+  windows (or the bar) has the keyboard.
+
+What's left: a guest app can still draw anything below the strip,
+including something that looks like a Mac dialog. The strip says whose
+window it is; read it before typing a password into a window.
+
 
 
 NAT is a userspace proxy: the guest never gets raw access to the host
@@ -355,7 +391,8 @@ SYSTEM/Administrators/interactive users only, remote clients refused,
 only clients from the active console session served. The helper only
 talks to a pipe server in session 0, so a user process squatting the pipe
 name gets nothing. The service accepts nothing from the helper but
-clipboard text (size-capped).
+clipboard text (size-capped), answers about dropped files, and window
+lists while the host's window is in Coherence (checked like the rest).
 
 The Linux agent has the same split: a hardened systemd service
 (`CAP_SYS_TIME` only, read-only file system, Unix sockets only) and a

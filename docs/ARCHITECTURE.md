@@ -123,6 +123,42 @@ its own. When the guest says `DropDone`, the app lets go of the button
 and the app under the pointer takes the files. Leaving the window sends
 `DragCancel`, Escape and the button up.
 
+## Coherence
+
+The app asks the guest for a screen the size of the Mac screen's free
+area (`ToVmm::Resize`, the usual path) and sends `ToVmm::Coherence(true)`;
+the VMM's agent service passes `Message::Coherence` on, the Windows
+service hands it to the session helper (`agent/src/coherence.rs`,
+`coh_win.rs`). The helper hides the taskbar, makes the whole screen the
+work area, and every 40 ms walks the windows front to back
+(`GetTopWindow`/`GW_HWNDNEXT`: `EnumWindows` leaves out Store apps and the
+Start menu), with per-monitor DPI awareness so it reads real pixels. When
+the list changes it sends `Message::Windows`: id (the window handle),
+what can be seen of it (DWM's frame bounds), flags (in front, minimized,
+app window, maximized), title. Back come `WindowDo` requests: activate
+(joining the foreground thread's input, as for drag and drop), minimize,
+close (`SC_CLOSE`), move (to the visible bounds, borders added back).
+Only windows of the last list are touched, in the VMM and the agent.
+
+The VMM forwards the list to the app coalesced (`ToViewer::Windows`, like
+damage: a busy guest costs one queued list). The app
+(`gui/src/console/coherence.rs`) keeps one frameless Slint window per
+guest window on screen (`ui/coherence.slint`): our strip on top, then the
+guest window's part of the shared framebuffer, copied where damage
+touches it. Guest pixels and Mac points convert through `Map` (the free
+area and the guest's mode, which may be smaller than asked: Windows'
+driver caps it). Pointer events map back through the picture's own size.
+Moves either way: the guest's list places the Mac windows; a Mac window
+moved or resized by the user sends `WindowDo::Move` and is left alone by
+guest reports for half a second. The guest's order is applied with
+`orderFront:` while vroom is the active app; new windows open behind
+other apps' windows when it isn't. The guest's window in front gets the
+keyboard on the Mac while one of ours has it. The bar (`CoherenceBar`)
+lists app windows and sends the Windows key for Start. Leaving sends
+`Coherence(false)` and the VM window's size; a viewer that goes away
+(the app crashed) turns Coherence off in the VMM, and the agent puts the
+taskbar back when its session ends or it starts again.
+
 ## 3D
 
 `gpu = "virtio3d"` adds three protocols to virtio-gpu. Venus: guest Vulkan

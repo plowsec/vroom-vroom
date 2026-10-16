@@ -21,6 +21,7 @@ The security design is better than the big three’s, at least on paper:
 
 - Ubuntu, Debian, Alpine, Windows 11 ARM64
 - Window with clipboard both ways and auto resolution, sharp on Retina
+- Coherence: Windows apps as windows of their own on the Mac
 - 3D: Vulkan (about 90% of native speed) and OpenGL 4.1 in Linux guests, Direct3D 11 in Windows guests
 - Snapshots, suspend/resume, reset
 - NAT with port forwards, several network adapters. Bridged and host-only need a root helper.
@@ -71,6 +72,7 @@ vroom usb list                    # host USB devices, the id for [[usb]]
 |---|---|
 | snapshot / suspend / pause | `Ctrl+Alt+Shift` + `S` / `Z` / `P` |
 | reset / shut down / power off | `Ctrl+Alt+Shift` + `R` / `D` / `Q` |
+| Coherence (Windows apps as Mac windows) | `Ctrl+Alt+Shift` + `C` |
 | toolbar in full screen | move the mouse to the top edge |
 | close the window | suspends the VM, next start resumes it |
 
