@@ -91,6 +91,12 @@ Windows guests:
 
 ## Before it's ready for people other than us
 
+- A Windows guest with 3D stopped once with "undecodable MMIO access at
+  0x8200010000" (the 3D device's memory window, about 40 s after login)
+  on a build from master 01a3d48. Not seen again: ten minutes on the
+  next master with the old and new guest tools, resizes and Coherence.
+  If it shows up again, the window's filler memory is the first suspect.
+
 - Test on other Macs (M1 to M4, base models with 8 GB) and macOS versions,
   and days-long runs: sleep and wake with VMs running, full disks.
 - Windows 3D: the text that sometimes doesn't draw (an agent is on it).
