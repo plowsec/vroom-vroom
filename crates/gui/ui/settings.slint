@@ -318,7 +318,7 @@ export component SettingsPanel inherits Rectangle {
                         changed(i) => { Bus.set("gpu", i); }
                     }
                     Text {
-                        text: root.s.gpu == 2 ? "Vulkan and OpenGL in Linux guests, drawn by your Mac's GPU. Needs the 3D libraries (see guide)."
+                        text: root.s.gpu == 2 ? "Drawn by your Mac's GPU: Vulkan and OpenGL in Linux, Direct3D 11 in Windows (with its 3D driver). Needs the 3D libraries (see guide)."
                             : root.s.gpu == 1 ? "Works everywhere. The guest follows the window size."
                             : "No screen. Use the serial console (vroom run).";
                         font-size: Theme.fs-xs;

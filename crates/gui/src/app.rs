@@ -682,6 +682,7 @@ impl App {
                     "{} · starts at {}×{}{}",
                     match (g, c.display.opengl, c.display.opengl_host) {
                         (1, ..) => "2D",
+                        _ if c.os == Some(GuestOs::Windows) => "3D (Direct3D 11)",
                         (_, true, OpenglHost::Apple) => "3D (Vulkan, OpenGL 4.1)",
                         (_, true, OpenglHost::Angle) => "3D (Vulkan, OpenGL 2.1)",
                         _ => "3D (Vulkan)",
