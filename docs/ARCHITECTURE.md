@@ -588,8 +588,13 @@ on GL 4.1; 0014 keeps the real count (4) on macOS's OpenGL. One sample
 left the guest's OpenGL ES 3.0 below its spec, and ANGLE, so Chrome's
 GPU process, refused to make an ES 3.0 context on it. With
 `opengl_host = "angle"` it is still one: ANGLE's ES 3.0 has no
-multisample textures. virglrenderer logs through our logger (`virgl:`
-lines).
+multisample textures. vrend pauses transform feedback after each draw
+and ends it only when the guest drops its buffers; macOS's GL crashed
+in `glEndTransformFeedback` when the program it began with wasn't
+bound any more (any GL app using transform feedback, at its end: the
+GPU process died). 0015 binds that program again for the end, or leaves
+the object to the context's end if the program is gone. virglrenderer
+logs through our logger (`virgl:` lines).
 
 What MoltenVK lacks, the Venus decoder makes up (patches 0007, 0008 and
 0012):

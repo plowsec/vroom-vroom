@@ -1,0 +1,52 @@
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -686,6 +686,9 @@
+    struct list_head head;
+    int xfb_state;
+    struct vrend_so_target *so_targets[16];
++   /* vroom: the program (or pipeline) bound at glBeginTransformFeedback */
++   GLuint begin_id;
++   bool begin_is_pipeline;
+ };
+ 
+ #define XFB_STATE_OFF 0
+@@ -2547,10 +2550,25 @@
+          if (obj->so_targets[i] == target) {
+             if (obj == sub_ctx->current_so)
+                sub_ctx->current_so = NULL;
+-            if (obj->xfb_state == XFB_STATE_PAUSED) {
++            /* vroom: macOS's GL crashes ending transform feedback unless the
++             * program it began with is bound, and the guest has usually
++             * unbound or deleted that program by now. Bind it again; if it
++             * is gone, leave the object to the GL context's end. */
++            if (obj->xfb_state == XFB_STATE_PAUSED && obj->begin_id &&
++                (obj->begin_is_pipeline ? glIsProgramPipeline(obj->begin_id) :
++                                          glIsProgram(obj->begin_id))) {
+                   if (has_feature(feat_transform_feedback2))
+                      glBindTransformFeedback(GL_TRANSFORM_FEEDBACK, obj->id);
++                  if (obj->begin_is_pipeline) {
++                     glUseProgram(0);
++                     glBindProgramPipeline(obj->begin_id);
++                  } else {
++                     if (has_feature(feat_separate_shader_objects))
++                        glBindProgramPipeline(0);
++                     glUseProgram(obj->begin_id);
++                  }
+                   glEndTransformFeedback();
++                  vrend_use_program(sub_ctx->prog);
+                if (sub_ctx->current_so && has_feature(feat_transform_feedback2))
+                   glBindTransformFeedback(GL_TRANSFORM_FEEDBACK, sub_ctx->current_so->id);
+             }
+@@ -6348,6 +6366,11 @@
+          else
+             glBeginTransformFeedback(get_xfb_mode(info->mode));
+          sub_ctx->current_so->xfb_state = XFB_STATE_STARTED;
++         if (sub_ctx->prog) {
++            sub_ctx->current_so->begin_is_pipeline = sub_ctx->prog->is_pipeline;
++            sub_ctx->current_so->begin_id = sub_ctx->prog->is_pipeline ? sub_ctx->prog->id.pipeline :
++                                                                         sub_ctx->prog->id.program;
++         }
+       } else if (sub_ctx->current_so->xfb_state == XFB_STATE_PAUSED) {
+          glResumeTransformFeedback();
+          sub_ctx->current_so->xfb_state = XFB_STATE_STARTED;

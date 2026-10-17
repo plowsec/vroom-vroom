@@ -679,6 +679,11 @@ games) make multisampled textures and resolve them with blits. A guest
 could ask for those before too: vrend checked and created them the same
 way. Now they are common, not rare. Snapshots don't keep their contents.
 
+Any guest GL app using transform feedback could crash the GPU process
+when it ended (macOS's `glEndTransformFeedback` with the wrong program
+bound; patch 0015). The guest lost 3D until the VM restarted, nothing
+more: the crash stays in the GPU process.
+
 ### A process per Vulkan and Direct3D context
 
 Each Vulkan (Venus) and Direct3D (Neptune) context of the guest, roughly
