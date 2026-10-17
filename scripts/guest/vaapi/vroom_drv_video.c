@@ -8,8 +8,10 @@
 // driver pictures already parsed: parameters and slices. The V4L2 decoder
 // takes a plain bitstream. So for each picture this driver writes the
 // parameter sets back out from VA-API's parameters (H.264: SPS and PPS),
-// puts the slices after them and queues that as one bitstream buffer. VP9
-// frames go as they are. The decoder is asked for pictures in decoding
+// puts the slices after them and queues that as one bitstream buffer.
+// HEVC slice headers name reference picture sets VA-API doesn't pass, so
+// those headers are rewritten to carry their sets. VP9 frames go as they
+// are. The decoder is asked for pictures in decoding
 // order (display delay 0), as soon as each is done: the player reorders.
 //
 // Decoded pictures land in our V4L2 buffers; the driver copies each into
@@ -55,6 +57,8 @@
 #endif
 
 #define VENDOR "vroom (VideoToolbox on the Mac, through virtio-media)"
+// Biggest PPS we write (HEVC with all its scaling lists explicit).
+#define PPS_MAX 2048
 #define MAX_PROFILES 16
 #define MAX_ENTRYPOINTS 2
 #define MAX_ATTRIBUTES 8
@@ -154,11 +158,14 @@ struct context {
 	VAIQMatrixBufferH264 h264_iq;
 	bool have_pic, have_iq;
 	VADecPictureParameterBufferVP9 vp9_pic;
-	// Parameter sets sent so far (H.264), to send them only when they change.
+	VAPictureParameterBufferHEVC hevc_pic;
+	VAIQMatrixBufferHEVC hevc_iq;
+	// Parameter sets sent so far (H.264: SPS; HEVC: VPS and SPS), to send
+	// them only when they change.
 	uint8_t last_sps[256];
 	size_t last_sps_len;
-	uint8_t last_pps[256][128];
-	uint8_t last_pps_len[256];
+	uint8_t last_pps[256][PPS_MAX];
+	uint16_t last_pps_len[256];
 	struct h264_pps_state pps_state[256];
 	// V4L2
 	int fd;
@@ -228,7 +235,7 @@ static void bo_free(struct surface *s);
 // Bit writer: RBSP, then NAL units with emulation prevention.
 
 struct bw {
-	uint8_t buf[1024];
+	uint8_t buf[4096];
 	size_t len;
 	uint32_t acc;
 	int n;
@@ -647,6 +654,9 @@ static uint32_t profile_fourcc(VAProfile p)
 	case VAProfileVP9Profile0:
 	case VAProfileVP9Profile2:
 		return V4L2_PIX_FMT_VP9;
+	case VAProfileHEVCMain:
+	case VAProfileHEVCMain10:
+		return V4L2_PIX_FMT_HEVC;
 	default:
 		return 0;
 	}
@@ -654,7 +664,7 @@ static uint32_t profile_fourcc(VAProfile p)
 
 static bool profile_10bit(VAProfile p)
 {
-	return p == VAProfileVP9Profile2;
+	return p == VAProfileVP9Profile2 || p == VAProfileHEVCMain10;
 }
 
 static void cap_release(struct context *c)
@@ -998,6 +1008,11 @@ static int list_profiles(struct driver *d, VAProfile *out)
 		out[n++] = VAProfileH264ConstrainedBaseline;
 		out[n++] = VAProfileH264Main;
 		out[n++] = VAProfileH264High;
+	}
+	if (has_coded(d, V4L2_PIX_FMT_HEVC)) {
+		out[n++] = VAProfileHEVCMain;
+		if (d->p010)
+			out[n++] = VAProfileHEVCMain10;
 	}
 	if (has_coded(d, V4L2_PIX_FMT_VP9)) {
 		out[n++] = VAProfileVP9Profile0;
@@ -1450,13 +1465,599 @@ static bool h264_build(struct context *c)
 			continue;
 		struct bw p = { 0 };
 		h264_pps(c, &p, id, c->pps_state[id].l0, c->pps_state[id].l1);
-		if (p.overflow || p.len > 128)
+		if (p.overflow || p.len > PPS_MAX)
 			return false;
 		if (p.len != c->last_pps_len[id] || memcmp(p.buf, c->last_pps[id], p.len)) {
 			memcpy(c->last_pps[id], p.buf, p.len);
-			c->last_pps_len[id] = (uint8_t)p.len;
+			c->last_pps_len[id] = (uint16_t)p.len;
 			uint8_t h = 0x68;
 			if (!au_nal(c, &h, 1, p.buf, p.len))
+				return false;
+		}
+	}
+	if (!au_grow(c, c->slices_len))
+		return false;
+	memcpy(c->au + c->au_len, c->slices, c->slices_len);
+	c->au_len += c->slices_len;
+	return true;
+}
+
+// ---------------------------------------------------------------------
+// HEVC: VPS, SPS and PPS back out of VA-API's parameters. VA-API doesn't
+// pass the SPS's reference picture sets (slices name them by index), so
+// each slice header is rewritten to carry its set itself, built from the
+// picture's references; the rest of the header and the slice data are
+// copied as they are.
+
+// Bits we read from (already unescaped) and write to, growing.
+struct rbits {
+	const uint8_t *p;
+	size_t nbits, pos;
+	bool bad;
+};
+
+static uint32_t rb_bits(struct rbits *r, int n)
+{
+	uint32_t v = 0;
+	for (int i = 0; i < n; i++) {
+		if (r->pos >= r->nbits) {
+			r->bad = true;
+			return 0;
+		}
+		v = (v << 1) | ((r->p[r->pos / 8] >> (7 - r->pos % 8)) & 1);
+		r->pos++;
+	}
+	return v;
+}
+
+static uint32_t rb_ue(struct rbits *r)
+{
+	int zeros = 0;
+	while (!r->bad && rb_bits(r, 1) == 0) {
+		if (++zeros > 31) {
+			r->bad = true;
+			return 0;
+		}
+	}
+	return (uint32_t)((1ull << zeros) - 1 + rb_bits(r, zeros));
+}
+
+struct wbits {
+	uint8_t *buf;
+	size_t len, cap;
+	uint32_t acc;
+	int n;
+	bool bad;
+};
+
+static void wb_bits(struct wbits *w, uint32_t v, int n)
+{
+	for (int i = n - 1; i >= 0; i--) {
+		w->acc = (w->acc << 1) | ((v >> i) & 1);
+		if (++w->n == 8) {
+			if (!grow(&w->buf, &w->cap, w->len, 1)) {
+				w->bad = true;
+				return;
+			}
+			w->buf[w->len++] = (uint8_t)w->acc;
+			w->acc = 0;
+			w->n = 0;
+		}
+	}
+}
+
+static void wb_ue(struct wbits *w, uint32_t v)
+{
+	uint64_t x = (uint64_t)v + 1;
+	int len = 0;
+	while ((x >> len) > 1)
+		len++;
+	wb_bits(w, 0, len);
+	wb_bits(w, (uint32_t)x, len + 1);
+}
+
+// Copy bits [from, to) of r.
+static void wb_copy(struct wbits *w, const struct rbits *r, size_t from, size_t to)
+{
+	for (size_t i = from; i < to && i < r->nbits; i++)
+		wb_bits(w, (r->p[i / 8] >> (7 - i % 8)) & 1, 1);
+}
+
+static void wb_trailing(struct wbits *w)
+{
+	wb_bits(w, 1, 1);
+	while (w->n)
+		wb_bits(w, 0, 1);
+}
+
+static unsigned ceil_log2(unsigned v)
+{
+	unsigned n = 0;
+	while ((1u << n) < v)
+		n++;
+	return n;
+}
+
+static void hevc_ptl(struct bw *b, unsigned profile)
+{
+	put_bits(b, 0, 2);          // general_profile_space
+	put_bits(b, 0, 1);          // general_tier_flag
+	put_bits(b, profile, 5);    // general_profile_idc
+	put_bits(b, 1u << (31 - profile), 32); // compatibility flag for it
+	put_bits(b, 1, 1);          // progressive_source_flag
+	put_bits(b, 0, 1);          // interlaced_source_flag
+	put_bits(b, 0, 1);          // non_packed_constraint_flag
+	put_bits(b, 1, 1);          // frame_only_constraint_flag
+	put_bits(b, 0, 32);         // reserved (43 bits) and inbld (1 bit)
+	put_bits(b, 0, 12);
+	put_bits(b, 153, 8);        // general_level_idc: 5.1
+}
+
+static unsigned hevc_profile(struct context *c)
+{
+	return c->profile == VAProfileHEVCMain10 ? 2 : 1;
+}
+
+static void hevc_vps(struct context *c, struct bw *b)
+{
+	const VAPictureParameterBufferHEVC *pp = &c->hevc_pic;
+	put_bits(b, 0, 4);      // vps_video_parameter_set_id
+	put_bits(b, 3, 2);      // base layer internal, available
+	put_bits(b, 0, 6);      // vps_max_layers_minus1
+	put_bits(b, 0, 3);      // vps_max_sub_layers_minus1
+	put_bits(b, 1, 1);      // vps_temporal_id_nesting_flag
+	put_bits(b, 0xffff, 16);
+	hevc_ptl(b, hevc_profile(c));
+	put_bits(b, 1, 1);      // vps_sub_layer_ordering_info_present_flag
+	put_ue(b, pp->sps_max_dec_pic_buffering_minus1);
+	put_ue(b, 0);           // vps_max_num_reorder_pics: see the SPS
+	put_ue(b, 0);           // vps_max_latency_increase_plus1
+	put_bits(b, 0, 6);      // vps_max_layer_id
+	put_ue(b, 0);           // vps_num_layer_sets_minus1
+	put_bits(b, 0, 1);      // vps_timing_info_present_flag
+	put_bits(b, 0, 1);      // vps_extension_flag
+	put_trailing(b);
+}
+
+static void hevc_sps(struct context *c, struct bw *b)
+{
+	const VAPictureParameterBufferHEVC *pp = &c->hevc_pic;
+	put_bits(b, 0, 4);      // sps_video_parameter_set_id
+	put_bits(b, 0, 3);      // sps_max_sub_layers_minus1
+	put_bits(b, 1, 1);      // sps_temporal_id_nesting_flag
+	hevc_ptl(b, hevc_profile(c));
+	put_ue(b, 0);           // sps_seq_parameter_set_id
+	put_ue(b, pp->pic_fields.bits.chroma_format_idc);
+	if (pp->pic_fields.bits.chroma_format_idc == 3)
+		put_bits(b, pp->pic_fields.bits.separate_colour_plane_flag, 1);
+	put_ue(b, pp->pic_width_in_luma_samples);
+	put_ue(b, pp->pic_height_in_luma_samples);
+	put_bits(b, 0, 1);      // conformance_window_flag: the player crops
+	put_ue(b, pp->bit_depth_luma_minus8);
+	put_ue(b, pp->bit_depth_chroma_minus8);
+	put_ue(b, pp->log2_max_pic_order_cnt_lsb_minus4);
+	put_bits(b, 1, 1);      // sps_sub_layer_ordering_info_present_flag
+	put_ue(b, pp->sps_max_dec_pic_buffering_minus1);
+	// No reordering: pictures come out as soon as they are decoded, in
+	// decoding order, which VA-API wants (the player reorders).
+	put_ue(b, 0);
+	put_ue(b, 0);
+	put_ue(b, pp->log2_min_luma_coding_block_size_minus3);
+	put_ue(b, pp->log2_diff_max_min_luma_coding_block_size);
+	put_ue(b, pp->log2_min_transform_block_size_minus2);
+	put_ue(b, pp->log2_diff_max_min_transform_block_size);
+	put_ue(b, pp->max_transform_hierarchy_depth_inter);
+	put_ue(b, pp->max_transform_hierarchy_depth_intra);
+	put_bits(b, pp->pic_fields.bits.scaling_list_enabled_flag, 1);
+	if (pp->pic_fields.bits.scaling_list_enabled_flag)
+		put_bits(b, 0, 1); // sps_scaling_list_data_present_flag: the PPS has them
+	put_bits(b, pp->pic_fields.bits.amp_enabled_flag, 1);
+	put_bits(b, pp->slice_parsing_fields.bits.sample_adaptive_offset_enabled_flag, 1);
+	put_bits(b, pp->pic_fields.bits.pcm_enabled_flag, 1);
+	if (pp->pic_fields.bits.pcm_enabled_flag) {
+		put_bits(b, pp->pcm_sample_bit_depth_luma_minus1, 4);
+		put_bits(b, pp->pcm_sample_bit_depth_chroma_minus1, 4);
+		put_ue(b, pp->log2_min_pcm_luma_coding_block_size_minus3);
+		put_ue(b, pp->log2_diff_max_min_pcm_luma_coding_block_size);
+		put_bits(b, pp->pic_fields.bits.pcm_loop_filter_disabled_flag, 1);
+	}
+	put_ue(b, 0);           // num_short_term_ref_pic_sets: each slice has its own
+	put_bits(b, pp->slice_parsing_fields.bits.long_term_ref_pics_present_flag, 1);
+	if (pp->slice_parsing_fields.bits.long_term_ref_pics_present_flag)
+		put_ue(b, 0);   // num_long_term_ref_pics_sps: likewise
+	put_bits(b, pp->slice_parsing_fields.bits.sps_temporal_mvp_enabled_flag, 1);
+	put_bits(b, pp->pic_fields.bits.strong_intra_smoothing_enabled_flag, 1);
+	put_bits(b, 0, 1);      // vui_parameters_present_flag
+	put_bits(b, 0, 1);      // sps_extension_present_flag
+	put_trailing(b);
+}
+
+// Up-right diagonal scan of an n x n block, as raster indices.
+static void diag_scan(int n, uint8_t *out)
+{
+	int i = 0, x = 0, y = 0;
+	while (i < n * n) {
+		while (y >= 0) {
+			if (x < n && y < n)
+				out[i++] = (uint8_t)(y * n + x);
+			y--;
+			x++;
+		}
+		y = x;
+		x = 0;
+	}
+}
+
+// One scaling list: VA-API gives it in raster order, the bitstream wants
+// up-right diagonal order, as differences.
+static void hevc_list(struct bw *b, const uint8_t *raster, int n, int dc)
+{
+	uint8_t scan[64];
+	diag_scan(n == 16 ? 4 : 8, scan);
+	put_bits(b, 1, 1); // scaling_list_pred_mode_flag: explicit
+	int next = 8;
+	if (dc >= 0) {
+		put_se(b, dc - 8);
+		next = dc;
+	}
+	for (int i = 0; i < n; i++) {
+		int v = raster[scan[i]];
+		int d = v - next;
+		if (d > 127)
+			d -= 256;
+		if (d < -128)
+			d += 256;
+		put_se(b, d);
+		next = v;
+	}
+}
+
+static void hevc_pps(struct context *c, struct bw *b, unsigned id)
+{
+	const VAPictureParameterBufferHEVC *pp = &c->hevc_pic;
+	put_ue(b, id);
+	put_ue(b, 0); // pps_seq_parameter_set_id
+	put_bits(b, pp->slice_parsing_fields.bits.dependent_slice_segments_enabled_flag, 1);
+	put_bits(b, pp->slice_parsing_fields.bits.output_flag_present_flag, 1);
+	put_bits(b, pp->num_extra_slice_header_bits, 3);
+	put_bits(b, pp->pic_fields.bits.sign_data_hiding_enabled_flag, 1);
+	put_bits(b, pp->slice_parsing_fields.bits.cabac_init_present_flag, 1);
+	put_ue(b, pp->num_ref_idx_l0_default_active_minus1);
+	put_ue(b, pp->num_ref_idx_l1_default_active_minus1);
+	put_se(b, pp->init_qp_minus26);
+	put_bits(b, pp->pic_fields.bits.constrained_intra_pred_flag, 1);
+	put_bits(b, pp->pic_fields.bits.transform_skip_enabled_flag, 1);
+	put_bits(b, pp->pic_fields.bits.cu_qp_delta_enabled_flag, 1);
+	if (pp->pic_fields.bits.cu_qp_delta_enabled_flag)
+		put_ue(b, pp->diff_cu_qp_delta_depth);
+	put_se(b, pp->pps_cb_qp_offset);
+	put_se(b, pp->pps_cr_qp_offset);
+	put_bits(b, pp->slice_parsing_fields.bits.pps_slice_chroma_qp_offsets_present_flag, 1);
+	put_bits(b, pp->pic_fields.bits.weighted_pred_flag, 1);
+	put_bits(b, pp->pic_fields.bits.weighted_bipred_flag, 1);
+	put_bits(b, pp->pic_fields.bits.transquant_bypass_enabled_flag, 1);
+	put_bits(b, pp->pic_fields.bits.tiles_enabled_flag, 1);
+	put_bits(b, pp->pic_fields.bits.entropy_coding_sync_enabled_flag, 1);
+	if (pp->pic_fields.bits.tiles_enabled_flag) {
+		unsigned cols = pp->num_tile_columns_minus1 < 19 ? pp->num_tile_columns_minus1 : 19;
+		unsigned rows = pp->num_tile_rows_minus1 < 21 ? pp->num_tile_rows_minus1 : 21;
+		put_ue(b, cols);
+		put_ue(b, rows);
+		put_bits(b, 0, 1); // uniform_spacing_flag: the sizes, as VA-API worked them out
+		for (unsigned i = 0; i < cols; i++)
+			put_ue(b, pp->column_width_minus1[i]);
+		for (unsigned i = 0; i < rows; i++)
+			put_ue(b, pp->row_height_minus1[i]);
+		put_bits(b, pp->pic_fields.bits.loop_filter_across_tiles_enabled_flag, 1);
+	}
+	put_bits(b, pp->pic_fields.bits.pps_loop_filter_across_slices_enabled_flag, 1);
+	put_bits(b, 1, 1); // deblocking_filter_control_present_flag
+	put_bits(b, pp->slice_parsing_fields.bits.deblocking_filter_override_enabled_flag, 1);
+	put_bits(b, pp->slice_parsing_fields.bits.pps_disable_deblocking_filter_flag, 1);
+	if (!pp->slice_parsing_fields.bits.pps_disable_deblocking_filter_flag) {
+		put_se(b, pp->pps_beta_offset_div2);
+		put_se(b, pp->pps_tc_offset_div2);
+	}
+	bool lists = pp->pic_fields.bits.scaling_list_enabled_flag && c->have_iq;
+	put_bits(b, lists, 1); // pps_scaling_list_data_present_flag
+	if (lists) {
+		const VAIQMatrixBufferHEVC *q = &c->hevc_iq;
+		for (int m = 0; m < 6; m++)
+			hevc_list(b, q->ScalingList4x4[m], 16, -1);
+		for (int m = 0; m < 6; m++)
+			hevc_list(b, q->ScalingList8x8[m], 64, -1);
+		for (int m = 0; m < 6; m++)
+			hevc_list(b, q->ScalingList16x16[m], 64, q->ScalingListDC16x16[m]);
+		for (int m = 0; m < 2; m++)
+			hevc_list(b, q->ScalingList32x32[m], 64, q->ScalingListDC32x32[m]);
+	}
+	put_bits(b, pp->slice_parsing_fields.bits.lists_modification_present_flag, 1);
+	put_ue(b, pp->log2_parallel_merge_level_minus2);
+	put_bits(b, pp->slice_parsing_fields.bits.slice_segment_header_extension_present_flag, 1);
+	put_bits(b, 0, 1); // pps_extension_present_flag
+	put_trailing(b);
+}
+
+static int cmp_desc(const void *a, const void *b)
+{
+	return *(const int32_t *)b > *(const int32_t *)a ? 1 : *(const int32_t *)b < *(const int32_t *)a ? -1 : 0;
+}
+
+// The picture's short-term references as an explicit st_ref_pic_set(0)
+// and its long-term ones spelled out, from VA-API's reference list.
+static void hevc_rps(struct context *c, struct wbits *w)
+{
+	const VAPictureParameterBufferHEVC *pp = &c->hevc_pic;
+	int32_t cur = pp->CurrPic.pic_order_cnt;
+	// (poc << 1) | used, so one sort keeps the flag with its POC.
+	int32_t neg[16], pos[16];
+	int nn = 0, np = 0;
+	struct { int32_t poc; bool used; } lt[16];
+	int nl = 0;
+	for (int i = 0; i < 15; i++) {
+		const VAPictureHEVC *r = &pp->ReferenceFrames[i];
+		if (r->picture_id == VA_INVALID_SURFACE || (r->flags & VA_PICTURE_HEVC_INVALID))
+			continue;
+		if (r->flags & VA_PICTURE_HEVC_LONG_TERM_REFERENCE) {
+			lt[nl].poc = r->pic_order_cnt;
+			lt[nl++].used = r->flags & VA_PICTURE_HEVC_RPS_LT_CURR;
+			continue;
+		}
+		bool used = r->flags & (VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE | VA_PICTURE_HEVC_RPS_ST_CURR_AFTER);
+		if (r->pic_order_cnt < cur)
+			neg[nn++] = r->pic_order_cnt * 2 + used;
+		else if (r->pic_order_cnt > cur)
+			pos[np++] = -(r->pic_order_cnt * 2 + used);
+	}
+	// Negative ones nearest first (descending POC), positive ones nearest
+	// first (ascending POC: sorted descending as negated).
+	qsort(neg, (size_t)nn, sizeof(neg[0]), cmp_desc);
+	qsort(pos, (size_t)np, sizeof(pos[0]), cmp_desc);
+	wb_bits(w, 0, 1); // short_term_ref_pic_set_sps_flag
+	// st_ref_pic_set(0): no inter RPS prediction for the first set.
+	wb_ue(w, (uint32_t)nn);
+	wb_ue(w, (uint32_t)np);
+	int32_t prev = cur;
+	for (int i = 0; i < nn; i++) {
+		int32_t poc = neg[i] >> 1;
+		wb_ue(w, (uint32_t)(prev - poc - 1));
+		wb_bits(w, neg[i] & 1, 1);
+		prev = poc;
+	}
+	prev = cur;
+	for (int i = 0; i < np; i++) {
+		int32_t v = -pos[i];
+		int32_t poc = v >> 1;
+		wb_ue(w, (uint32_t)(poc - prev - 1));
+		wb_bits(w, v & 1, 1);
+		prev = poc;
+	}
+	if (!pp->slice_parsing_fields.bits.long_term_ref_pics_present_flag)
+		return;
+	// Long-term: the SPS lists none, so each is spelled out with its LSBs
+	// and how many POC MSB cycles back it is (ascending, as the deltas
+	// are coded).
+	uint32_t max_lsb = 1u << (pp->log2_max_pic_order_cnt_lsb_minus4 + 4);
+	int64_t cycles[16];
+	for (int i = 0; i < nl; i++) {
+		int64_t cur_lsb = (int64_t)((uint32_t)cur & (max_lsb - 1));
+		int64_t lt_lsb = (int64_t)((uint32_t)lt[i].poc & (max_lsb - 1));
+		cycles[i] = ((int64_t)cur - lt[i].poc - (cur_lsb - lt_lsb)) / (int64_t)max_lsb;
+	}
+	for (int i = 1; i < nl; i++) // insertion sort by cycles
+		for (int j = i; j > 0 && cycles[j] < cycles[j - 1]; j--) {
+			int64_t t = cycles[j];
+			cycles[j] = cycles[j - 1];
+			cycles[j - 1] = t;
+			__typeof__(lt[0]) u = lt[j];
+			lt[j] = lt[j - 1];
+			lt[j - 1] = u;
+		}
+	wb_ue(w, (uint32_t)nl); // num_long_term_pics
+	int64_t last = 0;
+	for (int i = 0; i < nl; i++) {
+		wb_bits(w, (uint32_t)lt[i].poc & (max_lsb - 1), (int)(pp->log2_max_pic_order_cnt_lsb_minus4 + 4));
+		wb_bits(w, lt[i].used, 1);
+		wb_bits(w, 1, 1); // delta_poc_msb_present_flag
+		wb_ue(w, (uint32_t)(cycles[i] - last));
+		last = cycles[i];
+	}
+}
+
+// One HEVC slice NAL unit, its header rewritten if it names the SPS's
+// reference picture sets. False: it couldn't be read (it goes as it is).
+static bool hevc_slice(struct context *c, const VASliceParameterBufferHEVC *sp, const uint8_t *nal, size_t len, unsigned *pps_id)
+{
+	const VAPictureParameterBufferHEVC *pp = &c->hevc_pic;
+	*pps_id = 0;
+	if (len < 3)
+		return false;
+	unsigned type = (nal[0] >> 1) & 0x3f;
+	size_t hdr_end = sp->slice_data_byte_offset; // unescaped bytes, NAL header included
+	if (hdr_end <= 2 || hdr_end > len)
+		return false;
+	// The header, unescaped, and where it ends in the raw bytes.
+	uint8_t *rbsp = malloc(hdr_end);
+	if (!rbsp)
+		return false;
+	size_t rlen = 0, raw = 2;
+	int zeros = 0;
+	while (raw < len && rlen < hdr_end - 2) {
+		uint8_t v = nal[raw++];
+		if (zeros >= 2 && v == 3) {
+			zeros = 0;
+			continue;
+		}
+		zeros = v == 0 ? zeros + 1 : 0;
+		rbsp[rlen++] = v;
+	}
+	if (rlen != hdr_end - 2 || rbsp[rlen - 1] == 0) {
+		free(rbsp);
+		return false;
+	}
+	// The header proper ends at byte_alignment()'s one bit.
+	size_t end = rlen * 8 - 1;
+	while (!((rbsp[end / 8] >> (7 - end % 8)) & 1))
+		end--;
+	struct rbits r = { .p = rbsp, .nbits = end };
+	bool first = rb_bits(&r, 1);
+	if (type >= 16 && type <= 23)
+		rb_bits(&r, 1);
+	*pps_id = rb_ue(&r);
+	bool dependent = false;
+	unsigned ctb = pp->log2_min_luma_coding_block_size_minus3 + 3 + pp->log2_diff_max_min_luma_coding_block_size;
+	unsigned wc = (pp->pic_width_in_luma_samples + (1u << ctb) - 1) >> ctb;
+	unsigned hc = (pp->pic_height_in_luma_samples + (1u << ctb) - 1) >> ctb;
+	if (!first) {
+		if (pp->slice_parsing_fields.bits.dependent_slice_segments_enabled_flag)
+			dependent = rb_bits(&r, 1);
+		rb_bits(&r, (int)ceil_log2(wc * hc));
+	}
+	bool idr = type == 19 || type == 20;
+	if (r.bad || *pps_id > 63) {
+		free(rbsp);
+		*pps_id = 0;
+		return false;
+	}
+	if (dependent || idr) {
+		// No reference sets in the header: as it is.
+		free(rbsp);
+		return slice_add(c, nal, len, true);
+	}
+	rb_bits(&r, pp->num_extra_slice_header_bits);
+	rb_ue(&r); // slice_type
+	if (pp->slice_parsing_fields.bits.output_flag_present_flag)
+		rb_bits(&r, 1);
+	if (pp->pic_fields.bits.separate_colour_plane_flag)
+		rb_bits(&r, 2);
+	rb_bits(&r, (int)(pp->log2_max_pic_order_cnt_lsb_minus4 + 4));
+	size_t keep = r.pos;
+	// What the original says about reference sets, skipped.
+	if (rb_bits(&r, 1)) {
+		if (pp->num_short_term_ref_pic_sets > 1)
+			rb_bits(&r, (int)ceil_log2(pp->num_short_term_ref_pic_sets));
+	} else {
+		r.pos += pp->st_rps_bits;
+	}
+	if (pp->slice_parsing_fields.bits.long_term_ref_pics_present_flag) {
+		unsigned nsps = pp->num_long_term_ref_pic_sps ? rb_ue(&r) : 0;
+		unsigned npics = rb_ue(&r);
+		if (nsps + npics > 32)
+			r.bad = true;
+		for (unsigned i = 0; i < nsps + npics && !r.bad; i++) {
+			if (i < nsps) {
+				if (pp->num_long_term_ref_pic_sps > 1)
+					rb_bits(&r, (int)ceil_log2(pp->num_long_term_ref_pic_sps));
+			} else {
+				rb_bits(&r, (int)(pp->log2_max_pic_order_cnt_lsb_minus4 + 4) + 1);
+			}
+			if (rb_bits(&r, 1))
+				rb_ue(&r);
+		}
+	}
+	if (r.bad || r.pos > end) {
+		free(rbsp);
+		return false;
+	}
+	struct wbits w = { 0 };
+	wb_copy(&w, &r, 0, keep);
+	hevc_rps(c, &w);
+	wb_copy(&w, &r, r.pos, end);
+	wb_trailing(&w);
+	free(rbsp);
+	bool ok = !w.bad;
+	if (ok) {
+		// Start code, the NAL header, the new header escaped, then the
+		// slice data as it was (the header's last byte isn't zero, so
+		// no escape is needed where they meet).
+		uint8_t sc[3] = { 0, 0, 1 };
+		ok = slice_add(c, sc, 3, false) && slice_add(c, nal, 2, false);
+		if (ok && grow(&c->slices, &c->slices_cap, c->slices_len, w.len * 3 / 2 + 4)) {
+			int z = 0;
+			for (size_t i = 0; i < w.len; i++) {
+				if (z >= 2 && w.buf[i] <= 3) {
+					c->slices[c->slices_len++] = 3;
+					z = 0;
+				}
+				c->slices[c->slices_len++] = w.buf[i];
+				z = w.buf[i] == 0 ? z + 1 : 0;
+			}
+		} else {
+			ok = false;
+		}
+		ok = ok && slice_add(c, nal + raw, len - raw, false);
+	}
+	free(w.buf);
+	return ok;
+}
+
+// HEVC slices of one RenderPicture call.
+static VAStatus hevc_slices(struct context *c, struct buffer *params, struct buffer *data)
+{
+	if (!c->have_pic)
+		return VA_STATUS_ERROR_INVALID_PARAMETER;
+	if (params->size < sizeof(VASliceParameterBufferHEVC))
+		return VA_STATUS_ERROR_INVALID_BUFFER;
+	for (unsigned i = 0; i < params->num; i++) {
+		VASliceParameterBufferHEVC sp;
+		memcpy(&sp, params->data + (size_t)i * params->size, sizeof(sp));
+		if ((uint64_t)sp.slice_data_offset + sp.slice_data_size > (uint64_t)data->size * data->num)
+			return VA_STATUS_ERROR_INVALID_BUFFER;
+		const uint8_t *nal = data->data + sp.slice_data_offset;
+		size_t len = sp.slice_data_size;
+		size_t skipped = 0;
+		while (len > 3 && nal[0] == 0 && nal[1] == 0 && (nal[2] == 1 || (nal[2] == 0 && nal[3] == 1))) {
+			size_t sc = nal[2] == 1 ? 3 : 4;
+			nal += sc, len -= sc, skipped += sc;
+		}
+		sp.slice_data_byte_offset -= sp.slice_data_byte_offset >= skipped ? (uint32_t)skipped : 0;
+		size_t before = c->slices_len;
+		unsigned pps_id;
+		if (!hevc_slice(c, &sp, nal, len, &pps_id)) {
+			c->slices_len = before;
+			dbg("an HEVC slice header we can't read: it goes as it is");
+			if (!slice_add(c, nal, len, true))
+				return VA_STATUS_ERROR_ALLOCATION_FAILED;
+		}
+		c->pps_used[pps_id] = true;
+	}
+	return VA_STATUS_SUCCESS;
+}
+
+static bool hevc_build(struct context *c)
+{
+	struct bw v = { 0 }, s = { 0 };
+	hevc_vps(c, &v);
+	hevc_sps(c, &s);
+	if (v.overflow || s.overflow)
+		return false;
+	// VPS and SPS together decide whether they are sent again.
+	uint8_t both[512];
+	size_t blen = v.len + s.len;
+	if (blen > sizeof(both) || blen > sizeof(c->last_sps))
+		return false;
+	memcpy(both, v.buf, v.len);
+	memcpy(both + v.len, s.buf, s.len);
+	if (blen != c->last_sps_len || memcmp(both, c->last_sps, blen)) {
+		memcpy(c->last_sps, both, blen);
+		c->last_sps_len = blen;
+		memset(c->last_pps_len, 0, sizeof(c->last_pps_len));
+		uint8_t hv[2] = { 32 << 1, 1 }, hs[2] = { 33 << 1, 1 };
+		if (!au_nal(c, hv, 2, v.buf, v.len) || !au_nal(c, hs, 2, s.buf, s.len))
+			return false;
+	}
+	for (unsigned id = 0; id < 64; id++) {
+		if (!c->pps_used[id])
+			continue;
+		struct bw p = { 0 };
+		hevc_pps(c, &p, id);
+		if (p.overflow || p.len > sizeof(c->last_pps[0]))
+			return false;
+		if (p.len != c->last_pps_len[id] || memcmp(p.buf, c->last_pps[id], p.len)) {
+			memcpy(c->last_pps[id], p.buf, p.len);
+			c->last_pps_len[id] = (uint16_t)p.len;
+			uint8_t h[2] = { 34 << 1, 1 };
+			if (!au_nal(c, h, 2, p.buf, p.len))
 				return false;
 		}
 	}
@@ -1492,10 +2093,16 @@ static VAStatus vr_RenderPicture(VADriverContextP ctx, VAContextID cid, VABuffer
 			} else if (profile_fourcc(c->profile) == V4L2_PIX_FMT_VP9 && b->size >= sizeof(c->vp9_pic)) {
 				memcpy(&c->vp9_pic, b->data, sizeof(c->vp9_pic));
 				c->have_pic = true;
+			} else if (profile_fourcc(c->profile) == V4L2_PIX_FMT_HEVC && b->size >= sizeof(c->hevc_pic)) {
+				memcpy(&c->hevc_pic, b->data, sizeof(c->hevc_pic));
+				c->have_pic = true;
 			}
 			break;
 		case VAIQMatrixBufferType:
-			if (b->size >= sizeof(c->h264_iq)) {
+			if (profile_fourcc(c->profile) == V4L2_PIX_FMT_HEVC && b->size >= sizeof(c->hevc_iq)) {
+				memcpy(&c->hevc_iq, b->data, sizeof(c->hevc_iq));
+				c->have_iq = true;
+			} else if (profile_fourcc(c->profile) == V4L2_PIX_FMT_H264 && b->size >= sizeof(c->h264_iq)) {
 				memcpy(&c->h264_iq, b->data, sizeof(c->h264_iq));
 				c->have_iq = true;
 			}
@@ -1510,6 +2117,8 @@ static VAStatus vr_RenderPicture(VADriverContextP ctx, VAContextID cid, VABuffer
 			}
 			if (profile_fourcc(c->profile) == V4L2_PIX_FMT_H264) {
 				st = h264_slices(c, slice_params, b);
+			} else if (profile_fourcc(c->profile) == V4L2_PIX_FMT_HEVC) {
+				st = hevc_slices(c, slice_params, b);
 			} else {
 				// VP9: the whole frame, headers included.
 				VASliceParameterBufferVP9 sp;
@@ -1543,7 +2152,8 @@ static VAStatus vr_EndPicture(VADriverContextP ctx, VAContextID cid)
 	if (c) {
 		struct surface *s = get_obj(d, c->target, OBJ_SURFACE);
 		c->au_len = 0;
-		bool built = profile_fourcc(c->profile) == V4L2_PIX_FMT_H264 ? h264_build(c) : frame_build(c);
+		uint32_t f = profile_fourcc(c->profile);
+		bool built = f == V4L2_PIX_FMT_H264 ? h264_build(c) : f == V4L2_PIX_FMT_HEVC ? hevc_build(c) : frame_build(c);
 		if (!s)
 			st = VA_STATUS_ERROR_INVALID_SURFACE;
 		else if (!built || c->slices_len == 0)
