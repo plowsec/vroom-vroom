@@ -19,7 +19,8 @@ vroom run <vm.toml>   one process per VM, sandboxed after setup ◄───┘
 
 vroom-gui ── starts vroom usb-host for a device connected from the VM
              window, or asks vroom-netd to start it as root; passes its
-             socket to the VMM (viewer socket, SCM_RIGHTS)
+             socket to the VMM (viewer socket, SCM_RIGHTS); the same for
+             a vroom-netd port when an adapter goes bridged or host-only
 vroom-netd   root daemon (launchd): vmnet ports, root USB helpers
 ```
 
@@ -55,6 +56,38 @@ the window what it has plugged in (`ToViewer::Usb`), and the window
 tells the next one, if the app restarts. A saved VM keeps the number of
 pairs it was saved with (the guest read it at driver start); older saves
 had one pair per device in the VM file.
+
+## Network adapters while the VM runs
+
+Each virtio-net device keeps its backend, its MAC and its cable in a
+`Link` shared with a `NetControl` the VMM holds (`virtio/src/devices/net.rs`).
+The worker takes the link's lock for each batch of frames. Pulling the
+cable clears the status bit and raises a config interrupt; while it is
+out, frames are dropped both ways. A new backend is registered on the
+worker's poller (a clone of its `mio::Registry`) after the old one is
+taken off, and the link bounces: down, then up after two seconds on the
+worker's tick, so the guest asks DHCP again. A paused VM hears about it
+when it resumes. `MacXlate` (`net/src/mac.rs`) wraps a backend whose
+port passes another MAC than the guest's.
+
+`vmm/src/net.rs` owns the adapters (`NetPorts`): what each is now, the
+NAT an adapter started with while it is on another network (it holds
+the port forwards' listening sockets), and what the sandbox leaves
+(NAT only if an adapter had it at start; DNS read before the sandbox).
+The viewer asks (`ToVmm::NetConnect`, `ToVmm::NetSet`, with a netd
+socket for bridged and host-only) and is told the result
+(`ToViewer::Net`, replayed to a window that attaches later). On the app
+side, `gui/src/console/netmenu.rs` keeps the VM file in step: it maps
+the file's adapters to the running ones (an adapter added while running
+has none, a removed one is unplugged), asks netd for ports off the UI
+thread, and gives the settings page what waits for the next start.
+
+A resumed VM is built with the adapters of the config it was saved
+with, set up as the VM file says now (`net::plan`): the device layout
+must match the snapshot. A device's snapshot keeps its MAC, its link
+state and which network it was on: if the backend now passes another
+MAC, it translates; if the network changed, the link bounces after the
+resume. The adapters built are what the next save records.
 
 ## Layers
 

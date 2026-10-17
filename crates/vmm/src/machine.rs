@@ -206,6 +206,9 @@ pub(crate) struct BuildEnv {
     /// The config the snapshot was taken with, when restoring: its
     /// network adapters are the guest's.
     pub saved: Option<VmConfig>,
+    /// Network adapters get a control queue (not when the snapshot's had
+    /// none).
+    pub net_ctrl: bool,
     /// The VMM will lock itself down (what NAT may reach later).
     pub sandbox: bool,
 }
@@ -746,7 +749,10 @@ pub(crate) fn build(
     for (i, p) in planned.into_iter().enumerate() {
         let (backend, mac) = crate::net::boot_backend(&config.name, ident, i, &p.net, p.mac, reach.dns)?;
         let live = crate::net::live_of(&p.net)?;
-        let dev = Net::with_link(&format!("eth{i}"), mac, backend, &crate::net::label(&live), p.net.connected && !p.removed);
+        let mut dev = Net::with_link(&format!("eth{i}"), mac, backend, &crate::net::label(&live), p.net.connected && !p.removed);
+        if !env.net_ctrl {
+            dev = dev.without_ctrl();
+        }
         nics.push(crate::net::Nic::new(dev.control(), live));
         board.add_virtio(Box::new(dev))?;
         nets.push(p.net);

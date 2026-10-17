@@ -74,7 +74,11 @@ rebuild macOS may ask again.
   where it is.
 - Settings are saved to the VM file right away. Comments and layout in the
   file are kept. Hand edits show up in the app within a couple of seconds.
-- A running or suspended VM's hardware is locked. Clipboard rules apply
+- A running or suspended VM's hardware is locked: CPUs, memory, disks,
+  display, shared folders, sound, security, boot. Each locked card says
+  why. Network adapters and USB devices change right away on a VM
+  running in the app (or when a suspended one resumes); what has to
+  wait for the next start says so in its card. Clipboard rules apply
   right away.
 - Hover a setting to see its key in the file. Every option is in
   [CONFIG.md](CONFIG.md); the rare ones are under "Advanced" in each card.
@@ -92,7 +96,8 @@ A bar along the top of the window holds the VM's name and state, then
 pause, snapshot, suspend, the power menu (shut down, restart, force power
 off) and, for Windows, Ctrl+Alt+Del. On the right: how busy the VM is
 (the host CPU time it uses, out of what its CPUs could use), "3D" or
-"Direct3D 11" when 3D is on, USB devices (see [USB devices](#usb-devices)),
+"Direct3D 11" when 3D is on, the network adapters (see
+[Network adapters](#network-adapters)), USB devices (see [USB devices](#usb-devices)),
 Coherence (below), the settings (the VM's page in the app),
 full screen, and the VM list. The guest gets the rest of the window: a
 guest with the agent takes exactly that size. In full screen the bar
@@ -774,6 +779,26 @@ What to expect:
   with more than about 260,000 files and folders opened makes us drop the
   ones it doesn't have open; it looks them up again by name.
 
+## Network adapters
+
+The network button in the VM window's bar lists the VM's adapters. Click
+one to pull its cable out or plug it back in (VMware's "Connected"); the
+guest sees the link go down, as with a real cable, and asks DHCP again
+when it comes back. A mark on the button says a cable is out. Under each
+adapter, NAT, Bridged and Host-only put it on another network while the
+VM runs: same adapter, same MAC, and the guest gets an address on the
+new network after a two-second link bounce. "Network settings..." opens
+the VM's page. Both write the VM file (`connected`, `mode`), so the
+change stays.
+
+The settings page does the same and more. What can't change while the
+VM runs waits for its next start, and the adapter's card says so: port
+forwards, a new MAC, a new adapter (vroom has no PCI hotplug yet), NAT on
+a VM that started without NAT (its sandbox has no network then). A
+removed adapter is unplugged at once and gone at the next start. A
+suspended VM resumes with the adapters it was saved with, set up as the
+file says. Details: [NETWORKING.md](NETWORKING.md#changing-adapters-while-the-vm-runs).
+
 ## USB devices
 
 ```bash
@@ -799,7 +824,9 @@ vroom usb list               # what's plugged in, with its id
 id = "1209:000a"
 ```
 
-The library's "USB devices" card edits that list too.
+The library's "USB devices" card edits that list too. On a VM running in
+the app, a device added there is connected right away, and one removed
+is given back to the Mac.
 
 Unplugging a device and plugging it back in works while the VM runs.
 After a suspend/resume or a snapshot revert the guest sees the device

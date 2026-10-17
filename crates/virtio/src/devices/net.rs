@@ -21,10 +21,16 @@ use crate::{types, ActivateContext, DeviceState, Error, Result, VirtioDevice, Vi
 const F_MTU: u64 = 1 << 3;
 const F_MAC: u64 = 1 << 5;
 const F_STATUS: u64 = 1 << 16;
+const F_CTRL_VQ: u64 = 1 << 17;
 const S_LINK_UP: u16 = 1;
 
 const RX: usize = 0;
 const TX: usize = 1;
+/// The control queue: Windows' driver (NetKVM) only takes config
+/// interrupts, the link changes, through the vector it gives this queue.
+const CTRL: usize = 2;
+/// Biggest control command we read (a MAC filter table is the largest).
+const MAX_CTRL: usize = 4096;
 const HDR_LEN: usize = 12;
 const MTU: u16 = 1500;
 /// Biggest frame we accept from the guest (no TSO, so MTU + header).
@@ -168,6 +174,9 @@ pub struct Net {
     id: String,
     link: Arc<Mutex<Link>>,
     worker: WorkerSlot<NetHandler>,
+    /// Offer a control queue (devices restored from a snapshot taken
+    /// before it existed keep their two queues).
+    ctrl: bool,
 }
 
 /// What a snapshot keeps (older ones have nothing).
@@ -199,7 +208,13 @@ impl Net {
             mac,
             label: label.to_string(),
         };
-        Net { id: id.to_string(), link: Arc::new(Mutex::new(link)), worker: WorkerSlot::default() }
+        Net { id: id.to_string(), link: Arc::new(Mutex::new(link)), worker: WorkerSlot::default(), ctrl: true }
+    }
+
+    /// No control queue: the layout of devices saved before it existed.
+    pub fn without_ctrl(mut self) -> Self {
+        self.ctrl = false;
+        self
     }
 
     pub fn control(&self) -> NetControl {
@@ -318,6 +333,35 @@ impl NetHandler {
         }
     }
 
+    /// Control commands (receive mode, MAC filters, VLANs, announce
+    /// acks). We pass every frame anyway: each is acknowledged and
+    /// otherwise ignored.
+    fn ctrl(&mut self, ctx: &mut QueueCtx) {
+        if ctx.features & F_CTRL_VQ == 0 || ctx.queues.len() <= CTRL {
+            return;
+        }
+        loop {
+            let chain = match ctx.queues[CTRL].pop(&ctx.mem) {
+                Ok(Some(c)) => c,
+                Ok(None) => break,
+                Err(e) => {
+                    log::warn!("net ctrl: {e}");
+                    break;
+                }
+            };
+            let head = chain.head();
+            let mut len = 0;
+            if let Ok((r, mut w)) = chain.into_rw() {
+                // class, command, data; then one byte back: 0 ok, 1 error.
+                let ok = (2..=MAX_CTRL).contains(&r.available());
+                if w.write_all(&[if ok { 0 } else { 1 }]).is_ok() {
+                    len = w.written() as u32;
+                }
+            }
+            ctx.add_used(CTRL, head, len);
+        }
+    }
+
     /// A bounce that is over: the link comes back.
     fn relink(&mut self) {
         let mut l = lock(&self.link);
@@ -332,6 +376,9 @@ impl QueueHandler for NetHandler {
     fn process_queue(&mut self, ctx: &mut QueueCtx, q: usize) {
         if q == TX {
             self.tx(ctx);
+        }
+        if q == CTRL {
+            self.ctrl(ctx);
         }
         self.rx(ctx);
     }
@@ -392,10 +439,15 @@ impl VirtioDevice for Net {
         format!("net-{}", self.id)
     }
     fn queue_max_sizes(&self) -> Vec<u16> {
-        vec![256, 256]
+        if self.ctrl {
+            vec![256, 256, 64]
+        } else {
+            vec![256, 256]
+        }
     }
     fn device_features(&self) -> u64 {
-        F_MAC | F_STATUS | F_MTU | crate::features::RING_EVENT_IDX | crate::features::RING_INDIRECT_DESC
+        let ctrl = if self.ctrl { F_CTRL_VQ } else { 0 };
+        F_MAC | F_STATUS | F_MTU | ctrl | crate::features::RING_EVENT_IDX | crate::features::RING_INDIRECT_DESC
     }
     fn read_config(&self, offset: u64, data: &mut [u8]) {
         let (mac, up) = {
@@ -575,6 +627,14 @@ mod tests {
         lock(&n.link).backend.as_mut().unwrap().send_frame(&[1; 60]);
         assert_eq!(sent.lock().unwrap().len(), 1);
         n.reset();
+    }
+
+    #[test]
+    fn a_control_queue_unless_restoring_an_older_layout() {
+        let n = Net::new("eth0", [2, 0, 0, 0, 0, 1], Box::new(Pipe::default()));
+        assert_eq!((n.queue_max_sizes().len(), n.device_features() & F_CTRL_VQ), (3, F_CTRL_VQ));
+        let n = n.without_ctrl();
+        assert_eq!((n.queue_max_sizes().len(), n.device_features() & F_CTRL_VQ), (2, 0));
     }
 
     #[test]

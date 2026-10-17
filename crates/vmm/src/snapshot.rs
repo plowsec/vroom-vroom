@@ -61,10 +61,16 @@ pub(crate) fn disk_plan(dir: &Path) -> Result<BTreeMap<usize, PathBuf>> {
     Ok(layers)
 }
 
-/// The VM file as it was when `dir` was saved.
-pub(crate) fn saved_config(dir: &Path) -> Result<vroom_config::VmConfig> {
+/// Saved network adapters have a control queue (saves from before it
+/// don't say so, and have none).
+const NET_CTRL: &str = "net.ctrl_vq";
+
+/// The VM file as it was when `dir` was saved, and whether its network
+/// adapters had a control queue.
+pub(crate) fn saved_config(dir: &Path) -> Result<(vroom_config::VmConfig, bool)> {
     let snap = SnapshotDir::open(dir)?;
-    serde_json::from_value(snap.manifest.config.clone()).map_err(|e| Error::Setup(format!("snapshot config: {e}")))
+    let c = serde_json::from_value(snap.manifest.config.clone()).map_err(|e| Error::Setup(format!("snapshot config: {e}")))?;
+    Ok((c, snap.manifest.meta.contains_key(NET_CTRL)))
 }
 
 pub(crate) fn save(vmm: &mut Vmm, dir: &Path, description: &str, kind: Kind) -> Result<()> {
@@ -90,6 +96,9 @@ pub(crate) fn save(vmm: &mut Vmm, dir: &Path, description: &str, kind: Kind) -> 
     m.backend = vmm.hv.name().into();
     m.config = serde_json::to_value(&vmm.config).map_err(|e| Error::Setup(e.to_string()))?;
     m.meta.insert("vcpus".into(), vmm.vcpus.len().to_string());
+    if vmm.net_ctrl {
+        m.meta.insert(NET_CTRL.into(), "1".into());
+    }
 
     for (i, v) in vmm.vcpus.iter().enumerate() {
         let (tx, rx) = mpsc::channel();

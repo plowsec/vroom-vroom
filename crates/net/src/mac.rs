@@ -92,6 +92,16 @@ impl NetBackend for MacXlate {
     }
 }
 
+/// A frame the guest sends, as the port must see it (fuzzing, tests).
+pub fn outgoing(f: &mut [u8], guest: Mac, port: Mac) {
+    rewrite(f, guest, port, Dir::Out);
+}
+
+/// A frame from the port, as the guest must see it.
+pub fn incoming(f: &mut [u8], port: Mac, guest: Mac) {
+    rewrite(f, port, guest, Dir::In);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Dir {
     /// Guest to port.

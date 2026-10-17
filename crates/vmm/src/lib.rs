@@ -141,6 +141,8 @@ pub struct Vmm {
     pristine_irqchip: Option<IrqChipState>,
     boot: machine::BootImage,
     state: RunState,
+    /// The network adapters have a control queue (what a save records).
+    net_ctrl: bool,
 }
 
 impl std::fmt::Debug for Vmm {
@@ -176,11 +178,14 @@ impl Vmm {
             StartMode::Restore(dir) => Some(snapshot::saved_config(dir)?),
             StartMode::Boot => None,
         };
+        let net_ctrl = saved.as_ref().is_none_or(|s| s.1);
+        let saved = saved.map(|s| s.0);
         let env = machine::BuildEnv {
             uuid,
             state_dir: opts.state_dir.clone(),
             resuming: matches!(opts.start, StartMode::Restore(_)),
             saved,
+            net_ctrl,
             sandbox: opts.sandbox && config.security.sandbox,
         };
         let m = machine::build(&config, hv.as_ref(), opts.serial_out, opts.clipboard, ui, &disks, ev_tx, &env)?;
@@ -208,6 +213,7 @@ impl Vmm {
             pristine_irqchip: None,
             boot: m.boot,
             state: RunState::Paused,
+            net_ctrl,
         };
         vmm.pristine_irqchip = match vmm.vm.save_irqchip() {
             Ok(s) => Some(s),
