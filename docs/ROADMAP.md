@@ -205,14 +205,13 @@ A guest needs a driver and an API its players use. What exists:
   cards) not tried yet. The helper could tell the VMM why it gave up on
   a device, so the app shows it (today: the log only). A Developer ID
   signature would keep vroom-netd's permission across updates.
-- USB disks without passing the USB device: if Full Disk Access isn't
-  enough (macOS may want the `com.apple.vm.device-access` entitlement,
-  which only Apple grants), or for people who'd rather not give a root
-  helper that permission: unmount the disk on the Mac and hand the guest
-  the raw disk (`/dev/rdiskN`, opened by vroom-netd and passed to the VMM)
-  as an emulated USB stick or a hot-plugged disk. The guest sees a
-  plain disk, not the stick itself (no vendor tools), which is what most
-  people want from a USB disk anyway.
+- USB disks as files or as a disk, with a real stick from the app (only
+  disk images were tried here, and the folder of a volume): macOS's
+  "Removable Volumes" prompt for vroom.app, and `authopen` opening a
+  real `/dev/rdiskN` (its password prompt; whether macOS also wants
+  Full Disk Access for it is not known). A card reader with several
+  disks can only be passed as the device. Linux hosts: neither way yet
+  (the device can be passed there).
 - Things only a person at the Mac can try: bridged networking with real
   vmnet, a drag out of the guest to Finder, Mail or the Desktop with a
   real mouse, Coherence next to a window tiler, several monitors on
@@ -222,7 +221,8 @@ A guest needs a driver and an API its players use. What exists:
   15.3 and later refuses them to any program without Full Disk Access,
   root included). It needs a paid Developer ID and Apple's approval of
   the request; with it, the root helper isn't needed for USB at all.
-  Until then a USB disk can be shared as files or passed as a disk.
+  Until then a USB disk can be shared as files or used as a disk (GUIDE,
+  "USB disks").
 - A signed, notarized vroom.app (`scripts/app.sh` builds it, signed ad
   hoc: needs a Developer ID and the hardened runtime), a disk image to
   install from, updates, crash reports.

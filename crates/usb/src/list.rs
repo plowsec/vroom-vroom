@@ -358,11 +358,7 @@ mod mac {
                         });
                         here = Some(out.len() - 1);
                     }
-                    (Some(i), Some(bsd)) => {
-                        if !out[i].parts.contains(&bsd) && out[i].parts.len() < 64 {
-                            out[i].parts.push(bsd);
-                        }
-                    }
+                    (Some(i), Some(bsd)) if !out[i].parts.contains(&bsd) && out[i].parts.len() < 64 => out[i].parts.push(bsd),
                     _ => {}
                 }
             }

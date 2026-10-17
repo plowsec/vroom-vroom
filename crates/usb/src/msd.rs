@@ -835,7 +835,7 @@ mod tests {
             self.ro
         }
         fn read_at(&mut self, off: u64, buf: &mut [u8]) -> io::Result<()> {
-            assert!(off % 4096 == 0 && buf.len() % 4096 == 0, "whole blocks only: {off} {}", buf.len());
+            assert!(off.is_multiple_of(4096) && buf.len().is_multiple_of(4096), "whole blocks only: {off} {}", buf.len());
             if self.fail_reads {
                 return Err(io::Error::other("bad sector"));
             }
@@ -843,7 +843,7 @@ mod tests {
             Ok(())
         }
         fn write_at(&mut self, off: u64, data: &[u8]) -> io::Result<()> {
-            assert!(off % 4096 == 0 && data.len() % 4096 == 0, "whole blocks only: {off} {}", data.len());
+            assert!(off.is_multiple_of(4096) && data.len().is_multiple_of(4096), "whole blocks only: {off} {}", data.len());
             self.ram[off as usize..off as usize + data.len()].copy_from_slice(data);
             Ok(())
         }

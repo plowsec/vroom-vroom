@@ -215,7 +215,7 @@ fn check_fd(fd: &OwnedFd, d: &HostDisk) -> Result<(), String> {
     let f = File::from(fd.try_clone().map_err(|e| e.to_string())?);
     let m = f.metadata().map_err(|e| e.to_string())?;
     let want = ((d.major as u64) << 24) | (d.minor as u64 & 0xff_ffff);
-    if !m.file_type().is_char_device() || m.rdev() as u64 != want {
+    if !m.file_type().is_char_device() || m.rdev() != want {
         return Err(format!("/dev/r{} isn't the disk it should be", d.bsd));
     }
     Ok(())
