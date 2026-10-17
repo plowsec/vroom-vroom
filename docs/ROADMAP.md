@@ -6,11 +6,6 @@ move to the docs (GUIDE, ARCHITECTURE) once they work.
 
 ## In progress
 
-- **Coherence, next steps** (see GUIDE.md): Wayland sessions would need
-  a helper inside the compositor (a KWin script, or the GNOME Shell
-  extension the guest tools already install, which could report windows
-  too).
-
 - **Less text in the app.** Many screens explain themselves in
   sentences (Settings cards, the USB and network menus, the root helper,
   locked fields, the library's empty states). Do one pass over every
@@ -270,3 +265,13 @@ A guest needs a driver and an API its players use. What exists:
   on a build from master 01a3d48. Not seen again: ten minutes on the
   next master with the old and new guest tools, resizes and Coherence.
   If it shows up again, the window's filler memory is the first suspect.
+
+## Later
+
+vroom is for power users first. These wait until everything above is
+done.
+
+- **Coherence, next steps** (see GUIDE.md): Wayland sessions would need
+  a helper inside the compositor (a KWin script, or the GNOME Shell
+  extension the guest tools already install, which could report windows
+  too). Coherence works today for Windows and Linux on X11.
