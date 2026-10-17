@@ -187,12 +187,12 @@ pub fn scan() -> Vec<Entry<Target>> {
         let Some(stem) = p.file_stem().map(|s| s.to_string_lossy().into_owned()) else { continue };
         let name = shown_name(&p).filter(|n| !n.trim().is_empty()).unwrap_or_else(|| stem.clone());
         let also = if name == stem { Vec::new() } else { vec![stem] };
-        out.push(Entry { name, also, target: Target::Lnk(p) });
+        out.push(Entry { name, also, lesser: false, target: Target::Lnk(p) });
     }
     let mut names: std::collections::HashSet<String> = out.iter().map(|e| e.name.to_lowercase()).collect();
     for (name, id) in apps_folder() {
         if names.insert(name.to_lowercase()) {
-            out.push(Entry { name, also: Vec::new(), target: Target::App(id) });
+            out.push(Entry { name, also: Vec::new(), lesser: false, target: Target::App(id) });
         }
     }
     out

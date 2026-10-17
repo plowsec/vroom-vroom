@@ -18,6 +18,9 @@ pub struct Entry<T> {
     /// Other names it answers to, after its own: Linux's generic name
     /// ("Text Editor"), keywords, the entry's file name.
     pub also: Vec<String>,
+    /// Comes after the others that match as well (Linux: an app that
+    /// runs in a terminal, Vim before gedit for "Text Editor" otherwise).
+    pub lesser: bool,
     pub target: T,
 }
 
@@ -47,22 +50,22 @@ fn rank<T>(e: &Entry<T>, q: &str) -> Option<u32> {
 /// The app `q` names best: its own name (whole, its start, a word's
 /// start) over its other names ("calc": Calculator, not LibreOffice
 /// Calc, whose keyword it is), a shorter name first ("Notepad" before
-/// "Notepad++"), then the first in the list (the dirs that take
-/// precedence come first).
+/// "Notepad++") unless it is a lesser one, then the first in the list
+/// (the dirs that take precedence come first).
 pub fn best<'a, T>(list: &'a [Entry<T>], q: &str) -> Option<&'a Entry<T>> {
     let q = q.trim().to_lowercase();
     if q.is_empty() {
         return None;
     }
-    let mut found: Option<(u32, usize, usize)> = None;
+    let mut found: Option<(u32, bool, usize, usize)> = None;
     for (i, e) in list.iter().enumerate() {
         let Some(r) = rank(e, &q) else { continue };
-        let k = (r, e.name.chars().count(), i);
+        let k = (r, e.lesser, e.name.chars().count(), i);
         if found.is_none_or(|f| k < f) {
             found = Some(k);
         }
     }
-    found.map(|(_, _, i)| &list[i])
+    found.map(|(_, _, _, i)| &list[i])
 }
 
 /// Whether a name is just a name (letters, digits, spaces and the few
@@ -183,7 +186,7 @@ mod tests {
     use super::*;
 
     fn e(name: &str, also: &[&str]) -> Entry<u32> {
-        Entry { name: name.into(), also: also.iter().map(|s| s.to_string()).collect(), target: 0 }
+        Entry { name: name.into(), also: also.iter().map(|s| s.to_string()).collect(), lesser: false, target: 0 }
     }
 
     #[test]
@@ -209,6 +212,8 @@ mod tests {
         assert_eq!(name("calc"), Some("Calculator"));
         assert_eq!(name("spreadsheet"), Some("LibreOffice Calc"));
         assert_eq!(name("libreoffice"), Some("LibreOffice Calc"));
+        let vim = Entry { lesser: true, ..e("Vim", &["Text Editor"]) };
+        assert_eq!(best(&[vim, e("gedit", &["Text Editor"])], "text editor").map(|e| e.name.as_str()), Some("gedit"), "not the terminal one");
         assert_eq!(name("gimp"), Some("GNU Image Manipulation Program"));
         // A word of the name.
         assert_eq!(name("code"), Some("Visual Studio Code"));

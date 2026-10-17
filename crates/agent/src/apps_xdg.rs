@@ -323,7 +323,7 @@ pub fn entry(text: &str, id: &str, path: &Path, locs: &[String], desktops: &[Str
     also.retain(|a| !a.is_empty() && *a != name && seen.insert(a.clone()));
     let terminal = yes(get(&g, "Terminal", &[]));
     let dir = get(&g, "Path", &[]).map(unescape).filter(|d| !d.trim().is_empty());
-    Some(Entry { name, also, target: Target { path: path.to_path_buf(), exec, terminal, dir, icon } })
+    Some(Entry { name, also, lesser: terminal, target: Target { path: path.to_path_buf(), exec, terminal, dir, icon } })
 }
 
 /// The XDG data dirs, the one that takes precedence first: the user's
@@ -462,8 +462,6 @@ pub fn with_icons<R>(f: impl FnOnce(&[Entry<Target>], &mut dyn FnMut(&Target) ->
 
 /// Start it, as the session's user (this process is the session helper).
 pub fn launch(e: &Entry<Target>) -> Result<(), String> {
-    use std::os::unix::process::CommandExt;
-    use std::process::{Command, Stdio};
     // SAFETY: a plain call.
     #[allow(unsafe_code)]
     if unsafe { libc::geteuid() } == 0 {
@@ -472,35 +470,55 @@ pub fn launch(e: &Entry<Target>) -> Result<(), String> {
         return Err("the agent runs as root here, not as the desktop's user".into());
     }
     let t = &e.target;
-    let mut c = if which("gio").is_some() {
-        let mut c = Command::new("gio");
-        c.arg("launch").arg(&t.path);
-        c
-    } else {
-        let mut words = t.exec.clone();
-        if t.terminal {
-            let term = which("x-terminal-emulator").ok_or("a terminal app, and no terminal to run it in")?;
-            words.splice(0..0, [term.to_string_lossy().into_owned(), "-e".into()]);
+    if which("gio").is_some() {
+        // `gio launch` (GLib 2.68 and later) ends once the app is started;
+        // an older gio, or an entry it can't start, says so at once.
+        let mut child = spawn(&e.name, std::process::Command::new("gio").arg("launch").arg(&t.path), t)?;
+        for _ in 0..50 {
+            match child.try_wait() {
+                Ok(Some(s)) if s.success() => return Ok(()),
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
+            }
         }
-        let mut c = Command::new(&words[0]);
-        c.args(&words[1..]);
-        c
-    };
-    // Where the entry says (gio reads that itself), else the home folder,
-    // as from the desktop.
+        if child.try_wait().is_ok_and(|s| s.is_none()) {
+            // Still going: fine, it ends when the app is up.
+            reap(child);
+            return Ok(());
+        }
+        log::info!("apps: gio launch failed for {:?}: its Exec line then", e.name);
+    }
+    let mut words = t.exec.clone();
+    if t.terminal {
+        let term = which("x-terminal-emulator").ok_or("a terminal app, and no terminal to run it in")?;
+        words.splice(0..0, [term.to_string_lossy().into_owned(), "-e".into()]);
+    }
+    let child = spawn(&e.name, std::process::Command::new(&words[0]).args(&words[1..]), t)?;
+    reap(child);
+    Ok(())
+}
+
+/// Start `c` for entry `t`: where the entry says (gio reads that itself),
+/// else in the home folder, as from the desktop; in its own process
+/// group (it outlives us, and our signals aren't its); no shell.
+fn spawn(name: &str, c: &mut std::process::Command, t: &Target) -> Result<std::process::Child, String> {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
     let home = std::env::var("HOME").ok();
     if let Some(d) = t.dir.iter().chain(home.iter()).find(|d| Path::new(d).is_dir()) {
         c.current_dir(d);
     }
-    // Its own process group: it outlives us, and our signals aren't its.
     c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).process_group(0);
-    let mut child = c.spawn().map_err(|e| e.to_string())?;
-    log::info!("apps: started {:?} ({})", e.name, t.path.display());
-    // Reaped when it ends (gio ends right away; the app stays).
+    let child = c.spawn().map_err(|e| e.to_string())?;
+    log::info!("apps: started {name:?} ({})", t.path.display());
+    Ok(child)
+}
+
+/// Reaped when it ends.
+fn reap(mut child: std::process::Child) {
     let _ = std::thread::Builder::new().name("app-reaper".into()).spawn(move || {
         let _ = child.wait();
     });
-    Ok(())
 }
 
 #[cfg(test)]
