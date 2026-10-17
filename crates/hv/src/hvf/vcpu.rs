@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::ffi::{self, check};
 use super::BACKEND;
@@ -20,6 +20,13 @@ const PSTATE_SS: u64 = 1 << 21;
 /// How long a WFI sleep may last before we re-check for SGIs sent by other
 /// vCPUs. HVF delivers those in-kernel and gives us no wakeup signal.
 const WFI_POLL_SLICE: Duration = Duration::from_millis(1);
+
+/// How long an access we can't emulate (an exclusive load or store, say)
+/// may keep faulting at one address before the VM stops. Memory the
+/// guest sees as RAM (the GPU's host-visible window) has a gap of a few
+/// microseconds while we swap what backs it; running the instruction
+/// again gets past that.
+const UNDECODABLE_GRACE: Duration = Duration::from_millis(100);
 
 #[derive(Debug)]
 pub struct HvfKicker {
@@ -67,6 +74,8 @@ pub struct HvfVcpu {
     guest_debug: Vec<(u16, u64)>,
     /// An emulated instruction retired; stop before executing its successor.
     pending_debug_step: bool,
+    /// The address an access we can't emulate faulted at, and since when.
+    undecodable: Option<(u64, Instant)>,
 }
 
 impl HvfVcpu {
@@ -96,6 +105,7 @@ impl HvfVcpu {
             debug: DebugConfig::default(),
             guest_debug: Vec::new(),
             pending_debug_step: false,
+            undecodable: None,
         };
         v.set_sys(ffi::HV_SYS_REG_MPIDR_EL1, mpidr)?;
         v.apply_vm_clock()?;
@@ -292,9 +302,20 @@ impl HvfVcpu {
         match aarch64::exception_class(esr) {
             ExceptionClass::DataAbortLower => {
                 let Some(da) = aarch64::decode_data_abort(esr) else {
-                    return Err(Error::GuestFault(format!(
-                        "undecodable MMIO access at {ipa:#x} (esr {esr:#x})"
-                    )));
+                    let now = Instant::now();
+                    match self.undecodable {
+                        Some((at, since)) if at == ipa => {
+                            if now.duration_since(since) > UNDECODABLE_GRACE {
+                                return Err(Error::GuestFault(format!(
+                                    "undecodable MMIO access at {ipa:#x} (esr {esr:#x})"
+                                )));
+                            }
+                        }
+                        _ => self.undecodable = Some((ipa, now)),
+                    }
+                    // Run it again: see UNDECODABLE_GRACE.
+                    std::thread::yield_now();
+                    return Ok(None);
                 };
                 self.advance_pc()?;
                 if da.write {
