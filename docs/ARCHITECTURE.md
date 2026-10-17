@@ -462,7 +462,12 @@ decoded into it, and keeps showing that dma-buf; a GPU decoder writes
 into it in place. So a surface exported while still empty is marked, and
 from then on `vaEndPicture` waits for its picture and fills its buffers
 before returning (Chrome shows a picture once that returns). Firefox
-exports after decoding and keeps the old behaviour.
+exports after decoding and keeps the old behaviour. When the stream's
+format is set again (an HEVC seek), Chrome destroys its surfaces, keeps
+the dma-bufs and makes new surfaces from them (`DRM_PRIME` memory, which
+names only the first plane's buffer). A destroyed live surface's two
+buffers are kept for 5 seconds (32 at most), and such a surface gets
+them back by its luma buffer's handle; other dma-bufs are refused.
 
 ## 3D
 

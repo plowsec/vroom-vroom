@@ -69,6 +69,9 @@
 #define MAX_CAPTURE_BUFS 24
 // How long a picture may take before we give up on it.
 #define SYNC_TIMEOUT_MS 3000
+// Buffers of destroyed surfaces Chrome may import again (see bury()).
+#define MAX_GRAVES 32
+#define GRAVE_MS 5000
 
 static int debug_level = -1;
 
@@ -188,10 +191,22 @@ struct context {
 	uint64_t next_seq;
 };
 
+// A destroyed live surface's GBM buffers, kept a little while.
+struct grave {
+	struct gbm_bo *bo[2];
+	uint8_t *bo_map[2];
+	size_t bo_map_len[2];
+	unsigned width, height;
+	bool p010;
+	int64_t when;
+};
+
 struct driver {
 	pthread_mutex_t lock;
 	int drm_fd;
 	struct gbm_device *gbm;
+	struct grave graves[MAX_GRAVES];
+	unsigned n_graves;
 	char video[64];
 	uint32_t coded[8];
 	unsigned n_coded;
@@ -237,6 +252,7 @@ static void del_obj(struct driver *d, unsigned id)
 
 static void bo_free(struct surface *s);
 static bool upload(struct driver *d, struct surface *s);
+static void graves_prune(struct driver *d, bool all);
 
 // ---------------------------------------------------------------------
 // Bit writer: RBSP, then NAL units with emulation prevention.
@@ -1000,6 +1016,7 @@ static VAStatus vr_Terminate(VADriverContextP ctx)
 		free(o->p);
 	}
 	free(d->objs);
+	graves_prune(d, true);
 	if (d->gbm)
 		gbm_device_destroy(d->gbm);
 	pthread_mutex_destroy(&d->lock);
@@ -1134,6 +1151,96 @@ static VAStatus vr_QueryConfigAttributes(VADriverContextP ctx, VAConfigID id, VA
 	return c ? VA_STATUS_SUCCESS : VA_STATUS_ERROR_INVALID_CONFIG;
 }
 
+// Chrome destroys its surfaces when the stream's format is set again (an
+// HEVC seek does that), keeps the dma-bufs we exported, and makes new
+// surfaces from them: vaCreateSurfaces with DRM_PRIME memory. That only
+// passes the luma buffer's fd, and the two planes are two buffers here
+// (a virgl resource has one format). So a live surface's buffers outlive
+// it a little, to be found again by the luma buffer.
+static void grave_free(struct grave *g)
+{
+	for (int k = 0; k < 2; k++) {
+		if (g->bo_map[k])
+			munmap(g->bo_map[k], g->bo_map_len[k]);
+		if (g->bo[k])
+			gbm_bo_destroy(g->bo[k]);
+	}
+	memset(g, 0, sizeof(*g));
+}
+
+// Drop the graves older than GRAVE_MS (all of them: `all`).
+static void graves_prune(struct driver *d, bool all)
+{
+	int64_t now = now_ms();
+	unsigned j = 0;
+	for (unsigned i = 0; i < d->n_graves; i++) {
+		if (all || now - d->graves[i].when >= GRAVE_MS)
+			grave_free(&d->graves[i]);
+		else
+			d->graves[j++] = d->graves[i];
+	}
+	d->n_graves = j;
+}
+
+static void bury(struct driver *d, struct surface *s)
+{
+	if (!s->bo[0] || !s->bo[1])
+		return;
+	graves_prune(d, false);
+	if (d->n_graves == MAX_GRAVES) {
+		grave_free(&d->graves[0]);
+		memmove(&d->graves[0], &d->graves[1], (MAX_GRAVES - 1) * sizeof(d->graves[0]));
+		d->n_graves--;
+	}
+	struct grave *g = &d->graves[d->n_graves++];
+	for (int k = 0; k < 2; k++) {
+		g->bo[k] = s->bo[k];
+		g->bo_map[k] = s->bo_map[k];
+		g->bo_map_len[k] = s->bo_map_len[k];
+		s->bo[k] = NULL;
+		s->bo_map[k] = NULL;
+	}
+	g->width = s->width;
+	g->height = s->height;
+	g->p010 = s->p010;
+	g->when = now_ms();
+}
+
+// The grave whose luma buffer is the dma-buf `fd`, taken out; -1: none.
+// Our GBM device holds those buffers open, so the kernel gives back the
+// handle it already has for the buffer.
+static int grave_find(struct driver *d, int fd, unsigned w, unsigned h, bool p010, struct grave *out)
+{
+	struct drm_prime_handle ph = { .fd = fd };
+	if (xioctl(d->drm_fd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &ph))
+		return -1;
+	for (unsigned i = 0; i < d->n_graves; i++) {
+		struct grave *g = &d->graves[i];
+		if (gbm_bo_get_handle(g->bo[0]).u32 == ph.handle && g->width == w && g->height == h && g->p010 == p010) {
+			*out = *g;
+			memmove(g, g + 1, (d->n_graves - i - 1) * sizeof(*g));
+			d->n_graves--;
+			return 0;
+		}
+	}
+	// Not ours: let go of the handle, unless one of our buffers has it.
+	bool ours = false;
+	for (unsigned i = 0; i < d->n_graves && !ours; i++)
+		ours = gbm_bo_get_handle(d->graves[i].bo[0]).u32 == ph.handle || gbm_bo_get_handle(d->graves[i].bo[1]).u32 == ph.handle;
+	for (unsigned i = 0; i < d->n_objs && !ours; i++) {
+		if (d->objs[i].type != OBJ_SURFACE)
+			continue;
+		struct surface *s = d->objs[i].p;
+		for (int k = 0; k < 2; k++)
+			ours |= s->bo[k] && gbm_bo_get_handle(s->bo[k]).u32 == ph.handle;
+	}
+	if (!ours) {
+		struct drm_gem_close gc = { .handle = ph.handle };
+		xioctl(d->drm_fd, DRM_IOCTL_GEM_CLOSE, &gc);
+	}
+	return -1;
+}
+
 static struct surface *surface_new(unsigned w, unsigned h, bool p010)
 {
 	struct surface *s = calloc(1, sizeof(*s));
@@ -1170,8 +1277,12 @@ static VAStatus vr_CreateSurfaces2(VADriverContextP ctx, unsigned format, unsign
 	if (w == 0 || h == 0 || w > 4096 || h > 4096)
 		return VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED;
 	bool p010 = format == VA_RT_FORMAT_YUV420_10;
+	int mem = VA_SURFACE_ATTRIB_MEM_TYPE_VA;
+	void *ext = NULL;
 	for (unsigned i = 0; i < nattr; i++) {
-		if (attribs[i].type == VASurfaceAttribPixelFormat && (attribs[i].flags & VA_SURFACE_ATTRIB_SETTABLE)) {
+		if (!(attribs[i].flags & VA_SURFACE_ATTRIB_SETTABLE))
+			continue;
+		if (attribs[i].type == VASurfaceAttribPixelFormat) {
 			if (attribs[i].value.value.i == VA_FOURCC_P010)
 				p010 = true;
 			else if (attribs[i].value.value.i == VA_FOURCC_NV12)
@@ -1179,17 +1290,49 @@ static VAStatus vr_CreateSurfaces2(VADriverContextP ctx, unsigned format, unsign
 			else
 				return VA_STATUS_ERROR_INVALID_IMAGE_FORMAT;
 		}
-		if (attribs[i].type == VASurfaceAttribMemoryType && (attribs[i].flags & VA_SURFACE_ATTRIB_SETTABLE) &&
-		    attribs[i].value.value.i != VA_SURFACE_ATTRIB_MEM_TYPE_VA)
-			return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
+		if (attribs[i].type == VASurfaceAttribMemoryType)
+			mem = attribs[i].value.value.i;
+		if (attribs[i].type == VASurfaceAttribExternalBufferDescriptor)
+			ext = attribs[i].value.value.p;
 	}
+	// A dma-buf: only one we exported (see bury()), found by its first fd.
+	int fd = -1;
+	if (mem == VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME && ext) {
+		VASurfaceAttribExternalBuffers *eb = ext;
+		if (eb->num_buffers >= 1 && eb->buffers && eb->width == w && eb->height == h)
+			fd = (int)eb->buffers[0];
+	} else if (mem == VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 && ext) {
+		VADRMPRIMESurfaceDescriptor *pd = ext;
+		if (pd->num_objects >= 1 && pd->num_objects <= 4 && pd->width == w && pd->height == h)
+			fd = pd->objects[0].fd;
+	} else if (mem != VA_SURFACE_ATTRIB_MEM_TYPE_VA) {
+		return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
+	}
+	if (mem != VA_SURFACE_ATTRIB_MEM_TYPE_VA && (fd < 0 || n != 1))
+		return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
 	pthread_mutex_lock(&d->lock);
+	struct grave g;
+	if (fd >= 0 && grave_find(d, fd, w, h, p010, &g)) {
+		pthread_mutex_unlock(&d->lock);
+		dbg("can't import that dma-buf (not one of ours, or too old)");
+		return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
+	}
 	for (unsigned i = 0; i < n; i++) {
 		struct surface *s = surface_new(w, h, p010);
 		ids[i] = s ? new_obj(d, OBJ_SURFACE, s) : VA_INVALID_ID;
 		if (!s) {
+			if (fd >= 0)
+				grave_free(&g);
 			pthread_mutex_unlock(&d->lock);
 			return VA_STATUS_ERROR_ALLOCATION_FAILED;
+		}
+		if (fd >= 0) {
+			for (int k = 0; k < 2; k++) {
+				s->bo[k] = g.bo[k];
+				s->bo_map[k] = g.bo_map[k];
+				s->bo_map_len[k] = g.bo_map_len[k];
+			}
+			s->live = true;
 		}
 	}
 	pthread_mutex_unlock(&d->lock);
@@ -1209,6 +1352,8 @@ static VAStatus vr_DestroySurfaces(VADriverContextP ctx, VASurfaceID *ids, int n
 		struct surface *s = get_obj(d, ids[i], OBJ_SURFACE);
 		if (!s)
 			continue;
+		if (s->live)
+			bury(d, s);
 		bo_free(s);
 		free(s->data);
 		free(s);
