@@ -226,13 +226,24 @@ impl Console {
     }
 
     /// The VMM's list of what it has plugged in.
+    /// The VM has a USB controller (the VMM listed its ports).
+    pub(super) fn usb_controller(&self) -> bool {
+        self.usb.ports.is_some()
+    }
+
+    /// The port pair a device with this id is on.
+    pub(super) fn usb_port_of(&self, id: &str) -> Option<u8> {
+        self.usb.ports.as_ref()?.iter().find(|p| p.dev.id == id).map(|p| p.port)
+    }
+
     pub(super) fn usb_list(&mut self, l: Vec<UsbPort>) {
         TAKEN.with(|t| t.borrow_mut().insert(self.key.clone(), (self.name.clone(), l.clone())));
         // Remember what this run connected beyond the VM file's devices.
         let always = self.vm_usb();
         let in_file = |d: &UsbDev| always.iter().any(|u| u.id == d.id && !u.serial.as_deref().is_some_and(|s| s != d.serial));
         let mut session: Vec<(UsbDev, UsbMode)> = Vec::new();
-        for p in l.iter().filter(|p| !in_file(&p.dev)) {
+        // Not the guest tools stick either: the app plugs that in itself.
+        for p in l.iter().filter(|p| !in_file(&p.dev) && p.dev.id != super::tools::STICK_ID) {
             if !session.iter().any(|(d, _)| same(d, &p.dev)) {
                 session.push((p.dev.clone(), mode_of(p.how)));
             }

@@ -530,6 +530,11 @@ impl Nvme {
 
     /// Post a completion entry (the interrupt comes separately).
     fn complete(&mut self, cqid: u16, sqid: u16, sq_head: u16, cid: u16, sc: u16, dw0: u32) {
+        // The SQ's head now, not when this command was fetched: commands
+        // done on the I/O threads finish out of order, and a head going
+        // back makes the driver think its queue is full (Windows then
+        // waits for room forever).
+        let sq_head = self.sqs.get(&sqid).map_or(sq_head, |s| s.head);
         let Some(cq) = self.cqs.get_mut(&cqid) else { return };
         let mut e = [0u8; 16];
         e[0..4].copy_from_slice(&dw0.to_le_bytes());

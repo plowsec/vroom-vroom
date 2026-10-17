@@ -12,6 +12,7 @@
 #   Contents/MacOS/vroom-netd    the root helper the app installs when asked
 #   Contents/Frameworks/*.dylib  3D libraries, if built (see dist.sh)
 #   Contents/Resources/vroom.icns
+#   Contents/Resources/guest-tools  the guest agent, its installers, drivers
 #
 # Signing is ad hoc: fine on the Mac that built it. To give it to others
 # you need a Developer ID, the hardened runtime and notarization; see
@@ -44,6 +45,13 @@ cp "$r/vroom-gui" "$r/vroom" "$r/vroom-netd" "$app/Contents/MacOS/"
 sed "s/@VERSION@/$ver/g" packaging/macos/Info.plist >"$app/Contents/Info.plist"
 printf 'APPL????' >"$app/Contents/PkgInfo"
 cp packaging/macos/vroom.icns "$app/Contents/Resources/"
+# The guest tools (scripts/make-guest-tools.sh): what the app sends to a
+# guest's agent, puts in as a USB stick, and builds ready-made VMs with.
+if [ -d target/guest-tools ]; then
+  cp -R target/guest-tools "$app/Contents/Resources/guest-tools"
+else
+  echo "no guest tools in the app: run scripts/make-guest-tools.sh first" >&2
+fi
 
 # 3D: virglrenderer and what it loads from its own directory (MoltenVK,
 # DXMT, ANGLE). The GPU process looks in Contents/Frameworks.

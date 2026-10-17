@@ -962,7 +962,7 @@ What changes with `[display] monitors`:
   when the host has 3D), as Device Manager does. It only chooses between
   drivers that are already installed.
 
-## Guest agent (Windows)
+## Guest agent (Windows and Linux)
 
 The VirtIO serial port only admits Administrators and SYSTEM, so the agent
 is split. A LocalSystem service owns the port and does clock sync and
@@ -981,6 +981,54 @@ The Linux agent has the same split: a hardened systemd service
 session helper started with the desktop. They meet on
 `/run/vroom-agent.sock`; the service serves only the user logind reports
 active on seat0, and the helper only talks to a root-owned peer.
+
+### Guest tools updates
+
+Here the host sends code into the guest, which the guest runs as root
+(SYSTEM). That is the point: the guest asked for the host's tools when
+it installed the agent, and the host controls the guest entirely anyway.
+What has to hold is that nobody but the host can do it, and that the VMM
+never runs anything the guest sends.
+
+- Only the privileged side takes an update, and only from the host
+  port, which only root (Administrators and SYSTEM on Windows) can open.
+  The session helper's link never carries one: the service drops
+  `UpdateBegin` and `UpdateData` from a helper and never relays them to
+  one (tested: `updates_come_only_from_the_host`). The agent run by hand
+  (not as the service) refuses them unless it is root.
+- The update starts with a manifest: each file's path, size and SHA-256.
+  Paths are checked like dropped files' (relative, no `..`, no drive
+  letters, nothing Windows reads another way), at most 512 files and
+  256 MB in all, no file twice. The agent writes the files into a new
+  folder only root can write (Linux: `/var/lib/vroom-agent/update`, mode
+  0700, owned by root, never through a link; Windows: under
+  `Program Files\Vroom`, which users can't write), checks each against
+  its size and hash as it comes, and drops everything at the first
+  mismatch. Only a complete, checked set is installed. The hashes catch
+  damage and a half-sent update; they are not a signature, and need not
+  be one: only the host can write the port. Signing would protect
+  against nothing the host couldn't do another way.
+- Linux: the hardened service can't replace files in `/usr` or restart
+  itself, and stays that way. It writes a `ready` file; a systemd path
+  unit starts `vroom-agent-update.service`, which runs the update's
+  `install-agent.sh --update` as root. Windows: the service starts the
+  update's `vroom-agent.exe --apply-update`, which stops the service,
+  adds drivers whose version changed (`pnputil`; the display driver
+  only goes into the driver store), swaps the files (a file in use is
+  renamed out of the way, and put back if anything fails) and starts
+  the service again.
+- The VMM passes an update from the app to the guest only as announced:
+  one `UpdateBegin`, then exactly its bytes in `UpdateData` frames of the
+  same update, nothing else (`forward_update`). It never reads the
+  update's contents and never runs anything. The guest's only answer is
+  `UpdateDone` (one short line, shown as text).
+- The app takes the tools from its own bundle (`Contents/Resources/guest-tools`)
+  or `VROOM_GUEST_TOOLS`. The agent's version is read from the agent
+  binary there; the guest's version comes from its hello and is only
+  compared and shown, cleaned like every status line.
+- The tools stick for guests without an agent is the app's own image,
+  plugged in read-only; installing from it is the user's step in the
+  guest.
 
 ## Fuzzing
 

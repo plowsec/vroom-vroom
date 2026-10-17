@@ -748,6 +748,10 @@ fn serve(stream: UnixStream, c: &Serve) {
                         c.tx.send(&ToViewer::Status(format!("Network: adapter {}: {e}", nic + 1)));
                     }
                 }
+                Ok(Some(ToVmm::AgentUpdate)) => match (!fds.is_empty()).then(|| fds.remove(0)) {
+                    Some(from) => c.agent.send(AgentCmd::Update { from }),
+                    None => log::warn!("display: guest tools without their pipe"),
+                },
                 Ok(Some(ToVmm::DragOutGet { id, item })) => match (!fds.is_empty()).then(|| fds.remove(0)) {
                     Some(to) => c.agent.send(AgentCmd::DragOutGet { id, item, to }),
                     None => log::warn!("display: a drag out without its pipe"),
@@ -884,7 +888,8 @@ fn handle(
         | ToVmm::UsbFiles { .. }
         | ToVmm::DragOutGet { .. }
         | ToVmm::NetConnect { .. }
-        | ToVmm::NetSet { .. } => {}
+        | ToVmm::NetSet { .. }
+        | ToVmm::AgentUpdate => {}
         ToVmm::Coherence(on) => agent.send(AgentCmd::Coherence(on)),
         ToVmm::Window { id, op } => agent.send(AgentCmd::Window { id, op }),
         ToVmm::DragOut { id, end: false } => agent.send(AgentCmd::DragOut { id }),

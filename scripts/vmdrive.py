@@ -26,6 +26,8 @@ Commands, one per line, on <state-dir>.cmd (a fifo):
                          app does for a device a macOS driver holds)
   usbdetach PORT         pull out the device on that port pair (64, 65: a
                          USB disk's files)
+  update FILE            new guest tools for the agent, as the app sends them:
+                         FILE holds the agent frames (`vroom guest-tools bundle`)
   usbdisk PATH [ro]      "Use as a disk": PATH (an image, or a /dev/rdiskN we
                          may open) as a USB stick, as the app does
   usbfiles DIR [ro]      "Share its files": DIR on a removable share, with
@@ -307,6 +309,20 @@ def usb_disk(path, ro=""):
     fd = os.open(path, os.O_RDONLY if ro else os.O_RDWR)
     pl = bytes([1 if ro else 0]) + usb_dev("disk " + os.path.basename(path))
     socket.send_fds(a, [struct.pack("<BI", 80, len(pl)) + pl], [fd]); os.close(fd)
+def agent_update(path):
+    # New guest tools: a pipe the VMM forwards to the agent, checked.
+    r, w = socket.socketpair()
+    socket.send_fds(a, [struct.pack("<BI", 91, 0)], [r.fileno()]); r.close()
+    def writer():
+        with open(path, "rb") as f:
+            while True:
+                d = f.read(1 << 20)
+                if not d:
+                    break
+                w.sendall(d)
+        w.close()
+        ev.write(f"update sent: {os.path.getsize(path)} bytes\n")
+    threading.Thread(target=writer, daemon=True).start()
 def usb_files(path, ro=""):
     # "Share its files": the directory's fd and the sandbox token that
     # lets the VMM in below it (macOS).
@@ -478,6 +494,7 @@ if True:
                 elif c == "usbnetd": usb_netd(*arg.split())
                 elif c == "usbdetach": send(13, bytes([int(arg)]))
                 elif c == "usbdisk": usb_disk(*arg.split())
+                elif c == "update": agent_update(arg.strip())
                 elif c == "usbfiles": usb_files(*arg.split())
                 elif c == "net":
                     n, on = arg.split()

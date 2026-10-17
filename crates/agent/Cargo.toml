@@ -15,6 +15,8 @@ log.workspace = true
 env_logger.workspace = true
 # App icons (Linux icon themes, Windows Store app logos).
 png = "0.17"
+# Checks guest tools updates from the host.
+sha2 = "0.10"
 
 [target.'cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))'.dependencies]
 arboard = { version = "3", default-features = false }
@@ -36,6 +38,7 @@ windows-sys = { version = "0.59", features = ["Win32_System_SystemInformation", 
 
 [dev-dependencies]
 roxmltree = "0.21"
+tempfile = "3"
 
 [lints]
 workspace = true

@@ -90,6 +90,10 @@ component VmBar inherits HorizontalLayout {
     in property <bool> net-open;
     // Coherence: why it can't start (empty: it can).
     in property <string> coherence-why;
+    // Guest tools: 0 nothing to do, 1 none in the guest, 2 newer ones
+    // here, 3 being installed. What it means is in the tip.
+    in property <int> tools;
+    in property <string> tools-tip;
     out property <bool> power-open: false;
     callback act(string);
     // The USB button was clicked: where its bottom right corner is.
@@ -338,6 +342,26 @@ component VmBar inherits HorizontalLayout {
             }
         }
     }
+    if root.tools > 0: Rectangle {
+        width: 30px;
+        height: 30px;
+        y: (parent.height - self.height) / 2;
+        BarButton {
+            icon: Icons.package;
+            tip: root.tools-tip;
+            dim: root.tools == 3;
+            clicked => { root.act("tools"); }
+        }
+        // Newer tools: a dot on the icon's corner.
+        if root.tools == 2: Rectangle {
+            x: parent.width - self.width - 4px;
+            y: 4px;
+            width: 8px;
+            height: 8px;
+            border-radius: 4px;
+            background: Theme.accent;
+        }
+    }
     BarButton {
         icon: Icons.sliders;
         tip: "Settings";
@@ -443,6 +467,9 @@ export component ConsoleWindow inherits Window {
     in property <bool> monitors;
     // Why Coherence can't start now (empty: it can).
     in property <string> coherence-why: "Coherence needs the guest tools";
+    // Guest tools (see VmBar).
+    in property <int> tools;
+    in property <string> tools-tip;
     // Height of the bar above the guest screen (none in full screen).
     // Rust takes it off the size it asks the guest for.
     out property <length> bar-height: root.fullscreen ? 0px : 38px;
@@ -726,6 +753,8 @@ export component ConsoleWindow inherits Window {
             gpu-text: root.gpu-text;
             monitors: root.monitors;
             coherence-why: root.coherence-why;
+            tools: root.tools;
+            tools-tip: root.tools-tip;
             wide: true;
             usb-shown: root.usb-shown;
             usb-count: root.usb-count;
@@ -789,6 +818,8 @@ export component ConsoleWindow inherits Window {
                 root.net-y = y;
             }
             coherence-why: root.coherence-why;
+            tools: root.tools;
+            tools-tip: root.tools-tip;
             act(a) => { root.act(a); }
         }
     }

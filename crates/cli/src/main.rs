@@ -11,6 +11,7 @@ mod new;
 mod session;
 mod snap;
 mod term;
+mod tools;
 mod usb;
 mod video;
 #[cfg(target_os = "macos")]
@@ -100,6 +101,9 @@ enum Cmd {
     /// Snapshot housekeeping (list, delete, prune disk layers).
     #[command(subcommand)]
     Snapshot(snap::SnapCmd),
+    /// The guest tools: where they are, their versions, updates.
+    #[command(subcommand)]
+    GuestTools(tools::ToolsCmd),
 }
 
 /// Apps started from the Dock or Finder get 256 open files. A Windows
@@ -162,6 +166,7 @@ fn main() -> ExitCode {
         Cmd::Snapshot(s) => snap::run(s, load, default_state_dir),
         Cmd::New(a) => new::run(a, load),
         Cmd::Import(a) => import::run(a),
+        Cmd::GuestTools(c) => tools::run(c),
         Cmd::AudioOut { input } => audio_out(input),
         Cmd::CameraHelper => camera::helper(),
         #[cfg(unix)]

@@ -221,4 +221,12 @@ export struct NewVm {
     disk-gib: int,
     gpu3d: bool,
     start: bool,
+    // Ready-made (Ubuntu from its cloud image, Windows from its ISO): the
+    // account, SSH with a key of ~/.ssh, Ubuntu's desktop.
+    ready: bool,
+    user: string,
+    password: string,
+    ssh: bool,
+    ssh-key: int,
+    desktop: bool,
 }

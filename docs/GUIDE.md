@@ -100,8 +100,9 @@ off) and, for Windows, Ctrl+Alt+Del. On the right: how busy the VM is
 (the host CPU time it uses, out of what its CPUs could use), "3D" or
 "Direct3D 11" when 3D is on, the network adapters (see
 [Network adapters](#network-adapters)), USB devices (see [USB devices](#usb-devices)),
-Coherence (below), the settings (the VM's page in the app),
-full screen, and the VM list. The guest gets the rest of the window: a
+the guest tools (below; only when there is something to do), Coherence
+(below), the settings (the VM's page in the app), full screen, and the
+VM list. The guest gets the rest of the window: a
 guest with the agent takes exactly that size. In full screen the bar
 goes away and slides in when the mouse touches the top edge.
 
@@ -290,6 +291,81 @@ After the import:
   `--keep-hardware-ids` keeps VMware's BIOS UUID and SMBIOS names, which
   helps, but then the guest can tell it came from VMware.
 
+## Guest tools
+
+The guest tools (the vroom agent) give the guest the clipboard both ways,
+resizing with the window, the UI scale, time sync, clean shutdown, drag
+and drop, Coherence and USB disks' files. VMs made ready-made (below)
+have them from the start. The app carries them (`scripts/make-guest-tools.sh`
+builds them; `vroom guest-tools info` says which version it has).
+
+The VM window's box icon shows when there is something to do; its tip
+says what:
+
+- **Newer tools here** (a dot on the icon): click, and the app sends them
+  to the guest's agent, which checks them and installs them itself
+  (Linux: the service and the session helper; Windows: the service, the
+  helper, and the virtio drivers whose version changed). A few seconds;
+  the window says when the new agent is there. No restart.
+- **No agent after 90 s, or one too old to update itself**: click, and
+  the tools go in as a USB stick, `VRTOOLS`.
+  - Linux: run what the window shows (it is on the Mac's clipboard too):
+    `sudo mount -o ro LABEL=VRTOOLS /mnt && sudo sh /mnt/linux/install-agent.sh`.
+    This works on a live ISO too (until it shuts down).
+  - Windows: open the VRTOOLS drive and run `vroom-setup` (it asks for
+    administrator rights).
+  When the new agent says hello, the app takes the stick out. A VM
+  without USB (Linux started with `[boot] type = "kernel"`) gets
+  `vroom-tools.img` as a disk in its settings instead.
+
+`install-agent.sh` also replaces an agent from before the rename
+(`bulwark-agent`, which can't reach the host any more), and starts the
+session helper in the desktop that is on screen, so the clipboard works
+without logging out.
+
+Clipboard in Linux guests: the helper uses X11's clipboard, also in
+Wayland sessions (GNOME, KDE and wlroots pass it between X11 and Wayland
+apps through Xwayland). Tried both ways on Ubuntu 22.04 (GNOME 42, X11
+and Wayland) and 24.04 (GNOME 46, Wayland). A desktop without Xwayland
+gets no clipboard.
+
+## Ready-made VMs
+
+The New VM sheet makes a VM that comes up installed, with the guest
+tools, your user and, if you turn SSH on, your SSH key (any of
+`~/.ssh/*.pub`; the VM gets a port forward, written in its file):
+
+- **Ubuntu 24.04**: leave the installer empty. The app downloads Ubuntu's
+  cloud image (600 MB, checked against Ubuntu's SHA256SUMS, kept in
+  `~/Library/Caches/vroom`), or takes a cloud image (`.img`) you choose.
+  First boot sets it up (cloud-init): a minute without the desktop; with
+  "Desktop", about 10 minutes more (it downloads GNOME), then it restarts
+  into it.
+- **Windows 11 ARM64**: choose the Windows 11 ARM64 ISO (download it from
+  microsoft.com yourself). The app makes an install disk from it with the
+  virtio drivers and the guest tools (a minute, about 5 GB in the VM's
+  folder). Setup runs on its own (about 20 minutes): the network drivers
+  go in before the first logon, so NAT works at once, then the guest
+  tools, then OpenSSH if asked (a Windows download: a few more minutes
+  once the desktop is up). Afterwards, remove the install disk's block
+  from the VM file and delete `install.img` and `install.qcow2`; if it
+  stays, Setup shuts down rather than install over a Windows (a setup
+  that broke off halfway: make the VM again). An install image of 4 GB
+  or more needs wimlib (`brew install wimlib`).
+
+The same from the command line:
+
+```bash
+VROOM_NEW_PASSWORD=... vroom new web --os ubuntu --ready --ssh-key ~/.ssh/id_ed25519.pub [--desktop] [--image noble.img]
+VROOM_NEW_PASSWORD=... vroom new win --os windows --ready --iso Win11_ARM64.iso --ssh-key ~/.ssh/id_ed25519.pub
+```
+
+The VM goes in a folder named after it (`--dir` for where). The user is
+yours (`--user` for another). Passwords never go into the VM's files as
+they are: Ubuntu's seed holds a SHA-512 hash; Windows' answer file holds
+it in clear, on the install disk in the VM's folder, as Windows wants it
+(delete `install.img` after the install).
+
 ## Ubuntu 24.04 (cloud image, direct kernel boot)
 
 ```bash
@@ -307,14 +383,14 @@ with `user-data` / `meta-data` (any NoCloud ISO tool works, e.g.
 `hdiutil makehybrid -iso -joliet -default-volume-name cidata -o seed.iso seeddir`),
 then `target/debug/vroom run examples/ubuntu.toml`.
 
-Clipboard, time sync and clean shutdown need the agent in the guest:
-`cargo build --release --target aarch64-unknown-linux-musl -p vroom-agent`,
-copy it and `examples/linux/` in (with its `gnome-shell` folder), run
-`sudo ./install-agent.sh`. That installs a systemd service (root,
-hardened unit: the host channel, clock, shutdown), a desktop autostart
-entry for the unprivileged session helper (clipboard), and on GNOME the
-extension that hides the top bar in Coherence; the service only serves
-the user on screen.
+Clipboard, time sync and clean shutdown need the agent in the guest
+(see [Guest tools](#guest-tools)): `scripts/make-guest-tools.sh` puts it
+and its installer in `target/guest-tools/linux/`; copy that in and run
+`sudo sh install-agent.sh`. That installs a systemd service (root,
+hardened unit: the host channel, clock, shutdown), the unit that installs
+updates from the host, a desktop autostart entry for the unprivileged
+session helper (clipboard), and on GNOME the extension that hides the top
+bar in Coherence; the service only serves the user on screen.
 
 The cloud image has no driver for the hardware clock (`rtc-pl031`, in
 `linux-modules-extra-$(uname -r)`), so it boots with a wrong date until
@@ -377,17 +453,22 @@ path = "win11.qcow2"        # vroom disk create win11.qcow2 --size 64G
 format = "qcow2"
 bus = "nvme"
 [[disk]]
-path = "winusb.raw"
-readonly = true
-format = "raw"
+path = "winusb.qcow2"       # vroom disk create winusb.qcow2 --backing winusb.raw
+format = "qcow2"
 bus = "nvme"
 [[net]]
 mode = "nat"
 ```
 
+   The stick goes in through a layer Windows can write to: it writes to
+   it (FAT access times, setup's own files), and on a read-only NVMe disk
+   setup stalls at 57% for good (Windows ignores NVMe's write-protect
+   flag and retries the refused writes). `winusb.raw` stays as it was.
+
 4. `vroom-gui win11.toml`. Setup runs unattended (the unattend file wipes
    **disk 0**), reboots, and logs in as `vroom` / `vroom` (change it).
-   First logon installs the virtio drivers and the agent.
+   First logon installs the virtio drivers and the agent. (The New VM
+   sheet does all of this from the ISO: [Ready-made VMs](#ready-made-vms).)
 5. **Remove the stick from the config afterwards.** If Windows ever fails to
    boot, the firmware falls back to the next boot entry: with the stick
    still attached, that's an unattended reinstall that wipes disk 0.
@@ -398,8 +479,9 @@ mode = "nat"
 The agent is a Windows service (`VroomAgent`, clock sync and clean
 shutdown via `Ctrl+Alt+Shift+D`) plus an unprivileged helper started at
 each logon (clipboard, window resizes, UI scale). The status line says when it
-connects. Upgrading an older install: run the new `vroom-setup.cmd` as
-administrator.
+connects. Upgrading: the VM window's guest tools button (see
+[Guest tools](#guest-tools)); an install older than that: run the new
+`vroom-setup.cmd` (it asks for administrator rights).
 
 Until the agent runs, Windows may show two monitors (firmware framebuffer
 and virtio-gpu). The window shows whichever one Windows last drew on.

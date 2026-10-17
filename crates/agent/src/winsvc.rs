@@ -122,7 +122,7 @@ fn serve(port: Option<&str>) {
         let tx = tx.clone();
         std::thread::spawn(move || accept_helpers(tx));
     }
-    let mut relay = Relay::new(RealSystem, crate::MAX_CLIP);
+    let mut relay = Relay::new(RealSystem::default(), crate::MAX_CLIP);
     loop {
         match crate::open_port(port) {
             Ok((path, r, mut w)) => {

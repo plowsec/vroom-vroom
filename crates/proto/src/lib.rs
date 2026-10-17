@@ -46,6 +46,9 @@ pub mod features {
     pub const APP_LIST: u64 = 1 << 16;
     /// The agent mounts USB disks' files when they come (`UsbShare`).
     pub const USB_SHARES: u64 = 1 << 20;
+    /// The agent takes new guest tools from the host and installs them
+    /// (`UpdateBegin`).
+    pub const UPDATE: u64 = 1 << 40;
 }
 
 /// Most windows one `Windows` list may carry, and the longest title (bytes).
@@ -239,6 +242,112 @@ pub enum Message {
     /// mount point (Linux: /media/vroom/<label>; Windows: a drive
     /// letter). Checked with `usb_tag_ok` and `usb_label_ok`.
     UsbShare { tag: String, label: String, on: bool },
+    /// Host -> guest: new guest tools follow (`features::UPDATE`). The
+    /// manifest: each file's path in the bundle, size and SHA-256, in the
+    /// order their bytes come in `UpdateData`. Checked with
+    /// `update_files_ok`. `version`: the agent's, as its Hello will say.
+    UpdateBegin { id: u32, version: String, files: Vec<UpdateFile> },
+    /// Host -> guest: the next bytes of update `id`, at most `UPDATE_CHUNK`.
+    UpdateData { id: u32, data: Vec<u8> },
+    /// Guest -> host: update `id` is checked and being installed (`ok`;
+    /// the agent restarts and says hello again), or why not.
+    UpdateDone { id: u32, ok: bool, why: String },
+}
+
+/// One file of a guest tools update.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateFile {
+    /// Relative, '/' between names (`drop_path_ok`).
+    pub path: String,
+    pub size: u64,
+    pub sha256: [u8; 32],
+}
+
+/// Most files one update may carry, and the most bytes in all.
+pub const UPDATE_FILES_MAX: usize = 512;
+pub const UPDATE_MAX: u64 = 256 << 20;
+/// Update data comes in pieces of at most this.
+pub const UPDATE_CHUNK: usize = 256 << 10;
+
+/// A manifest the agent may take: some files, none twice, each path
+/// inside the bundle, the total within `UPDATE_MAX`.
+pub fn update_files_ok(files: &[UpdateFile]) -> bool {
+    let mut total = 0u64;
+    let mut seen = std::collections::HashSet::new();
+    !files.is_empty()
+        && files.len() <= UPDATE_FILES_MAX
+        && files.iter().all(|f| {
+            total = total.saturating_add(f.size);
+            drop_path_ok(&f.path) && f.path.len() <= 255 && seen.insert(f.path.to_ascii_lowercase())
+        })
+        && total <= UPDATE_MAX
+}
+
+/// Guest agent versions: `0.1.0`, or `0.1.0+348.e314084680` for one built
+/// from git (348 commits on its branch, then the commit). Newer means a
+/// higher crate version, then more commits; the hash only tells builds
+/// apart.
+pub mod version {
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Version {
+        pub semver: (u32, u32, u32),
+        pub commits: u32,
+        pub hash: String,
+    }
+
+    impl Version {
+        pub fn parse(s: &str) -> Option<Version> {
+            let (base, build) = match s.split_once('+') {
+                Some((b, x)) => (b, Some(x)),
+                None => (s, None),
+            };
+            let mut n = base.split('.').map(|p| p.parse::<u32>().ok());
+            let semver = (n.next()??, n.next()??, n.next()??);
+            if n.next().is_some() {
+                return None;
+            }
+            let (commits, hash) = match build {
+                None => (0, String::new()),
+                Some(b) => {
+                    let (c, h) = b.split_once('.')?;
+                    if h.is_empty() || h.len() > 40 || !h.bytes().all(|c| c.is_ascii_hexdigit()) {
+                        return None;
+                    }
+                    (c.parse().ok()?, h.to_string())
+                }
+            };
+            Some(Version { semver, commits, hash })
+        }
+
+        /// From a Hello's agent text: `vroom-agent 0.1.0+348.e314084680 linux`.
+        pub fn from_hello(agent: &str) -> Option<Version> {
+            let mut w = agent.split_whitespace();
+            (w.next()? == "vroom-agent").then_some(())?;
+            Version::parse(w.next()?)
+        }
+
+        /// Older than `o`: what "update the guest tools" goes by.
+        pub fn older_than(&self, o: &Version) -> bool {
+            (self.semver, self.commits) < (o.semver, o.commits)
+        }
+    }
+
+    impl std::fmt::Display for Version {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let (a, b, c) = self.semver;
+            write!(f, "{a}.{b}.{c}")?;
+            if !self.hash.is_empty() {
+                write!(f, "+{}.{}", self.commits, self.hash)?;
+            }
+            Ok(())
+        }
+    }
+
+    /// The guest's system from a Hello's agent text ("linux", "windows"),
+    /// if the agent says (agents before updates didn't).
+    pub fn hello_os(agent: &str) -> Option<&str> {
+        agent.split_whitespace().nth(2).filter(|o| matches!(*o, "linux" | "windows"))
+    }
 }
 
 /// Removable shares' tags: `vroom-usb` and a digit.
@@ -597,6 +706,10 @@ const T_COHERENCE_NO: u8 = 30;
 const T_APPS: u8 = 60;
 // Well above the others too.
 const T_USB_SHARE: u8 = 80;
+// Guest tools updates: well above the others.
+const T_UPDATE_BEGIN: u8 = 91;
+const T_UPDATE_DATA: u8 = 92;
+const T_UPDATE_DONE: u8 = 93;
 
 impl Message {
     pub fn encode(&self) -> Vec<u8> {
@@ -705,6 +818,30 @@ impl Message {
                 p.extend_from_slice(tag.as_bytes());
                 p.extend_from_slice(label.as_bytes());
                 (T_USB_SHARE, p)
+            }
+            Message::UpdateBegin { id, version, files } => {
+                let mut p = id.to_le_bytes().to_vec();
+                p.push(version.len().min(255) as u8);
+                p.extend_from_slice(&version.as_bytes()[..version.len().min(255)]);
+                p.extend_from_slice(&(files.len() as u32).to_le_bytes());
+                for f in files {
+                    p.extend_from_slice(&f.size.to_le_bytes());
+                    p.extend_from_slice(&f.sha256);
+                    p.extend_from_slice(&(f.path.len() as u16).to_le_bytes());
+                    p.extend_from_slice(f.path.as_bytes());
+                }
+                (T_UPDATE_BEGIN, p)
+            }
+            Message::UpdateData { id, data } => {
+                let mut p = id.to_le_bytes().to_vec();
+                p.extend_from_slice(data);
+                (T_UPDATE_DATA, p)
+            }
+            Message::UpdateDone { id, ok, why } => {
+                let mut p = id.to_le_bytes().to_vec();
+                p.push(*ok as u8);
+                p.extend_from_slice(why.as_bytes());
+                (T_UPDATE_DONE, p)
             }
         };
         let mut out = Vec::with_capacity(HDR + payload.len());
@@ -819,9 +956,12 @@ impl Message {
                 }
                 Message::UsbShare { tag: tag.into(), label: label.into(), on: p[0] != 0 }
             }
+            T_UPDATE_BEGIN if p.len() >= 5 => decode_update(p).ok_or(Error::Malformed)?,
+            T_UPDATE_DATA if p.len() >= 4 && p.len() - 4 <= UPDATE_CHUNK => Message::UpdateData { id: u32_at(0)?, data: p[4..].to_vec() },
+            T_UPDATE_DONE if p.len() >= 5 && p[4] <= 1 => Message::UpdateDone { id: u32_at(0)?, ok: p[4] != 0, why: text(&p[5..])?.chars().filter(|c| !c.is_control()).take(256).collect() },
             T_TIME | T_RES | T_SCALE | T_SHUTDOWN | T_PING | T_PONG | T_GPU3D | T_DRAG_READY | T_DRAG_CANCEL | T_DROP_ENTRY | T_DROP_DATA
             | T_DROP_END | T_DROP_DONE | T_COHERENCE | T_WINDOW_DO | T_DRAG_OUT_QUERY | T_DRAG_OUT_GET | T_DRAG_OUT_END | T_DRAG_OUT_FAIL | T_LAYOUT | T_MOUSE
-            | T_USB_SHARE => {
+            | T_USB_SHARE | T_UPDATE_BEGIN | T_UPDATE_DATA | T_UPDATE_DONE => {
                 return Err(Error::Malformed)
             }
             t => return Err(Error::Type(t)),
@@ -830,6 +970,31 @@ impl Message {
 }
 
 /// Incremental decoder for a byte stream.
+/// `UpdateBegin`: id u32 | version len u8, text | count u32 | per file:
+/// size u64, sha256 [32], path len u16, path.
+fn decode_update(p: &[u8]) -> Option<Message> {
+    let id = u32::from_le_bytes(p.get(0..4)?.try_into().ok()?);
+    let vl = *p.get(4)? as usize;
+    let version = std::str::from_utf8(p.get(5..5 + vl)?).ok()?;
+    version::Version::parse(version)?;
+    let mut o = 5 + vl;
+    let n = u32::from_le_bytes(p.get(o..o + 4)?.try_into().ok()?) as usize;
+    o += 4;
+    if n > UPDATE_FILES_MAX {
+        return None;
+    }
+    let mut files = Vec::with_capacity(n);
+    for _ in 0..n {
+        let size = u64::from_le_bytes(p.get(o..o + 8)?.try_into().ok()?);
+        let sha256: [u8; 32] = p.get(o + 8..o + 40)?.try_into().ok()?;
+        let len = u16::from_le_bytes(p.get(o + 40..o + 42)?.try_into().ok()?) as usize;
+        let path = std::str::from_utf8(p.get(o + 42..o + 42 + len)?).ok()?.to_string();
+        o += 42 + len;
+        files.push(UpdateFile { path, size, sha256 });
+    }
+    (o == p.len() && update_files_ok(&files)).then(|| Message::UpdateBegin { id, version: version.to_string(), files })
+}
+
 #[derive(Debug)]
 pub struct Decoder {
     buf: Vec<u8>,
@@ -941,7 +1106,58 @@ mod tests {
             ]),
             Message::UsbShare { tag: "vroom-usb0".into(), label: "TEST 1".into(), on: true },
             Message::UsbShare { tag: "vroom-usb1".into(), label: "Clé".into(), on: false },
+            Message::UpdateBegin {
+                id: 7,
+                version: "0.1.0+348.e314084680".into(),
+                files: vec![
+                    UpdateFile { path: "vroom-agent".into(), size: 3, sha256: [1; 32] },
+                    UpdateFile { path: "gnome-shell/extension.js".into(), size: 0, sha256: [2; 32] },
+                ],
+            },
+            Message::UpdateData { id: 7, data: vec![1, 2, 3] },
+            Message::UpdateDone { id: 7, ok: false, why: "hash mismatch".into() },
         ]
+    }
+
+    #[test]
+    fn updates_are_checked() {
+        let f = |path: &str, size: u64| UpdateFile { path: path.into(), size, sha256: [0; 32] };
+        let bad = |version: &str, files: Vec<UpdateFile>| {
+            let mut d = Decoder::new(MAX_PAYLOAD);
+            d.push(&Message::UpdateBegin { id: 1, version: version.into(), files }.encode());
+            d.next().is_err()
+        };
+        assert!(!bad("0.1.0", vec![f("a/b", 1)]));
+        assert!(bad("0.1.0", Vec::new()), "nothing");
+        assert!(bad("0.1", vec![f("a", 1)]), "not a version");
+        for p in ["../x", "/etc/passwd", "a//b", "a\\b", "c:x", ""] {
+            assert!(bad("0.1.0", vec![f(p, 1)]), "{p:?}");
+        }
+        assert!(bad("0.1.0", vec![f("a", 1), f("A", 1)]), "the same file twice (Windows)");
+        assert!(bad("0.1.0", vec![f("a", UPDATE_MAX), f("b", 1)]), "too big");
+        assert!(bad("0.1.0", (0..UPDATE_FILES_MAX + 1).map(|i| f(&i.to_string(), 0)).collect()), "too many");
+        let mut d = Decoder::new(MAX_PAYLOAD);
+        d.push(&Message::UpdateData { id: 1, data: vec![0; UPDATE_CHUNK + 1] }.encode());
+        assert!(d.next().is_err(), "chunk too big");
+    }
+
+    #[test]
+    fn versions_compare() {
+        use version::{hello_os, Version};
+        let v = |s: &str| Version::parse(s).unwrap();
+        assert!(v("0.1.0").older_than(&v("0.1.0+1.abc")));
+        assert!(v("0.1.0+347.abc").older_than(&v("0.1.0+348.def")));
+        assert!(v("0.1.9+999.abc").older_than(&v("0.2.0")));
+        assert!(!v("0.1.0+348.abc").older_than(&v("0.1.0+348.def")));
+        assert_eq!(v("1.2.3+4.ab").to_string(), "1.2.3+4.ab");
+        for bad in ["", "1.2", "1.2.3.4", "1.2.3+x", "1.2.3+1.", "1.2.3+1.xyz", "a.b.c"] {
+            assert_eq!(Version::parse(bad), None, "{bad:?}");
+        }
+        assert_eq!(Version::from_hello("vroom-agent 0.1.0"), Some(v("0.1.0")));
+        assert_eq!(Version::from_hello("vroom-agent 0.1.0+3.ab linux"), Some(v("0.1.0+3.ab")));
+        assert_eq!(Version::from_hello("bulwark-agent 0.1.0"), None);
+        assert_eq!(hello_os("vroom-agent 0.1.0+3.ab windows"), Some("windows"));
+        assert_eq!(hello_os("vroom-agent 0.1.0"), None);
     }
 
     #[test]

@@ -5388,6 +5388,8 @@ dependencies = [
  "png 0.17.16",
  "roxmltree",
  "serde_json",
+ "sha2",
+ "tempfile",
  "vroom-proto",
  "windows-sys 0.59.0",
  "x11rb",
@@ -5454,6 +5456,7 @@ dependencies = [
  "vroom-ipc",
  "vroom-net",
  "vroom-sandbox",
+ "vroom-tools",
  "vroom-usb",
  "vroom-video",
  "vroom-vmm",
@@ -5559,6 +5562,7 @@ dependencies = [
  "vroom-proto",
  "vroom-sandbox",
  "vroom-state",
+ "vroom-tools",
  "vroom-usb",
 ]
 
@@ -5695,6 +5699,18 @@ dependencies = [
  "thiserror 2.0.21",
  "vroom-block",
  "vroom-snapshot",
+]
+
+[[package]]
+name = "vroom-tools"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "sha2",
+ "tempfile",
+ "vroom-block",
+ "vroom-config",
+ "vroom-proto",
 ]
 
 [[package]]

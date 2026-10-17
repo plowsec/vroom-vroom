@@ -273,3 +273,16 @@ pub fn gpu_drivers(first_3d: bool) {
 #[cfg(not(windows))]
 #[allow(dead_code)]
 pub fn gpu_drivers(_first_3d: bool) {}
+
+/// Linux: whether the desktop this process was started in is still there
+/// (its Wayland socket, or an X server that takes a connection). None:
+/// started without one.
+#[cfg(target_os = "linux")]
+pub fn display_alive() -> Option<bool> {
+    if let (Some(w), Some(dir)) = (std::env::var_os("WAYLAND_DISPLAY"), std::env::var_os("XDG_RUNTIME_DIR")) {
+        let p = std::path::Path::new(&dir).join(w);
+        return Some(std::fs::symlink_metadata(p).is_ok());
+    }
+    std::env::var_os("DISPLAY")?;
+    Some(x11rb::connect(None).is_ok())
+}

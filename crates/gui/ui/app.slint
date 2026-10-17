@@ -26,6 +26,8 @@ export component AppWindow inherits Window {
     in property <string> newvm-dest;
     in property <string> newvm-error;
     in property <bool> newvm-creating;
+    in property <string> newvm-progress;
+    in property <[string]> newvm-keys;
 
     in-out property <bool> palette-open;
     in-out property <string> palette-query;
@@ -112,6 +114,8 @@ export component AppWindow inherits Window {
         dest: root.newvm-dest;
         error: root.newvm-error;
         creating: root.newvm-creating;
+        progress: root.newvm-progress;
+        keys: root.newvm-keys;
     }
     if root.palette-open: CommandPalette {
         items: root.palette-items;
