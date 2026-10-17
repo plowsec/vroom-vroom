@@ -32,7 +32,7 @@ use vroom_display::{recv_fd, Command, Decoder, GuestCursor, SharedFb, ToViewer, 
 use crate::msg::{self, Msg};
 use crate::{ConsoleWindow, MonitorWindow, VmState};
 
-mod usbmenu;
+pub mod usbmenu;
 mod coherence;
 mod netmenu;
 mod tools;
@@ -436,6 +436,24 @@ pub fn usb_unplug(key: &str, id: &str, serial: Option<&str>) {
     with(key, |c| c.usb_unplug(id, serial));
 }
 
+/// What the running VM has connected now (the VM window's USB menu), and
+/// whether its guest tools answer (they mount a disk's files). None: the
+/// VM doesn't run here, or has no USB controller.
+pub fn usb_now(key: &str) -> Option<(Vec<vroom_display::UsbPort>, bool)> {
+    with(key, |c| c.usb_ports().map(|p| (p, c.features != 0))).flatten()
+}
+
+/// The settings page changed how a USB disk connects: connected another
+/// way now, it is let go and connected again this way.
+pub fn usb_set_mode(key: &str, d: vroom_display::UsbDev, mode: vroom_config::UsbMode, readonly: bool) {
+    with(key, |c| c.usb_set_mode(d, mode, readonly));
+}
+
+/// Let go of a device connected for this run only.
+pub fn usb_disconnect(key: &str, d: &vroom_display::UsbDev) {
+    with(key, |c| c.usb_unplug(&d.id, Some(&d.serial).filter(|s| !s.is_empty()).map(|s| s.as_str())));
+}
+
 /// `[display] hidpi` changed: ask the guest for the new size now.
 pub fn set_hidpi(key: &str, on: bool) {
     with(key, |c| {
@@ -472,6 +490,15 @@ pub fn command_any(cmd: &str) {
     CONSOLES.with(|c| {
         for con in c.borrow_mut().values_mut() {
             con.command(cmd);
+        }
+    });
+}
+
+/// Show the tooltip with this text in every VM window (`VROOM_SHOT`).
+pub fn tip_any(text: &str) {
+    CONSOLES.with(|c| {
+        for con in c.borrow().values() {
+            con.win.global::<crate::Tips>().set_demo(text.into());
         }
     });
 }

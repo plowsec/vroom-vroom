@@ -75,12 +75,14 @@ rebuild macOS may ask again.
 - Settings are saved to the VM file right away. Comments and layout in the
   file are kept. Hand edits show up in the app within a couple of seconds.
 - A running or suspended VM's hardware is locked: CPUs, memory, disks,
-  display, shared folders, sound, security, boot. Each locked card says
-  why. Network adapters and USB devices change right away on a VM
+  display, shared folders, sound, security, boot. Each locked card has a
+  lock; hover it for why. Network adapters and USB devices change right away on a VM
   running in the app (or when a suspended one resumes); what has to
   wait for the next start says so in its card. Clipboard rules apply
   right away.
-- Hover a setting to see its key in the file. Every option is in
+- The app keeps text short: labels, icons and colors on screen. Hover a
+  setting, a button or a choice (or reach it with Tab) for what it does
+  and its key in the file. Every option is in
   [CONFIG.md](CONFIG.md); the rare ones are under "Advanced" in each card.
 - `⌘K` (Ctrl+K on Linux): start, suspend, snapshot, jump to a setting.
 - Each VM's last run log: `⋯` → Show log.
@@ -486,6 +488,8 @@ gpu = "virtio3d"     # or virtio2d
 monitors = 2         # up to 4
 ```
 
+In the app: Settings → Display → Monitors (1 to 4; the VM must be off).
+
 The app opens a window per guest monitor once the guest uses it. The
 first has the VM's bar; the others only the screen ("<VM> — display 2").
 Each can be resized on its own, and the guest follows with the agent.
@@ -629,7 +633,8 @@ vroom builds before October 17, 2026, Chrome's GPU process doesn't start
 ("eglCreateContext ES 3.0 failed with EGL_BAD_ATTRIBUTE" in its log, as
 a Wayland app): Chrome then draws with the CPU and has no WebGL. Chrome
 wants OpenGL ES 3.0 with 4x multisampling, and those had no
-multisampling.
+multisampling. The app marks the ANGLE choice (Settings → Display →
+OpenGL driver) with a warning sign that says so.
 
 ### OpenGL 4.4 for one app (Zink)
 
@@ -1085,7 +1090,8 @@ the VM's page. Both write the VM file (`connected`, `mode`), so the
 change stays.
 
 The settings page does the same and more. What can't change while the
-VM runs waits for its next start, and the adapter's card says so: port
+VM runs waits for its next start, and the adapter's card says so (hover
+the line for details): port
 forwards, a new MAC, a new adapter (vroom has no PCI hotplug yet), NAT on
 a VM that started without NAT (its sandbox has no network then). A
 removed adapter is unplugged at once and gone at the next start. A
@@ -1105,6 +1111,14 @@ device has "Always connect to this VM" under it: tick it and it goes in
 the VM file, so the VM takes it at every start. Without the tick it is
 only for this run; a suspended VM gets it back when it resumes, if it is
 still plugged into the Mac.
+
+The VM's settings page lists the same devices: those in the VM file
+(with a pin: connected at every start) and those connected now for this
+run only (marked "this run"). A green dot means connected now. The pin
+saves a run-only device in the file, or takes one out of the file while
+it stays connected; the cross lets go of a run-only device, the bin
+takes a file device out and lets go of it.
+
 
 From the terminal, the same thing for every start:
 
@@ -1193,16 +1207,24 @@ menu and it asks how the VM gets it:
 "Remember for this device" keeps the choice (for every VM; in this VM's
 file too if the device is in it). Devices that aren't disks don't ask.
 The menu says how each connected device is in the VM. The VM's settings
-page has the same choice for the devices in its file (`mode` in
-[CONFIG.md](CONFIG.md#usb-host-usb-devices-up-to-8)).
+page has the same choice for every USB disk it lists, in the file
+(`mode` in [CONFIG.md](CONFIG.md#usb-host-usb-devices-up-to-8)) or
+connected for this run: a disk connected now is let go and connected
+again the new way at once. A disk a root helper took earlier (it shows
+"Unplug it and plug it in again") has no disk for macOS until you plug
+it in again; the app remembers which devices are disks, so it still
+offers the choice.
 
 Where the files show up:
 
 - Linux guests with the vroom agent: under `/media/vroom/<volume name>`,
   mounted when you connect the disk and unmounted when you disconnect
-  it. GNOME's Files shows it. Without the agent:
+  it. GNOME's Files shows it. Without the agent (a live ISO, a guest
+  without the tools) nothing mounts it: the menu and the settings page
+  say "not mounted", and their tooltip has the command,
   `sudo mount -t virtiofs vroom-usb0 /mnt` (the second disk is
   `vroom-usb1`).
+
 - Windows guests: a drive letter, the same way as shared folders (see
   [Windows guests](#windows-guests)): `vroom-setup.cmd` makes a service
   for each of the two USB disk shares, and the agent starts it when you

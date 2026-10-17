@@ -68,6 +68,9 @@ pub(super) struct UsbMenu {
     /// Why the last disk couldn't be connected: stays in the menu (it
     /// may say what to allow in System Settings) until it is opened again.
     error: Option<String>,
+    /// Devices let go to be connected again another way (the settings
+    /// page changed their mode): how, read-only, since when.
+    reconnect: Vec<(UsbDev, UsbMode, bool, Instant)>,
 }
 
 /// Where a VM's devices connected for this run only are kept: a resumed
@@ -120,6 +123,12 @@ struct Target {
     ports: Vec<UsbPort>,
 }
 
+/// What vroom-netd is, for a tooltip.
+pub const NETD: &str = "Devices macOS uses need vroom-netd, a small helper that runs as root and takes them from macOS for the VM. It's set up once; macOS asks for an admin password.";
+
+/// A disk an earlier root helper took from macOS and didn't give back.
+pub const CAPTURED: &str = "An earlier root helper took it from macOS and didn't give it back, so macOS shows no disk for it. Unplug it and plug it in again to share its files or use it as a disk.";
+
 fn key_of(d: &UsbDev) -> String {
     format!("{}/{}", d.id, d.serial)
 }
@@ -161,16 +170,39 @@ fn used_as(drivers: &[String]) -> String {
     }
 }
 
-/// The menu's note for a connected device.
-fn connected_note(ports: &[UsbPort], files: &[String]) -> (String, bool) {
-    let ro = if ports.iter().any(|p| p.readonly) { " (read-only)" } else { "" };
+/// The guest's commands that mount a disk's shared files by hand.
+pub fn mount_commands(ports: &[UsbPort]) -> String {
+    ports
+        .iter()
+        .filter(|p| p.how == UsbHow::Files && p.port >= vroom_display::FILES_PORT0)
+        .map(|p| format!("sudo mount -t virtiofs {}{} /mnt", vroom_config::USB_SHARE_PREFIX, p.port - vroom_display::FILES_PORT0))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The note (short, on screen) and tip for a connected device, and
+/// whether the note is a warning. `agent`: the guest tools answer (they
+/// mount shared files).
+pub fn connected_note(ports: &[UsbPort], files: &[String], agent: bool) -> (String, String, bool) {
+    let ro = if ports.iter().any(|p| p.readonly) { " · read-only" } else { "" };
     match ports.first().map(|p| p.how) {
-        Some(UsbHow::Files) if !files.is_empty() => (format!("Its files are shared with this VM{ro}: {}", files.join(", ")), false),
-        Some(UsbHow::Files) => (format!("Its files are shared with this VM{ro}"), false),
-        Some(UsbHow::Disk) if ports.iter().all(|p| p.here) => (format!("Connected as a disk{ro}"), false),
-        Some(UsbHow::Disk) => ("Connected as a disk, but macOS took it back".into(), true),
-        _ if ports.iter().all(|p| p.here) => ("Connected to this VM".into(), false),
-        _ => ("Connected, but not plugged into the Mac".into(), true),
+        Some(UsbHow::Files) if !agent => (
+            format!("Files shared{ro} · not mounted"),
+            format!("No guest tools answer to mount it. In a Linux guest:\n{}", mount_commands(ports)),
+            true,
+        ),
+        Some(UsbHow::Files) => (
+            format!("Files shared{ro}"),
+            format!(
+                "The Mac keeps the disk. The guest tools mount its files: Linux under /media/vroom, Windows as a drive letter.{}",
+                if files.is_empty() { String::new() } else { format!(" On the Mac: {}.", files.join(", ")) }
+            ),
+            false,
+        ),
+        Some(UsbHow::Disk) if ports.iter().all(|p| p.here) => (format!("Connected as a disk{ro}"), "The VM has the whole disk; macOS gets it back when the VM lets go.".into(), false),
+        Some(UsbHow::Disk) => ("macOS took the disk back".into(), "Connected as a disk, but macOS has it again.".into(), true),
+        _ if ports.iter().all(|p| p.here) => ("Connected".into(), "The VM has the USB device itself.".into(), false),
+        _ => ("Not plugged into the Mac".into(), "Connected, but unplugged from the Mac. Plug it back in and the VM gets it again.".into(), true),
     }
 }
 
@@ -266,6 +298,7 @@ impl Console {
                 }
             }
         }
+        self.usb_again();
         if self.win.get_usb_open() {
             self.usb_rows();
         }
@@ -313,6 +346,8 @@ impl Console {
             keep
         });
         back.into_iter().for_each(usbdisk::remount);
+        self.usb_again();
+        let m = &mut self.usb;
         let stale = m.listed.is_none_or(|t| now.duration_since(t) >= LIST_EVERY);
         if self.win.get_usb_open() && (stale || n != self.usb.busy.len()) {
             self.usb_rows();
@@ -346,13 +381,14 @@ impl Console {
             return true;
         }
         // The same by device id, for scripts (VROOM_SHOT_DO):
-        // "usb.toggle-id.18a5:0302", "usb.how-id.18a5:0302.files".
+        // "usb.toggle-id.18a5:0302", "usb.how-id.18a5:0302.files" (or
+        // "18a5:0302/SERIAL" for one of several with that id).
         if let Some(rest) = cmd.strip_prefix("usb.toggle-id.").or_else(|| cmd.strip_prefix("usb.how-id.")) {
             let (id, how) = rest.split_once('.').unwrap_or((rest, ""));
             if self.usb.targets.is_empty() {
                 self.usb_rows();
             }
-            if let Some(i) = self.usb.targets.iter().position(|t| t.dev.id == id) {
+            if let Some(i) = self.usb.targets.iter().position(|t| t.dev.id == id || key_of(&t.dev) == id) {
                 let c = if how.is_empty() { format!("usb.toggle.{i}") } else { format!("usb.how.{i}.{how}") };
                 return self.usb_command(&c);
             }
@@ -387,7 +423,7 @@ impl Console {
         if let Some(m) = hostusb::remembered(dev) {
             return Some(m);
         }
-        if host.is_some_and(|h| h.is_storage()) && cfg!(target_os = "macos") {
+        if host.is_some_and(hostusb::is_disk) {
             return file;
         }
         Some(UsbMode::Device)
@@ -433,57 +469,60 @@ impl Console {
             let other = if on { None } else { elsewhere(&t.dev) };
             let always = self.usb.always.iter().any(|(id, serial, _)| *id == t.dev.id && serial.as_deref().unwrap_or("") == t.dev.serial);
             let mode = self.known_mode(&t.dev, t.host.as_ref());
-            let storage = t.host.as_ref().is_some_and(|h| h.is_storage()) && cfg!(target_os = "macos");
+            let storage = t.host.as_ref().is_some_and(hostusb::is_disk) || t.ports.iter().any(|p| p.how != UsbHow::Device);
             let choosing = !on && !busy && self.usb.choosing.as_deref() == Some(k.as_str());
-            let (note, warn) = if busy {
-                ((if on { "Letting go..." } else { "Connecting..." }).to_string(), false)
+            let captured = t.host.as_ref().is_some_and(|h| h.captured);
+            let ids = format!("{}{}", t.dev.id, if t.dev.serial.is_empty() { String::new() } else { format!(" · serial {}", t.dev.serial) });
+            let (note, tip, warn) = if busy {
+                ((if on { "Letting go..." } else { "Connecting..." }).to_string(), String::new(), false)
             } else if on {
                 let files: Vec<String> =
                     t.host.as_ref().map(|h| usbdisk::volumes(h).into_iter().map(|(_, p)| p.display().to_string()).collect()).unwrap_or_default();
-                connected_note(&t.ports, &files)
+                connected_note(&t.ports, &files, self.features != 0)
             } else if let Some(n) = &other {
-                (format!("In use by {n}"), true)
+                (format!("In use by {n}"), "Another VM has it. Let go of it there first.".into(), true)
+            } else if storage && captured && mode != Some(UsbMode::Device) {
+                ("Unplug it and plug it in again".into(), CAPTURED.into(), true)
             } else if storage && mode == Some(UsbMode::Files) {
-                ("A disk: connects its files".into(), false)
+                ("Disk · its files".into(), "Connects its files as a shared folder. Change it in the VM's settings.".into(), false)
             } else if storage && mode == Some(UsbMode::Disk) {
-                ("A disk: connects as a disk".into(), false)
+                ("Disk · whole disk".into(), "Connects as a whole disk. Change it in the VM's settings.".into(), false)
             } else if storage && mode.is_none() {
-                ("A disk: choose how the VM gets it".into(), false)
+                ("Disk · choose how".into(), ids.clone(), false)
             } else if root {
                 let what = used_as(&t.host.as_ref().map(|h| h.claimed_by.clone()).unwrap_or_default());
                 if helper_usb.is_ok() {
-                    (format!("macOS uses it as {what}: the VM takes it while connected"), false)
+                    ("Used by macOS".into(), format!("macOS uses it as {what}. The VM takes it while connected."), false)
                 } else {
                     needs_helper = true;
-                    (format!("macOS uses it as {what}: needs vroom-netd"), true)
+                    ("Needs vroom-netd".into(), format!("macOS uses it as {what}. vroom-netd, the root helper, takes it from macOS for the VM."), true)
                 }
             } else if always {
-                ("Not connected now; connects at every start".into(), false)
+                ("Connects at start".into(), "In the VM file: it connects at every start.".into(), false)
             } else {
                 let fast = t.host.as_ref().and_then(|h| h.speed).is_some_and(|s| s.is_super());
-                (format!("{}{}", t.dev.id, if fast { " · USB 3" } else { "" }), false)
+                ((if fast { "USB 3" } else { "" }).into(), ids.clone(), false)
             };
+            let tip = if tip.is_empty() || tip == ids { ids } else { format!("{tip}\n{ids}") };
             let label = if t.dev.name.is_empty() { t.dev.id.clone() } else { t.dev.name.clone() };
-            rows.push(UsbMenuRow { label: label.into(), note: note.into(), on, always, warn, busy, enabled: other.is_none(), choosing });
+            rows.push(UsbMenuRow { label: label.into(), note: note.into(), tip: tip.into(), on, always, warn, busy, enabled: other.is_none(), choosing });
         }
         self.usb.targets = targets;
-        let (note, setup) = match (&self.usb.helper, needs_helper) {
-            (_, false) => (String::new(), false),
-            (Helper::Ready(s), true) if !s.usb => (s.usb_why.clone(), false),
-            (Helper::Old, true) => ("vroom-netd, vroom's helper that runs as root, is from an older vroom. Set it up again to connect devices macOS uses.".into(), true),
-            (_, true) if !cfg!(target_os = "macos") => (String::new(), false),
-            (_, true) => (
-                "Devices macOS uses need vroom-netd, a small helper that runs as root and takes them from macOS for the VM. It's set up once; macOS asks for an admin password.".into(),
-                true,
-            ),
+        let (note, note_tip, setup) = match (&self.usb.helper, needs_helper) {
+            (_, false) => (String::new(), String::new(), false),
+            (Helper::Ready(s), true) if !s.usb => (s.usb_why.clone(), String::new(), false),
+            (Helper::Old, true) => ("vroom-netd is out of date".into(), format!("{NETD} This one is from an older vroom: set it up again."), true),
+            (_, true) if !cfg!(target_os = "macos") => (String::new(), String::new(), false),
+            (_, true) => ("Needs vroom-netd".into(), NETD.into(), true),
         };
         // A disk that couldn't be connected says why first.
-        let (note, setup) = match &self.usb.error {
-            Some(e) => (e.clone(), false),
-            None => (note, setup),
+        let (note, note_tip, setup) = match &self.usb.error {
+            Some(e) => (e.clone(), String::new(), false),
+            None => (note, note_tip, setup),
         };
         self.win.set_usb_rows(ModelRc::new(VecModel::from(rows)));
         self.win.set_usb_note(note.into());
+        self.win.set_usb_note_tip(note_tip.into());
         self.win.set_usb_setup(setup);
         self.win.set_usb_setup_busy(self.usb.setup_busy);
         self.win.set_usb_remember(self.usb.remember);
@@ -698,6 +737,59 @@ impl Console {
         }
     }
 
+    /// What the VMM has plugged in now (None: no USB controller yet).
+    pub(super) fn usb_ports(&self) -> Option<Vec<UsbPort>> {
+        self.usb.ports.clone()
+    }
+
+    /// The settings page changed how `dev` connects. Connected another
+    /// way now: let it go, and connect it again once the VMM has (see
+    /// `usb_again`).
+    pub(super) fn usb_set_mode(&mut self, dev: UsbDev, mode: UsbMode, readonly: bool) {
+        let ports: Vec<UsbPort> = self.usb.ports.iter().flatten().filter(|p| same(&p.dev, &dev)).cloned().collect();
+        if ports.is_empty() || ports.iter().all(|p| mode_of(p.how) == mode) {
+            return;
+        }
+        let dev = ports[0].dev.clone();
+        self.usb.busy.insert(key_of(&dev), Instant::now());
+        for p in &ports {
+            self.io.borrow_mut().send(ToVmm::UsbDetach { port: p.port });
+        }
+        self.usb.reconnect.retain(|(d, ..)| !same(d, &dev));
+        self.usb.reconnect.push((dev, mode, readonly, Instant::now()));
+        if self.win.get_usb_open() {
+            self.usb_rows();
+        }
+    }
+
+    /// Devices waiting to connect again in their new mode: once the VMM
+    /// let go of them. Shared files wait for macOS to mount a disk it got
+    /// back.
+    fn usb_again(&mut self) {
+        if self.usb.reconnect.is_empty() {
+            return;
+        }
+        let have = self.usb.ports.clone().unwrap_or_default();
+        let host = hostusb::host_list();
+        let now = Instant::now();
+        let mut go = Vec::new();
+        self.usb.reconnect.retain(|(d, mode, ro, since)| {
+            if have.iter().any(|p| same(&p.dev, d)) {
+                return now.duration_since(*since) < BUSY_FOR;
+            }
+            let h = host.iter().find(|h| same(&hostusb::dev_of(h), d));
+            let waiting = *mode == UsbMode::Files && h.is_some_and(|h| usbdisk::volumes(h).is_empty());
+            if waiting && now.duration_since(*since) < BUSY_FOR + Duration::from_secs(10) {
+                return true;
+            }
+            go.push((d.clone(), h.cloned(), *mode, *ro));
+            false
+        });
+        for (d, h, mode, ro) in go {
+            self.usb_connect_as(d, h, mode, ro);
+        }
+    }
+
     /// The settings page took `id` (`serial`) out of the VM file: let go
     /// of it now.
     pub(super) fn usb_unplug(&mut self, id: &str, serial: Option<&str>) {
@@ -766,11 +858,17 @@ mod tests {
 
     #[test]
     fn notes_say_how_it_is_connected() {
-        let p = |how, here, readonly| UsbPort { port: 64, dev: UsbDev::default(), here, always: false, how, readonly };
-        assert_eq!(connected_note(&[p(UsbHow::Files, true, true)], &["/Volumes/test".into()]).0, "Its files are shared with this VM (read-only): /Volumes/test");
-        assert_eq!(connected_note(&[p(UsbHow::Disk, true, false)], &[]).0, "Connected as a disk");
-        assert!(connected_note(&[p(UsbHow::Disk, false, false)], &[]).1, "a warning");
-        assert_eq!(connected_note(&[p(UsbHow::Device, true, false)], &[]).0, "Connected to this VM");
+        let p = |how, here, readonly| UsbPort { port: 65, dev: UsbDev::default(), here, always: false, how, readonly };
+        let files = connected_note(&[p(UsbHow::Files, true, true)], &["/Volumes/test".into()], true);
+        assert_eq!(files.0, "Files shared · read-only");
+        assert!(files.1.contains("/Volumes/test") && !files.2);
+        // No guest tools: it says so, and how to mount it by hand.
+        let bare = connected_note(&[p(UsbHow::Files, true, false)], &[], false);
+        assert!(bare.0.ends_with("not mounted") && bare.2);
+        assert!(bare.1.ends_with("sudo mount -t virtiofs vroom-usb1 /mnt"), "{}", bare.1);
+        assert_eq!(connected_note(&[p(UsbHow::Disk, true, false)], &[], true).0, "Connected as a disk");
+        assert!(connected_note(&[p(UsbHow::Disk, false, false)], &[], true).2, "a warning");
+        assert_eq!(connected_note(&[p(UsbHow::Device, true, false)], &[], true).0, "Connected");
     }
 
     #[test]

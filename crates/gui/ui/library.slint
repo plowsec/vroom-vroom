@@ -5,7 +5,7 @@ import { Theme, OsLook } from "theme.slint";
 import { Icons } from "icons.slint";
 import { Bus } from "bus.slint";
 import { VmItem, VmState, VmSettings, SnapRow, CardVis, HostInfo } from "types.slint";
-import { Button, IconButton, Chip, StatusDot, OsBadge, Icon, Spinner } from "controls.slint";
+import { Button, IconButton, Chip, StatusDot, OsBadge, Icon, Spinner, Tip } from "controls.slint";
 import { SettingsPanel } from "settings.slint";
 
 export global States {
@@ -139,6 +139,9 @@ export component Sidebar inherits Rectangle {
                 mouse-cursor: pointer;
                 clicked => { Bus.act("palette"); }
             }
+            Tip {
+                text: "Start a VM, open a setting, take a snapshot...";
+            }
             HorizontalLayout {
                 padding-left: 10px;
                 padding-right: 8px;
@@ -151,7 +154,7 @@ export component Sidebar inherits Rectangle {
                     tint: Theme.text-3;
                 }
                 Text {
-                    text: "Search, run, jump to...";
+                    text: "Search";
                     font-size: Theme.fs-sm;
                     color: Theme.text-3;
                     vertical-alignment: center;
@@ -206,12 +209,14 @@ export component Sidebar inherits Rectangle {
         }
         Button {
             text: "New VM";
+            tip: "⌘N";
             icon: Icons.plus;
             has-icon: true;
             clicked => { Bus.act("newvm"); }
         }
         Button {
-            text: "Import from VMware...";
+            text: "Import from VMware";
+            tip: "Copies a VMware Fusion VM's disks into a new VM. VMware's copy is only read.";
             kind: "ghost";
             small: true;
             clicked => { Bus.act("vmware"); }
@@ -340,7 +345,7 @@ component Hero inherits Rectangle {
         }
         Text {
             text: States.busy(root.vm.state) ? States.label(root.vm.state) + "..."
-                : root.vm.state == VmState.suspended ? "Resume where you left off" : "Start " + root.vm.name;
+                : root.vm.state == VmState.suspended ? "Resume" : "Start";
             horizontal-alignment: center;
             font-size: Theme.fs-lg;
             font-weight: 600;
@@ -451,10 +456,12 @@ component SnapCard inherits Rectangle {
                         icon: Icons.history;
                         has-icon: true;
                         enabled: root.can-restore;
+                        tip: root.can-restore ? "" : "Shut the VM down first";
                         clicked => { Bus.act("snap.restore:" + root.snap.name); }
                     }
                     IconButton {
                         icon: Icons.trash;
+                        tip: "Delete";
                         tint: #ffffff;
                         size: 30px;
                         clicked => { Bus.act("snap.delete:" + root.snap.name); }
@@ -611,31 +618,50 @@ export component VmPage inherits Rectangle {
                         alignment: start;
                         Chip {
                             icon: Icons.cpu;
-                            text: root.s.cpus + (root.s.cpus == 1 ? " CPU" : " CPUs");
+                            text: root.s.cpus;
+                            tip: root.s.cpus + (root.s.cpus == 1 ? " CPU" : " CPUs");
                             tint: Theme.text-2;
                         }
                         Chip {
                             icon: Icons.memory;
                             text: root.s.memory-gib + " GB";
+                            tip: "Memory";
                             tint: Theme.text-2;
                         }
                         Chip {
                             icon: Icons.globe;
                             text: root.s.nets.length == 0 ? "Offline" : root.s.nets.length == 1 ? root.s.nets[0].summary : root.s.nets.length + " adapters";
+                            tip: root.s.sum-net;
                             tint: Theme.text-2;
                         }
                         if root.s.gpu == 2: Chip {
                             icon: Icons.sparkles;
                             text: "3D";
+                            tip: root.s.sum-display;
+                            tint: Theme.text-2;
+                        }
+                        if root.s.monitors > 1: Chip {
+                            icon: Icons.display;
+                            text: root.s.monitors;
+                            tip: root.s.monitors + " monitors";
+                            tint: Theme.text-2;
+                        }
+                        if root.s.usb.length > 0: Chip {
+                            icon: Icons.usb;
+                            text: root.s.usb.length;
+                            tip: root.s.sum-usb;
                             tint: Theme.text-2;
                         }
                         if root.s.tpm: Chip {
                             icon: Icons.lock;
                             text: "TPM";
+                            tip: "TPM 2.0";
                         }
                         if root.s.sandbox: Chip {
                             icon: Icons.shield;
                             text: "Sandboxed";
+                            tip: "The VM process can only touch its own files.";
+                            tint: Theme.green;
                         }
                     }
                 }
@@ -656,14 +682,16 @@ export component VmPage inherits Rectangle {
                         vertical-alignment: center;
                         horizontal-stretch: 1;
                     }
-                    Button {
-                        small: true;
-                        kind: "ghost";
-                        text: "Take snapshot";
+                    IconButton {
                         icon: Icons.camera;
-                        has-icon: true;
-                        enabled: root.live && root.vm.ours;
-                        clicked => { Bus.act("snapshot"); }
+                        tip: root.live && root.vm.ours ? "Take snapshot" : "Take snapshot (start the VM first)";
+                        size: 30px;
+                        dim: !(root.live && root.vm.ours);
+                        clicked => {
+                            if root.live && root.vm.ours {
+                                Bus.act("snapshot");
+                            }
+                        }
                     }
                 }
                 if root.snaps.length == 0: Rectangle {
@@ -681,13 +709,15 @@ export component VmPage inherits Rectangle {
                             tint: Theme.text-3;
                         }
                         Text {
-                            text: root.live ? "No snapshots yet. Take one before you try something risky." : "No snapshots yet. Start the VM to take one.";
+                            text: "No snapshots";
                             font-size: Theme.fs-sm;
-                            color: Theme.text-2;
+                            color: Theme.text-3;
                             vertical-alignment: center;
-                            wrap: word-wrap;
                             horizontal-stretch: 1;
                         }
+                    }
+                    Tip {
+                        text: root.live ? "Take one before you try something risky." : "Start the VM to take one.";
                     }
                 }
                 if root.snaps.length > 0: Flickable {
@@ -758,34 +788,37 @@ export component EmptyState inherits Rectangle {
             color: Theme.text;
             horizontal-alignment: center;
         }
-        Text {
-            text: "Make one from an installer ISO, add a VM file you already have,\nor bring one over from VMware. You can also drop any of those on this window.";
-            font-size: Theme.fs-lg;
-            color: Theme.text-2;
-            horizontal-alignment: center;
-        }
         HorizontalLayout {
             alignment: center;
             spacing: 10px;
             Button {
                 kind: "primary";
                 text: "New VM";
+                tip: "From an installer ISO (⌘N)";
                 icon: Icons.plus;
                 has-icon: true;
                 clicked => { Bus.act("newvm"); }
             }
             Button {
-                text: "Add existing...";
+                text: "Open";
+                tip: "Add a VM file you already have";
                 icon: Icons.file;
                 has-icon: true;
                 clicked => { Bus.act("import"); }
             }
             Button {
-                text: "Import from VMware...";
+                text: "VMware";
+                tip: "Bring a VM over from VMware Fusion. VMware's copy is only read.";
                 icon: Icons.upload;
                 has-icon: true;
                 clicked => { Bus.act("vmware"); }
             }
+        }
+        Text {
+            text: "or drop an ISO or VM file here";
+            font-size: Theme.fs-sm;
+            color: Theme.text-3;
+            horizontal-alignment: center;
         }
     }
 }

@@ -233,18 +233,19 @@ impl Console {
             .map(|p| {
                 let fi = self.file_index(p.nic);
                 let busy = self.net.busy.contains_key(&p.nic);
-                let note = if busy {
-                    "Switching...".to_string()
+                let (note, tip) = if busy {
+                    ("Switching...", "")
                 } else if fi.is_none() {
-                    "Removed from the VM file: unplugged until the VM restarts".into()
+                    ("Removed", "Taken out of the VM file: unplugged until the VM restarts")
                 } else if p.connected {
-                    "Connected".into()
+                    ("Connected", "Click to pull the cable out")
                 } else {
-                    "Cable out: the guest sees no network here".into()
+                    ("Cable out", "The guest sees no network on this adapter. Click to plug it in.")
                 };
                 NetMenuRow {
                     label: format!("Adapter {} · {}", fi.unwrap_or(p.nic as usize) + 1, mode_text(&p.live)).into(),
                     note: note.into(),
+                    tip: tip.into(),
                     on: p.connected,
                     busy,
                     mode: p.live.kind as i32,

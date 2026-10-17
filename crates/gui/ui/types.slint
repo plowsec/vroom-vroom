@@ -61,15 +61,25 @@ export struct ShareRow {
     readonly: bool,
 }
 
-// A `[[usb]]` device of the VM.
+// A USB device of the VM: one in its file (`[[usb]]`), or one connected
+// to it now for this run only.
 export struct UsbRow {
     label: string,
-    note: string,   // id, plugged in or not, held by the host
+    // Short, on screen: connected, plugged in or not.
+    note: string,
+    // On hover: ids, how to mount its files by hand.
+    tip: string,
     // A disk, and how it goes to the VM: 0 its files, 1 the disk, 2 the
     // device.
     storage: bool,
     mode: int,
     warn: bool,
+    // In the VM file: connected at every start. `index` is its place
+    // there; else its place in the list of this run's devices.
+    pinned: bool,
+    index: int,
+    // Connected to the running VM now.
+    on: bool,
 }
 
 // A device plugged into this machine (the Add list).
@@ -102,6 +112,7 @@ export struct VmSettings {
     height: string,
     hidpi: bool,
     video-decode: bool,
+    monitors: int,
     disks: [DiskRow],
     nets: [NetRow],
     shares: [ShareRow],
@@ -129,9 +140,13 @@ export struct VmSettings {
     initrd: string,
     cmdline: string,
     warnings: [string],
+    // Each warning's first words, for the banner (the rest in its tip).
+    warn-short: [string],
     // Running or suspended: hardware can't change.
     locked: bool,
     lock-reason: string,
+    // A word or two of it, on screen.
+    lock-short: string,
     // Why, in each card that can't change now.
     lock-why: string,
     // Network and USB devices can change now (off, suspended, or running

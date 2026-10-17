@@ -148,7 +148,7 @@ resume. The adapters built are what the next save records.
 | `state` | A VM's state dir: one-VMM lock, snapshot list/delete, pruning disk layers nothing needs. Shared by the CLI and the app. |
 | `vmm` | Builds the board from the config, runs vCPUs, PSCI, the agent channel, display arbitration (ramfb vs virtio-gpu), snapshots and suspend, disk layering. |
 | `sandbox` | Seatbelt profile (macOS), seccomp + Landlock (Linux). |
-| `gui` | The app (Slint): VM list, settings that edit the VM file in place (toml_edit, comments kept), New VM, `⌘K` palette, VM windows. All state changes go through one message queue on the UI thread. VM windows only see pixels and send input. |
+| `gui` | The app (Slint): VM list, settings that edit the VM file in place (toml_edit, comments kept), New VM, `⌘K` palette, VM windows. All state changes go through one message queue on the UI thread. VM windows only see pixels and send input. Labels stay short; what a control does is in its tooltip: one `Tip` (`ui/controls.slint`) on Slint's `Tooltip` (hover delay, by the pointer, never takes a click), shown under its control on keyboard focus too. |
 | `agent` / `proto` | Guest agent (Linux, Windows) and its framed protocol over a virtio-serial port. |
 | `tools` | Host side of the guest tools: finding them (`Contents/Resources/guest-tools`, `target/guest-tools`), the agent's version in its binary, updates as agent frames, ready-made VMs (cloud-init seeds, Windows install sticks). |
 

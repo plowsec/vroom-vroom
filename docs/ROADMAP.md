@@ -4,18 +4,6 @@ What is left before vroom can replace VMware Fusion, Parallels or
 VirtualBox for everyday use, roughly in the order we mean to do it. Items
 move to the docs (GUIDE, ARCHITECTURE) once they work.
 
-## In progress
-
-- **Less text in the app.** Many screens explain themselves in
-  sentences (Settings cards, the USB and network menus, the root helper,
-  locked fields, the library's empty states). Do one pass over every
-  screen: icons, state colors and short labels on screen, the
-  explanation in a tooltip. Only what the user must read to act (an
-  error, a choice) stays visible. Slint has no tooltip of its own: one
-  shared `Tip` component in `controls.slint` (a hover delay, follows the
-  theme), used everywhere. Starts once the USB disk choices land, as both
-  change the same screens.
-
 ## 3D: catching up with VMware and Parallels
 
 Where we are: Linux gets OpenGL 4.1 (virgl), Vulkan 1.3 in windows and
@@ -223,6 +211,17 @@ A guest needs a driver and an API its players use. What exists:
   Full Disk Access for it is not known). A card reader with several
   disks can only be passed as the device. Linux hosts: neither way yet
   (the device can be passed there).
+- Two USB disk bugs found October 17 (disk images, Ubuntu guest, no
+  agent). "Share its files" on a volume the guest may change: the guest
+  lists the files but every open fails with EPERM while the VMM is
+  sandboxed (fine with `sandbox = false`, and a read-only volume works
+  sandboxed). The same token class and profile rules let a small test
+  program in `sandbox-exec` read and write, so something else in the
+  VMM's sandbox is in the way. And after "Use as a disk", macOS keeps
+  the whole disk but drops its partitions: `diskutil mountDisk` says it
+  worked, nothing mounts, and the disk has no volumes for "Share its
+  files" until it is unplugged (a disk image: detached and attached).
+
 - Things only a person at the Mac can try: bridged networking with real
   vmnet, a drag out of the guest to Finder, Mail or the Desktop with a
   real mouse, Coherence next to a window tiler, several monitors on
