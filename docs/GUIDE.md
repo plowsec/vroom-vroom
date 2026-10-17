@@ -347,9 +347,11 @@ tools, your user and, if you turn SSH on, your SSH key (any of
   folder). Setup runs on its own (about 20 minutes): the network drivers
   go in before the first logon, so NAT works at once, then the guest
   tools, then OpenSSH if asked (a Windows download: a few more minutes
-  once the desktop is up). Remove `install.img` from the VM afterwards;
-  if it stays, Setup shuts down rather than install over a Windows.
-  An install image of 4 GB or more needs wimlib (`brew install wimlib`).
+  once the desktop is up). Afterwards, remove the install disk's block
+  from the VM file and delete `install.img` and `install.qcow2`; if it
+  stays, Setup shuts down rather than install over a Windows (a setup
+  that broke off halfway: make the VM again). An install image of 4 GB
+  or more needs wimlib (`brew install wimlib`).
 
 The same from the command line:
 
@@ -362,7 +364,7 @@ The VM goes in a folder named after it (`--dir` for where). The user is
 yours (`--user` for another). Passwords never go into the VM's files as
 they are: Ubuntu's seed holds a SHA-512 hash; Windows' answer file holds
 it in clear, on the install disk in the VM's folder, as Windows wants it
-(remove `install.img` after the install).
+(delete `install.img` after the install).
 
 ## Ubuntu 24.04 (cloud image, direct kernel boot)
 
@@ -451,13 +453,17 @@ path = "win11.qcow2"        # vroom disk create win11.qcow2 --size 64G
 format = "qcow2"
 bus = "nvme"
 [[disk]]
-path = "winusb.raw"
-readonly = true
-format = "raw"
+path = "winusb.qcow2"       # vroom disk create winusb.qcow2 --backing winusb.raw
+format = "qcow2"
 bus = "nvme"
 [[net]]
 mode = "nat"
 ```
+
+   The stick goes in through a layer Windows can write to: it writes to
+   it (FAT access times, setup's own files), and on a read-only NVMe disk
+   setup stalls at 57% for good (Windows ignores NVMe's write-protect
+   flag and retries the refused writes). `winusb.raw` stays as it was.
 
 4. `vroom-gui win11.toml`. Setup runs unattended (the unattend file wipes
    **disk 0**), reboots, and logs in as `vroom` / `vroom` (change it).

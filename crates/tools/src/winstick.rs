@@ -67,8 +67,11 @@ pub fn ssh_script() -> &'static str {
      Set-Content -Path $f -Value $key -Encoding ascii\r\n\
      icacls $f /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F' | Out-Null\r\n\
      Start-Service sshd\r\n\
-     if (-not (Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue)) {\r\n  \
-       New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (sshd)' -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 | Out-Null\r\n\
+     # Windows' own rule is for private networks only; the VM's NAT network is public.\r\n\
+     if (Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue) {\r\n  \
+       Set-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -Profile Any -Enabled True\r\n\
+     } else {\r\n  \
+       New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (sshd)' -Profile Any -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 | Out-Null\r\n\
      }\r\n\
      'done' | Out-File C:\\vroom-ssh.done\r\n"
 }
