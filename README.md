@@ -67,6 +67,7 @@ of its own (apps); video decoding, when on, gets one too. Details in
 - Drag and drop files between the Mac and the guest, both ways
 - Up to 4 guest monitors, a window each, full screen on several Mac screens
 - The Mac's camera as a webcam in the guest, if you turn it on
+- Video decoding on the Mac's hardware for Linux guests (H.264, HEVC, VP9, AV1), if you turn it on; Firefox uses it
 - Fast disk and network I/O, measured against QEMU ([numbers](docs/PERFORMANCE.md))
 
 Not yet: x86_64 hosts (it builds, can't run VMs yet) and Secure Boot.

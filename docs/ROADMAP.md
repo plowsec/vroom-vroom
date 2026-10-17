@@ -86,10 +86,11 @@ Windows guests:
 
 ## Hardware video decoding
 
-Linux guests decode H.264 and HEVC on the Mac's VideoToolbox now
-(`[display] video_decode = true`, see [GUIDE.md](GUIDE.md#video-decoding)):
-GStreamer and FFmpeg use it, browsers don't yet. VMware Fusion and
-Parallels don't offer this to Linux guests on Apple Silicon at all.
+Linux guests decode H.264, HEVC, VP9 and AV1 on the Mac's VideoToolbox
+now (`[display] video_decode = true`, see [GUIDE.md](GUIDE.md#video-decoding)):
+GStreamer and FFmpeg through V4L2, Firefox through our VA-API driver
+(H.264, HEVC and VP9). VMware Fusion and Parallels don't offer this to
+Linux guests on Apple Silicon at all.
 
 ### Which guest side, and why (October 2026)
 
@@ -105,41 +106,66 @@ A guest needs a driver and an API its players use. What exists:
   tree in Linux 7.3). It builds out of tree on Ubuntu 24.04's 6.8 kernel
   with a two-line fix. **This is what we use.** Players that talk to V4L2
   stateful decoders use it as is: GStreamer (`v4l2h264dec`,
-  `v4l2h265dec`), FFmpeg (`h264_v4l2m2m`, `hevc_v4l2m2m`), so mpv and
+  `v4l2h265dec`, `v4l2vp9dec`), FFmpeg (`h264_v4l2m2m`, ...), so mpv and
   anything on FFmpeg. A stateful decoder also suits VideoToolbox: both
   take the plain bitstream.
-- **VA-API through virgl**: virglrenderer can decode with the host's
-  VA-API, and Mesa's virgl driver offers VA-API to the guest. That is
-  what browsers use on Linux (Firefox, Chromium). There is no VA-API on
-  macOS: virglrenderer would need a VideoToolbox backend, fed with VA-API's
-  already-parsed picture parameters (VideoToolbox wants the bitstream, so
-  the parameter sets have to be written back out). It would run in the
-  GPU process, with OpenGL (virgl) contexts only. Next step for browsers.
+- **VA-API**, what browsers use on Linux. Two ways: a VA-API driver in
+  the guest on top of the V4L2 decoder, or virglrenderer decoding the
+  guest's VA-API calls on the host (there is no VA-API on macOS: it would
+  need a VideoToolbox backend in the GPU process). Either way VA-API hands
+  over parsed parameters and VideoToolbox wants the bitstream, so the
+  parameter sets have to be written back out. **We did the guest driver**
+  (`scripts/guest/vaapi`): it keeps the decoding behind the existing
+  device and helper (no new host code, nothing in the GPU process), and
+  works without the 3D GPU for players that copy pictures (Firefox needs
+  3D anyway, for dma-bufs). No maintained VA-API driver on top of V4L2
+  stateful decoders exists (`libva-v4l2-request` is for stateless ones).
+- **Firefox's V4L2 path** (made for the Raspberry Pi, through FFmpeg):
+  it only takes pictures as DRM PRIME dma-bufs, which only the Raspberry
+  Pi's FFmpeg gives, and which need dma-buf export from the V4L2 driver.
+  Not usable on Ubuntu (checked against Firefox's source, 158).
 - **Vulkan Video through Venus**: Mesa's Venus driver doesn't expose
   Vulkan Video, and MoltenVK doesn't implement it. Not before both move.
-- Browsers today: Firefox has a V4L2-M2M path (made for the Raspberry Pi,
-  through FFmpeg), off by default, not tried here yet. Desktop Chromium
-  only uses VA-API (V4L2 is for ChromeOS builds).
 
 ### Left to do
 
-- **Browsers on Linux**: the VA-API path above, or Firefox's V4L2 path.
-- **The guest driver**: ship it (DKMS package) until it is upstream, and
-  follow its upstreaming.
-- **Fewer copies**: a picture crosses a socket from the helper to the
-  VMM, then is copied into the guest's buffer. Shared memory between the
-  helper and the buffer window would save both; 1080p H.264 tops out
-  around 230 to 500 pictures a second now, plenty to play but below what
-  the hardware does.
-- **More formats**: VP9 and AV1 (VideoToolbox decodes them on newer
-  Macs), 10-bit HEVC as P010 (now it comes out as 8-bit NV12).
-- **Snapshots**: a decoder open during a snapshot goes on afterwards
-  (GStreamer does; FFmpeg 6.1 gives up after the pause), but restoring
-  that snapshot, or resuming from a suspend, fails it in the guest: the
-  VideoToolbox side isn't saved. The player has to open it again.
+- **AV1 in the VA-API driver**: VA-API passes AV1's tile data and the
+  frame header's fields, not the header itself. Writing the sequence and
+  frame headers back out is long but mechanical; some fields are coded
+  against earlier frames (global motion, segmentation, loop filter
+  deltas), so the driver has to keep those per reference slot. Firefox
+  says AV1 isn't power efficient here, so YouTube sends it VP9 for now.
+- **Chromium and Chrome**: their GPU process doesn't start on the guest's
+  virgl OpenGL ("eglCreateContext ES 3.0 failed with EGL_BAD_ATTRIBUTE",
+  both the snap's Chromium 155 and Google's arm64 Chrome 155), so there
+  is no VA-API decoding to test. Once that works (virgl's EGL, or Zink),
+  the snap's Chromium can load our driver with
+  `LIBVA_DRIVERS_PATH=$HOME/<dir>` (its wrapper keeps that path).
+- **Snap Firefox**: it loads VA-API drivers only from its own runtime.
+  Mozilla's deb works.
+- **The guest drivers**: ship virtio-media (DKMS package) until it is
+  upstream, and follow its upstreaming; package the VA-API driver.
+- **A V4L2 stall**: rarely, right after the guest boots, a GStreamer
+  pipeline stops: the device has handed every buffer back and has nothing
+  queued, both of GStreamer's threads wait in `poll()`. Seen before this
+  round's changes too. Probably the guest driver's `poll()`; not found yet.
+- **Fewer copies, the rest**: a picture now goes from VideoToolbox's
+  buffer straight into the guest's (one copy; it crossed a socket and
+  was copied again before). For Firefox the VA-API driver copies it into
+  its surface and again into the GPU buffers it exports. Handing
+  VideoToolbox's IOSurface to virglrenderer as the texture would save
+  those, but it means sharing between the video helper and the GPU
+  process.
+- Firefox in our test setup (sway on virgl, headless) drops about 40% of
+  frames whatever decodes them (software too, and for 360p): the display
+  path, not decoding. To look at with a real window.
+- After restoring a snapshot taken while Firefox ran, its 3D context
+  fails (virgl `SUBMIT_3D` errors, software or hardware decoding): a
+  3D snapshot matter.
 - FFmpeg 6.1's `v4l2m2m` decoders, not ours: a mid-stream size change
-  hangs them ("waiting for user to release AVBufferRefs"), and with a
-  slow consumer they can drop the last pictures of a stream.
+  hangs them ("waiting for user to release AVBufferRefs"), they drop
+  pictures and their timestamps repeat. GStreamer 1.24 takes no P010 from
+  V4L2 and has no V4L2 AV1 decoder.
 
 ### Windows guests (research only)
 
@@ -148,9 +174,10 @@ A guest needs a driver and an API its players use. What exists:
   which forwards Direct3D 11 to DXMT on the Mac (Neptune); as far as we
   know DXMT has no video decoder. The work: the video decoder calls in
   the guest driver and Neptune, and a host side that decodes DXVA's
-  parsed picture parameters with VideoToolbox. That host side is the
-  same problem as VA-API on Linux (parameters back to bitstream), so the
-  two should share it.
+  parsed picture parameters with VideoToolbox. That is the problem our
+  Linux VA-API driver solves (parameters back to a bitstream: H.264 and
+  HEVC parameter sets, HEVC slice headers); DXVA's parameters are close
+  to VA-API's, so that code can be shared.
 - Media Foundation apps (Movies & TV) use DXVA too through Direct3D 11.
   A Media Foundation decoder of our own sending the bitstream to the
   video helper (as virtio-media does) would serve those without the

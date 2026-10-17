@@ -634,7 +634,7 @@ What works and what doesn't (Windows 11 24H2, M3 Max):
 
 ## Video decoding
 
-Linux guests can hand H.264 and HEVC video to the Mac's hardware decoder
+Linux guests can hand video to the Mac's hardware decoder
 (VideoToolbox). Off by default for now (app: Settings, Display, Hardware
 video decoding):
 
@@ -643,12 +643,16 @@ video decoding):
 video_decode = true
 ```
 
-The guest sees a V4L2 video decoder (`/dev/video0`, "Video decoder"):
-H.264 (Baseline to High, up to level 5.2) and HEVC Main in, NV12
-pictures out, up to 4096 pixels wide or high (4096x2304 at most). It
-needs Google's virtio-media driver, which isn't in mainline Linux yet.
-`scripts/guest/install-virtio-media.sh` builds it in the guest with DKMS
-(so new kernels get it too): it downloads one pinned version, checks
+The guest sees a V4L2 video decoder (`/dev/video0`, "Video decoder"). In:
+H.264 (Baseline to High), HEVC (Main, Main 10), VP9 (profiles 0 and 2,
+on Macs that decode it: M1 and later) and AV1 (Main, M3 and later); the
+decoder lists only what this Mac decodes. Out: NV12 pictures, or P010 for
+10-bit streams if the player asks for it (else 10-bit streams come out in
+8 bits). Up to 4096 pixels wide or high (4096x2304 at most).
+
+It needs Google's virtio-media driver, which isn't in mainline Linux
+yet. `scripts/guest/install-virtio-media.sh` builds it in the guest with
+DKMS (so new kernels get it too): it downloads one pinned version, checks
 its SHA-256, and patches two small things (older kernels; a `poll()`
 answer GStreamer stops on). Run it as root in the guest (Debian or
 Ubuntu; Ubuntu 24.04 is what we test):
@@ -659,45 +663,93 @@ v4l2-ctl --list-devices            # Video decoder (platform:virtio-media)
 sudo usermod -aG video $USER       # then log in again
 ```
 
-What uses it:
+What uses it as it is:
 
 ```bash
-# GStreamer (gstreamer1.0-plugins-good)
+# GStreamer (gstreamer1.0-plugins-good, -bad for the parsers)
 gst-launch-1.0 filesrc location=movie.mp4 ! qtdemux ! h264parse ! v4l2h264dec ! autovideosink
 gst-launch-1.0 filesrc location=movie.mp4 ! qtdemux ! h265parse ! v4l2h265dec ! autovideosink
-# FFmpeg (mpv should work too with --hwdec=v4l2m2m-copy; not tried)
+gst-launch-1.0 filesrc location=movie.ivf ! ivfparse ! vp9parse ! v4l2vp9dec ! autovideosink
+# FFmpeg
 ffmpeg -c:v h264_v4l2m2m -i movie.mp4 -f null -
-ffmpeg -c:v hevc_v4l2m2m -i movie.mp4 -f null -
 ```
 
-Browsers don't use it yet: Chromium and Firefox decode with VA-API on
-Linux (see [ROADMAP.md](ROADMAP.md#hardware-video-decoding)).
+GStreamer 1.24 (Ubuntu 24.04) has no V4L2 AV1 decoder and FFmpeg 6.1 none
+either; AV1 works through the device (checked with a small V4L2 client of
+our own), but the players in Ubuntu 24.04 don't use it yet.
 
-The pictures are bit for bit what software decoding gives (checked
-against FFmpeg's decoder, H.264 and HEVC, 720p to 4K, size changes in the
-middle of a stream). What it saves is the guest's CPU. On an M-series
-Mac, guest with 4 vCPUs, FFmpeg decoding to nowhere:
+### Browsers: VA-API
+
+Firefox and Chromium decode through VA-API on Linux, not V4L2. So the
+guest tools have a VA-API driver of our own, `vroom_drv_video.so`, that
+decodes through the same V4L2 decoder. Install it after the virtio-media
+driver (it builds in the guest):
+
+```bash
+sudo sh install-vaapi.sh     # from scripts/guest, with its vaapi/ folder
+vainfo                       # Driver version: vroom (VideoToolbox ...)
+```
+
+It makes itself the default (`LIBVA_DRIVER_NAME=vroom` in
+`/etc/environment`); log in again. It does H.264, HEVC (Main, Main 10)
+and VP9 (profiles 0 and 2), not AV1 yet.
+
+Firefox uses it with its default settings. It needs the 3D GPU (`gpu =
+"virtio3d"`): pictures reach Firefox's compositor as dma-bufs. Check in
+`about:support`, Media, Codec Support: H264 and VP9 say "HWDEC". Two
+things to know:
+
+- Ubuntu's Firefox is a snap, which only loads VA-API drivers from its
+  own runtime. Use Mozilla's deb (packages.mozilla.org, see
+  [Mozilla's instructions](https://support.mozilla.org/kb/install-firefox-linux)):
+  that is what we test (Firefox 158).
+- YouTube picks the codec from what the browser says it decodes well.
+  Firefox says AV1 isn't power efficient here, so YouTube usually sends
+  VP9, which goes to the Mac. If a video still comes as AV1 (software),
+  `media.av1.enabled = false` in `about:config` makes YouTube send VP9.
+
+Firefox playing 1080p files, its decoding process: H.264 at 12 Mbit/s
+from 0.24 CPUs to 0.02, VP9 at 10 Mbit/s from 0.35 to 0.02, HEVC at
+8 Mbit/s from 0.52 to 0.02. The
+picture is the same (bit for bit, checked with FFmpeg's VA-API decoding
+against FFmpeg's own decoders: H.264 with B-frames, slices, scaling
+matrices, weighted prediction; HEVC 8 and 10-bit with B-frame pyramids,
+slices, open GOPs; VP9 8 and 10-bit with hidden frames).
+
+Chromium and Chrome (Google's arm64 build) don't get that far: their GPU
+process can't start on the guest's OpenGL (it asks for an OpenGL ES 3.0
+context with options virgl doesn't take), so they decode in software.
+
+Firefox's other Linux path, V4L2 decoders through FFmpeg, needs FFmpeg's
+DRM PRIME output (only in the Raspberry Pi's FFmpeg) and dma-buf export
+from the V4L2 driver; neither is there on Ubuntu, so it isn't an option.
+
+### What it saves
+
+On an M3 Max, guest with 4 vCPUs, decoding to nowhere (hardware:
+GStreamer or our V4L2 client; software: FFmpeg on all 4 vCPUs):
 
 | Stream | Hardware: time, guest CPU | Software: time, guest CPU |
 |---|---|---|
-| H.264 1080p, 20 Mbit/s, 300 pictures | 1.3 s, 0.2 s | 1.4 s, 4.6 s |
-| HEVC 1080p, 300 pictures | 0.45 s, 0.04 s | 0.5 s, 1.5 s |
-| HEVC 4K, 30 Mbit/s, 120 pictures | 0.54 s, 0.04 s | 1.6 s, 5.7 s |
+| H.264 1080p, 12 Mbit/s, 600 pictures | 1.2 s, 0.15 s | 1.3 to 1.9 s, 4.5 to 5.5 s |
+| H.264 4K, 30 Mbit/s, 300 pictures | 2.2 s, 0.1 s | 3.4 s, 11.4 s |
+| VP9 1080p, 10 Mbit/s, 600 pictures | 2.0 s, 0.25 s | 3.9 s, 6.6 s |
+| AV1 1080p, 4 Mbit/s, 900 pictures | 1.0 s, 0.2 s | 1.9 s, 3.2 s |
 
-That is 220 to 650 pictures a second, far more than playing needs; on
-easy streams 4 software cores still go faster (pictures cross two copies
-on their way; see the roadmap).
+That is 140 to 900 pictures a second, far more than playing needs.
 
 Good to know:
 
 - Up to 8 decoders at once. Their buffers share a 1 GiB window (only what
   they use is real memory); a fifth 4K decoder may get fewer buffers.
-- A decoder open during a snapshot keeps going; after restoring the
-  snapshot, or resuming a suspended VM, it fails and the player has to
-  open it again.
+- A decoder open during a snapshot keeps going. After restoring the
+  snapshot, or resuming a suspended VM, it comes back and goes on from
+  the next key frame; pictures in between may be missing or wrong.
 - FFmpeg 6.1's `v4l2m2m` decoders (Ubuntu 24.04) hang on a size change in
-  the middle of a stream, and can drop the last pictures when what comes
-  after them is slow. GStreamer handles both.
+  the middle of a stream, drop pictures, and get timestamps wrong.
+  GStreamer and VA-API players are fine.
+- Rarely, a GStreamer pipeline started right after the guest boots stops
+  with every buffer handed back to it (see the roadmap); start it again.
 - The decoding runs in `vroom video-helper`, a process of its own
   sandboxed to VideoToolbox (see [SECURITY.md](SECURITY.md#video-decoding)).
   If it dies, decoders in the guest fail (`EIO`) until the VM restarts;

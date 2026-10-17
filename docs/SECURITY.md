@@ -292,46 +292,72 @@ the decoding never happens in the VMM:
 ```text
 guest V4L2 decoder --virtio-media--> VMM device (Rust)  --socket--> vroom video-helper --XPC--> Apple's decoder service
                                      checks every ioctl,             parses the stream,          (macOS's own sandbox)
-                                     copies bitstreams out            then VideoToolbox
-                                     and pictures in
+                                     copies bitstreams out,          then VideoToolbox;
+                                     grants picture buffers          writes pictures into
+                                                                     the granted buffers
 ```
 
 The VMM's device (`virtio/src/devices/media`, no unsafe code) speaks
 V4L2 to the guest and nothing else: every ioctl is size-checked, queue
-types, buffer indices and memory types are checked, at most 8 decoders,
-16 bitstream buffers (8 MiB each at most) and 24 picture buffers each
-(4096x2304 at most). The buffers live in one shared memory window of
-1 GiB the guest maps; the guest can only map our buffers' offsets in it.
-A bitstream is copied out of the window before it goes anywhere (the
-guest can't change it under the helper), and no more than 16 MiB or 32
-buffers per decoder wait at the helper. Pending events are capped.
+types, buffer indices, memory types and control values are checked, at
+most 8 decoders, 16 bitstream buffers (8 MiB each at most) and 24 picture
+buffers each (4096x2304 at most). The buffers live in one shared memory
+window of 1 GiB the guest maps; the guest can only map our buffers'
+offsets in it. A bitstream is copied out of the window before it goes
+anywhere (the guest can't change it under the helper), and no more than
+16 MiB or 32 buffers per decoder wait at the helper. Pending events are
+capped.
 
 The helper (`vroom video-helper`, one per VM, started before the VMM's
 sandbox goes up) runs under its own Seatbelt profile: system libraries
 (read), VideoToolbox's decoder service (an XPC service, the only
 service it may look up) and frame buffers (IOSurface). No files, no
-network, no exec, no GPU, no writes. Before VideoToolbox sees anything
-it takes the stream apart itself (`crates/video`, fuzzed): NAL units
-(4096 per buffer at most), parameter sets (4 KiB each, ids within what
-the standards allow), access units (256 per buffer), slice headers for
-the display order. VideoToolbox gets parameter sets and length-prefixed
-access units only.
+network, no exec, no GPU, no writes. Besides its socket it holds the
+buffer window: the VMM passes it the window's shared memory object at
+start, and it writes each picture straight into a guest buffer there.
+That is all the guest memory it gets: the window holds only decoder
+buffers, never guest RAM.
+
+Before VideoToolbox sees anything the helper takes the stream apart
+itself (`crates/video`, fuzzed): H.264 / HEVC NAL units (4096 per buffer
+at most), parameter sets (4 KiB each, ids within what the standards
+allow), access units (256 per buffer), slice headers for the display
+order; VP9 superframe indexes and frame headers up to the frame size;
+AV1 OBU headers and sequence headers (1 KiB at most). VideoToolbox gets
+parameter sets and length-prefixed access units, VP9 frames whose header
+we read, AV1 temporal units without delimiters or padding, and a
+sequence header we parsed.
 
 Each side treats the other as hostile. The helper takes from the VMM
-only messages of known kinds within their size (8 MiB of bitstream), for
-8 sessions, 64 queued buffers each. The VMM takes from the helper only
-pictures it gave a credit for (one per free guest buffer, under an epoch
-that changes whenever the guest's buffers do), of exactly the size it
-announced, which must fit the guest's buffer; a format must be a valid
-size; more than 256 unread messages, or a write that blocks for 2
-seconds, and the helper counts as gone. Then the guest's decoders fail
-with `EIO` and the rest of the VM runs on.
+only messages of known kinds within their size (8 MiB of bitstream, a
+grant for at most one 4K P010 picture), for 8 sessions, 64 queued buffers
+and 64 grants each. It writes a picture only into a grant that lies in
+the window and is big enough for it. The VMM takes from the helper only
+pictures in the oldest buffer it granted (the helper must name it), under
+the current epoch (one that changes whenever the guest's buffers do), of
+exactly the size the stream's format makes; a format must be a valid
+size and depth; more than 256 unread messages, or a write that blocks for
+2 seconds, and the helper counts as gone. Then the guest's decoders fail
+with `EIO` and the rest of the VM runs on. The VMM never reads a
+picture.
+
+A helper taken over by a stream can write anywhere in the window: into
+that VM's other decoders' buffers, which the guest sees anyway. It can't
+reach the VMM's memory, guest RAM or the guest's other devices.
+
+Snapshots keep each decoder's V4L2 side and up to 16 KiB of resume state
+from the helper (the stream's parameter sets, VP9 key frame header or AV1
+sequence header). The VMM doesn't read that state; after a restore it
+hands it to the new helper, which parses it like any stream. A snapshot
+is a file: on restore every saved field is checked again (sizes, buffer
+offsets inside the window and not overlapping, queues naming real
+buffers), and a decoder whose state doesn't hold together fails.
 
 What a bug reachable from a stream gets:
 
 - in the helper: VideoToolbox's client side, its decoder service and
-  IOSurfaces; the streams of that VM's other decoders. Nothing else of
-  the user's.
+  IOSurfaces; the streams and buffers of that VM's other decoders.
+  Nothing else of the user's.
 - in Apple's decoder service (`com.apple.coremedia.videodecoder`), which
   the hardware decoder's kernel driver sits behind: the same reach a video
   file opened in Safari or QuickTime has. That code is Apple's and shared
@@ -339,12 +365,15 @@ What a bug reachable from a stream gets:
 
 Memory a guest can make us use: the window (up to 1 GiB, only what its
 buffers touch), and in the helper per decoder up to 16 MiB of bitstream
-and 24 pictures (8 waiting for a guest buffer, up to 16 held for display
-order): about 350 MB for a 4K decoder.
+and 24 pictures held as VideoToolbox's buffers (8 waiting for a guest
+buffer, up to 16 held for display order): about 350 MB for a 4K decoder.
 
 The guest side runs Google's virtio-media driver, out of tree.
 `scripts/guest/install-virtio-media.sh` downloads one pinned commit and
-checks its SHA-256 before building it.
+checks its SHA-256 before building it. Our VA-API driver
+(`scripts/guest/vaapi`) runs inside the guest's players and only talks to
+that V4L2 decoder (and the guest's GPU for dma-bufs): nothing new on the
+host side.
 
 ## USB devices
 
@@ -716,8 +745,9 @@ and VMDK (sparse headers, grain tables, compressed grains, descriptors),
 the USB passthrough protocol both ways with the helper's checks, and USB
 descriptors (the xHCI target also has a passthrough device whose answers
 come from the input), and the video helper's stream parsing (NAL units,
-parameter sets, display order) and its protocol both ways (`video`; the
-virtio-media device has a junk-command test of its own). Run with
+parameter sets, display order, VP9 superframes and frame headers, AV1
+OBUs and sequence headers) and its protocol both ways (`video`, 21M runs
+clean; the virtio-media device has a junk-command test of its own). Run with
 `cargo +nightly fuzz run -O <target>`. First runs found two qcow2 bugs
 (a crash on short v3 headers, multi-GB allocations from crafted table
 sizes); both fixed. The USB target found a short configuration descriptor
@@ -773,7 +803,8 @@ Still visible, whatever the config says:
   Linux and the Windows drivers match on these (virtio-win INFs list
   `SUBSYS_11001AF4&REV_01`).
 - With `video_decode`: a virtio-media device (id 48) named "Video
-  decoder", whose formats, sizes and levels are VideoToolbox's.
+  decoder", whose formats (the codecs this Mac decodes), sizes and levels
+  are VideoToolbox's. Our VA-API driver names itself "vroom".
 - fw_cfg: the "QEMU" signature, its DMA signature and file names
   (`etc/acpi/tables`, `etc/smbios/...`, `etc/ramfb`). EDK2 looks for them.
 - The board: QEMU virt memory map, PL011/PL031 PrimeCell IDs, CFI flash

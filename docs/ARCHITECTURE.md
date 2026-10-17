@@ -15,7 +15,8 @@ vroom run <vm.toml>   one process per VM, sandboxed after setup ◄───┘
    ├─ optional: vroom usb-host (one per [[usb]] device), own sandbox,
    │  stream socket: transfer requests in, results and plug events out
    └─ optional: vroom video-helper (video_decode), own sandbox, stream
-      socket: bitstreams and credits in, pictures out (VideoToolbox)
+      socket: bitstreams and buffer grants in; pictures written into the
+      shared buffer window (VideoToolbox)
 
 vroom-gui ── starts vroom usb-host for a device connected from the VM
              window, or asks vroom-netd to start it as root; passes its
@@ -64,7 +65,7 @@ had one pair per device in the VM file.
 | `memory` | Guest RAM as guarded mmaps; every access bounds-checked (`GuestMemory`). |
 | `arch` | Board layout (QEMU-virt compatible), FDT, ACPI tables (own AML encoder), SMBIOS, kernel image loader (Image, gzip, EFI zboot). |
 | `devices` | Bus, PL011, PL031, fw_cfg (+DMA), CFI flash (NVRAM), PCI host (ECAM, MSI, MSI-X, INTx), NVMe, xHCI + USB HID (8 USB 2 + USB 3 port pairs for passthrough devices, plugged in and out while the VM runs; asynchronous transfers; isochronous TDs go out in batches, a few batches ahead), Intel HD Audio (controller + codec, streams moved by a timer thread). Parses hostile input only; `forbid(unsafe_code)`. |
-| `video` | Hardware video decoding, shared by the VMM and `vroom video-helper`: their protocol (credits, epochs), H.264/HEVC NAL unit, access unit and parameter set parsing, picture order counts. Parses hostile input only; `forbid(unsafe_code)`. |
+| `video` | Hardware video decoding, shared by the VMM and `vroom video-helper`: their protocol (grants, epochs, resume state), H.264/HEVC NAL unit, access unit and parameter set parsing, picture order counts, VP9 frame headers and AV1 OBUs. Parses hostile input only; `forbid(unsafe_code)`. |
 | `usb` | USB passthrough: the VMM/helper protocol, the helper's request checks, libusb (loaded with `dlopen`, helper only; the root helper only from its own copy), host device listing (IOKit registry / sysfs), a pretend serial port and sound card for tests. |
 | `virtio` | Split-queue handling (hardened), MMIO and modern PCI transports, devices (blk, net, console, rng, gpu, input, fs, sound, media), a pausable worker per device. `forbid(unsafe_code)`. |
 | `fs` | Host side of shared folders: component-wise `openat(O_NOFOLLOW)` walks from a root fd, Linux errno mapping. The virtio-fs FUSE server lives in `virtio`; it serves Linux and virtio-win's virtiofs.exe (Windows), telling them apart by their INIT flags. |
@@ -288,33 +289,76 @@ replaced by another (started twice) is told to leave Coherence first.
 `video_decode = true` (app: Settings, Display, Hardware video decoding) adds a virtio-media device (`virtio/src/devices/media`):
 V4L2 carried over virtio, the guest's kernel forwarding each ioctl of
 its `/dev/videoN` on the command queue. The device plays a V4L2 stateful
-decoder: H.264 or HEVC buffers in (OUTPUT queue), NV12 pictures out
-(CAPTURE queue), with the source-change event, the LAST buffer and
-decoder STOP/START the V4L2 decoder interface describes. Buffers are
-allocated in one shared memory window (region 0, 1 GiB, mapped into the
-guest where the guest puts it; `vmm/src/video.rs`), and the guest maps
-them with virtio-media's MMAP command.
+decoder: H.264, HEVC, VP9 or AV1 buffers in (OUTPUT queue; the codecs
+the helper said this Mac decodes), NV12 or P010 pictures out (CAPTURE
+queue), with the source-change event, the LAST buffer and decoder
+STOP/START the V4L2 decoder interface describes. Buffers are allocated in
+one shared memory window (region 0, 1 GiB, mapped into the guest where
+the guest puts it; `vmm/src/video.rs`), and the guest maps them with
+virtio-media's MMAP command.
 
 The decoding happens in `vroom video-helper` (`cli/src/video.rs`,
-`cli/src/vt.rs`). The VMM copies each bitstream buffer out of the window
-and sends it; the helper splits it into access units and parameter sets
-(`video/src/nal.rs`), makes a VideoToolbox decompression session for
-the parameter sets (a new one when the size changes, announced to the
-VMM before its first picture), decodes, and puts the pictures back in
-display order: VideoToolbox hands them out in decoding order, so the
-helper works out each picture's order count from its slice header, as
-the standards define it, and holds as many as the stream's SPS says it
-may reorder (`video/src/poc.rs`). Pictures go back only against credits:
-one per picture buffer the guest has queued, under an epoch the VMM bumps
-when those buffers change (size change, seek, stream off); the VMM drops
-pictures from an older epoch. The VMM then copies the picture into the
-guest's buffer and returns it with the timestamp of the bitstream buffer
-it came from. Bitstream buffers go back to the guest as soon as they are
-copied out.
+`cli/src/vt.rs`). At start the VMM hands it the window's shared memory
+object (it maps it) and the helper answers with the codecs VideoToolbox
+decodes here. The VMM copies each bitstream buffer out of the window and
+sends it; the helper takes it apart (`video/src/nal.rs` for H.264 and
+HEVC: access units and parameter sets; `video/src/vpx.rs` for VP9 frame
+headers and AV1 OBUs), makes a VideoToolbox decompression session for
+the stream's format (a new one when the size, depth or a key frame's
+format changes, announced to the VMM before its first picture), decodes,
+and puts the pictures back in display order: VideoToolbox hands H.264 and
+HEVC pictures out in decoding order, so the helper works out each
+picture's order count from its slice header, as the standards define it,
+and holds as many as the stream's SPS says it may reorder
+(`video/src/poc.rs`).
+
+Pictures don't cross the socket. The VMM grants the helper each guest
+picture buffer it may fill (offset, length, NV12 or P010) under an
+epoch it bumps when those buffers change (size change, seek, stream
+off); the helper writes the picture from VideoToolbox's buffer straight
+into the granted guest buffer (converting 10 to 8 bits if the guest
+wanted NV12) and says which one. The VMM checks that it is the oldest
+grant of the current epoch and of the stream's size, and returns the
+buffer to the guest with the timestamp of the bitstream buffer it came
+from. Bitstream buffers go back to the guest as soon as they are copied
+out.
+
+With V4L2's display delay set to 0 (`V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY`,
+enabled), a session runs in decoding order: no reordering, each picture
+out as soon as VideoToolbox has it, and a picture that failed comes back
+as a buffer with the error flag. That is for our VA-API driver.
 
 A pause (snapshot) first answers every command the guest waits on (its
-driver gives up after 5 seconds). Decoders don't survive a restore: the
-device saves only which sessions were open and fails them afterwards.
+driver gives up after 5 seconds). The device saves each decoder's V4L2
+side (formats, buffers and where they are in the window, queues) and the
+helper's resume state (it sends the stream's parameter sets, VP9 key
+frame header or AV1 sequence header whenever they change). On restore,
+the new helper opens the stream from that state and the decoder goes on
+from the next key frame; bitstream buffers that hadn't reached the helper
+go back to the guest (the window's contents aren't saved).
+
+### The guest's VA-API driver
+
+Browsers decode through VA-API, which hands the driver pictures already
+parsed. `scripts/guest/vaapi/vroom_drv_video.c` (a libva driver, in C,
+built in the guest) turns them back into a bitstream for the V4L2
+decoder, one buffer per picture, in decoding order:
+
+- H.264: SPS and PPS written from VA-API's picture parameters and scaling
+  lists, sent when they change; the PPS reference counts slices leave to
+  it are read from the slice headers. The SPS says no reordering, so
+  VideoToolbox outputs each picture at once.
+- HEVC: VPS, SPS and PPS likewise. VA-API doesn't pass the SPS's
+  reference picture sets that slice headers point to, so each slice
+  header is rewritten to carry its picture's set (from VA-API's
+  reference list); the rest of the header and the slice data are copied.
+- VP9: the frame as it came (VA-API passes all of it).
+
+Each VA surface has its own copy of its picture, filled when its
+decoded picture comes back (matched by the timestamp the driver gave the
+bitstream buffer). For players that want dma-bufs (Firefox), a surface
+also gets two GBM buffers on the virtio-gpu render node (luma, chroma),
+filled through their guest pages and one transfer each when exported.
 
 ## 3D
 
