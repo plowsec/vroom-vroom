@@ -922,7 +922,7 @@
  struct vkr_ring *
 --- /dev/null
 +++ b/src/venus/vkr_snap.c
-@@ -0,0 +1,2344 @@
+@@ -0,0 +1,2350 @@
 +/*
 + * vroom: snapshots of a Venus context (see vkr_snap.h).
 + * SPDX-License-Identifier: MIT
@@ -2505,6 +2505,7 @@
 +      mtx_lock(&ring->mutex);
 +      rec.virtqueue_seqno = ring->virtqueue_seqno;
 +      mtx_unlock(&ring->mutex);
++
 +      uint8_t *p = vkr_snap_w_rec(w, VKR_SNAP_TAG_RING, sizeof(rec));
 +      if (p)
 +         memcpy(p, &rec, sizeof(rec));
@@ -3075,6 +3076,10 @@
 +   ring->buffer.cur = rec->head;
 +   ring->virtqueue_seqno = rec->virtqueue_seqno;
 +   atomic_store(head, rec->head);
++   /* alive, as it was: the guest driver checks this bit while it waits
++    * and gives up if it isn't set (the monitor sets it again from now on) */
++   if (ring->monitor)
++      atomic_store(status, VK_RING_STATUS_ALIVE_BIT_MESA);
 +   mtx_lock(&ctx->ring_mutex);
 +   list_addtail(&ring->head, &ctx->rings);
 +   mtx_unlock(&ctx->ring_mutex);
@@ -3248,6 +3253,7 @@
 +bool
 +vkr_snap_resume(struct vkr_context *ctx)
 +{
++
 +   uint32_t monitor_us = 0;
 +   mtx_lock(&ctx->ring_mutex);
 +   list_for_each_entry (struct vkr_ring, ring, &ctx->rings, head) {

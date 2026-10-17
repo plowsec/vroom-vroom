@@ -196,6 +196,16 @@ pub(crate) fn restore(vmm: &mut Vmm, dir: &Path) -> Result<()> {
     // Before vCPU restore: each vCPU picks the VM clock up as it restores.
     vmm.vm.set_clock(clock);
 
+    // Devices before vCPUs: a vCPU runs as soon as it is restored, and the
+    // guest must not see a device half back (the GPU's shared memory window
+    // stays empty until its buffers are made again: a Vulkan driver reading
+    // its ring there gave up).
+    for d in &vmm.devices {
+        let mut d = d.lock().unwrap_or_else(|e| e.into_inner());
+        let id = d.snapshot_id();
+        d.restore(&snap.get_blob(&dev_blob(&id))?)?;
+    }
+
     let mut cpus = vmm.shared.cpus.lock().unwrap_or_else(|e| e.into_inner()).clone();
     for (i, v) in vmm.vcpus.iter().enumerate() {
         let st: VcpuState = serde_json::from_slice(&snap.get_blob(&vcpu_blob(i))?)
@@ -211,11 +221,6 @@ pub(crate) fn restore(vmm: &mut Vmm, dir: &Path) -> Result<()> {
     }
     *vmm.shared.cpus.lock().unwrap_or_else(|e| e.into_inner()) = cpus;
 
-    for d in &vmm.devices {
-        let mut d = d.lock().unwrap_or_else(|e| e.into_inner());
-        let id = d.snapshot_id();
-        d.restore(&snap.get_blob(&dev_blob(&id))?)?;
-    }
     log::info!("restored snapshot from {}", dir.display());
     Ok(())
 }
