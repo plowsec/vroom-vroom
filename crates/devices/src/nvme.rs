@@ -39,13 +39,20 @@ const SC_INVALID_FIELD: u16 = 0x2;
 const SC_DATA_XFER_ERROR: u16 = 0x4;
 const SC_INVALID_NS: u16 = 0xb;
 const SC_PRP_OFFSET: u16 = 0x13;
-const SC_WRITE_PROTECTED: u16 = 0x20;
 const SC_LBA_RANGE: u16 = 0x80;
 // Command specific (SCT 1).
 const SC_INVALID_QID: u16 = 0x101;
 const SC_INVALID_QSIZE: u16 = 0x102;
 const SC_INVALID_CQ: u16 = 0x100;
 const SC_INVALID_VECTOR: u16 = 0x108;
+/// Attempted Write to Read Only Range: what a write to a read-only
+/// namespace gets. NVMe 1.4's "Namespace Is Write Protected" (0x20) is
+/// the newer answer, but Windows' driver retries it forever, Do Not
+/// Retry or not (5 writes a second, for good); this one it takes as
+/// final, as the SCSI translation's "write protected".
+const SC_READ_ONLY: u16 = 0x182;
+/// Do Not Retry, kept above the SCT bits until the entry is posted.
+const DNR: u16 = 1 << 14;
 
 /// I/O threads per controller, started on first use.
 const IO_THREADS: usize = 4;
@@ -109,6 +116,16 @@ pub struct Namespace {
     /// 512, or 2048 for CD/DVD images (UDF expects 2 KiB sectors).
     pub block_size: u64,
 }
+
+impl Namespace {
+    /// Configured read-only, or the image can't be written.
+    fn ro(&self) -> bool {
+        self.read_only || self.disk.read_only()
+    }
+}
+
+/// Writes refused on read-only namespaces, all controllers (for the log).
+static REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[derive(Serialize, Deserialize)]
 struct Snap {
@@ -541,8 +558,12 @@ impl Nvme {
         e[8..10].copy_from_slice(&sq_head.to_le_bytes());
         e[10..12].copy_from_slice(&sqid.to_le_bytes());
         e[12..14].copy_from_slice(&cid.to_le_bytes());
-        // Status field: SC bits 1..9, SCT bits 9..12 (of the upper half).
-        let status = ((sc & 0xff) << 1) | ((sc >> 8) & 7) << 9 | cq.phase as u16;
+        // Status field: SC bits 1..9, SCT bits 9..12, DNR bit 15 (of the
+        // upper half). Every error but a host I/O error comes back the
+        // same if the driver tries again: say so, or it retries forever
+        // (Windows does, on a write-protected namespace).
+        let dnr = sc != SC_SUCCESS && sc & !DNR != SC_DATA_XFER_ERROR;
+        let status = ((sc & 0xff) << 1) | ((sc >> 8) & 7) << 9 | (dnr as u16) << 15 | cq.phase as u16;
         e[14..16].copy_from_slice(&status.to_le_bytes());
         let _ = self.mem.write(GuestAddress(cq.base + cq.tail as u64 * 16), &e);
         cq.tail = (cq.tail + 1) % cq.size;
@@ -579,7 +600,7 @@ impl Nvme {
     }
 
     fn admin_cmd(&mut self, c: &Cmd) -> Option<Outcome> {
-        match c.opc {
+            match c.opc {
             0x00 => self.delete_sq(c.cdw[0] as u16),
             0x04 => self.delete_cq(c.cdw[0] as u16),
             0x01 => self.create_sq(c),
@@ -710,10 +731,12 @@ impl Nvme {
                 d[0..8].copy_from_slice(&blocks.to_le_bytes());
                 d[8..16].copy_from_slice(&blocks.to_le_bytes());
                 d[16..24].copy_from_slice(&blocks.to_le_bytes());
-                d[24] = if n.read_only { 0 } else { 1 }; // thin provisioning (deallocate)
+                d[24] = if n.ro() { 0 } else { 1 }; // thin provisioning (deallocate)
                 d[25] = 0; // one LBA format
                 d[26] = 0;
-                d[99] = n.read_only as u8; // write protected
+                // NSATTR: write protected. Linux mounts it read-only;
+                // Windows doesn't look (nor at namespace write protection).
+                d[99] = n.ro() as u8;
                 d[128 + 2] = n.block_size.trailing_zeros() as u8; // LBAF0: block size
             }
             0x01 => {
@@ -931,7 +954,7 @@ fn exec_io(mem: &GuestMemory, ns: &[Namespace], c: &Cmd) -> Outcome {
     };
     let disk = n.disk.clone();
     let bs = n.block_size;
-    let ro = n.read_only || disk.read_only();
+    let ro = n.ro();
     let slba = c.cdw[0] as u64 | (c.cdw[1] as u64) << 32;
     let nlb = (c.cdw[2] & 0xffff) as u64 + 1;
     let range = || -> Result<(u64, u64), u16> {
@@ -946,19 +969,26 @@ fn exec_io(mem: &GuestMemory, ns: &[Namespace], c: &Cmd) -> Outcome {
             let segs = guest_segs(mem, c.prp1, c.prp2, len)?;
             disk.read_to_guest(mem, off, &segs).map_err(|_| SC_DATA_XFER_ERROR)
         }),
-        0x01 if ro => Err(SC_WRITE_PROTECTED),
+        0x01 if ro => Err(SC_READ_ONLY),
         0x01 => range().and_then(|(off, len)| {
             let segs = guest_segs(mem, c.prp1, c.prp2, len)?;
             disk.write_from_guest(mem, off, &segs).map_err(|_| SC_DATA_XFER_ERROR)
         }),
-        0x08 if ro => Err(SC_WRITE_PROTECTED),
+        0x08 if ro => Err(SC_READ_ONLY),
         0x08 => range().and_then(|(off, len)| disk.write_zeroes(off, len).map_err(|_| SC_DATA_XFER_ERROR)),
-        0x09 if ro => Err(SC_WRITE_PROTECTED),
+        0x09 if ro => Err(SC_READ_ONLY),
         0x09 => dsm(mem, c, &disk, bs),
         _ => Err(SC_INVALID_OPCODE),
     };
     match r {
         Ok(()) => (SC_SUCCESS, 0),
+        Err(SC_READ_ONLY) => {
+            let k = REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if k.is_power_of_two() {
+                log::info!("nvme: write to read-only namespace {} refused ({k} so far)", c.nsid);
+            }
+            (SC_READ_ONLY, 0)
+        }
         Err(sc) => (sc, 0),
     }
 }
@@ -1107,12 +1137,16 @@ mod tests {
     }
 
     fn ctrl_with(f: impl FnOnce(Nvme) -> Nvme) -> (Nvme, GuestMemory) {
+        ctrl_ro(false, f)
+    }
+
+    fn ctrl_ro(read_only: bool, f: impl FnOnce(Nvme) -> Nvme) -> (Nvme, GuestMemory) {
         let mem = GuestMemory::new(&[(GuestAddress(RAM), 4 << 20)]).unwrap();
         let file = tempfile::tempfile().unwrap();
         file.set_len(1 << 20).unwrap();
         let disk: Arc<dyn DiskImage> = Arc::new(RawImage::from_file(file, false).unwrap());
         let r = IntxRouter::new((0..4).map(|_| Arc::new(NoIrq) as Arc<dyn crate::IrqLine>).collect());
-        let mut n = f(Nvme::new(3, vec![Namespace { disk, read_only: false, block_size: SECTOR_SIZE }], mem.clone(), r.pin(3, 1), Arc::new(NoMsi)));
+        let mut n = f(Nvme::new(3, vec![Namespace { disk, read_only, block_size: SECTOR_SIZE }], mem.clone(), r.pin(3, 1), Arc::new(NoMsi)));
         n.reg_write(0x24, (3 << 16) | 3, 4); // 4-entry admin queues
         n.reg_write(0x28, ASQ, 8);
         n.reg_write(0x30, ACQ, 8);
@@ -1130,9 +1164,15 @@ mod tests {
         n.doorbell(DOORBELL + sq.0 as u64 * 8, ((slot + 1) % sq.2) as u32);
     }
 
+    /// Status code and type of a completion (DNR left out).
     fn status(mem: &GuestMemory, cq: u64, slot: u16) -> u16 {
         let s: u16 = mem.read_obj(GuestAddress(cq + slot as u64 * 16 + 14)).unwrap();
-        s >> 1
+        (s >> 1) & 0x7ff
+    }
+
+    fn dnr(mem: &GuestMemory, cq: u64, slot: u16) -> bool {
+        let s: u16 = mem.read_obj(GuestAddress(cq + slot as u64 * 16 + 14)).unwrap();
+        s & 1 << 15 != 0
     }
 
     #[test]
@@ -1187,6 +1227,38 @@ mod tests {
         n.cqs.get_mut(&1).unwrap().head = 3;
         submit(&mut n, &mem, (1, sq1, 4), 3, [2 | 13 << 16, 9, 0, 0, 0, 0, BUF as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(status(&mem, cq1, 3), SC_INVALID_NS);
+    }
+
+    /// A read-only namespace says so (NSATTR) and refuses writes for
+    /// good: with a status Windows doesn't retry, and Do Not Retry (as
+    /// every error but a host I/O error has).
+    #[test]
+    fn read_only_namespace() {
+        let (mut n, mem) = ctrl_ro(true, |n| n);
+        // Identify namespace 1: NSATTR bit 0.
+        submit(&mut n, &mem, (0, ASQ, 4), 0, [6 | 1 << 16, 1, 0, 0, 0, 0, BUF as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(status(&mem, ACQ, 0), 0);
+        assert!(!dnr(&mem, ACQ, 0));
+        assert_eq!(mem.read_obj::<u8>(GuestAddress(BUF + 99)).unwrap() & 1, 1);
+        // A feature we don't have: an error, final.
+        submit(&mut n, &mem, (0, ASQ, 4), 1, [0x0a | 2 << 16, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0x84, 0, 0, 0, 0, 0]);
+        assert_eq!(status(&mem, ACQ, 1), SC_INVALID_FIELD);
+        assert!(dnr(&mem, ACQ, 1));
+        // A namespace that isn't there.
+        submit(&mut n, &mem, (0, ASQ, 4), 2, [6 | 3 << 16, 2, 0, 0, 0, 0, BUF as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(status(&mem, ACQ, 2), SC_INVALID_NS);
+        n.cqs.get_mut(&0).unwrap().head = 3;
+        // A write: refused, and not to be retried. A read works.
+        let (cq1, sq1) = (RAM + 0x2000, RAM + 0x3000);
+        submit(&mut n, &mem, (0, ASQ, 4), 3, [5 | 4 << 16, 0, 0, 0, 0, 0, cq1 as u32, 0, 0, 0, 1 | 3 << 16, 1, 0, 0, 0, 0]);
+        submit(&mut n, &mem, (0, ASQ, 4), 0, [1 | 5 << 16, 0, 0, 0, 0, 0, sq1 as u32, 0, 0, 0, 1 | 3 << 16, 1 | 1 << 16, 0, 0, 0, 0]);
+        assert_eq!((status(&mem, ACQ, 3), status(&mem, ACQ, 0)), (0, 0));
+        submit(&mut n, &mem, (1, sq1, 4), 0, [1 | 10 << 16, 1, 0, 0, 0, 0, BUF as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(status(&mem, cq1, 0), SC_READ_ONLY);
+        assert!(dnr(&mem, cq1, 0));
+        submit(&mut n, &mem, (1, sq1, 4), 1, [2 | 11 << 16, 1, 0, 0, 0, 0, BUF as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(status(&mem, cq1, 1), 0);
+        assert!(!dnr(&mem, cq1, 1));
     }
 
     /// Several commands per doorbell run on the I/O threads; pausing
