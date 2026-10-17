@@ -84,6 +84,9 @@ pub fn recv_fd(sock: &UnixStream) -> Result<OwnedFd> {
         if fd < 0 {
             return Err(Error::Proto("bad fd"));
         }
+        // Not for the helpers we start later: a vroom-netd socket a
+        // helper inherited would keep its port open after we're gone.
+        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
         Ok(OwnedFd::from_raw_fd(fd))
     }
 }

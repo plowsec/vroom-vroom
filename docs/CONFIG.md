@@ -70,11 +70,20 @@ port_forwards = [{ host_port = 2222, guest_port = 22 }]
 | `interface` | bridged | Host interface, e.g. `en0`. |
 | `network` | host-only | Network name. VMs with the same name see each other. |
 | `mac` | generated | `02:12:34:56:78:9a`. Generated ones start with `identity.mac_prefix`. |
+| `connected` | all | `false`: the cable is out. The guest sees no link on this adapter and no frames go either way (VMware's "Connected" box). Default `true`. |
 
 Bridged and host-only need the `vroom-netd` helper running as root; the
 app sets it up when a VM needs it. See
 [GUIDE.md](GUIDE.md#the-root-helper-vroom-netd) and
 [NETWORKING.md](NETWORKING.md).
+
+While the VM runs (in the app), `connected`, `mode`, `interface`,
+`network` and `block_private` apply right away, to the same adapter with
+the same MAC. Port forwards, `allow_host_loopback` (unless an adapter had
+it at start), `mac`, and adding or removing an adapter apply at the next
+start; a removed adapter is unplugged until then. A suspended VM resumes
+with the adapters it was saved with, set up as the file says then. See
+[NETWORKING.md](NETWORKING.md#changing-adapters-while-the-vm-runs).
 
 ## `[display]`
 

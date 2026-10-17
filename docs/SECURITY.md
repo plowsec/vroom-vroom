@@ -201,6 +201,50 @@ network stack. Host loopback is unreachable unless `allow_host_loopback`;
 through `vroom-netd`, which enforces allow-listed interfaces and source
 MAC anti-spoofing (see [the root helper](#the-root-helper-vroom-netd)).
 
+### Network changes while the VM runs
+
+An adapter's cable and network can change while the VM runs (see
+[NETWORKING.md](NETWORKING.md#changing-adapters-while-the-vm-runs)). The
+sandbox stays as it was set at start; nothing here widens it.
+
+- **Who asks**: the VM window (`ToVmm::NetConnect`, `ToVmm::NetSet`,
+  viewer messages 40 and 41). The guest has no way to send them. The
+  VMM checks each like guest input: adapter index, mode, names (the VM
+  file's rules), forwards (count, addresses), MAC (unicast), and that a
+  bridged or host-only change comes with its socket.
+- **Bridged and host-only**: the sandboxed VMM can't open Unix sockets,
+  so it can't reach vroom-netd after start, and that stays so. The app
+  asks netd for the port, as the user (netd's checks and per-user
+  limits apply as for any request), and hands the VMM the frame socket
+  over the window's connection (SCM_RIGHTS), as for USB helpers. What
+  the VMM gets is what it gets at start: one datagram socket of Ethernet
+  frames for one adapter, behind netd's interface allow-list and
+  source-MAC check. Opening sockets itself would have needed Unix
+  sockets in its sandbox (ssh-agent, docker.sock); a socket handed over
+  reaches only netd's port. The MAC in the app's request is the one the
+  VMM reports for the adapter, made locally administered: netd refuses
+  other MACs whoever asks, and on macOS vmnet picks its own anyway.
+- **NAT**: the VMM's own, and only if its sandbox already allows
+  connections out (a NAT adapter at start). A VM that started with only
+  bridged or host-only adapters has no network in its sandbox and gets
+  none later: NAT waits for its next start. `allow_host_loopback` turned
+  on later works only if an adapter had it at start (the sandbox refuses
+  the host's loopback otherwise; the NAT code doesn't even try).
+- **Port forwards** need listening sockets, which the sandbox never
+  allows: new ones wait for the next start. A NAT the adapter started
+  with is kept, forwards and all, while the adapter is on another
+  network: its listening sockets stay open, so a connection to a
+  forwarded port then waits until the adapter is back on NAT.
+- **MAC translation**: when a vmnet port passes another MAC than the
+  guest's (the adapter started on NAT), the VMM rewrites one to the
+  other in frames: Ethernet, ARP, the DHCP client address, IPv6 neighbor
+  discovery options (`vroom-net/src/mac.rs`). Every offset is checked;
+  frames it can't parse pass unchanged. netd still drops frames whose
+  source isn't the port's MAC, so a guest can't use it to send as
+  another machine.
+- A cable pulled out drops frames both ways in the VMM: nothing reaches
+  the guest or leaves it on that adapter.
+
 ## Shared folders
 
 Off unless configured, read-only unless `readonly = false`. The host side
@@ -424,6 +468,11 @@ The guest gets full control of a device it is given (it can send it any
 request, including firmware updates). Give it only devices you'd plug
 into that machine.
 
+The test devices (`VROOM_USB_FAKE`: serial port, sound card, USB stick)
+run inside the helper in place of libusb, behind the same checks. The
+stick parses the guest's SCSI commands there: fixed-size blocks, every
+offset checked against its RAM disk.
+
 The VM's xHCI always has 8 USB 2 + USB 3 port pairs for these devices
 (fixed, so the guest and saved VMs see the same controller); the
 viewer protocol caps names and the list, and the VMM checks every
@@ -480,11 +529,31 @@ asked for: the user named the device, and the helper serves only that
 one. On Linux the root helper sets no_new_privs and Landlock like the
 user's.
 
-What a compromised VMM can do with it: nothing new. It never talks to
-the USB side (the app does), and the network side was already its
-business. A compromised user account in `admin` could take USB devices
-(keyboards included) without the password; it could also wait for the
-next sudo. The daemon logs every request with the user to
+What the root USB helper does to the device: as soon as it opens one a
+macOS driver holds (or one an earlier helper left taken), it takes the
+whole device (libusb's "capture": macOS re-enumerates it and keeps its
+drivers off; a mounted disk is unmounted). It keeps it through the
+guest's resets, so macOS never mounts the disk in between, and gives
+it back when it ends (one more re-enumeration, macOS's drivers come
+back). A device the guest can't use at all is given back at once.
+
+macOS 15 opens USB storage only to a program with Full Disk Access,
+root or not. For USB disks the user gives vroom-netd that permission
+(GUIDE). That covers the daemon and the helpers it starts: macOS then
+lets them read the user's protected files too (Mail, Messages, other
+apps' data), which root alone can't. Neither does: the daemon reads
+only its config, and the helpers' Seatbelt profile allows no files at
+all. It is a real widening still: code execution in vroom-netd would
+get it. Without the permission everything else works; only USB disks
+fail, and they go back to macOS.
+
+What a compromised VMM can do with it: nothing new. The VMM asks for
+the VM file's USB devices when it starts, before it locks itself down
+(the user wrote that file); afterwards its sandbox has no way to reach
+the daemon's socket. Devices connected while the VM runs come from the
+app. The network side was already its business. A compromised user
+account in `admin` could take USB devices (keyboards included) without
+the password; it could also wait for the next sudo. The daemon logs every request with the user to
 `/var/log/vroom-netd.log`.
 
 Passing sockets: macOS can deliver a socket already disconnected when
@@ -492,6 +561,15 @@ the sender closes its own copy while the socket is still in flight
 (about 1 in 10 times here). The daemon keeps its copy until the
 client hangs up; the app keeps its copy of a helper's socket for a few
 seconds after handing it to the VMM.
+
+Frame sockets: macOS gives a Unix datagram socket 4 KiB of buffer, two
+frames. Both ends now ask for 2 MiB, and when the VMM's side is full
+anyway the daemon drops the frame, as a full NIC queue would. Before,
+it gave the whole port up after the first failed send, so a bridged
+adapter could die a few seconds into a boot (the guest's driver isn't
+reading yet) or during a burst. Only a VMM that is gone ends a port.
+That part needs the daemon set up again to take effect; the VMM's
+bigger buffer helps with an older daemon too.
 
 ## Snapshots
 
@@ -517,7 +595,10 @@ has the longer history of bugs, and on Windows, Direct3D 11 calls
 (Neptune, UTM's protocol) by virglrenderer's Neptune decoder and DXMT,
 which turns the guest's Direct3D shaders into Metal ones with its own
 LLVM-based converter. That is a large amount of young C and C++ code in
-reach of the guest. So none of it runs in the VMM.
+reach of the guest. So none of it runs in the VMM. Windows guests reach
+vrend too: the 3D driver makes virgl contexts for its own copies, and
+our OpenGL driver for Windows apps uses them like Linux's Mesa does
+(nothing new on the host: any guest code could already ask for one).
 
 ### The GPU process
 
@@ -631,6 +712,29 @@ graphics (Win+Ctrl+Shift+B; tested: the desktop comes back). Holding the
 fences back instead doesn't help: Windows' GPU watchdog doesn't fire
 with this driver, the desktop just hangs.
 
+Snapshots of Vulkan contexts (patch 0010) add three requests on each
+worker's socket and three calls between the VMM and the GPU process. The
+worker writes its context's state into a shared memory object of its own
+(under one of the names its sandbox already allows) and hands it to the
+GPU process, which hands it to the VMM. The VMM checks its size (at most
+64 GiB, no more than the object holds) and stores it without reading it.
+On restore the VMM puts that data in shared memory, and it goes down the
+same way to a new worker, which maps it read only. The data comes from
+the snapshot file, which anything that can write the VM's state
+directory controls, so the worker checks it like guest input: each
+record's length against what is left; contents against the size of the
+resource, memory or image region they go to (regions are worked out again
+from the image, never taken from the file); rings with the same layout
+checks as `vkCreateRingMESA`; reply streams with the same checks as
+`vkSetReplyCommandStreamMESA`. The kept commands are the guest's own
+bytes, replayed through the same Venus decoder and handlers as when the
+guest sent them (with the reply flag cleared). Workers still never map
+guest RAM. The VMM checks what it keeps itself like the guest's own
+requests: blob sizes and kinds, guest RAM ranges, and each mapping with
+the same checks as `RESOURCE_MAP_BLOB`. Following commands adds code on
+every command a guest sends, with a bound: past 4M commands or 1 GiB
+kept, a context isn't followed any more.
+
 OpenGL (virgl) contexts stay together in the GPU process: vrend shares
 one GL context group across them (shared objects, one GL thread), so
 splitting them would mean a GL driver per guest app and copying every
@@ -733,7 +837,7 @@ active on seat0, and the helper only talks to a root-owned peer.
 ## Fuzzing
 
 `fuzz/` has cargo-fuzz targets for what a guest (or a downloaded image)
-controls: agent protocol, the viewer protocol (both directions), network frames, virtqueue chains over arbitrary
+controls: agent protocol, the viewer protocol (both directions), network frames (the NAT's parsers and the MAC translation), virtqueue chains over arbitrary
 guest memory, virtio-gpu 2D commands, virtio-fs (FUSE) requests, virtio-snd control
 and PCM transfers (playback and capture), the HD Audio controller (registers,
 CORB/RIRB, buffer descriptor lists, stream DMA, MSI), the virtio-pci transport and PCI

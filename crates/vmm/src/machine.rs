@@ -6,7 +6,7 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use vroom_arch::aarch64::{self as board, layout};
-use vroom_config::{Boot, DiskBus, Gpu, GuestOs, Identity, SoundDevice, VmConfig};
+use vroom_config::{Boot, DiskBus, Gpu, GuestOs, SoundDevice, VmConfig};
 use vroom_devices::audio::{AudioSink, AudioSource, NullSink, Silence};
 use vroom_devices::hda::{codec::CodecIds, Hda, HdaIds};
 use vroom_virtio::devices::sound::Sound;
@@ -16,10 +16,6 @@ use vroom_hv::{
 };
 use vroom_memory::{GuestAddress, GuestMemory};
 use vroom_snapshot::Snapshottable;
-use vroom_config::NetMode;
-use vroom_net::nat::{Nat, NatConfig, NatPolicy, TcpForward};
-use vroom_net::socket::FrameSocket;
-use vroom_net::{netd, NetBackend};
 use vroom_virtio::devices::gpu::{DisplaySink, Gpu as GpuDev, GpuControl, ThreeD};
 use vroom_virtio::devices::gpu3d::{Mapping, Renderer3d, ShmMapper};
 use vroom_virtio::devices::input::{Input, InputKind};
@@ -166,6 +162,9 @@ pub(crate) struct Machine {
     /// Every monitor, the first (with the firmware screen) first.
     pub screens: Vec<Arc<FbSink>>,
     pub boot: BootImage,
+    /// The network adapters built (a resumed VM: the ones it was saved
+    /// with), as the VM file had them: what a later save records.
+    pub nets: Vec<vroom_config::Net>,
 }
 
 /// Registers MMIO devices on the bus and in the snapshot list in one go,
@@ -204,6 +203,14 @@ pub(crate) struct BuildEnv {
     pub state_dir: std::path::PathBuf,
     /// Restoring a snapshot / suspend image rather than cold booting.
     pub resuming: bool,
+    /// The config the snapshot was taken with, when restoring: its
+    /// network adapters are the guest's.
+    pub saved: Option<VmConfig>,
+    /// Network adapters get a control queue (not when the snapshot's had
+    /// none).
+    pub net_ctrl: bool,
+    /// The VMM will lock itself down (what NAT may reach later).
+    pub sandbox: bool,
 }
 
 /// What gets loaded into RAM at (re)boot. Kept so reset can reload it.
@@ -438,19 +445,6 @@ impl ShmMapper for VmShm {
     }
 }
 
-/// Deterministic MAC per (VM, NIC index), so the guest keeps the same DHCP
-/// identity across boots without storing state. Starts with
-/// `identity.mac_prefix` (default 02: locally administered).
-fn stable_mac(ident: &Identity, name: &str, idx: usize) -> [u8; 6] {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in name.bytes().chain([0, idx as u8]) {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100_0000_01b3);
-    }
-    let b = h.to_le_bytes();
-    ident.mac([b[0], b[1], b[2], b[3], b[4], b[5]])
-}
-
 /// A `*_pci_id` from `[identity]` (the config checked it already).
 fn vendor_ids(s: &str) -> Result<VendorIds> {
     let [vendor, device, subsys_vendor, subsys] =
@@ -517,46 +511,6 @@ fn sound_card(
     }
     Ok(helper)
 }
-
-/// Backend for one NIC, and the MAC the guest must use.
-fn net_backend(
-    vm: &str,
-    ident: &Identity,
-    idx: usize,
-    n: &vroom_config::Net,
-    mac: [u8; 6],
-) -> Result<(Box<dyn NetBackend>, [u8; 6])> {
-    let via_netd = |attach: netd::Attach| -> Result<(Box<dyn NetBackend>, [u8; 6])> {
-        let sock = std::env::var_os("VROOM_NETD_SOCKET")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| netd::DEFAULT_SOCKET.into());
-        let req = netd::Request { version: netd::VERSION, vm: vm.to_string(), nic: idx as u32, attach, mac };
-        let (s, assigned) = netd::attach(&sock, &req).map_err(|e| Error::Setup(e.to_string()))?;
-        let fs = FrameSocket::new(s).map_err(|e| Error::Setup(format!("netd socket: {e}")))?;
-        Ok((Box::new(fs), assigned))
-    };
-    match n.mode()? {
-        NetMode::Nat { port_forwards } => {
-            let mut cfg = NatConfig::new(mac);
-            // Adapter N: the first adapter's /24 plus N (10.0.(2+N).0/24 by
-            // default): two NICs never share a subnet in the guest's
-            // routing table.
-            (cfg.guest, cfg.gateway, cfg.dns) = ident.nat_addrs(idx);
-            cfg.gateway_mac = vroom_config::parse_mac(&ident.nat_gateway_mac)?;
-            cfg.policy = NatPolicy { allow_host_loopback: n.allow_host_loopback, block_private: n.block_private };
-            for p in port_forwards {
-                let ip: std::net::IpAddr =
-                    p.host_addr.parse().map_err(|_| Error::Setup(format!("bad host_addr {}", p.host_addr)))?;
-                cfg.forwards.push(TcpForward { host: (ip, p.host_port).into(), guest_port: p.guest_port });
-            }
-            let nat = Nat::new(cfg).map_err(|e| Error::Setup(format!("nat: {e}")))?;
-            Ok((Box::new(nat), mac))
-        }
-        NetMode::Bridged { interface } => via_netd(netd::Attach::Bridged { interface }),
-        NetMode::HostOnly { network } => via_netd(netd::Attach::HostOnly { network }),
-    }
-}
-
 fn read_file(p: &std::path::Path, what: &str, max: u64) -> Result<Vec<u8>> {
     let meta = std::fs::metadata(p).map_err(|e| Error::Setup(format!("{what} {}: {e}", p.display())))?;
     if meta.len() > max {
@@ -738,7 +692,7 @@ pub(crate) fn build(
         let mut helpers = Vec::new();
         let mut links = Vec::new();
         for u in &config.usb {
-            let (h, link) = crate::usb::spawn(u)?;
+            let (h, link) = crate::usb::spawn(&config.name, u)?;
             helpers.push(h);
             links.push(link);
         }
@@ -786,6 +740,24 @@ pub(crate) fn build(
     let viewer = ui.as_ref().map(|d| d.tx());
     let screen_ctl = agent::Screen { heads, max_pixels, gpu3d: config.display.gpu == Gpu::Virtio3d, viewer: viewer.clone() };
     let agent = agent::spawn(host_end, config.clipboard.clone(), clipboard, screen_ctl)?;
+    // Network adapters (right after the console: the device order is the
+    // guest's layout). The viewer can change them while the VM runs.
+    let planned = crate::net::plan(config, env.saved.as_ref())?;
+    let reach = crate::net::Reach::of(planned.iter().map(|p| &p.net), env.sandbox);
+    let mut nics = Vec::new();
+    let mut nets = Vec::new();
+    for (i, p) in planned.into_iter().enumerate() {
+        let (backend, mac) = crate::net::boot_backend(&config.name, ident, i, &p.net, p.mac, reach.dns)?;
+        let live = crate::net::live_of(&p.net)?;
+        let mut dev = Net::with_link(&format!("eth{i}"), mac, backend, &crate::net::label(&live), p.net.connected && !p.removed);
+        if !env.net_ctrl {
+            dev = dev.without_ctrl();
+        }
+        nics.push(crate::net::Nic::new(dev.control(), live));
+        board.add_virtio(Box::new(dev))?;
+        nets.push(p.net);
+    }
+    let net_ports = crate::net::NetPorts::new(nics, viewer.clone(), reach, ident.clone());
     if let Some(ds) = ui {
         if screen.is_none() {
             return Err(Error::Setup("a viewer needs a display (display.gpu or UEFI boot)".into()));
@@ -815,15 +787,7 @@ pub(crate) fn build(
             }
         };
         let windows = config.guest_os() == GuestOs::Windows;
-        ds.run(input, agent.clone(), events.clone(), window, listener, screens.clone(), windows, usb_ports)?;
-    }
-    for (i, n) in config.nets.iter().enumerate() {
-        let mac = match &n.mac {
-            Some(m) => vroom_config::parse_mac(m)?,
-            None => stable_mac(ident, &config.name, i),
-        };
-        let (backend, mac) = net_backend(&config.name, ident, i, n, mac)?;
-        board.add_virtio(Box::new(Net::new(&format!("eth{i}"), mac, backend)))?;
+        ds.run(input, agent.clone(), events.clone(), window, listener, screens.clone(), windows, usb_ports, Some(net_ports))?;
     }
     for gpu in later_gpus {
         board.add_virtio(Box::new(gpu))?;
@@ -931,7 +895,7 @@ pub(crate) fn build(
     let _ = shared.peers.set(vcpus.iter().map(|v| v.peer.clone()).collect());
     vm.finalize()?;
 
-    Ok(Machine { vm, mem, shared, vcpus, devices: reg.stateful, uart, agent, gpus, viewer, screens, boot })
+    Ok(Machine { vm, mem, shared, vcpus, devices: reg.stateful, uart, agent, gpus, viewer, screens, boot, nets })
 }
 
 #[cfg(test)]
@@ -940,13 +904,13 @@ mod tests {
 
     #[test]
     fn macs_and_pci_ids_from_identity() {
-        let mut ident = Identity::default();
+        let mut ident = vroom_config::Identity::default();
         // Same MAC as before mac_prefix existed: 02 then five hash bytes.
-        let m = stable_mac(&ident, "dev", 0);
+        let m = ident.nic_mac("dev", 0);
         assert_eq!(m[0], 0x02);
-        assert_ne!(stable_mac(&ident, "dev", 1), m);
+        assert_ne!(ident.nic_mac("dev", 1), m);
         ident.mac_prefix = "00:1b:21".into();
-        let v = stable_mac(&ident, "dev", 0);
+        let v = ident.nic_mac("dev", 0);
         assert_eq!((&v[..3], &v[3..]), (&[0x00, 0x1b, 0x21][..], &m[1..4]));
         let ids = vendor_ids(&ident.nvme_pci_id).unwrap();
         assert_eq!(ids, VendorIds { vendor: 0x1b36, device: 0x0010, subsys_vendor: 0x1b36, subsys: 0 });

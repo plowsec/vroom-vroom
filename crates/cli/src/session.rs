@@ -366,7 +366,7 @@ pub fn run(o: RunOpts) -> Result<(), String> {
     let clipboard = if gui { None } else { o.clipboard };
     let has_clip = clipboard.is_some();
     let hv = vroom_hv::default_hypervisor().map_err(|e| e.to_string())?;
-    let opts = VmmOptions { serial_out: Box::new(std::io::stdout()), start, clipboard, ui, state_dir: o.state_dir.clone() };
+    let opts = VmmOptions { serial_out: Box::new(std::io::stdout()), start, clipboard, ui, state_dir: o.state_dir.clone(), sandbox: o.sandbox };
     let vmm = Vmm::start(o.config, hv, opts).map_err(|e| e.to_string())?;
     if resumed_suspend {
         // A suspend image is single use: the disks move on from here.

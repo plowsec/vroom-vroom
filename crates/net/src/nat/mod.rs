@@ -66,7 +66,7 @@ const MAX_BIG_BUFS: usize = 16;
 const UDP_IDLE: Duration = Duration::from_secs(60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NatPolicy {
     /// Let the guest reach host 127.0.0.1 through the gateway address.
     pub allow_host_loopback: bool,
@@ -917,6 +917,13 @@ impl NetBackend for Nat {
         self.expire_connects();
         self.expire_udp(false);
         self.poll_stack();
+    }
+
+    fn set_nat_policy(&mut self, p: &NatPolicy) -> bool {
+        // Connections already open stay; the policy is checked on the
+        // next one.
+        self.cfg.policy = p.clone();
+        true
     }
 }
 

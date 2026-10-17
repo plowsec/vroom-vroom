@@ -21,7 +21,16 @@ Commands, one per line, on <state-dir>.cmd (a fifo):
                          `vroom usb-host` for it, hand the VMM its socket
                          (VROOM_USB_FAKE=acm in our environment: a pretend
                          serial port)
+  usbnetd ID [SERIAL]    the same through vroom-netd's root helper (what the
+                         app does for a device a macOS driver holds)
   usbdetach PORT         pull out the device on that port pair
+  net N on|off           network adapter N (0, 1...): cable in or out
+  netmode N nat [loopback] [block] [HOSTPORT:GUESTPORT...]
+  netmode N bridged IFACE | netmode N host-only NAME
+                         put adapter N on another network while the VM
+                         runs, as the app does (bridged and host-only: ask
+                         vroom-netd for a port, hand the VMM its socket).
+                         Adapters show as "net ..." events.
   dragout X Y X2 Y2 DIR  press at X,Y, drag to X2,Y2 (an edge), ask the guest
                          what it drags out (as the app does when the mouse
                          leaves the window), cancel its drag with Escape and
@@ -121,6 +130,23 @@ def reader():
                 ev.write(f"icon {i:#x} {w}x{h} {png if w else 'none'}\n")
             elif t == 19:
                 ev.write(f"no coherence: {pl.decode(errors='replace')}\n")
+            elif t == 40:
+                n, o, out = pl[1], 2, []
+                for _ in range(n):
+                    nic, on, mac = pl[o], pl[o + 1], pl[o + 2:o + 8]; o += 8
+                    kind, flags, ln = pl[o], pl[o + 1], pl[o + 2]
+                    name = pl[o + 3:o + 3 + ln].decode(); o += 3 + ln
+                    nf = pl[o]; o += 1
+                    fw = []
+                    for _ in range(nf):
+                        al = pl[o]; addr = pl[o + 1:o + 1 + al].decode(); o += 1 + al
+                        hp, gp = struct.unpack("<HH", pl[o:o + 4]); o += 4
+                        fw.append(f"{addr}:{hp}->{gp}")
+                    macs[nic] = bytes(mac)
+                    out.append(f"{nic}:{('nat', 'bridged', 'host-only')[kind]}{':' + name if name else ''}"
+                               f"{'' if on else '(unplugged)'}{'(loopback)' if flags & 1 else ''}{'(block)' if flags & 2 else ''}"
+                               f" {mac.hex(':')} {' '.join(fw)}")
+                ev.write(f"net nat_ok={pl[0]} " + " | ".join(out) + "\n")
             elif t == 7:
                 if pl[0] != 2:
                     ev.write("cursor " + ("unset", "hidden")[pl[0]] + "\n"); continue
@@ -130,6 +156,7 @@ def reader():
                 write_png(png, w, h, pl[17:])
                 ev.write(f"cursor {w}x{h} hot {hx},{hy} {png}\n")
 drag_ev, drag_cv = [], threading.Event()
+macs = {}
 threading.Thread(target=reader, daemon=True).start()
 
 def send(t, payload):
@@ -231,6 +258,25 @@ def usb_attach(id_, serial=""):
     w.close()
     pl = b"".join(struct.pack("<H", len(x.encode())) + x.encode() for x in (id_, serial, "test " + id_))
     socket.send_fds(a, [struct.pack("<BI", 12, len(pl)) + pl], [r.fileno()]); r.close()
+def usb_netd(id_, serial=""):
+    import json
+    c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    c.connect("/var/run/vroom/netd.sock")
+    req = {"version": 1, "vm": "vmdrive", "usb": {"id": id_, "serial": serial or None}}
+    c.sendall((json.dumps(req) + "\n").encode())
+    line = b""
+    while not line.endswith(b"\n"):
+        ch = c.recv(1)
+        if not ch:
+            break
+        line += ch
+    resp = json.loads(line or b"{}")
+    if not resp.get("ok"):
+        ev.write(f"usbnetd {id_}: {resp.get('error', 'no answer')}\n")
+        return
+    _, fds, _, _ = socket.recv_fds(c, 16, 1)
+    pl = b"".join(struct.pack("<H", len(x.encode())) + x.encode() for x in (id_, serial, "netd " + id_))
+    socket.send_fds(a, [struct.pack("<BI", 12, len(pl)) + pl], [fds[0]]); os.close(fds[0])
 def fetch(i, idx, into):
     r, w = socket.socketpair()
     socket.send_fds(a, [struct.pack("<BI", 17, 8) + u32s(i, idx)], [w.fileno()]); w.close()
@@ -264,6 +310,48 @@ def fetch(i, idx, into):
                 return f"ok {n} bytes in {time.time() - t0:.1f}s"
             elif t == 24:
                 return "failed: " + pl[4:].decode(errors="replace")
+
+def net_live(kind, name=b"", flags=0, fwd=()):
+    f = b"".join(bytes([9]) + b"127.0.0.1" + struct.pack("<HH", h, g) for h, g in fwd)
+    return bytes([kind, flags, len(name)]) + name + bytes([len(fwd)]) + f
+def netmode(n, args):
+    kind = {"nat": 0, "bridged": 1, "host-only": 2}[args[0]]
+    if kind == 0:
+        flags = ("loopback" in args) | ("block" in args) << 1
+        fwd = [tuple(map(int, x.split(":"))) for x in args[1:] if ":" in x]
+        send(41, bytes([n]) + bytes(6) + net_live(0, flags=flags, fwd=fwd)); return
+    import json
+    name = args[1]
+    import tomllib
+    with open(cfg, "rb") as f:
+        vm = tomllib.load(f).get("name", "vm")
+    attach = {"mode": "bridged", "interface": name} if kind == 1 else {"mode": "host-only", "network": name}
+    mac = macs.get(n, b"\x02" + bytes(5))
+    req = {"version": 1, "vm": vm, "nic": n, "attach": attach, "mac": [(mac[0] | 2) & 0xfe] + list(mac[1:])}
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(os.environ.get("VROOM_NETD_SOCKET", "/var/run/vroom/netd.sock"))
+    s.sendall((json.dumps(req) + "\n").encode())
+    line = b""
+    while not line.endswith(b"\n"):
+        c = s.recv(1)
+        if not c: break
+        line += c
+    r = json.loads(line)
+    if not r.get("ok"):
+        ev.write(f"netd refused: {r.get('error')}\n"); return
+    _, fds, _, _ = socket.recv_fds(s, 1, 1)
+    s.close()
+    port_mac = bytes(r["mac"])
+    ev.write(f"netd: port {port_mac.hex(':')} for adapter {n}\n")
+    pl = bytes([n]) + port_mac + net_live(kind, name.encode())
+    socket.send_fds(a, [struct.pack("<BI", 41, len(pl)) + pl], fds)
+    # Ours goes once the VMM has its copy (macOS can drop a socket whose
+    # other copies all close while it is in flight).
+    def let_go():
+        time.sleep(5)
+        for fd in fds:
+            os.close(fd)
+    threading.Thread(target=let_go, daemon=True).start()
 
 out_id = [500]
 def dragout(x, y, x2, y2, into):
@@ -343,7 +431,14 @@ if True:
                     v = arg.split(" ", 4)
                     drop(int(v[0]), int(v[1]), int(v[2]), int(v[3]), v[4].split("|"))
                 elif c == "usb": usb_attach(*arg.split())
+                elif c == "usbnetd": usb_netd(*arg.split())
                 elif c == "usbdetach": send(13, bytes([int(arg)]))
+                elif c == "net":
+                    n, on = arg.split()
+                    send(40, bytes([int(n), int(on == "on")]))
+                elif c == "netmode":
+                    v = arg.split()
+                    netmode(int(v[0]), v[1:])
                 elif c == "dragout":
                     v = arg.split(" ", 4)
                     dragout(int(v[0]), int(v[1]), int(v[2]), int(v[3]), v[4])
