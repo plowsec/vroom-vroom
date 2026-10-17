@@ -684,6 +684,29 @@ when it ended (macOS's `glEndTransformFeedback` with the wrong program
 bound; patch 0015). The guest lost 3D until the VM restarted, nothing
 more: the crash stays in the GPU process.
 
+Transform feedback for Zink (patch 0016) adds, in the Venus worker:
+
+- A SPIR-V rewriter (`vkr_xfb.c`) reading the guest's vertex shaders.
+  Every read is checked against the module's size and id bound; anything
+  it doesn't expect (structs captured, 64-bit outputs, strides over 2048,
+  offsets past the stride, SPIR-V before 1.5) leaves the module as it was.
+  300,000 mutated Zink shaders ran through it under AddressSanitizer and
+  UBSan without a finding. Its output goes to MoltenVK's compiler, which
+  read the guest's own SPIR-V before anyway.
+- Shader stores through device addresses. The addresses and how many
+  vertices may be written come only from the host, pushed right before
+  each draw: the host's copy of the bound range (checked against the
+  buffer's size, buffers made for transform feedback and bound to memory
+  only) and the room left in it. The guest's own push constants into our
+  48 bytes are cut off. The rewritten shader checks each vertex's slot
+  against that count, so it writes inside the bound ranges. Zink devices
+  now have `bufferDeviceAddress` on, as a Vulkan app on Venus could
+  already ask for: a guest shader can write anywhere in its worker's GPU
+  memory, which only holds that app's own objects.
+- Command buffers keep a little state; layouts and query pools are found
+  again by id, so a guest destroying them mid-recording gets nothing
+  written rather than a dangling pointer.
+
 ### A process per Vulkan and Direct3D context
 
 Each Vulkan (Venus) and Direct3D (Neptune) context of the guest, roughly

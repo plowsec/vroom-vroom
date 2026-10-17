@@ -558,11 +558,21 @@ MESA_LOADER_DRIVER_OVERRIDE=zink glxinfo -B   # zink Vulkan 1.3(Virtio-GPU Venus
 
 In an Xorg session add `LIBGL_KOPPER_DRI2=1` (Xorg's modesetting driver
 doesn't offer what Zink wants for windows there; Wayland sessions don't
-need it). The host fills in what MoltenVK lacks, and some of it only
-roughly, for Zink only: transform feedback is accepted but writes nothing
-(apps that read it back get zeros), and packed 10-bit vertex formats and
-RGB32 texel buffers, which Metal doesn't have, read wrong. Few apps use
-them. Zink is a little slower than virgl for ordinary drawing: in a GNOME
+need it). The host fills in what MoltenVK lacks, for Zink only, and some
+of it only roughly:
+
+- Transform feedback (vertex shader outputs written to buffers, used by
+  some particle effects and CAD apps) works for `glDrawArrays` of points,
+  lines and triangles, instanced or not, with pause and resume,
+  `glDrawTransformFeedback` and the primitives written and generated
+  queries. Strips, fans and `glDrawElements` capture nothing while
+  transform feedback is on (apps that read those back get zeros); so do
+  geometry and tessellation shaders, which MoltenVK lacks anyway. A
+  million points are captured in about 15 ms.
+- Packed 10-bit vertex formats and RGB32 texel buffers, which Metal
+  doesn't have, read wrong. Few apps use them.
+
+Zink is a little slower than virgl for ordinary drawing: in a GNOME
 Wayland session, glmark2 scores about 1000 on Zink and 1170 on virgl, and
 its terrain scene, the heaviest for the GPU, runs at about 210 fps against
 420. Keep virgl for the desktop and use Zink for apps that need more than

@@ -619,10 +619,38 @@ What MoltenVK lacks, the Venus decoder makes up (patches 0007, 0008 and
   storage, so such an image gets no memory type at all. Zink asks for it
   on every texture it may copy into from the CPU, and every depth
   texture failed.
-- For Zink only (its instance says "mesa zink"): transform feedback taken
-  and dropped (queries of it are occlusion pools never started, results
-  zero), and packed 10-bit vertex formats and RGB32 texel buffers mapped
-  to the nearest Metal has. These are what lift Zink to OpenGL 4.4.
+- For Zink only (its instance says "mesa zink"): transform feedback, and
+  packed 10-bit vertex formats and RGB32 texel buffers mapped to the
+  nearest Metal has. These are what lift Zink to OpenGL 4.4.
+
+Transform feedback, which MoltenVK lacks, is done by the vertex shader
+itself (0016, `vkr_xfb.c`). A vertex shader module with the `Xfb`
+execution mode gets a second host module: before each return it stores
+its captured outputs (their `XfbBuffer`, `XfbStride` and `Offset`
+decorations) through buffer device addresses read from 48 bytes of push
+constants at offset 256. Every pipeline layout gets room for them (the
+vertex range grows to 304 bytes; a layout already using that range gets
+none, and its pipelines don't capture). Zink devices get
+`bufferDeviceAddress`, `shaderInt64` and vertex stores turned on,
+transform feedback buffers the device address usage, and every memory
+allocation the device address flag. Each command buffer keeps the bound
+buffers (address, size), what was written to each, the bound pipeline's
+topology and the transform feedback state; before every draw with such
+a pipeline the host pushes where its vertices go, or zeros (nothing to
+write). Vertex n of instance i goes to slot i * count + n, which is the
+order transform feedback writes in for non-indexed point, line and
+triangle lists only; other draws capture nothing. The host caps the slots
+at what fits in every buffer, in whole primitives, so a shader never
+writes past a buffer's bound range. Counter buffers (pause and resume
+across render passes, `glDrawTransformFeedback`) and the query pools for
+transform feedback and pipeline statistics (`GL_PRIMITIVES_GENERATED`;
+MoltenVK has neither) are kept by the host as commands are recorded:
+values are right when command buffers run in the order they were
+recorded, which is what Zink does. Before this, a Zink app asking for
+`GL_PRIMITIVES_GENERATED` got a query pool the host refused and its
+context failed. Apps without transform feedback run as before, within
+noise (glmark2 on Zink, three runs each: terrain 270 then 260 fps,
+refract 596 then 637).
 
 A Vulkan window reaches the screen through the guest's compositor, which
 imports the frame's dma-buf with OpenGL (virgl, `PIPE_RESOURCE_SET_TYPE`).

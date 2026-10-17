@@ -34,8 +34,9 @@ What we found (October 2026, macOS 15.6, MoltenVK 1.4.2, guest Mesa 25.2):
   (`third_party/virglrenderer/0007-venus-what-zink-needs.patch`):
   null descriptors become small zeroed objects of our own, depth clip off
   becomes depth clamp (what Metal does anyway), and, for Zink only (it
-  names itself when it starts), transform feedback is accepted but not
-  captured, and the missing formats are read through the nearest one.
+  names itself when it starts), transform feedback is written by the
+  vertex shaders themselves (0016, see ARCHITECTURE.md), and the missing
+  formats are read through the nearest one.
   Zink then reports OpenGL 4.4 core and compatibility, and OpenGL ES 3.1.
   A GL 4.3 compute shader test gives the right results, 330 times faster
   than llvmpipe.
@@ -54,11 +55,13 @@ What we found (October 2026, macOS 15.6, MoltenVK 1.4.2, guest Mesa 25.2):
 
 Linux guests, next:
 
-- **Transform feedback for real** (Zink, and Vulkan apps). Today it is
-  accepted and nothing is written, which is wrong for the few apps that
-  use it (some games' particles, some CAD). It would rewrite the vertex
-  shader to store its outputs into the buffers, and is only simple for
-  non-indexed draws.
+- **Transform feedback, the rest** (Zink). Non-indexed point, line and
+  triangle lists are captured now. Indexed draws, strips and fans capture
+  nothing: their output order isn't the vertex order. Indexed lists could
+  go through a non-indexed draw that reads the index buffer itself in the
+  vertex shader; strips need each vertex written up to three times.
+  Vulkan apps don't get `VK_EXT_transform_feedback` at all (Zink only:
+  only its SPIR-V is what the rewrite expects).
 - **KosmicKrisp on macOS 26**: load it instead of MoltenVK when the Mac
   has Metal 4. Zink then gets most of what we emulate for real, and its
   speed should be checked against MoltenVK.
