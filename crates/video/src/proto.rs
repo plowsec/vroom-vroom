@@ -29,6 +29,8 @@ pub const MAX_SESSIONS: u32 = 8;
 pub const MAX_HELD: usize = 8;
 /// Grants the helper keeps per session.
 pub const MAX_GRANTS: usize = 64;
+/// Biggest resume state (see [`FromHelper::Resume`]).
+pub const MAX_RESUME: usize = 16 << 10;
 
 /// [`ToHelper::Open`] flag: hand pictures out in decoding order, each as
 /// soon as it is decoded, and say when one failed. For a VA-API driver on
@@ -53,6 +55,10 @@ pub enum ToHelper {
     /// too, until the next `Grant`.
     Flush { session: u32 },
     Close { session: u32 },
+    /// Open a session again after a snapshot was restored (or a suspended
+    /// VM resumed), with the state a [`FromHelper::Resume`] gave: the
+    /// stream goes on from its next key frame.
+    Resume { session: u32, codec: Codec, flags: u8, state: Vec<u8> },
 }
 
 /// Helper -> VMM.
@@ -74,6 +80,11 @@ pub enum FromHelper {
     DrainDone { session: u32 },
     /// The session can't go on (bad stream, VideoToolbox gave up).
     Error { session: u32, errno: u32 },
+    /// What the helper needs to open this stream again in another helper
+    /// (after a restore): its parameter sets, VP9 key frame header or AV1
+    /// sequence header. Opaque to the VMM, which keeps the latest and
+    /// saves it with a snapshot; a new helper parses it like a stream.
+    Resume { session: u32, state: Vec<u8> },
 }
 
 mod kind {
@@ -83,6 +94,7 @@ mod kind {
     pub const DRAIN: u8 = 4;
     pub const FLUSH: u8 = 5;
     pub const CLOSE: u8 = 6;
+    pub const RESUME: u8 = 7;
 
     pub const FORMAT: u8 = 0x81;
     pub const PICTURE: u8 = 0x82;
@@ -90,6 +102,7 @@ mod kind {
     pub const DRAIN_DONE: u8 = 0x84;
     pub const ERROR: u8 = 0x85;
     pub const CAPS: u8 = 0x86;
+    pub const RESUMABLE: u8 = 0x87;
 }
 
 fn header(kind: u8, session: u32, len: usize) -> Vec<u8> {
@@ -157,6 +170,13 @@ impl ToHelper {
             ToHelper::Drain { session } => header(kind::DRAIN, *session, 0),
             ToHelper::Flush { session } => header(kind::FLUSH, *session, 0),
             ToHelper::Close { session } => header(kind::CLOSE, *session, 0),
+            ToHelper::Resume { session, codec, flags, state } => {
+                let mut v = header(kind::RESUME, *session, 2 + state.len());
+                v.push(codec.to_u8());
+                v.push(*flags);
+                v.extend_from_slice(state);
+                v
+            }
         }
     }
 
@@ -171,16 +191,24 @@ impl ToHelper {
             kind::DECODE => Some(4 + MAX_BITSTREAM as usize),
             kind::GRANT => Some(13),
             kind::DRAIN | kind::FLUSH | kind::CLOSE => Some(0),
+            kind::RESUME => Some(2 + MAX_RESUME),
             _ => None,
         })?;
         let exact = |n: usize| if b.len() == n { Ok(()) } else { Err(bad("body size")) };
         Ok(match k {
-            kind::OPEN => {
-                exact(2)?;
+            kind::OPEN | kind::RESUME => {
+                if b.len() < 2 || (k == kind::OPEN && b.len() != 2) {
+                    return Err(bad("body size"));
+                }
                 if b[1] & !OPEN_DECODE_ORDER != 0 {
                     return Err(bad("open flags"));
                 }
-                ToHelper::Open { session, codec: Codec::from_u8(b[0]).ok_or_else(|| bad("codec"))?, flags: b[1] }
+                let codec = Codec::from_u8(b[0]).ok_or_else(|| bad("codec"))?;
+                if k == kind::RESUME {
+                    ToHelper::Resume { session, codec, flags: b[1], state: b[2..].to_vec() }
+                } else {
+                    ToHelper::Open { session, codec, flags: b[1] }
+                }
             }
             kind::DECODE => {
                 if b.len() < 4 {
@@ -212,7 +240,8 @@ impl FromHelper {
             | FromHelper::Picture { session, .. }
             | FromHelper::Consumed { session, .. }
             | FromHelper::DrainDone { session }
-            | FromHelper::Error { session, .. } => *session,
+            | FromHelper::Error { session, .. }
+            | FromHelper::Resume { session, .. } => *session,
         }
     }
 
@@ -250,6 +279,11 @@ impl FromHelper {
                 v.extend_from_slice(&errno.to_le_bytes());
                 v
             }
+            FromHelper::Resume { session, state } => {
+                let mut v = header(kind::RESUMABLE, *session, state.len());
+                v.extend_from_slice(state);
+                v
+            }
         }
     }
 
@@ -268,6 +302,7 @@ impl FromHelper {
             kind::CONSUMED => Some(5),
             kind::DRAIN_DONE => Some(0),
             kind::ERROR => Some(4),
+            kind::RESUMABLE => Some(MAX_RESUME),
             _ => None,
         })?;
         let exact = |n: usize| if b.len() == n { Ok(()) } else { Err(bad("body size")) };
@@ -302,6 +337,7 @@ impl FromHelper {
                 FromHelper::Consumed { session, cookie: u32_at(&b, 0), ok: b[4] != 0 }
             }
             kind::DRAIN_DONE => FromHelper::DrainDone { session },
+            kind::RESUMABLE => FromHelper::Resume { session, state: b },
             _ => {
                 exact(4)?;
                 FromHelper::Error { session, errno: u32_at(&b, 0) }
@@ -324,6 +360,7 @@ mod tests {
             ToHelper::Drain { session: 0 },
             ToHelper::Flush { session: 0 },
             ToHelper::Close { session: 7 },
+            ToHelper::Resume { session: 2, codec: Codec::Vp9, flags: 0, state: vec![0x82, 0x49] },
         ];
         for m in to {
             assert_eq!(ToHelper::read_from(&mut &m.encode()[..]).unwrap(), m);
@@ -335,6 +372,7 @@ mod tests {
             FromHelper::Consumed { session: 1, cookie: 9, ok: true },
             FromHelper::DrainDone { session: 1 },
             FromHelper::Error { session: 1, errno: 22 },
+            FromHelper::Resume { session: 3, state: vec![0, 0, 1, 0x67] },
         ];
         for m in from {
             assert_eq!(FromHelper::read_from(&mut &m.encode()[..]).unwrap(), m);

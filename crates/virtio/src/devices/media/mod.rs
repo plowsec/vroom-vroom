@@ -21,6 +21,8 @@ pub mod v4l2;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use vroom_memory::{GuestAddress, GuestMemory};
 use vroom_video::proto::{FromHelper, ToHelper, MAX_SESSIONS, OPEN_DECODE_ORDER};
 use vroom_video::{Codec, Layout, PixFmt, MAX_BITSTREAM, MAX_SIDE, MIN_SIDE};
@@ -107,6 +109,7 @@ impl Media {
             events: VecDeque::new(),
             next_cookie: 1,
             helper_lost: false,
+            last_dump: None,
         }
     }
 }
@@ -136,6 +139,17 @@ impl Alloc {
 
     fn free(&mut self, off: u64) {
         self.used.remove(&off);
+    }
+
+    /// Take `len` bytes at `off` (a restored buffer), if free.
+    fn claim(&mut self, off: u64, len: u64) -> bool {
+        let len = len.div_ceil(BUF_ALIGN) * BUF_ALIGN;
+        let Some(end) = off.checked_add(len).filter(|&e| e <= WINDOW) else { return false };
+        if !off.is_multiple_of(BUF_ALIGN) || self.used.range(..end).next_back().is_some_and(|(&o, &l)| o + l > off) {
+            return false;
+        }
+        self.used.insert(off, len);
+        true
     }
 
     fn len(&self, off: u64) -> Option<u64> {
@@ -221,6 +235,11 @@ struct Session {
     sub_eos: bool,
     sequence: u32,
     dead: bool,
+    /// The helper's state to open this stream again (snapshots): opaque.
+    resume: Vec<u8>,
+    /// Bitstream buffers sent, pictures delivered (debug logs).
+    stat_sent: u64,
+    stat_pictures: u64,
 }
 
 impl Session {
@@ -260,6 +279,9 @@ impl Session {
             sub_eos: false,
             sequence: 0,
             dead: false,
+            resume: Vec::new(),
+            stat_sent: 0,
+            stat_pictures: 0,
         }
     }
 
@@ -285,6 +307,7 @@ struct Handler {
     events: VecDeque<Vec<u8>>,
     next_cookie: u32,
     helper_lost: bool,
+    last_dump: Option<std::time::Instant>,
 }
 
 impl std::fmt::Debug for Handler {
@@ -412,6 +435,9 @@ impl Handler {
             }
             ctx.add_used(1, head, n);
         }
+        if !self.events.is_empty() {
+            log::trace!("media: {} events wait for event buffers", self.events.len());
+        }
     }
 
     fn send(&mut self, m: &ToHelper) {
@@ -451,6 +477,9 @@ impl Handler {
             let Some(b) = s.cap_queue.get(s.granted as usize).and_then(|&i| s.cap_bufs.get(i as usize)) else { break };
             grants.push(ToHelper::Grant { session: id, epoch: s.epoch, offset: b.off as u32, len: b.len, format: s.cap_fmt });
             s.granted += 1;
+        }
+        if !grants.is_empty() {
+            log::trace!("media: session {id}: {} more granted, {} in all", grants.len(), s.granted);
         }
         for m in grants {
             self.send(&m);
@@ -514,6 +543,7 @@ impl Handler {
             while s.stamps.len() > 128 {
                 s.stamps.pop_front();
             }
+            s.stat_sent += 1;
             self.send(&ToHelper::Decode { session: id, cookie: inp.cookie, data });
             // We have our copy: the guest may fill the buffer again. (A
             // player that finds every bitstream buffer busy at the end of
@@ -543,6 +573,7 @@ impl Handler {
         }
         match m {
             FromHelper::Caps { .. } => {}
+            FromHelper::Resume { state, .. } => s.resume = state,
             FromHelper::Format { layout, visible, min_buffers, depth, .. } => {
                 let old = s.layout.replace(layout);
                 s.visible = visible;
@@ -591,6 +622,9 @@ impl Handler {
                 let Some(b) = s.cap_bufs.get_mut(index as usize) else { return };
                 b.ts = ts;
                 b.bytesused = if good { bytes } else { 0 };
+                if let Some(s) = self.sessions.get_mut(&id) {
+                    s.stat_pictures += 1;
+                }
                 self.dqbuf_event(id, Dir::Capture, index, if good { 0 } else { BUF_FLAG_ERROR }, seq);
             }
             FromHelper::Consumed { cookie, ok, .. } => {
@@ -1274,6 +1308,40 @@ impl QueueHandler for Handler {
         self.link.set_poker(poker);
     }
 
+    /// With trace logs on: what every decoder waits on, every 2 seconds.
+    fn tick_interval(&mut self) -> Option<std::time::Duration> {
+        log::log_enabled!(log::Level::Debug).then(|| std::time::Duration::from_secs(2))
+    }
+
+    fn tick(&mut self, _ctx: &mut QueueCtx) {
+        let now = std::time::Instant::now();
+        if self.last_dump.is_some_and(|t| now.duration_since(t).as_secs() < 2) {
+            return;
+        }
+        self.last_dump = Some(now);
+        for (id, s) in &self.sessions {
+            let q = |v: &Vec<Buf>| v.iter().map(|b| if b.queued { 'q' } else { '-' }).collect::<String>();
+            log::debug!(
+                "media: session {id}: sent {}, pictures {}, streaming {}/{}, pending {}, in flight {} ({} bytes), picture queue {:?}, granted {}, out [{}], cap [{}], last {}, restart {}, draining {}, {} events wait",
+                s.stat_sent,
+                s.stat_pictures,
+                s.out_streaming,
+                s.cap_streaming,
+                s.pending.len(),
+                s.in_flight.len(),
+                s.in_flight_bytes,
+                s.cap_queue,
+                s.granted,
+                q(&s.out_bufs),
+                q(&s.cap_bufs),
+                s.last_pending,
+                s.awaiting_restart,
+                s.draining,
+                self.events.len()
+            );
+        }
+    }
+
     /// The VM pauses (snapshot, suspend): answer every command the guest
     /// is waiting on first. Its driver gives up on a command after 5
     /// seconds of guest time, and a snapshot can take longer than that.
@@ -1329,22 +1397,224 @@ impl VirtioDevice for Media {
         self.worker.resume();
     }
     fn save_active(&mut self) -> Result<DeviceState> {
-        // Decoders don't survive a snapshot (VideoToolbox state can't be
-        // saved): keep their ids, and tell the guest they failed on restore.
-        let ids: Vec<u32> = self.worker.with(|_, h| h.sessions.keys().copied().collect()).unwrap_or_default();
-        let data = serde_json::to_vec(&ids).map_err(|e| crate::Error::Device(e.to_string()))?;
+        // VideoToolbox's state can't be saved, but what opens a stream
+        // again can: the V4L2 side (formats, buffers, queues) and the
+        // helper's resume state. After a restore the stream goes on from
+        // its next key frame.
+        let saved: Vec<Saved> = self.worker.with(|_, h| h.sessions.iter().map(|(&id, s)| Saved::of(id, s)).collect()).unwrap_or_default();
+        let data = serde_json::to_vec(&saved).map_err(|e| crate::Error::Device(e.to_string()))?;
         Ok(DeviceState { queues: self.worker.queues(), data })
     }
     fn restore_active(&mut self, ctx: ActivateContext, data: &[u8]) -> Result<()> {
-        let ids: Vec<u32> = serde_json::from_slice(data).unwrap_or_default();
         let mut h = self.handler();
-        for id in ids.into_iter().filter(|&i| i < MAX_SESSIONS) {
-            let mut s = Session::new();
-            s.dead = true;
-            h.sessions.insert(id, s);
-            h.error_event(id, EIO);
-        }
+        h.restore(data);
         self.worker.start("media", ctx, h, true)
+    }
+}
+
+/// A decoder as a snapshot keeps it. All of it is checked again on
+/// restore (a snapshot is a file the user could have changed).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Saved {
+    id: u32,
+    codec: u8,
+    out_size: (u32, u32),
+    sizeimage: u32,
+    layout: Option<(u32, u32)>,
+    provisional: (u32, u32),
+    visible: (u32, u32),
+    cap_fmt: u8,
+    depth: u32,
+    delay: (bool, u32),
+    min_buffers: u32,
+    /// (offset, length, queued) of each buffer.
+    out_bufs: Vec<(u64, u32, bool)>,
+    cap_bufs: Vec<(u64, u32, bool)>,
+    streaming: (bool, bool),
+    /// (codec, flags) the helper had it open with.
+    open: Option<(u8, u8)>,
+    cap_queue: Vec<u32>,
+    epoch: u32,
+    subscribed: (bool, bool),
+    sequence: u32,
+    /// awaiting_restart, last_pending, last_is_eos, draining.
+    flags: (bool, bool, bool, bool),
+    dead: bool,
+    resume: Vec<u8>,
+}
+
+impl Saved {
+    fn of(id: u32, s: &Session) -> Saved {
+        let bufs = |v: &Vec<Buf>| v.iter().map(|b| (b.off, b.len, b.queued)).collect();
+        Saved {
+            id,
+            codec: s.codec.to_u8(),
+            out_size: (s.out_w, s.out_h),
+            sizeimage: s.sizeimage,
+            layout: s.layout.map(|l| (l.width, l.height)),
+            provisional: (s.provisional.width, s.provisional.height),
+            visible: s.visible,
+            cap_fmt: s.cap_fmt.to_u8(),
+            depth: s.depth,
+            delay: (s.delay_enable, s.delay),
+            min_buffers: s.min_buffers,
+            out_bufs: bufs(&s.out_bufs),
+            cap_bufs: bufs(&s.cap_bufs),
+            streaming: (s.out_streaming, s.cap_streaming),
+            open: s.open.map(|(c, f)| (c.to_u8(), f)),
+            cap_queue: s.cap_queue.iter().copied().collect(),
+            epoch: s.epoch,
+            subscribed: (s.sub_src, s.sub_eos),
+            sequence: s.sequence,
+            flags: (s.awaiting_restart, s.last_pending, s.last_is_eos, s.draining),
+            dead: s.dead,
+            resume: s.resume.clone(),
+        }
+    }
+}
+
+impl Handler {
+    /// Decoders from a snapshot. One whose saved state doesn't hold
+    /// together fails in the guest; so do those of an older snapshot
+    /// (which kept only their ids).
+    fn restore(&mut self, data: &[u8]) {
+        let saved = match serde_json::from_slice::<Vec<Saved>>(data) {
+            Ok(v) => v,
+            Err(_) => {
+                let ids: Vec<u32> = serde_json::from_slice(data).unwrap_or_default();
+                for id in ids.into_iter().filter(|&i| i < MAX_SESSIONS) {
+                    self.fail_restored(id);
+                }
+                return;
+            }
+        };
+        for sv in saved {
+            let id = sv.id;
+            if id >= MAX_SESSIONS || self.sessions.contains_key(&id) {
+                continue;
+            }
+            match self.rebuild(&sv) {
+                Some(s) => {
+                    self.sessions.insert(id, s);
+                    self.resume_session(id, sv.resume);
+                }
+                None => {
+                    log::warn!("media: session {id}: saved state doesn't hold together");
+                    self.fail_restored(id);
+                }
+            }
+        }
+    }
+
+    fn fail_restored(&mut self, id: u32) {
+        let mut s = Session::new();
+        s.dead = true;
+        self.sessions.insert(id, s);
+        self.error_event(id, EIO);
+    }
+
+    /// A session from its saved state, its buffers back where they were
+    /// in the window (the guest has them mapped). None: it doesn't hold
+    /// together.
+    fn rebuild(&mut self, sv: &Saved) -> Option<Session> {
+        let mut s = Session::new();
+        s.codec = Codec::from_u8(sv.codec).filter(|c| self.codecs.contains(c))?;
+        let side = |v: u32| (MIN_SIDE..=MAX_SIDE).contains(&v);
+        if !side(sv.out_size.0) || !side(sv.out_size.1) || !(MIN_BITSTREAM..=MAX_BITSTREAM).contains(&sv.sizeimage) {
+            return None;
+        }
+        (s.out_w, s.out_h, s.sizeimage) = (sv.out_size.0, sv.out_size.1, sv.sizeimage);
+        s.layout = match sv.layout {
+            Some((width, height)) => Some(Some(Layout { width, height }).filter(|l| l.valid())?),
+            None => None,
+        };
+        s.provisional = Some(Layout { width: sv.provisional.0, height: sv.provisional.1 }).filter(|l| l.valid())?;
+        let l = s.cap_layout();
+        if sv.visible.0 == 0 || sv.visible.1 == 0 || sv.visible.0 > l.width || sv.visible.1 > l.height {
+            return None;
+        }
+        s.visible = sv.visible;
+        s.cap_fmt = PixFmt::from_u8(sv.cap_fmt)?;
+        if (sv.depth != 8 && sv.depth != 10) || sv.delay.1 > 16 || !(1..=32).contains(&sv.min_buffers) {
+            return None;
+        }
+        (s.depth, s.delay_enable, s.delay, s.min_buffers) = (sv.depth, sv.delay.0, sv.delay.1, sv.min_buffers);
+        if sv.out_bufs.len() > MAX_OUTPUT_BUFS as usize || sv.cap_bufs.len() > MAX_CAPTURE_BUFS as usize {
+            return None;
+        }
+        let mut took = Vec::new();
+        let mut ok = true;
+        for (saved, max, into) in [(&sv.out_bufs, MAX_BITSTREAM, &mut s.out_bufs), (&sv.cap_bufs, vroom_video::MAX_PICTURE, &mut s.cap_bufs)] {
+            for &(off, len, queued) in saved {
+                if !ok || len == 0 || len > max || !self.alloc.claim(off, len as u64) {
+                    ok = false;
+                    break;
+                }
+                took.push(off);
+                into.push(Buf { off, len, queued, bytesused: 0, ts: [0; 16] });
+            }
+        }
+        let checked = (|| {
+            if !ok {
+                return None;
+            }
+            (s.out_streaming, s.cap_streaming) = sv.streaming;
+            s.open = match sv.open {
+                Some((c, f)) => Some((Codec::from_u8(c).filter(|&c| c == s.codec)?, f & OPEN_DECODE_ORDER)),
+                None => None,
+            };
+            // Queued picture buffers stay queued.
+            for &i in &sv.cap_queue {
+                if s.cap_bufs.get(i as usize).is_none_or(|b| !b.queued) || s.cap_queue.contains(&i) {
+                    return None;
+                }
+                s.cap_queue.push_back(i);
+            }
+            Some(())
+        })();
+        if checked.is_none() {
+            for off in took {
+                self.alloc.free(off);
+            }
+            return None;
+        }
+        for (i, b) in s.cap_bufs.iter_mut().enumerate() {
+            b.queued = s.cap_queue.contains(&(i as u32));
+        }
+        s.epoch = sv.epoch.wrapping_add(1);
+        (s.sub_src, s.sub_eos) = sv.subscribed;
+        s.sequence = sv.sequence;
+        let (restart, last, eos, draining) = sv.flags;
+        s.awaiting_restart = restart;
+        // A drain under way: its pictures are gone, it ends now.
+        s.last_pending = last || draining;
+        s.last_is_eos = eos || draining;
+        s.dead = sv.dead;
+        Some(s)
+    }
+
+    /// Give the guest back its queued bitstream buffers (their bytes were
+    /// in the window, which a snapshot doesn't keep), open the stream in
+    /// the new helper and grant it the picture buffers.
+    fn resume_session(&mut self, id: u32, state: Vec<u8>) {
+        let Some(s) = self.sessions.get_mut(&id) else { return };
+        let queued: Vec<u32> = s.out_bufs.iter().enumerate().filter(|(_, b)| b.queued).map(|(i, _)| i as u32).collect();
+        let (open, dead, epoch, fmt) = (s.open, s.dead, s.epoch, s.cap_fmt);
+        s.resume = state.clone();
+        for i in queued {
+            self.dqbuf_event(id, Dir::Output, i, 0, 0);
+        }
+        if dead {
+            self.error_event(id, EIO);
+            return;
+        }
+        if let Some((codec, flags)) = open {
+            let m = if state.is_empty() { ToHelper::Open { session: id, codec, flags } } else { ToHelper::Resume { session: id, codec, flags, state } };
+            self.send(&m);
+            self.send(&ToHelper::Grant { session: id, epoch, offset: 0, len: 0, format: fmt });
+        }
+        self.deliver_last(id);
+        self.grant(id);
     }
 }
 

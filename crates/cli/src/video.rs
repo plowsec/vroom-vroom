@@ -23,7 +23,7 @@ use std::sync::mpsc;
 
 use vroom_video::nal::{self, ParamSets};
 use vroom_video::poc::{Picture, Poc, Reorder};
-use vroom_video::proto::{FromHelper, ToHelper, MAX_GRANTS, MAX_HELD, OPEN_DECODE_ORDER};
+use vroom_video::proto::{FromHelper, ToHelper, MAX_GRANTS, MAX_HELD, MAX_RESUME, OPEN_DECODE_ORDER};
 use vroom_video::vpx::{self, Config};
 use vroom_video::{Codec, Layout, PixFmt};
 
@@ -166,6 +166,13 @@ struct Stream {
     draining: bool,
     tag: u64,
     dead: bool,
+    /// What a new helper needs to open this stream again (snapshots), to
+    /// send to the VMM; and what we last sent.
+    resume: Option<Vec<u8>>,
+    resume_sent: Vec<u8>,
+    /// Samples sent to VideoToolbox, pictures back, pictures to the VMM
+    /// (debug logs).
+    stats: (u64, u64, u64),
 }
 
 impl Stream {
@@ -188,7 +195,55 @@ impl Stream {
             draining: false,
             tag: 0,
             dead: false,
+            resume: None,
+            resume_sent: Vec::new(),
+            stats: (0, 0, 0),
         }
+    }
+
+    /// Note the stream's resume state if it changed.
+    fn note_resume(&mut self, state: Vec<u8>) {
+        if state.len() <= MAX_RESUME && state != self.resume_sent {
+            self.resume = Some(state);
+        }
+    }
+
+    /// Open the stream from a resume state (after a restore): its
+    /// parameter sets, VP9 key frame header or AV1 sequence header. Guest
+    /// data like any other: it goes through the same parsing.
+    fn prime(&mut self, state: &[u8]) {
+        match self.codec {
+            Codec::H264 | Codec::Hevc => {
+                let parsed = nal::parse(self.codec, state);
+                for &(_, p, id, n) in parsed.params.iter().take(MAX_UNITS) {
+                    self.param(p, id, n);
+                }
+                self.reformat();
+            }
+            Codec::Vp9 => {
+                let mut refs = [(0, 0); 8];
+                if let Some(c) = vpx::vp9_header(state, &mut refs).filter(|h| h.key).and_then(|h| h.config) {
+                    self.vpx.refs = refs;
+                    if self.start(Desc::Vp9(&c)) {
+                        self.vpx.config = Some(c);
+                    }
+                }
+            }
+            Codec::Av1 => {
+                for o in vpx::av1_obus(state) {
+                    if o.kind != vpx::obu::SEQUENCE_HEADER || o.data.len() > vpx::MAX_SEQUENCE_HEADER {
+                        continue;
+                    }
+                    if let Some(c) = vpx::av1_sequence(&o.data[o.payload..]) {
+                        if self.start(Desc::Av1(&c, o.data)) {
+                            self.vpx.config = Some(c);
+                            self.vpx.sequence = o.data.to_vec();
+                        }
+                    }
+                }
+            }
+        }
+        self.resume_sent = state.to_vec();
     }
 
     fn pictures_held(&self) -> usize {
@@ -200,6 +255,7 @@ impl Stream {
     fn collect(&mut self) {
         let Some(vt) = &mut self.vt else { return };
         for d in vt.take() {
+            self.stats.1 += 1;
             let Some((cookie, poc, depth)) = self.decoding.remove(&d.tag) else { continue };
             if self.decode_order {
                 self.out.push_back(Out::Picture { cookie, image: d.image });
@@ -276,12 +332,22 @@ impl Stream {
         let sets: Vec<Vec<u8>> = self.params.list().into_iter().map(|s| s.to_vec()).collect();
         let sets: Vec<&[u8]> = sets.iter().map(|s| s.as_slice()).collect();
         let depth = self.params.depth();
+        let mut state = Vec::new();
+        for s in &sets {
+            state.extend_from_slice(&[0, 0, 0, 1]);
+            state.extend_from_slice(s);
+        }
         if let Some(vt) = &mut self.vt {
             if vt.depth == depth && vt.accept(self.codec, &sets) == Some(true) {
+                self.note_resume(state);
                 return true;
             }
         }
-        self.start(Desc::Nal(self.codec, &sets, depth))
+        let ok = self.start(Desc::Nal(self.codec, &sets, depth));
+        if ok {
+            self.note_resume(state);
+        }
+        ok
     }
 
     fn param(&mut self, p: nal::Param, id: u32, n: &[u8]) -> bool {
@@ -297,6 +363,7 @@ impl Stream {
             self.finish();
         }
         self.decoding.insert(tag, (cookie, pic.poc, pic.reorder));
+        self.stats.0 += 1;
         let reorder = !self.decode_order;
         let ok = self.vt.as_mut().is_some_and(|vt| vt.decode(sample, tag, tag as i64, reorder));
         self.collect();
@@ -367,12 +434,14 @@ impl Stream {
         let mut config = None;
         let mut shows = false;
         let mut any = false;
+        let mut key: &[u8] = &[];
         for f in vpx::vp9_frames(data) {
             let Some(h) = vpx::vp9_header(f, &mut self.vpx.refs) else { continue };
             any = true;
             shows |= h.show || h.show_existing.is_some();
             if h.key {
                 config = h.config;
+                key = f;
             }
         }
         if !any {
@@ -387,6 +456,8 @@ impl Stream {
                     self.skipped(cookie);
                     return false;
                 }
+                // The key frame's header is enough to open the stream again.
+                self.note_resume(key[..key.len().min(64)].to_vec());
             }
         }
         if self.vt.is_none() {
@@ -427,6 +498,7 @@ impl Stream {
                             self.skipped(cookie);
                             return false;
                         }
+                        self.note_resume(o.data.to_vec());
                     }
                     sample.extend_from_slice(o.data);
                 }
@@ -503,6 +575,21 @@ pub fn helper(args: &[String]) -> Result<(), String> {
                 Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
             }
         } else {
+            if log::log_enabled!(log::Level::Debug) {
+                for (id, s) in &streams {
+                    log::debug!(
+                        "video: session {id} waits: {} inputs, {} out ({} pictures), {} grants, epoch {}, decoding {}, reorder {}, samples/pictures/sent {:?}",
+                        s.inputs.len(),
+                        s.out.len(),
+                        s.pictures_held(),
+                        s.grants.len(),
+                        s.epoch,
+                        s.decoding.len(),
+                        s.reorder.len(),
+                        s.stats
+                    );
+                }
+            }
             match msgs.recv() {
                 Ok(m) => Some(m),
                 Err(_) => return Ok(()),
@@ -592,6 +679,11 @@ fn handle(streams: &mut BTreeMap<u32, Stream>, link: &mut Link, m: ToHelper) {
         ToHelper::Close { session } => {
             streams.remove(&session);
         }
+        ToHelper::Resume { session, codec, flags, state } => {
+            let mut s = Stream::new(codec, flags);
+            s.prime(&state);
+            streams.insert(session, s);
+        }
     }
 }
 
@@ -599,6 +691,10 @@ fn handle(streams: &mut BTreeMap<u32, Stream>, link: &mut Link, m: ToHelper) {
 fn work(session: u32, s: &mut Stream, link: &mut Link, window: &Window) {
     if s.dead {
         return;
+    }
+    if let Some(state) = s.resume.take() {
+        link.send(FromHelper::Resume { session, state: state.clone() });
+        s.resume_sent = state;
     }
     while s.pictures_held() < MAX_HELD {
         let Some((cookie, data)) = s.inputs.pop_front() else { break };
@@ -637,6 +733,7 @@ fn work(session: u32, s: &mut Stream, link: &mut Link, window: &Window) {
                     (Some(i), Some(l)) => window.write(g, i, l),
                     _ => None,
                 };
+                s.stats.2 += 1;
                 link.send(FromHelper::Picture { session, epoch: s.epoch, cookie, offset: g.offset, bytes: bytes.unwrap_or(0), ok: bytes.is_some() });
             }
         }

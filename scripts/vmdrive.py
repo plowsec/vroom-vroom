@@ -7,6 +7,7 @@ Commands, one per line, on <state-dir>.cmd (a fifo):
   type TEXT              US layout
   shot                   screendump (path shows in <state-dir>.log; other
                          monitors next to it, as -2.png, -3.png...)
+  snapshot | suspend     what Ctrl-A s / Ctrl-A z do on the console
   resize W H | focus 0|1 | clip TEXT | cmd N | quit
   hmove N X Y | hclick N X Y   on monitor N (2, 3...), its guest pixels
   hresize N W H          monitor N's window size (0 0: closed)
@@ -331,6 +332,8 @@ if True:
                     for k in reversed(codes): key(k, False)
                 elif c == "type": type_text(arg.replace("\\n", "\n"))
                 elif c == "shot": p.stdin.write(b"\x01g"); p.stdin.flush()
+                elif c == "snapshot": p.stdin.write(b"\x01s"); p.stdin.flush()
+                elif c == "suspend": p.stdin.write(b"\x01z"); p.stdin.flush()
                 elif c == "resize": send(5, u32s(*map(int, arg.split())))
                 elif c == "focus": send(6, bytes([int(arg)]))
                 elif c == "clip": send(7, arg.encode())

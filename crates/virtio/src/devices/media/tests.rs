@@ -41,6 +41,7 @@ impl T {
             events: VecDeque::new(),
             next_cookie: 1,
             helper_lost: false,
+            last_dump: None,
         };
         T { h, link }
     }
@@ -400,4 +401,57 @@ fn codecs_the_mac_lacks_are_not_offered() {
     // Asking for VP9 gets H.264.
     let (_, f) = t.fmt(ioc::S_FMT, OUTPUT_MPLANE, PIX_VP9, 640, 480);
     assert_eq!(get_u32(&f, fmt::PIXELFORMAT), PIX_H264);
+}
+
+#[test]
+fn a_decoder_comes_back_after_a_restore() {
+    let mut t = T::new();
+    t.open();
+    subscribe(&mut t, EVENT_SOURCE_CHANGE);
+    t.fmt(ioc::S_FMT, OUTPUT_MPLANE, PIX_HEVC, 1280, 720);
+    t.reqbufs(OUTPUT_MPLANE, 2);
+    t.reqbufs(CAPTURE_MPLANE, 3);
+    t.stream(ioc::STREAMON, OUTPUT_MPLANE);
+    t.stream(ioc::STREAMON, CAPTURE_MPLANE);
+    let layout = Layout { width: 1280, height: 720 };
+    t.reply(FromHelper::Format { session: 0, layout, visible: (1280, 720), min_buffers: 4, depth: 8 });
+    t.reply(FromHelper::Resume { session: 0, state: vec![0, 0, 0, 1, 0x40, 1] });
+    for i in 0..3 {
+        t.qbuf(CAPTURE_MPLANE, i, 0);
+    }
+    // A bitstream buffer still waiting when the snapshot is taken: the
+    // helper is busy (in flight at its cap).
+    t.h.sessions.get_mut(&0).unwrap().in_flight.insert(99, MAX_IN_FLIGHT);
+    t.h.sessions.get_mut(&0).unwrap().in_flight_bytes = MAX_IN_FLIGHT;
+    t.qbuf(OUTPUT_MPLANE, 1, 100);
+    let saved: Vec<Saved> = t.h.sessions.iter().map(|(&id, s)| Saved::of(id, s)).collect();
+    let data = serde_json::to_vec(&saved).unwrap();
+    let offs: Vec<u64> = t.h.sessions[&0].cap_bufs.iter().map(|b| b.off).collect();
+
+    // A new VMM, a new helper.
+    let mut u = T::new();
+    u.h.restore(&data);
+    let sent = u.sent();
+    assert_eq!(sent[0], ToHelper::Resume { session: 0, codec: Codec::Hevc, flags: 0, state: vec![0, 0, 0, 1, 0x40, 1] });
+    let grants: Vec<u64> = sent.iter().filter_map(|m| if let ToHelper::Grant { offset, len, .. } = m { (*len > 0).then_some(*offset as u64) } else { None }).collect();
+    assert_eq!(grants, offs, "the queued picture buffers, where they were");
+    // The waiting bitstream buffer comes back to the guest.
+    assert_eq!(u.events(), vec![(EVT_DQBUF, OUTPUT_MPLANE, 1, BUF_FLAG_TIMESTAMP_COPY, 0)]);
+    // Same buffers mapped at the same offsets; the window has room for no
+    // overlap.
+    assert_eq!(u.h.alloc.used.len(), 5);
+    assert_eq!(u.qbuf(OUTPUT_MPLANE, 1, 10), 0);
+
+    // A state that doesn't hold together fails that decoder only.
+    let mut bad = saved.clone();
+    bad[0].cap_bufs[1].0 = bad[0].cap_bufs[0].0; // overlapping buffers
+    let mut v = T::new();
+    v.h.restore(&serde_json::to_vec(&bad).unwrap());
+    assert!(v.h.sessions[&0].dead);
+    assert!(v.h.alloc.used.is_empty());
+    assert_eq!(v.events(), vec![(EVT_ERROR, EIO, 0, 0, 0)]);
+    // An older snapshot (ids only): failed.
+    let mut w = T::new();
+    w.h.restore(b"[0]");
+    assert!(w.h.sessions[&0].dead);
 }
