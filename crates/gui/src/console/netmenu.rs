@@ -3,7 +3,10 @@
 //!
 //! The VM file says what each adapter should be. When it changes (here,
 //! or on the settings page) we tell the VMM: the cable in or out
-//! (`ToVmm::NetConnect`), another network (`ToVmm::NetSet`). The VMM is
+//! (`ToVmm::NetConnect`), another network (`ToVmm::NetSet`), a new
+//! adapter (`ToVmm::NetAdd`, a VM on PCI: it goes in a hot plug slot) or
+//! one taken out (`ToVmm::NetRemove` for one added so; the ones the VM
+//! started with are unplugged until the next start). The VMM is
 //! sandboxed and can't reach vroom-netd: for bridged and host-only we ask
 //! netd for the port and hand the VMM its socket, as for USB helpers. The
 //! VMM says what each adapter is now (`ToViewer::Net`); the menu and the
@@ -33,8 +36,8 @@ const BUSY_FOR: Duration = Duration::from_secs(20);
 #[derive(Default)]
 pub(super) struct NetMenu {
     /// What the VMM says each adapter is now; whether it may switch one
-    /// to NAT.
-    live: Option<(bool, Vec<NetPort>)>,
+    /// to NAT; whether it can add adapters while it runs.
+    live: Option<(bool, bool, Vec<NetPort>)>,
     /// The VM file's adapters (by index) to the VM's (this run). None:
     /// added since the VM started, it comes at the next start. Running
     /// adapters no entry points to were taken out of the file.
@@ -44,6 +47,9 @@ pub(super) struct NetMenu {
     held: Vec<(Instant, OwnedFd)>,
     /// The VM file's adapters when this window opened.
     start: Vec<vroom_config::Net>,
+    /// The VM file's adapter being added while the VM runs (it gets a
+    /// number from the VMM's next list).
+    adding: Option<usize>,
 }
 
 impl NetMenu {
@@ -56,6 +62,8 @@ impl NetMenu {
 #[derive(Debug, Clone, Default)]
 pub struct NetView {
     pub nat_ok: bool,
+    /// The VM file's adapter on its way in.
+    pub adding: Option<usize>,
     pub ports: Vec<NetPort>,
     /// The VM file's adapters to the VM's (see `NetMenu::map`).
     pub map: Vec<Option<u8>>,
@@ -120,6 +128,21 @@ pub fn mode_text(l: &NetLive) -> String {
     }
 }
 
+/// Running adapter `nic`, one added while the VM ran, was taken out: the
+/// VM's numbers after it move down one (it does the same), in the file's
+/// map and in the list we have.
+fn renumber(map: &mut [Option<u8>], ports: &mut Vec<NetPort>, nic: u8) {
+    for e in map.iter_mut().flatten() {
+        if *e > nic {
+            *e -= 1;
+        }
+    }
+    ports.retain(|p| p.nic != nic);
+    for p in ports.iter_mut().filter(|p| p.nic > nic) {
+        p.nic -= 1;
+    }
+}
+
 /// The same network (the cable may differ).
 fn same_net(a: &NetLive, b: &NetLive) -> bool {
     a.kind == b.kind && a.name == b.name && (a.kind != NetKind::Nat || (a.loopback == b.loopback && a.block_private == b.block_private))
@@ -144,7 +167,7 @@ fn edit_file(path: &Path, f: impl FnOnce(&mut VmConfig) -> Result<(), String>) -
 
 impl Console {
     /// The VMM's word on its adapters.
-    pub(super) fn net_list(&mut self, nat_ok: bool, ports: Vec<NetPort>) {
+    pub(super) fn net_list(&mut self, nat_ok: bool, hotplug: bool, ports: Vec<NetPort>) {
         let m = &mut self.net;
         if m.map.is_none() {
             // The file's adapters, in order, are the VM's (a resumed VM
@@ -152,10 +175,25 @@ impl Console {
             let n = VmConfig::load_raw(&self.path).map(|c| c.nets.len()).unwrap_or(ports.len());
             m.map = Some((0..n).map(|i| ports.iter().any(|p| p.nic as usize == i).then_some(i as u8)).collect());
         }
-        m.live = Some((nat_ok, ports));
+        // An adapter being added: the new number in the list is its.
+        let mut came = None;
+        if let (Some(fi), Some(map)) = (m.adding, m.map.as_mut()) {
+            if let Some(p) = ports.iter().find(|p| p.added && !map.contains(&Some(p.nic))) {
+                if let Some(e) = map.get_mut(fi) {
+                    *e = Some(p.nic);
+                    came = Some(fi);
+                }
+                m.adding = None;
+            }
+        }
+        m.live = Some((nat_ok, hotplug, ports));
         // It has the sockets it got (or refused them): let ours go.
         m.held.clear();
         m.busy.clear();
+        if let Some(fi) = came {
+            // Changed in the file meanwhile? Now it can follow.
+            self.net_apply(fi);
+        }
         self.net_bar();
         if self.win.get_net_open() {
             self.net_rows();
@@ -166,6 +204,7 @@ impl Console {
     pub(super) fn net_refused(&mut self) {
         self.net.busy.clear();
         self.net.held.clear();
+        self.net.adding = None;
         if self.win.get_net_open() {
             self.net_rows();
         }
@@ -182,14 +221,14 @@ impl Console {
     }
 
     pub(super) fn net_view(&self) -> Option<NetView> {
-        let (nat_ok, ports) = self.net.live.clone()?;
-        Some(NetView { nat_ok, ports, map: self.net.map.clone().unwrap_or_default(), start: self.net.start.clone() })
+        let (nat_ok, _, ports) = self.net.live.clone()?;
+        Some(NetView { nat_ok, adding: self.net.adding, ports, map: self.net.map.clone().unwrap_or_default(), start: self.net.start.clone() })
     }
 
     /// The toolbar button: there if the VM has adapters, marked if a
     /// cable is out.
     fn net_bar(&self) {
-        let ports = self.net.live.as_ref().map(|(_, p)| p.as_slice()).unwrap_or_default();
+        let ports = self.net.live.as_ref().map(|(_, _, p)| p.as_slice()).unwrap_or_default();
         self.win.set_net_shown(!ports.is_empty());
         self.win.set_net_off(ports.iter().filter(|p| !p.connected && self.file_index(p.nic).is_some()).count() as i32);
     }
@@ -210,7 +249,7 @@ impl Console {
             }
             return true;
         }
-        let ports = self.net.live.as_ref().map(|(_, p)| p.clone()).unwrap_or_default();
+        let ports = self.net.live.as_ref().map(|(_, _, p)| p.clone()).unwrap_or_default();
         if let Some(i) = cmd.strip_prefix("net.toggle.").and_then(|i| i.parse::<usize>().ok()) {
             if let Some(p) = ports.get(i) {
                 self.net_toggle(p);
@@ -227,7 +266,7 @@ impl Console {
     }
 
     fn net_rows(&mut self) {
-        let Some((nat_ok, ports)) = self.net.live.clone() else { return };
+        let Some((nat_ok, _, ports)) = self.net.live.clone() else { return };
         let rows: Vec<NetMenuRow> = ports
             .iter()
             .map(|p| {
@@ -287,7 +326,7 @@ impl Console {
         let Ok(cfg) = VmConfig::load_raw(&self.path) else { return };
         let Some(n) = cfg.nets.get(fi) else { return };
         let Some(nic) = self.net.map.as_ref().and_then(|m| m.get(fi).copied().flatten()) else { return };
-        let Some(p) = self.net.live.as_ref().and_then(|(_, ps)| ps.iter().find(|p| p.nic == nic).cloned()) else { return };
+        let Some(p) = self.net.live.as_ref().and_then(|(_, _, ps)| ps.iter().find(|p| p.nic == nic).cloned()) else { return };
         let Some(want) = live_of(n) else { return };
         if n.connected != p.connected {
             self.io.borrow_mut().send(ToVmm::NetConnect { nic, on: n.connected });
@@ -307,9 +346,14 @@ impl Console {
     }
 
     /// Ask vroom-netd for a port for `nic` (off the UI thread: it can take
-    /// seconds), then hand the VMM its socket.
+    /// seconds), then hand the VMM its socket. `add`: for a new adapter
+    /// (`ToVmm::NetAdd`), not a change of network.
     fn net_attach(&mut self, nic: u8, want: NetLive, mac: [u8; 6]) {
         self.net.busy.insert(nic, Instant::now());
+        self.netd_port(nic, want, mac, false);
+    }
+
+    fn netd_port(&mut self, nic: u8, want: NetLive, mac: [u8; 6], add: bool) {
         let vm: String = self.name.chars().filter(|c| c.is_ascii_alphanumeric() || "._-".contains(*c)).take(64).collect();
         let attach = match want.kind {
             NetKind::Bridged => netd::Attach::Bridged { interface: want.name.clone() },
@@ -327,16 +371,19 @@ impl Console {
                 e => e.to_string(),
             });
             let _ = slint::invoke_from_event_loop(move || {
-                with(&key, |c| c.net_attached(nic, want, r));
+                with(&key, |c| c.net_attached(nic, want, mac, add, r));
             });
         });
     }
 
-    fn net_attached(&mut self, nic: u8, want: NetLive, r: Result<(std::os::unix::net::UnixDatagram, [u8; 6]), String>) {
+    fn net_attached(&mut self, nic: u8, want: NetLive, mac: [u8; 6], add: bool, r: Result<(std::os::unix::net::UnixDatagram, [u8; 6]), String>) {
         let (sock, port_mac) = match r {
             Ok(x) => x,
             Err(e) => {
                 self.net.busy.remove(&nic);
+                if add {
+                    self.net.adding = None;
+                }
                 self.toast(&format!("Network: {e}"));
                 if self.win.get_net_open() {
                     self.net_rows();
@@ -344,39 +391,75 @@ impl Console {
                 return;
             }
         };
+        let m = if add { ToVmm::NetAdd { live: want, mac, port_mac } } else { ToVmm::NetSet { nic, live: want, port_mac } };
         let sent = match self.io.borrow().tx.as_ref() {
-            Some(tx) => vroom_display::send_fd_with(tx, &ToVmm::NetSet { nic, live: want, port_mac }.encode(), sock.as_raw_fd())
-                .map_err(|e| e.to_string()),
+            Some(tx) => vroom_display::send_fd_with(tx, &m.encode(), sock.as_raw_fd()).map_err(|e| e.to_string()),
             None => Err("the VM is gone".into()),
         };
         match sent {
             Ok(()) => self.net.held.push((Instant::now(), OwnedFd::from(sock))),
             Err(e) => {
                 self.net.busy.remove(&nic);
+                if add {
+                    self.net.adding = None;
+                }
                 self.toast(&format!("Network: {e}"));
             }
         }
     }
 
-    /// File adapter `fi` was taken out: its running adapter is unplugged
-    /// now and goes at the next start; the ones after it move up.
+    /// File adapter `fi` was taken out. One added while the VM ran goes
+    /// now (the VM's after it move up a number); one it started with is
+    /// unplugged now and goes at the next start; the file's after it
+    /// move up.
     pub(super) fn net_removed(&mut self, fi: usize) {
-        let Some(map) = self.net.map.as_mut() else { return };
+        let m = &mut self.net;
+        let Some(map) = m.map.as_mut() else { return };
         if fi >= map.len() {
             return;
         }
+        match m.adding {
+            Some(a) if a == fi => m.adding = None,
+            Some(a) if a > fi => m.adding = Some(a - 1),
+            _ => {}
+        }
         if let Some(nic) = map.remove(fi) {
-            self.io.borrow_mut().send(ToVmm::NetConnect { nic, on: false });
+            let added = m.live.as_ref().is_some_and(|(_, _, ps)| ps.iter().any(|p| p.nic == nic && p.added));
+            if added {
+                let mut none = Vec::new();
+                renumber(map, m.live.as_mut().map_or(&mut none, |(_, _, ps)| ps), nic);
+                m.busy.clear();
+                self.io.borrow_mut().send(ToVmm::NetRemove { nic });
+            } else {
+                self.io.borrow_mut().send(ToVmm::NetConnect { nic, on: false });
+            }
         }
         // Kept forwards are by index: the ones after it moved.
         STASH.with(|s| s.borrow_mut().retain(|(k, _), _| *k != self.key));
         self.net_bar();
+        if self.win.get_net_open() {
+            self.net_rows();
+        }
     }
 
-    /// An adapter was added to the file: it comes at the next start.
+    /// An adapter was added to the file: the VM gets it now if it can
+    /// (on PCI, one at a time), else at the next start.
     pub(super) fn net_added(&mut self) {
-        if let Some(map) = self.net.map.as_mut() {
-            map.push(None);
+        let Some(map) = self.net.map.as_mut() else { return };
+        map.push(None);
+        let fi = map.len() - 1;
+        let hotplug = self.net.live.as_ref().is_some_and(|(_, h, _)| *h);
+        if !hotplug || self.net.adding.is_some() {
+            return;
+        }
+        let Ok(cfg) = VmConfig::load_raw(&self.path) else { return };
+        let Some(n) = cfg.nets.get(fi) else { return };
+        let (Some(want), Ok(mac)) = (live_of(n), n.mac_of(&cfg.identity, &cfg.name, fi)) else { return };
+        self.net.adding = Some(fi);
+        if want.kind == NetKind::Nat {
+            self.io.borrow_mut().send(ToVmm::NetAdd { live: want, mac, port_mac: [0; 6] });
+        } else {
+            self.netd_port(fi as u8, want, mac, true);
         }
     }
 }
@@ -407,6 +490,19 @@ mod tests {
         other.nets[0] = c.nets[0].clone();
         set_mode("other", &mut other, 0, 0, None).unwrap();
         assert!(other.nets[0].port_forwards.is_empty());
+    }
+
+    #[test]
+    fn taking_out_an_added_adapter_renumbers_the_rest() {
+        let port = |nic, added| NetPort { nic, live: live_of(&cfg().nets[0]).unwrap(), connected: true, mac: [2; 6], added };
+        // File: adapter 0 (VM's 0), one removed from the file (VM's 1
+        // stays), then the added ones (VM's 2 and 3).
+        let mut map = vec![Some(0), Some(2), Some(3)];
+        let mut ports = vec![port(0, false), port(1, false), port(2, true), port(3, true)];
+        map.remove(1);
+        renumber(&mut map, &mut ports, 2);
+        assert_eq!(map, vec![Some(0), Some(2)]);
+        assert_eq!(ports.iter().map(|p| (p.nic, p.added)).collect::<Vec<_>>(), vec![(0, false), (1, false), (2, true)]);
     }
 
     #[test]

@@ -217,6 +217,8 @@ pub struct Identity {
     /// PCI IDs, "vendor:device" or "vendor:device:subvendor:subdevice" in
     /// hex. Without the subsystem part it is vendor:0000.
     pub pci_bridge_id: String,
+    /// The hot plug root ports (PCI Express root port).
+    pub pcie_port_id: String,
     pub nvme_pci_id: String,
     pub usb_pci_id: String,
     /// Sound card (HD Audio controller), when `[audio]` uses one.
@@ -269,6 +271,7 @@ impl Default for Identity {
             disk_serial: "VRM".into(),
             disk_firmware: "1.0".into(),
             pci_bridge_id: "1b36:0008".into(),
+            pcie_port_id: "1b36:000c".into(),
             nvme_pci_id: "1b36:0010".into(),
             usb_pci_id: "1b36:000d".into(),
             hda_pci_id: "8086:2668:1af4:1100".into(),
@@ -328,6 +331,7 @@ impl Identity {
         }
         for (what, v) in [
             ("pci_bridge_id", &self.pci_bridge_id),
+            ("pcie_port_id", &self.pcie_port_id),
             ("nvme_pci_id", &self.nvme_pci_id),
             ("usb_pci_id", &self.usb_pci_id),
             ("hda_pci_id", &self.hda_pci_id),

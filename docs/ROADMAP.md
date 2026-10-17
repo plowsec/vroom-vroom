@@ -251,13 +251,18 @@ A guest needs a driver and an API its players use. What exists:
   screen with its own scale would want per-monitor scales), Direct3D on
   Windows' first monitor only (the others are copied to 2D GPUs),
   Coherence on the first monitor only (the others are off meanwhile).
-- Network: adding an adapter while the VM runs needs PCI hotplug (a
-  hotplug-capable root port, ACPI); it waits for the next start now.
-  New port forwards on a running VM need listening sockets the sandbox
-  doesn't allow (the app could open them and hand them over). Host-only
-  on macOS gets no DHCP (see NETWORKING.md): netd could run a small DHCP
-  server per host-only network. The netd fixes (frame buffers, a busy
-  VMM drops frames, not the port) need netd set up again.
+- Network: new port forwards on a running VM need listening sockets the
+  sandbox doesn't allow (the app could open them and hand them over).
+  An adapter added while the VM ran is an ordinary one on the root bus
+  at the next start: Windows sees a new device there (a new "Ethernet
+  N", its settings not carried over); the VM file could say which slot
+  to keep it in. Hot plug for disks (the slots take any virtio device;
+  a save would record them as it does adapters) and for VMs on
+  virtio-mmio (Linux booted straight into its kernel) isn't there yet.
+  Host-only on macOS gets no DHCP (see NETWORKING.md): netd could run a
+  small DHCP server per host-only network. The netd fixes (frame
+  buffers, a busy VMM drops frames, not the port) need netd set up
+  again.
 - Rosetta for Linux guests (x86_64 Linux programs). Apple only offers it
   through its Virtualization framework; we'd have to look like it.
 - Benchmarks against VMware Fusion and Parallels on the same Mac, the
@@ -298,20 +303,17 @@ A guest needs a driver and an API its players use. What exists:
   - The GNOME Shell extension could serve the clipboard from inside the
     compositor, for Wayland desktops without Xwayland (the helper uses
     X11's clipboard; GNOME passes it to Wayland apps).
-  - Windows ignores an NVMe namespace's write-protect flag: it mounts a
-    read-only FAT disk read-write, and the refused writes stall it (setup
-    at 57%). Install sticks go in through a writable qcow2 layer for
-    that. Telling Windows the disk is read-only some other way (or
-    taking the writes in memory) would fix it for every read-only disk.
+  - Windows still mounts a read-only NVMe disk read-write (refused writes
+    fail fast now, see GUIDE.md "Read-only disks"). It looks at neither
+    the namespace's write-protect flag nor namespace write protection;
+    what its driver reports to the disk class driver (the write-protect
+    bit of MODE SENSE) we can't reach. A tools or install stick could be
+    a USB stick or a USB CD-ROM instead, which Windows does see as
+    read-only.
   - Signed tools: an update is checked by hash against the manifest the
     host sends; a signature would matter only if something other than
     the host could write the agent's port.
 
-- Flaky tests (October 17): `gpu3d server::tests::create_and_refuse`
-  (at the "same id again" refusal) and `devices hda::tests::playback_moves_buffers_at_real_time`
-  (a timing test) each failed once in a full `cargo test --workspace`
-  run on a loaded machine, and pass on their own. Find the race in the
-  first; give the second slack or a fake clock.
 
 ## Later
 

@@ -19,7 +19,7 @@ picks up the change.
 | `tpm` | false | TPM 2.0 (needs `swtpm`). Windows 11 wants it. |
 | `nested` | false | Let the guest run its own VMs. M3 or newer, macOS 15+. No snapshots then. |
 | `camera` | false | The Mac's camera, as a USB webcam in the guest (video calls). On only while the VM's window is open and an app in the guest uses it; the window shows when. See [GUIDE.md](GUIDE.md#camera). |
-| `virtio_transport` | `auto` | `auto` (MMIO for kernel boot, PCI for UEFI), `mmio`, `pci`. |
+| `virtio_transport` | `auto` | `auto` (MMIO for kernel boot, PCI for UEFI), `mmio`, `pci`. On PCI the VM also gets four PCI Express hot plug slots (network adapters added while it runs go there). |
 
 ## `[boot]`
 
@@ -49,7 +49,7 @@ cmdline = "console=ttyAMA0 root=/dev/vda1"
 | `path` | required | Image file. |
 | `format` | `auto` | `auto`, `raw`, `qcow2`. |
 | `bus` | `virtio` | `virtio` (fast, needs a driver) or `nvme` (every OS has a driver, Windows setup needs it). |
-| `readonly` | false | Guest can't write. |
+| `readonly` | false | Guest can't write. Linux and virtio disks in Windows see a read-only disk; Windows mounts a read-only NVMe disk read-write, and its writes fail ([GUIDE](GUIDE.md#read-only-disks)). |
 | `cdrom` | false | Show as a CD (installer ISOs). Needs `readonly = true`. |
 | `sync` | `fsync` | What a guest flush costs: `full` (power-loss safe, slow on macOS), `fsync` (survives a host crash), `none` (scratch disks). |
 
@@ -203,6 +203,7 @@ defaults below. New VMs get random serials, so two VMs never match.
 | `disk_serial` | `VRM` | disk serial prefix (NVMe and virtio), a number is added |
 | `disk_firmware` | `1.0` | NVMe firmware revision (up to 8) |
 | `pci_bridge_id` | `1b36:0008` | PCI IDs of the host bridge |
+| `pcie_port_id` | `1b36:000c` | PCI IDs of the hot plug root ports |
 | `nvme_pci_id` | `1b36:0010` | PCI IDs of the NVMe controller; Identify reports the same vendor |
 | `usb_pci_id` | `1b36:000d` | PCI IDs of the USB (xHCI) controller |
 | `hda_pci_id` | `8086:2668:1af4:1100` | PCI IDs of the HD Audio sound card (QEMU's `intel-hda`: an Intel ICH6) |

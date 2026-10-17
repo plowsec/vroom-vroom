@@ -78,8 +78,9 @@ in the IOKit registry (`usb::list::disks`, `mounts`).
   (`virtio::devices::fs::FsSlot`): a virtio-fs device whose tree can be
   swapped while the guest has it mounted. The worker takes the new tree
   at once (a poke), dropping every node and open file of the old one.
-  No PCI hotplug, so a VM started on a Mac has two of them from the
-  start (`vroom-usb0`, `vroom-usb1`), added after every other device so
+  They are there from the start (PCI hot plug, below, could take them
+  later): a VM started on a Mac has two (`vroom-usb0`, `vroom-usb1`),
+  added after every other device so
   older VMs keep their device places; a save records how many it has
   (`usb.file_shares`) and a resume builds those. The VMM tells the agent
   (`Message::UsbShare`), which mounts it (Linux: `/media/vroom/NAME`
@@ -145,7 +146,7 @@ resume. The adapters built are what the next save records.
 | `hv` | `Hypervisor` / `Vm` / `Vcpu` traits. HVF backend (in-kernel GICv3, vtimer, EL2 for nested), KVM arm64 backend (vGICv3 with save/restore, in-kernel PSCI). Exits are decoded into `VcpuExit` (MMIO, hypercall, PSCI events). |
 | `memory` | Guest RAM as guarded mmaps; every access bounds-checked (`GuestMemory`). |
 | `arch` | Board layout (QEMU-virt compatible), FDT, ACPI tables (own AML encoder), SMBIOS, kernel image loader (Image, gzip, EFI zboot). |
-| `devices` | Bus, PL011, PL031, fw_cfg (+DMA), CFI flash (NVRAM), PCI host (ECAM, MSI, MSI-X, INTx), NVMe, xHCI + USB HID (8 USB 2 + USB 3 port pairs for passthrough devices, plugged in and out while the VM runs; asynchronous transfers; isochronous TDs go out in batches, a few batches ahead), Intel HD Audio (controller + codec, streams moved by a timer thread). Parses hostile input only; `forbid(unsafe_code)`. |
+| `devices` | Bus, PL011, PL031, fw_cfg (+DMA), CFI flash (NVRAM), PCI host (ECAM, MSI, MSI-X, INTx), PCI Express root ports with native hot plug, NVMe, xHCI + USB HID (8 USB 2 + USB 3 port pairs for passthrough devices, plugged in and out while the VM runs; asynchronous transfers; isochronous TDs go out in batches, a few batches ahead), Intel HD Audio (controller + codec, streams moved by a timer thread). Parses hostile input only; `forbid(unsafe_code)`. |
 | `video` | Hardware video decoding, shared by the VMM and `vroom video-helper`: their protocol (grants, epochs, resume state), H.264/HEVC NAL unit, access unit and parameter set parsing, picture order counts, VP9 frame headers and AV1 OBUs. Parses hostile input only; `forbid(unsafe_code)`. |
 | `usb` | USB passthrough: the VMM/helper protocol, the helper's request checks, libusb (loaded with `dlopen`, helper only; the root helper only from its own copy), host device listing (IOKit registry / sysfs), taking a device from the host's drivers and giving it back, a USB stick (Bulk-Only, SCSI) on a RAM disk for tests or on a Mac disk's fd ("Use as a disk"), a pretend serial port and sound card for tests. |
 | `virtio` | Split-queue handling (hardened), MMIO and modern PCI transports, devices (blk, net, console, rng, gpu, input, fs, sound, media), a pausable worker per device. `forbid(unsafe_code)`. |
@@ -172,6 +173,50 @@ windows (GPU host-visible memory) sit at 0x70_0000_0000.
 
 UEFI boots get ACPI (MADT, GTDT, SPCR, MCFG, DSDT with PCI and virtio
 devices) and SMBIOS through fw_cfg. Direct kernel boots get an FDT.
+
+### PCI hot plug
+
+A VM on PCI (UEFI boot, or `virtio_transport = "pci"`) gets four PCI
+Express root ports after its other devices, so those keep their slots
+(`devices::pci::port`, Red Hat's QEMU root port IDs, 1b36:000c). Each is
+a bridge with one empty slot that supports native hot plug: attention
+button, power controller, indicators, presence detect, Data Link Layer
+Link Active reporting, and an MSI (or INTx) for slot events. Guests
+drive it with their own drivers: Linux's pciehp (ACPI grants it
+through `_OSC`; device trees always do) and Windows' pci.sys. No ACPI
+hot plug is needed: the DSDT stays as it was.
+
+- Resources: EDK2's PciHotPlugInitDxe (in the stock build) reserves a
+  2 MiB window behind each port for what comes later; Linux reassigns
+  windows itself and pads hot plug bridges the same way. Windows keeps
+  the firmware's.
+- ECAM: a config cycle for a bus other than 0 goes to the port whose
+  secondary bus it is, and reaches device 0 behind it while the slot
+  has power. BARs of devices in slots are mapped as on the root bus.
+- In: `PciRoot::plug` puts a device in a free slot and raises Presence
+  Detect Changed and Attention Button Pressed, as QEMU does. The guest
+  powers the slot on, the link comes up, and it scans the bus.
+- Out: `PciRoot::unplug` presses the attention button. The guest lets
+  go of the device and powers the slot off; that write takes the device
+  out (dropped once no lock is held). The VMM gives it 15 seconds
+  (`hotplug::Hotplug`), then pulls it out (a surprise removal, which
+  both guests handle).
+- Command Completed is raised for each write to Slot Control, except
+  the 32-bit writes Windows uses to clear status bits, which carry Slot
+  Control unchanged: answering those as commands set Command Completed
+  again at once, and Windows kept clearing it.
+- A guest reset keeps a device in its slot (as a card in a real slot),
+  reset to the state it had when it went in; one on its way out goes.
+- Snapshots: a port's blob carries its device's. A save records which
+  network adapter is in which slot (`net.hotplug` in the manifest); a
+  resume builds those devices into those slots before restoring, and a
+  slot set that doesn't match refuses. A device still on its way out
+  is pulled out before the save. Snapshots from before the ports leave
+  them empty.
+- Only virtio-net uses it (`ToVmm::NetAdd`, `ToVmm::NetRemove`). The
+  ports take any virtio device (`Hotplug::add` takes a `VirtioDevice`):
+  a disk, a USB disk's files share, would work the same way, with a save
+  recording them as it records adapters.
 
 ## vCPU loop
 

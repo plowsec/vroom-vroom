@@ -67,6 +67,25 @@ const NET_CTRL: &str = "net.ctrl_vq";
 /// How many removable shares for USB disks' files it has (saves from
 /// before them have none).
 const USB_FILES: &str = "usb.file_shares";
+/// Network adapters in hot plug slots: "adapter:slot,..." (0-based).
+const NET_HOT: &str = "net.hotplug";
+
+/// The network adapters the VM saved in `dir` had in hot plug slots:
+/// adapter index to slot.
+pub(crate) fn saved_hot_nets(dir: &Path) -> Result<BTreeMap<usize, usize>> {
+    let snap = SnapshotDir::open(dir)?;
+    let mut m = BTreeMap::new();
+    let Some(v) = snap.manifest.meta.get(NET_HOT) else { return Ok(m) };
+    for pair in v.split(',').filter(|p| !p.is_empty()) {
+        let bad = || Error::Setup(format!("bad {NET_HOT}: {v}"));
+        let (a, b) = pair.split_once(':').ok_or_else(bad)?;
+        let (a, b) = (a.parse::<usize>().map_err(|_| bad())?, b.parse::<usize>().map_err(|_| bad())?);
+        if b >= crate::hotplug::PORTS || m.values().any(|&x| x == b) || m.insert(a, b).is_some() {
+            return Err(bad());
+        }
+    }
+    Ok(m)
+}
 
 /// The removable shares the VM saved in `dir` has.
 pub(crate) fn saved_usb_file_slots(dir: &Path) -> usize {
@@ -99,11 +118,25 @@ pub(crate) fn save(vmm: &mut Vmm, dir: &Path, description: &str, kind: Kind) -> 
             }
         }
     }
+    // The network adapters as they are now, held still until the devices
+    // are saved: none comes or goes meanwhile. One still on its way out
+    // goes now (a snapshot holds none half gone).
+    let nics = vmm.net_ports.clone();
+    let nics = nics.hold();
+    if let Some(h) = &vmm.hotplug {
+        h.settle();
+    }
+    let (nets, hot) = crate::net::saved(&nics);
+    vmm.config.nets = nets;
     let m = &mut snap.manifest;
     m.description = description.to_string();
     m.arch = "aarch64".into();
     m.backend = vmm.hv.name().into();
     m.config = serde_json::to_value(&vmm.config).map_err(|e| Error::Setup(e.to_string()))?;
+    if !hot.is_empty() {
+        let v: Vec<String> = hot.iter().map(|(a, b)| format!("{a}:{b}")).collect();
+        m.meta.insert(NET_HOT.into(), v.join(","));
+    }
     m.meta.insert("vcpus".into(), vmm.vcpus.len().to_string());
     if vmm.net_ctrl {
         m.meta.insert(NET_CTRL.into(), "1".into());

@@ -183,12 +183,9 @@ fn windows(spec: &Spec, iso: &Path, tools: &Path, progress: &mut dyn FnMut(&str)
     let dir = &spec.dir;
     let stick = dir.join("install.img");
     crate::winstick::build(iso, tools, &spec.account, &crate::winstick::computer_name(&spec.name), &stick, progress)?;
-    // Windows writes to the stick (FAT access times, setup's files) and
-    // stalls for good when a read-only disk refuses (it ignores NVMe's
-    // write-protect flag): it gets a layer of its own to write to, and
-    // install.img stays as it was made.
-    let size = std::fs::metadata(&stick).map_err(|e| e.to_string())?.len();
-    vroom_block::qcow2::Qcow2Image::create(&dir.join("install.qcow2"), size, Some((&stick, vroom_block::Format::Raw))).map_err(|e| format!("install disk: {e}"))?;
+    // Read-only: Windows mounts it read-write anyway (it ignores NVMe's
+    // write-protect flag), but the writes it tries fail at once and
+    // Setup goes on.
     mark_readonly(&stick);
     let disk = format!("{}.qcow2", spec.name);
     vroom_block::qcow2::Qcow2Image::create(&dir.join(&disk), spec.disk_gib << 30, None).map_err(|e| format!("disk: {e}"))?;
@@ -201,10 +198,9 @@ fn windows(spec: &Spec, iso: &Path, tools: &Path, progress: &mut dyn FnMut(&str)
          \n[boot]\ntype = \"uefi\"\nvars = {}\n\
          \n# Windows setup only has an NVMe driver.\n\
          [[disk]]\npath = {}\nformat = \"qcow2\"\nbus = \"nvme\"\n\
-         \n# The install stick (install.img below a layer Windows may write to).\n\
-         # Setup stops rather than reinstall over a disk that has Windows;\n\
-         # still, remove this block once Windows runs.\n\
-         [[disk]]\npath = \"install.qcow2\"\nformat = \"qcow2\"\nbus = \"nvme\"\n",
+         \n# The install stick. Setup stops rather than reinstall over a disk\n\
+         # that has Windows; still, remove this block once Windows runs.\n\
+         [[disk]]\npath = \"install.img\"\nreadonly = true\nformat = \"raw\"\nbus = \"nvme\"\n",
         if ssh.is_some() { ", OpenSSH" } else { "" },
         toml_str(&spec.name),
         spec.cpus,

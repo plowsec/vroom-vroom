@@ -221,6 +221,13 @@ impl VirtioPci {
         }
     }
 
+    /// A PCI Express function, for a hot plug root port's slot (what
+    /// guests expect behind one).
+    pub fn with_pcie(mut self) -> Self {
+        vroom_devices::pci::port::add_endpoint_cap(&mut self.cfg);
+        self
+    }
+
     fn irq_dyn(&self) -> Arc<dyn VirtioInterrupt> {
         self.irq.clone()
     }

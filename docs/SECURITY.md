@@ -237,10 +237,16 @@ An adapter's cable and network can change while the VM runs (see
 sandbox stays as it was set at start; nothing here widens it.
 
 - **Who asks**: the VM window (`ToVmm::NetConnect`, `ToVmm::NetSet`,
-  viewer messages 40 and 41). The guest has no way to send them. The
-  VMM checks each like guest input: adapter index, mode, names (the VM
-  file's rules), forwards (count, addresses), MAC (unicast), and that a
+  `ToVmm::NetAdd`, `ToVmm::NetRemove`, viewer messages 40, 41, 95 and
+  96). The guest has no way to send them. The VMM checks each like guest
+  input: adapter index, mode, names (the VM file's rules), forwards
+  (count, addresses), MAC (unicast, not one an adapter has), and that a
   bridged or host-only change comes with its socket.
+- **Adding and removing adapters** (a VM on PCI) builds the same
+  virtio-net device with the same backends as at start, in a PCI
+  Express hot plug slot (below), at most 8 adapters. Removing works only
+  on an adapter added that way; one the VM started with only has its
+  cable pulled.
 - **Bridged and host-only**: the sandboxed VMM can't open Unix sockets,
   so it can't reach vroom-netd after start, and that stays so. The app
   asks netd for the port, as the user (netd's checks and per-user
@@ -273,6 +279,33 @@ sandbox stays as it was set at start; nothing here widens it.
   another machine.
 - A cable pulled out drops frames both ways in the VMM: nothing reaches
   the guest or leaves it on that adapter.
+
+### PCI hot plug slots
+
+A VM on PCI has four PCI Express root ports (ARCHITECTURE.md, "PCI hot
+plug"). What the guest reaches through them:
+
+- Each port's config space: a bridge header (bus numbers, memory
+  windows: plain registers, masked as on real hardware), the PCI Express
+  capability (Slot Control and Status, Link Status) and an MSI. All in
+  `devices` (`forbid(unsafe_code)`), fixed size, every write masked.
+- Config cycles for other buses: routed to the port whose secondary bus
+  the guest set, device 0 only, and only while the slot has power; any
+  other bus, device or function reads all ones. A guest that gives two
+  ports the same bus reaches the first one's device.
+- The memory windows are not enforced: a device behind a port answers
+  at the BAR address the guest gave it, as devices on the root bus do.
+  A guest can only point its own devices at its own address space.
+- The slot's state machine: the guest can't plug anything in (only the
+  host does, from the VM window), and can't keep a device it was asked
+  to give back (pulled out after 15 seconds). Powering a slot off
+  without being asked only takes its link down. Devices taken out are
+  dropped after every lock is released.
+- Slot events raise one MSI per rising edge, or a level INTx: a guest
+  can't make a port send more interrupts than it writes commands.
+- A snapshot restores a device into a slot only if the VM was built
+  with that device there (the manifest's `net.hotplug`, checked: slot
+  numbers in range, each used once).
 
 ## Shared folders
 

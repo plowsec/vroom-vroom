@@ -143,6 +143,9 @@ pub struct NetPort {
     pub connected: bool,
     /// The MAC the guest uses.
     pub mac: [u8; 6],
+    /// Added while the VM runs (in a hot plug slot): it can be taken out
+    /// again (`ToVmm::NetRemove`).
+    pub added: bool,
 }
 
 /// Interface and network names: what the VM file allows.
@@ -279,8 +282,9 @@ pub enum ToViewer {
     HeadDamage { head: u32, x: u32, y: u32, w: u32, h: u32 },
     /// The network adapters, as they are now: sent at start and whenever
     /// one changes. `nat_ok`: an adapter can switch to NAT while the VM
-    /// runs (its sandbox allows the connections NAT makes).
-    Net { nat_ok: bool, ports: Vec<NetPort> },
+    /// runs (its sandbox allows the connections NAT makes). `hotplug`:
+    /// adapters can be added while it runs (`ToVmm::NetAdd`).
+    Net { nat_ok: bool, hotplug: bool, ports: Vec<NetPort> },
 }
 
 /// What the guest's pointer looks like.
@@ -378,6 +382,15 @@ pub enum ToVmm {
     /// answer). NAT: none, `port_mac` unused; `forwards` are what the VM
     /// file asks for.
     NetSet { nic: u8, live: NetLive, port_mac: [u8; 6] },
+    /// Add an adapter on `live` with MAC `mac` while the VM runs (a VM on
+    /// PCI: `ToViewer::Net`'s `hotplug`). It gets the next number. Bridged
+    /// and host-only come with the vroom-netd socket, as `NetSet`, and the
+    /// guest uses `port_mac`. NAT: `port_mac` unused, no port forwards
+    /// until the next start.
+    NetAdd { live: NetLive, mac: [u8; 6], port_mac: [u8; 6] },
+    /// Take out adapter `nic`, one added while the VM ran; the ones
+    /// after it move up a number.
+    NetRemove { nic: u8 },
     /// New guest tools for the agent: comes with a pipe (SCM_RIGHTS) the
     /// viewer writes them into, as guest agent frames (`UpdateBegin`,
     /// then `UpdateData`), which the VMM checks and passes on.
@@ -502,11 +515,11 @@ impl ToViewer {
             ToViewer::Apps(list) => frame(60, &vroom_proto::encode_apps(list)),
             ToViewer::HeadMode { head, width, height } => frame(16, &u32s(&[*head, *width, *height])),
             ToViewer::HeadDamage { head, x, y, w, h } => frame(17, &u32s(&[*head, *x, *y, *w, *h])),
-            ToViewer::Net { nat_ok, ports } => {
-                let mut p = vec![*nat_ok as u8, ports.len() as u8];
+            ToViewer::Net { nat_ok, hotplug, ports } => {
+                let mut p = vec![*nat_ok as u8 | (*hotplug as u8) << 1, ports.len() as u8];
                 for n in ports {
                     p.push(n.nic);
-                    p.push(n.connected as u8);
+                    p.push(n.connected as u8 | (n.added as u8) << 1);
                     p.extend_from_slice(&n.mac);
                     n.live.encode(&mut p);
                 }
@@ -587,8 +600,8 @@ impl ToViewer {
             19 => ToViewer::CoherenceNo(line(p)?),
             60 => ToViewer::Apps(vroom_proto::decode_apps(p).ok_or(Error::Proto("apps"))?),
             40 => {
-                let (nat_ok, n) = match p {
-                    [f @ (0 | 1), n, ..] => (*f != 0, *n as usize),
+                let (nat_ok, hotplug, n) = match p {
+                    [f @ 0..=3, n, ..] => (*f & 1 != 0, *f & 2 != 0, *n as usize),
                     _ => return Err(Error::Proto("network adapters")),
                 };
                 if n > NET_PORTS_MAX {
@@ -599,19 +612,19 @@ impl ToViewer {
                 for _ in 0..n {
                     let head = p.get(o..o + 8).ok_or(Error::Proto("short"))?;
                     let (nic, flags) = (head[0], head[1]);
-                    if nic as usize >= NET_PORTS_MAX || flags > 1 || ports.iter().any(|x: &NetPort| x.nic == nic) {
+                    if nic as usize >= NET_PORTS_MAX || flags > 3 || ports.iter().any(|x: &NetPort| x.nic == nic) {
                         return Err(Error::Proto("network adapters"));
                     }
                     let mut mac = [0u8; 6];
                     mac.copy_from_slice(&head[2..8]);
                     o += 8;
                     let live = NetLive::decode(p, &mut o)?;
-                    ports.push(NetPort { nic, live, connected: flags != 0, mac });
+                    ports.push(NetPort { nic, live, connected: flags & 1 != 0, mac, added: flags & 2 != 0 });
                 }
                 if o != p.len() {
                     return Err(Error::Proto("network adapters"));
                 }
-                ToViewer::Net { nat_ok, ports }
+                ToViewer::Net { nat_ok, hotplug, ports }
             }
             _ => return Err(Error::Proto("unknown viewer message")),
         })
@@ -678,6 +691,13 @@ impl ToVmm {
             }
             // Well above the others.
             ToVmm::AgentUpdate => frame(91, &[]),
+            ToVmm::NetAdd { live, mac, port_mac } => {
+                let mut p = mac.to_vec();
+                p.extend_from_slice(port_mac);
+                live.encode(&mut p);
+                frame(95, &p)
+            }
+            ToVmm::NetRemove { nic } => frame(96, &[*nic]),
         }
     }
 
@@ -778,6 +798,18 @@ impl ToVmm {
             }
             40 if p.len() == 2 && (p[0] as usize) < NET_PORTS_MAX && p[1] <= 1 => ToVmm::NetConnect { nic: p[0], on: p[1] != 0 },
             91 if p.is_empty() => ToVmm::AgentUpdate,
+            95 if p.len() >= 12 => {
+                let (mut mac, mut port_mac) = ([0u8; 6], [0u8; 6]);
+                mac.copy_from_slice(&p[..6]);
+                port_mac.copy_from_slice(&p[6..12]);
+                let mut o = 12;
+                let live = NetLive::decode(p, &mut o)?;
+                if o != p.len() || mac[0] & 1 != 0 || port_mac[0] & 1 != 0 {
+                    return Err(Error::Proto("network adapter"));
+                }
+                ToVmm::NetAdd { live, mac, port_mac }
+            }
+            96 if p.len() == 1 && (p[0] as usize) < NET_PORTS_MAX => ToVmm::NetRemove { nic: p[0] },
             41 if p.len() >= 7 && (p[0] as usize) < NET_PORTS_MAX => {
                 let mut port_mac = [0u8; 6];
                 port_mac.copy_from_slice(&p[1..7]);
@@ -1011,6 +1043,9 @@ mod tests {
             ToVmm::AgentUpdate,
             ToVmm::NetSet { nic: 0, live: nat(vec![fwd.clone()]), port_mac: [0; 6] },
             ToVmm::NetSet { nic: 7, live: bridged.clone(), port_mac: [0x3e, 1, 2, 3, 4, 5] },
+            ToVmm::NetAdd { live: nat(vec![]), mac: [2, 1, 2, 3, 4, 7], port_mac: [0; 6] },
+            ToVmm::NetAdd { live: bridged.clone(), mac: [2, 1, 2, 3, 4, 8], port_mac: [0x3e, 1, 2, 3, 4, 5] },
+            ToVmm::NetRemove { nic: 3 },
         ];
         let mut d = Decoder::default();
         for m in &msgs {
@@ -1019,9 +1054,10 @@ mod tests {
         }
         let v = ToViewer::Net {
             nat_ok: true,
+            hotplug: true,
             ports: vec![
-                NetPort { nic: 0, live: nat(vec![fwd.clone()]), connected: true, mac: [2, 1, 2, 3, 4, 5] },
-                NetPort { nic: 1, live: bridged.clone(), connected: false, mac: [2, 1, 2, 3, 4, 6] },
+                NetPort { nic: 0, live: nat(vec![fwd.clone()]), connected: true, mac: [2, 1, 2, 3, 4, 5], added: false },
+                NetPort { nic: 1, live: bridged.clone(), connected: false, mac: [2, 1, 2, 3, 4, 6], added: true },
             ],
         };
         d.push(&v.encode());
@@ -1045,6 +1081,16 @@ mod tests {
         }
         d.push(&ToVmm::NetConnect { nic: 8, on: true }.encode());
         assert!(d.next_to_vmm().is_err());
+        d.push(&ToVmm::NetRemove { nic: 8 }.encode());
+        assert!(d.next_to_vmm().is_err());
+        d.push(&ToVmm::NetAdd { live: nat(vec![]), mac: [3, 0, 0, 0, 0, 1], port_mac: [0; 6] }.encode());
+        assert!(d.next_to_vmm().is_err(), "multicast MAC");
+        let mut f = ToVmm::NetAdd { live: nat(vec![]), mac: [2, 0, 0, 0, 0, 1], port_mac: [0; 6] }.encode();
+        f.push(0);
+        let n = f.len() as u32 - 5;
+        f[1..5].copy_from_slice(&n.to_le_bytes());
+        d.push(&f);
+        assert!(d.next_to_vmm().is_err(), "trailing byte");
         d.push(&ToVmm::NetSet { nic: 0, live: bridged.clone(), port_mac: [1, 0, 0, 0, 0, 0] }.encode());
         assert!(d.next_to_vmm().is_err());
         let mut f = ToVmm::NetConnect { nic: 0, on: true }.encode();
@@ -1052,10 +1098,10 @@ mod tests {
         f.push(0);
         d.push(&f);
         assert!(d.next_to_vmm().is_err());
-        let port = |nic| NetPort { nic, live: bridged.clone(), connected: true, mac: [2; 6] };
-        d.push(&ToViewer::Net { nat_ok: false, ports: vec![port(1), port(1)] }.encode());
+        let port = |nic| NetPort { nic, live: bridged.clone(), connected: true, mac: [2; 6], added: false };
+        d.push(&ToViewer::Net { nat_ok: false, hotplug: false, ports: vec![port(1), port(1)] }.encode());
         assert!(d.next_to_viewer().is_err());
-        d.push(&ToViewer::Net { nat_ok: false, ports: (0..9).map(port).collect() }.encode());
+        d.push(&ToViewer::Net { nat_ok: false, hotplug: false, ports: (0..9).map(port).collect() }.encode());
         assert!(d.next_to_viewer().is_err());
         d.push(&frame(40, &[1, 1, 0, 1]));
         assert!(d.next_to_viewer().is_err());
