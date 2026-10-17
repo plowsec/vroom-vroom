@@ -330,6 +330,19 @@ impl Identity {
         m
     }
 
+    /// The MAC adapter `nic` of VM `name` gets when the file sets none:
+    /// the same at every boot (the guest keeps its DHCP identity) without
+    /// storing anything. Starts with `mac_prefix`.
+    pub fn nic_mac(&self, name: &str, nic: usize) -> [u8; 6] {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in name.bytes().chain([0, nic as u8]) {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+        let b = h.to_le_bytes();
+        self.mac([b[0], b[1], b[2], b[3], b[4], b[5]])
+    }
+
     /// NAT addresses of adapter `nic`: (guest, gateway, DNS).
     pub fn nat_addrs(&self, nic: usize) -> (Ipv4Addr, Ipv4Addr, Ipv4Addr) {
         let shift = |a: Ipv4Addr| {
@@ -619,9 +632,26 @@ pub struct Net {
     /// "02:12:34:56:78:9a". Generated if absent (`identity.mac_prefix`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mac: Option<String>,
+    /// The cable is plugged in. False: the guest sees no link and no
+    /// frames go either way (VMware's "Connected" box).
+    #[serde(default = "yes", skip_serializing_if = "is_yes")]
+    pub connected: bool,
+}
+
+fn is_yes(b: &bool) -> bool {
+    *b
 }
 
 impl Net {
+    /// The adapter's MAC: the file's, or the one generated for adapter
+    /// `nic` of VM `name` (see [`Identity::nic_mac`]).
+    pub fn mac_of(&self, ident: &Identity, name: &str, nic: usize) -> Result<[u8; 6]> {
+        match &self.mac {
+            Some(m) => parse_mac(m),
+            None => Ok(ident.nic_mac(name, nic)),
+        }
+    }
+
     /// Typed view. Fails if fields don't match the mode.
     pub fn mode(&self) -> Result<NetMode> {
         let bad = |m: &str| Err(Error::Invalid(format!("net ({:?}): {m}", self.mode)));

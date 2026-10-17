@@ -201,6 +201,50 @@ network stack. Host loopback is unreachable unless `allow_host_loopback`;
 through `vroom-netd`, which enforces allow-listed interfaces and source
 MAC anti-spoofing (see [the root helper](#the-root-helper-vroom-netd)).
 
+### Network changes while the VM runs
+
+An adapter's cable and network can change while the VM runs (see
+[NETWORKING.md](NETWORKING.md#changing-adapters-while-the-vm-runs)). The
+sandbox stays as it was set at start; nothing here widens it.
+
+- **Who asks**: the VM window (`ToVmm::NetConnect`, `ToVmm::NetSet`,
+  viewer messages 40 and 41). The guest has no way to send them. The
+  VMM checks each like guest input: adapter index, mode, names (the VM
+  file's rules), forwards (count, addresses), MAC (unicast), and that a
+  bridged or host-only change comes with its socket.
+- **Bridged and host-only**: the sandboxed VMM can't open Unix sockets,
+  so it can't reach vroom-netd after start, and that stays so. The app
+  asks netd for the port, as the user (netd's checks and per-user
+  limits apply as for any request), and hands the VMM the frame socket
+  over the window's connection (SCM_RIGHTS), as for USB helpers. What
+  the VMM gets is what it gets at start: one datagram socket of Ethernet
+  frames for one adapter, behind netd's interface allow-list and
+  source-MAC check. Opening sockets itself would have needed Unix
+  sockets in its sandbox (ssh-agent, docker.sock); a socket handed over
+  reaches only netd's port. The MAC in the app's request is the one the
+  VMM reports for the adapter, made locally administered: netd refuses
+  other MACs whoever asks, and on macOS vmnet picks its own anyway.
+- **NAT**: the VMM's own, and only if its sandbox already allows
+  connections out (a NAT adapter at start). A VM that started with only
+  bridged or host-only adapters has no network in its sandbox and gets
+  none later: NAT waits for its next start. `allow_host_loopback` turned
+  on later works only if an adapter had it at start (the sandbox refuses
+  the host's loopback otherwise; the NAT code doesn't even try).
+- **Port forwards** need listening sockets, which the sandbox never
+  allows: new ones wait for the next start. A NAT the adapter started
+  with is kept, forwards and all, while the adapter is on another
+  network: its listening sockets stay open, so a connection to a
+  forwarded port then waits until the adapter is back on NAT.
+- **MAC translation**: when a vmnet port passes another MAC than the
+  guest's (the adapter started on NAT), the VMM rewrites one to the
+  other in frames: Ethernet, ARP, the DHCP client address, IPv6 neighbor
+  discovery options (`vroom-net/src/mac.rs`). Every offset is checked;
+  frames it can't parse pass unchanged. netd still drops frames whose
+  source isn't the port's MAC, so a guest can't use it to send as
+  another machine.
+- A cable pulled out drops frames both ways in the VMM: nothing reaches
+  the guest or leaves it on that adapter.
+
 ## Shared folders
 
 Off unless configured, read-only unless `readonly = false`. The host side
@@ -489,6 +533,15 @@ the sender closes its own copy while the socket is still in flight
 client hangs up; the app keeps its copy of a helper's socket for a few
 seconds after handing it to the VMM.
 
+Frame sockets: macOS gives a Unix datagram socket 4 KiB of buffer, two
+frames. Both ends now ask for 2 MiB, and when the VMM's side is full
+anyway the daemon drops the frame, as a full NIC queue would. Before,
+it gave the whole port up after the first failed send, so a bridged
+adapter could die a few seconds into a boot (the guest's driver isn't
+reading yet) or during a burst. Only a VMM that is gone ends a port.
+That part needs the daemon set up again to take effect; the VMM's
+bigger buffer helps with an older daemon too.
+
 ## Snapshots
 
 Snapshots contain guest RAM (keys, passwords). They're written 0600 in 0700
@@ -732,7 +785,7 @@ active on seat0, and the helper only talks to a root-owned peer.
 ## Fuzzing
 
 `fuzz/` has cargo-fuzz targets for what a guest (or a downloaded image)
-controls: agent protocol, the viewer protocol (both directions), network frames, virtqueue chains over arbitrary
+controls: agent protocol, the viewer protocol (both directions), network frames (the NAT's parsers and the MAC translation), virtqueue chains over arbitrary
 guest memory, virtio-gpu 2D commands, virtio-fs (FUSE) requests, virtio-snd control
 and PCM transfers (playback and capture), the HD Audio controller (registers,
 CORB/RIRB, buffer descriptor lists, stream DMA, MSI), the virtio-pci transport and PCI

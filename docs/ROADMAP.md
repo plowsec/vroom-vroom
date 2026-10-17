@@ -197,6 +197,13 @@ A guest needs a driver and an API its players use. What exists:
   screen with its own scale would want per-monitor scales), Direct3D on
   Windows' first monitor only (the others are copied to 2D GPUs),
   Coherence on the first monitor only (the others are off meanwhile).
+- Network: adding an adapter while the VM runs needs PCI hotplug (a
+  hotplug-capable root port, ACPI); it waits for the next start now.
+  New port forwards on a running VM need listening sockets the sandbox
+  doesn't allow (the app could open them and hand them over). Host-only
+  on macOS gets no DHCP (see NETWORKING.md): netd could run a small DHCP
+  server per host-only network. The netd fixes (frame buffers, a busy
+  VMM drops frames, not the port) need netd set up again.
 - Rosetta for Linux guests (x86_64 Linux programs). Apple only offers it
   through its Virtualization framework; we'd have to look like it.
 - Benchmarks against VMware Fusion and Parallels on the same Mac, the

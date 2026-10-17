@@ -48,6 +48,10 @@ export struct NetRow {
     block-private: bool,
     mac: string,
     summary: string,
+    // The cable is in.
+    connected: bool,
+    // What of it waits (for the next start, a resume), or why.
+    note: string,
 }
 
 export struct ShareRow {
@@ -124,6 +128,14 @@ export struct VmSettings {
     // Running or suspended: hardware can't change.
     locked: bool,
     lock-reason: string,
+    // Why, in each card that can't change now.
+    lock-why: string,
+    // Network and USB devices can change now (off, suspended, or running
+    // in this app).
+    live: bool,
+    // What waits in those two cards (adapters removed, the next start).
+    net-note: string,
+    usb-note: string,
     config-path: string,
     state-path: string,
     snapshots-cpu-mem: string,

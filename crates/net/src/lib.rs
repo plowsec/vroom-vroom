@@ -6,6 +6,7 @@
 //!   bridged / host-only interfaces. The VMM never needs root.
 #![forbid(unsafe_code)]
 
+pub mod mac;
 pub mod nat;
 pub mod netd;
 pub mod packet;
@@ -47,4 +48,9 @@ pub trait NetBackend: Send + std::fmt::Debug {
         None
     }
     fn tick(&mut self) {}
+    /// NAT: where new connections may go from now on. False for backends
+    /// that aren't a NAT.
+    fn set_nat_policy(&mut self, _p: &nat::NatPolicy) -> bool {
+        false
+    }
 }

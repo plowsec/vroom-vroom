@@ -71,6 +71,131 @@ pub struct UsbPort {
     pub always: bool,
 }
 
+/// Most network adapters a VM has (the config's limit).
+pub const NET_PORTS_MAX: usize = 8;
+/// Most port forwards one adapter lists.
+pub const FORWARDS_MAX: usize = 64;
+
+/// What a network adapter is plugged into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetKind {
+    Nat,
+    Bridged,
+    HostOnly,
+}
+
+/// A NAT port forward: `host_addr:host_port` to the guest's `guest_port`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Forward {
+    pub host_addr: String,
+    pub host_port: u16,
+    pub guest_port: u16,
+}
+
+/// The other end of an adapter's cable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetLive {
+    pub kind: NetKind,
+    /// Bridged: the Mac's interface; host-only: the network. NAT: empty.
+    pub name: String,
+    /// NAT: the guest may reach the host's loopback, may not reach the LAN.
+    pub loopback: bool,
+    pub block_private: bool,
+    /// NAT: the port forwards it has.
+    pub forwards: Vec<Forward>,
+}
+
+/// One network adapter of the VM, as it is now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetPort {
+    /// Its index (`[[net]]` order at start).
+    pub nic: u8,
+    pub live: NetLive,
+    /// The cable is in.
+    pub connected: bool,
+    /// The MAC the guest uses.
+    pub mac: [u8; 6],
+}
+
+/// Interface and network names: what the VM file allows.
+fn net_name_ok(kind: NetKind, s: &str) -> bool {
+    let chars = s.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
+    match kind {
+        NetKind::Nat => s.is_empty(),
+        NetKind::Bridged => !s.is_empty() && s.len() <= 15 && chars,
+        NetKind::HostOnly => !s.is_empty() && s.len() <= 64 && !s.starts_with('.') && chars,
+    }
+}
+
+impl NetLive {
+    pub fn valid(&self) -> bool {
+        let fwd_ok = |f: &Forward| f.host_addr.len() <= 64 && f.host_addr.parse::<std::net::IpAddr>().is_ok();
+        net_name_ok(self.kind, &self.name)
+            && self.forwards.len() <= FORWARDS_MAX
+            && self.forwards.iter().all(fwd_ok)
+            && (self.kind == NetKind::Nat || (self.forwards.is_empty() && !self.loopback && !self.block_private))
+    }
+
+    /// kind u8 | flags u8 | name (u8 len) | forwards: n u8, then addr
+    /// (u8 len), host port u16, guest port u16 each.
+    fn encode(&self, p: &mut Vec<u8>) {
+        p.push(self.kind as u8);
+        p.push(self.loopback as u8 | (self.block_private as u8) << 1);
+        p.push(self.name.len() as u8);
+        p.extend_from_slice(self.name.as_bytes());
+        p.push(self.forwards.len() as u8);
+        for f in &self.forwards {
+            p.push(f.host_addr.len() as u8);
+            p.extend_from_slice(f.host_addr.as_bytes());
+            p.extend_from_slice(&f.host_port.to_le_bytes());
+            p.extend_from_slice(&f.guest_port.to_le_bytes());
+        }
+    }
+
+    fn decode(p: &[u8], o: &mut usize) -> Result<NetLive> {
+        let short = || Error::Proto("short");
+        let byte = |o: &mut usize| -> Result<u8> {
+            let b = *p.get(*o).ok_or_else(short)?;
+            *o += 1;
+            Ok(b)
+        };
+        let str8 = |o: &mut usize| -> Result<String> {
+            let n = *p.get(*o).ok_or_else(short)? as usize;
+            let s = text(p.get(*o + 1..*o + 1 + n).ok_or_else(short)?)?;
+            *o += 1 + n;
+            Ok(s)
+        };
+        let u16_at = |o: &mut usize| -> Result<u16> {
+            let b = p.get(*o..*o + 2).ok_or_else(short)?;
+            *o += 2;
+            Ok(u16::from_le_bytes([b[0], b[1]]))
+        };
+        let kind = match byte(o)? {
+            0 => NetKind::Nat,
+            1 => NetKind::Bridged,
+            2 => NetKind::HostOnly,
+            _ => return Err(Error::Proto("network mode")),
+        };
+        let flags = byte(o)?;
+        let name = str8(o)?;
+        let n = byte(o)? as usize;
+        if n > FORWARDS_MAX {
+            return Err(Error::Proto("port forwards"));
+        }
+        let mut forwards = Vec::with_capacity(n);
+        for _ in 0..n {
+            let host_addr = str8(o)?;
+            let (host_port, guest_port) = (u16_at(o)?, u16_at(o)?);
+            forwards.push(Forward { host_addr, host_port, guest_port });
+        }
+        let live = NetLive { kind, name, loopback: flags & 1 != 0, block_private: flags & 2 != 0, forwards };
+        if flags & !3 != 0 || !live.valid() {
+            return Err(Error::Proto("network adapter"));
+        }
+        Ok(live)
+    }
+}
+
 /// VMM -> viewer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToViewer {
@@ -121,6 +246,10 @@ pub enum ToViewer {
     HeadMode { head: u32, width: u32, height: u32 },
     /// Pixels changed on another monitor.
     HeadDamage { head: u32, x: u32, y: u32, w: u32, h: u32 },
+    /// The network adapters, as they are now: sent at start and whenever
+    /// one changes. `nat_ok`: an adapter can switch to NAT while the VM
+    /// runs (its sandbox allows the connections NAT makes).
+    Net { nat_ok: bool, ports: Vec<NetPort> },
 }
 
 /// What the guest's pointer looks like.
@@ -200,6 +329,14 @@ pub enum ToVmm {
     HeadResize { head: u32, width: u32, height: u32, scale: u32 },
     /// Absolute pointer on another monitor's window, 0..=POINTER_MAX.
     HeadPointer { head: u32, x: u16, y: u16 },
+    /// Plug network adapter `nic`'s cable in, or pull it out.
+    NetConnect { nic: u8, on: bool },
+    /// Put adapter `nic` on another network, same device and MAC. Bridged
+    /// and host-only come with the vroom-netd socket the viewer asked for
+    /// (SCM_RIGHTS); `port_mac` is the MAC that port passes (netd's
+    /// answer). NAT: none, `port_mac` unused; `forwards` are what the VM
+    /// file asks for.
+    NetSet { nic: u8, live: NetLive, port_mac: [u8; 6] },
 }
 
 fn frame(ty: u8, payload: &[u8]) -> Vec<u8> {
@@ -313,6 +450,16 @@ impl ToViewer {
             ToViewer::CoherenceNo(s) => frame(19, s.as_bytes()),
             ToViewer::HeadMode { head, width, height } => frame(16, &u32s(&[*head, *width, *height])),
             ToViewer::HeadDamage { head, x, y, w, h } => frame(17, &u32s(&[*head, *x, *y, *w, *h])),
+            ToViewer::Net { nat_ok, ports } => {
+                let mut p = vec![*nat_ok as u8, ports.len() as u8];
+                for n in ports {
+                    p.push(n.nic);
+                    p.push(n.connected as u8);
+                    p.extend_from_slice(&n.mac);
+                    n.live.encode(&mut p);
+                }
+                frame(40, &p)
+            }
         }
     }
 
@@ -377,6 +524,33 @@ impl ToViewer {
                 ToViewer::WindowIcon { id, w, h, rgba }
             }
             19 => ToViewer::CoherenceNo(line(p)?),
+            40 => {
+                let (nat_ok, n) = match p {
+                    [f @ (0 | 1), n, ..] => (*f != 0, *n as usize),
+                    _ => return Err(Error::Proto("network adapters")),
+                };
+                if n > NET_PORTS_MAX {
+                    return Err(Error::Proto("network adapters"));
+                }
+                let mut o = 2;
+                let mut ports = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let head = p.get(o..o + 8).ok_or(Error::Proto("short"))?;
+                    let (nic, flags) = (head[0], head[1]);
+                    if nic as usize >= NET_PORTS_MAX || flags > 1 || ports.iter().any(|x: &NetPort| x.nic == nic) {
+                        return Err(Error::Proto("network adapters"));
+                    }
+                    let mut mac = [0u8; 6];
+                    mac.copy_from_slice(&head[2..8]);
+                    o += 8;
+                    let live = NetLive::decode(p, &mut o)?;
+                    ports.push(NetPort { nic, live, connected: flags != 0, mac });
+                }
+                if o != p.len() {
+                    return Err(Error::Proto("network adapters"));
+                }
+                ToViewer::Net { nat_ok, ports }
+            }
             _ => return Err(Error::Proto("unknown viewer message")),
         })
     }
@@ -417,6 +591,13 @@ impl ToVmm {
             ToVmm::StartApp(s) => frame(20, s.as_bytes()),
             ToVmm::HeadResize { head, width, height, scale } => frame(18, &u32s(&[*head, *width, *height, *scale])),
             ToVmm::HeadPointer { head, x, y } => frame(19, &u32s(&[*head, *x as u32, *y as u32])),
+            ToVmm::NetConnect { nic, on } => frame(40, &[*nic, *on as u8]),
+            ToVmm::NetSet { nic, live, port_mac } => {
+                let mut p = vec![*nic];
+                p.extend_from_slice(port_mac);
+                live.encode(&mut p);
+                frame(41, &p)
+            }
         }
     }
 
@@ -486,6 +667,17 @@ impl ToVmm {
             19 if p.len() == 12 => {
                 let (x, y) = (small(get_u32(p, 1)?)?, small(get_u32(p, 2)?)?);
                 ToVmm::HeadPointer { head: head(get_u32(p, 0)?)?, x: x.min(POINTER_MAX), y: y.min(POINTER_MAX) }
+            }
+            40 if p.len() == 2 && (p[0] as usize) < NET_PORTS_MAX && p[1] <= 1 => ToVmm::NetConnect { nic: p[0], on: p[1] != 0 },
+            41 if p.len() >= 7 && (p[0] as usize) < NET_PORTS_MAX => {
+                let mut port_mac = [0u8; 6];
+                port_mac.copy_from_slice(&p[1..7]);
+                let mut o = 7;
+                let live = NetLive::decode(p, &mut o)?;
+                if o != p.len() || port_mac[0] & 1 != 0 {
+                    return Err(Error::Proto("network adapter"));
+                }
+                ToVmm::NetSet { nic: p[0], live, port_mac }
             }
             _ => return Err(Error::Proto("unknown vmm message")),
         })
@@ -676,6 +868,68 @@ mod tests {
         assert!(d.next_to_viewer().is_err());
         d.push(&frame(13, &[1, 2]));
         assert!(d.next_to_vmm().is_err());
+    }
+
+    fn nat(forwards: Vec<Forward>) -> NetLive {
+        NetLive { kind: NetKind::Nat, name: String::new(), loopback: false, block_private: true, forwards }
+    }
+
+    #[test]
+    fn network_adapters_roundtrip_and_are_checked() {
+        let fwd = Forward { host_addr: "127.0.0.1".into(), host_port: 2222, guest_port: 22 };
+        let bridged = NetLive { kind: NetKind::Bridged, name: "en0".into(), loopback: false, block_private: false, forwards: vec![] };
+        let msgs = [
+            ToVmm::NetConnect { nic: 1, on: false },
+            ToVmm::NetSet { nic: 0, live: nat(vec![fwd.clone()]), port_mac: [0; 6] },
+            ToVmm::NetSet { nic: 7, live: bridged.clone(), port_mac: [0x3e, 1, 2, 3, 4, 5] },
+        ];
+        let mut d = Decoder::default();
+        for m in &msgs {
+            d.push(&m.encode());
+            assert_eq!(d.next_to_vmm().unwrap().as_ref(), Some(m));
+        }
+        let v = ToViewer::Net {
+            nat_ok: true,
+            ports: vec![
+                NetPort { nic: 0, live: nat(vec![fwd.clone()]), connected: true, mac: [2, 1, 2, 3, 4, 5] },
+                NetPort { nic: 1, live: bridged.clone(), connected: false, mac: [2, 1, 2, 3, 4, 6] },
+            ],
+        };
+        d.push(&v.encode());
+        assert_eq!(d.next_to_viewer().unwrap(), Some(v));
+        // Bad: adapter 8, a name for NAT, no name for bridged, odd names,
+        // forwards on a bridged adapter, a bad address, a multicast MAC,
+        // trailing bytes, the same adapter twice.
+        let bad_live = [
+            NetLive { name: "en0".into(), ..nat(vec![]) },
+            NetLive { name: String::new(), ..bridged.clone() },
+            NetLive { name: "en0/../x".into(), ..bridged.clone() },
+            NetLive { name: "a".repeat(16), ..bridged.clone() },
+            NetLive { forwards: vec![fwd.clone()], ..bridged.clone() },
+            NetLive { block_private: true, ..bridged.clone() },
+            nat(vec![Forward { host_addr: "localhost".into(), ..fwd.clone() }]),
+        ];
+        for l in bad_live {
+            assert!(!l.valid(), "{l:?}");
+            d.push(&ToVmm::NetSet { nic: 0, live: l, port_mac: [0; 6] }.encode());
+            assert!(d.next_to_vmm().is_err());
+        }
+        d.push(&ToVmm::NetConnect { nic: 8, on: true }.encode());
+        assert!(d.next_to_vmm().is_err());
+        d.push(&ToVmm::NetSet { nic: 0, live: bridged.clone(), port_mac: [1, 0, 0, 0, 0, 0] }.encode());
+        assert!(d.next_to_vmm().is_err());
+        let mut f = ToVmm::NetConnect { nic: 0, on: true }.encode();
+        f[1] = 3;
+        f.push(0);
+        d.push(&f);
+        assert!(d.next_to_vmm().is_err());
+        let port = |nic| NetPort { nic, live: bridged.clone(), connected: true, mac: [2; 6] };
+        d.push(&ToViewer::Net { nat_ok: false, ports: vec![port(1), port(1)] }.encode());
+        assert!(d.next_to_viewer().is_err());
+        d.push(&ToViewer::Net { nat_ok: false, ports: (0..9).map(port).collect() }.encode());
+        assert!(d.next_to_viewer().is_err());
+        d.push(&frame(40, &[1, 1, 0, 1]));
+        assert!(d.next_to_viewer().is_err());
     }
 
     #[test]

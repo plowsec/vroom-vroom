@@ -131,7 +131,7 @@ pub fn set(c: &mut VmConfig, key: &str, v: &str, default_iface: Option<&str>) ->
                     let mode = [NetKind::Nat, NetKind::Bridged, NetKind::HostOnly][choice(v, 3, "network mode")?];
                     if mode != n.mode {
                         // Keep only what the new mode takes.
-                        *n = Net { mode, mac: n.mac.take(), ..empty_net() };
+                        *n = Net { mode, mac: n.mac.take(), connected: n.connected, ..empty_net() };
                         match mode {
                             NetKind::Bridged => n.interface = Some(default_iface.unwrap_or("en0").to_string()),
                             NetKind::HostOnly => n.network = Some("lab".into()),
@@ -143,6 +143,7 @@ pub fn set(c: &mut VmConfig, key: &str, v: &str, default_iface: Option<&str>) ->
                 "network" => n.network = Some(v.trim().to_string()),
                 "loopback" => n.allow_host_loopback = bool_of(v)?,
                 "block" => n.block_private = bool_of(v)?,
+                "connected" => n.connected = bool_of(v)?,
                 "mac" => n.mac = Some(v.trim().to_ascii_lowercase()).filter(|m| !m.is_empty()),
                 _ => return Err(format!("unknown setting {key}")),
             }
@@ -179,6 +180,7 @@ fn empty_net() -> Net {
         allow_host_loopback: false,
         block_private: false,
         mac: None,
+        connected: true,
     }
 }
 
@@ -679,6 +681,7 @@ gpu = "virtio2d"
         ("net.0.fwd.0.lan", "true"),
         ("net.0.loopback", "true"),
         ("net.0.block", "true"),
+        ("net.0.connected", "false"),
         ("net.0.mac", "52:54:00:aa:bb:cc"),
         ("share.0.tag", "work"),
         ("share.0.writable", "true"),
