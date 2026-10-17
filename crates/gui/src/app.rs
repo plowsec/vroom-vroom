@@ -499,23 +499,31 @@ impl App {
         // Not a full listing: this runs every tick, and each snapshot's
         // manifest can be megabytes.
         let has_snaps = std::fs::read_dir(v.state_dir().join("snapshots")).is_ok_and(|mut d| d.next().is_some());
-        let (locked, lock_reason, lock_why) = match state {
-            VmState::Off => (false, "", ""),
+        let (locked, lock_short, lock_reason, lock_why) = match state {
+            VmState::Off => (false, "", "", ""),
             VmState::Suspended => (
                 true,
+                "Suspended: hardware is locked",
                 "Suspended. Network and USB changes apply when it resumes. Other hardware changes after a fresh boot: resume and shut down, or discard the saved state (⋯ menu).",
                 "The VM was saved with this hardware: it changes after a fresh boot.",
             ),
             _ if !console::is_running(&v.key) && console::viewer_socket(&v.state_dir()).is_some() => (
                 true,
+                "Running without a window",
                 "Running without a window. Show brings it back; shut it down to change hardware.",
                 "Can't change while the VM runs without a window.",
             ),
             _ if !console::is_running(&v.key) => {
-                (true, "Running from a terminal (vroom run). Stop it there to change settings.", "Can't change while the VM runs from a terminal.")
+                (
+                    true,
+                    "Running from a terminal",
+                    "Running from a terminal (vroom run). Stop it there to change settings.",
+                    "Can't change while the VM runs from a terminal.",
+                )
             }
             _ => (
                 true,
+                "Running: hardware is locked",
                 "Running. Network, USB devices and the clipboard change right away; the rest needs the VM shut down.",
                 "The guest found this hardware when it started: shut the VM down to change it.",
             ),
@@ -592,32 +600,7 @@ impl App {
                 readonly: sh.readonly,
             })
             .collect();
-        let host_usb = if c.usb.is_empty() { Vec::new() } else { crate::hostusb::host_list() };
-        let usb: Vec<UsbRow> = c
-            .usb
-            .iter()
-            .map(|u| {
-                let ids = u.ids();
-                let here = host_usb.iter().find(|d| Some((d.vendor, d.product)) == ids && (u.serial.is_none() || d.serial == u.serial));
-                // A disk as files or as a disk needs no root: no warning.
-                let held = here.is_some_and(|d| !d.claimed_by.is_empty()) && u.mode == vroom_config::UsbMode::Device;
-                let state = match here {
-                    None => "not plugged in".to_string(),
-                    Some(d) if held => format!("held by {} (a VM can't take it without root)", d.claimed_by.join(", ")),
-                    Some(_) => "plugged in".to_string(),
-                };
-                let label = u.name.clone().or_else(|| here.map(|d| d.label())).unwrap_or_else(|| u.id.clone());
-                let serial = u.serial.as_ref().map(|sn| format!(" · serial {sn}")).unwrap_or_default();
-                // Unplugged: what it was set to tells whether it is a disk.
-                let storage = cfg!(target_os = "macos") && (here.is_some_and(|d| d.is_storage()) || u.mode != vroom_config::UsbMode::Device);
-                let mode = match u.mode {
-                    vroom_config::UsbMode::Files => 0,
-                    vroom_config::UsbMode::Disk => 1,
-                    vroom_config::UsbMode::Device => 2,
-                };
-                UsbRow { label: s(label), note: s(format!("{}{serial} · {state}", u.id)), warn: held, storage, mode }
-            })
-            .collect();
+        let usb = usb_rows(c, console::usb_now(&v.key));
         let usb_host: Vec<UsbHostRow> = self
             .usb_host
             .iter()
@@ -636,6 +619,7 @@ impl App {
             })
             .collect();
         let warnings: Vec<SharedString> = r.warnings().into_iter().map(|w| s(capitalize(&w))).collect();
+        let warn_short: Vec<SharedString> = r.warnings().iter().map(|w| s(warn_short(w))).collect();
 
         let (boot_kernel, firmware, vars, kernel, initrd, cmdline) = match &c.boot {
             Boot::Uefi { firmware, vars } => (
@@ -682,14 +666,17 @@ impl App {
             height: s(c.display.height.to_string()),
             hidpi: c.display.hidpi,
             video_decode: c.display.video_decode,
+            monitors: c.display.monitors as i32,
             disks: model(disks),
             nets: model(nets),
             shares: model(shares),
             usb_picking: self.usb_picking,
-            sum_usb: s(match c.usb.len() {
-                0 => "None".to_string(),
-                1 => usb[0].label.to_string(),
-                n => format!("{n} devices"),
+            sum_usb: s(match (usb.len(), usb.iter().filter(|u| u.on).count()) {
+                (0, _) => "None".to_string(),
+                (1, 0) => usb[0].label.to_string(),
+                (1, _) => format!("{} · connected", usb[0].label),
+                (n, 0) => format!("{n} devices"),
+                (n, on) => format!("{n} devices · {on} connected"),
             }),
             usb: model(usb),
             usb_host: model(usb_host),
@@ -729,7 +716,9 @@ impl App {
             initrd: s(initrd),
             cmdline: s(cmdline),
             warnings: model(warnings),
+            warn_short: model(warn_short),
             locked,
+            lock_short: s(lock_short),
             lock_reason: s(lock_reason),
             lock_why: s(lock_why),
             live,
@@ -748,7 +737,7 @@ impl App {
             sum_display: s(match gpu {
                 0 => "No screen".to_string(),
                 g => format!(
-                    "{} · starts at {}×{}{}",
+                    "{} · {}×{}{}",
                     match (g, c.display.opengl, c.display.opengl_host) {
                         (1, ..) => "2D",
                         _ if c.os == Some(GuestOs::Windows) => "3D (Direct3D 11)",
@@ -758,7 +747,7 @@ impl App {
                     },
                     c.display.width,
                     c.display.height,
-                    if c.display.hidpi { " · full resolution" } else { "" }
+                    if c.display.monitors > 1 { format!(" · {} monitors", c.display.monitors) } else { String::new() },
                 ),
             }),
             sum_storage: s(format!(
@@ -1016,6 +1005,9 @@ impl App {
         if let Some(k) = key.strip_prefix("newvm.") {
             return self.newvm_set(k, v);
         }
+        if key.starts_with("usbnow.") {
+            return self.usb_now_act(key, Some(v));
+        }
         let locked = self.cur().is_some_and(|vm| self.state_of(vm) != VmState::Off);
         // Not hardware: these apply to a running VM's window. Network
         // adapters apply to it too (or when it resumes).
@@ -1034,6 +1026,45 @@ impl App {
         };
         if let (true, Some(i)) = (saved, net) {
             console::net_apply(&vm, i);
+        }
+        // A USB disk connected now another way: again, this way.
+        if let (true, Some(i)) = (saved && key.ends_with(".mode"), key.strip_prefix("usb.").and_then(|r| r.split('.').next()).and_then(|i| i.parse::<usize>().ok())) {
+            if let Some(u) = self.cur().and_then(|v| v.raw.as_ref()).and_then(|c| c.usb.get(i).cloned()) {
+                let d = vroom_display::UsbDev { id: u.id.clone(), serial: u.serial.clone().unwrap_or_default(), name: u.name.clone().unwrap_or_default() };
+                console::usb_set_mode(&vm, d, u.mode, u.readonly);
+            }
+        }
+    }
+
+    /// A device connected for this run only, by its place in that list.
+    fn run_only_dev(&self, j: &str) -> Option<vroom_display::UsbPort> {
+        let v = self.cur()?;
+        let (ports, _) = console::usb_now(&v.key)?;
+        run_only(v.raw.as_ref()?, &ports).into_iter().nth(j.parse().ok()?)
+    }
+
+    /// The USB card's rows for this run's devices: how one connects (it
+    /// connects again that way), "always connect", let go.
+    fn usb_now_act(&mut self, a: &str, v: Option<&str>) {
+        let Some((j, what)) = a.strip_prefix("usbnow.").and_then(|r| r.split_once('.')) else { return };
+        let Some(p) = self.run_only_dev(j) else { return };
+        let Some(key) = self.cur().map(|v| v.key.clone()) else { return };
+        match (what, v) {
+            ("mode", Some(m)) => {
+                let mode = match m {
+                    "0" => vroom_config::UsbMode::Files,
+                    "1" => vroom_config::UsbMode::Disk,
+                    _ => vroom_config::UsbMode::Device,
+                };
+                console::usb_set_mode(&key, p.dev, mode, p.readonly);
+            }
+            ("pin", None) => {
+                if self.change(|c| crate::hostusb::apply_always(c, &p.dev, true, how_mode(p.how))) {
+                    self.toast("Saved: it connects at every start", 1);
+                }
+            }
+            ("disconnect", None) => console::usb_disconnect(&key, &p.dev),
+            _ => {}
         }
     }
 
@@ -1263,6 +1294,14 @@ impl App {
                 }
             }
             "share.add" | "disk.add-iso" | "disk.add-existing" | "disk.add-new" if self.hw_locked() => {}
+            _ if a.starts_with("usbnow.") => self.usb_now_act(a, None),
+            // Out of the VM file, but connected still (it was for this run).
+            _ if a.starts_with("usb.") && a.ends_with(".unpin") => {
+                let i = &a["usb.".len()..a.len() - ".unpin".len()];
+                if self.live_ok() {
+                    self.change(|c| edit::act(c, &format!("usb.{i}.remove")));
+                }
+            }
             "usb.add" if !self.live_ok() => {}
             "usb.add" => {
                 // Open or close the list of what's plugged in.
@@ -1894,6 +1933,141 @@ fn capitalize(w: &str) -> String {
     }
 }
 
+/// A config warning in a few words, for its banner (the whole of it goes
+/// in the tooltip).
+fn warn_short(w: &str) -> String {
+    let short = if w.starts_with("security.sandbox") {
+        "Sandbox is off"
+    } else if w.starts_with("net.allow_host_loopback") {
+        "Guest reaches this Mac's localhost"
+    } else if w.starts_with("port forward") {
+        "Port forward open to your network"
+    } else if w.starts_with("audio.input") {
+        "Microphone on"
+    } else if w.starts_with("share") && w.contains("home folder") {
+        "Share exposes your home folder"
+    } else if w.starts_with("share") && w.contains("writable") {
+        "Writable share"
+    } else {
+        return capitalize(w.split_once(": ").map_or(w, |(a, _)| a));
+    };
+    short.to_string()
+}
+
+/// The VM file's entry for `d`? One without a serial number matches any.
+fn in_file(c: &VmConfig, d: &vroom_display::UsbDev) -> Option<usize> {
+    c.usb.iter().position(|u| u.id == d.id && !u.serial.as_deref().is_some_and(|s| s != d.serial))
+}
+
+/// The devices the running VM has connected for this run only (not in
+/// its file), once each, in the order the VMM lists them.
+fn run_only(c: &VmConfig, ports: &[vroom_display::UsbPort]) -> Vec<vroom_display::UsbPort> {
+    let mut out: Vec<vroom_display::UsbPort> = Vec::new();
+    for p in ports.iter().filter(|p| in_file(c, &p.dev).is_none()) {
+        if !out.iter().any(|o| o.dev.id == p.dev.id && o.dev.serial == p.dev.serial) {
+            out.push(p.clone());
+        }
+    }
+    out
+}
+
+fn usb_mode_index(m: vroom_config::UsbMode) -> i32 {
+    match m {
+        vroom_config::UsbMode::Files => 0,
+        vroom_config::UsbMode::Disk => 1,
+        vroom_config::UsbMode::Device => 2,
+    }
+}
+
+fn how_mode(h: vroom_display::UsbHow) -> vroom_config::UsbMode {
+    match h {
+        vroom_display::UsbHow::Files => vroom_config::UsbMode::Files,
+        vroom_display::UsbHow::Disk => vroom_config::UsbMode::Disk,
+        vroom_display::UsbHow::Device => vroom_config::UsbMode::Device,
+    }
+}
+
+/// The USB card: the VM file's devices ("always connect"), then those
+/// connected now for this run only. `now`: what the running VM has
+/// connected, and whether its guest tools answer.
+fn usb_rows(c: &VmConfig, now: Option<(Vec<vroom_display::UsbPort>, bool)>) -> Vec<UsbRow> {
+    let running = now.is_some();
+    let (ports, agent) = now.unwrap_or_default();
+    let host = if c.usb.is_empty() && ports.is_empty() { Vec::new() } else { crate::hostusb::host_list() };
+    usb_rows_with(c, &ports, agent, running, &host)
+}
+
+fn usb_rows_with(
+    c: &VmConfig,
+    ports: &[vroom_display::UsbPort],
+    agent: bool,
+    running: bool,
+    host: &[vroom_usb::list::HostDevice],
+) -> Vec<UsbRow> {
+    use crate::console::usbmenu::{connected_note, CAPTURED};
+    use vroom_config::UsbMode;
+    let ids = |id: &str, serial: &str| format!("{id}{}", if serial.is_empty() { String::new() } else { format!(" · serial {serial}") });
+    let same = |d: &vroom_display::UsbDev, id: &str, serial: Option<&str>| d.id == id && serial.is_none_or(|s| s == d.serial || d.serial.is_empty());
+    let files_of = |h: Option<&vroom_usb::list::HostDevice>| -> Vec<String> {
+        h.map(|h| crate::usbdisk::volumes(h).into_iter().map(|(_, p)| p.display().to_string()).collect()).unwrap_or_default()
+    };
+    let mut rows = Vec::new();
+    for (i, u) in c.usb.iter().enumerate() {
+        let here = host.iter().find(|d| Some((d.vendor, d.product)) == u.ids() && (u.serial.is_none() || d.serial == u.serial));
+        let mine: Vec<vroom_display::UsbPort> = ports.iter().filter(|p| same(&p.dev, &u.id, u.serial.as_deref())).cloned().collect();
+        let on = !mine.is_empty();
+        let storage = cfg!(target_os = "macos")
+            && (here.is_some_and(crate::hostusb::is_disk) || u.mode != UsbMode::Device || mine.iter().any(|p| p.how != vroom_display::UsbHow::Device));
+        let id_line = ids(&u.id, u.serial.as_deref().unwrap_or(""));
+        let (note, tip, warn) = if on {
+            connected_note(&mine, &files_of(here), agent)
+        } else {
+            match here {
+                None => ("Not plugged in".to_string(), String::new(), false),
+                Some(h) if storage && h.captured && u.mode != UsbMode::Device => ("Unplug it and plug it in again".into(), CAPTURED.into(), true),
+                Some(h) if u.mode == UsbMode::Device && h.needs_root() => (
+                    "Used by macOS".into(),
+                    "macOS holds it: the VM takes it through vroom-netd, the root helper (USB menu of the VM window).".into(),
+                    true,
+                ),
+                Some(_) if running => ("Not connected".into(), "Plugged in. Connect it from the VM window's USB menu.".into(), false),
+                Some(_) => ("Plugged in".into(), "Connects when the VM starts.".into(), false),
+            }
+        };
+        let label = u.name.clone().or_else(|| here.map(|d| d.label())).unwrap_or_else(|| u.id.clone());
+        let mode = mine.first().map(|p| how_mode(p.how)).unwrap_or(u.mode);
+        rows.push(UsbRow {
+            label: s(label),
+            note: s(note),
+            tip: s(if tip.is_empty() { id_line } else { format!("{tip}\n{id_line}") }),
+            storage,
+            mode: usb_mode_index(mode),
+            warn,
+            pinned: true,
+            index: i as i32,
+            on,
+        });
+    }
+    for (j, p) in run_only(c, ports).into_iter().enumerate() {
+        let here = host.iter().find(|h| h.id() == p.dev.id && (p.dev.serial.is_empty() || h.serial.as_deref() == Some(p.dev.serial.as_str())));
+        let mine: Vec<vroom_display::UsbPort> = ports.iter().filter(|q| q.dev == p.dev).cloned().collect();
+        let (note, tip, warn) = connected_note(&mine, &files_of(here), agent);
+        let storage = cfg!(target_os = "macos") && (p.how != vroom_display::UsbHow::Device || here.is_some_and(crate::hostusb::is_disk));
+        rows.push(UsbRow {
+            label: s(if p.dev.name.is_empty() { p.dev.id.clone() } else { p.dev.name.clone() }),
+            note: s(format!("{note} · this run")),
+            tip: s(format!("{tip}\nConnected for this run only.\n{}", ids(&p.dev.id, &p.dev.serial))),
+            storage,
+            mode: usb_mode_index(how_mode(p.how)),
+            warn,
+            pinned: false,
+            index: j as i32,
+            on: true,
+        });
+    }
+    rows
+}
+
 /// Config errors as people would say them.
 fn plain_error(e: &str) -> String {
     let e = e.strip_prefix("invalid config: ").unwrap_or(e);
@@ -2057,6 +2231,54 @@ mod tests {
         a.update(Msg::Set("cpus".into(), "3".into()));
         let now = std::fs::read_to_string(&file).unwrap();
         assert!(now.contains("memory_mib = 8192 # by hand") && now.contains("cpus = 3"), "{now}");
+    }
+
+    #[test]
+    fn monitors_from_the_display_card() {
+        let (t, mut a) = app(&["a"]);
+        a.update(Msg::Set("gpu".into(), "1".into()));
+        a.update(Msg::Set("monitors".into(), "3".into()));
+        assert!(std::fs::read_to_string(t.path().join("a.toml")).unwrap().contains("monitors = 3"));
+        assert_eq!(a.ui.get_settings().monitors, 3);
+        // Out of range: refused, the file keeps 3.
+        a.update(Msg::Set("monitors".into(), "9".into()));
+        assert_eq!(a.ui.get_settings().monitors, 3);
+    }
+
+    #[test]
+    fn warnings_in_a_few_words() {
+        assert_eq!(warn_short("bridged network: the guest sits on your LAN like a physical machine"), "Bridged network");
+        assert_eq!(warn_short("audio.input: the guest hears your microphone"), "Microphone on");
+        assert_eq!(warn_short("port forward 0.0.0.0:2222 -> guest 22: reachable from other machines"), "Port forward open to your network");
+        assert_eq!(warn_short("clipboard both ways with no sandbox"), "Clipboard both ways with no sandbox");
+    }
+
+    #[test]
+    fn usb_card_has_the_file_and_this_run() {
+        use vroom_display::{UsbDev, UsbHow, UsbPort};
+        let c = VmConfig::from_toml(
+            "name = \"a\"\n[boot]\ntype = \"uefi\"\nvars = \"a.state/v.fd\"\n\n[[usb]]\nid = \"18a5:0302\"\nserial = \"V1\"\nname = \"Verbatim\"\n\n[[usb]]\nid = \"0951:1666\"\nname = \"Kingston\"\nmode = \"files\"\n",
+        )
+        .unwrap();
+        let dev = |id: &str, serial: &str, name: &str| UsbDev { id: id.into(), serial: serial.into(), name: name.into() };
+        let port = |port, d: UsbDev, how| UsbPort { port, dev: d, here: true, always: false, how, readonly: false };
+        let ports = vec![
+            // The Kingston (in the file, by id only) as files, a stick for
+            // this run only as a whole disk.
+            port(64, dev("0951:1666", "K9", "Kingston"), UsbHow::Files),
+            port(3, dev("1209:00ac", "disk8", "Test disk"), UsbHow::Disk),
+        ];
+        let rows = usb_rows_with(&c, &ports, false, true, &[]);
+        assert_eq!(rows.len(), 3);
+        let (v, k, run) = (&rows[0], &rows[1], &rows[2]);
+        assert!(v.pinned && !v.on && v.note == "Not plugged in" && v.tip.contains("18a5:0302 · serial V1"));
+        assert!(k.pinned && k.on && k.mode == 0 && k.warn, "files, no guest tools: a warning");
+        assert!(k.tip.contains("sudo mount -t virtiofs vroom-usb0 /mnt"), "{}", k.tip);
+        assert!(!run.pinned && run.on && run.index == 0 && run.mode == 1);
+        assert!(run.note.ends_with("this run"));
+        // A disk connected some way is a disk, whatever macOS says now.
+        assert_eq!(run.storage, cfg!(target_os = "macos"));
+        assert_eq!(run_only(&c, &ports).len(), 1);
     }
 
     #[test]
