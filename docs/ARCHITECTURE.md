@@ -371,8 +371,8 @@ guest.
 
 `StartApp` (`apps.rs`) reads the menu again, on a thread, and starts
 the app the name fits best: its name (whole, then its start, then a
-word's start) before its other names, a shorter name first. Windows
-(`apps_win.rs`): the `.lnk` files of both Start menu folders (named as
+word's start) before its other names; of equal ones, apps that run in
+a terminal last, then a shorter name first. Windows (`apps_win.rs`): the `.lnk` files of both Start menu folders (named as
 the shell shows them, localized through `desktop.ini`), then the apps
 of `shell:AppsFolder` no shortcut has the name of (Store apps by
 AppUserModelID; enumerated through `IShellItem` and
@@ -386,9 +386,10 @@ old way (the Windows key, the name typed as characters, Enter). Linux
 id, without NoDisplay, Hidden, OnlyShowIn/NotShowIn and missing TryExec
 ones; names in the session's language (`LC_ALL`, `LC_MESSAGES`,
 `LANG`), other names from GenericName, Keywords and the file name.
-Started with `gio launch <file>`, or else the Exec line split into
-words (quoting rules of the spec, field codes out: no files) run
-directly, in its own process group, from the home folder.
+Started with `gio launch <file>` (GLib 2.68 and later), or when that
+fails with the Exec line split into words (quoting rules of the spec,
+field codes out: no files) run directly, in its own process group,
+from the home folder.
 
 While Coherence is on the helper also sends the apps it can start
 (`Apps`: name and 32x32 icon, at most 512, sorted), read on a thread of
