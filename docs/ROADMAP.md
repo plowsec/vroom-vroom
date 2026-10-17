@@ -266,6 +266,10 @@ A guest needs a driver and an API its players use. What exists:
   next master with the old and new guest tools, resizes and Coherence.
   If it shows up again, the window's filler memory is the first suspect.
 
+- A flaky test: `gpu3d server::tests::create_and_refuse` failed once
+  in a full `cargo test --workspace` run (October 17), at the "same id
+  again" refusal; it passes on its own. Find the race.
+
 ## Later
 
 vroom is for power users first. These wait until everything above is
