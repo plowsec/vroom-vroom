@@ -137,7 +137,7 @@ fn edit_file(path: &Path, f: impl FnOnce(&mut VmConfig) -> Result<(), String>) -
     crate::edit::save(path, &before, &after)
 }
 
-fn apply_always(c: &mut VmConfig, d: &UsbDev, on: bool, mode: UsbMode) -> Result<(), String> {
+pub(crate) fn apply_always(c: &mut VmConfig, d: &UsbDev, on: bool, mode: UsbMode) -> Result<(), String> {
     let serial = (!d.serial.is_empty()).then_some(d.serial.as_str());
     let same = |u: &vroom_config::Usb| u.id == d.id && u.serial.as_deref() == serial;
     if on {
@@ -151,6 +151,33 @@ fn apply_always(c: &mut VmConfig, d: &UsbDev, on: bool, mode: UsbMode) -> Result
         c.usb.retain(|u| !same(u));
     }
     Ok(())
+}
+
+/// USB disks seen before, by id: one a root helper captured earlier
+/// shows macOS no interfaces, so it no longer looks like a disk.
+fn disks_file() -> std::path::PathBuf {
+    crate::paths::data_dir().join("usb-disks")
+}
+
+/// A USB disk (it can go as its files or a whole disk): macOS says so
+/// now, or did before. macOS only.
+pub fn is_disk(h: &HostDevice) -> bool {
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
+    let id = h.id();
+    let known = std::fs::read_to_string(disks_file()).unwrap_or_default();
+    let seen = known.lines().any(|l| l == id);
+    if h.is_storage() && !seen {
+        let mut lines: Vec<&str> = known.lines().rev().take(255).collect();
+        lines.reverse();
+        lines.push(&id);
+        if let Some(dir) = disks_file().parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = crate::library::write_atomic(&disks_file(), (lines.join("\n") + "\n").as_bytes());
+    }
+    h.is_storage() || seen
 }
 
 /// Choices remembered for a device ("Remember for this device"), for

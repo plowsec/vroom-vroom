@@ -11,6 +11,115 @@ export component Icon inherits Image {
     image-fit: contain;
 }
 
+// Tooltips. The explanation of a control lives here, not on screen.
+export global Tips {
+    // Test hook (VROOM_SHOT_DO "tip:<text>"): the tip with this text
+    // shows, as for keyboard focus.
+    in-out property <string> demo;
+}
+
+component TipBody inherits Rectangle {
+    in property <string> text;
+    // A config key, in mono under the text ("display.monitors").
+    in property <string> key;
+    width: min(300px, max(t.min-width, max(t.preferred-width, k.preferred-width)) + 20px);
+    height: l.preferred-height;
+    border-radius: Theme.r-sm;
+    background: Theme.popup;
+    border-width: 1px;
+    border-color: Theme.border-strong;
+    l := VerticalLayout {
+        padding: 7px;
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 3px;
+        t := Text {
+            text: root.text;
+            font-size: Theme.fs-xs;
+            color: Theme.text;
+            wrap: word-wrap;
+        }
+        k := Text {
+            visible: root.key != "";
+            height: root.key != "" ? self.preferred-height : 0px;
+            text: root.key;
+            font-size: 10px;
+            font-family: Theme.mono;
+            color: Theme.accent-text;
+            wrap: word-wrap;
+        }
+    }
+}
+
+// Put it inside what it explains (not straight in a layout): it covers
+// its parent, and after a short hover shows `text` by the pointer, in
+// the theme's colors. `focused` (the owner has keyboard focus) shows it
+// under the owner, and so does `Tips.demo`.
+export component Tip inherits Rectangle {
+    in property <string> text;
+    in property <string> key;
+    in property <bool> focused;
+    property <bool> pinned: (root.text != "" || root.key != "") && (root.focused || (Tips.demo != "" && Tips.demo == root.text));
+    init => {
+        if self.pinned {
+            pop.show();
+        }
+    }
+    changed pinned => {
+        if self.pinned {
+            pop.show();
+        } else {
+            pop.close();
+        }
+    }
+    if root.text != "" || root.key != "": Tooltip {
+        TipBody {
+            text: root.text;
+            key: root.key;
+        }
+    }
+    pop := PopupWindow {
+        x: 0;
+        y: root.height + 4px;
+        close-policy: close-on-click-outside;
+        TipBody {
+            text: root.text;
+            key: root.key;
+        }
+    }
+}
+
+// A small "i" that only holds a tip: for a line whose explanation has no
+// control to hang on. Tab reaches it.
+export component InfoTip inherits Rectangle {
+    in property <string> text;
+    in property <string> key;
+    in property <image> icon: Icons.info;
+    in property <color> tint: Theme.text-3;
+    width: 16px;
+    height: 16px;
+    fs := FocusScope {
+        focus-on-click: false;
+    }
+    Image {
+        source: root.icon;
+        width: 14px;
+        height: 14px;
+        colorize: root.tint;
+        image-fit: contain;
+    }
+    if fs.has-focus: Rectangle {
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: Theme.accent;
+    }
+    Tip {
+        text: root.text;
+        key: root.key;
+        focused: fs.has-focus;
+    }
+}
+
 export component Spinner inherits Rectangle {
     in property <color> tint: Theme.text-2;
     in property <bool> spinning: true;
@@ -41,6 +150,7 @@ export component Button inherits Rectangle {
     in property <bool> enabled: true;
     in property <bool> small: false;
     in property <bool> busy: false;
+    in property <string> tip;
     callback clicked;
 
     height: small ? 28px : 32px;
@@ -82,6 +192,9 @@ export component Button inherits Rectangle {
         mouse-cursor: pointer;
         clicked => { root.clicked(); }
     }
+    if root.tip != "": Tip {
+        text: root.tip;
+    }
     states [
         pressed when ta.pressed: { opacity: 0.8; }
     ]
@@ -103,6 +216,23 @@ export component IconButton inherits Rectangle {
     background: active || ta.has-hover ? Theme.selected : transparent;
     animate background { duration: 120ms; }
     opacity: enabled && !dim ? 1 : 0.35;
+    // Tab reaches it; Space or Enter clicks it. A click doesn't focus it.
+    fs := FocusScope {
+        focus-on-click: false;
+        enabled: root.enabled;
+        key-pressed(e) => {
+            if e.text == " " || e.text == "\n" {
+                root.clicked();
+                return accept;
+            }
+            reject
+        }
+    }
+    if fs.has-focus: Rectangle {
+        border-radius: Theme.r-md;
+        border-width: 1.5px;
+        border-color: Theme.accent;
+    }
     Icon {
         source: root.icon;
         width: root.size * 0.5;
@@ -114,22 +244,10 @@ export component IconButton inherits Rectangle {
         mouse-cursor: pointer;
         clicked => { root.clicked(); }
     }
-    if ta.has-hover && root.tip != "": Rectangle {
-        y: root.height + 6px;
-        x: (root.width - self.width) / 2;
-        width: tiptext.preferred-width + 16px;
-        height: 24px;
-        border-radius: 6px;
-        background: Theme.popup;
-        border-width: 1px;
-        border-color: Theme.border;
-        drop-shadow-blur: 10px;
-        drop-shadow-color: #0000004d;
-        tiptext := Text {
-            text: root.tip;
-            font-size: Theme.fs-xs;
-            color: Theme.text;
-        }
+    // An open menu under it says enough.
+    Tip {
+        text: root.active ? "" : root.tip;
+        focused: fs.has-focus;
     }
 }
 
@@ -167,6 +285,8 @@ export component Toggle inherits Rectangle {
 
 export component Segmented inherits Rectangle {
     in property <[string]> options;
+    // What each option does, in its tooltip.
+    in property <[string]> tips;
     in-out property <int> selected;
     in property <bool> enabled: true;
     callback changed(int);
@@ -214,6 +334,9 @@ export component Segmented inherits Rectangle {
                     root.changed(i);
                 }
             }
+        }
+        Tip {
+            text: i < root.tips.length ? root.tips[i] : "";
         }
     }
 }
@@ -490,8 +613,12 @@ export component Chip inherits Rectangle {
     in property <image> icon;
     in property <string> text;
     in property <color> tint: Theme.text-2;
+    in property <string> tip;
     height: 28px;
     min-width: l.preferred-width;
+    Tip {
+        text: root.tip;
+    }
     border-radius: Theme.r-md;
     background: Theme.card;
     border-width: 1px;
@@ -544,44 +671,40 @@ export component OsBadge inherits Rectangle {
     }
 }
 
-// A labelled line in a settings card. The config key shows on hover, so
-// people learn the file without a second UI for it.
+// A labelled line in a settings card. Hovering it shows what it does
+// and its config key, so people learn the file without a second UI.
 export component Row inherits Rectangle {
     in property <string> label;
+    // Under the label, on screen: only what must be read (a missing file).
     in property <string> hint;
+    in property <bool> hint-warn: false;
+    // In the tooltip.
+    in property <string> tip;
     in property <string> key;
     in property <bool> warn: false;
     min-height: max(38px, l.preferred-height);
-    hover := TouchArea { }
+    Tip {
+        text: root.tip;
+        key: root.key;
+    }
     l := HorizontalLayout {
         spacing: 12px;
         VerticalLayout {
             horizontal-stretch: 1;
             alignment: center;
             spacing: 1px;
-            HorizontalLayout {
-                spacing: 6px;
-                Text {
-                    text: root.label;
-                    font-size: Theme.fs-md;
-                    color: root.warn ? Theme.amber : Theme.text;
-                    vertical-alignment: center;
-                    overflow: elide;
-                }
-                if hover.has-hover && root.key != "": Text {
-                    text: root.key;
-                    font-size: 10px;
-                    font-family: Theme.mono;
-                    color: Theme.accent-text;
-                    vertical-alignment: center;
-                    overflow: elide;
-                }
+            Text {
+                text: root.label;
+                font-size: Theme.fs-md;
+                color: root.warn ? Theme.amber : Theme.text;
+                vertical-alignment: center;
+                overflow: elide;
             }
             if root.hint != "": Text {
                 text: root.hint;
                 font-size: Theme.fs-xs;
-                color: Theme.text-3;
-                wrap: word-wrap;
+                color: root.hint-warn ? Theme.amber : Theme.text-3;
+                overflow: elide;
             }
         }
         @children
@@ -596,6 +719,8 @@ export component SectionCard inherits Rectangle {
     in property <string> title;
     in property <string> summary;
     in property <bool> warn: false;
+    // Why its settings can't change now (empty: they can).
+    in property <string> lock-tip;
     in-out property <bool> expanded: false;
     // Search results open their cards without touching `expanded`.
     in property <bool> force-open: false;
@@ -646,6 +771,12 @@ export component SectionCard inherits Rectangle {
                         color: root.warn ? Theme.amber : Theme.text-2;
                         overflow: elide;
                     }
+                }
+                // Can't change now: a lock, and why in its tip.
+                if root.lock-tip != "": InfoTip {
+                    y: (parent.height - self.height) / 2;
+                    icon: Icons.lock;
+                    text: root.lock-tip;
                 }
                 if root.warn: Icon {
                     source: Icons.warning;
@@ -716,7 +847,12 @@ export component Banner inherits Rectangle {
     in property <int> kind: 2; // 1 ok, 2 warning, 3 error, 0 info
     in property <image> icon: kind == 3 ? Icons.warning : kind == 2 ? Icons.warning : kind == 1 ? Icons.check : Icons.info;
     property <color> c: kind == 3 ? Theme.red : kind == 2 ? Theme.amber : kind == 1 ? Theme.green : Theme.text-2;
+    // The long version, on hover.
+    in property <string> tip;
     min-height: l.preferred-height;
+    Tip {
+        text: root.tip;
+    }
     border-radius: Theme.r-lg;
     background: kind == 0 ? Theme.well : c.with-alpha(0.10);
     border-width: 1px;

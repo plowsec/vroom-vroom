@@ -4,7 +4,8 @@
 //! "console:suspend" to a VM window, "monshot:2:out.png" a picture of a
 //! VM's second monitor window, "vmkey:57" a key to the guest (evdev
 //! code; "vmkey:125+19" a combination), "vmtype:notepad" text,
-//! "cohclick:X,Y[,title]" a click on a Coherence window, "vmmove:X,Y"
+//! "cohclick:X,Y[,title]" a click on a Coherence window, "tip:Text" the
+//! tooltip with that exact text shown, "vmmove:X,Y"
 //! the mouse to a VM window's point, "shot:out.png" a
 //! picture now, "libshot:out.png" one of the library window, "barshot:out.png"
 //! one of the Coherence bar, "cohstart:Calculator" a name in its app field
@@ -90,6 +91,14 @@ fn run(acts: Vec<String>, i: usize, out: PathBuf, delay: f64) {
                 }
                 _ => eprintln!("shot: no window for monitor {n}"),
             }
+        } else if let Some(t) = a.strip_prefix("tip:") {
+            // The tooltip with exactly this text, as keyboard focus shows it.
+            TARGET.with(|w| {
+                if let Some(ui) = w.borrow().as_ref() {
+                    ui.global::<crate::Tips>().set_demo(t.into());
+                }
+            });
+            crate::console::tip_any(t);
         } else if let Some(t) = a.strip_prefix("cohtype:") {
             crate::console::coh_type_any(t);
         } else if let Some(n) = a.strip_prefix("cohstart:") {
