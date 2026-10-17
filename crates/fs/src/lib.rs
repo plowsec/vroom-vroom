@@ -70,9 +70,27 @@ pub struct DirEntry {
 
 #[derive(Debug)]
 pub struct Share {
-    root: OwnedFd,
+    /// None: an empty share (a removable share with nothing in it).
+    root: Option<OwnedFd>,
     readonly: bool,
 }
+
+/// What an empty share's root looks like: a read-only directory, no
+/// time stamps.
+const EMPTY_ROOT: Stat = Stat {
+    dev: 0,
+    ino: 1,
+    size: 0,
+    blocks: 0,
+    mode: libc::S_IFDIR as u32 | 0o555,
+    nlink: 2,
+    uid: 0,
+    gid: 0,
+    blksize: 4096,
+    atime: (0, 0),
+    mtime: (0, 0),
+    ctime: (0, 0),
+};
 
 /// Can the guest use this as one path component?
 pub fn valid_name(n: &OsStr) -> bool {
@@ -103,11 +121,34 @@ impl Share {
         if !sys::fstat(fd.as_raw_fd())?.is_dir() {
             return Err(os(libc::ENOTDIR));
         }
-        Ok(Share { root: fd, readonly })
+        Ok(Share { root: Some(fd), readonly })
+    }
+
+    /// A directory someone else opened for us (the app, for a USB disk's
+    /// volume): served the same way, below that fd.
+    pub fn from_fd(fd: OwnedFd, readonly: bool) -> io::Result<Share> {
+        if !sys::fstat(fd.as_raw_fd())?.is_dir() {
+            return Err(os(libc::ENOTDIR));
+        }
+        Ok(Share { root: Some(fd), readonly })
+    }
+
+    /// Nothing: an empty, read-only directory (a removable share with
+    /// nothing plugged in).
+    pub fn empty() -> Share {
+        Share { root: None, readonly: true }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.root.is_none()
     }
 
     pub fn readonly(&self) -> bool {
         self.readonly
+    }
+
+    fn root(&self) -> io::Result<&OwnedFd> {
+        self.root.as_ref().ok_or_else(|| os(libc::ENOENT))
     }
 
     fn writable(&self) -> io::Result<()> {
@@ -120,7 +161,7 @@ impl Share {
 
     /// Open directory `dir`, never following a symlink.
     fn dir(&self, dir: &Rel) -> io::Result<OwnedFd> {
-        let mut cur = self.root.try_clone()?;
+        let mut cur = self.root()?.try_clone()?;
         for c in dir {
             cur = sys::openat(cur.as_raw_fd(), &cname(c)?, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         }
@@ -130,7 +171,10 @@ impl Share {
     /// Attributes of `p` itself (a symlink is reported as one).
     pub fn stat(&self, p: &Rel) -> io::Result<Stat> {
         match split(p) {
-            None => sys::fstat(self.root.as_raw_fd()),
+            None => match &self.root {
+                Some(r) => sys::fstat(r.as_raw_fd()),
+                None => Ok(EMPTY_ROOT),
+            },
             Some((parent, name)) => sys::fstatat(self.dir(parent)?.as_raw_fd(), &cname(name)?),
         }
     }
@@ -164,6 +208,9 @@ impl Share {
 
     /// Entries of directory `p` (without `.` and `..`), at most `max`.
     pub fn read_dir(&self, p: &Rel, max: usize) -> io::Result<Vec<DirEntry>> {
+        if self.root.is_none() && p.is_empty() {
+            return Ok(Vec::new());
+        }
         sys::read_dir(self.dir(p)?, max)
     }
 
@@ -222,7 +269,7 @@ impl Share {
     pub fn set_mode(&self, p: &Rel, mode: u32) -> io::Result<()> {
         self.writable()?;
         let fd = match split(p) {
-            None => self.root.try_clone()?,
+            None => self.root()?.try_clone()?,
             Some((parent, name)) => {
                 let d = self.dir(parent)?;
                 let n = cname(name)?;
@@ -244,13 +291,16 @@ impl Share {
     pub fn set_times(&self, p: &Rel, atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>) -> io::Result<()> {
         self.writable()?;
         match split(p) {
-            None => sys::futimens(self.root.as_raw_fd(), atime, mtime),
+            None => sys::futimens(self.root()?.as_raw_fd(), atime, mtime),
             Some((parent, name)) => sys::utimensat(self.dir(parent)?.as_raw_fd(), &cname(name)?, atime, mtime),
         }
     }
 
     pub fn statfs(&self) -> io::Result<FsStat> {
-        sys::fstatvfs(self.root.as_raw_fd())
+        match &self.root {
+            Some(r) => sys::fstatvfs(r.as_raw_fd()),
+            None => Ok(FsStat { bsize: 4096, ..Default::default() }),
+        }
     }
 }
 
@@ -532,6 +582,24 @@ mod tests {
         let mut names: Vec<_> = s.read_dir(&p(&[]), 100).unwrap().into_iter().map(|e| e.name).collect();
         names.sort();
         assert_eq!(names, p(&["link-dir", "link-file", "sub"]));
+    }
+
+    #[test]
+    fn from_an_fd_and_empty() {
+        let (_td, root) = fixture();
+        let fd = OwnedFd::from(File::open(&root).unwrap());
+        let s = Share::from_fd(fd, true).unwrap();
+        assert_eq!(s.stat(&p(&["sub", "hello.txt"])).unwrap().size, 2);
+        assert!(s.stat(&p(&["link-dir", "secret.txt"])).is_err());
+        assert!(Share::from_fd(OwnedFd::from(File::open(root.join("sub/hello.txt")).unwrap()), true).is_err(), "not a directory");
+        let e = Share::empty();
+        assert!(e.is_empty() && e.readonly());
+        assert!(e.stat(&p(&[])).unwrap().is_dir());
+        assert!(e.read_dir(&p(&[]), 10).unwrap().is_empty());
+        assert_eq!(e.stat(&p(&["x"])).unwrap_err().raw_os_error(), Some(libc::ENOENT));
+        assert!(e.open_file(&p(&["x"]), false).is_err());
+        assert_eq!(e.mkdir(&p(&[]), OsStr::new("x"), 0o755).unwrap_err().raw_os_error(), Some(libc::EROFS));
+        assert!(e.statfs().is_ok());
     }
 
     #[test]

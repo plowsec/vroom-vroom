@@ -502,6 +502,71 @@ run inside the helper in place of libusb, behind the same checks. The
 stick parses the guest's SCSI commands there: fixed-size blocks, every
 offset checked against its RAM disk.
 
+### USB disks: their files, or the disk
+
+macOS 15.3 and later refuse USB storage to any program without Full Disk
+Access, root included. So the app offers two ways that don't pass the
+USB device, and need no root helper (GUIDE, "USB disks"):
+
+"Share its files". The app (unsandboxed, the user's) opens the volume's
+directory (`/Volumes/NAME`) and issues a sandbox extension for that one
+path: a token the kernel signs, of a class of ours
+(`org.vroom.usb-files.read`, or `.read-write`). It passes the directory
+fd and the token to the VMM over the viewer socket. The VMM's profile
+allows file access under an extension of those classes and nowhere else
+new: without a token from the app it reaches nothing more. Seatbelt
+checks paths, so a directory fd alone wouldn't be enough; the token is
+what lets the VMM in, and only below that directory. The files are
+served by the same code as shared folders (component walks with
+`openat(O_NOFOLLOW)`, no symlink followed, no `..`), read-only when the
+user asked or when macOS has the volume read-only. On disconnect the
+VMM drops the share (its fds close at once) and releases the token. A
+VMM taken over by the guest could keep the token instead: it then keeps
+read access to that volume, as long as the VMM lives. The token names
+the path; whether the kernel also binds it to that volume (a new one
+mounted later under the same name) we haven't checked. The extension
+calls are not public API (Safari and WebKit use them): a macOS update
+could change them, and the share would then fail, not open up.
+
+The guest sees these on two virtio-fs devices every VM started on a Mac
+has (`vroom-usb0`, `vroom-usb1`), empty until something is shared. The
+agent mounts them when the VMM says so (a tag of that form and a volume
+name checked like a file name: no `/`, `..`, leading dot or dash); on
+Linux through `systemd-run` (the agent's own service has no mount
+privilege), with the arguments passed as they are, no shell.
+
+"Use as a disk". The app finds the disk in the IOKit registry below the
+chosen USB device (vendor, product, serial), and takes it only if macOS
+calls it removable or ejectable, its storage device doesn't say it is
+internal, and nothing of it is mounted where macOS lives. It unmounts it
+(`diskutil unmountDisk`, which refuses while files are open), checks
+the same disk is still there, and opens `/dev/rdiskN`: directly when the
+user owns the node (disk images), else with `/usr/libexec/authopen`,
+macOS's tool for this, which asks for an admin password and passes the
+fd back over a socket. The fd must be a character device with that
+disk's device number. The VMM gets the fd over the viewer socket. It
+checks it is a character device (or, for tests, a plain file) and reads
+its size with the disk ioctls; its profile allows ioctls on
+`/dev/rdisk*` only, and only on fds it was given (it can open no disk).
+It serves the disk as a plain USB stick: the test stick's Bulk-Only and
+SCSI code, now in a thread of the VMM with the fd as its store, behind
+the same request checks as a helper (endpoints, sizes, transfers in
+flight). Every block number and length is checked against the disk's
+size before the read or write; reads and writes are whole blocks (the
+fuzzer's `usb_proto` target drives it as a hostile VMM would). On
+disconnect the VMM flushes (the disk's cache too) and closes the fd
+before it tells the app, which then has macOS mount the disk again.
+
+What the guest gets: all of that disk, to read and overwrite (format it,
+plant a boot sector). That is what was asked for. It can't reach other
+disks: the VMM holds the one fd. vroom-netd has no part in it: no root
+process opens disks.
+
+macOS's privacy checks: reading a removable volume, and probably opening
+a removable disk, is a "Removable Volumes" permission macOS asks the
+user for once, on behalf of vroom (the app's `Info.plist` says why). If
+the user said no, the app says where to allow it.
+
 The VM's xHCI always has 8 USB 2 + USB 3 port pairs for these devices
 (fixed, so the guest and saved VMs see the same controller); the
 viewer protocol caps names and the list, and the VMM checks every
@@ -567,8 +632,9 @@ it back when it ends (one more re-enumeration, macOS's drivers come
 back). A device the guest can't use at all is given back at once.
 
 macOS 15 opens USB storage only to a program with Full Disk Access,
-root or not. For USB disks the user gives vroom-netd that permission
-(GUIDE). That covers the daemon and the helpers it starts: macOS then
+root or not. To pass a USB disk as the device the user gives vroom-netd
+that permission (GUIDE); sharing its files or using it as a disk (above)
+needs neither the permission nor vroom-netd. That covers the daemon and the helpers it starts: macOS then
 lets them read the user's protected files too (Mail, Messages, other
 apps' data), which root alone can't. Neither does: the daemon reads
 only its config, and the helpers' Seatbelt profile allows no files at

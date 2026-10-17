@@ -48,6 +48,19 @@ fn line(d: &HostDevice) -> String {
     } else if d.captured {
         s += "\n           taken from macOS by a root helper earlier and not given back (root only; unplug it to reset)";
     }
+    if d.is_storage() {
+        let mounts = vroom_usb::list::mounts();
+        for k in vroom_usb::list::disks(d.vendor, d.product, d.serial.as_deref()) {
+            let on: Vec<String> = mounts.iter().filter(|(dev, _)| k.parts.contains(dev)).map(|(_, p)| p.display().to_string()).collect();
+            s += &format!(
+                "\n           disk /dev/{} ({} MB{}){}",
+                k.bsd,
+                k.bytes / 1_000_000,
+                if k.removable || k.ejectable { ", removable" } else { "" },
+                if on.is_empty() { String::new() } else { format!(", mounted at {}", on.join(", ")) }
+            );
+        }
+    }
     s
 }
 

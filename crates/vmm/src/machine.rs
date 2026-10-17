@@ -211,6 +211,9 @@ pub(crate) struct BuildEnv {
     pub net_ctrl: bool,
     /// The VMM will lock itself down (what NAT may reach later).
     pub sandbox: bool,
+    /// Removable shares for USB disks' files (`usb::FILE_SLOTS` on a
+    /// Mac; a resumed VM: as many as it was saved with).
+    pub usb_file_slots: usize,
 }
 
 /// What gets loaded into RAM at (re)boot. Kept so reset can reload it.
@@ -692,6 +695,11 @@ pub(crate) fn build(
         let mut helpers = Vec::new();
         let mut links = Vec::new();
         for u in &config.usb {
+            if u.mode != vroom_config::UsbMode::Device {
+                // The app does those: it opens the disk or the volume.
+                log::info!("usb {}: as {}, connected by the app when it shows this VM", u.id, u.mode.as_str());
+                continue;
+            }
             let (h, link) = crate::usb::spawn(&config.name, u)?;
             helpers.push(h);
             links.push(link);
@@ -757,6 +765,20 @@ pub(crate) fn build(
         board.add_virtio(Box::new(dev))?;
         nets.push(p.net);
     }
+    // Removable shares for USB disks' files (no hotplug: there from the
+    // start; a resumed VM has as many as it was saved with).
+    let mut usb_files = Vec::new();
+    if let Some(u) = &usb_ports {
+        let mut slots = Vec::new();
+        for i in 0..env.usb_file_slots {
+            let tag = format!("{}{i}", vroom_config::USB_SHARE_PREFIX);
+            let (fs, slot) = Fs::removable(&tag).map_err(|e| Error::Setup(e.to_string()))?;
+            usb_files.push(fs);
+            slots.push((tag, slot));
+        }
+        u.set_files(slots, agent.clone());
+        crate::usb::test_seam(u);
+    }
     let net_ports = crate::net::NetPorts::new(nics, viewer.clone(), reach, ident.clone());
     if let Some(ds) = ui {
         if screen.is_none() {
@@ -791,6 +813,10 @@ pub(crate) fn build(
     }
     for gpu in later_gpus {
         board.add_virtio(Box::new(gpu))?;
+    }
+    // Last, so the devices before keep their places in VMs made before.
+    for fs in usb_files {
+        board.add_virtio(Box::new(fs))?;
     }
     let need_pci = board.finish_pci(vendor_ids(&ident.pci_bridge_id)?)?;
     let Board { mut reg, fdt: mut fdt_devices, .. } = board;

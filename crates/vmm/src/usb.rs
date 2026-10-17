@@ -24,9 +24,13 @@ use std::time::Duration;
 
 use vroom_config::Usb;
 use vroom_devices::usb::xhci::Xhci;
-use vroom_display::{ToViewer, UsbDev, UsbPort};
+use vroom_display::{ToViewer, UsbDev, UsbHow, UsbPort, FILES_PORT0};
+use vroom_usb::msd::{Ids, Store, StoreOpener};
+use vroom_usb::rawdisk::FdStore;
+use vroom_virtio::devices::fs::FsSlot;
 use vroom_usb::proto::{self, Event, Request};
 
+use crate::agent::{Agent, AgentCmd};
 use crate::display::ViewerTx;
 use crate::{Error, Result};
 
@@ -124,6 +128,61 @@ fn command(exe: &Path) -> Result<Command> {
     }
 }
 
+/// For tests without the app (a headless VM, a script):
+/// `VROOM_USB_TEST_DISK=<file or /dev/rdiskN>` plugs that in as a USB
+/// disk, `VROOM_USB_TEST_FILES=<dir>` shares that directory as a USB
+/// disk's files, `VROOM_USB_TEST_AFTER` seconds after the start (15 by
+/// default), read-only with `VROOM_USB_TEST_RO=1`; they are taken away
+/// again `VROOM_USB_TEST_FOR` seconds later, if set. Opened here, before
+/// the sandbox, as the app would open them; handed over the way the
+/// app's are, sandbox token included.
+pub(crate) fn test_seam(ports: &Arc<UsbPorts>) {
+    let disk = std::env::var_os("VROOM_USB_TEST_DISK");
+    let files = std::env::var_os("VROOM_USB_TEST_FILES");
+    if disk.is_none() && files.is_none() {
+        return;
+    }
+    let secs = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<u64>().ok());
+    let (after, hold) = (secs("VROOM_USB_TEST_AFTER").unwrap_or(15), secs("VROOM_USB_TEST_FOR"));
+    let ro = std::env::var("VROOM_USB_TEST_RO").is_ok_and(|v| v == "1");
+    let dev = |name: &str| UsbDev { id: "1209:00ab".into(), serial: String::new(), name: name.into() };
+    let disk = disk.and_then(|p| {
+        let f = std::fs::OpenOptions::new().read(true).write(!ro).open(&p);
+        f.map_err(|e| log::warn!("usb test disk {}: {e}", p.to_string_lossy())).ok().map(OwnedFd::from)
+    });
+    let files = files.and_then(|p| {
+        let dir = std::path::PathBuf::from(p);
+        let label: String = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let label = if vroom_proto::usb_label_ok(&label) { label } else { "USB".into() };
+        let token = if cfg!(target_os = "macos") { vroom_sandbox::issue_extension(&dir, !ro).map_err(|e| log::warn!("usb test files: {e}")).ok()? } else { String::new() };
+        let fd = std::fs::File::open(&dir).map_err(|e| log::warn!("usb test files {}: {e}", dir.display())).ok()?;
+        Some((OwnedFd::from(fd), label, token))
+    });
+    let ports = ports.clone();
+    let _ = std::thread::Builder::new().name("usb-test".into()).spawn(move || {
+        std::thread::sleep(Duration::from_secs(after));
+        let mut plugged = Vec::new();
+        if let Some(fd) = disk {
+            match ports.attach_disk(dev("Test disk"), fd, ro) {
+                Ok(p) => plugged.push(p),
+                Err(e) => log::warn!("usb test disk: {e}"),
+            }
+        }
+        if let Some((fd, label, token)) = files {
+            match ports.attach_files(dev("Test files"), fd, ro, &label, &token) {
+                Ok(p) => plugged.push(p),
+                Err(e) => log::warn!("usb test files: {e}"),
+            }
+        }
+        if let Some(h) = hold {
+            std::thread::sleep(Duration::from_secs(h));
+            for p in plugged {
+                ports.detach(p);
+            }
+        }
+    });
+}
+
 /// One device on a port pair.
 struct Entry {
     dev: UsbDev,
@@ -134,6 +193,10 @@ struct Entry {
     always: bool,
     /// To end the helper: shutting this down closes its socket.
     sock: UnixStream,
+    how: UsbHow,
+    readonly: bool,
+    /// A disk served here: says when it is flushed and closed.
+    done: Option<Receiver<()>>,
 }
 
 /// The xHCI's host-device port pairs, and what is plugged into them.
@@ -141,23 +204,140 @@ pub(crate) struct UsbPorts {
     xhci: Arc<Mutex<Xhci>>,
     ports: Mutex<Vec<Option<Entry>>>,
     viewer: Option<ViewerTx>,
+    /// The removable shares for USB disks' files, once the agent is up.
+    files: Mutex<Option<Files>>,
 }
+
+/// USB disks' files: removable shares, and what is on each.
+struct Files {
+    slots: Vec<(String, FsSlot, Option<FilesEntry>)>,
+    agent: Agent,
+}
+
+struct FilesEntry {
+    dev: UsbDev,
+    label: String,
+    readonly: bool,
+    /// The sandbox extension that lets us into the volume.
+    ext: Option<i64>,
+}
+
+/// Removable shares a VM started on a Mac has for USB disks' files.
+pub(crate) const FILE_SLOTS: usize = 2;
 
 /// Port pairs we keep track of: no more than the viewer's list holds
 /// (the xHCI has fewer).
-const MAX_PORTS: usize = vroom_display::USB_PORTS_MAX;
+const MAX_PORTS: usize = vroom_display::USB_PORTS_MAX - FILE_SLOTS;
+
+/// What a USB disk handed to us says it is: the device the disk is of,
+/// as a plain stick of our own (another product id, so guests apply no
+/// quirks meant for the real one).
+fn disk_ids(dev: &UsbDev) -> Ids {
+    let name = if dev.name.is_empty() { "USB disk".to_string() } else { dev.name.clone() };
+    let serial = if dev.serial.is_empty() { "0001VROOMDISK".to_string() } else { dev.serial.clone() };
+    Ids { vendor: 0x1209, product: 0x00ab, manufacturer: "vroom".into(), name, serial }
+}
 
 impl UsbPorts {
     /// Wire the VM file's devices (already on pairs 0..n of `xhci`).
     pub(crate) fn new(xhci: Arc<Mutex<Xhci>>, helpers: Vec<UsbHelper>, viewer: Option<ViewerTx>) -> Result<Arc<UsbPorts>> {
-        let me = Arc::new(UsbPorts { xhci, ports: Mutex::new((0..MAX_PORTS).map(|_| None).collect()), viewer });
+        let me = Arc::new(UsbPorts { xhci, ports: Mutex::new((0..MAX_PORTS).map(|_| None).collect()), viewer, files: Mutex::new(None) });
         for (i, h) in helpers.into_iter().enumerate() {
             let UsbHelper { dev, sock, child, rx } = h;
-            me.lock()[i] = Some(Entry { dev, gen: 0, here: false, always: true, sock: sock.try_clone()? });
+            me.lock()[i] = Some(Entry { dev, gen: 0, here: false, always: true, sock: sock.try_clone()?, how: UsbHow::Device, readonly: false, done: None });
             me.clone().run(i, 0, sock, rx, child)?;
         }
         me.tell();
         Ok(me)
+    }
+
+    /// The removable shares (`tag`, slot) USB disks' files go to, and
+    /// the agent that mounts them in the guest.
+    pub(crate) fn set_files(&self, slots: Vec<(String, FsSlot)>, agent: Agent) {
+        *self.files() = Some(Files { slots: slots.into_iter().map(|(t, s)| (t, s, None)).collect(), agent });
+    }
+
+    fn files(&self) -> std::sync::MutexGuard<'_, Option<Files>> {
+        self.files.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A disk the app opened (the raw disk, or a file for tests): a USB
+    /// stick of ours on a free port pair. Its SCSI is served in a thread
+    /// here, as a helper process would; the disk fd is all it has.
+    pub(crate) fn attach_disk(self: &Arc<Self>, dev: UsbDev, fd: OwnedFd, readonly: bool) -> std::result::Result<u8, String> {
+        if !dev.valid() {
+            return Err("not a USB device id".into());
+        }
+        let store = FdStore::new(std::fs::File::from(fd), readonly).map_err(|e| format!("{}: not a disk we can use ({e})", dev.name))?;
+        let ro = store.readonly();
+        log::info!("usb: {} as a disk: {} MB{}", dev.id, store.bytes() / 1_000_000, if ro { ", read-only" } else { "" });
+        let (ours, theirs) = UnixStream::pair().map_err(|e| e.to_string())?;
+        let (done_tx, done_rx) = mpsc::channel();
+        let ids = disk_ids(&dev);
+        std::thread::Builder::new()
+            .name("usb-disk".into())
+            .spawn(move || {
+                if let Err(e) = vroom_usb::helper::serve(theirs, Box::new(StoreOpener::new(ids, Box::new(store)))) {
+                    log::warn!("usb disk: {e}");
+                }
+                // The disk is flushed and closed by now.
+                let _ = done_tx.send(());
+            })
+            .map_err(|e| e.to_string())?;
+        self.plug(dev, ours, UsbHow::Disk, ro, Some(done_rx))
+    }
+
+    /// A USB disk's volume the app opened (`fd`, a directory): on a free
+    /// removable share. `token` lets us in past our sandbox.
+    pub(crate) fn attach_files(&self, dev: UsbDev, fd: OwnedFd, readonly: bool, label: &str, token: &str) -> std::result::Result<u8, String> {
+        if !dev.valid() || !vroom_proto::usb_label_ok(label) {
+            return Err("not a USB disk's volume".into());
+        }
+        let mut g = self.files();
+        let Some(f) = g.as_mut() else {
+            return Err("this VM has no room for USB disks' files: it started before vroom had them. Restart it".into());
+        };
+        let i = f.slots.iter().position(|s| s.2.is_none()).ok_or("two USB disks' files are shared already")?;
+        let ext = if token.is_empty() {
+            None
+        } else {
+            Some(vroom_sandbox::consume_extension(token).map_err(|e| format!("{label}: {e}"))?)
+        };
+        let share = match vroom_fs::Share::from_fd(fd, readonly) {
+            Ok(s) => s,
+            Err(e) => {
+                if let Some(h) = ext {
+                    vroom_sandbox::release_extension(h);
+                }
+                return Err(format!("{label}: {e}"));
+            }
+        };
+        let (tag, slot, entry) = &mut f.slots[i];
+        slot.set(share);
+        *entry = Some(FilesEntry { dev: dev.clone(), label: label.to_string(), readonly, ext });
+        log::info!("usb: {} ({}): its volume {label:?} on share {tag}{}", dev.id, dev.name, if readonly { ", read-only" } else { "" });
+        f.agent.send(AgentCmd::UsbShare { tag: tag.clone(), label: label.to_string(), on: true });
+        drop(g);
+        self.tell();
+        Ok(FILES_PORT0 + i as u8)
+    }
+
+    /// Take the files on removable share `i` away.
+    fn detach_files(&self, i: usize) {
+        let mut g = self.files();
+        let Some(f) = g.as_mut() else { return };
+        let Some((tag, slot, entry)) = f.slots.get_mut(i) else { return };
+        let Some(e) = entry.take() else { return };
+        // The guest unmounts first if it can; its next request finds an
+        // empty share either way, and our fds on the volume close now.
+        f.agent.send(AgentCmd::UsbShare { tag: tag.clone(), label: e.label.clone(), on: false });
+        slot.set(vroom_fs::Share::empty());
+        if let Some(h) = e.ext {
+            vroom_sandbox::release_extension(h);
+        }
+        log::info!("usb: {} ({}): its files are gone from share {tag}", e.dev.id, e.dev.name);
+        drop(g);
+        self.tell();
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Option<Entry>>> {
@@ -171,12 +351,21 @@ impl UsbPorts {
     /// The viewer's list, now.
     fn tell(&self) {
         let Some(v) = &self.viewer else { return };
-        let list = self
+        let mut list: Vec<UsbPort> = self
             .lock()
             .iter()
             .enumerate()
-            .filter_map(|(i, e)| e.as_ref().map(|e| UsbPort { port: i as u8, dev: e.dev.clone(), here: e.here, always: e.always }))
+            .filter_map(|(i, e)| {
+                e.as_ref().map(|e| UsbPort { port: i as u8, dev: e.dev.clone(), here: e.here, always: e.always, how: e.how, readonly: e.readonly })
+            })
             .collect();
+        if let Some(f) = &*self.files() {
+            for (i, (_, _, e)) in f.slots.iter().enumerate() {
+                if let Some(e) = e {
+                    list.push(UsbPort { port: FILES_PORT0 + i as u8, dev: e.dev.clone(), here: true, always: false, how: UsbHow::Files, readonly: e.readonly });
+                }
+            }
+        }
         v.send(&ToViewer::Usb(list));
     }
 
@@ -185,6 +374,10 @@ impl UsbPorts {
         if !dev.valid() {
             return Err("not a USB device id".into());
         }
+        self.plug(dev, sock, UsbHow::Device, false, None)
+    }
+
+    fn plug(self: &Arc<Self>, dev: UsbDev, sock: UnixStream, how: UsbHow, readonly: bool, done: Option<Receiver<()>>) -> std::result::Result<u8, String> {
         let (tx, rx) = mpsc::channel();
         let (i, gen) = {
             let mut ports = self.lock();
@@ -192,7 +385,7 @@ impl UsbPorts {
             let i = x.pass_free().filter(|&i| i < ports.len()).ok_or("all USB ports of this VM are in use")?;
             let gen = x.pass_plug(i, tx).ok_or("all USB ports of this VM are in use")?;
             let keep = sock.try_clone().map_err(|e| e.to_string())?;
-            ports[i] = Some(Entry { dev: dev.clone(), gen, here: false, always: false, sock: keep });
+            ports[i] = Some(Entry { dev: dev.clone(), gen, here: false, always: false, sock: keep, how, readonly, done });
             (i, gen)
         };
         log::info!("usb: {} ({}) plugged into port pair {i}", dev.id, dev.name);
@@ -205,11 +398,21 @@ impl UsbPorts {
     }
 
     /// Pull out the device on pair `i`: the guest sees it go, its helper
-    /// sees its socket close and ends.
+    /// sees its socket close and ends. A disk served here is flushed and
+    /// closed before the viewer hears it is gone (it mounts it again on
+    /// the Mac then). From `FILES_PORT0`: a USB disk's files.
     pub(crate) fn detach(&self, i: u8) {
+        if i >= FILES_PORT0 {
+            return self.detach_files((i - FILES_PORT0) as usize);
+        }
         let Some(e) = self.lock().get_mut(i as usize).and_then(Option::take) else { return };
         self.xhci().pass_unplug(i as usize, e.gen);
         let _ = e.sock.shutdown(std::net::Shutdown::Both);
+        if let Some(done) = &e.done {
+            if done.recv_timeout(Duration::from_secs(10)).is_err() {
+                log::warn!("usb: {}: its disk took long to close", e.dev.id);
+            }
+        }
         log::info!("usb: {} unplugged from port pair {i}", e.dev.id);
         self.tell();
     }

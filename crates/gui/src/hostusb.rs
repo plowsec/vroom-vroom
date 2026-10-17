@@ -9,7 +9,7 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
-use vroom_config::VmConfig;
+use vroom_config::{UsbMode, VmConfig};
 use vroom_display::UsbDev;
 use vroom_usb::list::HostDevice;
 
@@ -18,6 +18,7 @@ use vroom_usb::list::HostDevice;
 /// is listed too, so the menu can be tried without hardware.
 pub fn host_list() -> Vec<HostDevice> {
     let mut v: Vec<HostDevice> = vroom_usb::list::list().into_iter().filter(|d| d.class != 9).collect();
+    v.extend(crate::usbdisk::test_devices());
     let fake = std::env::var("VROOM_USB_FAKE").ok();
     if let Some(name) = match fake.as_deref() {
         Some("acm") => Some("Pretend serial port (test)"),
@@ -107,11 +108,28 @@ pub fn via_netd(vm: &str, d: &UsbDev) -> Result<UnixStream, String> {
 
 /// "Always connect to this VM": add the device to the VM file's
 /// `[[usb]]`, or take it out. Comments and layout stay.
-pub fn set_always(path: &Path, d: &UsbDev, on: bool) -> Result<(), String> {
+/// `mode`: how it connects (a USB disk's files, the disk, the device).
+pub fn set_always(path: &Path, d: &UsbDev, on: bool, mode: UsbMode) -> Result<(), String> {
+    edit_file(path, |c| apply_always(c, d, on, mode))
+}
+
+/// A remembered choice: the VM file's entry for `d`, if it has one,
+/// connects it that way from now on.
+pub fn set_mode(path: &Path, d: &UsbDev, mode: UsbMode) -> Result<(), String> {
+    edit_file(path, |c| {
+        let serial = (!d.serial.is_empty()).then_some(d.serial.as_str());
+        for u in c.usb.iter_mut().filter(|u| u.id == d.id && u.serial.as_deref().is_none_or(|s| Some(s) == serial)) {
+            u.mode = mode;
+        }
+        Ok(())
+    })
+}
+
+fn edit_file(path: &Path, f: impl FnOnce(&mut VmConfig) -> Result<(), String>) -> Result<(), String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let before = VmConfig::from_toml(&text).map_err(|e| e.to_string())?;
     let mut after = before.clone();
-    apply_always(&mut after, d, on)?;
+    f(&mut after)?;
     after.validate().map_err(|e| e.to_string())?;
     if after == before {
         return Ok(());
@@ -119,17 +137,54 @@ pub fn set_always(path: &Path, d: &UsbDev, on: bool) -> Result<(), String> {
     crate::edit::save(path, &before, &after)
 }
 
-fn apply_always(c: &mut VmConfig, d: &UsbDev, on: bool) -> Result<(), String> {
+fn apply_always(c: &mut VmConfig, d: &UsbDev, on: bool, mode: UsbMode) -> Result<(), String> {
     let serial = (!d.serial.is_empty()).then_some(d.serial.as_str());
     let same = |u: &vroom_config::Usb| u.id == d.id && u.serial.as_deref() == serial;
     if on {
         if !c.usb.iter().any(same) {
             crate::edit::add_usb(c, &d.id, serial, (!d.name.is_empty()).then_some(d.name.as_str()))?;
         }
+        if let Some(u) = c.usb.iter_mut().find(|u| same(u)) {
+            u.mode = mode;
+        }
     } else {
         c.usb.retain(|u| !same(u));
     }
     Ok(())
+}
+
+/// Choices remembered for a device ("Remember for this device"), for
+/// every VM: one line each, id, serial and mode, tab-separated.
+fn modes_file() -> std::path::PathBuf {
+    crate::paths::data_dir().join("usb-modes")
+}
+
+pub fn remembered(d: &UsbDev) -> Option<UsbMode> {
+    let s = std::fs::read_to_string(modes_file()).ok()?;
+    s.lines().find_map(|l| {
+        let mut f = l.splitn(3, '\t');
+        let (id, serial, mode) = (f.next()?, f.next()?, f.next()?);
+        (id == d.id && serial == d.serial).then(|| UsbMode::parse(mode)).flatten()
+    })
+}
+
+pub fn remember(d: &UsbDev, mode: UsbMode) -> Result<(), String> {
+    let p = modes_file();
+    let old = std::fs::read_to_string(&p).unwrap_or_default();
+    let mut lines: Vec<String> = old
+        .lines()
+        .filter(|l| {
+            let mut f = l.splitn(3, '\t');
+            !(f.next() == Some(d.id.as_str()) && f.next() == Some(d.serial.as_str()))
+        })
+        .take(256)
+        .map(String::from)
+        .collect();
+    lines.push(format!("{}\t{}\t{}", d.id, d.serial, mode.as_str()));
+    if let Some(dir) = p.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    crate::library::write_atomic(&p, (lines.join("\n") + "\n").as_bytes()).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -164,19 +219,41 @@ mod tests {
     }
 
     #[test]
+    fn choices_are_remembered_per_device() {
+        let t = tempfile::tempdir().unwrap();
+        crate::paths::TEST_HOME.with(|h| *h.borrow_mut() = Some(t.path().to_path_buf()));
+        let a = dev_of(&host(Some("A1"), true));
+        let b = dev_of(&host(Some("B2"), true));
+        assert_eq!(remembered(&a), None);
+        remember(&a, UsbMode::Files).unwrap();
+        remember(&b, UsbMode::Disk).unwrap();
+        remember(&a, UsbMode::Disk).unwrap();
+        assert_eq!((remembered(&a), remembered(&b)), (Some(UsbMode::Disk), Some(UsbMode::Disk)));
+        assert_eq!(std::fs::read_to_string(modes_file()).unwrap().lines().count(), 2, "once per device");
+    }
+
+    #[test]
     fn always_goes_in_the_file_and_out() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("vm.toml");
         std::fs::write(&p, "# my vm\nname = \"vm\"\n\n[boot]\ntype = \"uefi\"\nvars = \"vm.state/efivars.fd\"\n").unwrap();
         let d = dev_of(&host(Some("A1"), false));
-        set_always(&p, &d, true).unwrap();
-        set_always(&p, &d, true).unwrap();
+        set_always(&p, &d, true, UsbMode::Device).unwrap();
+        set_always(&p, &d, true, UsbMode::Device).unwrap();
         let t = std::fs::read_to_string(&p).unwrap();
         assert!(t.starts_with("# my vm\n"), "{t}");
         let c = VmConfig::from_toml(&t).unwrap();
         assert_eq!(c.usb.len(), 1, "once");
         assert_eq!((c.usb[0].id.as_str(), c.usb[0].serial.as_deref()), ("18a5:0302", Some("A1")));
-        set_always(&p, &d, false).unwrap();
+        set_always(&p, &d, false, UsbMode::Device).unwrap();
+        // A disk shared as files: the mode goes in with it, and a
+        // remembered choice changes it.
+        set_always(&p, &d, true, UsbMode::Files).unwrap();
+        let t = std::fs::read_to_string(&p).unwrap();
+        assert!(t.contains("mode = \"files\""), "{t}");
+        set_mode(&p, &d, UsbMode::Disk).unwrap();
+        assert_eq!(VmConfig::from_toml(&std::fs::read_to_string(&p).unwrap()).unwrap().usb[0].mode, UsbMode::Disk);
+        set_always(&p, &d, false, UsbMode::Device).unwrap();
         assert!(VmConfig::from_toml(&std::fs::read_to_string(&p).unwrap()).unwrap().usb.is_empty());
     }
 }

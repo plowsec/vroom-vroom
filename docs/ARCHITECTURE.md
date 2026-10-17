@@ -60,6 +60,42 @@ tells the next one, if the app restarts. A saved VM keeps the number of
 pairs it was saved with (the guest read it at driver start); older saves
 had one pair per device in the VM file.
 
+## USB disks
+
+A USB disk can also go to the guest without its USB device (macOS
+15.3 and later refuse USB storage without Full Disk Access). The app
+does the host side (`gui/src/usbdisk.rs`, the menu in
+`gui/src/console/usbmenu.rs`); the disk is found below the USB device
+in the IOKit registry (`usb::list::disks`, `mounts`).
+
+- Files: the app opens the volume's directory and issues a sandbox
+  extension for it (`sandbox::issue_extension`), and sends both with
+  `ToVmm::UsbFiles`. The VMM consumes the token and puts a
+  `vroom_fs::Share` made from the fd on a free removable share
+  (`virtio::devices::fs::FsSlot`): a virtio-fs device whose tree can be
+  swapped while the guest has it mounted. The worker takes the new tree
+  at once (a poke), dropping every node and open file of the old one.
+  No PCI hotplug, so a VM started on a Mac has two of them from the
+  start (`vroom-usb0`, `vroom-usb1`), added after every other device so
+  older VMs keep their device places; a save records how many it has
+  (`usb.file_shares`) and a resume builds those. The VMM tells the agent
+  (`Message::UsbShare`), which mounts it (Linux: `/media/vroom/NAME`
+  through `systemd-run`; Windows: starts the share's virtiofs.exe
+  service, made demand-start for these tags) and unmounts it when it
+  goes. The viewer list shows it at `FILES_PORT0` + slot.
+- Disk: the app unmounts the disk, opens `/dev/rdiskN` (itself, or
+  through `authopen`) and sends the fd with `ToVmm::UsbDisk`. The VMM
+  wraps it (`usb::rawdisk::FdStore`) and runs the helper's code in a
+  thread of its own (`helper::serve` with `msd::StoreOpener`): the
+  Bulk-Only/SCSI stick (`usb::msd`), on a free port pair like any
+  helper. `UsbDetach` waits for that thread to flush and close the disk
+  before the viewer hears of it; the app then runs `diskutil mountDisk`
+  (also when the VM ends).
+
+`[[usb]] mode = "files" | "disk"` entries are the app's to connect once
+the VM has its USB controller; `vroom run` skips them. Without the app,
+`VROOM_USB_TEST_DISK` / `VROOM_USB_TEST_FILES` do the same for tests.
+
 ## Network adapters while the VM runs
 
 Each virtio-net device keeps its backend, its MAC and its cable in a
@@ -101,7 +137,7 @@ resume. The adapters built are what the next save records.
 | `arch` | Board layout (QEMU-virt compatible), FDT, ACPI tables (own AML encoder), SMBIOS, kernel image loader (Image, gzip, EFI zboot). |
 | `devices` | Bus, PL011, PL031, fw_cfg (+DMA), CFI flash (NVRAM), PCI host (ECAM, MSI, MSI-X, INTx), NVMe, xHCI + USB HID (8 USB 2 + USB 3 port pairs for passthrough devices, plugged in and out while the VM runs; asynchronous transfers; isochronous TDs go out in batches, a few batches ahead), Intel HD Audio (controller + codec, streams moved by a timer thread). Parses hostile input only; `forbid(unsafe_code)`. |
 | `video` | Hardware video decoding, shared by the VMM and `vroom video-helper`: their protocol (grants, epochs, resume state), H.264/HEVC NAL unit, access unit and parameter set parsing, picture order counts, VP9 frame headers and AV1 OBUs. Parses hostile input only; `forbid(unsafe_code)`. |
-| `usb` | USB passthrough: the VMM/helper protocol, the helper's request checks, libusb (loaded with `dlopen`, helper only; the root helper only from its own copy), host device listing (IOKit registry / sysfs), taking a device from the host's drivers and giving it back, a pretend serial port, sound card and USB stick for tests. |
+| `usb` | USB passthrough: the VMM/helper protocol, the helper's request checks, libusb (loaded with `dlopen`, helper only; the root helper only from its own copy), host device listing (IOKit registry / sysfs), taking a device from the host's drivers and giving it back, a USB stick (Bulk-Only, SCSI) on a RAM disk for tests or on a Mac disk's fd ("Use as a disk"), a pretend serial port and sound card for tests. |
 | `virtio` | Split-queue handling (hardened), MMIO and modern PCI transports, devices (blk, net, console, rng, gpu, input, fs, sound, media), a pausable worker per device. `forbid(unsafe_code)`. |
 | `fs` | Host side of shared folders: component-wise `openat(O_NOFOLLOW)` walks from a root fd, Linux errno mapping. The virtio-fs FUSE server lives in `virtio`; it serves Linux and virtio-win's virtiofs.exe (Windows), telling them apart by their INIT flags. |
 | `audio` | Sound helper: datagram protocol, ring buffer, CoreAudio (macOS) / ALSA (Linux, `dlopen`) playback and recording, WAV test files. |

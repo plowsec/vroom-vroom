@@ -708,6 +708,21 @@ fn serve(stream: UnixStream, c: &Serve) {
                         u.detach(port);
                     }
                 }
+                Ok(Some(m @ (ToVmm::UsbDisk { .. } | ToVmm::UsbFiles { .. }))) => {
+                    let Some(fd) = (!fds.is_empty()).then(|| fds.remove(0)) else {
+                        log::warn!("display: a USB disk without its fd");
+                        continue;
+                    };
+                    let r = match (&c.usb, m) {
+                        (Some(u), ToVmm::UsbDisk { dev, readonly }) => u.attach_disk(dev, fd, readonly),
+                        (Some(u), ToVmm::UsbFiles { dev, readonly, label, token }) => u.attach_files(dev, fd, readonly, &label, &token),
+                        _ => Err("this VM has no USB controller".into()),
+                    };
+                    if let Err(e) = r {
+                        log::warn!("usb: {e}");
+                        c.tx.send(&ToViewer::Status(format!("USB: {e}")));
+                    }
+                }
                 Ok(Some(ToVmm::NetConnect { nic, on })) => {
                     let r = c.net.as_ref().map_or(Err("no network adapters".into()), |n| n.connect(nic, on));
                     if let Err(e) = r {
@@ -865,6 +880,8 @@ fn handle(
         ToVmm::Drop { .. }
         | ToVmm::UsbAttach(_)
         | ToVmm::UsbDetach { .. }
+        | ToVmm::UsbDisk { .. }
+        | ToVmm::UsbFiles { .. }
         | ToVmm::DragOutGet { .. }
         | ToVmm::NetConnect { .. }
         | ToVmm::NetSet { .. } => {}

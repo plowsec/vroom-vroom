@@ -64,6 +64,15 @@ pub(crate) fn disk_plan(dir: &Path) -> Result<BTreeMap<usize, PathBuf>> {
 /// Saved network adapters have a control queue (saves from before it
 /// don't say so, and have none).
 const NET_CTRL: &str = "net.ctrl_vq";
+/// How many removable shares for USB disks' files it has (saves from
+/// before them have none).
+const USB_FILES: &str = "usb.file_shares";
+
+/// The removable shares the VM saved in `dir` has.
+pub(crate) fn saved_usb_file_slots(dir: &Path) -> usize {
+    let Ok(snap) = SnapshotDir::open(dir) else { return 0 };
+    snap.manifest.meta.get(USB_FILES).and_then(|n| n.parse::<usize>().ok()).unwrap_or(0).min(crate::usb::FILE_SLOTS)
+}
 
 /// The VM file as it was when `dir` was saved, and whether its network
 /// adapters had a control queue.
@@ -98,6 +107,9 @@ pub(crate) fn save(vmm: &mut Vmm, dir: &Path, description: &str, kind: Kind) -> 
     m.meta.insert("vcpus".into(), vmm.vcpus.len().to_string());
     if vmm.net_ctrl {
         m.meta.insert(NET_CTRL.into(), "1".into());
+    }
+    if vmm.usb_file_slots > 0 {
+        m.meta.insert(USB_FILES.into(), vmm.usb_file_slots.to_string());
     }
 
     for (i, v) in vmm.vcpus.iter().enumerate() {

@@ -1010,16 +1010,80 @@ the helper re-enumerates it once more without that hold, and macOS
 takes it back: a stick mounts again as before. Eject a disk in Finder
 before you connect it, so macOS finishes its writes first.
 
-USB disks need one more thing on macOS 15: macOS lets a program open a
-USB storage device only with its Full Disk Access permission, root
-included. Without it the guest can't use the disk (macOS logs
-`deny(1) iokit-open-service IOUSBHostInterface` for vroom-netd). Give it
-in System Settings, Privacy & Security, Full Disk Access: the + button,
-then Command-Shift-G and `/usr/local/libexec/vroom/vroom-netd`. A new
-vroom-netd (after an update, or "Set up" again) needs it again, as
-macOS ties the permission to that exact binary. Only USB storage needs
-this; keyboards, serial adapters and the rest don't. What it means for
-security: [SECURITY.md](SECURITY.md#the-root-helper-vroom-netd).
+Passing a USB disk as the device needs one more thing on macOS 15:
+macOS lets a program open a USB storage device only with its Full Disk
+Access permission, root included. Without it the guest can't use the
+disk (macOS logs `deny(1) iokit-open-service IOUSBHostInterface` for
+vroom-netd). Give it in System Settings, Privacy & Security, Full Disk
+Access: the + button, then Command-Shift-G and
+`/usr/local/libexec/vroom/vroom-netd`. A new vroom-netd (after an
+update, or "Set up" again) needs it again, as macOS ties the permission
+to that exact binary. Only USB storage needs this; keyboards, serial
+adapters and the rest don't. What it means for security:
+[SECURITY.md](SECURITY.md#the-root-helper-vroom-netd). Most of the time
+you don't need it: see the next section.
+
+### USB disks
+
+Click a USB disk (a stick, a card reader, an external drive) in the USB
+menu and it asks how the VM gets it:
+
+- **Share its files.** The Mac keeps the disk mounted. The VM sees its
+  volumes as a shared folder while it runs; the Mac can use it at the
+  same time. Nothing to set up, no password.
+- **Use as a disk.** The Mac lets go of the disk (it disappears from
+  Finder) and the VM gets the whole disk, as a plain USB stick: it can
+  partition, format and mount it. The stick's own tools and features
+  don't work (the VM doesn't see the stick itself). macOS asks for an
+  admin password. When you disconnect it, or the VM stops, the Mac
+  mounts it again.
+- **Pass the USB device.** The VM gets the device itself, as with other
+  devices. macOS 15.3 and later refuse USB disks to this unless
+  vroom-netd has Full Disk Access (above); this is for the other
+  devices, or Macs where it is allowed.
+
+"Remember for this device" keeps the choice (for every VM; in this VM's
+file too if the device is in it). Devices that aren't disks don't ask.
+The menu says how each connected device is in the VM. The VM's settings
+page has the same choice for the devices in its file (`mode` in
+[CONFIG.md](CONFIG.md#usb-host-usb-devices-up-to-8)).
+
+Where the files show up:
+
+- Linux guests with the vroom agent: under `/media/vroom/<volume name>`,
+  mounted when you connect the disk and unmounted when you disconnect
+  it. GNOME's Files shows it. Without the agent:
+  `sudo mount -t virtiofs vroom-usb0 /mnt` (the second disk is
+  `vroom-usb1`).
+- Windows guests: a drive letter, the same way as shared folders (see
+  [Windows guests](#windows-guests)): `vroom-setup.cmd` makes a service
+  for each of the two USB disk shares, and the agent starts it when you
+  connect a disk and stops it when you disconnect it.
+
+What to expect:
+
+- A VM has room for two disks' files at once. A VM started before this
+  vroom has none until it is shut down and started again (a suspended VM
+  resumes with the hardware it was saved with).
+- A volume macOS mounts read-only (NTFS without a driver) is read-only in
+  the guest too. `readonly = true` in the VM file keeps the guest from
+  changing a volume or a disk.
+- "Use as a disk" fails if a program on the Mac has files open on the
+  disk: close them, or eject it in Finder, and try again.
+- macOS may ask once whether vroom may use removable volumes. If you
+  said no, the menu says so: allow vroom in System Settings, Privacy &
+  Security, Files & Folders (Removable Volumes).
+- A suspend takes the disk away; connect it again after the resume (the
+  app does it for devices connected for that run).
+- Disks are on Mac hosts only. On a Linux host, pass the device.
+
+To test without a real disk: `hdiutil attach -nomount disk.dmg` makes a
+disk, and `VROOM_USB_TEST_DISKS=disk6 vroom-gui` lists it as a pretend
+USB disk (1209:00ac) the menu can share or hand over.
+`VROOM_USB_TEST_DISK=<file>` and `VROOM_USB_TEST_FILES=<dir>` on
+`vroom run` plug a file in as a disk or share a folder as a disk's files
+15 seconds after the start (`VROOM_USB_TEST_AFTER`, and
+`VROOM_USB_TEST_FOR` to take them away again).
 
 When no part of a device can be used (macOS refused it, or a macOS
 driver holds it and the root helper isn't set up), the helper says why

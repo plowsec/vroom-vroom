@@ -60,7 +60,7 @@ of its own (apps); video decoding, when on, gets one too. Details in
 - TPM 2.0 (Windows 11 needs it)
 - Nested VMs (M3 or newer)
 - Import from VMware Fusion (ARM64 VMs)
-- USB devices from the host, connected from the VM window while it runs (needs libusb; devices macOS uses go through the root helper)
+- USB devices from the host, connected from the VM window while it runs (needs libusb; devices macOS uses go through the root helper); USB disks also as shared files or as a plain disk, with no root helper
 - Drag and drop files from the Mac into the guest
 - Drag and drop files between the Mac and the guest, both ways
 - Up to 4 guest monitors, a window each, full screen on several Mac screens
