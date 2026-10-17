@@ -1,7 +1,7 @@
 //! Framed messages: type u8 | len u32 LE | payload.
 
 use crate::{Error, Result, MAX_HEADS};
-pub use vroom_proto::{GuestWindow, WindowOp};
+pub use vroom_proto::{GuestApp, GuestWindow, WindowOp};
 
 /// Absolute pointer range (like a USB tablet).
 pub const POINTER_MAX: u16 = 32767;
@@ -240,6 +240,9 @@ pub enum ToViewer {
     WindowIcon { id: u32, w: u32, h: u32, rgba: Vec<u8> },
     /// Coherence can't work in the guest's session, and why.
     CoherenceNo(String),
+    /// Coherence: the apps the guest can start by name (checked like the
+    /// agent's message), for the bar to suggest.
+    Apps(Vec<GuestApp>),
     /// Another guest monitor's mode (`head` 1..MAX_HEADS; head 0 is
     /// `Mode`). 0x0: the guest turned it off. Its pixels are in slot
     /// `head` of the framebuffer.
@@ -448,6 +451,8 @@ impl ToViewer {
             ToViewer::DragOutItems { id, items } => frame(14, &items_payload(*id, items)),
             ToViewer::WindowIcon { id, w, h, rgba } => frame(18, &vroom_proto::encode_icon(*id, *w, *h, rgba)),
             ToViewer::CoherenceNo(s) => frame(19, s.as_bytes()),
+            // Well above the others (other work adds types in the 20s).
+            ToViewer::Apps(list) => frame(60, &vroom_proto::encode_apps(list)),
             ToViewer::HeadMode { head, width, height } => frame(16, &u32s(&[*head, *width, *height])),
             ToViewer::HeadDamage { head, x, y, w, h } => frame(17, &u32s(&[*head, *x, *y, *w, *h])),
             ToViewer::Net { nat_ok, ports } => {
@@ -524,6 +529,7 @@ impl ToViewer {
                 ToViewer::WindowIcon { id, w, h, rgba }
             }
             19 => ToViewer::CoherenceNo(line(p)?),
+            60 => ToViewer::Apps(vroom_proto::decode_apps(p).ok_or(Error::Proto("apps"))?),
             40 => {
                 let (nat_ok, n) = match p {
                     [f @ (0 | 1), n, ..] => (*f != 0, *n as usize),
@@ -791,6 +797,7 @@ mod tests {
             ToViewer::WindowIcon { id: 1, w: 1, h: 1, rgba: vec![1, 2, 3, 4] },
             ToViewer::WindowIcon { id: 1, w: 0, h: 0, rgba: Vec::new() },
             ToViewer::CoherenceNo("a Wayland session".into()),
+            ToViewer::Apps(vec![GuestApp { name: "Paint".into(), w: 1, h: 1, rgba: vec![1, 2, 3, 4] }]),
             ToViewer::HeadMode { head: 1, width: 1024, height: 768 },
             ToViewer::HeadMode { head: 3, width: 0, height: 0 },
             ToViewer::HeadDamage { head: 2, x: 1, y: 2, w: 3, h: 4 },

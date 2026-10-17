@@ -8,6 +8,19 @@
 // Windows: a background app started at logon, no console window.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+// Matching names to apps is tested everywhere; only Windows and Linux
+// start them.
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+mod apps;
+#[cfg(windows)]
+mod apps_win;
+// Desktop entries: Linux only; the parsing is tested everywhere unix.
+#[cfg(any(target_os = "linux", all(test, unix)))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod apps_xdg;
+// Store app logos: Windows only; the parsing is tested everywhere.
+#[cfg(any(windows, test))]
+mod appx;
 mod clip;
 #[cfg(windows)]
 mod coh_win;
@@ -295,7 +308,7 @@ fn hello() -> Message {
         features |= features::COHERENCE;
     }
     if coherence::Coherence::starts_apps() {
-        features |= features::START_APP;
+        features |= features::START_APP | features::APP_LIST;
     }
     Message::Hello { features, agent: format!("vroom-agent {}", env!("CARGO_PKG_VERSION")) }
 }
@@ -363,6 +376,7 @@ fn handle(m: Message, system: bool, w: &mut dyn Write, clip: &mut dyn clip::Clip
         | Message::StartApp(_)
         | Message::WindowIcon { .. }
         | Message::CoherenceNo(_)
+        | Message::Apps(_)
         => {}
     }
     Ok(())

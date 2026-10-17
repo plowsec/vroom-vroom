@@ -171,6 +171,7 @@ impl<S: System> Relay<S> {
             | Message::Windows(_)
             | Message::WindowIcon { .. }
             | Message::CoherenceNo(_)
+            | Message::Apps(_)
             | Message::DragOutItems { .. }
             | Message::DragOutFail { .. } => {}
         }
@@ -198,7 +199,7 @@ impl<S: System> Relay<S> {
                     host.write_all(&Message::ClipboardText(t).encode())?;
                 }
                 // Checked by the decoder (count, sizes); the host checks again.
-                Ok(Some(m @ (Message::Windows(_) | Message::WindowIcon { .. } | Message::CoherenceNo(_)))) if self.coherence => host.write_all(&m.encode())?,
+                Ok(Some(m @ (Message::Windows(_) | Message::WindowIcon { .. } | Message::CoherenceNo(_) | Message::Apps(_)))) if self.coherence => host.write_all(&m.encode())?,
                 Ok(Some(
                     m @ (Message::DragReady { .. }
                     | Message::DropDone { .. }

@@ -171,11 +171,17 @@ Needs the guest tools of this version or later.
   resize it. The guest app follows. Moving it by its own title bar works
   too.
 - A bar at the bottom stands in for the taskbar: **Start** opens the Start
-  menu, a field to open an app by name (Windows: type `calc` or
-  `Paint` and press Enter; it searches the Start menu as you would),
-  then one button per app window with its icon (minimized ones too:
-  click to bring one back), and **Leave Coherence**. The bar can be
-  dragged anywhere.
+  menu, a field to open an app by name, then one button per app window
+  with its icon (minimized ones too: click to bring one back), and
+  **Leave Coherence**. The bar can be dragged anywhere.
+- The app field: type part of a name (`calc`, `term`, `pow`) and the
+  guest's apps that match show in the bar with their icons. Enter opens
+  the first (the arrow keys or Tab pick another; Escape clears), or click
+  one. Windows: the apps of the Start menu (shortcuts and Store apps).
+  Linux: the apps of the desktop's menu, found by name, generic name
+  ("Text Editor") or keyword ("gedit"). Only installed apps open, never
+  a command. Windows only: a name no app has is typed into the Start
+  menu's search, which may open something else (a web search).
 - Several Mac screens: the guest's screen is on the screen the bar is
   on. Drag the bar to another screen and the guest's screen goes there
   (its windows with it). A window dragged onto another screen goes back
@@ -194,9 +200,11 @@ Linux guests:
   says so and doesn't start.
 - The window manager must follow the usual desktop conventions (EWMH):
   GNOME, KDE, Xfce, Cinnamon and MATE do.
-- GNOME's top bar stays, out of sight: maximized windows start below it,
-  so they leave a strip free at the top of the Mac screen. Ubuntu's dock
-  is set to hide while Coherence is on and put back after.
+- GNOME's top bar and Ubuntu's dock hide while Coherence is on, and come
+  back after: maximized windows get the whole screen. The top bar needs
+  the guest tools' GNOME Shell extension, which `install-agent.sh` puts
+  in place; GNOME finds it at the next login. Before that the top bar
+  stays (out of sight, but maximized windows start below it).
 - The session helper of the guest tools must run in the desktop session
   (`install-agent.sh` sets it up to start at login).
 
@@ -207,8 +215,7 @@ but fights the guest's own placement. Tell the tool to leave vroom alone
 a terminal).
 
 Not there yet: one Dock tile per guest app (macOS gives an app one Dock
-tile; all Coherence windows are vroom's). Windows Store apps without an
-icon of their own (Calculator) show none in the bar.
+tile; all Coherence windows are vroom's).
 
 ### When the app crashes, or a VM stops answering
 
@@ -300,10 +307,12 @@ then `target/debug/vroom run examples/ubuntu.toml`.
 
 Clipboard, time sync and clean shutdown need the agent in the guest:
 `cargo build --release --target aarch64-unknown-linux-musl -p vroom-agent`,
-copy it and `examples/linux/*` in, run `sudo ./install-agent.sh`. That
-installs a systemd service (root, hardened unit: the host channel, clock,
-shutdown) and a desktop autostart entry for the unprivileged session
-helper (clipboard); the service only serves the user on screen.
+copy it and `examples/linux/` in (with its `gnome-shell` folder), run
+`sudo ./install-agent.sh`. That installs a systemd service (root,
+hardened unit: the host channel, clock, shutdown), a desktop autostart
+entry for the unprivileged session helper (clipboard), and on GNOME the
+extension that hides the top bar in Coherence; the service only serves
+the user on screen.
 
 The cloud image has no driver for the hardware clock (`rtc-pl031`, in
 `linux-modules-extra-$(uname -r)`), so it boots with a wrong date until

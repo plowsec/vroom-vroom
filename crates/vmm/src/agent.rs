@@ -362,6 +362,9 @@ impl Service {
             Message::WindowIcon { id, w, h, rgba } if self.coherence && self.win_ids.contains(&id) => {
                 self.to_viewer(ToViewer::WindowIcon { id, w, h, rgba });
             }
+            // Checked by the decoder (count, names, icon sizes); the bar
+            // only suggests them.
+            Message::Apps(list) if self.coherence => self.to_viewer(ToViewer::Apps(list)),
             Message::CoherenceNo(why) if self.coherence => {
                 log::info!("guest: no coherence here: {why}");
                 self.to_viewer(ToViewer::CoherenceNo(why));

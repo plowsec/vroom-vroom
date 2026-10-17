@@ -172,11 +172,38 @@ where, and with what title. That is the guest's word, so:
   politely (`SC_CLOSE`, the app may refuse) or move them.
 - The clipboard rules don't change: sync only while one of the VM's
   windows (or the bar) has the keyboard.
-- The bar's app field sends the name to the guest (one line of plain
+- The bar's app field sends a name to the guest (one line of plain
   text, at most 256 bytes, checked by the viewer protocol, the VMM and
-  the agent); the guest types it into its own Start menu. Nothing on the
-  Mac is started. Keys typed in the field stay out of the guest until
-  Enter.
+  the agent). Nothing on the Mac is started. Keys typed in the field
+  stay out of the guest until Enter.
+- In the guest, that name only picks one of the apps installed there:
+  Windows: a Start menu shortcut (`.lnk` in ProgramData's or the user's
+  Start menu folder) or an app of `shell:AppsFolder` (Store apps, by
+  their AppUserModelID); Linux: a desktop entry of the menu (the XDG
+  data dirs; entries the menu hides, NoDisplay, Hidden, OnlyShowIn
+  another desktop, are left out). The name is only compared with the
+  apps' names. It never becomes a command line, an argument, a path or
+  a file to open. That is the boundary: the host can start what the
+  user could start from the guest's menu, and nothing else, with no
+  files and no options. Linux runs the entry with `gio launch` or its
+  own Exec line split into words (field codes out), never through a
+  shell, as the session's user; an agent running as root refuses.
+  Windows opens the shortcut, or `shell:AppsFolder\<id>`, with
+  `ShellExecute` from the user's session helper. Only when no app has
+  the name, and the name is plain (letters, digits, spaces and a few
+  marks: no path, no command line), does Windows fall back to typing it
+  into Start's search, as the user would; that may pick something else
+  (a web search). The host has the guest's keyboard anyway.
+- The list of apps the guest sends for the field to suggest (`Apps`) is
+  the guest's word too: at most 512, each name a line the field could
+  send and given once, icons raw RGBA of at most 32x32 with exactly that
+  many bytes, checked by the VMM's and the app's decoders and once more
+  before they become an image. Passed on only in Coherence, and only
+  shown as suggestions: a guest that lies about its apps can make the
+  field suggest a name, and that name goes back to the guest's own
+  matching above. The guest reads its icons and logos itself (PNG files
+  of at most 4 MB and 1024x1024; Store app manifests without DTDs); no
+  image format is decoded on the Mac.
 - "Coherence can't work here" from the guest (Wayland) is one line of
   plain text, cleaned again before the app shows it.
 - The guest's screen follows the bar to another Mac screen, never on the
@@ -187,7 +214,9 @@ where, and with what title. That is the guest's word, so:
   time costs the helper's CPU and a list per look, coalesced as above.
 - X11: the helper acts on windows as a taskbar does (client messages to
   the window manager) and only on windows of its last list. It may hide
-  Ubuntu's dock (a user setting, put back after).
+  Ubuntu's dock (a user setting, put back after) and GNOME's top bar
+  (it enables the guest tools' own GNOME Shell extension, which does
+  nothing else, and disables it after).
 
 What's left: a guest app can still draw anything below the strip,
 including something that looks like a Mac dialog. The strip says whose
@@ -836,7 +865,8 @@ only clients from the active console session served. The helper only
 talks to a pipe server in session 0, so a user process squatting the pipe
 name gets nothing. The service accepts nothing from the helper but
 clipboard text (size-capped), answers about dropped files, and window
-lists while the host's window is in Coherence (checked like the rest).
+and app lists while the host's window is in Coherence (checked like the
+rest).
 
 The Linux agent has the same split: a hardened systemd service
 (`CAP_SYS_TIME` only, read-only file system, Unix sockets only) and a

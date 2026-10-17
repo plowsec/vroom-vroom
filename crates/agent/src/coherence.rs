@@ -6,8 +6,11 @@
 //! changes (`WindowIcon`); we hide the taskbar and give windows the whole
 //! screen (a maximized window then fills what the host shows). The host
 //! can bring a window to the front, minimize, close or move it
-//! (`WindowDo`), but only one of the last list we sent. Off, or when the
-//! session ends, the taskbar comes back.
+//! (`WindowDo`), but only one of the last list we sent, and start an app
+//! of the menu by name (`StartApp`, apps.rs). Off, or when the session
+//! ends, the taskbar comes back. While on, the host also gets the list of
+//! apps it can start (`Apps`), read on a thread of its own (it takes a
+//! second: every icon) and again every `APPS_AGAIN`.
 //!
 //! We look at the windows when the desktop says something changed
 //! (Windows: window events; X11: events on the root and the windows),
@@ -18,10 +21,11 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use vroom_proto::{win_flags, GuestWindow, Message, WindowOp, ICON_MAX, TITLE_MAX, WINDOWS_MAX};
+use vroom_proto::{win_flags, GuestApp, GuestWindow, Message, WindowOp, ICON_MAX, TITLE_MAX, WINDOWS_MAX};
 
 /// How often the windows are looked at without events.
 pub const EVERY: Duration = Duration::from_millis(40);
@@ -33,6 +37,8 @@ pub const SLOW: Duration = Duration::from_millis(500);
 /// Icons of windows already listed are looked at again this often (apps
 /// change them: a browser shows the page's).
 const ICONS_AGAIN: Duration = Duration::from_secs(2);
+/// The app list is read again this often while on (apps come and go).
+const APPS_AGAIN: Duration = Duration::from_secs(60);
 /// The icon size we ask the desktop for, in pixels.
 #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 pub const ICON_SIZE: u32 = 32;
@@ -66,9 +72,13 @@ pub trait Desktop {
     fn watch(&mut self, _poke: Option<Poke>) -> bool {
         false
     }
-    /// Start the app with this name, as the Start menu would.
+    /// Start the app with this name, as the Start menu would (apps.rs).
+    /// Returns at once.
     fn start(&mut self, _name: &str) {}
 }
+
+/// Reads the list of apps (apps.rs; tests play it).
+pub type Lister = Arc<dyn Fn() -> Vec<GuestApp> + Send + Sync>;
 
 pub struct Coherence {
     desk: Option<Box<dyn Desktop>>,
@@ -87,6 +97,12 @@ pub struct Coherence {
     /// Wakes the session loop (from another thread).
     wake: Poke,
     last: Instant,
+    lister: Option<Lister>,
+    /// The list being read, and when that started.
+    apps: Option<Receiver<Vec<GuestApp>>>,
+    apps_at: Option<Instant>,
+    /// What the host last got.
+    apps_sent: Option<Vec<GuestApp>>,
 }
 
 impl Coherence {
@@ -100,17 +116,33 @@ impl Coherence {
         if let Some(d) = desk.as_mut() {
             d.shell(false);
         }
-        Coherence::make(desk, why, wake)
+        let lister: Option<Lister> = Coherence::starts_apps().then(|| Arc::new(crate::apps::list) as Lister);
+        Coherence::make(desk, why, wake, lister)
     }
 
-    fn make(desk: Option<Box<dyn Desktop>>, why: String, wake: Poke) -> Coherence {
+    fn make(desk: Option<Box<dyn Desktop>>, why: String, wake: Poke, lister: Option<Lister>) -> Coherence {
         let now = Instant::now();
-        Coherence { desk, why, on: false, sent: None, icons: HashMap::new(), icons_at: now, watching: false, poked: Arc::default(), wake, last: now }
+        Coherence {
+            desk,
+            why,
+            on: false,
+            sent: None,
+            icons: HashMap::new(),
+            icons_at: now,
+            watching: false,
+            poked: Arc::default(),
+            wake,
+            last: now,
+            lister,
+            apps: None,
+            apps_at: None,
+            apps_sent: None,
+        }
     }
 
     #[cfg(test)]
     fn with(desk: Box<dyn Desktop>) -> Coherence {
-        Coherence::make(Some(desk), String::new(), Arc::new(|| {}))
+        Coherence::make(Some(desk), String::new(), Arc::new(|| {}), None)
     }
 
     /// Whether this guest can do it at all (Linux: if its session is X11,
@@ -121,7 +153,51 @@ impl Coherence {
 
     /// Whether we can start apps for the host.
     pub fn starts_apps() -> bool {
-        cfg!(windows)
+        cfg!(any(windows, target_os = "linux"))
+    }
+
+    /// Read the app list on a thread (unless that's underway); the
+    /// session loop is woken when it's done.
+    fn read_apps(&mut self) {
+        let Some(lister) = self.lister.clone() else { return };
+        if self.apps.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let wake = self.wake.clone();
+        let t = std::thread::Builder::new().name("app-list".into()).spawn(move || {
+            let t0 = Instant::now();
+            let list = lister();
+            log::info!("coherence: {} apps to start ({:?})", list.len(), t0.elapsed());
+            let _ = tx.send(list);
+            wake();
+        });
+        if t.is_ok() {
+            self.apps = Some(rx);
+            self.apps_at = Some(Instant::now());
+        }
+    }
+
+    /// The app list, if one was read (and is news to the host); time to
+    /// read it again.
+    fn send_apps(&mut self, out: &mut dyn Write) -> io::Result<()> {
+        if let Some(rx) = self.apps.as_ref() {
+            match rx.try_recv() {
+                Ok(list) => {
+                    self.apps = None;
+                    if self.on && self.apps_sent.as_ref() != Some(&list) {
+                        out.write_all(&Message::Apps(list.clone()).encode())?;
+                        self.apps_sent = Some(list);
+                    }
+                }
+                Err(TryRecvError::Disconnected) => self.apps = None,
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        if self.on && self.apps_at.is_some_and(|t| t.elapsed() >= APPS_AGAIN) {
+            self.read_apps();
+        }
+        Ok(())
     }
 
     /// How long the session loop may wait before calling `tick`.
@@ -174,6 +250,11 @@ impl Coherence {
                     });
                     self.watching = d.watch(poke) && *on;
                 }
+                if *on && !self.on {
+                    // The host's bar is new: it gets the list again.
+                    self.apps_sent = None;
+                    self.read_apps();
+                }
                 self.on = *on;
                 self.sent = None;
                 self.icons.clear();
@@ -204,6 +285,7 @@ impl Coherence {
         if !self.on {
             return Ok(());
         }
+        self.send_apps(out)?;
         if self.wait().is_some_and(|w| !w.is_zero()) {
             return Ok(());
         }
@@ -446,7 +528,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(Seen { list: vec![win(1, "a")], ..Default::default() }));
         let woken = Arc::new(Mutex::new(0));
         let w = woken.clone();
-        let mut c = Coherence::make(Some(Box::new(Fake(seen.clone(), true))), String::new(), Arc::new(move || *w.lock().unwrap() += 1));
+        let mut c = Coherence::make(Some(Box::new(Fake(seen.clone(), true))), String::new(), Arc::new(move || *w.lock().unwrap() += 1), None);
         let mut out = Vec::new();
         c.handle(&Message::Coherence { on: true }, &mut out).unwrap();
         assert!(c.wait().unwrap() > EVERY, "events: only a slow look");
@@ -504,7 +586,7 @@ mod tests {
 
     #[test]
     fn no_desktop_says_why() {
-        let mut c = Coherence::make(None, "a Wayland session".into(), Arc::new(|| {}));
+        let mut c = Coherence::make(None, "a Wayland session".into(), Arc::new(|| {}), None);
         let mut out = Vec::new();
         c.why = "a Wayland session".into();
         c.handle(&Message::Coherence { on: true }, &mut out).unwrap();
@@ -514,6 +596,47 @@ mod tests {
             assert!(matches!(&m[0], Message::CoherenceNo(_)));
             assert_eq!(m.last(), Some(&Message::Windows(Vec::new())));
         }
+    }
+
+    #[test]
+    fn the_app_list_goes_out_when_read_and_when_it_changes() {
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let apps = Arc::new(Mutex::new(vec![GuestApp { name: "Calculator".into(), w: 0, h: 0, rgba: Vec::new() }]));
+        let a = apps.clone();
+        let (wtx, wrx) = std::sync::mpsc::channel();
+        let wtx = Mutex::new(wtx);
+        let wake: Poke = Arc::new(move || {
+            let _ = wtx.lock().unwrap().send(());
+        });
+        let mut c = Coherence::make(Some(Box::new(Fake(seen, true))), String::new(), wake, Some(Arc::new(move || a.lock().unwrap().clone())));
+        let mut out = Vec::new();
+        c.handle(&Message::Coherence { on: true }, &mut out).unwrap();
+        wrx.recv_timeout(Duration::from_secs(5)).unwrap();
+        out.clear();
+        c.tick(&mut out).unwrap();
+        assert_eq!(msgs(&out), vec![Message::Apps(apps.lock().unwrap().clone())]);
+        // Read again, the same: nothing.
+        out.clear();
+        c.apps_at = Some(Instant::now() - APPS_AGAIN);
+        c.tick(&mut out).unwrap();
+        wrx.recv_timeout(Duration::from_secs(5)).unwrap();
+        c.tick(&mut out).unwrap();
+        assert!(msgs(&out).is_empty());
+        // A new app.
+        apps.lock().unwrap().push(GuestApp { name: "Paint".into(), w: 0, h: 0, rgba: Vec::new() });
+        c.apps_at = Some(Instant::now() - APPS_AGAIN);
+        c.tick(&mut out).unwrap();
+        wrx.recv_timeout(Duration::from_secs(5)).unwrap();
+        c.tick(&mut out).unwrap();
+        assert!(matches!(&msgs(&out)[..], [Message::Apps(l)] if l.len() == 2));
+        // Off, on: the host gets it again.
+        out.clear();
+        c.handle(&Message::Coherence { on: false }, &mut out).unwrap();
+        c.handle(&Message::Coherence { on: true }, &mut out).unwrap();
+        wrx.recv_timeout(Duration::from_secs(5)).unwrap();
+        out.clear();
+        c.tick(&mut out).unwrap();
+        assert!(matches!(&msgs(&out)[..], [Message::Apps(_)]));
     }
 
     #[test]

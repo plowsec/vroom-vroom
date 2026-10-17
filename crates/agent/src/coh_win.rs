@@ -19,6 +19,7 @@ use windows_sys::Win32::Foundation::{CloseHandle, HWND, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GdiFlush, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
 };
+use windows_sys::Win32::Storage::Packaging::Appx::GetPackageFullName;
 use windows_sys::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
 use windows_sys::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VK_LWIN, VK_RETURN};
@@ -267,21 +268,7 @@ impl WinDesktop {
                 return;
             }
             match op {
-                WindowOp::Activate => {
-                    if IsIconic(h) != 0 {
-                        ShowWindowAsync(h, SW_RESTORE);
-                    }
-                    // Windows only lets the app in front hand the keyboard
-                    // over: join its input queue for the moment.
-                    let me = GetCurrentThreadId();
-                    let fg = GetWindowThreadProcessId(GetForegroundWindow(), std::ptr::null_mut());
-                    let joined = fg != 0 && fg != me && AttachThreadInput(me, fg, 1) != 0;
-                    BringWindowToTop(h);
-                    SetForegroundWindow(h);
-                    if joined {
-                        AttachThreadInput(me, fg, 0);
-                    }
-                }
+                WindowOp::Activate => activate(h),
                 WindowOp::Minimize => {
                     ShowWindowAsync(h, SW_MINIMIZE);
                 }
@@ -305,6 +292,78 @@ impl WinDesktop {
                 }
             }
         }
+    }
+}
+
+/// Bring a window to the front with the keyboard (restored if minimized).
+/// The calling thread needs a message queue.
+fn activate(h: HWND) {
+    // SAFETY: plain calls; a window that went makes them fail.
+    unsafe {
+        if IsIconic(h) != 0 {
+            ShowWindowAsync(h, SW_RESTORE);
+        }
+        // Windows only lets the app in front hand the keyboard over: join
+        // its input queue for the moment.
+        let me = GetCurrentThreadId();
+        let fg = GetWindowThreadProcessId(GetForegroundWindow(), std::ptr::null_mut());
+        let joined = fg != 0 && fg != me && AttachThreadInput(me, fg, 1) != 0;
+        BringWindowToTop(h);
+        SetForegroundWindow(h);
+        if joined {
+            AttachThreadInput(me, fg, 0);
+        }
+    }
+}
+
+/// The app windows on screen now.
+fn app_windows() -> Vec<isize> {
+    let mut out = Vec::new();
+    // SAFETY: plain calls; the walk is capped.
+    unsafe {
+        let (fg, me, scr) = (GetForegroundWindow(), GetCurrentProcessId(), screen());
+        let mut h = GetTopWindow(std::ptr::null_mut());
+        let mut n = 0;
+        while !h.is_null() && n < 4096 {
+            if entry(h, fg, me, &scr).is_ok_and(|w| w.flags & (win_flags::APP | win_flags::MINIMIZED) == win_flags::APP) {
+                out.push(h as isize);
+            }
+            h = GetWindow(h, GW_HWNDNEXT);
+            n += 1;
+        }
+    }
+    out
+}
+
+/// After starting an app: its first window, when it comes (within a few
+/// seconds), goes to the front. Windows lets an app started by a program
+/// in the background open behind the others.
+fn front_new(before: &[isize]) {
+    // AttachThreadInput needs a message queue on this thread.
+    // SAFETY: zeroed MSG is valid; nothing is removed.
+    unsafe {
+        let mut m: MSG = std::mem::zeroed();
+        PeekMessageW(&mut m, std::ptr::null_mut(), 0, 0, PM_NOREMOVE);
+    }
+    let mut new = None;
+    let mut tries = 0;
+    for _ in 0..40 {
+        std::thread::sleep(Duration::from_millis(250));
+        let Some(h) = new.or_else(|| app_windows().into_iter().find(|h| !before.contains(h))) else { continue };
+        new = Some(h);
+        // SAFETY: a plain call.
+        if unsafe { GetForegroundWindow() } as isize == h {
+            return;
+        }
+        // Again a little later if the app (or another starting) took the
+        // front back while it came up.
+        if tries == 3 {
+            return;
+        }
+        tries += 1;
+        log::info!("apps: {h:#x} to the front");
+        activate(h as HWND);
+        std::thread::sleep(Duration::from_millis(750));
     }
 }
 
@@ -333,12 +392,23 @@ impl crate::coherence::Desktop for WinDesktop {
         }
         // No icon of its own: its program's (a Store app's window shows
         // the app's, not the frame host's).
-        let path = exe_of(app_window(h))?;
+        let app = app_window(h);
+        let path = exe_of(app)?;
         if self.exe_icons.len() > 64 {
             self.exe_icons.clear();
         }
         if let Some(i) = self.exe_icons.get(&path) {
             return i.clone();
+        }
+        // A Store app: the logo in its package (its program has none).
+        if let Some(i) = package_of(app).and_then(|dir| {
+            // Its program, relative to the package (which app of it).
+            let (p, d) = (path.to_lowercase(), dir.to_string_lossy().to_lowercase());
+            let exe = p.strip_prefix(&d).map(|e| e.trim_start_matches('\\').to_string());
+            crate::apps_win::package_logo(&dir, None, exe.as_deref())
+        }) {
+            self.exe_icons.insert(path, Some(i.clone()));
+            return Some(i);
         }
         let w = wide(&path);
         let mut big: HICON = std::ptr::null_mut();
@@ -380,11 +450,27 @@ impl crate::coherence::Desktop for WinDesktop {
     }
 
     fn start(&mut self, name: &str) {
-        // As a user would: the Start menu, the name in its search, Enter.
-        // Typed as characters, whatever the keyboard layout. On a thread:
-        // Start takes a moment to open and to search.
-        let name: Vec<u16> = name.encode_utf16().collect();
+        // The Start menu's shortcut or app of that name. On a thread: the
+        // menu is read again (a new app is found), and Start may take a
+        // moment to open and to search.
+        let name = name.to_string();
         let _ = std::thread::Builder::new().name("start-app".into()).spawn(move || {
+            let before = app_windows();
+            if crate::apps::start(&name) {
+                front_new(&before);
+                return;
+            }
+            // Not a command line: Start's search runs those too.
+            if !crate::apps::plain(&name) {
+                log::info!("apps: not searching Start for {name:?}");
+                return;
+            }
+            // None by that name: as a user would, the Start menu, the name
+            // in its search, Enter. Typed as characters, whatever the
+            // keyboard layout. Start's search may pick something else
+            // (a web search).
+            log::info!("apps: searching Start for {name:?}");
+            let name: Vec<u16> = name.encode_utf16().collect();
             send_keys(&[key(VK_LWIN, false), key(VK_LWIN, true)]);
             std::thread::sleep(Duration::from_millis(700));
             let typed: Vec<INPUT> = name.iter().flat_map(|&u| [unicode(u, false), unicode(u, true)]).collect();
@@ -552,6 +638,33 @@ fn app_window(h: HWND) -> HWND {
     }
 }
 
+/// The install folder of the package a window's program came in (Store
+/// apps), if it did.
+fn package_of(h: HWND) -> Option<std::path::PathBuf> {
+    let mut pid = 0u32;
+    // SAFETY: out pointers and buffers with their lengths; the process
+    // handle is closed below.
+    unsafe {
+        GetWindowThreadProcessId(h, &mut pid);
+        if pid == 0 {
+            return None;
+        }
+        let p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if p.is_null() {
+            return None;
+        }
+        let mut b = [0u16; 256];
+        let mut n = b.len() as u32;
+        let r = GetPackageFullName(p, &mut n, b.as_mut_ptr());
+        CloseHandle(p);
+        // Not packaged: APPMODEL_ERROR_NO_PACKAGE.
+        if r != 0 || n == 0 || n as usize > b.len() {
+            return None;
+        }
+        crate::apps_win::package_path(&b[..n as usize])
+    }
+}
+
 /// The program a window belongs to (full path).
 fn exe_of(h: HWND) -> Option<String> {
     let mut pid = 0u32;
@@ -576,7 +689,7 @@ fn exe_of(h: HWND) -> Option<String> {
 /// An icon as `size` x `size` RGBA. Drawn twice, on black and on white:
 /// how much the two differ is how transparent a pixel is, whatever kind of
 /// icon it is (with an alpha channel or a mask).
-fn render(icon: HICON, size: i32) -> Option<crate::coherence::Icon> {
+pub(crate) fn render(icon: HICON, size: i32) -> Option<crate::coherence::Icon> {
     let n = (size * size) as usize;
     let draw = |fill: u8| -> Option<Vec<u8>> {
         // SAFETY: a DIB section of `n` 32-bit pixels, top-down, selected

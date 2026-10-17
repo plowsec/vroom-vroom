@@ -6,10 +6,10 @@ move to the docs (GUIDE, ARCHITECTURE) once they work.
 
 ## In progress
 
-- **Coherence, next steps** (see GUIDE.md): starting Linux apps by
-  name; Store app icons on Windows (from the package's logo); GNOME's
-  top bar (only an extension can hide it); Wayland sessions would need a
-  helper inside the compositor (a KWin script, a GNOME Shell extension).
+- **Coherence, next steps** (see GUIDE.md): Wayland sessions would need
+  a helper inside the compositor (a KWin script, or the GNOME Shell
+  extension the guest tools already install, which could report windows
+  too).
 
 ## 3D: catching up with VMware and Parallels
 
