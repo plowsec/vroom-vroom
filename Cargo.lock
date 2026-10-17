@@ -5516,6 +5516,7 @@ dependencies = [
  "vroom-config",
  "vroom-display",
  "vroom-import",
+ "vroom-ipc",
  "vroom-net",
  "vroom-proto",
  "vroom-sandbox",

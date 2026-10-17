@@ -194,9 +194,9 @@ mod os {
     use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SERVICE_ALREADY_RUNNING, GENERIC_READ, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{CreateFileW, GetLogicalDrives, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING};
     use windows_sys::Win32::System::Services::{
-        CloseServiceHandle, ControlService, CreateServiceW, DeleteService, EnumServicesStatusExW, OpenSCManagerW, OpenServiceW,
+        ChangeServiceConfigW, CloseServiceHandle, ControlService, CreateServiceW, DeleteService, EnumServicesStatusExW, OpenSCManagerW, OpenServiceW,
         QueryServiceConfigW, StartServiceW, ENUM_SERVICE_STATUS_PROCESSW, QUERY_SERVICE_CONFIGW, SC_ENUM_PROCESS_INFO, SC_HANDLE,
-        SC_MANAGER_ALL_ACCESS, SERVICE_ALL_ACCESS, SERVICE_AUTO_START, SERVICE_CONTROL_STOP, SERVICE_DEMAND_START, SERVICE_ERROR_NORMAL, SERVICE_STATE_ALL,
+        SC_MANAGER_ALL_ACCESS, SERVICE_ALL_ACCESS, SERVICE_AUTO_START, SERVICE_CONTROL_STOP, SERVICE_DEMAND_START, SERVICE_ERROR_NORMAL, SERVICE_NO_CHANGE, SERVICE_STATE_ALL,
         SERVICE_STATUS, SERVICE_WIN32, SERVICE_WIN32_OWN_PROCESS,
     };
     use windows_sys::Win32::System::IO::DeviceIoControl;
@@ -410,8 +410,18 @@ mod os {
             if let Some(l) = command_of(&svc).as_deref().and_then(letter_of) {
                 used |= 1 << (l as u8 - b'A');
             }
-            // A USB disk's share starts when a disk is there.
-            if !usb_tag(t) {
+            // A USB disk's share starts when a disk is there (an older
+            // agent made it start at boot: not any more).
+            if usb_tag(t) {
+                let none = SERVICE_NO_CHANGE;
+                // SAFETY: valid service handle; NULL leaves the rest as is.
+                let ok = unsafe {
+                    ChangeServiceConfigW(svc.0, none, SERVICE_DEMAND_START, none, std::ptr::null(), std::ptr::null(), std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), std::ptr::null(), std::ptr::null())
+                };
+                if ok == 0 {
+                    log::warn!("shares: {name}: {}", io::Error::last_os_error());
+                }
+            } else {
                 start(&svc, &name);
             }
         }

@@ -754,18 +754,36 @@ export component SettingsPanel inherits Rectangle {
                         text: root.s.usb-note;
                         icon: Icons.history;
                     }
-                    for u[i] in root.s.usb: Row {
-                        label: u.label;
-                        hint: u.note;
-                        key: "usb";
-                        warn: u.warn;
-                        IconButton {
-                            icon: Icons.trash;
-                            tip: "Remove";
-                            size: 28px;
-                            y: (parent.height - self.height) / 2;
+                    for u[i] in root.s.usb: VerticalLayout {
+                        spacing: 6px;
+                        Row {
+                            label: u.label;
+                            hint: u.note;
+                            key: "usb";
+                            warn: u.warn;
+                            IconButton {
+                                icon: Icons.trash;
+                                tip: "Remove";
+                                size: 28px;
+                                y: (parent.height - self.height) / 2;
+                                enabled: root.s.live;
+                                clicked => { Bus.act("usb." + i + ".remove"); }
+                            }
+                        }
+                        // A disk: how it goes to the VM (`mode`).
+                        if u.storage: Segmented {
+                            options: ["Share its files", "Use as a disk", "Pass the device"];
+                            selected: u.mode;
                             enabled: root.s.live;
-                            clicked => { Bus.act("usb." + i + ".remove"); }
+                            changed(m) => { Bus.set("usb." + i + ".mode", m); }
+                        }
+                        if u.storage: Text {
+                            text: u.mode == 0 ? "The Mac keeps the disk. The VM sees its files as a shared folder."
+                                : u.mode == 1 ? "The Mac lets go of it. The VM gets the whole disk, to use, format or partition."
+                                : "The VM gets the device itself. macOS 15.3 and later refuse this for disks unless vroom-netd has Full Disk Access.";
+                            wrap: word-wrap;
+                            font-size: Theme.fs-xs;
+                            color: Theme.text-3;
                         }
                     }
                     // What's plugged in, while "Add device" is open (a

@@ -119,6 +119,20 @@ pub fn disks(vendor: u16, product: u16, serial: Option<&str>) -> Vec<HostDisk> {
     }
 }
 
+/// The whole disk `bsd` ("disk6"), whatever it is attached to: for
+/// tests with a disk image (`hdiutil attach`), which no USB device has.
+pub fn disk_named(bsd: &str) -> Option<HostDisk> {
+    #[cfg(target_os = "macos")]
+    {
+        bsd_disk_ok(bsd).then(|| mac::disk_named(bsd)).flatten()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = bsd;
+        None
+    }
+}
+
 /// Mounted file systems: (device, where), e.g. ("disk5s1", "/Volumes/test").
 pub fn mounts() -> Vec<(String, std::path::PathBuf)> {
     #[cfg(target_os = "macos")]
@@ -368,6 +382,29 @@ mod mac {
         }
         out.retain(|d| super::bsd_disk_ok(&d.bsd));
         out
+    }
+
+    pub fn disk_named(bsd: &str) -> Option<HostDisk> {
+        for m in matching(c"IOMedia") {
+            if string(m.0, "BSD Name").as_deref() != Some(bsd) || !flag(m.0, "Whole") {
+                continue;
+            }
+            let mut out = vec![HostDisk {
+                bsd: bsd.to_string(),
+                bytes: num(m.0, "Size").unwrap_or(0).max(0) as u64,
+                block: num(m.0, "Preferred Block Size").unwrap_or(512).clamp(0, u32::MAX as i64) as u32,
+                major: num(m.0, "BSD Major").unwrap_or(-1) as u32,
+                minor: num(m.0, "BSD Minor").unwrap_or(-1) as u32,
+                removable: flag(m.0, "Removable"),
+                ejectable: flag(m.0, "Ejectable"),
+                writable: flag(m.0, "Writable"),
+                internal: false,
+                parts: vec![bsd.to_string()],
+            }];
+            find_disks(m.0, 0, false, &mut out, Some(0));
+            return out.pop();
+        }
+        None
     }
 
     pub fn mounts() -> Vec<(String, std::path::PathBuf)> {

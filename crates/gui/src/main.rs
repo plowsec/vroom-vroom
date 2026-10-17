@@ -13,6 +13,7 @@ mod edit;
 mod fmt;
 mod host;
 mod hostusb;
+mod usbdisk;
 mod keymap;
 mod library;
 mod mac;

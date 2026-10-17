@@ -171,7 +171,15 @@ pub fn set(c: &mut VmConfig, key: &str, v: &str, default_iface: Option<&str>) ->
             let i = idx(&mut c.usb, i, "USB device")?;
             let u = &mut c.usb[i];
             match *f {
-                "mode" => u.mode = vroom_config::UsbMode::parse(v).ok_or_else(|| format!("unknown USB mode {v:?}"))?,
+                // The settings page sends its choice's number.
+                "mode" => {
+                    u.mode = match v {
+                        "0" => vroom_config::UsbMode::Files,
+                        "1" => vroom_config::UsbMode::Disk,
+                        "2" => vroom_config::UsbMode::Device,
+                        v => vroom_config::UsbMode::parse(v).ok_or_else(|| format!("unknown USB mode {v:?}"))?,
+                    }
+                }
                 "readonly" => u.readonly = bool_of(v)?,
                 _ => return Err(format!("unknown setting {key}")),
             }

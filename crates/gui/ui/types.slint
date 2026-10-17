@@ -65,6 +65,10 @@ export struct ShareRow {
 export struct UsbRow {
     label: string,
     note: string,   // id, plugged in or not, held by the host
+    // A disk, and how it goes to the VM: 0 its files, 1 the disk, 2 the
+    // device.
+    storage: bool,
+    mode: int,
     warn: bool,
 }
 

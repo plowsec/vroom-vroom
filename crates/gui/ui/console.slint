@@ -22,6 +22,9 @@ export struct UsbMenuRow {
     // Being connected or let go.
     busy: bool,
     enabled: bool,
+    // A disk: how it goes to the VM is being chosen (the three ways
+    // show under it).
+    choosing: bool,
 }
 
 // One network adapter in the VM window's network menu.
@@ -424,6 +427,8 @@ export component ConsoleWindow inherits Window {
     in property <string> usb-note;
     in property <bool> usb-setup;
     in property <bool> usb-setup-busy;
+    // "Remember for this device", under a disk's three ways.
+    in property <bool> usb-remember;
     // Where the menu hangs from (the USB button's bottom right corner).
     in-out property <length> usb-x: root.width - 120px;
     in-out property <length> usb-y: root.bar-height;
@@ -863,6 +868,74 @@ export component ConsoleWindow inherits Window {
                         enabled: it.enabled && !it.busy;
                         mouse-cursor: pointer;
                         clicked => { root.act("usb.toggle." + i); }
+                    }
+                }
+                // A disk: the three ways it can go to the VM.
+                if it.choosing: VerticalLayout {
+                    padding-left: 30px;
+                    padding-bottom: 4px;
+                    spacing: 4px;
+                    for w in [
+                        { key: "files", title: "Share its files", text: "The Mac keeps the disk. The VM sees its files as a shared folder." },
+                        { key: "disk", title: "Use as a disk", text: "The Mac lets go of it. The VM gets the whole disk, to use, format or partition." },
+                        { key: "device", title: "Pass the USB device", text: "The VM gets the device itself. macOS 15.3 and later refuse this for disks unless vroom-netd has Full Disk Access." },
+                    ]: Rectangle {
+                        height: cl.preferred-height + 12px;
+                        border-radius: Theme.r-sm;
+                        background: cta.has-hover ? #ffffff14 : transparent;
+                        cl := VerticalLayout {
+                            y: 6px;
+                            padding-left: 10px;
+                            padding-right: 10px;
+                            spacing: 1px;
+                            Text {
+                                text: w.title;
+                                color: #ffffff;
+                                font-size: Theme.fs-sm;
+                            }
+                            Text {
+                                text: w.text;
+                                color: #ffffff80;
+                                font-size: Theme.fs-xs;
+                                wrap: word-wrap;
+                            }
+                        }
+                        cta := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.act("usb.how." + i + "." + w.key); }
+                        }
+                    }
+                    Rectangle {
+                        height: 28px;
+                        HorizontalLayout {
+                            padding-left: 10px;
+                            spacing: 8px;
+                            Rectangle {
+                                width: 14px;
+                                height: 14px;
+                                y: (parent.height - self.height) / 2;
+                                border-radius: 3px;
+                                border-width: root.usb-remember ? 0px : 1px;
+                                border-color: #ffffff60;
+                                background: root.usb-remember ? Theme.accent : transparent;
+                                if root.usb-remember: Icon {
+                                    source: Icons.check;
+                                    width: 11px;
+                                    height: 11px;
+                                    tint: #ffffff;
+                                }
+                            }
+                            Text {
+                                text: "Remember for this device";
+                                color: rma.has-hover ? #ffffff : #ffffffb0;
+                                font-size: Theme.fs-sm;
+                                vertical-alignment: center;
+                            }
+                        }
+                        rma := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.act("usb.remember"); }
+                        }
                     }
                 }
                 // Connected, or in the VM file: keep it there, or not.

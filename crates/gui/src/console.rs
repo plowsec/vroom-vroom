@@ -1130,6 +1130,8 @@ fn ready(key: &str, fd: OwnedFd) {
 fn closed(key: &str) {
     usbmenu::forget(key);
     let Some(mut c) = CONSOLES.with(|m| m.borrow_mut().remove(key)) else { return };
+    // Disks the VM had go back to macOS.
+    c.usb_closed();
     c.save_thumb(None);
     c.coh_close();
     let _ = c.win.hide();
@@ -1191,6 +1193,7 @@ impl Console {
     }
 
     fn toast(&mut self, text: &str) {
+        log::info!("{}: {text}", self.name);
         self.toast_id += 1;
         let id = self.toast_id;
         self.win.set_toast(text.into());
