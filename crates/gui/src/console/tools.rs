@@ -87,7 +87,9 @@ impl Console {
             _ => State::Hidden,
         };
         if let (State::Updating { to, .. }, Some(t)) = (&was, &theirs) {
-            if !t.older_than(to) {
+            if t.older_than(to) {
+                self.toast("The guest tools update didn't take: the agent's log in the guest says why");
+            } else {
                 self.toast(&format!("Guest tools updated ({t})"));
             }
         }
