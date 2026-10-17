@@ -65,6 +65,8 @@ pub(super) struct UsbMenu {
     /// when, seen in the VMM's list yet). macOS mounts them again once
     /// the VM lets go.
     taken: Vec<(String, String, Instant, bool)>,
+    /// Disks being unmounted and opened (device keys), off the UI thread.
+    opening: Vec<String>,
     /// Why the last disk couldn't be connected: stays in the menu (it
     /// may say what to allow in System Settings) until it is opened again.
     error: Option<String>,
@@ -253,7 +255,7 @@ impl Console {
             }
             !*seen
         });
-        back.into_iter().for_each(usbdisk::remount);
+        back.into_iter().for_each(|b| self.give_back(b));
         let m = &mut self.usb;
         m.ports = Some(l);
         // It has the sockets it got (or refused them): let ours go.
@@ -307,16 +309,34 @@ impl Console {
             }
             keep
         });
-        back.into_iter().for_each(usbdisk::remount);
+        back.into_iter().for_each(|b| self.give_back(b));
         if self.win.get_usb_open() {
             self.usb_rows();
         }
     }
 
+    /// A disk the VM let go of goes back to macOS. If macOS shows no
+    /// partitions on it afterwards, the window says what to do.
+    fn give_back(&self, bsd: String) {
+        let key = self.key.clone();
+        usbdisk::remount(bsd.clone(), move |back| {
+            if back == usbdisk::Back::Blank {
+                let _ = slint::invoke_from_event_loop(move || {
+                    with(&key, |c| {
+                        // Not if the VM has it again by now.
+                        if !c.usb.taken.iter().any(|t| t.1 == bsd) {
+                            c.toast(&format!("USB: macOS sees no partitions on {bsd} now. If it had some, unplug it and plug it in again."));
+                        }
+                    });
+                });
+            }
+        });
+    }
+
     /// The VM is gone: every disk it had goes back to macOS.
     pub(super) fn usb_closed(&mut self) {
         for (_, bsd, _, _) in std::mem::take(&mut self.usb.taken) {
-            usbdisk::remount(bsd);
+            self.give_back(bsd);
         }
     }
 
@@ -334,7 +354,7 @@ impl Console {
             }
             keep
         });
-        back.into_iter().for_each(usbdisk::remount);
+        back.into_iter().for_each(|b| self.give_back(b));
         self.usb_again();
         let m = &mut self.usb;
         let stale = m.listed.is_none_or(|t| now.duration_since(t) >= LIST_EVERY);
@@ -374,9 +394,10 @@ impl Console {
         // "18a5:0302/SERIAL" for one of several with that id).
         if let Some(rest) = cmd.strip_prefix("usb.toggle-id.").or_else(|| cmd.strip_prefix("usb.how-id.")) {
             let (id, how) = rest.split_once('.').unwrap_or((rest, ""));
-            if self.usb.targets.is_empty() {
-                self.usb_rows();
-            }
+            // The rows as they are now: with the menu closed they aren't
+            // kept up to date, and a stale one would connect a device
+            // the VM has already.
+            self.usb_rows();
             if let Some(i) = self.usb.targets.iter().position(|t| t.dev.id == id || key_of(&t.dev) == id) {
                 let c = if how.is_empty() { format!("usb.toggle.{i}") } else { format!("usb.how.{i}.{how}") };
                 return self.usb_command(&c);
@@ -611,6 +632,11 @@ impl Console {
     /// for a password) off the UI thread, hand the VMM the fd.
     fn usb_disk(&mut self, dev: UsbDev, h: HostDevice, readonly: bool) {
         let k = key_of(&dev);
+        // Never the same disk twice: two sticks on one disk would wreck it.
+        if self.usb.opening.contains(&k) || self.usb.taken.iter().any(|t| t.0 == k) {
+            return;
+        }
+        self.usb.opening.push(k.clone());
         self.usb.busy.insert(k, Instant::now());
         self.usb_rows();
         let key = self.key.clone();
@@ -623,6 +649,7 @@ impl Console {
     }
 
     fn usb_disk_open(&mut self, dev: UsbDev, r: Result<usbdisk::Disk, String>) {
+        self.usb.opening.retain(|k| *k != key_of(&dev));
         let name = if dev.name.is_empty() { dev.id.clone() } else { dev.name.clone() };
         let d = match r {
             Ok(d) => d,
@@ -647,7 +674,7 @@ impl Console {
             }
             Err(e) => {
                 self.usb.busy.remove(&key_of(&dev));
-                usbdisk::remount(d.bsd);
+                self.give_back(d.bsd);
                 self.toast(&format!("USB: {e}"));
             }
         }

@@ -1162,6 +1162,11 @@ What to expect:
 - A volume macOS mounts read-only (NTFS without a driver) is read-only in
   the guest too. `readonly = true` in the VM file keeps the guest from
   changing a volume or a disk.
+- While the VM uses a disk, macOS shows it without partitions. When
+  the VM lets go, macOS reads it again and mounts what it can (a file
+  system the guest made that macOS can't read stays unmounted). If the
+  window says macOS sees no partitions on it and the guest didn't wipe
+  it, unplug it and plug it in again.
 - "Use as a disk" fails if a program on the Mac has files open on the
   disk: close them, or eject it in Finder, and try again.
 - macOS may ask once whether vroom may use removable volumes. If you

@@ -70,7 +70,10 @@ in the IOKit registry (`usb::list::disks`, `mounts`).
 
 - Files: the app opens the volume's directory and issues a sandbox
   extension for it (`sandbox::issue_extension`), and sends both with
-  `ToVmm::UsbFiles`. The VMM consumes the token and puts a
+  `ToVmm::UsbFiles`. The VMM consumes the token (one consumed before
+  `sandbox_init` doesn't carry into the sandbox it makes, and the VMM
+  handles the viewer while it sets up: `vroom_sandbox` keeps such a
+  token and consumes it right after the sandbox is applied) and puts a
   `vroom_fs::Share` made from the fd on a free removable share
   (`virtio::devices::fs::FsSlot`): a virtio-fs device whose tree can be
   swapped while the guest has it mounted. The worker takes the new tree
@@ -89,8 +92,15 @@ in the IOKit registry (`usb::list::disks`, `mounts`).
   thread of its own (`helper::serve` with `msd::StoreOpener`): the
   Bulk-Only/SCSI stick (`usb::msd`), on a free port pair like any
   helper. `UsbDetach` waits for that thread to flush and close the disk
-  before the viewer hears of it; the app then runs `diskutil mountDisk`
-  (also when the VM ends).
+  before the viewer hears of it; the app then waits for macOS to read
+  the disk again and mount it (`usbdisk::remount`, also when the VM
+  ends). macOS takes a disk's partitions away while a program has the
+  raw disk open for writing, and reads them again when the last one
+  closes it; `mountDisk` succeeds on a disk with no partitions, so the
+  app checks a volume did mount, asks again for 30 seconds, and reads
+  a disk it owns (a disk image) once more by opening it for writing
+  and closing it. A stick that still shows no partitions gets a
+  message: unplug it and plug it in again.
 
 `[[usb]] mode = "files" | "disk"` entries are the app's to connect once
 the VM has its USB controller; `vroom run` skips them. Without the app,

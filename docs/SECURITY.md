@@ -514,7 +514,10 @@ path: a token the kernel signs, of a class of ours
 (`org.vroom.usb-files.read`, or `.read-write`). It passes the directory
 fd and the token to the VMM over the viewer socket. The VMM's profile
 allows file access under an extension of those classes and nowhere else
-new: without a token from the app it reaches nothing more. Seatbelt
+new: without a token from the app it reaches nothing more. (A token
+that comes while the VMM is still setting up, as for a VM file's disk,
+is kept and consumed once the sandbox is on: one consumed before it
+would be lost with the new sandbox.) Seatbelt
 checks paths, so a directory fd alone wouldn't be enough; the token is
 what lets the VMM in, and only below that directory. The files are
 served by the same code as shared folders (component walks with
@@ -555,7 +558,12 @@ flight). Every block number and length is checked against the disk's
 size before the read or write; reads and writes are whole blocks (the
 fuzzer's `usb_proto` target drives it as a hostile VMM would). On
 disconnect the VMM flushes (the disk's cache too) and closes the fd
-before it tells the app, which then has macOS mount the disk again.
+before it tells the app, which then has macOS mount the disk again. A
+disk image whose partitions don't come back is read once more by the
+app: it opens `/dev/rdiskN` for writing and closes it (macOS reads the
+partition table again then). It writes nothing, does it only while
+nothing of that disk is mounted, and opens no disk node it can't open
+as the user (a USB stick's is root's).
 
 What the guest gets: all of that disk, to read and overwrite (format it,
 plant a boot sector). That is what was asked for. It can't reach other

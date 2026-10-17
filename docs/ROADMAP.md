@@ -211,16 +211,11 @@ A guest needs a driver and an API its players use. What exists:
   Full Disk Access for it is not known). A card reader with several
   disks can only be passed as the device. Linux hosts: neither way yet
   (the device can be passed there).
-- Two USB disk bugs found October 17 (disk images, Ubuntu guest, no
-  agent). "Share its files" on a volume the guest may change: the guest
-  lists the files but every open fails with EPERM while the VMM is
-  sandboxed (fine with `sandbox = false`, and a read-only volume works
-  sandboxed). The same token class and profile rules let a small test
-  program in `sandbox-exec` read and write, so something else in the
-  VMM's sandbox is in the way. And after "Use as a disk", macOS keeps
-  the whole disk but drops its partitions: `diskutil mountDisk` says it
-  worked, nothing mounts, and the disk has no volumes for "Share its
-  files" until it is unplugged (a disk image: detached and attached).
+- "Use as a disk" given back with a real stick: macOS should read the
+  partitions the guest wrote and mount them (seen with disk images
+  only). If the app says macOS sees no partitions, find out what still
+  has the disk open (`lsof /dev/rdiskN`); `vroom usb reset` through
+  vroom-netd re-enumerates a stick without a re-plug.
 
 - Things only a person at the Mac can try: bridged networking with real
   vmnet, a drag out of the guest to Finder, Mail or the Desktop with a

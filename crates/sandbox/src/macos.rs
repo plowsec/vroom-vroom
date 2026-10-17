@@ -40,10 +40,30 @@ pub fn issue_extension(dir: &Path, write: bool) -> Result<String> {
     Ok(s)
 }
 
-/// Take the access a token gives (in the sandboxed VMM). Returns a
-/// handle for `release_extension`.
-pub fn consume_extension(token: &str) -> Result<i64> {
-    let t = CString::new(token).map_err(|_| Error::Apply("NUL in token".into()))?;
+/// Tokens taken so far, by our own handle. An extension consumed before
+/// `sandbox_init` doesn't carry into the sandbox it makes (the VMM
+/// handles the viewer's messages, a USB disk of the VM file's among
+/// them, while it is still setting up): those wait here and are
+/// consumed right after the sandbox is in place.
+struct Exts {
+    applied: bool,
+    next: i64,
+    held: Vec<(i64, Ext)>,
+}
+
+enum Ext {
+    Waiting(CString),
+    /// The kernel's handle.
+    Live(i64),
+}
+
+static EXTS: std::sync::Mutex<Exts> = std::sync::Mutex::new(Exts { applied: false, next: 1, held: Vec::new() });
+
+fn exts() -> std::sync::MutexGuard<'static, Exts> {
+    EXTS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn consume_now(t: &CStr) -> Result<i64> {
     // SAFETY: a valid C string; the kernel checks the token.
     let h = unsafe { sandbox_extension_consume(t.as_ptr()) };
     if h < 0 {
@@ -52,10 +72,41 @@ pub fn consume_extension(token: &str) -> Result<i64> {
     Ok(h)
 }
 
+/// Take the access a token gives (in the VMM). Returns a handle for
+/// `release_extension`. Before the sandbox is applied the token is kept
+/// and consumed by `apply` (unsandboxed, nothing is in the way yet).
+pub fn consume_extension(token: &str) -> Result<i64> {
+    let t = CString::new(token).map_err(|_| Error::Apply("NUL in token".into()))?;
+    let mut x = exts();
+    let ext = if x.applied { Ext::Live(consume_now(&t)?) } else { Ext::Waiting(t) };
+    let id = x.next;
+    x.next += 1;
+    x.held.push((id, ext));
+    Ok(id)
+}
+
 /// Give that access back.
 pub fn release_extension(handle: i64) {
-    // SAFETY: a handle consume_extension returned; a stale one is refused.
-    unsafe { sandbox_extension_release(handle) };
+    let mut x = exts();
+    let Some(i) = x.held.iter().position(|(id, _)| *id == handle) else { return };
+    if let (_, Ext::Live(h)) = x.held.swap_remove(i) {
+        // SAFETY: a handle sandbox_extension_consume returned.
+        unsafe { sandbox_extension_release(h) };
+    }
+}
+
+/// Right after `sandbox_init`: the tokens taken before it.
+fn consume_waiting(x: &mut Exts) {
+    x.applied = true;
+    for (_, e) in &mut x.held {
+        if let Ext::Waiting(t) = e {
+            match consume_now(t) {
+                Ok(h) => *e = Ext::Live(h),
+                // The share then reads as denied, as without a token.
+                Err(err) => log::warn!("usb files: {err}"),
+            }
+        }
+    }
 }
 
 /// Quote a path for SBPL. Paths with quotes/backslashes are refused.
@@ -351,6 +402,8 @@ pub fn apply(p: &Policy) -> Result<()> {
     log::debug!("seatbelt profile:\n{prof}");
     let c = CString::new(prof).map_err(|_| Error::Apply("NUL in profile".into()))?;
     let mut err: *mut c_char = std::ptr::null_mut();
+    // Held across sandbox_init: a token taken meanwhile waits for it.
+    let mut x = exts();
     // SAFETY: valid NUL-terminated profile; err is an out pointer.
     let rc = unsafe { sandbox_init(c.as_ptr(), 0, &mut err) };
     if rc != 0 {
@@ -365,6 +418,7 @@ pub fn apply(p: &Policy) -> Result<()> {
         };
         return Err(Error::Apply(msg));
     }
+    consume_waiting(&mut x);
     Ok(())
 }
 
@@ -394,5 +448,40 @@ mod tests {
         assert!(t.len() > 16, "{t}");
         assert_ne!(t, issue_extension(d.path(), true).unwrap());
         assert!(issue_extension(&d.path().join("nothing"), false).is_err());
+    }
+
+    /// A USB disk's files handed over while the VMM is still setting up
+    /// (a VM file's disk): the token must work once the sandbox is on.
+    /// Run in a child, as a sandbox is for the whole process.
+    #[test]
+    fn a_token_taken_before_the_sandbox_works_in_it() {
+        const ME: &str = "macos::tests::a_token_taken_before_the_sandbox_works_in_it";
+        let Some(dir) = std::env::var_os("VROOM_SB_EXT_CHILD") else {
+            let d = tempfile::tempdir().unwrap();
+            let st = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", ME, "--nocapture", "--test-threads=1"])
+                .env("VROOM_SB_EXT_CHILD", d.path())
+                .status()
+                .unwrap();
+            assert!(st.success());
+            assert_eq!(std::fs::read_to_string(d.path().join("rw/in.txt")).unwrap(), "x");
+            assert!(!d.path().join("ro/out.txt").exists());
+            return;
+        };
+        let (rw, ro) = (Path::new(&dir).join("rw"), Path::new(&dir).join("ro"));
+        std::fs::create_dir(&rw).unwrap();
+        std::fs::create_dir(&ro).unwrap();
+        std::fs::write(ro.join("f"), "ro").unwrap();
+        let early = consume_extension(&issue_extension(&rw, true).unwrap()).unwrap();
+        let late = issue_extension(&ro, false).unwrap();
+        apply(&Policy { usb_storage: true, ..Default::default() }).unwrap();
+        std::fs::write(rw.join("in.txt"), "x").expect("write with a token taken before the sandbox");
+        assert!(std::fs::read(ro.join("f")).is_err(), "read without a token");
+        let late = consume_extension(&late).unwrap();
+        assert_eq!(std::fs::read(ro.join("f")).unwrap(), b"ro");
+        assert!(std::fs::write(ro.join("out.txt"), "y").is_err(), "write with a read token");
+        release_extension(early);
+        release_extension(late);
+        assert!(std::fs::read(ro.join("f")).is_err(), "read after the release");
     }
 }
