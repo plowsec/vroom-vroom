@@ -592,7 +592,7 @@ impl App {
                 readonly: sh.readonly,
             })
             .collect();
-        let host_usb = if c.usb.is_empty() { Vec::new() } else { vroom_usb::list::list() };
+        let host_usb = if c.usb.is_empty() { Vec::new() } else { crate::hostusb::host_list() };
         let usb: Vec<UsbRow> = c
             .usb
             .iter()
@@ -1257,8 +1257,15 @@ impl App {
             "usb.add" => {
                 // Open or close the list of what's plugged in.
                 self.usb_picking = !self.usb_picking;
-                self.usb_host = if self.usb_picking { vroom_usb::list::list() } else { Vec::new() };
+                self.usb_host = if self.usb_picking { crate::hostusb::host_list() } else { Vec::new() };
                 self.push_all();
+            }
+            // The same by id ("usb.pick-id.1209:00aa"; scripts, VROOM_SHOT).
+            _ if a.starts_with("usb.pick-id.") => {
+                let id = &a["usb.pick-id.".len()..];
+                if let Some(j) = self.usb_host.iter().position(|d| d.id() == id) {
+                    self.act(&format!("usb.pick.{j}"));
+                }
             }
             _ if a.starts_with("usb.pick.") => {
                 let j: usize = a["usb.pick.".len()..].parse().unwrap_or(usize::MAX);
