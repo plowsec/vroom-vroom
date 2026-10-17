@@ -74,11 +74,13 @@ Not yet: x86_64 hosts (it builds, can't run VMs yet) and Secure Boot.
 
 ```bash
 brew install qemu            # only for its UEFI firmware file
+scripts/make-guest-tools.sh images/virtio-win/virtio-win.iso   # the guest agent, drivers
 scripts/app.sh --install     # builds vroom.app and copies it to /Applications
 ```
 
-Then open vroom from Applications or Spotlight: New VM, pick the ISO,
-Start. Without `--install` the app is in `target/dist/vroom.app`. 3D needs
+Then open vroom from Applications or Spotlight: New VM, pick Ubuntu (it
+downloads it) or the Windows 11 ARM64 ISO, Create: it comes up installed,
+with the guest tools. Or pick any installer ISO. Without `--install` the app is in `target/dist/vroom.app`. 3D needs
 its libraries built first ([GUIDE.md](docs/GUIDE.md#the-mac-app)).
 
 Or from the terminal:
@@ -100,6 +102,8 @@ vroom-gui dev.toml                # open one VM in a window
 vroom run dev.toml                # no window: serial console in this terminal
 vroom check dev.toml              # validate a config, print it with defaults
 vroom new NAME --os linux|windows --disk 64G --iso FILE
+vroom new NAME --os ubuntu|windows --ready [--iso WIN.iso] --ssh-key ~/.ssh/id_ed25519.pub
+vroom guest-tools info            # the guest tools this vroom has
 vroom import ~/Virtual\ Machines.localized/X.vmwarevm   # from VMware Fusion
 vroom snapshot list|delete|prune dev.toml
 vroom disk create x.qcow2 --size 64G
