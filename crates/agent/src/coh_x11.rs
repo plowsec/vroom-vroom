@@ -94,6 +94,7 @@ pub struct X11Desktop {
     /// The event thread: told to stop, and woken through this window.
     events: Option<(Arc<AtomicBool>, Window, std::thread::JoinHandle<()>)>,
     dock: Dock,
+    top: TopBar,
 }
 
 impl X11Desktop {
@@ -106,7 +107,7 @@ impl X11Desktop {
         let (c, n) = x11rb::connect(None).map_err(|e| format!("no X11 display in the guest's session ({e})"))?;
         let root = c.setup().roots.get(n).ok_or("no X11 screen")?.root;
         let a = Atoms::new(&c).ok_or("the X server didn't answer")?;
-        let d = X11Desktop { c, root, a, listed: HashMap::new(), frames: HashMap::new(), events: None, dock: Dock::default() };
+        let d = X11Desktop { c, root, a, listed: HashMap::new(), frames: HashMap::new(), events: None, dock: Dock::default(), top: TopBar::default() };
         if d.prop32(root, a._NET_SUPPORTING_WM_CHECK, 1).is_empty() {
             return Err("the guest's window manager doesn't tell where windows are (no EWMH)".into());
         }
@@ -315,6 +316,15 @@ impl crate::coherence::Desktop for X11Desktop {
 
     fn shell(&mut self, on: bool) {
         self.dock.set(on);
+        self.top.set(on);
+    }
+
+    fn start(&mut self, name: &str) {
+        // The menu is read again (a new app is found): on a thread.
+        let name = name.to_string();
+        let _ = std::thread::Builder::new().name("start-app".into()).spawn(move || {
+            crate::apps::start(&name);
+        });
     }
 
     fn watch(&mut self, poke: Option<Poke>) -> bool {
@@ -449,6 +459,43 @@ impl Dock {
                 _ => {}
             }
             let _ = std::fs::remove_file(&note);
+        }
+    }
+}
+
+/// GNOME's top bar keeps a strip at the top of the screen that maximized
+/// windows stay below; only GNOME Shell itself can hide it. The guest
+/// tools install a small extension that does (`examples/linux/gnome-shell`):
+/// we enable it while Coherence is on and disable it after (and at
+/// start, after an agent that died). GNOME Shell finds a new extension
+/// only when it starts, so this works from the login after the install.
+#[derive(Default)]
+struct TopBar {
+    ours: Option<bool>,
+}
+
+const TOP_EXTENSION: &str = "vroom-coherence@vroom";
+
+impl TopBar {
+    fn set(&mut self, on: bool) {
+        if Some(on) == self.ours {
+            return;
+        }
+        self.ours = Some(on);
+        if !std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|d| d.split(':').any(|d| d == "GNOME")) {
+            return;
+        }
+        let r = std::process::Command::new("gnome-extensions")
+            .args([if on { "enable" } else { "disable" }, TOP_EXTENSION])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        match r {
+            Ok(s) if s.success() => log::info!("coherence: GNOME's top bar {}", if on { "hidden" } else { "back" }),
+            // Not installed, or GNOME Shell hasn't seen it yet (log in again).
+            _ if on => log::info!("coherence: GNOME's top bar stays (the {TOP_EXTENSION} extension isn't there yet)"),
+            _ => {}
         }
     }
 }

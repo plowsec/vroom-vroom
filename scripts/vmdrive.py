@@ -13,7 +13,8 @@ Commands, one per line, on <state-dir>.cmd (a fifo):
   hresize N W H          monitor N's window size (0 0: closed)
   coherence 0|1          Coherence on/off (windows show as "windows N: ...")
   win ID activate|minimize|close | win ID move X Y W H
-  startapp NAME          start a guest app by name (icons show as "icon ID ...")
+  startapp NAME          start a guest app by name (icons show as "icon ID ...";
+                         the apps it can start as "apps N: ...")
   serial TEXT            to the serial console (\\n for Enter)
   drop X Y X2 Y2 PATH... drag files in at X,Y, move to X2,Y2, drop there
                          (what the app does when files come from Finder)
@@ -130,6 +131,21 @@ def reader():
                 ev.write(f"icon {i:#x} {w}x{h} {png if w else 'none'}\n")
             elif t == 19:
                 ev.write(f"no coherence: {pl.decode(errors='replace')}\n")
+            elif t == 60:
+                # The apps the guest can start: names in the events, icons
+                # (with their names) in a folder next to the state.
+                n, o, out, icons = struct.unpack("<I", pl[:4])[0], 4, [], 0
+                d = f"{state}.apps"
+                os.makedirs(d, exist_ok=True)
+                for _ in range(n):
+                    ln = struct.unpack("<H", pl[o:o + 2])[0]; name = pl[o + 2:o + 2 + ln].decode(); o += 2 + ln
+                    w, h = struct.unpack("<HH", pl[o:o + 4]); o += 4
+                    if w:
+                        icons += 1
+                        write_png(os.path.join(d, "".join(c if c.isalnum() else "_" for c in name)[:60] + ".png"), w, h, pl[o:o + w * h * 4])
+                    o += w * h * 4
+                    out.append(name)
+                ev.write(f"apps {n} ({icons} icons in {d}): " + " | ".join(out) + "\n")
             elif t == 40:
                 n, o, out = pl[1], 2, []
                 for _ in range(n):

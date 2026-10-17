@@ -34,7 +34,7 @@ fn ipc_err(e: vroom_ipc::Error) -> Error {
     }
 }
 pub use proto::{
-    Command, Decoder, Forward, GuestCursor, GuestWindow, NetKind, NetLive, NetPort, ToViewer, ToVmm, UsbDev, UsbPort, WindowOp, CURSOR_MAX,
+    Command, Decoder, Forward, GuestApp, GuestCursor, GuestWindow, NetKind, NetLive, NetPort, ToViewer, ToVmm, UsbDev, UsbPort, WindowOp, CURSOR_MAX,
     DRAG_ITEMS_MAX, FORWARDS_MAX, NET_PORTS_MAX, POINTER_MAX, SCALE_MAX, SCALE_MIN, USB_PORTS_MAX,
 };
 

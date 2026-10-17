@@ -341,7 +341,15 @@ most every 10 ms, and every 500 ms anyway in case an event got lost:
   `WM_CHANGE_STATE`, `_NET_CLOSE_WINDOW`, `_NET_MOVERESIZE_WINDOW` with
   static gravity). Ubuntu's dock is set to hide (`gsettings`, put back
   after; what it was is noted in `$XDG_RUNTIME_DIR` for a helper that
-  died). On Wayland the helper answers `CoherenceNo` with the reason.
+  died). GNOME's top bar can only be hidden from inside GNOME Shell (no
+  setting does it): the guest tools install a small extension
+  (`examples/linux/gnome-shell`, `vroom-coherence@vroom`; one file for
+  GNOME 42 to 44, one for 45 and later) that takes the top bar out of
+  the struts and hides it while enabled. The helper runs
+  `gnome-extensions enable` when Coherence goes on and `disable` when it
+  goes off (and at start). GNOME Shell only finds a new extension when
+  it starts, so it works from the login after the install. On Wayland
+  the helper answers `CoherenceNo` with the reason.
 
 When the list changes the helper sends `Message::Windows`: id (window
 handle or X window), what can be seen of it, flags (in front, minimized,
@@ -353,8 +361,45 @@ kind of icon; X11 takes the size nearest 32 of `_NET_WM_ICON`. Back come
 `WindowDo` requests: activate, minimize, close (`SC_CLOSE` /
 `_NET_CLOSE_WINDOW`), move (to the visible bounds, borders added back).
 Only windows of the last list are touched, in the VMM and the agent.
-`StartApp` (Windows) presses the Windows key, types the name as
-characters (`KEYEVENTF_UNICODE`, any keyboard layout) and Enter.
+A Store app's window (in `ApplicationFrameHost`, or a packaged program)
+has no icon of its own and its program none either: the helper finds
+its package (`GetPackageFullName` on the process,
+`GetPackagePathByFullName`), the app's entry in `AppxManifest.xml` (by
+its program), its `Square44x44Logo`, and of that logo's files the
+unplated one at the size nearest 32 (`appx.rs`), a PNG decoded in the
+guest.
+
+`StartApp` (`apps.rs`) reads the menu again, on a thread, and starts
+the app the name fits best: its name (whole, then its start, then a
+word's start) before its other names; of equal ones, apps that run in
+a terminal last, then a shorter name first. Windows (`apps_win.rs`): the `.lnk` files of both Start menu folders (named as
+the shell shows them, localized through `desktop.ini`), then the apps
+of `shell:AppsFolder` no shortcut has the name of (Store apps by
+AppUserModelID; enumerated through `IShellItem` and
+`IEnumShellItems`); opened with `ShellExecute` (the `.lnk`, or
+`shell:AppsFolder\<id>`). Windows may open the new app behind the
+window in front, so the helper waits up to 10 s for its first window
+and brings it forward. No app by that name: if the name is plain, the
+old way (the Windows key, the name typed as characters, Enter). Linux
+(`apps_xdg.rs`): the desktop entries of the XDG data dirs (the user's,
+`XDG_DATA_DIRS`, Flatpak and Snap), in precedence order by desktop file
+id, without NoDisplay, Hidden, OnlyShowIn/NotShowIn and missing TryExec
+ones; names in the session's language (`LC_ALL`, `LC_MESSAGES`,
+`LANG`), other names from GenericName, Keywords and the file name.
+Started with `gio launch <file>` (GLib 2.68 and later), or when that
+fails with the Exec line split into words (quoting rules of the spec,
+field codes out: no files) run directly, in its own process group,
+from the home folder.
+
+While Coherence is on the helper also sends the apps it can start
+(`Apps`: name and 32x32 icon, at most 512, sorted), read on a thread of
+its own when Coherence goes on and again every minute, sent when it
+changed. Icons: Windows asks the shell (`SHGetFileInfo`) for shortcuts
+and the package logo (as above) for Store apps; Linux looks the entry's
+icon up in the icon themes (the user's GTK theme, Yaru, Adwaita,
+hicolor..., PNG files only, the size nearest 32) or takes the file it
+names. About 3 s on Windows (the shell draws every icon), 70 ms on
+Ubuntu.
 
 The VMM forwards the list to the app coalesced (`ToViewer::Windows`, like
 damage: a busy guest costs one queued list), icons the same way per
@@ -373,7 +418,9 @@ behind other apps' windows when it isn't. The guest's window in front
 gets the keyboard on the Mac while one of ours has it. The bar
 (`CoherenceBar`) lists app windows with their icons, sends the Windows
 key for Start, and has the app field (its keys stay in the bar while it
-has focus). Once a second the app looks at which screen the bar is on
+has focus). As one types there the bar shows the three apps of the
+guest's list the text fits best (`suggest`) in place of the window
+buttons; Enter sends the one picked, or the text if none fits. Once a second the app looks at which screen the bar is on
 and at that screen's free area; if either changed (the bar dragged to
 another screen, the Dock moved, a screen unplugged), the guest's screen
 moves there: new area, a resize, the bar at the bottom. Leaving sends

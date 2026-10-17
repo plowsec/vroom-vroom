@@ -5,8 +5,9 @@
 // window as the VM's, whatever the guest draws below it, and moves it.
 // The guest's picture fills the rest; input there goes to the guest.
 //
-// The Coherence bar stands in for the guest's taskbar: Start, its app
-// windows (minimized ones too), and the way back to the VM window.
+// The Coherence bar stands in for the guest's taskbar: Start, a field to
+// open an app by name (the guest's apps are suggested as one types), its
+// app windows (minimized ones too), and the way back to the VM window.
 
 import { Theme } from "theme.slint";
 import { Icons } from "icons.slint";
@@ -18,6 +19,13 @@ export struct CohChip {
     front: bool,
     minimized: bool,
     // The app's icon, from the guest (checked for size; may be empty).
+    icon: image,
+    has-icon: bool,
+}
+
+// An app the guest can start, as the field suggests it.
+export struct CohApp {
+    name: string,
     icon: image,
     has-icon: bool,
 }
@@ -138,9 +146,18 @@ export component CoherenceBar inherits Window {
     in property <bool> can-start;
     // The field has the keyboard: keys go to it, not to the guest.
     out property <bool> typing: name.has-focus;
+    // What is in the field (Rust sets it for screenshots).
+    in-out property <string> query <=> name.text;
+    // The guest's apps that match it, best first (Rust fills it).
+    in property <[CohApp]> suggestions;
+    // The one Enter starts (arrow keys move it).
+    in-out property <int> pick: 0;
+    property <bool> suggesting: name.text != "" && root.suggestions.length > 0;
     callback start();
     // Start the guest app with this name.
     callback start-app(string);
+    // The field's text changed.
+    callback typed(string);
     callback chip(int);
     callback exit();
     // Pressed where nothing else is: the bar follows the mouse.
@@ -181,6 +198,7 @@ export component CoherenceBar inherits Window {
             font-weight: 650;
             vertical-alignment: center;
             overflow: elide;
+            min-width: min(self.preferred-width, 60px);
             max-width: 160px;
         }
         Button {
@@ -216,15 +234,82 @@ export component CoherenceBar inherits Window {
                 color: Theme.text;
                 single-line: true;
                 selection-background-color: Theme.accent.with-alpha(0.35);
+                edited => {
+                    root.pick = 0;
+                    root.typed(self.text);
+                }
+                key-pressed(e) => {
+                    if (e.text == Key.DownArrow || e.text == Key.Tab) && root.suggesting {
+                        root.pick = Math.min(root.pick + 1, root.suggestions.length - 1);
+                        return accept;
+                    }
+                    if e.text == Key.UpArrow && root.suggesting {
+                        root.pick = Math.max(root.pick - 1, 0);
+                        return accept;
+                    }
+                    if e.text == Key.Escape && self.text != "" {
+                        self.text = "";
+                        root.typed("");
+                        return accept;
+                    }
+                    reject
+                }
                 accepted => {
-                    if self.text != "" {
+                    if root.suggesting {
+                        root.start-app(root.suggestions[Math.min(root.pick, root.suggestions.length - 1)].name);
+                    } else if self.text != "" {
                         root.start-app(self.text);
                     }
                     self.text = "";
+                    root.typed("");
                 }
             }
         }
-        HorizontalLayout {
+        // While typing: the apps that match, instead of the windows.
+        if root.suggesting: HorizontalLayout {
+            horizontal-stretch: 1;
+            spacing: 4px;
+            for a[i] in root.suggestions: Rectangle {
+                y: (parent.height - self.height) / 2;
+                height: 28px;
+                min-width: min(110px, at.preferred-width + at.x + 10px);
+                preferred-width: min(200px, at.preferred-width + at.x + 10px);
+                horizontal-stretch: 0;
+                max-width: 200px;
+                border-radius: Theme.r-sm;
+                background: i == root.pick ? Theme.selected : ata.has-hover ? Theme.card-hover : transparent;
+                if a.has-icon: Image {
+                    x: 8px;
+                    y: (parent.height - self.height) / 2;
+                    width: 16px;
+                    height: 16px;
+                    source: a.icon;
+                    image-rendering: smooth;
+                }
+                at := Text {
+                    x: a.has-icon ? 30px : 10px;
+                    width: parent.width - self.x - 10px;
+                    text: a.name;
+                    color: Theme.text;
+                    font-size: Theme.fs-sm;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+                ata := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => {
+                        root.start-app(a.name);
+                        name.text = "";
+                        root.typed("");
+                    }
+                }
+            }
+            // The room left, so the chips keep their size.
+            Rectangle {
+                horizontal-stretch: 1;
+            }
+        }
+        if !root.suggesting: HorizontalLayout {
             horizontal-stretch: 1;
             spacing: 4px;
             if root.chips.length == 0: Text {
@@ -273,6 +358,10 @@ export component CoherenceBar inherits Window {
                     mouse-cursor: pointer;
                     clicked => { root.chip(c.id); }
                 }
+            }
+            // A few windows: the room left (else the buttons before grow).
+            Rectangle {
+                horizontal-stretch: 1;
             }
         }
         Button {

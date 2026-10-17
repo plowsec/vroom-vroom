@@ -5362,6 +5362,8 @@ dependencies = [
  "env_logger",
  "libc",
  "log",
+ "png 0.17.16",
+ "roxmltree",
  "serde_json",
  "vroom-proto",
  "windows-sys 0.59.0",
