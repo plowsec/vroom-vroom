@@ -11,6 +11,16 @@ move to the docs (GUIDE, ARCHITECTURE) once they work.
   extension the guest tools already install, which could report windows
   too).
 
+- **Less text in the app.** Many screens explain themselves in
+  sentences (Settings cards, the USB and network menus, the root helper,
+  locked fields, the library's empty states). Do one pass over every
+  screen: icons, state colors and short labels on screen, the
+  explanation in a tooltip. Only what the user must read to act (an
+  error, a choice) stays visible. Slint has no tooltip of its own: one
+  shared `Tip` component in `controls.slint` (a hover delay, follows the
+  theme), used everywhere. Starts once the USB disk choices land, as both
+  change the same screens.
+
 ## 3D: catching up with VMware and Parallels
 
 Where we are: Linux gets OpenGL 4.1 (virgl), Vulkan 1.3 in windows and
