@@ -378,6 +378,10 @@ pub enum ToVmm {
     /// answer). NAT: none, `port_mac` unused; `forwards` are what the VM
     /// file asks for.
     NetSet { nic: u8, live: NetLive, port_mac: [u8; 6] },
+    /// New guest tools for the agent: comes with a pipe (SCM_RIGHTS) the
+    /// viewer writes them into, as guest agent frames (`UpdateBegin`,
+    /// then `UpdateData`), which the VMM checks and passes on.
+    AgentUpdate,
 }
 
 fn frame(ty: u8, payload: &[u8]) -> Vec<u8> {
@@ -672,6 +676,8 @@ impl ToVmm {
                 live.encode(&mut p);
                 frame(41, &p)
             }
+            // Well above the others.
+            ToVmm::AgentUpdate => frame(91, &[]),
         }
     }
 
@@ -771,6 +777,7 @@ impl ToVmm {
                 ToVmm::HeadPointer { head: head(get_u32(p, 0)?)?, x: x.min(POINTER_MAX), y: y.min(POINTER_MAX) }
             }
             40 if p.len() == 2 && (p[0] as usize) < NET_PORTS_MAX && p[1] <= 1 => ToVmm::NetConnect { nic: p[0], on: p[1] != 0 },
+            91 if p.is_empty() => ToVmm::AgentUpdate,
             41 if p.len() >= 7 && (p[0] as usize) < NET_PORTS_MAX => {
                 let mut port_mac = [0u8; 6];
                 port_mac.copy_from_slice(&p[1..7]);
@@ -1001,6 +1008,7 @@ mod tests {
         let bridged = NetLive { kind: NetKind::Bridged, name: "en0".into(), loopback: false, block_private: false, forwards: vec![] };
         let msgs = [
             ToVmm::NetConnect { nic: 1, on: false },
+            ToVmm::AgentUpdate,
             ToVmm::NetSet { nic: 0, live: nat(vec![fwd.clone()]), port_mac: [0; 6] },
             ToVmm::NetSet { nic: 7, live: bridged.clone(), port_mac: [0x3e, 1, 2, 3, 4, 5] },
         ];

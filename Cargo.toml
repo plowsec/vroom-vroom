@@ -32,6 +32,7 @@ vroom-state = { path = "crates/state" }
 vroom-import = { path = "crates/import" }
 vroom-usb = { path = "crates/usb" }
 vroom-video = { path = "crates/video" }
+vroom-tools = { path = "crates/tools" }
 
 thiserror = "2"
 log = "0.4"

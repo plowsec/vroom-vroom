@@ -68,6 +68,9 @@ pub enum AgentCmd {
     Mouse { x: u16, y: u16, buttons: u8, wheel: i8 },
     /// A USB disk's files came to the removable share `tag`, or left.
     UsbShare { tag: String, label: String, on: bool },
+    /// New guest tools: the viewer writes them into this pipe as agent
+    /// frames (`UpdateBegin`, `UpdateData`); checked, then to the guest.
+    Update { from: std::os::fd::OwnedFd },
     Stop,
 }
 
@@ -162,6 +165,8 @@ struct Service {
     streams: u32,
     /// USB disks' files on removable shares now: (tag, volume name).
     usb_shares: Vec<(String, String)>,
+    /// A guest tools update is on its way (set by its thread until done).
+    updating: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// A drag of files out of the guest (see `AgentCmd::DragOut`).
@@ -237,6 +242,7 @@ pub fn spawn(stream: UnixStream, policy: ClipPolicy, clip: Option<Box<dyn Clipbo
         streams: 0,
         revive: None,
         usb_shares: Vec::new(),
+        updating: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     std::thread::Builder::new().name("agent".into()).spawn(move || svc.run())?;
     Ok(Agent { tx, status })
@@ -408,6 +414,16 @@ impl Service {
                 }
             }
             m @ (Message::DropEntry { .. } | Message::DropData { .. } | Message::DropEnd { .. } | Message::DragOutFail { .. }) => self.drag_out_frame(m),
+            Message::UpdateDone { id, ok, why } => {
+                // The decoder kept it to one short line.
+                if ok {
+                    log::info!("guest: tools update {id} checked, installing");
+                    self.to_viewer(ToViewer::Status("guest tools: installing".into()));
+                } else {
+                    log::warn!("guest: tools update {id} refused: {why}");
+                    self.to_viewer(ToViewer::Status(format!("guest tools update failed: {why}")));
+                }
+            }
             // Host-bound only; a guest sending these is ignored.
             _ => {}
         }
@@ -633,6 +649,35 @@ impl Service {
                 o.fetch = Some(Fetch { stream, check: vroom_proto::TreeCheck::new(stream, &name, dir), pipe, bytes: 0, t0: Instant::now() });
                 self.send(&Message::DragOutGet { id, item, stream });
             }
+            AgentCmd::Update { from } => {
+                let s = self.status();
+                let why = if !s.connected {
+                    Some("no guest agent is running")
+                } else if s.features & features::UPDATE == 0 {
+                    Some("this guest agent can't update itself: install the guest tools by hand")
+                } else if self.updating.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                    Some("an update is on its way already")
+                } else {
+                    None
+                };
+                if let Some(w) = why {
+                    self.to_viewer(ToViewer::Status(format!("guest tools update failed: {w}")));
+                    return;
+                }
+                let (out, busy, viewer) = (self.out.clone(), self.updating.clone(), self.screen.viewer.clone());
+                let r = std::thread::Builder::new().name("agent-update".into()).spawn(move || {
+                    if let Err(e) = forward_update(from, &out) {
+                        log::warn!("tools update: {e}");
+                        if let Some(v) = &viewer {
+                            v.send(&ToViewer::Status(format!("guest tools update failed: {e}")));
+                        }
+                    }
+                    busy.store(false, std::sync::atomic::Ordering::Release);
+                });
+                if r.is_err() {
+                    self.updating.store(false, std::sync::atomic::Ordering::Release);
+                }
+            }
             AgentCmd::Stop => {}
         }
     }
@@ -746,6 +791,48 @@ fn forward_drop(id: u32, from: std::os::fd::OwnedFd, out: &Mutex<UnixStream>) {
     }
     log::info!("drop {id}: given up by the viewer");
     let _ = send(&Message::DragCancel { id });
+}
+
+/// Pass a guest tools update from the viewer's pipe to the guest,
+/// checked: one `UpdateBegin` (the decoder checks its file list), then
+/// exactly the bytes it announced, in `UpdateData` frames of the same
+/// update, nothing else. A pipe that ends early leaves the guest with an
+/// update it never installs (the next one starts over).
+fn forward_update(from: std::os::fd::OwnedFd, out: &Mutex<UnixStream>) -> Result<(), String> {
+    let mut from = std::fs::File::from(from);
+    let mut dec = Decoder::new(vroom_proto::UPDATE_CHUNK + (vroom_proto::UPDATE_FILES_MAX << 9));
+    let mut buf = vec![0u8; vroom_proto::UPDATE_CHUNK];
+    let send = |m: &Message| out.lock().unwrap_or_else(|e| e.into_inner()).write_all(&m.encode()).map_err(|e| format!("to the guest: {e}"));
+    // (id, bytes still to come)
+    let mut cur: Option<(u32, u64)> = None;
+    let t0 = Instant::now();
+    loop {
+        let n = from.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            return match cur {
+                Some((_, 0)) => Ok(()),
+                _ => Err("the app stopped sending it".into()),
+            };
+        }
+        dec.push(&buf[..n]);
+        while let Some(m) = dec.next().map_err(|e| format!("bad frame from the app: {e}"))? {
+            match (&m, cur) {
+                (Message::UpdateBegin { id, version, files }, None) => {
+                    let total = files.iter().map(|f| f.size).sum::<u64>();
+                    log::info!("tools update {id}: {} files, {total} bytes, version {version}", files.len());
+                    cur = Some((*id, total));
+                }
+                (Message::UpdateData { id, data }, Some((cid, left))) if *id == cid && data.len() as u64 <= left => {
+                    cur = Some((cid, left - data.len() as u64));
+                }
+                _ => return Err("unexpected frame from the app".into()),
+            }
+            send(&m)?;
+            if let Some((id, 0)) = cur {
+                log::info!("tools update {id}: sent in {:?}", t0.elapsed());
+            }
+        }
+    }
 }
 
 /// Monitors side by side, top edges lined up, in order: what the display
@@ -1062,5 +1149,39 @@ mod tests {
         let m = read_msgs(&mut guest, &mut d);
         assert!(!m.iter().any(|m| matches!(m, Message::ClipboardText(_))), "{m:?}");
         a.send(AgentCmd::Stop);
+    }
+
+    /// The viewer's update frames through `forward_update`: what reaches
+    /// the guest, and whether it went through.
+    fn forward(frames: &[Message]) -> (Result<(), String>, Vec<Message>) {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let (host, mut guest) = UnixStream::pair().unwrap();
+        let bytes: Vec<u8> = frames.iter().flat_map(|m| m.encode()).collect();
+        let w = std::thread::spawn(move || {
+            let mut ours = ours;
+            let _ = ours.write_all(&bytes);
+        });
+        let out = Mutex::new(host);
+        let r = forward_update(theirs.into(), &out);
+        w.join().unwrap();
+        (r, read_msgs(&mut guest, &mut Decoder::new(1 << 20)))
+    }
+
+    #[test]
+    fn updates_pass_only_as_announced() {
+        let file = |size| vroom_proto::UpdateFile { path: "vroom-agent".into(), size, sha256: [0; 32] };
+        let begin = |id, size| Message::UpdateBegin { id, version: "0.1.0".into(), files: vec![file(size)] };
+        let data = |id, n| Message::UpdateData { id, data: vec![1; n] };
+        let good = [begin(1, 5), data(1, 3), data(1, 2)];
+        let (r, got) = forward(&good);
+        assert_eq!(r, Ok(()));
+        assert_eq!(got, good);
+        // More than announced, another update's data, anything else, or
+        // a pipe that ends early: stopped there.
+        for bad in [vec![begin(1, 2), data(1, 3)], vec![begin(1, 2), data(2, 1)], vec![begin(1, 2), Message::Ping(1)], vec![data(1, 1)], vec![begin(1, 4), data(1, 2)]] {
+            let (r, got) = forward(&bad);
+            assert!(r.is_err(), "{bad:?}");
+            assert!(got.len() < bad.len() || matches!(bad.last(), Some(Message::UpdateData { .. })), "{bad:?} {got:?}");
+        }
     }
 }

@@ -1,0 +1,10 @@
+# New guest tools from the host: the agent service writes `ready` once
+# every file of the update is in and checked (see vroom-agent-update.service).
+[Unit]
+Description=vroom guest tools update, waiting
+
+[Path]
+PathExists=/var/lib/vroom-agent/update/ready
+
+[Install]
+WantedBy=multi-user.target

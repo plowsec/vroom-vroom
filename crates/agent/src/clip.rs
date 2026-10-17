@@ -51,13 +51,15 @@ impl Clip for SystemClip {
     }
 }
 
-/// Desktop clipboard if there is one, otherwise disabled.
-pub fn system() -> Box<dyn Clip> {
+/// The desktop's clipboard, if there is one now. Linux: X11's, also in
+/// Wayland sessions (Xwayland: GNOME, KDE and wlroots pass the clipboard
+/// between X11 and Wayland apps both ways).
+pub fn system() -> Option<Box<dyn Clip>> {
     match arboard::Clipboard::new() {
-        Ok(c) => Box::new(SystemClip(c)),
+        Ok(c) => Some(Box::new(SystemClip(c))),
         Err(e) => {
-            log::info!("no desktop clipboard ({e}); clipboard sync off");
-            Box::new(NoClip)
+            log::info!("no desktop clipboard yet ({e})");
+            None
         }
     }
 }

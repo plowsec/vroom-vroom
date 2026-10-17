@@ -36,9 +36,26 @@ pub trait System {
     fn usb_share(&mut self, tag: &str, label: &str, on: bool);
     /// A new host: forget what the last one shared.
     fn usb_reset(&mut self) {}
+    /// Whether updates can be installed here (update.rs).
+    fn can_update(&self) -> bool {
+        false
+    }
+    /// A frame of an update from the host; the answer once it is in (or
+    /// failed).
+    fn update(&mut self, _m: Message) -> Option<Message> {
+        None
+    }
 }
 
-pub struct RealSystem;
+pub struct RealSystem {
+    updater: crate::update::Updater,
+}
+
+impl Default for RealSystem {
+    fn default() -> RealSystem {
+        RealSystem { updater: crate::update::Updater::new(crate::update::root()) }
+    }
+}
 
 impl System for RealSystem {
     fn set_time(&mut self, secs: u64, nanos: u32) {
@@ -62,6 +79,12 @@ impl System for RealSystem {
     fn usb_reset(&mut self) {
         crate::shares::usb_reset();
     }
+    fn can_update(&self) -> bool {
+        crate::can_update(crate::Role::Service)
+    }
+    fn update(&mut self, m: Message) -> Option<Message> {
+        self.updater.handle(m, crate::update::apply)
+    }
 }
 
 pub struct Relay<S: System> {
@@ -83,7 +106,7 @@ impl<S: System> Relay<S> {
     /// Serve one host connection until it goes away. Helper state
     /// survives, so a reconnecting host finds the helper still there.
     pub fn run(&mut self, host: &mut Writer, rx: &Receiver<Ev>) -> io::Result<()> {
-        host.write_all(&crate::hello().encode())?;
+        host.write_all(&crate::hello(self.sys.can_update()).encode())?;
         let mut dec = Decoder::new(self.max + 64);
         loop {
             match rx.recv().map_err(|_| io::Error::other("event channel closed"))? {
@@ -135,7 +158,13 @@ impl<S: System> Relay<S> {
                 // A host that (re)starts has none of the last one's USB
                 // disks: it tells us again about those still shared.
                 self.sys.usb_reset();
-                host.write_all(&crate::hello().encode())?;
+                host.write_all(&crate::hello(self.sys.can_update()).encode())?;
+            }
+            // New guest tools: the service's alone, never the helper's.
+            m @ (Message::UpdateBegin { .. } | Message::UpdateData { .. }) => {
+                if let Some(r) = self.sys.update(m) {
+                    host.write_all(&r.encode())?;
+                }
             }
             Message::UsbShare { tag, label, on } => self.sys.usb_share(&tag, &label, on),
             Message::Ping(v) => host.write_all(&Message::Pong(v).encode())?,
@@ -187,7 +216,8 @@ impl<S: System> Relay<S> {
             | Message::CoherenceNo(_)
             | Message::Apps(_)
             | Message::DragOutItems { .. }
-            | Message::DragOutFail { .. } => {}
+            | Message::DragOutFail { .. }
+            | Message::UpdateDone { .. } => {}
         }
         Ok(())
     }
@@ -247,6 +277,7 @@ mod tests {
         shutdown: Vec<bool>,
         gpu3d: Vec<bool>,
         usb: Vec<(String, bool)>,
+        updates: usize,
     }
     struct Fake(Arc<Mutex<Seen>>);
     impl System for Fake {
@@ -265,6 +296,13 @@ mod tests {
         }
         fn usb_reset(&mut self) {
             self.0.lock().unwrap().usb.clear();
+        }
+        fn update(&mut self, m: Message) -> Option<Message> {
+            self.0.lock().unwrap().updates += 1;
+            match m {
+                Message::UpdateBegin { id, .. } => Some(Message::UpdateDone { id, ok: true, why: String::new() }),
+                _ => None,
+            }
         }
     }
 
@@ -345,6 +383,25 @@ mod tests {
         ]);
         assert_eq!(seen.lock().unwrap().usb, vec![("vroom-usb1".to_string(), true), ("vroom-usb1".to_string(), false)]);
         assert!(helper.msgs().is_empty(), "not the session's business");
+    }
+
+    #[test]
+    fn updates_come_only_from_the_host() {
+        let helper = Sink::default();
+        let begin = Message::UpdateBegin {
+            id: 3,
+            version: "0.1.0".into(),
+            files: vec![vroom_proto::UpdateFile { path: "a".into(), size: 0, sha256: [0; 32] }],
+        };
+        let (out, seen) = run(vec![
+            Ev::HelperUp(1, Box::new(helper.clone())),
+            // A helper can't send one in.
+            Ev::Helper(1, begin.encode()),
+            host(begin),
+        ]);
+        assert_eq!(seen.lock().unwrap().updates, 1);
+        assert_eq!(out[1..], [Message::UpdateDone { id: 3, ok: true, why: String::new() }]);
+        assert!(helper.msgs().is_empty(), "never relayed to the session");
     }
 
     #[test]

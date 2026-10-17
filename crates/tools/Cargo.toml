@@ -1,0 +1,19 @@
+[package]
+name = "vroom-tools"
+description = "Host side of the guest tools: finding them, their version, updates for a running guest's agent, and ready-made VMs (cloud-init seeds, Windows install sticks)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+log.workspace = true
+vroom-proto.workspace = true
+vroom-config.workspace = true
+vroom-block.workspace = true
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

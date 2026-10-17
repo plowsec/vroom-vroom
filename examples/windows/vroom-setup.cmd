@@ -3,11 +3,18 @@ rem vroom guest tools for Windows ARM64: virtio drivers, agent, shared
 rem folders. Looks for the virtio-win media on any drive letter. Run as
 rem admin (first logon runs it elevated). Safe to run again to upgrade.
 rem No labels or goto: cmd can miss labels in files with Unix line ends.
+rem Started by a double click: ask for administrator rights and start
+rem again (first logon runs it elevated already).
+net session >nul 2>&1
+if errorlevel 1 (
+  powershell -NoProfile -Command "Start-Process -Verb RunAs -FilePath '%~f0'"
+  exit /b
+)
 set VIOFS=
 for %%d in (D E F G H I J K) do (
   if exist %%d:\viogpudo\w11\ARM64 (
-    for %%x in (viogpudo NetKVM vioserial vioinput viorng viostor viofs) do (
-      pnputil /add-driver %%d:\%%x\w11\ARM64\*.inf /install
+    for %%x in (viogpudo NetKVM vioserial vioinput viorng viostor vioscsi viofs Balloon) do (
+      if exist %%d:\%%x\w11\ARM64 pnputil /add-driver %%d:\%%x\w11\ARM64\*.inf /install
     )
     if exist %%d:\viofs\w11\ARM64\virtiofs.exe set VIOFS=%%d:\viofs\w11\ARM64\virtiofs.exe
   )
