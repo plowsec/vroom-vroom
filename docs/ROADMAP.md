@@ -241,6 +241,14 @@ A guest needs a driver and an API its players use. What exists:
 - Windows: when the desktop's own Direct3D process dies, the screen
   freezes until Win+Ctrl+Shift+B. The guest driver should report a lost
   device for that context (Windows then rebuilds it by itself).
+- Windows with 3D and Edge open, suspend and resume (October 17,
+  master 3c8cd4b): once in three tries the guest's display stayed off
+  after resume (the guest ran on, its driver said OK, Windows never set
+  a scanout); the other two came back. An older build once refused the
+  suspend instead ("Windows didn't turn its 3D display off in time").
+  Both come from turning Windows' 3D display off and on around the save:
+  watch for a scanout after resume and turn the display off and on again
+  if none comes.
 - A Windows guest with 3D stopped once with "undecodable MMIO access at
   0x8200010000" (the 3D device's memory window, about 40 s after login)
   on a build from master 01a3d48. Not seen again: ten minutes on the
