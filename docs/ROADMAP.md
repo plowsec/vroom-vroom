@@ -284,11 +284,13 @@ A guest needs a driver and an API its players use. What exists:
   - The GNOME Shell extension could serve the clipboard from inside the
     compositor, for Wayland desktops without Xwayland (the helper uses
     X11's clipboard; GNOME passes it to Wayland apps).
-  - Windows ignores an NVMe namespace's write-protect flag: it mounts a
-    read-only FAT disk read-write, and the refused writes stall it (setup
-    at 57%). Install sticks go in through a writable qcow2 layer for
-    that. Telling Windows the disk is read-only some other way (or
-    taking the writes in memory) would fix it for every read-only disk.
+  - Windows still mounts a read-only NVMe disk read-write (refused writes
+    fail fast now, see GUIDE.md "Read-only disks"). It looks at neither
+    the namespace's write-protect flag nor namespace write protection;
+    what its driver reports to the disk class driver (the write-protect
+    bit of MODE SENSE) we can't reach. A tools or install stick could be
+    a USB stick or a USB CD-ROM instead, which Windows does see as
+    read-only.
   - Signed tools: an update is checked by hash against the manifest the
     host sends; a signature would matter only if something other than
     the host could write the agent's port.

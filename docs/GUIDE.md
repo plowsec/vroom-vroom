@@ -348,9 +348,9 @@ tools, your user and, if you turn SSH on, your SSH key (any of
   go in before the first logon, so NAT works at once, then the guest
   tools, then OpenSSH if asked (a Windows download: a few more minutes
   once the desktop is up). Afterwards, remove the install disk's block
-  from the VM file and delete `install.img` and `install.qcow2`; if it
-  stays, Setup shuts down rather than install over a Windows (a setup
-  that broke off halfway: make the VM again). An install image of 4 GB
+  from the VM file and delete `install.img`; if it stays, Setup shuts
+  down rather than install over a Windows (a setup that broke off
+  halfway: make the VM again). An install image of 4 GB
   or more needs wimlib (`brew install wimlib`).
 
 The same from the command line:
@@ -453,17 +453,18 @@ path = "win11.qcow2"        # vroom disk create win11.qcow2 --size 64G
 format = "qcow2"
 bus = "nvme"
 [[disk]]
-path = "winusb.qcow2"       # vroom disk create winusb.qcow2 --backing winusb.raw
-format = "qcow2"
+path = "winusb.raw"
+readonly = true
+format = "raw"
 bus = "nvme"
 [[net]]
 mode = "nat"
 ```
 
-   The stick goes in through a layer Windows can write to: it writes to
-   it (FAT access times, setup's own files), and on a read-only NVMe disk
-   setup stalls at 57% for good (Windows ignores NVMe's write-protect
-   flag and retries the refused writes). `winusb.raw` stays as it was.
+   Windows doesn't see that an NVMe disk is read-only: it mounts the
+   stick read-write and tries to write to it (FAT access times, setup's
+   own files). Those writes fail at once and Setup goes on (see
+   [Read-only disks](#read-only-disks)).
 
 4. `vroom-gui win11.toml`. Setup runs unattended (the unattend file wipes
    **disk 0**), reboots, and logs in as `vroom` / `vroom` (change it).
@@ -1529,6 +1530,25 @@ image and are reused. A qcow2 file can still keep a large apparent size
 `sync = "fsync"` (default) survives a host crash. `"full"` also survives a
 power cut but costs milliseconds per guest flush on macOS (Windows setup
 flushes a lot). `"none"` ignores flushes: scratch disks only.
+
+## Read-only disks
+
+`readonly = true` opens the image read-only: nothing the guest does
+changes it.
+
+- Linux sees a read-only disk on either bus (virtio's read-only flag,
+  NVMe's write-protected namespace) and mounts it read-only.
+- Windows sees a read-only virtio disk: "The media is write protected".
+- Windows does not see that an NVMe disk is read-only: it mounts it
+  read-write (diskpart: "Current Read-only State: No"). A file you save
+  there seems to work, then Windows says the write failed when it
+  flushes. vroom answers those writes with an error Windows takes as
+  final ("attempted write to read-only range"), so nothing hangs: Windows
+  Setup runs from a read-only install stick, and shuts down cleanly.
+  (NVMe's newer "namespace is write protected" error made Windows retry
+  the same write about five times a second for good, and Setup stopped
+  at 57%.) For a disk Windows should treat as read-only, use
+  `bus = "virtio"` once the virtio drivers are in.
 
 ## Known limitations
 

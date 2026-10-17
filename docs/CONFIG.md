@@ -49,7 +49,7 @@ cmdline = "console=ttyAMA0 root=/dev/vda1"
 | `path` | required | Image file. |
 | `format` | `auto` | `auto`, `raw`, `qcow2`. |
 | `bus` | `virtio` | `virtio` (fast, needs a driver) or `nvme` (every OS has a driver, Windows setup needs it). |
-| `readonly` | false | Guest can't write. |
+| `readonly` | false | Guest can't write. Linux and virtio disks in Windows see a read-only disk; Windows mounts a read-only NVMe disk read-write, and its writes fail ([GUIDE](GUIDE.md#read-only-disks)). |
 | `cdrom` | false | Show as a CD (installer ISOs). Needs `readonly = true`. |
 | `sync` | `fsync` | What a guest flush costs: `full` (power-loss safe, slow on macOS), `fsync` (survives a host crash), `none` (scratch disks). |
 
