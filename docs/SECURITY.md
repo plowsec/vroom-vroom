@@ -448,6 +448,68 @@ checks its SHA-256 before building it. Our VA-API driver
 that V4L2 decoder (and the guest's GPU for dma-bufs): nothing new on the
 host side.
 
+## Video encoding
+
+Off unless `[display] video_encode = true`. A guest's raw frames are only
+pixels: nothing in them is parsed. What the guest controls is the
+encoder's settings and where its buffers are, and both are checked:
+
+```text
+guest V4L2 encoder --virtio-media--> VMM device (Rust)   --socket--> vroom video-helper --encode --XPC--> Apple's encoder service
+                                     checks every ioctl,              reads granted frames,                (macOS's own sandbox)
+                                     every control value,             VideoToolbox; writes
+                                     grants coded buffers             coded frames into grants
+```
+
+The device is a second virtio-media device with a buffer window of its
+own (the decoder's is untouched), in the same code: every ioctl
+size-checked, at most 8 encoders, 16 raw buffers and 16 coded buffers
+each (8 MiB each at most), at most 4 raw frames at the helper per
+encoder, 64 controls per request. Formats it doesn't make are refused,
+picture sizes are even and within 16 to 4096 (4096x2304 at most), frame
+rates within one frame in 1000 s and 240 a second, bitrates within 1
+kbit/s and 400 Mbit/s; profiles, levels and menus take only the values
+listed; settings that would change the stream need the queues stopped.
+The settings go to the helper as one fixed-size message that both sides
+check the same way (`EncConfig::valid`).
+
+The encoder helper (`vroom video-helper --encode`) is a process of its
+own, separate from the decoder's, with its own Seatbelt profile: the
+decoder's minus Apple's decoder service, plus its encoder service
+(`com.apple.coremedia.videoencoder`) and the user's trust agent
+(`com.apple.trustd.agent`, Security's certificate service, which every
+app may reach; VideoToolbox finds no hardware encoder without it). No
+files, no network, no exec, no GPU, no writes. It reads a raw frame only
+where the VMM said (inside the window, as big as the session's layout)
+and writes a coded frame only into a grant that lies in the window and
+that it fits. It takes from the VMM only messages of known kinds within
+their size, a config that holds together, 8 sessions with 64 frames and
+64 grants each. Coded frames come from VideoToolbox; the helper still
+takes them apart as if they were hostile (length-prefixed NAL units to
+Annex B, every length checked, `video/src/nal.rs`, fuzzed).
+
+The VMM takes from the encoder helper only coded frames in the oldest
+buffer it granted, under the current epoch, no bigger than that buffer;
+a frame's buffer goes back to the guest only once the helper says it
+read it. The VMM never reads a frame or a coded frame. A guest may
+change a frame while the helper copies it: that spoils that frame's
+pixels, nothing else.
+
+A snapshot keeps each encoder's settings, controls and buffers, checked
+again on restore like the decoder's (a state that doesn't hold together
+fails that encoder in the guest).
+
+What a bug reachable from the guest gets: in the helper, VideoToolbox's
+client side and that VM's encoder buffers; in Apple's encoder service
+(which the hardware encoder's driver sits behind), the same reach an app
+encoding video (a FaceTime call, a screen recording) has. Memory: the
+window (up to 1 GiB, what buffers touch), and in the helper per encoder
+up to 8 coded frames held (8 MiB each at most) and VideoToolbox's pixel
+buffer pool.
+
+The guest side is the same virtio-media driver; our VA-API driver gets
+an encoder half that talks to that V4L2 encoder only.
+
 ## USB devices
 
 Off unless the VM file lists `[[usb]]` devices or you connect one from
@@ -1046,8 +1108,12 @@ the USB passthrough protocol both ways with the helper's checks, and USB
 descriptors (the xHCI target also has a passthrough device whose answers
 come from the input), and the video helper's stream parsing (NAL units,
 parameter sets, display order, VP9 superframes and frame headers, AV1
-OBUs and sequence headers) and its protocol both ways (`video`, 21M runs
-clean; the virtio-media device has a junk-command test of its own). Run with
+OBUs and sequence headers), the encoder's output turned into Annex B,
+and its protocol both ways, encoder messages included (`video`, 21M runs
+clean, and 4.5M more with the encoder's parts), and the virtio-media
+device itself, decoder and encoder: ioctls from guest memory, then what
+a hostile helper sends, then a snapshot of the result restored (`media`,
+4.7M runs clean; it also has junk-command tests). Run with
 `cargo +nightly fuzz run -O <target>`. First runs found two qcow2 bugs
 (a crash on short v3 headers, multi-GB allocations from crafted table
 sizes); both fixed. The USB target found a short configuration descriptor
@@ -1105,6 +1171,8 @@ Still visible, whatever the config says:
 - With `video_decode`: a virtio-media device (id 48) named "Video
   decoder", whose formats (the codecs this Mac decodes), sizes and levels
   are VideoToolbox's. Our VA-API driver names itself "vroom".
+- With `video_encode`: another one named "Video encoder", with the codecs
+  this Mac encodes; the streams it makes are VideoToolbox's.
 - fw_cfg: the "QEMU" signature, its DMA signature and file names
   (`etc/acpi/tables`, `etc/smbios/...`, `etc/ramfb`). EDK2 looks for them.
 - The board: QEMU virt memory map, PL011/PL031 PrimeCell IDs, CFI flash

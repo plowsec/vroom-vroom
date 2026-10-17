@@ -318,7 +318,13 @@ unsafe extern "C" fn on_output(refcon: *mut c_void, frame_refcon: *mut c_void, s
 pub fn caps() -> u32 {
     let mut bits = 0;
     for c in [Codec::H264, Codec::Hevc] {
-        if session(c, 640, 480, PixFmt::Nv12, false, None).is_some() {
+        if let Some((s, _sink)) = session(c, 640, 480, PixFmt::Nv12, false, None) {
+            // SAFETY: a session we just made and own; nothing was encoded,
+            // so no callback runs after this.
+            unsafe {
+                VTCompressionSessionInvalidate(s);
+                CFRelease(s);
+            }
             bits |= c.bit();
         }
     }

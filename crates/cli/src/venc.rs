@@ -44,9 +44,7 @@ mod novt {
         pub key: bool,
     }
 
-    pub struct Encoder {
-        pub config: EncConfig,
-    }
+    pub struct Encoder;
 
     impl Encoder {
         pub fn new(_: &EncConfig, _: Option<Wake>) -> Option<Encoder> {
