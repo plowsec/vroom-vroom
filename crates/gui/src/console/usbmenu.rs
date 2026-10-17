@@ -398,7 +398,7 @@ impl Console {
         }
         match hostusb::host_list().into_iter().find(|h| same(&hostusb::dev_of(h), &d)) {
             Some(h) => self.usb_connect(hostusb::dev_of(&h), Some(h)),
-            None => self.toast(&format!("{}: not plugged into the Mac; it connects when it is, at the next start", if d.name.is_empty() { &d.id } else { &d.name })),
+            None => self.toast(&format!("{}: not plugged into the Mac now", if d.name.is_empty() { &d.id } else { &d.name })),
         }
     }
 
