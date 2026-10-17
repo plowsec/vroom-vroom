@@ -115,7 +115,7 @@ fn serve(port: Option<&str>) {
     // want our driver on the 3D one.
     std::thread::spawn(|| {
         crate::sys::gpu_drivers(false);
-        crate::gl_icd::apply();
+        crate::icd::apply();
     });
     let (tx, rx) = channel::<Ev>();
     {
