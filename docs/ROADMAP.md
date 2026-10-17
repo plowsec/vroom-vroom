@@ -217,6 +217,12 @@ A guest needs a driver and an API its players use. What exists:
   vmnet, a drag out of the guest to Finder, Mail or the Desktop with a
   real mouse, Coherence next to a window tiler, several monitors on
   several Mac screens.
+- Apple's `com.apple.vm.device-access` entitlement, for real USB
+  passthrough of devices macOS drivers hold (USB disks above all: macOS
+  15.3 and later refuses them to any program without Full Disk Access,
+  root included). It needs a paid Developer ID and Apple's approval of
+  the request; with it, the root helper isn't needed for USB at all.
+  Until then a USB disk can be shared as files or passed as a disk.
 - A signed, notarized vroom.app (`scripts/app.sh` builds it, signed ad
   hoc: needs a Developer ID and the hardened runtime), a disk image to
   install from, updates, crash reports.
