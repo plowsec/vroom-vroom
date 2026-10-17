@@ -4,7 +4,7 @@
 #   linux/           vroom-agent (static, any distribution), install-agent.sh,
 #                    its systemd units, the session autostart entry, the
 #                    GNOME Shell extension
-#   windows/         vroom-agent.exe, vroom-setup.cmd, the OpenGL driver if
+#   windows/         vroom-agent.exe, vroom-setup.cmd, the OpenGL and Vulkan drivers if
 #                    scripts/build-windows-gl.sh made it, and with the
 #                    virtio-win ISO its ARM64 drivers
 #   vroom-tools.img  all of it on a FAT32 disk (MBR) labelled VRTOOLS, for
@@ -58,6 +58,9 @@ if [ -n "$win" ]; then
   cp "$win" examples/windows/vroom-setup.cmd "$out/windows/"
   if [ -f target/windows-gl/vroom_gl.dll ]; then
     cp target/windows-gl/vroom_gl.dll target/windows-gl/vroom_gl_arm64.dll target/windows-gl/vroom_gl_x64.dll "$out/windows/"
+  fi
+  if [ -f target/windows-gl/vroom_vk_arm64.json ]; then
+    for a in arm64 x64; do cp target/windows-gl/vroom_vk_$a.json target/windows-gl/vroom_vk_$a.dll "$out/windows/"; done
   fi
   if [ -n "$vw" ]; then
     mkdir "$tmp/vw"

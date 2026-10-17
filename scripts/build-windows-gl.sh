@@ -1,8 +1,11 @@
 #!/bin/sh
-# Build vroom's OpenGL driver for Windows guests (an OpenGL "ICD"): Mesa's
-# OpenGL with its virgl driver, talking to the viogpu3d kernel driver the
-# way that driver's own Vulkan ICD does. The guest's OpenGL then runs in
-# virglrenderer's vrend on the Mac, like Linux guests' OpenGL.
+# Build vroom's OpenGL and Vulkan drivers for Windows guests ("ICDs"), both
+# on the viogpu3d kernel driver:
+# - Vulkan: Mesa's Venus, which runs the guest's Vulkan in virglrenderer's
+#   Venus on the Mac (MoltenVK), as for Linux guests;
+# - OpenGL: Mesa's OpenGL with Zink on that Vulkan (OpenGL 4.4), or with
+#   its virgl driver (vrend on the Mac's OpenGL, 4.1) when there is no
+#   Vulkan.
 #
 # Base: the Mesa fork viogpu3d's user-mode drivers come from
 # (osy/virtio-win-mesa), pinned by commit and hash, with our patches in
@@ -16,7 +19,9 @@
 # Output in target/windows-gl/: vroom_gl_arm64.dll (ARM64 apps),
 # vroom_gl_x64.dll (x64 apps, emulated), and vroom_gl.dll, the one Windows
 # loads: an ARM64X file with no code of its own that sends each kind of
-# process to its build.
+# process to its build. Vulkan: vroom_vk_arm64.dll and vroom_vk_x64.dll,
+# each with its manifest (vroom_vk_*.json) for the Vulkan loader; the
+# agent names both in the display device's VulkanDriverName.
 set -eu
 cd "$(dirname "$0")/.."
 ROOT=$(pwd)
@@ -77,7 +82,7 @@ done
 
 # One build per architecture. clangcl-compat.h fills in MSVC intrinsics
 # clang-cl lacks.
-build() { # <meson cpu_family> <clang triple> <xwin lib dir> <dll name>
+build() { # <meson cpu_family> <clang triple> <xwin lib dir> <gl dll name> <vulkan dll name>
   cat >"cross-$1.ini" <<EOF
 [constants]
 inc = ['/imsvc$XWIN/crt/include', '/imsvc$XWIN/sdk/include/ucrt', '/imsvc$XWIN/sdk/include/um', '/imsvc$XWIN/sdk/include/shared']
@@ -99,19 +104,21 @@ EOF
   export LIB="$XWIN/crt/lib/$3;$XWIN/sdk/lib/um/$3;$XWIN/sdk/lib/ucrt/$3"
   rm -rf "build-$1"
   { meson setup "build-$1" src --cross-file "cross-$1.ini" --buildtype=release -Db_ndebug=true \
-      -Db_vscrt=mt --default-library=static -Dplatforms=windows -Dgallium-drivers=virgl \
-      -Dvulkan-drivers= -Dllvm=disabled -Dzlib=disabled -Dzstd=disabled -Dvideo-codecs= \
+      -Db_vscrt=mt --default-library=static -Dplatforms=windows -Dgallium-drivers=virgl,zink \
+      -Dvulkan-drivers=virtio -Dllvm=disabled -Dzlib=disabled -Dzstd=disabled -Dvideo-codecs= \
       -Degl=disabled -Dgles1=disabled -Dgles2=disabled -Dglx=disabled -Dbuild-tests=false \
       -Dgallium-wgl-dll-name="$4" &&
-    ninja -C "build-$1" src/gallium/targets/wgl/"$4".dll; } >>"$log" 2>&1 || { tail -20 "$log"; exit 1; }
+    ninja -C "build-$1" src/gallium/targets/wgl/"$4".dll src/virtio/vulkan/vulkan_virtio.dll; } >>"$log" 2>&1 ||
+    { tail -20 "$log"; exit 1; }
   cp "build-$1/src/gallium/targets/wgl/$4.dll" "$OUT/"
+  cp "build-$1/src/virtio/vulkan/vulkan_virtio.dll" "$OUT/$5.dll"
 }
-build aarch64 aarch64-pc-windows-msvc aarch64 vroom_gl_arm64
-build x86_64 x86_64-pc-windows-msvc x86_64 vroom_gl_x64
+build aarch64 aarch64-pc-windows-msvc aarch64 vroom_gl_arm64 vroom_vk_arm64
+build x86_64 x86_64-pc-windows-msvc x86_64 vroom_gl_x64 vroom_vk_x64
 
-# The ARM64X forwarder: ARM64 processes see exports forwarded to the ARM64
-# build, x64 ones (its ARM64EC view) the x64 build. Windows looks for those
-# next to it.
+# The ARM64X forwarder for OpenGL: ARM64 processes see exports forwarded
+# to the ARM64 build, x64 ones (its ARM64EC view) the x64 build. Windows
+# looks for those next to it.
 mkdir -p arm64x && cd arm64x
 FUNCS="DrvCopyContext DrvCreateContext DrvCreateLayerContext DrvDeleteContext DrvDescribeLayerPlane
   DrvDescribePixelFormat DrvGetLayerPaletteEntries DrvGetProcAddress DrvPresentBuffers DrvRealizeLayerPalette
@@ -132,4 +139,12 @@ lld-link /dll /entry:vroom_gl_entry /nodefaultlib /machine:arm64x /def:x64.def /
   /out:"$OUT/vroom_gl.dll" entry_arm64.obj entry_ec.obj loadcfg_arm64.obj loadcfg_ec.obj chpe_ec.obj >>"$log" 2>&1 ||
   { tail -20 "$log"; exit 1; }
 rm -f "$OUT/vroom_gl.lib"
+# Vulkan gets one manifest per build instead: the loader opens a driver
+# with LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, which a forwarder's target
+# doesn't get, and it skips a DLL of the other architecture. It reads a
+# library path with a separator as relative to the manifest.
+for v in arm64 x64; do
+  printf '%s\n' '{' '    "file_format_version": "1.0.1",' '    "ICD": {' \
+    "        \"library_path\": \".\\\\vroom_vk_$v.dll\"," '        "api_version": "1.3.0"' '    }' '}' >"$OUT/vroom_vk_$v.json"
+done
 ls -l "$OUT"

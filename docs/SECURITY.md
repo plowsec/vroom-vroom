@@ -700,8 +700,10 @@ which turns the guest's Direct3D shaders into Metal ones with its own
 LLVM-based converter. That is a large amount of young C and C++ code in
 reach of the guest. So none of it runs in the VMM. Windows guests reach
 vrend too: the 3D driver makes virgl contexts for its own copies, and
-our OpenGL driver for Windows apps uses them like Linux's Mesa does
-(nothing new on the host: any guest code could already ask for one).
+our OpenGL driver for Windows apps uses them like Linux's Mesa does.
+Our Vulkan driver for Windows (and OpenGL through Zink on it) makes
+Venus contexts the same way Linux's Mesa does. Nothing new on the host:
+any guest code could already ask for either.
 
 ### The GPU process
 
@@ -911,6 +913,12 @@ With 3D, the GPU's host-visible window (8 GiB of guest address space) is
 backed by reserved memory where no buffer is mapped, as a real card's
 memory would be. Pages the guest writes there become real host memory: a
 guest can grow the VMM by up to 8 GiB that way, on top of its RAM.
+Swapping what backs a page (a buffer unmapped, filler mapped) leaves it
+unbacked for a few microseconds. A guest access there that we can't
+emulate (an exclusive load, which Windows' Vulkan driver uses on its
+ring) is run again until it gets through, for at most 100 ms at one
+address; after that the VM stops as before. It costs the guest only its
+own vCPU's time.
 
 Snapshots with GL in them hold the guest's GPU contents (textures read
 back, so whatever was on screen) next to its RAM, in the state dir. On

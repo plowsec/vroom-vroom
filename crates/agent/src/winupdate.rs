@@ -7,7 +7,7 @@
 //!    alone, the display driver only goes into the store (the agent
 //!    picks the GPUs' drivers itself, sys::gpu_drivers);
 //! 3. swaps the files in Program Files\Vroom: a file in use (the agent
-//!    helpers, OpenGL apps holding vroom_gl.dll) is renamed out of the
+//!    helpers, OpenGL and Vulkan apps holding our drivers) is renamed out of the
 //!    way first, which Windows allows, and deleted at the next update;
 //! 4. starts the service again. The session helpers see their file
 //!    change when the service goes, and start the new one.
@@ -164,15 +164,17 @@ fn drivers(dir: &Path) {
     }
 }
 
-/// The files that go to Program Files\Vroom: the agent, the OpenGL
-/// driver, virtiofs.exe. Drivers stay where pnputil put them.
+/// The files that go to Program Files\Vroom: the agent, the OpenGL and
+/// Vulkan drivers, virtiofs.exe. Drivers stay where pnputil put them.
 fn swap_files(dir: &Path, dest: &Path) -> Result<(), String> {
     let mut wanted: Vec<(PathBuf, String)> = Vec::new();
     let Ok(rd) = std::fs::read_dir(dir) else { return Err(format!("{}: can't read", dir.display())) };
     for e in rd.flatten() {
         let n = e.file_name().to_string_lossy().into_owned();
         let l = n.to_ascii_lowercase();
-        if l == "vroom-agent.exe" || (l.starts_with("vroom_gl") && l.ends_with(".dll")) {
+        let gl = l.starts_with("vroom_gl") && l.ends_with(".dll");
+        let vk = l.starts_with("vroom_vk") && (l.ends_with(".dll") || l.ends_with(".json"));
+        if l == "vroom-agent.exe" || gl || vk {
             wanted.push((e.path(), n));
         }
     }

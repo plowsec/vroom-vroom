@@ -1,0 +1,67 @@
+diff --git a/src/gallium/drivers/zink/zink_kopper.c b/src/gallium/drivers/zink/zink_kopper.c
+index 4ab5839..dbd41d5 100644
+--- a/src/gallium/drivers/zink/zink_kopper.c
++++ b/src/gallium/drivers/zink/zink_kopper.c
+@@ -665,6 +665,11 @@ kill_swapchain(struct zink_context *ctx, struct zink_resource *res)
+    mesa_loge("zink: swapchain killed %p\n", res);
+    zink_batch_reference_resource(ctx, res);
+    struct pipe_resource *pres = screen->base.resource_create(&screen->base, &res->base.b);
++   if (!pres) {
++      /* the device is gone too: keep drawing into the dead one */
++      res->swapchain = false;
++      return;
++   }
+    zink_resource_object_reference(screen, &res->obj, zink_resource(pres)->obj);
+    res->rebind_count++;
+    res->layout = VK_IMAGE_LAYOUT_UNDEFINED;
+@@ -698,6 +703,11 @@ zink_kopper_acquire(struct zink_context *ctx, struct zink_resource *res, uint64_
+                        res->base.b.height0 != cswap->scci.imageExtent.height;
+    struct zink_screen *zscreen = zink_screen(kopper_get_zink_screen(ctx->base.screen));
+    VkResult ret = kopper_acquire(zscreen, res, timeout);
++   if (ret == VK_ERROR_DEVICE_LOST) {
++      /* the swapchain isn't dead, the device is: nothing more to draw into */
++      zink_screen_handle_vkresult(zscreen, ret);
++      return false;
++   }
+    if (ret == VK_SUCCESS || ret == VK_SUBOPTIMAL_KHR) {
+       if (cswap != cdt->swapchain) {
+          ctx->swapchain_size = cdt->swapchain->scci.imageExtent;
+@@ -717,7 +727,9 @@ zink_kopper_acquire_submit(struct zink_screen *screen, struct zink_resource *res
+ {
+    assert(res->obj->dt);
+    struct kopper_displaytarget *cdt = res->obj->dt;
+-   assert(res->obj->dt_idx != UINT32_MAX);
++   /* none acquired: the device went away */
++   if (res->obj->dt_idx == UINT32_MAX)
++      return VK_NULL_HANDLE;
+    if (cdt->swapchain->images[res->obj->dt_idx].dt_has_data)
+       return VK_NULL_HANDLE;
+    assert(res->obj->dt_idx != UINT32_MAX);
+@@ -850,7 +862,9 @@ zink_kopper_present_queue(struct zink_screen *screen, struct zink_resource *res,
+ {
+    assert(res->obj->dt);
+    struct kopper_displaytarget *cdt = res->obj->dt;
+-   assert(zink_kopper_acquired(res->obj->dt, res->obj->dt_idx));
++   /* none acquired: the device went away */
++   if (!zink_kopper_acquired(res->obj->dt, res->obj->dt_idx))
++      return;
+    assert(res->obj->present);
+ 
+    /* always try to prune if the current swapchain has seen presents */
+diff --git a/src/vulkan/wsi/wsi_common_win32.cpp b/src/vulkan/wsi/wsi_common_win32.cpp
+index df41fd9..c4b060e 100644
+--- a/src/vulkan/wsi/wsi_common_win32.cpp
++++ b/src/vulkan/wsi/wsi_common_win32.cpp
+@@ -657,7 +657,11 @@ wsi_win32_acquire_next_image(struct wsi_swapchain *drv_chain,
+       }
+    }
+ 
+-   assert(chain->dxgi);
++   /* The CPU path presents at once: none is idle only while the app
++    * holds them all, and none will come back by waiting. */
++   if (!chain->dxgi)
++      return info->timeout ? VK_TIMEOUT : VK_NOT_READY;
++
+    uint32_t index = chain->dxgi->GetCurrentBackBufferIndex();
+    if (chain->images[index].state == WSI_IMAGE_DRAWING) {
+       index = (index + 1) % chain->base.image_count;

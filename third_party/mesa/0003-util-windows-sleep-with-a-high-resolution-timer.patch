@@ -1,0 +1,31 @@
+diff --git a/src/util/os_time.c b/src/util/os_time.c
+index 71fc7e3..34a12c6 100644
+--- a/src/util/os_time.c
++++ b/src/util/os_time.c
+@@ -90,6 +90,26 @@ os_time_sleep(int64_t usecs)
+    usleep(usecs);
+ 
+ #elif DETECT_OS_WINDOWS
++   /* Sleep() rounds up to the system timer tick, 15.6 ms unless some
++    * process asked for less: drivers that poll with short sleeps (Venus)
++    * would wait that long each time. A high-resolution timer doesn't. */
++#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
++#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
++#endif
++   if (usecs <= 0)
++      return;
++   HANDLE timer = CreateWaitableTimerExW(NULL, NULL,
++                                         CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
++                                         TIMER_ALL_ACCESS);
++   if (timer) {
++      LARGE_INTEGER due;
++      due.QuadPart = -(LONGLONG)usecs * 10; /* relative, 100 ns units */
++      bool waited = SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE) &&
++                    WaitForSingleObject(timer, INFINITE) == WAIT_OBJECT_0;
++      CloseHandle(timer);
++      if (waited)
++         return;
++   }
+    DWORD dwMilliseconds = (DWORD) ((usecs + 999) / 1000);
+    /* Avoid Sleep(O) as that would cause to sleep for an undetermined duration */
+    if (dwMilliseconds) {
