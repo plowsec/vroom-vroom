@@ -671,10 +671,14 @@ pub(crate) fn build(
     }
     // Hardware video decoding: a V4L2 decoder whose work happens in the
     // video helper (VideoToolbox, sandboxed on its own).
-    if config.display.video_decode {
-        let (window, window_mem) = crate::video::Window::new(vm.clone())?;
-        let (helper, codecs) = crate::video::Helper::spawn(&window_mem)?;
-        board.add_virtio(Box::new(vroom_virtio::devices::media::Media::new(helper, codecs, window_mem, window, "Video decoder")))?;
+    // Encoding: a second device, a V4L2 encoder, and a helper of its own.
+    use vroom_virtio::devices::media::{Media, Role};
+    for (on, role) in [(config.display.video_decode, Role::Decoder), (config.display.video_encode, Role::Encoder)] {
+        if on {
+            let (window, window_mem) = crate::video::Window::new(vm.clone())?;
+            let (helper, codecs) = crate::video::Helper::spawn(&window_mem, role)?;
+            board.add_virtio(Box::new(Media::new(helper, codecs, window_mem, window, role)))?;
+        }
     }
     // Input: virtio-input for direct-boot Linux, USB HID otherwise (UEFI,
     // Windows setup: works with zero drivers). Never both: no doubled keys.

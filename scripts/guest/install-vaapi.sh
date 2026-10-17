@@ -1,22 +1,26 @@
 #!/bin/sh
 # Run as root in a Linux guest (Debian/Ubuntu) to let browsers and other
-# VA-API players decode video on the Mac: builds vroom's VA-API driver
-# (vaapi/ next to this script), installs it, and makes it the default
-# (LIBVA_DRIVER_NAME=vroom, for sessions that start after this).
+# VA-API players decode and encode video on the Mac: builds vroom's VA-API
+# driver (vaapi/ next to this script), installs it, and makes it the
+# default (LIBVA_DRIVER_NAME=vroom, for sessions that start after this).
 #
 #   sudo sh install-vaapi.sh
 #
 # Needs the virtio-media driver first (install-virtio-media.sh) and a VM
-# with `video_decode = true`; dma-buf export (Firefox, Chrome) needs `gpu =
-# "virtio3d"`. Check with `vainfo` after logging in again.
+# with `video_decode = true` (decoding) or `video_encode = true`
+# (encoding); dma-buf export (Firefox, Chrome) needs `gpu = "virtio3d"`.
+# Check with `vainfo` after logging in again.
 #
 # For Chrome and Chromium it also:
 # - names the GPU's render node (--render-node-override). Under X11 they
 #   look for the GPU on PCI only, and vroom's isn't on PCI; Wayland tells
-#   them. The Chromium snap reads it from CHROMIUM_FLAGS. Google
-#   Chrome (deb) reads no flags file: wrappers in /usr/local/bin add it,
-#   and a copy of Chrome's menu entry starts them. An apt hook redoes
-#   that after every package change (/usr/local/sbin/vroom-chrome-x11).
+#   them.
+# - turns on their VA-API encoder (--enable-features=AcceleratedVideoEncoder,
+#   off by default on Linux), for video calls.
+# The Chromium snap reads both from CHROMIUM_FLAGS. Google Chrome (deb)
+# reads no flags file: wrappers in /usr/local/bin add them, and a copy of
+# Chrome's menu entry starts them. An apt hook redoes that after every
+# package change (/usr/local/sbin/vroom-chrome-x11).
 # - copies the driver to /var/lib/snapd/lib/gl: snaps load drivers only
 #   from their own runtime and from there.
 set -eu
@@ -58,17 +62,21 @@ mkdir -p /etc/environment.d
 env_d=/etc/environment.d/90-vroom-vaapi.conf
 : > "$env_d"
 setenv() {
-	if ! grep -q "^$1=" /etc/environment; then
-		echo "$1=$2" >> /etc/environment
+	# A value this script wrote before (older versions) gives way.
+	if [ -n "${3:-}" ]; then
+		sed -i "\#^$1=$3\$#d" /etc/environment
 	fi
-	echo "$1=$2" >> "$env_d"
+	if ! grep -q "^$1=" /etc/environment; then
+		echo "$1=\"$2\"" >> /etc/environment
+	fi
+	echo "$1=\"$2\"" >> "$env_d"
 }
 setenv LIBVA_DRIVER_NAME vroom
 if [ -n "$snapgl" ]; then
 	setenv LIBVA_DRIVERS_PATH "$drivers:$snapgl"
 fi
 if [ -n "$node" ]; then
-	setenv CHROMIUM_FLAGS "--render-node-override=$node"
+	setenv CHROMIUM_FLAGS "--render-node-override=$node --enable-features=AcceleratedVideoEncoder" "--render-node-override=$node"
 fi
 
 # Google Chrome (deb), now and after every package change, so a Chrome
@@ -76,8 +84,10 @@ fi
 cat > /usr/local/sbin/vroom-chrome-x11 <<'EOF'
 #!/bin/sh
 # From vroom's install-vaapi.sh. Google Chrome under X11 decodes video on
-# the Mac only if told the GPU's render node. This makes wrappers that
-# add --render-node-override (/usr/local/bin/google-chrome{,-stable}) and
+# the Mac only if told the GPU's render node, and encodes there (calls)
+# only with its VA-API encoder turned on. This makes wrappers that add
+# --render-node-override and --enable-features=AcceleratedVideoEncoder
+# (/usr/local/bin/google-chrome{,-stable}) and
 # a copy of Chrome's menu entry that starts them
 # (/usr/local/share/applications/google-chrome.desktop), or removes them
 # when Chrome is gone. apt runs it after every package change. To undo:
@@ -101,7 +111,7 @@ for name in google-chrome google-chrome-stable; do
 	f=/usr/local/bin/$name
 	ours "$f" || continue
 	if [ -n "$chrome" ]; then
-		printf '#!/bin/sh\n# Made by /usr/local/sbin/vroom-chrome-x11.\nexec /usr/bin/google-chrome-stable --render-node-override=%s "$@"\n' "$node" > "$f"
+		printf '#!/bin/sh\n# Made by /usr/local/sbin/vroom-chrome-x11.\nexec /usr/bin/google-chrome-stable --render-node-override=%s --enable-features=AcceleratedVideoEncoder "$@"\n' "$node" > "$f"
 		chmod 755 "$f"
 	else
 		rm -f "$f"

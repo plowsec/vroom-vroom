@@ -28,6 +28,18 @@
 // imports here. We do that on the CPU, from our copy of the picture
 // straight into the buffer's guest pages.
 //
+// Encoding (VAEntrypointEncSlice: H.264, HEVC) goes to the VM's V4L2
+// video encoder ("Video encoder", VideoToolbox's encoder behind it). That
+// encoder is a stateful one: it takes raw frames and makes the whole
+// bitstream itself, parameter sets included. So the driver says it takes
+// no packed headers (Chrome and FFmpeg then leave the headers to it),
+// copies each input surface into a V4L2 buffer, maps the player's
+// parameters onto the encoder's controls (bitrate, rate control, frame
+// rate, a key frame when the picture is an IDR) and hands back what the
+// encoder made. References, slice and picture headers the player chose
+// are its own business: the encoder picks its own (no B-frames, one
+// reference, one slice a picture).
+//
 // Build: make (needs libva-dev, libdrm-dev, libgbm-dev). Install with
 // install-vaapi.sh; use with LIBVA_DRIVER_NAME=vroom.
 //
@@ -74,7 +86,10 @@
 #define PPS_MAX 2048
 #define MAX_PROFILES 16
 #define MAX_ENTRYPOINTS 2
-#define MAX_ATTRIBUTES 8
+#define MAX_ATTRIBUTES 16
+// Encoding: raw frames and coded buffers on the V4L2 encoder.
+#define ENC_RAW_BUFS 6
+#define ENC_CODED_BUFS 6
 #define MAX_IMAGE_FORMATS 2
 #define OUTPUT_BUFS 8
 #define MAX_CAPTURE_BUFS 24
@@ -115,6 +130,8 @@ struct config {
 	VAProfile profile;
 	VAEntrypoint entrypoint;
 	unsigned rt_format;
+	// Encoding: VA_RC_CBR, VA_RC_VBR or VA_RC_CQP.
+	unsigned rc_mode;
 };
 
 struct context;
@@ -157,6 +174,10 @@ struct surface {
 	bool rgb, rgb_nomap;
 	bool rgb_rfirst; // R, G, B, A in memory (else B, G, R, A)
 	unsigned rgb_pitch, rgb_offset;
+	// Encoding: the last frame made from it, frame `enc_seq` of `enc_ctx`
+	// (its coded frame may not be back yet).
+	struct context *enc_ctx;
+	uint64_t enc_seq;
 };
 
 struct buffer {
@@ -164,6 +185,10 @@ struct buffer {
 	unsigned size, num;
 	uint8_t *data;
 	bool borrowed; // data is a surface's (a derived image)
+	// A coded buffer (VAEncCodedBufferType): a VACodedBufferSegment, then
+	// room for `size` bytes. Waiting for frame `enc_seq` of `enc_ctx`.
+	struct context *enc_ctx;
+	uint64_t enc_seq;
 };
 
 struct image {
@@ -227,6 +252,23 @@ struct context {
 	unsigned cap_w, cap_h, cap_pitch;
 	bool cap_p010;
 	uint64_t next_seq;
+	// Encoding (VAEntrypointEncSlice). The V4L2 encoder's raw buffers are
+	// out_* above, its coded buffers cap_*; raw frames `enc_pitch` bytes a
+	// row, chroma after `enc_rows` rows.
+	bool enc;
+	unsigned rc_mode;
+	unsigned enc_pitch, enc_rows;
+	// What the player asked for so far, and what the encoder has.
+	struct enc_params {
+		unsigned visible_w, visible_h;
+		uint32_t bitrate, peak, fps_num, fps_den, qp;
+	} want, have;
+	bool have_seq;
+	VABufferID coded_buf;
+	bool idr;
+	// Frames sent, and done (in order: each coded frame comes back in
+	// the order its frame went).
+	uint64_t enc_sent, enc_done;
 };
 
 // A destroyed live surface's GBM buffers, kept a little while.
@@ -249,6 +291,12 @@ struct driver {
 	uint32_t coded[8];
 	unsigned n_coded;
 	bool p010;
+	// The encoder, if the VM has one: its device, what it makes, and
+	// whether it takes 10-bit frames.
+	char enc_video[64];
+	uint32_t enc_coded[4];
+	unsigned n_enc_coded;
+	bool enc_p010;
 	struct obj *objs;
 	unsigned n_objs, cap_objs;
 };
@@ -654,54 +702,75 @@ static int xioctl(int fd, unsigned long req, void *arg)
 	return r;
 }
 
-// Find our decoder: an M2M device whose card is "Video decoder" on
-// virtio-media. VROOM_VIDEO_DEVICE overrides.
+// The coded formats (on `coded_type`) and whether 10-bit raw pictures (on
+// the other queue) are there.
+static unsigned list_formats(int fd, unsigned coded_type, uint32_t *coded, unsigned max, bool *p010)
+{
+	unsigned n = 0;
+	unsigned raw_type = coded_type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE ? V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE : V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+	for (unsigned k = 0; k < 8 && n < max; k++) {
+		struct v4l2_fmtdesc f = { .index = k, .type = coded_type };
+		if (xioctl(fd, VIDIOC_ENUM_FMT, &f))
+			break;
+		coded[n++] = f.pixelformat;
+	}
+	for (unsigned k = 0; k < 4; k++) {
+		struct v4l2_fmtdesc f = { .index = k, .type = raw_type };
+		if (xioctl(fd, VIDIOC_ENUM_FMT, &f))
+			break;
+		if (f.pixelformat == V4L2_PIX_FMT_P010)
+			*p010 = true;
+	}
+	return n;
+}
+
+// Find our decoder and encoder: M2M devices on virtio-media whose card is
+// "Video decoder" or "Video encoder". VROOM_VIDEO_DEVICE and
+// VROOM_VIDEO_ENCODER override. True if either is there.
 static bool find_device(struct driver *d)
 {
-	const char *env = getenv("VROOM_VIDEO_DEVICE");
+	const char *envs[2] = { getenv("VROOM_VIDEO_DEVICE"), getenv("VROOM_VIDEO_ENCODER") };
 	for (int i = 0; i < 64; i++) {
 		char path[64];
-		if (env)
-			snprintf(path, sizeof(path), "%s", env);
-		else
-			snprintf(path, sizeof(path), "/dev/video%d", i);
-		int fd = open(path, O_RDWR | O_CLOEXEC);
-		if (fd >= 0) {
+		snprintf(path, sizeof(path), "/dev/video%d", i);
+		for (int e = 0; e < 2; e++) {
+			const char *p = envs[e] ? envs[e] : path;
+			char *dst = e ? d->enc_video : d->video;
+			if (dst[0] || (envs[e] && i > 0))
+				continue;
+			int fd = open(p, O_RDWR | O_CLOEXEC);
+			if (fd < 0)
+				continue;
 			struct v4l2_capability cap = { 0 };
+			const char *card = e ? "Video encoder" : "Video decoder";
 			bool ok = xioctl(fd, VIDIOC_QUERYCAP, &cap) == 0 && (cap.device_caps & V4L2_CAP_VIDEO_M2M_MPLANE) &&
-				  strstr((const char *)cap.bus_info, "virtio-media") && !strcmp((const char *)cap.card, "Video decoder");
+				  strstr((const char *)cap.bus_info, "virtio-media") && !strcmp((const char *)cap.card, card);
 			if (ok) {
-				snprintf(d->video, sizeof(d->video), "%s", path);
-				d->n_coded = 0;
-				for (unsigned k = 0; k < 8; k++) {
-					struct v4l2_fmtdesc f = { .index = k, .type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE };
-					if (xioctl(fd, VIDIOC_ENUM_FMT, &f))
-						break;
-					d->coded[d->n_coded++] = f.pixelformat;
-				}
-				for (unsigned k = 0; k < 4; k++) {
-					struct v4l2_fmtdesc f = { .index = k, .type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE };
-					if (xioctl(fd, VIDIOC_ENUM_FMT, &f))
-						break;
-					if (f.pixelformat == V4L2_PIX_FMT_P010)
-						d->p010 = true;
-				}
-				close(fd);
-				dbg("decoder %s, %u coded formats", path, d->n_coded);
-				return true;
+				snprintf(dst, sizeof(d->video), "%s", p);
+				if (e)
+					d->n_enc_coded = list_formats(fd, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, d->enc_coded, 4, &d->enc_p010);
+				else
+					d->n_coded = list_formats(fd, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, d->coded, 8, &d->p010);
+				dbg("%s %s, %u coded formats", e ? "encoder" : "decoder", p, e ? d->n_enc_coded : d->n_coded);
 			}
 			close(fd);
 		}
-		if (env)
-			break;
 	}
-	return false;
+	return d->video[0] || d->enc_video[0];
 }
 
 static bool has_coded(struct driver *d, uint32_t fourcc)
 {
 	for (unsigned i = 0; i < d->n_coded; i++)
 		if (d->coded[i] == fourcc)
+			return true;
+	return false;
+}
+
+static bool has_enc(struct driver *d, uint32_t fourcc)
+{
+	for (unsigned i = 0; i < d->n_enc_coded; i++)
+		if (d->enc_coded[i] == fourcc)
 			return true;
 	return false;
 }
@@ -934,14 +1003,16 @@ static void copy_picture(struct context *c, struct surface *s, const uint8_t *sr
 		memcpy(s->data + chroma_dst + (size_t)y * s->pitch, src + chroma_src + (size_t)y * c->cap_pitch, bytes);
 }
 
-// Take what the decoder has for us. `wait_ms`: how long to wait for
-// something (0: don't).
-static void pump(struct context *c, int wait_ms)
+// Take what the decoder has for us. `wait_ms`: how long to wait for a
+// picture or an event (0: don't), `out`: or a free bitstream buffer. A
+// free bitstream buffer wakes us only if we wait for one: poll says
+// there is one whenever not all are queued, which is nearly always.
+static void pump(struct context *c, int wait_ms, bool out)
 {
 	struct driver *d = c->drv;
 	if (c->fd < 0)
 		return;
-	struct pollfd p = { .fd = c->fd, .events = POLLIN | POLLOUT | POLLPRI };
+	struct pollfd p = { .fd = c->fd, .events = POLLIN | POLLPRI | (out ? POLLOUT : 0) };
 	if (poll(&p, 1, wait_ms) <= 0)
 		return;
 	if (p.revents & POLLPRI) {
@@ -990,6 +1061,13 @@ static int64_t now_ms(void)
 	return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
 }
 
+static int64_t now_us(void)
+{
+	struct timespec t;
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return (int64_t)t.tv_sec * 1000000 + t.tv_nsec / 1000;
+}
+
 // Queue the picture built in c->au, for surface s.
 static VAStatus submit(struct context *c, struct surface *s)
 {
@@ -1011,7 +1089,7 @@ static VAStatus submit(struct context *c, struct surface *s)
 		}
 		if (idx >= 0 || now_ms() > until)
 			break;
-		pump(c, 20);
+		pump(c, 20, true);
 	}
 	if (idx < 0 || c->au_len > c->out_len[idx]) {
 		dbg("no room for a picture (%zu bytes)", c->au_len);
@@ -1042,7 +1120,7 @@ static VAStatus submit(struct context *c, struct surface *s)
 	s->seq = seq;
 	s->ctx = c;
 	s->matrix = profile_fourcc(c->profile) == V4L2_PIX_FMT_VP9 ? c->vp9_matrix : MATRIX_GUESS;
-	pump(c, 0);
+	pump(c, 0, false);
 	return VA_STATUS_SUCCESS;
 }
 
@@ -1058,7 +1136,401 @@ static VAStatus wait_surface(struct driver *d, struct surface *s)
 			s->failed = true;
 			break;
 		}
-		pump(s->ctx, 20);
+		pump(s->ctx, 20, false);
+	}
+	return VA_STATUS_SUCCESS;
+}
+
+// ---------------------------------------------------------------------
+// Encoding on the V4L2 encoder
+
+static int set_ctrls(int fd, const struct v4l2_ext_control *list, unsigned n)
+{
+	struct v4l2_ext_controls cs = { .which = V4L2_CTRL_WHICH_CUR_VAL, .count = n, .controls = (struct v4l2_ext_control *)list };
+	return xioctl(fd, VIDIOC_S_EXT_CTRLS, &cs);
+}
+
+// Bitrate, rate control and frame rate as the player wants them now.
+static void enc_apply(struct context *c)
+{
+	struct enc_params *w = &c->want, *h = &c->have;
+	// QP matters to constant QP only, bitrates to the others.
+	if (c->rc_mode == VA_RC_CQP)
+		w->bitrate = h->bitrate, w->peak = h->peak;
+	else
+		w->qp = h->qp;
+	if (c->fd < 0 || !memcmp(w, h, sizeof(*w)))
+		return;
+	struct v4l2_ext_control list[4];
+	unsigned n = 0;
+	if (c->rc_mode == VA_RC_CQP) {
+		// QP 0 (best) to 51: VideoToolbox's quality, 100 to 1.
+		int q = 100 - (int)w->qp * 2;
+		list[n++] = (struct v4l2_ext_control){ .id = V4L2_CID_MPEG_VIDEO_CONSTANT_QUALITY, .value = q < 1 ? 1 : q > 100 ? 100 : q };
+	} else {
+		uint32_t bps = w->bitrate < 1000 ? 1000 : w->bitrate > 400000000 ? 400000000 : w->bitrate;
+		list[n++] = (struct v4l2_ext_control){ .id = V4L2_CID_MPEG_VIDEO_BITRATE, .value = (int32_t)bps };
+		if (c->rc_mode == VA_RC_VBR)
+			list[n++] = (struct v4l2_ext_control){ .id = V4L2_CID_MPEG_VIDEO_BITRATE_PEAK, .value = (int32_t)(w->peak > bps ? w->peak : 0) };
+	}
+	if (set_ctrls(c->fd, list, n))
+		dbg("encoder controls: %s", strerror(errno));
+	if (w->fps_num != h->fps_num || w->fps_den != h->fps_den) {
+		struct v4l2_streamparm p = { .type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE };
+		p.parm.output.timeperframe.numerator = w->fps_den;
+		p.parm.output.timeperframe.denominator = w->fps_num;
+		xioctl(c->fd, VIDIOC_S_PARM, &p);
+	}
+	*h = *w;
+}
+
+// Set up the V4L2 encoder for this context: formats, controls, buffers.
+static bool enc_open(struct context *c)
+{
+	struct driver *d = c->drv;
+	c->fd = open(d->enc_video, O_RDWR | O_NONBLOCK | O_CLOEXEC);
+	if (c->fd < 0)
+		return false;
+	bool hevc = profile_fourcc(c->profile) == V4L2_PIX_FMT_HEVC;
+	struct v4l2_format cf = { .type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE };
+	cf.fmt.pix_mp.pixelformat = hevc ? V4L2_PIX_FMT_HEVC : V4L2_PIX_FMT_H264;
+	cf.fmt.pix_mp.width = c->want.visible_w;
+	cf.fmt.pix_mp.height = c->want.visible_h;
+	cf.fmt.pix_mp.num_planes = 1;
+	if (xioctl(c->fd, VIDIOC_S_FMT, &cf))
+		return false;
+	struct v4l2_format f = { .type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE };
+	f.fmt.pix_mp.pixelformat = c->p010 ? V4L2_PIX_FMT_P010 : V4L2_PIX_FMT_NV12;
+	f.fmt.pix_mp.width = c->want.visible_w;
+	f.fmt.pix_mp.height = c->want.visible_h;
+	f.fmt.pix_mp.num_planes = 1;
+	if (xioctl(c->fd, VIDIOC_S_FMT, &f))
+		return false;
+	c->enc_pitch = f.fmt.pix_mp.plane_fmt[0].bytesperline;
+	c->enc_rows = f.fmt.pix_mp.height;
+	// The picture: the context's frames cropped as the sequence says.
+	struct v4l2_selection sel = { .type = V4L2_BUF_TYPE_VIDEO_OUTPUT, .target = V4L2_SEL_TGT_CROP };
+	sel.r.width = c->want.visible_w;
+	sel.r.height = c->want.visible_h;
+	xioctl(c->fd, VIDIOC_S_SELECTION, &sel);
+	int profile;
+	switch (c->profile) {
+	case VAProfileH264ConstrainedBaseline:
+		profile = V4L2_MPEG_VIDEO_H264_PROFILE_CONSTRAINED_BASELINE;
+		break;
+	case VAProfileH264Main:
+		profile = V4L2_MPEG_VIDEO_H264_PROFILE_MAIN;
+		break;
+	case VAProfileHEVCMain:
+		profile = V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN;
+		break;
+	case VAProfileHEVCMain10:
+		profile = V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10;
+		break;
+	default:
+		profile = V4L2_MPEG_VIDEO_H264_PROFILE_HIGH;
+	}
+	int mode = c->rc_mode == VA_RC_CBR ? V4L2_MPEG_VIDEO_BITRATE_MODE_CBR : c->rc_mode == VA_RC_VBR ? V4L2_MPEG_VIDEO_BITRATE_MODE_VBR : V4L2_MPEG_VIDEO_BITRATE_MODE_CQ;
+	struct v4l2_ext_control setup[] = {
+		{ .id = hevc ? V4L2_CID_MPEG_VIDEO_HEVC_PROFILE : V4L2_CID_MPEG_VIDEO_H264_PROFILE, .value = profile },
+		{ .id = V4L2_CID_MPEG_VIDEO_BITRATE_MODE, .value = mode },
+		// Key frames when the player makes a picture an IDR, no others.
+		{ .id = V4L2_CID_MPEG_VIDEO_GOP_SIZE, .value = 0 },
+	};
+	if (set_ctrls(c->fd, setup, 3))
+		dbg("encoder setup: %s", strerror(errno));
+	memset(&c->have, 0, sizeof(c->have));
+	c->have.visible_w = c->want.visible_w;
+	c->have.visible_h = c->want.visible_h;
+	enc_apply(c);
+	for (int q = 0; q < 2; q++) {
+		unsigned type = q ? V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE : V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+		struct v4l2_requestbuffers rb = { .count = q ? ENC_CODED_BUFS : ENC_RAW_BUFS, .type = type, .memory = V4L2_MEMORY_MMAP };
+		if (xioctl(c->fd, VIDIOC_REQBUFS, &rb) || rb.count == 0)
+			return false;
+		unsigned n = rb.count > (q ? ENC_CODED_BUFS : ENC_RAW_BUFS) ? (q ? ENC_CODED_BUFS : ENC_RAW_BUFS) : rb.count;
+		for (unsigned i = 0; i < n; i++) {
+			struct v4l2_plane pl[1] = { 0 };
+			struct v4l2_buffer b = { .index = i, .type = type, .memory = V4L2_MEMORY_MMAP, .m.planes = pl, .length = 1 };
+			if (xioctl(c->fd, VIDIOC_QUERYBUF, &b))
+				return false;
+			void *p = mmap(NULL, pl[0].length, q ? PROT_READ : PROT_READ | PROT_WRITE, MAP_SHARED, c->fd, pl[0].m.mem_offset);
+			if (p == MAP_FAILED)
+				return false;
+			if (q) {
+				c->cap_map[i] = p;
+				c->cap_len[i] = pl[0].length;
+				c->n_cap = i + 1;
+				if (xioctl(c->fd, VIDIOC_QBUF, &b))
+					return false;
+			} else {
+				c->out_map[i] = p;
+				c->out_len[i] = pl[0].length;
+				c->out_busy[i] = false;
+				c->n_out = i + 1;
+			}
+		}
+		if (xioctl(c->fd, VIDIOC_STREAMON, &type))
+			return false;
+	}
+	c->out_on = c->cap_on = true;
+	dbg("encoder open: %s %ux%u (frames %u bytes a row, %u rows), rate control %u", hevc ? "HEVC" : "H.264", c->want.visible_w, c->want.visible_h,
+	    c->enc_pitch, c->enc_rows, c->rc_mode);
+	return true;
+}
+
+// The coded buffer waiting for frame `seq` of `c`.
+static struct buffer *coded_for(struct driver *d, struct context *c, uint64_t seq)
+{
+	for (unsigned i = 0; i < d->n_objs; i++) {
+		if (d->objs[i].type != OBJ_BUFFER)
+			continue;
+		struct buffer *b = d->objs[i].p;
+		if (b->type == VAEncCodedBufferType && b->enc_ctx == c && b->enc_seq == seq)
+			return b;
+	}
+	return NULL;
+}
+
+// Take what the encoder has for us: raw buffers back, coded frames.
+// `wait_ms`: how long to wait for a coded frame (`raw`: or a raw buffer).
+// Only what we wait for wakes us: a free raw buffer is no news while we
+// wait for a coded frame (poll would say so at once, over and over).
+static void enc_pump(struct context *c, int wait_ms, bool raw)
+{
+	struct driver *d = c->drv;
+	if (c->fd < 0)
+		return;
+	struct pollfd p = { .fd = c->fd, .events = POLLIN | (raw ? POLLOUT : 0) };
+	if (wait_ms > 0 && poll(&p, 1, wait_ms) <= 0)
+		return;
+	for (;;) {
+		struct v4l2_plane pl[1] = { 0 };
+		struct v4l2_buffer b = { .type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, .memory = V4L2_MEMORY_MMAP, .m.planes = pl, .length = 1 };
+		if (xioctl(c->fd, VIDIOC_DQBUF, &b))
+			break;
+		if (b.index < c->n_out)
+			c->out_busy[b.index] = false;
+	}
+	for (;;) {
+		struct v4l2_plane pl[1] = { 0 };
+		struct v4l2_buffer b = { .type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, .memory = V4L2_MEMORY_MMAP, .m.planes = pl, .length = 1 };
+		if (xioctl(c->fd, VIDIOC_DQBUF, &b))
+			break;
+		uint64_t seq = (uint64_t)b.timestamp.tv_sec;
+		struct buffer *cb = coded_for(d, c, seq);
+		if (cb) {
+			VACodedBufferSegment *seg = (VACodedBufferSegment *)cb->data;
+			size_t room = (size_t)cb->size * cb->num;
+			bool ok = !(b.flags & V4L2_BUF_FLAG_ERROR) && pl[0].bytesused > 0 && b.index < c->n_cap && c->cap_map[b.index];
+			seg->size = 0;
+			seg->status = 0;
+			if (ok && pl[0].bytesused <= room && pl[0].bytesused <= c->cap_len[b.index]) {
+				memcpy(seg->buf, c->cap_map[b.index], pl[0].bytesused);
+				seg->size = pl[0].bytesused;
+			} else if (ok) {
+				dbg("frame %llu: %u bytes don't fit in %zu", (unsigned long long)seq, pl[0].bytesused, room);
+				seg->status = VA_CODED_BUF_STATUS_SLICE_OVERFLOW_MASK;
+			} else {
+				dbg("frame %llu didn't encode", (unsigned long long)seq);
+			}
+			cb->enc_ctx = NULL;
+		}
+		if (seq > c->enc_done && seq <= c->enc_sent)
+			c->enc_done = seq;
+		if (!(b.flags & V4L2_BUF_FLAG_LAST))
+			xioctl(c->fd, VIDIOC_QBUF, &b);
+	}
+}
+
+// Wait until frame `seq` of `c` is coded (or failed).
+static void enc_wait(struct context *c, uint64_t seq)
+{
+	int64_t until = now_ms() + SYNC_TIMEOUT_MS, t0 = now_us();
+	bool waited = false;
+	while (c && c->fd >= 0 && c->enc_done < seq && !c->failed) {
+		if (now_ms() > until) {
+			dbg("frame %llu timed out", (unsigned long long)seq);
+			c->enc_done = seq;
+			break;
+		}
+		enc_pump(c, 20, false);
+		waited = true;
+	}
+	if (waited && debug_level > 1)
+		dbg("frame %llu: waited %lld us for it", (unsigned long long)seq, (long long)(now_us() - t0));
+}
+
+// One frame: surface `s` into a raw buffer, queued; its coded frame goes
+// into the coded buffer the picture parameters named.
+static VAStatus enc_submit(struct driver *d, struct context *c, struct surface *s)
+{
+	struct buffer *cb = get_obj(d, c->coded_buf, OBJ_BUFFER);
+	if (!cb || cb->type != VAEncCodedBufferType)
+		return VA_STATUS_ERROR_INVALID_BUFFER;
+	if (c->failed)
+		return VA_STATUS_ERROR_ENCODING_ERROR;
+	// A new picture size: a new encoder (frames still coding are lost).
+	if (c->fd >= 0 && (c->want.visible_w != c->have.visible_w || c->want.visible_h != c->have.visible_h)) {
+		dbg("picture size changed: the encoder starts again");
+		v4l2_close(c);
+		c->enc_done = c->enc_sent;
+	}
+	if (c->fd < 0 && !enc_open(c)) {
+		dbg("can't set up the encoder: %s", strerror(errno));
+		c->failed = true;
+		v4l2_close(c);
+		return VA_STATUS_ERROR_OPERATION_FAILED;
+	}
+	enc_apply(c);
+	int64_t until = now_ms() + SYNC_TIMEOUT_MS;
+	int idx = -1;
+	for (;;) {
+		for (unsigned i = 0; i < c->n_out && idx < 0; i++)
+			if (!c->out_busy[i])
+				idx = (int)i;
+		if (idx >= 0 || now_ms() > until)
+			break;
+		enc_pump(c, 20, true);
+	}
+	size_t chroma = (size_t)c->enc_pitch * c->enc_rows;
+	size_t need = chroma + (size_t)c->enc_pitch * (c->enc_rows / 2);
+	if (idx < 0 || need > c->out_len[idx] || s->p010 != c->p010) {
+		dbg("no room for a frame");
+		return VA_STATUS_ERROR_ENCODING_ERROR;
+	}
+	// The surface's rows into the encoder's layout.
+	int64_t t0 = now_us();
+	uint8_t *dst = c->out_map[idx];
+	unsigned rows = s->rows < c->enc_rows ? s->rows : c->enc_rows;
+	unsigned bytes = s->pitch < c->enc_pitch ? s->pitch : c->enc_pitch;
+	for (unsigned y = 0; y < rows; y++)
+		memcpy(dst + (size_t)y * c->enc_pitch, s->data + (size_t)y * s->pitch, bytes);
+	for (unsigned y = 0; y < rows / 2; y++)
+		memcpy(dst + chroma + (size_t)y * c->enc_pitch, s->data + (size_t)s->pitch * s->rows + (size_t)y * s->pitch, bytes);
+	int64_t t1 = now_us();
+	if (c->idr) {
+		struct v4l2_ext_control k = { .id = V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME };
+		set_ctrls(c->fd, &k, 1);
+	}
+	if (debug_level > 1)
+		dbg("frame %llu: copied in %lld us%s", (unsigned long long)c->enc_sent + 1, (long long)(t1 - t0), c->idr ? ", key frame" : "");
+	struct v4l2_plane pl[1] = { { .bytesused = (uint32_t)need, .length = (uint32_t)c->out_len[idx] } };
+	struct v4l2_buffer b = { .index = (uint32_t)idx, .type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, .memory = V4L2_MEMORY_MMAP, .m.planes = pl, .length = 1 };
+	uint64_t seq = c->enc_sent + 1;
+	b.timestamp.tv_sec = (time_t)seq;
+	if (xioctl(c->fd, VIDIOC_QBUF, &b)) {
+		dbg("QBUF: %s", strerror(errno));
+		return VA_STATUS_ERROR_ENCODING_ERROR;
+	}
+	c->enc_sent = seq;
+	c->out_busy[idx] = true;
+	VACodedBufferSegment *seg = (VACodedBufferSegment *)cb->data;
+	seg->size = 0;
+	seg->status = 0;
+	cb->enc_ctx = c;
+	cb->enc_seq = seq;
+	s->enc_ctx = c;
+	s->enc_seq = seq;
+	enc_pump(c, 0, false);
+	return VA_STATUS_SUCCESS;
+}
+
+// The player's parameters for one picture, as far as the encoder needs
+// them: size, rates, IDR.
+static VAStatus enc_render(struct context *c, struct buffer *b)
+{
+	bool hevc = profile_fourcc(c->profile) == V4L2_PIX_FMT_HEVC;
+	struct enc_params *w = &c->want;
+	switch (b->type) {
+	case VAEncSequenceParameterBufferType:
+		if (!hevc && b->size >= sizeof(VAEncSequenceParameterBufferH264)) {
+			VAEncSequenceParameterBufferH264 sp;
+			memcpy(&sp, b->data, sizeof(sp));
+			unsigned cw = sp.picture_width_in_mbs * 16, ch = sp.picture_height_in_mbs * 16;
+			if (sp.frame_cropping_flag) {
+				cw -= 2 * (sp.frame_crop_left_offset + sp.frame_crop_right_offset);
+				ch -= 2 * (sp.frame_crop_top_offset + sp.frame_crop_bottom_offset);
+			}
+			if (cw >= 16 && ch >= 16 && cw <= c->width && ch <= c->height)
+				w->visible_w = cw, w->visible_h = ch;
+			if (sp.bits_per_second)
+				w->bitrate = sp.bits_per_second;
+			if (sp.vui_parameters_present_flag && sp.vui_fields.bits.timing_info_present_flag && sp.num_units_in_tick && sp.time_scale)
+				w->fps_num = sp.time_scale, w->fps_den = sp.num_units_in_tick * 2;
+		} else if (hevc && b->size >= sizeof(VAEncSequenceParameterBufferHEVC)) {
+			// No cropping in HEVC's parameters (players put it in the
+			// packed SPS we don't take): the frame as it is.
+			VAEncSequenceParameterBufferHEVC sp;
+			memcpy(&sp, b->data, sizeof(sp));
+			if (sp.pic_width_in_luma_samples >= 16 && sp.pic_height_in_luma_samples >= 16 && sp.pic_width_in_luma_samples <= c->width &&
+			    sp.pic_height_in_luma_samples <= c->height)
+				w->visible_w = sp.pic_width_in_luma_samples & ~1u, w->visible_h = sp.pic_height_in_luma_samples & ~1u;
+			if (sp.bits_per_second)
+				w->bitrate = sp.bits_per_second;
+			if (sp.vui_parameters_present_flag && sp.vui_fields.bits.vui_timing_info_present_flag && sp.vui_num_units_in_tick && sp.vui_time_scale)
+				w->fps_num = sp.vui_time_scale, w->fps_den = sp.vui_num_units_in_tick;
+		}
+		c->have_seq = true;
+		break;
+	case VAEncPictureParameterBufferType:
+		if (!hevc && b->size >= sizeof(VAEncPictureParameterBufferH264)) {
+			VAEncPictureParameterBufferH264 pp;
+			memcpy(&pp, b->data, sizeof(pp));
+			c->coded_buf = pp.coded_buf;
+			c->idr = pp.pic_fields.bits.idr_pic_flag;
+			w->qp = pp.pic_init_qp;
+		} else if (hevc && b->size >= sizeof(VAEncPictureParameterBufferHEVC)) {
+			VAEncPictureParameterBufferHEVC pp;
+			memcpy(&pp, b->data, sizeof(pp));
+			c->coded_buf = pp.coded_buf;
+			c->idr = pp.pic_fields.bits.idr_pic_flag;
+			w->qp = pp.pic_init_qp;
+		} else {
+			return VA_STATUS_ERROR_INVALID_BUFFER;
+		}
+		// Constant QP: the key frames' QP sets the quality (players give
+		// other pictures QPs of their own, a few steps off).
+		if (!c->idr)
+			w->qp = c->have.qp;
+		break;
+	case VAEncMiscParameterBufferType: {
+		if (b->size < sizeof(VAEncMiscParameterBuffer))
+			break;
+		VAEncMiscParameterBuffer mp;
+		memcpy(&mp, b->data, sizeof(mp));
+		const uint8_t *body = b->data + offsetof(VAEncMiscParameterBuffer, data);
+		size_t left = b->size - offsetof(VAEncMiscParameterBuffer, data);
+		if (mp.type == VAEncMiscParameterTypeRateControl && left >= sizeof(VAEncMiscParameterRateControl)) {
+			VAEncMiscParameterRateControl rc;
+			memcpy(&rc, body, sizeof(rc));
+			if (rc.bits_per_second) {
+				// VBR: bits_per_second is the peak, the target a share of it.
+				unsigned pct = rc.target_percentage && rc.target_percentage <= 100 ? rc.target_percentage : 100;
+				w->bitrate = c->rc_mode == VA_RC_VBR ? (uint32_t)((uint64_t)rc.bits_per_second * pct / 100) : rc.bits_per_second;
+				w->peak = rc.bits_per_second;
+			}
+		} else if (mp.type == VAEncMiscParameterTypeFrameRate && left >= sizeof(VAEncMiscParameterFrameRate)) {
+			VAEncMiscParameterFrameRate fr;
+			memcpy(&fr, body, sizeof(fr));
+			// Numerator in the low 16 bits, denominator in the high (0: 1).
+			uint32_t num = fr.framerate & 0xffff, den = fr.framerate >> 16;
+			if (num)
+				w->fps_num = num, w->fps_den = den ? den : 1;
+		}
+		break;
+	}
+	case VAEncSliceParameterBufferType:
+		if (!hevc && c->idr && b->size >= sizeof(VAEncSliceParameterBufferH264)) {
+			VAEncSliceParameterBufferH264 sl;
+			memcpy(&sl, b->data, sizeof(sl));
+			int qp = (int)w->qp + sl.slice_qp_delta;
+			w->qp = qp < 0 ? 0 : qp > 51 ? 51 : (uint32_t)qp;
+		}
+		break;
+	default:
+		// Packed headers and the rest: the encoder makes its own.
+		break;
 	}
 	return VA_STATUS_SUCCESS;
 }
@@ -1097,17 +1569,18 @@ static VAStatus vr_Terminate(VADriverContextP ctx)
 	return VA_STATUS_SUCCESS;
 }
 
+// Decoding profiles, then encoding ones not already in.
 static int list_profiles(struct driver *d, VAProfile *out)
 {
 	int n = 0;
-	if (has_coded(d, V4L2_PIX_FMT_H264)) {
+	if (has_coded(d, V4L2_PIX_FMT_H264) || has_enc(d, V4L2_PIX_FMT_H264)) {
 		out[n++] = VAProfileH264ConstrainedBaseline;
 		out[n++] = VAProfileH264Main;
 		out[n++] = VAProfileH264High;
 	}
-	if (has_coded(d, V4L2_PIX_FMT_HEVC)) {
+	if (has_coded(d, V4L2_PIX_FMT_HEVC) || has_enc(d, V4L2_PIX_FMT_HEVC)) {
 		out[n++] = VAProfileHEVCMain;
-		if (d->p010)
+		if ((has_coded(d, V4L2_PIX_FMT_HEVC) && d->p010) || (has_enc(d, V4L2_PIX_FMT_HEVC) && d->enc_p010))
 			out[n++] = VAProfileHEVCMain10;
 	}
 	if (has_coded(d, V4L2_PIX_FMT_VP9)) {
@@ -1116,18 +1589,41 @@ static int list_profiles(struct driver *d, VAProfile *out)
 			out[n++] = VAProfileVP9Profile2;
 	}
 	// Video processing: picture to BGRA (Chrome under X11).
-	out[n++] = VAProfileNone;
+	if (d->video[0])
+		out[n++] = VAProfileNone;
 	return n;
+}
+
+// Can the decoder (VLD) or the encoder (EncSlice) do this profile?
+static bool decodes(struct driver *d, VAProfile p)
+{
+	uint32_t f = profile_fourcc(p);
+	return d->video[0] && (p == VAProfileNone || (has_coded(d, f) && (!profile_10bit(p) || d->p010)));
+}
+
+static bool encodes(struct driver *d, VAProfile p)
+{
+	uint32_t f = profile_fourcc(p);
+	return (f == V4L2_PIX_FMT_H264 || f == V4L2_PIX_FMT_HEVC) && has_enc(d, f) && (!profile_10bit(p) || d->enc_p010);
+}
+
+static bool entrypoint_ok(struct driver *d, VAProfile p, VAEntrypoint e)
+{
+	switch (e) {
+	case VAEntrypointVLD:
+		return p != VAProfileNone && decodes(d, p);
+	case VAEntrypointVideoProc:
+		return p == VAProfileNone && decodes(d, p);
+	case VAEntrypointEncSlice:
+		return encodes(d, p);
+	default:
+		return false;
+	}
 }
 
 static bool profile_ok(struct driver *d, VAProfile p)
 {
-	VAProfile list[MAX_PROFILES];
-	int n = list_profiles(d, list);
-	for (int i = 0; i < n; i++)
-		if (list[i] == p)
-			return true;
-	return false;
+	return entrypoint_ok(d, p, VAEntrypointVLD) || entrypoint_ok(d, p, VAEntrypointVideoProc) || entrypoint_ok(d, p, VAEntrypointEncSlice);
 }
 
 static VAStatus vr_QueryConfigProfiles(VADriverContextP ctx, VAProfile *list, int *n)
@@ -1138,16 +1634,15 @@ static VAStatus vr_QueryConfigProfiles(VADriverContextP ctx, VAProfile *list, in
 
 static VAStatus vr_QueryConfigEntrypoints(VADriverContextP ctx, VAProfile p, VAEntrypoint *list, int *n)
 {
-	if (!profile_ok(DRV(ctx), p))
+	struct driver *d = DRV(ctx);
+	if (!profile_ok(d, p))
 		return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
-	list[0] = p == VAProfileNone ? VAEntrypointVideoProc : VAEntrypointVLD;
-	*n = 1;
+	*n = 0;
+	const VAEntrypoint all[] = { VAEntrypointVLD, VAEntrypointVideoProc, VAEntrypointEncSlice };
+	for (unsigned i = 0; i < 3; i++)
+		if (entrypoint_ok(d, p, all[i]))
+			list[(*n)++] = all[i];
 	return VA_STATUS_SUCCESS;
-}
-
-static VAEntrypoint entrypoint_of(VAProfile p)
-{
-	return p == VAProfileNone ? VAEntrypointVideoProc : VAEntrypointVLD;
 }
 
 static unsigned rt_format(VAProfile p)
@@ -1159,13 +1654,45 @@ static unsigned rt_format(VAProfile p)
 	return profile_10bit(p) ? VA_RT_FORMAT_YUV420_10 | VA_RT_FORMAT_YUV420 : VA_RT_FORMAT_YUV420;
 }
 
+// What the encoder offers. Rate control: constant and variable bitrate
+// (VideoToolbox's), and "constant QP" as a constant quality. Packed
+// headers: none (the encoder writes its own). One reference, no B-frames,
+// one slice a picture.
+static unsigned enc_attrib(VAProfile p, VAConfigAttribType t)
+{
+	switch (t) {
+	case VAConfigAttribRTFormat:
+		return profile_10bit(p) ? VA_RT_FORMAT_YUV420_10 : VA_RT_FORMAT_YUV420;
+	case VAConfigAttribRateControl:
+		return VA_RC_CBR | VA_RC_VBR | VA_RC_CQP;
+	case VAConfigAttribEncPackedHeaders:
+		return VA_ENC_PACKED_HEADER_NONE;
+	case VAConfigAttribEncMaxRefFrames:
+		return 1; // one in list 0, none in list 1
+	case VAConfigAttribEncMaxSlices:
+		return 1;
+	case VAConfigAttribEncQualityRange:
+		return 1;
+	case VAConfigAttribMaxPictureWidth:
+	case VAConfigAttribMaxPictureHeight:
+		return 4096;
+	default:
+		return VA_ATTRIB_NOT_SUPPORTED;
+	}
+}
+
 static VAStatus vr_GetConfigAttributes(VADriverContextP ctx, VAProfile p, VAEntrypoint e, VAConfigAttrib *a, int n)
 {
-	if (!profile_ok(DRV(ctx), p))
+	struct driver *d = DRV(ctx);
+	if (!profile_ok(d, p))
 		return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
-	if (e != entrypoint_of(p))
+	if (!entrypoint_ok(d, p, e))
 		return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
 	for (int i = 0; i < n; i++) {
+		if (e == VAEntrypointEncSlice) {
+			a[i].value = enc_attrib(p, a[i].type);
+			continue;
+		}
 		switch (a[i].type) {
 		case VAConfigAttribRTFormat:
 			a[i].value = rt_format(p);
@@ -1186,19 +1713,31 @@ static VAStatus vr_CreateConfig(VADriverContextP ctx, VAProfile p, VAEntrypoint 
 	struct driver *d = DRV(ctx);
 	if (!profile_ok(d, p))
 		return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
-	if (e != entrypoint_of(p))
+	if (!entrypoint_ok(d, p, e))
 		return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
 	struct config *c = calloc(1, sizeof(*c));
 	if (!c)
 		return VA_STATUS_ERROR_ALLOCATION_FAILED;
 	c->profile = p;
 	c->entrypoint = e;
-	c->rt_format = rt_format(p);
-	for (int i = 0; i < n; i++)
+	c->rt_format = e == VAEntrypointEncSlice ? enc_attrib(p, VAConfigAttribRTFormat) : rt_format(p);
+	c->rc_mode = VA_RC_CBR;
+	for (int i = 0; i < n; i++) {
 		if (a[i].type == VAConfigAttribRTFormat && !(a[i].value & c->rt_format)) {
 			free(c);
 			return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
 		}
+		if (e == VAEntrypointEncSlice && a[i].type == VAConfigAttribRateControl) {
+			// One mode; a set of them (some players ask so) takes the
+			// first we have.
+			unsigned m = a[i].value & enc_attrib(p, VAConfigAttribRateControl);
+			if (!m) {
+				free(c);
+				return VA_STATUS_ERROR_INVALID_CONFIG;
+			}
+			c->rc_mode = m & VA_RC_CBR ? VA_RC_CBR : m & VA_RC_VBR ? VA_RC_VBR : VA_RC_CQP;
+		}
+	}
 	pthread_mutex_lock(&d->lock);
 	*id = new_obj(d, OBJ_CONFIG, c);
 	pthread_mutex_unlock(&d->lock);
@@ -1229,6 +1768,13 @@ static VAStatus vr_QueryConfigAttributes(VADriverContextP ctx, VAConfigID id, VA
 		a[0].type = VAConfigAttribRTFormat;
 		a[0].value = c->rt_format;
 		*n = 1;
+		if (c->entrypoint == VAEntrypointEncSlice) {
+			a[1].type = VAConfigAttribRateControl;
+			a[1].value = c->rc_mode;
+			a[2].type = VAConfigAttribEncPackedHeaders;
+			a[2].value = VA_ENC_PACKED_HEADER_NONE;
+			*n = 3;
+		}
 	}
 	pthread_mutex_unlock(&d->lock);
 	return c ? VA_STATUS_SUCCESS : VA_STATUS_ERROR_INVALID_CONFIG;
@@ -1642,13 +2188,23 @@ static VAStatus vr_CreateContext(VADriverContextP ctx, VAConfigID cfg, int w, in
 	c->profile = conf->profile;
 	c->p010 = profile_10bit(conf->profile);
 	c->vpp = conf->profile == VAProfileNone;
+	c->enc = conf->entrypoint == VAEntrypointEncSlice;
+	c->rc_mode = conf->rc_mode;
 	c->width = (unsigned)w;
 	c->height = (unsigned)h;
 	c->fd = -1;
 	c->target = VA_INVALID_ID;
+	c->coded_buf = VA_INVALID_ID;
+	if (c->enc) {
+		// Until the sequence parameters say otherwise: the context's size,
+		// 30 frames a second, 2 Mbit/s.
+		c->want = (struct enc_params){ .visible_w = (unsigned)w, .visible_h = (unsigned)h, .bitrate = 2000000, .fps_num = 30, .fps_den = 1, .qp = 26 };
+		// 10-bit frames for Main 10, whatever the config's RT format.
+		c->p010 = conf->rt_format == VA_RT_FORMAT_YUV420_10;
+	}
 	*id = new_obj(d, OBJ_CONTEXT, c);
 	pthread_mutex_unlock(&d->lock);
-	dbg("context %u: profile %d, %dx%d", *id, conf->profile, w, h);
+	dbg("context %u: profile %d, %s, %dx%d", *id, conf->profile, c->enc ? "encoding" : "decoding", w, h);
 	return VA_STATUS_SUCCESS;
 }
 
@@ -1665,6 +2221,12 @@ static VAStatus vr_DestroyContext(VADriverContextP ctx, VAContextID id)
 					s->pending = false;
 					s->ctx = NULL;
 				}
+				if (s->enc_ctx == c)
+					s->enc_ctx = NULL;
+			} else if (d->objs[i].type == OBJ_BUFFER) {
+				struct buffer *b = d->objs[i].p;
+				if (b->enc_ctx == c)
+					b->enc_ctx = NULL;
 			}
 		}
 		v4l2_close(c);
@@ -1690,13 +2252,19 @@ static VAStatus vr_CreateBuffer(VADriverContextP ctx, VAContextID cid, VABufferT
 	b->type = type;
 	b->size = size;
 	b->num = num;
-	b->data = malloc((size_t)size * num + 1);
+	// A coded buffer maps as one segment, the bytes after it.
+	size_t head = type == VAEncCodedBufferType ? sizeof(VACodedBufferSegment) : 0;
+	b->data = malloc(head + (size_t)size * num + 1);
 	if (!b->data) {
 		free(b);
 		return VA_STATUS_ERROR_ALLOCATION_FAILED;
 	}
-	if (data)
+	if (head) {
+		VACodedBufferSegment seg = { .buf = b->data + head };
+		memcpy(b->data, &seg, sizeof(seg));
+	} else if (data) {
 		memcpy(b->data, data, (size_t)size * num);
+	}
 	pthread_mutex_lock(&d->lock);
 	*id = new_obj(d, OBJ_BUFFER, b);
 	pthread_mutex_unlock(&d->lock);
@@ -1722,8 +2290,24 @@ static VAStatus vr_MapBuffer(VADriverContextP ctx, VABufferID id, void **p)
 	struct driver *d = DRV(ctx);
 	pthread_mutex_lock(&d->lock);
 	struct buffer *b = get_obj(d, id, OBJ_BUFFER);
-	if (b)
+	if (b) {
+		// A coded buffer once its frame is coded.
+		if (b->type == VAEncCodedBufferType)
+			enc_wait(b->enc_ctx, b->enc_seq);
 		*p = b->data;
+	}
+	pthread_mutex_unlock(&d->lock);
+	return b ? VA_STATUS_SUCCESS : VA_STATUS_ERROR_INVALID_BUFFER;
+}
+
+static VAStatus vr_SyncBuffer(VADriverContextP ctx, VABufferID id, uint64_t timeout_ns)
+{
+	(void)timeout_ns;
+	struct driver *d = DRV(ctx);
+	pthread_mutex_lock(&d->lock);
+	struct buffer *b = get_obj(d, id, OBJ_BUFFER);
+	if (b && b->type == VAEncCodedBufferType)
+		enc_wait(b->enc_ctx, b->enc_seq);
 	pthread_mutex_unlock(&d->lock);
 	return b ? VA_STATUS_SUCCESS : VA_STATUS_ERROR_INVALID_BUFFER;
 }
@@ -1758,9 +2342,17 @@ static VAStatus vr_BeginPicture(VADriverContextP ctx, VAContextID cid, VASurface
 	pthread_mutex_lock(&d->lock);
 	struct context *c = get_obj(d, cid, OBJ_CONTEXT);
 	struct surface *s = get_obj(d, target, OBJ_SURFACE);
-	// Decoding writes our copy of a picture; video processing a BGRA buffer.
+	// Decoding writes our copy of a picture; video processing a BGRA
+	// buffer; encoding reads a picture.
 	if (c && s && (c->vpp ? !rgb_of(d, s) : !s->data))
 		s = NULL;
+	if (c && s && c->enc) {
+		c->target = target;
+		c->coded_buf = VA_INVALID_ID;
+		c->idr = false;
+		pthread_mutex_unlock(&d->lock);
+		return VA_STATUS_SUCCESS;
+	}
 	if (c && s) {
 		// The surface may still be on its way from an earlier picture.
 		if (s->pending && s->ctx)
@@ -2515,6 +3107,10 @@ static VAStatus vr_RenderPicture(VADriverContextP ctx, VAContextID cid, VABuffer
 			st = VA_STATUS_ERROR_INVALID_BUFFER;
 			break;
 		}
+		if (c->enc) {
+			st = enc_render(c, b);
+			continue;
+		}
 		switch (b->type) {
 		case VAProcPipelineParameterBufferType: {
 			if (!c->vpp || b->size < sizeof(VAProcPipelineParameterBuffer)) {
@@ -2601,6 +3197,9 @@ static VAStatus vr_EndPicture(VADriverContextP ctx, VAContextID cid)
 		struct surface *s = get_obj(d, c->target, OBJ_SURFACE);
 		st = s ? vpp_run(d, c, s) : VA_STATUS_ERROR_INVALID_SURFACE;
 		c->have_vpp = false;
+	} else if (c && c->enc) {
+		struct surface *s = get_obj(d, c->target, OBJ_SURFACE);
+		st = s && s->data ? enc_submit(d, c, s) : VA_STATUS_ERROR_INVALID_SURFACE;
 	} else if (c) {
 		struct surface *s = get_obj(d, c->target, OBJ_SURFACE);
 		c->au_len = 0;
@@ -2633,6 +3232,9 @@ static VAStatus vr_SyncSurface(VADriverContextP ctx, VASurfaceID id)
 	struct surface *s = get_obj(d, id, OBJ_SURFACE);
 	if (s && picture_of(d, s))
 		wait_surface(d, picture_of(d, s));
+	// A frame being encoded from it: until it is coded.
+	if (s && s->enc_ctx)
+		enc_wait(s->enc_ctx, s->enc_seq);
 	pthread_mutex_unlock(&d->lock);
 	return s ? VA_STATUS_SUCCESS : VA_STATUS_ERROR_INVALID_SURFACE;
 }
@@ -2646,8 +3248,12 @@ static VAStatus vr_QuerySurfaceStatus(VADriverContextP ctx, VASurfaceID id, VASu
 		s = picture_of(d, s);
 	if (s) {
 		if (s->pending && s->ctx)
-			pump(s->ctx, 0);
-		*status = s->pending ? VASurfaceRendering : VASurfaceReady;
+			pump(s->ctx, 0, false);
+		bool encoding = s->enc_ctx && s->enc_ctx->enc_done < s->enc_seq;
+		if (encoding)
+			enc_pump(s->enc_ctx, 0, false);
+		encoding = s->enc_ctx && s->enc_ctx->enc_done < s->enc_seq;
+		*status = s->pending || encoding ? VASurfaceRendering : VASurfaceReady;
 	}
 	pthread_mutex_unlock(&d->lock);
 	return s ? VA_STATUS_SUCCESS : VA_STATUS_ERROR_INVALID_SURFACE;
@@ -3314,7 +3920,7 @@ VAStatus INIT_NAME(VA_MAJOR_VERSION, VA_MINOR_VERSION)(VADriverContextP ctx)
 		return VA_STATUS_ERROR_ALLOCATION_FAILED;
 	pthread_mutex_init(&d->lock, NULL);
 	if (!find_device(d)) {
-		dbg("no vroom video decoder (is video_decode on, and the virtio-media driver installed?)");
+		dbg("no vroom video decoder or encoder (is video_decode or video_encode on, and the virtio-media driver installed?)");
 		pthread_mutex_destroy(&d->lock);
 		free(d);
 		return VA_STATUS_ERROR_UNKNOWN;
@@ -3385,6 +3991,9 @@ VAStatus INIT_NAME(VA_MAJOR_VERSION, VA_MINOR_VERSION)(VADriverContextP ctx)
 	vt->vaLockSurface = (void *)vr_Unimplemented;
 	vt->vaUnlockSurface = (void *)vr_Unimplemented;
 	vt->vaExportSurfaceHandle = vr_ExportSurfaceHandle;
-	dbg("ready (%s)", d->video);
+#if VA_CHECK_VERSION(1, 9, 0)
+	vt->vaSyncBuffer = vr_SyncBuffer;
+#endif
+	dbg("ready (decoder %s, encoder %s)", d->video[0] ? d->video : "none", d->enc_video[0] ? d->enc_video : "none");
 	return VA_STATUS_SUCCESS;
 }

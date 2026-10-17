@@ -778,6 +778,11 @@ pub struct Display {
     /// with the virtio-media driver. Off by default for now.
     #[serde(default)]
     pub video_decode: bool,
+    /// Hardware video encoding: a V4L2 encoder in the guest (H.264, HEVC)
+    /// backed by VideoToolbox, in a helper process of its own. For video
+    /// calls and recording. Off by default for now.
+    #[serde(default)]
+    pub video_encode: bool,
     /// Guest monitors, 1 to [`MAX_MONITORS`]: the app shows each in a
     /// window of its own. Linux guests get one GPU with that many
     /// outputs; Windows guests one GPU per monitor (its drivers drive one
@@ -815,7 +820,7 @@ fn default_h() -> u32 {
 
 impl Default for Display {
     fn default() -> Self {
-        Display { gpu: Gpu::None, width: default_w(), height: default_h(), hidpi: true, opengl: true, opengl_host: OpenglHost::Apple, video_decode: false, monitors: 1 }
+        Display { gpu: Gpu::None, width: default_w(), height: default_h(), hidpi: true, opengl: true, opengl_host: OpenglHost::Apple, video_decode: false, video_encode: false, monitors: 1 }
     }
 }
 

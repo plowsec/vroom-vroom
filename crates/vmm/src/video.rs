@@ -1,7 +1,9 @@
-//! Hardware video decoding: the virtio-media decoder's helper process
-//! (`vroom video-helper`, sandboxed: VideoToolbox and nothing else) and
-//! the shared memory window the decoder's buffers live in, which the
-//! helper maps too: it writes pictures straight into the guest's buffers.
+//! Hardware video decoding and encoding: the helper process of a
+//! virtio-media decoder or encoder (`vroom video-helper`, sandboxed:
+//! VideoToolbox and nothing else) and the shared memory window the
+//! device's buffers live in, which the helper maps too: it writes
+//! pictures (or coded frames) straight into the guest's buffers, and an
+//! encoder's reads raw frames from there.
 
 use std::collections::VecDeque;
 use std::os::fd::OwnedFd;
@@ -14,7 +16,7 @@ use std::time::Duration;
 use vroom_hv::Vm;
 use vroom_memory::{GuestAddress, GuestMemory};
 use vroom_video::proto::{FromHelper, ToHelper};
-use vroom_virtio::devices::media::{HelperLink, WindowPlacer, WINDOW};
+use vroom_virtio::devices::media::{HelperLink, Role, WindowPlacer, WINDOW};
 use vroom_virtio::worker::Poker;
 
 use crate::{Error, Result};
@@ -38,9 +40,10 @@ impl std::fmt::Debug for Helper {
 }
 
 impl Helper {
-    /// Start the helper, hand it the buffer window `window` (shared
-    /// memory) and wait for what it decodes: the helper and its codecs.
-    pub fn spawn(window: &GuestMemory) -> Result<(Arc<Helper>, u32)> {
+    /// Start the helper (a decoder's, or an encoder's), hand it the
+    /// buffer window `window` (shared memory) and wait for what it
+    /// decodes or encodes: the helper and its codecs.
+    pub fn spawn(window: &GuestMemory, role: Role) -> Result<(Arc<Helper>, u32)> {
         let exe = std::env::current_exe().map_err(|e| Error::Setup(format!("video: {e}")))?;
         let (fds, _) = window.shared_fds().ok_or_else(|| Error::Setup("video: the buffer window isn't shared memory".into()))?;
         let &[(window_fd, _)] = fds.as_slice() else { return Err(Error::Setup("video: buffer window".into())) };
@@ -50,14 +53,19 @@ impl Helper {
         for s in [&ours, &theirs] {
             socket_buffers(s);
         }
-        let child = command(&exe)?
-            .arg("video-helper")
+        let encode = role == Role::Encoder;
+        let mut cmd = command(&exe, encode)?;
+        cmd.arg("video-helper");
+        if encode {
+            cmd.arg("--encode");
+        }
+        let child = cmd
             .stdin(Stdio::from(OwnedFd::from(theirs)))
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()
             .map_err(|e| Error::Setup(format!("video helper: {e}")))?;
-        log::info!("video: helper {}", child.id());
+        log::info!("video: {} helper {}", if encode { "encoder" } else { "decoder" }, child.id());
         crate::note_helper(child.id());
         // A helper that stops reading (hung in VideoToolbox) must not
         // hang the device: writes give up, and the helper counts as gone.
@@ -73,7 +81,7 @@ impl Helper {
             Err(e) => return Err(Error::Setup(format!("video helper: {e}"))),
         };
         ours.set_read_timeout(None)?;
-        log::info!("video: the Mac decodes {codecs:#x}");
+        log::info!("video: the Mac {} {codecs:#x}", if encode { "encodes" } else { "decodes" });
         let h = Arc::new(Helper {
             sock: Mutex::new(ours),
             rx: Mutex::new(VecDeque::new()),
@@ -161,16 +169,17 @@ fn socket_buffers(s: &UnixStream) {
     }
 }
 
-fn command(exe: &std::path::Path) -> Result<Command> {
+fn command(exe: &std::path::Path, encode: bool) -> Result<Command> {
     #[cfg(target_os = "macos")]
     {
-        let prof = vroom_sandbox::video_profile(exe).map_err(|e| Error::Setup(format!("video sandbox: {e}")))?;
+        let prof = vroom_sandbox::video_profile(exe, encode).map_err(|e| Error::Setup(format!("video sandbox: {e}")))?;
         let mut c = Command::new("/usr/bin/sandbox-exec");
         c.arg("-p").arg(prof).arg(exe);
         Ok(c)
     }
     #[cfg(not(target_os = "macos"))]
     {
+        let _ = encode;
         Ok(Command::new(exe))
     }
 }

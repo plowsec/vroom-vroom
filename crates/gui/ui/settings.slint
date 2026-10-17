@@ -517,6 +517,17 @@ export component SettingsPanel inherits Rectangle {
                         }
                     }
                     Row {
+                        label: "Hardware video encoding";
+                        tip: "Linux guests: H.264 and HEVC encoded by your Mac's hardware, for video calls and recording. The guest needs a driver (see the guide).";
+                        key: "display.video_encode";
+                        Toggle {
+                            y: (parent.height - self.height) / 2;
+                            checked: root.s.video-encode;
+                            enabled: !root.lk;
+                            toggled(v) => { Bus.set("video_encode", v ? "true" : "false"); }
+                        }
+                    }
+                    Row {
                         label: "Starting size";
                         tip: "The guest's screen when it starts. It follows the window after that.";
                         key: "display.width, height";

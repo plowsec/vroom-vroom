@@ -18,6 +18,14 @@
 //! it filled; the VMM checks that against its own list and drops
 //! pictures of an older epoch. So the helper writes only where the VMM
 //! said, and holds at most [`MAX_HELD`] pictures per session.
+//!
+//! An encoder helper (`vroom video-helper --encode`, a process of its
+//! own for the guest's encoder device) speaks the same protocol the other
+//! way round: [`ToHelper::Encode`] names a raw frame in the window, which
+//! the helper reads (and says when it has: [`FromHelper::Consumed`]);
+//! grants are guest buffers for the coded frames, which come back as
+//! [`FromHelper::Coded`]. Its [`FromHelper::Caps`] are the codecs it
+//! encodes.
 
 use std::io::{self, Read, Write};
 
@@ -39,6 +47,149 @@ pub const OPEN_DECODE_ORDER: u8 = 1;
 
 const HDR: usize = 12;
 
+/// Most bits a second an encoder is asked for.
+pub const MAX_BITRATE: u32 = 400_000_000;
+/// Most frames a second.
+pub const MAX_FPS: u32 = 240;
+
+/// How an encoder spends its bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateControl {
+    /// Around [`EncConfig::bitrate`] on average, up to [`EncConfig::peak`].
+    Vbr,
+    /// [`EncConfig::bitrate`] as steadily as it can (calls).
+    Cbr,
+    /// A constant quality ([`EncConfig::quality`]), whatever that costs.
+    Quality,
+}
+
+impl RateControl {
+    pub fn to_u8(self) -> u8 {
+        match self {
+            RateControl::Vbr => 0,
+            RateControl::Cbr => 1,
+            RateControl::Quality => 2,
+        }
+    }
+
+    pub fn from_u8(v: u8) -> Option<RateControl> {
+        match v {
+            0 => Some(RateControl::Vbr),
+            1 => Some(RateControl::Cbr),
+            2 => Some(RateControl::Quality),
+            _ => None,
+        }
+    }
+}
+
+/// [`EncConfig::flags`]: real time (low latency: each frame out as soon
+/// as it is coded, rate control made for calls).
+pub const ENC_REALTIME: u8 = 1;
+/// [`EncConfig::flags`]: H.264 with CABAC (Main and High); else CAVLC.
+pub const ENC_CABAC: u8 = 2;
+
+/// H.264 profiles, as V4L2 numbers them (`V4L2_CID_MPEG_VIDEO_H264_PROFILE`).
+pub const H264_BASELINE: u8 = 0;
+pub const H264_CONSTRAINED_BASELINE: u8 = 1;
+pub const H264_MAIN: u8 = 2;
+pub const H264_HIGH: u8 = 4;
+/// HEVC profiles (`V4L2_CID_MPEG_VIDEO_HEVC_PROFILE`).
+pub const HEVC_MAIN: u8 = 0;
+pub const HEVC_MAIN10: u8 = 2;
+
+/// What an encoder session makes, and from what.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncConfig {
+    /// H.264 or HEVC.
+    pub codec: Codec,
+    /// The raw frames: NV12, or P010 (HEVC Main 10 only).
+    pub format: PixFmt,
+    /// How a raw frame lies in its guest buffer ([`Layout::for_frame`]).
+    pub layout: Layout,
+    /// The picture coded: the top left of each frame, even sizes.
+    pub visible: (u32, u32),
+    /// Frames a second: `fps.0 / fps.1`.
+    pub fps: (u32, u32),
+    pub rc: RateControl,
+    /// Bits a second.
+    pub bitrate: u32,
+    /// Most bits a second (VBR); 0: no limit of its own.
+    pub peak: u32,
+    /// 1 (smallest) to 100 (best), for [`RateControl::Quality`].
+    pub quality: u32,
+    /// Most frames from one key frame to the next; 0: no limit (key
+    /// frames first and when asked for).
+    pub gop: u32,
+    /// [`H264_MAIN`] and the others, or [`HEVC_MAIN`], [`HEVC_MAIN10`].
+    pub profile: u8,
+    /// The level as V4L2 numbers it (H.264: 0 is 1, 11 is 4.0, ...). A
+    /// hint: VideoToolbox picks one that fits.
+    pub level: u8,
+    /// [`ENC_REALTIME`], [`ENC_CABAC`].
+    pub flags: u8,
+}
+
+impl EncConfig {
+    const SIZE: usize = 48;
+
+    /// Within limits and consistent (one from the other side).
+    pub fn valid(&self) -> bool {
+        let (w, h) = self.visible;
+        let profile_ok = match self.codec {
+            Codec::H264 => matches!(self.profile, H264_BASELINE | H264_CONSTRAINED_BASELINE | H264_MAIN | H264_HIGH) && self.format == PixFmt::Nv12,
+            Codec::Hevc => (self.profile == HEVC_MAIN && self.format == PixFmt::Nv12) || self.profile == HEVC_MAIN10,
+            Codec::Vp9 | Codec::Av1 => false,
+        };
+        let (n, d) = (self.fps.0 as u64, self.fps.1 as u64);
+        profile_ok
+            && self.layout.valid_frame()
+            && (crate::MIN_SIDE..=self.layout.width).contains(&w)
+            && (crate::MIN_SIDE..=self.layout.height).contains(&h)
+            && w % 2 == 0
+            && h % 2 == 0
+            && n > 0
+            && d > 0
+            && n <= MAX_FPS as u64 * d
+            && d <= 1000 * n
+            && (1000..=MAX_BITRATE).contains(&self.bitrate)
+            && self.peak <= MAX_BITRATE
+            && (1..=100).contains(&self.quality)
+            && self.gop <= 1 << 20
+            && self.level <= 20
+            && self.flags & !(ENC_REALTIME | ENC_CABAC) == 0
+    }
+
+    fn encode(&self, v: &mut Vec<u8>) {
+        v.extend_from_slice(&[self.codec.to_u8(), self.format.to_u8(), self.rc.to_u8(), self.profile, self.level, self.flags, 0, 0]);
+        for x in [self.layout.width, self.layout.height, self.visible.0, self.visible.1, self.fps.0, self.fps.1, self.bitrate, self.peak, self.quality, self.gop] {
+            v.extend_from_slice(&x.to_le_bytes());
+        }
+    }
+
+    fn decode(b: &[u8]) -> Option<EncConfig> {
+        if b.len() != Self::SIZE || b[6..8] != [0, 0] {
+            return None;
+        }
+        let u = |i: usize| u32_at(b, 8 + 4 * i);
+        let c = EncConfig {
+            codec: Codec::from_u8(b[0])?,
+            format: PixFmt::from_u8(b[1])?,
+            rc: RateControl::from_u8(b[2])?,
+            profile: b[3],
+            level: b[4],
+            flags: b[5],
+            layout: Layout { width: u(0), height: u(1) },
+            visible: (u(2), u(3)),
+            fps: (u(4), u(5)),
+            bitrate: u(6),
+            peak: u(7),
+            quality: u(8),
+            gop: u(9),
+        };
+        c.valid().then_some(c)
+    }
+}
+
 /// VMM -> helper.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToHelper {
@@ -59,6 +210,13 @@ pub enum ToHelper {
     /// VM resumed), with the state a [`FromHelper::Resume`] gave: the
     /// stream goes on from its next key frame.
     Resume { session: u32, codec: Codec, flags: u8, state: Vec<u8> },
+    /// Encoder: set the session up, or change it. Rates (bitrate, frame
+    /// rate, quality, key frame interval) change from the next frame on;
+    /// anything else starts the stream again with a key frame.
+    Configure { session: u32, config: EncConfig },
+    /// Encoder: the raw frame at `offset` in the window, `len` bytes laid
+    /// out as the session's config says. `key`: make it a key frame.
+    Encode { session: u32, cookie: u32, offset: u32, len: u32, key: bool },
 }
 
 /// Helper -> VMM.
@@ -85,6 +243,10 @@ pub enum FromHelper {
     /// sequence header. Opaque to the VMM, which keeps the latest and
     /// saves it with a snapshot; a new helper parses it like a stream.
     Resume { session: u32, state: Vec<u8> },
+    /// Encoder: the grant at `offset` now holds the coded frame (Annex B)
+    /// of raw frame `cookie`, `bytes` long. `ok` false: that frame failed
+    /// (or didn't fit), nothing was written.
+    Coded { session: u32, epoch: u32, cookie: u32, offset: u32, bytes: u32, key: bool, ok: bool },
 }
 
 mod kind {
@@ -95,6 +257,8 @@ mod kind {
     pub const FLUSH: u8 = 5;
     pub const CLOSE: u8 = 6;
     pub const RESUME: u8 = 7;
+    pub const CONFIGURE: u8 = 8;
+    pub const ENCODE: u8 = 9;
 
     pub const FORMAT: u8 = 0x81;
     pub const PICTURE: u8 = 0x82;
@@ -103,6 +267,7 @@ mod kind {
     pub const ERROR: u8 = 0x85;
     pub const CAPS: u8 = 0x86;
     pub const RESUMABLE: u8 = 0x87;
+    pub const CODED: u8 = 0x88;
 }
 
 fn header(kind: u8, session: u32, len: usize) -> Vec<u8> {
@@ -177,6 +342,19 @@ impl ToHelper {
                 v.extend_from_slice(state);
                 v
             }
+            ToHelper::Configure { session, config } => {
+                let mut v = header(kind::CONFIGURE, *session, EncConfig::SIZE);
+                config.encode(&mut v);
+                v
+            }
+            ToHelper::Encode { session, cookie, offset, len, key } => {
+                let mut v = header(kind::ENCODE, *session, 13);
+                for x in [cookie, offset, len] {
+                    v.extend_from_slice(&x.to_le_bytes());
+                }
+                v.push(*key as u8);
+                v
+            }
         }
     }
 
@@ -192,6 +370,8 @@ impl ToHelper {
             kind::GRANT => Some(13),
             kind::DRAIN | kind::FLUSH | kind::CLOSE => Some(0),
             kind::RESUME => Some(2 + MAX_RESUME),
+            kind::CONFIGURE => Some(EncConfig::SIZE),
+            kind::ENCODE => Some(13),
             _ => None,
         })?;
         let exact = |n: usize| if b.len() == n { Ok(()) } else { Err(bad("body size")) };
@@ -227,6 +407,15 @@ impl ToHelper {
             }
             kind::DRAIN => ToHelper::Drain { session },
             kind::FLUSH => ToHelper::Flush { session },
+            kind::CONFIGURE => ToHelper::Configure { session, config: EncConfig::decode(&b).ok_or_else(|| bad("encoder config"))? },
+            kind::ENCODE => {
+                exact(13)?;
+                let len = u32_at(&b, 8);
+                if len > crate::MAX_PICTURE || b[12] > 1 {
+                    return Err(bad("frame"));
+                }
+                ToHelper::Encode { session, cookie: u32_at(&b, 0), offset: u32_at(&b, 4), len, key: b[12] != 0 }
+            }
             _ => ToHelper::Close { session },
         })
     }
@@ -241,7 +430,8 @@ impl FromHelper {
             | FromHelper::Consumed { session, .. }
             | FromHelper::DrainDone { session }
             | FromHelper::Error { session, .. }
-            | FromHelper::Resume { session, .. } => *session,
+            | FromHelper::Resume { session, .. }
+            | FromHelper::Coded { session, .. } => *session,
         }
     }
 
@@ -284,6 +474,15 @@ impl FromHelper {
                 v.extend_from_slice(state);
                 v
             }
+            FromHelper::Coded { session, epoch, cookie, offset, bytes, key, ok } => {
+                let mut v = header(kind::CODED, *session, 18);
+                for x in [epoch, cookie, offset, bytes] {
+                    v.extend_from_slice(&x.to_le_bytes());
+                }
+                v.push(*key as u8);
+                v.push(*ok as u8);
+                v
+            }
         }
     }
 
@@ -303,6 +502,7 @@ impl FromHelper {
             kind::DRAIN_DONE => Some(0),
             kind::ERROR => Some(4),
             kind::RESUMABLE => Some(MAX_RESUME),
+            kind::CODED => Some(18),
             _ => None,
         })?;
         let exact = |n: usize| if b.len() == n { Ok(()) } else { Err(bad("body size")) };
@@ -338,6 +538,11 @@ impl FromHelper {
             }
             kind::DRAIN_DONE => FromHelper::DrainDone { session },
             kind::RESUMABLE => FromHelper::Resume { session, state: b },
+            kind::CODED => {
+                exact(18)?;
+                let (epoch, cookie, offset, bytes) = (u32_at(&b, 0), u32_at(&b, 4), u32_at(&b, 8), u32_at(&b, 12));
+                FromHelper::Coded { session, epoch, cookie, offset, bytes, key: b[16] != 0, ok: b[17] != 0 }
+            }
             _ => {
                 exact(4)?;
                 FromHelper::Error { session, errno: u32_at(&b, 0) }
@@ -361,6 +566,9 @@ mod tests {
             ToHelper::Flush { session: 0 },
             ToHelper::Close { session: 7 },
             ToHelper::Resume { session: 2, codec: Codec::Vp9, flags: 0, state: vec![0x82, 0x49] },
+            ToHelper::Configure { session: 1, config: config() },
+            ToHelper::Configure { session: 1, config: EncConfig { codec: Codec::Hevc, format: PixFmt::P010, profile: HEVC_MAIN10, ..config() } },
+            ToHelper::Encode { session: 3, cookie: 9, offset: 1 << 20, len: 1382400, key: true },
         ];
         for m in to {
             assert_eq!(ToHelper::read_from(&mut &m.encode()[..]).unwrap(), m);
@@ -373,10 +581,67 @@ mod tests {
             FromHelper::DrainDone { session: 1 },
             FromHelper::Error { session: 1, errno: 22 },
             FromHelper::Resume { session: 3, state: vec![0, 0, 1, 0x67] },
+            FromHelper::Coded { session: 2, epoch: 1, cookie: 9, offset: 64 << 10, bytes: 1234, key: true, ok: true },
         ];
         for m in from {
             assert_eq!(FromHelper::read_from(&mut &m.encode()[..]).unwrap(), m);
         }
+    }
+
+    fn config() -> EncConfig {
+        EncConfig {
+            codec: Codec::H264,
+            format: PixFmt::Nv12,
+            layout: Layout { width: 1280, height: 720 },
+            visible: (1280, 720),
+            fps: (30, 1),
+            rc: RateControl::Cbr,
+            bitrate: 2_000_000,
+            peak: 0,
+            quality: 50,
+            gop: 0,
+            profile: H264_CONSTRAINED_BASELINE,
+            level: 11,
+            flags: ENC_REALTIME,
+        }
+    }
+
+    #[test]
+    fn rejects_bad_encoder_configs() {
+        let bad = [
+            EncConfig { codec: Codec::Vp9, ..config() },
+            EncConfig { format: PixFmt::P010, ..config() },
+            EncConfig { codec: Codec::Hevc, profile: HEVC_MAIN, format: PixFmt::P010, ..config() },
+            EncConfig { profile: 3, ..config() },
+            EncConfig { visible: (1296, 720), ..config() },
+            EncConfig { visible: (1278, 721), ..config() },
+            EncConfig { visible: (0, 720), ..config() },
+            EncConfig { layout: Layout { width: 1281, height: 720 }, ..config() },
+            EncConfig { layout: Layout { width: 4096, height: 4096 }, visible: (4096, 4096), ..config() },
+            EncConfig { fps: (0, 1), ..config() },
+            EncConfig { fps: (241, 1), ..config() },
+            EncConfig { fps: (1, 1001), ..config() },
+            EncConfig { bitrate: 10, ..config() },
+            EncConfig { bitrate: MAX_BITRATE + 1, ..config() },
+            EncConfig { quality: 0, ..config() },
+            EncConfig { flags: 0x80, ..config() },
+        ];
+        for c in bad {
+            assert!(!c.valid(), "{c:?}");
+            let m = ToHelper::Configure { session: 0, config: c };
+            assert!(ToHelper::read_from(&mut &m.encode()[..]).is_err(), "{c:?}");
+        }
+        assert!(config().valid());
+        // Padding must be zero; a frame's key flag 0 or 1; a frame no
+        // bigger than a picture.
+        let mut m = ToHelper::Configure { session: 0, config: config() }.encode();
+        m[HDR + 6] = 1;
+        assert!(ToHelper::read_from(&mut &m[..]).is_err());
+        let mut m = ToHelper::Encode { session: 0, cookie: 1, offset: 0, len: 10, key: false }.encode();
+        *m.last_mut().unwrap() = 2;
+        assert!(ToHelper::read_from(&mut &m[..]).is_err());
+        let m = ToHelper::Encode { session: 0, cookie: 1, offset: 0, len: crate::MAX_PICTURE + 1, key: false }.encode();
+        assert!(ToHelper::read_from(&mut &m[..]).is_err());
     }
 
     #[test]

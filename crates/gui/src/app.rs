@@ -668,6 +668,7 @@ impl App {
             height: s(c.display.height.to_string()),
             hidpi: c.display.hidpi,
             video_decode: c.display.video_decode,
+            video_encode: c.display.video_encode,
             monitors: c.display.monitors as i32,
             disks: model(disks),
             nets: model(nets),

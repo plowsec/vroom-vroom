@@ -111,12 +111,39 @@ struct Grant {
 }
 
 /// The guest's buffer window, mapped from the VMM's shared memory.
-struct Window {
+pub(crate) struct Window {
     base: *mut u8,
     len: usize,
 }
 
 impl Window {
+    /// A window over our own memory (test modes).
+    pub(crate) fn of(room: &mut [u8]) -> Window {
+        Window { base: room.as_mut_ptr(), len: room.len() }
+    }
+
+    /// Where `len` bytes at `offset` are, if inside the window.
+    pub(crate) fn range(&self, offset: u32, len: u32) -> Option<*mut u8> {
+        let end = (offset as usize).checked_add(len as usize)?;
+        // SAFETY: offset is inside our mapping (end <= len).
+        #[allow(unsafe_code)]
+        (end <= self.len).then(|| unsafe { self.base.add(offset as usize) })
+    }
+
+    /// Copy `data` into the grant at `offset` (`len` bytes), if it lies in
+    /// the window and `data` fits. The bytes written, or None.
+    pub(crate) fn put(&self, offset: u32, len: u32, data: &[u8]) -> Option<u32> {
+        let dst = self.range(offset, len).filter(|_| data.len() <= len as usize)?;
+        // SAFETY: dst..dst+len is inside our mapping (checked by range),
+        // data.len() <= len; nothing in this process holds a reference
+        // into the window.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len())
+        };
+        Some(data.len() as u32)
+    }
+
     /// Write `image` into the grant, if it lies inside the window and is
     /// big enough. The picture's bytes, or None.
     fn write(&self, g: Grant, image: &Image, layout: Layout) -> Option<u32> {
@@ -526,6 +553,9 @@ impl Link {
 }
 
 pub fn helper(args: &[String]) -> Result<(), String> {
+    if args.iter().any(|a| a == "--encode") {
+        return crate::venc::helper(args);
+    }
     if let Some(i) = args.iter().position(|a| a == "--file") {
         let file = args.get(i + 1).ok_or("--file needs a path")?;
         let codec = match args.iter().position(|a| a == "--codec").and_then(|i| args.get(i + 1)).map(|s| s.as_str()) {
@@ -615,7 +645,7 @@ fn caps() -> u32 {
 
 /// The buffer window: the first thing on the socket is its shared memory
 /// object. Mapped once, for the helper's life.
-fn map_window(sock: &UnixStream) -> Result<Window, String> {
+pub(crate) fn map_window(sock: &UnixStream) -> Result<Window, String> {
     use std::os::fd::AsRawFd;
     let fd = vroom_ipc::recv_fd(sock).map_err(|e| format!("video window: {e}"))?;
     #[allow(unsafe_code)]
@@ -684,6 +714,8 @@ fn handle(streams: &mut BTreeMap<u32, Stream>, link: &mut Link, m: ToHelper) {
             s.prime(&state);
             streams.insert(session, s);
         }
+        // An encoder's messages: not for us.
+        ToHelper::Configure { .. } | ToHelper::Encode { .. } => {}
     }
 }
 
