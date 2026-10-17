@@ -325,13 +325,21 @@ mod tests {
         assert!(!passed_on("NPT_D3D11_LIBRARY_PATH") && !passed_on("DYLD_INSERT_LIBRARIES") && !passed_on("HOME"));
     }
 
-    /// The server's side of the protocol, with `true` standing in for
-    /// the worker: refused contexts get `ok = 0` and no fd, good ones a
-    /// socket; bad framing ends the server.
+    /// The server's side of the protocol, with a script that sleeps
+    /// standing in for the worker: refused contexts get `ok = 0` and no
+    /// fd, good ones a socket; bad framing ends the server. (A worker that
+    /// exits at once, like `true`, is reaped before the next request on a
+    /// slow machine, and then the same id is no longer taken.)
     #[test]
     fn create_and_refuse() {
+        let dir = std::env::temp_dir().join(format!("vroom-gpu-server-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let worker = dir.join("worker");
+        std::fs::write(&worker, "#!/bin/sh\nexec /bin/sleep 60\n").unwrap();
+        std::fs::set_permissions(&worker, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
         let (mut client, server) = UnixStream::pair().unwrap();
-        let t = std::thread::spawn(move || serve(server, Path::new("/usr/bin/true")));
+        let w = worker.clone();
+        let t = std::thread::spawn(move || serve(server, &w));
         let create = |ctx: u32, capset: u32| {
             let mut b = ctx.to_ne_bytes().to_vec();
             b.extend(capset.to_ne_bytes());
@@ -372,5 +380,6 @@ mod tests {
         // A length the protocol never uses: the server stops.
         client.write_all(&1000u32.to_be_bytes()).unwrap();
         assert!(t.join().unwrap().is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
