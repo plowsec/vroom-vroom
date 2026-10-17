@@ -747,8 +747,10 @@ decoder lists only what this Mac decodes. Out: NV12 pictures, or P010 for
 It needs Google's virtio-media driver, which isn't in mainline Linux
 yet. `scripts/guest/install-virtio-media.sh` builds it in the guest with
 DKMS (so new kernels get it too): it downloads one pinned version, checks
-its SHA-256, and patches two small things (older kernels; a `poll()`
-answer GStreamer stops on). Run it as root in the guest (Debian or
+its SHA-256, and patches three small things (older kernels; a `poll()`
+answer GStreamer stops on; a race that could leave `poll()` asleep with
+a buffer free, which stalled GStreamer now and then: guests set up
+before October 17, 2026 should run the script again). Run it as root in the guest (Debian or
 Ubuntu; Ubuntu 24.04 is what we test):
 
 ```bash
@@ -842,8 +844,6 @@ Good to know:
 - FFmpeg 6.1's `v4l2m2m` decoders (Ubuntu 24.04) hang on a size change in
   the middle of a stream, drop pictures, and get timestamps wrong.
   GStreamer and VA-API players are fine.
-- Rarely, a GStreamer pipeline started right after the guest boots stops
-  with every buffer handed back to it (see the roadmap); start it again.
 - The decoding runs in `vroom video-helper`, a process of its own
   sandboxed to VideoToolbox (see [SECURITY.md](SECURITY.md#video-decoding)).
   If it dies, decoders in the guest fail (`EIO`) until the VM restarts;

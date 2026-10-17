@@ -158,10 +158,6 @@ A guest needs a driver and an API its players use. What exists:
   Mozilla's deb works.
 - **The guest drivers**: ship virtio-media (DKMS package) until it is
   upstream, and follow its upstreaming; package the VA-API driver.
-- **A V4L2 stall**: rarely, right after the guest boots, a GStreamer
-  pipeline stops: the device has handed every buffer back and has nothing
-  queued, both of GStreamer's threads wait in `poll()`. Seen before this
-  round's changes too. Probably the guest driver's `poll()`; not found yet.
 - **Fewer copies, the rest**: a picture now goes from VideoToolbox's
   buffer straight into the guest's (one copy; it crossed a socket and
   was copied again before). For Firefox the VA-API driver copies it into
