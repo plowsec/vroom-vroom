@@ -5562,6 +5562,7 @@ dependencies = [
  "vroom-proto",
  "vroom-sandbox",
  "vroom-state",
+ "vroom-tools",
  "vroom-usb",
 ]
 

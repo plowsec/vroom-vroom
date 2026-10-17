@@ -35,6 +35,8 @@ pub enum Msg {
     Toast { text: String, kind: i32, action: String },
     Refresh,
     Created(Result<PathBuf, String>, bool),
+    /// A ready-made VM being made: what it does now.
+    NewVmProgress(String),
     /// VMware import: percent done, then the result.
     ImportProgress(u32),
     Imported(Result<PathBuf, String>),

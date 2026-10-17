@@ -320,8 +320,10 @@ impl App {
                     Err(e) => self.toast(format!("Import failed: {e}"), 3),
                 }
             }
+            Msg::NewVmProgress(t) => self.ui.set_newvm_progress(s(t)),
             Msg::Created(r, start) => {
                 self.ui.set_newvm_creating(false);
+                self.ui.set_newvm_progress(s(""));
                 match r {
                     Ok(p) => {
                         self.ui.set_newvm_open(false);
@@ -1137,8 +1139,8 @@ impl App {
             "newvm.cancel" => self.ui.set_newvm_open(false),
             "newvm.pick" => {
                 let windows = self.ui.get_draft().os_index == 1;
-                let mut d = rfd::FileDialog::new().set_title(if windows { "Install stick image" } else { "Installer ISO" });
-                d = if windows { d.add_filter("Disk image", &["raw", "img"]) } else { d.add_filter("ISO image", &["iso", "img"]) };
+                let mut d = rfd::FileDialog::new().set_title(if windows { "Windows 11 ARM64 ISO" } else { "Installer ISO or cloud image" });
+                d = if windows { d.add_filter("ISO or install stick", &["iso", "raw", "img"]) } else { d.add_filter("ISO or cloud image", &["iso", "img"]) };
                 if let Some(p) = d.pick_file() {
                     self.set_installer(Some(p));
                 }
@@ -1684,6 +1686,17 @@ impl App {
         self.installer = installer;
         self.ui.set_newvm_error(s(""));
         self.ui.set_newvm_creating(false);
+        self.ui.set_newvm_progress(s(""));
+        // Ready-made VMs: the Mac user's name, their SSH keys.
+        let keys = ssh_keys();
+        self.ui.set_newvm_keys(model(keys.iter().map(|p| s(paths::tilde(p))).collect()));
+        let mut d = self.ui.get_draft();
+        if d.user.is_empty() {
+            d.user = s(std::env::var("USER").unwrap_or_default().to_ascii_lowercase());
+        }
+        d.ssh_key = 0;
+        d.ssh = false;
+        self.ui.set_draft(d);
         self.newvm_set("os", &os_index(os).to_string());
         self.ui.set_newvm_open(true);
     }
@@ -1691,11 +1704,16 @@ impl App {
     fn newvm_set(&mut self, k: &str, v: &str) {
         match k {
             "installer" => return self.set_installer(Some(PathBuf::from(v))),
-            "start" => {
+            "start" | "ssh" | "desktop" => {
                 let mut d = self.ui.get_draft();
-                d.start = v == "true";
+                match k {
+                    "start" => d.start = v == "true",
+                    "ssh" => d.ssh = v == "true",
+                    _ => d.desktop = v == "true",
+                }
                 return self.ui.set_draft(d);
             }
+
             "os" => {}
             _ => return,
         }
@@ -1726,6 +1744,7 @@ impl App {
     fn set_installer(&mut self, p: Option<PathBuf>) {
         let mut d = self.ui.get_draft();
         d.installer = s(p.as_ref().map(|p| paths::tilde(p)).unwrap_or_default());
+        d.ready = ready_kind(GuestOs::ALL.get(d.os_index.max(0) as usize).copied().unwrap_or(GuestOs::Linux), p.as_deref()).is_some();
         self.installer = p;
         self.ui.set_draft(d.clone());
         self.ui.set_newvm_dest(s(format!("Goes in {}", paths::tilde(&paths::vms_dir().join(d.name.as_str())))));
@@ -1742,11 +1761,71 @@ impl App {
         }
         let os = GuestOs::ALL.get(d.os_index.max(0) as usize).copied().unwrap_or(GuestOs::Linux);
         let installer = self.installer.clone();
+        if d.ready {
+            return self.newvm_ready(&name, os, installer);
+        }
         let (cpus, mem, disk, gpu3d, start) = (d.cpus.max(1) as u32, d.memory_gib.max(1) as u64, d.disk_gib.max(1) as u64, d.gpu3d, d.start);
         self.ui.set_newvm_error(s(""));
         self.ui.set_newvm_creating(true);
         std::thread::spawn(move || {
             let r = create_vm(&name, os, installer.as_deref(), cpus, mem, disk, gpu3d);
+            msg::post(move || Msg::Created(r, start));
+        });
+    }
+
+    /// A ready-made VM (vroom_tools::ready), made off the UI thread.
+    fn newvm_ready(&mut self, name: &str, os: GuestOs, installer: Option<PathBuf>) {
+        use vroom_tools::ready::{Account, Spec};
+        let d = self.ui.get_draft();
+        let ssh_key = if d.ssh {
+            let keys = ssh_keys();
+            let Some(k) = keys.get(d.ssh_key.max(0) as usize) else {
+                return self.ui.set_newvm_error(s("No SSH key in ~/.ssh (make one: ssh-keygen -t ed25519)."));
+            };
+            match std::fs::read_to_string(k) {
+                Ok(t) => Some(t.trim().to_string()),
+                Err(e) => return self.ui.set_newvm_error(s(format!("{}: {e}", paths::tilde(k)))),
+            }
+        } else {
+            None
+        };
+        // Ports other VMs forward: SSH gets another one.
+        let taken_ports: Vec<u16> = self.vms.iter().filter_map(|v| v.raw.as_ref()).flat_map(|c| c.nets.iter().flat_map(|n| n.port_forwards.iter().map(|f| f.host_port))).collect();
+        let spec = Spec {
+            name: name.to_string(),
+            dir: paths::vms_dir().join(name),
+            cpus: d.cpus.max(1) as u32,
+            memory_mib: d.memory_gib.max(1) as u64 * 1024,
+            disk_gib: d.disk_gib.max(8) as u64,
+            gpu3d: d.gpu3d && os != GuestOs::Windows,
+            account: Account { user: d.user.trim().to_string(), password: d.password.to_string(), ssh_key },
+            taken_ports,
+        };
+        // Checked now, so mistakes show before a download.
+        if let Some(Err(e)) = ready_kind(os, installer.as_deref()).map(|k| vroom_tools::ready::check(&spec, &k)) {
+            return self.ui.set_newvm_error(s(e));
+        }
+        let (start, desktop) = (d.start, d.desktop);
+        self.ui.set_newvm_error(s(""));
+        self.ui.set_newvm_creating(true);
+        std::thread::spawn(move || {
+            let mut say = |t: &str| {
+                let t = t.to_string();
+                msg::post(move || Msg::NewVmProgress(t));
+            };
+            let r = (|| {
+                let kind = match ready_kind(os, installer.as_deref()) {
+                    Some(vroom_tools::ready::Kind::Ubuntu { image, .. }) if image.as_os_str().is_empty() => {
+                        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/tmp"));
+                        let image = vroom_tools::ready::ubuntu_image(&home.join("Library/Caches/vroom"), &mut say)?;
+                        vroom_tools::ready::Kind::Ubuntu { image, desktop }
+                    }
+                    Some(vroom_tools::ready::Kind::Ubuntu { image, .. }) => vroom_tools::ready::Kind::Ubuntu { image, desktop },
+                    Some(k) => k,
+                    None => return Err("not a ready-made VM".to_string()),
+                };
+                vroom_tools::ready::create(&spec, &kind, &mut say)
+            })();
             msg::post(move || Msg::Created(r, start));
         });
     }
@@ -1841,6 +1920,30 @@ impl App {
         }
         self.push_palette();
     }
+}
+
+/// What a ready-made VM is made from, if this is one: Ubuntu with no
+/// installer (the cloud image, downloaded: an empty path) or a cloud
+/// image (.img); Windows with its ISO.
+fn ready_kind(os: GuestOs, installer: Option<&Path>) -> Option<vroom_tools::ready::Kind> {
+    use vroom_tools::ready::Kind;
+    let ext = installer.and_then(|p| p.extension()).map(|e| e.to_string_lossy().to_ascii_lowercase());
+    match (os, ext.as_deref()) {
+        (GuestOs::Ubuntu, None) => Some(Kind::Ubuntu { image: PathBuf::new(), desktop: false }),
+        (GuestOs::Ubuntu, Some("img")) => Some(Kind::Ubuntu { image: installer?.to_path_buf(), desktop: false }),
+        (GuestOs::Windows, Some("iso")) => Some(Kind::Windows { iso: installer?.to_path_buf() }),
+        _ => None,
+    }
+}
+
+/// The Mac user's SSH public keys (~/.ssh/*.pub), ed25519 first.
+fn ssh_keys() -> Vec<PathBuf> {
+    let Some(home) = std::env::var_os("HOME") else { return Vec::new() };
+    let mut keys: Vec<PathBuf> = std::fs::read_dir(PathBuf::from(home).join(".ssh"))
+        .map(|rd| rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "pub")).collect())
+        .unwrap_or_default();
+    keys.sort_by_key(|p| (!p.to_string_lossy().contains("ed25519"), p.clone()));
+    keys
 }
 
 /// Identity changed by hand? Random serials (every new VM has them) don't count.

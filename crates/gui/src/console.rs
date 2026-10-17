@@ -35,6 +35,7 @@ use crate::{ConsoleWindow, MonitorWindow, VmState};
 mod usbmenu;
 mod coherence;
 mod netmenu;
+mod tools;
 
 pub use netmenu::{live_of as net_live_of, mode_text as net_mode_text, set_mode as net_set_mode, NetView};
 
@@ -300,6 +301,8 @@ pub struct Console {
     /// Files dragged out of the guest, to the Mac.
     out: Option<OutDrag>,
     out_timer: slint::Timer,
+    /// The guest tools button.
+    tools: tools::Tools,
 }
 
 /// Another monitor's window.
@@ -815,6 +818,7 @@ fn open(key: String, path: &Path, cfg: &VmConfig, ours: UnixStream, child: Optio
         coh: None,
         out: None,
         out_timer: slint::Timer::default(),
+        tools: tools::Tools::default(),
     };
     CONSOLES.with(|m| m.borrow_mut().insert(key.clone(), c));
     ensure_timer();
@@ -1193,12 +1197,17 @@ impl Console {
     }
 
     fn toast(&mut self, text: &str) {
+        self.toast_for(text, Duration::from_millis(3500));
+    }
+
+    /// A toast that stays `d` (something to read and do).
+    fn toast_for(&mut self, text: &str, d: Duration) {
         log::info!("{}: {text}", self.name);
         self.toast_id += 1;
         let id = self.toast_id;
         self.win.set_toast(text.into());
         let k = self.key.clone();
-        slint::Timer::single_shot(Duration::from_millis(3500), move || {
+        slint::Timer::single_shot(d, move || {
             with(&k, |c| {
                 if c.toast_id == id {
                     c.win.set_toast("".into());
@@ -1284,6 +1293,7 @@ impl Console {
                 self.net_command(c);
             }
             "coherence" => self.coherence_toggle(),
+            "tools" => self.tools_click(),
             "library" => msg::send(Msg::ShowLibrary(None)),
             "settings" => msg::send(Msg::ShowLibrary(Some(self.key.clone()))),
             _ => {}
@@ -1381,7 +1391,20 @@ impl Console {
                 self.toast("Snapshot saved");
                 msg::send(Msg::SnapshotTaken { key: self.key.clone() });
             }
-            _ if t.starts_with("guest agent connected") => self.toast("Guest tools connected: clipboard and resizing work"),
+            _ if t.starts_with("guest agent connected") => {
+                // "guest agent connected (vroom-agent 0.1.0+348.e314084680 linux)"
+                let agent = t.split_once('(').map(|(_, a)| a.trim_end_matches(')')).unwrap_or("").to_string();
+                let first = self.tools_agent_first();
+                self.tools_agent(&agent);
+                if first {
+                    self.toast("Guest tools connected: clipboard and resizing work");
+                }
+            }
+            _ if t.starts_with("guest tools update failed") => {
+                self.tools_failed();
+                self.toast(&t);
+            }
+            "guest tools: installing" => {}
             _ if t.starts_with("USB: ") => {
                 self.usb_refused();
                 self.toast(&t);
@@ -1464,6 +1487,7 @@ impl Console {
             e.win.set_paused(self.state == VmState::Paused);
         }
         self.cpu_meter(now);
+        self.tools_tick(now);
         self.usb_tick(now);
         self.net_tick(now);
         // State, size or the screen's place changed: the pointer may too.
