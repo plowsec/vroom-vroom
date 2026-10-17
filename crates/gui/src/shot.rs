@@ -7,7 +7,8 @@
 //! "cohclick:X,Y[,title]" a click on a Coherence window, "vmmove:X,Y"
 //! the mouse to a VM window's point, "shot:out.png" a
 //! picture now, "libshot:out.png" one of the library window, "barshot:out.png"
-//! one of the Coherence bar, "cohstart:Calculator" a name in its app field;
+//! one of the Coherence bar, "cohstart:Calculator" a name in its app field
+//! and Enter, "cohtype:calc" a name there without Enter (suggestions);
 //! "console:net-menu", "console:net.toggle.N" and "console:net.mode.N.M" work
 //! the network menu). `VROOM_SHOT_VM=1`: picture the VM window instead. Used
 //! for the README pictures and
@@ -89,6 +90,8 @@ fn run(acts: Vec<String>, i: usize, out: PathBuf, delay: f64) {
                 }
                 _ => eprintln!("shot: no window for monitor {n}"),
             }
+        } else if let Some(t) = a.strip_prefix("cohtype:") {
+            crate::console::coh_type_any(t);
         } else if let Some(n) = a.strip_prefix("cohstart:") {
             crate::console::coh_start_any(n);
         } else if let Some(p) = a.strip_prefix("barshot:") {

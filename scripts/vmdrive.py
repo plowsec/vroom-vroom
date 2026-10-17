@@ -13,7 +13,8 @@ Commands, one per line, on <state-dir>.cmd (a fifo):
   hresize N W H          monitor N's window size (0 0: closed)
   coherence 0|1          Coherence on/off (windows show as "windows N: ...")
   win ID activate|minimize|close | win ID move X Y W H
-  startapp NAME          start a guest app by name (icons show as "icon ID ...")
+  startapp NAME          start a guest app by name (icons show as "icon ID ...";
+                         the apps it can start as "apps N: ...")
   serial TEXT            to the serial console (\\n for Enter)
   drop X Y X2 Y2 PATH... drag files in at X,Y, move to X2,Y2, drop there
                          (what the app does when files come from Finder)
@@ -23,7 +24,12 @@ Commands, one per line, on <state-dir>.cmd (a fifo):
                          serial port)
   usbnetd ID [SERIAL]    the same through vroom-netd's root helper (what the
                          app does for a device a macOS driver holds)
-  usbdetach PORT         pull out the device on that port pair
+  usbdetach PORT         pull out the device on that port pair (64, 65: a
+                         USB disk's files)
+  usbdisk PATH [ro]      "Use as a disk": PATH (an image, or a /dev/rdiskN we
+                         may open) as a USB stick, as the app does
+  usbfiles DIR [ro]      "Share its files": DIR on a removable share, with
+                         the sandbox token the app would issue
   net N on|off           network adapter N (0, 1...): cable in or out
   netmode N nat [loopback] [block] [HOSTPORT:GUESTPORT...]
   netmode N bridged IFACE | netmode N host-only NAME
@@ -102,7 +108,8 @@ def reader():
                     f = []
                     for _ in range(3):
                         ln = struct.unpack("<H", pl[o:o + 2])[0]; f.append(pl[o + 2:o + 2 + ln].decode()); o += 2 + ln
-                    out.append(f"{port}:{f[0]}{'' if flags & 1 else '(away)'}{'(always)' if flags & 2 else ''}")
+                    how = ["", "(disk)", "(files)", "?"][(flags >> 2) & 3] + ("(ro)" if flags & 16 else "")
+                    out.append(f"{port}:{f[0]}{'' if flags & 1 else '(away)'}{'(always)' if flags & 2 else ''}{how}")
                 ev.write("usb " + " ".join(out) + "\n")
             elif t == 10:
                 ev.write(f"camera {pl[0]}\n")
@@ -130,6 +137,21 @@ def reader():
                 ev.write(f"icon {i:#x} {w}x{h} {png if w else 'none'}\n")
             elif t == 19:
                 ev.write(f"no coherence: {pl.decode(errors='replace')}\n")
+            elif t == 60:
+                # The apps the guest can start: names in the events, icons
+                # (with their names) in a folder next to the state.
+                n, o, out, icons = struct.unpack("<I", pl[:4])[0], 4, [], 0
+                d = f"{state}.apps"
+                os.makedirs(d, exist_ok=True)
+                for _ in range(n):
+                    ln = struct.unpack("<H", pl[o:o + 2])[0]; name = pl[o + 2:o + 2 + ln].decode(); o += 2 + ln
+                    w, h = struct.unpack("<HH", pl[o:o + 4]); o += 4
+                    if w:
+                        icons += 1
+                        write_png(os.path.join(d, "".join(c if c.isalnum() else "_" for c in name)[:60] + ".png"), w, h, pl[o:o + w * h * 4])
+                    o += w * h * 4
+                    out.append(name)
+                ev.write(f"apps {n} ({icons} icons in {d}): " + " | ".join(out) + "\n")
             elif t == 40:
                 n, o, out = pl[1], 2, []
                 for _ in range(n):
@@ -277,6 +299,28 @@ def usb_netd(id_, serial=""):
     _, fds, _, _ = socket.recv_fds(c, 16, 1)
     pl = b"".join(struct.pack("<H", len(x.encode())) + x.encode() for x in (id_, serial, "netd " + id_))
     socket.send_fds(a, [struct.pack("<BI", 12, len(pl)) + pl], [fds[0]]); os.close(fds[0])
+def usb_dev(name):
+    return b"".join(struct.pack("<H", len(x.encode())) + x.encode() for x in ("1209:00ab", "", name))
+def usb_disk(path, ro=""):
+    # "Use as a disk", as the app does once it has the disk open (a disk
+    # image, or a /dev/rdiskN we may open: hdiutil attach's are ours).
+    fd = os.open(path, os.O_RDONLY if ro else os.O_RDWR)
+    pl = bytes([1 if ro else 0]) + usb_dev("disk " + os.path.basename(path))
+    socket.send_fds(a, [struct.pack("<BI", 80, len(pl)) + pl], [fd]); os.close(fd)
+def usb_files(path, ro=""):
+    # "Share its files": the directory's fd and the sandbox token that
+    # lets the VMM in below it (macOS).
+    import ctypes
+    lib = ctypes.CDLL(None)
+    lib.sandbox_extension_issue_file.restype = ctypes.c_void_p
+    cls = b"org.vroom.usb-files.read" if ro else b"org.vroom.usb-files.read-write"
+    t = lib.sandbox_extension_issue_file(cls, os.path.realpath(path).encode(), 0)
+    token = ctypes.string_at(t) if t else b""
+    fd = os.open(path, os.O_RDONLY)
+    label = (os.path.basename(path.rstrip("/")) or "USB").encode()
+    pl = bytes([1 if ro else 0]) + usb_dev("files " + label.decode())
+    pl += struct.pack("<H", len(label)) + label + struct.pack("<H", len(token)) + token
+    socket.send_fds(a, [struct.pack("<BI", 81, len(pl)) + pl], [fd]); os.close(fd)
 def fetch(i, idx, into):
     r, w = socket.socketpair()
     socket.send_fds(a, [struct.pack("<BI", 17, 8) + u32s(i, idx)], [w.fileno()]); w.close()
@@ -433,6 +477,8 @@ if True:
                 elif c == "usb": usb_attach(*arg.split())
                 elif c == "usbnetd": usb_netd(*arg.split())
                 elif c == "usbdetach": send(13, bytes([int(arg)]))
+                elif c == "usbdisk": usb_disk(*arg.split())
+                elif c == "usbfiles": usb_files(*arg.split())
                 elif c == "net":
                     n, on = arg.split()
                     send(40, bytes([int(n), int(on == "on")]))

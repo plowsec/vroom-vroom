@@ -5362,6 +5362,8 @@ dependencies = [
  "env_logger",
  "libc",
  "log",
+ "png 0.17.16",
+ "roxmltree",
  "serde_json",
  "vroom-proto",
  "windows-sys 0.59.0",
@@ -5514,6 +5516,7 @@ dependencies = [
  "vroom-config",
  "vroom-display",
  "vroom-import",
+ "vroom-ipc",
  "vroom-net",
  "vroom-proto",
  "vroom-sandbox",
@@ -5610,6 +5613,7 @@ dependencies = [
  "libc",
  "log",
  "seccompiler",
+ "tempfile",
  "thiserror 2.0.21",
 ]
 
@@ -5645,6 +5649,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "log",
+ "tempfile",
 ]
 
 [[package]]
@@ -5688,6 +5693,7 @@ dependencies = [
  "vroom-config",
  "vroom-devices",
  "vroom-display",
+ "vroom-fs",
  "vroom-gpu3d",
  "vroom-hv",
  "vroom-ipc",

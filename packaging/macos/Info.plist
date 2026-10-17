@@ -37,6 +37,8 @@
     <true/>
     <key>NSCameraUsageDescription</key>
     <string>A VM with the camera turned on uses it as its webcam, only while its window is open and an app in the VM reads from it.</string>
+    <key>NSRemovableVolumesUsageDescription</key>
+    <string>A USB disk you connect to a VM is shared with it as files, or given to it as a whole disk, only when you choose so in the VM window's USB menu.</string>
     <key>NSMicrophoneUsageDescription</key>
     <string>A VM with the microphone turned on records from it, only while its window is open and an app in the VM records.</string>
     <!-- Files Finder can open with vroom. Alternate: we never take .toml

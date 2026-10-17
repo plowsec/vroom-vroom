@@ -30,7 +30,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use vroom_fs::{linux_errno, Share, Stat};
 use serde::{Deserialize, Serialize};
 
-use crate::worker::{QueueCtx, QueueHandler, WorkerSlot};
+use std::sync::{Arc, Mutex};
+
+use crate::worker::{Poker, QueueCtx, QueueHandler, WorkerSlot};
 use crate::{ActivateContext, DeviceState, Error, Result, VirtioDevice};
 
 pub const TYPE_FS: u32 = 26;
@@ -294,14 +296,27 @@ impl FuseServer {
     }
 
     fn reset(&mut self) {
+        self.forget_all();
+        self.inited = false;
+        self.windows = false;
+    }
+
+    /// Drop every node and handle: only the root is left.
+    fn forget_all(&mut self) {
         self.nodes.clear();
         self.by_path.clear();
         self.handles.clear();
         self.nodes.insert(ROOT, Node { path: Some(Vec::new()), lookups: 1 });
         self.by_path.insert(Vec::new(), ROOT);
         self.path_bytes = 0;
-        self.inited = false;
-        self.windows = false;
+    }
+
+    /// Serve another tree from now on (a removable share plugged in or
+    /// pulled out). The guest's mount stays; what it knew of the old
+    /// tree is gone (ENOENT, EBADF), and the old tree's files are closed.
+    pub fn swap(&mut self, share: Share) {
+        self.forget_all();
+        self.share = share;
     }
 
     fn path(&self, node: u64) -> std::result::Result<Vec<Vec<u8>>, i32> {
@@ -952,14 +967,70 @@ fn reply(unique: u64, res: Reply) -> Vec<u8> {
     o.0
 }
 
+/// The VMM's end of a removable share: what it plugs in and pulls out
+/// while the VM runs. The device has the same tag all along; only the
+/// tree behind it changes.
+#[derive(Clone, Default)]
+pub struct FsSlot(Arc<SlotInner>);
+
+#[derive(Default)]
+struct SlotInner {
+    /// The tree to serve next, until the worker takes it.
+    pending: Mutex<Option<Share>>,
+    /// Wakes the worker, while it runs.
+    poker: Mutex<Option<Poker>>,
+}
+
+impl std::fmt::Debug for FsSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FsSlot")
+    }
+}
+
+impl FsSlot {
+    /// Serve `share` from now on (`Share::empty()`: nothing). The worker
+    /// takes it right away, so the old tree's fds close now, not at the
+    /// guest's next request.
+    pub fn set(&self, share: Share) {
+        *self.0.pending.lock().unwrap_or_else(|e| e.into_inner()) = Some(share);
+        if let Some(p) = &*self.0.poker.lock().unwrap_or_else(|e| e.into_inner()) {
+            p.poke();
+        }
+    }
+
+    fn take(&self) -> Option<Share> {
+        self.0.pending.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+}
+
 #[derive(Debug)]
 pub struct FsHandler {
     /// Always Some while the worker runs; taken back on stop.
     server: Option<FuseServer>,
+    slot: Option<FsSlot>,
+}
+
+impl FsHandler {
+    fn swap_in(&mut self) {
+        if let (Some(share), Some(s)) = (self.slot.as_ref().and_then(FsSlot::take), self.server.as_mut()) {
+            s.swap(share);
+        }
+    }
 }
 
 impl QueueHandler for FsHandler {
+    fn attach(&mut self, poker: Poker) {
+        if let Some(s) = &self.slot {
+            *s.0.poker.lock().unwrap_or_else(|e| e.into_inner()) = Some(poker);
+        }
+    }
+
+    fn backend_ready(&mut self, _ctx: &mut QueueCtx, _token: usize) {
+        self.swap_in();
+    }
+
     fn process_queue(&mut self, ctx: &mut QueueCtx, q: usize) {
+        self.swap_in();
         loop {
             let chain = match ctx.queues[q].pop(&ctx.mem) {
                 Ok(Some(c)) => c,
@@ -991,11 +1062,13 @@ impl QueueHandler for FsHandler {
 /// The device. One request queue (plus the high-priority one).
 pub struct Fs {
     tag: String,
-    root: PathBuf,
+    /// None: a removable share (its tree comes through `slot`).
+    root: Option<PathBuf>,
     readonly: bool,
     /// Kept between activations: guest reboots re-INIT it.
     server: Option<FuseServer>,
     worker: WorkerSlot<FsHandler>,
+    slot: Option<FsSlot>,
 }
 
 impl std::fmt::Debug for Fs {
@@ -1004,27 +1077,55 @@ impl std::fmt::Debug for Fs {
     }
 }
 
+fn check_tag(tag: &str) -> Result<()> {
+    if tag.is_empty() || tag.len() > 36 {
+        return Err(Error::Device(format!("share tag {tag:?}: 1 to 36 bytes")));
+    }
+    Ok(())
+}
+
 impl Fs {
     /// `tag` is what the guest mounts (36 bytes max).
     pub fn new(tag: &str, root: PathBuf, readonly: bool) -> Result<Self> {
-        if tag.is_empty() || tag.len() > 36 {
-            return Err(Error::Device(format!("share tag {tag:?}: 1 to 36 bytes")));
-        }
+        check_tag(tag)?;
         let share = Share::open(&root, readonly).map_err(|e| Error::Device(format!("share {}: {e}", root.display())))?;
-        Ok(Fs { tag: tag.into(), root, readonly, server: Some(FuseServer::new(share)), worker: WorkerSlot::default() })
+        Ok(Fs { tag: tag.into(), root: Some(root), readonly, server: Some(FuseServer::new(share)), worker: WorkerSlot::default(), slot: None })
+    }
+
+    /// A share whose tree is plugged in and pulled out while the VM runs
+    /// (a USB disk's files): empty until the slot says otherwise. There
+    /// is no PCI hotplug, so the device is there from the start.
+    pub fn removable(tag: &str) -> Result<(Self, FsSlot)> {
+        check_tag(tag)?;
+        let slot = FsSlot::default();
+        let fs = Fs {
+            tag: tag.into(),
+            root: None,
+            readonly: true,
+            server: Some(FuseServer::new(Share::empty())),
+            worker: WorkerSlot::default(),
+            slot: Some(slot.clone()),
+        };
+        Ok((fs, slot))
     }
 
     fn take_server(&mut self) -> Result<FuseServer> {
-        if let Some(Some(s)) = self.worker.stop_with(|h| h.server.take()) {
-            return Ok(s);
+        let mut s = match self.worker.stop_with(|h| h.server.take()) {
+            Some(Some(s)) => s,
+            _ => match (self.server.take(), &self.root) {
+                (Some(s), _) => s,
+                (None, Some(root)) => FuseServer::new(Share::open(root, self.readonly).map_err(|e| Error::Device(e.to_string()))?),
+                (None, None) => FuseServer::new(Share::empty()),
+            },
+        };
+        if let Some(share) = self.slot.as_ref().and_then(FsSlot::take) {
+            s.swap(share);
         }
-        match self.server.take() {
-            Some(s) => Ok(s),
-            None => {
-                let share = Share::open(&self.root, self.readonly).map_err(|e| Error::Device(e.to_string()))?;
-                Ok(FuseServer::new(share))
-            }
-        }
+        Ok(s)
+    }
+
+    fn handler(&self, server: FuseServer) -> FsHandler {
+        FsHandler { server: Some(server), slot: self.slot.clone() }
     }
 }
 
@@ -1056,7 +1157,8 @@ impl VirtioDevice for Fs {
     }
     fn activate(&mut self, ctx: ActivateContext) -> Result<()> {
         let server = self.take_server()?;
-        self.worker.start(&self.name(), ctx, FsHandler { server: Some(server) }, false)
+        let h = self.handler(server);
+        self.worker.start(&self.name(), ctx, h, false)
     }
     fn queue_notify(&mut self, q: u16) {
         self.worker.notify(q);
@@ -1074,7 +1176,13 @@ impl VirtioDevice for Fs {
         self.worker.resume();
     }
     fn save_active(&mut self) -> Result<DeviceState> {
-        let snap = self.worker.with(|_, h| h.server.as_ref().map(|s| s.save())).flatten().unwrap_or_default();
+        let mut snap = self.worker.with(|_, h| h.server.as_ref().map(|s| s.save())).flatten().unwrap_or_default();
+        if self.slot.is_some() {
+            // A removable share comes back empty: what is plugged in now
+            // is gone after a resume (it may not be there any more).
+            snap.nodes.clear();
+            snap.files.clear();
+        }
         let data = serde_json::to_vec(&snap).map_err(|e| Error::Device(e.to_string()))?;
         Ok(DeviceState { queues: self.worker.queues(), data })
     }
@@ -1082,7 +1190,8 @@ impl VirtioDevice for Fs {
         let mut server = self.take_server()?;
         let snap: Snap = serde_json::from_slice(data).map_err(|e| Error::Device(e.to_string()))?;
         server.restore(snap);
-        self.worker.start(&self.name(), ctx, FsHandler { server: Some(server) }, true)
+        let h = self.handler(server);
+        self.worker.start(&self.name(), ctx, h, true)
     }
 }
 

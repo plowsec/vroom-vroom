@@ -89,6 +89,8 @@ struct Shared {
     icons: BTreeMap<u32, (u32, u32, Vec<u8>)>,
     /// Coherence can't work in the guest, and why.
     coh_no: Option<String>,
+    /// Coherence: the apps the guest can start, the latest list.
+    apps: Option<Vec<vroom_display::GuestApp>>,
     posted: bool,
 }
 
@@ -172,6 +174,7 @@ impl Shared {
                 self.icons.insert(id, (w, h, rgba));
             }
             ToViewer::CoherenceNo(why) => self.coh_no = Some(why),
+            ToViewer::Apps(list) => self.apps = Some(list),
             ToViewer::Closed => return false,
         }
         !std::mem::replace(&mut self.posted, true)
@@ -549,6 +552,17 @@ pub fn coh_start_any(name: &str) {
     let bar = CONSOLES.with(|c| c.borrow().values().find_map(|c| c.coh.as_ref().map(|h| h.bar.clone_strong())));
     if let Some(b) = bar {
         b.invoke_start_app(name.into());
+    }
+}
+
+/// Type text in the Coherence bar's app field, without Enter: its
+/// suggestions show (for `VROOM_SHOT`).
+pub fn coh_type_any(text: &str) {
+    let bar = CONSOLES.with(|c| c.borrow().values().find_map(|c| c.coh.as_ref().map(|h| h.bar.clone_strong())));
+    if let Some(b) = bar {
+        b.set_query(text.into());
+        b.set_pick(0);
+        b.invoke_typed(text.into());
     }
 }
 
@@ -1116,6 +1130,8 @@ fn ready(key: &str, fd: OwnedFd) {
 fn closed(key: &str) {
     usbmenu::forget(key);
     let Some(mut c) = CONSOLES.with(|m| m.borrow_mut().remove(key)) else { return };
+    // Disks the VM had go back to macOS.
+    c.usb_closed();
     c.save_thumb(None);
     c.coh_close();
     let _ = c.win.hide();
@@ -1177,6 +1193,7 @@ impl Console {
     }
 
     fn toast(&mut self, text: &str) {
+        log::info!("{}: {text}", self.name);
         self.toast_id += 1;
         let id = self.toast_id;
         self.win.set_toast(text.into());
@@ -1285,10 +1302,10 @@ impl Console {
             let f = (std::mem::take(&mut s.frame), std::mem::take(&mut s.full), s.damage.take());
             let t = (std::mem::take(&mut s.status), s.clipboard.take(), s.mic.take(), s.cursor.take(), std::mem::take(&mut s.drag));
             let c = (s.camera.take(), s.usb.take(), s.features.take(), s.windows.take());
-            let h = (std::mem::take(&mut s.icons), s.coh_no.take(), s.net.take());
+            let h = (std::mem::take(&mut s.icons), s.coh_no.take(), s.net.take(), s.apps.take());
             (f.0, f.1, f.2, t.0, t.1, t.2, t.3, t.4, c.0, c.1, c.2, c.3, h, heads)
         };
-        let (icons, coh_no, net) = icons_no_net;
+        let (icons, coh_no, net, apps) = icons_no_net;
         if let Some((nat_ok, ports)) = net {
             self.net_list(nat_ok, ports);
         }
@@ -1339,6 +1356,9 @@ impl Console {
         }
         if !icons.is_empty() {
             self.coh_icons(icons);
+        }
+        if let Some(list) = apps {
+            self.coh_apps(list);
         }
         if let Some(why) = coh_no {
             self.coh_no(&why);

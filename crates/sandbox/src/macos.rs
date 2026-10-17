@@ -9,6 +9,53 @@ use crate::{Error, Policy, Result};
 extern "C" {
     fn sandbox_init(profile: *const c_char, flags: u64, errorbuf: *mut *mut c_char) -> i32;
     fn sandbox_free_error(errorbuf: *mut c_char);
+    // Sandbox extensions (libsystem_sandbox; what Safari and WebKit hand
+    // their sandboxed processes a file with). Not in Apple's public
+    // headers, stable for years.
+    fn sandbox_extension_issue_file(class: *const c_char, path: *const c_char, flags: u32) -> *mut c_char;
+    fn sandbox_extension_consume(token: *const c_char) -> i64;
+    fn sandbox_extension_release(handle: i64) -> i32;
+}
+
+/// Extension classes for a USB disk's volume shared while the VM runs:
+/// the profile lets the VMM into a path only with a token of these.
+const EXT_READ: &str = "org.vroom.usb-files.read";
+const EXT_WRITE: &str = "org.vroom.usb-files.read-write";
+
+/// A token that lets a sandboxed VMM into `dir`'s subtree (and only
+/// with `write`, change it). Made by the app, which may read it.
+pub fn issue_extension(dir: &Path, write: bool) -> Result<String> {
+    let real = dir.canonicalize().map_err(|e| Error::Apply(format!("{}: {e}", dir.display())))?;
+    let path = CString::new(real.as_os_str().as_encoded_bytes()).map_err(|_| Error::Apply("NUL in path".into()))?;
+    let class = CString::new(if write { EXT_WRITE } else { EXT_READ }).map_err(|_| Error::Apply("class".into()))?;
+    // SAFETY: valid C strings; the result is malloc'ed (or NULL) and ours.
+    let t = unsafe { sandbox_extension_issue_file(class.as_ptr(), path.as_ptr(), 0) };
+    if t.is_null() {
+        return Err(Error::Apply(format!("no sandbox extension for {}: {}", real.display(), std::io::Error::last_os_error())));
+    }
+    // SAFETY: a NUL-terminated string from the call above, freed once.
+    let s = unsafe { CStr::from_ptr(t) }.to_string_lossy().into_owned();
+    // SAFETY: allocated with malloc by libsandbox.
+    unsafe { libc::free(t.cast()) };
+    Ok(s)
+}
+
+/// Take the access a token gives (in the sandboxed VMM). Returns a
+/// handle for `release_extension`.
+pub fn consume_extension(token: &str) -> Result<i64> {
+    let t = CString::new(token).map_err(|_| Error::Apply("NUL in token".into()))?;
+    // SAFETY: a valid C string; the kernel checks the token.
+    let h = unsafe { sandbox_extension_consume(t.as_ptr()) };
+    if h < 0 {
+        return Err(Error::Apply(format!("sandbox extension refused: {}", std::io::Error::last_os_error())));
+    }
+    Ok(h)
+}
+
+/// Give that access back.
+pub fn release_extension(handle: i64) {
+    // SAFETY: a handle consume_extension returned; a stale one is refused.
+    unsafe { sandbox_extension_release(handle) };
 }
 
 /// Quote a path for SBPL. Paths with quotes/backslashes are refused.
@@ -56,6 +103,18 @@ pub fn profile(p: &Policy) -> Result<String> {
         s += &format!(
             "(deny file-write-setugid file-write-owner file-write-acl file-write-flags file-write-xattr file-write-finderinfo (subpath {}))\n",
             q(d)?
+        );
+    }
+    if p.usb_storage {
+        // USB disks the app hands over while the VM runs. A raw disk
+        // comes as an fd: only its size and cache ioctls are needed, and
+        // nothing here can open a disk by name. A volume's files come
+        // with a token the app issued for that one directory.
+        s += "(allow file-ioctl (regex #\"^/dev/rdisk[0-9]+$\"))\n";
+        s += &format!("(allow file-read* (extension \"{EXT_READ}\"))\n");
+        s += &format!("(allow file-read* file-write* (extension \"{EXT_WRITE}\"))\n");
+        s += &format!(
+            "(deny file-write-setugid file-write-owner file-write-acl file-write-flags file-write-xattr file-write-finderinfo (extension \"{EXT_WRITE}\"))\n"
         );
     }
     if p.network_outbound {
@@ -322,5 +381,18 @@ mod tests {
         assert!(s.contains("network-outbound"));
         let bad = Policy { rw_files: vec!["/tmp/x\")) (allow default) ((\"".into()], ..Default::default() };
         assert!(profile(&bad).is_err());
+    }
+
+    #[test]
+    fn usb_storage_rules_and_tokens() {
+        assert!(!profile(&Policy::default()).unwrap().contains("rdisk"));
+        let s = profile(&Policy { usb_storage: true, ..Default::default() }).unwrap();
+        assert!(s.contains("(allow file-ioctl (regex #\"^/dev/rdisk[0-9]+$\"))"));
+        assert!(s.contains(&format!("(allow file-read* (extension \"{EXT_READ}\"))")));
+        let d = tempfile::tempdir().unwrap();
+        let t = issue_extension(d.path(), false).unwrap();
+        assert!(t.len() > 16, "{t}");
+        assert_ne!(t, issue_extension(d.path(), true).unwrap());
+        assert!(issue_extension(&d.path().join("nothing"), false).is_err());
     }
 }

@@ -26,7 +26,7 @@ use vroom_display::{GuestCursor, GuestWindow, SharedFb, ToVmm, WindowOp, POINTER
 use vroom_proto::win_flags;
 
 use super::{clean, with, Console, Io};
-use crate::{CohChip, CoherenceBar, CoherenceWindow, VmState};
+use crate::{CohApp, CohChip, CoherenceBar, CoherenceWindow, VmState};
 
 /// Most guest windows shown at once (front first; the rest wait).
 pub const MAX_SHOWN: usize = 24;
@@ -45,6 +45,8 @@ const QUIET: Duration = Duration::from_millis(400);
 const SCREENS_EVERY: Duration = Duration::from_secs(1);
 /// What of a window the user moves stays on the guest's screen (points).
 const KEEP: f64 = 40.0;
+/// Most apps the field suggests at once.
+const SUGGEST: usize = 3;
 
 /// A rectangle in Mac points: global, top left origin, y down (winit's
 /// logical coordinates on macOS).
@@ -154,6 +156,37 @@ fn icon_image(w: u32, h: u32, rgba: &[u8]) -> Option<slint::Image> {
         return None;
     }
     Some(slint::Image::from_rgba8(SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(rgba, w, h)))
+}
+
+/// The apps (indexes into `names`) that `q` may mean, best first, at
+/// most `n`: the whole name, then its start, the start of one of its
+/// words, then anywhere in it; a shorter name first.
+pub fn suggest(names: &[String], q: &str, n: usize) -> Vec<usize> {
+    let q = q.trim().to_lowercase();
+    if q.is_empty() {
+        return Vec::new();
+    }
+    let mut hits: Vec<(u8, usize, String, usize)> = names
+        .iter()
+        .enumerate()
+        .filter_map(|(i, name)| {
+            let l = name.to_lowercase();
+            let r = if l == q {
+                0
+            } else if l.starts_with(&q) {
+                1
+            } else if l.split(|c: char| !c.is_alphanumeric()).any(|w| !w.is_empty() && w.starts_with(&q)) {
+                2
+            } else if l.contains(&q) {
+                3
+            } else {
+                return None;
+            };
+            Some((r, l.chars().count(), l, i))
+        })
+        .collect();
+    hits.sort();
+    hits.into_iter().take(n).map(|h| h.3).collect()
 }
 
 /// The part of `w` on a `mode` screen, if it is worth a window.
@@ -362,6 +395,12 @@ pub struct Coherence {
     map: Option<Map>,
     pub(super) bar: CoherenceBar,
     chips: Rc<VecModel<CohChip>>,
+    /// The apps the guest can start (names checked by the protocol;
+    /// cleaned here), and the field's suggestions from them.
+    apps: Vec<(String, Option<slint::Image>)>,
+    suggestions: Rc<VecModel<CohApp>>,
+    /// What the field holds.
+    query: String,
     /// Chips in the order their windows first came.
     chip_order: Vec<u32>,
     wins: HashMap<u32, CohWin>,
@@ -517,6 +556,8 @@ impl Console {
             }
         };
         let chips = Rc::new(VecModel::<CohChip>::default());
+        let suggestions = Rc::new(VecModel::<CohApp>::default());
+        bar.set_suggestions(suggestions.clone().into());
         bar.set_vm_name(self.name.clone().into());
         bar.set_os(self.win.get_os());
         bar.set_chips(chips.clone().into());
@@ -542,6 +583,9 @@ impl Console {
             map: (self.mode != (0, 0)).then_some(Map { area, mode: self.mode }),
             bar,
             chips,
+            apps: Vec::new(),
+            suggestions,
+            query: String::new(),
             chip_order: Vec::new(),
             wins: HashMap::new(),
             list: Vec::new(),
@@ -634,6 +678,10 @@ impl Console {
             }
         });
         let k = self.key.clone();
+        bar.on_typed(move |text| {
+            with(&k, |c| c.coh_suggest(&text));
+        });
+        let k = self.key.clone();
         bar.on_exit(move || {
             let k = k.clone();
             slint::Timer::single_shot(Duration::ZERO, move || {
@@ -681,6 +729,40 @@ impl Console {
             };
         }
         self.coh_layout();
+    }
+
+    /// The apps the guest can start: the field suggests them.
+    pub(super) fn coh_apps(&mut self, list: Vec<vroom_display::GuestApp>) {
+        let Some(c) = self.coh.as_mut() else { return };
+        log::debug!("{}: coherence: {} apps to start", self.name, list.len());
+        c.apps = list
+            .into_iter()
+            .map(|a| {
+                let icon = icon_image(a.w, a.h, &a.rgba);
+                (title(&a.name), icon)
+            })
+            .filter(|(n, _)| !n.is_empty())
+            .collect();
+        let q = c.query.clone();
+        self.coh_suggest(&q);
+    }
+
+    /// What the field suggests for `text`.
+    fn coh_suggest(&mut self, text: &str) {
+        let Some(c) = self.coh.as_mut() else { return };
+        c.query = text.to_string();
+        let names: Vec<String> = c.apps.iter().map(|a| a.0.clone()).collect();
+        let picks: Vec<CohApp> = suggest(&names, text, SUGGEST)
+            .into_iter()
+            .map(|i| {
+                let (name, icon) = &c.apps[i];
+                CohApp { name: name.as_str().into(), has_icon: icon.is_some(), icon: icon.clone().unwrap_or_default() }
+            })
+            .collect();
+        c.suggestions.set_vec(picks);
+        if c.bar.get_pick() >= c.suggestions.row_count() as i32 {
+            c.bar.set_pick(0);
+        }
     }
 
     /// The guest says Coherence can't work there.
@@ -1070,6 +1152,26 @@ fn crop(fb: &SharedFb, fb_w: u32, g: GRect, p: GRect, out: &mut [u8]) {
         if let Some(px) = dst.get_mut(r * stride..r * stride + row) {
             super::xrgb_to_rgba(px);
         }
+    }
+}
+
+#[cfg(test)]
+mod suggest_tests {
+    use super::suggest;
+
+    #[test]
+    fn names_are_suggested_best_first() {
+        let names: Vec<String> = ["Notepad++", "Notepad", "Calculator", "Visual Studio Code", "Paint", "Paint 3D", "Snipping Tool"].iter().map(|s| s.to_string()).collect();
+        let s = |q: &str| suggest(&names, q, 3).into_iter().map(|i| names[i].as_str()).collect::<Vec<_>>();
+        assert_eq!(s("notepad"), ["Notepad", "Notepad++"]);
+        assert_eq!(s("Note"), ["Notepad", "Notepad++"]);
+        assert_eq!(s("paint"), ["Paint", "Paint 3D"]);
+        assert_eq!(s("code"), ["Visual Studio Code"]);
+        assert_eq!(s("tool"), ["Snipping Tool"]);
+        assert_eq!(s("a"), ["Paint", "Notepad", "Paint 3D"], "inside a name: shorter first");
+        assert_eq!(s("s"), ["Snipping Tool", "Visual Studio Code"], "a name's start before a word's");
+        assert!(s("").is_empty() && s("  ").is_empty() && s("zz").is_empty());
+        assert_eq!(suggest(&names, "p", 1).len(), 1);
     }
 }
 

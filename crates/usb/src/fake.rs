@@ -4,7 +4,7 @@
 //!   their stock ACM driver (`/dev/ttyACM0` on Linux).
 //! - `VROOM_USB_FAKE=audio`: a USB sound card (isochronous in and out).
 //!   Guests drive it with their stock USB audio driver.
-//! - `VROOM_USB_FAKE=disk`: a USB stick ([`crate::fake_disk`]).
+//! - `VROOM_USB_FAKE=disk`: a USB stick ([`crate::msd`]).
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -255,7 +255,7 @@ impl Opener for FakeOpener {
         let dev: Box<dyn Device> = match self.kind {
             FakeKind::Acm => Box::new(Acm::new(sink.clone(), self.vendor, self.product)),
             FakeKind::Audio => Box::new(Audio::new(sink.clone(), self.vendor, self.product, true)),
-            FakeKind::Disk { broken } => Box::new(crate::fake_disk::Disk::new(sink.clone(), self.vendor, self.product, broken)),
+            FakeKind::Disk { broken } => Box::new(crate::msd::Disk::new(sink.clone(), self.vendor, self.product, broken)),
         };
         let speed = if matches!(self.kind, FakeKind::Disk { .. }) { Speed::High } else { Speed::Full };
         Some((dev, speed, self.vendor, self.product))

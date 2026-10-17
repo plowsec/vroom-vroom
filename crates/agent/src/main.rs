@@ -8,6 +8,19 @@
 // Windows: a background app started at logon, no console window.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+// Matching names to apps is tested everywhere; only Windows and Linux
+// start them.
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+mod apps;
+#[cfg(windows)]
+mod apps_win;
+// Desktop entries: Linux only; the parsing is tested everywhere unix.
+#[cfg(any(target_os = "linux", all(test, unix)))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod apps_xdg;
+// Store app logos: Windows only; the parsing is tested everywhere.
+#[cfg(any(windows, test))]
+mod appx;
 mod clip;
 #[cfg(windows)]
 mod coh_win;
@@ -286,7 +299,7 @@ enum In {
 fn hello() -> Message {
     let mut features = features::CLIPBOARD_TEXT | features::TIME_SYNC | features::SHUTDOWN | features::SCALE | features::FILE_DROP;
     if cfg!(any(windows, target_os = "linux")) {
-        features |= features::DRAG_OUT | features::MONITORS;
+        features |= features::DRAG_OUT | features::MONITORS | features::USB_SHARES;
     }
     if cfg!(windows) {
         features |= features::GPU3D;
@@ -295,7 +308,7 @@ fn hello() -> Message {
         features |= features::COHERENCE;
     }
     if coherence::Coherence::starts_apps() {
-        features |= features::START_APP;
+        features |= features::START_APP | features::APP_LIST;
     }
     Message::Hello { features, agent: format!("vroom-agent {}", env!("CARGO_PKG_VERSION")) }
 }
@@ -311,6 +324,7 @@ fn handle(m: Message, system: bool, w: &mut dyn Write, clip: &mut dyn clip::Clip
         // suspended VM in a new process: introduce ourselves again.
         Message::Hello { agent, .. } => {
             log::info!("host: {agent}");
+            shares::usb_reset();
             w.write_all(&hello().encode())?;
         }
         Message::ClipboardText(t) => {
@@ -324,6 +338,7 @@ fn handle(m: Message, system: bool, w: &mut dyn Write, clip: &mut dyn clip::Clip
             }
         }
         Message::Shutdown { reboot } => sys::shutdown(reboot),
+        Message::UsbShare { tag, label, on } if system => shares::usb_share(&tag, &label, on),
         Message::SetResolution { width, height } => {
             scale::note_resolution(width, height);
             if let Err(e) = sys::set_resolution(width, height) {
@@ -363,6 +378,8 @@ fn handle(m: Message, system: bool, w: &mut dyn Write, clip: &mut dyn clip::Clip
         | Message::StartApp(_)
         | Message::WindowIcon { .. }
         | Message::CoherenceNo(_)
+        | Message::Apps(_)
+        | Message::UsbShare { .. }
         => {}
     }
     Ok(())

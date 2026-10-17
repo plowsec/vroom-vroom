@@ -28,6 +28,7 @@ vroom-proto.workspace = true
 vroom-display.workspace = true
 vroom-state.workspace = true
 vroom-usb.workspace = true
+vroom-fs.workspace = true
 vroom-video.workspace = true
 png = "0.17"
 

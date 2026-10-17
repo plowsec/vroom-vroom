@@ -54,6 +54,44 @@ pub struct Policy {
     /// Our helper processes: the only ones we may signal (Linux; macOS's
     /// profile allows no signals but to ourselves, and we cope).
     pub helper_pids: Vec<u32>,
+    /// USB disks handed over while the VM runs (macOS): ioctls on raw
+    /// disk fds we are given, and volumes we get a token for.
+    pub usb_storage: bool,
+}
+
+/// A token for the VMM: read (`write`: and change) `dir`'s subtree from
+/// its sandbox (macOS). Issued by the app.
+pub fn issue_extension(dir: &std::path::Path, write: bool) -> Result<String> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::issue_extension(dir, write)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (dir, write);
+        Err(Error::Unsupported)
+    }
+}
+
+/// Use a token from `issue_extension` (the VMM, sandboxed). The handle
+/// gives it back (`release_extension`).
+pub fn consume_extension(token: &str) -> Result<i64> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::consume_extension(token)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = token;
+        Err(Error::Unsupported)
+    }
+}
+
+pub fn release_extension(handle: i64) {
+    #[cfg(target_os = "macos")]
+    macos::release_extension(handle);
+    #[cfg(not(target_os = "macos"))]
+    let _ = handle;
 }
 
 /// The Seatbelt profile `apply` would install (macOS), for debugging.

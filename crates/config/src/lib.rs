@@ -100,7 +100,56 @@ pub struct Usb {
     /// A label for the app; the guest never sees it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// How a USB disk goes to the guest (other devices: always as the
+    /// device). "files" and "disk" are macOS only, and the app does them.
+    #[serde(default, skip_serializing_if = "UsbMode::is_device")]
+    pub mode: UsbMode,
+    /// "files" and "disk": the guest may read, not change.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub readonly: bool,
 }
+
+/// How a USB disk reaches the guest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UsbMode {
+    /// The USB device itself (passthrough). macOS 15.3 and later keep USB
+    /// disks from it without Full Disk Access.
+    #[default]
+    Device,
+    /// macOS keeps the disk mounted; its volumes are a shared folder.
+    Files,
+    /// Unmounted on the Mac; the guest gets the whole disk as a plain
+    /// USB stick (not the device itself).
+    Disk,
+}
+
+impl UsbMode {
+    pub fn is_device(&self) -> bool {
+        *self == UsbMode::Device
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            UsbMode::Device => "device",
+            UsbMode::Files => "files",
+            UsbMode::Disk => "disk",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<UsbMode> {
+        Some(match s {
+            "device" => UsbMode::Device,
+            "files" => UsbMode::Files,
+            "disk" => UsbMode::Disk,
+            _ => return None,
+        })
+    }
+}
+
+/// Tags of the shares a USB disk's files come through (`vroom-usb0`...):
+/// not for `[[share]]`.
+pub const USB_SHARE_PREFIX: &str = "vroom-usb";
 
 impl Usb {
     /// (vendor, product) from `id`.
@@ -981,6 +1030,9 @@ impl VmConfig {
             if self.shares[..i].iter().any(|o| o.tag == s.tag) {
                 return bad(format!("share tag {:?} used twice", s.tag));
             }
+            if s.tag.starts_with(USB_SHARE_PREFIX) {
+                return bad(format!("share tag {:?}: tags starting with {USB_SHARE_PREFIX} are for USB disks", s.tag));
+            }
         }
         if self.shares.len() > 8 {
             return bad("at most 8 shares".into());
@@ -1143,9 +1195,19 @@ mod tests {
             "[[usb]]\nid = \"1050:0407\"\nserial = \"\"\n",
             "[[usb]]\nid = \"1050:0407\"\nbus = 1\n",
             "[[usb]]\nid = \"1050:0407\"\n[[usb]]\nid = \"1050:0407\"\n",
+            "[[usb]]\nid = \"1050:0407\"\nmode = \"raw\"\n",
+            "[[share]]\npath = \"/tmp\"\ntag = \"vroom-usb0\"\n",
         ] {
             assert!(super::VmConfig::from_toml(&format!("{base}{bad}")).is_err(), "{bad}");
         }
+        // The mode: "device" unless set, and only written when it isn't.
+        assert_eq!(ok.usb[0].mode, super::UsbMode::Device);
+        let m = super::VmConfig::from_toml(&format!("{base}[[usb]]\nid = \"18a5:0302\"\nmode = \"files\"\nreadonly = true\n")).unwrap();
+        assert_eq!((m.usb[0].mode, m.usb[0].readonly), (super::UsbMode::Files, true));
+        let t = toml::to_string(&ok).unwrap();
+        assert!(!t.contains("mode") && !t.contains("readonly"), "{t}");
+        assert!(toml::to_string(&m).unwrap().contains("mode = \"files\""));
+        assert_eq!(super::UsbMode::parse("disk"), Some(super::UsbMode::Disk));
     }
 
     #[test]

@@ -41,6 +41,11 @@ pub mod features {
     /// The agent arranges several monitors (`SetLayout`), and on Windows
     /// moves the pointer over all of them (`Mouse`).
     pub const MONITORS: u64 = 512;
+    /// The agent lists the apps it can start (`Apps`), for the host to
+    /// suggest names as one types.
+    pub const APP_LIST: u64 = 1 << 16;
+    /// The agent mounts USB disks' files when they come (`UsbShare`).
+    pub const USB_SHARES: u64 = 1 << 20;
 }
 
 /// Most windows one `Windows` list may carry, and the longest title (bytes).
@@ -52,6 +57,22 @@ pub const COORD_MAX: i32 = 1 << 16;
 pub const ICON_MAX: u32 = 64;
 /// Longest app name `StartApp` carries, and longest reason in `CoherenceNo`.
 pub const START_MAX: usize = 256;
+
+/// Most apps one `Apps` list may carry.
+pub const APPS_MAX: usize = 512;
+/// Biggest icon in an `Apps` list, in pixels on a side (smaller than
+/// window icons: a list holds hundreds).
+pub const APP_ICON_MAX: u32 = 32;
+
+/// An app the guest can start (`Apps`): its name, as `StartApp` takes
+/// it, and its icon, `w` x `h` RGBA (0 x 0: none).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestApp {
+    pub name: String,
+    pub w: u32,
+    pub h: u32,
+    pub rgba: Vec<u8>,
+}
 
 /// One of the guest's top-level windows (Coherence).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,12 +223,33 @@ pub enum Message {
     /// `h` RGBA (not premultiplied), at most `ICON_MAX` on a side; 0 x 0:
     /// it has none. Sent when it changes.
     WindowIcon { id: u32, w: u32, h: u32, rgba: Vec<u8> },
-    /// Host -> guest: start the app with this name, as typing it in the
-    /// Start menu (Windows) would. Plain text, at most `START_MAX` bytes.
+    /// Host -> guest: start the installed app this name fits best (the
+    /// Start menu's, the desktop's menu's), never a command. Plain text,
+    /// at most `START_MAX` bytes.
     StartApp(String),
     /// Guest -> host: Coherence can't work in this session, and why
     /// ("a Wayland session"). Short plain text.
     CoherenceNo(String),
+    /// Guest -> host: the apps `StartApp` can start (Windows: the Start
+    /// menu's; Linux: the desktop's menu entries), sorted by name, at
+    /// most `APPS_MAX`. Sent when Coherence goes on and when it changes.
+    Apps(Vec<GuestApp>),
+    /// Host -> guest: a USB disk's files are on the removable share `tag`
+    /// now (`on`), or gone from it. `label`: the volume's name, for the
+    /// mount point (Linux: /media/vroom/<label>; Windows: a drive
+    /// letter). Checked with `usb_tag_ok` and `usb_label_ok`.
+    UsbShare { tag: String, label: String, on: bool },
+}
+
+/// Removable shares' tags: `vroom-usb` and a digit.
+pub fn usb_tag_ok(t: &str) -> bool {
+    t.strip_prefix("vroom-usb").is_some_and(|n| n.len() == 1 && n.as_bytes()[0].is_ascii_digit())
+}
+
+/// A volume name fit for a mount point: one short name, nothing a shell
+/// or Windows reads another way (`drop_name_ok`), and not hidden.
+pub fn usb_label_ok(l: &str) -> bool {
+    l.len() <= 64 && drop_name_ok(l) && !l.starts_with('.') && !l.starts_with('-')
 }
 
 /// Whether `s` is fit for `StartApp` / `CoherenceNo`: short, one line.
@@ -234,6 +276,51 @@ pub fn decode_icon(p: &[u8]) -> Option<(u32, u32, u32, Vec<u8>)> {
         return None;
     }
     Some((id, w, h, p[8..].to_vec()))
+}
+
+/// An app list as bytes: `count u32`, then for each `len u16 | name |
+/// w u16 | h u16 | rgba` (the agent and viewer protocols both carry it).
+pub fn encode_apps(list: &[GuestApp]) -> Vec<u8> {
+    let mut p = (list.len() as u32).to_le_bytes().to_vec();
+    for a in list {
+        p.extend_from_slice(&(a.name.len() as u16).to_le_bytes());
+        p.extend_from_slice(a.name.as_bytes());
+        p.extend_from_slice(&(a.w as u16).to_le_bytes());
+        p.extend_from_slice(&(a.h as u16).to_le_bytes());
+        p.extend_from_slice(&a.rgba);
+    }
+    p
+}
+
+/// The other way, checked: at most `APPS_MAX` apps, names `line_ok`
+/// takes, no name twice, icons of at most `APP_ICON_MAX` on a side (both
+/// 0 or neither) with exactly their pixels. None if anything is off.
+pub fn decode_apps(p: &[u8]) -> Option<Vec<GuestApp>> {
+    let u16_at = |o: usize| -> Option<u32> { Some(u16::from_le_bytes(p.get(o..o + 2)?.try_into().ok()?) as u32) };
+    let n = u32::from_le_bytes(p.get(0..4)?.try_into().ok()?) as usize;
+    if n > APPS_MAX {
+        return None;
+    }
+    let mut out: Vec<GuestApp> = Vec::with_capacity(n);
+    let mut names = std::collections::HashSet::new();
+    let mut o = 4;
+    for _ in 0..n {
+        let len = u16_at(o)? as usize;
+        let name = std::str::from_utf8(p.get(o + 2..o + 2 + len)?).ok()?;
+        if !line_ok(name) || !names.insert(name) {
+            return None;
+        }
+        o += 2 + len;
+        let (w, h) = (u16_at(o)?, u16_at(o + 2)?);
+        if w > APP_ICON_MAX || h > APP_ICON_MAX || (w == 0) != (h == 0) {
+            return None;
+        }
+        let px = (w * h * 4) as usize;
+        let rgba = p.get(o + 4..o + 4 + px)?.to_vec();
+        o += 4 + px;
+        out.push(GuestApp { name: name.to_string(), w, h, rgba });
+    }
+    (o == p.len()).then_some(out)
 }
 
 fn rect_ok(x: i32, y: i32, w: u32, h: u32) -> bool {
@@ -506,6 +593,10 @@ fn get_items(p: &[u8], min: usize) -> Result<Vec<(String, bool)>, Error> {
 const T_WINDOW_ICON: u8 = 28;
 const T_START_APP: u8 = 29;
 const T_COHERENCE_NO: u8 = 30;
+// Well above the others: other work adds types in the 30s.
+const T_APPS: u8 = 60;
+// Well above the others too.
+const T_USB_SHARE: u8 = 80;
 
 impl Message {
     pub fn encode(&self) -> Vec<u8> {
@@ -608,6 +699,13 @@ impl Message {
             Message::WindowIcon { id, w, h, rgba } => (T_WINDOW_ICON, encode_icon(*id, *w, *h, rgba)),
             Message::StartApp(s) => (T_START_APP, s.as_bytes().to_vec()),
             Message::CoherenceNo(s) => (T_COHERENCE_NO, s.as_bytes().to_vec()),
+            Message::Apps(list) => (T_APPS, encode_apps(list)),
+            Message::UsbShare { tag, label, on } => {
+                let mut p = vec![*on as u8, tag.len() as u8];
+                p.extend_from_slice(tag.as_bytes());
+                p.extend_from_slice(label.as_bytes());
+                (T_USB_SHARE, p)
+            }
         };
         let mut out = Vec::with_capacity(HDR + payload.len());
         out.extend_from_slice(&MAGIC);
@@ -711,8 +809,19 @@ impl Message {
                     Message::CoherenceNo(s.to_string())
                 }
             }
+            T_APPS => Message::Apps(decode_apps(p).ok_or(Error::Malformed)?),
+            T_USB_SHARE if p.len() >= 2 && p[0] <= 1 => {
+                let n = p[1] as usize;
+                let tag = std::str::from_utf8(p.get(2..2 + n).ok_or(Error::Malformed)?).map_err(|_| Error::Malformed)?;
+                let label = std::str::from_utf8(&p[2 + n..]).map_err(|_| Error::Malformed)?;
+                if !usb_tag_ok(tag) || !usb_label_ok(label) {
+                    return Err(Error::Malformed);
+                }
+                Message::UsbShare { tag: tag.into(), label: label.into(), on: p[0] != 0 }
+            }
             T_TIME | T_RES | T_SCALE | T_SHUTDOWN | T_PING | T_PONG | T_GPU3D | T_DRAG_READY | T_DRAG_CANCEL | T_DROP_ENTRY | T_DROP_DATA
-            | T_DROP_END | T_DROP_DONE | T_COHERENCE | T_WINDOW_DO | T_DRAG_OUT_QUERY | T_DRAG_OUT_GET | T_DRAG_OUT_END | T_DRAG_OUT_FAIL | T_LAYOUT | T_MOUSE => {
+            | T_DROP_END | T_DROP_DONE | T_COHERENCE | T_WINDOW_DO | T_DRAG_OUT_QUERY | T_DRAG_OUT_GET | T_DRAG_OUT_END | T_DRAG_OUT_FAIL | T_LAYOUT | T_MOUSE
+            | T_USB_SHARE => {
                 return Err(Error::Malformed)
             }
             t => return Err(Error::Type(t)),
@@ -825,7 +934,46 @@ mod tests {
             Message::WindowIcon { id: 9, w: 0, h: 0, rgba: Vec::new() },
             Message::StartApp("Notepad".into()),
             Message::CoherenceNo("a Wayland session".into()),
+            Message::Apps(Vec::new()),
+            Message::Apps(vec![
+                GuestApp { name: "Calculator".into(), w: 1, h: 2, rgba: vec![1, 2, 3, 4, 5, 6, 7, 8] },
+                GuestApp { name: "Éditeur de texte".into(), w: 0, h: 0, rgba: Vec::new() },
+            ]),
+            Message::UsbShare { tag: "vroom-usb0".into(), label: "TEST 1".into(), on: true },
+            Message::UsbShare { tag: "vroom-usb1".into(), label: "Clé".into(), on: false },
         ]
+    }
+
+    #[test]
+    fn usb_shares_are_checked() {
+        for (tag, label) in [("vroom-usb", "a"), ("vroom-usb10", "a"), ("home", "a"), ("vroom-usb0", ".."), ("vroom-usb0", "a/b"), ("vroom-usb0", ".hidden"), ("vroom-usb0", "-rf"), ("vroom-usb0", "")] {
+            let b = Message::UsbShare { tag: tag.into(), label: label.into(), on: true }.encode();
+            let mut d = Decoder::new(MAX_PAYLOAD);
+            d.push(&b);
+            assert!(d.next().is_err(), "{tag:?} {label:?}");
+        }
+    }
+
+    #[test]
+    fn app_lists_are_checked() {
+        let a = |name: &str| GuestApp { name: name.into(), w: 0, h: 0, rgba: Vec::new() };
+        let bad = |list: Vec<GuestApp>| decode_apps(&encode_apps(&list)).is_none();
+        assert!(!bad(vec![a("a"), a("b")]));
+        assert!(bad(vec![a("a"), a("a")]), "same name twice");
+        assert!(bad(vec![a("")]));
+        assert!(bad(vec![a("a\nb")]));
+        assert!(bad(vec![a(&"x".repeat(START_MAX + 1))]));
+        assert!(bad((0..APPS_MAX + 1).map(|i| a(&i.to_string())).collect()), "too many");
+        let n = APP_ICON_MAX + 1;
+        assert!(bad(vec![GuestApp { w: n, h: 1, rgba: vec![0; n as usize * 4], ..a("a") }]), "icon too big");
+        assert!(bad(vec![GuestApp { w: 0, h: 1, rgba: Vec::new(), ..a("a") }]), "half empty");
+        assert!(bad(vec![GuestApp { w: 1, h: 1, rgba: vec![0; 3], ..a("a") }]), "short icon");
+        let mut p = encode_apps(&[a("a")]);
+        p.push(0);
+        assert!(decode_apps(&p).is_none(), "trailing bytes");
+        let mut p = encode_apps(&[a("a")]);
+        p[0] = 2;
+        assert!(decode_apps(&p).is_none(), "a count that lies");
     }
 
     #[test]

@@ -6,10 +6,15 @@ move to the docs (GUIDE, ARCHITECTURE) once they work.
 
 ## In progress
 
-- **Coherence, next steps** (see GUIDE.md): starting Linux apps by
-  name; Store app icons on Windows (from the package's logo); GNOME's
-  top bar (only an extension can hide it); Wayland sessions would need a
-  helper inside the compositor (a KWin script, a GNOME Shell extension).
+- **Less text in the app.** Many screens explain themselves in
+  sentences (Settings cards, the USB and network menus, the root helper,
+  locked fields, the library's empty states). Do one pass over every
+  screen: icons, state colors and short labels on screen, the
+  explanation in a tooltip. Only what the user must read to act (an
+  error, a choice) stays visible. Slint has no tooltip of its own: one
+  shared `Tip` component in `controls.slint` (a hover delay, follows the
+  theme), used everywhere. Starts once the USB disk choices land, as both
+  change the same screens.
 
 ## 3D: catching up with VMware and Parallels
 
@@ -211,18 +216,24 @@ A guest needs a driver and an API its players use. What exists:
   cards) not tried yet. The helper could tell the VMM why it gave up on
   a device, so the app shows it (today: the log only). A Developer ID
   signature would keep vroom-netd's permission across updates.
-- USB disks without passing the USB device: if Full Disk Access isn't
-  enough (macOS may want the `com.apple.vm.device-access` entitlement,
-  which only Apple grants), or for people who'd rather not give a root
-  helper that permission: unmount the disk on the Mac and hand the guest
-  the raw disk (`/dev/rdiskN`, opened by vroom-netd and passed to the VMM)
-  as an emulated USB stick or a hot-plugged disk. The guest sees a
-  plain disk, not the stick itself (no vendor tools), which is what most
-  people want from a USB disk anyway.
+- USB disks as files or as a disk, with a real stick from the app (only
+  disk images were tried here, and the folder of a volume): macOS's
+  "Removable Volumes" prompt for vroom.app, and `authopen` opening a
+  real `/dev/rdiskN` (its password prompt; whether macOS also wants
+  Full Disk Access for it is not known). A card reader with several
+  disks can only be passed as the device. Linux hosts: neither way yet
+  (the device can be passed there).
 - Things only a person at the Mac can try: bridged networking with real
   vmnet, a drag out of the guest to Finder, Mail or the Desktop with a
   real mouse, Coherence next to a window tiler, several monitors on
   several Mac screens.
+- Apple's `com.apple.vm.device-access` entitlement, for real USB
+  passthrough of devices macOS drivers hold (USB disks above all: macOS
+  15.3 and later refuses them to any program without Full Disk Access,
+  root included). It needs a paid Developer ID and Apple's approval of
+  the request; with it, the root helper isn't needed for USB at all.
+  Until then a USB disk can be shared as files or used as a disk (GUIDE,
+  "USB disks").
 - A signed, notarized vroom.app (`scripts/app.sh` builds it, signed ad
   hoc: needs a Developer ID and the hardened runtime), a disk image to
   install from, updates, crash reports.
@@ -260,3 +271,17 @@ A guest needs a driver and an API its players use. What exists:
   on a build from master 01a3d48. Not seen again: ten minutes on the
   next master with the old and new guest tools, resizes and Coherence.
   If it shows up again, the window's filler memory is the first suspect.
+
+- A flaky test: `gpu3d server::tests::create_and_refuse` failed once
+  in a full `cargo test --workspace` run (October 17), at the "same id
+  again" refusal; it passes on its own. Find the race.
+
+## Later
+
+vroom is for power users first. These wait until everything above is
+done.
+
+- **Coherence, next steps** (see GUIDE.md): Wayland sessions would need
+  a helper inside the compositor (a KWin script, or the GNOME Shell
+  extension the guest tools already install, which could report windows
+  too). Coherence works today for Windows and Linux on X11.

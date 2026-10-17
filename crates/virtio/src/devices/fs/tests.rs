@@ -112,6 +112,43 @@ impl T {
 }
 
 #[test]
+fn a_removable_share_swaps_trees() {
+    let mut t = T::new(true);
+    let sub = t.lookup(ROOT, "sub").unwrap();
+    let f = t.lookup(sub, "hello.txt").unwrap();
+    let fh = t.open(f, 0).unwrap();
+    // Pulled out: an empty directory; what the guest had is gone.
+    t.s.swap(Share::empty());
+    assert_eq!(t.dir_names(ROOT), vec![".", ".."]);
+    assert_eq!(t.lookup(ROOT, "sub"), Err(ENOENT));
+    assert_eq!(t.call(READ, 0, &le(&[&fh.to_le_bytes(), &0u64.to_le_bytes(), &8u32.to_le_bytes(), &[0; 20]])).0, -EBADF);
+    assert_eq!(t.call(GETATTR, f, &[0; 16]).0, -ENOENT);
+    let (e, _) = t.call(MKDIR, ROOT, &le(&[&0o755u32.to_le_bytes(), &0u32.to_le_bytes(), &name("x")]));
+    assert_eq!(e, -EROFS);
+    // Plugged in again (an fd opened elsewhere): the same mount sees it,
+    // without a new INIT.
+    let fd = std::os::fd::OwnedFd::from(File::open(&t.root).unwrap());
+    t.s.swap(Share::from_fd(fd, true).unwrap());
+    let sub = t.lookup(ROOT, "sub").unwrap();
+    let f = t.lookup(sub, "hello.txt").unwrap();
+    let fh = t.open(f, 0).unwrap();
+    assert_eq!(t.read(fh, 0, 5), b"hello");
+}
+
+#[test]
+fn the_slot_reaches_the_device() {
+    let (mut fs, slot) = Fs::removable("vroom-usb0").unwrap();
+    let td = tempfile::tempdir().unwrap();
+    std::fs::write(td.path().join("a"), b"x").unwrap();
+    slot.set(Share::from_fd(std::os::fd::OwnedFd::from(File::open(td.path()).unwrap()), true).unwrap());
+    // Not running: the next start takes it.
+    let s = fs.take_server().unwrap();
+    assert!(!s.share.is_empty());
+    assert!(fs.take_server().is_ok(), "again: an empty one");
+    assert!(Fs::removable("").is_err());
+}
+
+#[test]
 fn browse_and_read() {
     let mut t = T::new(true);
     assert_eq!(t.dir_names(ROOT), vec![".", "..", "escape", "sub"]);

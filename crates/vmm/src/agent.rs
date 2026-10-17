@@ -66,6 +66,8 @@ pub enum AgentCmd {
     StartApp(String),
     /// The pointer on the whole desktop (see `Message::Mouse`).
     Mouse { x: u16, y: u16, buttons: u8, wheel: i8 },
+    /// A USB disk's files came to the removable share `tag`, or left.
+    UsbShare { tag: String, label: String, on: bool },
     Stop,
 }
 
@@ -158,6 +160,8 @@ struct Service {
     /// should show something soon.
     revive: Option<Revive>,
     streams: u32,
+    /// USB disks' files on removable shares now: (tag, volume name).
+    usb_shares: Vec<(String, String)>,
 }
 
 /// A drag of files out of the guest (see `AgentCmd::DragOut`).
@@ -232,6 +236,7 @@ pub fn spawn(stream: UnixStream, policy: ClipPolicy, clip: Option<Box<dyn Clipbo
         dragout: None,
         streams: 0,
         revive: None,
+        usb_shares: Vec::new(),
     };
     std::thread::Builder::new().name("agent".into()).spawn(move || svc.run())?;
     Ok(Agent { tx, status })
@@ -349,6 +354,12 @@ impl Service {
                 // An agent that came back (guest reboot, new logon) while
                 // the window is in Coherence.
                 self.win_ids.clear();
+                // USB disks' files plugged in before it came.
+                if features & features::USB_SHARES != 0 {
+                    for (tag, label) in self.usb_shares.clone() {
+                        self.send(&Message::UsbShare { tag, label, on: true });
+                    }
+                }
                 if self.coherence && features & features::COHERENCE != 0 {
                     self.send(&Message::Coherence { on: true });
                 }
@@ -362,6 +373,9 @@ impl Service {
             Message::WindowIcon { id, w, h, rgba } if self.coherence && self.win_ids.contains(&id) => {
                 self.to_viewer(ToViewer::WindowIcon { id, w, h, rgba });
             }
+            // Checked by the decoder (count, names, icon sizes); the bar
+            // only suggests them.
+            Message::Apps(list) if self.coherence => self.to_viewer(ToViewer::Apps(list)),
             Message::CoherenceNo(why) if self.coherence => {
                 log::info!("guest: no coherence here: {why}");
                 self.to_viewer(ToViewer::CoherenceNo(why));
@@ -570,6 +584,15 @@ impl Service {
                 }
             }
             AgentCmd::Mouse { x, y, buttons, wheel } => self.send(&Message::Mouse { x, y, buttons, wheel }),
+            AgentCmd::UsbShare { tag, label, on } => {
+                self.usb_shares.retain(|(t, _)| *t != tag);
+                if on {
+                    self.usb_shares.push((tag.clone(), label.clone()));
+                }
+                if self.status().features & features::USB_SHARES != 0 {
+                    self.send(&Message::UsbShare { tag, label, on });
+                }
+            }
             AgentCmd::Drop { id, from } => {
                 let out = self.out.clone();
                 let r = std::thread::Builder::new().name("agent-drop".into()).spawn(move || forward_drop(id, from, &out));

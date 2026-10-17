@@ -18,6 +18,19 @@ if ls /usr/share/vulkan/icd.d/asahi_icd*.json >/dev/null 2>&1; then
   echo 'VK_LOADER_DRIVERS_DISABLE=*asahi*' > /etc/environment.d/90-vroom-vulkan.conf
   echo 'export VK_LOADER_DRIVERS_DISABLE="*asahi*"' > /etc/profile.d/vroom-vulkan.sh
 fi
+# GNOME: the extension that hides the top bar in Coherence (GNOME Shell
+# finds it at the next login; the agent turns it on and off).
+if command -v gnome-shell >/dev/null 2>&1 && [ -d gnome-shell ]; then
+  v=$(gnome-shell --version 2>/dev/null | sed -n 's/^GNOME Shell \([0-9]*\).*/\1/p')
+  d=/usr/share/gnome-shell/extensions/vroom-coherence@vroom
+  install -d $d
+  install -m 0644 gnome-shell/metadata.json $d/metadata.json
+  if [ -n "$v" ] && [ "$v" -lt 45 ]; then
+    install -m 0644 gnome-shell/extension-legacy.js $d/extension.js
+  else
+    install -m 0644 gnome-shell/extension.js $d/extension.js
+  fi
+fi
 systemctl daemon-reload
 systemctl enable --now vroom-agent
 echo "agent service running; the session helper starts at the next desktop login"

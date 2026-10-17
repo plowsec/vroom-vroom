@@ -599,7 +599,8 @@ impl App {
             .map(|u| {
                 let ids = u.ids();
                 let here = host_usb.iter().find(|d| Some((d.vendor, d.product)) == ids && (u.serial.is_none() || d.serial == u.serial));
-                let held = here.is_some_and(|d| !d.claimed_by.is_empty());
+                // A disk as files or as a disk needs no root: no warning.
+                let held = here.is_some_and(|d| !d.claimed_by.is_empty()) && u.mode == vroom_config::UsbMode::Device;
                 let state = match here {
                     None => "not plugged in".to_string(),
                     Some(d) if held => format!("held by {} (a VM can't take it without root)", d.claimed_by.join(", ")),
@@ -607,7 +608,14 @@ impl App {
                 };
                 let label = u.name.clone().or_else(|| here.map(|d| d.label())).unwrap_or_else(|| u.id.clone());
                 let serial = u.serial.as_ref().map(|sn| format!(" · serial {sn}")).unwrap_or_default();
-                UsbRow { label: s(label), note: s(format!("{}{serial} · {state}", u.id)), warn: held }
+                // Unplugged: what it was set to tells whether it is a disk.
+                let storage = cfg!(target_os = "macos") && (here.is_some_and(|d| d.is_storage()) || u.mode != vroom_config::UsbMode::Device);
+                let mode = match u.mode {
+                    vroom_config::UsbMode::Files => 0,
+                    vroom_config::UsbMode::Disk => 1,
+                    vroom_config::UsbMode::Device => 2,
+                };
+                UsbRow { label: s(label), note: s(format!("{}{serial} · {state}", u.id)), warn: held, storage, mode }
             })
             .collect();
         let usb_host: Vec<UsbHostRow> = self
@@ -1012,7 +1020,9 @@ impl App {
         // Not hardware: these apply to a running VM's window. Network
         // adapters apply to it too (or when it resumes).
         let net = key.strip_prefix("net.").and_then(|r| r.split('.').next()).and_then(|i| i.parse::<usize>().ok());
-        if locked && !key.starts_with("clip.") && key != "hidpi" && !(net.is_some() && self.live_ok()) {
+        // How a USB disk connects applies at its next connect.
+        let usb = key.starts_with("usb.") && self.live_ok();
+        if locked && !key.starts_with("clip.") && key != "hidpi" && !(net.is_some() && self.live_ok()) && !usb {
             return;
         }
         let iface = self.host_ifaces.first().cloned();

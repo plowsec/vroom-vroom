@@ -117,6 +117,8 @@ see [GUIDE.md](GUIDE.md#windows-guests).
 id = "1209:000a"                 # vendor:product, as `vroom usb list` shows it
 serial = "A1B2C3"                # optional: only this one of several alike
 name = "dev board"               # optional label for the app
+mode = "device"                  # a USB disk: "files", "disk" or "device"
+readonly = false                 # "files" and "disk": the guest can't change it
 ```
 
 | Key | Default | What it does |
@@ -124,6 +126,13 @@ name = "dev board"               # optional label for the app
 | `id` | required | `vendor:product`, 4 hex digits each. |
 | `serial` | none | Pick one device by its serial number. Without it, the first device with that `id` is taken. |
 | `name` | none | Shown in the app. The guest never sees it. |
+| `mode` | `"device"` | How a USB disk goes to the guest (macOS): `"files"` shares its volumes as a folder, `"disk"` gives the guest the whole disk as a plain USB stick, `"device"` passes the USB device itself. See [GUIDE.md](GUIDE.md#usb-disks). The app writes it when you tick "Remember for this device" or "Always connect to this VM". |
+| `readonly` | false | With `"files"` and `"disk"`: the guest may read, not change. |
+
+`"files"` and `"disk"` are done by the app: the VM file's entries with
+them connect when the app runs the VM (`vroom run` alone logs that it
+skips them). Share tags starting with `vroom-usb` are taken: they are the
+shares a USB disk's files come through.
 
 The VM takes the device when it starts and gives it back when it stops.
 Unplug it and plug it back in while the VM runs: the guest sees that too.
