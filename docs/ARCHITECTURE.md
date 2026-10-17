@@ -631,15 +631,33 @@ commands, virglrenderer's vrend replays them on macOS's OpenGL 4.1 (CGL),
 or with `opengl_host = "angle"` on OpenGL ES from ANGLE's Metal backend.
 Neptune: Windows' viogpu3d driver sends Direct3D 11 calls, virglrenderer
 (UTM's fork) replays them on DXMT, Direct3D on Metal. All capsets are
-offered; Mesa picks per API, Windows takes Neptune for Direct3D and
-virgl for OpenGL: our OpenGL driver for Windows (`vroom_gl.dll`, Mesa's
-virgl built for Windows with a winsys of ours, `third_party/mesa/`) makes
-a virgl context through viogpu3d's escapes and sends its command streams
-in D3DKMT render packets. Its resources are the driver's 3D allocations,
-which get the guest pages behind them to the host when they have a GPU
-address and are resident. Each frame is read back into the window's
-buffer and drawn with GDI, since Windows' compositor runs on Neptune and
-can't see vrend's textures. Venus and Neptune go
+offered; Mesa picks per API. Windows takes Neptune for Direct3D, Venus
+for Vulkan and for OpenGL through Zink, and virgl for OpenGL when there
+is no Vulkan. Our drivers for Windows come from one Mesa build
+(`third_party/mesa/`, `scripts/build-windows-gl.sh`):
+
+- `vroom_vk_*.dll`: Venus as a Vulkan driver of its own (D3DKMT, no
+  Direct3D runtime). viogpu3d runs in WDDM 2 mode (GpuMmu): render
+  packets carry no allocation lists, and a mappable blob's window in the
+  host-visible region is placed by the kernel driver, which maps it into
+  the process from its RES_INFO escape (D3DKMTLock would give staging
+  pages the host never sees). Maps and unmaps go by resource id. Command
+  streams go in D3DKMT render packets; fences are CPU events the kernel
+  driver signals when a packet is done.
+- `vroom_gl_*.dll`: Mesa's OpenGL with Zink on that Vulkan first, else
+  virgl with a winsys of ours: a virgl context through viogpu3d's escapes,
+  command streams in render packets, resources that are the driver's 3D
+  allocations (their guest pages go to the host when they have a GPU
+  address and are resident).
+
+Windows' compositor runs on Neptune and can't see Venus's or vrend's
+images, so frames come back to the guest and are drawn with GDI
+(Vulkan: Mesa's CPU swapchain; virgl: a read-back). When the 3D display
+device goes off (vroom does that before a save), the kernel driver drops
+the contexts and unmaps the windows. Our Venus driver then puts plain
+memory where a window was (an exception handler) and marks itself lost:
+waits end, submissions and presents fail with VK_ERROR_DEVICE_LOST, and
+Zink's OpenGL keeps running without drawing. Venus and Neptune go
 through virglrenderer's proxy to its render server: ours
 (`gpu3d/src/server.rs`, `vroom gpu-server`) starts one `vroom gpu-worker`
 per guest context, which runs that context with virglrenderer's own

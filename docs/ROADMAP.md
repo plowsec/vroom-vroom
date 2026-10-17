@@ -81,17 +81,30 @@ Linux guests, next:
 Windows guests:
 
 - **Direct3D 12**, the one most games since 2020 need. It is also the key
-  to the next two: Microsoft's "OpenCL, OpenGL and Vulkan Compatibility
-  Pack" runs OpenGL and Vulkan apps on top of Direct3D 12.
-- **OpenGL 4.3 and up** (VMware has 4.3; we have 4.1 through virgl,
-  see [GUIDE.md](GUIDE.md#opengl-in-windows-guests)): Zink over Venus, as
-  for Linux, from the same Mesa build. It needs Vulkan in the guest first.
-- **Vulkan apps**: the 3D driver package carries a Venus Vulkan driver,
-  but Windows' Vulkan loader doesn't load it (error 87: its manifest
-  names the DLL without a path).
-- **OpenGL without the copy**: frames go back to the guest and through
-  GDI. A texture both vrend and DXMT see (an IOSurface) would let the
-  compositor take them directly.
+  to Microsoft's "OpenCL, OpenGL and Vulkan Compatibility Pack", which
+  runs OpenGL and Vulkan apps on top of Direct3D 12 (we have our own
+  OpenGL 4.4 and Vulkan 1.3 now, see
+  [GUIDE.md](GUIDE.md#opengl-and-vulkan-in-windows-guests)).
+- **OpenGL and Vulkan without the copy**: frames go back to the guest and
+  through GDI. An image both the host's Vulkan (or vrend) and DXMT see (an
+  IOSurface) would let the compositor take them directly.
+- **Vulkan and OpenGL apps through a suspend**: the 3D display goes off
+  for the save, so they lose their GPU (Vulkan apps get a lost device).
+  Linux guests keep theirs (Venus snapshots). Windows would need the
+  Venus driver to reconnect after the 3D display comes back (new
+  context, same objects and mappings), and the host to restore the
+  context into it.
+- **Zink on real apps**: tried with our own tests only (a spinning cube
+  and triangle, compute shaders, Direct3D 11 at the same time). Blender
+  4.x, games and Qt apps not tried yet. Zink warns that MoltenVK lacks
+  logic ops and custom border colors.
+- **Explorer restarts on every suspend or snapshot**: when the 3D display
+  goes off, Explorer, the Start menu and the text input host crash in the
+  3D driver's Direct3D part (`neptune_umd_arm64.dll`, the same offset
+  each time; Explorer doesn't load our drivers) and Windows starts them
+  again. Ours to look at with UTM's driver.
+- **32-bit apps** get Microsoft's OpenGL 1.1 and no Vulkan: no x86
+  builds of our drivers yet.
 
 ## Hardware video decoding
 

@@ -798,7 +798,7 @@ What works and what doesn't (Windows 11 24H2, M3 Max):
   GPU without 3D (`gpu = "virtio2d"`) and the 3D one back when 3D is on
   again. Without the agent, or with only the 3D driver installed,
   `virtio2d` gets Windows' basic display (800x600, no resizing).
-- No Direct3D 12 and no Vulkan for Windows apps. OpenGL: next section.
+- No Direct3D 12. OpenGL and Vulkan: next section.
 - Suspend and snapshots work, a few seconds slower than without 3D.
   Direct3D's state lives on the Mac's GPU and can't be saved, so vroom
   first has the guest agent turn the 3D display device off, as in Device
@@ -813,50 +813,73 @@ What works and what doesn't (Windows 11 24H2, M3 Max):
 - DXMT keeps the Metal versions of the shaders it has converted in the
   VM's state folder (`shaders/`), so apps start faster the second time.
 
-## OpenGL in Windows guests
+## OpenGL and Vulkan in Windows guests
 
 ```bash
 brew install meson ninja bison llvm
 scripts/build-windows-gl.sh       # about 2 minutes
-scripts/make-windows-tools.sh     # puts it on the tools disk
+scripts/make-windows-tools.sh     # puts them on the tools disk
 ```
 
-The 3D driver above has no OpenGL of its own, so Windows apps only get
-Microsoft's software OpenGL 1.1. vroom brings an OpenGL driver: Mesa's
-OpenGL with its virgl driver, built for Windows, talking to the same 3D
-driver. The guest's OpenGL then runs in virglrenderer on the Mac's
-OpenGL, as for Linux guests. `vroom-setup.cmd` installs it in
-`C:\Program Files\Vroom`, and the agent registers it with the 3D display
-device (the screen goes black for a second, once).
+The 3D driver above has no working OpenGL or Vulkan of its own: Windows
+apps only get Microsoft's software OpenGL 1.1, and its Vulkan driver
+doesn't load (its manifest names the DLL without a path; Windows'
+Vulkan loader fails to open it, then fails every app). vroom brings
+both, built from Mesa for Windows and talking to the same 3D driver:
+
+- Vulkan: Mesa's Venus driver. The guest's Vulkan runs in
+  virglrenderer on MoltenVK, as for Linux guests.
+- OpenGL: Mesa's OpenGL on Zink, on that Vulkan. Without Vulkan (an
+  older host) it falls back to Mesa's virgl driver, which runs the
+  guest's OpenGL on the Mac's OpenGL 4.1.
+
+`vroom-setup.cmd` (or a guest tools update from the app) installs them
+in `C:\Program Files\Vroom`, and the agent registers them with the 3D
+display device (the screen goes black for a second, once). Its Vulkan
+manifests replace the 3D driver's broken one.
 
 Apps then see:
 
 ```
 GL_VENDOR   Mesa
-GL_RENDERER virgl (Apple M3 Max)
-GL_VERSION  4.1 (Compatibility Profile) Mesa 26.1.0-devel
-core profile: 4.1, GLSL 4.10, 154 extensions
+GL_RENDERER zink Vulkan 1.3(Virtio-GPU Venus (Apple M3 Max) (MOLTENVK))
+GL_VERSION  4.4 (Core Profile) Mesa 26.1.0-devel
+            4.4 (Compatibility Profile), GLSL 4.40
+            220 extensions (core), compute shaders, tessellation
+
+Vulkan      Virtio-GPU Venus (Apple M3 Max), Vulkan 1.3, 115 extensions
+            driver venus (Mesa 26.1.0-devel)
 ```
 
-- ARM64 and x64 apps both work: `vroom_gl.dll` is an ARM64X file that
-  sends each kind of process to its own build (`vroom_gl_arm64.dll`,
-  `vroom_gl_x64.dll`, the x64 one emulated like the app). 32-bit apps get
-  Microsoft's OpenGL 1.1.
+- ARM64 and x64 apps both work, the x64 ones emulated like the app.
+  OpenGL: `vroom_gl.dll` is an ARM64X file that sends each kind of
+  process to its own build (`vroom_gl_arm64.dll`, `vroom_gl_x64.dll`).
+  Vulkan: two drivers (`vroom_vk_arm64.dll`, `vroom_vk_x64.dll`) with a
+  manifest each; a process skips the one it can't load. 32-bit apps get
+  Microsoft's OpenGL 1.1 and no Vulkan.
 - Direct3D apps and the desktop go on as before, side by side with
-  OpenGL ones.
-- OpenGL 4.1, not VMware's 4.3: macOS's OpenGL stops at 4.1. Apps that
-  need 4.3 (Blender 4.x) don't start.
-- Each frame is read back from the Mac and drawn into the window with
-  GDI (the desktop compositor runs on Direct3D and can't see OpenGL's
-  textures). A small window runs at a few hundred frames per second
-  (about 220 at 624x441 for a spinning-gears test); big windows are
-  slower.
-- Like Direct3D apps, an OpenGL app loses its GPU when the VM suspends or
-  takes a snapshot (the 3D display goes off for the save): it keeps
-  running, its window keeps its last frame, and it draws again once you
-  start it again. Apps started after the save draw as usual.
-- `VROOM_GL_LOG=C:\path\gl.log` in an app's environment logs the
-  driver's errors there.
+  OpenGL and Vulkan ones.
+- OpenGL 4.4, more than VMware's 4.3. Zink tells apps two Vulkan
+  features MoltenVK lacks (logic ops, custom border colors): apps that
+  use those draw wrong. `GALLIUM_DRIVER=virgl` in an app's environment
+  gives it the virgl driver (OpenGL 4.1) instead.
+- Frames come back from the Mac and are drawn into the window with GDI
+  (the desktop compositor runs on Direct3D and can't see Vulkan's
+  images). Measured at 640x480 (M3 Max): a Vulkan spinning cube about
+  1000 frames per second; a spinning triangle in OpenGL 385 on Zink, 350
+  on virgl, without vsync (OpenGL apps wait for vsync by default: 60). A
+  compute shader over 1M values takes 5 to 10 ms in Vulkan, 16 ms in
+  OpenGL. Big windows are slower.
+- When the VM suspends or takes a snapshot, the 3D display goes off for
+  the save (see above) and these apps lose their GPU. A Vulkan app gets
+  VK_ERROR_DEVICE_LOST from its next call; most stop there, one that
+  makes a new device draws again once the VM runs. An OpenGL app keeps
+  running, so you can save your work, but its window stays blank (with
+  virgl: its last frame); it draws again once you start it again. Apps
+  started after the save draw as usual.
+- `VROOM_GL_LOG=C:\path\gl.log` in an app's environment logs the virgl
+  driver's errors there. Venus and Zink log to the app's console with
+  `MESA_LOG_LEVEL=debug` (and `VN_DEBUG=init` for Venus's start).
 
 ## Video decoding
 
