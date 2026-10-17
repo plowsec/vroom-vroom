@@ -22,6 +22,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use vroom_usb::list::{HostDevice, HostDisk};
 
@@ -152,22 +153,88 @@ pub fn unmount(bsd: &str) -> Result<(), String> {
     Err("macOS couldn't unmount it: a program still has files open on it. Close them (or eject it in Finder), then try again.".into())
 }
 
+/// What became of a disk given back to macOS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Back {
+    Mounted,
+    /// Partitions, but nothing macOS mounts (the guest made ext4, say).
+    Unreadable,
+    /// No partitions at all: the guest wiped it, or macOS didn't read
+    /// the disk again.
+    Blank,
+    /// Unplugged meanwhile.
+    Gone,
+}
+
+/// How long macOS gets to mount a disk given back.
+const BACK_FOR: Duration = Duration::from_secs(30);
+
 /// Have macOS mount the disk's volumes again (the VM let go of it).
-/// Retried for a few seconds: the VMM may still be closing it.
-pub fn remount(bsd: String) {
+///
+/// While a program has the raw disk open for writing, macOS takes its
+/// partitions away; when the last such program closes it, macOS reads
+/// the partition table again and mounts what it finds by itself (not a
+/// disk image attached with `-nomount`). So we wait for a volume to
+/// show up, and ask for the mount (`mountDisk`) every few seconds and
+/// as soon as partitions appear. Its success says nothing: it succeeds
+/// on a disk with no partitions, as while something still has it open.
+/// A disk that shows no partitions after a while is read again, if we
+/// may (`reread`). `done` hears how it ended (in this thread).
+pub fn remount(bsd: String, done: impl FnOnce(Back) + Send + 'static) {
     std::thread::spawn(move || {
-        for _ in 0..5 {
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            match Command::new("/usr/sbin/diskutil").args(["mountDisk", &format!("/dev/{bsd}")]).output() {
-                Ok(o) if o.status.success() => {
-                    log::info!("usb: {bsd} mounted on the Mac again");
-                    return;
+        let start = Instant::now();
+        let (mut asked, mut parts, mut reread_once) = (None::<Instant>, 0, false);
+        let back = loop {
+            std::thread::sleep(Duration::from_secs(1));
+            let Some(d) = vroom_usb::list::disk_named(&bsd) else { break Back::Gone };
+            if vroom_usb::list::mounts().iter().any(|(dev, _)| d.parts.contains(dev)) {
+                break Back::Mounted;
+            }
+            let t = start.elapsed();
+            if t >= BACK_FOR {
+                break if d.parts.len() > 1 { Back::Unreadable } else { Back::Blank };
+            }
+            let fresh = std::mem::replace(&mut parts, d.parts.len()) != d.parts.len();
+            if d.parts.len() == 1 && t >= Duration::from_secs(6) && !reread_once {
+                reread_once = true;
+                reread(&d);
+                continue;
+            }
+            if t >= Duration::from_secs(2) && (fresh || asked.is_none_or(|a| a.elapsed() >= Duration::from_secs(3))) {
+                asked = Some(Instant::now());
+                match Command::new("/usr/sbin/diskutil").args(["mountDisk", &format!("/dev/{bsd}")]).output() {
+                    Ok(o) if !o.status.success() => log::info!("usb: diskutil mountDisk {bsd}: {}", String::from_utf8_lossy(&o.stderr).trim()),
+                    Ok(_) => {}
+                    Err(e) => log::warn!("usb: diskutil: {e}"),
                 }
-                Ok(o) => log::info!("usb: diskutil mountDisk {bsd}: {}", String::from_utf8_lossy(&o.stderr).trim()),
-                Err(e) => log::warn!("usb: diskutil: {e}"),
+            }
+        };
+        match back {
+            Back::Mounted => log::info!("usb: {bsd} mounted on the Mac again"),
+            Back::Unreadable => log::info!("usb: {bsd} is back on the Mac, with nothing macOS can mount"),
+            Back::Blank => log::warn!("usb: {bsd} is back on the Mac without partitions"),
+            Back::Gone => log::info!("usb: {bsd} is gone from the Mac"),
+        }
+        done(back);
+    });
+}
+
+/// Have macOS read `d`'s partition table again: it does when the last
+/// program that had the raw disk open for writing closes it. Only a disk
+/// node we may open ourselves (a disk image); a USB stick's is root's,
+/// and we won't ask for a password for this. Nothing is written.
+fn reread(d: &HostDisk) {
+    let path = format!("/dev/r{}", d.bsd);
+    match std::fs::OpenOptions::new().read(true).write(true).open(&path) {
+        Ok(f) => {
+            let fd = OwnedFd::from(f);
+            match check_fd(&fd, d) {
+                Ok(()) => log::info!("usb: {path} read again"),
+                Err(e) => log::warn!("usb: {e}"),
             }
         }
-    });
+        Err(e) => log::info!("usb: {path} can't be read again from here ({e}): unplug it and plug it in again"),
+    }
 }
 
 /// What the VMM gets for "Use as a disk".
@@ -185,7 +252,7 @@ pub fn open_disk(h: &HostDevice, readonly: bool) -> Result<Disk, String> {
     let r = open_unmounted(h, &d, readonly);
     if r.is_err() {
         // Not the VM's after all: macOS gets it back.
-        remount(d.bsd.clone());
+        remount(d.bsd.clone(), |_| {});
     }
     r
 }
