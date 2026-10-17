@@ -21,9 +21,11 @@ pub mod v4l2;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use vroom_memory::{GuestAddress, GuestMemory};
-use vroom_video::proto::{FromHelper, ToHelper, MAX_SESSIONS};
-use vroom_video::{Codec, Layout, MAX_BITSTREAM, MAX_SIDE, MIN_SIDE};
+use vroom_video::proto::{FromHelper, ToHelper, MAX_SESSIONS, OPEN_DECODE_ORDER};
+use vroom_video::{Codec, Layout, PixFmt, MAX_BITSTREAM, MAX_SIDE, MIN_SIDE};
 
 use crate::worker::{Poker, QueueCtx, QueueHandler, WorkerSlot, POKE_TOKEN, RESUME_TOKEN};
 use crate::{types, ActivateContext, DeviceState, Reader, Result, VirtioDevice, Writer};
@@ -76,6 +78,8 @@ pub trait WindowPlacer: Send + Sync {
 
 pub struct Media {
     link: Arc<dyn HelperLink>,
+    /// The codecs the helper decodes ([`Codec::bit`]s).
+    codecs: u32,
     window: GuestMemory,
     placer: Arc<dyn WindowPlacer>,
     card: String,
@@ -89,20 +93,23 @@ impl std::fmt::Debug for Media {
 }
 
 impl Media {
-    /// `window`: [`WINDOW`] bytes at guest address 0 (our view of it).
-    pub fn new(link: Arc<dyn HelperLink>, window: GuestMemory, placer: Arc<dyn WindowPlacer>, card: &str) -> Self {
-        Media { link, window, placer, card: card.to_string(), worker: WorkerSlot::default() }
+    /// `window`: [`WINDOW`] bytes at guest address 0 (our view of it,
+    /// shared with the helper). `codecs`: what the helper said it decodes.
+    pub fn new(link: Arc<dyn HelperLink>, codecs: u32, window: GuestMemory, placer: Arc<dyn WindowPlacer>, card: &str) -> Self {
+        Media { link, codecs, window, placer, card: card.to_string(), worker: WorkerSlot::default() }
     }
 
     fn handler(&self) -> Handler {
         Handler {
             link: self.link.clone(),
+            codecs: codec_list(self.codecs),
             window: self.window.clone(),
             sessions: BTreeMap::new(),
             alloc: Alloc::default(),
             events: VecDeque::new(),
             next_cookie: 1,
             helper_lost: false,
+            last_dump: None,
         }
     }
 }
@@ -132,6 +139,17 @@ impl Alloc {
 
     fn free(&mut self, off: u64) {
         self.used.remove(&off);
+    }
+
+    /// Take `len` bytes at `off` (a restored buffer), if free.
+    fn claim(&mut self, off: u64, len: u64) -> bool {
+        let len = len.div_ceil(BUF_ALIGN) * BUF_ALIGN;
+        let Some(end) = off.checked_add(len).filter(|&e| e <= WINDOW) else { return false };
+        if !off.is_multiple_of(BUF_ALIGN) || self.used.range(..end).next_back().is_some_and(|(&o, &l)| o + l > off) {
+            return false;
+        }
+        self.used.insert(off, len);
+        true
     }
 
     fn len(&self, off: u64) -> Option<u64> {
@@ -180,6 +198,14 @@ struct Session {
     /// The stream's layout once the helper said; before that, what the
     /// guest asked for.
     layout: Option<Layout>,
+    /// How pictures go into the guest's buffers (the guest's choice).
+    cap_fmt: PixFmt,
+    /// The stream's bits per sample, once the helper said.
+    depth: u32,
+    /// V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY(_ENABLE): a delay of 0 asks
+    /// for pictures in decoding order, as soon as each is decoded.
+    delay_enable: bool,
+    delay: u32,
     provisional: Layout,
     visible: (u32, u32),
     min_buffers: u32,
@@ -187,8 +213,8 @@ struct Session {
     cap_bufs: Vec<Buf>,
     out_streaming: bool,
     cap_streaming: bool,
-    /// The helper has this session open (with `codec`).
-    open: Option<Codec>,
+    /// The helper has this session open (with `codec` and these flags).
+    open: Option<(Codec, u8)>,
     pending: VecDeque<Input>,
     /// Bitstream at the helper: cookie -> bytes.
     in_flight: BTreeMap<u32, usize>,
@@ -209,6 +235,11 @@ struct Session {
     sub_eos: bool,
     sequence: u32,
     dead: bool,
+    /// The helper's state to open this stream again (snapshots): opaque.
+    resume: Vec<u8>,
+    /// Bitstream buffers sent, pictures delivered (debug logs).
+    stat_sent: u64,
+    stat_pictures: u64,
 }
 
 impl Session {
@@ -220,6 +251,10 @@ impl Session {
             out_h: 1080,
             sizeimage: DEFAULT_BITSTREAM,
             layout: None,
+            cap_fmt: PixFmt::Nv12,
+            depth: 8,
+            delay_enable: false,
+            delay: 0,
             provisional,
             visible: (1920, 1080),
             min_buffers: 4,
@@ -244,6 +279,9 @@ impl Session {
             sub_eos: false,
             sequence: 0,
             dead: false,
+            resume: Vec::new(),
+            stat_sent: 0,
+            stat_pictures: 0,
         }
     }
 
@@ -261,12 +299,15 @@ impl Session {
 
 struct Handler {
     link: Arc<dyn HelperLink>,
+    /// The coded formats we offer, in [`Codec::ALL`] order.
+    codecs: Vec<Codec>,
     window: GuestMemory,
     sessions: BTreeMap<u32, Session>,
     alloc: Alloc,
     events: VecDeque<Vec<u8>>,
     next_cookie: u32,
     helper_lost: bool,
+    last_dump: Option<std::time::Instant>,
 }
 
 impl std::fmt::Debug for Handler {
@@ -294,6 +335,30 @@ fn coded_pixfmt(c: Codec) -> u32 {
     match c {
         Codec::H264 => PIX_H264,
         Codec::Hevc => PIX_HEVC,
+        Codec::Vp9 => PIX_VP9,
+        Codec::Av1 => PIX_AV1,
+    }
+}
+
+fn codec_name(c: Codec) -> &'static str {
+    match c {
+        Codec::H264 => "H.264",
+        Codec::Hevc => "HEVC",
+        Codec::Vp9 => "VP9",
+        Codec::Av1 => "AV1",
+    }
+}
+
+/// The codecs in a set of [`Codec::bit`]s. H.264 and HEVC always: every
+/// Mac we run on decodes them.
+fn codec_list(bits: u32) -> Vec<Codec> {
+    Codec::ALL.into_iter().filter(|c| matches!(c, Codec::H264 | Codec::Hevc) || bits & c.bit() != 0).collect()
+}
+
+fn raw_pixfmt(f: PixFmt) -> u32 {
+    match f {
+        PixFmt::Nv12 => PIX_NV12,
+        PixFmt::P010 => PIX_P010,
     }
 }
 
@@ -370,6 +435,9 @@ impl Handler {
             }
             ctx.add_used(1, head, n);
         }
+        if !self.events.is_empty() {
+            log::trace!("media: {} events wait for event buffers", self.events.len());
+        }
     }
 
     fn send(&mut self, m: &ToHelper) {
@@ -395,18 +463,25 @@ impl Handler {
 
     // ---- credits and pictures ----
 
-    /// Give the helper credits for picture buffers it hasn't got yet.
+    /// Grant the helper the queued picture buffers it hasn't got yet: it
+    /// writes pictures into them, in this order.
     fn grant(&mut self, id: u32) {
         let Some(s) = self.sessions.get_mut(&id) else { return };
         let Some(layout) = s.layout else { return };
-        let fits = s.cap_bufs.iter().all(|b| b.len >= layout.size());
+        let fits = s.cap_bufs.iter().all(|b| b.len >= layout.size(s.cap_fmt));
         if s.dead || s.open.is_none() || !s.cap_streaming || s.awaiting_restart || s.last_pending || !fits {
             return;
         }
-        let have = s.cap_queue.len() as u32;
-        if have > s.granted {
-            let m = ToHelper::Credit { session: id, epoch: s.epoch, n: have - s.granted };
-            s.granted = have;
+        let mut grants = Vec::new();
+        while (s.granted as usize) < s.cap_queue.len() {
+            let Some(b) = s.cap_queue.get(s.granted as usize).and_then(|&i| s.cap_bufs.get(i as usize)) else { break };
+            grants.push(ToHelper::Grant { session: id, epoch: s.epoch, offset: b.off as u32, len: b.len, format: s.cap_fmt });
+            s.granted += 1;
+        }
+        if !grants.is_empty() {
+            log::trace!("media: session {id}: {} more granted, {} in all", grants.len(), s.granted);
+        }
+        for m in grants {
             self.send(&m);
         }
     }
@@ -418,7 +493,7 @@ impl Handler {
         s.epoch = s.epoch.wrapping_add(1);
         s.granted = 0;
         if s.open.is_some() {
-            let m = ToHelper::Credit { session: id, epoch: s.epoch, n: 0 };
+            let m = ToHelper::Grant { session: id, epoch: s.epoch, offset: 0, len: 0, format: s.cap_fmt };
             self.send(&m);
         }
     }
@@ -468,6 +543,7 @@ impl Handler {
             while s.stamps.len() > 128 {
                 s.stamps.pop_front();
             }
+            s.stat_sent += 1;
             self.send(&ToHelper::Decode { session: id, cookie: inp.cookie, data });
             // We have our copy: the guest may fill the buffer again. (A
             // player that finds every bitstream buffer busy at the end of
@@ -496,10 +572,13 @@ impl Handler {
             log::trace!("media: session {id}: helper: {what}");
         }
         match m {
-            FromHelper::Format { layout, visible, min_buffers, .. } => {
+            FromHelper::Caps { .. } => {}
+            FromHelper::Resume { state, .. } => s.resume = state,
+            FromHelper::Format { layout, visible, min_buffers, depth, .. } => {
                 let old = s.layout.replace(layout);
                 s.visible = visible;
                 s.min_buffers = min_buffers;
+                s.depth = depth;
                 if old.is_some_and(|o| o != layout) && s.cap_streaming {
                     s.awaiting_restart = true;
                     s.last_pending = true;
@@ -515,33 +594,38 @@ impl Handler {
                 self.deliver_last(id);
                 self.grant(id);
             }
-            FromHelper::Picture { epoch, cookie, data, .. } => {
+            FromHelper::Picture { epoch, cookie, offset, bytes, ok, .. } => {
                 if epoch != s.epoch {
                     log::debug!("media: session {id}: stale picture dropped");
                     return;
                 }
                 let Some(layout) = s.layout else { return };
-                if data.len() != layout.size() as usize {
-                    log::warn!("media: picture of the wrong size from the helper");
-                    return;
-                }
-                let Some(index) = s.cap_queue.pop_front() else {
+                // The helper fills grants in order: this must be the oldest.
+                let Some(&index) = s.cap_queue.front().filter(|_| s.granted > 0) else {
                     log::info!("media: session {id}: a picture came without a buffer for it");
                     return;
                 };
-                s.granted = s.granted.saturating_sub(1);
+                let Some(b) = s.cap_bufs.get(index as usize) else { return };
+                if b.off != offset as u64 {
+                    log::warn!("media: session {id}: the helper wrote a picture where it wasn't granted");
+                    return;
+                }
+                let good = ok && bytes == layout.size(s.cap_fmt) && bytes <= b.len;
+                if ok && !good {
+                    log::warn!("media: picture of the wrong size from the helper");
+                }
+                s.cap_queue.pop_front();
+                s.granted -= 1;
                 let ts = s.stamps.iter().find(|(c, _)| *c == cookie).map_or([0; 16], |&(_, t)| t);
                 let seq = s.sequence;
                 s.sequence = s.sequence.wrapping_add(1);
                 let Some(b) = s.cap_bufs.get_mut(index as usize) else { return };
-                if (b.len as usize) < data.len() || self.window.write(GuestAddress(b.off), &data).is_err() {
-                    b.bytesused = 0;
-                    self.dqbuf_event(id, Dir::Capture, index, BUF_FLAG_ERROR, seq);
-                    return;
-                }
-                b.bytesused = data.len() as u32;
                 b.ts = ts;
-                self.dqbuf_event(id, Dir::Capture, index, 0, seq);
+                b.bytesused = if good { bytes } else { 0 };
+                if let Some(s) = self.sessions.get_mut(&id) {
+                    s.stat_pictures += 1;
+                }
+                self.dqbuf_event(id, Dir::Capture, index, if good { 0 } else { BUF_FLAG_ERROR }, seq);
             }
             FromHelper::Consumed { cookie, ok, .. } => {
                 let Some(len) = s.in_flight.remove(&cookie) else { return };
@@ -663,9 +747,12 @@ impl Handler {
                 let mut b = read_payload(r, FMTDESC_SIZE)?;
                 let (index, t) = (get_u32(&b, 0), get_u32(&b, 4));
                 let (fourcc, flags, name) = match (dir(t).ok_or(EINVAL)?, index) {
-                    (Dir::Output, 0) => (PIX_H264, FMT_FLAG_COMPRESSED | FMT_FLAG_DYN_RESOLUTION, "H.264"),
-                    (Dir::Output, 1) => (PIX_HEVC, FMT_FLAG_COMPRESSED | FMT_FLAG_DYN_RESOLUTION, "HEVC"),
+                    (Dir::Output, i) => {
+                        let c = *self.codecs.get(i as usize).ok_or(EINVAL)?;
+                        (coded_pixfmt(c), FMT_FLAG_COMPRESSED | FMT_FLAG_DYN_RESOLUTION, codec_name(c))
+                    }
                     (Dir::Capture, 0) => (PIX_NV12, 0, "Y/UV 4:2:0"),
+                    (Dir::Capture, 1) => (PIX_P010, 0, "10-bit Y/UV 4:2:0"),
                     _ => return Err(EINVAL),
                 };
                 b[8..].fill(0);
@@ -677,7 +764,8 @@ impl Handler {
             ioc::ENUM_FRAMESIZES => {
                 let mut b = read_payload(r, FRMSIZEENUM_SIZE)?;
                 let f = get_u32(&b, 4);
-                if get_u32(&b, 0) != 0 || ![PIX_H264, PIX_HEVC, PIX_NV12].contains(&f) {
+                let known = self.codecs.iter().any(|&c| coded_pixfmt(c) == f) || f == PIX_NV12 || f == PIX_P010;
+                if get_u32(&b, 0) != 0 || !known {
                     return Err(EINVAL);
                 }
                 b[8..].fill(0);
@@ -690,14 +778,16 @@ impl Handler {
                 Ok(b)
             }
             ioc::G_FMT | ioc::S_FMT | ioc::TRY_FMT => {
-                let mut b = read_payload(r, FORMAT_SIZE)?;
+                let b = read_payload(r, FORMAT_SIZE)?;
                 let d = dir(get_u32(&b, fmt::TYPE)).ok_or(EINVAL)?;
+                let pix = get_u32(&b, fmt::PIXELFORMAT);
+                // Formats we don't have become the first one we do.
+                let codec = self.codecs.iter().copied().find(|&c| coded_pixfmt(c) == pix).unwrap_or(Codec::H264);
                 let s = self.sessions.get_mut(&id).ok_or(EINVAL)?;
                 if code != ioc::G_FMT {
                     let (w, h) = (get_u32(&b, fmt::WIDTH), get_u32(&b, fmt::HEIGHT));
                     match d {
                         Dir::Output => {
-                            let codec = if get_u32(&b, fmt::PIXELFORMAT) == PIX_HEVC { Codec::Hevc } else { Codec::H264 };
                             // A buffer must take a whole access unit: at least
                             // what the guest asks, and no less than a raw
                             // picture of that size (an intra picture can come
@@ -729,27 +819,30 @@ impl Handler {
                             }
                         }
                         Dir::Capture => {
-                            // The stream decides; before it does, the guest may.
+                            // NV12 or P010 (10-bit streams in 8 bits, or the
+                            // other way round, if the guest wants).
+                            let f = if pix == PIX_P010 { PixFmt::P010 } else { PixFmt::Nv12 };
+                            if code == ioc::S_FMT && !s.cap_streaming {
+                                s.cap_fmt = f;
+                            }
+                            // The stream decides the size; before it does,
+                            // the guest may.
                             if s.layout.is_none() && code == ioc::S_FMT && !s.cap_streaming {
                                 if let Some(l) = Layout::for_picture(w, h) {
                                     s.provisional = l;
                                     s.visible = (w, h);
                                 }
                             }
-                            if code == ioc::TRY_FMT && s.layout.is_none() {
-                                let l = Layout::for_picture(w, h).unwrap_or(s.provisional);
-                                return Ok(capture_format(b, l));
+                            if code == ioc::TRY_FMT {
+                                let l = if s.layout.is_none() { Layout::for_picture(w, h).unwrap_or(s.provisional) } else { s.cap_layout() };
+                                return Ok(capture_format(b, l, f));
                             }
                         }
                     }
                 }
                 Ok(match d {
                     Dir::Output => output_format(b, s.codec, s.out_w, s.out_h, s.sizeimage),
-                    Dir::Capture => {
-                        let l = s.cap_layout();
-                        b = capture_format(b, l);
-                        b
-                    }
+                    Dir::Capture => capture_format(b, s.cap_layout(), s.cap_fmt),
                 })
             }
             ioc::REQBUFS => {
@@ -764,7 +857,7 @@ impl Handler {
                 let s = self.sessions.get_mut(&id).ok_or(EINVAL)?;
                 let (max, size) = match d {
                     Dir::Output => (MAX_OUTPUT_BUFS, s.sizeimage),
-                    Dir::Capture => (MAX_CAPTURE_BUFS, s.cap_layout().size()),
+                    Dir::Capture => (MAX_CAPTURE_BUFS, s.cap_layout().size(s.cap_fmt)),
                 };
                 let old = std::mem::take(s.bufs(d));
                 for x in &old {
@@ -834,15 +927,16 @@ impl Handler {
                     Dir::Output => {
                         s.out_streaming = true;
                         let codec = s.codec;
-                        let was = s.open.replace(codec);
-                        if was != Some(codec) {
+                        let flags = if s.delay_enable && s.delay == 0 { OPEN_DECODE_ORDER } else { 0 };
+                        let was = s.open.replace((codec, flags));
+                        if was != Some((codec, flags)) {
                             s.layout = None;
                             s.epoch = 0;
                             s.granted = 0;
                             if was.is_some() {
                                 self.send(&ToHelper::Close { session: id });
                             }
-                            self.send(&ToHelper::Open { session: id, codec });
+                            self.send(&ToHelper::Open { session: id, codec, flags });
                         }
                         self.pump(id);
                     }
@@ -891,8 +985,31 @@ impl Handler {
             ioc::G_CTRL => {
                 let mut b = read_payload(r, CONTROL_SIZE)?;
                 let c = control(get_u32(&b, 0)).ok_or(EINVAL)?;
-                let v = if c.id == CID_MIN_BUFFERS_FOR_CAPTURE { self.sessions.get(&id).map_or(4, |s| s.min_buffers) } else { c.default };
+                let s = self.sessions.get(&id).ok_or(EINVAL)?;
+                let v = match c.id {
+                    CID_MIN_BUFFERS_FOR_CAPTURE => s.min_buffers,
+                    CID_DEC_DISPLAY_DELAY_ENABLE => s.delay_enable as u32,
+                    CID_DEC_DISPLAY_DELAY => s.delay,
+                    _ => c.default,
+                };
                 put_u32(&mut b, 4, v);
+                Ok(b)
+            }
+            ioc::S_CTRL => {
+                let b = read_payload(r, CONTROL_SIZE)?;
+                let c = control(get_u32(&b, 0)).ok_or(EINVAL)?;
+                let v = get_u32(&b, 4);
+                let s = self.sessions.get_mut(&id).ok_or(EINVAL)?;
+                match c.id {
+                    CID_DEC_DISPLAY_DELAY_ENABLE | CID_DEC_DISPLAY_DELAY if v > c.max => return Err(EINVAL),
+                    // Taken when the bitstream queue starts.
+                    CID_DEC_DISPLAY_DELAY_ENABLE if !s.out_streaming => s.delay_enable = v != 0,
+                    CID_DEC_DISPLAY_DELAY if !s.out_streaming => s.delay = v,
+                    CID_DEC_DISPLAY_DELAY_ENABLE | CID_DEC_DISPLAY_DELAY => return Err(EBUSY),
+                    // The rest are read only (the stream decides).
+                    _ if v == c.default => {}
+                    _ => return Err(EINVAL),
+                }
                 Ok(b)
             }
             ioc::QUERYCTRL => {
@@ -907,8 +1024,15 @@ impl Handler {
                 .ok_or(EINVAL)?;
                 b.fill(0);
                 put_u32(&mut b, 0, c.id);
-                put_u32(&mut b, 4, if c.menu.is_empty() { CTRL_TYPE_INTEGER } else { CTRL_TYPE_MENU });
                 put_str(&mut b, 8, 32, c.name);
+                let kind = if !c.menu.is_empty() {
+                    CTRL_TYPE_MENU
+                } else if c.max == 1 {
+                    CTRL_TYPE_BOOLEAN
+                } else {
+                    CTRL_TYPE_INTEGER
+                };
+                put_u32(&mut b, 4, kind);
                 let flags = if c.id == CID_MIN_BUFFERS_FOR_CAPTURE { CTRL_FLAG_READ_ONLY | CTRL_FLAG_VOLATILE } else { 0 };
                 for (i, v) in [c.min, c.max, 1, c.default, flags].into_iter().enumerate() {
                     put_u32(&mut b, 40 + 4 * i, v);
@@ -1061,8 +1185,9 @@ struct Control {
     menu: &'static [&'static str],
 }
 
-/// What VideoToolbox decodes: H.264 up to High, level 5.2; HEVC Main,
-/// level 5.1. Players read these to decide what to send.
+/// What VideoToolbox decodes: H.264 up to High, level 5.2; HEVC Main and
+/// Main 10, level 5.1; VP9 profiles 0 and 2; AV1 Main. Players read these
+/// to decide what to send. Sorted by id (QUERYCTRL walks them in order).
 const CONTROLS: &[Control] = &[
     Control { id: CID_MIN_BUFFERS_FOR_CAPTURE, name: "Min Number of Capture Buffers", min: 1, max: 32, default: 4, menu: &[] },
     Control {
@@ -1081,7 +1206,16 @@ const CONTROLS: &[Control] = &[
         default: 4,
         menu: &["Baseline", "Constrained Baseline", "Main", "Extended", "High"],
     },
-    Control { id: CID_HEVC_PROFILE, name: "HEVC Profile", min: 0, max: 1, default: 0, menu: &["Main", "Main Still Picture"] },
+    Control { id: CID_VP9_PROFILE, name: "VP9 Profile", min: 0, max: 2, default: 0, menu: &["0", "1", "2", "3"] },
+    Control {
+        id: CID_VP9_LEVEL,
+        name: "VP9 Level",
+        min: 0,
+        max: 13,
+        default: 13,
+        menu: &["1", "1.1", "2", "2.1", "3", "3.1", "4", "4.1", "5", "5.1", "5.2", "6", "6.1", "6.2"],
+    },
+    Control { id: CID_HEVC_PROFILE, name: "HEVC Profile", min: 0, max: 2, default: 0, menu: &["Main", "Main Still Picture", "Main 10"] },
     Control {
         id: CID_HEVC_LEVEL,
         name: "HEVC Level",
@@ -1089,6 +1223,20 @@ const CONTROLS: &[Control] = &[
         max: 8,
         default: 8,
         menu: &["1", "2", "2.1", "3", "3.1", "4", "4.1", "5", "5.1"],
+    },
+    // Settable: a delay of 0 gives pictures in decoding order.
+    Control { id: CID_DEC_DISPLAY_DELAY, name: "Display Delay", min: 0, max: 16, default: 0, menu: &[] },
+    Control { id: CID_DEC_DISPLAY_DELAY_ENABLE, name: "Display Delay Enable", min: 0, max: 1, default: 0, menu: &[] },
+    Control { id: CID_AV1_PROFILE, name: "AV1 Profile", min: 0, max: 0, default: 0, menu: &["Main", "High", "Professional"] },
+    Control {
+        id: CID_AV1_LEVEL,
+        name: "AV1 Level",
+        min: 0,
+        max: 19,
+        default: 19,
+        menu: &[
+            "2.0", "2.1", "2.2", "2.3", "3.0", "3.1", "3.2", "3.3", "4.0", "4.1", "4.2", "4.3", "5.0", "5.1", "5.2", "5.3", "6.0", "6.1", "6.2", "6.3",
+        ],
     },
 ];
 
@@ -1108,15 +1256,15 @@ fn output_format(mut b: Vec<u8>, codec: Codec, w: u32, h: u32, size: u32) -> Vec
     b
 }
 
-fn capture_format(mut b: Vec<u8>, l: Layout) -> Vec<u8> {
+fn capture_format(mut b: Vec<u8>, l: Layout, f: PixFmt) -> Vec<u8> {
     b[8..].fill(0);
     put_u32(&mut b, fmt::WIDTH, l.width);
     put_u32(&mut b, fmt::HEIGHT, l.height);
-    put_u32(&mut b, fmt::PIXELFORMAT, PIX_NV12);
+    put_u32(&mut b, fmt::PIXELFORMAT, raw_pixfmt(f));
     put_u32(&mut b, fmt::FIELD, FIELD_NONE);
     put_u32(&mut b, fmt::COLORSPACE, COLORSPACE_REC709);
-    put_u32(&mut b, fmt::SIZEIMAGE, l.size());
-    put_u32(&mut b, fmt::BYTESPERLINE, l.stride());
+    put_u32(&mut b, fmt::SIZEIMAGE, l.size(f));
+    put_u32(&mut b, fmt::BYTESPERLINE, l.stride(f));
     put_u8(&mut b, fmt::NUM_PLANES, 1);
     put_u8(&mut b, fmt::YCBCR_ENC, YCBCR_ENC_709);
     put_u8(&mut b, fmt::QUANTIZATION, QUANTIZATION_LIM_RANGE);
@@ -1158,6 +1306,40 @@ impl QueueHandler for Handler {
 
     fn attach(&mut self, poker: Poker) {
         self.link.set_poker(poker);
+    }
+
+    /// With trace logs on: what every decoder waits on, every 2 seconds.
+    fn tick_interval(&mut self) -> Option<std::time::Duration> {
+        log::log_enabled!(log::Level::Debug).then(|| std::time::Duration::from_secs(2))
+    }
+
+    fn tick(&mut self, _ctx: &mut QueueCtx) {
+        let now = std::time::Instant::now();
+        if self.last_dump.is_some_and(|t| now.duration_since(t).as_secs() < 2) {
+            return;
+        }
+        self.last_dump = Some(now);
+        for (id, s) in &self.sessions {
+            let q = |v: &Vec<Buf>| v.iter().map(|b| if b.queued { 'q' } else { '-' }).collect::<String>();
+            log::debug!(
+                "media: session {id}: sent {}, pictures {}, streaming {}/{}, pending {}, in flight {} ({} bytes), picture queue {:?}, granted {}, out [{}], cap [{}], last {}, restart {}, draining {}, {} events wait",
+                s.stat_sent,
+                s.stat_pictures,
+                s.out_streaming,
+                s.cap_streaming,
+                s.pending.len(),
+                s.in_flight.len(),
+                s.in_flight_bytes,
+                s.cap_queue,
+                s.granted,
+                q(&s.out_bufs),
+                q(&s.cap_bufs),
+                s.last_pending,
+                s.awaiting_restart,
+                s.draining,
+                self.events.len()
+            );
+        }
     }
 
     /// The VM pauses (snapshot, suspend): answer every command the guest
@@ -1215,22 +1397,224 @@ impl VirtioDevice for Media {
         self.worker.resume();
     }
     fn save_active(&mut self) -> Result<DeviceState> {
-        // Decoders don't survive a snapshot (VideoToolbox state can't be
-        // saved): keep their ids, and tell the guest they failed on restore.
-        let ids: Vec<u32> = self.worker.with(|_, h| h.sessions.keys().copied().collect()).unwrap_or_default();
-        let data = serde_json::to_vec(&ids).map_err(|e| crate::Error::Device(e.to_string()))?;
+        // VideoToolbox's state can't be saved, but what opens a stream
+        // again can: the V4L2 side (formats, buffers, queues) and the
+        // helper's resume state. After a restore the stream goes on from
+        // its next key frame.
+        let saved: Vec<Saved> = self.worker.with(|_, h| h.sessions.iter().map(|(&id, s)| Saved::of(id, s)).collect()).unwrap_or_default();
+        let data = serde_json::to_vec(&saved).map_err(|e| crate::Error::Device(e.to_string()))?;
         Ok(DeviceState { queues: self.worker.queues(), data })
     }
     fn restore_active(&mut self, ctx: ActivateContext, data: &[u8]) -> Result<()> {
-        let ids: Vec<u32> = serde_json::from_slice(data).unwrap_or_default();
         let mut h = self.handler();
-        for id in ids.into_iter().filter(|&i| i < MAX_SESSIONS) {
-            let mut s = Session::new();
-            s.dead = true;
-            h.sessions.insert(id, s);
-            h.error_event(id, EIO);
-        }
+        h.restore(data);
         self.worker.start("media", ctx, h, true)
+    }
+}
+
+/// A decoder as a snapshot keeps it. All of it is checked again on
+/// restore (a snapshot is a file the user could have changed).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Saved {
+    id: u32,
+    codec: u8,
+    out_size: (u32, u32),
+    sizeimage: u32,
+    layout: Option<(u32, u32)>,
+    provisional: (u32, u32),
+    visible: (u32, u32),
+    cap_fmt: u8,
+    depth: u32,
+    delay: (bool, u32),
+    min_buffers: u32,
+    /// (offset, length, queued) of each buffer.
+    out_bufs: Vec<(u64, u32, bool)>,
+    cap_bufs: Vec<(u64, u32, bool)>,
+    streaming: (bool, bool),
+    /// (codec, flags) the helper had it open with.
+    open: Option<(u8, u8)>,
+    cap_queue: Vec<u32>,
+    epoch: u32,
+    subscribed: (bool, bool),
+    sequence: u32,
+    /// awaiting_restart, last_pending, last_is_eos, draining.
+    flags: (bool, bool, bool, bool),
+    dead: bool,
+    resume: Vec<u8>,
+}
+
+impl Saved {
+    fn of(id: u32, s: &Session) -> Saved {
+        let bufs = |v: &Vec<Buf>| v.iter().map(|b| (b.off, b.len, b.queued)).collect();
+        Saved {
+            id,
+            codec: s.codec.to_u8(),
+            out_size: (s.out_w, s.out_h),
+            sizeimage: s.sizeimage,
+            layout: s.layout.map(|l| (l.width, l.height)),
+            provisional: (s.provisional.width, s.provisional.height),
+            visible: s.visible,
+            cap_fmt: s.cap_fmt.to_u8(),
+            depth: s.depth,
+            delay: (s.delay_enable, s.delay),
+            min_buffers: s.min_buffers,
+            out_bufs: bufs(&s.out_bufs),
+            cap_bufs: bufs(&s.cap_bufs),
+            streaming: (s.out_streaming, s.cap_streaming),
+            open: s.open.map(|(c, f)| (c.to_u8(), f)),
+            cap_queue: s.cap_queue.iter().copied().collect(),
+            epoch: s.epoch,
+            subscribed: (s.sub_src, s.sub_eos),
+            sequence: s.sequence,
+            flags: (s.awaiting_restart, s.last_pending, s.last_is_eos, s.draining),
+            dead: s.dead,
+            resume: s.resume.clone(),
+        }
+    }
+}
+
+impl Handler {
+    /// Decoders from a snapshot. One whose saved state doesn't hold
+    /// together fails in the guest; so do those of an older snapshot
+    /// (which kept only their ids).
+    fn restore(&mut self, data: &[u8]) {
+        let saved = match serde_json::from_slice::<Vec<Saved>>(data) {
+            Ok(v) => v,
+            Err(_) => {
+                let ids: Vec<u32> = serde_json::from_slice(data).unwrap_or_default();
+                for id in ids.into_iter().filter(|&i| i < MAX_SESSIONS) {
+                    self.fail_restored(id);
+                }
+                return;
+            }
+        };
+        for sv in saved {
+            let id = sv.id;
+            if id >= MAX_SESSIONS || self.sessions.contains_key(&id) {
+                continue;
+            }
+            match self.rebuild(&sv) {
+                Some(s) => {
+                    self.sessions.insert(id, s);
+                    self.resume_session(id, sv.resume);
+                }
+                None => {
+                    log::warn!("media: session {id}: saved state doesn't hold together");
+                    self.fail_restored(id);
+                }
+            }
+        }
+    }
+
+    fn fail_restored(&mut self, id: u32) {
+        let mut s = Session::new();
+        s.dead = true;
+        self.sessions.insert(id, s);
+        self.error_event(id, EIO);
+    }
+
+    /// A session from its saved state, its buffers back where they were
+    /// in the window (the guest has them mapped). None: it doesn't hold
+    /// together.
+    fn rebuild(&mut self, sv: &Saved) -> Option<Session> {
+        let mut s = Session::new();
+        s.codec = Codec::from_u8(sv.codec).filter(|c| self.codecs.contains(c))?;
+        let side = |v: u32| (MIN_SIDE..=MAX_SIDE).contains(&v);
+        if !side(sv.out_size.0) || !side(sv.out_size.1) || !(MIN_BITSTREAM..=MAX_BITSTREAM).contains(&sv.sizeimage) {
+            return None;
+        }
+        (s.out_w, s.out_h, s.sizeimage) = (sv.out_size.0, sv.out_size.1, sv.sizeimage);
+        s.layout = match sv.layout {
+            Some((width, height)) => Some(Some(Layout { width, height }).filter(|l| l.valid())?),
+            None => None,
+        };
+        s.provisional = Some(Layout { width: sv.provisional.0, height: sv.provisional.1 }).filter(|l| l.valid())?;
+        let l = s.cap_layout();
+        if sv.visible.0 == 0 || sv.visible.1 == 0 || sv.visible.0 > l.width || sv.visible.1 > l.height {
+            return None;
+        }
+        s.visible = sv.visible;
+        s.cap_fmt = PixFmt::from_u8(sv.cap_fmt)?;
+        if (sv.depth != 8 && sv.depth != 10) || sv.delay.1 > 16 || !(1..=32).contains(&sv.min_buffers) {
+            return None;
+        }
+        (s.depth, s.delay_enable, s.delay, s.min_buffers) = (sv.depth, sv.delay.0, sv.delay.1, sv.min_buffers);
+        if sv.out_bufs.len() > MAX_OUTPUT_BUFS as usize || sv.cap_bufs.len() > MAX_CAPTURE_BUFS as usize {
+            return None;
+        }
+        let mut took = Vec::new();
+        let mut ok = true;
+        for (saved, max, into) in [(&sv.out_bufs, MAX_BITSTREAM, &mut s.out_bufs), (&sv.cap_bufs, vroom_video::MAX_PICTURE, &mut s.cap_bufs)] {
+            for &(off, len, queued) in saved {
+                if !ok || len == 0 || len > max || !self.alloc.claim(off, len as u64) {
+                    ok = false;
+                    break;
+                }
+                took.push(off);
+                into.push(Buf { off, len, queued, bytesused: 0, ts: [0; 16] });
+            }
+        }
+        let checked = (|| {
+            if !ok {
+                return None;
+            }
+            (s.out_streaming, s.cap_streaming) = sv.streaming;
+            s.open = match sv.open {
+                Some((c, f)) => Some((Codec::from_u8(c).filter(|&c| c == s.codec)?, f & OPEN_DECODE_ORDER)),
+                None => None,
+            };
+            // Queued picture buffers stay queued.
+            for &i in &sv.cap_queue {
+                if s.cap_bufs.get(i as usize).is_none_or(|b| !b.queued) || s.cap_queue.contains(&i) {
+                    return None;
+                }
+                s.cap_queue.push_back(i);
+            }
+            Some(())
+        })();
+        if checked.is_none() {
+            for off in took {
+                self.alloc.free(off);
+            }
+            return None;
+        }
+        for (i, b) in s.cap_bufs.iter_mut().enumerate() {
+            b.queued = s.cap_queue.contains(&(i as u32));
+        }
+        s.epoch = sv.epoch.wrapping_add(1);
+        (s.sub_src, s.sub_eos) = sv.subscribed;
+        s.sequence = sv.sequence;
+        let (restart, last, eos, draining) = sv.flags;
+        s.awaiting_restart = restart;
+        // A drain under way: its pictures are gone, it ends now.
+        s.last_pending = last || draining;
+        s.last_is_eos = eos || draining;
+        s.dead = sv.dead;
+        Some(s)
+    }
+
+    /// Give the guest back its queued bitstream buffers (their bytes were
+    /// in the window, which a snapshot doesn't keep), open the stream in
+    /// the new helper and grant it the picture buffers.
+    fn resume_session(&mut self, id: u32, state: Vec<u8>) {
+        let Some(s) = self.sessions.get_mut(&id) else { return };
+        let queued: Vec<u32> = s.out_bufs.iter().enumerate().filter(|(_, b)| b.queued).map(|(i, _)| i as u32).collect();
+        let (open, dead, epoch, fmt) = (s.open, s.dead, s.epoch, s.cap_fmt);
+        s.resume = state.clone();
+        for i in queued {
+            self.dqbuf_event(id, Dir::Output, i, 0, 0);
+        }
+        if dead {
+            self.error_event(id, EIO);
+            return;
+        }
+        if let Some((codec, flags)) = open {
+            let m = if state.is_empty() { ToHelper::Open { session: id, codec, flags } } else { ToHelper::Resume { session: id, codec, flags, state } };
+            self.send(&m);
+            self.send(&ToHelper::Grant { session: id, epoch, offset: 0, len: 0, format: fmt });
+        }
+        self.deliver_last(id);
+        self.grant(id);
     }
 }
 

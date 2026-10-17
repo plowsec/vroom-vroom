@@ -350,6 +350,7 @@ impl Poc {
         match self.codec {
             Codec::H264 => self.h264(au),
             Codec::Hevc => self.hevc(au),
+            Codec::Vp9 | Codec::Av1 => None,
         }
     }
 

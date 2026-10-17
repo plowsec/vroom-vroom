@@ -1,5 +1,6 @@
 //! Video decoding: what a guest's bitstream does to the helper's parsing
-//! (NAL units, access units, parameter sets, display order) before
+//! (NAL units, access units, parameter sets, display order; VP9 frame
+//! headers and superframes; AV1 OBUs and sequence headers) before
 //! VideoToolbox sees it, and what either side of the helper protocol can
 //! send the other.
 #![no_main]
@@ -7,13 +8,14 @@ use libfuzzer_sys::fuzz_target;
 use vroom_video::nal::{self, ParamSets};
 use vroom_video::poc::{Poc, Reorder};
 use vroom_video::proto::{FromHelper, ToHelper};
+use vroom_video::vpx;
 use vroom_video::Codec;
 
 fuzz_target!(|data: &[u8]| {
     let Some((&sel, rest)) = data.split_first() else { return };
-    match sel % 3 {
+    match sel % 5 {
         0 | 1 => {
-            let codec = if sel % 3 == 0 { Codec::H264 } else { Codec::Hevc };
+            let codec = if sel % 5 == 0 { Codec::H264 } else { Codec::Hevc };
             let mut sets = ParamSets::new(codec);
             let mut poc = Poc::new(codec);
             let mut order = Reorder::default();
@@ -35,8 +37,27 @@ fuzz_target!(|data: &[u8]| {
                 }
                 let _ = sets.complete();
                 let _ = sets.list();
+                let _ = sets.depth();
             }
             order.flush();
+        }
+        2 => {
+            let mut refs = [(0, 0); 8];
+            for chunk in rest.chunks(512) {
+                for f in vpx::vp9_frames(chunk) {
+                    if let Some(c) = vpx::vp9_header(f, &mut refs).and_then(|h| h.config) {
+                        let _ = vpx::vpcc(&c);
+                    }
+                }
+            }
+        }
+        3 => {
+            for o in vpx::av1_obus(rest) {
+                assert!(o.payload <= o.data.len());
+                if let Some(c) = vpx::av1_sequence(&o.data[o.payload..]) {
+                    let _ = vpx::av1c(&c, o.data);
+                }
+            }
         }
         _ => {
             let mut r = rest;

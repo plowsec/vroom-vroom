@@ -14,6 +14,7 @@ pub mod ioc {
     pub const STREAMON: u32 = 18;
     pub const STREAMOFF: u32 = 19;
     pub const G_CTRL: u32 = 27;
+    pub const S_CTRL: u32 = 28;
     pub const QUERYCTRL: u32 = 36;
     pub const QUERYMENU: u32 = 37;
     pub const TRY_FMT: u32 = 64;
@@ -40,7 +41,12 @@ pub const fn fourcc(s: &[u8; 4]) -> u32 {
 }
 pub const PIX_H264: u32 = fourcc(b"H264");
 pub const PIX_HEVC: u32 = fourcc(b"HEVC");
+pub const PIX_VP9: u32 = fourcc(b"VP90");
+/// Not in Linux 6.8's headers: what later kernels and GStreamer call
+/// `V4L2_PIX_FMT_AV1` (a stateful decoder's AV1 stream).
+pub const PIX_AV1: u32 = fourcc(b"AV01");
 pub const PIX_NV12: u32 = fourcc(b"NV12");
+pub const PIX_P010: u32 = fourcc(b"P010");
 
 pub const CAP_VIDEO_M2M_MPLANE: u32 = 0x0000_4000;
 pub const CAP_STREAMING: u32 = 0x0400_0000;
@@ -69,7 +75,14 @@ pub const CID_H264_LEVEL: u32 = 0x0099_0a67;
 pub const CID_H264_PROFILE: u32 = 0x0099_0a6b;
 pub const CID_HEVC_PROFILE: u32 = 0x0099_0b67;
 pub const CID_HEVC_LEVEL: u32 = 0x0099_0b68;
+pub const CID_VP9_PROFILE: u32 = 0x0099_0b00;
+pub const CID_VP9_LEVEL: u32 = 0x0099_0b01;
+pub const CID_DEC_DISPLAY_DELAY: u32 = 0x0099_0b8d;
+pub const CID_DEC_DISPLAY_DELAY_ENABLE: u32 = 0x0099_0b8e;
+pub const CID_AV1_PROFILE: u32 = 0x0099_0b8f;
+pub const CID_AV1_LEVEL: u32 = 0x0099_0b90;
 pub const CTRL_TYPE_INTEGER: u32 = 1;
+pub const CTRL_TYPE_BOOLEAN: u32 = 2;
 pub const CTRL_TYPE_MENU: u32 = 3;
 pub const CTRL_FLAG_NEXT_CTRL: u32 = 0x8000_0000;
 pub const CTRL_FLAG_NEXT_COMPOUND: u32 = 0x4000_0000;
@@ -182,5 +195,7 @@ mod tests {
         assert_eq!(PIX_NV12, 0x3231_564e);
         assert_eq!(PIX_H264, 0x3436_3248);
         assert_eq!(PIX_HEVC, 0x4356_4548);
+        assert_eq!(PIX_P010, 0x3031_3050);
+        assert_eq!(PIX_VP9, 0x3039_5056);
     }
 }

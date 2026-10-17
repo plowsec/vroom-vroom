@@ -1,6 +1,7 @@
 //! Hardware video decoding: the virtio-media decoder's helper process
 //! (`vroom video-helper`, sandboxed: VideoToolbox and nothing else) and
-//! the shared memory window the decoder's buffers live in.
+//! the shared memory window the decoder's buffers live in, which the
+//! helper maps too: it writes pictures straight into the guest's buffers.
 
 use std::collections::VecDeque;
 use std::os::fd::OwnedFd;
@@ -37,8 +38,12 @@ impl std::fmt::Debug for Helper {
 }
 
 impl Helper {
-    pub fn spawn() -> Result<Arc<Helper>> {
+    /// Start the helper, hand it the buffer window `window` (shared
+    /// memory) and wait for what it decodes: the helper and its codecs.
+    pub fn spawn(window: &GuestMemory) -> Result<(Arc<Helper>, u32)> {
         let exe = std::env::current_exe().map_err(|e| Error::Setup(format!("video: {e}")))?;
+        let (fds, _) = window.shared_fds().ok_or_else(|| Error::Setup("video: the buffer window isn't shared memory".into()))?;
+        let &[(window_fd, _)] = fds.as_slice() else { return Err(Error::Setup("video: buffer window".into())) };
         let (ours, theirs) = UnixStream::pair()?;
         // Unix sockets on macOS buffer 8 KiB: a 3 MB picture would cross
         // in hundreds of steps.
@@ -57,7 +62,18 @@ impl Helper {
         // A helper that stops reading (hung in VideoToolbox) must not
         // hang the device: writes give up, and the helper counts as gone.
         ours.set_write_timeout(Some(Duration::from_secs(2)))?;
+        vroom_ipc::send_fd(&ours, window_fd).map_err(|e| Error::Setup(format!("video helper: {e}")))?;
+        // Its first message says what this Mac decodes. VideoToolbox can
+        // take a moment to answer the first time.
+        ours.set_read_timeout(Some(Duration::from_secs(10)))?;
         let mut r = ours.try_clone()?;
+        let codecs = match FromHelper::read_from(&mut r) {
+            Ok(FromHelper::Caps { codecs }) => codecs,
+            Ok(m) => return Err(Error::Setup(format!("video helper: {m:?} before its codecs"))),
+            Err(e) => return Err(Error::Setup(format!("video helper: {e}"))),
+        };
+        ours.set_read_timeout(None)?;
+        log::info!("video: the Mac decodes {codecs:#x}");
         let h = Arc::new(Helper {
             sock: Mutex::new(ours),
             rx: Mutex::new(VecDeque::new()),
@@ -88,7 +104,7 @@ impl Helper {
             let _ = me.sock.lock().unwrap_or_else(|e| e.into_inner()).shutdown(std::net::Shutdown::Both);
             me.poke();
         })?;
-        Ok(h)
+        Ok((h, codecs))
     }
 
     fn poke(&self) {
@@ -170,7 +186,7 @@ pub(crate) struct Window {
 
 impl Window {
     pub fn new(vm: Arc<dyn Vm>) -> Result<(Arc<Window>, GuestMemory)> {
-        let mem = GuestMemory::new(&[(GuestAddress(0), WINDOW)])?;
+        let mem = GuestMemory::new_shared(&[(GuestAddress(0), WINDOW)])?;
         Ok((Arc::new(Window { vm, mem: mem.clone(), at: Mutex::new(None) }), mem))
     }
 }

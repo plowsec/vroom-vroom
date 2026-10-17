@@ -5426,6 +5426,7 @@ dependencies = [
  "vroom-gpu3d",
  "vroom-hv",
  "vroom-import",
+ "vroom-ipc",
  "vroom-net",
  "vroom-sandbox",
  "vroom-usb",

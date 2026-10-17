@@ -34,12 +34,14 @@ impl T {
         let window = GuestMemory::new(&[(GuestAddress(0), WINDOW)]).unwrap();
         let h = Handler {
             link: link.clone(),
+            codecs: codec_list(u32::MAX),
             window,
             sessions: BTreeMap::new(),
             alloc: Alloc::default(),
             events: VecDeque::new(),
             next_cookie: 1,
             helper_lost: false,
+            last_dump: None,
         };
         T { h, link }
     }
@@ -151,7 +153,7 @@ fn decodes_through_the_helper() {
     assert_eq!(t.reqbufs(OUTPUT_MPLANE, 2), 2);
     assert_eq!(t.reqbufs(CAPTURE_MPLANE, 3), 3);
     assert_eq!(t.stream(ioc::STREAMON, OUTPUT_MPLANE), 0);
-    assert_eq!(t.sent(), vec![ToHelper::Open { session: 0, codec: Codec::H264 }]);
+    assert_eq!(t.sent(), vec![ToHelper::Open { session: 0, codec: Codec::H264, flags: 0 }]);
 
     // A bitstream buffer: its bytes go to the helper, the buffer comes back.
     let off = t.h.sessions[&0].out_bufs[1].off;
@@ -165,7 +167,7 @@ fn decodes_through_the_helper() {
 
     // The stream's size: an event, then the picture queue's format.
     let layout = Layout { width: 1280, height: 720 };
-    t.reply(FromHelper::Format { session: 0, layout, visible: (1280, 720), min_buffers: 4 });
+    t.reply(FromHelper::Format { session: 0, layout, visible: (1280, 720), min_buffers: 4, depth: 8 });
     assert_eq!(t.events(), vec![(EVT_EVENT, EVENT_SOURCE_CHANGE, 0, 0, 0)]);
     let (_, f) = t.fmt(ioc::G_FMT, CAPTURE_MPLANE, 0, 0, 0);
     assert_eq!((get_u32(&f, fmt::WIDTH), get_u32(&f, fmt::HEIGHT), get_u32(&f, fmt::PIXELFORMAT)), (1280, 720, PIX_NV12));
@@ -174,24 +176,26 @@ fn decodes_through_the_helper() {
     for i in 0..3 {
         assert_eq!(t.qbuf(CAPTURE_MPLANE, i, 0), 0);
     }
-    let credits: u32 = t.sent().iter().map(|m| if let ToHelper::Credit { n, .. } = m { *n } else { 0 }).sum();
-    assert_eq!(credits, 3);
+    // Each queued buffer is granted, where it is, in order.
+    let offs: Vec<u32> = (0..3).map(|i| t.h.sessions[&0].cap_bufs[i].off as u32).collect();
+    let grants: Vec<u32> = t.sent().iter().filter_map(|m| if let ToHelper::Grant { offset, len, .. } = m { (*len > 0).then_some(*offset) } else { None }).collect();
+    assert_eq!(grants, offs);
     let epoch = t.h.sessions[&0].epoch;
+    let size = layout.size(PixFmt::Nv12);
 
-    // A picture fills the first queued buffer, with the bitstream's time.
-    let pic = vec![7u8; layout.size() as usize];
-    t.reply(FromHelper::Picture { session: 0, epoch, cookie, data: pic.clone() });
-    assert_eq!(t.events(), vec![(EVT_DQBUF, CAPTURE_MPLANE, 0, BUF_FLAG_TIMESTAMP_COPY, layout.size())]);
-    let off = t.h.sessions[&0].cap_bufs[0].off;
-    let mut got = vec![0u8; pic.len()];
-    t.h.window.read(GuestAddress(off), &mut got).unwrap();
-    assert_eq!(got, pic);
+    // The helper wrote a picture into the first one: it goes back with
+    // the bitstream's time.
+    t.reply(FromHelper::Picture { session: 0, epoch, cookie, offset: offs[0], bytes: size, ok: true });
+    assert_eq!(t.events(), vec![(EVT_DQBUF, CAPTURE_MPLANE, 0, BUF_FLAG_TIMESTAMP_COPY, size)]);
     assert_eq!(get_u32(&t.h.sessions[&0].cap_bufs[0].ts, 0), 1001);
 
-    // Stale epoch, wrong size: dropped.
-    t.reply(FromHelper::Picture { session: 0, epoch: epoch + 1, cookie, data: pic.clone() });
-    t.reply(FromHelper::Picture { session: 0, epoch, cookie, data: vec![0; 10] });
+    // Stale epoch, not the next granted buffer: dropped. Wrong size: the
+    // buffer goes back as an error.
+    t.reply(FromHelper::Picture { session: 0, epoch: epoch + 1, cookie, offset: offs[1], bytes: size, ok: true });
+    t.reply(FromHelper::Picture { session: 0, epoch, cookie, offset: offs[2], bytes: size, ok: true });
     assert!(t.events().is_empty());
+    t.reply(FromHelper::Picture { session: 0, epoch, cookie, offset: offs[1], bytes: 10, ok: true });
+    assert_eq!(t.events(), vec![(EVT_DQBUF, CAPTURE_MPLANE, 1, BUF_FLAG_ERROR | BUF_FLAG_TIMESTAMP_COPY, 0)]);
 
     // Drain: the helper is told after the last bitstream, then the LAST
     // buffer and EOS come back.
@@ -200,7 +204,7 @@ fn decodes_through_the_helper() {
     assert_eq!(t.ioctl(ioc::DECODER_CMD, &c, DECODER_CMD_SIZE as u32).0, 0);
     assert!(t.sent().contains(&ToHelper::Drain { session: 0 }));
     t.reply(FromHelper::DrainDone { session: 0 });
-    assert_eq!(t.events(), vec![(EVT_DQBUF, CAPTURE_MPLANE, 1, BUF_FLAG_LAST | BUF_FLAG_TIMESTAMP_COPY, 0), (EVT_EVENT, EVENT_EOS, 0, 0, 0)]);
+    assert_eq!(t.events(), vec![(EVT_DQBUF, CAPTURE_MPLANE, 2, BUF_FLAG_LAST | BUF_FLAG_TIMESTAMP_COPY, 0), (EVT_EVENT, EVENT_EOS, 0, 0, 0)]);
 
     // Closing frees the window.
     let mut close = vec![0u8; 16];
@@ -219,22 +223,22 @@ fn a_size_change_mid_stream_needs_new_buffers() {
     t.reqbufs(CAPTURE_MPLANE, 2);
     t.stream(ioc::STREAMON, OUTPUT_MPLANE);
     t.stream(ioc::STREAMON, CAPTURE_MPLANE);
-    t.reply(FromHelper::Format { session: 0, layout: Layout { width: 640, height: 480 }, visible: (640, 480), min_buffers: 4 });
+    t.reply(FromHelper::Format { session: 0, layout: Layout { width: 640, height: 480 }, visible: (640, 480), min_buffers: 4, depth: 8 });
     t.qbuf(CAPTURE_MPLANE, 0, 0);
     t.qbuf(CAPTURE_MPLANE, 1, 0);
     t.events();
     t.sent();
     // Bigger than the buffers: the next one goes back empty and LAST, and
     // no credit until the guest makes new buffers.
-    t.reply(FromHelper::Format { session: 0, layout: Layout { width: 4096, height: 2304 }, visible: (4096, 2304), min_buffers: 4 });
+    t.reply(FromHelper::Format { session: 0, layout: Layout { width: 4096, height: 2304 }, visible: (4096, 2304), min_buffers: 4, depth: 8 });
     assert_eq!(t.events(), vec![(EVT_EVENT, EVENT_SOURCE_CHANGE, 0, 0, 0), (EVT_DQBUF, CAPTURE_MPLANE, 0, BUF_FLAG_LAST | BUF_FLAG_TIMESTAMP_COPY, 0)]);
-    assert!(!t.sent().iter().any(|m| matches!(m, ToHelper::Credit { n, .. } if *n > 0)));
+    assert!(!t.sent().iter().any(|m| matches!(m, ToHelper::Grant { len, .. } if *len > 0)));
     t.stream(ioc::STREAMOFF, CAPTURE_MPLANE);
     assert_eq!(t.reqbufs(CAPTURE_MPLANE, 2), 2);
     assert!(t.h.sessions[&0].cap_bufs.iter().all(|b| b.len >= 4096 * 2304 * 3 / 2));
     t.stream(ioc::STREAMON, CAPTURE_MPLANE);
     t.qbuf(CAPTURE_MPLANE, 0, 0);
-    assert!(t.sent().iter().any(|m| matches!(m, ToHelper::Credit { n: 1, .. })));
+    assert_eq!(t.sent().iter().filter(|m| matches!(m, ToHelper::Grant { len, .. } if *len > 0)).count(), 1);
 }
 
 #[test]
@@ -273,8 +277,8 @@ fn hostile_requests_are_refused() {
     assert_eq!(get_u32(&t.cmd(&m, 24), 0), EINVAL);
     // A helper message for a session that isn't there, a picture without
     // a credit.
-    t.reply(FromHelper::Picture { session: 3, epoch: 0, cookie: 0, data: vec![] });
-    t.reply(FromHelper::Picture { session: 0, epoch: 0, cookie: 0, data: vec![0; 16 * 16 * 3 / 2] });
+    t.reply(FromHelper::Picture { session: 3, epoch: 0, cookie: 0, offset: 0, bytes: 0, ok: true });
+    t.reply(FromHelper::Picture { session: 0, epoch: 0, cookie: 0, offset: 0, bytes: 16 * 16 * 3 / 2, ok: true });
     // At most MAX_SESSIONS sessions.
     for _ in 1..MAX_SESSIONS {
         t.open();
@@ -322,8 +326,8 @@ fn junk_commands_never_panic() {
         if rnd() % 5 == 0 {
             let s = rnd() % 3;
             let m = match rnd() % 5 {
-                0 => FromHelper::Format { session: s, layout: Layout { width: 16 * (1 + rnd() % 50), height: 16 * (1 + rnd() % 50) }, visible: (16, 16), min_buffers: 4 },
-                1 => FromHelper::Picture { session: s, epoch: rnd() % 3, cookie: rnd() % 5, data: vec![1; (rnd() % 5000) as usize] },
+                0 => FromHelper::Format { session: s, layout: Layout { width: 16 * (1 + rnd() % 50), height: 16 * (1 + rnd() % 50) }, visible: (16, 16), min_buffers: 4, depth: 8 + 2 * (rnd() % 2) },
+                1 => FromHelper::Picture { session: s, epoch: rnd() % 3, cookie: rnd() % 5, offset: (rnd() % 8) << 16, bytes: rnd() % 5000, ok: rnd() % 2 == 0 },
                 2 => FromHelper::Consumed { session: s, cookie: rnd() % 5, ok: true },
                 3 => FromHelper::DrainDone { session: s },
                 _ => FromHelper::Error { session: s, errno: rnd() },
@@ -333,4 +337,121 @@ fn junk_commands_never_panic() {
         t.events();
         t.sent();
     }
+}
+
+#[test]
+fn decoding_order_and_10_bits() {
+    let mut t = T::new();
+    t.open();
+    // VP9, pictures in decoding order (display delay 0), P010 pictures.
+    let (_, f) = t.fmt(ioc::S_FMT, OUTPUT_MPLANE, PIX_VP9, 1920, 1080);
+    assert_eq!(get_u32(&f, fmt::PIXELFORMAT), PIX_VP9);
+    let ctrl = |id: u32, v: u32| {
+        let mut c = vec![0u8; CONTROL_SIZE];
+        put_u32(&mut c, 0, id);
+        put_u32(&mut c, 4, v);
+        c
+    };
+    assert_eq!(t.ioctl(ioc::S_CTRL, &ctrl(CID_DEC_DISPLAY_DELAY_ENABLE, 1), CONTROL_SIZE as u32).0, 0);
+    assert_eq!(t.ioctl(ioc::S_CTRL, &ctrl(CID_DEC_DISPLAY_DELAY, 99), CONTROL_SIZE as u32).0, EINVAL);
+    assert_eq!(t.ioctl(ioc::S_CTRL, &ctrl(CID_VP9_PROFILE, 2), CONTROL_SIZE as u32).0, EINVAL, "read only");
+    let (_, f) = t.fmt(ioc::S_FMT, CAPTURE_MPLANE, PIX_P010, 0, 0);
+    assert_eq!(get_u32(&f, fmt::PIXELFORMAT), PIX_P010);
+    assert_eq!(get_u32(&f, fmt::BYTESPERLINE), 1920 * 2);
+    t.reqbufs(OUTPUT_MPLANE, 1);
+    t.reqbufs(CAPTURE_MPLANE, 2);
+    assert!(t.h.sessions[&0].cap_bufs.iter().all(|b| b.len >= 1920 * 1088 * 3));
+    t.stream(ioc::STREAMON, OUTPUT_MPLANE);
+    assert_eq!(t.sent(), vec![ToHelper::Open { session: 0, codec: Codec::Vp9, flags: OPEN_DECODE_ORDER }]);
+    // Too late to change now.
+    assert_eq!(t.ioctl(ioc::S_CTRL, &ctrl(CID_DEC_DISPLAY_DELAY_ENABLE, 0), CONTROL_SIZE as u32).0, EBUSY);
+    t.stream(ioc::STREAMON, CAPTURE_MPLANE);
+    let layout = Layout { width: 1920, height: 1088 };
+    t.reply(FromHelper::Format { session: 0, layout, visible: (1920, 1080), min_buffers: 4, depth: 10 });
+    t.qbuf(CAPTURE_MPLANE, 0, 0);
+    t.qbuf(CAPTURE_MPLANE, 1, 0);
+    let grants: Vec<PixFmt> = t.sent().iter().filter_map(|m| if let ToHelper::Grant { len, format, .. } = m { (*len > 0).then_some(*format) } else { None }).collect();
+    assert_eq!(grants, vec![PixFmt::P010, PixFmt::P010]);
+    t.events();
+    // A picture that failed comes back as an error.
+    let (epoch, off) = (t.h.sessions[&0].epoch, t.h.sessions[&0].cap_bufs[0].off as u32);
+    t.reply(FromHelper::Picture { session: 0, epoch, cookie: 1, offset: off, bytes: 0, ok: false });
+    assert_eq!(t.events(), vec![(EVT_DQBUF, CAPTURE_MPLANE, 0, BUF_FLAG_ERROR | BUF_FLAG_TIMESTAMP_COPY, 0)]);
+    let off = t.h.sessions[&0].cap_bufs[1].off as u32;
+    t.reply(FromHelper::Picture { session: 0, epoch, cookie: 1, offset: off, bytes: layout.size(PixFmt::P010), ok: true });
+    assert_eq!(t.events(), vec![(EVT_DQBUF, CAPTURE_MPLANE, 1, BUF_FLAG_TIMESTAMP_COPY, layout.size(PixFmt::P010))]);
+}
+
+#[test]
+fn codecs_the_mac_lacks_are_not_offered() {
+    let mut t = T::new();
+    t.h.codecs = codec_list(0);
+    t.open();
+    let mut e = vec![0u8; FMTDESC_SIZE];
+    put_u32(&mut e, 4, OUTPUT_MPLANE);
+    let mut got = Vec::new();
+    for i in 0..4 {
+        put_u32(&mut e, 0, i);
+        let (st, b) = t.ioctl(ioc::ENUM_FMT, &e, FMTDESC_SIZE as u32);
+        if st == 0 {
+            got.push(get_u32(&b, 44));
+        }
+    }
+    assert_eq!(got, vec![PIX_H264, PIX_HEVC]);
+    // Asking for VP9 gets H.264.
+    let (_, f) = t.fmt(ioc::S_FMT, OUTPUT_MPLANE, PIX_VP9, 640, 480);
+    assert_eq!(get_u32(&f, fmt::PIXELFORMAT), PIX_H264);
+}
+
+#[test]
+fn a_decoder_comes_back_after_a_restore() {
+    let mut t = T::new();
+    t.open();
+    subscribe(&mut t, EVENT_SOURCE_CHANGE);
+    t.fmt(ioc::S_FMT, OUTPUT_MPLANE, PIX_HEVC, 1280, 720);
+    t.reqbufs(OUTPUT_MPLANE, 2);
+    t.reqbufs(CAPTURE_MPLANE, 3);
+    t.stream(ioc::STREAMON, OUTPUT_MPLANE);
+    t.stream(ioc::STREAMON, CAPTURE_MPLANE);
+    let layout = Layout { width: 1280, height: 720 };
+    t.reply(FromHelper::Format { session: 0, layout, visible: (1280, 720), min_buffers: 4, depth: 8 });
+    t.reply(FromHelper::Resume { session: 0, state: vec![0, 0, 0, 1, 0x40, 1] });
+    for i in 0..3 {
+        t.qbuf(CAPTURE_MPLANE, i, 0);
+    }
+    // A bitstream buffer still waiting when the snapshot is taken: the
+    // helper is busy (in flight at its cap).
+    t.h.sessions.get_mut(&0).unwrap().in_flight.insert(99, MAX_IN_FLIGHT);
+    t.h.sessions.get_mut(&0).unwrap().in_flight_bytes = MAX_IN_FLIGHT;
+    t.qbuf(OUTPUT_MPLANE, 1, 100);
+    let saved: Vec<Saved> = t.h.sessions.iter().map(|(&id, s)| Saved::of(id, s)).collect();
+    let data = serde_json::to_vec(&saved).unwrap();
+    let offs: Vec<u64> = t.h.sessions[&0].cap_bufs.iter().map(|b| b.off).collect();
+
+    // A new VMM, a new helper.
+    let mut u = T::new();
+    u.h.restore(&data);
+    let sent = u.sent();
+    assert_eq!(sent[0], ToHelper::Resume { session: 0, codec: Codec::Hevc, flags: 0, state: vec![0, 0, 0, 1, 0x40, 1] });
+    let grants: Vec<u64> = sent.iter().filter_map(|m| if let ToHelper::Grant { offset, len, .. } = m { (*len > 0).then_some(*offset as u64) } else { None }).collect();
+    assert_eq!(grants, offs, "the queued picture buffers, where they were");
+    // The waiting bitstream buffer comes back to the guest.
+    assert_eq!(u.events(), vec![(EVT_DQBUF, OUTPUT_MPLANE, 1, BUF_FLAG_TIMESTAMP_COPY, 0)]);
+    // Same buffers mapped at the same offsets; the window has room for no
+    // overlap.
+    assert_eq!(u.h.alloc.used.len(), 5);
+    assert_eq!(u.qbuf(OUTPUT_MPLANE, 1, 10), 0);
+
+    // A state that doesn't hold together fails that decoder only.
+    let mut bad = saved.clone();
+    bad[0].cap_bufs[1].0 = bad[0].cap_bufs[0].0; // overlapping buffers
+    let mut v = T::new();
+    v.h.restore(&serde_json::to_vec(&bad).unwrap());
+    assert!(v.h.sessions[&0].dead);
+    assert!(v.h.alloc.used.is_empty());
+    assert_eq!(v.events(), vec![(EVT_ERROR, EIO, 0, 0, 0)]);
+    // An older snapshot (ids only): failed.
+    let mut w = T::new();
+    w.h.restore(b"[0]");
+    assert!(w.h.sessions[&0].dead);
 }
