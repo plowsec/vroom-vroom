@@ -23,7 +23,7 @@ use vroom_virtio::devices::{block::Block, console::Console, fs::Fs, net::Net, rn
 use vroom_devices::nvme::{Namespace, Nvme};
 use vroom_devices::usb::hid::UsbIds;
 use vroom_devices::usb::xhci::Xhci;
-use vroom_devices::pci::{Intx, IntxRouter, MsiSender, PciRoot, SharedPciDevice, VendorIds};
+use vroom_devices::pci::{Intx, IntxRouter, MsiSender, PciRoot, RootPort, SharedPciDevice, VendorIds};
 use vroom_devices::IrqLine;
 use vroom_virtio::mmio::{ShmRegion, VirtioMmio};
 use vroom_virtio::{pci::VirtioPci, VirtioDevice};
@@ -31,6 +31,7 @@ use vroom_virtio::{pci::VirtioPci, VirtioDevice};
 use crate::agent::{self, Agent, ClipboardProvider};
 use crate::disks::DiskSet;
 use crate::display::{DisplayServer, FbSink, InputPipes, ViewerTx};
+use crate::hotplug::{self, Hotplug};
 use crate::irq::{GicMsi, SpiLine};
 use crate::psci::CpuTable;
 use crate::vcpu::{self, VcpuHandle, VcpuShared, VmEvent};
@@ -68,6 +69,8 @@ struct Board {
     next_pci_slot: u8,
     intx: Arc<IntxRouter>,
     msi: Arc<GicMsi>,
+    /// Devices a resumed VM had in hot plug slots: (port, device).
+    hot: Vec<(usize, Box<dyn VirtioDevice>)>,
 }
 
 impl Board {
@@ -88,6 +91,7 @@ impl Board {
             next_pci_slot: 1,
             intx,
             msi,
+            hot: Vec::new(),
         }
     }
 
@@ -130,12 +134,37 @@ impl Board {
         Ok(())
     }
 
-    /// Put the root complex on the bus if anything needs it.
-    fn finish_pci(&mut self, host_ids: VendorIds) -> Result<bool> {
+    /// Put the root complex on the bus if anything needs it. A machine on
+    /// PCI gets the hot plug root ports, last (the other devices keep
+    /// their slots), with a resumed VM's devices in them.
+    fn finish_pci(&mut self, host_ids: VendorIds) -> Result<Option<Arc<PciRoot>>> {
         if self.pci.is_empty() && !self.use_pci {
-            return Ok(false);
+            return Ok(None);
         }
-        let root = PciRoot::with_host_ids(std::mem::take(&mut self.pci), host_ids);
+        let mut ports = Vec::new();
+        if self.use_pci {
+            let mut hot = std::mem::take(&mut self.hot);
+            for i in 0..hotplug::PORTS {
+                let slot = self.next_pci_slot;
+                if slot > 31 {
+                    log::warn!("pci: no slot left for hot plug port {}", i + 1);
+                    break;
+                }
+                self.next_pci_slot += 1;
+                let mut port = RootPort::new(slot, i as u8, self.intx.pin(slot, 1), self.msi.clone());
+                if let Some(k) = hot.iter().position(|(p, _)| *p == i) {
+                    let (_, dev) = hot.remove(k);
+                    let f = hotplug::function_in(slot, i, dev, &self.mem, &self.msi, &self.intx);
+                    let pristine = f.lock().unwrap_or_else(|e| e.into_inner()).save()?;
+                    port.plug(f, pristine, true).map_err(|e| Error::Setup(e.into()))?;
+                }
+                ports.push((slot, Arc::new(Mutex::new(port))));
+            }
+            if !hot.is_empty() {
+                return Err(Error::Setup("the snapshot has a device in a hot plug slot this VM doesn't have".into()));
+            }
+        }
+        let root = PciRoot::with_ports(std::mem::take(&mut self.pci), host_ids, ports);
         self.reg.add(layout::PCI_ECAM_BASE, layout::PCI_ECAM_SIZE, Arc::new(Mutex::new(root.ecam_port())))?;
         self.reg.add_concurrent(layout::PCI_MMIO_BASE, layout::PCI_MMIO_SIZE, Arc::new(root.window_port(layout::PCI_MMIO_BASE)))?;
         self.reg.add_concurrent(layout::PCI_MMIO64_BASE, layout::PCI_MMIO64_SIZE, Arc::new(root.window_port(layout::PCI_MMIO64_BASE)))?;
@@ -144,7 +173,7 @@ impl Board {
             ecam_size: layout::PCI_ECAM_SIZE,
             buses: (layout::PCI_ECAM_SIZE >> 20) as u32,
         });
-        Ok(true)
+        Ok(Some(root))
     }
 }
 
@@ -165,6 +194,10 @@ pub(crate) struct Machine {
     /// The network adapters built (a resumed VM: the ones it was saved
     /// with), as the VM file had them: what a later save records.
     pub nets: Vec<vroom_config::Net>,
+    /// The adapters while the VM runs (and those plugged in since).
+    pub net_ports: Arc<crate::net::NetPorts>,
+    /// The hot plug slots (a VM on PCI).
+    pub hotplug: Option<Arc<Hotplug>>,
 }
 
 /// Registers MMIO devices on the bus and in the snapshot list in one go,
@@ -214,6 +247,9 @@ pub(crate) struct BuildEnv {
     /// Removable shares for USB disks' files (`usb::FILE_SLOTS` on a
     /// Mac; a resumed VM: as many as it was saved with).
     pub usb_file_slots: usize,
+    /// A resumed VM's network adapters in hot plug slots: adapter index
+    /// to port.
+    pub hot_nets: std::collections::BTreeMap<usize, usize>,
 }
 
 /// What gets loaded into RAM at (re)boot. Kept so reset can reload it.
@@ -761,8 +797,13 @@ pub(crate) fn build(
         if !env.net_ctrl {
             dev = dev.without_ctrl();
         }
-        nics.push(crate::net::Nic::new(dev.control(), live));
-        board.add_virtio(Box::new(dev))?;
+        let port = env.hot_nets.get(&i).copied();
+        nics.push(crate::net::Nic::new(dev.control(), live, p.net.clone(), port));
+        match port {
+            Some(port) if board.use_pci => board.hot.push((port, Box::new(dev))),
+            Some(_) => return Err(Error::Setup("the snapshot has an adapter in a hot plug slot, and this VM isn't on PCI".into())),
+            None => board.add_virtio(Box::new(dev))?,
+        }
         nets.push(p.net);
     }
     // Removable shares for USB disks' files (no hotplug: there from the
@@ -779,7 +820,7 @@ pub(crate) fn build(
         u.set_files(slots, agent.clone());
         crate::usb::test_seam(u);
     }
-    let net_ports = crate::net::NetPorts::new(nics, viewer.clone(), reach, ident.clone());
+    let net_ports = crate::net::NetPorts::new(nics, viewer.clone(), reach, ident.clone(), env.net_ctrl);
     if let Some(ds) = ui {
         if screen.is_none() {
             return Err(Error::Setup("a viewer needs a display (display.gpu or UEFI boot)".into()));
@@ -809,7 +850,7 @@ pub(crate) fn build(
             }
         };
         let windows = config.guest_os() == GuestOs::Windows;
-        ds.run(input, agent.clone(), events.clone(), window, listener, screens.clone(), windows, usb_ports, Some(net_ports))?;
+        ds.run(input, agent.clone(), events.clone(), window, listener, screens.clone(), windows, usb_ports, Some(net_ports.clone()))?;
     }
     for gpu in later_gpus {
         board.add_virtio(Box::new(gpu))?;
@@ -818,7 +859,14 @@ pub(crate) fn build(
     for fs in usb_files {
         board.add_virtio(Box::new(fs))?;
     }
-    let need_pci = board.finish_pci(vendor_ids(&ident.pci_bridge_id)?)?;
+    let root = board.finish_pci(vendor_ids(&ident.pci_bridge_id)?)?;
+    let need_pci = root.is_some();
+    let hotplug = root
+        .filter(|r| r.ports() > 0)
+        .map(|r| Hotplug::new(r, mem.clone(), board.msi.clone(), board.intx.clone()));
+    if let Some(h) = &hotplug {
+        net_ports.set_hotplug(h.clone());
+    }
     let Board { mut reg, fdt: mut fdt_devices, .. } = board;
     if config.tpm {
         let backend = crate::tpm::Swtpm::start(&env.state_dir.join("tpm"), !env.resuming)?;
@@ -921,7 +969,7 @@ pub(crate) fn build(
     let _ = shared.peers.set(vcpus.iter().map(|v| v.peer.clone()).collect());
     vm.finalize()?;
 
-    Ok(Machine { vm, mem, shared, vcpus, devices: reg.stateful, uart, agent, gpus, viewer, screens, boot, nets })
+    Ok(Machine { vm, mem, shared, vcpus, devices: reg.stateful, uart, agent, gpus, viewer, screens, boot, nets, net_ports, hotplug })
 }
 
 #[cfg(test)]

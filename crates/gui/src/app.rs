@@ -971,7 +971,7 @@ impl App {
                 let Some(view) = console::net_view(&v.key) else { return (notes, String::new()) };
                 for (i, n) in c.nets.iter().enumerate() {
                     let Some(Some(nic)) = view.map.get(i) else {
-                        notes[i] = "Added: it comes when the VM next starts.".into();
+                        notes[i] = if view.adding == Some(i) { "Adding...".into() } else { "Added: it comes when the VM next starts.".into() };
                         continue;
                     };
                     let (Some(p), Some(want)) = (view.ports.iter().find(|p| p.nic == *nic), console::net_live_of(n)) else { continue };

@@ -75,7 +75,7 @@ struct Sticky {
     /// Host USB devices plugged in (once there is a USB controller).
     usb: Option<Vec<vroom_display::UsbPort>>,
     /// The network adapters.
-    net: Option<(bool, Vec<vroom_display::NetPort>)>,
+    net: Option<(bool, bool, Vec<vroom_display::NetPort>)>,
     /// What the guest agent can do.
     features: Option<u64>,
 }
@@ -177,7 +177,7 @@ impl ViewerTx {
         first.extend(st.features.map(|features| ToViewer::Agent { features }));
         first.extend(st.state.clone().map(ToViewer::Status));
         first.extend(st.usb.clone().map(ToViewer::Usb));
-        first.extend(st.net.clone().map(|(nat_ok, ports)| ToViewer::Net { nat_ok, ports }));
+        first.extend(st.net.clone().map(|(nat_ok, hotplug, ports)| ToViewer::Net { nat_ok, hotplug, ports }));
         drop(st);
         for m in first {
             v.write_all(&m.encode())?;
@@ -203,7 +203,7 @@ impl ViewerTx {
             }
             ToViewer::Status(t) if t.starts_with("guest agent connected") => st.agent = Some(t.clone()),
             ToViewer::Usb(l) => st.usb = Some(l.clone()),
-            ToViewer::Net { nat_ok, ports } => st.net = Some((*nat_ok, ports.clone())),
+            ToViewer::Net { nat_ok, hotplug, ports } => st.net = Some((*nat_ok, *hotplug, ports.clone())),
             ToViewer::Agent { features } => st.features = Some(*features),
             _ => {}
         }
@@ -748,6 +748,31 @@ fn serve(stream: UnixStream, c: &Serve) {
                         c.tx.send(&ToViewer::Status(format!("Network: adapter {}: {e}", nic + 1)));
                     }
                 }
+                Ok(Some(ToVmm::NetAdd { live, mac, port_mac })) => {
+                    let sock = if live.kind == vroom_display::NetKind::Nat {
+                        None
+                    } else {
+                        match (!fds.is_empty()).then(|| fds.remove(0)) {
+                            Some(fd) => Some(fd),
+                            None => {
+                                log::warn!("display: a new network adapter without its socket");
+                                continue;
+                            }
+                        }
+                    };
+                    let r = c.net.as_ref().map_or(Err("no network adapters".into()), |n| n.add(live, mac, port_mac, sock));
+                    if let Err(e) = r {
+                        log::warn!("net: new adapter: {e}");
+                        c.tx.send(&ToViewer::Status(format!("Network: new adapter: {e}")));
+                    }
+                }
+                Ok(Some(ToVmm::NetRemove { nic })) => {
+                    let r = c.net.as_ref().map_or(Err("no network adapters".into()), |n| n.remove(nic));
+                    if let Err(e) = r {
+                        log::warn!("net: adapter {}: {e}", nic + 1);
+                        c.tx.send(&ToViewer::Status(format!("Network: adapter {}: {e}", nic + 1)));
+                    }
+                }
                 Ok(Some(ToVmm::AgentUpdate)) => match (!fds.is_empty()).then(|| fds.remove(0)) {
                     Some(from) => c.agent.send(AgentCmd::Update { from }),
                     None => log::warn!("display: guest tools without their pipe"),
@@ -889,6 +914,8 @@ fn handle(
         | ToVmm::DragOutGet { .. }
         | ToVmm::NetConnect { .. }
         | ToVmm::NetSet { .. }
+        | ToVmm::NetAdd { .. }
+        | ToVmm::NetRemove { .. }
         | ToVmm::AgentUpdate => {}
         ToVmm::Coherence(on) => agent.send(AgentCmd::Coherence(on)),
         ToVmm::Window { id, op } => agent.send(AgentCmd::Window { id, op }),

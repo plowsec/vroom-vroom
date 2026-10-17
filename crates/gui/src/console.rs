@@ -81,7 +81,7 @@ struct Shared {
     /// The host USB devices the VM has, the latest list.
     usb: Option<Vec<vroom_display::UsbPort>>,
     /// The network adapters, the latest word.
-    net: Option<(bool, Vec<vroom_display::NetPort>)>,
+    net: Option<(bool, bool, Vec<vroom_display::NetPort>)>,
     /// What the guest agent can do, when it (re)connects.
     features: Option<u64>,
     /// Coherence: the guest's latest window list.
@@ -165,7 +165,7 @@ impl Shared {
                 self.drag.push_back(m);
             }
             ToViewer::Usb(l) => self.usb = Some(l),
-            ToViewer::Net { nat_ok, ports } => self.net = Some((nat_ok, ports)),
+            ToViewer::Net { nat_ok, hotplug, ports } => self.net = Some((nat_ok, hotplug, ports)),
             ToViewer::Agent { features } => self.features = Some(features),
             ToViewer::Windows(list) => self.windows = Some(list),
             ToViewer::WindowIcon { id, w, h, rgba } => {
@@ -420,7 +420,8 @@ pub fn net_removed(key: &str, i: usize) {
     with(key, |c| c.net_removed(i));
 }
 
-/// An adapter was added to the VM file: it comes at the next start.
+/// An adapter was added to the VM file: it comes now (a VM on PCI), or
+/// at the next start.
 pub fn net_added(key: &str) {
     with(key, |c| c.net_added());
 }
@@ -1343,8 +1344,8 @@ impl Console {
             (f.0, f.1, f.2, t.0, t.1, t.2, t.3, t.4, c.0, c.1, c.2, c.3, h, heads)
         };
         let (icons, coh_no, net, apps) = icons_no_net;
-        if let Some((nat_ok, ports)) = net {
-            self.net_list(nat_ok, ports);
+        if let Some((nat_ok, hotplug, ports)) = net {
+            self.net_list(nat_ok, hotplug, ports);
         }
         for (h, hd) in heads.iter().enumerate().skip(1).take(self.monitors.saturating_sub(1)) {
             if hd.frame {

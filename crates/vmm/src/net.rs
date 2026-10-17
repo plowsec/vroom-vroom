@@ -1,7 +1,11 @@
 //! Network adapters: their backends at start, and changes while the VM
 //! runs. The VM window plugs an adapter's cable in or out
 //! (`ToVmm::NetConnect`) and puts it on another network (`ToVmm::NetSet`):
-//! same virtio-net device, same MAC, another backend behind it.
+//! same virtio-net device, same MAC, another backend behind it. On a VM
+//! on PCI it can also add an adapter (`ToVmm::NetAdd`: a new virtio-net
+//! device in a hot plug slot) and take one it added out again
+//! (`ToVmm::NetRemove`). Adapters the VM started with stay: removing one
+//! unplugs its cable until the next start.
 //!
 //! The VMM is sandboxed by then: it can't reach vroom-netd (no Unix
 //! sockets), so for bridged and host-only the app asks netd and hands us
@@ -15,16 +19,17 @@
 use std::net::SocketAddr;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixDatagram;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use vroom_config::{Identity, NetKind as ConfigKind, NetMode, VmConfig};
 use vroom_display::{Forward, NetKind, NetLive, NetPort, ToViewer};
 use vroom_net::nat::{Nat, NatConfig, NatPolicy, TcpForward};
 use vroom_net::socket::FrameSocket;
 use vroom_net::{netd, NetBackend};
-use vroom_virtio::devices::net::NetControl;
+use vroom_virtio::devices::net::{Net, NetControl};
 
 use crate::display::ViewerTx;
+use crate::hotplug::Hotplug;
 use crate::{Error, Result};
 
 /// One adapter to build.
@@ -152,12 +157,43 @@ pub(crate) struct Nic {
     /// The NAT it started with, while it is on another network: it holds
     /// the port forwards' listening sockets, which can't be opened again.
     parked: Option<(Box<dyn NetBackend>, Vec<Forward>)>,
+    /// As it was built: what a save records.
+    net: vroom_config::Net,
+    /// The hot plug slot it is in (added while the VM ran).
+    port: Option<usize>,
 }
 
 impl Nic {
-    pub fn new(ctl: NetControl, live: NetLive) -> Self {
-        Nic { ctl, live, parked: None }
+    pub fn new(ctl: NetControl, live: NetLive, net: vroom_config::Net, port: Option<usize>) -> Self {
+        Nic { ctl, live, parked: None, net, port }
     }
+}
+
+/// The VM file's form of an adapter added while the VM runs.
+fn net_of(l: &NetLive, mac: [u8; 6]) -> vroom_config::Net {
+    let (kind, interface, network) = match l.kind {
+        NetKind::Nat => (ConfigKind::Nat, None, None),
+        NetKind::Bridged => (ConfigKind::Bridged, Some(l.name.clone()), None),
+        NetKind::HostOnly => (ConfigKind::HostOnly, None, Some(l.name.clone())),
+    };
+    vroom_config::Net {
+        mode: kind,
+        interface,
+        network,
+        port_forwards: Vec::new(),
+        allow_host_loopback: l.loopback,
+        block_private: l.block_private,
+        mac: Some(vroom_config::format_mac(&mac)),
+        connected: true,
+    }
+}
+
+/// What a save records of the adapters: each as built, and which hot plug
+/// slot each added one is in.
+pub(crate) fn saved(nics: &[Nic]) -> (Vec<vroom_config::Net>, Vec<(usize, usize)>) {
+    let nets = nics.iter().map(|n| n.net.clone()).collect();
+    let hot = nics.iter().enumerate().filter_map(|(i, n)| n.port.map(|p| (i, p))).collect();
+    (nets, hot)
 }
 
 /// What the sandbox leaves this VMM, for adapters changed later.
@@ -185,17 +221,32 @@ pub(crate) struct NetPorts {
     viewer: Option<ViewerTx>,
     reach: Reach,
     ident: Identity,
+    /// Adapters get a control queue (as the ones the VM started with).
+    ctrl: bool,
+    /// Where added adapters go (a VM on PCI).
+    hot: OnceLock<Arc<Hotplug>>,
 }
 
 impl NetPorts {
-    pub fn new(nics: Vec<Nic>, viewer: Option<ViewerTx>, reach: Reach, ident: Identity) -> Arc<NetPorts> {
-        let me = Arc::new(NetPorts { nics: Mutex::new(nics), viewer, reach, ident });
+    pub fn new(nics: Vec<Nic>, viewer: Option<ViewerTx>, reach: Reach, ident: Identity, ctrl: bool) -> Arc<NetPorts> {
+        let me = Arc::new(NetPorts { nics: Mutex::new(nics), viewer, reach, ident, ctrl, hot: OnceLock::new() });
         me.tell();
         me
     }
 
+    /// The hot plug slots, once the machine has them.
+    pub fn set_hotplug(&self, h: Arc<Hotplug>) {
+        let _ = self.hot.set(h);
+        self.tell();
+    }
+
     fn lock(&self) -> MutexGuard<'_, Vec<Nic>> {
         self.nics.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The adapters, held still (a save: nothing comes or goes meanwhile).
+    pub fn hold(&self) -> MutexGuard<'_, Vec<Nic>> {
+        self.lock()
     }
 
     /// The viewer's list, now.
@@ -205,9 +256,79 @@ impl NetPorts {
             .lock()
             .iter()
             .enumerate()
-            .map(|(i, n)| NetPort { nic: i as u8, live: n.live.clone(), connected: n.ctl.connected(), mac: n.ctl.mac() })
+            .map(|(i, n)| NetPort { nic: i as u8, live: n.live.clone(), connected: n.ctl.connected(), mac: n.ctl.mac(), added: n.port.is_some() })
             .collect();
-        v.send(&ToViewer::Net { nat_ok: self.reach.nat, ports });
+        v.send(&ToViewer::Net { nat_ok: self.reach.nat, hotplug: self.hot.get().is_some(), ports });
+    }
+
+    /// A new adapter on `want`, MAC `mac`, in a hot plug slot. Bridged and
+    /// host-only: `sock` is the vroom-netd port the app asked for, and
+    /// the guest gets `port_mac`, the MAC that port passes (as at start).
+    /// NAT port forwards wait for the next start (they need listening
+    /// sockets the sandbox can't open).
+    pub fn add(&self, want: NetLive, mac: [u8; 6], port_mac: [u8; 6], sock: Option<OwnedFd>) -> std::result::Result<(), String> {
+        let hot = self.hot.get().ok_or("adding an adapter while the VM runs needs a VM on PCI (UEFI boot)")?;
+        if !want.valid() {
+            return Err("not a network setting".into());
+        }
+        let mut nics = self.lock();
+        if nics.len() >= vroom_display::NET_PORTS_MAX {
+            return Err(format!("{} adapters at most", vroom_display::NET_PORTS_MAX));
+        }
+        let i = nics.len();
+        let label = label(&want);
+        let (backend, mac, live): (Box<dyn NetBackend>, [u8; 6], NetLive) = match want.kind {
+            NetKind::Nat => {
+                if !self.reach.nat {
+                    return Err("NAT needs the VM restarted: it started without a NAT adapter, so its sandbox allows no connections out".into());
+                }
+                let policy = NatPolicy { allow_host_loopback: want.loopback && self.reach.loopback, block_private: want.block_private };
+                let cfg = nat_config(&self.ident, i, mac, policy.clone(), self.reach.dns).map_err(|e| e.to_string())?;
+                let nat = Nat::new(cfg).map_err(|e| format!("NAT: {e}"))?;
+                let live = NetLive { forwards: Vec::new(), loopback: policy.allow_host_loopback, ..want };
+                (Box::new(nat), mac, live)
+            }
+            NetKind::Bridged | NetKind::HostOnly => {
+                let fd = sock.ok_or("no vroom-netd socket came with it")?;
+                let fs = FrameSocket::new(UnixDatagram::from(fd)).map_err(|e| e.to_string())?;
+                (Box::new(fs), port_mac, want)
+            }
+        };
+        if mac[0] & 1 != 0 || mac == [0; 6] {
+            return Err("not a MAC address for an adapter".into());
+        }
+        if nics.iter().any(|n| n.ctl.mac() == mac) {
+            return Err("an adapter with this MAC is still in the VM (one taken out of the VM file stays until the VM restarts): it comes at the next start".into());
+        }
+        let mut dev = Net::with_link(&format!("eth{i}"), mac, backend, &label, true);
+        if !self.ctrl {
+            dev = dev.without_ctrl();
+        }
+        let ctl = dev.control();
+        let port = hot.add(Box::new(dev))?;
+        let net = net_of(&live, mac);
+        nics.push(Nic { ctl, live, parked: None, net, port: Some(port) });
+        log::info!("net: adapter {} added ({label}), in hot plug slot {}", i + 1, port + 1);
+        drop(nics);
+        self.tell();
+        Ok(())
+    }
+
+    /// Take adapter `nic` out: the guest is asked to let go of it. Only
+    /// one added while the VM runs; the ones after it move up.
+    pub fn remove(&self, nic: u8) -> std::result::Result<(), String> {
+        let hot = self.hot.get().ok_or("no hot plug slots")?;
+        let mut nics = self.lock();
+        let n = nics.get(nic as usize).ok_or("no such network adapter")?;
+        let port = n.port.ok_or("this adapter was there when the VM started: it goes at the next start (its cable is out until then)")?;
+        n.ctl.set_connected(false);
+        nics.remove(nic as usize);
+        // Still holding the list: a save sees both changes or neither.
+        hot.remove(port);
+        drop(nics);
+        log::info!("net: adapter {} taken out (hot plug slot {})", nic + 1, port + 1);
+        self.tell();
+        Ok(())
     }
 
     /// Cable in or out.

@@ -20,6 +20,7 @@ pub(crate) fn note_helper(pid: u32) {
 pub use vroom_state as state;
 mod display;
 mod firmware;
+mod hotplug;
 mod irq;
 mod machine;
 mod net;
@@ -152,6 +153,10 @@ pub struct Vmm {
     net_ctrl: bool,
     /// Removable shares for USB disks' files (what a save records).
     usb_file_slots: usize,
+    /// The network adapters now (a save records them).
+    net_ports: Arc<net::NetPorts>,
+    /// Hot plug slots (a VM on PCI).
+    hotplug: Option<Arc<hotplug::Hotplug>>,
     #[cfg(feature = "research")]
     research_baseline: Option<ResearchBaseline>,
 }
@@ -206,6 +211,10 @@ impl Vmm {
             StartMode::Boot | StartMode::BootPaused => 0,
         };
         let saved = saved.map(|s| s.0);
+        let hot_nets = match &opts.start {
+            StartMode::Restore(dir) | StartMode::RestorePaused(dir) => snapshot::saved_hot_nets(dir)?,
+            StartMode::Boot | StartMode::BootPaused => Default::default(),
+        };
         let env = machine::BuildEnv {
             uuid,
             state_dir: opts.state_dir.clone(),
@@ -214,6 +223,7 @@ impl Vmm {
             net_ctrl,
             usb_file_slots,
             sandbox: opts.sandbox && config.security.sandbox,
+            hot_nets,
         };
         let m = machine::build(&config, hv.as_ref(), opts.serial_out, opts.clipboard, ui, &disks, ev_tx, &env)?;
         // A save records the hardware the guest has: a resumed VM keeps
@@ -242,6 +252,8 @@ impl Vmm {
             state: RunState::Paused,
             net_ctrl,
             usb_file_slots,
+            net_ports: m.net_ports,
+            hotplug: m.hotplug,
             #[cfg(feature = "research")]
             research_baseline: None,
         };

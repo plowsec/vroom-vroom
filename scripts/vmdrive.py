@@ -38,7 +38,13 @@ Commands, one per line, on <state-dir>.cmd (a fifo):
                          put adapter N on another network while the VM
                          runs, as the app does (bridged and host-only: ask
                          vroom-netd for a port, hand the VMM its socket).
-                         Adapters show as "net ..." events.
+                         Adapters show as "net ..." events ("(added)": in a
+                         hot plug slot; "hotplug=1": adapters can be added).
+  netadd MAC nat [loopback] [block] | netadd MAC bridged IFACE |
+  netadd MAC host-only NAME
+                         add an adapter while the VM runs (a VM on PCI), as
+                         the app does; MAC like 02:12:34:56:78:9a
+  netdel N               take out adapter N (one added while it ran)
   dragout X Y X2 Y2 DIR  press at X,Y, drag to X2,Y2 (an edge), ask the guest
                          what it drags out (as the app does when the mouse
                          leaves the window), cancel its drag with Escape and
@@ -168,9 +174,9 @@ def reader():
                         fw.append(f"{addr}:{hp}->{gp}")
                     macs[nic] = bytes(mac)
                     out.append(f"{nic}:{('nat', 'bridged', 'host-only')[kind]}{':' + name if name else ''}"
-                               f"{'' if on else '(unplugged)'}{'(loopback)' if flags & 1 else ''}{'(block)' if flags & 2 else ''}"
+                               f"{'' if on & 1 else '(unplugged)'}{'(added)' if on & 2 else ''}{'(loopback)' if flags & 1 else ''}{'(block)' if flags & 2 else ''}"
                                f" {mac.hex(':')} {' '.join(fw)}")
-                ev.write(f"net nat_ok={pl[0]} " + " | ".join(out) + "\n")
+                ev.write(f"net nat_ok={pl[0] & 1} hotplug={pl[0] >> 1} " + " | ".join(out) + "\n")
             elif t == 7:
                 if pl[0] != 2:
                     ev.write("cursor " + ("unset", "hidden")[pl[0]] + "\n"); continue
@@ -374,11 +380,13 @@ def fetch(i, idx, into):
 def net_live(kind, name=b"", flags=0, fwd=()):
     f = b"".join(bytes([9]) + b"127.0.0.1" + struct.pack("<HH", h, g) for h, g in fwd)
     return bytes([kind, flags, len(name)]) + name + bytes([len(fwd)]) + f
-def netmode(n, args):
+def netmode(n, args, add=None):
     kind = {"nat": 0, "bridged": 1, "host-only": 2}[args[0]]
     if kind == 0:
         flags = ("loopback" in args) | ("block" in args) << 1
         fwd = [tuple(map(int, x.split(":"))) for x in args[1:] if ":" in x]
+        if add is not None:
+            send(95, add + bytes(6) + net_live(0, flags=flags)); return
         send(41, bytes([n]) + bytes(6) + net_live(0, flags=flags, fwd=fwd)); return
     import json
     name = args[1]
@@ -386,7 +394,7 @@ def netmode(n, args):
     with open(cfg, "rb") as f:
         vm = tomllib.load(f).get("name", "vm")
     attach = {"mode": "bridged", "interface": name} if kind == 1 else {"mode": "host-only", "network": name}
-    mac = macs.get(n, b"\x02" + bytes(5))
+    mac = add if add is not None else macs.get(n, b"\x02" + bytes(5))
     req = {"version": 1, "vm": vm, "nic": n, "attach": attach, "mac": [(mac[0] | 2) & 0xfe] + list(mac[1:])}
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.connect(os.environ.get("VROOM_NETD_SOCKET", "/var/run/vroom/netd.sock"))
@@ -403,8 +411,12 @@ def netmode(n, args):
     s.close()
     port_mac = bytes(r["mac"])
     ev.write(f"netd: port {port_mac.hex(':')} for adapter {n}\n")
-    pl = bytes([n]) + port_mac + net_live(kind, name.encode())
-    socket.send_fds(a, [struct.pack("<BI", 41, len(pl)) + pl], fds)
+    if add is not None:
+        pl = add + port_mac + net_live(kind, name.encode())
+        socket.send_fds(a, [struct.pack("<BI", 95, len(pl)) + pl], fds)
+    else:
+        pl = bytes([n]) + port_mac + net_live(kind, name.encode())
+        socket.send_fds(a, [struct.pack("<BI", 41, len(pl)) + pl], fds)
     # Ours goes once the VMM has its copy (macOS can drop a socket whose
     # other copies all close while it is in flight).
     def let_go():
@@ -502,6 +514,13 @@ if True:
                 elif c == "netmode":
                     v = arg.split()
                     netmode(int(v[0]), v[1:])
+                elif c == "netadd":
+                    v = arg.split()
+                    netmode(len(macs), v[1:], add=bytes.fromhex(v[0].replace(":", "")))
+                elif c == "netdel":
+                    n = int(arg)
+                    send(96, bytes([n]))
+                    macs.clear()
                 elif c == "dragout":
                     v = arg.split(" ", 4)
                     dragout(int(v[0]), int(v[1]), int(v[2]), int(v[3]), v[4])
