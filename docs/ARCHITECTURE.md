@@ -150,6 +150,7 @@ resume. The adapters built are what the next save records.
 | `sandbox` | Seatbelt profile (macOS), seccomp + Landlock (Linux). |
 | `gui` | The app (Slint): VM list, settings that edit the VM file in place (toml_edit, comments kept), New VM, `⌘K` palette, VM windows. All state changes go through one message queue on the UI thread. VM windows only see pixels and send input. |
 | `agent` / `proto` | Guest agent (Linux, Windows) and its framed protocol over a virtio-serial port. |
+| `tools` | Host side of the guest tools: finding them (`Contents/Resources/guest-tools`, `target/guest-tools`), the agent's version in its binary, updates as agent frames, ready-made VMs (cloud-init seeds, Windows install sticks). |
 
 ## Board (aarch64)
 
@@ -346,6 +347,47 @@ guest's DropEntry, DropData and DropEnd frames on, checked, with the
 drag's id. The app writes the item where the promise says. When all are
 written (or the drag ends with no drop) the app sends `DragOut` with
 `end`, and the agent forgets the paths.
+
+## Guest tools
+
+`scripts/make-guest-tools.sh` builds them into `target/guest-tools/`
+(`linux/`, `windows/`, and `vroom-tools.img`, a FAT32 disk with both);
+`scripts/app.sh` copies that into the app. `vroom_tools::dir()` finds it.
+
+Versions: `agent/build.rs` makes `0.1.0+348.e314084680` (crate version,
+commits on the branch, commit) and puts it in the binary after
+`\0VROOM_AGENT_VERSION=`. The agent's hello says it, with its system:
+`vroom-agent 0.1.0+348.e314084680 linux`. Older means a lower crate
+version, then fewer commits (`vroom_proto::version`). The app reads the
+tools' version from the agent binary it carries.
+
+The VM window (`gui/src/console/tools.rs`) learns the guest's agent from
+the VMM's "guest agent connected (...)" status line and its features.
+Its tools button shows when the guest's agent is older, or when none
+came in 90 s of running:
+
+- An agent with `features::UPDATE` gets the tools over the agent
+  channel. The app writes them into a pipe as agent frames
+  (`vroom_tools::bundle`: `UpdateBegin` with each file's path, size and
+  SHA-256, then `UpdateData`, 256 KiB at most each) and sends the pipe
+  with `ToVmm::AgentUpdate`. The VMM's `forward_update` passes exactly
+  what was announced to the guest. The agent's service
+  (`agent/src/update.rs`) stages and checks the files, then installs them
+  (Linux: `vroom-agent-update.path` sees `ready` and runs the bundle's
+  `install-agent.sh --update`; Windows: `winupdate.rs`), and answers
+  `UpdateDone`. The service restarts; the session helpers notice their
+  file changed when the service goes, and start the new one (exec on
+  Linux, a new process on Windows). The new agent's hello ends it.
+- Otherwise the app plugs `vroom-tools.img` in as a read-only USB stick
+  (`ToVmm::UsbDisk` with the file's fd, as for a Mac disk) and says what
+  to run; on Linux the command also goes on the Mac's clipboard. When
+  an up-to-date agent says hello, the app takes the stick out.
+
+Ready-made VMs (`vroom_tools::ready`, used by `vroom new --ready` and the
+New VM sheet) put the same tools in at install time: Ubuntu's on the
+cloud-init seed (`seed.rs`), installed by its `runcmd`; Windows' on the
+install stick (`winstick.rs`), with the drivers added in the specialize
+pass and `vroom-setup.cmd` at the first logon.
 
 ## Coherence
 

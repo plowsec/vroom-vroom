@@ -98,6 +98,14 @@ impl Seed<'_> {
         }
         if self.desktop {
             s += "  - [systemctl, set-default, graphical.target]\n";
+            // NetworkManager takes the network over from networkd: its
+            // wait-online would hold every boot for 2 minutes.
+            s += "  - [systemctl, mask, systemd-networkd-wait-online.service]\n";
+            // No welcome wizard: the account is set up.
+            let u = self.user;
+            s += &format!(
+                "  - [sh, -c, 'install -d -o {u} -g {u} /home/{u}/.config && echo yes > /home/{u}/.config/gnome-initial-setup-done && chown {u}:{u} /home/{u}/.config/gnome-initial-setup-done']\n"
+            );
             // The desktop starts after a restart, set up.
             s += "power_state:\n  mode: reboot\n  condition: true\n";
         }
