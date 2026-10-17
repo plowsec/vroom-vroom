@@ -356,8 +356,11 @@ one bound on whichever thread calls in (setup thread, then the GPU
 worker, which changes on device reset). GL fences have no completion thread (ANGLE
 serializes a share group's contexts, so a thread blocked on a fence
 would stall submits): the worker polls them every millisecond while any
-is pending. With GL on, the render server's fences are polled the same
-way (it only has a fence thread of its own with GL off). A GL scanout is copied back on flush: from a context of our
+is pending. The render server's contexts (Vulkan, Direct3D) always get a
+fence thread in the GPU process, woken by their worker process
+(`0013-proxy-fence-thread-always.patch`): polled once a millisecond like
+GL, each Zink frame waited half a millisecond more on average, and
+glmark2 on Zink scored 547 instead of 963. A GL scanout is copied back on flush: from a context of our
 own, into a pixel buffer on the GPU, and shown when the copy lands while
 the worker goes on. Windows' Direct3D frames are blobs in the render
 server's shared memory that the guest never maps: a flush reads them
@@ -420,7 +423,8 @@ surface the host never saw (handle 0), vrend puts the whole context in
 error, and Xwayland under GNOME on Wayland drew nothing (its glamor clears
 pixmaps this way). virglrenderer logs through our logger (`virgl:` lines).
 
-What MoltenVK lacks, the Venus decoder makes up (patches 0007 and 0008):
+What MoltenVK lacks, the Venus decoder makes up (patches 0007, 0008 and
+0012):
 
 - `nullDescriptor`: the guest may leave a descriptor or vertex buffer
   null. Each device gets, on first need, a 64 KiB buffer for reads, one
@@ -437,6 +441,11 @@ What MoltenVK lacks, the Venus decoder makes up (patches 0007 and 0008):
   visible memory types: their memory is shm imported as host memory, which
   device local memory can't be. A guest that picks device local anyway
   gets host visible memory under it (it never maps it).
+- Host image copy isn't offered for depth and stencil formats
+  (0012): MoltenVK offers it, but keeps depth images in private Metal
+  storage, so such an image gets no memory type at all. Zink asks for it
+  on every texture it may copy into from the CPU, and every depth
+  texture failed.
 - For Zink only (its instance says "mesa zink"): transform feedback taken
   and dropped (queries of it are occlusion pools never started, results
   zero), and packed 10-bit vertex formats and RGB32 texel buffers mapped

@@ -551,7 +551,11 @@ emulation, a guest could already crash the GPU process by calling
 a Vulkan window on macOS's OpenGL, vrend maps the frame's shared memory
 read only and copies rows out of it; the row size, offset and height the
 guest gives are checked against the memory's size first. Nothing new is
-loaded and the sandbox rules don't change.
+loaded and the sandbox rules don't change. Each Vulkan or Direct3D
+context also has a thread in the GPU process that its worker wakes
+through a pipe when fences finish; it reads the same shared fence
+counters the millisecond poll read before, so a worker gains nothing new
+by writing to that pipe.
 
 On the GL side, texture clears (`VIRGL_CCMD_CLEAR_TEXTURE`) now reach the
 host on macOS's OpenGL and ANGLE too, which lack the GL call: vrend checks

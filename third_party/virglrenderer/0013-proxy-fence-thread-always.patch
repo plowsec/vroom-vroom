@@ -1,0 +1,163 @@
+--- a/src/proxy/proxy_context.c
++++ b/src/proxy/proxy_context.c
+@@ -21,6 +21,19 @@
+ 
+ #include "proxy_client.h"
+ 
++/* vroom: every proxy context retires its fences on a thread of its own,
++ * woken by its worker, whatever the renderer flags say.  vroom runs GL
++ * without THREAD_SYNC (no vrend fence thread: ANGLE serializes a share
++ * group), and without it a Venus or Direct3D fence was only retired when
++ * the VMM next polled, once a millisecond: Zink waited half a millisecond
++ * more per frame on average.  The fence callbacks then come from that
++ * thread; virgl_renderer_poll may still retire them too (under the lock). */
++static inline bool
++proxy_async_fences(void)
++{
++   return true;
++}
++
+ struct proxy_fence {
+    uint32_t flags;
+    uint32_t seqno;
+@@ -73,7 +86,7 @@
+ {
+    struct proxy_fence *fence = NULL;
+ 
+-   if (proxy_renderer.flags & VIRGL_RENDERER_ASYNC_FENCE_CB)
++   if (proxy_async_fences())
+       mtx_lock(&ctx->free_fences_mutex);
+ 
+    if (!list_is_empty(&ctx->free_fences)) {
+@@ -81,7 +94,7 @@
+       list_del(&fence->head);
+    }
+ 
+-   if (proxy_renderer.flags & VIRGL_RENDERER_ASYNC_FENCE_CB)
++   if (proxy_async_fences())
+       mtx_unlock(&ctx->free_fences_mutex);
+ 
+    return fence ? fence : malloc(sizeof(*fence));
+@@ -90,12 +103,12 @@
+ static void
+ proxy_context_free_fence(struct proxy_context *ctx, struct proxy_fence *fence)
+ {
+-   if (proxy_renderer.flags & VIRGL_RENDERER_ASYNC_FENCE_CB)
++   if (proxy_async_fences())
+       mtx_lock(&ctx->free_fences_mutex);
+ 
+    list_add(&fence->head, &ctx->free_fences);
+ 
+-   if (proxy_renderer.flags & VIRGL_RENDERER_ASYNC_FENCE_CB)
++   if (proxy_async_fences())
+       mtx_unlock(&ctx->free_fences_mutex);
+ }
+ 
+@@ -161,7 +174,7 @@
+    if (ctx->sync_thread.fence_eventfd >= 0)
+       flush_eventfd(ctx->sync_thread.fence_eventfd);
+ 
+-   if (proxy_renderer.flags & VIRGL_RENDERER_ASYNC_FENCE_CB)
++   if (proxy_async_fences())
+       mtx_lock(&ctx->timeline_mutex);
+ 
+    uint64_t new_busy_mask = 0;
+@@ -175,7 +188,7 @@
+ 
+    ctx->timeline_busy_mask = new_busy_mask;
+ 
+-   if (proxy_renderer.flags & VIRGL_RENDERER_ASYNC_FENCE_CB)
++   if (proxy_async_fences())
+       mtx_unlock(&ctx->timeline_mutex);
+ }
+ 
+@@ -193,7 +206,7 @@
+       },
+    };
+ 
+-   assert(proxy_renderer.flags & VIRGL_RENDERER_ASYNC_FENCE_CB);
++   assert(proxy_async_fences());
+ 
+    while (!ctx->sync_thread.stop) {
+       const int ret = poll(poll_fds, ARRAY_SIZE(poll_fds), -1);
+@@ -209,12 +222,12 @@
+        * spin this thread) and settle the fences left right away (see
+        * proxy_context_retire_timeline_fences_locked). */
+       if (poll_fds[1].fd >= 0 && (poll_fds[1].revents & (POLLHUP | POLLERR | POLLNVAL))) {
+-         if (proxy_renderer.flags & VIRGL_RENDERER_ASYNC_FENCE_CB)
++         if (proxy_async_fences())
+             mtx_lock(&ctx->timeline_mutex);
+          if (!ctx->worker_gone)
+             proxy_log("ctx %d: the worker is gone", ctx->base.ctx_id);
+          ctx->worker_gone = true;
+-         if (proxy_renderer.flags & VIRGL_RENDERER_ASYNC_FENCE_CB)
++         if (proxy_async_fences())
+             mtx_unlock(&ctx->timeline_mutex);
+          poll_fds[1].fd = -1;
+       }
+@@ -330,13 +343,13 @@
+    fence->seqno = timeline->next_seqno++;
+    fence->fence_id = fence_id;
+ 
+-   if (proxy_renderer.flags & VIRGL_RENDERER_ASYNC_FENCE_CB)
++   if (proxy_async_fences())
+       mtx_lock(&ctx->timeline_mutex);
+ 
+    list_addtail(&fence->head, &timeline->fences);
+    ctx->timeline_busy_mask |= 1ull << ring_idx;
+ 
+-   if (proxy_renderer.flags & VIRGL_RENDERER_ASYNC_FENCE_CB)
++   if (proxy_async_fences())
+       mtx_unlock(&ctx->timeline_mutex);
+ 
+    /* Event-ring fences take the out-of-band channel: registered by the
+@@ -358,13 +371,13 @@
+       return 0;
+ 
+    /* recover timeline fences and busy_mask on submit_fence request failure */
+-   if (proxy_renderer.flags & VIRGL_RENDERER_ASYNC_FENCE_CB)
++   if (proxy_async_fences())
+       mtx_lock(&ctx->timeline_mutex);
+ 
+    list_del(&fence->head);
+    ctx->timeline_busy_mask = old_busy_mask;
+ 
+-   if (proxy_renderer.flags & VIRGL_RENDERER_ASYNC_FENCE_CB)
++   if (proxy_async_fences())
+       mtx_unlock(&ctx->timeline_mutex);
+ 
+    proxy_context_free_fence(ctx, fence);
+@@ -377,7 +390,6 @@
+ {
+    struct proxy_context *ctx = (struct proxy_context *)base;
+ 
+-   assert(!(proxy_renderer.flags & VIRGL_RENDERER_ASYNC_FENCE_CB));
+    proxy_context_retire_fences_internal(ctx);
+ }
+ 
+@@ -386,7 +398,6 @@
+ {
+    struct proxy_context *ctx = (struct proxy_context *)base;
+ 
+-   assert(!(proxy_renderer.flags & VIRGL_RENDERER_ASYNC_FENCE_CB));
+    return ctx->sync_thread.fence_eventfd;
+ }
+ 
+@@ -710,7 +721,7 @@
+     *
+     * Fence polling can always check the shmem directly.
+     */
+-   if (!(proxy_renderer.flags & VIRGL_RENDERER_THREAD_SYNC))
++   if (!(proxy_renderer.flags & VIRGL_RENDERER_THREAD_SYNC) && !proxy_async_fences())
+       return true;
+ 
+    if (create_fence_pipe(&ctx->sync_thread.fence_eventfd,
+@@ -719,7 +730,7 @@
+       return false;
+    }
+ 
+-   if (proxy_renderer.flags & VIRGL_RENDERER_ASYNC_FENCE_CB) {
++   if (proxy_async_fences()) {
+       int ret = thrd_create(&ctx->sync_thread.thread, proxy_context_sync_thread, ctx);
+       if (ret != thrd_success) {
+          proxy_log("failed to create sync thread");
