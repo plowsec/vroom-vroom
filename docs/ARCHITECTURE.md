@@ -16,9 +16,12 @@ vroom run <vm.toml>   one process per VM, sandboxed after setup ◄───┘
    │  stream socket: transfer requests in, results and plug events out
    │  (a device a macOS driver holds: vroom-netd's root helper instead,
    │  asked for before the sandbox)
-   └─ optional: vroom video-helper (video_decode), own sandbox, stream
-      socket: bitstreams and buffer grants in; pictures written into the
-      shared buffer window (VideoToolbox)
+   ├─ optional: vroom video-helper (video_decode), own sandbox, stream
+   │  socket: bitstreams and buffer grants in; pictures written into the
+   │  shared buffer window (VideoToolbox)
+   └─ optional: vroom video-helper --encode (video_encode), own sandbox,
+      stream socket: where raw frames are and buffer grants in; frames
+      read from its buffer window, coded frames written into it
 
 vroom-gui ── starts vroom usb-host for a device connected from the VM
              window, or asks vroom-netd to start it as root; passes its
@@ -666,6 +669,86 @@ theirs through VA-API, so the driver guesses it from the size and bit
 depth. Transfers to the host give no stride: the kernel refuses one for
 these (non-blob) resources, and the host reads the rows packed, as GBM
 lays them out.
+
+## Video encoding
+
+`video_encode = true` (app: Settings, Display, Hardware video encoding)
+adds a second virtio-media device, the encoder
+(`virtio/src/devices/media/enc.rs`): the same transport, command and
+event queues, and a buffer window of its own (1 GiB, only what buffers
+touch is real memory), in front of a V4L2 stateful encoder. Raw frames
+on the OUTPUT queue (NV12, or P010 for HEVC Main 10, laid out at the
+guest's own size: rows of the frame's width, chroma right after the last
+row), H.264 or HEVC on the CAPTURE queue, the formats the helper said it
+encodes. Frame intervals come from `S_PARM`, the rest from controls
+(`G/S/TRY_EXT_CTRLS`, `QUERY_EXT_CTRL` and the old single-control
+ioctls): bitrate, peak bitrate, rate control (VBR, CBR, constant
+quality), GOP size and H.264 I-frame period, force key frame, profile,
+level, entropy coding. B-frames are 0 only; parameter sets come joined
+with each key frame. `ENCODER_CMD` STOP drains: every frame queued comes
+back coded, then an empty buffer with the LAST flag and the EOS event.
+
+The work happens in a second helper, `vroom video-helper --encode`
+(`cli/src/venc.rs`, `cli/src/vtenc.rs`), with the encoder's window. When
+the queues start, the device sends the helper the session's settings
+(`EncConfig`: codec, raw format and layout, picture size, frame rate,
+rate control, bitrate, key frame interval, profile, flags); changed
+rates go to the running session, anything else starts a new
+VideoToolbox session with a key frame. Each raw frame the guest queues
+becomes an `Encode` message naming where it is in the window; the helper
+copies it into one of the compression session's pixel buffers (IOSurface)
+and the guest gets its buffer back. Frames don't cross the socket either
+way: coded frames go into CAPTURE buffers the device granted, as
+pictures do for the decoder (same grants and epochs). VideoToolbox hands
+out length-prefixed NAL units with the parameter sets apart; the helper
+writes Annex B with the parameter sets in front of each key frame
+(`video/src/nal.rs`). No frame reordering: coded frames come out in the
+order their frames went in, and the device gives each the time of its
+frame, the KEYFRAME or PFRAME flag, and its size.
+
+Constant bitrate asks for VideoToolbox's low-latency mode (real time,
+the rate control FaceTime uses; one frame in, one out, about 5 ms for
+720p on an M3 Max), as calls want; the other modes run the ordinary
+encoder, which pipelines frames for throughput. A key frame on request
+is a frame option; the GOP size is VideoToolbox's key frame interval
+(0: only the first frame and those asked for).
+
+A pause (snapshot) keeps each encoder's V4L2 side: formats, controls,
+buffers and queues. Raw frames still queued, at the helper, or coded but
+not handed back are lost (the window isn't saved): after a restore the
+raw buffers go back to the guest and, for each lost frame, a coded buffer
+comes back empty with the error flag and that frame's time, so a player
+waiting on it moves on. The new helper gets the session's settings and
+the stream goes on with a key frame.
+
+### The VA-API driver's encoder
+
+`vroom_drv_video.c` offers `VAEntrypointEncSlice` for H.264
+(Constrained Baseline, Main, High) and HEVC (Main, Main 10) when the VM
+has the encoder. VA-API encoders are made for hardware that codes slices
+the player describes, with headers the player writes (packed headers).
+Ours codes whole frames and writes its own headers, so the driver says
+it takes no packed headers (Chrome and FFmpeg then leave the headers to
+the driver), one reference frame and no B-frames, and maps what the
+player sends onto the encoder:
+
+- the sequence parameters: the picture size (H.264's frame cropping
+  included), bitrate and frame rate (VUI timing);
+- the misc parameters: rate control (target and peak bitrate) and frame
+  rate;
+- the picture parameters: the coded buffer to fill, and IDR, which
+  becomes a forced key frame;
+- the config's rate control mode: CBR, VBR, or CQP as a constant
+  quality from the key frames' QP.
+
+At `vaEndPicture` the input surface (our copy of its picture: Chrome
+fills it through `vaDeriveImage`, FFmpeg through `vaDeriveImage` or
+`vaPutImage`) is copied into a V4L2 raw buffer and queued; the coded
+frame lands in the VA coded buffer when it comes back.
+`vaSyncSurface` on the input surface, `vaSyncBuffer` and `vaMapBuffer`
+on the coded buffer wait for it. Rate changes become control changes
+only when they change. Reference surfaces and the player's slice headers
+are ignored.
 
 ## 3D
 

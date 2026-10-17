@@ -106,13 +106,16 @@ Windows guests:
 - **32-bit apps** get Microsoft's OpenGL 1.1 and no Vulkan: no x86
   builds of our drivers yet.
 
-## Hardware video decoding
+## Hardware video decoding and encoding
 
 Linux guests decode H.264, HEVC, VP9 and AV1 on the Mac's VideoToolbox
 now (`[display] video_decode = true`, see [GUIDE.md](GUIDE.md#video-decoding)):
 GStreamer and FFmpeg through V4L2, Firefox and Chrome through our VA-API
-driver (H.264, HEVC and VP9). VMware Fusion and Parallels don't offer this to
-Linux guests on Apple Silicon at all.
+driver (H.264, HEVC and VP9). They encode H.264 and HEVC there too
+(`video_encode = true`, see [GUIDE.md](GUIDE.md#video-encoding)): FFmpeg
+and GStreamer through V4L2, Chrome's calls and FFmpeg through VA-API.
+VMware Fusion and Parallels don't offer this to Linux guests on Apple
+Silicon at all.
 
 ### Which guest side, and why (October 2026)
 
@@ -160,9 +163,22 @@ A guest needs a driver and an API its players use. What exists:
 - **Chrome with `opengl_host = "angle"`**: its GPU process still doesn't
   start (ANGLE's ES 3.0 has no multisample textures, so the guest gets
   one sample and no ES 3.0 by the spec). Chrome works on `apple`.
-- **Hardware encoding** for video calls: Chrome sends with libvpx or
-  OpenH264 in the page's process (0.1 to 0.2 of a CPU at 720p). A VA-API
-  encoder on VideoToolbox's would take that to the Mac.
+- **Encoding, the rest** (H.264 and HEVC encode on VideoToolbox now,
+  `video_encode = true`, see [GUIDE.md](GUIDE.md#video-encoding)):
+  - Calls that send VP8 or VP9 (Google Meet often picks them) stay in
+    software: VideoToolbox has no VP8 or VP9 encoder. Steering Chrome to
+    H.264 when the other side takes it would need a page or an extension.
+  - Chrome needs `--enable-features=AcceleratedVideoEncoder` (the install
+    script adds it). Follow Chrome: the flag may go once Linux turns it on.
+  - Chrome's frames reach the driver as pictures in memory: it converts
+    each camera frame to NV12 and the driver copies it into the encoder's
+    buffer. Encoding straight from Chrome's GPU buffers (dma-bufs, screen
+    sharing) would need the driver to import them; it imports only its
+    own.
+  - HEVC through VA-API: VA-API doesn't pass the crop, so pictures come
+    out in whole rows of 16 (1920x1088). Reading it from FFmpeg's packed
+    SPS would fix that; `hevc_v4l2m2m` has no such problem.
+  - Windows guests: a Media Foundation encoder on the same helper.
 - **The guest drivers**: ship virtio-media (DKMS package) until it is
   upstream, and follow its upstreaming; package the VA-API driver.
 - **Fewer copies, the rest**: a picture now goes from VideoToolbox's

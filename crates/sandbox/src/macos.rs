@@ -282,9 +282,18 @@ pub fn camera_profile(exe: &Path) -> Result<String> {
 /// decoding itself runs in Apple's own decoder service (an XPC service,
 /// sandboxed by macOS); we may reach that service and the frame buffers
 /// (IOSurface) it hands back, nothing else: no files beyond the system,
-/// no network, no exec, no GPU, no writes.
-pub fn video_profile(exe: &Path) -> Result<String> {
+/// no network, no exec, no GPU, no writes. The encoding helper (`encode`)
+/// reaches the encoder service instead, and not the decoder's; making a
+/// hardware encoding session also asks the user's trust agent (Security's
+/// certificate service, which every app may reach): without it
+/// VideoToolbox finds no encoder.
+pub fn video_profile(exe: &Path, encode: bool) -> Result<String> {
     let exe_real = exe.canonicalize().unwrap_or_else(|_| exe.to_path_buf());
+    let service = if encode {
+        r#"(xpc-service-name "com.apple.coremedia.videoencoder") (global-name "com.apple.trustd.agent")"#
+    } else {
+        r#"(xpc-service-name "com.apple.coremedia.videodecoder")"#
+    };
     Ok(format!(
         r#"(version 1)
 (deny default)
@@ -296,7 +305,7 @@ pub fn video_profile(exe: &Path) -> Result<String> {
 (allow sysctl-read)
 (allow signal (target self))
 (allow mach-task-name (target self))
-(allow mach-lookup (xpc-service-name "com.apple.coremedia.videodecoder"))
+(allow mach-lookup {service})
 (allow iokit-open (iokit-user-client-class "IOSurfaceRootUserClient"))
 "#,
         exe = q(&exe_real)?,

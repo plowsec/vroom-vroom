@@ -33,7 +33,7 @@ The security design is better than the big three’s, at least on paper:
  │  ╔══╧═══╗╔══╧═══╗╔══╧═══╗╔══╧═══╗╔══╧═══╗╔══╧═══╗  ┌──────────┐   │
  │  ║  3D  ║║audio ║║camera║║video ║║ USB  ║║ TPM  ║  │   netd   │   │
  │  ╚══╤═══╝╚══╤═══╝╚══╤═══╝╚══╤═══╝╚══╤═══╝╚══════╝  │  (root)  │   │
- │  ╔══╧═══╗ sound  camera  decoder device            └────┬─────┘   │
+ │  ╔══╧═══╗ sound  camera  codecs  device            └────┬─────┘   │
  │  ║ apps ║ (mic)                                        LAN        │
  │  ╚══╤═══╝                                                         │
  │    GPU                                                            │
@@ -43,7 +43,7 @@ The security design is better than the big three’s, at least on paper:
 
 A guest that breaks out lands in the VMM's sandbox: its own disks, nothing
 else of yours. Each Vulkan or Direct3D app in the guest gets a 3D process
-of its own (apps); video decoding, when on, gets one too. Details in
+of its own (apps); video decoding and encoding, when on, get one each. Details in
 [SECURITY.md](docs/SECURITY.md).
 
 
@@ -65,7 +65,8 @@ of its own (apps); video decoding, when on, gets one too. Details in
 - Drag and drop files between the Mac and the guest, both ways
 - Up to 4 guest monitors, a window each, full screen on several Mac screens
 - The Mac's camera as a webcam in the guest, if you turn it on
-- Video decoding on the Mac's hardware for Linux guests (H.264, HEVC, VP9, AV1), if you turn it on; Firefox uses it
+- Video decoding on the Mac's hardware for Linux guests (H.264, HEVC, VP9, AV1), if you turn it on; Firefox and Chrome use it
+- Video encoding on the Mac's hardware for Linux guests (H.264, HEVC), if you turn it on; Chrome's video calls and FFmpeg use it
 - Fast disk and network I/O, measured against QEMU ([numbers](docs/PERFORMANCE.md))
 
 Not yet: x86_64 hosts (it builds, can't run VMs yet) and Secure Boot.

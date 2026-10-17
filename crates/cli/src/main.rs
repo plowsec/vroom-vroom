@@ -13,9 +13,12 @@ mod snap;
 mod term;
 mod tools;
 mod usb;
+mod venc;
 mod video;
 #[cfg(target_os = "macos")]
 mod vt;
+#[cfg(target_os = "macos")]
+mod vtenc;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;

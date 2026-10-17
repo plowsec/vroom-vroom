@@ -15,7 +15,12 @@
 //! `vroom_video::proto`). Everything from the guest and the helper is
 //! checked: buffer counts and sizes, indices, lengths, the window's
 //! bounds.
+//!
+//! A second instance of the device is the encoder (`enc`): the same
+//! transport and buffer window, a V4L2 stateful encoder in front, an
+//! encoder helper behind.
 
+mod enc;
 pub mod v4l2;
 
 use std::collections::{BTreeMap, VecDeque};
@@ -76,13 +81,32 @@ pub trait WindowPlacer: Send + Sync {
     fn place(&self, gpa: u64);
 }
 
+/// What a media device is to the guest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// "Video decoder": coded streams in, pictures out.
+    Decoder,
+    /// "Video encoder": raw frames in, H.264 / HEVC out.
+    Encoder,
+}
+
+impl Role {
+    /// The card name the guest sees (our VA-API driver looks for these).
+    pub fn card(self) -> &'static str {
+        match self {
+            Role::Decoder => "Video decoder",
+            Role::Encoder => "Video encoder",
+        }
+    }
+}
+
 pub struct Media {
     link: Arc<dyn HelperLink>,
-    /// The codecs the helper decodes ([`Codec::bit`]s).
+    /// The codecs the helper decodes, or encodes ([`Codec::bit`]s).
     codecs: u32,
     window: GuestMemory,
     placer: Arc<dyn WindowPlacer>,
-    card: String,
+    role: Role,
     worker: WorkerSlot<Handler>,
 }
 
@@ -94,23 +118,44 @@ impl std::fmt::Debug for Media {
 
 impl Media {
     /// `window`: [`WINDOW`] bytes at guest address 0 (our view of it,
-    /// shared with the helper). `codecs`: what the helper said it decodes.
-    pub fn new(link: Arc<dyn HelperLink>, codecs: u32, window: GuestMemory, placer: Arc<dyn WindowPlacer>, card: &str) -> Self {
-        Media { link, codecs, window, placer, card: card.to_string(), worker: WorkerSlot::default() }
+    /// shared with the helper). `codecs`: what the helper said it decodes
+    /// (or encodes).
+    pub fn new(link: Arc<dyn HelperLink>, codecs: u32, window: GuestMemory, placer: Arc<dyn WindowPlacer>, role: Role) -> Self {
+        Media { link, codecs, window, placer, role, worker: WorkerSlot::default() }
     }
 
     fn handler(&self) -> Handler {
-        Handler {
-            link: self.link.clone(),
-            codecs: codec_list(self.codecs),
-            window: self.window.clone(),
-            sessions: BTreeMap::new(),
-            alloc: Alloc::default(),
-            events: VecDeque::new(),
-            next_cookie: 1,
-            helper_lost: false,
-            last_dump: None,
+        Handler::new(self.link.clone(), self.role, self.codecs, self.window.clone())
+    }
+
+    /// Fuzzing: run the command queue over guest memory, hand the device
+    /// what a hostile helper sends (`from_helper`, protocol bytes), run
+    /// the queues again, then save the state and restore it in a new
+    /// device. Synchronously, the way the worker does. Not for anything
+    /// else.
+    #[doc(hidden)]
+    pub fn fuzz_queues(&self, ctx: ActivateContext, from_helper: &[u8]) {
+        let mut h = self.handler();
+        let mut c = QueueCtx::new(ctx);
+        h.process_queue(&mut c, 0);
+        let mut r = from_helper;
+        while let Ok(m) = FromHelper::read_from(&mut r) {
+            h.on_helper(m);
         }
+        h.process_queue(&mut c, 0);
+        h.process_queue(&mut c, 1);
+        let data = match self.role {
+            Role::Decoder => serde_json::to_vec(&h.sessions.iter().map(|(&id, s)| Saved::of(id, s)).collect::<Vec<_>>()),
+            Role::Encoder => serde_json::to_vec(&h.enc.iter().map(|(&id, s)| enc::SavedEnc::of(id, s)).collect::<Vec<_>>()),
+        };
+        let mut again = self.handler();
+        match (self.role, data) {
+            (Role::Decoder, Ok(d)) => again.restore(&d),
+            (Role::Encoder, Ok(d)) => again.enc_restore(&d),
+            _ => {}
+        }
+        h.close_all();
+        again.close_all();
     }
 }
 
@@ -299,15 +344,40 @@ impl Session {
 
 struct Handler {
     link: Arc<dyn HelperLink>,
+    role: Role,
     /// The coded formats we offer, in [`Codec::ALL`] order.
     codecs: Vec<Codec>,
     window: GuestMemory,
+    /// Decoders (role Decoder) or encoders (role Encoder).
     sessions: BTreeMap<u32, Session>,
+    enc: BTreeMap<u32, enc::EncSession>,
     alloc: Alloc,
     events: VecDeque<Vec<u8>>,
     next_cookie: u32,
     helper_lost: bool,
     last_dump: Option<std::time::Instant>,
+}
+
+impl Handler {
+    fn new(link: Arc<dyn HelperLink>, role: Role, codecs: u32, window: GuestMemory) -> Handler {
+        let codecs = match role {
+            Role::Decoder => codec_list(codecs),
+            Role::Encoder => Handler::enc_codecs(codecs),
+        };
+        Handler {
+            link,
+            role,
+            codecs,
+            window,
+            sessions: BTreeMap::new(),
+            enc: BTreeMap::new(),
+            alloc: Alloc::default(),
+            events: VecDeque::new(),
+            next_cookie: 1,
+            helper_lost: false,
+            last_dump: None,
+        }
+    }
 }
 
 impl std::fmt::Debug for Handler {
@@ -355,6 +425,28 @@ fn codec_list(bits: u32) -> Vec<Codec> {
     Codec::ALL.into_iter().filter(|c| matches!(c, Codec::H264 | Codec::Hevc) || bits & c.bit() != 0).collect()
 }
 
+/// The event that hands buffer `index` of a queue (`b`) back to the guest.
+fn buffer_event(session: u32, d: Dir, index: u32, b: &Buf, flags: u32, sequence: u32) -> Vec<u8> {
+    log::trace!("media: session {session}: {d:?} buffer {index} back, {} bytes, flags {flags:#x}", b.bytesused);
+    let mut ev = vec![0u8; 8 + BUFFER_SIZE + MAX_PLANES * PLANE_SIZE];
+    put_u32(&mut ev, 0, EVT_DQBUF);
+    put_u32(&mut ev, 4, session);
+    let o = 8;
+    put_u32(&mut ev, o + buf::INDEX, index);
+    put_u32(&mut ev, o + buf::TYPE, if d == Dir::Output { OUTPUT_MPLANE } else { CAPTURE_MPLANE });
+    put_u32(&mut ev, o + buf::FLAGS, flags | BUF_FLAG_TIMESTAMP_COPY);
+    put_u32(&mut ev, o + buf::FIELD, FIELD_NONE);
+    ev[o + buf::TIMESTAMP..o + buf::TIMESTAMP + 16].copy_from_slice(&b.ts);
+    put_u32(&mut ev, o + buf::SEQUENCE, sequence);
+    put_u32(&mut ev, o + buf::MEMORY, MEMORY_MMAP);
+    put_u32(&mut ev, o + buf::LENGTH, 1);
+    let p = o + BUFFER_SIZE;
+    put_u32(&mut ev, p + plane::BYTESUSED, b.bytesused);
+    put_u32(&mut ev, p + plane::LENGTH, b.len);
+    put_u32(&mut ev, p + plane::MEM_OFFSET, b.off as u32);
+    ev
+}
+
 fn raw_pixfmt(f: PixFmt) -> u32 {
     match f {
         PixFmt::Nv12 => PIX_NV12,
@@ -394,23 +486,7 @@ impl Handler {
         let Some(s) = self.sessions.get_mut(&session) else { return };
         let Some(b) = s.bufs(d).get_mut(index as usize) else { return };
         b.queued = false;
-        log::trace!("media: session {session}: {d:?} buffer {index} back, {} bytes, flags {flags:#x}", b.bytesused);
-        let mut ev = vec![0u8; 8 + BUFFER_SIZE + MAX_PLANES * PLANE_SIZE];
-        put_u32(&mut ev, 0, EVT_DQBUF);
-        put_u32(&mut ev, 4, session);
-        let o = 8;
-        put_u32(&mut ev, o + buf::INDEX, index);
-        put_u32(&mut ev, o + buf::TYPE, if d == Dir::Output { OUTPUT_MPLANE } else { CAPTURE_MPLANE });
-        put_u32(&mut ev, o + buf::FLAGS, flags | BUF_FLAG_TIMESTAMP_COPY);
-        put_u32(&mut ev, o + buf::FIELD, FIELD_NONE);
-        ev[o + buf::TIMESTAMP..o + buf::TIMESTAMP + 16].copy_from_slice(&b.ts);
-        put_u32(&mut ev, o + buf::SEQUENCE, sequence);
-        put_u32(&mut ev, o + buf::MEMORY, MEMORY_MMAP);
-        put_u32(&mut ev, o + buf::LENGTH, 1);
-        let p = o + BUFFER_SIZE;
-        put_u32(&mut ev, p + plane::BYTESUSED, b.bytesused);
-        put_u32(&mut ev, p + plane::LENGTH, b.len);
-        put_u32(&mut ev, p + plane::MEM_OFFSET, b.off as u32);
+        let ev = buffer_event(session, d, index, b, flags, sequence);
         self.event(ev);
     }
 
@@ -458,6 +534,9 @@ impl Handler {
                     self.error_event(id, EIO);
                 }
             }
+        }
+        for id in self.enc_fail_all() {
+            self.error_event(id, EIO);
         }
     }
 
@@ -558,6 +637,9 @@ impl Handler {
     }
 
     fn on_helper(&mut self, m: FromHelper) {
+        if self.role == Role::Encoder {
+            return self.enc_on_helper(m);
+        }
         let id = m.session();
         let Some(s) = self.sessions.get_mut(&id) else { return };
         if s.dead {
@@ -572,7 +654,8 @@ impl Handler {
             log::trace!("media: session {id}: helper: {what}");
         }
         match m {
-            FromHelper::Caps { .. } => {}
+            // Encoder messages aren't ours.
+            FromHelper::Caps { .. } | FromHelper::Coded { .. } => {}
             FromHelper::Resume { state, .. } => s.resume = state,
             FromHelper::Format { layout, visible, min_buffers, depth, .. } => {
                 let old = s.layout.replace(layout);
@@ -663,10 +746,15 @@ impl Handler {
         let cmd = get_u32(&h, 0);
         let out: Vec<u8> = match cmd {
             CMD_OPEN => {
-                let free = (0..MAX_SESSIONS).find(|i| !self.sessions.contains_key(i));
+                let free = (0..MAX_SESSIONS).find(|i| !self.sessions.contains_key(i) && !self.enc.contains_key(i));
                 match free {
                     Some(id) if !self.helper_lost => {
-                        self.sessions.insert(id, Session::new());
+                        match self.role {
+                            Role::Decoder => {
+                                self.sessions.insert(id, Session::new());
+                            }
+                            Role::Encoder => self.enc_open(id),
+                        }
                         let mut v = resp_header(0).to_vec();
                         v.extend_from_slice(&id.to_le_bytes());
                         v.extend_from_slice(&[0; 4]);
@@ -685,7 +773,11 @@ impl Handler {
             CMD_IOCTL => match read_payload(r, 8) {
                 Ok(b) => {
                     let (id, code) = (get_u32(&b, 0), get_u32(&b, 4));
-                    match self.ioctl(id, code, r) {
+                    let answer = match self.role {
+                        Role::Decoder => self.ioctl(id, code, r),
+                        Role::Encoder => self.enc_ioctl(id, code, r),
+                    };
+                    match answer {
                         Ok(payload) => {
                             let mut v = resp_header(0).to_vec();
                             v.extend_from_slice(&payload);
@@ -699,7 +791,8 @@ impl Handler {
             CMD_MMAP => match read_payload(r, 12) {
                 Ok(b) => {
                     let (id, off) = (get_u32(&b, 0), get_u32(&b, 8) as u64);
-                    let ok = self.sessions.get(&id).is_some_and(|s| s.out_bufs.iter().chain(&s.cap_bufs).any(|x| x.off == off));
+                    let ok = self.sessions.get(&id).is_some_and(|s| s.out_bufs.iter().chain(&s.cap_bufs).any(|x| x.off == off))
+                        || self.enc.get(&id).is_some_and(|s| s.out_bufs.iter().chain(&s.cap_bufs).any(|x| x.off == off));
                     match self.alloc.len(off).filter(|_| ok) {
                         Some(len) => {
                             let mut v = resp_header(0).to_vec();
@@ -721,6 +814,7 @@ impl Handler {
     }
 
     fn close(&mut self, id: u32) {
+        self.enc_close(id);
         let Some(s) = self.sessions.remove(&id) else { return };
         for b in s.out_bufs.iter().chain(&s.cap_bufs) {
             self.alloc.free(b.off);
@@ -732,7 +826,7 @@ impl Handler {
     }
 
     fn close_all(&mut self) {
-        let ids: Vec<u32> = self.sessions.keys().copied().collect();
+        let ids: Vec<u32> = self.sessions.keys().chain(self.enc.keys()).copied().collect();
         for id in ids {
             self.close(id);
         }
@@ -1319,6 +1413,7 @@ impl QueueHandler for Handler {
             return;
         }
         self.last_dump = Some(now);
+        self.enc_tick();
         for (id, s) in &self.sessions {
             let q = |v: &Vec<Buf>| v.iter().map(|b| if b.queued { 'q' } else { '-' }).collect::<String>();
             log::debug!(
@@ -1367,7 +1462,7 @@ impl VirtioDevice for Media {
         let mut cfg = [0u8; 40];
         put_u32(&mut cfg, 0, CAP_VIDEO_M2M_MPLANE | CAP_STREAMING | CAP_EXT_PIX_FORMAT);
         put_u32(&mut cfg, 4, 0); // VFL_TYPE_VIDEO
-        put_str(&mut cfg, 8, 32, &self.card);
+        put_str(&mut cfg, 8, 32, self.role.card());
         for (i, b) in data.iter_mut().enumerate() {
             *b = cfg.get(offset as usize + i).copied().unwrap_or(0);
         }
@@ -1401,13 +1496,27 @@ impl VirtioDevice for Media {
         // again can: the V4L2 side (formats, buffers, queues) and the
         // helper's resume state. After a restore the stream goes on from
         // its next key frame.
-        let saved: Vec<Saved> = self.worker.with(|_, h| h.sessions.iter().map(|(&id, s)| Saved::of(id, s)).collect()).unwrap_or_default();
-        let data = serde_json::to_vec(&saved).map_err(|e| crate::Error::Device(e.to_string()))?;
+        // An encoder keeps its formats, controls and buffers; the frames
+        // it was coding are lost, and it goes on with a key frame.
+        let data = match self.role {
+            Role::Decoder => {
+                let saved: Vec<Saved> = self.worker.with(|_, h| h.sessions.iter().map(|(&id, s)| Saved::of(id, s)).collect()).unwrap_or_default();
+                serde_json::to_vec(&saved)
+            }
+            Role::Encoder => {
+                let saved: Vec<enc::SavedEnc> = self.worker.with(|_, h| h.enc.iter().map(|(&id, s)| enc::SavedEnc::of(id, s)).collect()).unwrap_or_default();
+                serde_json::to_vec(&saved)
+            }
+        }
+        .map_err(|e| crate::Error::Device(e.to_string()))?;
         Ok(DeviceState { queues: self.worker.queues(), data })
     }
     fn restore_active(&mut self, ctx: ActivateContext, data: &[u8]) -> Result<()> {
         let mut h = self.handler();
-        h.restore(data);
+        match self.role {
+            Role::Decoder => h.restore(data),
+            Role::Encoder => h.enc_restore(data),
+        }
         self.worker.start("media", ctx, h, true)
     }
 }

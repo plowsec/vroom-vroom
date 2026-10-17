@@ -113,10 +113,11 @@ pub fn camera_profile(exe: &std::path::Path) -> Result<String> {
     macos::camera_profile(exe)
 }
 
-/// Seatbelt profile for the video decoding helper (macOS).
+/// Seatbelt profile for the video decoding helper, or with `encode` the
+/// encoding one (macOS).
 #[cfg(target_os = "macos")]
-pub fn video_profile(exe: &std::path::Path) -> Result<String> {
-    macos::video_profile(exe)
+pub fn video_profile(exe: &std::path::Path, encode: bool) -> Result<String> {
+    macos::video_profile(exe, encode)
 }
 
 /// Seatbelt profile for the USB passthrough helper (macOS).

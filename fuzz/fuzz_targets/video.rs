@@ -1,8 +1,9 @@
 //! Video decoding: what a guest's bitstream does to the helper's parsing
 //! (NAL units, access units, parameter sets, display order; VP9 frame
 //! headers and superframes; AV1 OBUs and sequence headers) before
-//! VideoToolbox sees it, and what either side of the helper protocol can
-//! send the other.
+//! VideoToolbox sees it, the encoder's output turned into Annex B, and
+//! what either side of the helper protocol (decoder and encoder messages)
+//! can send the other.
 #![no_main]
 use libfuzzer_sys::fuzz_target;
 use vroom_video::nal::{self, ParamSets};
@@ -57,6 +58,13 @@ fuzz_target!(|data: &[u8]| {
                 if let Some(c) = vpx::av1_sequence(&o.data[o.payload..]) {
                     let _ = vpx::av1c(&c, o.data);
                 }
+            }
+            // The encoder's output: length-prefixed NAL units to Annex B.
+            // What comes out splits back into the same units.
+            let len_size = 1 + (sel as usize / 5) % 4;
+            if let Some(out) = nal::annexb(&[], rest, len_size, 1 << 20) {
+                assert!(out.len() <= 1 << 20);
+                let _ = nal::split_annexb(&out);
             }
         }
         _ => {

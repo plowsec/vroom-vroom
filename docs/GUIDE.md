@@ -1007,7 +1007,9 @@ VaapiVideoDecoder`. Flags older guides give
   10-bit video is shown in 8 bits there.
 - In video calls (WebRTC), Chrome decodes incoming H.264 and VP9 on the
   Mac too (`getStats()`: "ExternalDecoder (VaapiVideoDecoder)", power
-  efficient). VP8, and the video it sends, stay in software.
+  efficient). VP8 stays in software; the video it sends goes to the Mac
+  too with `video_encode` when it is H.264 (see
+  [Video encoding](#video-encoding)).
 - Under Wayland, hardware decoded video is a little more saturated than
   the same video decoded in software (reds and greens stand out more).
   Chrome converts limited range BT.709 video with BT.601's colours on
@@ -1025,8 +1027,16 @@ busy), before and after Chrome could use the GPU:
 | The same in VP9 | | 0.09, 0.14, 0.49 |
 
 The decoding moves out of the page's process; the GPU process does the
-copies into GPU memory. A call costs about the same: sending is in
-software either way.
+copies into GPU memory. A call costs about the same: sending was in
+software either way (for H.264 it no longer is, see
+[Video encoding](#video-encoding)).
+
+Since October 18, 2026 the driver no longer spins while it waits for a
+picture (it asked `poll()` about free bitstream buffers too, which are
+nearly always there): Chrome playing a 1080p30 H.264 clip at 12 Mbit/s
+under Wayland, GPU process 0.13 to 0.06, whole guest 0.35 to 0.28 (same
+clip, old and new driver, two runs each). Run `install-vaapi.sh` again
+to get it.
 
 The same videos in GNOME on Xorg (mean of two runs), before and after
 the X11 support (October 17, 2026):
@@ -1072,6 +1082,142 @@ Good to know:
   sandboxed to VideoToolbox (see [SECURITY.md](SECURITY.md#video-decoding)).
   If it dies, decoders in the guest fail (`EIO`) until the VM restarts;
   the rest of the VM is fine.
+
+## Video encoding
+
+Linux guests can hand video encoding to the Mac's hardware encoder
+(VideoToolbox): video calls in Chrome, recording and converting with
+FFmpeg or GStreamer. Off by default for now (app: Settings, Display,
+Hardware video encoding):
+
+```toml
+[display]
+video_encode = true
+```
+
+The guest sees a V4L2 video encoder (`/dev/videoN`, "Video encoder";
+with `video_decode` on too, the decoder is the other one). In: NV12
+frames, or P010 for HEVC Main 10. Out: H.264 (Baseline, Constrained
+Baseline, Main, High) or HEVC (Main, Main 10), from 16 to 4096 pixels
+wide or high (4096x2304 at most). Every Apple Silicon Mac encodes both
+in hardware. VP8, VP9 and AV1: VideoToolbox doesn't encode them, so
+those stay in software in the guest.
+
+It needs the same virtio-media driver as decoding
+(`scripts/guest/install-virtio-media.sh`, see above). Then:
+
+```bash
+v4l2-ctl -d /dev/video1 --info                 # Card type: Video encoder
+v4l2-ctl -d /dev/video1 -l                     # its controls
+# FFmpeg: NV12 frames in
+ffmpeg -i in.mp4 -pix_fmt nv12 -c:v h264_v4l2m2m -b:v 4M out.mkv
+ffmpeg -i in.mp4 -pix_fmt nv12 -c:v hevc_v4l2m2m -b:v 3M out.mkv
+# GStreamer
+gst-launch-1.0 videotestsrc num-buffers=300 ! video/x-raw,format=NV12,width=1280,height=720 \
+  ! v4l2h264enc ! h264parse ! matroskamux ! filesink location=out.mkv
+```
+
+What it takes: bitrate and peak bitrate; rate control (variable,
+constant, or constant quality 0 to 100); the key frame interval (GOP
+size, or H.264's I-frame period; 0: only the first frame and those asked
+for); a key frame on request; profile; level (a hint: VideoToolbox picks
+a level that fits); H.264 entropy coding (CABAC for Main and High). No
+B-frames. Each key frame carries its parameter sets. Constant bitrate
+also turns on VideoToolbox's low-latency mode (the one FaceTime uses):
+each frame comes out about 5 ms after it went in (720p, M3 Max). The
+other modes favour throughput.
+
+### Browsers and FFmpeg's VA-API encoders
+
+Our VA-API driver (`scripts/guest/install-vaapi.sh`, installed on or
+after October 18, 2026) encodes through the same device: `vainfo` lists
+`VAEntrypointEncSlice` for H.264 and HEVC. Chrome encodes video calls
+(WebRTC) with it, FFmpeg's `h264_vaapi` and `hevc_vaapi` too:
+
+```bash
+ffmpeg -vaapi_device /dev/dri/renderD128 -i in.mp4 -vf 'format=nv12,hwupload' -c:v h264_vaapi -b:v 4M out.mp4
+```
+
+FFmpeg says "Driver does not support some wanted packed headers": that
+is expected, the encoder writes its own headers. Rate control: constant
+or variable bitrate, or constant QP (taken as a constant quality).
+Through VA-API, HEVC pictures come out in whole rows of 16 (1080p comes
+out 1920x1088): VA-API's HEVC parameters don't carry the crop. Use
+`hevc_v4l2m2m` for exact sizes.
+
+Chrome (Google's deb and the Chromium snap) needs its VA-API encoder
+turned on: `--enable-features=AcceleratedVideoEncoder` (off by default on
+Linux). The script adds it to the same wrapper and `CHROMIUM_FLAGS` as
+the render node (see Browsers: VA-API above); if you start Chrome with an
+`--enable-features` of your own, add `AcceleratedVideoEncoder` to it.
+Check in `chrome://webrtc-internals`, a call's `outbound-rtp`:
+`encoderImplementation=VaapiVideoEncodeAccelerator,
+powerEfficientEncoder=true`. Things to know:
+
+- Chrome encodes H.264 on the Mac, and only H.264: a call that picks VP8
+  or VP9 (Google Meet often does) still sends in software.
+- Chrome on Linux doesn't ask a VA-API encoder for temporal layers (SVC);
+  this one has none either.
+- Frames reach the driver as pictures in memory (what Chrome does with
+  a camera). Frames Chrome only has as GPU buffers (dma-bufs) the driver
+  can't take: it imports only buffers it exported itself. Chrome should
+  then encode in software (not tried).
+
+Chrome 155 in a call with itself (H.264, 720p camera, at most 2.5
+Mbit/s, received through the hardware decoder), in CPUs (1.0 is one
+guest CPU busy): GPU process, page, whole guest; mean of three 30-second
+runs each:
+
+| | OpenH264 (software) | VideoToolbox |
+|---|---|---|
+| Wayland: the VM's camera (test colour bars, about 170 kbit/s) | 0.06, 0.11, 0.44 | 0.08, 0.07, 0.44 |
+| Wayland: a noisy 720p clip as the camera (2.5 Mbit/s) | 0.07, 0.16, 0.47 | 0.10, 0.09, 0.45 |
+| Xorg: the VM's camera | 0.06, 0.09, 0.41 | 0.08, 0.06, 0.41 |
+| Xorg: the noisy clip | 0.07, 0.15, 0.44 | 0.10, 0.09, 0.42 |
+
+The encoding leaves the page's process (0.03 to 0.07 of a CPU less); the
+GPU process takes 0.02 to 0.03 more: it converts each camera frame to
+NV12 for the driver, which hands it to the device. For the guest as a
+whole it comes out about even at these sizes. With the noisy clip,
+OpenH264 sent 960x540 at that bitrate in every run; VideoToolbox kept
+1280x720 in two runs of six. Each frame takes longer: 5 to 7.5 ms from Chrome's
+side (`totalEncodeTime` over `framesEncoded`), against 2 to 3.5 ms for
+OpenH264; about 5 ms of it is VideoToolbox's low-latency encoder itself.
+
+### What it saves
+
+FFmpeg 6.1 encoding 300 frames of NV12 at 4 Mbit/s (time, then guest
+CPU: user and system), on an M3 Max with 4 vCPUs; PSNR of the result
+against its source:
+
+| | 1280x720 | 1920x1080 |
+|---|---|---|
+| `h264_v4l2m2m` | 0.46 s, 0.15 s; 42.0 dB | 0.84 s, 0.64 s; 39.6 dB |
+| `hevc_v4l2m2m` | | 0.87 s, 0.66 s |
+| `h264_vaapi` | 0.93 s, 0.98 s; 44.8 dB | 1.48 s, 1.77 s; 40.6 dB |
+| `hevc_vaapi` | 0.93 s, 1.00 s; 46.1 dB | 1.35 s, 1.50 s (1920x1088) |
+| `libx264 -preset veryfast` (software) | 0.77 s, 2.10 s; 46.2 dB | 1.23 s, 3.64 s; 41.0 dB |
+
+That is 200 to 650 frames a second. Through V4L2 the guest's CPU barely
+works; through VA-API, FFmpeg's upload and the driver's copies cost
+about 3 ms of guest CPU a frame. FFmpeg's V4L2 encoders put a key frame
+every 12 frames by default (`-g` changes that), hence their lower PSNR.
+All of these decode back cleanly. GStreamer's `v4l2h264enc` (720p,
+decodes back cleanly) and `v4l2h265enc` (1080p, 300 frames) work too.
+
+Good to know:
+
+- Up to 8 encoders at once, in a 1 GiB buffer window of their own.
+- An encoder open during a snapshot keeps going. After restoring a
+  snapshot, or resuming a suspended VM, it comes back: the frames it was
+  encoding at that moment are lost (each comes back as an empty buffer
+  with the error flag) and the stream goes on with a key frame. Chrome's
+  call went on with the hardware encoder; FFmpeg's encodes went on and
+  their files decode cleanly (minus those frames).
+- The encoding runs in `vroom video-helper --encode`, a process of its
+  own sandboxed to VideoToolbox's encoder (see
+  [SECURITY.md](SECURITY.md#video-encoding)). If it dies, encoders in the
+  guest fail (`EIO`) until the VM restarts; the rest of the VM is fine.
 
 ## Shared folders
 

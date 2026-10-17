@@ -135,6 +135,21 @@ impl Layout {
         l.valid().then_some(l)
     }
 
+    /// An encoder's raw frames: the guest's own size, any even one within
+    /// limits, rows of `width` samples with nothing rounded up (players
+    /// write frames packed, and FFmpeg takes the format's size for its
+    /// frames' size).
+    pub fn for_frame(w: u32, h: u32) -> Option<Layout> {
+        let l = Layout { width: w, height: h };
+        l.valid_frame().then_some(l)
+    }
+
+    /// Within limits and even (a frame layout from the other side).
+    pub fn valid_frame(&self) -> bool {
+        let (w, h) = (self.width, self.height);
+        (MIN_SIDE..=MAX_SIDE).contains(&w) && (MIN_SIDE..=MAX_SIDE).contains(&h) && w % 2 == 0 && h % 2 == 0 && w * h <= MAX_PIXELS + 16 * MAX_SIDE
+    }
+
     /// Within limits and aligned (a layout from the other side).
     pub fn valid(&self) -> bool {
         let (w, h) = (self.width, self.height);

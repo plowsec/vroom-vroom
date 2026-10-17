@@ -30,19 +30,13 @@ struct T {
 
 impl T {
     fn new() -> T {
+        T::with(Role::Decoder)
+    }
+
+    fn with(role: Role) -> T {
         let link = Arc::new(FakeLink::default());
         let window = GuestMemory::new(&[(GuestAddress(0), WINDOW)]).unwrap();
-        let h = Handler {
-            link: link.clone(),
-            codecs: codec_list(u32::MAX),
-            window,
-            sessions: BTreeMap::new(),
-            alloc: Alloc::default(),
-            events: VecDeque::new(),
-            next_cookie: 1,
-            helper_lost: false,
-            last_dump: None,
-        };
+        let h = Handler::new(link.clone(), role, u32::MAX, window);
         T { h, link }
     }
 
@@ -454,4 +448,298 @@ fn a_decoder_comes_back_after_a_restore() {
     let mut w = T::new();
     w.h.restore(b"[0]");
     assert!(w.h.sessions[&0].dead);
+}
+
+// ---- the encoder ----
+
+fn ext_ctrls(t: &mut T, code: u32, which: u32, list: &[(u32, i32)]) -> (u32, Vec<(u32, i32)>) {
+    let mut b = vec![0u8; EXT_CONTROLS_SIZE];
+    put_u32(&mut b, 0, which);
+    put_u32(&mut b, 4, list.len() as u32);
+    for &(id, v) in list {
+        let mut c = vec![0u8; EXT_CONTROL_SIZE];
+        put_u32(&mut c, 0, id);
+        put_i32(&mut c, 12, v);
+        b.extend_from_slice(&c);
+    }
+    let n = b.len() as u32;
+    let (st, r) = t.ioctl(code, &b, n);
+    let got = (0..list.len()).map(|i| (get_u32(&r, EXT_CONTROLS_SIZE + i * EXT_CONTROL_SIZE), get_u32(&r, EXT_CONTROLS_SIZE + i * EXT_CONTROL_SIZE + 12) as i32)).collect();
+    (st, got)
+}
+
+fn parm(t: &mut T, code: u32, num: u32, den: u32) -> (u32, u32) {
+    let mut p = vec![0u8; STREAMPARM_SIZE];
+    put_u32(&mut p, 0, OUTPUT_MPLANE);
+    put_u32(&mut p, 12, num);
+    put_u32(&mut p, 16, den);
+    let (st, r) = t.ioctl(code, &p, STREAMPARM_SIZE as u32);
+    assert_eq!(st, 0);
+    assert_eq!(get_u32(&r, 4), CAP_TIMEPERFRAME);
+    (get_u32(&r, 12), get_u32(&r, 16))
+}
+
+fn enc_cmd(t: &mut T, cmd: u32) -> u32 {
+    let mut c = vec![0u8; ENCODER_CMD_SIZE];
+    put_u32(&mut c, 0, cmd);
+    t.ioctl(ioc::ENCODER_CMD, &c, ENCODER_CMD_SIZE as u32).0
+}
+
+/// An encoder set up as FFmpeg's h264_v4l2m2m does it, streaming.
+fn encoder() -> T {
+    let mut t = T::with(Role::Encoder);
+    assert_eq!(t.open(), 0);
+    subscribe(&mut t, EVENT_EOS);
+    let (st, f) = t.fmt(ioc::S_FMT, OUTPUT_MPLANE, PIX_NV12, 1920, 1080);
+    assert_eq!(st, 0);
+    // The frame as the guest has it: rows of 1920 samples, 1080 of them.
+    assert_eq!((get_u32(&f, fmt::WIDTH), get_u32(&f, fmt::HEIGHT), get_u32(&f, fmt::BYTESPERLINE)), (1920, 1080, 1920));
+    assert_eq!(get_u32(&f, fmt::SIZEIMAGE), 1920 * 1080 * 3 / 2);
+    let (st, f) = t.fmt(ioc::S_FMT, CAPTURE_MPLANE, PIX_H264, 1920, 1080);
+    assert_eq!(st, 0);
+    assert!(get_u32(&f, fmt::SIZEIMAGE) >= 512 << 10);
+    assert_eq!(parm(&mut t, ioc::S_PARM, 1, 30), (1, 30));
+    let (st, _) = ext_ctrls(&mut t, ioc::S_EXT_CTRLS, CTRL_CLASS_CODEC, &[(CID_BITRATE, 4_000_000), (CID_GOP_SIZE, 12), (CID_FRAME_RC_ENABLE, 1)]);
+    assert_eq!(st, 0);
+    assert_eq!(t.reqbufs(OUTPUT_MPLANE, 2), 2);
+    assert_eq!(t.reqbufs(CAPTURE_MPLANE, 2), 2);
+    assert_eq!(t.stream(ioc::STREAMON, OUTPUT_MPLANE), 0);
+    assert_eq!(t.stream(ioc::STREAMON, CAPTURE_MPLANE), 0);
+    t
+}
+
+#[test]
+fn encodes_through_the_helper() {
+    let mut t = encoder();
+    let sent = t.sent();
+    let ToHelper::Configure { session: 0, config } = sent[0] else { panic!("{sent:?}") };
+    assert_eq!((config.codec, config.format, config.visible, config.layout), (Codec::H264, PixFmt::Nv12, (1920, 1080), Layout { width: 1920, height: 1080 }));
+    assert_eq!((config.fps, config.bitrate, config.gop, config.rc), ((30, 1), 4_000_000, 12, vroom_video::proto::RateControl::Vbr));
+    assert!(config.valid());
+
+    // The coded buffers are granted in order.
+    for i in 0..2 {
+        assert_eq!(t.qbuf(CAPTURE_MPLANE, i, 0), 0);
+    }
+    let offs: Vec<u32> = (0..2).map(|i| t.h.enc[&0].cap_bufs[i].off as u32).collect();
+    let grants: Vec<u32> = t.sent().iter().filter_map(|m| if let ToHelper::Grant { offset, len, .. } = m { (*len > 0).then_some(*offset) } else { None }).collect();
+    assert_eq!(grants, offs);
+
+    // A raw frame: the helper is told where it is (the first one is a key
+    // frame); the guest gets the buffer back once the helper has read it.
+    assert_eq!(t.qbuf(OUTPUT_MPLANE, 1, 1920 * 1080 * 3 / 2), 0);
+    let sent = t.sent();
+    let ToHelper::Encode { cookie, offset, len, key, .. } = sent[0] else { panic!("{sent:?}") };
+    assert_eq!((offset as u64, len, key), (t.h.enc[&0].out_bufs[1].off, 1920 * 1080 * 3 / 2, true));
+    assert!(t.events().is_empty());
+    t.reply(FromHelper::Consumed { session: 0, cookie, ok: true });
+    assert_eq!(t.events(), vec![(EVT_DQBUF, OUTPUT_MPLANE, 1, BUF_FLAG_TIMESTAMP_COPY, 1920 * 1080 * 3 / 2)]);
+
+    // Its coded frame, in the first coded buffer, with the frame's time.
+    let epoch = t.h.enc[&0].epoch;
+    t.reply(FromHelper::Coded { session: 0, epoch, cookie, offset: offs[0], bytes: 5000, key: true, ok: true });
+    assert_eq!(t.events(), vec![(EVT_DQBUF, CAPTURE_MPLANE, 0, BUF_FLAG_KEYFRAME | BUF_FLAG_TIMESTAMP_COPY, 5000)]);
+    assert_eq!(get_u32(&t.h.enc[&0].cap_bufs[0].ts, 0), 1001);
+    // Not the oldest grant, a stale epoch: refused. Too big: an error.
+    t.reply(FromHelper::Coded { session: 0, epoch, cookie, offset: offs[0], bytes: 10, key: false, ok: true });
+    t.reply(FromHelper::Coded { session: 0, epoch: epoch + 1, cookie, offset: offs[1], bytes: 10, key: false, ok: true });
+    assert!(t.events().is_empty());
+    t.reply(FromHelper::Coded { session: 0, epoch, cookie, offset: offs[1], bytes: u32::MAX, key: false, ok: true });
+    assert_eq!(t.events(), vec![(EVT_DQBUF, CAPTURE_MPLANE, 1, BUF_FLAG_ERROR | BUF_FLAG_TIMESTAMP_COPY, 0)]);
+
+    // Rates change live; a key frame on request.
+    let (st, _) = ext_ctrls(&mut t, ioc::S_EXT_CTRLS, CTRL_WHICH_CUR_VAL, &[(CID_BITRATE, 1_000_000), (CID_FORCE_KEY_FRAME, 0)]);
+    assert_eq!(st, 0);
+    let sent = t.sent();
+    assert!(matches!(sent[0], ToHelper::Configure { config, .. } if config.bitrate == 1_000_000), "{sent:?}");
+    t.qbuf(OUTPUT_MPLANE, 0, 100);
+    assert!(t.sent().iter().any(|m| matches!(m, ToHelper::Encode { key: true, .. })));
+    // The rest needs the queues stopped.
+    let (st, _) = ext_ctrls(&mut t, ioc::S_EXT_CTRLS, CTRL_WHICH_CUR_VAL, &[(CID_H264_PROFILE, 2)]);
+    assert_eq!(st, EBUSY);
+    let (st, got) = ext_ctrls(&mut t, ioc::G_EXT_CTRLS, CTRL_WHICH_CUR_VAL, &[(CID_BITRATE, 0), (CID_GOP_SIZE, 0)]);
+    assert_eq!((st, got), (0, vec![(CID_BITRATE, 1_000_000), (CID_GOP_SIZE, 12)]));
+
+    // Stop: the helper drains, then the empty LAST buffer and EOS.
+    t.qbuf(CAPTURE_MPLANE, 0, 0);
+    t.events();
+    assert_eq!(enc_cmd(&mut t, ENC_CMD_STOP), 0);
+    assert!(t.sent().contains(&ToHelper::Drain { session: 0 }));
+    t.reply(FromHelper::DrainDone { session: 0 });
+    assert_eq!(t.events(), vec![(EVT_DQBUF, CAPTURE_MPLANE, 0, BUF_FLAG_LAST | BUF_FLAG_TIMESTAMP_COPY, 0), (EVT_EVENT, EVENT_EOS, 0, 0, 0)]);
+
+    let mut close = vec![0u8; 16];
+    put_u32(&mut close, 0, CMD_CLOSE);
+    t.cmd(&close, 0);
+    assert!(t.h.alloc.used.is_empty());
+    assert!(t.sent().contains(&ToHelper::Close { session: 0 }));
+}
+
+#[test]
+fn encoder_formats_and_controls_are_checked() {
+    let mut t = T::with(Role::Encoder);
+    t.open();
+    // Formats it doesn't take are refused, not changed (FFmpeg probes so).
+    assert_eq!(t.fmt(ioc::TRY_FMT, OUTPUT_MPLANE, fourcc(b"YU12"), 640, 480).0, EINVAL);
+    assert_eq!(t.fmt(ioc::S_FMT, CAPTURE_MPLANE, PIX_VP9, 640, 480).0, EINVAL);
+    assert_eq!(t.fmt(ioc::S_FMT, OUTPUT_MPLANE, PIX_P010, 640, 480).0, EINVAL, "10 bits is HEVC only");
+    assert_eq!(t.fmt(ioc::S_FMT, CAPTURE_MPLANE, PIX_HEVC, 640, 480).0, 0);
+    let (st, f) = t.fmt(ioc::S_FMT, OUTPUT_MPLANE, PIX_P010, 641, 2000);
+    assert_eq!(st, 0);
+    assert_eq!((get_u32(&f, fmt::WIDTH), get_u32(&f, fmt::HEIGHT), get_u32(&f, fmt::BYTESPERLINE)), (642, 2000, 642 * 2));
+    assert_eq!(t.h.enc[&0].visible, (642, 2000));
+    // Frame rates within 1/1000 to 240 a second.
+    assert_eq!(parm(&mut t, ioc::S_PARM, 1, 100000), (1, 240));
+    assert_eq!(parm(&mut t, ioc::S_PARM, 0, 0), (1, 30));
+    assert_eq!(parm(&mut t, ioc::S_PARM, 1001, 30000), (1001, 30000));
+    // Controls: out of range, values we don't take, unknown, read only.
+    let bad = [(CID_BITRATE, 5), (CID_H264_PROFILE, 3), (CID_BITRATE_MODE, 3), (CID_HEADER_MODE, 0), (CID_B_FRAMES, 2), (0x0099_1234, 0), (CID_MIN_BUFFERS_FOR_OUTPUT, 4)];
+    for (id, v) in bad {
+        assert_eq!(ext_ctrls(&mut t, ioc::S_EXT_CTRLS, CTRL_WHICH_CUR_VAL, &[(id, v)]).0, EINVAL, "{id:#x} = {v}");
+    }
+    // One bad control and none is set.
+    assert_eq!(ext_ctrls(&mut t, ioc::S_EXT_CTRLS, CTRL_WHICH_CUR_VAL, &[(CID_BITRATE, 3_000_000), (CID_BITRATE, 1)]).0, EINVAL);
+    assert_eq!(t.h.enc[&0].c.bitrate, 2_000_000);
+    // Too many at once, requests.
+    let many = vec![(CID_BITRATE, 3_000_000); 65];
+    assert_eq!(ext_ctrls(&mut t, ioc::S_EXT_CTRLS, CTRL_WHICH_CUR_VAL, &many).0, EINVAL);
+    assert_eq!(ext_ctrls(&mut t, ioc::S_EXT_CTRLS, 0x0f01_0000, &[(CID_BITRATE, 3_000_000)]).0, EINVAL);
+    // The menu skips what VideoToolbox doesn't make.
+    let mut m = vec![0u8; QUERYMENU_SIZE];
+    put_u32(&mut m, 0, CID_H264_PROFILE);
+    put_u32(&mut m, 4, 3);
+    assert_eq!(t.ioctl(ioc::QUERYMENU, &m, QUERYMENU_SIZE as u32).0, EINVAL);
+    put_u32(&mut m, 4, 1);
+    assert_eq!(t.ioctl(ioc::QUERYMENU, &m, QUERYMENU_SIZE as u32).0, 0);
+    // Walking the controls visits each once, in order.
+    let mut ids = Vec::new();
+    let mut q = vec![0u8; QUERY_EXT_CTRL_SIZE];
+    put_u32(&mut q, 0, CTRL_FLAG_NEXT_CTRL);
+    while let (0, r) = t.ioctl(ioc::QUERY_EXT_CTRL, &q, QUERY_EXT_CTRL_SIZE as u32) {
+        ids.push(get_u32(&r, 0));
+        put_u32(&mut q, 0, get_u32(&r, 0) | CTRL_FLAG_NEXT_CTRL);
+    }
+    assert!(ids.windows(2).all(|w| w[0] < w[1]) && ids.len() > 10, "{ids:x?}");
+    // Raw buffers that don't start at the start, or a buffer queued twice.
+    t.reqbufs(OUTPUT_MPLANE, 1);
+    let mut b = vec![0u8; BUFFER_SIZE + PLANE_SIZE];
+    put_u32(&mut b, buf::TYPE, OUTPUT_MPLANE);
+    put_u32(&mut b, buf::MEMORY, MEMORY_MMAP);
+    put_u32(&mut b, buf::LENGTH, 1);
+    put_u32(&mut b, BUFFER_SIZE + plane::BYTESUSED, 100);
+    put_u32(&mut b, BUFFER_SIZE + plane::DATA_OFFSET, 8);
+    assert_eq!(t.ioctl(ioc::QBUF, &b, (BUFFER_SIZE + PLANE_SIZE) as u32).0, EINVAL);
+    assert_eq!(t.qbuf(OUTPUT_MPLANE, 0, 100), 0);
+    assert_eq!(t.qbuf(OUTPUT_MPLANE, 0, 100), EINVAL);
+    // A size change with buffers made: busy.
+    assert_eq!(t.fmt(ioc::S_FMT, OUTPUT_MPLANE, PIX_NV12, 320, 240).0, EBUSY);
+    // Decoder commands aren't an encoder's.
+    let c = vec![0u8; DECODER_CMD_SIZE];
+    assert_eq!(t.ioctl(ioc::DECODER_CMD, &c, DECODER_CMD_SIZE as u32).0, ENOTTY);
+    assert_eq!(enc_cmd(&mut t, 2), EINVAL, "pause");
+}
+
+#[test]
+fn only_codecs_the_helper_encodes() {
+    let link = Arc::new(FakeLink::default());
+    let window = GuestMemory::new(&[(GuestAddress(0), WINDOW)]).unwrap();
+    let mut t = T { h: Handler::new(link.clone(), Role::Encoder, Codec::H264.bit(), window), link };
+    t.open();
+    let mut e = vec![0u8; FMTDESC_SIZE];
+    put_u32(&mut e, 4, CAPTURE_MPLANE);
+    assert_eq!(get_u32(&t.ioctl(ioc::ENUM_FMT, &e, FMTDESC_SIZE as u32).1, 44), PIX_H264);
+    put_u32(&mut e, 0, 1);
+    assert_eq!(t.ioctl(ioc::ENUM_FMT, &e, FMTDESC_SIZE as u32).0, EINVAL);
+    // No HEVC, so no P010 either.
+    put_u32(&mut e, 4, OUTPUT_MPLANE);
+    assert_eq!(t.ioctl(ioc::ENUM_FMT, &e, FMTDESC_SIZE as u32).0, EINVAL);
+    assert_eq!(t.fmt(ioc::S_FMT, CAPTURE_MPLANE, PIX_HEVC, 640, 480).0, EINVAL);
+}
+
+#[test]
+fn an_encoder_comes_back_after_a_restore() {
+    let mut t = encoder();
+    t.qbuf(CAPTURE_MPLANE, 0, 0);
+    // One frame at the helper, one waiting here (the helper is busy).
+    t.qbuf(OUTPUT_MPLANE, 0, 100);
+    t.h.enc.get_mut(&0).unwrap().in_flight.extend((100..110).map(|c| (c, 9)));
+    t.qbuf(OUTPUT_MPLANE, 1, 100);
+    let saved: Vec<enc::SavedEnc> = t.h.enc.iter().map(|(&id, s)| enc::SavedEnc::of(id, s)).collect();
+    let data = serde_json::to_vec(&saved).unwrap();
+
+    let mut u = T::with(Role::Encoder);
+    u.h.enc_restore(&data);
+    let sent = u.sent();
+    assert!(matches!(sent[0], ToHelper::Configure { config, .. } if config.bitrate == 4_000_000), "{sent:?}");
+    // Both queued raw frames come back; both frames' coded buffers come
+    // back failed, with their times: the first now, the second when the
+    // guest queues another buffer.
+    let ev = u.events();
+    assert_eq!(&ev[..2], &[(EVT_DQBUF, OUTPUT_MPLANE, 0, BUF_FLAG_ERROR | BUF_FLAG_TIMESTAMP_COPY, 0), (EVT_DQBUF, OUTPUT_MPLANE, 1, BUF_FLAG_ERROR | BUF_FLAG_TIMESTAMP_COPY, 0)]);
+    assert_eq!(ev[2], (EVT_DQBUF, CAPTURE_MPLANE, 0, BUF_FLAG_ERROR | BUF_FLAG_TIMESTAMP_COPY, 0));
+    assert_eq!(get_u32(&u.h.enc[&0].cap_bufs[0].ts, 0), 1000);
+    assert!(!u.sent().iter().any(|m| matches!(m, ToHelper::Grant { len, .. } if *len > 0)));
+    u.qbuf(CAPTURE_MPLANE, 1, 0);
+    assert_eq!(u.events(), vec![(EVT_DQBUF, CAPTURE_MPLANE, 1, BUF_FLAG_ERROR | BUF_FLAG_TIMESTAMP_COPY, 0)]);
+    assert_eq!(get_u32(&u.h.enc[&0].cap_bufs[1].ts, 0), 1001);
+    // Then it goes on, from a key frame.
+    u.qbuf(CAPTURE_MPLANE, 0, 0);
+    assert!(u.sent().iter().any(|m| matches!(m, ToHelper::Grant { len, .. } if *len > 0)));
+    u.qbuf(OUTPUT_MPLANE, 1, 100);
+    assert!(u.sent().iter().any(|m| matches!(m, ToHelper::Encode { key: true, .. })));
+
+    // A state that doesn't hold together fails that encoder only.
+    let mut bad = saved.clone();
+    bad[0].cap_bufs[1].0 = bad[0].cap_bufs[0].0;
+    let mut v = T::with(Role::Encoder);
+    v.h.enc_restore(&serde_json::to_vec(&bad).unwrap());
+    assert!(v.h.enc[&0].dead);
+    assert!(v.h.alloc.used.is_empty());
+    let mut bad = saved;
+    bad[0].fps = (1000, 1);
+    let mut v = T::with(Role::Encoder);
+    v.h.enc_restore(&serde_json::to_vec(&bad).unwrap());
+    assert!(v.h.enc[&0].dead);
+}
+
+#[test]
+fn junk_encoder_commands_never_panic() {
+    let mut t = encoder();
+    let mut seed = 0x9e37_79b9u32;
+    let mut rnd = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed
+    };
+    for _ in 0..3000 {
+        let len = (rnd() % 900) as usize + 8;
+        let mut c: Vec<u8> = (0..len).map(|_| rnd() as u8).collect();
+        put_u32(&mut c, 0, rnd() % 7);
+        put_u32(&mut c, 8, rnd() % 3);
+        put_u32(&mut c, 12, rnd() % 110);
+        if rnd() % 2 == 0 {
+            put_u32(&mut c, 16 + 4, [OUTPUT_MPLANE, CAPTURE_MPLANE][rnd() as usize % 2]);
+        }
+        if rnd() % 3 == 0 {
+            put_u32(&mut c, 16 + 4, rnd() % 70);
+        }
+        t.cmd(&c, rnd() % 1200);
+        if rnd() % 5 == 0 {
+            let s = rnd() % 3;
+            let m = match rnd() % 4 {
+                0 => FromHelper::Coded { session: s, epoch: rnd() % 3, cookie: rnd() % 5, offset: (rnd() % 8) << 16, bytes: rnd() % 5000, key: rnd() % 2 == 0, ok: rnd() % 2 == 0 },
+                1 => FromHelper::Consumed { session: s, cookie: rnd() % 5, ok: true },
+                2 => FromHelper::DrainDone { session: s },
+                _ => FromHelper::Error { session: s, errno: rnd() },
+            };
+            t.reply(m);
+        }
+        t.events();
+        for m in t.sent() {
+            if let ToHelper::Configure { config, .. } = m {
+                assert!(config.valid(), "{config:?}");
+            }
+        }
+    }
 }

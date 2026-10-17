@@ -395,9 +395,64 @@ pub fn length_prefixed(au: &AccessUnit) -> Vec<u8> {
     out
 }
 
+/// The other way, for the encoder: VideoToolbox hands out length-prefixed
+/// NAL units (`len_size` bytes of length, big endian) and keeps the
+/// parameter sets apart; the guest wants Annex B. `params` (each a NAL
+/// unit) go first, as on a key frame. At most `max` bytes come out; None
+/// if the sample doesn't hold together (a length past its end, an empty
+/// unit, a bad length size) or the result wouldn't fit.
+pub fn annexb(params: &[&[u8]], sample: &[u8], len_size: usize, max: usize) -> Option<Vec<u8>> {
+    if !(1..=4).contains(&len_size) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(sample.len() + 64);
+    let put = |nal: &[u8], out: &mut Vec<u8>| -> Option<()> {
+        if nal.is_empty() || out.len().checked_add(nal.len() + 4)? > max {
+            return None;
+        }
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(nal);
+        Some(())
+    };
+    for p in params.iter().take(MAX_NALS) {
+        put(p, &mut out)?;
+    }
+    let mut at = 0;
+    let mut n = 0;
+    while at < sample.len() {
+        let len_end = at.checked_add(len_size).filter(|&e| e <= sample.len())?;
+        let len = sample[at..len_end].iter().fold(0usize, |v, &b| (v << 8) | b as usize);
+        let end = len_end.checked_add(len).filter(|&e| e <= sample.len())?;
+        n += 1;
+        if n > MAX_NALS {
+            return None;
+        }
+        put(&sample[len_end..end], &mut out)?;
+        at = end;
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn writes_annexb() {
+        let sps = [0x67, 1, 2];
+        let sample = [0, 0, 0, 2, 0x65, 0x88, 0, 0, 0, 1, 0x06];
+        let out = annexb(&[&sps], &sample, 4, 1 << 20).unwrap();
+        assert_eq!(out, vec![0, 0, 0, 1, 0x67, 1, 2, 0, 0, 0, 1, 0x65, 0x88, 0, 0, 0, 1, 0x06]);
+        // Round trip through our own splitter.
+        assert_eq!(split_annexb(&out), vec![&sps[..], &[0x65, 0x88][..], &[0x06][..]]);
+        // Two-byte lengths; a length past the end; an empty unit; too big.
+        assert_eq!(annexb(&[], &[0, 1, 0x41], 2, 100).unwrap(), vec![0, 0, 0, 1, 0x41]);
+        assert!(annexb(&[], &[0, 0, 0, 9, 0x65], 4, 100).is_none());
+        assert!(annexb(&[], &[0, 0, 0, 0], 4, 100).is_none());
+        assert!(annexb(&[], &sample, 4, 8).is_none());
+        assert!(annexb(&[], &sample, 0, 100).is_none());
+        assert_eq!(annexb(&[], &[], 4, 100).unwrap(), Vec::<u8>::new());
+    }
 
     #[test]
     fn splits_start_codes() {
