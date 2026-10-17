@@ -21,6 +21,7 @@ mod display;
 mod firmware;
 mod irq;
 mod machine;
+mod net;
 pub use machine::gpu_in_process;
 pub mod psci;
 mod ramfb;
@@ -95,6 +96,9 @@ pub struct VmmOptions {
     pub ui: Option<std::os::unix::net::UnixStream>,
     /// Per-VM state directory (disk layers live in `disks/`).
     pub state_dir: PathBuf,
+    /// The frontend sandboxes the VMM once it is built (what a network
+    /// adapter changed later may still reach).
+    pub sandbox: bool,
 }
 
 impl std::fmt::Debug for VmmOptions {
@@ -137,6 +141,8 @@ pub struct Vmm {
     pristine_irqchip: Option<IrqChipState>,
     boot: machine::BootImage,
     state: RunState,
+    /// The network adapters have a control queue (what a save records).
+    net_ctrl: bool,
 }
 
 impl std::fmt::Debug for Vmm {
@@ -168,12 +174,25 @@ impl Vmm {
         };
         let disks = disks::DiskSet::open(&config, &opts.state_dir, &layers)?;
         let uuid = machine_uuid(&opts.state_dir)?;
+        let saved = match &opts.start {
+            StartMode::Restore(dir) => Some(snapshot::saved_config(dir)?),
+            StartMode::Boot => None,
+        };
+        let net_ctrl = saved.as_ref().is_none_or(|s| s.1);
+        let saved = saved.map(|s| s.0);
         let env = machine::BuildEnv {
             uuid,
             state_dir: opts.state_dir.clone(),
             resuming: matches!(opts.start, StartMode::Restore(_)),
+            saved,
+            net_ctrl,
+            sandbox: opts.sandbox && config.security.sandbox,
         };
         let m = machine::build(&config, hv.as_ref(), opts.serial_out, opts.clipboard, ui, &disks, ev_tx, &env)?;
+        // A save records the hardware the guest has: a resumed VM keeps
+        // the network adapters it was saved with until it restarts.
+        let mut config = config;
+        config.nets = m.nets;
         let mut vmm = Vmm {
             _lock: lock,
             config,
@@ -194,6 +213,7 @@ impl Vmm {
             pristine_irqchip: None,
             boot: m.boot,
             state: RunState::Paused,
+            net_ctrl,
         };
         vmm.pristine_irqchip = match vmm.vm.save_irqchip() {
             Ok(s) => Some(s),

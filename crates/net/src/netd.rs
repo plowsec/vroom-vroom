@@ -174,6 +174,22 @@ fn ask<T: serde::de::DeserializeOwned>(mut s: &UnixStream, req: &impl Serialize)
 
 /// Ask netd for a frame socket. Returns it and the MAC to use.
 pub fn attach(socket: &Path, req: &Request) -> Result<(UnixDatagram, [u8; 6]), NetdError> {
+    // The same adapter's last port (a VM restarted or resumed at once, an
+    // adapter switched back) may still be closing: vmnet refuses a second
+    // interface with its id until then.
+    let mut tries = 0;
+    loop {
+        match attach_once(socket, req) {
+            Err(NetdError::Refused(m)) if m.contains("start failed") && tries < 6 => {
+                tries += 1;
+                std::thread::sleep(Duration::from_millis(800));
+            }
+            r => return r,
+        }
+    }
+}
+
+fn attach_once(socket: &Path, req: &Request) -> Result<(UnixDatagram, [u8; 6]), NetdError> {
     let s = connect(socket, Duration::from_secs(10))?;
     let resp: Response = ask(&s, req)?;
     if !resp.ok {

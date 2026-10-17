@@ -304,6 +304,12 @@ pub fn is_suspended(state: &Path) -> bool {
     state.join("suspend").join("manifest.json").is_file()
 }
 
+/// The VM file the waiting suspend image was saved with (JSON), if any.
+/// The VMM writes it: the caller checks what it reads.
+pub fn suspended_config(state: &Path) -> Option<serde_json::Value> {
+    SnapshotDir::open(&state.join("suspend")).ok().map(|s| s.manifest.config)
+}
+
 /// Throw the suspend image away: the next start boots fresh. The caller
 /// holds the lock. Its disk layers go with the next prune.
 pub fn discard_suspend(state: &Path, base_dirs: &[PathBuf]) -> Result<PruneReport> {

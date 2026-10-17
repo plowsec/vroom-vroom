@@ -14,12 +14,15 @@ vroom run <vm.toml>   one process per VM, sandboxed after setup ◄───┘
    ├─ optional: vroom audio-out (sound, microphone), own sandbox, datagram socket
    ├─ optional: vroom usb-host (one per [[usb]] device), own sandbox,
    │  stream socket: transfer requests in, results and plug events out
+   │  (a device a macOS driver holds: vroom-netd's root helper instead,
+   │  asked for before the sandbox)
    └─ optional: vroom video-helper (video_decode), own sandbox, stream
       socket: bitstreams and credits in, pictures out (VideoToolbox)
 
 vroom-gui ── starts vroom usb-host for a device connected from the VM
              window, or asks vroom-netd to start it as root; passes its
-             socket to the VMM (viewer socket, SCM_RIGHTS)
+             socket to the VMM (viewer socket, SCM_RIGHTS); the same for
+             a vroom-netd port when an adapter goes bridged or host-only
 vroom-netd   root daemon (launchd): vmnet ports, root USB helpers
 ```
 
@@ -56,6 +59,38 @@ tells the next one, if the app restarts. A saved VM keeps the number of
 pairs it was saved with (the guest read it at driver start); older saves
 had one pair per device in the VM file.
 
+## Network adapters while the VM runs
+
+Each virtio-net device keeps its backend, its MAC and its cable in a
+`Link` shared with a `NetControl` the VMM holds (`virtio/src/devices/net.rs`).
+The worker takes the link's lock for each batch of frames. Pulling the
+cable clears the status bit and raises a config interrupt; while it is
+out, frames are dropped both ways. A new backend is registered on the
+worker's poller (a clone of its `mio::Registry`) after the old one is
+taken off, and the link bounces: down, then up after two seconds on the
+worker's tick, so the guest asks DHCP again. A paused VM hears about it
+when it resumes. `MacXlate` (`net/src/mac.rs`) wraps a backend whose
+port passes another MAC than the guest's.
+
+`vmm/src/net.rs` owns the adapters (`NetPorts`): what each is now, the
+NAT an adapter started with while it is on another network (it holds
+the port forwards' listening sockets), and what the sandbox leaves
+(NAT only if an adapter had it at start; DNS read before the sandbox).
+The viewer asks (`ToVmm::NetConnect`, `ToVmm::NetSet`, with a netd
+socket for bridged and host-only) and is told the result
+(`ToViewer::Net`, replayed to a window that attaches later). On the app
+side, `gui/src/console/netmenu.rs` keeps the VM file in step: it maps
+the file's adapters to the running ones (an adapter added while running
+has none, a removed one is unplugged), asks netd for ports off the UI
+thread, and gives the settings page what waits for the next start.
+
+A resumed VM is built with the adapters of the config it was saved
+with, set up as the VM file says now (`net::plan`): the device layout
+must match the snapshot. A device's snapshot keeps its MAC, its link
+state and which network it was on: if the backend now passes another
+MAC, it translates; if the network changed, the link bounces after the
+resume. The adapters built are what the next save records.
+
 ## Layers
 
 | Crate | Role |
@@ -65,7 +100,7 @@ had one pair per device in the VM file.
 | `arch` | Board layout (QEMU-virt compatible), FDT, ACPI tables (own AML encoder), SMBIOS, kernel image loader (Image, gzip, EFI zboot). |
 | `devices` | Bus, PL011, PL031, fw_cfg (+DMA), CFI flash (NVRAM), PCI host (ECAM, MSI, MSI-X, INTx), NVMe, xHCI + USB HID (8 USB 2 + USB 3 port pairs for passthrough devices, plugged in and out while the VM runs; asynchronous transfers; isochronous TDs go out in batches, a few batches ahead), Intel HD Audio (controller + codec, streams moved by a timer thread). Parses hostile input only; `forbid(unsafe_code)`. |
 | `video` | Hardware video decoding, shared by the VMM and `vroom video-helper`: their protocol (credits, epochs), H.264/HEVC NAL unit, access unit and parameter set parsing, picture order counts. Parses hostile input only; `forbid(unsafe_code)`. |
-| `usb` | USB passthrough: the VMM/helper protocol, the helper's request checks, libusb (loaded with `dlopen`, helper only; the root helper only from its own copy), host device listing (IOKit registry / sysfs), a pretend serial port and sound card for tests. |
+| `usb` | USB passthrough: the VMM/helper protocol, the helper's request checks, libusb (loaded with `dlopen`, helper only; the root helper only from its own copy), host device listing (IOKit registry / sysfs), taking a device from the host's drivers and giving it back, a pretend serial port, sound card and USB stick for tests. |
 | `virtio` | Split-queue handling (hardened), MMIO and modern PCI transports, devices (blk, net, console, rng, gpu, input, fs, sound, media), a pausable worker per device. `forbid(unsafe_code)`. |
 | `fs` | Host side of shared folders: component-wise `openat(O_NOFOLLOW)` walks from a root fd, Linux errno mapping. The virtio-fs FUSE server lives in `virtio`; it serves Linux and virtio-win's virtiofs.exe (Windows), telling them apart by their INIT flags. |
 | `audio` | Sound helper: datagram protocol, ring buffer, CoreAudio (macOS) / ALSA (Linux, `dlopen`) playback and recording, WAV test files. |
@@ -388,7 +423,15 @@ commands, virglrenderer's vrend replays them on macOS's OpenGL 4.1 (CGL),
 or with `opengl_host = "angle"` on OpenGL ES from ANGLE's Metal backend.
 Neptune: Windows' viogpu3d driver sends Direct3D 11 calls, virglrenderer
 (UTM's fork) replays them on DXMT, Direct3D on Metal. All capsets are
-offered; Mesa picks per API, Windows takes Neptune. Venus and Neptune go
+offered; Mesa picks per API, Windows takes Neptune for Direct3D and
+virgl for OpenGL: our OpenGL driver for Windows (`vroom_gl.dll`, Mesa's
+virgl built for Windows with a winsys of ours, `third_party/mesa/`) makes
+a virgl context through viogpu3d's escapes and sends its command streams
+in D3DKMT render packets. Its resources are the driver's 3D allocations,
+which get the guest pages behind them to the host when they have a GPU
+address and are resident. Each frame is read back into the window's
+buffer and drawn with GDI, since Windows' compositor runs on Neptune and
+can't see vrend's textures. Venus and Neptune go
 through virglrenderer's proxy to its render server: ours
 (`gpu3d/src/server.rs`, `vroom gpu-server`) starts one `vroom gpu-worker`
 per guest context, which runs that context with virglrenderer's own

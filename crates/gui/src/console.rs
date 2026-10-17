@@ -34,6 +34,9 @@ use crate::{ConsoleWindow, MonitorWindow, VmState};
 
 mod usbmenu;
 mod coherence;
+mod netmenu;
+
+pub use netmenu::{live_of as net_live_of, mode_text as net_mode_text, set_mode as net_set_mode, NetView};
 
 const CLIP_POLL: Duration = Duration::from_millis(500);
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(300);
@@ -76,6 +79,8 @@ struct Shared {
     heads: [HeadIn; MAX_HEADS],
     /// The host USB devices the VM has, the latest list.
     usb: Option<Vec<vroom_display::UsbPort>>,
+    /// The network adapters, the latest word.
+    net: Option<(bool, Vec<vroom_display::NetPort>)>,
     /// What the guest agent can do, when it (re)connects.
     features: Option<u64>,
     /// Coherence: the guest's latest window list.
@@ -157,6 +162,7 @@ impl Shared {
                 self.drag.push_back(m);
             }
             ToViewer::Usb(l) => self.usb = Some(l),
+            ToViewer::Net { nat_ok, ports } => self.net = Some((nat_ok, ports)),
             ToViewer::Agent { features } => self.features = Some(features),
             ToViewer::Windows(list) => self.windows = Some(list),
             ToViewer::WindowIcon { id, w, h, rgba } => {
@@ -281,6 +287,8 @@ pub struct Console {
     drag_timer: slint::Timer,
     /// Host USB devices: the menu, and what the VM has.
     usb: usbmenu::UsbMenu,
+    /// Network adapters: the menu, and what the VM has.
+    net: netmenu::NetMenu,
     /// What the guest agent says it can do (0: none connected yet).
     features: u64,
     windows_guest: bool,
@@ -387,6 +395,39 @@ pub fn show(key: &str) {
 /// The VM file's clipboard rules changed: apply them now (we enforce them).
 pub fn set_clip_policy(key: &str, p: vroom_config::Clipboard) {
     with(key, |c| c.clip_policy = p);
+}
+
+/// The VM's network adapters as the VMM says they are now (None: not
+/// running here, or no word yet).
+pub fn net_view(key: &str) -> Option<NetView> {
+    with(key, |c| c.net_view()).flatten()
+}
+
+/// Adapter `i` of the VM file changed: make the running one match, as
+/// far as it can while the VM runs.
+pub fn net_apply(key: &str, i: usize) {
+    with(key, |c| c.net_apply(i));
+}
+
+/// Adapter `i` was taken out of the VM file: unplug it now.
+pub fn net_removed(key: &str, i: usize) {
+    with(key, |c| c.net_removed(i));
+}
+
+/// An adapter was added to the VM file: it comes at the next start.
+pub fn net_added(key: &str) {
+    with(key, |c| c.net_added());
+}
+
+/// A host USB device went into the VM file's `[[usb]]` list: plug it in
+/// now. False if the VM doesn't run here.
+pub fn usb_plug(key: &str, d: vroom_display::UsbDev) -> bool {
+    with(key, |c| c.usb_plug(d)).is_some()
+}
+
+/// One left the list: pull it out now.
+pub fn usb_unplug(key: &str, id: &str, serial: Option<&str>) {
+    with(key, |c| c.usb_unplug(id, serial));
 }
 
 /// `[display] hidpi` changed: ask the guest for the new size now.
@@ -754,6 +795,7 @@ fn open(key: String, path: &Path, cfg: &VmConfig, ours: UnixStream, child: Optio
         drag_seq: 0,
         drag_timer: slint::Timer::default(),
         usb: usbmenu::UsbMenu::default(),
+        net: netmenu::NetMenu::new(cfg.nets.clone()),
         features: 0,
         windows_guest: os == GuestOs::Windows,
         coh: None,
@@ -1221,6 +1263,9 @@ impl Console {
             c if c.starts_with("usb") => {
                 self.usb_command(c);
             }
+            c if c.starts_with("net") => {
+                self.net_command(c);
+            }
             "coherence" => self.coherence_toggle(),
             "library" => msg::send(Msg::ShowLibrary(None)),
             "settings" => msg::send(Msg::ShowLibrary(Some(self.key.clone()))),
@@ -1230,7 +1275,7 @@ impl Console {
 
     /// What the reader thread collected since the last wakeup.
     fn inbox(&mut self) {
-        let (frame, full, damage, status, clip, mic, cursor, drag, camera, usb, features, windows, (icons, coh_no), heads) = {
+        let (frame, full, damage, status, clip, mic, cursor, drag, camera, usb, features, windows, icons_no_net, heads) = {
             let mut s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
             s.posted = false;
             let heads = s.heads;
@@ -1240,9 +1285,13 @@ impl Console {
             let f = (std::mem::take(&mut s.frame), std::mem::take(&mut s.full), s.damage.take());
             let t = (std::mem::take(&mut s.status), s.clipboard.take(), s.mic.take(), s.cursor.take(), std::mem::take(&mut s.drag));
             let c = (s.camera.take(), s.usb.take(), s.features.take(), s.windows.take());
-            let h = (std::mem::take(&mut s.icons), s.coh_no.take());
+            let h = (std::mem::take(&mut s.icons), s.coh_no.take(), s.net.take());
             (f.0, f.1, f.2, t.0, t.1, t.2, t.3, t.4, c.0, c.1, c.2, c.3, h, heads)
         };
+        let (icons, coh_no, net) = icons_no_net;
+        if let Some((nat_ok, ports)) = net {
+            self.net_list(nat_ok, ports);
+        }
         for (h, hd) in heads.iter().enumerate().skip(1).take(self.monitors.saturating_sub(1)) {
             if hd.frame {
                 self.head_frame(h, hd.mode, hd.full, hd.damage);
@@ -1315,6 +1364,10 @@ impl Console {
             _ if t.starts_with("guest agent connected") => self.toast("Guest tools connected: clipboard and resizing work"),
             _ if t.starts_with("USB: ") => {
                 self.usb_refused();
+                self.toast(&t);
+            }
+            _ if t.starts_with("Network: ") => {
+                self.net_refused();
                 self.toast(&t);
             }
             _ if t.starts_with("suspend failed") => {
@@ -1392,6 +1445,7 @@ impl Console {
         }
         self.cpu_meter(now);
         self.usb_tick(now);
+        self.net_tick(now);
         // State, size or the screen's place changed: the pointer may too.
         self.apply_pointer();
         // Host clipboard -> guest, only while this window has focus.

@@ -3,7 +3,10 @@
 //! VMM's own sandbox, in its own sandbox on macOS (the IOKit USB user
 //! clients and libusb, nothing else). Devices plugged in while the VM
 //! runs come from the app: it starts the helper (or has the root helper
-//! start it) and hands us its socket over the viewer connection. Either
+//! start it) and hands us its socket over the viewer connection. A VM
+//! file's device that a macOS driver holds (a USB stick, a serial
+//! adapter) needs root to take: we ask vroom-netd's root helper for it,
+//! as the app does, when netd is set up. Either
 //! way the VMM never opens a host device; it sends the helper transfer
 //! requests and checks what comes back (xHCI side).
 //!
@@ -31,7 +34,8 @@ use crate::{Error, Result};
 pub(crate) struct UsbHelper {
     dev: UsbDev,
     sock: UnixStream,
-    child: Child,
+    /// None for netd's root helper (not our child).
+    child: Option<Child>,
     rx: Receiver<Request>,
 }
 
@@ -43,7 +47,21 @@ impl std::fmt::Debug for UsbHelper {
 
 /// Start the helper for `dev`. Returns it and where the controller sends
 /// its requests.
-pub(crate) fn spawn(dev: &Usb) -> Result<(UsbHelper, Sender<Request>)> {
+pub(crate) fn spawn(vm: &str, dev: &Usb) -> Result<(UsbHelper, Sender<Request>)> {
+    let d = UsbDev { id: dev.id.clone(), serial: dev.serial.clone().unwrap_or_default(), name: dev.name.clone().unwrap_or_default() };
+    if let Some(drivers) = held_by_macos(dev) {
+        let (tx, rx) = mpsc::channel();
+        let sock = via_netd(vm, dev).map_err(|why| {
+            Error::Setup(format!(
+                "usb {}: held by {}, and only the root helper can take it: {why}. \
+                 Set the helper up in the app (Settings, Network or USB)",
+                dev.id,
+                drivers.join(", ")
+            ))
+        })?;
+        log::info!("usb: {} from the root helper (held by {})", dev.id, drivers.join(", "));
+        return Ok((UsbHelper { dev: d, sock, child: None, rx }, tx));
+    }
     let exe = std::env::current_exe().map_err(|e| Error::Setup(format!("usb: {e}")))?;
     let (ours, theirs) = UnixStream::pair()?;
     let mut cmd = command(&exe)?;
@@ -60,8 +78,35 @@ pub(crate) fn spawn(dev: &Usb) -> Result<(UsbHelper, Sender<Request>)> {
     log::info!("usb: helper {} for {}", child.id(), dev.id);
     crate::note_helper(child.id());
     let (tx, rx) = mpsc::channel();
-    let d = UsbDev { id: dev.id.clone(), serial: dev.serial.clone().unwrap_or_default(), name: dev.name.clone().unwrap_or_default() };
-    Ok((UsbHelper { dev: d, sock: ours, child, rx }, tx))
+    Ok((UsbHelper { dev: d, sock: ours, child: Some(child), rx }, tx))
+}
+
+/// Why only root can take `dev`, if so: the macOS drivers holding its
+/// interfaces, or an earlier root helper's capture (macOS then lets only
+/// root open it, until it is re-enumerated).
+fn held_by_macos(dev: &Usb) -> Option<Vec<String>> {
+    let h = vroom_usb::list::list().into_iter().find(|h| {
+        h.id() == dev.id && dev.serial.as_ref().is_none_or(|s| h.serial.as_deref() == Some(s.as_str()))
+    })?;
+    if !h.needs_root() {
+        return None;
+    }
+    Some(if h.claimed_by.is_empty() { vec!["an earlier root helper's capture".into()] } else { h.claimed_by })
+}
+
+/// netd's root helper for `dev`: its socket.
+fn via_netd(vm: &str, dev: &Usb) -> std::result::Result<UnixStream, String> {
+    use vroom_net::netd;
+    let vm: String = vm.chars().filter(|c| c.is_ascii_alphanumeric() || "._-".contains(*c)).take(64).collect();
+    let req = netd::UsbRequest {
+        version: netd::VERSION,
+        vm: if vm.is_empty() { "vm".into() } else { vm },
+        usb: netd::UsbWanted { id: dev.id.clone(), serial: dev.serial.clone() },
+    };
+    netd::usb(Path::new(netd::DEFAULT_SOCKET), &req).map_err(|e| match e {
+        netd::NetdError::Refused(m) => m,
+        e => e.to_string(),
+    })
 }
 
 fn command(exe: &Path) -> Result<Command> {
@@ -109,7 +154,7 @@ impl UsbPorts {
         for (i, h) in helpers.into_iter().enumerate() {
             let UsbHelper { dev, sock, child, rx } = h;
             me.lock()[i] = Some(Entry { dev, gen: 0, here: false, always: true, sock: sock.try_clone()? });
-            me.clone().run(i, 0, sock, rx, Some(child))?;
+            me.clone().run(i, 0, sock, rx, child)?;
         }
         me.tell();
         Ok(me)
@@ -236,13 +281,18 @@ impl UsbPorts {
             let _ = r.get_ref().shutdown(std::net::Shutdown::Both);
             self.gone(i, gen);
             if let Some(mut child) = child {
-                let _ = child.kill();
-                for _ in 0..50 {
+                // It ends by itself once its socket is closed, after giving
+                // the device back to the host's drivers (a re-enumeration
+                // on macOS takes a moment): killed only if it hangs.
+                for _ in 0..500 {
                     if !matches!(child.try_wait(), Ok(None)) {
                         return;
                     }
                     std::thread::sleep(Duration::from_millis(20));
                 }
+                log::warn!("usb: helper on port pair {i} didn't end, killing it");
+                let _ = child.kill();
+                let _ = child.wait();
             }
         })?;
         Ok(())
