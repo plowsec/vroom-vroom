@@ -22,6 +22,12 @@
 // surface once, empty, and keeps the dma-buf: those are filled at each
 // vaEndPicture instead.
 //
+// Chrome under X11 can't show NV12 dma-bufs: its X11 path imports only
+// BGRA buffers. It asks the driver to convert each picture (video
+// processing, VAEntrypointVideoProc) into a BGRA buffer it allocated and
+// imports here. We do that on the CPU, from our copy of the picture
+// straight into the buffer's guest pages.
+//
 // Build: make (needs libva-dev, libdrm-dev, libgbm-dev). Install with
 // install-vaapi.sh; use with LIBVA_DRIVER_NAME=vroom.
 //
@@ -53,6 +59,11 @@
 #include <va/va.h>
 #include <va/va_backend.h>
 #include <va/va_drmcommon.h>
+#include <va/va_vpp.h>
+
+#ifdef __aarch64__
+#include <arm_neon.h>
+#endif
 
 #ifndef V4L2_PIX_FMT_AV1
 #define V4L2_PIX_FMT_AV1 v4l2_fourcc('A', 'V', '0', '1')
@@ -96,6 +107,10 @@ static void dbg(const char *fmt, ...)
 
 enum { OBJ_NONE, OBJ_CONFIG, OBJ_CONTEXT, OBJ_SURFACE, OBJ_BUFFER, OBJ_IMAGE };
 
+// A picture's YUV matrix, for video processing. VA-API doesn't pass it;
+// VP9 frames say it (we parse their headers), else we guess.
+enum matrix { MATRIX_GUESS, MATRIX_601, MATRIX_709, MATRIX_2020 };
+
 struct config {
 	VAProfile profile;
 	VAEntrypoint entrypoint;
@@ -116,6 +131,7 @@ struct surface {
 	bool failed;
 	uint64_t seq;
 	struct context *ctx;
+	enum matrix matrix;
 	// For export: luma and chroma planes as GBM buffers, and our
 	// mapping of each (virtio-gpu: its guest pages).
 	struct gbm_bo *bo[2];
@@ -126,6 +142,21 @@ struct surface {
 	// expects it to follow the surface, as a GPU decoder's would
 	// (Chromium). Each picture then goes into the buffers as it is decoded.
 	bool live;
+	// Read only by video processing: its buffers aren't shown, so they
+	// aren't filled.
+	bool vpp_only;
+	// An import of buffers another surface exported (no data of its
+	// own): that surface's GEM handle (its luma buffer's). Found again
+	// at each use, as Chrome may destroy that surface and make a new one
+	// from the same buffers (see bury()).
+	uint32_t src_handle;
+	bool alias, alias_rgb;
+	// A BGRA buffer (bo[0]), ours (Chrome makes them with
+	// vaCreateSurfaces and exports them) or one the player imported: video
+	// processing writes into it. No data of its own either.
+	bool rgb, rgb_nomap;
+	bool rgb_rfirst; // R, G, B, A in memory (else B, G, R, A)
+	unsigned rgb_pitch, rgb_offset;
 };
 
 struct buffer {
@@ -157,6 +188,12 @@ struct context {
 	unsigned width, height;
 	bool p010;
 	VASurfaceID target;
+	// Video processing (VAProfileNone): the source and its rectangles,
+	// from the pipeline parameters.
+	bool vpp, have_vpp;
+	VASurfaceID vpp_src;
+	VARectangle vpp_in, vpp_out;
+	bool vpp_has_in, vpp_has_out;
 	// The picture being built: its slices (Annex B), then all of it.
 	uint8_t *slices;
 	size_t slices_len, slices_cap;
@@ -167,6 +204,7 @@ struct context {
 	VAIQMatrixBufferH264 h264_iq;
 	bool have_pic, have_iq;
 	VADecPictureParameterBufferVP9 vp9_pic;
+	enum matrix vp9_matrix; // from the last key frame
 	VAPictureParameterBufferHEVC hevc_pic;
 	VAIQMatrixBufferHEVC hevc_iq;
 	// Parameter sets sent so far (H.264: SPS; HEVC: VPS and SPS), to send
@@ -253,6 +291,7 @@ static void del_obj(struct driver *d, unsigned id)
 static void bo_free(struct surface *s);
 static bool upload(struct driver *d, struct surface *s);
 static void graves_prune(struct driver *d, bool all);
+static VAStatus vpp_run(struct driver *d, struct context *c, struct surface *dst);
 
 // ---------------------------------------------------------------------
 // Bit writer: RBSP, then NAL units with emulation prevention.
@@ -690,6 +729,38 @@ static bool profile_10bit(VAProfile p)
 	return p == VAProfileVP9Profile2 || p == VAProfileHEVCMain10;
 }
 
+// The surface an import stands for, if there is one now.
+static struct surface *alias_of(struct driver *d, struct surface *a)
+{
+	for (unsigned i = 0; i < d->n_objs; i++) {
+		if (d->objs[i].type != OBJ_SURFACE)
+			continue;
+		struct surface *s = d->objs[i].p;
+		if ((a->alias_rgb ? s->rgb : s->data != NULL) && s->bo[0] && gbm_bo_get_handle(s->bo[0]).u32 == a->src_handle &&
+		    s->width == a->width && s->height == a->height && s->p010 == a->p010)
+			return s;
+	}
+	return NULL;
+}
+
+// The surface whose picture `s` holds (an import of another surface's
+// buffers holds that one's); NULL if it has none (a BGRA buffer, or an
+// import whose surface is gone).
+static struct surface *picture_of(struct driver *d, struct surface *s)
+{
+	if (s->alias && !s->alias_rgb)
+		s = alias_of(d, s);
+	return s && s->data ? s : NULL;
+}
+
+// The BGRA buffer `s` stands for (itself, or the surface it imports).
+static struct surface *rgb_of(struct driver *d, struct surface *s)
+{
+	if (s->alias && s->alias_rgb)
+		s = alias_of(d, s);
+	return s && s->rgb ? s : NULL;
+}
+
 static void cap_release(struct context *c)
 {
 	for (unsigned i = 0; i < c->n_cap; i++)
@@ -970,6 +1041,7 @@ static VAStatus submit(struct context *c, struct surface *s)
 	s->failed = false;
 	s->seq = seq;
 	s->ctx = c;
+	s->matrix = profile_fourcc(c->profile) == V4L2_PIX_FMT_VP9 ? c->vp9_matrix : MATRIX_GUESS;
 	pump(c, 0);
 	return VA_STATUS_SUCCESS;
 }
@@ -1043,6 +1115,8 @@ static int list_profiles(struct driver *d, VAProfile *out)
 		if (d->p010)
 			out[n++] = VAProfileVP9Profile2;
 	}
+	// Video processing: picture to BGRA (Chrome under X11).
+	out[n++] = VAProfileNone;
 	return n;
 }
 
@@ -1066,21 +1140,30 @@ static VAStatus vr_QueryConfigEntrypoints(VADriverContextP ctx, VAProfile p, VAE
 {
 	if (!profile_ok(DRV(ctx), p))
 		return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
-	list[0] = VAEntrypointVLD;
+	list[0] = p == VAProfileNone ? VAEntrypointVideoProc : VAEntrypointVLD;
 	*n = 1;
 	return VA_STATUS_SUCCESS;
 }
 
+static VAEntrypoint entrypoint_of(VAProfile p)
+{
+	return p == VAProfileNone ? VAEntrypointVideoProc : VAEntrypointVLD;
+}
+
 static unsigned rt_format(VAProfile p)
 {
-	return profile_10bit(p) ? VA_RT_FORMAT_YUV420_10 : VA_RT_FORMAT_YUV420;
+	if (p == VAProfileNone)
+		return VA_RT_FORMAT_YUV420 | VA_RT_FORMAT_YUV420_10 | VA_RT_FORMAT_RGB32;
+	// 10-bit profiles carry 8-bit streams too (Chrome asks HEVC Main 10
+	// for YUV420 before it takes it).
+	return profile_10bit(p) ? VA_RT_FORMAT_YUV420_10 | VA_RT_FORMAT_YUV420 : VA_RT_FORMAT_YUV420;
 }
 
 static VAStatus vr_GetConfigAttributes(VADriverContextP ctx, VAProfile p, VAEntrypoint e, VAConfigAttrib *a, int n)
 {
 	if (!profile_ok(DRV(ctx), p))
 		return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
-	if (e != VAEntrypointVLD)
+	if (e != entrypoint_of(p))
 		return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
 	for (int i = 0; i < n; i++) {
 		switch (a[i].type) {
@@ -1103,7 +1186,7 @@ static VAStatus vr_CreateConfig(VADriverContextP ctx, VAProfile p, VAEntrypoint 
 	struct driver *d = DRV(ctx);
 	if (!profile_ok(d, p))
 		return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
-	if (e != VAEntrypointVLD)
+	if (e != entrypoint_of(p))
 		return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
 	struct config *c = calloc(1, sizeof(*c));
 	if (!c)
@@ -1268,49 +1351,183 @@ static struct surface *surface_new(unsigned w, unsigned h, bool p010)
 	return s;
 }
 
+// A surface for a BGRA buffer the player made (video processing output).
+static struct surface *rgb_import(struct driver *d, int fd, unsigned w, unsigned h, unsigned pitch, unsigned offset, uint64_t modifier,
+				  bool rfirst)
+{
+	if (!d->gbm || pitch < w * 4 || pitch > 4 * 4096 + 4096 || offset > (64u << 20))
+		return NULL;
+	struct gbm_import_fd_modifier_data data = {
+		.width = w,
+		.height = h,
+		.format = rfirst ? GBM_FORMAT_ABGR8888 : GBM_FORMAT_ARGB8888,
+		.num_fds = 1,
+		.fds = { fd },
+		.strides = { (int)pitch },
+		.offsets = { (int)offset },
+		.modifier = modifier,
+	};
+	struct gbm_bo *bo = gbm_bo_import(d->gbm, GBM_BO_IMPORT_FD_MODIFIER, &data, GBM_BO_USE_RENDERING);
+	if (!bo) {
+		dbg("can't import a %ux%u BGRA buffer: %s", w, h, strerror(errno));
+		return NULL;
+	}
+	struct surface *s = calloc(1, sizeof(*s));
+	if (!s) {
+		gbm_bo_destroy(bo);
+		return NULL;
+	}
+	s->width = w;
+	s->height = h;
+	s->rgb = true;
+	s->rgb_rfirst = rfirst;
+	s->rgb_pitch = pitch;
+	s->rgb_offset = offset;
+	s->bo[0] = bo;
+	return s;
+}
+
+// A BGRA surface of our own: Chrome makes them, exports them to show
+// them, and imports them back as video processing output.
+static struct surface *rgb_new(struct driver *d, unsigned w, unsigned h)
+{
+	if (!d->gbm)
+		return NULL;
+	struct gbm_bo *bo = gbm_bo_create(d->gbm, w, h, GBM_FORMAT_ARGB8888, GBM_BO_USE_LINEAR | GBM_BO_USE_RENDERING);
+	if (!bo) {
+		dbg("gbm_bo_create %ux%u BGRA: %s", w, h, strerror(errno));
+		return NULL;
+	}
+	struct surface *s = calloc(1, sizeof(*s));
+	if (!s) {
+		gbm_bo_destroy(bo);
+		return NULL;
+	}
+	s->width = w;
+	s->height = h;
+	s->rgb = true;
+	s->rgb_pitch = gbm_bo_get_stride(bo);
+	s->bo[0] = bo;
+	return s;
+}
+
+// The surface whose exported (luma) buffer is the dma-buf `fd`, if it
+// still exists: Chrome's video processing imports the pictures and BGRA
+// buffers Chrome exported.
+static struct surface *live_find(struct driver *d, int fd, unsigned w, unsigned h, bool p010, bool rgb)
+{
+	struct drm_prime_handle ph = { .fd = fd };
+	if (d->drm_fd < 0 || xioctl(d->drm_fd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &ph))
+		return NULL;
+	// Ours, so the kernel gave back the handle our GBM device has.
+	for (unsigned i = 0; i < d->n_objs; i++) {
+		if (d->objs[i].type != OBJ_SURFACE)
+			continue;
+		struct surface *s = d->objs[i].p;
+		if ((rgb ? s->rgb : s->data != NULL) && s->bo[0] && gbm_bo_get_handle(s->bo[0]).u32 == ph.handle && s->width == w &&
+		    s->height == h && s->p010 == p010)
+			return s;
+	}
+	return NULL;
+}
+
 static VAStatus vr_CreateSurfaces2(VADriverContextP ctx, unsigned format, unsigned w, unsigned h, VASurfaceID *ids, unsigned n,
 				   VASurfaceAttrib *attribs, unsigned nattr)
 {
 	struct driver *d = DRV(ctx);
-	if (format != VA_RT_FORMAT_YUV420 && format != VA_RT_FORMAT_YUV420_10)
+	if (format != VA_RT_FORMAT_YUV420 && format != VA_RT_FORMAT_YUV420_10 && format != VA_RT_FORMAT_RGB32)
 		return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
 	if (w == 0 || h == 0 || w > 4096 || h > 4096)
 		return VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED;
 	bool p010 = format == VA_RT_FORMAT_YUV420_10;
+	bool rgb = format == VA_RT_FORMAT_RGB32;
 	int mem = VA_SURFACE_ATTRIB_MEM_TYPE_VA;
 	void *ext = NULL;
 	for (unsigned i = 0; i < nattr; i++) {
 		if (!(attribs[i].flags & VA_SURFACE_ATTRIB_SETTABLE))
 			continue;
 		if (attribs[i].type == VASurfaceAttribPixelFormat) {
-			if (attribs[i].value.value.i == VA_FOURCC_P010)
-				p010 = true;
-			else if (attribs[i].value.value.i == VA_FOURCC_NV12)
-				p010 = false;
-			else
+			uint32_t f = (uint32_t)attribs[i].value.value.i;
+			if (rgb ? f != VA_FOURCC_ARGB : f != VA_FOURCC_P010 && f != VA_FOURCC_NV12)
 				return VA_STATUS_ERROR_INVALID_IMAGE_FORMAT;
+			if (!rgb)
+				p010 = f == VA_FOURCC_P010;
 		}
 		if (attribs[i].type == VASurfaceAttribMemoryType)
 			mem = attribs[i].value.value.i;
 		if (attribs[i].type == VASurfaceAttribExternalBufferDescriptor)
 			ext = attribs[i].value.value.p;
 	}
-	// A dma-buf: only one we exported (see bury()), found by its first fd.
+	// A dma-buf: its first fd, and for BGRA its layout.
 	int fd = -1;
+	unsigned pitch = 0, offset = 0;
+	uint32_t fourcc = 0;
+	uint64_t modifier = DRM_FORMAT_MOD_INVALID;
 	if (mem == VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME && ext) {
 		VASurfaceAttribExternalBuffers *eb = ext;
-		if (eb->num_buffers >= 1 && eb->buffers && eb->width == w && eb->height == h)
+		if (eb->num_buffers >= 1 && eb->buffers && eb->width == w && eb->height == h) {
 			fd = (int)eb->buffers[0];
+			pitch = eb->pitches[0];
+			offset = eb->offsets[0];
+			fourcc = eb->pixel_format;
+		}
 	} else if (mem == VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 && ext) {
 		VADRMPRIMESurfaceDescriptor *pd = ext;
-		if (pd->num_objects >= 1 && pd->num_objects <= 4 && pd->width == w && pd->height == h)
+		if (pd->num_objects >= 1 && pd->num_objects <= 4 && pd->num_layers >= 1 && pd->layers[0].object_index[0] == 0 &&
+		    pd->width == w && pd->height == h) {
 			fd = pd->objects[0].fd;
+			pitch = pd->layers[0].pitch[0];
+			offset = pd->layers[0].offset[0];
+			fourcc = pd->fourcc;
+			modifier = pd->objects[0].drm_format_modifier;
+		}
 	} else if (mem != VA_SURFACE_ATTRIB_MEM_TYPE_VA) {
 		return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
 	}
 	if (mem != VA_SURFACE_ATTRIB_MEM_TYPE_VA && (fd < 0 || n != 1))
 		return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
+	// The layout an import says, in VA's names (B, G, R, A in memory
+	// for Chrome's BGRA).
+	bool rfirst = fourcc == VA_FOURCC_RGBA || fourcc == VA_FOURCC_RGBX || fourcc == VA_FOURCC_ABGR || fourcc == VA_FOURCC_XBGR;
+	if (rgb && fourcc && !rfirst && fourcc != VA_FOURCC_BGRA && fourcc != VA_FOURCC_BGRX && fourcc != VA_FOURCC_ARGB &&
+	    fourcc != VA_FOURCC_XRGB)
+		return VA_STATUS_ERROR_INVALID_IMAGE_FORMAT;
 	pthread_mutex_lock(&d->lock);
+	if (rgb && fd < 0) {
+		VAStatus st = VA_STATUS_SUCCESS;
+		for (unsigned i = 0; i < n && st == VA_STATUS_SUCCESS; i++) {
+			struct surface *s = rgb_new(d, w, h);
+			ids[i] = s ? new_obj(d, OBJ_SURFACE, s) : VA_INVALID_ID;
+			if (!s)
+				st = VA_STATUS_ERROR_ALLOCATION_FAILED;
+		}
+		pthread_mutex_unlock(&d->lock);
+		return st;
+	}
+	struct surface *live = fd >= 0 ? live_find(d, fd, w, h, p010, rgb) : NULL;
+	if (live) {
+		struct surface *s = calloc(1, sizeof(*s));
+		ids[0] = s ? new_obj(d, OBJ_SURFACE, s) : VA_INVALID_ID;
+		if (s) {
+			s->width = w;
+			s->height = h;
+			s->p010 = p010;
+			s->alias = true;
+			s->alias_rgb = rgb;
+			s->src_handle = gbm_bo_get_handle(live->bo[0]).u32;
+			if (!rgb)
+				live->vpp_only = true;
+		}
+		pthread_mutex_unlock(&d->lock);
+		return s ? VA_STATUS_SUCCESS : VA_STATUS_ERROR_ALLOCATION_FAILED;
+	}
+	if (rgb) {
+		struct surface *s = rgb_import(d, fd, w, h, pitch, offset, modifier, rfirst);
+		ids[0] = s ? new_obj(d, OBJ_SURFACE, s) : VA_INVALID_ID;
+		pthread_mutex_unlock(&d->lock);
+		return s ? VA_STATUS_SUCCESS : VA_STATUS_ERROR_ALLOCATION_FAILED;
+	}
+	// Else only a buffer we exported (see bury()), found by its first fd.
 	struct grave g;
 	if (fd >= 0 && grave_find(d, fd, w, h, p010, &g)) {
 		pthread_mutex_unlock(&d->lock);
@@ -1369,20 +1586,30 @@ static VAStatus vr_QuerySurfaceAttributes(VADriverContextP ctx, VAConfigID cfg, 
 	pthread_mutex_lock(&d->lock);
 	struct config *c = get_obj(d, cfg, OBJ_CONFIG);
 	bool p010 = c && profile_10bit(c->profile);
+	bool vpp = c && c->profile == VAProfileNone;
 	pthread_mutex_unlock(&d->lock);
 	if (!c)
 		return VA_STATUS_ERROR_INVALID_CONFIG;
-	VASurfaceAttrib list[] = {
-		{ VASurfaceAttribPixelFormat, VA_SURFACE_ATTRIB_GETTABLE | VA_SURFACE_ATTRIB_SETTABLE,
-		  { VAGenericValueTypeInteger, { .i = p010 ? VA_FOURCC_P010 : VA_FOURCC_NV12 } } },
-		{ VASurfaceAttribMemoryType, VA_SURFACE_ATTRIB_GETTABLE | VA_SURFACE_ATTRIB_SETTABLE,
-		  { VAGenericValueTypeInteger, { .i = VA_SURFACE_ATTRIB_MEM_TYPE_VA | VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 } } },
-		{ VASurfaceAttribMinWidth, VA_SURFACE_ATTRIB_GETTABLE, { VAGenericValueTypeInteger, { .i = 16 } } },
-		{ VASurfaceAttribMinHeight, VA_SURFACE_ATTRIB_GETTABLE, { VAGenericValueTypeInteger, { .i = 16 } } },
-		{ VASurfaceAttribMaxWidth, VA_SURFACE_ATTRIB_GETTABLE, { VAGenericValueTypeInteger, { .i = 4096 } } },
-		{ VASurfaceAttribMaxHeight, VA_SURFACE_ATTRIB_GETTABLE, { VAGenericValueTypeInteger, { .i = 4096 } } },
-	};
-	unsigned count = sizeof(list) / sizeof(list[0]);
+#define ATTR(t, f, v) { t, f, { VAGenericValueTypeInteger, { .i = (int)(v) } } }
+	const int rw = VA_SURFACE_ATTRIB_GETTABLE | VA_SURFACE_ATTRIB_SETTABLE;
+	VASurfaceAttrib list[10];
+	unsigned count = 0;
+	// Video processing reads NV12 (and P010) and writes BGRA.
+	if (vpp) {
+		list[count++] = (VASurfaceAttrib)ATTR(VASurfaceAttribPixelFormat, rw, VA_FOURCC_NV12);
+		if (d->p010)
+			list[count++] = (VASurfaceAttrib)ATTR(VASurfaceAttribPixelFormat, rw, VA_FOURCC_P010);
+		list[count++] = (VASurfaceAttrib)ATTR(VASurfaceAttribPixelFormat, rw, VA_FOURCC_ARGB);
+	} else {
+		list[count++] = (VASurfaceAttrib)ATTR(VASurfaceAttribPixelFormat, rw, p010 ? VA_FOURCC_P010 : VA_FOURCC_NV12);
+	}
+	list[count++] = (VASurfaceAttrib)ATTR(VASurfaceAttribMemoryType, rw,
+					      VA_SURFACE_ATTRIB_MEM_TYPE_VA | VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME | VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2);
+	list[count++] = (VASurfaceAttrib)ATTR(VASurfaceAttribMinWidth, VA_SURFACE_ATTRIB_GETTABLE, 16);
+	list[count++] = (VASurfaceAttrib)ATTR(VASurfaceAttribMinHeight, VA_SURFACE_ATTRIB_GETTABLE, 16);
+	list[count++] = (VASurfaceAttrib)ATTR(VASurfaceAttribMaxWidth, VA_SURFACE_ATTRIB_GETTABLE, 4096);
+	list[count++] = (VASurfaceAttrib)ATTR(VASurfaceAttribMaxHeight, VA_SURFACE_ATTRIB_GETTABLE, 4096);
+#undef ATTR
 	if (!a) {
 		*n = count;
 		return VA_STATUS_SUCCESS;
@@ -1391,7 +1618,7 @@ static VAStatus vr_QuerySurfaceAttributes(VADriverContextP ctx, VAConfigID cfg, 
 		*n = count;
 		return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
 	}
-	memcpy(a, list, sizeof(list));
+	memcpy(a, list, count * sizeof(list[0]));
 	*n = count;
 	return VA_STATUS_SUCCESS;
 }
@@ -1414,6 +1641,7 @@ static VAStatus vr_CreateContext(VADriverContextP ctx, VAConfigID cfg, int w, in
 	c->drv = d;
 	c->profile = conf->profile;
 	c->p010 = profile_10bit(conf->profile);
+	c->vpp = conf->profile == VAProfileNone;
 	c->width = (unsigned)w;
 	c->height = (unsigned)h;
 	c->fd = -1;
@@ -1530,6 +1758,9 @@ static VAStatus vr_BeginPicture(VADriverContextP ctx, VAContextID cid, VASurface
 	pthread_mutex_lock(&d->lock);
 	struct context *c = get_obj(d, cid, OBJ_CONTEXT);
 	struct surface *s = get_obj(d, target, OBJ_SURFACE);
+	// Decoding writes our copy of a picture; video processing a BGRA buffer.
+	if (c && s && (c->vpp ? !rgb_of(d, s) : !s->data))
+		s = NULL;
 	if (c && s) {
 		// The surface may still be on its way from an earlier picture.
 		if (s->pending && s->ctx)
@@ -1539,6 +1770,7 @@ static VAStatus vr_BeginPicture(VADriverContextP ctx, VAContextID cid, VASurface
 		c->slices_len = 0;
 		memset(c->pps_used, 0, sizeof(c->pps_used));
 		c->have_pic = c->have_iq = false;
+		c->have_vpp = false;
 	}
 	pthread_mutex_unlock(&d->lock);
 	if (!c)
@@ -1588,8 +1820,54 @@ static VAStatus h264_slices(struct context *c, struct buffer *params, struct buf
 }
 
 // A VP9 picture: the frame as it came.
+static uint32_t vp9_bits(const uint8_t *p, size_t *pos, int n)
+{
+	uint32_t v = 0;
+	for (int i = 0; i < n; i++, (*pos)++)
+		v = (v << 1) | ((p[*pos / 8] >> (7 - *pos % 8)) & 1);
+	return v;
+}
+
+// A VP9 key frame's colour space, from its uncompressed header; other
+// frames keep the last one.
+static enum matrix vp9_matrix(const uint8_t *p, size_t len, enum matrix last)
+{
+	size_t pos = 0;
+	// The first 5 bytes hold everything up to the colour space.
+#define BITS(n) (pos + (n) > len * 8 ? 0 : vp9_bits(p, &pos, (n)))
+	if (len < 5 || BITS(2) != 2)
+		return last;
+	unsigned profile = BITS(1);
+	profile |= BITS(1) << 1;
+	if (profile == 3)
+		BITS(1);
+	if (BITS(1)) // show_existing_frame
+		return last;
+	if (BITS(1) != 0) // not a key frame
+		return last;
+	BITS(2); // show_frame, error_resilient_mode
+	if (BITS(24) != 0x498342)
+		return last;
+	if (profile >= 2)
+		BITS(1);
+	unsigned cs = BITS(3);
+#undef BITS
+	switch (cs) {
+	case 1: // BT.601
+	case 3: // SMPTE 170
+		return MATRIX_601;
+	case 2: // BT.709
+		return MATRIX_709;
+	case 5: // BT.2020
+		return MATRIX_2020;
+	default:
+		return MATRIX_GUESS;
+	}
+}
+
 static bool frame_build(struct context *c)
 {
+	c->vp9_matrix = vp9_matrix(c->slices, c->slices_len, c->vp9_matrix);
 	if (!au_grow(c, c->slices_len))
 		return false;
 	memcpy(c->au, c->slices, c->slices_len);
@@ -2238,6 +2516,24 @@ static VAStatus vr_RenderPicture(VADriverContextP ctx, VAContextID cid, VABuffer
 			break;
 		}
 		switch (b->type) {
+		case VAProcPipelineParameterBufferType: {
+			if (!c->vpp || b->size < sizeof(VAProcPipelineParameterBuffer)) {
+				st = VA_STATUS_ERROR_INVALID_BUFFER;
+				break;
+			}
+			// The rectangles are the player's memory, read now.
+			VAProcPipelineParameterBuffer pp;
+			memcpy(&pp, b->data, sizeof(pp));
+			c->vpp_src = pp.surface;
+			c->vpp_has_in = pp.surface_region != NULL;
+			c->vpp_has_out = pp.output_region != NULL;
+			if (pp.surface_region)
+				c->vpp_in = *pp.surface_region;
+			if (pp.output_region)
+				c->vpp_out = *pp.output_region;
+			c->have_vpp = true;
+			break;
+		}
 		case VAPictureParameterBufferType:
 			if (profile_fourcc(c->profile) == V4L2_PIX_FMT_H264 && b->size >= sizeof(c->h264_pic)) {
 				memcpy(&c->h264_pic, b->data, sizeof(c->h264_pic));
@@ -2301,7 +2597,11 @@ static VAStatus vr_EndPicture(VADriverContextP ctx, VAContextID cid)
 	pthread_mutex_lock(&d->lock);
 	struct context *c = get_obj(d, cid, OBJ_CONTEXT);
 	VAStatus st = VA_STATUS_ERROR_INVALID_CONTEXT;
-	if (c) {
+	if (c && c->vpp) {
+		struct surface *s = get_obj(d, c->target, OBJ_SURFACE);
+		st = s ? vpp_run(d, c, s) : VA_STATUS_ERROR_INVALID_SURFACE;
+		c->have_vpp = false;
+	} else if (c) {
 		struct surface *s = get_obj(d, c->target, OBJ_SURFACE);
 		c->au_len = 0;
 		uint32_t f = profile_fourcc(c->profile);
@@ -2314,7 +2614,7 @@ static VAStatus vr_EndPicture(VADriverContextP ctx, VAContextID cid)
 			st = submit(c, s);
 		// Chromium shows the picture once this returns, from the
 		// dma-buf it exported at the start.
-		if (st == VA_STATUS_SUCCESS && s->live) {
+		if (st == VA_STATUS_SUCCESS && s->live && !s->vpp_only) {
 			wait_surface(d, s);
 			if (!s->failed && !upload(d, s))
 				st = VA_STATUS_ERROR_OPERATION_FAILED;
@@ -2331,8 +2631,8 @@ static VAStatus vr_SyncSurface(VADriverContextP ctx, VASurfaceID id)
 	struct driver *d = DRV(ctx);
 	pthread_mutex_lock(&d->lock);
 	struct surface *s = get_obj(d, id, OBJ_SURFACE);
-	if (s)
-		wait_surface(d, s);
+	if (s && picture_of(d, s))
+		wait_surface(d, picture_of(d, s));
 	pthread_mutex_unlock(&d->lock);
 	return s ? VA_STATUS_SUCCESS : VA_STATUS_ERROR_INVALID_SURFACE;
 }
@@ -2342,6 +2642,8 @@ static VAStatus vr_QuerySurfaceStatus(VADriverContextP ctx, VASurfaceID id, VASu
 	struct driver *d = DRV(ctx);
 	pthread_mutex_lock(&d->lock);
 	struct surface *s = get_obj(d, id, OBJ_SURFACE);
+	if (s && picture_of(d, s))
+		s = picture_of(d, s);
 	if (s) {
 		if (s->pending && s->ctx)
 			pump(s->ctx, 0);
@@ -2432,7 +2734,7 @@ static VAStatus vr_DeriveImage(VADriverContextP ctx, VASurfaceID sid, VAImage *o
 	pthread_mutex_lock(&d->lock);
 	struct surface *s = get_obj(d, sid, OBJ_SURFACE);
 	VAStatus st = VA_STATUS_ERROR_INVALID_SURFACE;
-	if (s) {
+	if (s && s->data) {
 		wait_surface(d, s);
 		VAImageFormat f = image_format(s->p010);
 		st = make_image(d, &f, s->width, s->height, s, sid, out);
@@ -2504,7 +2806,7 @@ static VAStatus vr_GetImage(VADriverContextP ctx, VASurfaceID sid, int x, int y,
 	struct image *im = get_obj(d, iid, OBJ_IMAGE);
 	struct buffer *b = im ? get_obj(d, im->image.buf, OBJ_BUFFER) : NULL;
 	VAStatus st = VA_STATUS_ERROR_INVALID_PARAMETER;
-	if (s && b) {
+	if (s && s->data && b) {
 		wait_surface(d, s);
 		st = b->borrowed ? VA_STATUS_SUCCESS : copy_rect(s, im, b, x, y, w, h, true);
 	}
@@ -2523,7 +2825,7 @@ static VAStatus vr_PutImage(VADriverContextP ctx, VASurfaceID sid, VAImageID iid
 	struct image *im = get_obj(d, iid, OBJ_IMAGE);
 	struct buffer *b = im ? get_obj(d, im->image.buf, OBJ_BUFFER) : NULL;
 	VAStatus st = VA_STATUS_ERROR_INVALID_PARAMETER;
-	if (s && b && !b->borrowed) {
+	if (s && s->data && b && !b->borrowed) {
 		wait_surface(d, s);
 		st = copy_rect(s, im, b, dx, dy, dw, dh, false);
 		s->bo_stale = true;
@@ -2544,6 +2846,24 @@ static void bo_free(struct surface *s)
 	}
 }
 
+// Send a virtio-gpu buffer's guest pages to the host. The kernel takes
+// no stride for these (non-blob) resources: the host reads rows packed,
+// as GBM lays them out.
+static bool transfer_to_host(struct driver *d, struct gbm_bo *bo, unsigned w, unsigned h)
+{
+	if (gbm_bo_get_stride(bo) != w * (gbm_bo_get_bpp(bo) / 8))
+		return false;
+	struct drm_virtgpu_3d_transfer_to_host t = {
+		.bo_handle = gbm_bo_get_handle(bo).u32,
+		.box = { .w = w, .h = h, .d = 1 },
+	};
+	if (xioctl(d->drm_fd, DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST, &t)) {
+		dbg("transfer %ux%u: %s", w, h, strerror(errno));
+		return false;
+	}
+	return true;
+}
+
 // Write one plane into a virtio-gpu buffer: into its guest pages, then
 // one transfer to the host. (GBM's own map reads the buffer back from
 // the host first and waits for it: 60 ms a 1080p picture.) False: not a
@@ -2553,6 +2873,8 @@ static bool upload_virtgpu(struct driver *d, struct surface *s, int k, const uin
 	uint32_t handle = gbm_bo_get_handle(s->bo[k]).u32;
 	uint32_t stride = gbm_bo_get_stride(s->bo[k]);
 	size_t len = (size_t)stride * rows;
+	if (stride != gbm_bo_get_width(s->bo[k]) * (gbm_bo_get_bpp(s->bo[k]) / 8))
+		return false;
 	if (!s->bo_map[k]) {
 		struct drm_virtgpu_map m = { .handle = handle };
 		if (xioctl(d->drm_fd, DRM_IOCTL_VIRTGPU_MAP, &m))
@@ -2568,12 +2890,7 @@ static bool upload_virtgpu(struct driver *d, struct surface *s, int k, const uin
 	xioctl(d->drm_fd, DRM_IOCTL_VIRTGPU_WAIT, &w);
 	for (unsigned y = 0; y < rows; y++)
 		memcpy(s->bo_map[k] + (size_t)y * stride, src + (size_t)y * src_pitch, row);
-	struct drm_virtgpu_3d_transfer_to_host t = {
-		.bo_handle = handle,
-		.box = { .w = gbm_bo_get_width(s->bo[k]), .h = rows, .d = 1 },
-		.stride = stride,
-	};
-	return xioctl(d->drm_fd, DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST, &t) == 0;
+	return transfer_to_host(d, s->bo[k], gbm_bo_get_width(s->bo[k]), rows);
 }
 
 // Fill the surface's GBM buffers from its picture.
@@ -2619,6 +2936,258 @@ static bool upload(struct driver *d, struct surface *s)
 	return true;
 }
 
+// ---------------------------------------------------------------------
+// Video processing: a picture into a BGRA buffer (Chrome under X11)
+
+// Limited range YUV to RGB, in 64ths: R = Y' + rv V', G = Y' + gu U' +
+// gv V', B = Y' + bu U' (Y' = 1.164 (Y - 16), U' = U - 128, V' = V - 128).
+struct yuv_coefs {
+	int16_t rv, gu, gv, bu;
+};
+static const struct yuv_coefs bt601 = { 102, -25, -52, 129 };
+static const struct yuv_coefs bt709 = { 115, -14, -34, 135 };
+
+// The matrix the picture says, else the usual one for its kind: BT.2020
+// for 10 bits (HDR), BT.709 for HD, BT.601 below.
+static const struct yuv_coefs *coefs_for(const struct surface *s)
+{
+	static const struct yuv_coefs bt2020 = { 107, -12, -42, 137 };
+	switch (s->matrix) {
+	case MATRIX_601:
+		return &bt601;
+	case MATRIX_709:
+		return &bt709;
+	case MATRIX_2020:
+		return &bt2020;
+	default:
+		return s->p010 ? &bt2020 : s->height >= 720 ? &bt709 : &bt601;
+	}
+}
+
+static inline uint8_t clamp8(int v)
+{
+	return v < 0 ? 0 : v > 255 ? 255 : (uint8_t)v;
+}
+
+// One pixel, B, G, R, A (R first: R, G, B, A).
+static inline void yuv_pixel(uint8_t *out, int y, int u, int v, const struct yuv_coefs *k, bool rfirst)
+{
+	int yy = ((y * 149 - 16 * 149) >> 1) + 32;
+	u -= 128;
+	v -= 128;
+	out[rfirst ? 2 : 0] = clamp8((yy + k->bu * u) >> 6);
+	out[1] = clamp8((yy + k->gu * u + k->gv * v) >> 6);
+	out[rfirst ? 0 : 2] = clamp8((yy + k->rv * v) >> 6);
+	out[3] = 255;
+}
+
+#ifdef __aarch64__
+// Two rows of 16 pixels from 8-bit samples: luma even and odd columns of
+// each row, and the 8 chroma pairs they share.
+static inline void yuv_16x2(uint8_t *o0, uint8_t *o1, const uint8x8_t yl[2][2], uint8x8_t cu, uint8x8_t cv, const struct yuv_coefs *k,
+			    bool rfirst)
+{
+	int16x8_t u = vreinterpretq_s16_u16(vsubl_u8(cu, vdup_n_u8(128)));
+	int16x8_t v = vreinterpretq_s16_u16(vsubl_u8(cv, vdup_n_u8(128)));
+	int16x8_t rv = vmulq_n_s16(v, k->rv);
+	int16x8_t guv = vmlaq_n_s16(vmulq_n_s16(u, k->gu), v, k->gv);
+	int16x8_t bu = vmulq_n_s16(u, k->bu);
+	uint8_t *os[2] = { o0, o1 };
+	for (int r = 0; r < 2; r++) {
+		uint8x8_t ch[3][2];
+		for (int h = 0; h < 2; h++) {
+			// 1.164 (Y - 16) in 64ths: Y * 149 / 2 - 16 * 149 / 2.
+			uint16x8_t yw = vshrq_n_u16(vmull_u8(yl[r][h], vdup_n_u8(149)), 1);
+			int16x8_t yy = vsubq_s16(vreinterpretq_s16_u16(yw), vdupq_n_s16(16 * 149 / 2));
+			ch[0][h] = vqrshrun_n_s16(vqaddq_s16(yy, bu), 6);
+			ch[1][h] = vqrshrun_n_s16(vqaddq_s16(yy, guv), 6);
+			ch[2][h] = vqrshrun_n_s16(vqaddq_s16(yy, rv), 6);
+		}
+		uint8x16x4_t px;
+		for (int c = 0; c < 3; c++) {
+			uint8x8x2_t z = vzip_u8(ch[c][0], ch[c][1]);
+			px.val[rfirst ? 2 - c : c] = vcombine_u8(z.val[0], z.val[1]);
+		}
+		px.val[3] = vdupq_n_u8(255);
+		vst4q_u8(os[r], px);
+	}
+}
+
+static inline void yuv8_16x2(uint8_t *o0, uint8_t *o1, const uint8_t *y0, const uint8_t *y1, const uint8_t *uv, const struct yuv_coefs *k,
+			     bool rfirst)
+{
+	uint8x8x2_t a = vld2_u8(y0), b = vld2_u8(y1), c = vld2_u8(uv);
+	const uint8x8_t yl[2][2] = { { a.val[0], a.val[1] }, { b.val[0], b.val[1] } };
+	yuv_16x2(o0, o1, yl, c.val[0], c.val[1], k, rfirst);
+}
+
+// P010: the high byte of each sample is its top 8 bits.
+static inline void yuv10_16x2(uint8_t *o0, uint8_t *o1, const uint8_t *y0, const uint8_t *y1, const uint8_t *uv, const struct yuv_coefs *k,
+			      bool rfirst)
+{
+	uint16x8x2_t a = vld2q_u16((const uint16_t *)y0), b = vld2q_u16((const uint16_t *)y1), c = vld2q_u16((const uint16_t *)uv);
+	const uint8x8_t yl[2][2] = { { vshrn_n_u16(a.val[0], 8), vshrn_n_u16(a.val[1], 8) },
+				     { vshrn_n_u16(b.val[0], 8), vshrn_n_u16(b.val[1], 8) } };
+	yuv_16x2(o0, o1, yl, vshrn_n_u16(c.val[0], 8), vshrn_n_u16(c.val[1], 8), k, rfirst);
+}
+#endif
+
+// Convert rectangle `in` of picture `s` into rectangle `out` of the BGRA
+// image at `dst` (`pitch` bytes a row), scaling to the nearest pixel.
+static void vpp_convert(const struct surface *s, VARectangle in, uint8_t *dst, unsigned pitch, VARectangle out, bool rfirst)
+{
+	const struct yuv_coefs *k = coefs_for(s);
+	const uint8_t *luma = s->data, *chroma = s->data + (size_t)s->pitch * s->rows;
+	// Bytes a sample, and which byte has the top 8 bits.
+	unsigned bpp = s->p010 ? 2 : 1, hi = s->p010 ? 1 : 0;
+	if (in.width == out.width && in.height == out.height && !(in.x & 1) && !(in.y & 1)) {
+		for (unsigned r = 0; r < out.height; r += 2) {
+			unsigned sy = in.y + r;
+			const uint8_t *y0 = luma + (size_t)sy * s->pitch + (size_t)in.x * bpp;
+			const uint8_t *uv = chroma + (size_t)(sy / 2) * s->pitch + (size_t)in.x * bpp;
+			uint8_t *o0 = dst + (size_t)(out.y + r) * pitch + (size_t)out.x * 4;
+			bool two = r + 1 < out.height;
+			const uint8_t *y1 = two ? y0 + s->pitch : y0;
+			uint8_t *o1 = two ? o0 + pitch : NULL;
+			unsigned x = 0;
+#ifdef __aarch64__
+			for (; two && x + 16 <= out.width; x += 16) {
+				if (s->p010)
+					yuv10_16x2(o0 + x * 4, o1 + x * 4, y0 + x * 2, y1 + x * 2, uv + x * 2, k, rfirst);
+				else
+					yuv8_16x2(o0 + x * 4, o1 + x * 4, y0 + x, y1 + x, uv + x, k, rfirst);
+			}
+#endif
+			for (; x < out.width; x++) {
+				size_t cx = (size_t)(x & ~1u) * bpp;
+				uint8_t u = uv[cx + hi], v = uv[cx + bpp + hi];
+				yuv_pixel(o0 + x * 4, y0[(size_t)x * bpp + hi], u, v, k, rfirst);
+				if (two)
+					yuv_pixel(o1 + x * 4, y1[(size_t)x * bpp + hi], u, v, k, rfirst);
+			}
+		}
+		return;
+	}
+	// Cropped at odd offsets, or scaled: one pixel at a time.
+	unsigned *sxs = malloc(out.width * sizeof(*sxs));
+	if (!sxs)
+		return;
+	for (unsigned x = 0; x < out.width; x++)
+		sxs[x] = in.x + (unsigned)((uint64_t)x * in.width / out.width);
+	for (unsigned r = 0; r < out.height; r++) {
+		unsigned sy = in.y + (unsigned)((uint64_t)r * in.height / out.height);
+		const uint8_t *yrow = luma + (size_t)sy * s->pitch;
+		const uint8_t *uvrow = chroma + (size_t)(sy / 2) * s->pitch;
+		uint8_t *o = dst + (size_t)(out.y + r) * pitch + (size_t)out.x * 4;
+		for (unsigned x = 0; x < out.width; x++) {
+			unsigned sx = sxs[x];
+			size_t cx = (size_t)(sx & ~1u) * bpp;
+			yuv_pixel(o + x * 4, yrow[(size_t)sx * bpp + hi], uvrow[cx + hi], uvrow[cx + bpp + hi], k, rfirst);
+		}
+	}
+	free(sxs);
+}
+
+// `r` (whole surface if absent) cut to a w x h surface; false if empty.
+static bool clip_rect(VARectangle *r, bool given, unsigned w, unsigned h)
+{
+	if (!given)
+		*r = (VARectangle){ 0, 0, (uint16_t)w, (uint16_t)h };
+	if (r->x < 0 || r->y < 0 || (unsigned)r->x >= w || (unsigned)r->y >= h)
+		return false;
+	if ((unsigned)r->x + r->width > w)
+		r->width = (uint16_t)(w - (unsigned)r->x);
+	if ((unsigned)r->y + r->height > h)
+		r->height = (uint16_t)(h - (unsigned)r->y);
+	return r->width > 0 && r->height > 0;
+}
+
+// Run the video processing set up for c into BGRA surface dst. The
+// player shows dst as soon as this returns (it doesn't sync).
+static VAStatus vpp_run(struct driver *d, struct context *c, struct surface *dst)
+{
+	struct surface *from = get_obj(d, c->vpp_src, OBJ_SURFACE);
+	struct surface *s = from ? picture_of(d, from) : NULL;
+	dst = rgb_of(d, dst);
+	if (!c->have_vpp || !s || !dst) {
+		dbg("video processing: %s", !c->have_vpp ? "no parameters" : !s ? "no source picture" : "no BGRA output");
+		return VA_STATUS_ERROR_INVALID_SURFACE;
+	}
+	// Its own buffers aren't shown, then: no need to fill them.
+	if (from != s)
+		s->vpp_only = true;
+	wait_surface(d, s);
+	VARectangle in = c->vpp_in, out = c->vpp_out;
+	if (!clip_rect(&in, c->vpp_has_in, s->width, s->height) || !clip_rect(&out, c->vpp_has_out, dst->width, dst->height))
+		return VA_STATUS_ERROR_INVALID_PARAMETER;
+	if (s->failed)
+		return VA_STATUS_SUCCESS;
+	uint32_t handle = gbm_bo_get_handle(dst->bo[0]).u32;
+	size_t len = dst->rgb_offset + (size_t)dst->rgb_pitch * dst->height;
+	if (dst->rgb_offset || dst->rgb_pitch != dst->width * 4)
+		dst->rgb_nomap = true;
+	if (!dst->bo_map[0] && !dst->rgb_nomap) {
+		// Its guest pages, as for our own buffers (see upload_virtgpu()).
+		struct drm_virtgpu_map m = { .handle = handle };
+		void *p = MAP_FAILED;
+		if (xioctl(d->drm_fd, DRM_IOCTL_VIRTGPU_MAP, &m) == 0)
+			p = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, d->drm_fd, (off_t)m.offset);
+		if (p != MAP_FAILED) {
+			dst->bo_map[0] = p;
+			dst->bo_map_len[0] = len;
+		} else {
+			dbg("can't map the BGRA buffer, using GBM's map");
+			dst->rgb_nomap = true;
+		}
+	}
+	int64_t t0 = now_ms();
+	if (dst->bo_map[0]) {
+		struct drm_virtgpu_3d_wait w = { .handle = handle };
+		xioctl(d->drm_fd, DRM_IOCTL_VIRTGPU_WAIT, &w);
+		vpp_convert(s, in, dst->bo_map[0], dst->rgb_pitch, out, dst->rgb_rfirst);
+		if (!transfer_to_host(d, dst->bo[0], dst->width, dst->height))
+			return VA_STATUS_ERROR_OPERATION_FAILED;
+	} else {
+		uint32_t stride = 0;
+		void *map_data = NULL;
+		uint8_t *p = gbm_bo_map(dst->bo[0], 0, 0, dst->width, dst->height, GBM_BO_TRANSFER_WRITE, &stride, &map_data);
+		if (!p) {
+			dbg("video processing: gbm_bo_map failed");
+			return VA_STATUS_ERROR_OPERATION_FAILED;
+		}
+		vpp_convert(s, in, p, stride, out, dst->rgb_rfirst);
+		gbm_bo_unmap(dst->bo[0], map_data);
+	}
+	if (debug_level > 1)
+		dbg("vpp %ux%u -> %ux%u: %lld ms", in.width, in.height, out.width, out.height, (long long)(now_ms() - t0));
+	return VA_STATUS_SUCCESS;
+}
+
+// A BGRA surface as one dma-buf (Chrome shows video processing output
+// from it).
+static VAStatus export_rgb(struct surface *s, VADRMPRIMESurfaceDescriptor *desc)
+{
+	int fd = gbm_bo_get_fd(s->bo[0]);
+	if (fd < 0)
+		return VA_STATUS_ERROR_OPERATION_FAILED;
+	memset(desc, 0, sizeof(*desc));
+	desc->fourcc = VA_FOURCC_ARGB;
+	desc->width = s->width;
+	desc->height = s->height;
+	desc->num_objects = 1;
+	desc->objects[0].fd = fd;
+	off_t end = lseek(fd, 0, SEEK_END);
+	desc->objects[0].size = end > 0 ? (uint32_t)end : s->rgb_offset + s->rgb_pitch * s->height;
+	lseek(fd, 0, SEEK_SET);
+	desc->objects[0].drm_format_modifier = gbm_bo_get_modifier(s->bo[0]);
+	desc->num_layers = 1;
+	desc->layers[0].drm_format = DRM_FORMAT_ARGB8888;
+	desc->layers[0].num_planes = 1;
+	desc->layers[0].offset[0] = s->rgb_offset;
+	desc->layers[0].pitch[0] = s->rgb_pitch;
+	return VA_STATUS_SUCCESS;
+}
+
 static VAStatus vr_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID sid, uint32_t mem_type, uint32_t flags, void *descriptor)
 {
 	struct driver *d = DRV(ctx);
@@ -2627,7 +3196,12 @@ static VAStatus vr_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID sid, ui
 	VADRMPRIMESurfaceDescriptor *desc = descriptor;
 	pthread_mutex_lock(&d->lock);
 	struct surface *s = get_obj(d, sid, OBJ_SURFACE);
-	if (!s) {
+	if (s && rgb_of(d, s)) {
+		VAStatus st = export_rgb(rgb_of(d, s), desc);
+		pthread_mutex_unlock(&d->lock);
+		return st;
+	}
+	if (!s || !s->data) {
 		pthread_mutex_unlock(&d->lock);
 		return VA_STATUS_ERROR_INVALID_SURFACE;
 	}

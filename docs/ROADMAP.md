@@ -144,16 +144,12 @@ A guest needs a driver and an API its players use. What exists:
   against earlier frames (global motion, segmentation, loop filter
   deltas), so the driver has to keep those per reference slot. Firefox
   says AV1 isn't power efficient here, so YouTube sends it VP9 for now.
-- **Chrome under X11**: it decodes in software there (it uses VA-API only
-  on its EGL path; X11 gets GLX). Wayland sessions are fine.
 - **Chrome with `opengl_host = "angle"`**: its GPU process still doesn't
   start (ANGLE's ES 3.0 has no multisample textures, so the guest gets
   one sample and no ES 3.0 by the spec). Chrome works on `apple`.
 - **Hardware encoding** for video calls: Chrome sends with libvpx or
   OpenH264 in the page's process (0.1 to 0.2 of a CPU at 720p). A VA-API
   encoder on VideoToolbox's would take that to the Mac.
-- **Snap Firefox**: it loads VA-API drivers only from its own runtime.
-  Mozilla's deb works.
 - **The guest drivers**: ship virtio-media (DKMS package) until it is
   upstream, and follow its upstreaming; package the VA-API driver.
 - **Fewer copies, the rest**: a picture now goes from VideoToolbox's
@@ -163,7 +159,12 @@ A guest needs a driver and an API its players use. What exists:
   (in Chrome's GPU process: 0.13 of a CPU for 1080p30). Handing
   VideoToolbox's IOSurface to virglrenderer as the texture would save
   those, but it means sharing between the video helper and the GPU
-  process.
+  process. Chrome under X11 also has the driver convert each picture to
+  BGRA on the guest's CPU (about 1 ms a 1080p picture): a shader on the
+  Mac's GPU would do it for free, and keep 10-bit video in 10 bits.
+- Chrome under GNOME Wayland drops about one 1080p30 picture in 25
+  with hardware decoding; under Xorg it drops none. The display path,
+  to look at.
 - Firefox in our test setup (sway on virgl, headless) drops about 40% of
   frames whatever decodes them (software too, and for 360p): the display
   path, not decoding. To look at with a real window.

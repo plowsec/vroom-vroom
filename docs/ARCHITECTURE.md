@@ -562,6 +562,24 @@ names only the first plane's buffer). A destroyed live surface's two
 buffers are kept for 5 seconds (32 at most), and such a surface gets
 them back by its luma buffer's handle; other dma-bufs are refused.
 
+Chrome under X11 shows video through X pixmaps (DRI3), which take only
+BGRA buffers, so it asks for video processing (`VAProfileNone`,
+`VAEntrypointVideoProc`): NV12 or P010 into BGRA. It makes the BGRA
+surfaces with `vaCreateSurfaces` and exports them, then imports both the
+decoded surfaces and the BGRA ones back as dma-bufs. Such an import
+becomes a surface that stands for the one that exported the buffer,
+found again by its GEM handle at each use (Chrome may have remade it
+from the same buffers meanwhile). `vaEndPicture` on a processing
+context converts the picture on the CPU (NEON, 16 pixels by 2 rows,
+nearest-pixel scaling) straight into the BGRA buffer's guest pages and
+sends one transfer: Chrome doesn't sync before showing it. A decoded
+surface that only feeds processing no longer fills its own GBM buffers.
+The colour matrix comes from VP9 key frames; H.264 and HEVC don't pass
+theirs through VA-API, so the driver guesses it from the size and bit
+depth. Transfers to the host give no stride: the kernel refuses one for
+these (non-blob) resources, and the host reads the rows packed, as GBM
+lays them out.
+
 ## 3D
 
 `gpu = "virtio3d"` adds three protocols to virtio-gpu. Venus: guest Vulkan

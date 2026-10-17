@@ -547,7 +547,8 @@ Chrome and Chromium draw with the GPU, with nothing to set in the guest:
 rasterization, WebGL and WebGL2, and its GL renderer is `ANGLE (Mesa,
 virgl (Apple M…), OpenGL ES 3.0 …)`. Tested with Google Chrome 155 for
 arm64 (Google's deb) and the Chromium 155 snap on Ubuntu 24.04, as
-Wayland apps (sway) and X11 apps (Xwayland). A WebGL2 page drawing 2000
+Wayland apps (sway, GNOME) and X11 apps (Xwayland, GNOME on Xorg, where
+the renderer says `OpenGL 4.1 (Core Profile)`). A WebGL2 page drawing 2000
 cubes with antialiasing runs at 60 frames a second, WebGL Aquarium
 (500 fish) at 57; Chrome's GPU and page processes use about a tenth of a
 CPU each. For video, see [Video decoding](#browsers-va-api).
@@ -836,18 +837,23 @@ vainfo                       # Driver version: vroom (VideoToolbox ...)
 ```
 
 It makes itself the default (`LIBVA_DRIVER_NAME=vroom` in
-`/etc/environment`); log in again. It does H.264, HEVC (Main, Main 10)
-and VP9 (profiles 0 and 2), not AV1 yet.
+`/etc/environment`), sets up snaps and Chrome under X11 (below); log in
+again. It does H.264, HEVC (Main, Main 10) and VP9 (profiles 0 and 2),
+not AV1 yet.
 
 Firefox uses it with its default settings. It needs the 3D GPU (`gpu =
 "virtio3d"`): pictures reach Firefox's compositor as dma-bufs. Check in
 `about:support`, Media, Codec Support: H264 and VP9 say "HWDEC". Two
 things to know:
 
-- Ubuntu's Firefox is a snap, which only loads VA-API drivers from its
-  own runtime. Use Mozilla's deb (packages.mozilla.org, see
-  [Mozilla's instructions](https://support.mozilla.org/kb/install-firefox-linux)):
-  that is what we test (Firefox 158).
+- Ubuntu's Firefox is a snap. Snaps load VA-API drivers only from their
+  own runtime and from `/var/lib/snapd/lib/gl`, so the script puts a
+  copy of the driver there and adds that folder to `LIBVA_DRIVERS_PATH`
+  (driver installed before October 17, 2026: run the script again).
+  Firefox 158's snap, its decoding process, in an Xorg session: H.264
+  from 0.27 CPUs to 0.01, VP9 from 0.40 to 0.03. Mozilla's deb works as
+  well (packages.mozilla.org, see
+  [Mozilla's instructions](https://support.mozilla.org/kb/install-firefox-linux)).
 - YouTube picks the codec from what the browser says it decodes well.
   Firefox says AV1 isn't power efficient here, so YouTube usually sends
   VP9, which goes to the Mac. If a video still comes as AV1 (software),
@@ -861,35 +867,46 @@ against FFmpeg's own decoders: H.264 with B-frames, slices, scaling
 matrices, weighted prediction; HEVC 8 and 10-bit with B-frame pyramids,
 slices, open GOPs; VP9 8 and 10-bit with hidden frames).
 
-Chrome (Google's arm64 build) uses it with its default settings, in a
-Wayland session (Ubuntu's default: Chrome runs as a Wayland app there).
-It needs the 3D GPU with `opengl_host = "apple"` (see
-[Chrome and Chromium](#chrome-and-chromium)), and the driver installed
-on or after October 17, 2026 (run `install-vaapi.sh` again if it is
-older: Chrome showed black video). Check in `chrome://media-internals`:
-the player says `kVideoDecoderName: VaapiVideoDecoder`. Flags older
-guides give (`--enable-features=AcceleratedVideoDecodeLinuxGL,VaapiIgnoreDriverChecks`)
-change nothing in Chrome 155. Things to know:
+Chrome (Google's arm64 deb) and the Chromium snap use it with their
+default settings, in Wayland and Xorg sessions (Ubuntu's default is
+Wayland; Chrome runs as a Wayland app there). They need the 3D GPU with
+`opengl_host = "apple"` (see [Chrome and Chromium](#chrome-and-chromium)),
+and the driver installed on or after October 17, 2026 (run
+`install-vaapi.sh` again if it is older: Chrome showed black video under
+Wayland, decoded in software under X11 and didn't play HEVC Main 10).
+Check in
+`chrome://media-internals`: the player says `kVideoDecoderName:
+VaapiVideoDecoder`. Flags older guides give
+(`--enable-features=AcceleratedVideoDecodeLinuxGL,VaapiIgnoreDriverChecks`,
+`--use-angle=gl-egl`) don't help in Chrome 155. Things to know:
 
-- The Chromium snap loads VA-API drivers from its own runtime, but keeps
-  `LIBVA_DRIVERS_PATH`: copy the driver to your home and start it from
-  there:
-
-  ```bash
-  mkdir -p ~/vaapi && cp /usr/lib/aarch64-linux-gnu/dri/vroom_drv_video.so ~/vaapi/
-  LIBVA_DRIVERS_PATH=$HOME/vaapi chromium
-  ```
-
-- Under X11 (an Xorg session, or `--ozone-platform=x11`) Chrome draws
-  with the GPU but decodes in software: it uses VA-API only when it runs
-  OpenGL through EGL, and on X11 it uses GLX.
+- Under X11 (an Xorg session, or `--ozone-platform=x11`) Chrome looks
+  for the GPU on PCI only, and vroom's isn't on PCI (under Wayland the
+  compositor tells Chrome). So it needs
+  `--render-node-override=/dev/dri/renderD128`, and the script adds it:
+  the Chromium snap reads it from `CHROMIUM_FLAGS`; Google Chrome reads
+  no flags file, so `google-chrome` in `/usr/local/bin` is a wrapper
+  that adds it, and a copy of Chrome's menu entry in
+  `/usr/local/share/applications` starts the wrapper. An
+  apt hook (`/usr/local/sbin/vroom-chrome-x11`) redoes both after every
+  package change, so a Chrome installed or updated later is covered.
+  Chrome started another way (`/opt/google/chrome/chrome`) needs the
+  flag by hand.
+- Also under X11, Chrome can show only RGB pictures, not the decoder's
+  YUV ones, so it asks the driver to convert each one to BGRA. The
+  driver does that on the guest's CPU, in Chrome's GPU process: about
+  1 ms a 1080p picture, 3 ms at 4K. VA-API doesn't pass the video's
+  colour matrix: VP9 says it in its frames, and for H.264 and HEVC the
+  driver takes BT.709 for HD, BT.601 below that, BT.2020 for 10 bits.
+  10-bit video is shown in 8 bits there.
 - In video calls (WebRTC), Chrome decodes incoming H.264 and VP9 on the
   Mac too (`getStats()`: "ExternalDecoder (VaapiVideoDecoder)", power
   efficient). VP8, and the video it sends, stay in software.
-- Hardware decoded video is a little more saturated than the same video
-  decoded in software (reds and greens stand out more). Chrome converts
-  limited range BT.709 video with BT.601's colours on this path, on
-  purpose (it does the same on Intel GPUs); not ours to fix.
+- Under Wayland, hardware decoded video is a little more saturated than
+  the same video decoded in software (reds and greens stand out more).
+  Chrome converts limited range BT.709 video with BT.601's colours on
+  that path, on purpose (it does the same on Intel GPUs); not ours to
+  fix. Under X11, 8-bit video's colours match software decoding.
 
 Chrome 155, 1080p at 30 frames a second, in CPUs (1.0 is one guest CPU
 busy), before and after Chrome could use the GPU:
@@ -904,6 +921,18 @@ busy), before and after Chrome could use the GPU:
 The decoding moves out of the page's process; the GPU process does the
 copies into GPU memory. A call costs about the same: sending is in
 software either way.
+
+The same videos in GNOME on Xorg (mean of two runs), before and after
+the X11 support (October 17, 2026):
+
+| | Before: GPU process, page, whole guest | Now: GPU process, page, whole guest |
+|---|---|---|
+| H.264, 12 Mbit/s | 0.04, 0.28, 0.44 | 0.09, 0.02, 0.28 |
+| VP9, 22 Mbit/s | 0.04, 0.49, 0.64 | 0.15, 0.02, 0.34 |
+| HEVC, 8 Mbit/s | doesn't play | 0.10, 0.02, 0.28 |
+
+No pictures dropped either way. The GPU process's share includes the
+conversion to BGRA (about 0.03 of a CPU at 1080p30).
 
 Firefox's other Linux path, V4L2 decoders through FFmpeg, needs FFmpeg's
 DRM PRIME output (only in the Raspberry Pi's FFmpeg) and dma-buf export
