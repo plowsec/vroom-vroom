@@ -214,8 +214,9 @@ it:
   window comes back by itself, as it was (the guest may have turned its
   screen off meanwhile: press a key).
 - If vroom isn't started again within 5 minutes, the VM suspends itself
-  rather than run unseen. If it can't be saved (a Vulkan app runs, say),
-  it stays up and its window comes back the next time vroom starts.
+  rather than run unseen. If it can't be saved (an OpenGL app shares GPU
+  memory with the guest, say), it stays up and its window comes back the
+  next time vroom starts.
 - In the list, such a VM shows as running, with "Running without a
   window"; Show window, pause, snapshot and the power menu all bring the
   window back first.
