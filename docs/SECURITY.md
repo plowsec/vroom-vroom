@@ -602,6 +602,29 @@ graphics (Win+Ctrl+Shift+B; tested: the desktop comes back). Holding the
 fences back instead doesn't help: Windows' GPU watchdog doesn't fire
 with this driver, the desktop just hangs.
 
+Snapshots of Vulkan contexts (patch 0010) add three requests on each
+worker's socket and three calls between the VMM and the GPU process. The
+worker writes its context's state into a shared memory object of its own
+(under one of the names its sandbox already allows) and hands it to the
+GPU process, which hands it to the VMM. The VMM checks its size (at most
+64 GiB, no more than the object holds) and stores it without reading it.
+On restore the VMM puts that data in shared memory, and it goes down the
+same way to a new worker, which maps it read only. The data comes from
+the snapshot file, which anything that can write the VM's state
+directory controls, so the worker checks it like guest input: each
+record's length against what is left; contents against the size of the
+resource, memory or image region they go to (regions are worked out again
+from the image, never taken from the file); rings with the same layout
+checks as `vkCreateRingMESA`; reply streams with the same checks as
+`vkSetReplyCommandStreamMESA`. The kept commands are the guest's own
+bytes, replayed through the same Venus decoder and handlers as when the
+guest sent them (with the reply flag cleared). Workers still never map
+guest RAM. The VMM checks what it keeps itself like the guest's own
+requests: blob sizes and kinds, guest RAM ranges, and each mapping with
+the same checks as `RESOURCE_MAP_BLOB`. Following commands adds code on
+every command a guest sends, with a bound: past 4M commands or 1 GiB
+kept, a context isn't followed any more.
+
 OpenGL (virgl) contexts stay together in the GPU process: vrend shares
 one GL context group across them (shared objects, one GL thread), so
 splitting them would mean a GL driver per guest app and copying every

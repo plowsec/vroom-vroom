@@ -538,11 +538,46 @@ and glxgears open: about 105 MiB of GPU contents, 16 s to suspend, 17 s to
 resume, glxgears still drawing afterwards. A few things come back empty:
 multisampled buffers, and depth buffers with `opengl_host = "angle"`
 (OpenGL ES can't read depth); apps redraw those every frame anyway.
-Refused, with the reason shown: a running Vulkan app (Vulkan state isn't
-tracked), and GPU memory shared with the guest (blobs). Closing the window
-then leaves the VM paused with "Can't save this VM's state"; keep it
-running, or shut it down from the guest. Windows guests with 3D are saved
-another way (see below).
+
+Vulkan apps keep running through snapshots and suspend too, windows
+included (vkcube in Xorg, OpenGL apps on Zink). Each Vulkan app's
+renderer keeps the commands that made its objects (and the latest
+recording of each command buffer, the latest descriptor writes); a
+snapshot stops the app's renderer between two commands, waits for the
+GPU, and copies out its memory and images. On resume a fresh renderer
+replays the commands, puts the contents back and carries on where the
+app's command ring stood. The app notices nothing. Measured, Ubuntu 24.04,
+4 GiB guest:
+
+| Running | Kept per app | Saving it | Building it again |
+|---|---|---|---|
+| a compute loop (8 MiB of buffers) | 44 commands, 17.6 MiB | 6 to 9 ms | 0.4 s |
+| an off-screen drawing test (textures with layers and mipmaps) | 58 commands, 18.4 MiB | 8 to 13 ms | 0.46 s |
+| vkcube in an Xorg window | 216 commands, 17.8 MiB | 10 to 16 ms | 0.47 to 0.52 s |
+| glxgears on Zink | 380 commands, 28.9 MiB | | 0.44 s |
+| the compute loop with 1 GiB of buffers | 44 commands, 1033 MiB | 0.33 s | 0.8 s |
+
+About 9 MiB of each app's share is the guest driver's own command and
+reply memory. With vkcube, glxgears, the compute loop and the drawing
+test all open, suspend took 5.2 s and resume 5.6 s, and all four went on
+(the two tests check their results: no wrong values, the same pictures as
+before). With 1 GiB of Vulkan memory the snapshot took 9 s and 2 GB on
+disk (the GPU's part is stored as base64 for now, a third larger).
+
+What doesn't come back: multisampled images, transient attachments and
+lazily allocated memory (apps redraw those every frame), query results,
+images in multi-planar formats. An app whose renderer can't stop in 5 s
+(a host-side wait, the GPU busy for over 10 s) or that broke its context
+before is saved without its state: after the resume it sees its device
+lost (its Mesa driver stops it), and the rest of the guest goes on.
+`VKR_SNAPSHOT_LOST=1` in vroom's environment saves every Vulkan app that
+way, to try it.
+
+Still refused, with the reason shown: GPU memory an OpenGL app shares
+with the guest (OpenGL blobs), and a Vulkan app's window memory still in
+use after that app is gone. Closing the window then leaves the VM paused
+with "Can't save this VM's state"; keep it running, or shut it down from
+the guest. Windows guests with 3D are saved another way (see below).
 
 The build: `build-virglrenderer.sh` builds UTM's fork of virglrenderer
 (the one with Direct3D for Windows, below), pinned by hash, with our
@@ -1046,7 +1081,8 @@ flushes a lot). `"none"` ignores flushes: scratch disks only.
   which Windows sees and uses.
 - Windows guests: 3D is Direct3D 11 only (see above). Shared folders need
   WinFsp (see above).
-- 3D snapshots: not while a Vulkan app runs. Guest OpenGL stops at 4.1
+- 3D snapshots: not while an OpenGL app shares GPU memory with the guest
+  (blobs). Vulkan apps come back, see above. Guest OpenGL stops at 4.1
   (2.1 with `opengl_host = "angle"`).
 - NAT connections don't survive suspend/resume (the guest reconnects).
 - USB passthrough: not yet tried with a real device in a guest; tested

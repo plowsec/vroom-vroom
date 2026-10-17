@@ -2057,9 +2057,9 @@ impl GpuHandler {
                 && swizzle(format).is_some()
                 && w > 0
                 && h > 0
-                && w <= MAX_DIM
-                && h <= MAX_DIM
-                && view.inside(x.saturating_add(w), y.saturating_add(h))
+                && x.checked_add(w).is_some_and(|e| e <= MAX_DIM)
+                && y.checked_add(h).is_some_and(|e| e <= MAX_DIM)
+                // reads of the view stay inside the blob (read_mapped checks)
                 && (stride as u64) >= (x as u64 + w as u64) * 4;
             if !ok {
                 return Err(bad("bad scanout"));
