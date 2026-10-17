@@ -59,7 +59,8 @@ impl UsbDev {
     }
 }
 
-/// A host device on one of the VM's USB port pairs.
+/// A host device on one of the VM's USB port pairs, or a USB disk's
+/// files on one of its removable shares (`port` from `FILES_PORT0`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsbPort {
     pub port: u8,
@@ -69,6 +70,33 @@ pub struct UsbPort {
     pub here: bool,
     /// From the VM file (`[[usb]]`), connected at every start.
     pub always: bool,
+    pub how: UsbHow,
+    /// "files" and "disk": the guest can't change it.
+    pub readonly: bool,
+}
+
+/// How a host USB device is in the VM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UsbHow {
+    /// The device itself (passthrough).
+    #[default]
+    Device,
+    /// A disk of it, as a plain USB stick.
+    Disk,
+    /// The files of its volumes, as a shared folder.
+    Files,
+}
+
+/// `UsbPort::port` of the first removable share (USB disks' files);
+/// `UsbDetach` takes these too.
+pub const FILES_PORT0: u8 = 64;
+/// Longest volume name `UsbFiles` carries, and longest sandbox token.
+pub const USB_LABEL_MAX: usize = 64;
+pub const USB_TOKEN_MAX: usize = 2048;
+
+/// A volume name fit for the guest to see (a mount point's last part).
+pub fn usb_label_ok(s: &str) -> bool {
+    !s.is_empty() && s.len() <= USB_LABEL_MAX && s != "." && s != ".." && !s.chars().any(|c| c.is_control() || c == '/' || c == '\\')
 }
 
 /// Most network adapters a VM has (the config's limit).
@@ -312,7 +340,17 @@ pub enum ToVmm {
     /// does to the helpers it starts itself.
     UsbAttach(UsbDev),
     /// Pull the device on this port pair out; its helper is told to go.
+    /// From `FILES_PORT0`: take that USB disk's files away.
     UsbDetach { port: u8 },
+    /// Plug a USB disk in as a plain stick: comes with the disk's fd
+    /// (the raw disk the viewer opened, SCM_RIGHTS). `dev` is the USB
+    /// device it belongs to, for the list.
+    UsbDisk { dev: UsbDev, readonly: bool },
+    /// Share a USB disk's volume with the guest: comes with the
+    /// volume's directory fd (SCM_RIGHTS) and `token`, the sandbox
+    /// extension that lets the VMM in below it. `label`: the volume's
+    /// name, for the guest's mount point.
+    UsbFiles { dev: UsbDev, readonly: bool, label: String, token: String },
     /// Coherence on or off (the guest agent shows and hides its taskbar).
     Coherence(bool),
     /// Coherence: do this to a guest window.
@@ -441,7 +479,12 @@ impl ToViewer {
                 let mut p = vec![ports.len() as u8];
                 for u in ports {
                     p.push(u.port);
-                    p.push(u.here as u8 | (u.always as u8) << 1);
+                    let how = match u.how {
+                        UsbHow::Device => 0,
+                        UsbHow::Disk => 1,
+                        UsbHow::Files => 2,
+                    };
+                    p.push(u.here as u8 | (u.always as u8) << 1 | how << 2 | (u.readonly as u8) << 4);
                     u.dev.encode(&mut p);
                 }
                 frame(11, &p)
@@ -515,7 +558,16 @@ impl ToViewer {
                     let (port, flags) = (*p.get(o).ok_or(Error::Proto("short"))?, *p.get(o + 1).ok_or(Error::Proto("short"))?);
                     o += 2;
                     let dev = UsbDev::decode(p, &mut o)?;
-                    ports.push(UsbPort { port, dev, here: flags & 1 != 0, always: flags & 2 != 0 });
+                    let how = match (flags >> 2) & 3 {
+                        0 => UsbHow::Device,
+                        1 => UsbHow::Disk,
+                        2 => UsbHow::Files,
+                        _ => return Err(Error::Proto("usb ports")),
+                    };
+                    if flags & 0xe0 != 0 {
+                        return Err(Error::Proto("usb ports"));
+                    }
+                    ports.push(UsbPort { port, dev, here: flags & 1 != 0, always: flags & 2 != 0, how, readonly: flags & 16 != 0 });
                 }
                 if o != p.len() {
                     return Err(Error::Proto("usb ports"));
@@ -582,6 +634,22 @@ impl ToVmm {
                 frame(12, &p)
             }
             ToVmm::UsbDetach { port } => frame(13, &[*port]),
+            // Well above the others (other work adds types in the 20s
+            // to 40s).
+            ToVmm::UsbDisk { dev, readonly } => {
+                let mut p = vec![*readonly as u8];
+                dev.encode(&mut p);
+                frame(80, &p)
+            }
+            ToVmm::UsbFiles { dev, readonly, label, token } => {
+                let mut p = vec![*readonly as u8];
+                dev.encode(&mut p);
+                for s in [label, token] {
+                    p.extend_from_slice(&(s.len() as u16).to_le_bytes());
+                    p.extend_from_slice(s.as_bytes());
+                }
+                frame(81, &p)
+            }
             ToVmm::Coherence(on) => frame(14, &[*on as u8]),
             ToVmm::Window { id, op } => {
                 let mut p = id.to_le_bytes().to_vec();
@@ -655,6 +723,34 @@ impl ToVmm {
                 ToVmm::UsbAttach(d)
             }
             13 if p.len() == 1 => ToVmm::UsbDetach { port: p[0] },
+            80 if !p.is_empty() && p[0] <= 1 => {
+                let mut o = 1;
+                let dev = UsbDev::decode(p, &mut o)?;
+                if o != p.len() {
+                    return Err(Error::Proto("usb disk"));
+                }
+                ToVmm::UsbDisk { dev, readonly: p[0] != 0 }
+            }
+            81 if !p.is_empty() && p[0] <= 1 => {
+                let mut o = 1;
+                let dev = UsbDev::decode(p, &mut o)?;
+                let mut field = |max: usize| -> Result<String> {
+                    let len = u16::from_le_bytes(p.get(o..o + 2).ok_or(Error::Proto("short"))?.try_into().map_err(|_| Error::Proto("short"))?) as usize;
+                    if len > max {
+                        return Err(Error::Proto("usb files"));
+                    }
+                    let s = text(p.get(o + 2..o + 2 + len).ok_or(Error::Proto("short"))?)?;
+                    o += 2 + len;
+                    Ok(s)
+                };
+                let (label, token) = (field(USB_LABEL_MAX)?, field(USB_TOKEN_MAX)?);
+                // The token is the kernel's to check (it ends in the path): text
+                // on one line, or nothing (no sandbox).
+                if o != p.len() || !usb_label_ok(&label) || token.chars().any(char::is_control) {
+                    return Err(Error::Proto("usb files"));
+                }
+                ToVmm::UsbFiles { dev, readonly: p[0] != 0, label, token }
+            }
             14 if p.len() == 1 => ToVmm::Coherence(p[0] != 0),
             15 if p.len() > 4 => ToVmm::Window { id: get_u32(p, 0)?, op: WindowOp::decode(&p[4..]).ok_or(Error::Proto("window op"))? },
             16 if p.len() == 5 => ToVmm::DragOut { id: get_u32(p, 0)?, end: p[4] != 0 },
@@ -756,6 +852,8 @@ mod tests {
             ToVmm::Drop { id: 4 },
             ToVmm::UsbAttach(UsbDev { id: "1209:000a".into(), serial: "A1".into(), name: "dev board".into() }),
             ToVmm::UsbDetach { port: 3 },
+            ToVmm::UsbDisk { dev: UsbDev { id: "18a5:0302".into(), serial: "0703896E1A305748".into(), name: "stick".into() }, readonly: true },
+            ToVmm::UsbFiles { dev: UsbDev { id: "18a5:0302".into(), serial: String::new(), name: String::new() }, readonly: false, label: "TEST 1".into(), token: "ab;01;/Volumes/TEST 1".into() },
             ToVmm::Coherence(true),
             ToVmm::Window { id: 9, op: WindowOp::Activate },
             ToVmm::Window { id: 9, op: WindowOp::Move { x: -3, y: 4, w: 100, h: 50 } },
@@ -787,8 +885,9 @@ mod tests {
             ToViewer::DropDone { id: 4, ok: false, place: "Desktop".into() },
             ToViewer::Usb(vec![]),
             ToViewer::Usb(vec![
-                UsbPort { port: 0, dev: UsbDev { id: "1209:000a".into(), serial: String::new(), name: "x".into() }, here: true, always: true },
-                UsbPort { port: 5, dev: UsbDev { id: "05ac:12a8".into(), serial: "s".into(), name: String::new() }, here: false, always: false },
+                UsbPort { port: 0, dev: UsbDev { id: "1209:000a".into(), serial: String::new(), name: "x".into() }, here: true, always: true, how: UsbHow::Device, readonly: false },
+                UsbPort { port: 5, dev: UsbDev { id: "05ac:12a8".into(), serial: "s".into(), name: String::new() }, here: false, always: false, how: UsbHow::Disk, readonly: true },
+                UsbPort { port: FILES_PORT0, dev: UsbDev { id: "18a5:0302".into(), serial: String::new(), name: "stick".into() }, here: true, always: false, how: UsbHow::Files, readonly: false },
             ]),
             ToViewer::Agent { features: 1 << 40 | 128 },
             ToViewer::Windows(vec![GuestWindow { id: 1, x: 0, y: -2, w: 3, h: 4, flags: 4, title: "Paint".into() }]),
@@ -873,6 +972,21 @@ mod tests {
         assert!(d.next_to_viewer().is_err());
         d.push(&frame(11, &[USB_PORTS_MAX as u8 + 1]));
         assert!(d.next_to_viewer().is_err());
+        // USB disks' files: names that would leave the mount point, lines
+        // in the token, an unknown way to attach.
+        let ok = dev("18a5:0302", "", "");
+        for (label, token) in [("..", "t"), ("a/b", "t"), ("", "t"), ("x", "a\nb")] {
+            d.push(&ToVmm::UsbFiles { dev: ok.clone(), readonly: true, label: label.into(), token: token.into() }.encode());
+            assert!(d.next_to_vmm().is_err(), "{label:?} {token:?}");
+        }
+        let mut p = vec![2];
+        ok.encode(&mut p);
+        d.push(&frame(80, &p));
+        assert!(d.next_to_vmm().is_err(), "readonly is a bool");
+        let mut p = vec![1, 0, 0xc];
+        ok.encode(&mut p);
+        d.push(&frame(11, &p));
+        assert!(d.next_to_viewer().is_err(), "how 3");
         d.push(&frame(13, &[1, 2]));
         assert!(d.next_to_vmm().is_err());
     }

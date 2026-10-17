@@ -221,6 +221,9 @@ impl Session {
 struct Shared {
     dev: Option<Box<dyn Device>>,
     session: Session,
+    /// The VMM went away: the watcher ends too (the helper may be a
+    /// thread of a longer-lived process, the VMM's own for a disk).
+    stop: bool,
 }
 
 /// Serve the VMM on `sock` until it goes away. The device comes and goes
@@ -235,11 +238,14 @@ pub fn serve(sock: UnixStream, mut opener: Box<dyn Opener>) -> io::Result<()> {
             }
         }
     })?;
-    let shared = Arc::new(Mutex::new(Shared { dev: None, session: Session::new(tx.clone()) }));
+    let shared = Arc::new(Mutex::new(Shared { dev: None, session: Session::new(tx.clone()), stop: false }));
     let watch = shared.clone();
     std::thread::Builder::new().name("usb-watch".into()).spawn(move || loop {
         {
             let mut s = watch.lock().unwrap_or_else(|e| e.into_inner());
+            if s.stop {
+                break;
+            }
             let gone = s.dev.as_ref().is_some_and(|d| d.gone());
             if s.dev.is_some() && (gone || !opener.present()) {
                 log::info!("usb: device unplugged");
@@ -262,7 +268,7 @@ pub fn serve(sock: UnixStream, mut opener: Box<dyn Opener>) -> io::Result<()> {
         match proto::read_request(&mut r) {
             Ok(Some(req)) => {
                 let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
-                let Shared { dev, session } = &mut *s;
+                let Shared { dev, session, .. } = &mut *s;
                 session.request(dev.as_deref_mut(), req);
             }
             Ok(None) => break Ok(()),
@@ -270,7 +276,9 @@ pub fn serve(sock: UnixStream, mut opener: Box<dyn Opener>) -> io::Result<()> {
         }
     };
     // Let go of the device (release interfaces, close) before exiting.
-    shared.lock().unwrap_or_else(|e| e.into_inner()).dev = None;
+    let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
+    s.stop = true;
+    s.dev = None;
     res
 }
 

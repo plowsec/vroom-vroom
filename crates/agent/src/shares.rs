@@ -53,8 +53,135 @@ pub fn command_line(exe: &str, tag: &str, letter: char) -> String {
     format!("\"{exe}\" -t {tag} -m {letter}:")
 }
 
+/// A removable share a USB disk's files come through: its service is
+/// started when the host says so, not at boot.
+pub fn usb_tag(t: &str) -> bool {
+    vroom_proto::usb_tag_ok(t)
+}
+
+/// Where a Linux guest shows a USB disk's files.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub const MEDIA: &str = "/media/vroom";
+
+/// The mount point for volume `label`: `/media/vroom/<label>`, or
+/// `<label> 2`, `<label> 3`... when two volumes share a name.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn mount_point(label: &str, taken: &[String]) -> String {
+    let mut p = format!("{MEDIA}/{label}");
+    let mut n = 2;
+    while taken.contains(&p) {
+        p = format!("{MEDIA}/{label} {n}");
+        n += 1;
+    }
+    p
+}
+
+/// A USB disk's files came to share `tag`, or left it.
+pub fn usb_share(tag: &str, label: &str, on: bool) {
+    if !usb_tag(tag) || !vroom_proto::usb_label_ok(label) {
+        return;
+    }
+    #[cfg(any(windows, target_os = "linux"))]
+    os_usb::share(tag, label, on);
+    #[cfg(not(any(windows, target_os = "linux")))]
+    let _ = on;
+}
+
+/// A new host: what the last one shared is gone.
+pub fn usb_reset() {
+    #[cfg(any(windows, target_os = "linux"))]
+    os_usb::reset();
+}
+
+/// Linux: systemd mounts them for us (`systemd-run`, over D-Bus), so
+/// the agent's service needs no mount privilege of its own; GNOME's
+/// file manager lists them (`x-gvfs-show`).
+#[cfg(target_os = "linux")]
+mod os_usb {
+    use std::process::Command;
+    use std::sync::Mutex;
+
+    /// (tag, mount point) of what we mounted.
+    static MOUNTED: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+    /// Run `cmd` as a short-lived systemd service: in the system's own
+    /// mount namespace, with the privileges mounting takes, which our
+    /// own hardened service doesn't have. No shell: the arguments are
+    /// passed as they are.
+    fn run(cmd: &[&str]) -> bool {
+        match Command::new("systemd-run").args(["--wait", "--collect", "--quiet", "--"]).args(cmd).output() {
+            Ok(o) if o.status.success() => true,
+            Ok(o) => {
+                log::warn!("usb: {cmd:?}: {}", String::from_utf8_lossy(&o.stderr).trim());
+                false
+            }
+            Err(e) => {
+                log::warn!("usb: systemd-run: {e}");
+                false
+            }
+        }
+    }
+
+    fn unmount(dir: &str) {
+        // Lazily: a shell or a file manager in it doesn't keep it.
+        if run(&["/usr/bin/umount", "-l", dir]) {
+            run(&["/usr/bin/rmdir", dir]);
+        }
+    }
+
+    pub fn share(tag: &str, label: &str, on: bool) {
+        let mut m = MOUNTED.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = m.iter().position(|(t, _)| t == tag) {
+            let (_, dir) = m.remove(i);
+            unmount(&dir);
+            log::info!("usb: {tag} unmounted from {dir}");
+        }
+        if !on {
+            return;
+        }
+        let taken: Vec<String> = m.iter().map(|(_, d)| d.clone()).collect();
+        let dir = super::mount_point(label, &taken);
+        if run(&["/usr/bin/mkdir", "-p", &dir]) && run(&["/usr/bin/mount", "-t", "virtiofs", "-o", "x-gvfs-show", tag, &dir]) {
+            log::info!("usb: {tag} ({label}) on {dir}");
+            m.push((tag.to_string(), dir));
+        }
+    }
+
+    /// Unmount every USB disk share there is (a host that restarted, or
+    /// a VM resumed: those shares are empty now).
+    pub fn reset() {
+        MOUNTED.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let mounts = std::fs::read_to_string("/proc/self/mounts").unwrap_or_default();
+        for l in mounts.lines() {
+            let f: Vec<&str> = l.split(' ').collect();
+            if f.len() > 2 && f[2] == "virtiofs" && super::usb_tag(f[0]) {
+                // /proc/mounts writes a space as \040.
+                let dir = f[1].replace("\\040", " ");
+                unmount(&dir);
+            }
+        }
+    }
+}
+
 #[cfg(windows)]
 pub use os::mount_all;
+
+/// Windows: the share's service mounts it on a drive letter; it is
+/// made at boot (`mount_all`) but started only while a disk is there.
+#[cfg(windows)]
+mod os_usb {
+    pub fn share(tag: &str, _label: &str, on: bool) {
+        if let Err(e) = super::os::usb_service(tag, on) {
+            log::warn!("usb: {tag}: {e}");
+        }
+    }
+
+    pub fn reset() {
+        for i in 0..10 {
+            let _ = super::os::usb_service(&format!("vroom-usb{i}"), false);
+        }
+    }
+}
 
 #[cfg(windows)]
 mod os {
@@ -69,7 +196,7 @@ mod os {
     use windows_sys::Win32::System::Services::{
         CloseServiceHandle, ControlService, CreateServiceW, DeleteService, EnumServicesStatusExW, OpenSCManagerW, OpenServiceW,
         QueryServiceConfigW, StartServiceW, ENUM_SERVICE_STATUS_PROCESSW, QUERY_SERVICE_CONFIGW, SC_ENUM_PROCESS_INFO, SC_HANDLE,
-        SC_MANAGER_ALL_ACCESS, SERVICE_ALL_ACCESS, SERVICE_AUTO_START, SERVICE_CONTROL_STOP, SERVICE_ERROR_NORMAL, SERVICE_STATE_ALL,
+        SC_MANAGER_ALL_ACCESS, SERVICE_ALL_ACCESS, SERVICE_AUTO_START, SERVICE_CONTROL_STOP, SERVICE_DEMAND_START, SERVICE_ERROR_NORMAL, SERVICE_STATE_ALL,
         SERVICE_STATUS, SERVICE_WIN32, SERVICE_WIN32_OWN_PROCESS,
     };
     use windows_sys::Win32::System::IO::DeviceIoControl;
@@ -283,7 +410,10 @@ mod os {
             if let Some(l) = command_of(&svc).as_deref().and_then(letter_of) {
                 used |= 1 << (l as u8 - b'A');
             }
-            start(&svc, &name);
+            // A USB disk's share starts when a disk is there.
+            if !usb_tag(t) {
+                start(&svc, &name);
+            }
         }
         for t in todo {
             let Some(letter) = pick_letter(used) else {
@@ -292,7 +422,9 @@ mod os {
             };
             used |= 1 << (letter as u8 - b'A');
             let name = format!("{PREFIX}{t}");
-            let (w, display, cmd) = (wide(&name), wide(&format!("Vroom shared folder {t}")), wide(&command_line(&exe, t, letter)));
+            let usb = usb_tag(t);
+            let what = if usb { format!("Vroom USB disk files {t}") } else { format!("Vroom shared folder {t}") };
+            let (w, display, cmd) = (wide(&name), wide(&what), wide(&command_line(&exe, t, letter)));
             let deps: Vec<u16> = "WinFsp.Launcher\0VirtioFsDrv\0\0".encode_utf16().collect();
             // SAFETY: valid SCM handle and NUL-terminated strings; deps is
             // a double-NUL-terminated list; LocalSystem account.
@@ -303,7 +435,7 @@ mod os {
                     display.as_ptr(),
                     SERVICE_ALL_ACCESS,
                     SERVICE_WIN32_OWN_PROCESS,
-                    SERVICE_AUTO_START,
+                    if usb { SERVICE_DEMAND_START } else { SERVICE_AUTO_START },
                     SERVICE_ERROR_NORMAL,
                     cmd.as_ptr(),
                     std::ptr::null(),
@@ -319,7 +451,43 @@ mod os {
             }
             let svc = Sc(h);
             log::info!("shares: {t} on {letter}:");
-            start(&svc, &name);
+            if !usb {
+                start(&svc, &name);
+            }
+        }
+        Ok(())
+    }
+
+    /// Start (`on`) or stop the service of USB disk share `tag`; made
+    /// first if the boot didn't (the agent started before the device).
+    pub fn usb_service(tag: &str, on: bool) -> io::Result<()> {
+        let open = || -> io::Result<Option<Sc>> {
+            // SAFETY: local SCM, plain access mask.
+            let scm = unsafe { OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_ALL_ACCESS) };
+            if scm.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            let scm = Sc(scm);
+            let w = wide(&format!("{PREFIX}{tag}"));
+            // SAFETY: valid SCM handle and name.
+            let h = unsafe { OpenServiceW(scm.0, w.as_ptr(), SERVICE_ALL_ACCESS) };
+            Ok((!h.is_null()).then_some(Sc(h)))
+        };
+        let svc = match open()? {
+            Some(s) => s,
+            None if on => {
+                mount_all()?;
+                open()?.ok_or_else(|| io::Error::other("no service for it"))?
+            }
+            None => return Ok(()),
+        };
+        if on {
+            start(&svc, tag);
+        } else {
+            // SAFETY: zeroed SERVICE_STATUS is a valid out value.
+            let mut st: SERVICE_STATUS = unsafe { std::mem::zeroed() };
+            // SAFETY: valid handle and out pointer; failing (not running) is fine.
+            unsafe { ControlService(svc.0, SERVICE_CONTROL_STOP, &mut st) };
         }
         Ok(())
     }
@@ -335,6 +503,15 @@ mod tests {
         for bad in ["", "a b", "a\"b", "x -m C:", &"a".repeat(37), "é"] {
             assert!(!valid_tag(bad), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn usb_mount_points() {
+        assert!(usb_tag("vroom-usb0") && !usb_tag("host") && !usb_tag("vroom-usb"));
+        assert_eq!(mount_point("STICK", &[]), "/media/vroom/STICK");
+        let taken = vec!["/media/vroom/STICK".to_string(), "/media/vroom/STICK 2".to_string()];
+        assert_eq!(mount_point("STICK", &taken), "/media/vroom/STICK 3");
+        assert_eq!(mount_point("TEST 1", &taken), "/media/vroom/TEST 1");
     }
 
     #[test]

@@ -57,6 +57,9 @@ fn lock_down(cfg: &VmConfig, state_dir: &Path, clipboard: bool, helpers: Vec<u32
     let mut p = vroom_sandbox::Policy {
         write_dirs: vec![state_dir.to_path_buf()],
         clipboard,
+        // USB disks the app hands over while the VM runs (nothing else
+        // can be reached through these rules).
+        usb_storage: cfg!(target_os = "macos"),
         // With 3D the GPU is the GPU process's, unless it runs in here.
         gpu: cfg.display.gpu == vroom_config::Gpu::Virtio3d && vroom_vmm::gpu_in_process(),
         shared_ram: cfg.display.gpu == vroom_config::Gpu::Virtio3d,

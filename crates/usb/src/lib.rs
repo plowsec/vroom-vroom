@@ -12,14 +12,15 @@ pub mod desc;
 #[forbid(unsafe_code)]
 pub mod fake;
 #[forbid(unsafe_code)]
-pub mod fake_disk;
-#[forbid(unsafe_code)]
 pub mod helper;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod libusb;
 pub mod list;
 #[forbid(unsafe_code)]
+pub mod msd;
+#[forbid(unsafe_code)]
 pub mod proto;
+pub mod rawdisk;
 
 use std::os::unix::net::UnixStream;
 use std::time::Duration;

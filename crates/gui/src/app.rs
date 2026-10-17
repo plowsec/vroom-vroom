@@ -1012,7 +1012,9 @@ impl App {
         // Not hardware: these apply to a running VM's window. Network
         // adapters apply to it too (or when it resumes).
         let net = key.strip_prefix("net.").and_then(|r| r.split('.').next()).and_then(|i| i.parse::<usize>().ok());
-        if locked && !key.starts_with("clip.") && key != "hidpi" && !(net.is_some() && self.live_ok()) {
+        // How a USB disk connects applies at its next connect.
+        let usb = key.starts_with("usb.") && self.live_ok();
+        if locked && !key.starts_with("clip.") && key != "hidpi" && !(net.is_some() && self.live_ok()) && !usb {
             return;
         }
         let iface = self.host_ifaces.first().cloned();

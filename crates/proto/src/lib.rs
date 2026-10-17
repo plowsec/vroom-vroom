@@ -44,6 +44,8 @@ pub mod features {
     /// The agent lists the apps it can start (`Apps`), for the host to
     /// suggest names as one types.
     pub const APP_LIST: u64 = 1 << 16;
+    /// The agent mounts USB disks' files when they come (`UsbShare`).
+    pub const USB_SHARES: u64 = 1 << 20;
 }
 
 /// Most windows one `Windows` list may carry, and the longest title (bytes).
@@ -232,6 +234,22 @@ pub enum Message {
     /// menu's; Linux: the desktop's menu entries), sorted by name, at
     /// most `APPS_MAX`. Sent when Coherence goes on and when it changes.
     Apps(Vec<GuestApp>),
+    /// Host -> guest: a USB disk's files are on the removable share `tag`
+    /// now (`on`), or gone from it. `label`: the volume's name, for the
+    /// mount point (Linux: /media/vroom/<label>; Windows: a drive
+    /// letter). Checked with `usb_tag_ok` and `usb_label_ok`.
+    UsbShare { tag: String, label: String, on: bool },
+}
+
+/// Removable shares' tags: `vroom-usb` and a digit.
+pub fn usb_tag_ok(t: &str) -> bool {
+    t.strip_prefix("vroom-usb").is_some_and(|n| n.len() == 1 && n.as_bytes()[0].is_ascii_digit())
+}
+
+/// A volume name fit for a mount point: one short name, nothing a shell
+/// or Windows reads another way (`drop_name_ok`), and not hidden.
+pub fn usb_label_ok(l: &str) -> bool {
+    l.len() <= 64 && drop_name_ok(l) && !l.starts_with('.') && !l.starts_with('-')
 }
 
 /// Whether `s` is fit for `StartApp` / `CoherenceNo`: short, one line.
@@ -577,6 +595,8 @@ const T_START_APP: u8 = 29;
 const T_COHERENCE_NO: u8 = 30;
 // Well above the others: other work adds types in the 30s.
 const T_APPS: u8 = 60;
+// Well above the others too.
+const T_USB_SHARE: u8 = 80;
 
 impl Message {
     pub fn encode(&self) -> Vec<u8> {
@@ -680,6 +700,12 @@ impl Message {
             Message::StartApp(s) => (T_START_APP, s.as_bytes().to_vec()),
             Message::CoherenceNo(s) => (T_COHERENCE_NO, s.as_bytes().to_vec()),
             Message::Apps(list) => (T_APPS, encode_apps(list)),
+            Message::UsbShare { tag, label, on } => {
+                let mut p = vec![*on as u8, tag.len() as u8];
+                p.extend_from_slice(tag.as_bytes());
+                p.extend_from_slice(label.as_bytes());
+                (T_USB_SHARE, p)
+            }
         };
         let mut out = Vec::with_capacity(HDR + payload.len());
         out.extend_from_slice(&MAGIC);
@@ -784,8 +810,18 @@ impl Message {
                 }
             }
             T_APPS => Message::Apps(decode_apps(p).ok_or(Error::Malformed)?),
+            T_USB_SHARE if p.len() >= 2 && p[0] <= 1 => {
+                let n = p[1] as usize;
+                let tag = std::str::from_utf8(p.get(2..2 + n).ok_or(Error::Malformed)?).map_err(|_| Error::Malformed)?;
+                let label = std::str::from_utf8(&p[2 + n..]).map_err(|_| Error::Malformed)?;
+                if !usb_tag_ok(tag) || !usb_label_ok(label) {
+                    return Err(Error::Malformed);
+                }
+                Message::UsbShare { tag: tag.into(), label: label.into(), on: p[0] != 0 }
+            }
             T_TIME | T_RES | T_SCALE | T_SHUTDOWN | T_PING | T_PONG | T_GPU3D | T_DRAG_READY | T_DRAG_CANCEL | T_DROP_ENTRY | T_DROP_DATA
-            | T_DROP_END | T_DROP_DONE | T_COHERENCE | T_WINDOW_DO | T_DRAG_OUT_QUERY | T_DRAG_OUT_GET | T_DRAG_OUT_END | T_DRAG_OUT_FAIL | T_LAYOUT | T_MOUSE => {
+            | T_DROP_END | T_DROP_DONE | T_COHERENCE | T_WINDOW_DO | T_DRAG_OUT_QUERY | T_DRAG_OUT_GET | T_DRAG_OUT_END | T_DRAG_OUT_FAIL | T_LAYOUT | T_MOUSE
+            | T_USB_SHARE => {
                 return Err(Error::Malformed)
             }
             t => return Err(Error::Type(t)),
@@ -903,7 +939,19 @@ mod tests {
                 GuestApp { name: "Calculator".into(), w: 1, h: 2, rgba: vec![1, 2, 3, 4, 5, 6, 7, 8] },
                 GuestApp { name: "Éditeur de texte".into(), w: 0, h: 0, rgba: Vec::new() },
             ]),
+            Message::UsbShare { tag: "vroom-usb0".into(), label: "TEST 1".into(), on: true },
+            Message::UsbShare { tag: "vroom-usb1".into(), label: "Clé".into(), on: false },
         ]
+    }
+
+    #[test]
+    fn usb_shares_are_checked() {
+        for (tag, label) in [("vroom-usb", "a"), ("vroom-usb10", "a"), ("home", "a"), ("vroom-usb0", ".."), ("vroom-usb0", "a/b"), ("vroom-usb0", ".hidden"), ("vroom-usb0", "-rf"), ("vroom-usb0", "")] {
+            let b = Message::UsbShare { tag: tag.into(), label: label.into(), on: true }.encode();
+            let mut d = Decoder::new(MAX_PAYLOAD);
+            d.push(&b);
+            assert!(d.next().is_err(), "{tag:?} {label:?}");
+        }
     }
 
     #[test]

@@ -143,6 +143,8 @@ pub struct Vmm {
     state: RunState,
     /// The network adapters have a control queue (what a save records).
     net_ctrl: bool,
+    /// Removable shares for USB disks' files (what a save records).
+    usb_file_slots: usize,
 }
 
 impl std::fmt::Debug for Vmm {
@@ -179,6 +181,13 @@ impl Vmm {
             StartMode::Boot => None,
         };
         let net_ctrl = saved.as_ref().is_none_or(|s| s.1);
+        // USB disks' files go to removable shares a VM started on a Mac
+        // has; a resumed one has those it was saved with.
+        let usb_file_slots = match &opts.start {
+            StartMode::Restore(dir) => snapshot::saved_usb_file_slots(dir),
+            StartMode::Boot if cfg!(target_os = "macos") => usb::FILE_SLOTS,
+            StartMode::Boot => 0,
+        };
         let saved = saved.map(|s| s.0);
         let env = machine::BuildEnv {
             uuid,
@@ -186,6 +195,7 @@ impl Vmm {
             resuming: matches!(opts.start, StartMode::Restore(_)),
             saved,
             net_ctrl,
+            usb_file_slots,
             sandbox: opts.sandbox && config.security.sandbox,
         };
         let m = machine::build(&config, hv.as_ref(), opts.serial_out, opts.clipboard, ui, &disks, ev_tx, &env)?;
@@ -214,6 +224,7 @@ impl Vmm {
             boot: m.boot,
             state: RunState::Paused,
             net_ctrl,
+            usb_file_slots,
         };
         vmm.pristine_irqchip = match vmm.vm.save_irqchip() {
             Ok(s) => Some(s),

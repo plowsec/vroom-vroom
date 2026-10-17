@@ -166,6 +166,16 @@ pub fn set(c: &mut VmConfig, key: &str, v: &str, default_iface: Option<&str>) ->
                 _ => return Err(format!("unknown setting {key}")),
             }
         }
+        // How a USB disk goes to the guest ("device", "files", "disk").
+        ["usb", i, f] => {
+            let i = idx(&mut c.usb, i, "USB device")?;
+            let u = &mut c.usb[i];
+            match *f {
+                "mode" => u.mode = vroom_config::UsbMode::parse(v).ok_or_else(|| format!("unknown USB mode {v:?}"))?,
+                "readonly" => u.readonly = bool_of(v)?,
+                _ => return Err(format!("unknown setting {key}")),
+            }
+        }
         _ => return Err(format!("unknown setting {key}")),
     }
     Ok(())
@@ -258,7 +268,7 @@ pub fn add_usb(c: &mut VmConfig, id: &str, serial: Option<&str>, name: Option<&s
     if c.usb.iter().any(|u| u.id == id && u.serial == serial) {
         return Err("That device is already in the list".into());
     }
-    c.usb.push(Usb { id: id.to_string(), serial, name });
+    c.usb.push(Usb { id: id.to_string(), serial, name, mode: Default::default(), readonly: false });
     Ok(())
 }
 

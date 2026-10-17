@@ -32,6 +32,10 @@ pub trait System {
     fn shutdown(&mut self, reboot: bool);
     /// Turn the 3D display device on or off; whether it is on now.
     fn gpu3d(&mut self, on: bool) -> Option<bool>;
+    /// A USB disk's files came to removable share `tag` (`on`), or left.
+    fn usb_share(&mut self, tag: &str, label: &str, on: bool);
+    /// A new host: forget what the last one shared.
+    fn usb_reset(&mut self) {}
 }
 
 pub struct RealSystem;
@@ -51,6 +55,12 @@ impl System for RealSystem {
             crate::sys::gpu_drivers(true);
         }
         crate::sys::gpu3d(on)
+    }
+    fn usb_share(&mut self, tag: &str, label: &str, on: bool) {
+        crate::shares::usb_share(tag, label, on);
+    }
+    fn usb_reset(&mut self) {
+        crate::shares::usb_reset();
     }
 }
 
@@ -122,8 +132,12 @@ impl<S: System> Relay<S> {
         match m {
             Message::Hello { agent, .. } => {
                 log::info!("host: {agent}");
+                // A host that (re)starts has none of the last one's USB
+                // disks: it tells us again about those still shared.
+                self.sys.usb_reset();
                 host.write_all(&crate::hello().encode())?;
             }
+            Message::UsbShare { tag, label, on } => self.sys.usb_share(&tag, &label, on),
             Message::Ping(v) => host.write_all(&Message::Pong(v).encode())?,
             Message::TimeSync { unix_secs, nanos } => self.sys.set_time(unix_secs, nanos),
             Message::Shutdown { reboot } => self.sys.shutdown(reboot),
@@ -232,6 +246,7 @@ mod tests {
         time: Vec<u64>,
         shutdown: Vec<bool>,
         gpu3d: Vec<bool>,
+        usb: Vec<(String, bool)>,
     }
     struct Fake(Arc<Mutex<Seen>>);
     impl System for Fake {
@@ -244,6 +259,12 @@ mod tests {
         fn gpu3d(&mut self, on: bool) -> Option<bool> {
             self.0.lock().unwrap().gpu3d.push(on);
             Some(on)
+        }
+        fn usb_share(&mut self, tag: &str, _label: &str, on: bool) {
+            self.0.lock().unwrap().usb.push((tag.to_string(), on));
+        }
+        fn usb_reset(&mut self) {
+            self.0.lock().unwrap().usb.clear();
         }
     }
 
@@ -308,6 +329,22 @@ mod tests {
         assert!(matches!(out[0], Message::Hello { .. }));
         assert!(out.iter().any(|m| matches!(m, Message::Pong(7))));
         assert!(helper.msgs().is_empty());
+    }
+
+    #[test]
+    fn usb_shares_are_mounted_by_the_service() {
+        let helper = Sink::default();
+        let share = |tag: &str, on| host(Message::UsbShare { tag: tag.into(), label: "STICK".into(), on });
+        let (_, seen) = run(vec![
+            Ev::HelperUp(1, Box::new(helper.clone())),
+            share("vroom-usb0", true),
+            // A new host forgets the last one's.
+            host(Message::Hello { features: 0, agent: "h".into() }),
+            share("vroom-usb1", true),
+            share("vroom-usb1", false),
+        ]);
+        assert_eq!(seen.lock().unwrap().usb, vec![("vroom-usb1".to_string(), true), ("vroom-usb1".to_string(), false)]);
+        assert!(helper.msgs().is_empty(), "not the session's business");
     }
 
     #[test]
