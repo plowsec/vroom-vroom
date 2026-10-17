@@ -30,6 +30,9 @@ pub enum Error {
     Mmap(i32),
     #[error("i/o error: {0}")]
     Io(String),
+    #[cfg(feature = "research")]
+    #[error("copy-on-write snapshot: {0}")]
+    Cow(&'static str),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -272,9 +272,11 @@ A guest needs a driver and an API its players use. What exists:
   next master with the old and new guest tools, resizes and Coherence.
   If it shows up again, the window's filler memory is the first suspect.
 
-- A flaky test: `gpu3d server::tests::create_and_refuse` failed once
-  in a full `cargo test --workspace` run (October 17), at the "same id
-  again" refusal; it passes on its own. Find the race.
+- Flaky tests (October 17): `gpu3d server::tests::create_and_refuse`
+  (at the "same id again" refusal) and `devices hda::tests::playback_moves_buffers_at_real_time`
+  (a timing test) each failed once in a full `cargo test --workspace`
+  run on a loaded machine, and pass on their own. Find the race in the
+  first; give the second slack or a fake clock.
 
 ## Later
 

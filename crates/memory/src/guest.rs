@@ -67,7 +67,11 @@ impl GuestMemory {
     /// Each region's shared memory object and size, if RAM is shared, and
     /// the generation they belong to.
     pub fn shared_fds(&self) -> Option<(Vec<(std::os::fd::RawFd, u64)>, u64)> {
-        let fds = self.regions.iter().map(|r| r.mmap.shared_fd().map(|f| (f, r.len()))).collect::<Option<Vec<_>>>()?;
+        let fds = self
+            .regions
+            .iter()
+            .map(|r| r.mmap.shared_fd().map(|f| (f, r.len())))
+            .collect::<Option<Vec<_>>>()?;
         Some((fds, self.generation.load(Ordering::Acquire)))
     }
 
@@ -91,10 +95,17 @@ impl GuestMemory {
             }
             prev_end = end;
             let size = usize::try_from(size).map_err(|_| Error::Overflow)?;
-            let mmap = if shared { MmapRegion::new_shared(size)? } else { MmapRegion::new(size)? };
+            let mmap = if shared {
+                MmapRegion::new_shared(size)?
+            } else {
+                MmapRegion::new(size)?
+            };
             regions.push(GuestRegion { start, mmap });
         }
-        Ok(GuestMemory { regions: Arc::new(regions), generation: Arc::default() })
+        Ok(GuestMemory {
+            regions: Arc::new(regions),
+            generation: Arc::default(),
+        })
     }
 
     pub fn regions(&self) -> impl Iterator<Item = &GuestRegion> {
@@ -190,7 +201,8 @@ impl GuestMemory {
         let mut done = 0u64;
         while done < len {
             let n = std::cmp::min(buf.len() as u64, len - done) as usize;
-            src.read_exact(&mut buf[..n]).map_err(|e| Error::Io(e.to_string()))?;
+            src.read_exact(&mut buf[..n])
+                .map_err(|e| Error::Io(e.to_string()))?;
             self.write(GuestAddress(addr.0 + done), &buf[..n])?;
             done += n as u64;
         }
@@ -204,7 +216,8 @@ impl GuestMemory {
         while done < len {
             let n = std::cmp::min(buf.len() as u64, len - done) as usize;
             self.read(GuestAddress(addr.0 + done), &mut buf[..n])?;
-            dst.write_all(&buf[..n]).map_err(|e| Error::Io(e.to_string()))?;
+            dst.write_all(&buf[..n])
+                .map_err(|e| Error::Io(e.to_string()))?;
             done += n as u64;
         }
         Ok(())
@@ -215,7 +228,10 @@ impl GuestMemory {
         let mut v = Vec::with_capacity(segs.len());
         for &(a, len) in segs {
             self.walk(a, len as u64, |r, off, span| {
-                v.push(libc::iovec { iov_base: r.host_ptr().wrapping_add(off).cast(), iov_len: span.len() });
+                v.push(libc::iovec {
+                    iov_base: r.host_ptr().wrapping_add(off).cast(),
+                    iov_len: span.len(),
+                });
                 Ok(())
             })
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
@@ -227,13 +243,23 @@ impl GuestMemory {
     /// order (disk reads without a bounce buffer: the kernel copies into
     /// guest RAM). All of it or an error; reading past the end of the file
     /// is an error.
-    pub fn read_file(&self, file: &std::fs::File, offset: u64, segs: &[(GuestAddress, usize)]) -> std::io::Result<()> {
+    pub fn read_file(
+        &self,
+        file: &std::fs::File,
+        offset: u64,
+        segs: &[(GuestAddress, usize)],
+    ) -> std::io::Result<()> {
         let mut iov = self.iovecs(segs)?;
         file_io(file, offset, &mut iov, false)
     }
 
     /// Write the guest buffers `segs`, in order, to `file` at `offset`.
-    pub fn write_file(&self, file: &std::fs::File, offset: u64, segs: &[(GuestAddress, usize)]) -> std::io::Result<()> {
+    pub fn write_file(
+        &self,
+        file: &std::fs::File,
+        offset: u64,
+        segs: &[(GuestAddress, usize)],
+    ) -> std::io::Result<()> {
         let mut iov = self.iovecs(segs)?;
         file_io(file, offset, &mut iov, true)
     }
@@ -283,11 +309,42 @@ impl GuestMemory {
         self.generation.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
+
+    #[cfg(feature = "research")]
+    pub fn can_snapshot_cow(&self) -> bool {
+        self.regions.iter().all(|r| r.mmap.can_snapshot_cow())
+    }
+
+    #[cfg(feature = "research")]
+    /// Freeze all RAM using file-backed private mappings. This is intended
+    /// for high-rate lab resets while every vCPU and DMA worker is paused.
+    pub fn snapshot_cow(&self) -> Result<()> {
+        if !self.can_snapshot_cow() {
+            return Err(Error::Cow("shared RAM cannot be snapshotted with COW"));
+        }
+        for r in self.regions.iter() {
+            r.mmap.snapshot_cow()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "research")]
+    pub fn restore_cow(&self) -> Result<()> {
+        for r in self.regions.iter() {
+            r.mmap.restore_cow()?;
+        }
+        Ok(())
+    }
 }
 
 /// preadv/pwritev until every iovec is done. The iovecs point into guest
 /// RAM (checked by the caller); no Rust reference to it is ever made.
-fn file_io(file: &std::fs::File, mut offset: u64, iov: &mut [libc::iovec], write: bool) -> std::io::Result<()> {
+fn file_io(
+    file: &std::fs::File,
+    mut offset: u64,
+    iov: &mut [libc::iovec],
+    write: bool,
+) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
     const IOV_MAX: usize = 1024;
     let mut i = 0;
@@ -297,7 +354,8 @@ fn file_io(file: &std::fs::File, mut offset: u64, iov: &mut [libc::iovec], write
             continue;
         }
         let n = (iov.len() - i).min(IOV_MAX);
-        let off = libc::off_t::try_from(offset).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        let off = libc::off_t::try_from(offset)
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
         // SAFETY: iov[i..i+n] describe live guest RAM (bounds-checked in
         // iovecs(), mappings live as long as self); the kernel accesses
         // them, not Rust code. n <= IOV_MAX fits a c_int.
@@ -348,7 +406,10 @@ mod tests {
         f.write_all(&data).unwrap();
         f.rewind().unwrap();
         // Two segments, the first crossing the region boundary.
-        let segs = [(GuestAddress(boundary.0 - 100), 300), (GuestAddress(boundary.0 + 1000), 5000)];
+        let segs = [
+            (GuestAddress(boundary.0 - 100), 300),
+            (GuestAddress(boundary.0 + 1000), 5000),
+        ];
         m.read_file(&f, 7, &segs).unwrap();
         let mut b = vec![0u8; 300];
         m.read(segs[0].0, &mut b).unwrap();
@@ -364,12 +425,24 @@ mod tests {
         // Past the end of the file, outside RAM: errors, not crashes.
         assert!(m.read_file(&f, 30000, &segs).is_err());
         assert!(m.read_file(&f, 0, &[(m.end_addr(), 1)]).is_err());
-        assert!(m.write_file(&f, 0, &[(GuestAddress(boundary.0 - 1), usize::MAX)]).is_err());
+        assert!(m
+            .write_file(&f, 0, &[(GuestAddress(boundary.0 - 1), usize::MAX)])
+            .is_err());
     }
 
     fn tempfile_in_tmp() -> std::fs::File {
-        let p = std::env::temp_dir().join(format!("vroom-mem-test-{}-{:?}", std::process::id(), std::thread::current().id()));
-        let f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&p).unwrap();
+        let p = std::env::temp_dir().join(format!(
+            "vroom-mem-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&p)
+            .unwrap();
         let _ = std::fs::remove_file(&p);
         f
     }
@@ -385,7 +458,16 @@ mod tests {
         // What another process mapping the object sees.
         let other = |fd| {
             // SAFETY: a fresh read-only shared mapping of the object.
-            let p = unsafe { libc::mmap(std::ptr::null_mut(), (4 * ps) as usize, libc::PROT_READ, libc::MAP_SHARED, fd, 0) };
+            let p = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    (4 * ps) as usize,
+                    libc::PROT_READ,
+                    libc::MAP_SHARED,
+                    fd,
+                    0,
+                )
+            };
             assert_ne!(p, libc::MAP_FAILED);
             // SAFETY: inside the mapping just made.
             let b = unsafe { *(p as *const u8).add(ps as usize) };
@@ -403,13 +485,19 @@ mod tests {
         m.write(GuestAddress(0x1000_0000 + ps), &[9u8; 1]).unwrap();
         assert_eq!(other(fds2[0].0), 9, "the new object is what the guest uses");
         // Private RAM has no objects to share.
-        assert!(GuestMemory::new(&[(GuestAddress(0), ps)]).unwrap().shared_fds().is_none());
+        assert!(GuestMemory::new(&[(GuestAddress(0), ps)])
+            .unwrap()
+            .shared_fds()
+            .is_none());
     }
 
     fn mem() -> GuestMemory {
         let ps = page_size() as u64;
-        GuestMemory::new(&[(GuestAddress(0x10000 * ps / 4096), 4 * ps), (GuestAddress(0x10000 * ps / 4096 + 4 * ps), 2 * ps)])
-            .unwrap()
+        GuestMemory::new(&[
+            (GuestAddress(0x10000 * ps / 4096), 4 * ps),
+            (GuestAddress(0x10000 * ps / 4096 + 4 * ps), 2 * ps),
+        ])
+        .unwrap()
     }
 
     #[test]
@@ -452,5 +540,19 @@ mod tests {
         assert!(m.load_u16_acquire(GuestAddress(a.0 + 1)).is_err());
         m.discard_all().unwrap();
         assert_eq!(m.read_obj::<u16>(a).unwrap(), 0);
+    }
+
+    #[cfg(feature = "research")]
+    #[test]
+    fn cow_snapshot_restores_only_the_frozen_baseline() {
+        let ps = page_size() as u64;
+        let m = GuestMemory::new(&[(GuestAddress(0), 2 * ps)]).unwrap();
+        m.write(GuestAddress(0), &[1, 2, 3, 4]).unwrap();
+        m.snapshot_cow().unwrap();
+        m.write(GuestAddress(0), &[9, 8, 7, 6]).unwrap();
+        m.restore_cow().unwrap();
+        let mut got = [0u8; 4];
+        m.read(GuestAddress(0), &mut got).unwrap();
+        assert_eq!(got, [1, 2, 3, 4]);
     }
 }

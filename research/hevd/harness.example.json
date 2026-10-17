@@ -1,0 +1,30 @@
+{
+  "name": "hevd-arm64",
+  "source_revision": "b1cc756e55f69530f6468a6c3c310ed7b967bada",
+  "config": "hevd.toml",
+  "checkpoint": "checkpoint.state",
+  "state_dir": "state",
+  "input_gpa": 4096,
+  "input_capacity": 4096,
+  "input_va": 0,
+  "ioctl_prefix": true,
+  "ioctl_register": "x1",
+  "input_register": "x2",
+  "input_length_register": "x3",
+  "stop_pc": 0,
+  "reset_is_bugcheck": true,
+  "timeout_ms": 250,
+  "max_input": 4096,
+  "coverage": [],
+  "detectors": [
+    "access-violation",
+    "bugcheck",
+    "pool-corruption",
+    "double-free",
+    "use-after-free",
+    "out-of-bounds",
+    "integer-overflow",
+    "uninitialized",
+    "timeout"
+  ]
+}

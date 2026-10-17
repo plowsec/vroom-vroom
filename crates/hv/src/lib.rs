@@ -14,6 +14,7 @@ pub mod hvf;
 #[cfg(target_os = "linux")]
 pub mod kvm;
 mod state;
+pub mod debug;
 
 use std::sync::Arc;
 
@@ -160,6 +161,8 @@ pub trait Vm: Send + Sync {
 /// Why the vCPU stopped running guest code.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VcpuExit {
+    /// An architectural debug stop. PC still names the stopped instruction.
+    Debug(debug::DebugStop),
     /// Guest read device memory. Call [`Vcpu::complete_mmio_read`] next.
     MmioRead { addr: u64, len: usize },
     MmioWrite { addr: u64, len: usize, data: [u8; 8] },
@@ -196,6 +199,13 @@ pub enum BootRegs {
 
 /// A virtual CPU. Not `Send`: lives and dies on its own thread.
 pub trait Vcpu {
+    fn debug_write_register(&mut self, _register: debug::Register, _value: u64) -> Result<()> {
+        Err(Error::Unsupported("register editing on this backend"))
+    }
+    /// Configure host debugging on the owning thread, while stopped.
+    fn configure_debug(&mut self, _config: &debug::DebugConfig) -> Result<()> {
+        Err(Error::Unsupported("host debugging on this backend"))
+    }
     fn index(&self) -> u32;
     fn run(&mut self) -> Result<VcpuExit>;
     fn complete_mmio_read(&mut self, data: &[u8]) -> Result<()>;

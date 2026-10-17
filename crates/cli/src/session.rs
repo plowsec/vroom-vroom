@@ -283,6 +283,11 @@ impl Session {
 
     fn event(&mut self, ev: VmEvent) -> Result<Flow, String> {
         Ok(match ev {
+            VmEvent::Debug(stop) => {
+                self.vmm.pause().map_err(|e| e.to_string())?;
+                self.note(&format!("debug stop: CPU {} at {:#x} ({:?})", stop.cpu, stop.pc, stop.reason));
+                Flow::Continue
+            }
             VmEvent::Shutdown => {
                 self.vmm.shutdown();
                 eprint!("\r\n[vroom] guest powered off\r\n");

@@ -18,6 +18,8 @@ use crate::{Error, Result};
 
 /// Commands for a vCPU thread. Replies go back on the embedded channel.
 pub enum VcpuCmd {
+    WriteRegister(vroom_hv::debug::Register, u64, Sender<Result<()>>),
+    Debug(vroom_hv::debug::DebugConfig, Sender<Result<()>>),
     /// Start executing (boot CPU, or PSCI CPU_ON target).
     PowerOn(BootRegs),
     /// Enter the run loop without touching registers (secondaries when
@@ -36,6 +38,8 @@ pub enum VcpuCmd {
 impl std::fmt::Debug for VcpuCmd {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
+            VcpuCmd::WriteRegister(..) => "WriteRegister",
+            VcpuCmd::Debug(..) => "Debug",
             VcpuCmd::PowerOn(_) => "PowerOn",
             VcpuCmd::Start => "Start",
             VcpuCmd::Pause(_) => "Pause",
@@ -52,6 +56,9 @@ impl std::fmt::Debug for VcpuCmd {
 /// Things vCPU threads tell the VMM.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VmEvent {
+    /// The originating CPU is parked. The frontend must pause the VM
+    /// before inspecting RAM or other CPUs.
+    Debug(vroom_hv::debug::DebugStop),
     Shutdown,
     Reset,
     Crashed(String),
@@ -198,6 +205,20 @@ impl VcpuLoop {
     /// Returns false when the thread should exit.
     fn command(&mut self, cmd: VcpuCmd) -> bool {
         match cmd {
+            VcpuCmd::WriteRegister(register, value, reply) => {
+                let result = if self.paused {
+                    self.vcpu.debug_write_register(register, value).map_err(Error::Hv)
+                } else { Err(Error::Setup("pause before editing registers".into())) };
+                let _ = reply.send(result);
+            }
+            VcpuCmd::Debug(config, reply) => {
+                let r = if self.paused {
+                    self.vcpu.configure_debug(&config).map_err(Error::Hv)
+                } else {
+                    Err(Error::Setup("pause the CPU before configuring debug".into()))
+                };
+                let _ = reply.send(r);
+            }
             VcpuCmd::PowerOn(regs) => match self.power_on(&regs) {
                 Ok(()) => self.running = true,
                 Err(e) => log::error!("vcpu{}: power on: {e}", self.index()),
@@ -209,8 +230,9 @@ impl VcpuLoop {
             }
             VcpuCmd::Resume => self.paused = false,
             VcpuCmd::Save(reply) => {
+                let kernel_psci = self.vcpu.in_kernel_psci();
                 let r = self.vcpu.save_state().map(|mut s| {
-                    s.powered_on = self.running;
+                    if !kernel_psci { s.powered_on = self.running; }
                     s
                 });
                 let _ = reply.send(r.map_err(Error::Hv));
@@ -251,6 +273,10 @@ impl VcpuLoop {
 
     fn step(&mut self) -> Result<()> {
         match self.vcpu.run()? {
+            VcpuExit::Debug(stop) => {
+                self.paused = true;
+                let _ = self.shared.events.send(VmEvent::Debug(stop));
+            }
             VcpuExit::Kicked => {}
             VcpuExit::MmioRead { addr, len } => {
                 let mut buf = [0u8; 8];

@@ -7,6 +7,7 @@
 pub mod agent;
 mod audio;
 mod camera;
+mod debug;
 mod disks;
 
 /// Helper processes we started (swtpm, audio): the only processes the
@@ -40,6 +41,8 @@ use std::time::{Duration, Instant};
 use vroom_config::VmConfig;
 use vroom_devices::pl011::Pl011;
 use vroom_hv::{BootRegs, Hypervisor, IrqChipState, Vm};
+#[cfg(feature = "research")]
+use vroom_hv::VcpuState;
 use vroom_memory::GuestMemory;
 use vroom_snapshot::Snapshottable;
 
@@ -82,8 +85,12 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum StartMode {
     /// Cold boot from the configured kernel/firmware.
     Boot,
+    /// Cold boot with CPUs parked before the first guest instruction.
+    BootPaused,
     /// Resume from a snapshot directory.
     Restore(PathBuf),
+    /// Restore without executing guest instructions until explicitly resumed.
+    RestorePaused(PathBuf),
 }
 
 /// Host-side wiring the frontend provides.
@@ -145,6 +152,16 @@ pub struct Vmm {
     net_ctrl: bool,
     /// Removable shares for USB disks' files (what a save records).
     usb_file_slots: usize,
+    #[cfg(feature = "research")]
+    research_baseline: Option<ResearchBaseline>,
+}
+
+#[cfg(feature = "research")]
+struct ResearchBaseline {
+    devices: Vec<Vec<u8>>,
+    vcpus: Vec<VcpuState>,
+    irqchip: Option<IrqChipState>,
+    clock: u64,
 }
 
 impl std::fmt::Debug for Vmm {
@@ -171,28 +188,28 @@ impl Vmm {
         };
         let lock = state::StateLock::acquire(&opts.state_dir)?;
         let layers = match &opts.start {
-            StartMode::Restore(dir) => snapshot::disk_plan(dir)?,
-            StartMode::Boot => Default::default(),
+            StartMode::Restore(dir) | StartMode::RestorePaused(dir) => snapshot::disk_plan(dir)?,
+            StartMode::Boot | StartMode::BootPaused => Default::default(),
         };
         let disks = disks::DiskSet::open(&config, &opts.state_dir, &layers)?;
         let uuid = machine_uuid(&opts.state_dir)?;
         let saved = match &opts.start {
-            StartMode::Restore(dir) => Some(snapshot::saved_config(dir)?),
-            StartMode::Boot => None,
+            StartMode::Restore(dir) | StartMode::RestorePaused(dir) => Some(snapshot::saved_config(dir)?),
+            StartMode::Boot | StartMode::BootPaused => None,
         };
         let net_ctrl = saved.as_ref().is_none_or(|s| s.1);
         // USB disks' files go to removable shares a VM started on a Mac
         // has; a resumed one has those it was saved with.
         let usb_file_slots = match &opts.start {
-            StartMode::Restore(dir) => snapshot::saved_usb_file_slots(dir),
-            StartMode::Boot if cfg!(target_os = "macos") => usb::FILE_SLOTS,
-            StartMode::Boot => 0,
+            StartMode::Restore(dir) | StartMode::RestorePaused(dir) => snapshot::saved_usb_file_slots(dir),
+            StartMode::Boot | StartMode::BootPaused if cfg!(target_os = "macos") => usb::FILE_SLOTS,
+            StartMode::Boot | StartMode::BootPaused => 0,
         };
         let saved = saved.map(|s| s.0);
         let env = machine::BuildEnv {
             uuid,
             state_dir: opts.state_dir.clone(),
-            resuming: matches!(opts.start, StartMode::Restore(_)),
+            resuming: matches!(opts.start, StartMode::Restore(_) | StartMode::RestorePaused(_)),
             saved,
             net_ctrl,
             usb_file_slots,
@@ -225,6 +242,8 @@ impl Vmm {
             state: RunState::Paused,
             net_ctrl,
             usb_file_slots,
+            #[cfg(feature = "research")]
+            research_baseline: None,
         };
         vmm.pristine_irqchip = match vmm.vm.save_irqchip() {
             Ok(s) => Some(s),
@@ -238,8 +257,13 @@ impl Vmm {
             let s = d.lock().unwrap_or_else(|e| e.into_inner()).save()?;
             vmm.pristine_devices.push(s);
         }
+        let start_paused = matches!(opts.start, StartMode::BootPaused | StartMode::RestorePaused(_));
+        // Restore marks each CPU runnable. Park every CPU before loading any
+        // state so none can execute against partially restored RAM/devices.
+        vmm.state = RunState::Running;
+        vmm.pause()?;
         match opts.start {
-            StartMode::Boot => {
+            StartMode::Boot | StartMode::BootPaused => {
                 let regs = vmm.boot.load(&vmm.mem)?;
                 vmm.vcpus[0].peer.send(VcpuCmd::PowerOn(regs))?;
                 // In-kernel PSCI: secondaries wait inside KVM_RUN for CPU_ON.
@@ -248,17 +272,13 @@ impl Vmm {
                     v.peer.send(VcpuCmd::Start)?;
                 }
             }
-            StartMode::Restore(dir) => {
+            StartMode::Restore(dir) | StartMode::RestorePaused(dir) => {
                 snapshot::restore(&mut vmm, &dir)?;
-                // Restored workers start parked; let them go with the vCPUs.
-                for d in &vmm.devices {
-                    d.lock().unwrap_or_else(|e| e.into_inner()).resume();
-                }
                 // Guest wall clock is stuck at snapshot time; fix it.
                 vmm.agent.send(agent::AgentCmd::SyncTime);
             }
         }
-        vmm.state = RunState::Running;
+        if !start_paused { vmm.resume()?; }
         Ok(vmm)
     }
 
@@ -268,6 +288,64 @@ impl Vmm {
 
     pub fn state(&self) -> RunState {
         self.state
+    }
+
+    #[cfg(feature = "research")]
+    /// Capture the paused machine for high-rate fuzz iterations.
+    pub fn research_arm(&mut self) -> Result<()> {
+        if self.state != RunState::Paused {
+            return Err(Error::Setup("research baseline requires a paused VM".into()));
+        }
+        if self.research_baseline.is_some() {
+            return Err(Error::Setup("research baseline is already armed".into()));
+        }
+        let mut devices = Vec::with_capacity(self.devices.len());
+        for d in &self.devices {
+            devices.push(d.lock().unwrap_or_else(|e| e.into_inner()).save()?);
+        }
+        let mut vcpus = Vec::with_capacity(self.vcpus.len());
+        for v in &self.vcpus {
+            let (tx, rx) = mpsc::channel();
+            v.peer.send(VcpuCmd::Save(tx))?;
+            vcpus.push(rx.recv_timeout(PAUSE_TIMEOUT).map_err(|_| Error::Timeout)??);
+        }
+        let irqchip = match self.vm.save_irqchip() {
+            Ok(s) => Some(s),
+            Err(vroom_hv::Error::Unsupported(_)) => None,
+            Err(e) => return Err(e.into()),
+        };
+        let clock = self.vm.clock();
+        self.mem.snapshot_cow()?;
+        self.research_baseline = Some(ResearchBaseline { devices, vcpus, irqchip, clock });
+        Ok(())
+    }
+
+    #[cfg(feature = "research")]
+    /// Restore the armed baseline without rebuilding the VM or its mappings.
+    pub fn research_reset(&mut self) -> Result<()> {
+        if self.state != RunState::Paused {
+            return Err(Error::Setup("research reset requires a paused VM".into()));
+        }
+        let Some(baseline) = &self.research_baseline else {
+            return Err(Error::Setup("research baseline is not armed".into()));
+        };
+        self.mem.restore_cow()?;
+        if let Some(irqchip) = &baseline.irqchip {
+            self.vm.restore_irqchip(irqchip)?;
+        }
+        self.vm.set_clock(baseline.clock);
+        for (d, state) in self.devices.iter().zip(&baseline.devices) {
+            d.lock().unwrap_or_else(|e| e.into_inner()).restore(state)?;
+        }
+        let mut cpus = self.shared.cpus.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        for (v, state) in self.vcpus.iter().zip(&baseline.vcpus) {
+            cpus.set_on(state.index as usize, state.powered_on);
+            let (tx, rx) = mpsc::channel();
+            v.peer.send(VcpuCmd::Restore(Box::new(state.clone()), state.powered_on, tx))?;
+            rx.recv_timeout(PAUSE_TIMEOUT).map_err(|_| Error::Timeout)??;
+        }
+        *self.shared.cpus.lock().unwrap_or_else(|e| e.into_inner()) = cpus;
+        Ok(())
     }
 
     /// Save the guest screen as PNG. Returns the mode. Other monitors
