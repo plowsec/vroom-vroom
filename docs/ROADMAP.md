@@ -101,8 +101,8 @@ Windows guests:
 
 Linux guests decode H.264, HEVC, VP9 and AV1 on the Mac's VideoToolbox
 now (`[display] video_decode = true`, see [GUIDE.md](GUIDE.md#video-decoding)):
-GStreamer and FFmpeg through V4L2, Firefox through our VA-API driver
-(H.264, HEVC and VP9). VMware Fusion and Parallels don't offer this to
+GStreamer and FFmpeg through V4L2, Firefox and Chrome through our VA-API
+driver (H.264, HEVC and VP9). VMware Fusion and Parallels don't offer this to
 Linux guests on Apple Silicon at all.
 
 ### Which guest side, and why (October 2026)
@@ -148,20 +148,23 @@ A guest needs a driver and an API its players use. What exists:
   against earlier frames (global motion, segmentation, loop filter
   deltas), so the driver has to keep those per reference slot. Firefox
   says AV1 isn't power efficient here, so YouTube sends it VP9 for now.
-- **Chromium and Chrome**: their GPU process doesn't start on the guest's
-  virgl OpenGL ("eglCreateContext ES 3.0 failed with EGL_BAD_ATTRIBUTE",
-  both the snap's Chromium 155 and Google's arm64 Chrome 155), so there
-  is no VA-API decoding to test. Once that works (virgl's EGL, or Zink),
-  the snap's Chromium can load our driver with
-  `LIBVA_DRIVERS_PATH=$HOME/<dir>` (its wrapper keeps that path).
+- **Chrome under X11**: it decodes in software there (it uses VA-API only
+  on its EGL path; X11 gets GLX). Wayland sessions are fine.
+- **Chrome with `opengl_host = "angle"`**: its GPU process still doesn't
+  start (ANGLE's ES 3.0 has no multisample textures, so the guest gets
+  one sample and no ES 3.0 by the spec). Chrome works on `apple`.
+- **Hardware encoding** for video calls: Chrome sends with libvpx or
+  OpenH264 in the page's process (0.1 to 0.2 of a CPU at 720p). A VA-API
+  encoder on VideoToolbox's would take that to the Mac.
 - **Snap Firefox**: it loads VA-API drivers only from its own runtime.
   Mozilla's deb works.
 - **The guest drivers**: ship virtio-media (DKMS package) until it is
   upstream, and follow its upstreaming; package the VA-API driver.
 - **Fewer copies, the rest**: a picture now goes from VideoToolbox's
   buffer straight into the guest's (one copy; it crossed a socket and
-  was copied again before). For Firefox the VA-API driver copies it into
-  its surface and again into the GPU buffers it exports. Handing
+  was copied again before). For Firefox and Chrome the VA-API driver
+  copies it into its surface and again into the GPU buffers it exports
+  (in Chrome's GPU process: 0.13 of a CPU for 1080p30). Handing
   VideoToolbox's IOSurface to virglrenderer as the texture would save
   those, but it means sharing between the video helper and the GPU
   process.

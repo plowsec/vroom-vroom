@@ -7,7 +7,7 @@
 #   sudo sh install-vaapi.sh
 #
 # Needs the virtio-media driver first (install-virtio-media.sh) and a VM
-# with `video_decode = true`; dma-buf export (Firefox) needs `gpu =
+# with `video_decode = true`; dma-buf export (Firefox, Chrome) needs `gpu =
 # "virtio3d"`. Check with `vainfo` after logging in again.
 set -eu
 

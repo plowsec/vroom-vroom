@@ -457,6 +457,12 @@ decoded picture comes back (matched by the timestamp the driver gave the
 bitstream buffer). For players that want dma-bufs (Firefox), a surface
 also gets two GBM buffers on the virtio-gpu render node (luma, chroma),
 filled through their guest pages and one transfer each when exported.
+Chrome exports each surface once, when it makes it, before anything is
+decoded into it, and keeps showing that dma-buf; a GPU decoder writes
+into it in place. So a surface exported while still empty is marked, and
+from then on `vaEndPicture` waits for its picture and fills its buffers
+before returning (Chrome shows a picture once that returns). Firefox
+exports after decoding and keeps the old behaviour.
 
 ## 3D
 
@@ -571,7 +577,14 @@ the guest's texel over the box, 4 MiB of rows at a time, through vrend's
 normal upload path. Without it, the guest's Mesa 25.2 clears through a
 surface the host never saw (handle 0), vrend puts the whole context in
 error, and Xwayland under GNOME on Wayland drew nothing (its glamor clears
-pixmaps this way). virglrenderer logs through our logger (`virgl:` lines).
+pixmaps this way). UTM's fork told the guest the Mac had no multisampling
+(one sample, so Mesa fakes it), from before multisample textures worked
+on GL 4.1; 0014 keeps the real count (4) on macOS's OpenGL. One sample
+left the guest's OpenGL ES 3.0 below its spec, and ANGLE, so Chrome's
+GPU process, refused to make an ES 3.0 context on it. With
+`opengl_host = "angle"` it is still one: ANGLE's ES 3.0 has no
+multisample textures. virglrenderer logs through our logger (`virgl:`
+lines).
 
 What MoltenVK lacks, the Venus decoder makes up (patches 0007, 0008 and
 0012):

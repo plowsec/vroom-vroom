@@ -673,6 +673,12 @@ the box against the texture's level first, then uploads the texel through
 its normal upload path from a scratch buffer of at most 4 MiB (one band of
 rows), so a huge box costs time, not memory.
 
+On macOS's OpenGL the guest is now told the GPU's real sample count (4)
+instead of 1 (patch 0014), so ordinary apps (Chrome, antialiased WebGL,
+games) make multisampled textures and resolve them with blits. A guest
+could ask for those before too: vrend checked and created them the same
+way. Now they are common, not rare. Snapshots don't keep their contents.
+
 ### A process per Vulkan and Direct3D context
 
 Each Vulkan (Venus) and Direct3D (Neptune) context of the guest, roughly

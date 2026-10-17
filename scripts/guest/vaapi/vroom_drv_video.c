@@ -18,7 +18,9 @@
 // its VA surface's memory. For a player that wants the picture as a
 // dma-buf (vaExportSurfaceHandle: Firefox, mpv), the surface also gets
 // two GBM buffers on the virtio-gpu render node (luma, chroma), filled
-// on export, which the player's OpenGL imports.
+// on export, which the player's OpenGL imports. Chrome exports each
+// surface once, empty, and keeps the dma-buf: those are filled at each
+// vaEndPicture instead.
 //
 // Build: make (needs libva-dev, libdrm-dev, libgbm-dev). Install with
 // install-vaapi.sh; use with LIBVA_DRIVER_NAME=vroom.
@@ -117,6 +119,10 @@ struct surface {
 	uint8_t *bo_map[2];
 	size_t bo_map_len[2];
 	bool bo_stale;
+	// Exported before it held a picture: the player keeps the dma-buf and
+	// expects it to follow the surface, as a GPU decoder's would
+	// (Chromium). Each picture then goes into the buffers as it is decoded.
+	bool live;
 };
 
 struct buffer {
@@ -230,6 +236,7 @@ static void del_obj(struct driver *d, unsigned id)
 #define DRV(ctx) ((struct driver *)(ctx)->pDriverData)
 
 static void bo_free(struct surface *s);
+static bool upload(struct driver *d, struct surface *s);
 
 // ---------------------------------------------------------------------
 // Bit writer: RBSP, then NAL units with emulation prevention.
@@ -2160,6 +2167,13 @@ static VAStatus vr_EndPicture(VADriverContextP ctx, VAContextID cid)
 			st = VA_STATUS_ERROR_INVALID_PARAMETER;
 		else
 			st = submit(c, s);
+		// Chromium shows the picture once this returns, from the
+		// dma-buf it exported at the start.
+		if (st == VA_STATUS_SUCCESS && s->live) {
+			wait_surface(d, s);
+			if (!s->failed && !upload(d, s))
+				st = VA_STATUS_ERROR_OPERATION_FAILED;
+		}
 		c->au_len = 0;
 		c->slices_len = 0;
 	}
@@ -2472,6 +2486,8 @@ static VAStatus vr_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID sid, ui
 		pthread_mutex_unlock(&d->lock);
 		return VA_STATUS_ERROR_INVALID_SURFACE;
 	}
+	if (!s->pending && s->seq == 0)
+		s->live = true;
 	// The player reads the picture as soon as it has it.
 	int64_t t0 = now_ms();
 	wait_surface(d, s);
