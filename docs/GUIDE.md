@@ -533,6 +533,28 @@ trip to the host, and the window shows a copy read back from the GPU.
 Anything with real work is many times faster, and the guest's CPUs stay
 free.
 
+The guest gets 4x multisampling (antialiasing) on `apple`; on `angle` it
+is faked (one sample).
+
+### Chrome and Chromium
+
+Chrome and Chromium draw with the GPU, with nothing to set in the guest:
+`chrome://gpu` says "Hardware accelerated" for compositing,
+rasterization, WebGL and WebGL2, and its GL renderer is `ANGLE (Mesa,
+virgl (Apple M…), OpenGL ES 3.0 …)`. Tested with Google Chrome 155 for
+arm64 (Google's deb) and the Chromium 155 snap on Ubuntu 24.04, as
+Wayland apps (sway) and X11 apps (Xwayland). A WebGL2 page drawing 2000
+cubes with antialiasing runs at 60 frames a second, WebGL Aquarium
+(500 fish) at 57; Chrome's GPU and page processes use about a tenth of a
+CPU each. For video, see [Video decoding](#browsers-va-api).
+
+This needs `opengl_host = "apple"` (the default). On `angle`, and on
+vroom builds before October 17, 2026, Chrome's GPU process doesn't start
+("eglCreateContext ES 3.0 failed with EGL_BAD_ATTRIBUTE" in its log, as
+a Wayland app): Chrome then draws with the CPU and has no WebGL. Chrome
+wants OpenGL ES 3.0 with 4x multisampling, and those had no
+multisampling.
+
 ### OpenGL 4.4 for one app (Zink)
 
 macOS's OpenGL stops at 4.1, so virgl can't give compute shaders (4.3).
@@ -545,11 +567,21 @@ MESA_LOADER_DRIVER_OVERRIDE=zink glxinfo -B   # zink Vulkan 1.3(Virtio-GPU Venus
 
 In an Xorg session add `LIBGL_KOPPER_DRI2=1` (Xorg's modesetting driver
 doesn't offer what Zink wants for windows there; Wayland sessions don't
-need it). The host fills in what MoltenVK lacks, and some of it only
-roughly, for Zink only: transform feedback is accepted but writes nothing
-(apps that read it back get zeros), and packed 10-bit vertex formats and
-RGB32 texel buffers, which Metal doesn't have, read wrong. Few apps use
-them. Zink is a little slower than virgl for ordinary drawing: in a GNOME
+need it). The host fills in what MoltenVK lacks, for Zink only, and some
+of it only roughly:
+
+- Transform feedback (vertex shader outputs written to buffers, used by
+  some particle effects and CAD apps) works for `glDrawArrays` of points,
+  lines and triangles, instanced or not, with pause and resume,
+  `glDrawTransformFeedback` and the primitives written and generated
+  queries. Strips, fans and `glDrawElements` capture nothing while
+  transform feedback is on (apps that read those back get zeros); so do
+  geometry and tessellation shaders, which MoltenVK lacks anyway. A
+  million points are captured in about 15 ms.
+- Packed 10-bit vertex formats and RGB32 texel buffers, which Metal
+  doesn't have, read wrong. Few apps use them.
+
+Zink is a little slower than virgl for ordinary drawing: in a GNOME
 Wayland session, glmark2 scores about 1000 on Zink and 1170 on virgl, and
 its terrain scene, the heaviest for the GPU, runs at about 210 fps against
 420. Keep virgl for the desktop and use Zink for apps that need more than
@@ -824,9 +856,49 @@ against FFmpeg's own decoders: H.264 with B-frames, slices, scaling
 matrices, weighted prediction; HEVC 8 and 10-bit with B-frame pyramids,
 slices, open GOPs; VP9 8 and 10-bit with hidden frames).
 
-Chromium and Chrome (Google's arm64 build) don't get that far: their GPU
-process can't start on the guest's OpenGL (it asks for an OpenGL ES 3.0
-context with options virgl doesn't take), so they decode in software.
+Chrome (Google's arm64 build) uses it with its default settings, in a
+Wayland session (Ubuntu's default: Chrome runs as a Wayland app there).
+It needs the 3D GPU with `opengl_host = "apple"` (see
+[Chrome and Chromium](#chrome-and-chromium)), and the driver installed
+on or after October 17, 2026 (run `install-vaapi.sh` again if it is
+older: Chrome showed black video). Check in `chrome://media-internals`:
+the player says `kVideoDecoderName: VaapiVideoDecoder`. Flags older
+guides give (`--enable-features=AcceleratedVideoDecodeLinuxGL,VaapiIgnoreDriverChecks`)
+change nothing in Chrome 155. Things to know:
+
+- The Chromium snap loads VA-API drivers from its own runtime, but keeps
+  `LIBVA_DRIVERS_PATH`: copy the driver to your home and start it from
+  there:
+
+  ```bash
+  mkdir -p ~/vaapi && cp /usr/lib/aarch64-linux-gnu/dri/vroom_drv_video.so ~/vaapi/
+  LIBVA_DRIVERS_PATH=$HOME/vaapi chromium
+  ```
+
+- Under X11 (an Xorg session, or `--ozone-platform=x11`) Chrome draws
+  with the GPU but decodes in software: it uses VA-API only when it runs
+  OpenGL through EGL, and on X11 it uses GLX.
+- In video calls (WebRTC), Chrome decodes incoming H.264 and VP9 on the
+  Mac too (`getStats()`: "ExternalDecoder (VaapiVideoDecoder)", power
+  efficient). VP8, and the video it sends, stay in software.
+- Hardware decoded video is a little more saturated than the same video
+  decoded in software (reds and greens stand out more). Chrome converts
+  limited range BT.709 video with BT.601's colours on this path, on
+  purpose (it does the same on Intel GPUs); not ours to fix.
+
+Chrome 155, 1080p at 30 frames a second, in CPUs (1.0 is one guest CPU
+busy), before and after Chrome could use the GPU:
+
+| | Before: GPU process, page, whole guest | Now: GPU process, page, whole guest |
+|---|---|---|
+| H.264, 12 Mbit/s | 0.04, 0.24, 0.45 | 0.13, 0.02, 0.29 |
+| VP9, 22 Mbit/s | 0.04, 0.35, 0.49 | 0.16, 0.02, 0.30 |
+| Video call with itself, 720p VP8 (camera) | 0.04, 0.17, 0.43 | 0.04, 0.19, 0.48 |
+| The same in VP9 | | 0.09, 0.14, 0.49 |
+
+The decoding moves out of the page's process; the GPU process does the
+copies into GPU memory. A call costs about the same: sending is in
+software either way.
 
 Firefox's other Linux path, V4L2 decoders through FFmpeg, needs FFmpeg's
 DRM PRIME output (only in the Raspberry Pi's FFmpeg) and dma-buf export

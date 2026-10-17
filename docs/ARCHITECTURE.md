@@ -540,6 +540,17 @@ decoded picture comes back (matched by the timestamp the driver gave the
 bitstream buffer). For players that want dma-bufs (Firefox), a surface
 also gets two GBM buffers on the virtio-gpu render node (luma, chroma),
 filled through their guest pages and one transfer each when exported.
+Chrome exports each surface once, when it makes it, before anything is
+decoded into it, and keeps showing that dma-buf; a GPU decoder writes
+into it in place. So a surface exported while still empty is marked, and
+from then on `vaEndPicture` waits for its picture and fills its buffers
+before returning (Chrome shows a picture once that returns). Firefox
+exports after decoding and keeps the old behaviour. When the stream's
+format is set again (an HEVC seek), Chrome destroys its surfaces, keeps
+the dma-bufs and makes new surfaces from them (`DRM_PRIME` memory, which
+names only the first plane's buffer). A destroyed live surface's two
+buffers are kept for 5 seconds (32 at most), and such a surface gets
+them back by its luma buffer's handle; other dma-bufs are refused.
 
 ## 3D
 
@@ -654,7 +665,19 @@ the guest's texel over the box, 4 MiB of rows at a time, through vrend's
 normal upload path. Without it, the guest's Mesa 25.2 clears through a
 surface the host never saw (handle 0), vrend puts the whole context in
 error, and Xwayland under GNOME on Wayland drew nothing (its glamor clears
-pixmaps this way). virglrenderer logs through our logger (`virgl:` lines).
+pixmaps this way). UTM's fork told the guest the Mac had no multisampling
+(one sample, so Mesa fakes it), from before multisample textures worked
+on GL 4.1; 0014 keeps the real count (4) on macOS's OpenGL. One sample
+left the guest's OpenGL ES 3.0 below its spec, and ANGLE, so Chrome's
+GPU process, refused to make an ES 3.0 context on it. With
+`opengl_host = "angle"` it is still one: ANGLE's ES 3.0 has no
+multisample textures. vrend pauses transform feedback after each draw
+and ends it only when the guest drops its buffers; macOS's GL crashed
+in `glEndTransformFeedback` when the program it began with wasn't
+bound any more (any GL app using transform feedback, at its end: the
+GPU process died). 0015 binds that program again for the end, or leaves
+the object to the context's end if the program is gone. virglrenderer
+logs through our logger (`virgl:` lines).
 
 What MoltenVK lacks, the Venus decoder makes up (patches 0007, 0008 and
 0012):
@@ -679,10 +702,38 @@ What MoltenVK lacks, the Venus decoder makes up (patches 0007, 0008 and
   storage, so such an image gets no memory type at all. Zink asks for it
   on every texture it may copy into from the CPU, and every depth
   texture failed.
-- For Zink only (its instance says "mesa zink"): transform feedback taken
-  and dropped (queries of it are occlusion pools never started, results
-  zero), and packed 10-bit vertex formats and RGB32 texel buffers mapped
-  to the nearest Metal has. These are what lift Zink to OpenGL 4.4.
+- For Zink only (its instance says "mesa zink"): transform feedback, and
+  packed 10-bit vertex formats and RGB32 texel buffers mapped to the
+  nearest Metal has. These are what lift Zink to OpenGL 4.4.
+
+Transform feedback, which MoltenVK lacks, is done by the vertex shader
+itself (0016, `vkr_xfb.c`). A vertex shader module with the `Xfb`
+execution mode gets a second host module: before each return it stores
+its captured outputs (their `XfbBuffer`, `XfbStride` and `Offset`
+decorations) through buffer device addresses read from 48 bytes of push
+constants at offset 256. Every pipeline layout gets room for them (the
+vertex range grows to 304 bytes; a layout already using that range gets
+none, and its pipelines don't capture). Zink devices get
+`bufferDeviceAddress`, `shaderInt64` and vertex stores turned on,
+transform feedback buffers the device address usage, and every memory
+allocation the device address flag. Each command buffer keeps the bound
+buffers (address, size), what was written to each, the bound pipeline's
+topology and the transform feedback state; before every draw with such
+a pipeline the host pushes where its vertices go, or zeros (nothing to
+write). Vertex n of instance i goes to slot i * count + n, which is the
+order transform feedback writes in for non-indexed point, line and
+triangle lists only; other draws capture nothing. The host caps the slots
+at what fits in every buffer, in whole primitives, so a shader never
+writes past a buffer's bound range. Counter buffers (pause and resume
+across render passes, `glDrawTransformFeedback`) and the query pools for
+transform feedback and pipeline statistics (`GL_PRIMITIVES_GENERATED`;
+MoltenVK has neither) are kept by the host as commands are recorded:
+values are right when command buffers run in the order they were
+recorded, which is what Zink does. Before this, a Zink app asking for
+`GL_PRIMITIVES_GENERATED` got a query pool the host refused and its
+context failed. Apps without transform feedback run as before, within
+noise (glmark2 on Zink, three runs each: terrain 270 then 260 fps,
+refract 596 then 637).
 
 A Vulkan window reaches the screen through the guest's compositor, which
 imports the frame's dma-buf with OpenGL (virgl, `PIPE_RESOURCE_SET_TYPE`).
