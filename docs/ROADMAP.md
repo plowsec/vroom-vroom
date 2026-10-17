@@ -67,10 +67,16 @@ Linux guests, next:
   make on MoltenVK). virgl stays the default; Zink is per app.
 - **No copy for Vulkan windows**: an IOSurface shared by Metal and
   OpenGL instead of copying each frame. The copy is fine at 1280x800.
-- **Snapshots and suspend while a Vulkan app runs.** Vulkan state lives
-  on the Mac's GPU. Like we do for OpenGL, we'd follow what each Vulkan
-  app creates and rebuild it on resume; Vulkan has far more kinds of
-  objects, so this is the biggest of these items.
+- **Snapshots with Vulkan, what's left** (they work, see GUIDE.md and
+  ARCHITECTURE.md): store the GPU's part of a snapshot as raw bytes, not
+  base64 in JSON (1 GiB of Vulkan memory makes a 1.45 GB blob and most of
+  a 9 s snapshot); save a Vulkan window's memory still shown after its
+  app is gone (today that refuses); query results; GNOME's Wayland
+  session not tried yet (Xorg was).
+- **A Vulkan fence that comes back early.** Seen while testing: about
+  once a minute, a guest's `vkWaitForFences` returns before a buffer copy
+  in the same submission is visible; 20 ms later it is. Venus and
+  MoltenVK, not snapshots; not looked into yet.
 - **Xwayland under GNOME on virgl**: its GL context breaks at login
   (`vrend_clear_surface: ... Illegal surface 0`), so X11 apps in a
   GNOME Wayland session show nothing. Not new; seen with the old library

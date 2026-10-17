@@ -148,7 +148,8 @@ state, one blob per device, sparse RAM (64 KiB chunks plus a bitmap). Disks
 are frozen at the same moment: the current top layer becomes read-only and
 a new qcow2 overlay starts on it. Reverting starts a fresh overlay on the
 frozen layer. Suspend is a snapshot that ends the process; resuming checks
-the disks didn't change in between.
+the disks didn't change in between. On restore, devices come back before
+the vCPUs: a vCPU runs as soon as its state is back.
 
 Host GPU objects can't be saved as they are. For GL (virgl) contexts the
 GPU device follows each submitted command stream (`virgl_state.rs`): live
@@ -157,9 +158,71 @@ writes everything it wrote (vrend's own rules: sampler views clear the
 slots after them, sampler states don't). A snapshot reads every texture
 level and buffer back through virglrenderer; restore makes the resources
 again, writes the contents, makes the contexts and replays their state,
-then returns the fenced commands the GPU had finished. Vulkan (Venus)
-contexts and blob resources aren't tracked: snapshots refuse while they
-exist. Nested-virtualization EL2 state is best effort.
+then returns the fenced commands the GPU had finished. Blobs of GL
+contexts aren't tracked: snapshots refuse while one is in use. The GL
+side also keeps the type a compositor gives a Vulkan window's blob
+(`PIPE_RESOURCE_SET_TYPE`) and replays it before anything uses that blob.
+
+Vulkan (Venus) contexts are saved by their render worker
+(`third_party/virglrenderer/0010-venus-snapshots.patch`, `vkr_snap.c`).
+The worker runs every command, from the virtqueue, a ring or a command
+stream, through one function that notes what the command looked up (the
+decoder's object lookups), made and destroyed (the context's object
+table). It keeps, as the guest encoded them, the commands that made or
+destroyed objects, bound memory, wrote descriptors or recorded command
+buffers. Venus ids are the guest's own, so replaying the kept commands in
+a fresh context gives the same objects under the same ids. What goes:
+
+- a command buffer's recording, when it begins again or is reset (also
+  through its pool);
+- a descriptor write that a later one writes over completely, unless a
+  recording still holds it (it bound that set while the old value was
+  there: the replay must record it the same way); a copy of descriptors
+  stops this for everything older;
+- now and then, everything nothing alive needs. An object is needed if it
+  is alive or a needed command uses it; a command is needed if it makes a
+  needed object, destroys one (the replay must too), or, making nothing,
+  uses only needed objects. So a pipeline keeps the shader module it was
+  made from, even after the app destroyed it.
+
+Past 4M commands or 1 GiB kept after that clean-up, the context isn't
+followed any more and comes back lost.
+
+A snapshot (`RENDER_CONTEXT_OP_SAVE` from the GPU process's proxy, in turn
+from `Renderer3d::venus_save`) first stops every thread of the context at a
+command boundary: dispatching threads hold a gate per command, and a ring
+stores its head inside it, so the saved head is exactly what ran. A
+command blocked in a wait (`vkWaitVirtqueueSeqnoMESA`, `vkWaitForFences`)
+lets go of the gate while it waits; it runs again from the start after a
+restore. Then each queue gets an empty submission with a fence, and the
+worker waits for those. It writes, into one shared memory object: the
+shared memory the context made (rings, reply streams), the kept commands,
+the contents of each device memory object (host-visible memory from its
+shared memory; device-local memory a buffer was bound to, through a
+staging buffer), the contents of each image (every level, layer and
+aspect, copied to a staging buffer with `VK_IMAGE_LAYOUT_GENERAL`:
+MoltenVK keeps no layouts, Metal has none; images get transfer usage
+added when they are made, where the format allows it), fence and event
+states, timeline semaphore values and which binary semaphores are left
+signaled (followed from submissions), each ring's place and creation
+parameters, and the reply stream positions. If the threads don't stop in
+5 s, the GPU doesn't finish in 10 s, or the context had already failed,
+only the rings are written: the context comes back lost.
+
+The VMM stores that next to the GL state, with the context's blobs (how
+each was made, where the guest had it mapped). Restore: make the context,
+make its shared-memory blobs (blob id 0) again with their ids,
+`RENDER_CONTEXT_OP_RESTORE` (the worker copies the shared memory back,
+replays the commands with replies off, fills memory and images, sets the
+states, makes the rings at their old head, alive), then the memory blobs
+(blob id = the memory object's id, so they export the new memory),
+`RENDER_CONTEXT_OP_RESUME` (start the rings), map every blob where the
+guest had it, and only then the GL contexts. A context the worker can't
+build again gets plain shared memory for its memory blobs, so the guest's
+pages stay backed, and its rings marked fatal: Mesa's Venus driver stops
+that app ("ring fatal error"), the rest of the guest goes on.
+
+Nested-virtualization EL2 state is best effort.
 
 Layers form a tree under `<state>/disks`. `vroom snapshot delete/prune`
 (VM stopped) removes layers nothing references and folds a layer that only
