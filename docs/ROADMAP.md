@@ -272,6 +272,27 @@ A guest needs a driver and an API its players use. What exists:
   next master with the old and new guest tools, resizes and Coherence.
   If it shows up again, the window's filler memory is the first suspect.
 
+- Guest tools, what's left (the update button and ready-made VMs work,
+  see GUIDE.md):
+  - A real CD drive: the tools stick is a USB disk, so Windows shows
+    AutoPlay ("open folder") and ignores `autorun.inf`. A USB CD-ROM
+    (MMC commands on the existing Bulk-Only stick) would run
+    `vroom-setup` from AutoPlay, and could carry the Windows ISO itself:
+    no install stick to build, and no 4 GB limit (wimlib).
+  - Ready-made Windows: OpenSSH comes from Windows Update (a download in
+    the guest); the 3D driver package isn't on the install stick yet;
+    the app could take `install.img` out of the VM file itself once the
+    new agent says hello.
+  - GDM's login screen doesn't get the window's UI scale on a HiDPI Mac
+    (the session helper starts with the session): small text until you
+    log in.
+  - The GNOME Shell extension could serve the clipboard from inside the
+    compositor, for Wayland desktops without Xwayland (the helper uses
+    X11's clipboard; GNOME passes it to Wayland apps).
+  - Signed tools: an update is checked by hash against the manifest the
+    host sends; a signature would matter only if something other than
+    the host could write the agent's port.
+
 - Flaky tests (October 17): `gpu3d server::tests::create_and_refuse`
   (at the "same id again" refusal) and `devices hda::tests::playback_moves_buffers_at_real_time`
   (a timing test) each failed once in a full `cargo test --workspace`

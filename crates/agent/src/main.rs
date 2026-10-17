@@ -464,6 +464,12 @@ fn handle(m: Message, role: Role, w: &mut dyn Write, clip: &mut dyn clip::Clip, 
             shares::usb_reset();
             w.write_all(&hello(can_update(role)).encode())?;
         }
+        // Not set up to install updates (it said so in its hello).
+        Message::UpdateBegin { id, .. } if !can_update(role) => {
+            let why = "this agent can't install updates: install the guest tools by hand".to_string();
+            w.write_all(&Message::UpdateDone { id, ok: false, why }.encode())?;
+        }
+        Message::UpdateData { .. } if !can_update(role) => {}
         m @ (Message::UpdateBegin { .. } | Message::UpdateData { .. }) => {
             if let Some(r) = updater.handle(m, update::apply) {
                 w.write_all(&r.encode())?;

@@ -157,8 +157,18 @@ fn copy_tree(from: &Path, to: &Path, rel: &str, skip: &[&str], done: &mut dyn Fn
         if t.is_dir() {
             copy_tree(&e.path(), &to.join(&name), &r, skip, done)?;
         } else if t.is_file() {
-            let n = std::fs::copy(e.path(), to.join(&name)).map_err(|e| format!("{r}: {e}"))?;
-            done(n);
+            // In pieces, so a big file (install.wim) shows progress.
+            let mut src = std::fs::File::open(e.path()).map_err(|e| format!("{r}: {e}"))?;
+            let mut dst = std::fs::File::create(to.join(&name)).map_err(|e| format!("{r}: {e}"))?;
+            let mut buf = vec![0u8; 8 << 20];
+            loop {
+                let n = src.read(&mut buf).map_err(|e| format!("{r}: {e}"))?;
+                if n == 0 {
+                    break;
+                }
+                dst.write_all(&buf[..n]).map_err(|e| format!("{r}: {e}"))?;
+                done(n as u64);
+            }
         }
     }
     Ok(())
