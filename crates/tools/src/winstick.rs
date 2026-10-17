@@ -112,20 +112,59 @@ fn run(c: &mut Command) -> Result<(), String> {
     if o.status.success() {
         Ok(())
     } else {
-        Err(format!("{:?}: {}", c.get_program(), String::from_utf8_lossy(&o.stderr).trim()))
+        let why = if o.stderr.is_empty() { &o.stdout } else { &o.stderr };
+        Err(format!("{:?} {}: {}", c.get_program(), o.status, String::from_utf8_lossy(why).trim()))
     }
 }
 
-/// Unmounts what it mounted, removes its scratch folder.
+/// Attach `image` at `at`; returns its device (/dev/diskN), which is what
+/// gets detached (a mount point can be gone with the device still there).
+fn attach(image: &Path, at: &Path, readonly: bool) -> Result<String, String> {
+    let mut c = Command::new("hdiutil");
+    c.args(["attach", "-nobrowse", "-mountpoint"]).arg(at);
+    if readonly {
+        c.arg("-readonly");
+    }
+    let o = c.arg(image).output().map_err(|e| format!("hdiutil: {e}"))?;
+    if !o.status.success() {
+        return Err(format!("hdiutil attach {}: {}", image.display(), String::from_utf8_lossy(&o.stderr).trim()));
+    }
+    String::from_utf8_lossy(&o.stdout)
+        .split_whitespace()
+        // The whole disk comes first: "/dev/disk6  FDisk_partition_scheme".
+        .find(|w| w.starts_with("/dev/disk"))
+        .map(str::to_string)
+        .ok_or_else(|| format!("hdiutil attach {}: no device", image.display()))
+}
+
+/// Detach a disk we wrote: macOS (Spotlight) may still hold it for a
+/// moment, so a few tries, then by force (our writes are on it by then).
+fn detach(dev: &str) -> Result<(), String> {
+    let _ = Command::new("sync").output();
+    for _ in 0..5 {
+        if run(Command::new("hdiutil").args(["detach", "-quiet", dev])).is_ok() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    let r = run(Command::new("hdiutil").args(["detach", "-quiet", "-force", dev]));
+    if r.is_err() {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        return run(Command::new("hdiutil").args(["detach", "-quiet", "-force", dev]));
+    }
+    r
+}
+
+/// Detaches what it attached, removes its scratch folder.
 struct Scratch {
     dir: PathBuf,
-    mounts: Vec<PathBuf>,
+    devices: Vec<String>,
 }
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        for m in self.mounts.iter().rev() {
-            let _ = Command::new("hdiutil").args(["detach", "-quiet", "-force"]).arg(m).output();
+        for d in self.devices.iter().rev() {
+            let _ = detach(d);
         }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
@@ -200,15 +239,14 @@ pub fn build(iso: &Path, tools: &Path, acct: &Account, computer: &str, out: &Pat
         return Err("the guest tools have no virtio drivers (build them with the virtio-win ISO)".into());
     }
     let parent = out.parent().ok_or("no folder for the stick")?;
-    let mut s = Scratch { dir: parent.join(".winstick"), mounts: Vec::new() };
+    let mut s = Scratch { dir: parent.join(".winstick"), devices: Vec::new() };
     let _ = std::fs::remove_dir_all(&s.dir);
     std::fs::create_dir_all(&s.dir).map_err(|e| e.to_string())?;
     let (isom, usbm) = (s.dir.join("iso"), s.dir.join("usb"));
     std::fs::create_dir_all(&isom).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&usbm).map_err(|e| e.to_string())?;
     progress("Opening the Windows ISO");
-    run(Command::new("hdiutil").args(["attach", "-quiet", "-nobrowse", "-readonly", "-mountpoint"]).arg(&isom).arg(iso))?;
-    s.mounts.push(isom.clone());
+    s.devices.push(attach(iso, &isom, true)?);
     if !isom.join("sources/boot.wim").is_file() {
         return Err("not a Windows install ISO (no sources/boot.wim)".into());
     }
@@ -228,8 +266,8 @@ pub fn build(iso: &Path, tools: &Path, acct: &Account, computer: &str, out: &Pat
     progress("Making the install disk");
     let dmg = s.dir.join("usb.dmg");
     run(Command::new("hdiutil").args(["create", "-quiet", "-size", &format!("{mb}m"), "-fs", "MS-DOS FAT32", "-volname", "WININST", "-layout", "MBRSPUD"]).arg(&dmg))?;
-    run(Command::new("hdiutil").args(["attach", "-quiet", "-nobrowse", "-mountpoint"]).arg(&usbm).arg(&dmg))?;
-    s.mounts.push(usbm.clone());
+    let usb_dev = attach(&dmg, &usbm, false)?;
+    s.devices.push(usb_dev.clone());
     let (mut copied, mut last) = (0u64, 0u64);
     let skip: &[&str] = if big { &["boot.catalog", "sources/install.wim", "sources/install.esd"] } else { &["boot.catalog"] };
     copy_tree(&isom, &usbm, "", skip, &mut ticker(&mut copied, &mut last, total, progress))?;
@@ -244,8 +282,8 @@ pub fn build(iso: &Path, tools: &Path, acct: &Account, computer: &str, out: &Pat
         std::fs::write(usbm.join("vroom-ssh.pub"), format!("{}\r\n", k.trim())).map_err(|e| e.to_string())?;
     }
     progress("Finishing the install disk");
-    run(Command::new("hdiutil").args(["detach", "-quiet"]).arg(&usbm))?;
-    s.mounts.pop();
+    detach(&usb_dev)?;
+    s.devices.pop();
     let cdr = s.dir.join("usb.cdr");
     run(Command::new("hdiutil").args(["convert", "-quiet", "-format", "UDTO", "-o"]).arg(s.dir.join("usb")).arg(&dmg))?;
     let _ = std::fs::remove_file(&dmg);

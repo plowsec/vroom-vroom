@@ -39,8 +39,16 @@ done
 cp examples/linux/gnome-shell/* "$out/linux/gnome-shell/"
 
 tmp=$(mktemp -d)
+devs=
+# Attach an image; print its device (/dev/diskN) and remember it, to
+# detach it even when its mount point went first.
+attach() {
+  d=$(hdiutil attach -nobrowse "$@" | awk '/^\/dev\/disk/ {print $1; exit}')
+  [ -n "$d" ] || { echo "hdiutil attach $*: no device" >&2; exit 1; }
+  echo "$d"
+}
 cleanup() {
-  for m in "$tmp/mnt" "$tmp/vw"; do hdiutil detach -quiet "$m" 2>/dev/null || true; done
+  for d in $devs; do hdiutil detach -quiet -force "$d" 2>/dev/null || { sleep 2; hdiutil detach -quiet -force "$d" 2>/dev/null; } || true; done
   rm -rf "$tmp"
 }
 trap cleanup EXIT
@@ -53,7 +61,8 @@ if [ -n "$win" ]; then
   fi
   if [ -n "$vw" ]; then
     mkdir "$tmp/vw"
-    hdiutil attach -quiet -nobrowse -readonly -mountpoint "$tmp/vw" "$vw"
+    vwdev=$(attach -readonly -mountpoint "$tmp/vw" "$vw")
+    devs="$vwdev $devs"
     # What vroom's devices need: display, network, serial (the agent's
     # port), input, RNG, disks (virtio-blk, virtio-scsi), shared folders,
     # memory balloon.
@@ -63,7 +72,6 @@ if [ -n "$win" ]; then
         find "$tmp/vw/$d/w11/ARM64" -type f ! -name '*.pdb' -exec cp {} "$out/windows/$d/w11/ARM64/" \;
       fi
     done
-    hdiutil detach -quiet "$tmp/vw"
   else
     echo "no virtio-win ISO given: the Windows tools have no drivers" >&2
   fi
@@ -78,7 +86,8 @@ if [ "$(uname)" = Darwin ]; then
   # Windows ignores MBR disks whose signature is zero.
   printf 'VRT1' | dd of="$tmp/t.cdr" bs=1 seek=440 conv=notrunc 2>/dev/null
   mkdir "$tmp/mnt"
-  hdiutil attach -quiet -nobrowse -imagekey diskimage-class=CRawDiskImage "$tmp/t.cdr" -mountpoint "$tmp/mnt"
+  tdev=$(attach -imagekey diskimage-class=CRawDiskImage "$tmp/t.cdr" -mountpoint "$tmp/mnt")
+  devs="$tdev $devs"
   if [ -d "$out/windows" ]; then
     cp -R "$out/windows/" "$tmp/mnt/"
     printf '[autorun]\r\nshellexecute=vroom-setup.cmd\r\nicon=vroom-agent.exe\r\nlabel=vroom tools\r\n' > "$tmp/mnt/autorun.inf"
@@ -87,7 +96,8 @@ if [ "$(uname)" = Darwin ]; then
   printf 'vroom guest tools\r\n\r\nWindows: run vroom-setup.cmd (it asks for administrator rights).\r\nLinux: sudo sh linux/install-agent.sh\r\n' > "$tmp/mnt/README.txt"
   # macOS leaves ._ files next to copies; pnputil chokes on ._x.inf.
   find "$tmp/mnt" -name "._*" -delete
-  hdiutil detach -quiet "$tmp/mnt"
+  sync
+  hdiutil detach -quiet "$tdev" || { sleep 3; hdiutil detach -quiet -force "$tdev"; }
   mv "$tmp/t.cdr" "$out/vroom-tools.img"
 fi
 ver=$(strings "$lin" | sed -n 's/^VROOM_AGENT_VERSION=//p' | head -1)
