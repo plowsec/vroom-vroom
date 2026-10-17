@@ -447,7 +447,7 @@ export component SettingsPanel inherits Rectangle {
                     }
                     if root.s.gpu != 0: Row {
                         label: "Monitors";
-                        tip: "Screens the guest gets, a window each. Closing one turns it off in the guest; the display button brings it back.";
+                        tip: "Screens the guest gets, a window each. Closing one turns it off in the guest. The display button brings it back.";
                         key: "display.monitors";
                         Segmented {
                             y: (parent.height - self.height) / 2;
@@ -1175,6 +1175,7 @@ export component SettingsPanel inherits Rectangle {
 
                 if root.vis.searching && !(root.vis.hw || root.vis.display || root.vis.storage || root.vis.net || root.vis.share || root.vis.usb || root.vis.sound || root.vis.clip || root.vis.security || root.vis.boot): HorizontalLayout {
                     spacing: 8px;
+                    alignment: start;
                     Text {
                         text: "Nothing matches";
                         font-size: Theme.fs-sm;

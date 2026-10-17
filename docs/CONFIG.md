@@ -95,7 +95,7 @@ with the adapters it was saved with, set up as the file says then. See
 | `video_decode` | false | Hardware video decoding for Linux guests: a V4L2 decoder (H.264, HEVC, VP9 on M1 and later, AV1 on M3 and later) backed by the Mac's VideoToolbox in a sandboxed helper. Needs the guest's virtio-media driver; browsers also need our VA-API driver. See the [guide](GUIDE.md#video-decoding). |
 | `width`, `height` | 1280, 800 | Starting resolution. The guest follows the window size once its agent or driver runs. |
 | `hidpi` | true | Full resolution on Retina (HiDPI) screens: the guest gets every pixel of the window and its agent sets its UI scale to match (2x on Retina), so text is sharp. Guests without an agent that can scale get half the pixels and the window scales the picture up, as with `false`. See [GUIDE.md](GUIDE.md#retina-screens). |
-| `monitors` | 1 | Guest monitors, 1 to 4, each in a window of its own. Needs a `gpu`. Linux gets one GPU with that many outputs; Windows gets a GPU per monitor, the extra ones 2D. See [GUIDE.md](GUIDE.md#several-monitors). |
+| `monitors` | 1 | Guest monitors, 1 to 4, each in a window of its own. Needs a `gpu`. Linux gets one GPU with that many outputs; Windows gets a GPU per monitor, the extra ones 2D. The app sets it in Settings → Display. See [GUIDE.md](GUIDE.md#several-monitors). |
 
 ## `[[share]]` (host folders, up to 8)
 
