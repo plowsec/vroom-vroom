@@ -22,6 +22,7 @@ pub fn host_list() -> Vec<HostDevice> {
     if let Some(name) = match fake.as_deref() {
         Some("acm") => Some("Pretend serial port (test)"),
         Some("audio") => Some("Pretend sound card (test)"),
+        Some("disk" | "disk-broken") => Some("Pretend USB stick (test)"),
         _ => None,
     } {
         v.push(HostDevice {
@@ -36,6 +37,7 @@ pub fn host_list() -> Vec<HostDevice> {
             ports: vec![0],
             interface_classes: vec![2, 10],
             claimed_by: Vec::new(),
+            captured: false,
         });
     }
     v
@@ -48,10 +50,11 @@ pub fn dev_of(d: &HostDevice) -> UsbDev {
     UsbDev { id: d.id(), serial, name: d.label().chars().filter(|&c| text(c)).take(64).collect::<String>().trim().to_string() }
 }
 
-/// A macOS driver holds it: taking it needs root (vroom-netd). On Linux
-/// the helper detaches kernel drivers itself (with access to the device).
+/// A macOS driver holds it, or an earlier root helper captured it:
+/// taking it needs root (vroom-netd). On Linux the helper detaches kernel
+/// drivers itself (with access to the device).
 pub fn needs_root(d: &HostDevice) -> bool {
-    cfg!(target_os = "macos") && !d.claimed_by.is_empty()
+    d.needs_root()
 }
 
 /// Start `vroom usb-host` for `d`, as we do. Returns it and its socket.
@@ -146,6 +149,7 @@ mod tests {
             ports: vec![1, 3],
             interface_classes: vec![8],
             claimed_by: if claimed { vec!["IOUSBMassStorageInterfaceNub".into()] } else { vec![] },
+            captured: false,
         }
     }
 

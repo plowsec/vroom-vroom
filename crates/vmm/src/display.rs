@@ -19,6 +19,7 @@ use vroom_virtio::devices::gpu::{Cursor, DisplaySink};
 use vroom_virtio::devices::input::{self as ev, event};
 
 use crate::agent::{Agent, AgentCmd, ClipboardProvider};
+use crate::net::NetPorts;
 use crate::usb::UsbPorts;
 use crate::vcpu::VmEvent;
 
@@ -73,6 +74,8 @@ struct Sticky {
     agent: Option<String>,
     /// Host USB devices plugged in (once there is a USB controller).
     usb: Option<Vec<vroom_display::UsbPort>>,
+    /// The network adapters.
+    net: Option<(bool, Vec<vroom_display::NetPort>)>,
     /// What the guest agent can do.
     features: Option<u64>,
 }
@@ -174,6 +177,7 @@ impl ViewerTx {
         first.extend(st.features.map(|features| ToViewer::Agent { features }));
         first.extend(st.state.clone().map(ToViewer::Status));
         first.extend(st.usb.clone().map(ToViewer::Usb));
+        first.extend(st.net.clone().map(|(nat_ok, ports)| ToViewer::Net { nat_ok, ports }));
         drop(st);
         for m in first {
             v.write_all(&m.encode())?;
@@ -199,6 +203,7 @@ impl ViewerTx {
             }
             ToViewer::Status(t) if t.starts_with("guest agent connected") => st.agent = Some(t.clone()),
             ToViewer::Usb(l) => st.usb = Some(l.clone()),
+            ToViewer::Net { nat_ok, ports } => st.net = Some((*nat_ok, ports.clone())),
             ToViewer::Agent { features } => st.features = Some(*features),
             _ => {}
         }
@@ -554,8 +559,9 @@ impl DisplayServer {
         screens: Vec<Arc<FbSink>>,
         windows: bool,
         usb: Option<Arc<UsbPorts>>,
+        net: Option<Arc<NetPorts>>,
     ) -> std::io::Result<()> {
-        let ctx = Arc::new(Serve { input, agent, events, window, latest: self.clip_latest, tx: self.tx, screens, windows, ptr: Mutex::default(), usb });
+        let ctx = Arc::new(Serve { input, agent, events, window, latest: self.clip_latest, tx: self.tx, screens, windows, ptr: Mutex::default(), usb, net });
         let c = ctx.clone();
         let first = self.stream;
         std::thread::Builder::new().name("display".into()).spawn(move || serve(first, &c))?;
@@ -604,6 +610,8 @@ struct Serve {
     /// Host USB devices plugged in while the VM runs (if it has a USB
     /// controller).
     usb: Option<Arc<UsbPorts>>,
+    /// Network adapters changed while the VM runs.
+    net: Option<Arc<NetPorts>>,
 }
 
 /// Where the viewer's pointer is (which monitor), and its buttons.
@@ -698,6 +706,31 @@ fn serve(stream: UnixStream, c: &Serve) {
                 Ok(Some(ToVmm::UsbDetach { port })) => {
                     if let Some(u) = &c.usb {
                         u.detach(port);
+                    }
+                }
+                Ok(Some(ToVmm::NetConnect { nic, on })) => {
+                    let r = c.net.as_ref().map_or(Err("no network adapters".into()), |n| n.connect(nic, on));
+                    if let Err(e) = r {
+                        c.tx.send(&ToViewer::Status(format!("Network: {e}")));
+                    }
+                }
+                Ok(Some(ToVmm::NetSet { nic, live, port_mac })) => {
+                    // Bridged and host-only bring their vroom-netd socket.
+                    let sock = if live.kind == vroom_display::NetKind::Nat {
+                        None
+                    } else {
+                        match (!fds.is_empty()).then(|| fds.remove(0)) {
+                            Some(fd) => Some(fd),
+                            None => {
+                                log::warn!("display: a network change without its socket");
+                                continue;
+                            }
+                        }
+                    };
+                    let r = c.net.as_ref().map_or(Err("no network adapters".into()), |n| n.set(nic, live, port_mac, sock));
+                    if let Err(e) = r {
+                        log::warn!("net: adapter {}: {e}", nic + 1);
+                        c.tx.send(&ToViewer::Status(format!("Network: adapter {}: {e}", nic + 1)));
                     }
                 }
                 Ok(Some(ToVmm::DragOutGet { id, item })) => match (!fds.is_empty()).then(|| fds.remove(0)) {
@@ -829,7 +862,12 @@ fn handle(
         ToVmm::DragEnter { id, items } => agent.send(AgentCmd::DragEnter { id, items }),
         ToVmm::DragCancel { id } => agent.send(AgentCmd::DragCancel { id }),
         // serve() pairs these with their fds.
-        ToVmm::Drop { .. } | ToVmm::UsbAttach(_) | ToVmm::UsbDetach { .. } | ToVmm::DragOutGet { .. } => {}
+        ToVmm::Drop { .. }
+        | ToVmm::UsbAttach(_)
+        | ToVmm::UsbDetach { .. }
+        | ToVmm::DragOutGet { .. }
+        | ToVmm::NetConnect { .. }
+        | ToVmm::NetSet { .. } => {}
         ToVmm::Coherence(on) => agent.send(AgentCmd::Coherence(on)),
         ToVmm::Window { id, op } => agent.send(AgentCmd::Window { id, op }),
         ToVmm::DragOut { id, end: false } => agent.send(AgentCmd::DragOut { id }),

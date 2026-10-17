@@ -360,6 +360,7 @@ mod tests {
             ports: vec![1],
             interface_classes: vec![],
             claimed_by: vec!["AppleUSBCDC".into()],
+            captured: false,
         }
     }
 

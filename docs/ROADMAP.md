@@ -15,7 +15,7 @@ move to the docs (GUIDE, ARCHITECTURE) once they work.
 
 Where we are: Linux gets OpenGL 4.1 (virgl), Vulkan 1.3 in windows and
 off screen (Venus), and OpenGL 4.4 for the apps you start on Zink (below);
-Windows gets Direct3D 11. VMware Fusion gives Windows on Apple Silicon
+Windows gets Direct3D 11 and OpenGL 4.1 (virgl). VMware Fusion gives Windows on Apple Silicon
 Direct3D 11 and OpenGL 4.3, and Linux OpenGL 4.3.
 
 What we found (October 2026, macOS 15.6, MoltenVK 1.4.2, guest Mesa 25.2):
@@ -71,18 +71,31 @@ Linux guests, next:
   default; Zink is per app.
 - **No copy for Vulkan windows**: an IOSurface shared by Metal and
   OpenGL instead of copying each frame. The copy is fine at 1280x800.
-- **Snapshots and suspend while a Vulkan app runs.** Vulkan state lives
-  on the Mac's GPU. Like we do for OpenGL, we'd follow what each Vulkan
-  app creates and rebuild it on resume; Vulkan has far more kinds of
-  objects, so this is the biggest of these items.
+- **Snapshots with Vulkan, what's left** (they work, see GUIDE.md and
+  ARCHITECTURE.md): store the GPU's part of a snapshot as raw bytes, not
+  base64 in JSON (1 GiB of Vulkan memory makes a 1.45 GB blob and most of
+  a 9 s snapshot); save a Vulkan window's memory still shown after its
+  app is gone (today that refuses); query results; GNOME's Wayland
+  session not tried yet (Xorg was).
+- **A Vulkan fence that comes back early.** Seen while testing: about
+  once a minute, a guest's `vkWaitForFences` returns before a buffer copy
+  in the same submission is visible; 20 ms later it is. Venus and
+  MoltenVK, not snapshots; not looked into yet.
 
 Windows guests:
 
 - **Direct3D 12**, the one most games since 2020 need. It is also the key
   to the next two: Microsoft's "OpenCL, OpenGL and Vulkan Compatibility
   Pack" runs OpenGL and Vulkan apps on top of Direct3D 12.
-- **OpenGL and Vulkan apps** (VMware has OpenGL 4.3): through that pack
-  once Direct3D 12 works, or our own driver path.
+- **OpenGL 4.3 and up** (VMware has 4.3; we have 4.1 through virgl,
+  see [GUIDE.md](GUIDE.md#opengl-in-windows-guests)): Zink over Venus, as
+  for Linux, from the same Mesa build. It needs Vulkan in the guest first.
+- **Vulkan apps**: the 3D driver package carries a Venus Vulkan driver,
+  but Windows' Vulkan loader doesn't load it (error 87: its manifest
+  names the DLL without a path).
+- **OpenGL without the copy**: frames go back to the guest and through
+  GDI. A texture both vrend and DXMT see (an IOSurface) would let the
+  compositor take them directly.
 
 ## Hardware video decoding
 
@@ -161,11 +174,26 @@ A guest needs a driver and an API its players use. What exists:
 
 - Test on other Macs (M1 to M4, base models with 8 GB) and macOS versions,
   and days-long runs: sleep and wake with VMs running, full disks.
-- Things only a person at the Mac can try: USB passthrough with real
-  devices, bridged networking with real vmnet, vroom-netd as root taking
-  devices from macOS drivers (the app sets it up), a drag out of the
-  guest to Finder, Mail or the Desktop with a real mouse, Coherence next
-  to a window tiler, several monitors on several Mac screens.
+- USB disks through vroom-netd: give the installed vroom-netd Full Disk
+  Access and try a real stick in a guest (macOS 15 refuses USB storage
+  to a program without it, root included; tried here without it only:
+  macOS lets go of the stick and takes it back, the guest can't read
+  it). Other real devices (serial adapters, keyboards, webcams, sound
+  cards) not tried yet. The helper could tell the VMM why it gave up on
+  a device, so the app shows it (today: the log only). A Developer ID
+  signature would keep vroom-netd's permission across updates.
+- USB disks without passing the USB device: if Full Disk Access isn't
+  enough (macOS may want the `com.apple.vm.device-access` entitlement,
+  which only Apple grants), or for people who'd rather not give a root
+  helper that permission: unmount the disk on the Mac and hand the guest
+  the raw disk (`/dev/rdiskN`, opened by vroom-netd and passed to the VMM)
+  as an emulated USB stick or a hot-plugged disk. The guest sees a
+  plain disk, not the stick itself (no vendor tools), which is what most
+  people want from a USB disk anyway.
+- Things only a person at the Mac can try: bridged networking with real
+  vmnet, a drag out of the guest to Finder, Mail or the Desktop with a
+  real mouse, Coherence next to a window tiler, several monitors on
+  several Mac screens.
 - A signed, notarized vroom.app (`scripts/app.sh` builds it, signed ad
   hoc: needs a Developer ID and the hardened runtime), a disk image to
   install from, updates, crash reports.
@@ -175,6 +203,13 @@ A guest needs a driver and an API its players use. What exists:
   screen with its own scale would want per-monitor scales), Direct3D on
   Windows' first monitor only (the others are copied to 2D GPUs),
   Coherence on the first monitor only (the others are off meanwhile).
+- Network: adding an adapter while the VM runs needs PCI hotplug (a
+  hotplug-capable root port, ACPI); it waits for the next start now.
+  New port forwards on a running VM need listening sockets the sandbox
+  doesn't allow (the app could open them and hand them over). Host-only
+  on macOS gets no DHCP (see NETWORKING.md): netd could run a small DHCP
+  server per host-only network. The netd fixes (frame buffers, a busy
+  VMM drops frames, not the port) need netd set up again.
 - Rosetta for Linux guests (x86_64 Linux programs). Apple only offers it
   through its Virtualization framework; we'd have to look like it.
 - Benchmarks against VMware Fusion and Parallels on the same Mac, the

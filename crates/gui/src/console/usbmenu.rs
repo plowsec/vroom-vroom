@@ -386,6 +386,31 @@ impl Console {
         }
     }
 
+    /// The settings page put `d` in the VM file: connect it now too, as
+    /// the menu does. Nothing if it is in already.
+    pub(super) fn usb_plug(&mut self, d: UsbDev) {
+        if self.usb.ports.is_none() {
+            self.toast("This VM has no USB controller now: the device comes at its next start");
+            return;
+        }
+        if self.usb.ports.iter().flatten().any(|p| same(&p.dev, &d)) {
+            return;
+        }
+        match hostusb::host_list().into_iter().find(|h| same(&hostusb::dev_of(h), &d)) {
+            Some(h) => self.usb_connect(hostusb::dev_of(&h), Some(h)),
+            None => self.toast(&format!("{}: not plugged into the Mac now", if d.name.is_empty() { &d.id } else { &d.name })),
+        }
+    }
+
+    /// The settings page took `id` (`serial`) out of the VM file: let go
+    /// of it now.
+    pub(super) fn usb_unplug(&mut self, id: &str, serial: Option<&str>) {
+        let d = UsbDev { id: id.to_string(), serial: serial.unwrap_or_default().to_string(), name: String::new() };
+        let Some(p) = self.usb.ports.iter().flatten().find(|p| same(&p.dev, &d)).cloned() else { return };
+        self.usb.busy.insert(key_of(&p.dev), Instant::now());
+        self.io.borrow_mut().send(ToVmm::UsbDetach { port: p.port });
+    }
+
     fn usb_always(&mut self, i: usize) {
         let Some(t) = self.usb.targets.get(i).cloned() else { return };
         let on = !self.usb.always.iter().any(|(id, serial)| *id == t.dev.id && serial.as_deref().unwrap_or("") == t.dev.serial);

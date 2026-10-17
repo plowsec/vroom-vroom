@@ -86,6 +86,7 @@ impl VirtioInterrupt for PciInterrupt {
 
     fn signal_config_changed(&self) {
         let v = self.st.lock().unwrap_or_else(|e| e.into_inner()).config_vec;
+        log::debug!("virtio-pci: config change, vector {v:#x}");
         self.fire(v, 2);
     }
 }

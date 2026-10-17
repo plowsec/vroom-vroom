@@ -564,6 +564,7 @@ dependencies = [
  "libc",
  "thiserror",
  "vroom-ipc",
+ "vroom-proto",
 ]
 
 [[package]]

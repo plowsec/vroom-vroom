@@ -61,6 +61,18 @@ pub(crate) fn disk_plan(dir: &Path) -> Result<BTreeMap<usize, PathBuf>> {
     Ok(layers)
 }
 
+/// Saved network adapters have a control queue (saves from before it
+/// don't say so, and have none).
+const NET_CTRL: &str = "net.ctrl_vq";
+
+/// The VM file as it was when `dir` was saved, and whether its network
+/// adapters had a control queue.
+pub(crate) fn saved_config(dir: &Path) -> Result<(vroom_config::VmConfig, bool)> {
+    let snap = SnapshotDir::open(dir)?;
+    let c = serde_json::from_value(snap.manifest.config.clone()).map_err(|e| Error::Setup(format!("snapshot config: {e}")))?;
+    Ok((c, snap.manifest.meta.contains_key(NET_CTRL)))
+}
+
 pub(crate) fn save(vmm: &mut Vmm, dir: &Path, description: &str, kind: Kind) -> Result<()> {
     let mut snap = SnapshotDir::create(dir)?;
     match kind {
@@ -84,6 +96,9 @@ pub(crate) fn save(vmm: &mut Vmm, dir: &Path, description: &str, kind: Kind) -> 
     m.backend = vmm.hv.name().into();
     m.config = serde_json::to_value(&vmm.config).map_err(|e| Error::Setup(e.to_string()))?;
     m.meta.insert("vcpus".into(), vmm.vcpus.len().to_string());
+    if vmm.net_ctrl {
+        m.meta.insert(NET_CTRL.into(), "1".into());
+    }
 
     for (i, v) in vmm.vcpus.iter().enumerate() {
         let (tx, rx) = mpsc::channel();
@@ -196,6 +211,16 @@ pub(crate) fn restore(vmm: &mut Vmm, dir: &Path) -> Result<()> {
     // Before vCPU restore: each vCPU picks the VM clock up as it restores.
     vmm.vm.set_clock(clock);
 
+    // Devices before vCPUs: a vCPU runs as soon as it is restored, and the
+    // guest must not see a device half back (the GPU's shared memory window
+    // stays empty until its buffers are made again: a Vulkan driver reading
+    // its ring there gave up).
+    for d in &vmm.devices {
+        let mut d = d.lock().unwrap_or_else(|e| e.into_inner());
+        let id = d.snapshot_id();
+        d.restore(&snap.get_blob(&dev_blob(&id))?)?;
+    }
+
     let mut cpus = vmm.shared.cpus.lock().unwrap_or_else(|e| e.into_inner()).clone();
     for (i, v) in vmm.vcpus.iter().enumerate() {
         let st: VcpuState = serde_json::from_slice(&snap.get_blob(&vcpu_blob(i))?)
@@ -211,11 +236,6 @@ pub(crate) fn restore(vmm: &mut Vmm, dir: &Path) -> Result<()> {
     }
     *vmm.shared.cpus.lock().unwrap_or_else(|e| e.into_inner()) = cpus;
 
-    for d in &vmm.devices {
-        let mut d = d.lock().unwrap_or_else(|e| e.into_inner());
-        let id = d.snapshot_id();
-        d.restore(&snap.get_blob(&dev_blob(&id))?)?;
-    }
     log::info!("restored snapshot from {}", dir.display());
     Ok(())
 }

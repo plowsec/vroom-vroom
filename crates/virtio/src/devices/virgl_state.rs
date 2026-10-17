@@ -65,6 +65,7 @@ const END_TRANSFERS: u8 = 44;
 const COPY_TRANSFER3D: u8 = 45;
 const SET_TWEAKS: u8 = 46;
 const CLEAR_TEXTURE: u8 = 47;
+const PIPE_RESOURCE_SET_TYPE: u8 = 49;
 const GET_MEMORY_INFO: u8 = 50;
 const SEND_STRING_MARKER: u8 = 51;
 const LINK_SHADER: u8 = 52;
@@ -155,11 +156,16 @@ pub struct GlState {
     words: usize,
     /// Why a snapshot can't rebuild this context (None: it can).
     broken: Option<String>,
+    /// What the context said each blob it shows holds (format, size:
+    /// PIPE_RESOURCE_SET_TYPE), by resource: Vulkan windows a compositor
+    /// imports. Made again before any object that uses them.
+    #[serde(default)]
+    set_types: BTreeMap<u32, Vec<u32>>,
 }
 
 impl Default for GlState {
     fn default() -> Self {
-        GlState { subs: vec![Sub::default()], current: 0, next_order: 0, objects: 0, words: 0, broken: None }
+        GlState { subs: vec![Sub::default()], current: 0, next_order: 0, objects: 0, words: 0, broken: None, set_types: BTreeMap::new() }
     }
 }
 
@@ -175,6 +181,7 @@ impl GlState {
             self.broken = Some(why);
             // Nothing kept is of use now.
             self.subs = vec![Sub::default()];
+            self.set_types.clear();
             self.objects = 0;
             self.words = 0;
         }
@@ -260,6 +267,14 @@ impl GlState {
             SET_SUB_CTX => {
                 self.current = at(1);
                 return;
+            }
+            PIPE_RESOURCE_SET_TYPE => {
+                if self.set_types.len() >= MAX_OBJECTS {
+                    return self.give_up("too many blob types".into());
+                }
+                let old = self.set_types.insert(at(1), c.to_vec()).map_or(0, |o| o.len());
+                self.words = self.words - old + c.len();
+                return self.check_limits();
             }
             BIND_OBJECT => Key::Whole(cmd, obj as u32),
             BIND_SHADER => Key::Whole(cmd, at(2)),
@@ -349,6 +364,11 @@ impl GlState {
     /// to ones that don't (or to objects that are gone) become 0.
     pub fn replay(&self, resource: &dyn Fn(u32) -> bool) -> Vec<u32> {
         let mut out = vec![];
+        for (&r, c) in &self.set_types {
+            if resource(r) {
+                out.extend_from_slice(c);
+            }
+        }
         for s in &self.subs {
             if s.id != 0 {
                 out.extend([header(CREATE_SUB_CTX, 0, 1), s.id]);
@@ -446,6 +466,22 @@ mod tests {
             i += n;
         }
         out
+    }
+
+    #[test]
+    fn blob_types_come_first() {
+        let mut s = GlState::default();
+        let mut buf = vec![];
+        buf.extend(cmd(CREATE_OBJECT, OBJ_SAMPLER_VIEW, &[20, 5, 0, 0, 0, 0]));
+        buf.extend(cmd(PIPE_RESOURCE_SET_TYPE, 0, &[5, 1, 2, 640, 480, 0, 0, 0]));
+        buf.extend(cmd(PIPE_RESOURCE_SET_TYPE, 0, &[6, 1, 2, 64, 64, 0, 0, 0]));
+        buf.extend(cmd(PIPE_RESOURCE_SET_TYPE, 0, &[5, 1, 2, 800, 600, 0, 0, 0]));
+        s.follow(&buf);
+        assert!(s.broken().is_none());
+        // The latest type of each blob still there, before the view on it.
+        let out = cmds(&s.replay(&|r| r == 5));
+        assert_eq!(out[0], cmd(PIPE_RESOURCE_SET_TYPE, 0, &[5, 1, 2, 800, 600, 0, 0, 0]));
+        assert_eq!(out[2], cmd(CREATE_OBJECT, OBJ_SAMPLER_VIEW, &[20, 5, 0, 0, 0, 0]));
     }
 
     #[test]

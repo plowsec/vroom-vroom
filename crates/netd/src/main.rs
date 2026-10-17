@@ -191,6 +191,12 @@ fn open_port(st: &State, req: &Request) -> Result<Arc<dyn Port>, String> {
     }
 }
 
+/// A send that failed for room, not because the VMM is gone (macOS:
+/// ENOBUFS once the other end's buffer is full, whatever its blocking).
+fn buffer_full(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::WouldBlock || e.raw_os_error() == Some(libc::ENOBUFS)
+}
+
 /// Shuttle frames until the VMM goes away.
 fn pump(guest: UnixDatagram, port: Arc<dyn Port>) {
     let mac = port.mac();
@@ -208,8 +214,15 @@ fn pump(guest: UnixDatagram, port: Arc<dyn Port>) {
                 Ok(n) if n >= 14 => {
                     // Only frames for this guest (or broadcast/multicast).
                     let dst = &buf[0..6];
-                    if (dst == mac || dst[0] & 1 == 1) && g2.send(&buf[..n]).is_err() {
-                        break;
+                    if dst != mac && dst[0] & 1 == 0 {
+                        continue;
+                    }
+                    match g2.send(&buf[..n]) {
+                        Ok(_) => {}
+                        // The VMM is behind (or its NIC isn't up yet):
+                        // drop the frame, as a full NIC queue would.
+                        Err(e) if buffer_full(&e) => {}
+                        Err(_) => break,
                     }
                 }
                 Ok(_) => {}
@@ -334,6 +347,9 @@ fn net(st: &State, mut s: UnixStream, uid: u32, req: Request) {
             return refuse(&mut s, &e.to_string());
         }
     };
+    // Room for bursts both ways (macOS: 4 KiB, two frames, by default).
+    vroom_net::socket::grow_buffers(&vmm_end);
+    vroom_net::socket::grow_buffers(&our_end);
     log::info!("uid {uid}: {} nic{} {:?} mac {:02x?}", req.vm, req.nic, req.attach, port.mac());
     reply(&mut s, &Response { ok: true, error: String::new(), mac: port.mac(), mtu: port.mtu() });
     if vroom_ipc::send_fd(&s, vmm_end.as_raw_fd()).is_err() {
@@ -478,6 +494,7 @@ name = "lab"
                 ports: vec![2],
                 interface_classes: vec![2, 10],
                 claimed_by: vec!["AppleUSBCDCACMData".into()],
+                captured: false,
             }]
         };
         // SAFETY: getuid has no preconditions.
