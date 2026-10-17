@@ -347,6 +347,25 @@ impl GpuControl {
     pub fn direct3d(&self) -> bool {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).direct3d
     }
+
+    /// Unplug the monitor and plug it back in at the same size (Windows'
+    /// 3D driver; others get a display event): the guest sets a mode, and
+    /// a scanout, again.
+    pub fn replug(&self) {
+        let mut s = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if s.replug && s.plug == Plug::In {
+            let size = (s.width, s.height);
+            s.tries = 0;
+            s.unplug(size);
+        } else {
+            s.display_event();
+        }
+    }
+
+    /// The guest shows something on scanout 0.
+    pub fn showing(&self) -> bool {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).shown != (0, 0)
+    }
 }
 
 /// The 3D side: renderer, capsets, and the host-visible window.

@@ -82,6 +82,21 @@ pub struct AgentStatus {
 }
 
 const POLL: Duration = Duration::from_millis(250);
+/// How long Windows gets to show something once its 3D display is back
+/// on, and how often we turn it off and on again when it doesn't.
+const REVIVE_WAIT: Duration = if cfg!(test) { Duration::from_millis(400) } else { Duration::from_secs(15) };
+const REVIVE_TRIES: u8 = 3;
+/// How long turning it off may take (it often takes a few seconds).
+const REVIVE_OFF_WAIT: Duration = Duration::from_secs(30);
+
+/// Watching the 3D display come back (see `Service::revive`).
+#[derive(Debug, Clone, Copy)]
+struct Revive {
+    since: Instant,
+    tries: u8,
+    /// We turned it off to turn it on again.
+    cycling: bool,
+}
 /// A viewer that doesn't take a dragged file's data for this long has
 /// given up on it.
 const PIPE_TIMEOUT: Duration = Duration::from_secs(20);
@@ -139,6 +154,9 @@ struct Service {
     win_ids: Vec<u32>,
     /// Files dragged out of the guest, if any.
     dragout: Option<OutDrag>,
+    /// Windows said its 3D display is on again (after a suspend): it
+    /// should show something soon.
+    revive: Option<Revive>,
     streams: u32,
 }
 
@@ -213,6 +231,7 @@ pub fn spawn(stream: UnixStream, policy: ClipPolicy, clip: Option<Box<dyn Clipbo
         win_ids: Vec::new(),
         dragout: None,
         streams: 0,
+        revive: None,
     };
     std::thread::Builder::new().name("agent".into()).spawn(move || svc.run())?;
     Ok(Agent { tx, status })
@@ -264,10 +283,46 @@ impl Service {
             for (g, _) in self.screen.heads.iter().filter(|h| h.1 == 0) {
                 g.tick();
             }
+            self.revive_tick();
             self.send_mode();
             if self.focus {
                 self.auto_push();
             }
+        }
+    }
+
+    /// Windows sometimes turns its 3D display back on after a resume and
+    /// never shows anything on it (the guest runs, its driver says OK):
+    /// turn it off and on again, as one would in Device Manager.
+    fn revive_tick(&mut self) {
+        let Some(r) = self.revive else { return };
+        if r.cycling {
+            if r.since.elapsed() > REVIVE_OFF_WAIT {
+                log::warn!("gpu: Windows didn't turn its 3D display off and on again");
+                self.revive = None;
+            }
+            return;
+        }
+        if self.screen.heads.first().is_none_or(|h| h.0.showing()) {
+            self.revive = None;
+        } else if r.since.elapsed() > REVIVE_WAIT {
+            if r.tries >= REVIVE_TRIES {
+                log::warn!("gpu: Windows shows nothing on its 3D display; turn the display device off and on in Device Manager");
+                self.revive = None;
+                return;
+            }
+            if r.tries == 0 {
+                // First a new monitor, which makes Windows set a mode.
+                log::info!("gpu: Windows shows nothing on its 3D display: plugging its monitor in again");
+                self.revive = Some(Revive { since: Instant::now(), tries: 1, cycling: false });
+                if let Some(h) = self.screen.heads.first() {
+                    h.0.replug();
+                }
+                return;
+            }
+            log::info!("gpu: Windows shows nothing on its 3D display: turning it off and on again");
+            self.revive = Some(Revive { since: Instant::now(), tries: r.tries + 1, cycling: true });
+            self.send(&Message::Gpu3d { on: false });
         }
     }
 
@@ -316,6 +371,13 @@ impl Service {
             Message::Gpu3d { on } => {
                 log::info!("guest: 3D display device {}", if on { "on" } else { "off" });
                 self.status.lock().unwrap_or_else(|e| e.into_inner()).gpu3d = Some(on);
+                match (on, self.revive) {
+                    (true, r) if self.screen.gpu3d => {
+                        self.revive = Some(Revive { since: Instant::now(), tries: r.map_or(0, |r| r.tries), cycling: false });
+                    }
+                    (false, Some(r)) if r.cycling => self.send(&Message::Gpu3d { on: true }),
+                    _ => {}
+                }
             }
             Message::DragReady { id, live } => self.to_viewer(ToViewer::DragReady { id, live }),
             Message::DropDone { id, ok, place } => {
@@ -468,6 +530,7 @@ impl Service {
             AgentCmd::Shutdown { reboot } => self.send(&Message::Shutdown { reboot }),
             AgentCmd::Gpu3d(on) => {
                 self.status.lock().unwrap_or_else(|e| e.into_inner()).gpu3d = None;
+                self.revive = None;
                 self.send(&Message::Gpu3d { on });
             }
             AgentCmd::DragEnter { id, items } => {
@@ -795,6 +858,26 @@ mod tests {
         a.send(AgentCmd::Display { head: 5, width: 640, height: 480, scale: 0 }); // no such monitor
         read_msgs(&mut guest, &mut d);
         assert_eq!(ctl.head_size(1), Some((640, 480)));
+        a.send(AgentCmd::Stop);
+    }
+
+    #[test]
+    fn a_3d_display_that_shows_nothing_is_replugged_then_turned_off_and_on() {
+        let (gpu, ctl) = vroom_virtio::devices::gpu::Gpu::with_heads(&[(1024, 768)], vec![Arc::new(NoSink)]);
+        drop(gpu);
+        let screen = Screen { heads: vec![(ctl, 0)], gpu3d: true, ..Default::default() };
+        let (host, mut guest) = UnixStream::pair().unwrap();
+        let a = spawn(host, ClipPolicy::default(), None, screen).unwrap();
+        let mut d = Decoder::new(1 << 20);
+        guest.write_all(&Message::Hello { features: features::GPU3D, agent: "t".into() }.encode()).unwrap();
+        assert!(read_msgs(&mut guest, &mut d).contains(&Message::Gpu3d { on: true }));
+        // On, and nothing shows on it: off, then on again once it's off.
+        guest.write_all(&Message::Gpu3d { on: true }.encode()).unwrap();
+        // First its monitor is plugged in again, then the device cycled.
+        std::thread::sleep(REVIVE_WAIT * 2 + POLL * 3);
+        assert!(read_msgs(&mut guest, &mut d).contains(&Message::Gpu3d { on: false }));
+        guest.write_all(&Message::Gpu3d { on: false }.encode()).unwrap();
+        assert!(read_msgs(&mut guest, &mut d).contains(&Message::Gpu3d { on: true }));
         a.send(AgentCmd::Stop);
     }
 
