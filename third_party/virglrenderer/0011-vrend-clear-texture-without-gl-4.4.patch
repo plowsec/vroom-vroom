@@ -1,0 +1,121 @@
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -4986,6 +4986,95 @@
+       glClear(bits);
+ 
+    vrend_clear_finish(sub_ctx, buffers);
++}
++
++static int vrend_renderer_transfer_write_iov(struct vrend_context *ctx,
++                                             struct vrend_resource *res,
++                                             const struct iovec *iov, int num_iovs,
++                                             const struct vrend_transfer_info *info);
++static inline bool resource_contains_box(struct vrend_resource *res,
++                                         const struct pipe_box *box,
++                                         uint32_t level);
++
++/* glClearTexSubImage is GL 4.4: macOS's GL stops at 4.1, and ANGLE's GLES
++ * doesn't have it either. Without the capability, the guest's Mesa (25.2)
++ * clears through clear_render_target with a surface it never created here
++ * (util_clear_texture_as_surface passes a template on its stack), so we see
++ * surface 0 and the whole context goes into error: Xwayland's glamor does
++ * this at its start, and X11 apps in a Wayland session then show nothing.
++ * So the capability is always offered, and without the GL call the texel
++ * is uploaded over the box, a band of rows at a time, through the normal
++ * upload path (which knows the format, flips y_0_top resources and scales
++ * Z24). Multisampled textures can't be uploaded to and stay as they are. */
++static int vrend_clear_texture_by_upload(struct vrend_context *ctx,
++                                         struct vrend_resource *res,
++                                         uint32_t level,
++                                         const struct pipe_box *box,
++                                         const void *data)
++{
++   enum virgl_formats fmt = res->base.format;
++   const uint32_t elsize = util_format_get_blocksize(fmt);
++   const uint64_t band_bytes = 4u << 20;
++
++   if (!resource_contains_box(res, box, level)) {
++      vrend_report_context_error(ctx, VIRGL_ERROR_CTX_TRANSFER_IOV_BOUNDS, res->gl_id);
++      return EINVAL;
++   }
++   if (box->width == 0 || box->height == 0 || box->depth == 0)
++      return 0;
++   if (!has_bit(res->storage_bits, VREND_STORAGE_GL_TEXTURE) ||
++       res->target == GL_TEXTURE_2D_MULTISAMPLE ||
++       res->target == GL_TEXTURE_2D_MULTISAMPLE_ARRAY ||
++       res->target == GL_TEXTURE_BUFFER ||
++       util_format_is_compressed(fmt) || elsize == 0 || elsize > 16) {
++      VREND_DEBUG(dbg_tex, ctx, "clear_texture: can't upload to texture %d, left as is\n",
++                  res->gl_id);
++      return 0;
++   }
++
++   uint64_t row = (uint64_t)box->width * elsize;
++   uint64_t rows = MAX2(band_bytes / row, 1);
++   rows = MIN2(rows, (uint64_t)box->height);
++   uint64_t size = row * rows;
++   uint8_t *buf = malloc(size);
++   if (!buf)
++      return ENOMEM;
++   for (uint64_t off = 0; off < size; off += elsize)
++      memcpy(buf + off, data, elsize);
++
++   uint64_t saved_offset = 0;
++   if (level < VR_MAX_TEXTURE_2D_LEVELS)
++      saved_offset = res->mipmap_offsets[level];
++
++   int ret = 0;
++   for (int z = box->z; z < box->z + box->depth && !ret; z++) {
++      for (int y = box->y; y < box->y + box->height && !ret; y += rows) {
++         struct pipe_box band = *box;
++         band.y = y;
++         band.height = MIN2((int)rows, box->y + box->height - y);
++         band.z = z;
++         band.depth = 1;
++         struct iovec iov = { .iov_base = buf, .iov_len = row * band.height };
++         struct vrend_transfer_info info = {
++            .level = level,
++            .stride = row,
++            .layer_stride = row * band.height,
++            .iovec_cnt = 1,
++            .iovec = &iov,
++            .offset = 0,
++            .box = &band,
++            .synchronized = true,
++         };
++         ret = vrend_renderer_transfer_write_iov(ctx, res, &iov, 1, &info);
++      }
++   }
++
++   /* An upload notes where each level sits in the guest's backing, for
++    * later readbacks; ours came from a scratch buffer. */
++   if (level < VR_MAX_TEXTURE_2D_LEVELS)
++      res->mipmap_offsets[level] = saved_offset;
++   free(buf);
++   return ret;
+ }
+ 
+ int vrend_clear_texture(struct vrend_context* ctx,
+@@ -4999,9 +5088,8 @@
+    format = tex_conv_table[fmt].glformat;
+    type = tex_conv_table[fmt].gltype;
+ 
+-   if (!has_feature(feat_clear_texture)) {
+-      return EINVAL;
+-   }
++   if (!has_feature(feat_clear_texture))
++      return vrend_clear_texture_by_upload(ctx, res, level, box, data);
+ 
+    /* 32-bit BGRA resources are always reordered to RGBA ordering before
+     * submission to the host driver. Reorder red/blue color bytes in
+@@ -13446,8 +13534,8 @@
+    /* Needed for framebuffer_no_attachment */
+    set_format_bit(&caps->v2.supported_multisample_formats, VIRGL_FORMAT_NONE);
+ 
+-   if (has_feature(feat_clear_texture))
+-      caps->v2.capability_bits |= VIRGL_CAP_CLEAR_TEXTURE;
++   /* Without the GL call, see vrend_clear_texture_by_upload. */
++   caps->v2.capability_bits |= VIRGL_CAP_CLEAR_TEXTURE;
+ 
+    if (has_feature(feat_clip_control))
+       caps->v2.capability_bits |= VIRGL_CAP_CLIP_HALFZ;

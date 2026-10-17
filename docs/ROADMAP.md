@@ -62,9 +62,13 @@ Linux guests, next:
 - **KosmicKrisp on macOS 26**: load it instead of MoltenVK when the Mac
   has Metal 4. Zink then gets most of what we emulate for real, and its
   speed should be checked against MoltenVK.
-- **Zink speed and gaps**: about half virgl's speed on glmark2's terrain,
-  and glmark2's refract scene fails (a depth render target Zink can't
-  make on MoltenVK). virgl stays the default; Zink is per app.
+- **Zink speed**: glmark2 scores about 1000 on Zink and 1170 on virgl,
+  but its terrain scene runs at half virgl's speed (about 210 fps against
+  420). It is GPU bound there: the guest and host CPUs are mostly idle,
+  so the cost is in the shaders MoltenVK makes from Zink's, or in what
+  MoltenVK does per draw. Each Zink frame also waits in the guest for
+  the GPU before it is shown, so frames don't overlap. virgl stays the
+  default; Zink is per app.
 - **No copy for Vulkan windows**: an IOSurface shared by Metal and
   OpenGL instead of copying each frame. The copy is fine at 1280x800.
 - **Snapshots with Vulkan, what's left** (they work, see GUIDE.md and
@@ -77,10 +81,6 @@ Linux guests, next:
   once a minute, a guest's `vkWaitForFences` returns before a buffer copy
   in the same submission is visible; 20 ms later it is. Venus and
   MoltenVK, not snapshots; not looked into yet.
-- **Xwayland under GNOME on virgl**: its GL context breaks at login
-  (`vrend_clear_surface: ... Illegal surface 0`), so X11 apps in a
-  GNOME Wayland session show nothing. Not new; seen with the old library
-  too.
 
 Windows guests:
 

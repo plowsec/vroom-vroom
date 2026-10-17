@@ -623,9 +623,9 @@ fn init(lib: &Lib, gl: bool, proxy: bool) -> c_int {
     // With GL, no fence thread: ANGLE serializes the contexts of a share
     // group, so a thread blocked on a GL fence would stall every submit.
     // GL fences are polled by the GPU worker instead (`poll`).
-    // The render server's contexts only get a fence thread with
-    // THREAD_SYNC, and with ASYNC_FENCE_CB the poll skips them: with GL
-    // and the server, no async callbacks, so the poll retires those too.
+    // The render server's contexts always have a fence thread of their own
+    // (our patch 0013), which calls back from that thread; the poll may
+    // retire their fences too.
     // (Venus in place has fence threads of its own either way.)
     let async_cb = if gl && proxy { 0 } else { ASYNC_FENCE_CB };
     let flags = VENUS | async_cb | if gl { 0 } else { NO_VIRGL | THREAD_SYNC } | if proxy { RENDER_SERVER | NEPTUNE } else { 0 };

@@ -468,7 +468,8 @@ picks the right one by itself:
 
 - **OpenGL** (virgl): Mesa's virgl driver sends GL work to the host,
   where virglrenderer replays it on the Mac's GPU. Stock Ubuntu works as
-  it is (any kernel, Mesa from the archive), in Wayland and X11 sessions.
+  it is (any kernel, Mesa from the archive), in Wayland and X11 sessions,
+  and X11 apps in a Wayland session (Xwayland) are accelerated too.
 - **Vulkan** (Venus): needs `mesa-vulkan-drivers` (Mesa ≥ 24) and the
   user in the `render` group; stock Ubuntu kernels work. `vulkaninfo
   --summary` should show `Virtio-GPU Venus (Apple M…)`. If every Vulkan
@@ -539,9 +540,11 @@ need it). The host fills in what MoltenVK lacks, and some of it only
 roughly, for Zink only: transform feedback is accepted but writes nothing
 (apps that read it back get zeros), and packed 10-bit vertex formats and
 RGB32 texel buffers, which Metal doesn't have, read wrong. Few apps use
-them. Zink is slower than virgl for ordinary drawing (glmark2's terrain:
-211 fps against 413), so keep virgl for the desktop and use Zink for apps
-that need more than 4.1. A compute shader test (1M invocations, 4096
+them. Zink is a little slower than virgl for ordinary drawing: in a GNOME
+Wayland session, glmark2 scores about 1000 on Zink and 1170 on virgl, and
+its terrain scene, the heaviest for the GPU, runs at about 210 fps against
+420. Keep virgl for the desktop and use Zink for apps that need more than
+4.1. A compute shader test (1M invocations, 4096
 `sin` each) takes 9.4 ms on Zink, 3.1 s on llvmpipe.
 
 Snapshots and suspend work with OpenGL. GL state lives on the host GPU,
