@@ -69,15 +69,30 @@ VM file, so the change stays.
   NAT with the same forwards (the app puts them back in the file).
   Meanwhile a connection to a forwarded port waits. New or changed
   forwards apply at the next start.
-- Adding an adapter needs PCI hotplug, which vroom doesn't have yet: a
-  new adapter comes at the next start. A removed one is unplugged at
-  once and gone at the next start. A new MAC also waits for the next
-  start (the guest read the old one when its driver started).
-- A suspended VM resumes with the adapters it was saved with (the guest
-  knows them), set up as the file says then: a new mode or cable state
-  applies on resume (the link bounces if the network changed), an added
-  adapter waits for the next start, a removed one stays unplugged until
-  then. The guest keeps the MAC it had.
+- **A new adapter** comes at once on a VM on PCI (UEFI boot, or
+  `virtio_transport = "pci"`): a new virtio-net device goes into one of
+  the VM's four PCI Express hot plug slots, and the guest's own hot plug
+  driver brings it up (Linux and Windows: a few seconds, then DHCP). One
+  at a time; NAT needs a VM that started with NAT (above); its port
+  forwards wait for the next start. On a VM on virtio-mmio (Linux with
+  direct kernel boot and the default transport) it comes at the next
+  start.
+- **Removing an adapter added that way** takes it out: vroom presses the
+  slot's attention button, the guest lets go of the device and turns the
+  slot off (Linux waits 5 seconds first), and the device goes. A guest
+  that hasn't let go after 15 seconds loses it anyway. An adapter the VM
+  started with stays: it is unplugged at once and gone at the next
+  start.
+- A new MAC waits for the next start (the guest read the old one when
+  its driver started).
+- At the next start, every adapter in the file is an ordinary one on the
+  root bus again, the added ones included.
+- A suspended VM resumes with the adapters it was saved with, the added
+  ones in their slots (the guest knows them), set up as the file says
+  then: a new mode or cable state applies on resume (the link bounces if
+  the network changed), an adapter added while it was suspended waits
+  for the next start, a removed one stays unplugged until then. The
+  guest keeps the MAC it had.
 
 The VMM can't reach vroom-netd once it is sandboxed (no Unix sockets).
 For bridged and host-only the app asks netd for the port and hands the

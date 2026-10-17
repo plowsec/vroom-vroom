@@ -1125,14 +1125,17 @@ new network after a two-second link bounce. "Network settings..." opens
 the VM's page. Both write the VM file (`connected`, `mode`), so the
 change stays.
 
-The settings page does the same and more. What can't change while the
-VM runs waits for its next start, and the adapter's card says so (hover
-the line for details): port
-forwards, a new MAC, a new adapter (vroom has no PCI hotplug yet), NAT on
-a VM that started without NAT (its sandbox has no network then). A
-removed adapter is unplugged at once and gone at the next start. A
-suspended VM resumes with the adapters it was saved with, set up as the
-file says. Details: [NETWORKING.md](NETWORKING.md#changing-adapters-while-the-vm-runs).
+The settings page does the same and more. A new adapter comes at once
+on a UEFI VM (it goes into a PCI hot plug slot; the guest has it in a
+few seconds and asks DHCP), and one added that way goes at once when you
+remove it. What can't change while the VM runs waits for its next start,
+and the adapter's card says so (hover the line for details): port
+forwards, a new MAC, a new adapter on a VM booted straight into a Linux
+kernel, NAT on a VM that started without NAT (its sandbox has no network
+then). An adapter the VM started with, removed, is unplugged at once and
+gone at the next start. A suspended VM resumes with the adapters it was
+saved with, the added ones too, set up as the file says. Details:
+[NETWORKING.md](NETWORKING.md#changing-adapters-while-the-vm-runs).
 
 ## USB devices
 
