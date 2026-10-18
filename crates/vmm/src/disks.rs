@@ -12,6 +12,8 @@ use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
 use vroom_block::qcow2::{OpenPolicy, Qcow2Image};
+#[cfg(feature = "research")]
+use vroom_block::rollback::RollbackDisk;
 use vroom_block::{DiskImage, Format, SwapDisk, SyncMode};
 use vroom_config::{DiskFormat, DiskSync, VmConfig};
 use serde::{Deserialize, Serialize};
@@ -41,6 +43,9 @@ pub(crate) struct DiskSet {
     /// Directories of writable images outside the state dir (opened now,
     /// before the sandbox): their file systems fill up too.
     watch: Vec<std::fs::File>,
+    /// In-memory top layers while research resets are armed.
+    #[cfg(feature = "research")]
+    rollback: Vec<Arc<RollbackDisk>>,
 }
 
 fn sync_of(s: DiskSync) -> SyncMode {
@@ -134,13 +139,63 @@ impl DiskSet {
             .filter(|a| !a.starts_with(&dir))
             .filter_map(|a| a.parent().and_then(|p| std::fs::File::open(p).ok()))
             .collect();
-        Ok(DiskSet { dir, disks, watch })
+        Ok(DiskSet {
+            dir,
+            disks,
+            watch,
+            #[cfg(feature = "research")]
+            rollback: Vec::new(),
+        })
+    }
+
+    /// Keep the guest's writes from now on in memory, over every writable
+    /// disk, until [`DiskSet::rollback`] drops them. Research resets put
+    /// RAM back in place; without this the disk keeps what each testcase
+    /// wrote, and the next one's page cache no longer matches it.
+    /// The VM must be paused.
+    #[cfg(feature = "research")]
+    pub fn arm_rollback(&mut self) -> Result<()> {
+        if !self.rollback.is_empty() {
+            return Err(Error::Setup("disk rollback is already armed".into()));
+        }
+        for d in &self.disks {
+            if d.active.is_none() {
+                continue;
+            }
+            d.image.flush().map_err(|e| Error::Setup(e.to_string()))?;
+            let layer = Arc::new(RollbackDisk::new(d.image.current()));
+            d.image.swap(layer.clone()).map_err(|e| Error::Setup(e.to_string()))?;
+            self.rollback.push(layer);
+        }
+        Ok(())
+    }
+
+    /// Forget what the guest wrote since [`DiskSet::arm_rollback`]. The VM
+    /// must be paused (no request running). Returns the bytes dropped.
+    #[cfg(feature = "research")]
+    pub fn rollback(&self) -> u64 {
+        self.rollback.iter().map(|l| {
+            let n = l.held_bytes();
+            l.rollback();
+            n
+        }).sum()
+    }
+
+    /// Snapshots and suspends record files, which don't hold what the
+    /// rollback layers do.
+    fn check_not_rolling_back(&self) -> Result<()> {
+        #[cfg(feature = "research")]
+        if !self.rollback.is_empty() {
+            return Err(Error::Setup("disks keep writes in memory for research resets; can't save them".into()));
+        }
+        Ok(())
     }
 
     /// Freeze every writable disk at its current state and continue on a
     /// new overlay. Returns index -> frozen layer for the snapshot manifest.
     /// The VM must be paused.
     pub fn freeze(&mut self) -> Result<BTreeMap<usize, PathBuf>> {
+        self.check_not_rolling_back()?;
         let mut out = BTreeMap::new();
         for d in &mut self.disks {
             let Some(frozen) = d.active.clone() else { continue };
@@ -162,6 +217,7 @@ impl DiskSet {
 
     /// Current top layers with change stamps (suspend images).
     pub fn active_stamps(&self) -> Result<BTreeMap<usize, (PathBuf, String)>> {
+        self.check_not_rolling_back()?;
         let mut m = BTreeMap::new();
         for d in &self.disks {
             if let Some(a) = &d.active {
@@ -234,5 +290,49 @@ mod tests {
         let orig = Qcow2Image::open(&disk, true).unwrap();
         orig.read_at(&mut b, 0).unwrap();
         assert_eq!(&b, b"v1");
+    }
+
+    #[cfg(feature = "research")]
+    #[test]
+    fn research_rollback_keeps_files_untouched() {
+        let td = tempfile::tempdir().unwrap();
+        let disk = td.path().join("disk.qcow2");
+        Qcow2Image::create(&disk, 1 << 20, None).unwrap();
+        let state = td.path().join("vm.state");
+        let c = cfg(&disk);
+        let mut ds = DiskSet::open(&c, &state, &BTreeMap::new()).unwrap();
+        // Revert to a frozen layer, as the fuzzer's checkpoint restore does.
+        ds.disks[0].image.write_at(b"base", 0).unwrap();
+        let layers = ds.freeze().unwrap();
+        drop(ds);
+        let mut ds = DiskSet::open(&c, &state, &layers).unwrap();
+        let top = ds.disks[0].active.clone().unwrap();
+        let top_len = std::fs::metadata(&top).unwrap().len();
+        let read = |ds: &DiskSet| {
+            let mut b = [0u8; 4];
+            ds.disks[0].image.read_at(&mut b, 0).unwrap();
+            b
+        };
+
+        // Without the layer a testcase's write stays for the next one.
+        ds.disks[0].image.write_at(b"tc-0", 0).unwrap();
+        assert_eq!(&read(&ds), b"tc-0");
+        ds.disks[0].image.write_at(b"base", 0).unwrap();
+        ds.disks[0].image.flush().unwrap();
+        let top_len = std::fs::metadata(&top).unwrap().len().max(top_len);
+
+        ds.arm_rollback().unwrap();
+        assert!(ds.arm_rollback().is_err());
+        for tc in [b"tc-1", b"tc-2"] {
+            ds.disks[0].image.write_at(tc, 0).unwrap();
+            ds.disks[0].image.write_at(&[7; 8192], 512 << 10).unwrap();
+            ds.disks[0].image.flush().unwrap();
+            assert_eq!(&read(&ds), tc);
+            assert_eq!(ds.rollback(), 3 * 4096);
+            assert_eq!(&read(&ds), b"base");
+        }
+        assert_eq!(std::fs::metadata(&top).unwrap().len(), top_len, "the overlay file grew");
+        assert!(ds.freeze().is_err());
+        assert!(ds.active_stamps().is_err());
     }
 }

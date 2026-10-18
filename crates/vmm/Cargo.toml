@@ -7,7 +7,7 @@ license.workspace = true
 
 [features]
 default = []
-research = ["vroom-memory/research"]
+research = ["vroom-memory/research", "vroom-block/research"]
 
 [dependencies]
 thiserror.workspace = true

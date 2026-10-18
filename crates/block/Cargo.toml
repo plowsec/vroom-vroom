@@ -5,6 +5,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# In-memory write layer for snapshot fuzzing (`rollback`).
+research = []
+
 [dependencies]
 thiserror.workspace = true
 log.workspace = true

@@ -359,6 +359,8 @@ impl Vmm {
             }
             Err(e) => return Err(e.into()),
         };
+        // RAM goes back to here, so the page cache will: the disks must too.
+        self.disks.arm_rollback()?;
         self.research_baseline = Some(ResearchBaseline { devices, vcpus, irqchip, clock, logged });
         Ok(())
     }
@@ -403,6 +405,11 @@ impl Vmm {
                     first.join(" ")
                 )));
             }
+        }
+        // Paused devices have no request running.
+        let dropped = self.disks.rollback();
+        if dropped > 0 {
+            log::trace!("research reset: dropped {dropped} bytes of disk writes");
         }
         if let Some(irqchip) = &baseline.irqchip {
             self.vm.restore_irqchip(irqchip)?;

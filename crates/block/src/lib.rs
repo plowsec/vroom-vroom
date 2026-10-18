@@ -5,11 +5,15 @@
 //! - [`qcow2::Qcow2Image`]: sparse, copy-on-write over a backing image.
 //!   Disk snapshots = freeze current image, write to a new overlay.
 //! - [`vmdk::VmdkImage`]: VMware disks, read-only (for importing).
+//! - `rollback::RollbackDisk` (feature `research`): writes kept in memory
+//!   and thrown away on demand (snapshot fuzzing).
 // One audited exception: plain fsync(2) in `sync_file`.
 #![deny(unsafe_code)]
 
 pub mod qcow2;
 pub mod raw;
+#[cfg(feature = "research")]
+pub mod rollback;
 pub mod vmdk;
 
 use std::fs::{File, OpenOptions};
