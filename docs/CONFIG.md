@@ -1,12 +1,9 @@
 # VM config reference
 
-One TOML file per VM. Unknown keys are errors, so a typo can't silently
-turn off a security setting. Relative paths are relative to the file.
-`vroom check vm.toml` validates a file and prints it back with every
-default filled in.
-
-The app edits these same files. You can edit them by hand too; the app
-picks up the change.
+One TOML file per VM. Unknown keys are errors (a typo can't turn off a
+security setting). Relative paths are relative to the file. `vroom check
+vm.toml` validates and prints it with defaults filled in. The app edits
+the same files and picks up hand edits.
 
 ## Top level
 
@@ -18,8 +15,8 @@ picks up the change.
 | `memory_mib` | 2048 | RAM in MiB. |
 | `tpm` | false | TPM 2.0 (needs `swtpm`). Windows 11 wants it. |
 | `nested` | false | Let the guest run its own VMs. M3 or newer, macOS 15+. No snapshots then. |
-| `camera` | false | The Mac's camera, as a USB webcam in the guest (video calls). On only while the VM's window is open and an app in the guest uses it; the window shows when. See [GUIDE.md](GUIDE.md#camera). |
-| `virtio_transport` | `auto` | `auto` (MMIO for kernel boot, PCI for UEFI), `mmio`, `pci`. On PCI the VM also gets four PCI Express hot plug slots (network adapters added while it runs go there). |
+| `camera` | false | The Mac's camera as a USB webcam. Live only while the window is open and a guest app uses it. [GUIDE](GUIDE.md#camera). |
+| `virtio_transport` | `auto` | `auto` (MMIO for kernel boot, PCI for UEFI), `mmio`, `pci`. PCI adds four hot plug slots. |
 
 ## `[boot]`
 
@@ -49,7 +46,7 @@ cmdline = "console=ttyAMA0 root=/dev/vda1"
 | `path` | required | Image file. |
 | `format` | `auto` | `auto`, `raw`, `qcow2`. |
 | `bus` | `virtio` | `virtio` (fast, needs a driver) or `nvme` (every OS has a driver, Windows setup needs it). |
-| `readonly` | false | Guest can't write. Linux and virtio disks in Windows see a read-only disk; Windows mounts a read-only NVMe disk read-write, and its writes fail ([GUIDE](GUIDE.md#read-only-disks)). |
+| `readonly` | false | Guest can't write. Windows doesn't see it on NVMe ([GUIDE](GUIDE.md#read-only-disks)). |
 | `cdrom` | false | Show as a CD (installer ISOs). Needs `readonly = true`. |
 | `sync` | `fsync` | What a guest flush costs: `full` (power-loss safe, slow on macOS), `fsync` (survives a host crash), `none` (scratch disks). |
 
@@ -70,33 +67,27 @@ port_forwards = [{ host_port = 2222, guest_port = 22 }]
 | `interface` | bridged | Host interface, e.g. `en0`. |
 | `network` | host-only | Network name. VMs with the same name see each other. |
 | `mac` | generated | `02:12:34:56:78:9a`. Generated ones start with `identity.mac_prefix`. |
-| `connected` | all | `false`: the cable is out. The guest sees no link on this adapter and no frames go either way (VMware's "Connected" box). Default `true`. |
+| `connected` | all | `false`: cable out, no link, no frames. Default `true`. |
 
-Bridged and host-only need the `vroom-netd` helper running as root; the
-app sets it up when a VM needs it. See
-[GUIDE.md](GUIDE.md#the-root-helper-vroom-netd) and
-[NETWORKING.md](NETWORKING.md).
+Bridged and host-only need `vroom-netd`
+([GUIDE](GUIDE.md#the-root-helper-vroom-netd)).
 
-While the VM runs (in the app), `connected`, `mode`, `interface`,
-`network` and `block_private` apply right away, to the same adapter with
-the same MAC. Port forwards, `allow_host_loopback` (unless an adapter had
-it at start), `mac`, and adding or removing an adapter apply at the next
-start; a removed adapter is unplugged until then. A suspended VM resumes
-with the adapters it was saved with, set up as the file says then. See
-[NETWORKING.md](NETWORKING.md#changing-adapters-while-the-vm-runs).
+Live in the app: `connected`, `mode`, `interface`, `network`,
+`block_private`. Next start: port forwards, `allow_host_loopback`, `mac`.
+Adapters: [NETWORKING.md](NETWORKING.md#changing-adapters-while-the-vm-runs).
 
 ## `[display]`
 
 | Key | Default | What it does |
 |---|---|---|
-| `gpu` | `none` | `none` (serial console only), `virtio2d`, `virtio3d` (Vulkan and OpenGL drawn by the host GPU, Linux guests; see the [guide](GUIDE.md#3d-acceleration-linux-guests)). |
-| `opengl` | true | With `virtio3d`: OpenGL too (virgl). `false` keeps Vulkan only: less host code facing the guest. |
-| `opengl_host` | `"apple"` | What runs the guest's OpenGL: `"apple"` (macOS's OpenGL 4.1; the guest gets OpenGL 4.1) or `"angle"` (ANGLE on Metal; the guest gets OpenGL 2.1, with every call checked). See the [guide](GUIDE.md#3d-acceleration-linux-guests). |
-| `video_decode` | false | Hardware video decoding for Linux guests: a V4L2 decoder (H.264, HEVC, VP9 on M1 and later, AV1 on M3 and later) backed by the Mac's VideoToolbox in a sandboxed helper. Needs the guest's virtio-media driver; browsers also need our VA-API driver. See the [guide](GUIDE.md#video-decoding). |
-| `video_encode` | false | Hardware video encoding for Linux guests: a V4L2 encoder (NV12 in; H.264 or HEVC out) backed by the Mac's VideoToolbox in a sandboxed helper of its own. For video calls and recording. Needs the guest's virtio-media driver; Chrome and FFmpeg's VA-API encoders also need our VA-API driver. See the [guide](GUIDE.md#video-encoding). |
-| `width`, `height` | 1280, 800 | Starting resolution. The guest follows the window size once its agent or driver runs. |
-| `hidpi` | true | Full resolution on Retina (HiDPI) screens: the guest gets every pixel of the window and its agent sets its UI scale to match (2x on Retina), so text is sharp. Guests without an agent that can scale get half the pixels and the window scales the picture up, as with `false`. See [GUIDE.md](GUIDE.md#retina-screens). |
-| `monitors` | 1 | Guest monitors, 1 to 4, each in a window of its own. Needs a `gpu`. Linux gets one GPU with that many outputs; Windows gets a GPU per monitor, the extra ones 2D. The app sets it in Settings → Display. See [GUIDE.md](GUIDE.md#several-monitors). |
+| `gpu` | `none` | `none` (serial only), `virtio2d`, `virtio3d` ([3D](GUIDE.md#3d-acceleration-linux-guests)). |
+| `opengl` | true | With `virtio3d`: OpenGL too. `false`: Vulkan only, less attack surface. |
+| `opengl_host` | `"apple"` | `"apple"` (guest GL 4.1) or `"angle"` (ANGLE on Metal, guest GL 2.1, stricter checks). |
+| `video_decode` | false | Linux guests: V4L2 decoder on VideoToolbox. [GUIDE](GUIDE.md#video-decoding). |
+| `video_encode` | false | Linux guests: V4L2 H.264/HEVC encoder on VideoToolbox. [GUIDE](GUIDE.md#video-encoding). |
+| `width`, `height` | 1280, 800 | Starting resolution; then the guest follows the window. |
+| `hidpi` | true | Real Retina pixels, guest UI at 2x (needs the agent). [GUIDE](GUIDE.md#retina-screens). |
+| `monitors` | 1 | 1 to 4, a window each. Needs a `gpu`. [GUIDE](GUIDE.md#several-monitors). |
 
 ## `[[share]]` (host folders, up to 8)
 
@@ -107,9 +98,8 @@ tag = "host"                     # in the guest: mount -t virtiofs host /mnt
 readonly = true                  # default; false lets the guest change files
 ```
 
-`tag`: 1-36 of `[A-Za-z0-9._-]`, different for each share. Windows guests
-see each share as a drive letter (Z:, Y:, ...) once `vroom-setup.cmd` ran;
-see [GUIDE.md](GUIDE.md#windows-guests).
+`tag`: 1-36 of `[A-Za-z0-9._-]`, unique. Windows: drive letters from Z:
+after `vroom-setup.cmd` ([GUIDE](GUIDE.md#windows-guests)).
 
 ## `[[usb]]` (host USB devices, up to 8)
 
@@ -125,39 +115,28 @@ readonly = false                 # "files" and "disk": the guest can't change it
 | Key | Default | What it does |
 |---|---|---|
 | `id` | required | `vendor:product`, 4 hex digits each. |
-| `serial` | none | Pick one device by its serial number. Without it, the first device with that `id` is taken. |
+| `serial` | none | Pick one of several alike. Default: the first with that `id`. |
 | `name` | none | Shown in the app. The guest never sees it. |
-| `mode` | `"device"` | How a USB disk goes to the guest (macOS): `"files"` shares its volumes as a folder, `"disk"` gives the guest the whole disk as a plain USB stick, `"device"` passes the USB device itself. See [GUIDE.md](GUIDE.md#usb-disks). The app writes it when you tick "Remember for this device" or "Always connect to this VM". |
+| `mode` | `"device"` | USB disks (macOS): `"files"` (volumes as a share), `"disk"` (whole disk), `"device"` (the USB device). [GUIDE](GUIDE.md#usb-disks). |
 | `readonly` | false | With `"files"` and `"disk"`: the guest may read, not change. |
 
-`"files"` and `"disk"` are done by the app: the VM file's entries with
-them connect when the app runs the VM (`vroom run` alone logs that it
-skips them). Share tags starting with `vroom-usb` are taken: they are the
-shares a USB disk's files come through.
-
-The VM takes the device when it starts and gives it back when it stops.
-Unplug it and plug it back in while the VM runs: the guest sees that too.
-A device added to the file while the VM runs is picked up at the next
-start; to connect one right away, use the USB button in the VM window
-("Always connect to this VM" there writes this entry).
-
-The guest sees the device's own descriptors. On macOS, a device that a
-macOS driver holds (keyboards, mice, disks, security keys, most USB
-serial chips) is taken through vroom-netd, the root helper: see
-[GUIDE.md](GUIDE.md#devices-macos-uses). Needs libusb (`brew install libusb`).
+- `"files"` and `"disk"` need the app (`vroom run` skips them). Share
+  tags `vroom-usb*` are reserved.
+- Taken at start, given back at stop; replugging works live. Entries added
+  while running apply next start (the window's USB button connects now).
+- Devices a macOS driver holds go through vroom-netd
+  ([GUIDE](GUIDE.md#devices-macos-uses)). Needs `brew install libusb`.
 
 ## `[audio]`
 
 | Key | Default | What it does |
 |---|---|---|
 | `output` | false | Guest sound out through the host speakers. |
-| `input` | false | The host microphone, for the guest to record from (video calls). It only flows while the VM's window is open, the VM runs and the guest records; the window shows when. Headless runs (`vroom run`) never get it. |
-| `device` | `auto` | The sound card: `hda` (Intel HD Audio: Windows and Linux have a driver built in), `virtio` (virtio-snd: Linux only). `auto` is `hda` for Windows guests (`os`, or guessed from the name), `virtio` otherwise. |
+| `input` | false | Host microphone. Live only while the window is open, the VM runs and the guest records. Never headless. |
+| `device` | `auto` | `hda` (Intel HD Audio, inbox everywhere), `virtio` (Linux). `auto`: `hda` for Windows. |
 
-The card is there when `output` or `input` is on. With `output` off the
-guest still sees speakers but they play nowhere; with `input` off the
-guest has no microphone at all. See [GUIDE.md](GUIDE.md#sound) for the
-macOS microphone permission.
+The card exists when `output` or `input` is on. Mic permission:
+[GUIDE](GUIDE.md#sound).
 
 ## `[clipboard]`
 

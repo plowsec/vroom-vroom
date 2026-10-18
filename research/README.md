@@ -5,44 +5,18 @@ Optional; excluded from normal vroom builds.
 
 ## fuzz lab
 
-The fuzz runner is another optional research package. It keeps the VMM's
-snapshot primitive small and lets the campaign policy, detectors, corpus and
-coverage reports stay here.
+Snapshot fuzzer, optional package: [fuzz/README.md](fuzz/README.md), walkthrough [fuzz/DEMO.md](fuzz/DEMO.md).
 
 ```sh
-cargo run -p vroom-fuzz -- check harness.json
-cargo run -p vroom-fuzz -- mutate seed.bin --count 16
-cargo run -p vroom-fuzz -- run harness.json seed.bin --iterations 1000
-cargo run -p vroom-fuzz -- coverage STATE/fuzz/coverage.json STATE/fuzz/blocks.json
+cargo check -p vroom-vmm                        # product build
+cargo check -p vroom-vmm --features research    # + file-backed RAM baselines, paused restore API
 ```
-
-The harness declares the checkpoint, input buffer, target-specific IOCTL field,
-analysed function and detectors. angr_tui exports basic blocks from the driver
-binary; the runner translates their guest virtual addresses through the
-restored page tables and traps each block entry. Each run records block hits,
-edges, first-seen inputs, function coverage and findings as JSON.
-
-The VMM side is opt-in:
-
-```sh
-cargo check -p vroom-vmm
-cargo check -p vroom-vmm --features research
-```
-
-The first command is the normal product build. The second enables private
-file-backed RAM baselines and the paused restore API used by `vroom-fuzz`.
 
 ## targets
 
-`hevd/` contains the first target harness for HackSys Extreme Vulnerable
-Driver. Target source, driver binaries, checkpoints and generated coverage
-stay outside the repository.
+`hevd/`: HackSys Extreme Vulnerable Driver ([hevd/README.md](hevd/README.md)). Target binaries, checkpoints and coverage stay outside the repo.
 
-To inspect a run, enter `coverage /path/to/run/coverage.json` at the kernel TUI
-command bar. To compare two runs that share the same block manifest, enter
-`coverage-diff /path/to/baseline/coverage.json /path/to/current/coverage.json`.
-The Coverage tab shows newly reached blocks and hit-count changes per function
-and block.
+TUI: `coverage RUN/coverage.json`; `coverage-diff BASE/coverage.json CUR/coverage.json` (same block manifest): new blocks and hit changes per function.
 
 ## run
 

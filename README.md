@@ -8,8 +8,7 @@ and every virtual device treats the guest as hostile.
 
 ## Security
 
-
-The security design is better than the big three’s, at least on paper:
+Better than the big three's, at least on paper:
 
 - a sandboxed VMM written in Rust;
 - a separate sandboxed GPU process;
@@ -42,31 +41,26 @@ The security design is better than the big three’s, at least on paper:
 ```
 
 A guest that breaks out lands in the VMM's sandbox: its own disks, nothing
-else of yours. Each Vulkan or Direct3D app in the guest gets a 3D process
-of its own (apps); video decoding and encoding, when on, get one each. Details in
-[SECURITY.md](docs/SECURITY.md).
-
+else of yours. Each guest Vulkan or Direct3D app gets its own 3D process;
+video decoding and encoding get one each. [SECURITY.md](docs/SECURITY.md).
 
 ## What works
 
 - Ubuntu, Debian, Alpine, Windows 11 ARM64
-- Window with clipboard both ways and auto resolution, sharp on Retina
+- Clipboard both ways, auto resolution, sharp on Retina
 - 3D: Vulkan 1.3 (about 90% of native speed, in windows too) and OpenGL 4.1 in Linux guests, OpenGL 4.4 per app through Zink, Direct3D 11 and OpenGL 4.1 in Windows guests
 - Coherence: Windows and Linux (X11) apps as windows of their own on the Mac
 - Snapshots, suspend/resume, reset
-- NAT with port forwards, several network adapters. Bridged and host-only go through a small root helper the app sets up (one password prompt).
-- Sound in Linux and Windows guests; microphone if you turn it on
+- NAT with port forwards, several adapters; bridged and host-only via a root helper (one password prompt)
+- Sound; microphone and camera, opt-in
 - Shared folders (Linux and Windows guests)
 - TPM 2.0 (Windows 11 needs it)
 - Nested VMs (M3 or newer)
 - Import from VMware Fusion (ARM64 VMs)
-- USB devices from the host, connected from the VM window while it runs (needs libusb; devices macOS uses go through the root helper); USB disks also as shared files or as a plain disk, with no root helper
-- Drag and drop files from the Mac into the guest
-- Drag and drop files between the Mac and the guest, both ways
-- Up to 4 guest monitors, a window each, full screen on several Mac screens
-- The Mac's camera as a webcam in the guest, if you turn it on
-- Video decoding on the Mac's hardware for Linux guests (H.264, HEVC, VP9, AV1), if you turn it on; Firefox and Chrome use it
-- Video encoding on the Mac's hardware for Linux guests (H.264, HEVC), if you turn it on; Chrome's video calls and FFmpeg use it
+- USB passthrough, live from the VM window; USB disks also as shared files or a plain disk
+- Drag and drop files both ways
+- Up to 4 guest monitors, full screen across Mac screens
+- Hardware video decode (H.264, HEVC, VP9, AV1) and encode (H.264, HEVC) for Linux guests, opt-in; Firefox, Chrome, FFmpeg use them
 - Fast disk and network I/O, measured against QEMU ([numbers](docs/PERFORMANCE.md))
 
 Not yet: x86_64 hosts (it builds, can't run VMs yet) and Secure Boot.
@@ -79,10 +73,10 @@ scripts/make-guest-tools.sh images/virtio-win/virtio-win.iso   # the guest agent
 scripts/app.sh --install     # builds vroom.app and copies it to /Applications
 ```
 
-Then open vroom from Applications or Spotlight: New VM, pick Ubuntu (it
-downloads it) or the Windows 11 ARM64 ISO, Create: it comes up installed,
-with the guest tools. Or pick any installer ISO. Without `--install` the app is in `target/dist/vroom.app`. 3D needs
-its libraries built first ([GUIDE.md](docs/GUIDE.md#the-mac-app)).
+Open vroom, New VM, pick Ubuntu (downloaded for you) or a Windows 11
+ARM64 ISO: it comes up installed, with the guest tools. Any installer ISO
+works too. 3D needs its libraries built first
+([GUIDE.md](docs/GUIDE.md#the-mac-app)).
 
 Or from the terminal:
 
@@ -92,8 +86,7 @@ target/release/vroom new dev --os linux --disk 32G --iso ubuntu-24.04-desktop-ar
 target/release/vroom-gui dev.toml
 ```
 
-Ubuntu installs like on a real machine. Windows needs a few more steps:
-[docs/GUIDE.md](docs/GUIDE.md#windows-11-arm64).
+Windows by hand: [GUIDE.md](docs/GUIDE.md#windows-11-arm64).
 
 ## Cheat sheet
 
@@ -126,11 +119,9 @@ vroom usb list                    # host USB devices, the id for [[usb]]
 | snapshot / pause / reset | `s` / `p` / `r` |
 | clipboard to / from guest, screenshot | `c` / `v` / `g` |
 
-In the app: `⌘K` finds VMs, actions and settings. Drop an ISO on the
-window to make a VM from it.
+App: `⌘K` for VMs, actions, settings; drop an ISO to make a VM.
 
-A VM is one TOML file. The app edits the same file and keeps your
-comments:
+A VM is one TOML file; the app edits it in place, keeping comments:
 
 ```toml
 name = "dev"
