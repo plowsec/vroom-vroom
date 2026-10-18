@@ -366,6 +366,14 @@ impl Vmm {
     }
 
     #[cfg(feature = "research")]
+    /// The disk overlays this VM started on its checkpoint are scratch:
+    /// delete them when the VM goes away (a fuzzer that restores the same
+    /// checkpoint again would otherwise leave one behind per restore).
+    pub fn research_discard_disk_layers(&mut self) {
+        self.disks.discard_fresh_layers();
+    }
+
+    #[cfg(feature = "research")]
     /// Restore the armed baseline without rebuilding the VM or its mappings.
     pub fn research_reset(&mut self) -> Result<()> {
         if self.state != RunState::Paused {
@@ -407,7 +415,7 @@ impl Vmm {
             }
         }
         // Paused devices have no request running.
-        let dropped = self.disks.rollback();
+        let dropped = self.disks.rollback()?;
         if dropped > 0 {
             log::trace!("research reset: dropped {dropped} bytes of disk writes");
         }

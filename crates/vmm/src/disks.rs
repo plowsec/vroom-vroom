@@ -46,7 +46,19 @@ pub(crate) struct DiskSet {
     /// In-memory top layers while research resets are armed.
     #[cfg(feature = "research")]
     rollback: Vec<Arc<RollbackDisk>>,
+    /// Overlays `open` started on snapshot layers: (overlay, pointer file,
+    /// what the pointer file held before).
+    #[cfg(feature = "research")]
+    fresh: Vec<(PathBuf, PathBuf, Option<Vec<u8>>)>,
+    /// Delete `fresh` on close and put the pointers back.
+    #[cfg(feature = "research")]
+    discard_fresh: bool,
 }
+
+/// RAM a disk's research rollback layer may hold; more spills to a
+/// scratch file in the disks dir.
+#[cfg(feature = "research")]
+const ROLLBACK_MEMORY: u64 = 64 << 20;
 
 fn sync_of(s: DiskSync) -> SyncMode {
     match s {
@@ -85,6 +97,8 @@ impl DiskSet {
         let dir = std::path::absolute(state_dir.join("disks"))?;
         std::fs::create_dir_all(&dir)?;
         let mut disks = Vec::new();
+        #[cfg(feature = "research")]
+        let mut fresh = Vec::new();
         for (i, d) in cfg.disks.iter().enumerate() {
             let policy = OpenPolicy {
                 allowed_dirs: vec![dir.clone(), d.path.parent().map(Path::to_path_buf).unwrap_or_default()],
@@ -104,6 +118,8 @@ impl DiskSet {
                 let lfmt = vroom_block::detect(layer).map_err(|e| Error::Setup(e.to_string()))?;
                 let top = dir.join(format!("disk{i}-{}.qcow2", stamp()));
                 Qcow2Image::create(&top, lower.size(), Some((layer, lfmt))).map_err(|e| Error::Setup(e.to_string()))?;
+                #[cfg(feature = "research")]
+                fresh.push((top.clone(), ptr_path.clone(), std::fs::read(&ptr_path).ok()));
                 (top, Format::Qcow2)
             } else {
                 match std::fs::read(&ptr_path).ok().and_then(|b| serde_json::from_slice::<Pointer>(&b).ok()) {
@@ -145,7 +161,20 @@ impl DiskSet {
             watch,
             #[cfg(feature = "research")]
             rollback: Vec::new(),
+            #[cfg(feature = "research")]
+            fresh,
+            #[cfg(feature = "research")]
+            discard_fresh: false,
         })
+    }
+
+    /// The overlays `open` started on snapshot layers are scratch (a
+    /// fuzzer restoring the same checkpoint again and again): delete them
+    /// when the disks close and put the state's disk pointers back, instead
+    /// of leaving one more overlay behind per restore.
+    #[cfg(feature = "research")]
+    pub fn discard_fresh_layers(&mut self) {
+        self.discard_fresh = true;
     }
 
     /// Keep the guest's writes from now on in memory, over every writable
@@ -163,7 +192,7 @@ impl DiskSet {
                 continue;
             }
             d.image.flush().map_err(|e| Error::Setup(e.to_string()))?;
-            let layer = Arc::new(RollbackDisk::new(d.image.current()));
+            let layer = Arc::new(RollbackDisk::new(d.image.current(), self.dir.clone(), ROLLBACK_MEMORY));
             d.image.swap(layer.clone()).map_err(|e| Error::Setup(e.to_string()))?;
             self.rollback.push(layer);
         }
@@ -173,12 +202,13 @@ impl DiskSet {
     /// Forget what the guest wrote since [`DiskSet::arm_rollback`]. The VM
     /// must be paused (no request running). Returns the bytes dropped.
     #[cfg(feature = "research")]
-    pub fn rollback(&self) -> u64 {
-        self.rollback.iter().map(|l| {
-            let n = l.held_bytes();
-            l.rollback();
-            n
-        }).sum()
+    pub fn rollback(&self) -> Result<u64> {
+        let mut dropped = 0;
+        for l in &self.rollback {
+            dropped += l.held_bytes();
+            l.rollback().map_err(|e| Error::Setup(format!("disk rollback: {e}")))?;
+        }
+        Ok(dropped)
     }
 
     /// Snapshots and suspends record files, which don't hold what the
@@ -196,6 +226,11 @@ impl DiskSet {
     /// The VM must be paused.
     pub fn freeze(&mut self) -> Result<BTreeMap<usize, PathBuf>> {
         self.check_not_rolling_back()?;
+        // A snapshot refers to the overlays now: keep them.
+        #[cfg(feature = "research")]
+        {
+            self.discard_fresh = false;
+        }
         let mut out = BTreeMap::new();
         for d in &mut self.disks {
             let Some(frozen) = d.active.clone() else { continue };
@@ -236,6 +271,24 @@ impl DiskSet {
     pub fn flush_all(&self) {
         for d in &self.disks {
             let _ = d.image.flush();
+        }
+    }
+}
+
+#[cfg(feature = "research")]
+impl Drop for DiskSet {
+    fn drop(&mut self) {
+        if !self.discard_fresh {
+            return;
+        }
+        for (layer, pointer, before) in &self.fresh {
+            let restored = match before {
+                Some(bytes) => std::fs::write(pointer, bytes),
+                None => std::fs::remove_file(pointer),
+            };
+            if let Err(e) = restored.and_then(|()| std::fs::remove_file(layer)) {
+                log::warn!("scratch disk layer {}: {e}", layer.display());
+            }
         }
     }
 }
@@ -297,7 +350,7 @@ mod tests {
     fn research_rollback_keeps_files_untouched() {
         let td = tempfile::tempdir().unwrap();
         let disk = td.path().join("disk.qcow2");
-        Qcow2Image::create(&disk, 1 << 20, None).unwrap();
+        Qcow2Image::create(&disk, 2 * ROLLBACK_MEMORY, None).unwrap();
         let state = td.path().join("vm.state");
         let c = cfg(&disk);
         let mut ds = DiskSet::open(&c, &state, &BTreeMap::new()).unwrap();
@@ -328,11 +381,54 @@ mod tests {
             ds.disks[0].image.write_at(&[7; 8192], 512 << 10).unwrap();
             ds.disks[0].image.flush().unwrap();
             assert_eq!(&read(&ds), tc);
-            assert_eq!(ds.rollback(), 3 * 4096);
+            assert_eq!(ds.rollback().unwrap(), 3 * 4096);
             assert_eq!(&read(&ds), b"base");
         }
         assert_eq!(std::fs::metadata(&top).unwrap().len(), top_len, "the overlay file grew");
+        // RAM past the limit goes to an unlinked file in the disks dir.
+        let files = || std::fs::read_dir(state.join("disks")).unwrap().count();
+        let before = files();
+        ds.disks[0].image.write_at(&vec![9; (ROLLBACK_MEMORY + (64 << 10)) as usize], 0).unwrap();
+        assert_eq!(ds.rollback.iter().map(|l| l.memory_bytes()).sum::<u64>(), ROLLBACK_MEMORY);
+        assert_eq!(files(), before);
+        assert_eq!(ds.rollback().unwrap(), ROLLBACK_MEMORY + (64 << 10));
+        assert_eq!(&read(&ds), b"base");
         assert!(ds.freeze().is_err());
         assert!(ds.active_stamps().is_err());
+    }
+
+    #[cfg(feature = "research")]
+    #[test]
+    fn scratch_overlays_go_away_on_close() {
+        let td = tempfile::tempdir().unwrap();
+        let disk = td.path().join("disk.qcow2");
+        Qcow2Image::create(&disk, 1 << 20, None).unwrap();
+        let state = td.path().join("vm.state");
+        let c = cfg(&disk);
+        let mut ds = DiskSet::open(&c, &state, &BTreeMap::new()).unwrap();
+        let layers = ds.freeze().unwrap();
+        drop(ds);
+        let names = || {
+            let mut v: Vec<_> = std::fs::read_dir(state.join("disks")).unwrap().map(|e| e.unwrap().file_name()).collect();
+            v.sort();
+            v
+        };
+        let pointer = state.join("disks/disk0.json");
+        let (files, before) = (names(), std::fs::read(&pointer).unwrap());
+        for _ in 0..3 {
+            let mut ds = DiskSet::open(&c, &state, &layers).unwrap();
+            ds.discard_fresh_layers();
+            ds.disks[0].image.write_at(b"scratch", 0).unwrap();
+            assert_eq!(names().len(), files.len() + 1);
+            drop(ds);
+            assert_eq!(names(), files, "a restore left its overlay behind");
+            assert_eq!(std::fs::read(&pointer).unwrap(), before);
+        }
+        // Without it (or once a snapshot refers to it) the overlay stays.
+        let mut ds = DiskSet::open(&c, &state, &layers).unwrap();
+        ds.discard_fresh_layers();
+        ds.freeze().unwrap();
+        drop(ds);
+        assert_eq!(names().len(), files.len() + 2);
     }
 }
