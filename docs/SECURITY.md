@@ -827,7 +827,10 @@ up after the libraries are loaded and before the first guest command.
 What the VMM trusts from it: nothing it can't check. Replies are framed
 with size limits; buffers it hands over are mapped at the size the guest
 asked for, never more; frames come back through a shared buffer the VMM
-made, copied out at the size the VMM asked for. If the GPU process dies,
+made, copied out at the size the VMM asked for, or (macOS, a window the
+app started) as IOSurfaces the VMM passes to the app unopened (below).
+The GPU process gets its fence socket and guest RAM over its call
+socket at start, not by inheritance. If the GPU process dies,
 the VMM sees the socket close: 3D stops for that VM (the guest gets GPU
 errors, nothing else breaks) until the VM is started again.
 `VROOM_GPU_IN_PROCESS=1` puts the renderer back in the VMM, with the GPU
@@ -860,7 +863,15 @@ emulation, a guest could already crash the GPU process by calling
 `vkWaitSemaphoreResourceMESA`, which MoltenVK has no function for. To show
 a Vulkan window on macOS's OpenGL, vrend maps the frame's shared memory
 read only and copies rows out of it; the row size, offset and height the
-guest gives are checked against the memory's size first. Nothing new is
+guest gives are checked against the memory's size first. For big BGRA
+frames (patch 0030) the copy is done by Metal in the GPU process: the
+same read-only mapping, whole pages, becomes a Metal buffer (Metal only
+reads it), and a blit with that checked offset, stride and size goes into
+an IOSurface the GPU process makes and keeps to itself (not global,
+never sent anywhere), which GL then copies into the texture. The GPU
+process already had Metal (its sandbox rules don't change); the guest
+reaches no new code on the CPU side, only one more GPU copy whose bounds
+were checked as before. Nothing new is
 loaded and the sandbox rules don't change. Each Vulkan or Direct3D
 context also has a thread in the GPU process that its worker wakes
 through a pipe when fences finish; it reads the same shared fence
@@ -906,6 +917,45 @@ Transform feedback for Zink (patch 0016) adds, in the Venus worker:
 - Command buffers keep a little state; layouts and query pools are found
   again by id, so a guest destroying them mid-recording gets nothing
   written rather than a dangling pointer.
+
+### The screen as IOSurfaces (macOS)
+
+When the app starts a VMM, the guest's GL screen can go to the app as
+IOSurfaces instead of pixels (ARCHITECTURE.md, "The screen straight from
+the GPU"). What that adds:
+
+- Mach ports between our own processes. An IOSurface can only cross as a
+  mach port or by its global id; global ids stay unused (no surface is
+  made global, nothing looks one up by id), and Unix sockets can't carry
+  ports. So the app gives the VMM, and the VMM the GPU process, a send
+  right to a port of its own at spawn (a registered port,
+  `mach_ports_register`, taken by the child before it starts anything
+  and cleared so its own children don't get it). No name goes into the
+  bootstrap namespace and no sandbox gets a `mach-lookup` rule.
+- What crosses: one message per surface (three per monitor, made when
+  the size changes), holding the surface's port and five numbers, and a
+  small socket message per frame. The VMM takes messages on its port
+  only from its GPU process (the kernel gives the sender's pid), checks
+  the numbers (monitor, slot, generation, size) and passes the port on
+  as is: it never maps or looks up a surface, and its sandbox has no
+  IOSurface access. The app takes messages only from the VMM it started,
+  and checks each surface: the size announced, one plane, BGRA, rows
+  inside its memory. The guest can't name a surface, only change the
+  pixels the GPU process puts in it, which it could before.
+- A compromised GPU process could send the VMM other ports or junk:
+  anything malformed is thrown away (its rights given back), and the
+  VMM only forwards ports in well-formed messages from that pid, to the
+  app, which then refuses what isn't a surface of the announced size. A
+  compromised VMM can send the app any surface of the right size: it
+  decides what the screen shows anyway. Surfaces the app keeps are those
+  of the latest size only (three).
+- The app reads a surface with the CPU only for thumbnails and
+  pictures, locked read only and inside its size. The window server
+  shows the rest.
+
+A process that sends on someone else's port can only be one we started
+during the short window the app or VMM registers its port (another
+helper spawned at that moment); its messages fail the pid check.
 
 ### A process per Vulkan and Direct3D context
 

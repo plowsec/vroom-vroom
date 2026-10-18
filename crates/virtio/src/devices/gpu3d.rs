@@ -72,6 +72,15 @@ pub struct FenceDone {
     pub fence: u64,
 }
 
+/// A frame now in one of a monitor's IOSurfaces: `slot` of the surfaces
+/// of generation `gen` (a new generation per size).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SurfaceFrame {
+    pub head: u32,
+    pub gen: u32,
+    pub slot: u32,
+}
+
 pub trait Renderer3d: Send {
     /// `(capset id, max version, max size)`.
     fn capsets(&self) -> Vec<(u32, u32, u32)>;
@@ -119,6 +128,21 @@ pub trait Renderer3d: Send {
     /// The read `scanout_start` began: None while the GPU is at it (unless
     /// `wait`) or if there is none, else whether `out` holds it.
     fn scanout_poll(&mut self, _out: &mut [u8], _wait: bool) -> Option<bool> {
+        None
+    }
+    /// Like [`Renderer3d::scanout_start`], but the frame (box `bx` of
+    /// `resource`: all of what monitor `head` shows) goes into one of that
+    /// monitor's IOSurfaces on the GPU, which the app shows itself: no
+    /// pixels come back. The surfaces reach the app on their own (macOS:
+    /// mach ports, through the VMM). False if the renderer can't: then
+    /// `scanout_start`.
+    fn surface_start(&mut self, _head: u32, _resource: u32, _bx: Box3d) -> bool {
+        false
+    }
+    /// The frame `surface_start` began: None while the GPU is at it
+    /// (unless `wait`) or if there is none, else where it went (None
+    /// inside: it failed).
+    fn surface_poll(&mut self, _wait: bool) -> Option<Option<SurfaceFrame>> {
         None
     }
     /// Snapshots of a Vulkan (Venus) context: what it needs to be built

@@ -41,7 +41,8 @@ What we found (October 2026, macOS 15.6, MoltenVK 1.4.2, guest Mesa 25.2):
   memory. The guest's compositor (Xorg's glamor, Weston, GNOME Shell) then
   shows the frame with OpenGL through virgl, and macOS's OpenGL can't
   share memory with Vulkan: vrend copies the frame into a texture when
-  the compositor uses it (`0008-venus-swapchain.patch`). The same fix
+  the compositor uses it (`0008-venus-swapchain.patch`), on the GPU
+  through an IOSurface for big frames (0030, see ARCHITECTURE.md). The same fix
   gives the guest Vulkan 1.3 (it lacked `synchronization2`). Proton and
   DXVK still can't run: they need geometry shaders, which neither MoltenVK
   nor KosmicKrisp has.
@@ -58,15 +59,14 @@ Linux guests, next:
 - **KosmicKrisp on macOS 26**: load it instead of MoltenVK when the Mac
   has Metal 4. Zink then gets most of what we emulate for real, and its
   speed should be checked against MoltenVK.
-- **Zink speed**: glmark2 scores about 1000 on Zink and 1170 on virgl,
-  but its terrain scene runs at half virgl's speed (about 210 fps against
-  420). It is GPU bound there: the guest and host CPUs are mostly idle,
-  so the cost is in the shaders MoltenVK makes from Zink's, or in what
-  MoltenVK does per draw. Each Zink frame also waits in the guest for
-  the GPU before it is shown, so frames don't overlap. virgl stays the
-  default; Zink is per app.
-- **No copy for Vulkan windows**: an IOSurface shared by Metal and
-  OpenGL instead of copying each frame. The copy is fine at 1280x800.
+- **Zink speed**: in the app's window (Xorg, 1280x760, six glmark2
+  scenes) Zink scores about 860 and virgl 1930 since the screen comes
+  straight from the GPU; Zink's light scenes run at 1240 fps against
+  virgl's 2800, its terrain scene at 228 against 389. Terrain is GPU
+  bound: the guest and host CPUs are mostly idle, so the cost is in the
+  shaders MoltenVK makes from Zink's, or in what MoltenVK does per draw.
+  Each Zink frame also waits in the guest for the GPU before it is shown,
+  so frames don't overlap. virgl stays the default; Zink is per app.
 - **Snapshots with Vulkan, what's left** (they work, see GUIDE.md and
   ARCHITECTURE.md): store the GPU's part of a snapshot as raw bytes, not
   base64 in JSON (1 GiB of Vulkan memory makes a 1.45 GB blob and most of
@@ -78,6 +78,18 @@ Linux guests, next:
   in the same submission is visible; 20 ms later it is. Venus and
   MoltenVK, not snapshots; not looked into yet.
 
+- **The screen as IOSurfaces, what's left** (it works for the first
+  monitor's GL screen in a window the app started, see GUIDE.md):
+  Windows' Direct3D screen is a blob the VMM reads with the CPU (the
+  GPU process could blit it into a surface with Metal, as vrend now does
+  for Vulkan windows); other monitors still get pixels; a window
+  reattached to a running VM gets pixels (the mach port only comes with
+  the VMM's start: a later one would need XPC or a launchd name). The
+  layer steps aside while the mouse is over the toolbar, for its
+  tooltips; a tooltip shown by keyboard focus would hide under it.
+  Tooltips, menus, live resize and full screen want a check with a real
+  mouse.
+
 Windows guests:
 
 - **Direct3D 12**, the one most games since 2020 need. It is also the key
@@ -86,8 +98,15 @@ Windows guests:
   OpenGL 4.4 and Vulkan 1.3 now, see
   [GUIDE.md](GUIDE.md#opengl-and-vulkan-in-windows-guests)).
 - **OpenGL and Vulkan without the copy**: frames go back to the guest and
-  through GDI. An image both the host's Vulkan (or vrend) and DXMT see (an
-  IOSurface) would let the compositor take them directly.
+  through GDI (a 640x480 spinning triangle: 415 fps on Zink, 750 on
+  virgl, with the VM's vCPUs at two cores, mostly copying). What it
+  would take: the guest's Vulkan presenting into a Direct3D 11 texture
+  the desktop compositor takes (Mesa's win32 WSI has such a path, for
+  drivers that share memory with Direct3D 12), and on the host that
+  Neptune texture and the Venus image being one IOSurface. Both live in
+  render workers, so the IOSurface would go from one worker to another
+  through the GPU process, as mach ports, the way the screen now goes to
+  the app. Guest driver, Neptune and Venus work all three.
 - **An OpenGL app on Zink crashed at a save** (1 in 8, October 18): a
   write to address 0 in `vroom_gl_arm64.dll` (+0x733838) after its
   Vulkan device was lost, called from the app's frame.
