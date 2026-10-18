@@ -27,6 +27,96 @@ struct Args {
     /// owner-only Unix socket. The lab then keeps running when stdin closes.
     #[arg(long)]
     agent_socket: Option<PathBuf>,
+    /// Detach into the background (its own session: shells and agent
+    /// harnesses that kill what a command started leave it running) and
+    /// return once the agent socket accepts. Log: the socket path + ".log".
+    #[arg(long, requires = "agent_socket")]
+    daemon: bool,
+}
+
+/// Write end of the pipe the `--daemon` parent waits on.
+static READY: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// Fork before any thread exists. The parent waits for the child to say
+/// it listens (or to die) and exits; the child carries on as the lab.
+fn daemonize(socket: &std::path::Path) -> Result<(), String> {
+    let log_path = PathBuf::from(format!("{}.log", socket.display()));
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|e| format!("{}: {e}", log_path.display()))?;
+    let mut fds = [0; 2];
+    // SAFETY: two out fds.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    for fd in fds {
+        // Helpers the lab starts (swtpm...) must not hold the pipe open.
+        // SAFETY: our own new fds.
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
+    // SAFETY: single-threaded here (called before anything spawns).
+    match unsafe { libc::fork() } {
+        -1 => Err(std::io::Error::last_os_error().to_string()),
+        0 => {
+            use std::os::fd::AsRawFd;
+            // SAFETY: plain fd and session calls in the new child.
+            unsafe {
+                libc::close(fds[0]);
+                libc::setsid();
+                let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
+                libc::dup2(null, 0);
+                libc::dup2(log.as_raw_fd(), 1);
+                libc::dup2(log.as_raw_fd(), 2);
+            }
+            READY.store(fds[1], std::sync::atomic::Ordering::Release);
+            Ok(())
+        }
+        child => {
+            // SAFETY: our pipe's write end.
+            unsafe { libc::close(fds[1]) };
+            let mut ready = String::new();
+            // SAFETY: our pipe's read end, owned from here on.
+            let pipe = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fds[0]) };
+            // One line: "ok", or EOF if the child exits first.
+            let _ = std::io::BufRead::read_line(&mut std::io::BufReader::new(pipe), &mut ready);
+            if ready.starts_with("ok") {
+                println!(
+                    "vroom-lab: running (pid {child}); agents: {}; log: {}",
+                    socket.display(),
+                    log_path.display()
+                );
+                std::process::exit(0);
+            }
+            let tail = std::fs::read_to_string(&log_path).unwrap_or_default();
+            let tail: Vec<&str> = tail.lines().rev().take(5).collect();
+            eprintln!("vroom-lab: failed to start; {}:", log_path.display());
+            for line in tail.into_iter().rev() {
+                eprintln!("  {line}");
+            }
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Set by SIGTERM, SIGINT or SIGHUP: stop the VM and remove the socket.
+static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn on_stop_signal(_: libc::c_int) {
+    STOP.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Tell a waiting `--daemon` parent the agent socket accepts.
+fn report_ready() {
+    let fd = READY.swap(-1, std::sync::atomic::Ordering::AcqRel);
+    if fd >= 0 {
+        // SAFETY: the pipe's write end, written once and closed.
+        unsafe {
+            libc::write(fd, b"ok\n".as_ptr().cast(), 3);
+            libc::close(fd);
+        }
+    }
 }
 
 /// A request from the frontend on stdin, or from an agent.
@@ -988,8 +1078,7 @@ impl Session {
     }
 }
 
-fn run() -> Result<(), String> {
-    let args = Args::parse();
+fn run(args: Args) -> Result<(), String> {
     let args_agent_socket = args.agent_socket.clone();
     let config = vroom_config::VmConfig::load(&args.config).map_err(|e| e.to_string())?;
     if config.nested {
@@ -1078,6 +1167,11 @@ fn run() -> Result<(), String> {
                 }
             });
             eprintln!("vroom-lab: agents: {}", path.display());
+            for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+                // SAFETY: the handler only stores an atomic flag.
+                unsafe { libc::signal(signal, on_stop_signal as extern "C" fn(libc::c_int) as libc::sighandler_t) };
+            }
+            report_ready();
             Some(endpoint)
         }
         None => None,
@@ -1107,6 +1201,11 @@ fn run() -> Result<(), String> {
         }
     });
     loop {
+        if STOP.load(std::sync::atomic::Ordering::Acquire) {
+            session.vm.shutdown();
+            output(json!({"event":"shutdown"}))?;
+            return Ok(());
+        }
         // Consume debug events first: RAM reads only happen after all-stop.
         while let Some(event) = session.vm.next_event(Duration::ZERO) {
             match event {
@@ -1208,7 +1307,14 @@ fn run() -> Result<(), String> {
 }
 
 fn main() {
-    if let Err(e) = run() {
+    let args = Args::parse();
+    if args.daemon {
+        if let Err(e) = daemonize(args.agent_socket.as_deref().expect("clap: requires agent_socket")) {
+            eprintln!("vroom-lab: {e}");
+            std::process::exit(1);
+        }
+    }
+    if let Err(e) = run(args) {
         eprintln!("vroom-lab: {e}");
         std::process::exit(1);
     }

@@ -40,7 +40,16 @@ fn json_arg(s: Option<&String>) -> Result<Value, String> {
 
 fn run() -> Result<(), String> {
     let args = Args::parse();
-    let stream = UnixStream::connect(&args.socket).map_err(|e| format!("{}: {e}", args.socket.display()))?;
+    let stream = UnixStream::connect(&args.socket).map_err(|e| {
+        let hint = match e.kind() {
+            std::io::ErrorKind::ConnectionRefused => {
+                "\n  nothing listens there: the lab that made it has exited (killed with the shell that started it?).\n  Start it with: vroom-lab CONFIG [--restore CHECKPOINT] --agent-socket PATH --daemon"
+            }
+            std::io::ErrorKind::NotFound => "\n  no lab socket there yet: start vroom-lab with --agent-socket PATH (--daemon to background it)",
+            _ => "",
+        };
+        format!("{}: {e}{hint}", args.socket.display())
+    })?;
     let mut write = stream.try_clone().map_err(|e| e.to_string())?;
     let mut read = BufReader::new(stream);
     call(&mut read, &mut write, 1, "initialize", json!({"actor": args.actor}))?;

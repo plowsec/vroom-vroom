@@ -37,9 +37,10 @@ Use a disposable overlay. Separate state directory. Starts paused.
 JSON-RPC 2.0, one object per line, owner-only Unix socket. Same protocol as angr_tui's.
 
 ```sh
+research/build.sh --release                                                # signed: target/research/release/vroom-lab
 research/run.sh LAB.toml --restore CHECKPOINT --agent-socket lab.sock     # beside the TUI
-target/research/release/vroom-lab LAB.toml --restore CHECKPOINT --agent-socket lab.sock < /dev/null   # headless
-cargo build --release -p vroom-kernel --bin vroom-rpc
+target/research/release/vroom-lab LAB.toml --restore CHECKPOINT --agent-socket lab.sock --daemon   # headless
+kill PID                                                                   # stops the VM, removes the socket
 vroom-rpc --socket lab.sock describe
 vroom-rpc --socket lab.sock commands.list '{"category":"kernel"}'
 vroom-rpc --socket lab.sock run memory.read_virtual '{"cpu":1,"address":"0xfffff80275ff70a8","length":16}'
@@ -70,6 +71,8 @@ fuzz      check run* probe* coverage blocks diff crashes          * jobs.start o
 - `fuzz.coverage|blocks|diff|crashes` read a run directory; no VM.
 - Results and jobs belong to the actor that made them.
 - Socket paths: under 104 bytes. A path in a deep temp dir fails: use a relative one.
+- `--daemon`: own session, returns when the socket accepts (prints pid, log `PATH.log`). Use it from agents: their shells often kill what a command started, which leaves a dead socket (`Connection refused`).
+- `target/debug/vroom-lab` is unsigned (cargo tests relink it): run the `target/research/` builds.
 
 Function-calling adapter (one tool):
 
