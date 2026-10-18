@@ -353,7 +353,8 @@ first has 3D: two 3D GPUs would need to share frames (Windows draws a
 monitor on one GPU and shows it on another), which the Direct3D driver
 can't do across renderers. The others are 2D; Windows' 2D driver clears
 "its framebuffer" in BAR 0 with stores the hypervisor can't decode, so
-those GPUs have plain memory there and their registers in BAR 2.
+those GPUs have plain memory there and their registers in BAR 2. The 3D
+one has some too (see "Direct3D state can't be saved" below).
 
 The viewer sends each window's size (`HeadResize`, 0x0 when it closes)
 and pointer (`HeadPointer`). The agent service turns the sizes into one
@@ -849,16 +850,62 @@ then everything as usual. One viewer at a time. No viewer for 5 minutes:
 the VMM suspends. The state lock holds the VMM's pid, so the app can stop
 one that hangs (only a process whose executable is `vroom`).
 
-Direct3D state can't be saved. A suspend or snapshot of a Windows guest
-using it first asks the guest agent to turn the 3D display device off
-(SetupAPI, like Device Manager); the VMM waits until the guest has no
-Direct3D context left and the agent confirms, saves, and asks for the
-device back on (after a snapshot, and whenever an agent connects, so a
-resumed or killed VM gets it back). A stopped driver leaves blobs behind;
-host blobs no context uses are left out of the save. Where no buffer is
-mapped, the host-visible window is backed by reserved anonymous memory,
-so a guest touching a buffer it already gave back reads memory instead of
-stopping the VM.
+Direct3D state can't be saved ("parking"). A suspend or snapshot of a
+Windows guest using it first asks the guest agent to turn the 3D display
+device off (SetupAPI, like Device Manager); the VMM waits until the guest
+has no Direct3D context left and the agent confirms, lets Windows settle
+on its basic display for 3 s, saves, and asks for the device back on
+(after a snapshot, and whenever an agent connects, so a resumed or killed
+VM gets it back). Pieces that make this work:
+
+- The kernel driver stops before Windows has destroyed every process's
+  Direct3D device, and it destroys the rest when it can no longer tell
+  the host. Contexts still there 3 s after the agent said "off" are the
+  stopped driver's: the GPU worker drops them (the driver resets the GPU
+  when it starts again anyway). virglrenderer patch 0017 sets the
+  "fatal" bit in each ring's status when a Neptune context goes, so a
+  process still waiting on one gives up at once.
+- The driver unmaps its shared memory (the UMD's rings) from every
+  process while their UMD threads still use it: each process with a
+  Direct3D device crashed at its next draw. `vroom_d3d.dll`
+  (`scripts/guest/d3d/`), which the agent registers in place of the
+  driver's UMD and which loads it, adds an exception handler: an access
+  from the UMD's code to memory that is gone (free, or sometimes left
+  reserved) gets zeroed memory there, with "fatal" where a ring's status
+  would be. The UMD fails the call and Windows reports the device
+  removed, as after any GPU loss. A fault it can't handle leaves a line
+  in the process's `%TEMP%\vroom_d3d.log`.
+- When the driver stops it hands Windows' basic display driver a
+  1024x768 framebuffer at BAR 0, which was the virtio registers: the
+  basic display wrote its pixels there (registers garbled, and once an
+  access the hypervisor can't decode stopped a CPU; the save then held a
+  dead CPU and the resumed guest hung). Windows' 3D GPU now has 8 MiB of
+  plain memory in BAR 0 (as Windows' extra GPUs have), the host window in
+  BAR 2 and the registers in BAR 4. Saves from before keep the old layout
+  (snapshot meta `gpu.bar0_vram`).
+- A CPU that stopped on a fault is not saved: the save fails instead.
+
+A stopped driver also leaves blobs behind; host blobs no context uses
+are left out of the save. Where no buffer is mapped, the host-visible
+window is backed by reserved anonymous memory, so a guest touching a
+buffer it already gave back reads memory instead of stopping the VM.
+
+Why not save Direct3D instead (studied October 2026): Neptune forwards
+the COM calls of Direct3D 11 and 12 and DXGI (about 800 methods, 107 of
+them create objects, 195 object types; 142 methods on the D3D11 device
+context alone) over rings that several guest threads share. Venus
+snapshots (patch 0010, 3000 lines) replay a context's creation calls and
+copy its memory back; for Neptune the same needs: a record of every
+creation call with its data (resources made with initial data,
+shaders, states, views, swapchains, fences, shared handles between
+processes: Windows' compositor opens every app's surfaces), the
+immediate context's bound state (no Vulkan-style explicit state: read
+back with the Get* calls), texture contents copied out through staging
+resources (multisampled and depth textures can't be, they would need a
+resolve or a shader), deferred contexts and their command lists, queries
+and fences with values in flight, and D3D12 on top. All of it in
+virglrenderer's C against DXMT's behaviour, with the guest UMD's ids kept.
+Several months of work with a long tail, so parking stays.
 
 With GL on, 2D resources (dumb buffers) live in virglrenderer too, as in
 QEMU: Xorg's glamor draws into them with GL, and a context that touches

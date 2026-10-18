@@ -956,6 +956,16 @@ graphics (Win+Ctrl+Shift+B; tested: the desktop comes back). Holding the
 fences back instead doesn't help: Windows' GPU watchdog doesn't fire
 with this driver, the desktop just hangs.
 
+Windows' Direct3D contexts are not saved: the VMM has the guest agent
+turn the 3D display off first (ARCHITECTURE.md, "Direct3D state can't be
+saved"). Contexts the stopped driver left are destroyed by the VMM, as a
+device reset would; that is a host decision on the agent's word that the
+device is off, and a guest that lies about it only loses its own
+contexts. Patch 0017 writes the "fatal" bit into the ring status the
+guest already shares with the host. `vroom_d3d.dll`, the wrapper around
+the guest's Direct3D driver, runs inside the guest only and adds no path
+to the host.
+
 Snapshots of Vulkan contexts (patch 0010) add three requests on each
 worker's socket and three calls between the VMM and the GPU process. The
 worker writes its context's state into a shared memory object of its own
@@ -1059,7 +1069,11 @@ What changes with `[display] monitors`:
   desktop (UAC), as with any app of the user.
 - Windows' extra GPUs carry 32 MiB of plain memory in BAR 0 (reserved,
   only what the guest writes is ever memory): its 2D driver clears it
-  as a framebuffer. The device never reads it.
+  as a framebuffer. Windows' 3D GPU carries 8 MiB, for the basic display
+  driver while the 3D one is off. The device never reads it. The memory
+  follows the BAR only inside the PCI windows: a BAR halfway through
+  being sized (all ones in its low half) can sit on RAM, and the memory
+  once went there and RAM was unmapped when it moved on.
 - On Windows the agent's service picks a display driver per GPU from the
   driver store (the 2D one on GPUs without 3D, the 3D one on the first
   when the host has 3D), as Device Manager does. It only chooses between
