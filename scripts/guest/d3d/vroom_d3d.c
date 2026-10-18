@@ -11,13 +11,14 @@
  * This DLL loads the real UMD (its path is in vroom_d3d.txt next to this
  * file, written by the agent), hands Direct3D its entry points, and adds
  * an exception handler: an access by the UMD to memory that is no longer
- * mapped gets fresh zeroed memory there instead. A ring's header starts a
- * page; in each page the handler sets where a ring's status would be to
- * "fatal", the host's own way of saying it is gone, so the UMD stops
- * waiting on it and fails the call. Windows reports the device removed to
- * the app at its next present, as for any lost GPU. Only accesses from the
- * UMD's code to unmapped memory are handled; anything else crashes as it
- * would have.
+ * mapped (free, or left reserved) gets fresh zeroed memory there
+ * instead. A ring's header starts a page; in each page the handler sets
+ * where a ring's status would be to "fatal", the host's own way of saying
+ * it is gone, so the UMD stops waiting on it and fails the call. Windows
+ * reports the device removed to the app at its next present, as for any
+ * lost GPU. Only accesses from the UMD's code to unmapped memory are
+ * handled; anything else crashes as it would have, and a fault it can't
+ * handle leaves a line in %TEMP%\vroom_d3d.log.
  *
  * Built for ARM64 and x64 (scripts/build-windows-d3d.sh); vroom_d3d.dll,
  * an ARM64X forwarder, sends each kind of process to its build. 32-bit
@@ -38,6 +39,42 @@ static open_adapter_fn open10, open12;
 /* The UMD's code: faults elsewhere aren't ours to touch. */
 static ULONG_PTR umd_lo, umd_hi;
 
+/* A fault in the UMD the handler leaves alone (the process then crashes
+ * as it would have): one line in %TEMP%\vroom_d3d.log, for a bug report. */
+static void
+note(ULONG_PTR a, const MEMORY_BASIC_INFORMATION *mi, DWORD err)
+{
+   wchar_t path[MAX_PATH];
+   DWORD n = GetTempPathW(MAX_PATH - 16, path);
+   if (!n || n >= MAX_PATH - 16)
+      return;
+   lstrcpyW(path + n, L"vroom_d3d.log");
+   HANDLE f = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS, 0, NULL);
+   if (f == INVALID_HANDLE_VALUE)
+      return;
+   /* fault, state, type, protect, allocation base, size, error: in hex. */
+   const ULONG_PTR v[] = {a, mi->State, mi->Type, mi->Protect, (ULONG_PTR)mi->AllocationBase, mi->RegionSize, err};
+   char line[7 * 17 + 2];
+   int len = 0;
+   for (int i = 0; i < 7; i++) {
+      for (int s = 60; s >= 0; s -= 4)
+         line[len++] = "0123456789abcdef"[(v[i] >> s) & 15];
+      line[len++] = i < 6 ? ' ' : '\r';
+   }
+   line[len++] = '\n';
+   DWORD wrote;
+   WriteFile(f, line, (DWORD)len, &wrote, NULL);
+   CloseHandle(f);
+}
+
+/* A ring's header starts a page: mark each page's would-be status. */
+static void
+mark_fatal(void *p, SIZE_T size)
+{
+   for (SIZE_T off = 0; off + RING_STATUS_OFFSET < size; off += PAGE)
+      ((volatile UINT32 *)((char *)p + off))[RING_STATUS_OFFSET / 4] = RING_STATUS_FATAL;
+}
+
 static LONG CALLBACK
 on_fault(EXCEPTION_POINTERS *e)
 {
@@ -56,27 +93,43 @@ on_fault(EXCEPTION_POINTERS *e)
       return EXCEPTION_CONTINUE_EXECUTION; /* another thread got here first */
    /* Seen once after a boot: the ring still listed as a mapped view, its
     * pages gone. A view that faults is dead: take it out. */
-   if (mi.State == MEM_COMMIT && mi.Type == MEM_MAPPED && UnmapViewOfFile(mi.AllocationBase))
-      return EXCEPTION_CONTINUE_EXECUTION; /* faults again, on free memory */
-   if (mi.State != MEM_FREE)
+   if (mi.State == MEM_COMMIT && mi.Type == MEM_MAPPED) {
+      if (UnmapViewOfFile(mi.AllocationBase))
+         return EXCEPTION_CONTINUE_EXECUTION; /* faults again, on free memory */
+      note(a, &mi, GetLastError());
       return EXCEPTION_CONTINUE_SEARCH;
+   }
+   /* Seen too: the ring's addresses still reserved, nothing behind them
+    * (the reservation starts where the ring did). Fill them in. */
+   if (mi.State == MEM_RESERVE && mi.Type == MEM_PRIVATE) {
+      void *p = VirtualAlloc(mi.BaseAddress, mi.RegionSize, MEM_COMMIT, PAGE_READWRITE);
+      if (!p) {
+         note(a, &mi, GetLastError());
+         return EXCEPTION_CONTINUE_SEARCH;
+      }
+      mark_fatal(p, mi.RegionSize);
+      return EXCEPTION_CONTINUE_EXECUTION;
+   }
+   if (mi.State != MEM_FREE) {
+      note(a, &mi, 0);
+      return EXCEPTION_CONTINUE_SEARCH;
+   }
    /* Memory starts on 64 KiB, but the next mapping may follow closer
     * than that: take what is free from the window's start. */
-   if (!VirtualQuery((void *)base, &mi, sizeof mi) || mi.State != MEM_FREE)
+   if (!VirtualQuery((void *)base, &mi, sizeof mi) || mi.State != MEM_FREE || a - base >= mi.RegionSize) {
+      note(a, &mi, 1);
       return EXCEPTION_CONTINUE_SEARCH;
+   }
    const SIZE_T size = mi.RegionSize < WINDOW ? mi.RegionSize : WINDOW;
-   if (a - base >= size)
-      return EXCEPTION_CONTINUE_SEARCH;
    void *p = VirtualAlloc((void *)base, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
    if (!p) {
       /* Lost a race with another thread mapping the same window. */
       if (VirtualQuery((void *)a, &mi, sizeof mi) && mi.State == MEM_COMMIT && mi.Type == MEM_PRIVATE)
          return EXCEPTION_CONTINUE_EXECUTION;
+      note(a, &mi, GetLastError());
       return EXCEPTION_CONTINUE_SEARCH;
    }
-   /* A ring's header starts a page: mark each page's would-be status. */
-   for (SIZE_T off = 0; off < size; off += PAGE)
-      ((volatile UINT32 *)((char *)p + off))[RING_STATUS_OFFSET / 4] = RING_STATUS_FATAL;
+   mark_fatal(p, size);
    return EXCEPTION_CONTINUE_EXECUTION;
 }
 

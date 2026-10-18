@@ -93,6 +93,9 @@ const REVIVE_WAIT: Duration = if cfg!(test) { Duration::from_millis(400) } else 
 const REVIVE_TRIES: u8 = 3;
 /// How long turning it off may take (it often takes a few seconds).
 const REVIVE_OFF_WAIT: Duration = Duration::from_secs(30);
+/// How long it stays off before it goes on again: Windows settles on its
+/// basic display first (on again at once, it often showed nothing still).
+const REVIVE_OFF_PAUSE: Duration = if cfg!(test) { Duration::from_millis(100) } else { Duration::from_secs(3) };
 
 /// Watching the 3D display come back (see `Service::revive`).
 #[derive(Debug, Clone, Copy)]
@@ -101,6 +104,8 @@ struct Revive {
     tries: u8,
     /// We turned it off to turn it on again.
     cycling: bool,
+    /// When the guest said it is off (while cycling).
+    off_at: Option<Instant>,
 }
 /// A viewer that doesn't take a dragged file's data for this long has
 /// given up on it.
@@ -305,16 +310,28 @@ impl Service {
     /// Windows sometimes turns its 3D display back on after a resume and
     /// never shows anything on it (the guest runs, its driver says OK):
     /// turn it off and on again, as one would in Device Manager.
+    /// (Plugging the monitor in again never brought one back in tests, so
+    /// it isn't tried; the device off for a few seconds and on did.)
     fn revive_tick(&mut self) {
         let Some(r) = self.revive else { return };
         if r.cycling {
-            if r.since.elapsed() > REVIVE_OFF_WAIT {
-                log::warn!("gpu: Windows didn't turn its 3D display off and on again");
-                self.revive = None;
+            match r.off_at {
+                Some(t) if t.elapsed() > REVIVE_OFF_PAUSE => {
+                    self.revive = Some(Revive { since: Instant::now(), cycling: false, off_at: None, ..r });
+                    self.send(&Message::Gpu3d { on: true });
+                }
+                None if r.since.elapsed() > REVIVE_OFF_WAIT => {
+                    log::warn!("gpu: Windows didn't turn its 3D display off and on again");
+                    self.revive = None;
+                }
+                _ => {}
             }
             return;
         }
         if self.screen.heads.first().is_none_or(|h| h.0.showing()) {
+            if r.tries > 0 {
+                log::info!("gpu: Windows shows its 3D display again ({} times off and on)", r.tries);
+            }
             self.revive = None;
         } else if r.since.elapsed() > REVIVE_WAIT {
             if r.tries >= REVIVE_TRIES {
@@ -322,17 +339,8 @@ impl Service {
                 self.revive = None;
                 return;
             }
-            if r.tries == 0 {
-                // First a new monitor, which makes Windows set a mode.
-                log::info!("gpu: Windows shows nothing on its 3D display: plugging its monitor in again");
-                self.revive = Some(Revive { since: Instant::now(), tries: 1, cycling: false });
-                if let Some(h) = self.screen.heads.first() {
-                    h.0.replug();
-                }
-                return;
-            }
             log::info!("gpu: Windows shows nothing on its 3D display: turning it off and on again");
-            self.revive = Some(Revive { since: Instant::now(), tries: r.tries + 1, cycling: true });
+            self.revive = Some(Revive { since: Instant::now(), tries: r.tries + 1, cycling: true, off_at: None });
             self.send(&Message::Gpu3d { on: false });
         }
     }
@@ -393,9 +401,11 @@ impl Service {
                 self.status.lock().unwrap_or_else(|e| e.into_inner()).gpu3d = Some(on);
                 match (on, self.revive) {
                     (true, r) if self.screen.gpu3d => {
-                        self.revive = Some(Revive { since: Instant::now(), tries: r.map_or(0, |r| r.tries), cycling: false });
+                        self.revive = Some(Revive { since: Instant::now(), tries: r.map_or(0, |r| r.tries), cycling: false, off_at: None });
                     }
-                    (false, Some(r)) if r.cycling => self.send(&Message::Gpu3d { on: true }),
+                    (false, Some(r)) if r.cycling && r.off_at.is_none() => {
+                        self.revive = Some(Revive { off_at: Some(Instant::now()), ..r });
+                    }
                     _ => {}
                 }
             }
@@ -972,7 +982,7 @@ mod tests {
     }
 
     #[test]
-    fn a_3d_display_that_shows_nothing_is_replugged_then_turned_off_and_on() {
+    fn a_3d_display_that_shows_nothing_is_turned_off_and_on() {
         let (gpu, ctl) = vroom_virtio::devices::gpu::Gpu::with_heads(&[(1024, 768)], vec![Arc::new(NoSink)]);
         drop(gpu);
         let screen = Screen { heads: vec![(ctl, 0)], gpu3d: true, ..Default::default() };
@@ -983,10 +993,11 @@ mod tests {
         assert!(read_msgs(&mut guest, &mut d).contains(&Message::Gpu3d { on: true }));
         // On, and nothing shows on it: off, then on again once it's off.
         guest.write_all(&Message::Gpu3d { on: true }.encode()).unwrap();
-        // First its monitor is plugged in again, then the device cycled.
-        std::thread::sleep(REVIVE_WAIT * 2 + POLL * 3);
+        std::thread::sleep(REVIVE_WAIT + POLL * 3);
         assert!(read_msgs(&mut guest, &mut d).contains(&Message::Gpu3d { on: false }));
+        // Off: on again, after a pause.
         guest.write_all(&Message::Gpu3d { on: false }.encode()).unwrap();
+        std::thread::sleep(REVIVE_OFF_PAUSE + POLL * 3);
         assert!(read_msgs(&mut guest, &mut d).contains(&Message::Gpu3d { on: true }));
         a.send(AgentCmd::Stop);
     }

@@ -182,7 +182,9 @@ const PAUSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long Windows gets to turn its 3D display off before a save, and
 /// to settle on its basic display afterwards.
 const PARK_TIMEOUT: Duration = Duration::from_secs(20);
-const PARK_SETTLE: Duration = Duration::from_millis(6000);
+/// Saved 1.5 s after its 3D display went off, Windows showed nothing on
+/// it after the first resume after a boot (4 of 4); 3 s and more, never.
+const PARK_SETTLE: Duration = Duration::from_secs(3);
 /// Once the device is off, how long its driver's Direct3D contexts get to
 /// go before the save drops them (see `GpuControl::set_driver_stopped`).
 const PARK_LEFTOVERS: Duration = Duration::from_secs(3);
