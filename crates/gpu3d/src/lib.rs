@@ -20,7 +20,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
-use vroom_virtio::devices::gpu3d::{Blob, Box3d, Create3d, FenceDone, HostIov, Mapping, Renderer3d, Transfer3d};
+use vroom_virtio::devices::gpu3d::{Blob, Box3d, Create3d, FenceDone, HostIov, Mapping, Renderer3d, SurfaceFrame, Transfer3d};
 
 #[cfg(target_os = "macos")]
 mod gl;
@@ -31,6 +31,8 @@ pub mod server;
 
 #[cfg(target_os = "macos")]
 pub use gl::Host as GlHost;
+#[cfg(target_os = "macos")]
+pub use gl::NewSurface;
 
 const CAPSET_VIRGL: u32 = 1;
 const CAPSET_VIRGL2: u32 = 2;
@@ -1095,6 +1097,36 @@ impl Renderer3d for Virgl {
         }
     }
 
+    fn surface_start(&mut self, head: u32, resource: u32, bx: Box3d) -> bool {
+        enter();
+        // Only where the surfaces can reach the app (the GPU process,
+        // with a port to the VMM).
+        #[cfg(target_os = "macos")]
+        if remote::surfaces_wanted() {
+            let mut info = [0u32; 16];
+            // SAFETY: the buffer is larger than the struct the library fills.
+            if unsafe { (self.lib.get_info)(resource as c_int, info.as_mut_ptr() as *mut c_void) } != 0 || info[6] == 0 {
+                return false;
+            }
+            const Y_0_TOP: u32 = 1;
+            let flip = (info[5] & Y_0_TOP != 0).then_some(info[3]);
+            return gl::surface_start(head, info[6], flip, (bx.x, bx.y, bx.w, bx.h));
+        }
+        let _ = (head, resource, bx);
+        false
+    }
+
+    fn surface_poll(&mut self, wait: bool) -> Option<Option<SurfaceFrame>> {
+        enter();
+        #[cfg(target_os = "macos")]
+        return gl::surface_poll(wait).map(|f| f.map(|(head, gen, slot)| SurfaceFrame { head, gen, slot }));
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = wait;
+            None
+        }
+    }
+
     fn venus_save(&mut self, ctx: u32) -> Option<(bool, Vec<u8>)> {
         let (complete, fd, size) = self.save_context(ctx)?;
         let len = usize::try_from(size).ok().filter(|&n| n > 0)?;
@@ -1170,6 +1202,8 @@ impl Renderer3d for Virgl {
             self.drop_view(id);
         }
         sink().done.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(target_os = "macos")]
+        gl::surfaces_reset();
         leave();
     }
 

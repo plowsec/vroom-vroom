@@ -35,6 +35,8 @@ use crate::{ConsoleWindow, MonitorWindow, VmState};
 pub mod usbmenu;
 mod coherence;
 mod netmenu;
+#[cfg(target_os = "macos")]
+mod surfaces;
 mod tools;
 
 pub use netmenu::{live_of as net_live_of, mode_text as net_mode_text, set_mode as net_set_mode, NetView};
@@ -66,6 +68,8 @@ struct Shared {
     full: bool,
     /// What changed since the UI last looked: x0, y0, x1, y1.
     damage: Option<[u32; 4]>,
+    /// macOS: the latest frame is in this IOSurface (generation, slot).
+    surface: Option<(u32, u32)>,
     status: VecDeque<String>,
     clipboard: Option<String>,
     /// The guest records from the microphone (latest word from the VMM).
@@ -125,6 +129,11 @@ impl Shared {
                 // Clipped to the mode when used.
                 let r = [x, y, x.saturating_add(w), y.saturating_add(h)];
                 self.damage = grow(self.damage, r);
+                self.frame = true;
+            }
+            ToViewer::Surface { gen, slot, x, y, w, h } => {
+                self.surface = Some((gen, slot));
+                self.damage = grow(self.damage, [x, y, x.saturating_add(w), y.saturating_add(h)]);
                 self.frame = true;
             }
             ToViewer::HeadMode { head, width, height } => {
@@ -303,6 +312,21 @@ pub struct Console {
     out_timer: slint::Timer,
     /// The guest tools button.
     tools: tools::Tools,
+    /// The screen straight from the GPU, when we started the VMM.
+    #[cfg(target_os = "macos")]
+    surf: Option<Surf>,
+}
+
+/// The screen as IOSurfaces in a layer (see console/surfaces.rs).
+#[cfg(target_os = "macos")]
+struct Surf {
+    pool: Arc<Mutex<surfaces::Pool>>,
+    /// Made once the window is up.
+    layer: Option<surfaces::Layer>,
+    /// We told the VMM to send surfaces.
+    on: bool,
+    /// The frame's surface: generation, slot.
+    shown: Option<(u32, u32)>,
 }
 
 /// Another monitor's window.
@@ -569,7 +593,16 @@ pub fn coh_click_any(x: f32, y: f32, title: &str) {
 
 /// A picture of some VM window (for `VROOM_SHOT`).
 pub fn snapshot_any() -> Option<Result<SharedPixelBuffer<Rgba8Pixel>, slint::PlatformError>> {
-    CONSOLES.with(|c| c.borrow().values().next().map(|c| c.win.window().take_snapshot()))
+    CONSOLES.with(|c| {
+        c.borrow_mut().values_mut().next().map(|c| {
+            // The screen in the layer isn't in Slint's picture: put it there.
+            #[cfg(target_os = "macos")]
+            if c.surf.as_ref().is_some_and(|s| s.on && s.shown.is_some()) {
+                c.picture_from_surface();
+            }
+            c.win.window().take_snapshot()
+        })
+    })
 }
 
 /// A picture of some VM's window for monitor `n` (2, 3...; for `VROOM_SHOT`).
@@ -714,20 +747,39 @@ pub fn start(path: &Path, cfg: &VmConfig, extra: &[String]) -> Result<String, St
     // Through a symlink (in /usr/local/bin, say): the real one's folder.
     let exe = std::env::current_exe().and_then(std::fs::canonicalize).map_err(|e| e.to_string())?;
     let vmm = exe.with_file_name("vroom");
-    let child = Proc::new(&vmm)
-        .arg("run")
+    let mut cmd = Proc::new(&vmm);
+    cmd.arg("run")
         .arg(path)
         .arg("--ui-fd")
         .arg(theirs.as_raw_fd().to_string())
         .args(extra)
         .stdin(Stdio::null())
         .stdout(logf.try_clone().map_err(|e| e.to_string())?)
-        .stderr(logf)
-        .spawn()
-        .map_err(|e| format!("start {}: {e}", vmm.display()))?;
+        .stderr(logf);
+    // A port for the screen's IOSurfaces: the VMM inherits a send right.
+    // VROOM_NO_SURFACES=1: pixels through the shared frame buffer only.
+    #[cfg(target_os = "macos")]
+    let rx = std::env::var_os("VROOM_NO_SURFACES").is_none().then(vroom_ipc::mach::Port::receiver).and_then(Result::ok);
+    #[cfg(target_os = "macos")]
+    let child = match rx.as_ref().map(|r| r.sender()) {
+        Some(Ok(tx)) => vroom_ipc::mach::bequeath(&tx, || cmd.spawn()),
+        _ => cmd.spawn(),
+    };
+    #[cfg(not(target_os = "macos"))]
+    let child = cmd.spawn();
+    let child = child.map_err(|e| format!("start {}: {e}", vmm.display()))?;
     drop(theirs);
     let pid = child.id();
     let key = open(key, path, cfg, ours, Some(child), pid, VmState::Starting)?;
+    #[cfg(target_os = "macos")]
+    if let Some(rx) = rx {
+        with(&key, |c| {
+            match surfaces::inbox(rx, pid, c.gone.clone()) {
+                Ok(pool) => c.surf = Some(Surf { pool, layer: None, on: false, shown: None }),
+                Err(e) => log::warn!("surfaces: {e}"),
+            }
+        });
+    }
     with(&key, |c| c.usb_prepare(resuming));
     Ok(key)
 }
@@ -847,6 +899,8 @@ fn open(key: String, path: &Path, cfg: &VmConfig, ours: UnixStream, child: Optio
         out: None,
         out_timer: slint::Timer::default(),
         tools: tools::Tools::default(),
+        #[cfg(target_os = "macos")]
+        surf: None,
     };
     CONSOLES.with(|m| m.borrow_mut().insert(key.clone(), c));
     ensure_timer();
@@ -900,6 +954,18 @@ fn wire(win: &ConsoleWindow, key: &str, io: &Rc<RefCell<Io>>) {
             let k = k.clone();
             slint::Timer::single_shot(Duration::ZERO, move || command(&k, "close"));
             slint::CloseRequestResponse::KeepWindowShown
+        });
+    }
+    {
+        let k = key.to_string();
+        win.on_screen_moved(move || {
+            let k = k.clone();
+            // Not while Slint is busy with the window.
+            slint::Timer::single_shot(Duration::ZERO, move || {
+                #[cfg(target_os = "macos")]
+                with(&k, |c| c.surface_update());
+                let _ = &k;
+            });
         });
     }
     let (k, io) = (key.to_string(), io.clone());
@@ -1333,6 +1399,17 @@ impl Console {
         let (frame, full, damage, status, clip, mic, cursor, drag, camera, usb, features, windows, icons_no_net, heads) = {
             let mut s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
             s.posted = false;
+            #[cfg(target_os = "macos")]
+            if let (Some(f), Some(surf)) = (s.surface.take(), self.surf.as_mut()) {
+                // Only while we asked for them (stragglers after we stop).
+                if surf.on {
+                    surf.shown = Some(f);
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                s.surface = None;
+            }
             let heads = s.heads;
             for h in s.heads.iter_mut() {
                 (h.frame, h.full, h.damage) = (false, false, None);
@@ -1545,6 +1622,8 @@ impl Console {
         self.win.set_captured(self.io.borrow().focused && self.state == VmState::Running);
         self.win.set_coherence_why(self.coherence_why().into());
         self.coh_tick();
+        #[cfg(target_os = "macos")]
+        self.surface_update();
     }
 
     /// A file is dragged over the window (several come at once).
@@ -2228,9 +2307,19 @@ impl Console {
             return;
         }
         let fresh = full || self.mode != mode;
-        let win = self.win.clone_strong();
-        if let Some(img) = paint(fb, 0, mode, fresh, damage, &mut self.img, &|| win.set_frame(slint::Image::default())) {
-            self.win.set_frame(img);
+        #[cfg(target_os = "macos")]
+        let from_gpu = self.surf.as_ref().is_some_and(|s| s.on && s.shown.is_some());
+        #[cfg(not(target_os = "macos"))]
+        let from_gpu = false;
+        if from_gpu {
+            // In the layer: nothing to paint.
+            #[cfg(target_os = "macos")]
+            self.surface_update();
+        } else {
+            let win = self.win.clone_strong();
+            if let Some(img) = paint(fb, 0, mode, fresh, damage, &mut self.img, &|| win.set_frame(slint::Image::default())) {
+                self.win.set_frame(img);
+            }
         }
         if self.mode != mode {
             // Ask the guest to match the window on the first frame.
@@ -2252,6 +2341,10 @@ impl Console {
         let now = Instant::now();
         if now.duration_since(self.last_thumb) > THUMB_EVERY {
             self.last_thumb = now;
+            if from_gpu {
+                #[cfg(target_os = "macos")]
+                self.picture_from_surface();
+            }
             if let Some(img) = self.scaled(640).map(|(b, _, _)| slint::Image::from_rgba8(b)) {
                 msg::send(Msg::Thumb { key: self.key.clone(), image: img });
             }

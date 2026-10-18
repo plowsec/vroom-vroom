@@ -5526,6 +5526,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "log",
+ "vroom-ipc",
  "vroom-memory",
  "vroom-sandbox",
  "vroom-virtio",
@@ -5595,6 +5596,7 @@ name = "vroom-ipc"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "log",
 ]
 
 [[package]]

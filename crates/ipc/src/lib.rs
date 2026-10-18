@@ -1,7 +1,13 @@
-//! Pass one fd over a unix stream (SCM_RIGHTS).
+//! Pass one fd over a unix stream (SCM_RIGHTS), and mach ports between
+//! our processes on macOS ([`mach`]).
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
+
+#[cfg(target_os = "macos")]
+pub mod mach;
+#[cfg(target_os = "macos")]
+pub mod surface;
 
 #[derive(Debug)]
 pub enum Error {

@@ -7,21 +7,17 @@
 //! vroom_gpu3d::server). A worker loads MoltenVK or DXMT and locks itself
 //! down to the GPU (and DXMT's shader cache), then serves its context.
 
-use std::os::fd::{FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
+/// The call socket is our stdin; the fence socket and guest RAM come
+/// over it first (vroom_gpu3d::remote::helper_fds).
 #[derive(clap::Args, Debug)]
 pub struct HelperArgs {
-    /// Socket for calls (an fd we inherit).
+    /// Guest RAM regions' sizes, in the order their fds come.
     #[arg(long)]
-    sock: RawFd,
-    /// Socket for fence wakeups (an fd we inherit).
-    #[arg(long)]
-    events: RawFd,
-    /// Guest RAM regions: fd:size (inherited shared memory).
-    #[arg(long, value_parser = ram)]
-    ram: Vec<(RawFd, u64)>,
+    ram_size: Vec<u64>,
     #[arg(long, default_value_t = 0)]
     granule: u64,
     /// OpenGL for the guest: apple or angle.
@@ -35,16 +31,13 @@ pub struct HelperArgs {
     shaders: PathBuf,
 }
 
-fn ram(s: &str) -> Result<(RawFd, u64), String> {
-    let (fd, size) = s.split_once(':').ok_or("fd:size")?;
-    Ok((fd.parse().map_err(|_| "fd")?, size.parse().map_err(|_| "size")?))
-}
-
 pub fn helper(a: HelperArgs) -> Result<(), String> {
-    // SAFETY: fds our parent (the VMM) set up for us; nothing else here
-    // uses them.
-    #[allow(unsafe_code)]
-    let (sock, events) = unsafe { (UnixStream::from_raw_fd(a.sock), UnixStream::from_raw_fd(a.events)) };
+    let sock = UnixStream::from(vroom_gpu3d::remote::take_stdin().map_err(|e| e.to_string())?);
+    if a.ram_size.len() > 64 {
+        return Err("too many guest RAM regions".into());
+    }
+    let (events, ram_fds) = vroom_gpu3d::remote::helper_fds(&sock, a.ram_size.len()).map_err(|e| format!("from the VMM: {e}"))?;
+    let ram: Vec<(RawFd, u64)> = ram_fds.iter().map(|f| f.as_raw_fd()).zip(a.ram_size.iter().copied()).collect();
     #[cfg(target_os = "macos")]
     let gl = match a.gl.as_deref() {
         Some("angle") => Some(vroom_gpu3d::GlHost::Angle),
@@ -78,7 +71,7 @@ pub fn helper(a: HelperArgs) -> Result<(), String> {
     if std::env::var_os("VROOM_SANDBOX_SELFTEST").is_some() {
         crate::session::selftest("gpu process", false);
     }
-    vroom_gpu3d::remote::serve(r, sock, events, &a.ram).map_err(|e| e.to_string())
+    vroom_gpu3d::remote::serve(r, sock, events, &ram).map_err(|e| e.to_string())
 }
 
 #[cfg(target_os = "macos")]

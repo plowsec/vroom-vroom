@@ -285,6 +285,10 @@ pub enum ToViewer {
     /// runs (its sandbox allows the connections NAT makes). `hotplug`:
     /// adapters can be added while it runs (`ToVmm::NetAdd`).
     Net { nat_ok: bool, hotplug: bool, ports: Vec<NetPort> },
+    /// macOS: the first monitor's frame is in IOSurface `slot` of
+    /// generation `gen` (the app got the surfaces from the VMM as mach
+    /// ports); the rect changed. Only after `ToVmm::Surfaces(true)`.
+    Surface { gen: u32, slot: u32, x: u32, y: u32, w: u32, h: u32 },
 }
 
 /// What the guest's pointer looks like.
@@ -395,6 +399,11 @@ pub enum ToVmm {
     /// viewer writes them into, as guest agent frames (`UpdateBegin`,
     /// then `UpdateData`), which the VMM checks and passes on.
     AgentUpdate,
+    /// macOS: the viewer shows the first monitor's GL frames from the
+    /// IOSurfaces the VMM passes it (it started the VMM, with a mach port
+    /// for them): send `ToViewer::Surface` instead of pixels. False: back
+    /// to pixels in the shared frame buffer.
+    Surfaces(bool),
 }
 
 fn frame(ty: u8, payload: &[u8]) -> Vec<u8> {
@@ -515,6 +524,7 @@ impl ToViewer {
             ToViewer::Apps(list) => frame(60, &vroom_proto::encode_apps(list)),
             ToViewer::HeadMode { head, width, height } => frame(16, &u32s(&[*head, *width, *height])),
             ToViewer::HeadDamage { head, x, y, w, h } => frame(17, &u32s(&[*head, *x, *y, *w, *h])),
+            ToViewer::Surface { gen, slot, x, y, w, h } => frame(110, &u32s(&[*gen, *slot, *x, *y, *w, *h])),
             ToViewer::Net { nat_ok, hotplug, ports } => {
                 let mut p = vec![*nat_ok as u8 | (*hotplug as u8) << 1, ports.len() as u8];
                 for n in ports {
@@ -598,6 +608,10 @@ impl ToViewer {
                 ToViewer::WindowIcon { id, w, h, rgba }
             }
             19 => ToViewer::CoherenceNo(line(p)?),
+            110 if p.len() == 24 => {
+                let v: Vec<u32> = (0..6).map(|i| get_u32(p, i)).collect::<Result<_>>()?;
+                ToViewer::Surface { gen: v[0], slot: v[1], x: v[2], y: v[3], w: v[4], h: v[5] }
+            }
             60 => ToViewer::Apps(vroom_proto::decode_apps(p).ok_or(Error::Proto("apps"))?),
             40 => {
                 let (nat_ok, hotplug, n) = match p {
@@ -691,6 +705,7 @@ impl ToVmm {
             }
             // Well above the others.
             ToVmm::AgentUpdate => frame(91, &[]),
+            ToVmm::Surfaces(on) => frame(110, &[*on as u8]),
             ToVmm::NetAdd { live, mac, port_mac } => {
                 let mut p = mac.to_vec();
                 p.extend_from_slice(port_mac);
@@ -798,6 +813,7 @@ impl ToVmm {
             }
             40 if p.len() == 2 && (p[0] as usize) < NET_PORTS_MAX && p[1] <= 1 => ToVmm::NetConnect { nic: p[0], on: p[1] != 0 },
             91 if p.is_empty() => ToVmm::AgentUpdate,
+            110 if p.len() == 1 && p[0] <= 1 => ToVmm::Surfaces(p[0] != 0),
             95 if p.len() >= 12 => {
                 let (mut mac, mut port_mac) = ([0u8; 6], [0u8; 6]);
                 mac.copy_from_slice(&p[..6]);
@@ -1041,6 +1057,8 @@ mod tests {
         let msgs = [
             ToVmm::NetConnect { nic: 1, on: false },
             ToVmm::AgentUpdate,
+            ToVmm::Surfaces(true),
+            ToVmm::Surfaces(false),
             ToVmm::NetSet { nic: 0, live: nat(vec![fwd.clone()]), port_mac: [0; 6] },
             ToVmm::NetSet { nic: 7, live: bridged.clone(), port_mac: [0x3e, 1, 2, 3, 4, 5] },
             ToVmm::NetAdd { live: nat(vec![]), mac: [2, 1, 2, 3, 4, 7], port_mac: [0; 6] },
@@ -1062,6 +1080,11 @@ mod tests {
         };
         d.push(&v.encode());
         assert_eq!(d.next_to_viewer().unwrap(), Some(v));
+        let s = ToViewer::Surface { gen: 3, slot: 2, x: 0, y: 10, w: 640, h: 20 };
+        d.push(&s.encode());
+        assert_eq!(d.next_to_viewer().unwrap(), Some(s));
+        d.push(&frame(110, &[2]));
+        assert!(d.next_to_vmm().is_err(), "surfaces is a bool");
         // Bad: adapter 8, a name for NAT, no name for bridged, odd names,
         // forwards on a bridged adapter, a bad address, a multicast MAC,
         // trailing bytes, the same adapter twice.

@@ -23,7 +23,7 @@
 
 use std::ffi::{c_int, c_void};
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -98,24 +98,7 @@ extern "C" fn server_fd(_cookie: *mut c_void, version: u32) -> c_int {
     unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) }
 }
 
-/// Move a socket we got as stdin to a fd of its own, and give stdin
-/// /dev/null. For the server and the workers.
-pub fn take_stdin() -> std::io::Result<OwnedFd> {
-    // SAFETY: plain fcntl/open/dup2 on fd 0, which our parent set up for
-    // us and nothing else in this process uses.
-    unsafe {
-        let fd = libc::fcntl(0, libc::F_DUPFD_CLOEXEC, 3);
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
-        if null >= 0 {
-            libc::dup2(null, 0);
-            libc::close(null);
-        }
-        Ok(OwnedFd::from_raw_fd(fd))
-    }
-}
+pub use crate::remote::take_stdin;
 
 /// One worker: the context it serves.
 #[derive(Debug)]

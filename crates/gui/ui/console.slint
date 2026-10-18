@@ -514,6 +514,17 @@ export component ConsoleWindow inherits Window {
     callback act(string);
     // The mouse went over the guest screen (true) or left it.
     callback pointer-over(bool);
+    // macOS: the screen may show from a layer of Rust's over this place
+    // (frames straight from the GPU); it goes whenever something here is
+    // drawn over the screen. Rust follows these.
+    in-out property <bool> bar-menu;
+    out property <bool> screen-covered: root.state != VmState.running || root.mode-w == 0 || root.suspend-error != "" || root.float-out || root.drop-over || root.drop-text != "" || root.usb-open || root.net-open || root.toast != "" || root.bar-menu || ((root.mic-on || root.camera-on) && root.fullscreen);
+    callback screen-moved();
+    changed screen-covered => { root.screen-moved(); }
+    changed screen-x => { root.screen-moved(); }
+    changed screen-y => { root.screen-moved(); }
+    changed screen-width => { root.screen-moved(); }
+    changed screen-height => { root.screen-moved(); }
 
     title: vm-name + " — vroom";
     icon: Icons.logo;
@@ -756,6 +767,7 @@ export component ConsoleWindow inherits Window {
             tools: root.tools;
             tools-tip: root.tools-tip;
             wide: true;
+            changed power-open => { root.bar-menu = self.power-open; }
             usb-shown: root.usb-shown;
             usb-count: root.usb-count;
             usb-open: root.usb-open;
