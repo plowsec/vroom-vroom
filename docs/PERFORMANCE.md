@@ -213,6 +213,187 @@ change they stopped near 1200 fps, below before, because the copies had
 been waking the device thread early. The GPU-heavy terrain scene gains
 10 to 15 %.
 
+## Guest features
+
+Measurements behind [GUIDE.md](GUIDE.md); M3 Max unless said.
+
+### OpenGL (Linux guests)
+
+Speed, Ubuntu 22.04 live desktop (X11), 1280×800, 4 vCPUs, M3 Max,
+glmark2 2021.02 at its default 800×600 window, `opengl_host = "apple"`
+against llvmpipe in the same guest:
+
+| | llvmpipe (CPU) | `apple` |
+|---|---|---|
+| glmark2 score (full run) | 676 | 1059 |
+| terrain | 13 fps | 388 to 448 fps |
+| refract | 40 fps | 981 to 1071 fps |
+| desktop (blur) | 159 fps | 892 to 1006 fps |
+
+Anything with real work is many times faster, and the guest's CPUs stay
+free.
+
+### Zink
+
+Zink is a little slower than virgl for ordinary drawing: in a GNOME
+Wayland session, glmark2 scores about 1000 on Zink and 1170 on virgl, and
+its terrain scene, the heaviest for the GPU, runs at about 210 fps against
+420. Keep virgl for the desktop and use Zink for apps that need more than
+4.1. A compute shader test (1M invocations, 4096
+`sin` each) takes 9.4 ms on Zink, 3.1 s on llvmpipe.
+
+### Vulkan apps through snapshots
+
+Vulkan apps keep running through snapshots and suspend too, windows
+included (vkcube in Xorg, OpenGL apps on Zink). Each Vulkan app's
+renderer keeps the commands that made its objects (and the latest
+recording of each command buffer, the latest descriptor writes); a
+snapshot stops the app's renderer between two commands, waits for the
+GPU, and copies out its memory and images. On resume a fresh renderer
+replays the commands, puts the contents back and carries on where the
+app's command ring stood. The app notices nothing. Measured, Ubuntu 24.04,
+4 GiB guest:
+
+| Running | Kept per app | Saving it | Building it again |
+|---|---|---|---|
+| a compute loop (8 MiB of buffers) | 44 commands, 17.6 MiB | 6 to 9 ms | 0.4 s |
+| an off-screen drawing test (textures with layers and mipmaps) | 58 commands, 18.4 MiB | 8 to 13 ms | 0.46 s |
+| vkcube in an Xorg window | 216 commands, 17.8 MiB | 10 to 16 ms | 0.47 to 0.52 s |
+| glxgears on Zink | 380 commands, 28.9 MiB | | 0.44 s |
+| the compute loop with 1 GiB of buffers | 44 commands, 1033 MiB | 0.33 s | 0.8 s |
+
+About 9 MiB of each app's share is the guest driver's own command and
+reply memory. With vkcube, glxgears, the compute loop and the drawing
+test all open, suspend took 5.2 s and resume 5.6 s, and all four went on
+(the two tests check their results: no wrong values, the same pictures as
+before). With 1 GiB of Vulkan memory the snapshot took 9 s and 2 GB on
+disk (the GPU's part is stored as base64 for now, a third larger).
+
+### Direct3D 11 suspend (Windows guests)
+
+Measured (M3 Max, 8 GB guest, Edge and a Direct3D app open, 20
+suspends and resumes): before, 77 crash reports (about 4 per suspend:
+Explorer, the Start menu, the text input host, DWM, the app), one
+suspend refused, one resume that hung; after (42 suspends), no crash
+in the Direct3D driver, no refusal, no hang. Suspend about 13 s,
+resume about 10 s. In 2 to 4 resumes of 12, Windows shows nothing on
+its 3D display for about a minute, then comes back by itself; vroom
+turns the display device off and on meanwhile, which sometimes helps.
+If it stays black, suspend and resume again. With an OpenGL (Zink)
+and a Vulkan app open as well (8 suspends): no crash in the Direct3D
+driver; the Vulkan app stops at each save (lost device), the OpenGL
+one keeps running, except once when it crashed in our OpenGL driver.
+
+### OpenGL and Vulkan in Windows guests
+
+Frames come back from the Mac and are drawn into the window with GDI
+(the desktop compositor runs on Direct3D and can't see Vulkan's
+images). Measured at 640x480 (M3 Max): a Vulkan spinning cube about
+1000 frames per second; a spinning triangle in OpenGL 385 on Zink, 350
+on virgl, without vsync (OpenGL apps wait for vsync by default: 60). A
+compute shader over 1M values takes 5 to 10 ms in Vulkan, 16 ms in
+OpenGL. Big windows are slower.
+
+### Video decoding
+
+### What it saves
+
+On an M3 Max, guest with 4 vCPUs, decoding to nowhere (hardware:
+GStreamer or our V4L2 client; software: FFmpeg on all 4 vCPUs):
+
+| Stream | Hardware: time, guest CPU | Software: time, guest CPU |
+|---|---|---|
+| H.264 1080p, 12 Mbit/s, 600 pictures | 1.2 s, 0.15 s | 1.3 to 1.9 s, 4.5 to 5.5 s |
+| H.264 4K, 30 Mbit/s, 300 pictures | 2.2 s, 0.1 s | 3.4 s, 11.4 s |
+| VP9 1080p, 10 Mbit/s, 600 pictures | 2.0 s, 0.25 s | 3.9 s, 6.6 s |
+| AV1 1080p, 4 Mbit/s, 900 pictures | 1.0 s, 0.2 s | 1.9 s, 3.2 s |
+
+That is 140 to 900 pictures a second, far more than playing needs.
+
+Firefox playing 1080p files, its decoding process: H.264 at 12 Mbit/s
+from 0.24 CPUs to 0.02, VP9 at 10 Mbit/s from 0.35 to 0.02, HEVC at
+8 Mbit/s from 0.52 to 0.02. The
+picture is the same (bit for bit, checked with FFmpeg's VA-API decoding
+against FFmpeg's own decoders: H.264 with B-frames, slices, scaling
+matrices, weighted prediction; HEVC 8 and 10-bit with B-frame pyramids,
+slices, open GOPs; VP9 8 and 10-bit with hidden frames).
+
+Chrome 155, 1080p at 30 frames a second, in CPUs (1.0 is one guest CPU
+busy), before and after Chrome could use the GPU:
+
+| | Before: GPU process, page, whole guest | Now: GPU process, page, whole guest |
+|---|---|---|
+| H.264, 12 Mbit/s | 0.04, 0.24, 0.45 | 0.13, 0.02, 0.29 |
+| VP9, 22 Mbit/s | 0.04, 0.35, 0.49 | 0.16, 0.02, 0.30 |
+| Video call with itself, 720p VP8 (camera) | 0.04, 0.17, 0.43 | 0.04, 0.19, 0.48 |
+| The same in VP9 | | 0.09, 0.14, 0.49 |
+
+The decoding moves out of the page's process; the GPU process does the
+copies into GPU memory. A call costs about the same: sending was in
+software either way (for H.264 it no longer is, see
+[Video encoding](#video-encoding)).
+
+Since October 18, 2026 the driver no longer spins while it waits for a
+picture (it asked `poll()` about free bitstream buffers too, which are
+nearly always there): Chrome playing a 1080p30 H.264 clip at 12 Mbit/s
+under Wayland, GPU process 0.13 to 0.06, whole guest 0.35 to 0.28 (same
+clip, old and new driver, two runs each). Run `install-vaapi.sh` again
+to get it.
+
+The same videos in GNOME on Xorg (mean of two runs), before and after
+the X11 support (October 17, 2026):
+
+| | Before: GPU process, page, whole guest | Now: GPU process, page, whole guest |
+|---|---|---|
+| H.264, 12 Mbit/s | 0.04, 0.28, 0.44 | 0.09, 0.02, 0.28 |
+| VP9, 22 Mbit/s | 0.04, 0.49, 0.64 | 0.15, 0.02, 0.34 |
+| HEVC, 8 Mbit/s | doesn't play | 0.10, 0.02, 0.28 |
+
+No pictures dropped either way. The GPU process's share includes the
+conversion to BGRA (about 0.03 of a CPU at 1080p30).
+
+### Video encoding
+
+FFmpeg 6.1 encoding 300 frames of NV12 at 4 Mbit/s (time, then guest
+CPU: user and system), on an M3 Max with 4 vCPUs; PSNR of the result
+against its source:
+
+| | 1280x720 | 1920x1080 |
+|---|---|---|
+| `h264_v4l2m2m` | 0.46 s, 0.15 s; 42.0 dB | 0.84 s, 0.64 s; 39.6 dB |
+| `hevc_v4l2m2m` | | 0.87 s, 0.66 s |
+| `h264_vaapi` | 0.93 s, 0.98 s; 44.8 dB | 1.48 s, 1.77 s; 40.6 dB |
+| `hevc_vaapi` | 0.93 s, 1.00 s; 46.1 dB | 1.35 s, 1.50 s (1920x1088) |
+| `libx264 -preset veryfast` (software) | 0.77 s, 2.10 s; 46.2 dB | 1.23 s, 3.64 s; 41.0 dB |
+
+That is 200 to 650 frames a second. Through V4L2 the guest's CPU barely
+works; through VA-API, FFmpeg's upload and the driver's copies cost
+about 3 ms of guest CPU a frame. FFmpeg's V4L2 encoders put a key frame
+every 12 frames by default (`-g` changes that), hence their lower PSNR.
+All of these decode back cleanly. GStreamer's `v4l2h264enc` (720p,
+decodes back cleanly) and `v4l2h265enc` (1080p, 300 frames) work too.
+
+Chrome 155 in a call with itself (H.264, 720p camera, at most 2.5
+Mbit/s, received through the hardware decoder), in CPUs (1.0 is one
+guest CPU busy): GPU process, page, whole guest; mean of three 30-second
+runs each:
+
+| | OpenH264 (software) | VideoToolbox |
+|---|---|---|
+| Wayland: the VM's camera (test colour bars, about 170 kbit/s) | 0.06, 0.11, 0.44 | 0.08, 0.07, 0.44 |
+| Wayland: a noisy 720p clip as the camera (2.5 Mbit/s) | 0.07, 0.16, 0.47 | 0.10, 0.09, 0.45 |
+| Xorg: the VM's camera | 0.06, 0.09, 0.41 | 0.08, 0.06, 0.41 |
+| Xorg: the noisy clip | 0.07, 0.15, 0.44 | 0.10, 0.09, 0.42 |
+
+The encoding leaves the page's process (0.03 to 0.07 of a CPU less); the
+GPU process takes 0.02 to 0.03 more: it converts each camera frame to
+NV12 for the driver, which hands it to the device. For the guest as a
+whole it comes out about even at these sizes. With the noisy clip,
+OpenH264 sent 960x540 at that bitrate in every run; VideoToolbox kept
+1280x720 in two runs of six. Each frame takes longer: 5 to 7.5 ms from Chrome's
+side (`totalEncodeTime` over `framesEncoded`), against 2 to 3.5 ms for
+OpenH264; about 5 ms of it is VideoToolbox's low-latency encoder itself.
+
 ## Trade-offs
 
 - 4 KiB random I/O at queue depth 32 on virtio-blk is about 10 % below
