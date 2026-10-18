@@ -117,9 +117,15 @@ mod win {
         }
     }
 
+    /// Most bytes one write hands the driver. vioser puts a write in the
+    /// queue whole, a descriptor per page; the host's queues hold 64 and
+    /// take no indirect lists, so a bigger write (a command's output, a
+    /// file's 256 KiB piece) never fits and the port hangs for good.
+    const WRITE_MAX: usize = 64 << 10;
+
     impl io::Write for Side {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            let len = buf.len().min(u32::MAX as usize) as u32;
+            let len = buf.len().min(WRITE_MAX) as u32;
             // SAFETY: buf is valid for len bytes until the op completes.
             self.io(|h, ov| unsafe { WriteFile(h, buf.as_ptr(), len, std::ptr::null_mut(), ov) })
         }

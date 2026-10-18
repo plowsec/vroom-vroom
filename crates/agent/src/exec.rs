@@ -132,8 +132,10 @@ fn command(shell: Shell, line: &str) -> Command {
         }
         Shell::PowerShell => {
             let mut c = Command::new(sys.join("WindowsPowerShell\\v1.0\\powershell.exe"));
-            let script = format!("try {{ [Console]::OutputEncoding = [Text.Encoding]::UTF8 }} catch {{}}\n{line}");
-            c.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", &utf16_base64(&script)]);
+            // No progress records ("Preparing modules for first use"),
+            // and text, not CLIXML, on stderr.
+            let script = format!("$ProgressPreference = 'SilentlyContinue'\ntry {{ [Console]::OutputEncoding = [Text.Encoding]::UTF8 }} catch {{}}\n{line}");
+            c.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-OutputFormat", "Text", "-EncodedCommand", &utf16_base64(&script)]);
             c
         }
     };

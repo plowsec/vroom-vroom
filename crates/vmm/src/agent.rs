@@ -1326,6 +1326,8 @@ mod tests {
         guest.write_all(&Message::Hello { features: features::TIME_SYNC, agent: "t".into() }.encode()).unwrap();
         read_msgs(&mut guest, &mut d);
         assert!(a.exec(req("ver")).unwrap_err().contains("too old"));
+        let (_keep, pipe) = UnixStream::pair().unwrap();
+        assert!(a.update(pipe.into()).unwrap_err().contains("can't update itself"), "an agent without updates");
         guest.write_all(&Message::Hello { features: features::EXEC, agent: "t".into() }.encode()).unwrap();
         read_msgs(&mut guest, &mut d);
         assert!(a.exec(req("")).is_err());
