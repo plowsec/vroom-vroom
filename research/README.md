@@ -54,7 +54,7 @@ Methods: `initialize {actor}` first, `describe`, `commands.list {category?}`,
 
 ```text
 vm        status pause resume step step_over step_out checkpoint screenshot key shutdown
-guest     exec                                                    VM running; current guest tools
+guest     exec update_tools                                       VM running
 cpu       registers write_register
 memory    regions read_virtual read_physical translate write_virtual write_physical dump
 debug     breakpoints watchpoints
@@ -64,7 +64,8 @@ fuzz      check run* probe* coverage blocks diff crashes          * jobs.start o
 ```
 
 - Commands run on the lab's thread, in order with the TUI's. The TUI sees the agent's stops too.
-- `guest.exec {command, powershell?, timeout?, max_output?}`: the guest agent runs it (cmd.exe as SYSTEM); answers `{exit_code, timed_out, truncated, stdout, stderr}` when it ends.
+- The lab starts paused: `vm.resume` runs the guest (network, agent, screen). `vm.status` shows `guest_agent`.
+- `guest.exec {command, powershell?, timeout?, max_output?}`: the guest agent runs it (cmd.exe as SYSTEM); answers `{exit_code, timed_out, truncated, stdout, stderr}` when it ends. Older agent: `guest.update_tools` first.
 - Each command lists params, `mutates` and `risk` (read, control, write, destructive): gate writes on these.
 - Addresses: integers or `"0x..."`. Inspection needs a paused VM.
 - `events.poll` without `after` waits for the next event (stop, fault, shutdown). Events carry `seq`.

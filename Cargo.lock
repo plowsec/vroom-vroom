@@ -5655,6 +5655,7 @@ name = "vroom-kernel"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "env_logger",
  "libc",
  "pdb",
  "serde",
@@ -5664,6 +5665,7 @@ dependencies = [
  "vroom-display",
  "vroom-hv",
  "vroom-memory",
+ "vroom-tools",
  "vroom-vmm",
 ]
 

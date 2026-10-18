@@ -59,14 +59,15 @@ impl Os {
 }
 
 /// The guest tools folder: `VROOM_GUEST_TOOLS`, else next to the running
-/// program (vroom.app's Resources, or a build's target/ folder).
+/// program (vroom.app's Resources, or a build's target/ folder; vroom-lab's
+/// is target/research/<profile>).
 pub fn dir() -> Option<PathBuf> {
     if let Some(d) = std::env::var_os("VROOM_GUEST_TOOLS") {
         return Some(PathBuf::from(d)).filter(|d| looks_right(d));
     }
     let exe = std::env::current_exe().ok()?;
     let here = exe.parent()?;
-    [here.join("../Resources/guest-tools"), here.join("guest-tools"), here.join("../guest-tools")]
+    [here.join("../Resources/guest-tools"), here.join("guest-tools"), here.join("../guest-tools"), here.join("../../guest-tools")]
         .into_iter()
         .find(|d| looks_right(d))
         .map(|d| d.canonicalize().unwrap_or(d))

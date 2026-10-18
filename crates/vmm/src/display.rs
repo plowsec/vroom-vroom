@@ -835,7 +835,7 @@ fn serve(stream: UnixStream, c: &Serve) {
                 }
                 Ok(Some(ToVmm::Surfaces(on))) => c.tx.set_surfaces(on),
                 Ok(Some(ToVmm::AgentUpdate)) => match (!fds.is_empty()).then(|| fds.remove(0)) {
-                    Some(from) => c.agent.send(AgentCmd::Update { from }),
+                    Some(from) => c.agent.send(AgentCmd::Update { from, reply: None }),
                     None => log::warn!("display: guest tools without their pipe"),
                 },
                 Ok(Some(ToVmm::DragOutGet { id, item })) => match (!fds.is_empty()).then(|| fds.remove(0)) {

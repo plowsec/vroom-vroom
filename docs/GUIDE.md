@@ -164,7 +164,8 @@ Linux: a root systemd service plus an unprivileged session helper
 Commands in a running guest, no guest network needed:
 `vroom guest exec <vm.toml | name> [-p] [-t secs] -- ipconfig /all`
 (cmd.exe as SYSTEM, `-p` PowerShell; Linux: sh as root). Exits with the
-command's code. vroom-lab: `guest.exec`.
+command's code. vroom-lab: `guest.exec`. Newer tools without a window:
+`vroom guest update-tools <vm>` (vroom-lab: `guest.update_tools`).
 
 ## Ready-made VMs
 

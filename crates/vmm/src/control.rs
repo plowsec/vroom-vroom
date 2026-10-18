@@ -1,12 +1,15 @@
-//! The VM's control socket (`vroom guest exec`): one request per
-//! connection, as agent frames. `Exec` in (its id unused), `ExecDone`
-//! out; one refused here comes back `Failed`, stderr says why.
+//! The VM's control socket (`vroom guest ...`): one request per
+//! connection, as agent frames (ids unused).
+//! - `Exec` -> `ExecDone`; one refused here comes back `Failed`, stderr
+//!   says why.
+//! - `UpdateBegin`, its `UpdateData`, then the caller's end of writing ->
+//!   `UpdateDone`.
 
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::time::Duration;
 
-use vroom_proto::{Decoder, ExecEnd, Message, EXEC_CMD_MAX};
+use vroom_proto::{Decoder, ExecEnd, Message, MAGIC};
 
 use crate::agent::{Agent, ExecReq};
 
@@ -27,22 +30,47 @@ pub(crate) fn serve(l: UnixListener, agent: Agent) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The first frame, read to its end and no further (what follows may be
+/// for someone else), as bytes and decoded.
+fn read_frame(s: &mut UnixStream) -> std::io::Result<(Vec<u8>, Message)> {
+    let mut f = vec![0u8; 8];
+    s.read_exact(&mut f)?;
+    let len = u32::from_le_bytes([f[4], f[5], f[6], f[7]]) as usize;
+    if f[..2] != MAGIC || len > 1 << 20 {
+        return Err(std::io::Error::other("not a request"));
+    }
+    f.resize(8 + len, 0);
+    s.read_exact(&mut f[8..])?;
+    let mut d = Decoder::new(1 << 20);
+    d.push(&f);
+    let m = d.next().map_err(std::io::Error::other)?.ok_or_else(|| std::io::Error::other("not a request"))?;
+    Ok((f, m))
+}
+
 fn one(mut s: UnixStream, agent: &Agent) -> std::io::Result<()> {
     s.set_read_timeout(Some(Duration::from_secs(5)))?;
-    let mut d = Decoder::new(EXEC_CMD_MAX + 64);
-    let mut buf = vec![0u8; 16 << 10];
-    let m = loop {
-        if let Some(m) = d.next().map_err(std::io::Error::other)? {
-            break m;
+    let (raw, m) = read_frame(&mut s)?;
+    let (shell, timeout_ms, max_out, command) = match m {
+        Message::Exec { shell, timeout_ms, max_out, command, .. } => (shell, timeout_ms, max_out, command),
+        Message::UpdateBegin { version, .. } => {
+            log::info!("control: guest tools {version}");
+            s.set_read_timeout(Some(Duration::from_secs(60)))?;
+            // The update reads frames from a pipe to its end: this one,
+            // then the rest of what the caller sends.
+            let (mut a, b) = UnixStream::pair()?;
+            let mut rest = s.try_clone()?;
+            std::thread::Builder::new().name("control-update".into()).spawn(move || {
+                if a.write_all(&raw).is_ok() {
+                    let _ = std::io::copy(&mut rest, &mut a);
+                }
+            })?;
+            let (ok, why) = match agent.update(b.into()) {
+                Ok(()) => (true, String::new()),
+                Err(e) => (false, e),
+            };
+            return s.write_all(&Message::UpdateDone { id: 0, ok, why }.encode());
         }
-        let n = s.read(&mut buf)?;
-        if n == 0 {
-            return Ok(());
-        }
-        d.push(&buf[..n]);
-    };
-    let Message::Exec { shell, timeout_ms, max_out, command, .. } = m else {
-        return Err(std::io::Error::other("not a request"));
+        _ => return Err(std::io::Error::other("not a request")),
     };
     log::info!("control: exec {command}");
     let r = agent.exec(ExecReq { shell, command, timeout: Duration::from_millis(timeout_ms as u64), max_out });
@@ -63,7 +91,7 @@ mod tests {
     fn a_request_reaches_the_agent_and_its_answer_comes_back() {
         let (host, mut guest) = UnixStream::pair().unwrap();
         let agent = spawn(host, Default::default(), None, Screen::default()).unwrap();
-        guest.write_all(&Message::Hello { features: features::EXEC, agent: "t".into() }.encode()).unwrap();
+        guest.write_all(&Message::Hello { features: features::EXEC | features::UPDATE, agent: "t".into() }.encode()).unwrap();
         // The guest agent: answers what it is asked.
         std::thread::spawn(move || {
             let mut d = Decoder::new(1 << 20);
@@ -71,18 +99,27 @@ mod tests {
             while let Ok(n @ 1..) = guest.read(&mut buf) {
                 d.push(&buf[..n]);
                 while let Ok(Some(m)) = d.next() {
-                    if let Message::Exec { id, command, .. } = m {
-                        let done = Message::ExecDone { id, end: ExecEnd::Exited(2), truncated: true, stdout: command.into_bytes(), stderr: Vec::new() };
-                        guest.write_all(&done.encode()).unwrap();
+                    match m {
+                        Message::Exec { id, command, .. } => {
+                            let done = Message::ExecDone { id, end: ExecEnd::Exited(2), truncated: true, stdout: command.into_bytes(), stderr: Vec::new() };
+                            guest.write_all(&done.encode()).unwrap();
+                        }
+                        Message::UpdateData { id, data } => {
+                            guest.write_all(&Message::UpdateDone { id, ok: data == b"agent", why: "bad".into() }.encode()).unwrap();
+                        }
+                        _ => {}
                     }
                 }
             }
         });
-        let ask = |m: Message| {
+        let ask = |ms: &[Message]| {
             let (mut cli, vmm) = UnixStream::pair().unwrap();
             let a = agent.clone();
             let t = std::thread::spawn(move || one(vmm, &a));
-            cli.write_all(&m.encode()).unwrap();
+            for m in ms {
+                cli.write_all(&m.encode()).unwrap();
+            }
+            cli.shutdown(std::net::Shutdown::Write).unwrap();
             t.join().unwrap().unwrap();
             let mut b = Vec::new();
             cli.read_to_end(&mut b).unwrap();
@@ -92,7 +129,11 @@ mod tests {
         };
         let exec = |command: &str| Message::Exec { id: 9, shell: Shell::Default, timeout_ms: 5000, max_out: 64, command: command.into() };
         std::thread::sleep(Duration::from_millis(300));
-        assert_eq!(ask(exec("netsh")), Message::ExecDone { id: 0, end: ExecEnd::Exited(2), truncated: true, stdout: b"netsh".to_vec(), stderr: Vec::new() });
+        assert_eq!(ask(&[exec("netsh")]), Message::ExecDone { id: 0, end: ExecEnd::Exited(2), truncated: true, stdout: b"netsh".to_vec(), stderr: Vec::new() });
+        // Guest tools: the frames after the first reach the guest too.
+        let files = vec![vroom_proto::UpdateFile { path: "vroom-agent".into(), size: 5, sha256: [0; 32] }];
+        let update = [Message::UpdateBegin { id: 1, version: "0.1.0".into(), files }, Message::UpdateData { id: 1, data: b"agent".to_vec() }];
+        assert_eq!(ask(&update), Message::UpdateDone { id: 0, ok: true, why: String::new() });
         agent.send(crate::agent::AgentCmd::Stop);
     }
 }

@@ -71,7 +71,9 @@ pub enum AgentCmd {
     UsbShare { tag: String, label: String, on: bool },
     /// New guest tools: the viewer writes them into this pipe as agent
     /// frames (`UpdateBegin`, `UpdateData`); checked, then to the guest.
-    Update { from: std::os::fd::OwnedFd },
+    /// `reply`: how it went (the guest's `UpdateDone`), for callers
+    /// without a window.
+    Update { from: std::os::fd::OwnedFd, reply: Option<Sender<Result<(), String>>> },
     /// Run a command in the guest; the answer, or why not, goes to `reply`.
     Exec { req: ExecReq, reply: Sender<Result<ExecOut, String>> },
     Stop,
@@ -173,6 +175,14 @@ impl Agent {
         self.send(AgentCmd::Exec { req, reply: tx });
         rx.recv().map_err(|_| "the VM stopped".to_string())?
     }
+
+    /// Send new guest tools (agent frames, read from `from` to its end)
+    /// and wait for the guest to check them.
+    pub fn update(&self, from: std::os::fd::OwnedFd) -> Result<(), String> {
+        let (tx, rx) = mpsc::channel();
+        self.send(AgentCmd::Update { from, reply: Some(tx) });
+        rx.recv_timeout(Duration::from_secs(600)).map_err(|_| "the guest agent didn't answer".to_string())?
+    }
 }
 
 struct Service {
@@ -212,6 +222,8 @@ struct Service {
     usb_shares: Vec<(String, String)>,
     /// A guest tools update is on its way (set by its thread until done).
     updating: Arc<std::sync::atomic::AtomicBool>,
+    /// Who waits for the guest's word on that update.
+    update_reply: Option<Sender<Result<(), String>>>,
     /// Commands the guest runs for us, and the last number given one.
     execs: Vec<Pending>,
     exec_ids: u32,
@@ -291,6 +303,7 @@ pub fn spawn(stream: UnixStream, policy: ClipPolicy, clip: Option<Box<dyn Clipbo
         revive: None,
         usb_shares: Vec::new(),
         updating: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        update_reply: None,
         execs: Vec::new(),
         exec_ids: 0,
     };
@@ -479,6 +492,9 @@ impl Service {
             }
             m @ (Message::DropEntry { .. } | Message::DropData { .. } | Message::DropEnd { .. } | Message::DragOutFail { .. }) => self.drag_out_frame(m),
             Message::UpdateDone { id, ok, why } => {
+                if let Some(r) = self.update_reply.take() {
+                    let _ = r.send(if ok { Ok(()) } else { Err(why.clone()) });
+                }
                 // The decoder kept it to one short line.
                 if ok {
                     log::info!("guest: tools update {id} checked, installing");
@@ -718,7 +734,7 @@ impl Service {
                 o.fetch = Some(Fetch { stream, check: vroom_proto::TreeCheck::new(stream, &name, dir), pipe, bytes: 0, t0: Instant::now() });
                 self.send(&Message::DragOutGet { id, item, stream });
             }
-            AgentCmd::Update { from } => {
+            AgentCmd::Update { from, reply } => {
                 let s = self.status();
                 let why = if !s.connected {
                     Some("no guest agent is running")
@@ -731,14 +747,21 @@ impl Service {
                 };
                 if let Some(w) = why {
                     self.to_viewer(ToViewer::Status(format!("guest tools update failed: {w}")));
+                    if let Some(r) = reply {
+                        let _ = r.send(Err(w.into()));
+                    }
                     return;
                 }
+                self.update_reply = reply.clone();
                 let (out, busy, viewer) = (self.out.clone(), self.updating.clone(), self.screen.viewer.clone());
                 let r = std::thread::Builder::new().name("agent-update".into()).spawn(move || {
                     if let Err(e) = forward_update(from, &out) {
                         log::warn!("tools update: {e}");
                         if let Some(v) = &viewer {
                             v.send(&ToViewer::Status(format!("guest tools update failed: {e}")));
+                        }
+                        if let Some(r) = reply {
+                            let _ = r.send(Err(e));
                         }
                     }
                     busy.store(false, std::sync::atomic::Ordering::Release);

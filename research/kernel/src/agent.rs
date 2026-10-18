@@ -185,6 +185,7 @@ static COMMANDS: &[Command] = &[
         p("timeout", "integer", false, "seconds before it is killed, default 60"),
         p("max_output", "integer", false, "bytes kept of stdout and of stderr, default 1048576"),
     ], "write", Target::Op("guest_exec")),
+    c("guest.update_tools", "guest", "Install the lab's guest tools in the running guest (target/guest-tools); the agent restarts", &[], "write", Target::Op("guest_update_tools")),
     // CPU.
     c("cpu.registers", "cpu", "General, PC, SP, PSTATE and translation registers", &[CPU], "read", Target::Op("registers")),
     c("cpu.write_register", "cpu", "Set a register (x0..x30, pc, sp, pstate, ttbr0, ...)", &[CPU, p("register", "string", true, "register name"), p("value", "address", true, "new value")], "write", Target::Op("write_register")),
@@ -608,7 +609,8 @@ impl Connection {
                     "notes": [
                         "Addresses are integers or \"0x...\" strings; results give integers.",
                         "Inspection needs a paused VM: vm.pause, or wait for a stop with events.poll after vm.resume.",
-                        "guest.exec needs a running VM and a guest agent with the current guest tools; it answers once the command ends.",
+                        "The lab starts paused (restore too): vm.resume runs the guest; its network, agent and screen are frozen until then.",
+                        "guest.* needs a running VM and a guest agent (vm.status: guest_agent); guest.exec needs current guest tools: guest.update_tools installs them.",
                         "Commands with mutates=true change the guest, the VM or files; risk says how much.",
                         "fuzz.run and fuzz.probe start their own VM from a checkpoint: run them with jobs.start."
                     ],

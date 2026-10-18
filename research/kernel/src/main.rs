@@ -340,9 +340,14 @@ impl Session {
             return Err("pause the VM before inspection or control".into());
         }
         match op {
-            "status" => Ok(
-                json!({"state": format!("{:?}", self.vm.state()), "cpus": self.vm.config().cpus, "breakpoints": self.breakpoints, "temporary":self.run_to.as_ref().map(|r|r.address)}),
-            ),
+            "status" => {
+                let agent = self.vm.agent().status();
+                let mut s = json!({"state": format!("{:?}", self.vm.state()), "cpus": self.vm.config().cpus, "breakpoints": self.breakpoints, "temporary":self.run_to.as_ref().map(|r|r.address), "guest_agent": agent.connected.then_some(agent.agent)});
+                if self.vm.state() == RunState::Paused {
+                    s["note"] = json!("paused: vm.resume runs the guest; its network, agent and screen are frozen until then");
+                }
+                Ok(s)
+            }
             "pause" => {
                 self.continue_cpus.clear();
                 self.continuing = false;
@@ -1180,7 +1185,7 @@ fn run(args: Args) -> Result<(), String> {
         input,
     };
     session.configure()?;
-    output(json!({"event":"ready", "state":"Paused", "cpus": session.vm.config().cpus}))?;
+    output(json!({"event":"ready", "state":"Paused", "cpus": session.vm.config().cpus, "note": "paused: vm.resume runs the guest"}))?;
     let (tx, rx) = mpsc::sync_channel::<Input>(8);
     let _endpoint = match &args_agent_socket {
         Some(path) => {
@@ -1322,8 +1327,8 @@ fn run(args: Args) -> Result<(), String> {
             }
             Ok(Input::Stdio(Err(error))) => output(json!({"id":null,"error":error}))?,
             // Answered from its own thread: the guest runs meanwhile.
-            Ok(Input::Agent(forward)) if forward.request["op"] == "guest_exec" => {
-                guest::exec(session.vm.agent().clone(), session.vm.state() == RunState::Running, forward);
+            Ok(Input::Agent(forward)) if forward.request["op"].as_str().is_some_and(|op| op.starts_with("guest_")) => {
+                guest::run(&session.vm, &session.exports, forward);
             }
             Ok(Input::Agent(forward)) => {
                 let _ = forward.reply.send(session.command(&forward.request));
@@ -1340,6 +1345,9 @@ fn run(args: Args) -> Result<(), String> {
 
 fn main() {
     let args = Args::parse();
+    // The VMM's warnings (a device's queue errors, a backend gone): stderr,
+    // the socket's .log with --daemon.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     if args.daemon {
         if let Err(e) = daemonize(args.agent_socket.as_deref().expect("clap: requires agent_socket")) {
             eprintln!("vroom-lab: {e}");
