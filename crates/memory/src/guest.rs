@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 use std::sync::atomic::{fence, AtomicU16, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use crate::{page_size, ByteValued, Error, GuestAddress, MmapRegion, Result};
 
@@ -47,6 +47,9 @@ impl GuestRegion {
 #[derive(Debug, Clone, Default)]
 pub struct GuestMemory {
     regions: Arc<Vec<GuestRegion>>,
+    /// Keep readers from touching an address range while a research reset
+    /// replaces its file-backed mappings.
+    mapping_lock: Arc<RwLock<()>>,
     /// Bumped when shared RAM gets new objects (reset): whoever maps it
     /// elsewhere must map again.
     generation: Arc<AtomicU64>,
@@ -104,6 +107,7 @@ impl GuestMemory {
         }
         Ok(GuestMemory {
             regions: Arc::new(regions),
+            mapping_lock: Arc::default(),
             generation: Arc::default(),
         })
     }
@@ -136,6 +140,10 @@ impl GuestMemory {
     /// buffers to native libraries (GPU renderer). None if any byte is not
     /// guest RAM. Pointers stay valid for the life of this memory.
     pub fn host_ranges(&self, addr: GuestAddress, len: u64) -> Option<Vec<(*mut u8, usize)>> {
+        let _mapping = self
+            .mapping_lock
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
         let mut out = Vec::new();
         self.walk(addr, len, |r, off, chunk| {
             out.push((r.host_ptr().wrapping_add(off), chunk.len()));
@@ -165,6 +173,10 @@ impl GuestMemory {
     }
 
     pub fn read(&self, addr: GuestAddress, buf: &mut [u8]) -> Result<()> {
+        let _mapping = self
+            .mapping_lock
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
         self.walk(addr, buf.len() as u64, |r, off, span| {
             r.mmap.read_at(off, &mut buf[span]);
             Ok(())
@@ -172,6 +184,10 @@ impl GuestMemory {
     }
 
     pub fn write(&self, addr: GuestAddress, buf: &[u8]) -> Result<()> {
+        let _mapping = self
+            .mapping_lock
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
         self.walk(addr, buf.len() as u64, |r, off, span| {
             r.mmap.write_at(off, &buf[span]);
             Ok(())
@@ -179,6 +195,10 @@ impl GuestMemory {
     }
 
     pub fn fill(&self, addr: GuestAddress, len: u64, val: u8) -> Result<()> {
+        let _mapping = self
+            .mapping_lock
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
         self.walk(addr, len, |r, off, span| {
             r.mmap.fill_at(off, span.len(), val);
             Ok(())
@@ -303,6 +323,10 @@ impl GuestMemory {
 
     /// Zero all RAM and give pages back to the host (VM reset).
     pub fn discard_all(&self) -> Result<()> {
+        let _mapping = self
+            .mapping_lock
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
         for r in self.regions.iter() {
             r.mmap.discard(0, r.mmap.size())?;
         }
@@ -319,6 +343,10 @@ impl GuestMemory {
     /// Freeze all RAM using file-backed private mappings. This is intended
     /// for high-rate lab resets while every vCPU and DMA worker is paused.
     pub fn snapshot_cow(&self) -> Result<()> {
+        let _mapping = self
+            .mapping_lock
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
         if !self.can_snapshot_cow() {
             return Err(Error::Cow("shared RAM cannot be snapshotted with COW"));
         }
@@ -330,6 +358,10 @@ impl GuestMemory {
 
     #[cfg(feature = "research")]
     pub fn restore_cow(&self) -> Result<()> {
+        let _mapping = self
+            .mapping_lock
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
         for r in self.regions.iter() {
             r.mmap.restore_cow()?;
         }
