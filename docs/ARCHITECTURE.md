@@ -3,7 +3,8 @@
 ## Processes
 
 ```
-vroom-gui ──(socketpair: display protocol + shared framebuffer fd)──┐
+vroom-gui ──(socketpair: display protocol + shared framebuffer fd;──┐
+             macOS: a mach port for the screen's IOSurfaces)        │
                                                                       │
 vroom run <vm.toml>   one process per VM, sandboxed after setup ◄───┘
    │
@@ -815,14 +816,17 @@ virglrenderer asks for (one share group, no surfaces) and keep the right
 one bound on whichever thread calls in (setup thread, then the GPU
 worker, which changes on device reset). GL fences have no completion thread (ANGLE
 serializes a share group's contexts, so a thread blocked on a fence
-would stall submits): the worker polls them every millisecond while any
-is pending. The render server's contexts (Vulkan, Direct3D) always get a
+would stall submits): the worker polls them every 250 microseconds while
+any is pending (at 1 ms, a frame whose display no longer waits for the
+GPU waited for its fence instead: glmark2's light scenes stopped near
+1,200 frames a second). The render server's contexts (Vulkan, Direct3D) always get a
 fence thread in the GPU process, woken by their worker process
 (`0013-proxy-fence-thread-always.patch`): polled once a millisecond like
 GL, each Zink frame waited half a millisecond more on average, and
 glmark2 on Zink scored 547 instead of 963. A GL scanout is copied back on flush: from a context of our
 own, into a pixel buffer on the GPU, and shown when the copy lands while
-the worker goes on. Windows' Direct3D frames are blobs in the render
+the worker goes on. On macOS, when the app started the VMM, it shows GL
+scanouts from IOSurfaces instead (next section). Windows' Direct3D frames are blobs in the render
 server's shared memory that the guest never maps: a flush reads them
 through a read-only mapping of that memory, made on first use.
 Windows only lists the modes a monitor offered when it was plugged in,
@@ -954,9 +958,71 @@ refract 596 then 637).
 A Vulkan window reaches the screen through the guest's compositor, which
 imports the frame's dma-buf with OpenGL (virgl, `PIPE_RESOURCE_SET_TYPE`).
 On macOS's OpenGL (no EGL, no memory objects) vrend makes a texture of its
-own, maps the Venus blob's shm read only (layout checked against its size)
-and copies it in with `glTexSubImage2D` the first time each command stream
-samples, blits or copies from it. ANGLE takes UTM's path instead (a Metal
-texture on the same memory, no copy). When a guest context goes away,
-commands still waiting on its fences go back to the guest: virglrenderer
-drops those fences.
+own and maps the Venus blob's shm read only (layout checked against its
+size); the first time each command stream samples, blits or copies from
+it, the frame goes into the texture. For BGRA frames of 0.6 megapixels
+and up that is done on the GPU (`0030-vrend-venus-frames-through-an-iosurface.patch`,
+`vrend_shm_surface.m`): Metal takes the shm as a buffer
+(`newBufferWithBytesNoCopy`) and blits the frame into an IOSurface; GL
+sees that IOSurface as a rectangle texture (CGL takes IOSurfaces as
+rectangle textures, and as BGRA, only) and copies it into vrend's
+texture. Smaller or other frames are copied with `glTexSubImage2D` as
+before: Metal's round trip costs the GL thread 0.2 to 0.3 ms whatever
+the size, the CPU copy 0.45 ms at 1280x800 and 1.8 ms at 2560x1600
+(Apple's driver retiles on the CPU). `VROOM_SHM_COPY=1` copies always.
+Why not one IOSurface for both sides, with no copy at all: under Xorg the
+guest's Vulkan driver presents through a buffer (its "prime blit": it
+copies its image into a linear exported buffer), and the buffer's layout
+isn't known when its memory is made, so it can't be an IOSurface; and GL
+can't sample an IOSurface as the 2D texture the guest's shaders expect,
+so a copy on the GPU stays whatever the Vulkan side does. Done this way
+nothing new crosses between processes. ANGLE takes UTM's path instead (a
+Metal texture on the same memory, no copy). When a guest context goes
+away, commands still waiting on its fences go back to the guest:
+virglrenderer drops those fences.
+
+### The screen straight from the GPU (macOS)
+
+Each GL frame used to be copied four times on the CPU on its way to the
+app: the GPU process mapped its readback into the VMM's frame buffer,
+the VMM copied it into its shadow and into the shared frame buffer, the
+app converted it to RGBA, and its UI toolkit uploaded it to a texture
+again. At 2560x1600 that was about a core in the app and half a core in
+the VMM, and halved the frame rate of anything drawing full screen.
+
+Now, when the app starts the VMM (not when it reattaches to one):
+
+- The app makes a mach receive port and starts `vroom run` with a send
+  right to it as its registered port (`mach_ports_register` around the
+  spawn, `vroom_ipc::mach`): no bootstrap name, nothing another process
+  can look up. The VMM takes it before it starts anything, and starts
+  the GPU process the same way with a port of its own. A child must be
+  started with posix_spawn for this (a process forked then exec'd gets a
+  right to some other port), so the GPU process now gets its fence
+  socket and guest RAM over its call socket (its stdin) instead of
+  inheriting them.
+- The app sends `ToVmm::Surfaces(true)` (message 110). For the first
+  monitor's GL scanout, a flush then asks the GPU process to blit the
+  scanout into one of three IOSurfaces of the monitor's size
+  (`gl.rs`, `Present`; on the GPU, with alpha set opaque), made when the
+  size changes and sent to the VMM as mach ports with
+  `[head, generation, slot, width, height]`. The VMM checks the sender
+  is its GPU process and the numbers are in range, and passes each port
+  on to the app without looking inside (its sandbox has no IOSurface).
+  When the blit is done the VMM sends `ToViewer::Surface` (message 110:
+  generation, slot, changed rect). At most 240 frames a second go into
+  surfaces; frames in between are skipped (the last one always goes) and
+  the guest doesn't wait for them.
+- The app checks each surface's sender (the VMM's pid, from the kernel),
+  size and format, and shows the latest one in a CALayer over the
+  screen's place in the window (`console/surfaces.rs`). Whenever
+  something of the app's is drawn over the screen (menus, messages, the
+  pause veil, the fullscreen bar, a drop), it hides the layer and asks
+  for pixels again (`Surfaces(false)`), first putting the last surface
+  into its own picture so nothing old flashes; the VMM then reads the
+  next frame back whole. Thumbnails and `VROOM_SHOT` pictures read the
+  surface on the CPU. Coherence, other monitors and reattached apps use
+  pixels. `VROOM_NO_SURFACES=1` in the app's environment turns it off.
+
+Windows' Direct3D scanouts are blobs read by the VMM, not GL scanouts:
+they still go as pixels.

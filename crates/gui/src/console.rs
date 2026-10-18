@@ -204,6 +204,11 @@ struct Io {
     /// The guest's left button went down and the mouse hasn't left the
     /// screen since: leaving it asks the guest for a drag out.
     out_armed: bool,
+    /// The mouse is over the toolbar, where tooltips hang over the screen
+    /// (the screen's layer steps aside, console/surfaces.rs); the bar's
+    /// height in pixels.
+    in_bar: bool,
+    bar_px: f64,
 }
 
 impl Io {
@@ -838,6 +843,8 @@ fn open(key: String, path: &Path, cfg: &VmConfig, ours: UnixStream, child: Optio
         wheel: (0.0, 0.0),
         focused: false,
         out_armed: false,
+        in_bar: false,
+        bar_px: 0.0,
     }));
     wire(&win, &key, &io);
 
@@ -1120,6 +1127,21 @@ fn winit_event(key: &str, head: usize, io: &Rc<RefCell<Io>>, ev: &WindowEvent) -
             });
             EventResult::Propagate
         }
+        // Over the toolbar or not (only changes matter).
+        WindowEvent::CursorMoved { .. } | WindowEvent::CursorLeft { .. } if head == 0 => {
+            let in_bar = match ev {
+                WindowEvent::CursorMoved { .. } => position_y(ev) < io.borrow().bar_px,
+                _ => false,
+            };
+            if std::mem::replace(&mut io.borrow_mut().in_bar, in_bar) != in_bar {
+                let _key = key.to_string();
+                #[cfg(target_os = "macos")]
+                slint::Timer::single_shot(Duration::ZERO, move || {
+                    with(&_key, |c| c.surface_update());
+                });
+            }
+            EventResult::Propagate
+        }
         WindowEvent::DroppedFile(p) => {
             let (key, p) = (key.to_string(), p.clone());
             slint::Timer::single_shot(Duration::ZERO, move || {
@@ -1146,6 +1168,14 @@ fn winit_event(key: &str, head: usize, io: &Rc<RefCell<Io>>, ev: &WindowEvent) -
             EventResult::Propagate
         }
         _ => EventResult::Propagate,
+    }
+}
+
+/// The pointer's height in a CursorMoved event (physical pixels).
+fn position_y(ev: &WindowEvent) -> f64 {
+    match ev {
+        WindowEvent::CursorMoved { position, .. } => position.y,
+        _ => f64::MAX,
     }
 }
 
@@ -2644,6 +2674,8 @@ mod tests {
             wheel: (0.0, 0.0),
             focused: true,
             out_armed: false,
+            in_bar: false,
+            bar_px: 0.0,
         };
         io.key(30, true);
         io.button(272, true);

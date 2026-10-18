@@ -176,7 +176,15 @@ impl super::Console {
         if self.surf.is_none() {
             return;
         }
-        let covered = self.win.get_screen_covered();
+        // Tooltips hang from the toolbar over the screen: step aside while
+        // the mouse is there (and a little below, where they show).
+        let sf = self.win.window().scale_factor() as f64;
+        let in_bar = {
+            let mut io = self.io.borrow_mut();
+            io.bar_px = (self.win.get_bar_height() as f64 + 4.0) * sf;
+            io.in_bar
+        };
+        let covered = self.win.get_screen_covered() || in_bar;
         let want = !covered && self.coh.is_none() && self.state == crate::VmState::Running && self.mode != (0, 0);
         let Some(s) = self.surf.as_mut() else { return };
         if s.layer.is_none() && want {

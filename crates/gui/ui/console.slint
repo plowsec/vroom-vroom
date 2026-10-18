@@ -6,7 +6,7 @@
 import { Theme } from "theme.slint";
 import { Icons } from "icons.slint";
 import { VmState } from "types.slint";
-import { IconButton, Icon, Spinner, OsBadge, StatusDot, Button, Tip, InfoTip } from "controls.slint";
+import { IconButton, Icon, Spinner, OsBadge, StatusDot, Button, Tip, InfoTip, Tips } from "controls.slint";
 
 // One host USB device in the VM window's USB menu.
 export struct UsbMenuRow {
@@ -518,7 +518,7 @@ export component ConsoleWindow inherits Window {
     // (frames straight from the GPU); it goes whenever something here is
     // drawn over the screen. Rust follows these.
     in-out property <bool> bar-menu;
-    out property <bool> screen-covered: root.state != VmState.running || root.mode-w == 0 || root.suspend-error != "" || root.float-out || root.drop-over || root.drop-text != "" || root.usb-open || root.net-open || root.toast != "" || root.bar-menu || ((root.mic-on || root.camera-on) && root.fullscreen);
+    out property <bool> screen-covered: root.state != VmState.running || root.mode-w == 0 || root.suspend-error != "" || root.float-out || root.drop-over || root.drop-text != "" || root.usb-open || root.net-open || root.toast != "" || root.bar-menu || Tips.demo != "" || ((root.mic-on || root.camera-on) && root.fullscreen);
     callback screen-moved();
     changed screen-covered => { root.screen-moved(); }
     changed screen-x => { root.screen-moved(); }
