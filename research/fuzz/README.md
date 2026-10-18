@@ -25,6 +25,28 @@ coverage runs/test/coverage.json
 coverage-diff runs/a/coverage.json runs/b/coverage.json
 ```
 
+## Dashboard
+
+`run --tui` (and `serve --tui`, `fleet`) replaces the JSON lines with a live screen: run time, time since the last new block or edge and since the last new finding, corpus size, blocks reached out of the manifest, edges, execs/s now and on average with a 10-minute history, guest and reset time per input, checkpoint restores from disk, timeouts, threads stepped past shared sites, the unique findings (bugcheck code and parameters), one row per instance, and how many blocks of each function were reached. `q`, Esc or Ctrl-C stop the campaign cleanly. Every run also writes `stats.json` in its output directory every 5 s, for scripts or a dashboard elsewhere.
+
+## Parallel and distributed
+
+HVF runs one VM per process, so parallel fuzzing means processes. One master holds the shared corpus; workers fuzz and synchronize with it about twice a second over TCP:
+
+```sh
+# This machine: a master and four workers, with the dashboard.
+vroom-fuzz fleet harness.json payload.bin --ioctl 0x222003 --workers 4 --output runs/fleet --duration-secs 3600
+
+# Several machines: one master, then fleets that join it.
+export VROOM_FUZZ_TOKEN=some-secret
+vroom-fuzz serve harness.json --listen 0.0.0.0:7979 --output runs/shared --tui
+vroom-fuzz fleet harness.json payload.bin --ioctl 0x222003 --workers 6 --output runs/local --master master-host:7979
+```
+
+A worker sends the inputs it found novel, with the blocks and edges they reached and its new findings. The master keeps those that add a block, an edge or a finding signature campaign-wide, saves them and the crashes under its output, and hands them to the other workers. A worker takes the coverage instead of running the input (every worker restores the same checkpoint, so the input would reach the same blocks), but only if it is new to that worker, and then mutates it like its own finds. Each worker has its own VM state directory (`--state-dir`), its own output under `workers/<i>` and a random mutator salt. `run --master ADDR` starts a single worker by hand. A master restarted on the same output hands out the saved inputs again, and workers run those. Workers keep fuzzing while the master is unreachable and reconnect. The master tells them to stop at `--duration-secs` or `q`.
+
+The master binds to 127.0.0.1 unless `--listen` says otherwise. The protocol is plain JSON lines without encryption: on other machines, set the same `VROOM_FUZZ_TOKEN` on the master and the workers, and keep it to a trusted network or an SSH tunnel. Every machine needs the checkpoint, the VM config's disks and the harness at the paths the harness and the checkpoint manifest name, and the harness must have the same name and block list as the master's (the master refuses others). Each worker holds about 9 GB for the 8 GiB HEVD VM and takes about 10 s to restore the checkpoint. On an M3 Max, one worker runs about 105 inputs/s and three run about 90 each (270/s).
+
 ## Speed
 
 The VM is reset in place between inputs: the hypervisor logs the pages the guest writes (write-protected on stage 2, HVF), RAM logs what host code writes, and a reset copies only those pages back from the frozen checkpoint. Backends without the log remap all RAM instead. `VROOM_COW_VERIFY=1` compares all RAM with the checkpoint after every reset and stops on any difference; it is slow (about a second for 8 GiB), so use it to check a new target, not to fuzz.

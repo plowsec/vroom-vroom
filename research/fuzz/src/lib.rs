@@ -12,6 +12,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use vroom_kernel::arm64::{AddressSpace, Registers};
 
+pub mod campaign;
+pub mod hub;
+pub mod sync;
+pub mod tui;
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("configuration: {0}")]
@@ -418,6 +423,25 @@ impl CoverageMap {
         fresh
     }
 
+    /// Take coverage another instance reached for `input`. Returns the
+    /// blocks and edges that are new here.
+    pub fn merge(&mut self, blocks: &[u64], edges: &[(u64, u64)], input: &str) -> (usize, usize) {
+        let mut new_blocks = 0;
+        for id in blocks {
+            let row = self.blocks.entry(*id).or_default();
+            if row.hits == 0 {
+                row.first_input = Some(input.to_string());
+                new_blocks += 1;
+            }
+            row.hits += 1;
+        }
+        let new_edges = edges
+            .iter()
+            .filter(|(from, to)| self.observe_edge(*from, *to))
+            .count();
+        (new_blocks, new_edges)
+    }
+
     pub fn finish_execution(&mut self) {
         self.executions += 1;
     }
@@ -489,6 +513,11 @@ pub struct Finding {
     pub detail: String,
     pub pc: Option<u64>,
     pub input: String,
+}
+
+/// Findings with the same signature are the same bug for corpus novelty.
+pub fn signature(finding: &Finding) -> String {
+    format!("{:?}:{:?}", finding.class, finding.pc)
 }
 
 /// Classifies hypervisor and guest diagnostics without guessing from a mere

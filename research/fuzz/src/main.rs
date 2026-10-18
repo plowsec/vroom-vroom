@@ -1,11 +1,16 @@
 use clap::{Parser, Subcommand};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use vroom_fuzz::campaign::{Campaign, CampaignOptions};
+use vroom_fuzz::hub::Hub;
+use vroom_fuzz::sync::{Client, Hello, PROTOCOL};
 use vroom_fuzz::{
-    BlockCoverage, BugClass, CorpusStore, CoverageBlock, CoverageMap, Engine, Harness, Mutator,
-    Result, RunResult,
+    tui, BlockCoverage, BugClass, CorpusStore, CoverageBlock, CoverageMap, Engine, Harness,
+    Mutator, Result, RunResult,
 };
 
 #[derive(Debug, Parser)]
@@ -36,22 +41,73 @@ enum Command {
     Run {
         harness: PathBuf,
         seed: PathBuf,
-        /// Set a fixed IOCTL and treat the seed file as payload bytes.
-        #[arg(long, value_parser = parse_u32)]
-        ioctl: Option<u32>,
-        #[arg(long, default_value_t = 100)]
-        iterations: usize,
-        /// Skip common payload-size boundary inputs.
+        #[command(flatten)]
+        fuzz: FuzzArgs,
+        /// Stop after this many inputs (default 100 unless --duration-secs
+        /// or --master is given).
         #[arg(long)]
-        no_boundary_seeds: bool,
-        /// Replay the seed while rotating unresolved-branch breakpoints.
-        #[arg(long)]
-        repeat_seed: bool,
+        iterations: Option<usize>,
         #[arg(long)]
         output: Option<PathBuf>,
-        /// Keep fuzzing until this many seconds have elapsed (overrides iterations).
+        /// Use this VM state directory instead of the harness's (one per
+        /// parallel instance).
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Live dashboard instead of JSON lines.
+        #[arg(long)]
+        tui: bool,
+        /// Share the corpus through this master (`serve`); fuzz until it
+        /// says stop.
+        #[arg(long)]
+        master: Option<String>,
+        /// Instance name on the master (default host-pid).
+        #[arg(long)]
+        name: Option<String>,
+        /// Mutator salt (default: 0 alone, random under a master).
+        #[arg(long)]
+        salt: Option<u64>,
+        /// Stop when the process that started this one exits (`fleet`).
+        #[arg(long, hide = true)]
+        exit_with_parent: bool,
+    },
+    /// Hold the shared corpus for workers on this or other machines.
+    Serve {
+        harness: PathBuf,
+        /// Shared corpus, findings, coverage.json and stats.json. Inputs
+        /// already there are handed out again (resume).
+        #[arg(long)]
+        output: PathBuf,
+        /// Address to accept workers on. Other machines need a reachable
+        /// interface, e.g. 0.0.0.0:7979, and should set a token.
+        #[arg(long, default_value = vroom_fuzz::sync::DEFAULT_ADDRESS)]
+        listen: String,
+        /// Tell workers to stop after this many seconds.
         #[arg(long)]
         duration_secs: Option<u64>,
+        #[arg(long)]
+        tui: bool,
+    },
+    /// Start several workers on this machine (one VM each), with a master
+    /// and dashboard here unless --master points at one elsewhere.
+    Fleet {
+        harness: PathBuf,
+        seed: PathBuf,
+        #[command(flatten)]
+        fuzz: FuzzArgs,
+        #[arg(long, default_value_t = 2)]
+        workers: usize,
+        /// Shared output (local master) or per-worker output root (remote).
+        #[arg(long)]
+        output: PathBuf,
+        /// Join this master instead of starting one.
+        #[arg(long)]
+        master: Option<String>,
+        /// Local master address (default: a free localhost port).
+        #[arg(long)]
+        listen: Option<String>,
+        /// Plain progress lines instead of the dashboard.
+        #[arg(long)]
+        no_tui: bool,
     },
     /// Test each IOCTL in the harness range from the same saved VM state.
     Probe {
@@ -61,6 +117,39 @@ enum Command {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+}
+
+/// Input selection shared by `run` and `fleet`.
+#[derive(Debug, Clone, clap::Args)]
+struct FuzzArgs {
+    /// Set a fixed IOCTL and treat the seed file as payload bytes.
+    #[arg(long, value_parser = parse_u32)]
+    ioctl: Option<u32>,
+    /// Skip common payload-size boundary inputs.
+    #[arg(long)]
+    no_boundary_seeds: bool,
+    /// Replay the seed while rotating unresolved-branch breakpoints.
+    #[arg(long)]
+    repeat_seed: bool,
+    /// Keep fuzzing until this many seconds have elapsed (overrides iterations).
+    #[arg(long)]
+    duration_secs: Option<u64>,
+}
+
+/// Workers and master share this secret (`VROOM_FUZZ_TOKEN`) when set.
+fn token() -> Option<String> {
+    std::env::var("VROOM_FUZZ_TOKEN").ok().filter(|t| !t.is_empty())
+}
+
+fn host_name() -> String {
+    std::process::Command::new("hostname")
+        .arg("-s")
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "host".into())
 }
 
 #[derive(serde::Serialize)]
@@ -121,199 +210,60 @@ fn main() -> Result<()> {
         Command::Run {
             harness,
             seed,
-            ioctl,
+            fuzz,
             iterations,
-            no_boundary_seeds,
-            repeat_seed,
             output,
+            state_dir,
+            tui,
+            master,
+            name,
+            salt,
+            exit_with_parent,
+        } => run(RunArgs {
+            harness,
+            seed,
+            fuzz,
+            iterations,
+            output,
+            state_dir,
+            tui,
+            master,
+            name,
+            salt,
+            exit_with_parent,
+        })?,
+        Command::Serve {
+            harness,
+            output,
+            listen,
             duration_secs,
+            tui,
         } => {
             let h = Harness::load(&harness)?;
-            let root = output.unwrap_or_else(|| h.state_dir.join("fuzz"));
-            let store = CorpusStore::new(&root)?;
-            let mut engine = Engine::open(h)?;
-            engine.instrument()?;
-            let mut seed = std::fs::read(seed)?;
-            if let Some(ioctl) = ioctl {
-                if !engine.harness.ioctl_prefix {
-                    return Err(vroom_fuzz::Error::Invalid(
-                        "--ioctl requires ioctl_prefix: true in the harness".into(),
-                    ));
-                }
-                let mut prefixed = ioctl.to_le_bytes().to_vec();
-                prefixed.extend_from_slice(&seed);
-                seed = prefixed;
-            }
-            if seed.len() > engine.harness.max_input {
-                return Err(vroom_fuzz::Error::Invalid("seed exceeds max_input".into()));
-            }
-            if engine.harness.ioctl_prefix && seed.len() < 4 {
-                return Err(vroom_fuzz::Error::Invalid(
-                    "IOCTL-prefixed seed is shorter than four bytes".into(),
-                ));
-            }
-            let mut corpus_inputs = store.load_inputs()?;
-            let prefix_len = if engine.harness.ioctl_prefix { 4 } else { 0 };
-            let fixed_prefix = ioctl.map(|_| seed[..prefix_len].to_vec());
-            corpus_inputs.retain(|input| {
-                input.len() <= engine.harness.max_input
-                    && input.len() >= prefix_len
-                    && fixed_prefix
-                        .as_ref()
-                        .map_or(true, |prefix| input.starts_with(prefix))
-            });
-            let mut corpus_energy = vec![1u32; corpus_inputs.len()];
-            let mut corpus_hashes = corpus_inputs
-                .iter()
-                .map(|input| CorpusStore::hash(input))
-                .collect::<BTreeSet<_>>();
-            if corpus_hashes.insert(CorpusStore::hash(&seed)) {
-                store.save_input(&seed, 0)?;
-                corpus_inputs.push(seed.clone());
-                corpus_energy.push(1);
-            }
-            let mut scheduled_inputs = vec![seed.clone()];
-            if !no_boundary_seeds {
-                let max_payload_len =
-                    (engine.harness.max_input - prefix_len).min(engine.harness.input_capacity);
-                let boundaries = [
-                    0, 1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2047, 2048, 2049, 3072,
-                ];
-                for payload_len in boundaries
-                    .into_iter()
-                    .chain(std::iter::once(max_payload_len))
-                {
-                    if payload_len > max_payload_len {
-                        continue;
-                    }
-                    let mut input = seed[..prefix_len].to_vec();
-                    input.resize(prefix_len + payload_len, b'A');
-                    if corpus_hashes.insert(CorpusStore::hash(&input)) {
-                        store.save_input(&input, 0)?;
-                        corpus_inputs.push(input.clone());
-                        corpus_energy.push(1);
-                        scheduled_inputs.push(input);
-                    }
-                }
-            }
-            let mut mutator = Mutator::new(0x0076_326f_6f6d_u64, engine.harness.max_input);
-            let campaign_start = Instant::now();
-            let mut recoveries = 0;
-            let mut inputs_since_reopen = 0;
-            let mut finding_novelty = BTreeSet::<String>::new();
-            let mut i = 0usize;
-            while duration_secs.map_or(i < iterations, |seconds| {
-                campaign_start.elapsed() < std::time::Duration::from_secs(seconds)
-            }) {
-                let mut selected_parent = None;
-                let input = if i < scheduled_inputs.len() {
-                    scheduled_inputs[i].clone()
-                } else if repeat_seed {
-                    seed.clone()
-                } else {
-                    let parent_index = mutator.choose_weighted(&corpus_energy);
-                    selected_parent = Some(parent_index);
-                    corpus_energy[parent_index] =
-                        corpus_energy[parent_index].saturating_sub(1).max(1);
-                    let parent = &corpus_inputs[parent_index];
-                    mutator.mutate_preserving_prefix(parent, prefix_len)
-                };
-                let result = engine.run_input(&input)?;
-                let new_findings = result
-                    .findings
-                    .iter()
-                    .filter(|finding| {
-                        finding_novelty.insert(format!("{:?}:{:?}", finding.class, finding.pc))
-                    })
-                    .count();
-                let novel = result.new_blocks != 0 || result.new_edges != 0 || new_findings != 0;
-                if novel {
-                    if corpus_hashes.insert(result.input_hash.clone()) {
-                        store.save_input(&input, result.new_blocks)?;
-                        corpus_inputs.push(input.clone());
-                        let score = (1
-                            + result.new_blocks as u32 * 16
-                            + result.new_edges as u32 * 4
-                            + new_findings as u32 * 8)
-                            .min(256);
-                        corpus_energy.push(score);
-                    } else if let Some(index) = corpus_inputs
-                        .iter()
-                        .position(|candidate| CorpusStore::hash(candidate) == result.input_hash)
-                    {
-                        let score = (1
-                            + result.new_blocks as u32 * 16
-                            + result.new_edges as u32 * 4
-                            + new_findings as u32 * 8)
-                            .min(256);
-                        corpus_energy[index] = (corpus_energy[index] + score).min(256);
-                    }
-                    if let Some(parent) = selected_parent {
-                        corpus_energy[parent] =
-                            (corpus_energy[parent] + 4 + new_findings as u32 * 4).min(256);
-                    }
-                }
-                for finding in &result.findings {
-                    store.save_finding(finding, &input)?;
-                }
-                // A bugcheck stopped at `bugcheck_pc` resets in place like a
-                // clean input; a timeout or a guest reset restores from disk.
-                let unstable = result.reopen;
-                println!("{}", serde_json::to_string(&result)?);
-                std::io::stdout().flush()?;
-                if i % 25 == 0 {
-                    eprintln!(
-                        "progress: {} inputs, {} blocks, {} corpus inputs, {} finding signatures",
-                        i + 1,
-                        engine.coverage.covered(),
-                        corpus_inputs.len(),
-                        finding_novelty.len()
-                    );
-                }
-                if unstable {
-                    eprintln!(
-                        "restoring the clean checkpoint after {:?} ({}/{})",
-                        result.finding.as_ref().map(|finding| finding.class),
-                        i + 1,
-                        iterations
-                    );
-                    engine = engine.reopen()?;
-                    recoveries += 1;
-                    inputs_since_reopen = 0;
-                } else {
-                    inputs_since_reopen += 1;
-                    if engine.harness.reopen_after != 0
-                        && inputs_since_reopen >= engine.harness.reopen_after
-                    {
-                        eprintln!(
-                            "reopening the checkpoint after {} inputs",
-                            inputs_since_reopen
-                        );
-                        engine = engine.reopen()?;
-                        recoveries += 1;
-                        inputs_since_reopen = 0;
-                    }
-                }
-                i += 1;
-            }
-            std::fs::write(
-                root.join("coverage.json"),
-                serde_json::to_vec_pretty(&engine.coverage)?,
-            )?;
-            std::fs::write(
-                root.join("blocks.json"),
-                serde_json::to_vec_pretty(&engine.harness.coverage)?,
-            )?;
-            eprintln!(
-                "campaign: {} executions, {} blocks, {} corpus inputs, {} finding signatures, {} checkpoint restores, {:.1} executions/s",
-                engine.coverage.executions,
-                engine.coverage.covered(),
-                corpus_inputs.len(),
-                finding_novelty.len(),
-                recoveries,
-                engine.coverage.executions as f64 / campaign_start.elapsed().as_secs_f64()
-            );
+            let listener = std::net::TcpListener::bind(&listen)?;
+            eprintln!("master for {} on {}", h.name, listener.local_addr()?);
+            let hub = master_hub(&h, &output, listener)?;
+            supervise(&hub, duration_secs, tui, None)?;
         }
+        Command::Fleet {
+            harness,
+            seed,
+            fuzz,
+            workers,
+            output,
+            master,
+            listen,
+            no_tui,
+        } => fleet(FleetArgs {
+            harness,
+            seed,
+            fuzz,
+            workers,
+            output,
+            master,
+            listen,
+            tui: !no_tui,
+        })?,
         Command::Probe {
             harness,
             payload,
@@ -466,6 +416,377 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug)]
+struct RunArgs {
+    harness: PathBuf,
+    seed: PathBuf,
+    fuzz: FuzzArgs,
+    iterations: Option<usize>,
+    output: Option<PathBuf>,
+    state_dir: Option<PathBuf>,
+    tui: bool,
+    master: Option<String>,
+    name: Option<String>,
+    salt: Option<u64>,
+    exit_with_parent: bool,
+}
+
+/// How often a running instance reports to its hub (and master).
+const REPORT_EVERY: Duration = Duration::from_millis(250);
+
+fn lock(hub: &Mutex<Hub>) -> std::sync::MutexGuard<'_, Hub> {
+    hub.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn random_salt() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    nanos ^ (u64::from(std::process::id()) << 32)
+}
+
+/// One instance: alone (JSON lines or `--tui`) or as a worker of a master.
+fn run(args: RunArgs) -> Result<()> {
+    let mut h = Harness::load(&args.harness)?;
+    if let Some(dir) = args.state_dir {
+        h.state_dir = dir;
+    }
+    let root = args.output.unwrap_or_else(|| h.state_dir.join("fuzz"));
+    std::fs::create_dir_all(&root)?;
+    let name = args
+        .name
+        .unwrap_or_else(|| format!("{}-{}", host_name(), std::process::id()));
+    let worker = args.master.is_some();
+    // Workers must not all try the same mutations.
+    let salt = args
+        .salt
+        .unwrap_or_else(|| if worker { random_salt() } else { 0 });
+    let title = h.name.clone();
+    let mut engine = Engine::open(h)?;
+    engine.instrument()?;
+    let seed = std::fs::read(&args.seed)?;
+    let verbose = !args.tui && !worker;
+    let mut campaign = Campaign::new(
+        engine,
+        root.clone(),
+        seed,
+        CampaignOptions {
+            name: name.clone(),
+            ioctl: args.fuzz.ioctl,
+            boundary_seeds: !args.fuzz.no_boundary_seeds,
+            repeat_seed: args.fuzz.repeat_seed,
+            salt,
+            verbose,
+        },
+    )?;
+    let hub = Arc::new(Mutex::new(Hub::new(
+        title.clone(),
+        campaign.blocks().to_vec(),
+        None,
+        Some(root.clone()),
+    )));
+    let client = args.master.map(|address| {
+        Client::start(
+            address,
+            Hello {
+                protocol: PROTOCOL,
+                token: token(),
+                instance: name.clone(),
+                harness: title,
+                blocks: campaign.blocks().len(),
+            },
+        )
+    });
+    let stop = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
+    let dashboard = args
+        .tui
+        .then(|| tui::spawn(hub.clone(), stop.clone(), done.clone()));
+    let iterations = args
+        .iterations
+        .or((args.fuzz.duration_secs.is_none() && !worker).then_some(100));
+    let duration = args.fuzz.duration_secs.map(Duration::from_secs);
+    let parent = std::os::unix::process::parent_id();
+    let started = Instant::now();
+    let mut last_report = Instant::now();
+    let mut last_sample = Instant::now();
+    let mut last_persist = Instant::now();
+    let mut last_log = Instant::now();
+    let outcome = loop {
+        if stop.load(Ordering::Relaxed)
+            || iterations.is_some_and(|n| campaign.iterations() >= n)
+            || duration.is_some_and(|d| started.elapsed() >= d)
+            || client.as_ref().is_some_and(Client::stop_requested)
+            || (args.exit_with_parent && std::os::unix::process::parent_id() != parent)
+        {
+            break Ok(());
+        }
+        if let Err(error) = campaign.step() {
+            break Err(error);
+        }
+        if last_report.elapsed() >= REPORT_EVERY {
+            last_report = Instant::now();
+            let (entries, findings) = campaign.take_reports();
+            let stats = campaign.stats();
+            if let Some(client) = &client {
+                client.send(stats.clone(), entries.clone(), findings.clone());
+            }
+            let mut hub = lock(&hub);
+            if let Err(error) = hub.submit(stats.clone(), entries, findings) {
+                break Err(error);
+            }
+            if last_sample.elapsed() >= Duration::from_secs(1) {
+                last_sample = Instant::now();
+                hub.sample();
+            }
+            if last_persist.elapsed() >= Duration::from_secs(5) {
+                last_persist = Instant::now();
+                hub.persist()?;
+            }
+            drop(hub);
+            if let Some(client) = &client {
+                for entry in client.received() {
+                    campaign.import(entry)?;
+                }
+            }
+            if worker && !args.tui && last_log.elapsed() >= Duration::from_secs(30) {
+                last_log = Instant::now();
+                eprintln!(
+                    "{name}: {} inputs, {:.0}/s, {} blocks, {} corpus inputs, {} crashing inputs",
+                    stats.execs, stats.execs_per_sec, stats.blocks, stats.corpus, stats.crashes
+                );
+            }
+        }
+    };
+    let (entries, findings) = campaign.take_reports();
+    let mut stats = campaign.stats();
+    stats.done = true;
+    {
+        let mut hub = lock(&hub);
+        hub.submit(stats.clone(), entries.clone(), findings.clone())?;
+        hub.persist()?;
+    }
+    let refusal = client.as_ref().and_then(Client::refusal);
+    if let Some(client) = client {
+        client.finish(stats, entries, findings);
+    }
+    done.store(true, Ordering::Relaxed);
+    if let Some(dashboard) = dashboard {
+        let _ = dashboard.join();
+    }
+    outcome?;
+    campaign.finish()?;
+    if let Some(reason) = refusal {
+        return Err(vroom_fuzz::Error::Invalid(format!("master refused this worker: {reason}")));
+    }
+    Ok(())
+}
+
+/// A master's hub: shared corpus in `output`, serving workers on `listener`.
+fn master_hub(h: &Harness, output: &Path, listener: std::net::TcpListener) -> Result<Arc<Mutex<Hub>>> {
+    let store = CorpusStore::new(output)?;
+    let resumed = store.load_inputs()?;
+    let mut hub = Hub::new(
+        h.name.clone(),
+        h.coverage.clone(),
+        Some(store),
+        Some(output.to_path_buf()),
+    );
+    hub.master = true;
+    if !resumed.is_empty() {
+        eprintln!("resuming with {} inputs from {}", resumed.len(), output.display());
+    }
+    hub.add_unverified(resumed);
+    let hub = Arc::new(Mutex::new(hub));
+    vroom_fuzz::sync::serve(listener, hub.clone(), token(), h.name.clone(), h.coverage.len());
+    Ok(hub)
+}
+
+/// Run a master until its duration, `q`, or (for a fleet) the end of every
+/// local worker; then stop the workers and save.
+fn supervise(
+    hub: &Arc<Mutex<Hub>>,
+    duration_secs: Option<u64>,
+    dashboard: bool,
+    mut children: Option<&mut Vec<std::process::Child>>,
+) -> Result<()> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
+    let dashboard = dashboard.then(|| tui::spawn(hub.clone(), stop.clone(), done.clone()));
+    let started = Instant::now();
+    let mut ticks = 0u64;
+    let all_exited = |children: &mut Option<&mut Vec<std::process::Child>>| {
+        children.as_mut().is_some_and(|children| {
+            children
+                .iter_mut()
+                .all(|child| child.try_wait().ok().flatten().is_some())
+        })
+    };
+    loop {
+        for _ in 0..10 {
+            std::thread::sleep(Duration::from_millis(100));
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+        ticks += 1;
+        {
+            let mut hub = lock(hub);
+            hub.sample();
+            if ticks % 5 == 0 {
+                hub.persist()?;
+            }
+            if dashboard.is_none() && ticks % 10 == 0 {
+                eprintln!(
+                    "{}: {} execs, {:.0}/s, {} corpus, {} blocks, {} edges, {} unique findings, {} workers",
+                    tui::duration(started.elapsed().as_secs_f64()),
+                    hub.execs(),
+                    hub.execs_per_sec(),
+                    hub.corpus_len(),
+                    hub.covered_blocks(),
+                    hub.edge_count(),
+                    hub.findings().count(),
+                    hub.live().count()
+                );
+            }
+        }
+        if stop.load(Ordering::Relaxed)
+            || duration_secs.is_some_and(|d| started.elapsed() >= Duration::from_secs(d))
+            || all_exited(&mut children)
+        {
+            break;
+        }
+    }
+    lock(hub).stop = true;
+    // Workers hear it on their next sync and send their last report.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline {
+        let finished = lock(hub).all_done();
+        let exited = children.is_none() || all_exited(&mut children);
+        if finished && exited {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        lock(hub).sample();
+    }
+    lock(hub).persist()?;
+    done.store(true, Ordering::Relaxed);
+    if let Some(dashboard) = dashboard {
+        let _ = dashboard.join();
+    }
+    let hub = lock(hub);
+    eprintln!(
+        "campaign: {} executions, {} blocks, {} edges, {} corpus inputs, {} unique findings, {} instances",
+        hub.execs(),
+        hub.covered_blocks(),
+        hub.edge_count(),
+        hub.corpus_len(),
+        hub.findings().count(),
+        hub.instances().count()
+    );
+    Ok(())
+}
+
+#[derive(Debug)]
+struct FleetArgs {
+    harness: PathBuf,
+    seed: PathBuf,
+    fuzz: FuzzArgs,
+    workers: usize,
+    output: PathBuf,
+    master: Option<String>,
+    listen: Option<String>,
+    tui: bool,
+}
+
+/// N worker processes (HVF runs one VM per process), each with its own VM
+/// state, salt and output under `output/workers/<i>`.
+fn fleet(args: FleetArgs) -> Result<()> {
+    if args.workers == 0 {
+        return Err(vroom_fuzz::Error::Invalid("--workers must be at least 1".into()));
+    }
+    std::fs::create_dir_all(&args.output)?;
+    let h = Harness::load(&args.harness)?;
+    let (address, hub) = match &args.master {
+        Some(address) => (address.clone(), None),
+        None => {
+            let listener =
+                std::net::TcpListener::bind(args.listen.as_deref().unwrap_or("127.0.0.1:0"))?;
+            let address = listener.local_addr()?.to_string();
+            (address, Some(master_hub(&h, &args.output, listener)?))
+        }
+    };
+    let program = std::env::current_exe()?;
+    let host = host_name();
+    let mut children = Vec::new();
+    for i in 0..args.workers {
+        let dir = args.output.join("workers").join(i.to_string());
+        std::fs::create_dir_all(&dir)?;
+        let log = std::fs::File::create(dir.join("worker.log"))?;
+        let mut command = std::process::Command::new(&program);
+        command
+            .arg("run")
+            .arg(&args.harness)
+            .arg(&args.seed)
+            .arg("--master")
+            .arg(&address)
+            .arg("--name")
+            .arg(format!("{host}-{i}"))
+            .arg("--state-dir")
+            .arg(dir.join("state"))
+            .arg("--output")
+            .arg(&dir)
+            .arg("--exit-with-parent")
+            .stdin(std::process::Stdio::null())
+            .stdout(log.try_clone()?)
+            .stderr(log);
+        if let Some(ioctl) = args.fuzz.ioctl {
+            command.arg("--ioctl").arg(format!("{ioctl:#x}"));
+        }
+        if args.fuzz.no_boundary_seeds {
+            command.arg("--no-boundary-seeds");
+        }
+        if args.fuzz.repeat_seed {
+            command.arg("--repeat-seed");
+        }
+        if hub.is_none() {
+            if let Some(seconds) = args.fuzz.duration_secs {
+                command.arg("--duration-secs").arg(seconds.to_string());
+            }
+        }
+        children.push(command.spawn()?);
+    }
+    eprintln!(
+        "{} workers on {address}; logs in {}",
+        args.workers,
+        args.output.join("workers").display()
+    );
+    if let Some(hub) = &hub {
+        supervise(hub, args.fuzz.duration_secs, args.tui, Some(&mut children))?;
+    }
+    let deadline = Instant::now() + Duration::from_secs(if hub.is_some() { 30 } else { u64::MAX / 4 });
+    for (i, child) in children.iter_mut().enumerate() {
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break Some(status);
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                break child.wait().ok();
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        if !status.is_some_and(|status| status.success()) {
+            eprintln!(
+                "worker {i} ended with {status:?}; see {}",
+                args.output.join("workers").join(i.to_string()).join("worker.log").display()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn parse_u32(value: &str) -> std::result::Result<u32, String> {
     let parsed = value
         .strip_prefix("0x")
@@ -528,4 +849,13 @@ fn write_probe_row(
     serde_json::to_writer(&mut *report, &row)?;
     report.write_all(b"\n")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn command_line_is_consistent() {
+        use clap::CommandFactory;
+        super::Cli::command().debug_assert();
+    }
 }

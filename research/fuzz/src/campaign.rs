@@ -1,0 +1,408 @@
+//! One fuzzing instance: picks inputs (scheduled seeds, then mutations of
+//! the corpus weighted by recent novelty), runs them, keeps the novel ones
+//! and recovers the VM. Instances share corpus entries through a `Hub`.
+
+use crate::hub::{now, Entry, FindingReport, InstanceStats};
+use crate::{signature, BugClass, CorpusStore, CoverageBlock, Engine, Error, Mutator, Result};
+use std::collections::{BTreeSet, VecDeque};
+use std::io::Write;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone, Default)]
+pub struct CampaignOptions {
+    /// Instance name in the hub and on the dashboard.
+    pub name: String,
+    /// Fix the IOCTL and treat the seed as payload bytes.
+    pub ioctl: Option<u32>,
+    pub boundary_seeds: bool,
+    pub repeat_seed: bool,
+    /// Mixed into the mutator seed so parallel instances don't all try the
+    /// same mutations. Zero keeps a single run reproducible.
+    pub salt: u64,
+    /// Each result as a JSON line on stdout, progress on stderr.
+    pub verbose: bool,
+}
+
+/// Rate window for `execs_per_sec`.
+const RATE_WINDOW: Duration = Duration::from_secs(5);
+
+#[derive(Debug)]
+pub struct Campaign {
+    engine: Option<Engine>,
+    store: CorpusStore,
+    root: PathBuf,
+    options: CampaignOptions,
+    seed: Vec<u8>,
+    prefix_len: usize,
+    fixed_prefix: Option<Vec<u8>>,
+    corpus_inputs: Vec<Vec<u8>>,
+    corpus_energy: Vec<u32>,
+    corpus_hashes: BTreeSet<String>,
+    scheduled: VecDeque<Vec<u8>>,
+    mutator: Mutator,
+    finding_novelty: BTreeSet<String>,
+    iteration: usize,
+    recoveries: usize,
+    inputs_since_reopen: usize,
+    started: Instant,
+    stats: InstanceStats,
+    rate: VecDeque<(Instant, u64)>,
+    outbox: Vec<Entry>,
+    found: Vec<FindingReport>,
+}
+
+impl Campaign {
+    pub fn new(
+        engine: Engine,
+        root: PathBuf,
+        seed: Vec<u8>,
+        options: CampaignOptions,
+    ) -> Result<Self> {
+        let store = CorpusStore::new(&root)?;
+        let mut seed = seed;
+        if let Some(ioctl) = options.ioctl {
+            if !engine.harness.ioctl_prefix {
+                return Err(Error::Invalid(
+                    "--ioctl requires ioctl_prefix: true in the harness".into(),
+                ));
+            }
+            let mut prefixed = ioctl.to_le_bytes().to_vec();
+            prefixed.extend_from_slice(&seed);
+            seed = prefixed;
+        }
+        if seed.len() > engine.harness.max_input {
+            return Err(Error::Invalid("seed exceeds max_input".into()));
+        }
+        if engine.harness.ioctl_prefix && seed.len() < 4 {
+            return Err(Error::Invalid(
+                "IOCTL-prefixed seed is shorter than four bytes".into(),
+            ));
+        }
+        let mut corpus_inputs = store.load_inputs()?;
+        let prefix_len = if engine.harness.ioctl_prefix { 4 } else { 0 };
+        let fixed_prefix = options.ioctl.map(|_| seed[..prefix_len].to_vec());
+        corpus_inputs.retain(|input| {
+            input.len() <= engine.harness.max_input
+                && input.len() >= prefix_len
+                && fixed_prefix
+                    .as_ref()
+                    .map_or(true, |prefix| input.starts_with(prefix))
+        });
+        let mut corpus_energy = vec![1u32; corpus_inputs.len()];
+        let mut corpus_hashes = corpus_inputs
+            .iter()
+            .map(|input| CorpusStore::hash(input))
+            .collect::<BTreeSet<_>>();
+        if corpus_hashes.insert(CorpusStore::hash(&seed)) {
+            store.save_input(&seed, 0)?;
+            corpus_inputs.push(seed.clone());
+            corpus_energy.push(1);
+        }
+        let mut scheduled = VecDeque::from([seed.clone()]);
+        if options.boundary_seeds {
+            let max_payload_len =
+                (engine.harness.max_input - prefix_len).min(engine.harness.input_capacity);
+            let boundaries = [
+                0, 1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2047, 2048, 2049, 3072,
+            ];
+            for payload_len in boundaries
+                .into_iter()
+                .chain(std::iter::once(max_payload_len))
+            {
+                if payload_len > max_payload_len {
+                    continue;
+                }
+                let mut input = seed[..prefix_len].to_vec();
+                input.resize(prefix_len + payload_len, b'A');
+                if corpus_hashes.insert(CorpusStore::hash(&input)) {
+                    store.save_input(&input, 0)?;
+                    corpus_inputs.push(input.clone());
+                    corpus_energy.push(1);
+                    scheduled.push_back(input);
+                }
+            }
+        }
+        let mutator = Mutator::new(0x0076_326f_6f6d_u64 ^ options.salt, engine.harness.max_input);
+        let stats = InstanceStats {
+            name: options.name.clone(),
+            started: now(),
+            ..Default::default()
+        };
+        Ok(Self {
+            engine: Some(engine),
+            store,
+            root,
+            options,
+            seed,
+            prefix_len,
+            fixed_prefix,
+            corpus_inputs,
+            corpus_energy,
+            corpus_hashes,
+            scheduled,
+            mutator,
+            finding_novelty: BTreeSet::new(),
+            iteration: 0,
+            recoveries: 0,
+            inputs_since_reopen: 0,
+            started: Instant::now(),
+            stats,
+            rate: VecDeque::new(),
+            outbox: Vec::new(),
+            found: Vec::new(),
+        })
+    }
+
+    pub fn engine(&self) -> &Engine {
+        self.engine.as_ref().expect("engine present between steps")
+    }
+
+    fn engine_mut(&mut self) -> &mut Engine {
+        self.engine.as_mut().expect("engine present between steps")
+    }
+
+    pub fn blocks(&self) -> &[CoverageBlock] {
+        &self.engine().harness.coverage
+    }
+
+    pub fn iterations(&self) -> usize {
+        self.iteration
+    }
+
+    /// Run one input.
+    pub fn step(&mut self) -> Result<()> {
+        let mut selected_parent = None;
+        let input = if let Some(input) = self.scheduled.pop_front() {
+            input
+        } else if self.options.repeat_seed {
+            self.seed.clone()
+        } else {
+            let parent_index = self.mutator.choose_weighted(&self.corpus_energy);
+            selected_parent = Some(parent_index);
+            self.corpus_energy[parent_index] =
+                self.corpus_energy[parent_index].saturating_sub(1).max(1);
+            let parent = &self.corpus_inputs[parent_index];
+            self.mutator
+                .mutate_preserving_prefix(parent, self.prefix_len)
+        };
+        let result = self.engine_mut().run_input(&input)?;
+        let mut new_signatures = Vec::new();
+        for finding in &result.findings {
+            let signature = signature(finding);
+            if self.finding_novelty.insert(signature.clone()) {
+                new_signatures.push(signature.clone());
+                self.found.push(FindingReport {
+                    signature,
+                    finding: finding.clone(),
+                    data: input.clone(),
+                });
+            }
+        }
+        let new_findings = new_signatures.len();
+        let novel = result.new_blocks != 0 || result.new_edges != 0 || new_findings != 0;
+        if novel {
+            let score = (1
+                + result.new_blocks as u32 * 16
+                + result.new_edges as u32 * 4
+                + new_findings as u32 * 8)
+                .min(256);
+            if self.corpus_hashes.insert(result.input_hash.clone()) {
+                self.store.save_input(&input, result.new_blocks)?;
+                self.corpus_inputs.push(input.clone());
+                self.corpus_energy.push(score);
+            } else if let Some(index) = self
+                .corpus_inputs
+                .iter()
+                .position(|candidate| CorpusStore::hash(candidate) == result.input_hash)
+            {
+                self.corpus_energy[index] = (self.corpus_energy[index] + score).min(256);
+            }
+            if let Some(parent) = selected_parent {
+                self.corpus_energy[parent] =
+                    (self.corpus_energy[parent] + 4 + new_findings as u32 * 4).min(256);
+            }
+            if result.new_blocks != 0 || result.new_edges != 0 {
+                self.stats.last_new_cov = Some(now());
+            }
+            self.outbox.push(Entry {
+                hash: result.input_hash.clone(),
+                data: input.clone(),
+                blocks: Some(result.block_hits.keys().copied().collect()),
+                edges: result.edges_hit.iter().copied().collect(),
+                findings: result.findings.iter().map(signature).collect(),
+            });
+        }
+        for finding in &result.findings {
+            self.store.save_finding(finding, &input)?;
+        }
+        self.stats.execs += 1;
+        if !result.findings.is_empty() {
+            self.stats.crashes += 1;
+        }
+        if result
+            .findings
+            .iter()
+            .any(|finding| finding.class == BugClass::Timeout)
+        {
+            self.stats.timeouts += 1;
+        }
+        self.stats.foreign_threads += result.foreign_threads;
+        // Recent inputs weigh most: a mean over the last ~50.
+        let average = |old: u64, new: u64| {
+            if old == 0 {
+                new
+            } else {
+                (old * 49 + new) / 50
+            }
+        };
+        self.stats.exec_us = average(self.stats.exec_us, result.elapsed_us);
+        self.stats.reset_us = average(self.stats.reset_us, result.reset_us);
+        if self.options.verbose {
+            println!("{}", serde_json::to_string(&result)?);
+            std::io::stdout().flush()?;
+            if self.iteration % 25 == 0 {
+                eprintln!(
+                    "progress: {} inputs, {} blocks, {} corpus inputs, {} finding signatures",
+                    self.iteration + 1,
+                    self.engine().coverage.covered(),
+                    self.corpus_inputs.len(),
+                    self.finding_novelty.len()
+                );
+            }
+        }
+        // A bugcheck stopped at `bugcheck_pc` resets in place like a clean
+        // input; a timeout or a guest reset restores from disk.
+        if result.reopen {
+            if self.options.verbose {
+                eprintln!(
+                    "restoring the clean checkpoint after {:?} ({})",
+                    result.finding.as_ref().map(|finding| finding.class),
+                    self.iteration + 1
+                );
+            }
+            self.reopen()?;
+        } else {
+            self.inputs_since_reopen += 1;
+            let reopen_after = self.engine().harness.reopen_after;
+            if reopen_after != 0 && self.inputs_since_reopen >= reopen_after {
+                if self.options.verbose {
+                    eprintln!(
+                        "reopening the checkpoint after {} inputs",
+                        self.inputs_since_reopen
+                    );
+                }
+                self.reopen()?;
+            }
+        }
+        self.iteration += 1;
+        Ok(())
+    }
+
+    fn reopen(&mut self) -> Result<()> {
+        let engine = self.engine.take().expect("engine present between steps");
+        self.engine = Some(engine.reopen()?);
+        self.recoveries += 1;
+        self.stats.restores += 1;
+        self.inputs_since_reopen = 0;
+        Ok(())
+    }
+
+    /// Take an entry another instance found. Known coverage joins the corpus
+    /// when it is new here, as if this instance had found it; an entry
+    /// without coverage is run like a seed.
+    pub fn import(&mut self, entry: Entry) -> Result<()> {
+        if entry.data.len() > self.engine().harness.max_input
+            || entry.data.len() < self.prefix_len
+            || self
+                .fixed_prefix
+                .as_ref()
+                .is_some_and(|prefix| !entry.data.starts_with(prefix))
+            || self.corpus_hashes.contains(&entry.hash)
+        {
+            return Ok(());
+        }
+        let Some(blocks) = &entry.blocks else {
+            self.scheduled.push_back(entry.data);
+            return Ok(());
+        };
+        let new_findings = entry
+            .findings
+            .iter()
+            .filter(|signature| self.finding_novelty.insert((*signature).clone()))
+            .count();
+        let (new_blocks, new_edges) =
+            self.engine_mut()
+                .coverage
+                .merge(blocks, &entry.edges, &entry.hash);
+        if new_blocks == 0 && new_edges == 0 && new_findings == 0 {
+            return Ok(());
+        }
+        let score =
+            (1 + new_blocks as u32 * 16 + new_edges as u32 * 4 + new_findings as u32 * 8).min(256);
+        self.store.save_input(&entry.data, new_blocks)?;
+        self.corpus_hashes.insert(entry.hash);
+        self.corpus_inputs.push(entry.data);
+        self.corpus_energy.push(score);
+        Ok(())
+    }
+
+    /// Novel inputs and new findings since the last call.
+    pub fn take_reports(&mut self) -> (Vec<Entry>, Vec<FindingReport>) {
+        (
+            std::mem::take(&mut self.outbox),
+            std::mem::take(&mut self.found),
+        )
+    }
+
+    pub fn stats(&mut self) -> InstanceStats {
+        let at = Instant::now();
+        self.rate.push_back((at, self.stats.execs));
+        while self
+            .rate
+            .front()
+            .is_some_and(|(then, _)| at.duration_since(*then) > RATE_WINDOW)
+        {
+            self.rate.pop_front();
+        }
+        if let Some((then, execs)) = self.rate.front() {
+            let span = at.duration_since(*then).as_secs_f64();
+            self.stats.execs_per_sec = if span > 0.2 {
+                (self.stats.execs - execs) as f64 / span
+            } else {
+                self.stats.execs as f64 / self.started.elapsed().as_secs_f64().max(1e-3)
+            };
+        }
+        let (blocks, edges) = {
+            let coverage = &self.engine().coverage;
+            (coverage.covered(), coverage.edges.len())
+        };
+        self.stats.blocks = blocks;
+        self.stats.edges = edges;
+        self.stats.corpus = self.corpus_inputs.len();
+        self.stats.clone()
+    }
+
+    /// Write the coverage map and block list; summarize on stderr.
+    pub fn finish(&self) -> Result<()> {
+        let engine = self.engine();
+        std::fs::write(
+            self.root.join("coverage.json"),
+            serde_json::to_vec_pretty(&engine.coverage)?,
+        )?;
+        std::fs::write(
+            self.root.join("blocks.json"),
+            serde_json::to_vec_pretty(&engine.harness.coverage)?,
+        )?;
+        eprintln!(
+            "campaign: {} executions, {} blocks, {} corpus inputs, {} finding signatures, {} checkpoint restores, {:.1} executions/s",
+            engine.coverage.executions,
+            engine.coverage.covered(),
+            self.corpus_inputs.len(),
+            self.finding_novelty.len(),
+            self.recoveries,
+            engine.coverage.executions as f64 / self.started.elapsed().as_secs_f64()
+        );
+        Ok(())
+    }
+}
