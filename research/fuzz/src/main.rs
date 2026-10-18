@@ -278,6 +278,11 @@ fn main() -> Result<()> {
                     "add coverage blocks before probing IOCTLs".into(),
                 ));
             }
+            if h.coverage_mode == vroom_fuzz::CoverageMode::Blocks {
+                return Err(vroom_fuzz::Error::Invalid(
+                    "probe compares each IOCTL's blocks with a baseline: use coverage_mode edges".into(),
+                ));
+            }
             let root = output.unwrap_or_else(|| h.state_dir.join("ioctl-probe"));
             if root.exists() {
                 return Err(vroom_fuzz::Error::Invalid(format!(

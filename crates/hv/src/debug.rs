@@ -11,6 +11,16 @@ pub struct DebugConfig {
     /// Stop on guest BRK instructions. Otherwise deliver them to the guest
     /// exception vector, so its own debug services keep working.
     pub trap_software_breakpoints: bool,
+    /// Stop on guest BRKs with this immediate only; others still go to the
+    /// guest (a fuzzer's coverage breakpoints next to Windows' own BRKs).
+    pub trap_brk_immediate: Option<u16>,
+}
+
+impl DebugConfig {
+    /// Whether a BRK with syndrome `esr` stops for the host.
+    pub fn traps_brk(&self, esr: u64) -> bool {
+        self.trap_software_breakpoints || self.trap_brk_immediate == Some(esr as u16)
+    }
 }
 
 /// A byte range within one aligned 8-byte granule.
@@ -106,6 +116,23 @@ pub fn arm64_reason(esr: u64) -> Option<DebugReason> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn one_brk_immediate_can_trap_alone() {
+        let brk = |imm: u64| 0x3c << 26 | 1 << 25 | imm;
+        let only = DebugConfig {
+            trap_brk_immediate: Some(0x766d),
+            ..Default::default()
+        };
+        assert!(only.traps_brk(brk(0x766d)));
+        assert!(!only.traps_brk(brk(0xf000)));
+        assert!(!DebugConfig::default().traps_brk(brk(0x766d)));
+        let all = DebugConfig {
+            trap_software_breakpoints: true,
+            ..Default::default()
+        };
+        assert!(all.traps_brk(brk(0xf000)));
+    }
+
     #[test]
     fn debug_syndromes_do_not_consume_memory_faults() {
         assert_eq!(

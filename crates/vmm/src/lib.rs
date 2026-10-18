@@ -400,6 +400,47 @@ impl Vmm {
     }
 
     #[cfg(feature = "research")]
+    /// Whether `len` bytes at `gpa` read the same in live RAM and in the
+    /// armed baseline (false when nothing is armed). VM paused.
+    pub fn research_matches_baseline(&self, gpa: u64, len: usize) -> Result<bool> {
+        if self.state != RunState::Paused {
+            return Err(Error::Setup("research check requires a paused VM".into()));
+        }
+        if self.research_baseline.is_none() {
+            return Ok(false);
+        }
+        let addr = vroom_memory::GuestAddress(gpa);
+        let (mut live, mut base) = (vec![0u8; len], vec![0u8; len]);
+        self.mem.read(addr, &mut live)?;
+        self.mem.read_baseline(addr, &mut base)?;
+        Ok(live == base)
+    }
+
+    #[cfg(feature = "research")]
+    /// Write guest RAM so that research resets keep the change: into the
+    /// armed baseline too (a fuzzer's code breakpoints, planted or taken
+    /// out). Before `research_arm` it is a plain write. VM paused.
+    pub fn research_patch(&self, gpa: u64, bytes: &[u8]) -> Result<()> {
+        if self.state != RunState::Paused {
+            return Err(Error::Setup("research patch requires a paused VM".into()));
+        }
+        let addr = vroom_memory::GuestAddress(gpa);
+        if !self.mem.check_range(addr, bytes.len() as u64) {
+            return Err(Error::Setup(format!("patch outside RAM at {gpa:#x}")));
+        }
+        if self.research_baseline.is_some() {
+            self.mem.write_baseline(addr, bytes)?;
+        } else {
+            self.mem.write(addr, bytes)?;
+        }
+        for (pointer, length) in self.mem.host_ranges(addr, bytes.len() as u64).expect("checked RAM") {
+            // SAFETY: mapped guest RAM; every vCPU is paused.
+            unsafe { debug::sync_instruction_cache(pointer, length) };
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "research")]
     pub(crate) fn research_devices_ran(&mut self) {
         if let Some(baseline) = &mut self.research_baseline {
             baseline.devices_ran = true;

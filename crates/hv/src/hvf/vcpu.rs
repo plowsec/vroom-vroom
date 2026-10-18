@@ -285,7 +285,7 @@ impl HvfVcpu {
     fn handle_exception(&mut self, esr: u64, ipa: u64) -> Result<Option<VcpuExit>> {
         if self.debug.enabled {
             if let Some(reason) = arm64_reason(esr) {
-                if reason == DebugReason::SoftwareBreakpoint && !self.debug.trap_software_breakpoints {
+                if reason == DebugReason::SoftwareBreakpoint && !self.debug.traps_brk(esr) {
                     let pc = self.get(ffi::HV_REG_PC)?;
                     let ps = self.get(ffi::HV_REG_CPSR)?;
                     let sctlr = self.get_sys(0xc080)?;

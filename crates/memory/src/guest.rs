@@ -445,6 +445,32 @@ impl GuestMemory {
     }
 
     #[cfg(feature = "research")]
+    /// Read the COW baseline (what a reset restores) instead of live RAM.
+    pub fn read_baseline(&self, addr: GuestAddress, buf: &mut [u8]) -> Result<()> {
+        let _mapping = self
+            .mapping_lock
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        self.walk(addr, buf.len() as u64, |r, off, span| r.mmap.read_cow_baseline(off, &mut buf[span]))
+    }
+
+    #[cfg(feature = "research")]
+    /// Write `buf` to RAM and to the COW baseline under it, so research
+    /// resets keep it (a fuzzer's breakpoints). Not logged as a host write:
+    /// the page needs no copying back.
+    pub fn write_baseline(&self, addr: GuestAddress, buf: &[u8]) -> Result<()> {
+        let _mapping = self
+            .mapping_lock
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        self.walk(addr, buf.len() as u64, |r, off, span| {
+            r.mmap.write_cow_baseline(off, &buf[span.clone()])?;
+            r.mmap.write_at(off, &buf[span]);
+            Ok(())
+        })
+    }
+
+    #[cfg(feature = "research")]
     /// Pages that differ from the COW baseline (slow: reads all RAM).
     pub fn cow_verify(&self) -> Result<Vec<GuestAddress>> {
         let _mapping = self

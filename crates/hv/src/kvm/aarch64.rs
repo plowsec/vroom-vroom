@@ -290,6 +290,11 @@ fn debug_config(config: &crate::debug::DebugConfig, bps: usize, wps: usize) -> R
         || config.breakpoints.iter().any(|a| a & 3 != 0) {
         return Err(Error::Invalid("KVM debug slot limit or unaligned breakpoint".into()));
     }
+    if config.trap_brk_immediate.is_some() {
+        // KVM traps every BRK or none; handing the others back to the
+        // guest from user space isn't implemented.
+        return Err(Error::Unsupported("trapping one BRK immediate"));
+    }
     if !config.enabled && (config.single_step || !config.breakpoints.is_empty()
         || !config.watchpoints.is_empty() || config.trap_software_breakpoints) {
         return Err(Error::Invalid("debug controls require enabled=true".into()));

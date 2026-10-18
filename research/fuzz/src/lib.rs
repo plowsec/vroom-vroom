@@ -135,6 +135,13 @@ pub struct Harness {
     pub timeout_ms: u64,
     #[serde(default)]
     pub max_input: usize,
+    /// `edges` (default): follow the path with hardware breakpoints on each
+    /// block's successors; every block an input reaches costs an exit, and
+    /// edges and hit counts are recorded. `blocks`: a BRK on every block not
+    /// covered yet, removed for good once hit; covered paths run without
+    /// exits, only new blocks are recorded (no edges, no hit counts).
+    #[serde(default)]
+    pub coverage_mode: CoverageMode,
     #[serde(default)]
     pub coverage: Vec<CoverageBlock>,
     /// Optional block manifest. Relative paths are resolved next to the
@@ -154,6 +161,22 @@ pub struct Harness {
     /// or freed objects whose address is known from a target harness.
     #[serde(default)]
     pub watchpoints: Vec<MemoryWatch>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CoverageMode {
+    #[default]
+    Edges,
+    Blocks,
+}
+
+/// BRK immediate of the `blocks` coverage breakpoints ("vm"); other BRKs
+/// (Windows uses 0xf000..) still go to the guest.
+pub const COVERAGE_BRK: u16 = 0x766d;
+
+fn brk_instruction(immediate: u16) -> [u8; 4] {
+    (0xd420_0000u32 | u32::from(immediate) << 5).to_le_bytes()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -750,6 +773,20 @@ pub struct Engine {
     checkpoint_fresh: bool,
     cow_enabled: bool,
     input_buffer: Vec<u8>,
+    /// `blocks` mode: block index -> the instruction its BRK replaced.
+    planted: HashMap<usize, [u8; 4]>,
+    /// `blocks` mode: blocks whose code page isn't mapped at the checkpoint
+    /// (pageable code in transition), by 4 KiB VA page. Each is planted once
+    /// an input has faulted its page in: resets bring back the same
+    /// physical page every time.
+    pending: BTreeMap<u64, Vec<usize>>,
+}
+
+/// What every debug configuration of an input keeps.
+#[derive(Debug, Clone, Copy)]
+struct Always {
+    bugcheck: Option<u64>,
+    brk: Option<u16>,
 }
 
 impl Engine {
@@ -792,6 +829,8 @@ impl Engine {
             checkpoint_fresh: true,
             cow_enabled,
             input_buffer: vec![0; input_capacity],
+            planted: HashMap::new(),
+            pending: BTreeMap::new(),
         })
     }
 
@@ -867,6 +906,9 @@ impl Engine {
                     .join(", ")
             );
         }
+        if self.harness.coverage_mode == CoverageMode::Blocks {
+            self.plant(entry_pc)?;
+        }
         if let Some(bugcheck) = self.harness.bugcheck_pc {
             // The bugcheck breakpoint sits beyond the four coverage slots.
             // Check the backend has it before the first input needs it.
@@ -909,6 +951,147 @@ impl Engine {
         fresh.instrument()?;
         fresh.watch_cursor = watch_cursor;
         Ok(fresh)
+    }
+
+    /// `blocks` mode: a BRK on every resolved block not covered yet, except
+    /// the entry block (the checkpoint stands on it) and the hardware
+    /// breakpoint sites. Covered blocks stay as they are after a reopen.
+    fn plant(&mut self, entry_pc: u64) -> Result<()> {
+        let brk = brk_instruction(COVERAGE_BRK);
+        let hardware: Vec<u64> = self
+            .harness
+            .stop_pc
+            .into_iter()
+            .chain(self.harness.bugcheck_pc)
+            .chain(self.harness.exception_sites.iter().copied())
+            .collect();
+        self.pending.clear();
+        for index in 0..self.harness.coverage.len() {
+            let block = &self.harness.coverage[index];
+            let covered = self.coverage.blocks.get(&block.id).is_some_and(|row| row.hits > 0);
+            let entry = block.va == Some(entry_pc) || block.gpa == Some(entry_pc);
+            if covered || entry || block.va.is_some_and(|va| hardware.contains(&va)) {
+                continue;
+            }
+            match (block.gpa, block.va) {
+                (Some(gpa), _) => self.plant_at(index, gpa, brk)?,
+                (None, Some(va)) => self.pending.entry(va & !0xfff).or_default().push(index),
+                (None, None) => {}
+            }
+        }
+        if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
+            eprintln!(
+                "planted {} coverage breakpoints; {} blocks on {} pages not mapped yet",
+                self.planted.len(),
+                self.pending.values().map(Vec::len).sum::<usize>(),
+                self.pending.len()
+            );
+        }
+        Ok(())
+    }
+
+    fn plant_at(&mut self, index: usize, gpa: u64, brk: [u8; 4]) -> Result<()> {
+        let mut original = [0u8; 4];
+        self.vm.debug_read_physical(gpa, &mut original)?;
+        if original == brk {
+            // Two manifest rows for one address.
+            return Ok(());
+        }
+        self.vm.research_patch(gpa, &brk)?;
+        self.planted.insert(index, original);
+        Ok(())
+    }
+
+    /// `blocks` mode, after an input: plant the blocks on pages that input
+    /// mapped. VM paused.
+    fn plant_pending(&mut self) -> Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let state = self.vm.debug_registers(self.harness.cpu)?;
+        let registers = Registers::from_state(&state)
+            .map_err(|error| Error::Invalid(format!("ARM64 register state: {error}")))?;
+        let mut mapped = Vec::new();
+        {
+            let address_space = AddressSpace {
+                memory: &self.vm,
+                registers: &registers,
+            };
+            for &page in self.pending.keys() {
+                if let Ok(translated) = address_space.translate(page) {
+                    mapped.push((page, translated.physical));
+                }
+            }
+        }
+        let brk = brk_instruction(COVERAGE_BRK);
+        for (page, physical) in mapped {
+            // A page the checkpoint already held (in transition) comes back
+            // at this frame every input. One the input filled in has other
+            // contents in the baseline: a BRK there would corrupt them.
+            if !self.vm.research_matches_baseline(physical, 0x1000)? {
+                continue;
+            }
+            for index in self.pending.remove(&page).unwrap_or_default() {
+                let va = self.harness.coverage[index].va.expect("pending blocks have a VA");
+                let gpa = physical + (va - page);
+                self.harness.coverage[index].gpa = Some(gpa);
+                self.block_by_pc.insert(gpa, index);
+                let covered = self
+                    .coverage
+                    .blocks
+                    .get(&self.harness.coverage[index].id)
+                    .is_some_and(|row| row.hits > 0);
+                if !covered {
+                    self.plant_at(index, gpa, brk)?;
+                }
+            }
+            if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
+                eprintln!("page {page:#x} mapped at {physical:#x}: planted its blocks");
+            }
+        }
+        Ok(())
+    }
+
+    /// `blocks` mode: blocks still waiting for their page to be mapped.
+    pub fn unmapped_blocks(&self) -> usize {
+        self.pending.values().map(Vec::len).sum()
+    }
+
+    /// `blocks` mode: put back block `index`'s instruction for good.
+    fn unplant(&mut self, index: usize) -> Result<bool> {
+        let Some(original) = self.planted.remove(&index) else {
+            return Ok(false);
+        };
+        let gpa = self.harness.coverage[index].gpa.expect("planted blocks have a GPA");
+        self.vm.research_patch(gpa, &original)?;
+        Ok(true)
+    }
+
+    /// Coverage another instance found: those blocks need no breakpoint
+    /// here any more. The VM must be paused (between inputs).
+    pub fn take_coverage(&mut self, block_ids: &[u64]) -> Result<()> {
+        if self.planted.is_empty() {
+            return Ok(());
+        }
+        let indices: Vec<usize> = self
+            .harness
+            .coverage
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| block_ids.contains(&block.id))
+            .map(|(index, _)| index)
+            .collect();
+        for index in indices {
+            self.unplant(index)?;
+        }
+        Ok(())
+    }
+
+    fn always(&self) -> Always {
+        Always {
+            bugcheck: self.harness.bugcheck_pc,
+            brk: (self.harness.coverage_mode == CoverageMode::Blocks).then_some(COVERAGE_BRK),
+        }
     }
 
     pub fn watch_cursor(&self) -> usize {
@@ -1155,9 +1338,16 @@ impl Engine {
         // a software trap there: resume directly and use hardware execution
         // breakpoints on its CFG successors to observe the next block.
         let entry_index = *self.block_by_pc.get(&entry_pc).expect("checked above");
-        let entry_successors = self.harness.coverage[entry_index].successors.clone();
+        let always = self.always();
+        let blocks_mode = always.brk.is_some();
+        // Blocks mode needs no path following: BRKs mark every new block.
+        let entry_successors = if blocks_mode {
+            Vec::new()
+        } else {
+            self.harness.coverage[entry_index].successors.clone()
+        };
         let mut active_exception_sites = self.harness.exception_sites.clone();
-        let mut watch_target = self.next_watch_target();
+        let mut watch_target = if blocks_mode { None } else { self.next_watch_target() };
         if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
             eprintln!("watch target={watch_target:?}");
         }
@@ -1171,7 +1361,7 @@ impl Engine {
             eprintln!("initial breakpoints={initial_breakpoints:?}");
         }
         let mut armed = initial_breakpoints;
-        configure_all(&self.vm, &armed, self.harness.bugcheck_pc, &case_watchpoints)?;
+        configure_all(&self.vm, &armed, always, &case_watchpoints)?;
         let isolate = self.harness.isolate_cpu.then_some(self.harness.cpu);
         if isolate.is_some() {
             // PSTATE.I and F: no interrupt can preempt the target thread.
@@ -1259,13 +1449,37 @@ impl Engine {
                         findings.push(bugcheck);
                         break;
                     }
+                    if stop.reason == vroom_hv::debug::DebugReason::SoftwareBreakpoint {
+                        // A coverage BRK (blocks mode): the only BRK that stops.
+                        let index = self.block_by_pc.get(&stop.pc).copied().ok_or_else(|| {
+                            Error::Invalid(format!("coverage breakpoint at unknown pc {:#x}", stop.pc))
+                        })?;
+                        // Another CPU may have taken this one out already; its
+                        // instruction runs now either way.
+                        if self.unplant(index)? {
+                            let block = &self.harness.coverage[index];
+                            *block_hits.entry(block.id).or_default() += 1;
+                            if self.coverage.observe(block, &token) {
+                                new_blocks += 1;
+                            }
+                            if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
+                                eprintln!("new block {} at {:#x} on cpu {}", block.id, stop.pc, stop.cpu);
+                            }
+                        }
+                        // A step this stop interrupted is over too.
+                        own_step = None;
+                        foreign_step = None;
+                        configure_all(&self.vm, &armed, always, &case_watchpoints)?;
+                        resume_vm(&mut self.vm, isolate)?;
+                        continue;
+                    }
                     let stepped_own = own_step.take().is_some();
                     if foreign_step.take().is_some()
                         || (stop.reason == vroom_hv::debug::DebugReason::SingleStep && !stepped_own)
                     {
                         // A foreign thread is past the shared site (or a
                         // step a re-arm already cancelled): re-arm, resume.
-                        configure_all(&self.vm, &armed, self.harness.bugcheck_pc, &case_watchpoints)?;
+                        configure_all(&self.vm, &armed, always, &case_watchpoints)?;
                         resume_vm(&mut self.vm, isolate)?;
                         continue;
                     }
@@ -1291,7 +1505,7 @@ impl Engine {
                                 self.harness.stop_pc,
                                 &active_exception_sites,
                             );
-                            configure_all(&self.vm, &armed, self.harness.bugcheck_pc, &case_watchpoints)?;
+                            configure_all(&self.vm, &armed, always, &case_watchpoints)?;
                             resume_vm(&mut self.vm, isolate)?;
                             continue;
                         }
@@ -1300,7 +1514,7 @@ impl Engine {
                         && stop.reason == vroom_hv::debug::DebugReason::Breakpoint
                     {
                         exception_return = None;
-                        self.vm.debug_step(stop.cpu as usize, step_debug_config(&case_watchpoints))?;
+                        self.vm.debug_step(stop.cpu as usize, step_debug_config(&case_watchpoints, always))?;
                         own_step = Some(stop.cpu);
                         continue;
                     }
@@ -1331,7 +1545,7 @@ impl Engine {
                         if !ours {
                             foreign_threads += 1;
                             foreign_step = Some(stop.cpu);
-                            self.vm.debug_step(stop.cpu as usize, step_debug_config(&[]))?;
+                            self.vm.debug_step(stop.cpu as usize, step_debug_config(&[], always))?;
                             continue;
                         }
                     }
@@ -1382,7 +1596,7 @@ impl Engine {
                             self.harness.stop_pc,
                             &active_exception_sites,
                         );
-                        configure_all(&self.vm, &armed, self.harness.bugcheck_pc, &case_watchpoints)?;
+                        configure_all(&self.vm, &armed, always, &case_watchpoints)?;
                         resume_vm(&mut self.vm, isolate)?;
                         continue;
                     }
@@ -1410,7 +1624,7 @@ impl Engine {
                             self.harness.stop_pc,
                             &active_exception_sites,
                         );
-                        configure_all(&self.vm, &armed, self.harness.bugcheck_pc, &case_watchpoints)?;
+                        configure_all(&self.vm, &armed, always, &case_watchpoints)?;
                         resume_vm(&mut self.vm, isolate)?;
                         continue;
                     }
@@ -1482,7 +1696,7 @@ impl Engine {
                                 if call_step_remaining > 0 {
                                     self.vm.debug_step(
                                         stop.cpu as usize,
-                                        step_debug_config(&case_watchpoints),
+                                        step_debug_config(&case_watchpoints, always),
                                     )?;
                                     own_step = Some(stop.cpu);
                                     continue;
@@ -1514,7 +1728,7 @@ impl Engine {
                                 step_to_call_target = true;
                                 self.vm.debug_step(
                                     stop.cpu as usize,
-                                    step_debug_config(&case_watchpoints),
+                                    step_debug_config(&case_watchpoints, always),
                                 )?;
                                 own_step = Some(stop.cpu);
                                 continue;
@@ -1529,7 +1743,7 @@ impl Engine {
                                 eprintln!("arm block {} successors {:?}", block.id, breakpoints);
                             }
                             armed = breakpoints;
-                            configure_all(&self.vm, &armed, self.harness.bugcheck_pc, &case_watchpoints)?;
+                            configure_all(&self.vm, &armed, always, &case_watchpoints)?;
                             resume_vm(&mut self.vm, isolate)?;
                         }
                     } else if stop.reason == vroom_hv::debug::DebugReason::SingleStep {
@@ -1543,7 +1757,7 @@ impl Engine {
                                 call_step_remaining = (block.size as usize / 4).clamp(1, 64);
                                 self.vm.debug_step(
                                     stop.cpu as usize,
-                                    step_debug_config(&case_watchpoints),
+                                    step_debug_config(&case_watchpoints, always),
                                 )?;
                                 own_step = Some(stop.cpu);
                                 continue;
@@ -1556,7 +1770,7 @@ impl Engine {
                                 &active_exception_sites,
                             );
                             armed = breakpoints;
-                            configure_all(&self.vm, &armed, self.harness.bugcheck_pc, &case_watchpoints)?;
+                            configure_all(&self.vm, &armed, always, &case_watchpoints)?;
                             resume_vm(&mut self.vm, isolate)?;
                         } else {
                             armed = breakpoint_set(
@@ -1565,7 +1779,7 @@ impl Engine {
                                 self.harness.stop_pc,
                                 &active_exception_sites,
                             );
-                            configure_all(&self.vm, &armed, self.harness.bugcheck_pc, &case_watchpoints)?;
+                            configure_all(&self.vm, &armed, always, &case_watchpoints)?;
                             resume_vm(&mut self.vm, isolate)?;
                         }
                     }
@@ -1598,6 +1812,9 @@ impl Engine {
             }
         }
         self.coverage.finish_execution();
+        if blocks_mode && !reopen {
+            self.plant_pending()?;
+        }
         Ok(RunResult {
             input_hash: token,
             new_blocks,
@@ -1725,11 +1942,11 @@ fn elr_el1(state: &vroom_hv::VcpuState) -> Option<u64> {
 fn configure_all(
     vm: &vroom_vmm::Vmm,
     breakpoints: &[u64],
-    bugcheck: Option<u64>,
+    always: Always,
     watches: &[MemoryWatch],
 ) -> Result<()> {
     let mut breakpoints = breakpoints.to_vec();
-    if let Some(pc) = bugcheck.filter(|pc| !breakpoints.contains(pc)) {
+    if let Some(pc) = always.bugcheck.filter(|pc| !breakpoints.contains(pc)) {
         breakpoints.push(pc);
     }
     for cpu in 0..vm.config().cpus as usize {
@@ -1739,6 +1956,7 @@ fn configure_all(
                 enabled: true,
                 breakpoints: breakpoints.clone(),
                 watchpoints: hv_watchpoints(watches),
+                trap_brk_immediate: always.brk,
                 ..Default::default()
             },
         )?;
@@ -1758,11 +1976,13 @@ fn hv_watchpoints(watches: &[MemoryWatch]) -> Vec<vroom_hv::debug::Watchpoint> {
         .collect()
 }
 
-fn step_debug_config(watches: &[MemoryWatch]) -> vroom_hv::debug::DebugConfig {
+fn step_debug_config(watches: &[MemoryWatch], always: Always) -> vroom_hv::debug::DebugConfig {
     vroom_hv::debug::DebugConfig {
         enabled: true,
         single_step: true,
         watchpoints: hv_watchpoints(watches),
+        // A stepped thread can land on a coverage BRK too.
+        trap_brk_immediate: always.brk,
         ..Default::default()
     }
 }
@@ -1882,6 +2102,26 @@ mod tests {
             breakpoint_set(&[10, 11, 12], Some(20), Some(30), &[]),
             vec![30, 10, 11, 12]
         );
+    }
+
+    #[test]
+    fn coverage_breakpoints_are_brk_with_the_fuzzer_immediate() {
+        assert_eq!(brk_instruction(0), 0xd420_0000u32.to_le_bytes());
+        assert_eq!(brk_instruction(0xf000), 0xd43e_0000u32.to_le_bytes());
+        let word = u32::from_le_bytes(brk_instruction(COVERAGE_BRK));
+        assert_eq!((word >> 5) & 0xffff, u32::from(COVERAGE_BRK));
+    }
+
+    #[test]
+    fn coverage_mode_defaults_to_edges() {
+        #[derive(serde::Deserialize)]
+        struct Only {
+            #[serde(default)]
+            coverage_mode: CoverageMode,
+        }
+        let parse = |text: &str| serde_json::from_str::<Only>(text).unwrap().coverage_mode;
+        assert_eq!(parse("{}"), CoverageMode::Edges);
+        assert_eq!(parse(r#"{"coverage_mode":"blocks"}"#), CoverageMode::Blocks);
     }
 
     #[test]

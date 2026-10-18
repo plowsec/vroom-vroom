@@ -190,6 +190,7 @@ impl Session {
                         breakpoints: addresses.clone(),
                         watchpoints: self.watchpoints.clone(),
                         trap_software_breakpoints: false,
+                        trap_brk_immediate: None,
                     },
                 )
                 .map_err(|e| e.to_string())?;

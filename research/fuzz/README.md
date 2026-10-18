@@ -43,6 +43,7 @@ Kernel TUI: `coverage runs/a/coverage.json`, `coverage-diff runs/a/coverage.json
 | `reopen_after` | `0` reset in place, `1` restore from disk every input |
 | `timeout_ms` | per input; a timeout restores from disk |
 | `coverage` / `coverage_file` | block manifest (`angr_blocks.py`); ≤4 successors per block |
+| `coverage_mode` | `edges` (default): HW breakpoints follow the path, edges + hit counts, one exit per block. `blocks`: one-shot BRK per uncovered block, known paths run exit-free, new blocks only (~1.8x faster; not for `probe`) |
 | `exception_sites` | ≤4 exception-dispatch PCs, reported when reached |
 | `watchpoints` | 1 range ≤8 bytes: `address`/`input_end_offset`, `read`, `write`, `poisoned`, `poison_value`, `double_fetch` |
 | `ioctl_probe` | `device_type`, `function_start..end`, `methods`, `access`, `baseline_ioctl` |
@@ -55,7 +56,8 @@ Kernel TUI: `coverage runs/a/coverage.json`, `coverage-diff runs/a/coverage.json
 - Distributed: every machine needs the checkpoint, its disk layers and the VM config at the same paths; the master refuses other harness names or block counts.
 - Workers import a shared input (with its coverage, not re-run) only if it is new to them.
 - Reset with `isolate_cpu` (HEVD): dirty pages only, pages written every input stay writable (hot), device restore skipped if no MMIO, GIC restored per register: ~0.5 ms.
-- HEVD, M3 Max: ~750 inputs/s per worker, ~545/s each with 3 (1640/s). ~9 GB RAM and ~10 s start per worker.
+- `blocks` mode: BRK `#0x766d` in RAM and the checkpoint baseline (other BRKs still reach the guest; HVF only). Pageable code not mapped at the checkpoint is planted once an input maps it. Shared inputs remove their blocks' BRKs.
+- HEVD, M3 Max, edges: ~750 inputs/s per worker, ~545/s each with 3 (1640/s). Blocks: ~1360/s, ~950/s each with 3 (2840/s). ~9 GB RAM and ~10 s start per worker.
 
 ## HEVD
 

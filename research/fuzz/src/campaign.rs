@@ -335,6 +335,8 @@ impl Campaign {
             self.engine_mut()
                 .coverage
                 .merge(blocks, &entry.edges, &entry.hash);
+        // Blocks mode: no breakpoint needed where the others have been.
+        self.engine_mut().take_coverage(blocks)?;
         if new_blocks == 0 && new_edges == 0 && new_findings == 0 {
             return Ok(());
         }

@@ -309,6 +309,51 @@ impl MmapRegion {
     }
 
     #[cfg(feature = "research")]
+    /// Read the COW baseline (not the live RAM) at `off`.
+    pub fn read_cow_baseline(&self, off: usize, buf: &mut [u8]) -> Result<()> {
+        let view = self.cow_view.load(std::sync::atomic::Ordering::Acquire);
+        if view.is_null() {
+            return Err(Error::Cow("no COW baseline is armed"));
+        }
+        if off.checked_add(buf.len()).is_none_or(|e| e > self.size) {
+            return Err(Error::Overflow);
+        }
+        // SAFETY: inside the `size`-byte baseline view.
+        unsafe { std::ptr::copy_nonoverlapping(view.add(off), buf.as_mut_ptr(), buf.len()) };
+        Ok(())
+    }
+
+    #[cfg(feature = "research")]
+    /// Change the COW baseline itself at `off` (resets keep the new bytes).
+    /// Pages the guest hasn't written since the last reset show them at
+    /// once; the caller writes the live mapping too.
+    pub fn write_cow_baseline(&self, off: usize, bytes: &[u8]) -> Result<()> {
+        let view = self.cow_view.load(std::sync::atomic::Ordering::Acquire);
+        if view.is_null() {
+            return Err(Error::Cow("no COW baseline is armed"));
+        }
+        if off.checked_add(bytes.len()).is_none_or(|e| e > self.size) {
+            return Err(Error::Overflow);
+        }
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let page = page_size();
+        let first = off & !(page - 1);
+        let span = (off + bytes.len()).div_ceil(page) * page - first;
+        // SAFETY: pages inside the shared baseline view (`size` bytes, page
+        // aligned); writable only for this copy, the VM is paused.
+        unsafe {
+            if libc::mprotect(view.add(first).cast(), span, libc::PROT_READ | libc::PROT_WRITE) != 0 {
+                return Err(Error::Mmap(errno()));
+            }
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), view.add(off), bytes.len());
+            libc::mprotect(view.add(first).cast(), span, libc::PROT_READ);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "research")]
     /// Offsets of pages that differ from the COW baseline (a slow check of
     /// a reset: it reads all of RAM and the baseline).
     pub fn cow_verify(&self) -> Result<Vec<usize>> {
