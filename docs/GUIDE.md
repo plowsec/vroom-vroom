@@ -161,6 +161,11 @@ Linux: a root systemd service plus an unprivileged session helper
 (clipboard, through X11, also on Wayland via Xwayland). Windows: the
 `VroomAgent` service plus a per-logon helper.
 
+Commands in a running guest, no guest network needed:
+`vroom guest exec <vm.toml | name> [-p] [-t secs] -- ipconfig /all`
+(cmd.exe as SYSTEM, `-p` PowerShell; Linux: sh as root). Exits with the
+command's code. vroom-lab: `guest.exec`.
+
 ## Ready-made VMs
 
 New VM makes a VM that comes up installed, with the tools, your user and

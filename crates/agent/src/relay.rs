@@ -9,7 +9,7 @@
 //! host checks those again).
 
 use std::io::{self, Write};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, Sender};
 
 use vroom_proto::{Decoder, Message};
 
@@ -26,6 +26,8 @@ pub enum Ev {
     HelperGone(u64),
     /// The guest is shutting down: tell the host before we go.
     Stopping,
+    /// For the host, from one of our threads (`Exec`).
+    Reply(Message),
 }
 
 /// Privileged actions, behind a trait so tests can watch them.
@@ -47,6 +49,8 @@ pub trait System {
     fn update(&mut self, _m: Message) -> Option<Message> {
         None
     }
+    /// Run an `Exec` without blocking; `done` gets its `ExecDone`.
+    fn exec(&mut self, m: Message, done: Box<dyn FnOnce(Message) + Send>);
 }
 
 pub struct RealSystem {
@@ -87,6 +91,9 @@ impl System for RealSystem {
     fn update(&mut self, m: Message) -> Option<Message> {
         self.updater.handle(m, crate::update::apply)
     }
+    fn exec(&mut self, m: Message, done: Box<dyn FnOnce(Message) + Send>) {
+        crate::exec::spawn(m, done);
+    }
 }
 
 pub struct Relay<S: System> {
@@ -98,11 +105,13 @@ pub struct Relay<S: System> {
     display: (Option<Message>, Option<Message>),
     /// The host's window is in Coherence: a later helper starts it too.
     coherence: bool,
+    /// Our own events' channel, for answers that come later (`Exec`).
+    events: Sender<Ev>,
 }
 
 impl<S: System> Relay<S> {
-    pub fn new(sys: S, max: usize) -> Self {
-        Relay { sys, helper: None, max, display: (None, None), coherence: false }
+    pub fn new(sys: S, max: usize, events: Sender<Ev>) -> Self {
+        Relay { sys, helper: None, max, display: (None, None), coherence: false, events }
     }
 
     /// Serve one host connection until it goes away. Helper state
@@ -124,6 +133,7 @@ impl<S: System> Relay<S> {
                 }
                 Ev::HostGone => return Err(io::Error::other("port closed")),
                 Ev::Stopping => host.write_all(&Message::Stopping.encode())?,
+                Ev::Reply(m) => host.write_all(&m.encode())?,
                 Ev::HelperUp(id, w) => {
                     log::info!("session helper {id} connected");
                     // A helper it replaces (started twice in a session)
@@ -170,6 +180,13 @@ impl<S: System> Relay<S> {
                 }
             }
             Message::UsbShare { tag, label, on } => self.sys.usb_share(&tag, &label, on),
+            // Commands run as the service's user: never the helper's.
+            m @ Message::Exec { .. } => {
+                let tx = self.events.clone();
+                self.sys.exec(m, Box::new(move |r| {
+                    let _ = tx.send(Ev::Reply(r));
+                }));
+            }
             Message::Ping(v) => host.write_all(&Message::Pong(v).encode())?,
             Message::TimeSync { unix_secs, nanos } => self.sys.set_time(unix_secs, nanos),
             Message::Shutdown { reboot } => self.sys.shutdown(reboot),
@@ -221,6 +238,7 @@ impl<S: System> Relay<S> {
             | Message::DragOutItems { .. }
             | Message::DragOutFail { .. }
             | Message::UpdateDone { .. }
+            | Message::ExecDone { .. }
             | Message::Stopping => {}
         }
         Ok(())
@@ -308,6 +326,10 @@ mod tests {
                 _ => None,
             }
         }
+        fn exec(&mut self, m: Message, done: Box<dyn FnOnce(Message) + Send>) {
+            let Message::Exec { id, command, .. } = m else { return };
+            std::thread::spawn(move || done(Message::ExecDone { id, end: vroom_proto::ExecEnd::Exited(0), truncated: false, stdout: command.into_bytes(), stderr: Vec::new() }));
+        }
     }
 
     #[derive(Clone, Default)]
@@ -332,9 +354,9 @@ mod tests {
     /// Feed events, then end the host link; returns what the relay did.
     fn run(evs: Vec<Ev>) -> (Vec<Message>, Arc<Mutex<Seen>>) {
         let seen = Arc::new(Mutex::new(Seen::default()));
-        let mut r = Relay::new(Fake(seen.clone()), 1024);
         let host = Sink::default();
         let (tx, rx): (Sender<Ev>, _) = channel();
+        let mut r = Relay::new(Fake(seen.clone()), 1024, tx.clone());
         for e in evs {
             tx.send(e).unwrap();
         }
@@ -406,6 +428,33 @@ mod tests {
         assert_eq!(seen.lock().unwrap().updates, 1);
         assert_eq!(out[1..], [Message::UpdateDone { id: 3, ok: true, why: String::new() }]);
         assert!(helper.msgs().is_empty(), "never relayed to the session");
+    }
+
+    #[test]
+    fn commands_run_in_the_service_and_answer_later() {
+        let helper = Sink::default();
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let out = Sink::default();
+        let (tx, rx) = channel();
+        let mut r = Relay::new(Fake(seen), 1024, tx.clone());
+        let exec = Message::Exec { id: 4, shell: vroom_proto::Shell::Default, timeout_ms: 1000, max_out: 64, command: "ver".into() };
+        tx.send(Ev::HelperUp(1, Box::new(helper.clone()))).unwrap();
+        // A helper can't ask, nor answer.
+        tx.send(Ev::Helper(1, exec.encode())).unwrap();
+        tx.send(Ev::Helper(1, Message::ExecDone { id: 4, end: vroom_proto::ExecEnd::Exited(1), truncated: false, stdout: Vec::new(), stderr: Vec::new() }.encode())).unwrap();
+        tx.send(host(exec)).unwrap();
+        let mut hw: Writer = Box::new(out.clone());
+        // The answer comes from another thread: end once it is out.
+        let watch = out.clone();
+        std::thread::spawn(move || {
+            while watch.msgs().len() < 2 {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            tx.send(Ev::HostGone).unwrap();
+        });
+        assert!(r.run(&mut hw, &rx).is_err());
+        assert_eq!(out.msgs()[1..], [Message::ExecDone { id: 4, end: vroom_proto::ExecEnd::Exited(0), truncated: false, stdout: b"ver".to_vec(), stderr: Vec::new() }]);
+        assert!(helper.msgs().is_empty());
     }
 
     #[test]

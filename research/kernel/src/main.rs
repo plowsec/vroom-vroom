@@ -1,6 +1,7 @@
 //! Line-delimited JSON control endpoint; the Textual frontend owns this process.
 //! `--agent-socket` also serves agents (JSON-RPC 2.0, see agent.rs).
 mod agent;
+mod guest;
 
 use clap::Parser;
 use serde_json::{json, Value};
@@ -1320,6 +1321,10 @@ fn run(args: Args) -> Result<(), String> {
                 }
             }
             Ok(Input::Stdio(Err(error))) => output(json!({"id":null,"error":error}))?,
+            // Answered from its own thread: the guest runs meanwhile.
+            Ok(Input::Agent(forward)) if forward.request["op"] == "guest_exec" => {
+                guest::exec(session.vm.agent().clone(), session.vm.state() == RunState::Running, forward);
+            }
             Ok(Input::Agent(forward)) => {
                 let _ = forward.reply.send(session.command(&forward.request));
                 if session.vm.state() == RunState::Stopped {

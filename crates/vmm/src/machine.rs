@@ -295,6 +295,12 @@ impl BootImage {
 pub(crate) const VIEWER_FILE: &str = "viewer";
 
 fn viewer_socket(state_dir: &std::path::Path) -> std::io::Result<std::os::unix::net::UnixListener> {
+    user_socket(state_dir, "sock", VIEWER_FILE)
+}
+
+/// A socket of this VM's in the user's temp dir (`ext`: what for), and
+/// the file `file` in the state dir that says where it is.
+fn user_socket(state_dir: &std::path::Path, ext: &str, file: &str) -> std::io::Result<std::os::unix::net::UnixListener> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{FileTypeExt, PermissionsExt};
     let dir = std::env::temp_dir().join("vroom");
@@ -305,7 +311,7 @@ fn viewer_socket(state_dir: &std::path::Path) -> std::io::Result<std::os::unix::
     for b in real.as_os_str().as_bytes() {
         h = (h ^ *b as u64).wrapping_mul(0x100_0000_01b3);
     }
-    let p = dir.join(format!("{h:016x}.sock"));
+    let p = dir.join(format!("{h:016x}.{ext}"));
     // One left by a VMM that died: we hold the state lock, so it's stale.
     if let Ok(m) = std::fs::symlink_metadata(&p) {
         if !m.file_type().is_socket() {
@@ -315,7 +321,7 @@ fn viewer_socket(state_dir: &std::path::Path) -> std::io::Result<std::os::unix::
     }
     let l = std::os::unix::net::UnixListener::bind(&p)?;
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
-    std::fs::write(state_dir.join(VIEWER_FILE), p.as_os_str().as_bytes())?;
+    std::fs::write(state_dir.join(file), p.as_os_str().as_bytes())?;
     Ok(l)
 }
 
@@ -804,6 +810,11 @@ pub(crate) fn build(
     let viewer = ui.as_ref().map(|d| d.tx());
     let screen_ctl = agent::Screen { heads, max_pixels, gpu3d: config.display.gpu == Gpu::Virtio3d, viewer: viewer.clone() };
     let agent = agent::spawn(host_end, config.clipboard.clone(), clipboard, screen_ctl)?;
+    // `vroom guest exec` reaches the guest agent through it.
+    match user_socket(&env.state_dir, "ctl", crate::control::CONTROL_FILE) {
+        Ok(l) => crate::control::serve(l, agent.clone())?,
+        Err(e) => log::warn!("no control socket ({e}): `vroom guest exec` can't reach this VM"),
+    }
     // Network adapters (right after the console: the device order is the
     // guest's layout). The viewer can change them while the VM runs.
     let planned = crate::net::plan(config, env.saved.as_ref())?;

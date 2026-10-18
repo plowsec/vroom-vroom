@@ -179,6 +179,12 @@ static COMMANDS: &[Command] = &[
     c("vm.screenshot", "vm", "Save the guest screen as PNG", &[p("path", "path", true, "PNG file to write")], "write", Target::Op("screen")),
     c("vm.key", "vm", "Press or release a key (USB HID usage code)", &[p("code", "integer", true, "HID usage code"), p("down", "boolean", true, "true = press, false = release")], "control", Target::Op("key")),
     c("vm.shutdown", "vm", "Stop the VM and end the lab", &[], "destructive", Target::Op("shutdown")),
+    c("guest.exec", "guest", "Run a command in the running guest through its agent (Windows: cmd.exe as SYSTEM; Linux: sh as root)", &[
+        p("command", "string", true, "command line"),
+        p("powershell", "boolean", false, "PowerShell instead (Linux: pwsh)"),
+        p("timeout", "integer", false, "seconds before it is killed, default 60"),
+        p("max_output", "integer", false, "bytes kept of stdout and of stderr, default 1048576"),
+    ], "write", Target::Op("guest_exec")),
     // CPU.
     c("cpu.registers", "cpu", "General, PC, SP, PSTATE and translation registers", &[CPU], "read", Target::Op("registers")),
     c("cpu.write_register", "cpu", "Set a register (x0..x30, pc, sp, pstate, ttbr0, ...)", &[CPU, p("register", "string", true, "register name"), p("value", "address", true, "new value")], "write", Target::Op("write_register")),
@@ -602,6 +608,7 @@ impl Connection {
                     "notes": [
                         "Addresses are integers or \"0x...\" strings; results give integers.",
                         "Inspection needs a paused VM: vm.pause, or wait for a stop with events.poll after vm.resume.",
+                        "guest.exec needs a running VM and a guest agent with the current guest tools; it answers once the command ends.",
                         "Commands with mutates=true change the guest, the VM or files; risk says how much.",
                         "fuzz.run and fuzz.probe start their own VM from a checkpoint: run them with jobs.start."
                     ],

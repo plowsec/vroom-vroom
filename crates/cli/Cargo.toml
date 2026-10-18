@@ -17,6 +17,7 @@ libc.workspace = true
 vroom-config.workspace = true
 vroom-hv.workspace = true
 vroom-vmm.workspace = true
+vroom-proto.workspace = true
 vroom-block.workspace = true
 vroom-net.workspace = true
 vroom-audio.workspace = true

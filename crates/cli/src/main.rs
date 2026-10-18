@@ -5,6 +5,7 @@ mod clip;
 mod disk;
 #[cfg(unix)]
 mod gpu;
+mod guest;
 mod import;
 mod log_limit;
 mod net;
@@ -110,6 +111,9 @@ enum Cmd {
     /// The guest tools: where they are, their versions, updates.
     #[command(subcommand)]
     GuestTools(tools::ToolsCmd),
+    /// A running VM's guest, through its agent.
+    #[command(subcommand)]
+    Guest(guest::GuestCmd),
 }
 
 /// Apps started from the Dock or Finder get 256 open files. A Windows
@@ -186,6 +190,7 @@ fn main() -> ExitCode {
         Cmd::New(a) => new::run(a, load),
         Cmd::Import(a) => import::run(a),
         Cmd::GuestTools(c) => tools::run(c),
+        Cmd::Guest(c) => guest::run(c, load, default_state_dir),
         Cmd::AudioOut { input } => audio_out(input),
         Cmd::CameraHelper => camera::helper(),
         #[cfg(unix)]

@@ -49,6 +49,8 @@ pub mod features {
     /// The agent takes new guest tools from the host and installs them
     /// (`UpdateBegin`).
     pub const UPDATE: u64 = 1 << 40;
+    /// The agent runs commands for the host (`Exec`).
+    pub const EXEC: u64 = 1 << 41;
 }
 
 /// Most windows one `Windows` list may carry, and the longest title (bytes).
@@ -255,6 +257,44 @@ pub enum Message {
     /// Guest -> host: update `id` is checked and being installed (`ok`;
     /// the agent restarts and says hello again), or why not.
     UpdateDone { id: u32, ok: bool, why: String },
+    /// Host -> guest (`features::EXEC`): run `command` with `shell`, as
+    /// the agent's user (Windows: SYSTEM; Linux: root), no input. Killed
+    /// after `timeout_ms`; at most `max_out` bytes of each output kept.
+    /// Checked with `exec_ok`.
+    Exec { id: u32, shell: Shell, timeout_ms: u32, max_out: u32, command: String },
+    /// Guest -> host: how command `id` ended and what it wrote (raw
+    /// bytes: Windows' console code page is not UTF-8). `truncated`: some
+    /// output was cut at `max_out`. `Failed`: it couldn't start, stderr
+    /// says why.
+    ExecDone { id: u32, end: ExecEnd, truncated: bool, stdout: Vec<u8>, stderr: Vec<u8> },
+}
+
+/// What runs an `Exec` command line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shell {
+    /// Windows: `cmd.exe /c`; Linux: `sh -c`.
+    Default,
+    /// `powershell.exe` (Linux: `pwsh`).
+    PowerShell,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecEnd {
+    Exited(i32),
+    TimedOut,
+    Failed,
+}
+
+/// Longest `Exec` command line, longest timeout, most output kept of
+/// each stream.
+pub const EXEC_CMD_MAX: usize = 32 << 10;
+pub const EXEC_TIMEOUT_MAX_MS: u32 = 3_600_000;
+pub const EXEC_OUT_MAX: u32 = 4 << 20;
+
+/// An `Exec` the agent may take: a command line without NULs, a timeout
+/// and output cap within bounds.
+pub fn exec_ok(command: &str, timeout_ms: u32, max_out: u32) -> bool {
+    !command.is_empty() && command.len() <= EXEC_CMD_MAX && !command.contains('\0') && (1..=EXEC_TIMEOUT_MAX_MS).contains(&timeout_ms) && max_out <= EXEC_OUT_MAX
 }
 
 /// One file of a guest tools update.
@@ -714,6 +754,9 @@ const T_UPDATE_BEGIN: u8 = 91;
 const T_UPDATE_DATA: u8 = 92;
 const T_UPDATE_DONE: u8 = 93;
 const T_STOPPING: u8 = 94;
+// Commands run for the host: well above the others.
+const T_EXEC: u8 = 100;
+const T_EXEC_DONE: u8 = 101;
 
 impl Message {
     pub fn encode(&self) -> Vec<u8> {
@@ -848,6 +891,29 @@ impl Message {
                 p.extend_from_slice(why.as_bytes());
                 (T_UPDATE_DONE, p)
             }
+            Message::Exec { id, shell, timeout_ms, max_out, command } => {
+                let mut p = id.to_le_bytes().to_vec();
+                p.push(matches!(shell, Shell::PowerShell) as u8);
+                p.extend_from_slice(&timeout_ms.to_le_bytes());
+                p.extend_from_slice(&max_out.to_le_bytes());
+                p.extend_from_slice(command.as_bytes());
+                (T_EXEC, p)
+            }
+            Message::ExecDone { id, end, truncated, stdout, stderr } => {
+                let mut p = id.to_le_bytes().to_vec();
+                let (e, code) = match end {
+                    ExecEnd::Exited(c) => (0u8, *c),
+                    ExecEnd::TimedOut => (1, 0),
+                    ExecEnd::Failed => (2, 0),
+                };
+                p.push(e);
+                p.extend_from_slice(&code.to_le_bytes());
+                p.push(*truncated as u8);
+                p.extend_from_slice(&(stdout.len() as u32).to_le_bytes());
+                p.extend_from_slice(stdout);
+                p.extend_from_slice(stderr);
+                (T_EXEC_DONE, p)
+            }
         };
         let mut out = Vec::with_capacity(HDR + payload.len());
         out.extend_from_slice(&MAGIC);
@@ -965,9 +1031,32 @@ impl Message {
             T_UPDATE_BEGIN if p.len() >= 5 => decode_update(p).ok_or(Error::Malformed)?,
             T_UPDATE_DATA if p.len() >= 4 && p.len() - 4 <= UPDATE_CHUNK => Message::UpdateData { id: u32_at(0)?, data: p[4..].to_vec() },
             T_UPDATE_DONE if p.len() >= 5 && p[4] <= 1 => Message::UpdateDone { id: u32_at(0)?, ok: p[4] != 0, why: text(&p[5..])?.chars().filter(|c| !c.is_control()).take(256).collect() },
+            T_EXEC if p.len() > 13 && p[4] <= 1 => {
+                let (timeout_ms, max_out) = (u32_at(5)?, u32_at(9)?);
+                let command = std::str::from_utf8(&p[13..]).map_err(|_| Error::Malformed)?;
+                if !exec_ok(command, timeout_ms, max_out) {
+                    return Err(Error::Malformed);
+                }
+                let shell = if p[4] == 1 { Shell::PowerShell } else { Shell::Default };
+                Message::Exec { id: u32_at(0)?, shell, timeout_ms, max_out, command: command.to_string() }
+            }
+            T_EXEC_DONE if p.len() >= 14 && p[4] <= 2 && p[9] <= 1 => {
+                let n = u32_at(10)? as usize;
+                let stdout = p.get(14..14 + n).ok_or(Error::Malformed)?;
+                let stderr = &p[14 + n..];
+                if n > EXEC_OUT_MAX as usize || stderr.len() > EXEC_OUT_MAX as usize {
+                    return Err(Error::Malformed);
+                }
+                let end = match p[4] {
+                    0 => ExecEnd::Exited(u32_at(5)? as i32),
+                    1 => ExecEnd::TimedOut,
+                    _ => ExecEnd::Failed,
+                };
+                Message::ExecDone { id: u32_at(0)?, end, truncated: p[9] != 0, stdout: stdout.to_vec(), stderr: stderr.to_vec() }
+            }
             T_TIME | T_RES | T_SCALE | T_SHUTDOWN | T_PING | T_PONG | T_GPU3D | T_DRAG_READY | T_DRAG_CANCEL | T_DROP_ENTRY | T_DROP_DATA
             | T_DROP_END | T_DROP_DONE | T_COHERENCE | T_WINDOW_DO | T_DRAG_OUT_QUERY | T_DRAG_OUT_GET | T_DRAG_OUT_END | T_DRAG_OUT_FAIL | T_LAYOUT | T_MOUSE
-            | T_USB_SHARE | T_UPDATE_BEGIN | T_UPDATE_DATA | T_UPDATE_DONE | T_STOPPING => {
+            | T_USB_SHARE | T_UPDATE_BEGIN | T_UPDATE_DATA | T_UPDATE_DONE | T_STOPPING | T_EXEC | T_EXEC_DONE => {
                 return Err(Error::Malformed)
             }
             t => return Err(Error::Type(t)),
@@ -1123,6 +1212,11 @@ mod tests {
             },
             Message::UpdateData { id: 7, data: vec![1, 2, 3] },
             Message::UpdateDone { id: 7, ok: false, why: "hash mismatch".into() },
+            Message::Exec { id: 1, shell: Shell::Default, timeout_ms: 30_000, max_out: 1 << 20, command: "ipconfig /all & netsh interface show interface".into() },
+            Message::Exec { id: 2, shell: Shell::PowerShell, timeout_ms: 1, max_out: 0, command: "Get-NetAdapter | fl *".into() },
+            Message::ExecDone { id: 1, end: ExecEnd::Exited(-1073741510), truncated: false, stdout: b"Windows IP Configuration\r\n\x82".to_vec(), stderr: Vec::new() },
+            Message::ExecDone { id: 2, end: ExecEnd::TimedOut, truncated: true, stdout: Vec::new(), stderr: b"x".to_vec() },
+            Message::ExecDone { id: 3, end: ExecEnd::Failed, truncated: false, stdout: Vec::new(), stderr: b"no pwsh".to_vec() },
         ]
     }
 
@@ -1146,6 +1240,38 @@ mod tests {
         let mut d = Decoder::new(MAX_PAYLOAD);
         d.push(&Message::UpdateData { id: 1, data: vec![0; UPDATE_CHUNK + 1] }.encode());
         assert!(d.next().is_err(), "chunk too big");
+    }
+
+    #[test]
+    fn execs_are_checked() {
+        let bad = |command: &str, timeout_ms: u32, max_out: u32| {
+            let mut d = Decoder::new(MAX_PAYLOAD);
+            d.push(&Message::Exec { id: 1, shell: Shell::Default, timeout_ms, max_out, command: command.into() }.encode());
+            d.next().is_err()
+        };
+        assert!(!bad("ver", 1000, EXEC_OUT_MAX));
+        assert!(bad("", 1000, 0), "nothing to run");
+        assert!(bad("a\0b", 1000, 0), "a NUL");
+        assert!(bad(&"x".repeat(EXEC_CMD_MAX + 1), 1000, 0), "too long");
+        assert!(bad("ver", 0, 0), "no time");
+        assert!(bad("ver", EXEC_TIMEOUT_MAX_MS + 1, 0), "too long a wait");
+        assert!(bad("ver", 1000, EXEC_OUT_MAX + 1), "too much output");
+        let mut f = Message::Exec { id: 1, shell: Shell::Default, timeout_ms: 1, max_out: 0, command: "x".into() }.encode();
+        f[12] = 2;
+        let mut d = Decoder::new(1024);
+        d.push(&f);
+        assert_eq!(d.next(), Err(Error::Malformed), "unknown shell");
+        let done = |stdout: usize, stderr: usize| Message::ExecDone { id: 1, end: ExecEnd::Exited(0), truncated: false, stdout: vec![0; stdout], stderr: vec![0; stderr] }.encode();
+        for f in [done(EXEC_OUT_MAX as usize + 1, 0), done(0, EXEC_OUT_MAX as usize + 1)] {
+            let mut d = Decoder::new(MAX_PAYLOAD);
+            d.push(&f);
+            assert_eq!(d.next(), Err(Error::Malformed));
+        }
+        let mut f = done(2, 0);
+        f[18..22].copy_from_slice(&3u32.to_le_bytes());
+        let mut d = Decoder::new(1024);
+        d.push(&f);
+        assert_eq!(d.next(), Err(Error::Malformed), "a stdout length that lies");
     }
 
     #[test]

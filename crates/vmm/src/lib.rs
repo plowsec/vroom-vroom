@@ -7,6 +7,7 @@
 pub mod agent;
 mod audio;
 mod camera;
+pub mod control;
 mod debug;
 mod disks;
 

@@ -17,6 +17,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use vroom_config::Clipboard as ClipPolicy;
 use vroom_proto::{features, Decoder, Message, Monitor, WindowOp, SCALE_MAX, SCALE_MIN};
+pub use vroom_proto::{ExecEnd, Shell};
 use vroom_display::ToViewer;
 use vroom_virtio::devices::gpu::GpuControl;
 
@@ -71,7 +72,38 @@ pub enum AgentCmd {
     /// New guest tools: the viewer writes them into this pipe as agent
     /// frames (`UpdateBegin`, `UpdateData`); checked, then to the guest.
     Update { from: std::os::fd::OwnedFd },
+    /// Run a command in the guest; the answer, or why not, goes to `reply`.
+    Exec { req: ExecReq, reply: Sender<Result<ExecOut, String>> },
     Stop,
+}
+
+/// A command for the guest agent to run (`Message::Exec`).
+#[derive(Debug, Clone)]
+pub struct ExecReq {
+    pub shell: Shell,
+    pub command: String,
+    pub timeout: Duration,
+    /// Most bytes kept of each output.
+    pub max_out: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecOut {
+    pub end: ExecEnd,
+    /// Some output was cut at `max_out`.
+    pub truncated: bool,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+/// How long past its timeout a command's answer may take.
+const EXEC_GRACE: Duration = Duration::from_secs(15);
+
+/// A command the guest runs for us.
+struct Pending {
+    id: u32,
+    deadline: Instant,
+    reply: Sender<Result<ExecOut, String>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -133,6 +165,14 @@ impl Agent {
         let s = self.status.lock().unwrap_or_else(|e| e.into_inner());
         if s.connected { s.features } else { 0 }
     }
+
+    /// Run a command in the guest and wait for it (at most its timeout
+    /// and a little).
+    pub fn exec(&self, req: ExecReq) -> Result<ExecOut, String> {
+        let (tx, rx) = mpsc::channel();
+        self.send(AgentCmd::Exec { req, reply: tx });
+        rx.recv().map_err(|_| "the VM stopped".to_string())?
+    }
 }
 
 struct Service {
@@ -172,6 +212,9 @@ struct Service {
     usb_shares: Vec<(String, String)>,
     /// A guest tools update is on its way (set by its thread until done).
     updating: Arc<std::sync::atomic::AtomicBool>,
+    /// Commands the guest runs for us, and the last number given one.
+    execs: Vec<Pending>,
+    exec_ids: u32,
 }
 
 /// A drag of files out of the guest (see `AgentCmd::DragOut`).
@@ -223,7 +266,7 @@ pub fn spawn(stream: UnixStream, policy: ClipPolicy, clip: Option<Box<dyn Clipbo
     stream.set_read_timeout(Some(POLL))?;
     // Room for dragged files' data too; clipboard text is held to the
     // policy's size where it is taken.
-    let max = (policy.max_bytes as usize).max(vroom_proto::DROP_CHUNK + 64) + 64;
+    let max = (policy.max_bytes as usize).max(vroom_proto::DROP_CHUNK + 64).max(2 * vroom_proto::EXEC_OUT_MAX as usize + 64) + 64;
     let out = Arc::new(Mutex::new(stream.try_clone()?));
     let svc = Service {
         stream,
@@ -248,6 +291,8 @@ pub fn spawn(stream: UnixStream, policy: ClipPolicy, clip: Option<Box<dyn Clipbo
         revive: None,
         usb_shares: Vec::new(),
         updating: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        execs: Vec::new(),
+        exec_ids: 0,
     };
     std::thread::Builder::new().name("agent".into()).spawn(move || svc.run())?;
     Ok(Agent { tx, status })
@@ -300,6 +345,7 @@ impl Service {
                 g.tick();
             }
             self.revive_tick();
+            self.exec_tick();
             self.send_mode();
             if self.focus {
                 self.auto_push();
@@ -354,6 +400,9 @@ impl Service {
                 let sessions = s.sessions.wrapping_add(1);
                 *s = AgentStatus { connected: true, agent, features, sessions, gpu3d: None };
                 drop(s);
+                for p in self.execs.drain(..) {
+                    let _ = p.reply.send(Err("the guest agent restarted".into()));
+                }
                 if self.screen.gpu3d && features & features::GPU3D != 0 {
                     self.send(&Message::Gpu3d { on: true });
                 }
@@ -437,6 +486,11 @@ impl Service {
                 } else {
                     log::warn!("guest: tools update {id} refused: {why}");
                     self.to_viewer(ToViewer::Status(format!("guest tools update failed: {why}")));
+                }
+            }
+            Message::ExecDone { id, end, truncated, stdout, stderr } => {
+                if let Some(i) = self.execs.iter().position(|p| p.id == id) {
+                    let _ = self.execs.swap_remove(i).reply.send(Ok(ExecOut { end, truncated, stdout, stderr }));
                 }
             }
             // Host-bound only; a guest sending these is ignored.
@@ -693,8 +747,41 @@ impl Service {
                     self.updating.store(false, std::sync::atomic::Ordering::Release);
                 }
             }
+            AgentCmd::Exec { req, reply } => {
+                let s = self.status();
+                let timeout_ms = req.timeout.as_millis().min(u32::MAX as u128) as u32;
+                let why = if !s.connected {
+                    Some("no guest agent is running")
+                } else if s.features & features::EXEC == 0 {
+                    Some("the guest agent is too old to run commands: update the guest tools")
+                } else if !vroom_proto::exec_ok(&req.command, timeout_ms, req.max_out) {
+                    Some("a command the guest can't take: empty, too long or with a NUL; or a timeout or output cap out of range")
+                } else {
+                    None
+                };
+                if let Some(w) = why {
+                    let _ = reply.send(Err(w.into()));
+                    return;
+                }
+                self.exec_ids = self.exec_ids.wrapping_add(1);
+                let id = self.exec_ids;
+                self.execs.push(Pending { id, deadline: Instant::now() + req.timeout + EXEC_GRACE, reply });
+                self.send(&Message::Exec { id, shell: req.shell, timeout_ms, max_out: req.max_out, command: req.command });
+            }
             AgentCmd::Stop => {}
         }
+    }
+
+    /// Commands the guest never answered.
+    fn exec_tick(&mut self) {
+        let now = Instant::now();
+        self.execs.retain(|p| {
+            let late = now > p.deadline;
+            if late {
+                let _ = p.reply.send(Err("the guest agent didn't answer".into()));
+            }
+            !late
+        });
     }
 
     /// A frame of the item being fetched: checked, then to the viewer
@@ -1004,6 +1091,41 @@ mod tests {
         guest.write_all(&Message::Gpu3d { on: false }.encode()).unwrap();
         std::thread::sleep(REVIVE_OFF_PAUSE + POLL * 3);
         assert!(read_msgs(&mut guest, &mut d).contains(&Message::Gpu3d { on: true }));
+        a.send(AgentCmd::Stop);
+    }
+
+    #[test]
+    fn commands_go_to_an_agent_that_runs_them_and_come_back() {
+        let (host, mut guest) = UnixStream::pair().unwrap();
+        let a = spawn(host, ClipPolicy::default(), None, Screen::default()).unwrap();
+        let mut d = Decoder::new(1 << 20);
+        read_msgs(&mut guest, &mut d);
+        let req = |command: &str| ExecReq { shell: Shell::Default, command: command.into(), timeout: Duration::from_secs(5), max_out: 1024 };
+        assert_eq!(a.exec(req("ver")), Err("no guest agent is running".into()));
+        guest.write_all(&Message::Hello { features: features::TIME_SYNC, agent: "t".into() }.encode()).unwrap();
+        read_msgs(&mut guest, &mut d);
+        assert!(a.exec(req("ver")).unwrap_err().contains("too old"));
+        guest.write_all(&Message::Hello { features: features::EXEC, agent: "t".into() }.encode()).unwrap();
+        read_msgs(&mut guest, &mut d);
+        assert!(a.exec(req("")).is_err());
+        assert!(read_msgs(&mut guest, &mut d).is_empty(), "refused here");
+        let a2 = a.clone();
+        let t = std::thread::spawn(move || a2.exec(req("ipconfig")));
+        let id = match read_msgs(&mut guest, &mut d).as_slice() {
+            [Message::Exec { id, shell: Shell::Default, timeout_ms: 5000, max_out: 1024, command }] if command == "ipconfig" => *id,
+            m => panic!("{m:?}"),
+        };
+        // Another command's answer is no answer.
+        let done = |id| Message::ExecDone { id, end: ExecEnd::Exited(1), truncated: false, stdout: b"out".to_vec(), stderr: b"err".to_vec() };
+        guest.write_all(&done(id + 1).encode()).unwrap();
+        guest.write_all(&done(id).encode()).unwrap();
+        assert_eq!(t.join().unwrap(), Ok(ExecOut { end: ExecEnd::Exited(1), truncated: false, stdout: b"out".to_vec(), stderr: b"err".to_vec() }));
+        // An agent that restarts drops what it was running.
+        let a2 = a.clone();
+        let t = std::thread::spawn(move || a2.exec(req("ping -t x")));
+        read_msgs(&mut guest, &mut d);
+        guest.write_all(&Message::Hello { features: features::EXEC, agent: "t".into() }.encode()).unwrap();
+        assert_eq!(t.join().unwrap(), Err("the guest agent restarted".into()));
         a.send(AgentCmd::Stop);
     }
 

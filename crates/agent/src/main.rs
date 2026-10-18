@@ -32,6 +32,7 @@ mod coherence;
 mod ewmh;
 #[cfg(windows)]
 mod dnd_win;
+mod exec;
 // The session side; built everywhere so it's tested everywhere.
 #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 mod drop;
@@ -341,6 +342,13 @@ fn session(args: &Args) -> std::io::Result<()> {
                 dec.push(&bytes);
                 loop {
                     match dec.next() {
+                        // Ours alone: never the session helper's.
+                        Ok(Some(m @ Message::Exec { .. })) if system => {
+                            let w = writer.clone();
+                            exec::spawn(m, move |r| {
+                                let _ = w.send(&r);
+                            });
+                        }
                         Ok(Some(m)) => {
                             if !drops.handle(&m, &mut writer)? && !coh.handle(&m, &mut writer)? && !dragout.handle(&m, &writer)? {
                                 handle(m, args.role, &mut writer, clip.as_mut(), &mut last, &mut updater)?
@@ -423,7 +431,7 @@ fn can_update(role: Role) -> bool {
 }
 
 fn hello(updates: bool) -> Message {
-    let mut features = features::CLIPBOARD_TEXT | features::TIME_SYNC | features::SHUTDOWN | features::SCALE | features::FILE_DROP;
+    let mut features = features::CLIPBOARD_TEXT | features::TIME_SYNC | features::SHUTDOWN | features::SCALE | features::FILE_DROP | features::EXEC;
     if cfg!(any(windows, target_os = "linux")) {
         features |= features::DRAG_OUT | features::MONITORS | features::USB_SHARES;
     }
@@ -453,6 +461,7 @@ fn handle(m: Message, role: Role, w: &mut dyn Write, clip: &mut dyn clip::Clip, 
         | Message::Ping(_)
         | Message::UpdateBegin { .. }
         | Message::UpdateData { .. }
+        | Message::Exec { .. }
             if !system =>
         {
             log::debug!("ignoring a privileged message on the session link");
@@ -530,6 +539,9 @@ fn handle(m: Message, role: Role, w: &mut dyn Write, clip: &mut dyn clip::Clip, 
         | Message::Apps(_)
         | Message::UsbShare { .. }
         | Message::UpdateDone { .. }
+        // Exec: the session loop's (Role::Full).
+        | Message::Exec { .. }
+        | Message::ExecDone { .. }
         => {}
     }
     Ok(())
