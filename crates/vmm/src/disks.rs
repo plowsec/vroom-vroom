@@ -34,6 +34,9 @@ pub(crate) struct VmDisk {
     active: Option<PathBuf>,
     active_fmt: Format,
     sync: SyncMode,
+    /// The layers under `active`, top down to the base (found at open,
+    /// before the sandbox, which can't read them later).
+    below: Vec<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -125,7 +128,7 @@ impl DiskSet {
             if d.readonly {
                 let img = vroom_block::open_with(&d.path, fmt_of(d.format), true, &policy)
                     .map_err(|e| Error::Setup(format!("disk {}: {e}", d.path.display())))?;
-                disks.push(VmDisk { index: i, image: SwapDisk::new(img), active: None, active_fmt: Format::Raw, sync: policy.sync });
+                disks.push(VmDisk { index: i, image: SwapDisk::new(img), active: None, active_fmt: Format::Raw, sync: policy.sync, below: Vec::new() });
                 continue;
             }
             let ptr_path = dir.join(format!("disk{i}.json"));
@@ -180,8 +183,14 @@ impl DiskSet {
             let img = vroom_block::open_with(&active, fmt, false, &policy)
                 .map_err(|e| Error::Setup(format!("disk {}: {e}", active.display())))?;
             let active_fmt = fmt.unwrap_or(Format::Raw);
+            let below = match active_fmt {
+                Format::Qcow2 => vroom_block::qcow2::chain(&active, &policy)
+                    .map_err(|e| Error::Setup(format!("disk {}: {e}", active.display())))?
+                    .split_off(1),
+                _ => Vec::new(),
+            };
             write_pointer(&ptr_path, &active)?;
-            disks.push(VmDisk { index: i, image: SwapDisk::new(img), active: Some(active), active_fmt, sync: policy.sync });
+            disks.push(VmDisk { index: i, image: SwapDisk::new(img), active: Some(active), active_fmt, sync: policy.sync, below });
         }
         let watch = disks
             .iter()
@@ -278,6 +287,7 @@ impl DiskSet {
             d.image.swap(Arc::new(top)).map_err(|e| Error::Setup(e.to_string()))?;
             write_pointer(&self.dir.join(format!("disk{}.json", d.index)), &top_path)?;
             freeze_file(&frozen);
+            d.below.insert(0, frozen.clone());
             d.active = Some(top_path);
             d.active_fmt = Format::Qcow2;
             out.insert(d.index, frozen);
@@ -285,15 +295,21 @@ impl DiskSet {
         Ok(out)
     }
 
-    /// Current top layers with change stamps (suspend images).
-    pub fn active_stamps(&self) -> Result<BTreeMap<usize, (PathBuf, String)>> {
+    /// Every file a save depends on, with change stamps: per writable
+    /// disk the layers under the top one (a snapshot: the top is the new
+    /// overlay, the VM's from now on), and the top too for a suspend.
+    /// A file another program writes to meanwhile (a copied config run
+    /// on the same image) makes the save unusable: restoring it would put
+    /// the guest's caches back over a disk that moved on.
+    pub fn chain_stamps(&self, with_top: bool) -> Result<BTreeMap<usize, Vec<(PathBuf, String)>>> {
         self.check_not_rolling_back()?;
         let mut m = BTreeMap::new();
         for d in &self.disks {
-            if let Some(a) = &d.active {
-                d.image.flush().map_err(|e| Error::Setup(e.to_string()))?;
-                m.insert(d.index, (a.clone(), file_stamp(a)?));
-            }
+            let Some(a) = &d.active else { continue };
+            d.image.flush().map_err(|e| Error::Setup(e.to_string()))?;
+            let top = with_top.then_some(a);
+            let files = top.into_iter().chain(&d.below).map(|f| Ok((f.clone(), file_stamp(f)?))).collect::<Result<Vec<_>>>()?;
+            m.insert(d.index, files);
         }
         Ok(m)
     }
@@ -364,6 +380,30 @@ mod tests {
         // A copy of the config elsewhere would write the snapshot's base.
         let e = DiskSet::open(&c, &td.path().join("copy.state"), &BTreeMap::new()).err().expect("refused");
         assert!(e.to_string().contains("frozen by a snapshot"), "{e}");
+    }
+
+    #[test]
+    fn a_save_stamps_every_layer_it_stands_on() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let td = tempfile::tempdir().unwrap();
+        let disk = td.path().join("disk.qcow2");
+        Qcow2Image::create(&disk, 1 << 20, None).unwrap();
+        let mut ds = DiskSet::open(&cfg(&disk), &td.path().join("vm.state"), &BTreeMap::new()).unwrap();
+        ds.freeze().unwrap();
+        let layer = ds.freeze().unwrap()[&0].clone();
+        let snap = ds.chain_stamps(false).unwrap()[&0].clone();
+        let files: Vec<&PathBuf> = snap.iter().map(|(p, _)| p).collect();
+        assert_eq!(files, [&layer, &disk], "the snapshot's layer, then the base");
+        let top = ds.chain_stamps(true).unwrap()[&0].clone();
+        assert_eq!(top.len(), 3, "a suspend adds the top layer");
+        drop(ds);
+        // Another program writes the base (a copied config run on it).
+        std::fs::set_permissions(&disk, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::OpenOptions::new().append(true).open(&disk).unwrap().write_all(&[0]).unwrap();
+        assert_ne!(file_stamp(&snap[1].0).unwrap(), snap[1].1);
+        assert_eq!(file_stamp(&snap[0].0).unwrap(), snap[0].1, "the frozen layer stayed as it was");
     }
 
     #[test]
@@ -446,7 +486,7 @@ mod tests {
         assert_eq!(ds.rollback().unwrap(), ROLLBACK_MEMORY + (64 << 10));
         assert_eq!(&read(&ds), b"base");
         assert!(ds.freeze().is_err());
-        assert!(ds.active_stamps().is_err());
+        assert!(ds.chain_stamps(true).is_err());
     }
 
     #[cfg(feature = "research")]

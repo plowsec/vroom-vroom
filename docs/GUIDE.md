@@ -625,6 +625,9 @@ or 15 fps. Testing: `VROOM_CAMERA_TEST=1` sends color bars.
   `run` resumes; `--fresh` ignores it.
 - `vroom snapshot list|delete|prune vm.toml` (VM stopped): deleting also
   drops and merges unused disk layers.
+- A snapshot's disk layers go read-only. A save whose layers changed
+  since (another program wrote one) is refused: restoring it corrupts
+  the guest's disk.
 
 ## Disks
 

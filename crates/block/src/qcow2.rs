@@ -302,6 +302,23 @@ fn resolve_backing(image: &Path, name: &str, policy: &OpenPolicy) -> Result<Path
     Ok(real)
 }
 
+/// The files `path` reads from: itself, then its backing files down to
+/// the base, vetted as `open_with` does.
+pub fn chain(path: &Path, policy: &OpenPolicy) -> Result<Vec<PathBuf>> {
+    let mut out = vec![path.to_path_buf()];
+    while out.len() <= MAX_CHAIN as usize {
+        let cur = out[out.len() - 1].clone();
+        if crate::detect(&cur)? != Format::Qcow2 {
+            break;
+        }
+        let f = File::open(&cur)?;
+        let len = f.metadata()?.len();
+        let Some(name) = parse_header(&f, len)?.backing_file else { break };
+        out.push(resolve_backing(&cur, &name, policy)?);
+    }
+    Ok(out)
+}
+
 struct State {
     l1: Vec<u64>,
     l2_cache: HashMap<u64, Vec<u64>>,

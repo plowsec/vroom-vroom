@@ -40,16 +40,22 @@ pub(crate) fn disk_plan(dir: &Path) -> Result<BTreeMap<usize, PathBuf>> {
     let snap = SnapshotDir::open(dir)?;
     let m = &snap.manifest.meta;
     let mut layers = BTreeMap::new();
-    if m.get("kind").map(String::as_str) == Some("suspend") {
-        for (k, v) in m.iter().filter(|(k, _)| k.starts_with("active.")) {
-            let (path, stamp) = v.split_once('|').ok_or_else(|| Error::Setup(format!("bad {k}")))?;
+    let suspend = m.get("kind").map(String::as_str) == Some("suspend");
+    // The guest's RAM in the save caches what these files held then.
+    for (k, v) in m.iter().filter(|(k, _)| k.starts_with("chain.")) {
+        for line in v.lines() {
+            let (stamp, path) = line.split_once('|').ok_or_else(|| Error::Setup(format!("bad {k}")))?;
             let now = crate::disks::file_stamp(Path::new(path)).unwrap_or_default();
             if now != stamp {
-                return Err(Error::Setup(format!(
-                    "disk {path} changed since this VM was suspended; resuming would corrupt it (use --fresh)"
-                )));
+                return Err(Error::Setup(if suspend {
+                    format!("disk {path} changed since this VM was suspended; resuming would corrupt it (use --fresh)")
+                } else {
+                    format!("disk {path} changed since this snapshot was taken; restoring it would corrupt the guest's disk")
+                }));
             }
         }
+    }
+    if suspend {
         return Ok(layers);
     }
     for (k, v) in m.iter() {
@@ -121,10 +127,11 @@ pub(crate) fn save(vmm: &mut Vmm, dir: &Path, description: &str, kind: Kind) -> 
         }
         Kind::Suspend => {
             snap.manifest.meta.insert("kind".into(), "suspend".into());
-            for (i, (path, stamp)) in vmm.disks.active_stamps()? {
-                snap.manifest.meta.insert(format!("active.{i}"), format!("{}|{stamp}", path.display()));
-            }
         }
+    }
+    for (i, files) in vmm.disks.chain_stamps(kind == Kind::Suspend)? {
+        let lines: Vec<String> = files.iter().map(|(p, stamp)| format!("{stamp}|{}", p.display())).collect();
+        snap.manifest.meta.insert(format!("chain.{i}"), lines.join("\n"));
     }
     // The network adapters as they are now, held still until the devices
     // are saved: none comes or goes meanwhile. One still on its way out

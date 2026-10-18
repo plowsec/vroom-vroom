@@ -165,7 +165,7 @@ pub fn delete(state: &Path, name: &str, base_dirs: &[PathBuf]) -> Result<PruneRe
 /// Layer paths something points at directly.
 fn roots(state: &Path) -> Result<(BTreeSet<PathBuf>, BTreeSet<PathBuf>)> {
     let mut roots = BTreeSet::new();
-    // Layers whose bytes a suspend image pins (it checks size + mtime).
+    // Layers whose bytes a save pins (it checks size + mtime).
     let mut pinned = BTreeSet::new();
     let disks = state.join("disks");
     for e in std::fs::read_dir(&disks)?.flatten() {
@@ -184,10 +184,15 @@ fn roots(state: &Path) -> Result<(BTreeSet<PathBuf>, BTreeSet<PathBuf>)> {
         for (k, v) in &s.manifest.meta {
             if k.starts_with("disk.") {
                 roots.insert(canon(Path::new(v)));
-            } else if k.starts_with("active.") {
-                let p = canon(Path::new(v.split_once('|').map(|(p, _)| p).unwrap_or(v)));
-                roots.insert(p.clone());
-                pinned.insert(p);
+            } else if k.starts_with("chain.") {
+                // "stamp|path" per file, the save's top layer first.
+                for (n, line) in v.lines().enumerate() {
+                    let p = canon(Path::new(line.split_once('|').map(|(_, p)| p).unwrap_or(line)));
+                    if n == 0 {
+                        roots.insert(p.clone());
+                    }
+                    pinned.insert(p);
+                }
             }
         }
     }
