@@ -26,8 +26,9 @@ pub enum Ev {
     HelperGone(u64),
     /// The guest is shutting down: tell the host before we go.
     Stopping,
-    /// For the host, from one of our threads (`Exec`).
-    Reply(Message),
+    /// For the host, from one of our threads (`Exec`, files); told once
+    /// it's written, if asked.
+    Reply(Message, Option<Sender<()>>),
 }
 
 /// Privileged actions, behind a trait so tests can watch them.
@@ -107,11 +108,20 @@ pub struct Relay<S: System> {
     coherence: bool,
     /// Our own events' channel, for answers that come later (`Exec`).
     events: Sender<Ev>,
+    /// Files the host puts and gets; how their threads write to it.
+    files: crate::files::Files,
+    send_file: crate::files::Send,
 }
 
 impl<S: System> Relay<S> {
     pub fn new(sys: S, max: usize, events: Sender<Ev>) -> Self {
-        Relay { sys, helper: None, max, display: (None, None), coherence: false, events }
+        let tx = events.clone();
+        let send_file: crate::files::Send = std::sync::Arc::new(move |m| {
+            let (ack, written) = std::sync::mpsc::channel();
+            tx.send(Ev::Reply(m, Some(ack))).map_err(|_| io::Error::other("the service stopped"))?;
+            written.recv_timeout(std::time::Duration::from_secs(60)).map_err(|_| io::Error::other("the host is gone"))
+        });
+        Relay { sys, helper: None, max, display: (None, None), coherence: false, events, files: Default::default(), send_file }
     }
 
     /// Serve one host connection until it goes away. Helper state
@@ -133,7 +143,12 @@ impl<S: System> Relay<S> {
                 }
                 Ev::HostGone => return Err(io::Error::other("port closed")),
                 Ev::Stopping => host.write_all(&Message::Stopping.encode())?,
-                Ev::Reply(m) => host.write_all(&m.encode())?,
+                Ev::Reply(m, ack) => {
+                    host.write_all(&m.encode())?;
+                    if let Some(a) = ack {
+                        let _ = a.send(());
+                    }
+                }
                 Ev::HelperUp(id, w) => {
                     log::info!("session helper {id} connected");
                     // A helper it replaces (started twice in a session)
@@ -180,11 +195,12 @@ impl<S: System> Relay<S> {
                 }
             }
             Message::UsbShare { tag, label, on } => self.sys.usb_share(&tag, &label, on),
-            // Commands run as the service's user: never the helper's.
+            // Files and commands: the service's user's, never the helper's.
+            m @ (Message::FilePut { .. } | Message::FileGet { .. } | Message::FileData { .. }) => self.files.handle(m, &self.send_file),
             m @ Message::Exec { .. } => {
                 let tx = self.events.clone();
                 self.sys.exec(m, Box::new(move |r| {
-                    let _ = tx.send(Ev::Reply(r));
+                    let _ = tx.send(Ev::Reply(r, None));
                 }));
             }
             Message::Ping(v) => host.write_all(&Message::Pong(v).encode())?,
@@ -239,6 +255,7 @@ impl<S: System> Relay<S> {
             | Message::DragOutFail { .. }
             | Message::UpdateDone { .. }
             | Message::ExecDone { .. }
+            | Message::FileDone { .. }
             | Message::Stopping => {}
         }
         Ok(())
@@ -454,6 +471,32 @@ mod tests {
         });
         assert!(r.run(&mut hw, &rx).is_err());
         assert_eq!(out.msgs()[1..], [Message::ExecDone { id: 4, end: vroom_proto::ExecEnd::Exited(0), truncated: false, stdout: b"ver".to_vec(), stderr: Vec::new() }]);
+        assert!(helper.msgs().is_empty());
+    }
+
+    #[test]
+    fn files_go_out_from_the_service_paced_by_the_host() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("f");
+        std::fs::write(&path, vec![5u8; vroom_proto::FILE_CHUNK * 3]).unwrap();
+        let helper = Sink::default();
+        let out = Sink::default();
+        let (tx, rx) = channel();
+        let mut r = Relay::new(Fake(Default::default()), 1024, tx.clone());
+        tx.send(Ev::HelperUp(1, Box::new(helper.clone()))).unwrap();
+        tx.send(host(Message::FileGet { id: 2, path: path.to_string_lossy().into_owned() })).unwrap();
+        let mut hw: Writer = Box::new(out.clone());
+        let watch = out.clone();
+        std::thread::spawn(move || {
+            while !watch.msgs().iter().any(|m| matches!(m, Message::FileDone { .. })) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            tx.send(Ev::HostGone).unwrap();
+        });
+        assert!(r.run(&mut hw, &rx).is_err());
+        let m = out.msgs();
+        assert_eq!(m.iter().filter(|m| matches!(m, Message::FileData { id: 2, .. })).count(), 3);
+        assert!(matches!(m.last(), Some(Message::FileDone { id: 2, ok: true, size, .. }) if *size == 3 * vroom_proto::FILE_CHUNK as u64));
         assert!(helper.msgs().is_empty());
     }
 

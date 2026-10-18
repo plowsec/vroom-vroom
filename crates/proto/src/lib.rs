@@ -51,6 +51,9 @@ pub mod features {
     pub const UPDATE: u64 = 1 << 40;
     /// The agent runs commands for the host (`Exec`).
     pub const EXEC: u64 = 1 << 41;
+    /// The agent takes files from the host and sends its own (`FilePut`,
+    /// `FileGet`).
+    pub const FILES: u64 = 1 << 42;
 }
 
 /// Most windows one `Windows` list may carry, and the longest title (bytes).
@@ -267,6 +270,27 @@ pub enum Message {
     /// output was cut at `max_out`. `Failed`: it couldn't start, stderr
     /// says why.
     ExecDone { id: u32, end: ExecEnd, truncated: bool, stdout: Vec<u8>, stderr: Vec<u8> },
+    /// Host -> guest (`features::FILES`): `size` bytes follow in
+    /// `FileData`, for the file at `path` (the guest's own, `file_path_ok`),
+    /// made or replaced once all came. The guest answers `FileDone`.
+    FilePut { id: u32, size: u64, path: String },
+    /// Host -> guest: send the file at `path`: `FileData`, then `FileDone`.
+    FileGet { id: u32, path: String },
+    /// Either way: the next bytes of file `id`, at most `FILE_CHUNK`.
+    FileData { id: u32, data: Vec<u8> },
+    /// Guest -> host: file `id` is written / was sent whole: its size and
+    /// SHA-256. Or why not.
+    FileDone { id: u32, ok: bool, size: u64, sha256: [u8; 32], why: String },
+}
+
+/// File data goes in pieces of at most this; paths are at most this long.
+pub const FILE_CHUNK: usize = 256 << 10;
+pub const FILE_PATH_MAX: usize = 4096;
+
+/// A guest path `FilePut` / `FileGet` may name: any the guest's system
+/// takes, on one line.
+pub fn file_path_ok(p: &str) -> bool {
+    !p.is_empty() && p.len() <= FILE_PATH_MAX && !p.chars().any(char::is_control)
 }
 
 /// What runs an `Exec` command line.
@@ -757,6 +781,10 @@ const T_STOPPING: u8 = 94;
 // Commands run for the host: well above the others.
 const T_EXEC: u8 = 100;
 const T_EXEC_DONE: u8 = 101;
+const T_FILE_PUT: u8 = 102;
+const T_FILE_GET: u8 = 103;
+const T_FILE_DATA: u8 = 104;
+const T_FILE_DONE: u8 = 105;
 
 impl Message {
     pub fn encode(&self) -> Vec<u8> {
@@ -914,6 +942,30 @@ impl Message {
                 p.extend_from_slice(stderr);
                 (T_EXEC_DONE, p)
             }
+            Message::FilePut { id, size, path } => {
+                let mut p = id.to_le_bytes().to_vec();
+                p.extend_from_slice(&size.to_le_bytes());
+                p.extend_from_slice(path.as_bytes());
+                (T_FILE_PUT, p)
+            }
+            Message::FileGet { id, path } => {
+                let mut p = id.to_le_bytes().to_vec();
+                p.extend_from_slice(path.as_bytes());
+                (T_FILE_GET, p)
+            }
+            Message::FileData { id, data } => {
+                let mut p = id.to_le_bytes().to_vec();
+                p.extend_from_slice(data);
+                (T_FILE_DATA, p)
+            }
+            Message::FileDone { id, ok, size, sha256, why } => {
+                let mut p = id.to_le_bytes().to_vec();
+                p.push(*ok as u8);
+                p.extend_from_slice(&size.to_le_bytes());
+                p.extend_from_slice(sha256);
+                p.extend_from_slice(why.as_bytes());
+                (T_FILE_DONE, p)
+            }
         };
         let mut out = Vec::with_capacity(HDR + payload.len());
         out.extend_from_slice(&MAGIC);
@@ -1040,6 +1092,27 @@ impl Message {
                 let shell = if p[4] == 1 { Shell::PowerShell } else { Shell::Default };
                 Message::Exec { id: u32_at(0)?, shell, timeout_ms, max_out, command: command.to_string() }
             }
+            T_FILE_PUT | T_FILE_GET if p.len() > 4 + if ty == T_FILE_PUT { 8 } else { 0 } => {
+                let at = if ty == T_FILE_PUT { 12 } else { 4 };
+                let path = std::str::from_utf8(&p[at..]).map_err(|_| Error::Malformed)?;
+                if !file_path_ok(path) {
+                    return Err(Error::Malformed);
+                }
+                let (id, path) = (u32_at(0)?, path.to_string());
+                if ty == T_FILE_PUT {
+                    Message::FilePut { id, size: u64_at(4)?, path }
+                } else {
+                    Message::FileGet { id, path }
+                }
+            }
+            T_FILE_DATA if p.len() >= 4 && p.len() - 4 <= FILE_CHUNK => Message::FileData { id: u32_at(0)?, data: p[4..].to_vec() },
+            T_FILE_DONE if p.len() >= 45 && p[4] <= 1 => Message::FileDone {
+                id: u32_at(0)?,
+                ok: p[4] != 0,
+                size: u64_at(5)?,
+                sha256: p[13..45].try_into().map_err(|_| Error::Malformed)?,
+                why: text(&p[45..])?.chars().filter(|c| !c.is_control()).take(256).collect(),
+            },
             T_EXEC_DONE if p.len() >= 14 && p[4] <= 2 && p[9] <= 1 => {
                 let n = u32_at(10)? as usize;
                 let stdout = p.get(14..14 + n).ok_or(Error::Malformed)?;
@@ -1056,7 +1129,8 @@ impl Message {
             }
             T_TIME | T_RES | T_SCALE | T_SHUTDOWN | T_PING | T_PONG | T_GPU3D | T_DRAG_READY | T_DRAG_CANCEL | T_DROP_ENTRY | T_DROP_DATA
             | T_DROP_END | T_DROP_DONE | T_COHERENCE | T_WINDOW_DO | T_DRAG_OUT_QUERY | T_DRAG_OUT_GET | T_DRAG_OUT_END | T_DRAG_OUT_FAIL | T_LAYOUT | T_MOUSE
-            | T_USB_SHARE | T_UPDATE_BEGIN | T_UPDATE_DATA | T_UPDATE_DONE | T_STOPPING | T_EXEC | T_EXEC_DONE => {
+            | T_USB_SHARE | T_UPDATE_BEGIN | T_UPDATE_DATA | T_UPDATE_DONE | T_STOPPING | T_EXEC | T_EXEC_DONE
+            | T_FILE_PUT | T_FILE_GET | T_FILE_DATA | T_FILE_DONE => {
                 return Err(Error::Malformed)
             }
             t => return Err(Error::Type(t)),
@@ -1217,6 +1291,12 @@ mod tests {
             Message::ExecDone { id: 1, end: ExecEnd::Exited(-1073741510), truncated: false, stdout: b"Windows IP Configuration\r\n\x82".to_vec(), stderr: Vec::new() },
             Message::ExecDone { id: 2, end: ExecEnd::TimedOut, truncated: true, stdout: Vec::new(), stderr: b"x".to_vec() },
             Message::ExecDone { id: 3, end: ExecEnd::Failed, truncated: false, stdout: Vec::new(), stderr: b"no pwsh".to_vec() },
+            Message::FilePut { id: 4, size: 1 << 33, path: "C:\\Users\\Public\\é.txt".into() },
+            Message::FileGet { id: 5, path: "/var/log/syslog".into() },
+            Message::FileData { id: 4, data: vec![0, 1, 2] },
+            Message::FileData { id: 4, data: Vec::new() },
+            Message::FileDone { id: 4, ok: true, size: 3, sha256: [7; 32], why: String::new() },
+            Message::FileDone { id: 5, ok: false, size: 0, sha256: [0; 32], why: "Access is denied".into() },
         ]
     }
 
@@ -1272,6 +1352,26 @@ mod tests {
         let mut d = Decoder::new(1024);
         d.push(&f);
         assert_eq!(d.next(), Err(Error::Malformed), "a stdout length that lies");
+    }
+
+    #[test]
+    fn files_are_checked() {
+        for bad in ["", "a\nb", &"x".repeat(FILE_PATH_MAX + 1)] {
+            for m in [Message::FilePut { id: 1, size: 0, path: bad.into() }, Message::FileGet { id: 1, path: bad.into() }] {
+                let mut d = Decoder::new(MAX_PAYLOAD);
+                d.push(&m.encode());
+                assert_eq!(d.next(), Err(Error::Malformed), "{bad:?}");
+            }
+        }
+        let mut d = Decoder::new(MAX_PAYLOAD);
+        d.push(&Message::FileData { id: 1, data: vec![0; FILE_CHUNK + 1] }.encode());
+        assert_eq!(d.next(), Err(Error::Malformed), "chunk too big");
+        let mut f = Message::FileDone { id: 1, ok: true, size: 0, sha256: [0; 32], why: String::new() }.encode();
+        f[4..8].copy_from_slice(&44u32.to_le_bytes());
+        f.truncate(8 + 44);
+        let mut d = Decoder::new(1024);
+        d.push(&f);
+        assert_eq!(d.next(), Err(Error::Malformed), "short");
     }
 
     #[test]

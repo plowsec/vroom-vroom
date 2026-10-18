@@ -76,7 +76,57 @@ pub enum AgentCmd {
     Update { from: std::os::fd::OwnedFd, reply: Option<Sender<Result<(), String>>> },
     /// Run a command in the guest; the answer, or why not, goes to `reply`.
     Exec { req: ExecReq, reply: Sender<Result<ExecOut, String>> },
+    /// Put `size` bytes from `from` at the guest's `path`.
+    FilePut { path: String, size: u64, from: FileFrom, reply: Sender<Result<FileOut, String>> },
+    /// Write the guest's file at `path` into `to`.
+    FileGet { path: String, to: FileTo, reply: Sender<Result<FileOut, String>> },
     Stop,
+}
+
+/// Where a file for the guest comes from.
+pub struct FileFrom(pub Box<dyn Read + Send>);
+/// Where a file from the guest goes.
+pub struct FileTo(pub Box<dyn Write + Send>);
+
+impl std::fmt::Debug for FileFrom {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FileFrom")
+    }
+}
+
+impl std::fmt::Debug for FileTo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FileTo")
+    }
+}
+
+/// A file that went whole: its size and SHA-256, the same both sides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileOut {
+    pub size: u64,
+    pub sha256: [u8; 32],
+}
+
+/// How long a file on its way may go without news.
+const FILE_IDLE: Duration = Duration::from_secs(60);
+
+/// A sender thread's word: file `id` went, with this SHA-256, or why not.
+type Sent = (u32, Result<[u8; 32], String>);
+
+/// A file on its way to or from the guest.
+struct Xfer {
+    id: u32,
+    /// None: we're still sending it.
+    deadline: Option<Instant>,
+    reply: Sender<Result<FileOut, String>>,
+    kind: XferKind,
+}
+
+enum XferKind {
+    /// What our sender says once all went (its SHA-256), and the guest's
+    /// word: either may come first.
+    Put { size: u64, sent: Option<Result<[u8; 32], String>>, done: Option<Result<FileOut, String>> },
+    Get { to: FileTo, size: u64, hash: sha2::Sha256 },
 }
 
 /// A command for the guest agent to run (`Message::Exec`).
@@ -178,6 +228,22 @@ impl Agent {
 
     /// Send new guest tools (agent frames, read from `from` to its end)
     /// and wait for the guest to check them.
+    /// Put `size` bytes from `from` at the guest's `path`; returns once
+    /// the guest wrote them and its SHA-256 matches.
+    pub fn put(&self, path: String, size: u64, from: Box<dyn Read + Send>) -> Result<FileOut, String> {
+        let (tx, rx) = mpsc::channel();
+        self.send(AgentCmd::FilePut { path, size, from: FileFrom(from), reply: tx });
+        rx.recv().map_err(|_| "the VM stopped".to_string())?
+    }
+
+    /// Write the guest's file at `path` into `to`; returns once all came
+    /// and its SHA-256 matches.
+    pub fn get(&self, path: String, to: Box<dyn Write + Send>) -> Result<FileOut, String> {
+        let (tx, rx) = mpsc::channel();
+        self.send(AgentCmd::FileGet { path, to: FileTo(to), reply: tx });
+        rx.recv().map_err(|_| "the VM stopped".to_string())?
+    }
+
     pub fn update(&self, from: std::os::fd::OwnedFd) -> Result<(), String> {
         let (tx, rx) = mpsc::channel();
         self.send(AgentCmd::Update { from, reply: Some(tx) });
@@ -227,6 +293,9 @@ struct Service {
     /// Commands the guest runs for us, and the last number given one.
     execs: Vec<Pending>,
     exec_ids: u32,
+    /// Files on their way, and word from the threads sending ours.
+    xfers: Vec<Xfer>,
+    sent: (Sender<Sent>, Receiver<Sent>),
 }
 
 /// A drag of files out of the guest (see `AgentCmd::DragOut`).
@@ -306,6 +375,8 @@ pub fn spawn(stream: UnixStream, policy: ClipPolicy, clip: Option<Box<dyn Clipbo
         update_reply: None,
         execs: Vec::new(),
         exec_ids: 0,
+        xfers: Vec::new(),
+        sent: mpsc::channel(),
     };
     std::thread::Builder::new().name("agent".into()).spawn(move || svc.run())?;
     Ok(Agent { tx, status })
@@ -359,6 +430,7 @@ impl Service {
             }
             self.revive_tick();
             self.exec_tick();
+            self.file_tick();
             self.send_mode();
             if self.focus {
                 self.auto_push();
@@ -415,6 +487,9 @@ impl Service {
                 drop(s);
                 for p in self.execs.drain(..) {
                     let _ = p.reply.send(Err("the guest agent restarted".into()));
+                }
+                for x in self.xfers.drain(..) {
+                    let _ = x.reply.send(Err("the guest agent restarted".into()));
                 }
                 if self.screen.gpu3d && features & features::GPU3D != 0 {
                     self.send(&Message::Gpu3d { on: true });
@@ -503,6 +578,11 @@ impl Service {
                     log::warn!("guest: tools update {id} refused: {why}");
                     self.to_viewer(ToViewer::Status(format!("guest tools update failed: {why}")));
                 }
+            }
+            Message::FileData { id, data } => self.file_data(id, &data),
+            Message::FileDone { id, ok, size, sha256, why } => {
+                let done = if ok { Ok(FileOut { size, sha256 }) } else { Err(why) };
+                self.file_done(id, done);
             }
             Message::ExecDone { id, end, truncated, stdout, stderr } => {
                 if let Some(i) = self.execs.iter().position(|p| p.id == id) {
@@ -791,8 +871,106 @@ impl Service {
                 self.execs.push(Pending { id, deadline: Instant::now() + req.timeout + EXEC_GRACE, reply });
                 self.send(&Message::Exec { id, shell: req.shell, timeout_ms, max_out: req.max_out, command: req.command });
             }
+            AgentCmd::FilePut { path, size, from, reply } => {
+                let Some(id) = self.file_start(&path, &reply) else { return };
+                self.xfers.push(Xfer { id, deadline: None, reply, kind: XferKind::Put { size, sent: None, done: None } });
+                self.send(&Message::FilePut { id, size, path });
+                let (out, sent) = (self.out.clone(), self.sent.0.clone());
+                let r = std::thread::Builder::new().name("agent-file".into()).spawn(move || {
+                    let _ = sent.send((id, forward_file(id, size, from, &out)));
+                });
+                if r.is_err() {
+                    self.file_done(id, Err("can't start sending it".into()));
+                }
+            }
+            AgentCmd::FileGet { path, to, reply } => {
+                let Some(id) = self.file_start(&path, &reply) else { return };
+                use sha2::Digest;
+                self.xfers.push(Xfer { id, deadline: Some(Instant::now() + FILE_IDLE), reply, kind: XferKind::Get { to, size: 0, hash: sha2::Sha256::new() } });
+                self.send(&Message::FileGet { id, path });
+            }
             AgentCmd::Stop => {}
         }
+    }
+
+    /// A number for a file to or from the guest, or None (and why, to
+    /// `reply`) if it can't go.
+    fn file_start(&mut self, path: &str, reply: &Sender<Result<FileOut, String>>) -> Option<u32> {
+        let s = self.status();
+        let why = if !s.connected {
+            Some("no guest agent is running")
+        } else if s.features & features::FILES == 0 {
+            Some("the guest agent is too old for files: update the guest tools")
+        } else if !vroom_proto::file_path_ok(path) {
+            Some("a path the guest can't take")
+        } else {
+            None
+        };
+        if let Some(w) = why {
+            let _ = reply.send(Err(w.into()));
+            return None;
+        }
+        self.exec_ids = self.exec_ids.wrapping_add(1);
+        Some(self.exec_ids)
+    }
+
+    fn file_data(&mut self, id: u32, data: &[u8]) {
+        let Some(i) = self.xfers.iter().position(|x| x.id == id) else { return };
+        let x = &mut self.xfers[i];
+        let XferKind::Get { to, size, hash } = &mut x.kind else { return };
+        if let Err(e) = to.0.write_all(data) {
+            let _ = self.xfers.swap_remove(i).reply.send(Err(format!("can't write it: {e}")));
+            return;
+        }
+        use sha2::Digest;
+        hash.update(data);
+        *size += data.len() as u64;
+        x.deadline = Some(Instant::now() + FILE_IDLE);
+    }
+
+    /// The guest's word on a file, or ours: settle it once all is known.
+    fn file_done(&mut self, id: u32, done: Result<FileOut, String>) {
+        let Some(i) = self.xfers.iter().position(|x| x.id == id) else { return };
+        let r = match &mut self.xfers[i].kind {
+            XferKind::Get { to, size, hash } => {
+                use sha2::Digest;
+                let ours = FileOut { size: *size, sha256: std::mem::take(hash).finalize().into() };
+                done.and_then(|d| if d == ours { to.0.flush().map(|_| ours).map_err(|e| format!("can't write it: {e}")) } else { Err("what came differs from the guest's file (size or SHA-256)".into()) })
+            }
+            XferKind::Put { done: slot, sent, size } => {
+                *slot = Some(done);
+                match (sent.clone(), slot.clone()) {
+                    (_, Some(Err(e))) | (Some(Err(e)), _) => Err(e),
+                    (Some(Ok(h)), Some(Ok(d))) if d == (FileOut { size: *size, sha256: h }) => Ok(d),
+                    (Some(Ok(_)), Some(Ok(_))) => Err("the guest wrote something else (size or SHA-256 differs)".into()),
+                    _ => return,
+                }
+            }
+        };
+        let _ = self.xfers.swap_remove(i).reply.send(r);
+    }
+
+    /// Our threads' word on files sent; files the guest went quiet on.
+    fn file_tick(&mut self) {
+        while let Ok((id, r)) = self.sent.1.try_recv() {
+            let Some(x) = self.xfers.iter_mut().find(|x| x.id == id) else { continue };
+            let XferKind::Put { sent, done, .. } = &mut x.kind else { continue };
+            *sent = Some(r.clone());
+            x.deadline = Some(Instant::now() + FILE_IDLE);
+            match (r, done.clone()) {
+                (Err(e), _) => self.file_done(id, Err(e)),
+                (Ok(_), Some(d)) => self.file_done(id, d),
+                _ => {}
+            }
+        }
+        let now = Instant::now();
+        self.xfers.retain(|x| {
+            let late = x.deadline.is_some_and(|d| now > d);
+            if late {
+                let _ = x.reply.send(Err("the guest agent stopped answering".into()));
+            }
+            !late
+        });
     }
 
     /// Commands the guest never answered.
@@ -923,6 +1101,26 @@ fn forward_drop(id: u32, from: std::os::fd::OwnedFd, out: &Mutex<UnixStream>) {
 /// exactly the bytes it announced, in `UpdateData` frames of the same
 /// update, nothing else. A pipe that ends early leaves the guest with an
 /// update it never installs (the next one starts over).
+/// Send `size` bytes from `from` to the guest as file `id`'s data; their
+/// SHA-256.
+fn forward_file(id: u32, size: u64, mut from: FileFrom, out: &Mutex<UnixStream>) -> Result<[u8; 32], String> {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    let mut buf = vec![0u8; vroom_proto::FILE_CHUNK];
+    let mut left = size;
+    while left > 0 {
+        let want = left.min(buf.len() as u64) as usize;
+        let n = from.0.read(&mut buf[..want]).map_err(|e| format!("reading it: {e}"))?;
+        if n == 0 {
+            return Err(format!("it came short: {} of {size} bytes", size - left));
+        }
+        h.update(&buf[..n]);
+        out.lock().unwrap_or_else(|e| e.into_inner()).write_all(&Message::FileData { id, data: buf[..n].to_vec() }.encode()).map_err(|e| format!("to the guest: {e}"))?;
+        left -= n as u64;
+    }
+    Ok(h.finalize().into())
+}
+
 fn forward_update(from: std::os::fd::OwnedFd, out: &Mutex<UnixStream>) -> Result<(), String> {
     let mut from = std::fs::File::from(from);
     let mut dec = Decoder::new(vroom_proto::UPDATE_CHUNK + (vroom_proto::UPDATE_FILES_MAX << 9));
@@ -1149,6 +1347,74 @@ mod tests {
         read_msgs(&mut guest, &mut d);
         guest.write_all(&Message::Hello { features: features::EXEC, agent: "t".into() }.encode()).unwrap();
         assert_eq!(t.join().unwrap(), Err("the guest agent restarted".into()));
+        a.send(AgentCmd::Stop);
+    }
+
+    #[test]
+    fn files_go_both_ways_checked() {
+        use sha2::Digest;
+        let (host, mut guest) = UnixStream::pair().unwrap();
+        let a = spawn(host, ClipPolicy::default(), None, Screen::default()).unwrap();
+        let mut d = Decoder::new(1 << 20);
+        read_msgs(&mut guest, &mut d);
+        let data: Vec<u8> = (0..vroom_proto::FILE_CHUNK + 9).map(|i| i as u8).collect();
+        let sha = |b: &[u8]| -> [u8; 32] { sha2::Sha256::digest(b).into() };
+        guest.write_all(&Message::Hello { features: features::EXEC, agent: "t".into() }.encode()).unwrap();
+        read_msgs(&mut guest, &mut d);
+        assert!(a.get("x".into(), Box::new(Vec::new())).unwrap_err().contains("too old"));
+        guest.write_all(&Message::Hello { features: features::FILES, agent: "t".into() }.encode()).unwrap();
+        read_msgs(&mut guest, &mut d);
+        // In: the guest gets it in pieces and says what it wrote.
+        let (a2, d2) = (a.clone(), data.clone());
+        let t = std::thread::spawn(move || a2.put("C:\\x.bin".into(), d2.len() as u64, Box::new(std::io::Cursor::new(d2))));
+        let mut got = Vec::new();
+        let id = loop {
+            let m = read_msgs(&mut guest, &mut d);
+            for m in &m {
+                if let Message::FileData { data, .. } = m {
+                    got.extend_from_slice(data);
+                }
+            }
+            if got.len() == data.len() {
+                break m.iter().find_map(|m| if let Message::FileData { id, .. } = m { Some(*id) } else { None }).unwrap();
+            }
+        };
+        assert_eq!(got, data);
+        guest.write_all(&Message::FileDone { id, ok: true, size: data.len() as u64, sha256: sha(&data), why: String::new() }.encode()).unwrap();
+        assert_eq!(t.join().unwrap(), Ok(FileOut { size: data.len() as u64, sha256: sha(&data) }));
+        // Out: what came is checked against the guest's word.
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for lie in [false, true] {
+            let (a2, buf) = (a.clone(), Buf::default());
+            let b2 = buf.clone();
+            let t = std::thread::spawn(move || a2.get("/etc/hosts".into(), Box::new(b2)));
+            let id = match read_msgs(&mut guest, &mut d).as_slice() {
+                [Message::FileGet { id, path }] if path == "/etc/hosts" => *id,
+                m => panic!("{m:?}"),
+            };
+            for c in data.chunks(vroom_proto::FILE_CHUNK) {
+                guest.write_all(&Message::FileData { id, data: c.to_vec() }.encode()).unwrap();
+            }
+            let size = data.len() as u64 + lie as u64;
+            guest.write_all(&Message::FileDone { id, ok: true, size, sha256: sha(&data), why: String::new() }.encode()).unwrap();
+            let r = t.join().unwrap();
+            if lie {
+                assert!(r.is_err(), "{r:?}");
+            } else {
+                assert_eq!(r, Ok(FileOut { size, sha256: sha(&data) }));
+                assert_eq!(*buf.0.lock().unwrap(), data);
+            }
+        }
         a.send(AgentCmd::Stop);
     }
 

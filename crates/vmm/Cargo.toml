@@ -29,6 +29,7 @@ vroom-block.workspace = true
 vroom-net.workspace = true
 vroom-audio.workspace = true
 vroom-proto.workspace = true
+sha2 = "0.10"
 vroom-display.workspace = true
 vroom-state.workspace = true
 vroom-usb.workspace = true

@@ -185,6 +185,14 @@ static COMMANDS: &[Command] = &[
         p("timeout", "integer", false, "seconds before it is killed, default 60"),
         p("max_output", "integer", false, "bytes kept of stdout and of stderr, default 1048576"),
     ], "write", Target::Op("guest_exec")),
+    c("guest.upload", "guest", "Copy a host file into the running guest (made or replaced once whole); size and SHA-256", &[
+        p("host_path", "path", true, "absolute, or under the lab's exports directory"),
+        p("guest_path", "string", true, "the guest's path (Windows: C:\\...)"),
+    ], "write", Target::Op("guest_upload")),
+    c("guest.download", "guest", "Copy a file out of the running guest; size and SHA-256", &[
+        p("guest_path", "string", true, "the guest's path"),
+        p("host_path", "path", false, "new file: absolute, or under the exports directory (default: exports/guest-<stamp>-<name>)"),
+    ], "write", Target::Op("guest_download")),
     c("guest.update_tools", "guest", "Install the lab's guest tools in the running guest (target/guest-tools); the agent restarts", &[], "write", Target::Op("guest_update_tools")),
     // CPU.
     c("cpu.registers", "cpu", "General, PC, SP, PSTATE and translation registers", &[CPU], "read", Target::Op("registers")),

@@ -33,6 +33,7 @@ mod ewmh;
 #[cfg(windows)]
 mod dnd_win;
 mod exec;
+mod files;
 // The session side; built everywhere so it's tested everywhere.
 #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 mod drop;
@@ -333,6 +334,11 @@ fn session(args: &Args) -> std::io::Result<()> {
     }));
     let mut clip_at = std::time::Instant::now();
     let mut dragout = dragout::DragOut::new();
+    let mut files = files::Files::default();
+    let send_file: files::Send = {
+        let w = writer.clone();
+        std::sync::Arc::new(move |m| w.send(&m))
+    };
     loop {
         match rx.recv_timeout(coh.wait().unwrap_or(POLL).min(POLL)) {
             // Coherence: something changed on screen.
@@ -349,6 +355,7 @@ fn session(args: &Args) -> std::io::Result<()> {
                                 let _ = w.send(&r);
                             });
                         }
+                        Ok(Some(m @ (Message::FilePut { .. } | Message::FileGet { .. } | Message::FileData { .. }))) if system => files.handle(m, &send_file),
                         Ok(Some(m)) => {
                             if !drops.handle(&m, &mut writer)? && !coh.handle(&m, &mut writer)? && !dragout.handle(&m, &writer)? {
                                 handle(m, args.role, &mut writer, clip.as_mut(), &mut last, &mut updater)?
@@ -431,7 +438,7 @@ fn can_update(role: Role) -> bool {
 }
 
 fn hello(updates: bool) -> Message {
-    let mut features = features::CLIPBOARD_TEXT | features::TIME_SYNC | features::SHUTDOWN | features::SCALE | features::FILE_DROP | features::EXEC;
+    let mut features = features::CLIPBOARD_TEXT | features::TIME_SYNC | features::SHUTDOWN | features::SCALE | features::FILE_DROP | features::EXEC | features::FILES;
     if cfg!(any(windows, target_os = "linux")) {
         features |= features::DRAG_OUT | features::MONITORS | features::USB_SHARES;
     }
@@ -462,6 +469,9 @@ fn handle(m: Message, role: Role, w: &mut dyn Write, clip: &mut dyn clip::Clip, 
         | Message::UpdateBegin { .. }
         | Message::UpdateData { .. }
         | Message::Exec { .. }
+        | Message::FilePut { .. }
+        | Message::FileGet { .. }
+        | Message::FileData { .. }
             if !system =>
         {
             log::debug!("ignoring a privileged message on the session link");
@@ -542,6 +552,10 @@ fn handle(m: Message, role: Role, w: &mut dyn Write, clip: &mut dyn clip::Clip, 
         // Exec: the session loop's (Role::Full).
         | Message::Exec { .. }
         | Message::ExecDone { .. }
+        | Message::FilePut { .. }
+        | Message::FileGet { .. }
+        | Message::FileData { .. }
+        | Message::FileDone { .. }
         => {}
     }
     Ok(())

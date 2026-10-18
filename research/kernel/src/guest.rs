@@ -1,15 +1,16 @@
-//! `guest.*`: the guest agent's work (commands, guest tools), while the
-//! VM runs. Each answers from a thread of its own: the guest runs on.
+//! `guest.*`: the guest agent's work (commands, files, guest tools),
+//! while the VM runs. Each answers from a thread of its own: the guest
+//! runs on. Host files: absolute paths, or under the lab's exports.
 
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use vroom_vmm::agent::{Agent, ExecEnd, ExecReq, Shell};
 use vroom_vmm::{RunState, Vmm};
 
 use crate::agent::Forward;
 
-pub fn run(vm: &Vmm, _exports: &Path, f: Forward) {
+pub fn run(vm: &Vmm, exports: &Path, f: Forward) {
     let r = &f.request;
     let op = r["op"].as_str().unwrap_or_default();
     let agent = vm.agent().clone();
@@ -18,6 +19,8 @@ pub fn run(vm: &Vmm, _exports: &Path, f: Forward) {
     } else {
         match op {
             "guest_exec" => exec(agent, r),
+            "guest_upload" => upload(agent, r, exports),
+            "guest_download" => download(agent, r, exports),
             "guest_update_tools" => update_tools(agent, vm.config().guest_os() == vroom_config::GuestOs::Windows),
             _ => Err(format!("unknown op {op}")),
         }
@@ -52,6 +55,48 @@ fn exec(agent: Agent, r: &Value) -> Result<Work, String> {
             ExecEnd::Failed => return Err(text(&o.stderr)),
         };
         Ok(json!({"exit_code": code, "timed_out": o.end == ExecEnd::TimedOut, "truncated": o.truncated, "stdout": text(&o.stdout), "stderr": text(&o.stderr)}))
+    }))
+}
+
+fn host_path(r: &Value, exports: &Path) -> Option<PathBuf> {
+    r["host_path"].as_str().map(|p| exports.join(p))
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn upload(agent: Agent, r: &Value, exports: &Path) -> Result<Work, String> {
+    let guest = r["guest_path"].as_str().ok_or("missing guest_path")?.to_string();
+    let host = host_path(r, exports).ok_or("missing host_path")?;
+    let f = std::fs::File::open(&host).map_err(|e| format!("{}: {e}", host.display()))?;
+    let size = f.metadata().map_err(|e| e.to_string())?.len();
+    Ok(Box::new(move || {
+        let o = agent.put(guest.clone(), size, Box::new(f))?;
+        Ok(json!({"guest_path": guest, "size": o.size, "sha256": hex(&o.sha256)}))
+    }))
+}
+
+fn download(agent: Agent, r: &Value, exports: &Path) -> Result<Work, String> {
+    let guest = r["guest_path"].as_str().ok_or("missing guest_path")?.to_string();
+    let host = match host_path(r, exports) {
+        Some(p) => p,
+        None => {
+            let name = guest.rsplit(['/', '\\']).next().filter(|n| !n.is_empty()).unwrap_or("file");
+            let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+            exports.join(format!("guest-{stamp}-{name}"))
+        }
+    };
+    if let Some(d) = host.parent() {
+        std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
+    }
+    let f = std::fs::OpenOptions::new().write(true).create_new(true).open(&host).map_err(|e| format!("{}: {e}", host.display()))?;
+    Ok(Box::new(move || match agent.get(guest, Box::new(f)) {
+        Ok(o) => Ok(json!({"path": host, "size": o.size, "sha256": hex(&o.sha256)})),
+        Err(e) => {
+            let _ = std::fs::remove_file(&host);
+            Err(e)
+        }
     }))
 }
 

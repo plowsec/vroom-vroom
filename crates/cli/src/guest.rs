@@ -17,6 +17,21 @@ pub enum GuestCmd {
     Exec(ExecArgs),
     /// Install this vroom's guest tools in the guest (no window needed).
     UpdateTools(Vm),
+    /// Copy a file into the guest (made or replaced once all came).
+    Push {
+        #[command(flatten)]
+        vm: Vm,
+        host: PathBuf,
+        /// The guest's path (Windows: C:\...).
+        guest: String,
+    },
+    /// Copy a file out of the guest (to a folder: same name).
+    Pull {
+        #[command(flatten)]
+        vm: Vm,
+        guest: String,
+        host: PathBuf,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -52,6 +67,8 @@ pub fn run(c: GuestCmd, load: Load, state_dir: StateDir) -> Result<(), String> {
     match c {
         GuestCmd::Exec(a) => exec(a, load, state_dir),
         GuestCmd::UpdateTools(vm) => update_tools(vm, load, state_dir),
+        GuestCmd::Push { vm, host, guest } => push(vm, &host, guest, load, state_dir),
+        GuestCmd::Pull { vm, guest, host } => pull(vm, guest, &host, load, state_dir),
     }
 }
 
@@ -66,19 +83,106 @@ fn connect(vm: &Vm, load: Load, state_dir: StateDir) -> Result<(UnixStream, VmCo
     Ok((s, cfg))
 }
 
+/// The VMM's answers, frame by frame.
+struct Frames<'a> {
+    s: &'a mut UnixStream,
+    d: Decoder,
+    buf: Vec<u8>,
+}
+
+impl Frames<'_> {
+    fn new(s: &mut UnixStream, wait: Duration) -> Result<Frames<'_>, String> {
+        s.set_read_timeout(Some(wait)).map_err(|e| e.to_string())?;
+        Ok(Frames { s, d: Decoder::new(MAX_PAYLOAD), buf: vec![0u8; 64 << 10] })
+    }
+
+    fn next(&mut self) -> Result<Message, String> {
+        loop {
+            if let Some(m) = self.d.next().map_err(|e| e.to_string())? {
+                return Ok(m);
+            }
+            match self.s.read(&mut self.buf) {
+                Ok(0) => return Err("the VM hung up".into()),
+                Ok(n) => self.d.push(&self.buf[..n]),
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+    }
+}
+
 /// The VMM's answer.
 fn reply(s: &mut UnixStream, wait: Duration) -> Result<Message, String> {
-    s.set_read_timeout(Some(wait)).map_err(|e| e.to_string())?;
-    let mut d = Decoder::new(MAX_PAYLOAD);
-    let mut buf = vec![0u8; 64 << 10];
-    loop {
-        if let Some(m) = d.next().map_err(|e| e.to_string())? {
-            return Ok(m);
+    Frames::new(s, wait)?.next()
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// A file's size and SHA-256 as the guest's agent and we both saw them.
+fn agreed(m: Message, size: u64, sha256: [u8; 32]) -> Result<String, String> {
+    match m {
+        Message::FileDone { ok: true, size: s2, sha256: h2, .. } if (s2, h2) == (size, sha256) => Ok(format!("{size} bytes, sha256 {}", hex(&sha256))),
+        Message::FileDone { ok: true, .. } => Err("the guest's file differs from ours (size or SHA-256)".into()),
+        Message::FileDone { why, .. } => Err(why),
+        _ => Err("a strange answer".into()),
+    }
+}
+
+fn push(vm: Vm, host: &Path, guest: String, load: Load, state_dir: StateDir) -> Result<(), String> {
+    use sha2::Digest;
+    let mut f = std::fs::File::open(host).map_err(|e| format!("{}: {e}", host.display()))?;
+    let size = f.metadata().map_err(|e| e.to_string())?.len();
+    let (mut s, _) = connect(&vm, load, state_dir)?;
+    s.write_all(&Message::FilePut { id: 0, size, path: guest }.encode()).map_err(|e| e.to_string())?;
+    let mut h = sha2::Sha256::new();
+    let mut buf = vec![0u8; 256 << 10];
+    let mut left = size;
+    while left > 0 {
+        let want = left.min(buf.len() as u64) as usize;
+        let n = f.read(&mut buf[..want]).map_err(|e| format!("{}: {e}", host.display()))?;
+        if n == 0 {
+            return Err(format!("{}: changed while being sent", host.display()));
         }
-        match s.read(&mut buf) {
-            Ok(0) => return Err("the VM hung up".into()),
-            Ok(n) => d.push(&buf[..n]),
-            Err(e) => return Err(e.to_string()),
+        h.update(&buf[..n]);
+        s.write_all(&buf[..n]).map_err(|e| format!("to the VM: {e}"))?;
+        left -= n as u64;
+    }
+    println!("{}", agreed(reply(&mut s, Duration::from_secs(120))?, size, h.finalize().into())?);
+    Ok(())
+}
+
+fn pull(vm: Vm, guest: String, host: &Path, load: Load, state_dir: StateDir) -> Result<(), String> {
+    use sha2::Digest;
+    let to = if host.is_dir() { host.join(guest.rsplit(['/', '\\']).next().filter(|n| !n.is_empty()).unwrap_or("file")) } else { host.to_path_buf() };
+    let (mut s, _) = connect(&vm, load, state_dir)?;
+    s.write_all(&Message::FileGet { id: 0, path: guest }.encode()).map_err(|e| e.to_string())?;
+    let part = PathBuf::from(format!("{}.vroom-part", to.display()));
+    let mut f = std::fs::File::create(&part).map_err(|e| format!("{}: {e}", part.display()))?;
+    let r = (|| {
+        let mut frames = Frames::new(&mut s, Duration::from_secs(120))?;
+        let mut h = sha2::Sha256::new();
+        let mut size = 0u64;
+        loop {
+            match frames.next()? {
+                Message::FileData { data, .. } => {
+                    f.write_all(&data).map_err(|e| format!("{}: {e}", part.display()))?;
+                    h.update(&data);
+                    size += data.len() as u64;
+                }
+                m => return agreed(m, size, h.finalize().into()),
+            }
+        }
+    })()
+    .and_then(|ok| std::fs::rename(&part, &to).map(|_| ok).map_err(|e| format!("{}: {e}", to.display())));
+    match r {
+        Ok(ok) => {
+            println!("{}: {ok}", to.display());
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&part);
+            Err(e)
         }
     }
 }
