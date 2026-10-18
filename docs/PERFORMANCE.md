@@ -185,6 +185,34 @@ depth 1 in the tables above (well under a microsecond) is not real: the
 request finishes before fio's submit call returns, so fio times nothing.
 The per-request time in the "µs per 4k read" rows is the real one.
 
+## 3D display
+
+Ubuntu 24.04, Xorg in the app's window, M3 Max. "before" is master
+344e5e8 (each GL frame read back and copied four times on the CPU on its
+way to the window, Vulkan window frames copied into GL with the CPU),
+"after" the IOSurface paths (ARCHITECTURE.md, "The screen straight from
+the GPU"). CPU: cores used by the app / the VM process (vCPUs included)
+/ the GPU process.
+
+| | before | after |
+|---|---|---|
+| glmark2, 1280x760 window, screen 1280x800 | 1306 | 1932 |
+| CPU during it | 0.69 / 0.50 / 0.70 | 0.03 / 0.37 / 0.72 |
+| glmark2, 2560x1560, screen 2560x1600 | 617 | 1827 |
+| CPU during it | 0.98 / 0.57 / 0.57 | 0.04 / 0.36 / 0.70 |
+| glmark2 on Zink, 2560x1560 | 228 | 759 |
+| `vkcube` 1280x760, screen 1280x800 | 546 fps | 1004 fps |
+| `vkcube` 2560x1560, screen 2560x1600 | 188 fps | 781 fps |
+| GNOME on Wayland, glmark2 1200x700 | 996 | 1973 |
+
+glmark2 is six scenes (build, texture, shading, terrain, refract,
+desktop; four on Wayland), 5 s each. Light scenes gain most (1900 to
+2800 fps): their frames no longer wait for the copies, and GL fences are
+looked at every 250 µs instead of every millisecond. Without the second
+change they stopped near 1200 fps, below before, because the copies had
+been waking the device thread early. The GPU-heavy terrain scene gains
+10 to 15 %.
+
 ## Trade-offs
 
 - 4 KiB random I/O at queue depth 32 on virtio-blk is about 10 % below
@@ -244,8 +272,9 @@ The per-request time in the "µs per 4k read" rows is the real one.
   virtio-net (NAT only: it terminates TCP, so big segments are fine for
   it) would cut the guest's per-packet work; on the receive side smoltcp
   computes a checksum per frame the guest could skip.
-- **VM window**: Slint uploads the whole image to the GPU each frame.
-  Partial texture updates need a lower-level path than `slint::Image`.
+- **VM window, 2D**: without 3D (and whenever something covers the 3D
+  screen) Slint uploads the whole image to the GPU each frame. Partial
+  texture updates need a lower-level path than `slint::Image`.
 - **NAT latency** (a 1-byte TCP round trip through a port forward takes
   about 60 µs) is thread wakeups: host socket to the device worker to the
   vCPU and back. Polling instead of sleeping would cut it, at a CPU cost

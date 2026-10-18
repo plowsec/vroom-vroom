@@ -103,8 +103,18 @@ const MAX_SUBMIT: usize = 16 << 20;
 const MAX_PENDING_FENCES: usize = 4096;
 /// How often to look for finished fences while some are pending. GL
 /// fences have no completion callback (no fence thread, see vroom-gpu3d),
-/// so this bounds how long a guest waits after the GPU is done.
-const FENCE_POLL: Duration = Duration::from_millis(1);
+/// so this bounds how long a guest waits after the GPU is done. A frame
+/// whose display doesn't wait for the GPU (IOSurfaces) waits for its fence
+/// instead: at 1 ms, glmark2's light scenes stopped near 1,200 frames a
+/// second; at 250 us they reach 2,900.
+const FENCE_POLL: Duration = Duration::from_micros(250);
+/// How often to look for a frame on its way from the GPU (or one waiting
+/// for its turn) when no fence is pending.
+const READ_POLL: Duration = Duration::from_millis(1);
+/// IOSurface frames go to the app at most this often (240 a second, more
+/// than any Mac screen shows); frames in between are skipped, the last
+/// one always goes. The guest doesn't wait for those at all.
+const SURFACE_EVERY: Duration = Duration::from_micros(4166);
 
 /// Where finished frames go.
 pub trait DisplaySink: Send + Sync {
@@ -114,6 +124,14 @@ pub trait DisplaySink: Send + Sync {
     fn flush(&self, x: u32, y: u32, w: u32, h: u32, rows: &[u8], stride: usize);
     /// The guest's pointer changed (cursor queue).
     fn cursor(&self, _c: &Cursor) {}
+    /// The app shows this monitor's GL frames from IOSurfaces itself (it
+    /// asked to): give it [`DisplaySink::surface`] instead of pixels.
+    fn wants_surfaces(&self) -> bool {
+        false
+    }
+    /// The monitor's frame is now in its IOSurface `slot` of generation
+    /// `gen` (whole); `x`, `y`, `w`, `h` changed since the one before.
+    fn surface(&self, _gen: u32, _slot: u32, _x: u32, _y: u32, _w: u32, _h: u32) {}
 }
 
 /// The pointer a guest shows through the cursor queue, for the host to
@@ -482,6 +500,9 @@ impl Gpu {
             pending: Vec::new(),
             ctx_info: HashMap::new(),
             reading: None,
+            surfaced: vec![false; self.sinks.len()],
+            surface_at: vec![None; self.sinks.len()],
+            surface_due: vec![None; self.sinks.len()],
             read_buf: Vec::new(),
             cursor: None,
             cursor_shown: None,
@@ -754,6 +775,13 @@ pub struct GpuHandler {
     ctx_info: HashMap<u32, CtxInfo>,
     /// A GL scanout on its way back from the GPU, and where it lands.
     reading: Option<Reading>,
+    /// Scanouts whose last frame went into an IOSurface: the next one
+    /// read back is read whole (the shared frame buffer missed those).
+    surfaced: Vec<bool>,
+    /// Per scanout: when a frame last went into an IOSurface, and a later
+    /// one waiting for its turn (resource, changed rect).
+    surface_at: Vec<Option<std::time::Instant>>,
+    surface_due: Vec<Option<(u32, Rect)>>,
     read_buf: Vec<u8>,
     /// The pointer as last set: (resource id or 0, hot x, hot y), and
     /// what the sink was last given.
@@ -768,6 +796,8 @@ struct Reading {
     id: u32,
     rect: Rect,
     to: Vec<(usize, Rect)>,
+    /// It goes into the one scanout's IOSurface, not back to us.
+    surface: bool,
 }
 
 impl std::fmt::Debug for GpuHandler {
@@ -1490,14 +1520,37 @@ impl GpuHandler {
             return OK_NODATA;
         }
         if let (Scanout::Gl { .. }, Some(t)) = (targets[0].1, self.three_d.clone()) {
+            // One monitor the app draws from IOSurfaces: the whole view
+            // goes into one on the GPU, nothing comes back.
+            if let [(sid, _, part)] = targets[..] {
+                if self.sinks[sid].wants_surfaces() {
+                    let due = self.surface_due[sid].take().filter(|d| d.0 == id).map_or(part, |d| d.1.union(part));
+                    let soon = self.surface_at[sid].is_some_and(|at| at.elapsed() < SURFACE_EVERY);
+                    if soon || self.reading.as_ref().is_some_and(|r| r.surface) {
+                        // Its turn comes in tick().
+                        self.surface_due[sid] = Some((id, due));
+                        return OK_NODATA;
+                    }
+                    self.finish_read(true);
+                    if self.surface_start(sid, id, due) {
+                        return OK_NODATA;
+                    }
+                }
+            }
             // Show the frame before, then let the GPU copy this one while
             // we go on with other commands: what all of them show, at once.
             self.finish_read(true);
-            let all = targets.iter().skip(1).fold(targets[0].2, |u, t| u.union(t.2));
+            let mut all = targets.iter().skip(1).fold(targets[0].2, |u, t| u.union(t.2));
+            // Back from IOSurfaces: everything, the frame buffer is old.
+            for &(sid, sc, _) in &targets {
+                if std::mem::take(&mut self.surfaced[sid]) {
+                    all = all.union(sc.view());
+                }
+            }
             let bx = Box3d { x: all.x, y: all.y, z: 0, w: all.w, h: all.h, d: 1 };
             if t.r().scanout_start(id, bx) {
                 let to = targets.iter().map(|&(i, s, _)| (i, s.view())).collect();
-                self.reading = Some(Reading { id, rect: all, to });
+                self.reading = Some(Reading { id, rect: all, to, surface: false });
                 return OK_NODATA;
             }
         }
@@ -1508,6 +1561,39 @@ impl GpuHandler {
             }
         }
         OK_NODATA
+    }
+
+    /// Frame `id` (`part` changed) of scanout `sid`, a GL one, into one of
+    /// its IOSurfaces. False if that can't be done (read it back then).
+    fn surface_start(&mut self, sid: usize, id: u32, part: Rect) -> bool {
+        let Some(t) = self.three_d.clone() else { return false };
+        let Some(Some(Scanout::Gl { id: shown, view, .. })) = self.scanouts.get(sid).copied() else { return false };
+        if shown != id || !t.r().surface_start(sid as u32, id, Box3d { x: view.x, y: view.y, z: 0, w: view.w, h: view.h, d: 1 }) {
+            return false;
+        }
+        self.surfaced[sid] = true;
+        self.surface_at[sid] = Some(std::time::Instant::now());
+        self.reading = Some(Reading { id, rect: part, to: vec![(sid, view)], surface: true });
+        true
+    }
+
+    /// Frames that waited for their turn (see SURFACE_EVERY).
+    fn surfaces_due(&mut self) {
+        for sid in 0..self.surface_due.len() {
+            if self.reading.is_some() {
+                return;
+            }
+            let Some((id, part)) = self.surface_due[sid] else { continue };
+            if self.surface_at[sid].is_some_and(|at| at.elapsed() < SURFACE_EVERY) {
+                continue;
+            }
+            self.surface_due[sid] = None;
+            if !self.sinks[sid].wants_surfaces() || !self.surface_start(sid, id, part) {
+                // The app stopped taking surfaces: the next frame is read
+                // back whole.
+                self.surfaced[sid] = true;
+            }
+        }
     }
 
     /// Show `part` (resource coordinates, inside the view) of scanout `sid`.
@@ -1564,6 +1650,24 @@ impl GpuHandler {
     /// with `wait`). Dropped if the scanout moved on meanwhile.
     fn finish_read(&mut self, wait: bool) {
         let (Some(rd), Some(t)) = (&self.reading, &self.three_d) else { return };
+        if rd.surface {
+            let got = t.r().surface_poll(wait);
+            if got.is_none() && !wait {
+                return;
+            }
+            let Some(rd) = self.reading.take() else { return };
+            let Some(&(sid, view)) = rd.to.first() else { return };
+            let current = matches!(self.scanouts.get(sid), Some(Some(Scanout::Gl { id, view: v, .. })) if *id == rd.id && *v == view);
+            match got.flatten() {
+                Some(f) if current && f.head as usize == sid => {
+                    let p = rd.rect;
+                    self.sinks[sid].surface(f.gen, f.slot, p.x - view.x, p.y - view.y, p.w, p.h);
+                }
+                // Lost: the next one is read whole if read back.
+                _ => self.surfaced[sid] = true,
+            }
+            return;
+        }
         let row = rd.rect.w as usize * 4;
         // Reused: frames come often and are large.
         let mut out = std::mem::take(&mut self.read_buf);
@@ -2256,15 +2360,21 @@ impl QueueHandler for GpuHandler {
     fn backend_ready(&mut self, ctx: &mut QueueCtx, _token: usize) {
         self.complete_fences(ctx);
         self.finish_read(false);
+        self.surfaces_due();
     }
 
     fn tick_interval(&mut self) -> Option<Duration> {
-        (!self.pending.is_empty() || self.reading.is_some()).then_some(FENCE_POLL)
+        if !self.pending.is_empty() {
+            Some(FENCE_POLL)
+        } else {
+            (self.reading.is_some() || self.surface_due.iter().any(Option::is_some)).then_some(READ_POLL)
+        }
     }
 
     fn tick(&mut self, ctx: &mut QueueCtx) {
         self.complete_fences(ctx);
         self.finish_read(false);
+        self.surfaces_due();
     }
 }
 

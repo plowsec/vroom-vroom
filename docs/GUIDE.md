@@ -580,9 +580,11 @@ picks the right one by itself:
   page kernel, see `examples/ubuntu/kernel-16k.sh`). Memory speed in the
   guest doesn't change measurably (fill and random reads, both ways).
   The guest gets Vulkan 1.3, and Vulkan apps show their windows like
-  others (`vkcube` runs at about 730 frames a second in a 500x500 window
-  under Xorg; Weston and GNOME on Wayland work too). Each frame is copied
-  once on the Mac, from the Vulkan app's memory to the desktop's OpenGL.
+  others (`vkcube` runs at about 1000 frames a second in a 1280x760
+  window under Xorg; Weston and GNOME on Wayland work too). Each frame is
+  copied once from the Vulkan app's memory to the desktop's OpenGL, on
+  the Mac's GPU for windows of 0.6 megapixels and up, with the CPU for
+  smaller ones (cheap either way).
 
 Two ways to run the guest's OpenGL, `[display] opengl_host`:
 
@@ -615,10 +617,29 @@ against llvmpipe in the same guest:
 | refract | 40 fps | 981 to 1071 fps |
 | desktop (blur) | 159 fps | 892 to 1006 fps |
 
-Small scenes stop near 1,100 fps either way: each frame makes a round
-trip to the host, and the window shows a copy read back from the GPU.
 Anything with real work is many times faster, and the guest's CPUs stay
 free.
+
+In the app's window on a Mac, the screen comes straight from the GPU: the
+GPU process draws each frame into an IOSurface and the window shows it,
+with no copy through the CPU (see ARCHITECTURE.md). Measured in the app,
+Xorg, against the build before (which read every frame back and copied
+it four times):
+
+| | before | now |
+|---|---|---|
+| glmark2 at 1280x760 (guest screen 1280x800) | 1306 | 1932 |
+| glmark2 at 2560x1560 (screen 2560x1600) | 617 | 1827 |
+| glmark2 on Zink at 2560x1560 | 228 | 759 |
+| `vkcube` at 2560x1560 | 188 fps | 781 fps |
+| the app's CPU while those run | 0.55 to 0.98 of a core | 0.03 |
+| the VM's process (all of it) | 0.4 to 0.6 | 0.3 to 0.5 |
+
+GNOME on Wayland gains the same way (glmark2 996 to 1973 at 1200x700).
+The window falls back to pixels while a menu, a message or the pause
+veil is over the screen, in Coherence, on other monitors, and in a window
+reattached to a VM another app started. `VROOM_NO_SURFACES=1` in the
+app's environment turns it off.
 
 The guest gets 4x multisampling (antialiasing) on `apple`; on `angle` it
 is faked (one sample).

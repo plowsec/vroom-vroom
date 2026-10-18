@@ -1,0 +1,459 @@
+diff --git a/src/meson.build b/src/meson.build
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -62,6 +62,7 @@
+ 
+ vrend_metal_sources = [
+    'vrend/vrend_metal.m',
++   'vrend/vrend_shm_surface.m',
+ ]
+ 
+ venus_sources = [
+@@ -252,7 +253,7 @@
+    virgl_sources += vrend_metal_sources
+    # Foundation pulls in the Objective-C runtime (libobjc) that vrend_metal.m
+    # needs; without it a Metal-only (e.g. venus-less) build fails to link.
+-   virgl_depends += [metal_dep, dependency('appleframeworks', modules : ['Foundation'])]
++   virgl_depends += [metal_dep, dependency('appleframeworks', modules : ['Foundation', 'IOSurface'])]
+ endif
+ 
+ if with_venus
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -30,6 +30,9 @@
+ 
+ #include <unistd.h>
+ #include <stdatomic.h>
++#ifdef __APPLE__
++#include <dlfcn.h>
++#endif
+ #include <stdio.h>
+ #include <string.h>
+ #include <errno.h>
+@@ -53,6 +56,7 @@
+ #include "vrend_shader.h"
+ 
+ #include "vrend_renderer.h"
++#include "vrend_shm_surface.h"
+ #include "vrend_blitter.h"
+ #include "vrend_debug.h"
+ #include "vrend_winsys.h"
+@@ -5481,6 +5485,51 @@
+       vrend_shm_epoch = 1;
+ }
+ 
++/* The IOSurface's frame into the texture, on the GPU: from a read
++ * framebuffer of our own (framebuffers aren't shared between contexts, so
++ * one per copy), sRGB writes off so the bytes go across as they are.  What
++ * this changes is put back as it was.  False if GL reported an error. */
++static bool vrend_resource_shm_surface_copy(struct vrend_resource *res)
++{
++   GLint active, bound, read_fbo, read_buffer;
++   const GLboolean srgb = glIsEnabled(GL_FRAMEBUFFER_SRGB);
++   while (glGetError() != GL_NO_ERROR)
++      ;
++   glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
++   glActiveTexture(GL_TEXTURE0);
++   glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
++   glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_fbo);
++
++   GLuint fbo;
++   glGenFramebuffers(1, &fbo);
++   glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
++   glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_RECTANGLE,
++                          res->shm_surface_tex, 0);
++   glGetIntegerv(GL_READ_BUFFER, &read_buffer);
++   glReadBuffer(GL_COLOR_ATTACHMENT0);
++   if (srgb)
++      glDisable(GL_FRAMEBUFFER_SRGB);
++   glBindTexture(GL_TEXTURE_2D, res->gl_id);
++   glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, res->base.width0, res->base.height0);
++   if (srgb)
++      glEnable(GL_FRAMEBUFFER_SRGB);
++   glReadBuffer(read_buffer);
++   glBindFramebuffer(GL_READ_FRAMEBUFFER, read_fbo);
++   glDeleteFramebuffers(1, &fbo);
++   glBindTexture(GL_TEXTURE_2D, bound);
++   glActiveTexture(active);
++   return glGetError() == GL_NO_ERROR;
++}
++
++static void vrend_resource_shm_surface_drop(struct vrend_resource *res)
++{
++   if (res->shm_surface_tex)
++      glDeleteTextures(1, &res->shm_surface_tex);
++   res->shm_surface_tex = 0;
++   vrend_shm_surface_destroy(res->shm_surface);
++   res->shm_surface = NULL;
++}
++
+ /* Copy a Venus blob's current contents into its GL texture, once per
+  * command stream.  Texture unit 0's 2D binding and the unpack state are put
+  * back as they were. */
+@@ -5489,6 +5538,15 @@
+    if (!res || !res->shm_map || res->shm_epoch == vrend_shm_epoch)
+       return;
+    res->shm_epoch = vrend_shm_epoch;
++
++   /* through an IOSurface, on the GPU; on any failure, the CPU copy below
++    * from then on */
++   if (res->shm_surface) {
++      if (vrend_shm_surface_update(res->shm_surface) && vrend_resource_shm_surface_copy(res))
++         return;
++      virgl_warn("vroom: the IOSurface copy failed: copying on the CPU\n");
++      vrend_resource_shm_surface_drop(res);
++   }
+ 
+    const struct vrend_format_table *tf = &tex_conv_table[res->base.format];
+    const unsigned bpp = util_format_get_blocksize(res->base.format);
+@@ -5514,6 +5572,70 @@
+    glActiveTexture(active);
+ }
+ 
++#ifdef __APPLE__
++typedef int (*vrend_cgl_tex_image_iosurface_2d)(void *ctx, GLenum target, GLenum internal_format,
++                                                GLsizei width, GLsizei height, GLenum format,
++                                                GLenum type, void *surface, GLuint plane);
++typedef void *(*vrend_cgl_get_current_context)(void);
++
++/* vroom: the frame's way through an IOSurface (vrend_shm_surface.h), for
++ * BGRA formats (what windows use): the surface, and a rectangle texture on
++ * it (CGL takes IOSurfaces as rectangle textures, and as BGRA only), so it
++ * holds what the CPU copy would.  Only for frames of 0.6 megapixels and up:
++ * Metal's round trip costs the GL thread 0.2 to 0.3 ms whatever the size,
++ * which is what the CPU copy of an 800x600 frame costs (2560x1600: 0.9 ms
++ * against 1.8, of which 0.3 on the CPU).  Without it (VROOM_SHM_COPY=1,
++ * another format, a smaller frame, no Metal), the CPU copy. */
++#define VREND_SHM_SURFACE_MIN_PIXELS 600000
++static void vrend_resource_shm_surface_init(struct vrend_resource *gr)
++{
++   static vrend_cgl_tex_image_iosurface_2d tex_image;
++   static vrend_cgl_get_current_context current;
++   static int off = -1;
++   if (off < 0) {
++      const char *e = getenv("VROOM_SHM_COPY");
++      off = e && *e && *e != '0';
++      tex_image = (vrend_cgl_tex_image_iosurface_2d)dlsym(RTLD_DEFAULT, "CGLTexImageIOSurface2D");
++      current = (vrend_cgl_get_current_context)dlsym(RTLD_DEFAULT, "CGLGetCurrentContext");
++   }
++   void *cgl = current ? current() : NULL;
++   if (off || !tex_image || !cgl ||
++       (uint64_t)gr->base.width0 * gr->base.height0 < VREND_SHM_SURFACE_MIN_PIXELS)
++      return;
++
++   switch (gr->base.format) {
++   case VIRGL_FORMAT_B8G8R8A8_UNORM:
++   case VIRGL_FORMAT_B8G8R8X8_UNORM:
++   case VIRGL_FORMAT_B8G8R8A8_SRGB:
++   case VIRGL_FORMAT_B8G8R8X8_SRGB:
++      break;
++   default:
++      return;
++   }
++   const size_t page = getpagesize();
++   const size_t map_size = (gr->shm_map_size + page - 1) & ~(page - 1);
++   gr->shm_surface = vrend_shm_surface_create(gr->shm_map, map_size, gr->shm_offset,
++                                              gr->shm_stride, gr->base.width0,
++                                              gr->base.height0, 0x42475241 /* 'BGRA' */);
++   if (!gr->shm_surface)
++      return;
++
++   const struct vrend_format_table *tf = &tex_conv_table[gr->base.format];
++   GLint bound;
++   glGetIntegerv(GL_TEXTURE_BINDING_RECTANGLE, &bound);
++   glGenTextures(1, &gr->shm_surface_tex);
++   glBindTexture(GL_TEXTURE_RECTANGLE, gr->shm_surface_tex);
++   int err = tex_image(cgl, GL_TEXTURE_RECTANGLE, tf->internalformat, gr->base.width0,
++                       gr->base.height0, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV,
++                       vrend_shm_surface_iosurface(gr->shm_surface), 0);
++   glBindTexture(GL_TEXTURE_RECTANGLE, bound);
++   if (err) {
++      virgl_warn("vroom: GL can't take the frame's IOSurface (%d): copying on the CPU\n", err);
++      vrend_resource_shm_surface_drop(gr);
++   }
++}
++#endif
++
+ #ifndef WIN32
+ /* set_type for a Venus blob without EGL (macOS's OpenGL): a texture of our
+  * own and the blob's memory mapped read only, checked against the layout
+@@ -5550,6 +5672,9 @@
+    gr->shm_stride = stride;
+    gr->shm_offset = offset;
+    gr->shm_epoch = 0;
++#ifdef __APPLE__
++   vrend_resource_shm_surface_init(gr);
++#endif
+    vrend_resource_shm_refresh(gr);
+    return 0;
+ }
+@@ -9336,6 +9461,8 @@
+ void vrend_renderer_resource_destroy(struct vrend_resource *res)
+ {
+ #ifndef WIN32
++   /* the surface reads the mapping: it goes first */
++   vrend_resource_shm_surface_drop(res);
+    if (res->shm_map)
+       munmap((void *)res->shm_map, res->shm_map_size);
+ #endif
+diff --git a/src/vrend/vrend_renderer.h b/src/vrend/vrend_renderer.h
+--- a/src/vrend/vrend_renderer.h
++++ b/src/vrend/vrend_renderer.h
+@@ -135,6 +135,10 @@
+    uint32_t shm_stride;
+    uint32_t shm_offset;
+    uint32_t shm_epoch;
++   /* vroom (macOS): the copy goes through an IOSurface on the GPU instead
++    * (vrend_shm_surface.h): the surface and its rectangle texture */
++   struct vrend_shm_surface *shm_surface;
++   GLuint shm_surface_tex;
+ };
+ 
+ #define VIRGL_TEXTURE_NEED_SWIZZLE        (1 << 0)
+diff --git a/src/vrend/vrend_shm_surface.h b/src/vrend/vrend_shm_surface.h
+new file mode 100644
+--- /dev/null
++++ b/src/vrend/vrend_shm_surface.h
+@@ -0,0 +1,92 @@
++/*
++ * vroom: a Venus window's frame shown through macOS's OpenGL with no CPU
++ * copy.
++ * SPDX-License-Identifier: MIT
++ *
++ * A Vulkan window's frame sits in shared memory the render worker made and
++ * vrend maps read only.  macOS's OpenGL can't take that memory as a texture,
++ * and copying it in with glTexSubImage2D costs the GPU process's GL thread
++ * about 0.5 ms a frame at 1280x800 and 1.9 ms at 2560x1600 (the driver
++ * retiles it on the CPU).  Metal can take the memory as a buffer, and Metal
++ * and OpenGL can share an IOSurface: Metal copies the frame into an IOSurface
++ * on the GPU, GL sees the IOSurface as a rectangle texture and copies it into
++ * the resource's texture, on the GPU too.  Everything stays in the GPU
++ * process; nothing new crosses processes.
++ */
++#ifndef VREND_SHM_SURFACE_H
++#define VREND_SHM_SURFACE_H
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++struct vrend_shm_surface;
++
++#ifdef __APPLE__
++
++/* A surface for a `width` x `height` frame of 4-byte pixels at `offset` in
++ * `map` (a read-only mapping, page aligned, `map_size` bytes, whole pages),
++ * rows `stride` bytes apart, laid out as IOSurface pixel format `fourcc`
++ * ('BGRA' or 'RGBA'; macOS's GL takes 'BGRA' only).  The caller has checked
++ * the frame lies in the map.  NULL if Metal can't do it (then the caller
++ * copies as before). */
++struct vrend_shm_surface *
++vrend_shm_surface_create(const void *map,
++                         size_t map_size,
++                         size_t offset,
++                         uint32_t stride,
++                         uint32_t width,
++                         uint32_t height,
++                         uint32_t fourcc);
++
++/* its IOSurfaceRef (owned by the surface) */
++void *
++vrend_shm_surface_iosurface(struct vrend_shm_surface *s);
++
++/* Copy the frame from the memory into the IOSurface, and wait for the GPU
++ * to finish it.  False on a Metal error. */
++bool
++vrend_shm_surface_update(struct vrend_shm_surface *s);
++
++void
++vrend_shm_surface_destroy(struct vrend_shm_surface *s);
++
++#else
++
++static inline struct vrend_shm_surface *
++vrend_shm_surface_create(const void *map,
++                         size_t map_size,
++                         size_t offset,
++                         uint32_t stride,
++                         uint32_t width,
++                         uint32_t height,
++                         uint32_t fourcc)
++{
++   (void)map, (void)map_size, (void)offset, (void)stride;
++   (void)width, (void)height, (void)fourcc;
++   return NULL;
++}
++
++static inline void *
++vrend_shm_surface_iosurface(struct vrend_shm_surface *s)
++{
++   (void)s;
++   return NULL;
++}
++
++static inline bool
++vrend_shm_surface_update(struct vrend_shm_surface *s)
++{
++   (void)s;
++   return false;
++}
++
++static inline void
++vrend_shm_surface_destroy(struct vrend_shm_surface *s)
++{
++   (void)s;
++}
++
++#endif
++
++#endif /* VREND_SHM_SURFACE_H */
+diff --git a/src/vrend/vrend_shm_surface.m b/src/vrend/vrend_shm_surface.m
+new file mode 100644
+--- /dev/null
++++ b/src/vrend/vrend_shm_surface.m
+@@ -0,0 +1,144 @@
++/*
++ * vroom: a Venus window's frame shown through macOS's OpenGL with no CPU
++ * copy (see vrend_shm_surface.h).
++ * SPDX-License-Identifier: MIT
++ */
++#include "vrend_shm_surface.h"
++
++#include <IOSurface/IOSurface.h>
++#include <Metal/Metal.h>
++#include <pthread.h>
++#include <unistd.h>
++
++struct vrend_shm_surface {
++   id<MTLBuffer> buffer;
++   id<MTLTexture> texture;
++   IOSurfaceRef surface;
++   size_t offset;
++   uint32_t stride, width, height;
++};
++
++static id<MTLDevice> vrend_shm_device;
++static id<MTLCommandQueue> vrend_shm_queue;
++
++static void
++vrend_shm_surface_init(void)
++{
++   vrend_shm_device = MTLCreateSystemDefaultDevice();
++   if (vrend_shm_device)
++      vrend_shm_queue = [vrend_shm_device newCommandQueue];
++}
++
++struct vrend_shm_surface *
++vrend_shm_surface_create(const void *map,
++                         size_t map_size,
++                         size_t offset,
++                         uint32_t stride,
++                         uint32_t width,
++                         uint32_t height,
++                         uint32_t fourcc)
++{
++   static pthread_once_t once = PTHREAD_ONCE_INIT;
++   pthread_once(&once, vrend_shm_surface_init);
++   if (!vrend_shm_queue)
++      return NULL;
++
++   MTLPixelFormat format;
++   switch (fourcc) {
++   case 'BGRA':
++      format = MTLPixelFormatBGRA8Unorm;
++      break;
++   case 'RGBA':
++      format = MTLPixelFormatRGBA8Unorm;
++      break;
++   default:
++      return NULL;
++   }
++   const size_t page = getpagesize();
++   if (!map || ((uintptr_t)map % page) || !map_size || (map_size % page) || !width ||
++       !height || width > 16384 || height > 16384 || (offset % 4) || (stride % 4) ||
++       stride < width * 4 || offset + (size_t)stride * (height - 1) + width * 4 > map_size)
++      return NULL;
++
++   struct vrend_shm_surface *s = calloc(1, sizeof(*s));
++   if (!s)
++      return NULL;
++   @autoreleasepool {
++      /* The guest's memory, read where it lies: Metal only reads it. */
++      s->buffer = [vrend_shm_device newBufferWithBytesNoCopy:(void *)map
++                                                      length:map_size
++                                                     options:MTLResourceStorageModeShared
++                                                 deallocator:nil];
++      NSDictionary *props = @{
++         (id)kIOSurfaceWidth : @(width),
++         (id)kIOSurfaceHeight : @(height),
++         (id)kIOSurfaceBytesPerElement : @4,
++         (id)kIOSurfacePixelFormat : @(fourcc),
++      };
++      /* not global: it never leaves this process */
++      s->surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
++      if (s->buffer && s->surface) {
++         MTLTextureDescriptor *desc =
++            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
++                                                               width:width
++                                                              height:height
++                                                           mipmapped:NO];
++         desc.usage = MTLTextureUsageShaderRead;
++         desc.storageMode = MTLStorageModeShared;
++         s->texture = [vrend_shm_device newTextureWithDescriptor:desc iosurface:s->surface plane:0];
++      }
++   }
++   if (!s->texture) {
++      vrend_shm_surface_destroy(s);
++      return NULL;
++   }
++   s->offset = offset;
++   s->stride = stride;
++   s->width = width;
++   s->height = height;
++   return s;
++}
++
++void *
++vrend_shm_surface_iosurface(struct vrend_shm_surface *s)
++{
++   return s ? (void *)s->surface : NULL;
++}
++
++bool
++vrend_shm_surface_update(struct vrend_shm_surface *s)
++{
++   if (!s)
++      return false;
++   @autoreleasepool {
++      id<MTLCommandBuffer> cb = [vrend_shm_queue commandBuffer];
++      id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
++      [blit copyFromBuffer:s->buffer
++                 sourceOffset:s->offset
++            sourceBytesPerRow:s->stride
++          sourceBytesPerImage:0
++                   sourceSize:MTLSizeMake(s->width, s->height, 1)
++                    toTexture:s->texture
++             destinationSlice:0
++             destinationLevel:0
++            destinationOrigin:MTLOriginMake(0, 0, 0)];
++      [blit endEncoding];
++      [cb commit];
++      /* GL reads the IOSurface next, on another queue: it must be there */
++      [cb waitUntilCompleted];
++      return cb.status == MTLCommandBufferStatusCompleted;
++   }
++}
++
++void
++vrend_shm_surface_destroy(struct vrend_shm_surface *s)
++{
++   if (!s)
++      return;
++   /* built without ARC */
++   [s->texture release];
++   [s->buffer release];
++   if (s->surface)
++      CFRelease(s->surface);
++   free(s);
++}

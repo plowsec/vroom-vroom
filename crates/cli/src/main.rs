@@ -144,7 +144,20 @@ fn raise_open_files() {
 
 fn main() -> ExitCode {
     log_limit::Limited::install(env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).build());
-    let r = match Cli::parse().cmd {
+    let cli = Cli::parse();
+    // A mach port our parent left us (vroom_ipc::mach), taken before we
+    // start anything: the app's, for the VMM it starts (the screen's
+    // IOSurfaces go there); the VMM's, for its GPU process. Everyone
+    // else drops whatever came.
+    #[cfg(target_os = "macos")]
+    if let Some(p) = vroom_ipc::mach::inherited(false) {
+        match &cli.cmd {
+            Cmd::Run { .. } => vroom_gpu3d::remote::set_viewer_port(p),
+            Cmd::GpuHelper(_) => vroom_gpu3d::remote::set_vmm_port(p),
+            _ => drop(p),
+        }
+    }
+    let r = match cli.cmd {
         Cmd::Run { config, restore, fresh, state_dir, host_clipboard_file, no_sandbox, ui_fd } => {
             raise_open_files();
             load(&config).and_then(|cfg| {

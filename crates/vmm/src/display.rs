@@ -47,6 +47,9 @@ pub(crate) struct ViewerTx {
     /// The guest's latest window list not yet sent (Coherence): like
     /// damage, a guest that keeps changing it costs one queued message.
     windows: Arc<Mutex<Option<Vec<GuestWindow>>>>,
+    /// The viewer shows the first monitor's GL frames from IOSurfaces
+    /// (`ToVmm::Surfaces`): off again when it goes.
+    surfaces: Arc<std::sync::atomic::AtomicBool>,
     /// Window icons not yet sent, by window: the latest of each, at most
     /// `ICONS_PENDING` windows.
     icons: Arc<Mutex<Icons>>,
@@ -133,7 +136,7 @@ impl ViewerTx {
                 }
             }
         })?;
-        Ok(ViewerTx { q, gen, damage, windows, icons, sock, sticky: Arc::default() })
+        Ok(ViewerTx { q, gen, damage, windows, icons, sock, sticky: Arc::default(), surfaces: Arc::default() })
     }
 
     /// A viewer is connected.
@@ -142,7 +145,26 @@ impl ViewerTx {
     }
 
     fn detach(&self) {
+        self.surfaces.store(false, std::sync::atomic::Ordering::Release);
         *self.sock.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// The viewer wants IOSurfaces, or pixels again. Only the app that
+    /// started this VMM can have them: it left us a mach port for them.
+    fn set_surfaces(&self, on: bool) {
+        #[cfg(target_os = "macos")]
+        let on = on && vroom_gpu3d::remote::surfaces_possible();
+        #[cfg(not(target_os = "macos"))]
+        let on = {
+            let _ = on;
+            false
+        };
+        log::info!("display: {}", if on { "the app shows GL frames from IOSurfaces" } else { "GL frames as pixels" });
+        self.surfaces.store(on, std::sync::atomic::Ordering::Release);
+    }
+
+    fn surfaces(&self) -> bool {
+        self.surfaces.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// A new viewer: the framebuffer first (as at start), then what it
@@ -153,6 +175,8 @@ impl ViewerTx {
 
     fn attach(&self, mut v: UnixStream, fb: RawFd) -> std::io::Result<()> {
         let mut s = self.sock.lock().unwrap_or_else(|e| e.into_inner());
+        // A new viewer asks for IOSurfaces itself if it can have them.
+        self.surfaces.store(false, std::sync::atomic::Ordering::Release);
         // What is queued now is in the replay below (sticky is updated
         // before a message is queued): drop the queued copies.
         self.gen.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
@@ -421,6 +445,26 @@ impl DisplaySink for FbSink {
 
     fn flush(&self, x: u32, y: u32, w: u32, h: u32, rows: &[u8], stride: usize) {
         self.flush_at(Instant::now(), x, y, w, h, rows, stride)
+    }
+
+    fn wants_surfaces(&self) -> bool {
+        // The first monitor, while the GPU (not the firmware) is on it.
+        self.head == 0
+            && self.tx.as_ref().is_some_and(|t| t.surfaces())
+            && self.arb.lock().unwrap_or_else(|e| e.into_inner()).gpu_on_screen
+    }
+
+    fn surface(&self, gen: u32, slot: u32, x: u32, y: u32, w: u32, h: u32) {
+        let mut a = self.arb.lock().unwrap_or_else(|e| e.into_inner());
+        let (mw, mh) = a.gpu_mode;
+        if self.head != 0 || x.saturating_add(w) > mw || y.saturating_add(h) > mh {
+            return;
+        }
+        a.last_gpu = Some(Instant::now());
+        if a.gpu_on_screen {
+            drop(a);
+            self.send(ToViewer::Surface { gen, slot, x, y, w, h });
+        }
     }
 
     fn cursor(&self, c: &Cursor) {
@@ -773,6 +817,7 @@ fn serve(stream: UnixStream, c: &Serve) {
                         c.tx.send(&ToViewer::Status(format!("Network: adapter {}: {e}", nic + 1)));
                     }
                 }
+                Ok(Some(ToVmm::Surfaces(on))) => c.tx.set_surfaces(on),
                 Ok(Some(ToVmm::AgentUpdate)) => match (!fds.is_empty()).then(|| fds.remove(0)) {
                     Some(from) => c.agent.send(AgentCmd::Update { from }),
                     None => log::warn!("display: guest tools without their pipe"),
@@ -916,6 +961,7 @@ fn handle(
         | ToVmm::NetSet { .. }
         | ToVmm::NetAdd { .. }
         | ToVmm::NetRemove { .. }
+        | ToVmm::Surfaces(_)
         | ToVmm::AgentUpdate => {}
         ToVmm::Coherence(on) => agent.send(AgentCmd::Coherence(on)),
         ToVmm::Window { id, op } => agent.send(AgentCmd::Window { id, op }),
