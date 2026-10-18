@@ -8,8 +8,9 @@ from pathlib import Path
 
 
 class Client:
-    def __init__(self, binary: Path, config: Path, on_event, on_log, restore=None):
+    def __init__(self, binary: Path, config: Path, on_event, on_log, restore=None, agent_socket=None):
         self.binary, self.config = binary, config
+        self.agent_socket = agent_socket
         self.on_event, self.on_log = on_event, on_log
         self.pending = {}
         self.sequence = 0
@@ -35,6 +36,8 @@ class Client:
         arguments = [str(self.binary), str(self.config)]
         if self.restore:
             arguments.extend(['--restore', str(self.restore)])
+        if self.agent_socket:
+            arguments.extend(['--agent-socket', str(self.agent_socket)])
         self.process = await asyncio.create_subprocess_exec(
             *arguments, stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,

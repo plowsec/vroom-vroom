@@ -93,9 +93,11 @@ class KernelApp(App):
         Binding('up', 'history_previous', show=False), Binding('down', 'history_next', show=False),
     ]
 
-    def __init__(self, binary=None, config=None, client=None, atui=None, restore=None, ex_callback_demo=False):
+    def __init__(self, binary=None, config=None, client=None, atui=None, restore=None, ex_callback_demo=False,
+                 agent_socket=None):
         super().__init__()
-        self.client = client or Client(binary, config, self.event, self.log_message, restore=restore)
+        self.client = client or Client(binary, config, self.event, self.log_message, restore=restore,
+                                       agent_socket=agent_socket)
         self.cpu = 0
         self.address = 0
         self.breakpoints = []
@@ -1159,7 +1161,9 @@ def main():
     parser.add_argument('--atui', type=Path, help='angr_tui executable or run-atui-macos.sh')
     parser.add_argument('--restore', type=Path, help='vroom checkpoint directory')
     parser.add_argument('--ex-callback-demo', action='store_true', help='load symbols and Ex callback arguments from a paused checkpoint')
+    parser.add_argument('--agent-socket', type=Path, help='also serve agents (JSON-RPC) on this Unix socket')
     args = parser.parse_args()
     atui = args.atui.resolve() if args.atui else shutil.which('atui')
     KernelApp(args.backend.resolve(), args.config.resolve(), atui=Path(atui) if atui else None,
-              restore=args.restore, ex_callback_demo=args.ex_callback_demo).run()
+              restore=args.restore, ex_callback_demo=args.ex_callback_demo,
+              agent_socket=args.agent_socket).run()

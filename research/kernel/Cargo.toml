@@ -19,6 +19,7 @@ vroom-display.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+libc.workspace = true
 thiserror.workspace = true
 pdb = "0.8"
 

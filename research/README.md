@@ -58,6 +58,59 @@ Requires `uv`. UEFI: QEMU firmware; TPM: swtpm. Nested virtualization off.
 Linux: `/dev/kvm` access. HVF checkpoints cannot restore on KVM.
 Use a disposable overlay. Separate state directory. Starts paused.
 
+## agents
+
+JSON-RPC 2.0, one object per line, owner-only Unix socket. Same protocol as angr_tui's.
+
+```sh
+research/run.sh LAB.toml --restore CHECKPOINT --agent-socket lab.sock     # beside the TUI
+target/research/release/vroom-lab LAB.toml --restore CHECKPOINT --agent-socket lab.sock < /dev/null   # headless
+cargo build --release -p vroom-kernel --bin vroom-rpc
+vroom-rpc --socket lab.sock describe
+vroom-rpc --socket lab.sock commands.list '{"category":"kernel"}'
+vroom-rpc --socket lab.sock run memory.read_virtual '{"cpu":1,"address":"0xfffff80275ff70a8","length":16}'
+vroom-rpc --socket lab.sock events.poll '{"wait_ms":10000}'
+```
+
+Methods: `initialize {actor}` first, `describe`, `commands.list {category?}`,
+`commands.run {command, args, limit?}`, `results.page {handle, offset?, limit?}`,
+`events.poll {after?, wait_ms?, limit?}`, `jobs.start {command, args}`,
+`jobs.status|result|cancel {handle}`.
+
+```text
+vm        status pause resume step step_over step_out checkpoint screenshot key shutdown
+cpu       registers write_register
+memory    regions read_virtual read_physical translate write_virtual write_physical dump
+debug     breakpoints watchpoints
+kernel    info symbols functions resolve processes process peb user_modules modules
+          callbacks stack image export process_event cache
+fuzz      check run* probe* coverage blocks diff crashes          * jobs.start only
+```
+
+- Commands run on the lab's thread, in order with the TUI's. The TUI sees the agent's stops too.
+- Each command lists params, `mutates` and `risk` (read, control, write, destructive): gate writes on these.
+- Addresses: integers or `"0x..."`. Inspection needs a paused VM.
+- `events.poll` without `after` waits for the next event (stop, fault, shutdown). Events carry `seq`.
+- Arrays over `limit` (200) return `{items, total, handle, next_offset}`: page with `results.page`.
+- `fuzz.run`/`fuzz.probe` start `vroom-fuzz` (its own VM, signed; `$VROOM_FUZZ` or `target/release/vroom-fuzz`). Output and progress: `OUTPUT.agent.jsonl`, `OUTPUT.agent.log`.
+- `fuzz.coverage|blocks|diff|crashes` read a run directory; no VM.
+- Results and jobs belong to the actor that made them.
+- Socket paths: under 104 bytes. A path in a deep temp dir fails: use a relative one.
+
+Function-calling adapter (one tool):
+
+```python
+import json, socket
+s = socket.socket(socket.AF_UNIX); s.connect("lab.sock"); f = s.makefile("rw")
+def vroom(method, params=None, _id=[0]):
+    _id[0] += 1
+    f.write(json.dumps({"jsonrpc": "2.0", "id": _id[0], "method": method, "params": params or {}}) + "\n"); f.flush()
+    r = json.loads(f.readline())
+    if "error" in r: raise RuntimeError(r["error"])
+    return r["result"]
+vroom("initialize", {"actor": "pentest-llm"})
+```
+
 ## keys
 
 | Key | Action |

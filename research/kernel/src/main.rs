@@ -1,4 +1,7 @@
 //! Line-delimited JSON control endpoint; the Textual frontend owns this process.
+//! `--agent-socket` also serves agents (JSON-RPC 2.0, see agent.rs).
+mod agent;
+
 use clap::Parser;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -20,6 +23,16 @@ struct Args {
     /// Restore a vroom checkpoint instead of cold booting.
     #[arg(long)]
     restore: Option<PathBuf>,
+    /// Also serve agents (JSON-RPC 2.0, one object per line) on this
+    /// owner-only Unix socket. The lab then keeps running when stdin closes.
+    #[arg(long)]
+    agent_socket: Option<PathBuf>,
+}
+
+/// A request from the frontend on stdin, or from an agent.
+enum Input {
+    Stdio(Result<Value, String>),
+    Agent(agent::Forward),
 }
 
 fn number(v: &Value) -> Result<u64, String> {
@@ -49,6 +62,9 @@ fn vector_length(request: &Value) -> Result<Option<u16>, String> {
 }
 
 fn output(v: Value) -> Result<(), String> {
+    if v.get("event").is_some() {
+        agent::record_event(&v);
+    }
     let mut out = std::io::stdout().lock();
     serde_json::to_writer(&mut out, &v).map_err(|e| e.to_string())?;
     writeln!(out)
@@ -974,6 +990,7 @@ impl Session {
 
 fn run() -> Result<(), String> {
     let args = Args::parse();
+    let args_agent_socket = args.agent_socket.clone();
     let config = vroom_config::VmConfig::load(&args.config).map_err(|e| e.to_string())?;
     if config.nested {
         return Err("disable nested virtualization for kernel debugging".into());
@@ -1047,7 +1064,24 @@ fn run() -> Result<(), String> {
     };
     session.configure()?;
     output(json!({"event":"ready", "state":"Paused", "cpus": session.vm.config().cpus}))?;
-    let (tx, rx) = mpsc::sync_channel(8);
+    let (tx, rx) = mpsc::sync_channel::<Input>(8);
+    let _endpoint = match &args_agent_socket {
+        Some(path) => {
+            let (forward, requests) = mpsc::channel();
+            let endpoint = agent::start(path, forward)?;
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                for request in requests {
+                    if tx.send(Input::Agent(request)).is_err() {
+                        break;
+                    }
+                }
+            });
+            eprintln!("vroom-lab: agents: {}", path.display());
+            Some(endpoint)
+        }
+        None => None,
+    };
     std::thread::spawn(move || {
         let mut input = std::io::stdin().lock();
         loop {
@@ -1056,12 +1090,14 @@ fn run() -> Result<(), String> {
             match n {
                 Ok(0) | Err(_) => break,
                 Ok(_) if line.len() > 65536 => {
-                    let _ = tx.send(Err("request exceeds 64 KiB".to_owned()));
+                    let _ = tx.send(Input::Stdio(Err("request exceeds 64 KiB".to_owned())));
                     break;
                 }
                 Ok(_) => {
                     if tx
-                        .send(serde_json::from_slice::<Value>(&line).map_err(|e| e.to_string()))
+                        .send(Input::Stdio(
+                            serde_json::from_slice::<Value>(&line).map_err(|e| e.to_string()),
+                        ))
                         .is_err()
                     {
                         break;
@@ -1146,7 +1182,7 @@ fn run() -> Result<(), String> {
             }
         }
         match rx.recv_timeout(Duration::from_millis(20)) {
-            Ok(Ok(request)) => {
+            Ok(Input::Stdio(Ok(request))) => {
                 let id = request.get("id").cloned().unwrap_or(Value::Null);
                 let response = match session.command(&request) {
                     Ok(result) => json!({"id":id,"result":result}),
@@ -1157,7 +1193,14 @@ fn run() -> Result<(), String> {
                     return Ok(());
                 }
             }
-            Ok(Err(error)) => output(json!({"id":null,"error":error}))?,
+            Ok(Input::Stdio(Err(error))) => output(json!({"id":null,"error":error}))?,
+            Ok(Input::Agent(forward)) => {
+                let _ = forward.reply.send(session.command(&forward.request));
+                if session.vm.state() == RunState::Stopped {
+                    output(json!({"event":"shutdown"}))?;
+                    return Ok(());
+                }
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
         }
