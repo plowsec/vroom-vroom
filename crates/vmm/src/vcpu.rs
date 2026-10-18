@@ -29,6 +29,7 @@ pub enum VcpuCmd {
     Resume,
     Save(Sender<Result<VcpuState>>),
     /// This CPU's interrupt controller registers; load the given ones first.
+    #[cfg(feature = "research")]
     GicRegisters(Option<Vec<(u32, u64)>>, Sender<Result<Vec<(u32, u64)>>>),
     /// Load saved registers; `on` says whether the CPU should run on resume.
     Restore(Box<VcpuState>, bool, Sender<Result<()>>),
@@ -47,6 +48,7 @@ impl std::fmt::Debug for VcpuCmd {
             VcpuCmd::Pause(_) => "Pause",
             VcpuCmd::Resume => "Resume",
             VcpuCmd::Save(_) => "Save",
+            #[cfg(feature = "research")]
             VcpuCmd::GicRegisters(..) => "GicRegisters",
             VcpuCmd::Restore(..) => "Restore",
             VcpuCmd::Reset(..) => "Reset",
@@ -215,6 +217,7 @@ impl VcpuLoop {
     /// Returns false when the thread should exit.
     fn command(&mut self, cmd: VcpuCmd) -> bool {
         match cmd {
+            #[cfg(feature = "research")]
             VcpuCmd::GicRegisters(restore, reply) => {
                 let result = if self.paused {
                     self.vcpu.gic_cpu_registers(restore.as_deref()).map_err(Error::Hv)

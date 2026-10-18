@@ -116,6 +116,9 @@ enum Command {
         payload: PathBuf,
         #[arg(long)]
         output: Option<PathBuf>,
+        /// Use this VM state directory instead of the harness's.
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
     },
 }
 
@@ -268,8 +271,12 @@ fn main() -> Result<()> {
             harness,
             payload,
             output,
+            state_dir,
         } => {
-            let h = Harness::load(&harness)?;
+            let mut h = Harness::load(&harness)?;
+            if let Some(dir) = state_dir {
+                h.state_dir = dir;
+            }
             let probe = h.ioctl_probe.clone().ok_or_else(|| {
                 vroom_fuzz::Error::Invalid("harness has no ioctl_probe range".into())
             })?;

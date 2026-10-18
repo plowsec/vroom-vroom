@@ -47,3 +47,24 @@ def test_load_artifacts_aggregates_functions_and_first_seen_inputs(tmp_path):
     assert [(row.module, row.name, row.covered, row.total, row.hits)
             for row in functions] == [("HEVD.sys", "Trigger", 1, 2, 4)]
     assert [block["first_input"] for block in blocks] == ["abc123", None]
+
+
+def _run(directory, gpa, va=18446603336221204480, hits=1):
+    directory.mkdir()
+    (directory / "coverage.json").write_text(json.dumps({
+        "executions": 1, "new_edges": 0, "blocks": {"1": {"hits": hits, "first_input": "x"}},
+    }), encoding="utf-8")
+    (directory / "blocks.json").write_text(json.dumps([
+        {"id": 1, "gpa": gpa, "va": va, "size": 4, "module": "HEVD.sys", "function": "Trigger"},
+    ]), encoding="utf-8")
+    return directory / "coverage.json"
+
+
+def test_compare_ignores_runtime_gpa_but_not_moved_blocks(tmp_path):
+    import pytest
+    from vroom_tui.coverage import compare_artifacts
+
+    # Blocks mode resolves pageable code's GPA late: edges run has none.
+    compare_artifacts(_run(tmp_path / "edges", None, hits=0), _run(tmp_path / "blocks", 8192))
+    with pytest.raises(ValueError, match="changed between runs"):
+        compare_artifacts(_run(tmp_path / "a", 4096), _run(tmp_path / "b", 4096, va=18446603336221204484))

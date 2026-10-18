@@ -369,6 +369,9 @@ pub struct ModuleLayout {
     pub path: u64,
 }
 
+/// A module name or path whose buffer is not resident.
+pub const PAGED_OUT: &str = "<paged out>";
+
 pub fn modules(
     memory: &impl VirtualMemory,
     head: u64,
@@ -396,11 +399,16 @@ pub fn modules(
         let base = memory.u64(field(layout.base)?)?;
         let mut size = [0; 4];
         memory.read(field(layout.size)?, &mut size)?;
+        // Name buffers are pool memory that may be paged out; the entry and
+        // its base still are not.
+        let text = |off| -> Result<String> {
+            Ok(unicode(memory, field(off)?).unwrap_or_else(|_| PAGED_OUT.into()))
+        };
         modules.push(Module {
             base,
             size: u32::from_le_bytes(size),
-            name: unicode(memory, field(layout.name)?)?,
-            path: unicode(memory, field(layout.path)?)?,
+            name: text(layout.name)?,
+            path: text(layout.path)?,
         });
         previous = next;
         next = memory.u64(next)?;

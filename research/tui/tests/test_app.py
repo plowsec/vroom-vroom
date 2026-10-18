@@ -152,3 +152,32 @@ async def test_function_filter_process_selection_and_qualified_symbols():
         await app.workers.wait_for_complete()
         assert app.query_one('#functions',DataTable).get_row_at(0)[0] == 'NtCreateFile'
         assert any(op=='functions' and args['prefix']=='NtCreate' for op,args in client.calls)
+
+
+async def test_enter_on_a_coverage_block_opens_its_code(tmp_path):
+    import json
+    (tmp_path / 'coverage.json').write_text(json.dumps({
+        'executions': 1, 'new_edges': 0, 'blocks': {'1': {'hits': 2, 'first_input': 'x'}}}))
+    (tmp_path / 'blocks.json').write_text(json.dumps([
+        {'id': 1, 'gpa': 4096, 'va': 0xfffff80000001000, 'size': 8, 'module': 'example.sys', 'function': 'f'}]))
+    client = FakeClient()
+    app = KernelApp(client=client)
+    client.app = app
+    async with app.run_test(size=(150, 45)) as pilot:
+        await pilot.pause()
+        command = app.query_one('#command', Input)
+        command.value = f'coverage {tmp_path / "coverage.json"}'
+        command.focus()
+        await pilot.press('enter')
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert app.query_one(TabbedContent).active == 'coverage-tab'
+        app.query_one('#coverage-functions', DataTable).focus()
+        await pilot.press('enter')
+        await pilot.pause()
+        app.query_one('#coverage-blocks', DataTable).focus()
+        await pilot.press('enter')
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert any(op == 'read_virtual' for op, _ in client.calls)
+        assert app.query_one(TabbedContent).active == 'code-tab'

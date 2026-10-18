@@ -226,6 +226,7 @@ static COMMANDS: &[Command] = &[
         p("harness", "path", true, "harness JSON"),
         p("payload", "path", true, "payload bytes"),
         p("output", "path", true, "new probe directory"),
+        p("state_dir", "path", false, "VM state directory, one per parallel run"),
     ], "control", Target::FuzzProbe)),
     c("fuzz.coverage", "fuzz", "Per-function block coverage of a run", &[p("run", "path", true, "run directory (coverage.json, blocks.json)")], "read", Target::FuzzCoverage),
     c("fuzz.blocks", "fuzz", "Blocks of a run with hit counts; filter by function or covered", &[p("run", "path", true, "run directory"), p("function", "string", false, "only this function"), p("covered", "boolean", false, "only covered (true) or uncovered (false)")], "read", Target::FuzzBlocks),
@@ -403,6 +404,9 @@ impl Shared {
             // probe refuses an existing output directory: it makes its own.
             std::fs::remove_dir(&output).map_err(|e| e.to_string())?;
             cmd.arg("probe").arg(path(args, "harness")?).arg(path(args, "payload")?).arg("--output").arg(&output);
+            if let Some(v) = args.get("state_dir").and_then(Value::as_str) {
+                cmd.arg("--state-dir").arg(v);
+            }
         }
         let log = output.with_extension("agent.log");
         let results = std::fs::File::create(output.with_extension("agent.jsonl")).map_err(|e| e.to_string())?;

@@ -74,9 +74,11 @@ def compare_artifacts(baseline_path: str | Path, current_path: str | Path):
         raise ValueError("coverage runs use different block sets")
     for ident in base_by_id:
         left, right = base_by_id[ident], current_by_id[ident]
-        if (left.get("va"), left.get("gpa"), left.get("size")) != (
-            right.get("va"), right.get("gpa"), right.get("size")
-        ):
+        # The manifest's VA names a block; its GPA is resolved per run (and
+        # late, for pageable code in blocks mode), so it may differ.
+        def place(block):
+            return (block.get("va"), block.get("size")) if block.get("va") is not None else (block.get("gpa"), block.get("size"))
+        if place(left) != place(right):
             raise ValueError(f"coverage block {ident} changed between runs")
         right["baseline_hits"] = left["hits"]
         right["delta_hits"] = right["hits"] - left["hits"]

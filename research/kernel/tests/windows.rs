@@ -118,6 +118,32 @@ fn module_list_backlinks_and_cycles() {
 }
 
 #[test]
+fn module_names_on_paged_out_pages_do_not_end_the_list() {
+    let mut m = Memory(vec![0; 0x1000]);
+    let head = 0x100;
+    w64(&mut m, head, 0x200);
+    w64(&mut m, head + 8, 0x200);
+    w64(&mut m, 0x200, head as u64);
+    w64(&mut m, 0x208, head as u64);
+    w64(&mut m, 0x210, 0xfffff80000000000);
+    w32(&mut m, 0x218, 0x1000);
+    // Name: "a.sys" at 0x300. Path: a buffer on an unmapped page.
+    w16(&mut m, 0x220, 10);
+    w16(&mut m, 0x222, 10);
+    w64(&mut m, 0x228, 0x300);
+    for (i, c) in "a.sys".encode_utf16().enumerate() {
+        w16(&mut m, 0x300 + 2 * i, c);
+    }
+    w16(&mut m, 0x230, 8);
+    w16(&mut m, 0x232, 8);
+    w64(&mut m, 0x238, 0x5000);
+    let layout = ModuleLayout { links: 0, base: 0x10, size: 0x18, name: 0x20, path: 0x30 };
+    let modules = windows::modules(&m, head as u64, &layout).unwrap();
+    assert_eq!(modules[0].name, "a.sys");
+    assert_eq!(modules[0].path, windows::PAGED_OUT);
+}
+
+#[test]
 fn export_revalidates_headers_after_discovery() {
     let mut m = pe();
     let image = Image::read(&m, 0).unwrap();

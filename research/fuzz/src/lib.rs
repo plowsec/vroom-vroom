@@ -789,11 +789,32 @@ struct Always {
     brk: Option<u16>,
 }
 
+/// A fuzzing VM is disposable: no host port forwards (they would clash
+/// between workers, and with the lab), and its own copy of the EFI
+/// variables, since restoring a checkpoint writes them back.
+fn disposable(config: &mut vroom_config::VmConfig, state_dir: &Path) -> Result<()> {
+    for net in &mut config.nets {
+        net.port_forwards.clear();
+    }
+    if let vroom_config::Boot::Uefi { vars, .. } = &mut config.boot {
+        let copy = state_dir.join("fuzz-efivars.fd");
+        if !copy.exists() {
+            fs::create_dir_all(state_dir)?;
+            if vars.exists() {
+                fs::copy(&*vars, &copy)?;
+            }
+        }
+        *vars = copy;
+    }
+    Ok(())
+}
+
 impl Engine {
     pub fn open(harness: Harness) -> Result<Self> {
         let input_capacity = harness.input_capacity;
-        let config = vroom_config::VmConfig::load(&harness.config)
+        let mut config = vroom_config::VmConfig::load(&harness.config)
             .map_err(|e| Error::Config(e.to_string()))?;
+        disposable(&mut config, &harness.state_dir)?;
         if harness.cpu >= config.cpus as usize {
             return Err(Error::Invalid(format!(
                 "harness CPU {} is outside VM CPU count {}",

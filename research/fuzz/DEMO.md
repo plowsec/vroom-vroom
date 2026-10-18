@@ -106,15 +106,14 @@ checkpoint /Users/vladimir/VMs/hevd-windows-arm64/checkpoints/hevd-dispatch-NEW
 | `bugcheck_pc` | `x nt!KeBugCheckEx` | `0xfffff8027845bb70` |
 | `ioctl_va` | IrpSp+0x18 IoControlCode (X1+0xe8) | `0xffffc50aa8c7dd28` |
 | `input_pointer_va` | IrpSp+0x20 Type3InputBuffer (X1+0xf0) | `0xffffc50aa8c7dd30` |
-| `output_length_va` | IrpSp+0x10 (X1+0xe0): the size HEVD copies | `0xffffc50aa8c7dd20` |
-| `input_length_va` | X1+0xe4 | `0xffffc50aa8c7dd24` |
+| `input_length_va` | IrpSp+0x10 InputBufferLength (X1+0xe0): the size HEVD copies | `0xffffc50aa8c7dd20` |
 | `input_va` | value at `input_pointer_va` (client heap) | `0x1f93110d020` |
 | `input_capacity` | `0x1000 - (input_va & 0xfff)`: one page | `4064` |
 | `input_gpa` | run once with a wrong one, the error prints it | `0x159df5020` |
 | `max_input` | 4-byte IOCTL + payload | `5` safe, `4068` overflow |
 | `coverage_file` | `angr_blocks.py` | `$VM/hevd-all-driver-blocks.json` |
 
-- WDK names vs harness names: the length HEVD reads is `output_length_va`; `input_length_va` is the dword after it (check).
+- IrpSp: +0x08 OutputBufferLength, +0x10 InputBufferLength, +0x18 IoControlCode, +0x20 Type3InputBuffer; +0x14 is padding.
 - `input_gpa`: any RAM address (0x40000000 = RAM base) as placeholder:
 
 ```bash
@@ -141,7 +140,7 @@ uv run --project research/tui --extra angr python research/fuzz/tools/angr_ioctl
 | harness | |
 |---|---|
 | `$CK/hevd-harness-all-safe.json` | 5-byte inputs, no crash, fastest |
-| `$CK/hevd-harness-all-30s.json` | 4068-byte inputs, finds the BugCheck; its `state_dir` is the VM's own: always `--state-dir` |
+| `$CK/hevd-harness-all-30s.json` | 4068-byte inputs, finds the BugCheck (`state_dir`: `$VM/fuzz.state`) |
 
 Seed `$CK/one-byte-payload.bin` (one `00`), IOCTL `0x222003` (stack overflow).
 
@@ -160,7 +159,7 @@ $F probe $CK/hevd-harness-all-safe.json $CK/one-byte-payload.bin --output $OUT/p
 head -3 $OUT/probe/results.jsonl
 ```
 
-- New `--output` each time; edges mode only; no `--state-dir` (uses the harness's).
+- New `--output` each time; edges mode only; `--state-dir` optional.
 
 3. Run, edges (default), dashboard:
 
@@ -222,14 +221,10 @@ VROOM_COW_VERIFY=1 $F run $CK/hevd-harness-all-30s.json $CK/one-byte-payload.bin
   --iterations 20 --state-dir $OUT/state-c --output $OUT/verify
 ```
 
-7. Workers (one VM each, ~9 GB). A second VM can't bind the SSH forward (`nat: Address already in use`): config copy without it.
+7. Workers (one VM each, ~9 GB). Fuzz VMs drop host port forwards and keep their own EFI vars, so they run beside each other and beside the lab.
 
 ```bash
-sed -e '/^port_forwards/d' -e "s|^vars = \"|vars = \"$VM/|" \
-  -e "s|^path = \"hevd-windows-arm64.qcow2\"|path = \"$VM/hevd-windows-arm64.qcow2\"|" \
-  $VM/hevd-windows-arm64.toml > $OUT/hevd-fuzz.toml
-jq --arg c $OUT/hevd-fuzz.toml '. + {coverage_mode: "blocks", config: $c}' \
-  $CK/hevd-harness-all-safe.json > $OUT/fleet.json
+jq '. + {coverage_mode: "blocks"}' $CK/hevd-harness-all-safe.json > $OUT/fleet.json
 $F fleet $OUT/fleet.json $CK/one-byte-payload.bin --ioctl 0x222003 --workers 3 \
   --duration-secs 60 --output $OUT/fleet                                       # local master + dashboard
 ```
@@ -261,7 +256,7 @@ $F run $OUT/fleet.json $CK/one-byte-payload.bin --ioctl 0x222003 \
 research/run.sh $VM/hevd-windows-arm64.toml --restore $CK/hevd-dispatch-buffer
 ```
 
-- Uses `$VM/hevd-windows-arm64.state`: fuzz runs beside it need `--state-dir`.
+- The lab uses `$VM/hevd-windows-arm64.state`; the harnesses use `fuzz.state` / `fuzz-coverage-run2.state`.
 - No VM (tables only, no disassembly): `uv run --project research/tui vroom-kernel $VM/hevd-windows-arm64.toml --backend /usr/bin/false`, ignore `FAILED`.
 
 2. One run:
@@ -276,14 +271,10 @@ coverage /Users/vladimir/VMs/hevd-windows-arm64/demo/edges/coverage.json
 coverage-diff /Users/vladimir/VMs/hevd-windows-arm64/demo/edges/coverage.json /Users/vladimir/VMs/hevd-windows-arm64/demo/probe/coverage.json
 ```
 
-4. Diff, edges vs blocks mode (`20/600 → 26/600 · +6 new`). Blocks mode resolves pageable GPAs later, so a direct diff fails `coverage block 226 changed between runs`: pair its coverage with the edges manifest first.
-
-```bash
-mkdir -p $OUT/blocks-diff && cp $OUT/blocks/coverage.json $OUT/blocks-diff/ && cp $OUT/edges/blocks.json $OUT/blocks-diff/
-```
+4. Diff, edges vs blocks mode (`20/600 → 26/600 · +6 new`):
 
 ```text
-coverage-diff /Users/vladimir/VMs/hevd-windows-arm64/demo/edges/coverage.json /Users/vladimir/VMs/hevd-windows-arm64/demo/blocks-diff/coverage.json
+coverage-diff /Users/vladimir/VMs/hevd-windows-arm64/demo/edges/coverage.json /Users/vladimir/VMs/hevd-windows-arm64/demo/blocks/coverage.json
 ```
 
 | key | |
@@ -291,7 +282,7 @@ coverage-diff /Users/vladimir/VMs/hevd-windows-arm64/demo/edges/coverage.json /U
 | `:` | command bar; ↑ / ↓ history |
 | ↑ ↓ PgUp PgDn | move in a table |
 | Enter on a function | its blocks in the lower table |
-| Enter on a block | disassembly loads: click the **Code** tab (focus stays in Coverage) |
+| Enter on a block | its disassembly, in the Code tab |
 | `dis 0xVA` | same, switches to Code |
 | F3 | angr C beside the assembly (Live/File button) |
 | F10 | code full width |
@@ -312,4 +303,22 @@ Optional, path inspection in angr_tui (`a` goto, space graph, `d` decompile, `/`
 
 ```bash
 uv run --project research/tui --extra angr atui $VM/HEVD.sys -s 0x140088a60
+```
+
+## 5. Agents (optional)
+
+Same lab, piloted over JSON-RPC (angr_tui's protocol). Full list: `research/README.md` → agents.
+
+```bash
+research/run.sh $VM/hevd-windows-arm64.toml --restore $CK/hevd-dispatch-buffer --agent-socket lab.sock
+# second terminal, same directory:
+cargo build --release -p vroom-kernel --bin vroom-rpc; R() { target/release/vroom-rpc --socket lab.sock "$@"; }
+R describe
+R run kernel.info '{"cpu":1}'; R run kernel.symbols '{"cpu":1}'  # once
+R run kernel.stack '{"cpu":1}'                                  # HEVD handler ← IofCallDriver
+R run debug.breakpoints '{"addresses":["0xfffff80275ff70c8"]}'
+R run vm.resume; R events.poll '{"wait_ms":10000}'             # the TUI stops too
+R jobs.start '{"command":"fuzz.run","args":{"harness":"'$CK'/hevd-harness-all-safe.json","seed":"'$CK'/one-byte-payload.bin","output":"'$OUT'/agent","ioctl":"0x222003","iterations":2000}}'
+R jobs.status '{"handle":"job-..."}'
+R run fuzz.coverage '{"run":"'$OUT'/agent"}'
 ```

@@ -685,6 +685,9 @@ class KernelApp(App):
             if address is None:
                 self.status(f"Block has no VA; GPA is 0x{int(row['gpa']):x}")
             else:
+                # Focus left in the Coverage pane would pull that tab back.
+                self.query_one(TabbedContent).active = 'code-tab'
+                self.query_one('#code-scroll', VerticalScroll).focus()
                 self.run_worker(self.show_address(int(address)), group='browse', exclusive=True)
             return
         if event.data_table.id == 'stack':
