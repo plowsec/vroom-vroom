@@ -208,14 +208,17 @@ pub(crate) struct UsbPorts {
     files: Mutex<Option<Files>>,
 }
 
-/// USB disks' files: removable shares, and what is on each.
+/// USB disks' files and folders shared while the VM runs: removable
+/// shares, and what is on each.
 struct Files {
     slots: Vec<(String, FsSlot, Option<FilesEntry>)>,
     agent: Agent,
 }
 
 struct FilesEntry {
-    dev: UsbDev,
+    /// The USB disk the files are of; None: a folder shared while the VM
+    /// runs (it isn't in the USB list).
+    dev: Option<UsbDev>,
     label: String,
     readonly: bool,
     /// The sandbox extension that lets us into the volume.
@@ -293,11 +296,49 @@ impl UsbPorts {
         if !dev.valid() || !vroom_proto::usb_label_ok(label) {
             return Err("not a USB disk's volume".into());
         }
+        let i = self.attach_share(Some(dev), fd, readonly, label, token)?;
+        Ok(FILES_PORT0 + i as u8)
+    }
+
+    /// A folder of the Mac (`fd`, from the app) shared while the VM runs,
+    /// on a free removable share; the guest mounts it as `label` (the
+    /// share's tag). It becomes an ordinary share when the VM next starts.
+    pub(crate) fn attach_folder(&self, fd: OwnedFd, readonly: bool, label: &str, token: &str) -> std::result::Result<(), String> {
+        if !vroom_proto::usb_label_ok(label) {
+            return Err(format!("{label:?}: not a name the guest can mount"));
+        }
+        if self.folder_slot(label).is_some() {
+            return Err(format!("{label} is shared already"));
+        }
+        self.attach_share(None, fd, readonly, label, token).map(|_| ())
+    }
+
+    /// Stop sharing the folder `attach_folder` shared as `label`.
+    pub(crate) fn detach_folder(&self, label: &str) {
+        if let Some(i) = self.folder_slot(label) {
+            self.detach_files(i);
+        }
+    }
+
+    fn folder_slot(&self, label: &str) -> Option<usize> {
+        self.files()
+            .as_ref()?
+            .slots
+            .iter()
+            .position(|(_, _, e)| e.as_ref().is_some_and(|e| e.dev.is_none() && e.label == label))
+    }
+
+    /// Serve `fd` on a free removable share and tell the agent to mount it.
+    fn attach_share(&self, dev: Option<UsbDev>, fd: OwnedFd, readonly: bool, label: &str, token: &str) -> std::result::Result<usize, String> {
         let mut g = self.files();
         let Some(f) = g.as_mut() else {
-            return Err("this VM has no room for USB disks' files: it started before vroom had them. Restart it".into());
+            return Err("this VM has no removable shares: it started before vroom had them. Restart it".into());
         };
-        let i = f.slots.iter().position(|s| s.2.is_none()).ok_or("two USB disks' files are shared already")?;
+        let i = f
+            .slots
+            .iter()
+            .position(|s| s.2.is_none())
+            .ok_or(format!("all {} live shares in use", f.slots.len()))?;
         let ext = if token.is_empty() {
             None
         } else {
@@ -314,12 +355,15 @@ impl UsbPorts {
         };
         let (tag, slot, entry) = &mut f.slots[i];
         slot.set(share);
-        *entry = Some(FilesEntry { dev: dev.clone(), label: label.to_string(), readonly, ext });
-        log::info!("usb: {} ({}): its volume {label:?} on share {tag}{}", dev.id, dev.name, if readonly { ", read-only" } else { "" });
+        match &dev {
+            Some(d) => log::info!("usb: {} ({}): its volume {label:?} on share {tag}{}", d.id, d.name, if readonly { ", read-only" } else { "" }),
+            None => log::info!("shares: folder {label:?} on share {tag}{}", if readonly { ", read-only" } else { "" }),
+        }
+        *entry = Some(FilesEntry { dev, label: label.to_string(), readonly, ext });
         f.agent.send(AgentCmd::UsbShare { tag: tag.clone(), label: label.to_string(), on: true });
         drop(g);
         self.tell();
-        Ok(FILES_PORT0 + i as u8)
+        Ok(i)
     }
 
     /// Take the files on removable share `i` away.
@@ -335,7 +379,10 @@ impl UsbPorts {
         if let Some(h) = e.ext {
             vroom_sandbox::release_extension(h);
         }
-        log::info!("usb: {} ({}): its files are gone from share {tag}", e.dev.id, e.dev.name);
+        match &e.dev {
+            Some(d) => log::info!("usb: {} ({}): its files are gone from share {tag}", d.id, d.name),
+            None => log::info!("shares: folder {:?} is gone from share {tag}", e.label),
+        }
         drop(g);
         self.tell();
     }
@@ -361,8 +408,8 @@ impl UsbPorts {
             .collect();
         if let Some(f) = &*self.files() {
             for (i, (_, _, e)) in f.slots.iter().enumerate() {
-                if let Some(e) = e {
-                    list.push(UsbPort { port: FILES_PORT0 + i as u8, dev: e.dev.clone(), here: true, always: false, how: UsbHow::Files, readonly: e.readonly });
+                if let Some((e, dev)) = e.as_ref().and_then(|e| Some((e, e.dev.clone()?))) {
+                    list.push(UsbPort { port: FILES_PORT0 + i as u8, dev, here: true, always: false, how: UsbHow::Files, readonly: e.readonly });
                 }
             }
         }

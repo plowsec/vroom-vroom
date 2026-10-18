@@ -24,6 +24,8 @@ pub enum Ev {
     HelperUp(u64, Writer),
     Helper(u64, Vec<u8>),
     HelperGone(u64),
+    /// The guest is shutting down: tell the host before we go.
+    Stopping,
 }
 
 /// Privileged actions, behind a trait so tests can watch them.
@@ -121,6 +123,7 @@ impl<S: System> Relay<S> {
                     }
                 }
                 Ev::HostGone => return Err(io::Error::other("port closed")),
+                Ev::Stopping => host.write_all(&Message::Stopping.encode())?,
                 Ev::HelperUp(id, w) => {
                     log::info!("session helper {id} connected");
                     // A helper it replaces (started twice in a session)
@@ -217,7 +220,8 @@ impl<S: System> Relay<S> {
             | Message::Apps(_)
             | Message::DragOutItems { .. }
             | Message::DragOutFail { .. }
-            | Message::UpdateDone { .. } => {}
+            | Message::UpdateDone { .. }
+            | Message::Stopping => {}
         }
         Ok(())
     }

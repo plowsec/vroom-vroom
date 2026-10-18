@@ -20,7 +20,8 @@ use vroom_vmm::{RunState, StartMode, VmEvent, Vmm, VmmOptions};
 struct Args {
     /// A disposable vroom VM config. Boots paused; resume explicitly.
     config: PathBuf,
-    /// Restore a vroom checkpoint instead of cold booting.
+    /// Restore a vroom checkpoint (or snapshot) instead of cold booting: its
+    /// folder, or the name of one of this VM's snapshots (snap-...).
     #[arg(long)]
     restore: Option<PathBuf>,
     /// Also serve agents (JSON-RPC 2.0, one object per line) on this
@@ -32,6 +33,31 @@ struct Args {
     /// return once the agent socket accepts. Log: the socket path + ".log".
     #[arg(long, requires = "agent_socket")]
     daemon: bool,
+}
+
+/// `--restore`'s folder: as given, or a snapshot of this VM by name.
+/// Anything else is explained (a path with a space split in two by the
+/// shell looks like this), with the VM's snapshots to pick from.
+fn restore_dir(given: &std::path::Path, state_dir: &std::path::Path) -> Result<PathBuf, String> {
+    let snapshots = state_dir.join("snapshots");
+    if given.join("manifest.json").is_file() {
+        return Ok(given.to_path_buf());
+    }
+    if given.components().count() == 1 && snapshots.join(given).join("manifest.json").is_file() {
+        return Ok(snapshots.join(given));
+    }
+    let mut names: Vec<String> = std::fs::read_dir(&snapshots)
+        .map(|d| d.flatten().filter(|e| e.path().join("manifest.json").is_file()).map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+        .unwrap_or_default();
+    names.sort();
+    let what = if given.exists() { "not a vroom checkpoint or snapshot (no manifest.json in it)" } else { "no such folder" };
+    let mut why = format!("--restore {}: {what}. Quote paths with spaces.", given.display());
+    if names.is_empty() {
+        why.push_str(&format!(" This VM has no snapshots in {}.", snapshots.display()));
+    } else {
+        why.push_str(&format!(" This VM's snapshots (pass a name): {}", names.join(", ")));
+    }
+    Err(why)
 }
 
 /// Write end of the pipe the `--daemon` parent waits on.
@@ -1104,7 +1130,8 @@ fn run(args: Args) -> Result<(), String> {
     let input = viewer.try_clone().map_err(|e| e.to_string())?;
     let start = args
         .restore
-        .map(StartMode::RestorePaused)
+        .map(|r| restore_dir(&r, &state_dir).map(StartMode::RestorePaused))
+        .transpose()?
         .unwrap_or(StartMode::BootPaused);
     let mut vm = Vmm::start(
         config,

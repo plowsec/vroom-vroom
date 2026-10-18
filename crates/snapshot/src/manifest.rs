@@ -105,7 +105,8 @@ impl SnapshotDir {
         let f = fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(root.join(MANIFEST))?;
+            .open(root.join(MANIFEST))
+            .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", root.join(MANIFEST).display())))?;
         let md = f.metadata()?;
         if !md.is_file() {
             return Err(Error::Invalid("manifest is not a file".into()));

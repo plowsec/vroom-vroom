@@ -48,6 +48,8 @@ fn wide(s: &str) -> Vec<u16> {
 static STATUS: AtomicPtr<core::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 /// `--port`, for service_main. None: find it on every try.
 static PORT: OnceLock<Option<String>> = OnceLock::new();
+/// The relay's events, for the control handler to say we're going down.
+static EVENTS: OnceLock<Sender<Ev>> = OnceLock::new();
 
 fn set_state(state: SERVICE_STATUS_CURRENT_STATE) {
     let h = STATUS.load(Ordering::Acquire);
@@ -70,6 +72,14 @@ fn set_state(state: SERVICE_STATUS_CURRENT_STATE) {
 unsafe extern "system" fn control(ctrl: u32, _ty: u32, _data: *mut core::ffi::c_void, _ctx: *mut core::ffi::c_void) -> u32 {
     match ctrl {
         SERVICE_CONTROL_STOP | SERVICE_CONTROL_SHUTDOWN => {
+            if ctrl == SERVICE_CONTROL_SHUTDOWN {
+                // Windows is shutting down or restarting: the host shows
+                // that instead of a dark screen. A moment to send it.
+                if let Some(tx) = EVENTS.get() {
+                    let _ = tx.send(Ev::Stopping);
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+            }
             set_state(SERVICE_STOPPED);
             std::process::exit(0);
         }
@@ -118,6 +128,7 @@ fn serve(port: Option<&str>) {
         crate::icd::apply();
     });
     let (tx, rx) = channel::<Ev>();
+    let _ = EVENTS.set(tx.clone());
     {
         let tx = tx.clone();
         std::thread::spawn(move || accept_helpers(tx));

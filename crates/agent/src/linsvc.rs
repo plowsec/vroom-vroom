@@ -11,7 +11,7 @@ use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::time::Duration;
 
@@ -39,6 +39,40 @@ fn active_uid() -> Option<u32> {
     s.lines().find_map(|l| l.strip_prefix("ACTIVE_UID=")).and_then(|v| v.trim().parse().ok())
 }
 
+/// Set by SIGTERM (systemd stopping us).
+static TERM: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_term(_: libc::c_int) {
+    TERM.store(true, Ordering::Release);
+}
+
+/// Whether systemd is taking the whole system down (shutdown, reboot), not
+/// just restarting us.
+fn system_stopping() -> bool {
+    std::process::Command::new("systemctl")
+        .arg("is-system-running")
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "stopping")
+}
+
+/// On SIGTERM: if the system is going down, tell the host first (its
+/// window says "Shutting down" rather than showing a dark screen).
+#[allow(unsafe_code)]
+fn watch_term(tx: Sender<Ev>) {
+    // SAFETY: the handler only stores an atomic flag.
+    unsafe { libc::signal(libc::SIGTERM, on_term as extern "C" fn(libc::c_int) as libc::sighandler_t) };
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_millis(100));
+        if TERM.load(Ordering::Acquire) {
+            if system_stopping() {
+                let _ = tx.send(Ev::Stopping);
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            std::process::exit(0);
+        }
+    });
+}
+
 /// `port`: from `--port`; None finds it on every try.
 pub fn run_service(port: Option<&str>) -> std::io::Result<()> {
     let _ = std::fs::remove_file(SOCKET);
@@ -46,6 +80,7 @@ pub fn run_service(port: Option<&str>) -> std::io::Result<()> {
     // Anyone may connect; who gets served is checked per connection.
     std::fs::set_permissions(SOCKET, std::fs::Permissions::from_mode(0o666))?;
     let (tx, rx) = channel::<Ev>();
+    watch_term(tx.clone());
     {
         let tx = tx.clone();
         std::thread::spawn(move || accept_helpers(l, tx));

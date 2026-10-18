@@ -767,6 +767,22 @@ fn serve(stream: UnixStream, c: &Serve) {
                         c.tx.send(&ToViewer::Status(format!("USB: {e}")));
                     }
                 }
+                Ok(Some(ToVmm::FolderShare { readonly, label, token })) => {
+                    let Some(fd) = (!fds.is_empty()).then(|| fds.remove(0)) else {
+                        log::warn!("display: a shared folder without its fd");
+                        continue;
+                    };
+                    let r = c.usb.as_ref().map_or(Err("this VM can't take folders while it runs".into()), |u| u.attach_folder(fd, readonly, &label, &token));
+                    if let Err(e) = r {
+                        log::warn!("shares: {e}");
+                        c.tx.send(&ToViewer::Status(format!("Shared folders: {e}")));
+                    }
+                }
+                Ok(Some(ToVmm::FolderUnshare { label })) => {
+                    if let Some(u) = &c.usb {
+                        u.detach_folder(&label);
+                    }
+                }
                 Ok(Some(ToVmm::NetConnect { nic, on })) => {
                     let r = c.net.as_ref().map_or(Err("no network adapters".into()), |n| n.connect(nic, on));
                     if let Err(e) = r {
@@ -956,6 +972,8 @@ fn handle(
         | ToVmm::UsbDetach { .. }
         | ToVmm::UsbDisk { .. }
         | ToVmm::UsbFiles { .. }
+        | ToVmm::FolderShare { .. }
+        | ToVmm::FolderUnshare { .. }
         | ToVmm::DragOutGet { .. }
         | ToVmm::NetConnect { .. }
         | ToVmm::NetSet { .. }

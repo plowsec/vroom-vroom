@@ -450,6 +450,11 @@ export component ConsoleWindow inherits Window {
     in property <int> mode-h;
     in property <VmState> state;
     in property <bool> has-display: true;
+    // What the center message says while the guest's screen is off or
+    // something takes a while (a snapshot), and whether that covers the
+    // screen even when it's on.
+    in property <string> busy-text;
+    in property <bool> busy-cover;
     in property <bool> windows-guest;
     in property <string> toast;
     in property <bool> captured;
@@ -518,7 +523,7 @@ export component ConsoleWindow inherits Window {
     // (frames straight from the GPU); it goes whenever something here is
     // drawn over the screen. Rust follows these.
     in-out property <bool> bar-menu;
-    out property <bool> screen-covered: root.state != VmState.running || root.mode-w == 0 || root.suspend-error != "" || root.float-out || root.drop-over || root.drop-text != "" || root.usb-open || root.net-open || root.toast != "" || root.bar-menu || Tips.demo != "" || ((root.mic-on || root.camera-on) && root.fullscreen);
+    out property <bool> screen-covered: root.state != VmState.running || root.mode-w == 0 || root.busy-cover || root.suspend-error != "" || root.float-out || root.drop-over || root.drop-text != "" || root.usb-open || root.net-open || root.toast != "" || root.bar-menu || Tips.demo != "" || ((root.mic-on || root.camera-on) && root.fullscreen);
     callback screen-moved();
     changed screen-covered => { root.screen-moved(); }
     changed screen-x => { root.screen-moved(); }
@@ -577,7 +582,7 @@ export component ConsoleWindow inherits Window {
     }
 
     // Center messages, over the guest screen's area.
-    if root.state == VmState.starting || root.state == VmState.suspending || root.state == VmState.stopping || (root.mode-w == 0 && root.state == VmState.running): Rectangle {
+    if root.state == VmState.starting || root.state == VmState.suspending || root.state == VmState.stopping || root.busy-cover || (root.mode-w == 0 && root.state == VmState.running): Rectangle {
         y: root.bar-height;
         height: root.avail-h;
         background: root.mode-w == 0 ? #000000 : #000000a0;
@@ -600,6 +605,7 @@ export component ConsoleWindow inherits Window {
                 }
                 Text {
                     text: root.state == VmState.suspending ? "Saving state..." : root.state == VmState.stopping ? "Shutting down..."
+                        : root.busy-text != "" ? root.busy-text
                         : root.has-display ? "Starting " + root.vm-name + "..." : "Running. This VM has no screen: see its log.";
                     color: #ffffffd0;
                     font-size: Theme.fs-lg;

@@ -359,6 +359,12 @@ pub enum ToVmm {
     /// extension that lets the VMM in below it. `label`: the volume's
     /// name, for the guest's mount point.
     UsbFiles { dev: UsbDev, readonly: bool, label: String, token: String },
+    /// Share a folder of the Mac while the VM runs: comes with its
+    /// directory fd and `token`, as `UsbFiles`. `label`: the share's tag,
+    /// the guest's name for it.
+    FolderShare { readonly: bool, label: String, token: String },
+    /// Stop sharing the folder `FolderShare` shared as `label`.
+    FolderUnshare { label: String },
     /// Coherence on or off (the guest agent shows and hides its taskbar).
     Coherence(bool),
     /// Coherence: do this to a guest window.
@@ -681,6 +687,15 @@ impl ToVmm {
                 }
                 frame(81, &p)
             }
+            ToVmm::FolderShare { readonly, label, token } => {
+                let mut p = vec![*readonly as u8];
+                for s in [label, token] {
+                    p.extend_from_slice(&(s.len() as u16).to_le_bytes());
+                    p.extend_from_slice(s.as_bytes());
+                }
+                frame(82, &p)
+            }
+            ToVmm::FolderUnshare { label } => frame(83, label.as_bytes()),
             ToVmm::Coherence(on) => frame(14, &[*on as u8]),
             ToVmm::Window { id, op } => {
                 let mut p = id.to_le_bytes().to_vec();
@@ -791,6 +806,30 @@ impl ToVmm {
                     return Err(Error::Proto("usb files"));
                 }
                 ToVmm::UsbFiles { dev, readonly: p[0] != 0, label, token }
+            }
+            82 if !p.is_empty() && p[0] <= 1 => {
+                let mut o = 1;
+                let mut field = |max: usize| -> Result<String> {
+                    let len = u16::from_le_bytes(p.get(o..o + 2).ok_or(Error::Proto("short"))?.try_into().map_err(|_| Error::Proto("short"))?) as usize;
+                    if len > max {
+                        return Err(Error::Proto("folder share"));
+                    }
+                    let s = text(p.get(o + 2..o + 2 + len).ok_or(Error::Proto("short"))?)?;
+                    o += 2 + len;
+                    Ok(s)
+                };
+                let (label, token) = (field(USB_LABEL_MAX)?, field(USB_TOKEN_MAX)?);
+                if o != p.len() || !usb_label_ok(&label) || token.chars().any(char::is_control) {
+                    return Err(Error::Proto("folder share"));
+                }
+                ToVmm::FolderShare { readonly: p[0] != 0, label, token }
+            }
+            83 if p.len() <= USB_LABEL_MAX => {
+                let label = text(p)?;
+                if !usb_label_ok(&label) {
+                    return Err(Error::Proto("folder unshare"));
+                }
+                ToVmm::FolderUnshare { label }
             }
             14 if p.len() == 1 => ToVmm::Coherence(p[0] != 0),
             15 if p.len() > 4 => ToVmm::Window { id: get_u32(p, 0)?, op: WindowOp::decode(&p[4..]).ok_or(Error::Proto("window op"))? },
@@ -909,6 +948,8 @@ mod tests {
             ToVmm::UsbDetach { port: 3 },
             ToVmm::UsbDisk { dev: UsbDev { id: "18a5:0302".into(), serial: "0703896E1A305748".into(), name: "stick".into() }, readonly: true },
             ToVmm::UsbFiles { dev: UsbDev { id: "18a5:0302".into(), serial: String::new(), name: String::new() }, readonly: false, label: "TEST 1".into(), token: "ab;01;/Volumes/TEST 1".into() },
+            ToVmm::FolderShare { readonly: true, label: "share_vm2".into(), token: "ab;01;/Users/x/share".into() },
+            ToVmm::FolderUnshare { label: "share_vm2".into() },
             ToVmm::Coherence(true),
             ToVmm::Window { id: 9, op: WindowOp::Activate },
             ToVmm::Window { id: 9, op: WindowOp::Move { x: -3, y: 4, w: 100, h: 50 } },

@@ -396,6 +396,11 @@ impl Service {
             }
             Message::ClipboardText(t) => self.guest_clipboard(t),
             Message::Ping(v) => self.send(&Message::Pong(v)),
+            // Its screen is about to go off: the window says so.
+            Message::Stopping => {
+                log::info!("the guest is shutting down");
+                self.to_viewer(ToViewer::Status("guest shutting down".into()));
+            }
             Message::Gpu3d { on } => {
                 log::info!("guest: 3D display device {}", if on { "on" } else { "off" });
                 self.status.lock().unwrap_or_else(|e| e.into_inner()).gpu3d = Some(on);

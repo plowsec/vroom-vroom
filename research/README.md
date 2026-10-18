@@ -73,6 +73,7 @@ fuzz      check run* probe* coverage blocks diff crashes          * jobs.start o
 - Socket paths: under 104 bytes. A path in a deep temp dir fails: use a relative one.
 - `--daemon`: own session, returns when the socket accepts (prints pid, log `PATH.log`). Use it from agents: their shells often kill what a command started, which leaves a dead socket (`Connection refused`).
 - `target/debug/vroom-lab` is unsigned (cargo tests relink it): run the `target/research/` builds.
+- `--restore` takes a lab checkpoint or a GUI snapshot (same format): its folder, or just its name (`snap-...`) for the VM's own snapshots. One VM runs once: the lab and the app can't both run it.
 
 Function-calling adapter (one tool):
 

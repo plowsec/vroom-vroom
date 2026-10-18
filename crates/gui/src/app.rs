@@ -526,7 +526,7 @@ impl App {
             _ => (
                 true,
                 "Running: hardware is locked",
-                "Running. Network, USB devices and the clipboard change right away; the rest needs the VM shut down.",
+                "Running. Network, USB devices, shared folders and the clipboard change right away; the rest needs the VM shut down.",
                 "The guest found this hardware when it started: shut the VM down to change it.",
             ),
         };
@@ -913,6 +913,57 @@ impl App {
         saved
     }
 
+    /// A folder just added to the file: the running VM gets it now if it
+    /// can; otherwise say when it comes.
+    fn share_now(&mut self, path: &std::path::Path) {
+        let Some(v) = self.cur() else { return };
+        let (key, state) = (v.key.clone(), self.state_of(v));
+        let Some(sh) = v.raw.as_ref().and_then(|c| c.shares.iter().rev().find(|s| s.path == path).cloned()) else { return };
+        match state {
+            VmState::Off => {}
+            VmState::Suspended => self.toast("Applies after a restart", 0),
+            _ => {
+                if let Err(e) = console::share_folder(&key, path, &sh.tag, sh.readonly) {
+                    self.toast(format!("Applies after a restart: {e}"), 0);
+                }
+            }
+        }
+        self.last_settings = None;
+        self.push_all();
+    }
+
+    /// A folder removed from the file: unshare it now if it was shared
+    /// this run; one the VM started with stays until it restarts.
+    fn share_gone(&mut self, tag: &str) {
+        let Some(v) = self.cur() else { return };
+        let (key, state) = (v.key.clone(), self.state_of(v));
+        if console::live_shared(&key, tag) {
+            console::unshare_folder(&key, tag);
+        } else if state != VmState::Off {
+            self.toast("Applies after a restart", 0);
+        }
+    }
+
+    /// Share `i` changed (writable, tag): a folder shared this run is
+    /// shared again that way now; the others when the VM restarts.
+    fn share_changed(&mut self, i: usize, old: &vroom_config::Share) {
+        let Some(v) = self.cur() else { return };
+        let (key, state) = (v.key.clone(), self.state_of(v));
+        let Some(new) = v.raw.as_ref().and_then(|c| c.shares.get(i).cloned()) else { return };
+        if matches!(state, VmState::Off) {
+            return;
+        }
+        if console::live_shared(&key, &old.tag) {
+            console::unshare_folder(&key, &old.tag);
+            let path = v.resolved().and_then(|r| r.shares.get(i).map(|s| s.path.clone())).unwrap_or(new.path.clone());
+            if let Err(e) = console::share_folder(&key, &path, &new.tag, new.readonly) {
+                self.toast(format!("Applies after a restart: {e}"), 0);
+            }
+        } else {
+            self.toast("Applies after a restart", 0);
+        }
+    }
+
     /// Hardware is locked while the VM runs or is suspended (it resumes on
     /// the hardware it was saved with). The UI greys those controls out,
     /// but the palette and keys can still ask.
@@ -1017,9 +1068,13 @@ impl App {
         let net = key.strip_prefix("net.").and_then(|r| r.split('.').next()).and_then(|i| i.parse::<usize>().ok());
         // How a USB disk connects applies at its next connect.
         let usb = key.starts_with("usb.") && self.live_ok();
-        if locked && !key.starts_with("clip.") && key != "hidpi" && !(net.is_some() && self.live_ok()) && !usb {
+        // A folder shared this run is shared again the new way.
+        let share = key.strip_prefix("share.").and_then(|r| r.split('.').next()).and_then(|i| i.parse::<usize>().ok());
+        let share_ok = share.is_some() && self.live_ok();
+        if locked && !key.starts_with("clip.") && key != "hidpi" && !(net.is_some() && self.live_ok()) && !usb && !share_ok {
             return;
         }
+        let old_share = share.and_then(|i| self.cur().and_then(|v| v.raw.as_ref()).and_then(|c| c.shares.get(i).cloned()));
         let iface = self.host_ifaces.first().cloned();
         let vm = self.cur().map(|v| v.key.clone()).unwrap_or_default();
         let saved = match (net, key.ends_with(".mode"), v.parse::<usize>()) {
@@ -1029,6 +1084,9 @@ impl App {
         };
         if let (true, Some(i)) = (saved, net) {
             console::net_apply(&vm, i);
+        }
+        if let (true, Some(i), Some(old)) = (saved, share, old_share) {
+            self.share_changed(i, &old);
         }
         // A USB disk connected now another way: again, this way.
         if let (true, Some(i)) = (saved && key.ends_with(".mode"), key.strip_prefix("usb.").and_then(|r| r.split('.').next()).and_then(|i| i.parse::<usize>().ok())) {
@@ -1296,7 +1354,8 @@ impl App {
                     self.push_all();
                 }
             }
-            "share.add" | "disk.add-iso" | "disk.add-existing" | "disk.add-new" if self.hw_locked() => {}
+            "disk.add-iso" | "disk.add-existing" | "disk.add-new" if self.hw_locked() => {}
+            "share.add" if !self.live_ok() => {}
             _ if a.starts_with("usbnow.") => self.usb_now_act(a, None),
             // Out of the VM file, but connected still (it was for this run).
             _ if a.starts_with("usb.") && a.ends_with(".unpin") => {
@@ -1335,10 +1394,13 @@ impl App {
             }
             "share.add" => {
                 if let Some(p) = rfd::FileDialog::new().set_title("Share a folder").pick_folder() {
-                    self.change(|c| {
+                    let added = self.change(|c| {
                         edit::add_share(c, &p);
                         Ok(())
                     });
+                    if added {
+                        self.share_now(&p);
+                    }
                 }
             }
             "disk.add-iso" => {
@@ -1376,9 +1438,9 @@ impl App {
                         _ => {}
                     }
                 }
-                // Network adapters and USB devices change while the VM
-                // runs (or is suspended) too.
-                let live = a.starts_with("net.") || a.starts_with("usb.");
+                // Network adapters, USB devices and shared folders change
+                // while the VM runs (or is suspended) too.
+                let live = a.starts_with("net.") || a.starts_with("usb.") || a.starts_with("share.");
                 if if live { !self.live_ok() } else { self.hw_locked() } {
                     return;
                 }
@@ -1387,9 +1449,17 @@ impl App {
                     .and_then(|r| r.strip_suffix(".remove"))
                     .and_then(|i| i.parse::<usize>().ok())
                     .and_then(|i| self.cur().and_then(|v| v.raw.as_ref()).and_then(|c| c.usb.get(i).cloned()));
+                let gone_share = a
+                    .strip_prefix("share.")
+                    .and_then(|r| r.strip_suffix(".remove"))
+                    .and_then(|i| i.parse::<usize>().ok())
+                    .and_then(|i| self.cur().and_then(|v| v.raw.as_ref()).and_then(|c| c.shares.get(i).map(|s| s.tag.clone())));
                 let a = a.to_string();
                 if !self.change(|c| edit::act(c, &a)) {
                     return;
+                }
+                if let Some(tag) = gone_share {
+                    self.share_gone(&tag);
                 }
                 let Some(key) = self.cur().map(|v| v.key.clone()) else { return };
                 let parts: Vec<&str> = a.split('.').collect();

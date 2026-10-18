@@ -732,7 +732,7 @@ export component SettingsPanel inherits Rectangle {
                     title: "Shared folders";
                     summary: root.s.sum-share;
                     force-open: root.open-all;
-                    lock-tip: root.lock-tip;
+                    lock-tip: root.live-tip;
                     for sh[i] in root.s.shares: SubCard {
                         HorizontalLayout {
                             spacing: 8px;
@@ -761,7 +761,7 @@ export component SettingsPanel inherits Rectangle {
                             }
                             IconButton {
                                 icon: Icons.copy;
-                                tip: "Copy the Linux mount command: sudo mount -t virtiofs " + sh.tag + " /mnt. Windows: a drive letter (Z: first) once vroom-setup.cmd ran.";
+                                tip: "Linux: sudo mount -t virtiofs " + sh.tag + " /mnt. Windows: a drive, Z: first.";
                                 size: 28px;
                                 y: (parent.height - self.height) / 2;
                                 clicked => { Bus.copy("sudo mount -t virtiofs " + sh.tag + " /mnt"); }
@@ -771,7 +771,7 @@ export component SettingsPanel inherits Rectangle {
                                 tip: "Stop sharing";
                                 size: 28px;
                                 y: (parent.height - self.height) / 2;
-                                enabled: !root.lk;
+                                enabled: root.s.live;
                                 clicked => { Bus.act("share." + i + ".remove"); }
                             }
                         }
@@ -783,20 +783,20 @@ export component SettingsPanel inherits Rectangle {
                                 width: 120px;
                                 text: sh.tag;
                                 mono: true;
-                                enabled: !root.lk;
+                                enabled: root.s.live;
                                 committed(t) => { Bus.set("share." + i + ".tag", t); }
                             }
                         }
                         Row {
                             label: "Guest can change files";
-                            tip: "Off: the guest only reads them.";
+                            tip: "Off: read-only.";
                             key: "readonly = false";
                             warn: !sh.readonly;
                             Toggle {
                                 y: (parent.height - self.height) / 2;
                                 checked: !sh.readonly;
                                 danger: true;
-                                enabled: !root.lk;
+                                enabled: root.s.live;
                                 toggled(v) => { Bus.set("share." + i + ".writable", v ? "true" : "false"); }
                             }
                         }
@@ -807,10 +807,10 @@ export component SettingsPanel inherits Rectangle {
                             small: true;
                             kind: "ghost";
                             text: "Folder";
-                            tip: "Share a folder of this Mac with the guest. Read-only unless you allow changes.";
+                            tip: "Read-only until “Guest can change files” is on.";
                             icon: Icons.plus;
                             has-icon: true;
-                            enabled: !root.lk;
+                            enabled: root.s.live;
                             clicked => { Bus.act("share.add"); }
                         }
                     }

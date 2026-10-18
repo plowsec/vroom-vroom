@@ -242,6 +242,9 @@ pub enum Message {
     /// mount point (Linux: /media/vroom/<label>; Windows: a drive
     /// letter). Checked with `usb_tag_ok` and `usb_label_ok`.
     UsbShare { tag: String, label: String, on: bool },
+    /// Guest -> host: the guest is shutting down or restarting (its agent
+    /// was told to stop for that), so its screen is about to go off.
+    Stopping,
     /// Host -> guest: new guest tools follow (`features::UPDATE`). The
     /// manifest: each file's path in the bundle, size and SHA-256, in the
     /// order their bytes come in `UpdateData`. Checked with
@@ -710,6 +713,7 @@ const T_USB_SHARE: u8 = 80;
 const T_UPDATE_BEGIN: u8 = 91;
 const T_UPDATE_DATA: u8 = 92;
 const T_UPDATE_DONE: u8 = 93;
+const T_STOPPING: u8 = 94;
 
 impl Message {
     pub fn encode(&self) -> Vec<u8> {
@@ -732,6 +736,7 @@ impl Message {
             }
             Message::SetScale { percent } => (T_SCALE, percent.to_le_bytes().to_vec()),
             Message::Shutdown { reboot } => (T_SHUTDOWN, vec![*reboot as u8]),
+            Message::Stopping => (T_STOPPING, Vec::new()),
             Message::Ping(v) => (T_PING, v.to_le_bytes().to_vec()),
             Message::Pong(v) => (T_PONG, v.to_le_bytes().to_vec()),
             Message::Gpu3d { on } => (T_GPU3D, vec![*on as u8]),
@@ -891,6 +896,7 @@ impl Message {
                 Message::SetScale { percent }
             }
             T_SHUTDOWN if p.len() == 1 => Message::Shutdown { reboot: p[0] != 0 },
+            T_STOPPING if p.is_empty() => Message::Stopping,
             T_PING if p.len() == 8 => Message::Ping(u64_at(0)?),
             T_PONG if p.len() == 8 => Message::Pong(u64_at(0)?),
             T_GPU3D if p.len() == 1 => Message::Gpu3d { on: p[0] != 0 },
@@ -961,7 +967,7 @@ impl Message {
             T_UPDATE_DONE if p.len() >= 5 && p[4] <= 1 => Message::UpdateDone { id: u32_at(0)?, ok: p[4] != 0, why: text(&p[5..])?.chars().filter(|c| !c.is_control()).take(256).collect() },
             T_TIME | T_RES | T_SCALE | T_SHUTDOWN | T_PING | T_PONG | T_GPU3D | T_DRAG_READY | T_DRAG_CANCEL | T_DROP_ENTRY | T_DROP_DATA
             | T_DROP_END | T_DROP_DONE | T_COHERENCE | T_WINDOW_DO | T_DRAG_OUT_QUERY | T_DRAG_OUT_GET | T_DRAG_OUT_END | T_DRAG_OUT_FAIL | T_LAYOUT | T_MOUSE
-            | T_USB_SHARE | T_UPDATE_BEGIN | T_UPDATE_DATA | T_UPDATE_DONE => {
+            | T_USB_SHARE | T_UPDATE_BEGIN | T_UPDATE_DATA | T_UPDATE_DONE | T_STOPPING => {
                 return Err(Error::Malformed)
             }
             t => return Err(Error::Type(t)),
@@ -1105,6 +1111,7 @@ mod tests {
                 GuestApp { name: "Éditeur de texte".into(), w: 0, h: 0, rgba: Vec::new() },
             ]),
             Message::UsbShare { tag: "vroom-usb0".into(), label: "TEST 1".into(), on: true },
+            Message::Stopping,
             Message::UsbShare { tag: "vroom-usb1".into(), label: "Clé".into(), on: false },
             Message::UpdateBegin {
                 id: 7,

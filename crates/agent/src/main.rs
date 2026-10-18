@@ -526,6 +526,7 @@ fn handle(m: Message, role: Role, w: &mut dyn Write, clip: &mut dyn clip::Clip, 
         | Message::StartApp(_)
         | Message::WindowIcon { .. }
         | Message::CoherenceNo(_)
+        | Message::Stopping
         | Message::Apps(_)
         | Message::UsbShare { .. }
         | Message::UpdateDone { .. }

@@ -275,6 +275,15 @@ pub struct Console {
     hidpi: bool,
     toast_id: u64,
     ever_ran: bool,
+    /// A snapshot is being taken (from our command to the VMM's answer).
+    snapshotting: bool,
+    /// The guest said, or was asked, it shuts down: its screen going off
+    /// means that, not a start.
+    guest_stopping: bool,
+    /// The guest showed a screen since it started.
+    screen_seen: bool,
+    /// Folders shared this run (by tag), on its removable shares.
+    live_shares: Vec<String>,
     gone: Arc<AtomicBool>,
     /// The guest's pointer, as it last said.
     cursor: GuestCursor,
@@ -459,6 +468,22 @@ pub fn net_added(key: &str) {
 /// now. False if the VM doesn't run here.
 pub fn usb_plug(key: &str, d: vroom_display::UsbDev) -> bool {
     with(key, |c| c.usb_plug(d)).is_some()
+}
+
+/// Whether `tag` is one of the folders shared with it this run.
+pub fn live_shared(key: &str, tag: &str) -> bool {
+    with(key, |c| c.live_shares.iter().any(|t| t == tag)).unwrap_or(false)
+}
+
+/// Share `path` with the running VM now, as `tag` (Windows: a drive
+/// letter; Linux: /media/vroom/<tag>).
+pub fn share_folder(key: &str, path: &std::path::Path, tag: &str, readonly: bool) -> Result<(), String> {
+    with(key, |c| c.share_folder(path, tag, readonly)).unwrap_or_else(|| Err("the VM isn't running here".into()))
+}
+
+/// Stop sharing a folder `share_folder` shared.
+pub fn unshare_folder(key: &str, tag: &str) {
+    with(key, |c| c.unshare_folder(tag));
 }
 
 /// One left the list: pull it out now.
@@ -673,6 +698,20 @@ fn tail(p: &Path, lines: usize) -> String {
 }
 
 /// The state a status line from the VMM puts the VM in.
+/// The center message's text and whether it covers a screen that is on.
+/// Empty: the default ("Starting ...").
+fn busy_text(snapshotting: bool, guest_stopping: bool, screen_seen: bool) -> (&'static str, bool) {
+    if snapshotting {
+        ("Taking a snapshot...", true)
+    } else if guest_stopping {
+        ("Shutting down...", false)
+    } else if screen_seen {
+        ("Screen off", false)
+    } else {
+        ("", false)
+    }
+}
+
 fn status_state(t: &str) -> Option<VmState> {
     if t == "running" {
         Some(VmState::Running)
@@ -884,6 +923,10 @@ fn open(key: String, path: &Path, cfg: &VmConfig, ours: UnixStream, child: Optio
         hidpi: cfg.display.hidpi,
         toast_id: 0,
         ever_ran: false,
+        snapshotting: false,
+        guest_stopping: false,
+        screen_seen: false,
+        live_shares: Vec::new(),
         gone,
         cursor: GuestCursor::Unset,
         cursor_gen: 0,
@@ -1317,7 +1360,24 @@ impl Console {
             self.state = s;
             self.win.set_state(s);
             msg::send(Msg::ConsoleState { key: self.key.clone(), state: s });
+            if matches!(s, VmState::Starting | VmState::Off) {
+                self.snapshotting = false;
+                self.guest_stopping = false;
+                self.screen_seen = false;
+                // Folders shared last run are ordinary shares now.
+                self.live_shares.clear();
+            }
+            self.update_busy();
         }
+    }
+
+    /// The center message: a snapshot covers the screen until it's saved;
+    /// a guest shutting down or one whose screen went off after it showed
+    /// one isn't "Starting".
+    fn update_busy(&mut self) {
+        let (text, cover) = busy_text(self.snapshotting, self.guest_stopping, self.screen_seen);
+        self.win.set_busy_text(text.into());
+        self.win.set_busy_cover(cover);
     }
 
     fn toast(&mut self, text: &str) {
@@ -1353,8 +1413,14 @@ impl Console {
                 send(self, m);
             }
             "snapshot" => {
+                if self.snapshotting {
+                    return;
+                }
                 send(self, Command::Snapshot);
-                self.toast("Taking a snapshot...");
+                // The overlay says so until the VMM answers: the guest's
+                // screen may come back before the save is done.
+                self.snapshotting = true;
+                self.update_busy();
             }
             "reset" => send(self, Command::Reset),
             "shutdown" => {
@@ -1364,6 +1430,8 @@ impl Console {
                     send(self, Command::Resume);
                 }
                 send(self, Command::Shutdown);
+                self.guest_stopping = true;
+                self.update_busy();
                 self.toast("Asked the guest to shut down");
             }
             "poweroff" => {
@@ -1519,6 +1587,8 @@ impl Console {
         match t.as_str() {
             "running" | "paused" => {}
             _ if t.starts_with("snapshot: ") => {
+                self.snapshotting = false;
+                self.update_busy();
                 // From the raw line: the cleaned one may be cut short.
                 if let Some(n) = snapshot_name(raw) {
                     self.save_thumb(Some(&n));
@@ -1526,7 +1596,19 @@ impl Console {
                 self.toast("Snapshot saved");
                 msg::send(Msg::SnapshotTaken { key: self.key.clone() });
             }
+            _ if t.starts_with("snapshot failed") => {
+                self.snapshotting = false;
+                self.update_busy();
+                self.toast_for(&t, Duration::from_secs(8));
+            }
+            "guest shutting down" => {
+                self.guest_stopping = true;
+                self.update_busy();
+            }
             _ if t.starts_with("guest agent connected") => {
+                // An agent that comes back: the guest isn't stopping.
+                self.guest_stopping = false;
+                self.update_busy();
                 // "guest agent connected (vroom-agent 0.1.0+348.e314084680 linux)"
                 let agent = t.split_once('(').map(|(_, a)| a.trim_end_matches(')')).unwrap_or("").to_string();
                 let first = self.tools_agent_first();
@@ -1558,6 +1640,28 @@ impl Console {
                 msg::send(Msg::Toast { text: format!("{}: {t}", self.name), kind: 2, action: String::new() });
             }
             _ => self.toast(&t),
+        }
+    }
+
+    fn share_folder(&mut self, path: &std::path::Path, tag: &str, readonly: bool) -> Result<(), String> {
+        let dir = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        // Reading it is what macOS asks permission for: now, not in the guest.
+        std::fs::read_dir(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let token = vroom_sandbox::issue_extension(path, !readonly).map_err(|e| e.to_string())?;
+        let m = ToVmm::FolderShare { readonly, label: tag.to_string(), token };
+        match self.io.borrow().tx.as_ref() {
+            Some(tx) => vroom_display::send_fd_with(tx, &m.encode(), dir.as_raw_fd()).map_err(|e| e.to_string())?,
+            None => return Err("the VM is gone".into()),
+        }
+        self.live_shares.retain(|t| t != tag);
+        self.live_shares.push(tag.to_string());
+        Ok(())
+    }
+
+    fn unshare_folder(&mut self, tag: &str) {
+        if self.live_shares.iter().any(|t| t == tag) {
+            self.io.borrow_mut().send(ToVmm::FolderUnshare { label: tag.to_string() });
+            self.live_shares.retain(|t| t != tag);
         }
     }
 
@@ -2327,6 +2431,15 @@ impl Console {
 
     fn frame(&mut self, full: bool, damage: Option<[u32; 4]>) {
         let mode = self.shared.lock().unwrap_or_else(|e| e.into_inner()).mode;
+        if mode.0 != 0 && mode.1 != 0 && (self.mode == (0, 0) || !self.screen_seen) {
+            // A screen again: a guest that restarted, or cancelled its
+            // shutdown, is no longer stopping.
+            if self.mode == (0, 0) {
+                self.guest_stopping = false;
+            }
+            self.screen_seen |= self.state == VmState::Running;
+            self.update_busy();
+        }
         let Some(fb) = &self.fb else { return };
         let (w, h) = mode;
         if w == 0 || h == 0 {
@@ -2636,6 +2749,12 @@ mod tests {
         // A suspend that failed leaves the VM paused, not "suspending" forever.
         assert_eq!(status_state("suspend failed: disk full"), Some(VmState::Paused));
         assert_eq!(status_state("snapshot: /x"), None);
+        // A snapshot covers the screen; a guest going down or whose screen
+        // went off after it showed one isn't "Starting".
+        assert_eq!(busy_text(true, true, true), ("Taking a snapshot...", true));
+        assert_eq!(busy_text(false, true, true), ("Shutting down...", false));
+        assert_eq!(busy_text(false, false, true), ("Screen off", false));
+        assert_eq!(busy_text(false, false, false), ("", false));
         assert_eq!(snapshot_name("snapshot: /a/b/vm.state/snapshots/snap-20261015-1200"), Some("snap-20261015-1200".into()));
         let long = format!("snapshot: /{}/snap-1", "d".repeat(300));
         assert_eq!(snapshot_name(&long), Some("snap-1".into()), "names come from the whole line");
