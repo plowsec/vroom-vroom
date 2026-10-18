@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::devices::gpu3d::{Blob, Box3d, Create3d, Renderer3d, ShmMapper, Transfer3d};
 use crate::devices::virgl_state::GlState;
-use crate::worker::{QueueCtx, QueueHandler, WorkerSlot, BACKEND_TOKEN_BASE};
+use crate::worker::{Poker, QueueCtx, QueueHandler, WorkerSlot, BACKEND_TOKEN_BASE};
 use crate::{types, ActivateContext, DeviceState, Error, Reader, Result, VirtioDevice, VirtioInterrupt, Writer};
 
 const GET_DISPLAY_INFO: u32 = 0x0100;
@@ -153,6 +153,12 @@ struct Shared {
     irq: Option<Arc<dyn VirtioInterrupt>>,
     /// The guest has Direct3D contexts (Windows), which can't be saved.
     direct3d: bool,
+    /// Windows' 3D display device is off (the VMM turned it off for a
+    /// save): its driver is stopped and resets the GPU when it starts
+    /// again, so Direct3D contexts it left behind are dropped (by the
+    /// worker, woken through `poker`, or at the save).
+    driver_stopped: bool,
+    poker: Option<Poker>,
     /// Windows' Direct3D driver (viogpu3d) runs the display. It offers a
     /// new size as a mode, but Windows hides modes its monitor didn't list
     /// when it was plugged in, so a resize there unplugs the monitor and
@@ -193,7 +199,21 @@ impl Shared {
     fn new(sizes: &[(u32, u32)]) -> Self {
         let (width, height) = sizes.first().copied().unwrap_or((1280, 800));
         let more = sizes.iter().skip(1).map(|&(width, height)| Head { width, height, on: true }).collect();
-        Shared { width, height, more, events_read: 0, irq: None, direct3d: false, replug: false, plug: Plug::In, tries: 0, replugs: 0, shown: (0, 0) }
+        Shared {
+            width,
+            height,
+            more,
+            events_read: 0,
+            irq: None,
+            direct3d: false,
+            driver_stopped: false,
+            poker: None,
+            replug: false,
+            plug: Plug::In,
+            tries: 0,
+            replugs: 0,
+            shown: (0, 0),
+        }
     }
 
     fn display_event(&mut self) {
@@ -348,6 +368,19 @@ impl GpuControl {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).direct3d
     }
 
+    /// The guest's 3D driver is stopped (Windows turned the device off for
+    /// a save) or running again. Stopped, a save drops the Direct3D
+    /// contexts it left behind instead of refusing.
+    pub fn set_driver_stopped(&self, stopped: bool) {
+        let mut s = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        s.driver_stopped = stopped;
+        let poker = s.poker.clone().filter(|_| stopped);
+        drop(s);
+        if let Some(p) = poker {
+            p.poke();
+        }
+    }
+
     /// Unplug the monitor and plug it back in at the same size (Windows'
     /// 3D driver; others get a display event): the guest sets a mode, and
     /// a scanout, again.
@@ -435,11 +468,12 @@ impl Gpu {
     /// clears "its framebuffer", BAR 0, with stores a hypervisor can't
     /// decode, and the VM stops. Give 2D GPUs like that `size` bytes of
     /// plain memory there (as QEMU's virtio-vga has), the registers next.
-    /// The device never reads it.
+    /// The device never reads it. Windows' 3D driver (viogpu3d) wants it
+    /// too: when it stops (vroom turns it off for a save) it hands
+    /// Windows' basic display driver a 1024x768 framebuffer at BAR 0,
+    /// which was the registers.
     pub fn with_vram(mut self, mapper: Arc<dyn ShmMapper>, size: u64) -> Self {
-        if self.three_d.is_none() {
-            self.vram = Some((mapper, size));
-        }
+        self.vram = Some((mapper, size));
         self
     }
 
@@ -1120,6 +1154,20 @@ impl GpuHandler {
             SET_SCANOUT_BLOB => (self.set_scanout_blob(r), vec![]),
             _ => (ERR_UNSPEC, vec![]),
         }
+    }
+
+    /// Drop the Direct3D contexts a stopped driver left behind (see
+    /// `Shared::driver_stopped`). How many there were.
+    fn drop_direct3d(&mut self) -> usize {
+        let Some(t) = self.three_d.clone() else { return 0 };
+        let gone: Vec<u32> = self.ctx_info.iter().filter(|(_, c)| c.capset == CAPSET_NEPTUNE).map(|(&id, _)| id).collect();
+        for id in &gone {
+            self.contexts.retain(|c| c != id);
+            self.ctx_info.remove(id);
+            t.r().context_destroy(*id);
+        }
+        self.note_direct3d();
+        gone.len()
     }
 
     fn note_direct3d(&self) {
@@ -2253,9 +2301,21 @@ impl QueueHandler for GpuHandler {
         }
     }
 
+    fn attach(&mut self, poker: Poker) {
+        self.shared.lock().unwrap_or_else(|e| e.into_inner()).poker = Some(poker);
+    }
+
     fn backend_ready(&mut self, ctx: &mut QueueCtx, _token: usize) {
         self.complete_fences(ctx);
         self.finish_read(false);
+        // Now, while the guest runs: its apps stuck waiting on those
+        // contexts' rings get the "fatal" status and let go.
+        if self.shared.lock().unwrap_or_else(|e| e.into_inner()).driver_stopped {
+            let n = self.drop_direct3d();
+            if n > 0 {
+                log::info!("gpu: {n} Direct3D contexts of the stopped driver dropped");
+            }
+        }
     }
 
     fn tick_interval(&mut self) -> Option<Duration> {
@@ -2317,10 +2377,10 @@ impl VirtioDevice for Gpu {
         }
     }
     fn shm_regions(&self) -> Vec<(u8, u64)> {
-        if let Some((_, size)) = &self.vram {
-            return vec![(SHM_VRAM, *size)];
-        }
-        self.three_d.as_ref().map(|t| vec![(SHM_HOST_VISIBLE, t.shm_size)]).unwrap_or_default()
+        // VRAM first: it goes in BAR 0 (`pci_shm_first`).
+        let vram = self.vram.as_ref().map(|(_, size)| (SHM_VRAM, *size));
+        let host = self.three_d.as_ref().map(|t| (SHM_HOST_VISIBLE, t.shm_size));
+        vram.into_iter().chain(host).collect()
     }
     fn set_shm_base(&mut self, id: u8, gpa: u64) {
         if let (SHM_VRAM, Some((m, size))) = (id, &self.vram) {
@@ -2344,6 +2404,7 @@ impl VirtioDevice for Gpu {
         let mut s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
         s.irq = None;
         s.direct3d = false;
+        s.driver_stopped = false;
         // The next driver starts with the monitor plugged in.
         s.replug = false;
         if let Plug::Out { size, .. } | Plug::Back { next: Some(size), .. } = s.plug {
@@ -2363,6 +2424,12 @@ impl VirtioDevice for Gpu {
         self.worker.resume();
     }
     fn save_active(&mut self) -> Result<DeviceState> {
+        if self.shared.lock().unwrap_or_else(|e| e.into_inner()).driver_stopped {
+            let n = self.worker.with(|_, h| h.drop_direct3d()).unwrap_or(0);
+            if n > 0 {
+                log::info!("gpu: {n} Direct3D contexts of the stopped driver dropped");
+            }
+        }
         if let Some(why) = self.worker.with(|_, h| h.snapshot_blocker()).flatten() {
             return Err(Error::Device(format!("the GPU can't be saved: {why}")));
         }

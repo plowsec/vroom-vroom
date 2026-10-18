@@ -69,6 +69,9 @@ const NET_CTRL: &str = "net.ctrl_vq";
 const USB_FILES: &str = "usb.file_shares";
 /// Network adapters in hot plug slots: "adapter:slot,..." (0-based).
 const NET_HOT: &str = "net.hotplug";
+/// Windows' 3D GPU has memory in BAR 0, the registers after the host
+/// window (saves from before have the registers in BAR 0).
+const GPU3D_VRAM: &str = "gpu.bar0_vram";
 
 /// The network adapters the VM saved in `dir` had in hot plug slots:
 /// adapter index to slot.
@@ -85,6 +88,11 @@ pub(crate) fn saved_hot_nets(dir: &Path) -> Result<BTreeMap<usize, usize>> {
         }
     }
     Ok(m)
+}
+
+/// Whether the VM saved in `dir` has memory in its 3D GPU's BAR 0.
+pub(crate) fn saved_gpu3d_vram(dir: &Path) -> bool {
+    SnapshotDir::open(dir).is_ok_and(|s| s.manifest.meta.get(GPU3D_VRAM).is_some_and(|v| v == "1"))
 }
 
 /// The removable shares the VM saved in `dir` has.
@@ -143,6 +151,9 @@ pub(crate) fn save(vmm: &mut Vmm, dir: &Path, description: &str, kind: Kind) -> 
     }
     if vmm.usb_file_slots > 0 {
         m.meta.insert(USB_FILES.into(), vmm.usb_file_slots.to_string());
+    }
+    if vmm.gpu3d_vram {
+        m.meta.insert(GPU3D_VRAM.into(), "1".into());
     }
 
     for (i, v) in vmm.vcpus.iter().enumerate() {

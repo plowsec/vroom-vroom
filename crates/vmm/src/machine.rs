@@ -250,6 +250,8 @@ pub(crate) struct BuildEnv {
     /// A resumed VM's network adapters in hot plug slots: adapter index
     /// to port.
     pub hot_nets: std::collections::BTreeMap<usize, usize>,
+    /// Windows' 3D GPU gets memory in BAR 0 (a resumed VM: if it had it).
+    pub gpu3d_vram: bool,
 }
 
 /// What gets loaded into RAM at (re)boot. Kept so reset can reload it.
@@ -323,6 +325,10 @@ const GPU_SHM_SIZE: u64 = 8 << 30;
 /// (16 MiB, `agent::WINDOWS_MAX_PIXELS`), with room. Only what the guest
 /// writes is ever memory.
 const EXTRA_GPU_VRAM: u64 = 32 << 20;
+/// Windows' 3D GPU: when its driver stops (vroom turns it off for a save)
+/// it hands Windows' basic display driver a 1024x768 framebuffer at BAR 0
+/// (3 MiB). Under 16 MiB, which the driver would take as video memory.
+const GPU3D_VRAM: u64 = 8 << 20;
 
 /// Whether the renderer runs in the VMM (`VROOM_GPU_IN_PROCESS=1`, for
 /// debugging, and off macOS) rather than in a GPU process of its own.
@@ -454,6 +460,13 @@ impl ShmMapper for VmShm {
         // A BAR sits at a multiple of its size. Anything else is the
         // firmware sizing it (all ones) or halfway through moving it.
         if gpa == 0 || size == 0 || !gpa.is_multiple_of(size) || gpa.checked_add(size).is_none() {
+            return;
+        }
+        // Halfway through sizing a 64-bit BAR (all ones in its low half
+        // only) a small BAR sits just under 4 GiB, which is RAM: the
+        // filler went there, and moving it on unmapped the guest's RAM.
+        let inside = |base: u64, len: u64| gpa >= base && gpa + size <= base + len;
+        if !inside(layout::PCI_MMIO_BASE, layout::PCI_MMIO_SIZE) && !inside(layout::PCI_MMIO64_BASE, layout::PCI_MMIO64_SIZE) {
             return;
         }
         let mut f = self.filler.lock().unwrap_or_else(|e| e.into_inner());
@@ -691,6 +704,9 @@ pub(crate) fn build(
             // draws on the first and copies to the others.
             if config.display.gpu == Gpu::Virtio3d && n == 0 {
                 gpu = gpu.with_3d(three_d(&vm, config, &mem, &env.state_dir)?);
+                if config.guest_os() == GuestOs::Windows && env.gpu3d_vram {
+                    gpu = gpu.with_vram(Arc::new(VmShm { vm: vm.clone(), filler: Mutex::new(None) }), GPU3D_VRAM);
+                }
             }
             if n > 0 {
                 // Room for the framebuffer Windows' 2D driver clears.
