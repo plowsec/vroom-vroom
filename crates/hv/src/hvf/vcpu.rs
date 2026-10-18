@@ -11,6 +11,7 @@ use crate::debug::{arm64_reason, arm64_el1_exception_entry, DebugConfig, DebugRe
 const MDSCR: u16 = 0x8012;
 const BVR: u16 = 0x8004;
 const BCR: u16 = 0x8005;
+/// Fewest hardware breakpoints the debugger supports; the CPU may have more.
 const DEBUG_SLOTS: usize = 4;
 const WATCH_SLOTS: usize = 2;
 const WVR: u16 = 0x8006;
@@ -72,6 +73,8 @@ pub struct HvfVcpu {
     debug: DebugConfig,
     /// Guest debug state while the host owns the hardware registers.
     guest_debug: Vec<(u16, u64)>,
+    /// Hardware breakpoints this CPU has (ID_AA64DFR0_EL1.BRPs + 1).
+    breakpoint_slots: usize,
     /// An emulated instruction retired; stop before executing its successor.
     pending_debug_step: bool,
     /// The address an access we can't emulate faulted at, since when,
@@ -94,7 +97,7 @@ impl HvfVcpu {
             ffi::hv_vcpu_create(&mut id, &mut exit, std::ptr::null_mut())
         })?;
         let mpidr = aarch64::mpidr_for(index);
-        let v = HvfVcpu {
+        let mut v = HvfVcpu {
             id,
             index,
             mpidr,
@@ -111,6 +114,7 @@ impl HvfVcpu {
             el2,
             debug: DebugConfig::default(),
             guest_debug: Vec::new(),
+            breakpoint_slots: 0,
             pending_debug_step: false,
             undecodable: None,
             dirty,
@@ -121,6 +125,7 @@ impl HvfVcpu {
         // PMU accesses; Windows requires a PMU (its boot manager reads
         // PMCR_EL0 unconditionally). Once advertised, HVF virtualizes it.
         let dfr0 = v.get_sys(ffi::HV_SYS_REG_ID_AA64DFR0_EL1)?;
+        v.breakpoint_slots = ((dfr0 >> 12) & 15) as usize + 1;
         if (dfr0 >> 8) & 0xf == 0 {
             v.set_sys(ffi::HV_SYS_REG_ID_AA64DFR0_EL1, dfr0 | (1 << 8))?;
         }
@@ -455,8 +460,8 @@ impl Vcpu for HvfVcpu {
         if self.el2 {
             return Err(Error::Unsupported("debugging nested EL2 guests"));
         }
-        if config.breakpoints.len() > DEBUG_SLOTS || config.breakpoints.iter().any(|a| a & 3 != 0) {
-            return Err(Error::Invalid("at most four aligned ARM64 breakpoints".into()));
+        if config.breakpoints.len() > self.breakpoint_slots || config.breakpoints.iter().any(|a| a & 3 != 0) {
+            return Err(Error::Invalid(format!("at most {} aligned ARM64 breakpoints", self.breakpoint_slots)));
         }
         if config.watchpoints.len() > WATCH_SLOTS {
             return Err(Error::Invalid("at most two hardware watchpoints".into()));
@@ -467,12 +472,11 @@ impl Vcpu for HvfVcpu {
         }
         if config.enabled && !self.debug.enabled {
             // Query before changing anything, and retain guest state for detach.
-            let count = ((self.get_sys(ffi::HV_SYS_REG_ID_AA64DFR0_EL1)? >> 12) & 15) + 1;
-            if count < DEBUG_SLOTS as u64 {
+            if self.breakpoint_slots < DEBUG_SLOTS {
                 return Err(Error::Unsupported("fewer than four hardware breakpoints"));
             }
             let mut saved = vec![(MDSCR, self.get_sys(MDSCR)?)];
-            for i in 0..DEBUG_SLOTS as u16 {
+            for i in 0..self.breakpoint_slots as u16 {
                 saved.push((BVR + i * 8, self.get_sys(BVR + i * 8)?));
                 saved.push((BCR + i * 8, self.get_sys(BCR + i * 8)?));
             }
@@ -490,7 +494,7 @@ impl Vcpu for HvfVcpu {
         // SAFETY: owning thread, live vCPU.
         check("trap debug registers", unsafe { ffi::hv_vcpu_set_trap_debug_reg_accesses(self.id, config.enabled) })?;
         if config.enabled {
-            for i in 0..DEBUG_SLOTS {
+            for i in 0..self.breakpoint_slots {
                 self.set_sys(BCR + i as u16 * 8, 0)?;
                 if let Some(&address) = config.breakpoints.get(i) {
                     self.set_sys(BVR + i as u16 * 8, address)?;

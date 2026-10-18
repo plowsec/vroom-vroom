@@ -256,10 +256,9 @@ fn main() -> Result<()> {
                 for finding in &result.findings {
                     store.save_finding(finding, &input)?;
                 }
-                let unstable = result
-                    .findings
-                    .iter()
-                    .any(|finding| matches!(finding.class, BugClass::BugCheck | BugClass::Timeout));
+                // A bugcheck stopped at `bugcheck_pc` resets in place like a
+                // clean input; a timeout or a guest reset restores from disk.
+                let unstable = result.reopen;
                 println!("{}", serde_json::to_string(&result)?);
                 std::io::stdout().flush()?;
                 if i % 25 == 0 {
@@ -369,9 +368,7 @@ fn main() -> Result<()> {
                 Some(format!("ioctl_{:08x}", probe.baseline_ioctl)),
             )?;
             let mut recoveries = 0;
-            if baseline_result.finding.as_ref().is_some_and(|finding| {
-                matches!(finding.class, BugClass::BugCheck | BugClass::Timeout)
-            }) {
+            if baseline_result.reopen {
                 engine = engine.reopen()?;
                 recoveries += 1;
                 inputs_since_reopen = 0;
@@ -413,10 +410,7 @@ fn main() -> Result<()> {
                 };
                 write_probe_row(&mut report, ioctl, false, differs, &result, profile)?;
                 tested_candidates += 1;
-                let unstable = result.finding.as_ref().is_some_and(|finding| {
-                    matches!(finding.class, BugClass::BugCheck | BugClass::Timeout)
-                });
-                if unstable {
+                if result.reopen {
                     eprintln!(
                         "restoring the clean checkpoint after IOCTL {ioctl:#010x}: {:?}",
                         result.finding.as_ref().map(|finding| finding.class)

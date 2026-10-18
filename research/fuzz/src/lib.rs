@@ -107,6 +107,13 @@ pub struct Harness {
     /// such as HEVD whose deliberate faults reset the lab guest.
     #[serde(default)]
     pub reset_is_bugcheck: bool,
+    /// Guest VA of the kernel's bugcheck entry (Windows: `KeBugCheckEx`).
+    /// Any thread reaching it ends the input with a bugcheck finding before
+    /// the guest crashes, and the VM is reset in place instead of restored
+    /// from disk. Takes a hardware breakpoint beyond the four the coverage
+    /// breakpoints use.
+    #[serde(default)]
+    pub bugcheck_pc: Option<u64>,
     /// Reopen the VM after this many completed inputs. Zero keeps the COW VM
     /// resident; small values are useful on hosts whose hypervisor retains
     /// stale mappings across remaps.
@@ -265,9 +272,12 @@ impl Harness {
                     .into(),
             ));
         }
-        if h.stop_pc.is_some_and(|pc| pc & 3 != 0) || h.entry_pc.is_some_and(|pc| pc & 3 != 0) {
+        if h.stop_pc.is_some_and(|pc| pc & 3 != 0)
+            || h.entry_pc.is_some_and(|pc| pc & 3 != 0)
+            || h.bugcheck_pc.is_some_and(|pc| pc & 3 != 0)
+        {
             return Err(Error::Invalid(
-                "entry_pc and stop_pc must be instruction aligned".into(),
+                "entry_pc, stop_pc and bugcheck_pc must be instruction aligned".into(),
             ));
         }
         if h.coverage.iter().any(|b| {
@@ -728,7 +738,7 @@ impl Engine {
         // COW resets restore the VM in place (`Vmm::research_reset`).
         // `reopen_after: 1` opts out and restores the checkpoint each time.
         let cow_enabled = harness.reopen_after != 1;
-        let vm = vroom_vmm::Vmm::start(
+        let mut vm = vroom_vmm::Vmm::start(
             config,
             hv,
             vroom_vmm::VmmOptions {
@@ -741,6 +751,8 @@ impl Engine {
                 sandbox: false,
             },
         )?;
+        // Each reopen restores the checkpoint onto a new disk overlay.
+        vm.research_discard_disk_layers();
         Ok(Self {
             vm,
             harness,
@@ -825,6 +837,25 @@ impl Engine {
                     .collect::<Vec<_>>()
                     .join(", ")
             );
+        }
+        if let Some(bugcheck) = self.harness.bugcheck_pc {
+            // The bugcheck breakpoint sits beyond the four coverage slots.
+            // Check the backend has it before the first input needs it.
+            let fits = self.vm.debug_configure(
+                self.harness.cpu,
+                vroom_hv::debug::DebugConfig {
+                    enabled: true,
+                    breakpoints: vec![bugcheck; 5],
+                    ..Default::default()
+                },
+            );
+            self.vm
+                .debug_configure(self.harness.cpu, vroom_hv::debug::DebugConfig::default())?;
+            fits.map_err(|error| {
+                Error::Invalid(format!(
+                    "bugcheck_pc needs a fifth hardware breakpoint: {error}"
+                ))
+            })?;
         }
         if self.cow_enabled {
             self.vm.research_arm()?;
@@ -1111,7 +1142,7 @@ impl Engine {
             eprintln!("initial breakpoints={initial_breakpoints:?}");
         }
         let mut armed = initial_breakpoints;
-        configure_all(&self.vm, &armed, &case_watchpoints)?;
+        configure_all(&self.vm, &armed, self.harness.bugcheck_pc, &case_watchpoints)?;
         let isolate = self.harness.isolate_cpu.then_some(self.harness.cpu);
         if isolate.is_some() {
             // PSTATE.I and F: no interrupt can preempt the target thread.
@@ -1131,6 +1162,9 @@ impl Engine {
         let mut finding = None;
         let mut findings = Vec::<Finding>::new();
         let mut watch_hits = BTreeMap::<usize, u64>::new();
+        // The VM left the checkpoint's machine (a timeout, a guest reset, a
+        // VMM failure): restore the checkpoint rather than reset in place.
+        let mut reopen = false;
         let entry_block = &self.harness.coverage[entry_index];
         let mut previous_pc = Some(entry_block.id);
         let mut call_step_targets = Vec::new();
@@ -1151,6 +1185,7 @@ impl Engine {
                     })?;
                     eprintln!("timeout at pc={:#x}", registers.pc);
                 }
+                reopen = true;
                 finding = detect("execution timeout", None, &token, true);
                 if let Some(found) = &finding {
                     findings.push(found.clone());
@@ -1169,13 +1204,39 @@ impl Engine {
                         continue;
                     }
                     self.vm.pause()?;
+                    if self.harness.bugcheck_pc == Some(stop.pc) {
+                        // Any thread: the kernel is going down. Stop before
+                        // it does, so an in-place reset recovers the VM.
+                        let state = self.vm.debug_registers(stop.cpu as usize)?;
+                        let registers = Registers::from_state(&state).map_err(|error| {
+                            Error::Invalid(format!("ARM64 bugcheck registers: {error}"))
+                        })?;
+                        let x = &registers.x;
+                        let bugcheck = Finding {
+                            class: BugClass::BugCheck,
+                            detail: format!(
+                                "bugcheck {:#x} ({:#x}, {:#x}, {:#x}, {:#x}) from {:#x} on cpu {}",
+                                x[0], x[1], x[2], x[3], x[4], x[30], stop.cpu
+                            ),
+                            pc: Some(stop.pc),
+                            input: token.clone(),
+                        };
+                        if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
+                            eprintln!("{}", bugcheck.detail);
+                        }
+                        if finding.is_none() {
+                            finding = Some(bugcheck.clone());
+                        }
+                        findings.push(bugcheck);
+                        break;
+                    }
                     let stepped_own = own_step.take().is_some();
                     if foreign_step.take().is_some()
                         || (stop.reason == vroom_hv::debug::DebugReason::SingleStep && !stepped_own)
                     {
                         // A foreign thread is past the shared site (or a
                         // step a re-arm already cancelled): re-arm, resume.
-                        configure_all(&self.vm, &armed, &case_watchpoints)?;
+                        configure_all(&self.vm, &armed, self.harness.bugcheck_pc, &case_watchpoints)?;
                         resume_vm(&mut self.vm, isolate)?;
                         continue;
                     }
@@ -1201,7 +1262,7 @@ impl Engine {
                                 self.harness.stop_pc,
                                 &active_exception_sites,
                             );
-                            configure_all(&self.vm, &armed, &case_watchpoints)?;
+                            configure_all(&self.vm, &armed, self.harness.bugcheck_pc, &case_watchpoints)?;
                             resume_vm(&mut self.vm, isolate)?;
                             continue;
                         }
@@ -1292,7 +1353,7 @@ impl Engine {
                             self.harness.stop_pc,
                             &active_exception_sites,
                         );
-                        configure_all(&self.vm, &armed, &case_watchpoints)?;
+                        configure_all(&self.vm, &armed, self.harness.bugcheck_pc, &case_watchpoints)?;
                         resume_vm(&mut self.vm, isolate)?;
                         continue;
                     }
@@ -1320,7 +1381,7 @@ impl Engine {
                             self.harness.stop_pc,
                             &active_exception_sites,
                         );
-                        configure_all(&self.vm, &armed, &case_watchpoints)?;
+                        configure_all(&self.vm, &armed, self.harness.bugcheck_pc, &case_watchpoints)?;
                         resume_vm(&mut self.vm, isolate)?;
                         continue;
                     }
@@ -1439,7 +1500,7 @@ impl Engine {
                                 eprintln!("arm block {} successors {:?}", block.id, breakpoints);
                             }
                             armed = breakpoints;
-                            configure_all(&self.vm, &armed, &case_watchpoints)?;
+                            configure_all(&self.vm, &armed, self.harness.bugcheck_pc, &case_watchpoints)?;
                             resume_vm(&mut self.vm, isolate)?;
                         }
                     } else if stop.reason == vroom_hv::debug::DebugReason::SingleStep {
@@ -1466,7 +1527,7 @@ impl Engine {
                                 &active_exception_sites,
                             );
                             armed = breakpoints;
-                            configure_all(&self.vm, &armed, &case_watchpoints)?;
+                            configure_all(&self.vm, &armed, self.harness.bugcheck_pc, &case_watchpoints)?;
                             resume_vm(&mut self.vm, isolate)?;
                         } else {
                             armed = breakpoint_set(
@@ -1475,13 +1536,14 @@ impl Engine {
                                 self.harness.stop_pc,
                                 &active_exception_sites,
                             );
-                            configure_all(&self.vm, &armed, &case_watchpoints)?;
+                            configure_all(&self.vm, &armed, self.harness.bugcheck_pc, &case_watchpoints)?;
                             resume_vm(&mut self.vm, isolate)?;
                         }
                     }
                 }
                 vroom_vmm::VmEvent::Crashed(detail) => {
                     self.vm.pause()?;
+                    reopen = true;
                     finding = detect(&detail, None, &token, false);
                     if let Some(found) = &finding {
                         findings.push(found.clone());
@@ -1494,6 +1556,7 @@ impl Engine {
                 }
                 vroom_vmm::VmEvent::Reset => {
                     self.vm.pause()?;
+                    reopen = true;
                     if self.harness.reset_is_bugcheck {
                         finding = detect("guest reset after bugcheck", None, &token, false);
                         if let Some(found) = &finding {
@@ -1517,6 +1580,7 @@ impl Engine {
             elapsed_us: start.elapsed().as_micros() as u64,
             foreign_threads,
             reset_us,
+            reopen,
         })
     }
 }
@@ -1627,18 +1691,24 @@ fn elr_el1(state: &vroom_hv::VcpuState) -> Option<u64> {
 }
 
 /// Arm the same breakpoints on every vCPU: the testcase's thread can be
-/// preempted and resumed on another CPU.
+/// preempted and resumed on another CPU. The bugcheck entry takes a slot of
+/// its own after the (at most four) coverage breakpoints.
 fn configure_all(
     vm: &vroom_vmm::Vmm,
     breakpoints: &[u64],
+    bugcheck: Option<u64>,
     watches: &[MemoryWatch],
 ) -> Result<()> {
+    let mut breakpoints = breakpoints.to_vec();
+    if let Some(pc) = bugcheck.filter(|pc| !breakpoints.contains(pc)) {
+        breakpoints.push(pc);
+    }
     for cpu in 0..vm.config().cpus as usize {
         vm.debug_configure(
             cpu,
             vroom_hv::debug::DebugConfig {
                 enabled: true,
-                breakpoints: breakpoints.to_vec(),
+                breakpoints: breakpoints.clone(),
                 watchpoints: hv_watchpoints(watches),
                 ..Default::default()
             },
@@ -1692,6 +1762,11 @@ pub struct RunResult {
     /// Time spent restoring the COW baseline before this input.
     #[serde(default)]
     pub reset_us: u64,
+    /// The input ended in a timeout, a guest reset or a VMM failure, so the
+    /// in-place reset can't be trusted: restore the checkpoint before the
+    /// next input. A bugcheck stopped at `bugcheck_pc` doesn't need this.
+    #[serde(default)]
+    pub reopen: bool,
 }
 
 #[cfg(test)]
