@@ -309,8 +309,9 @@ impl HvfVcpu {
                         // just now. One from long ago starts a new run.
                         Some((at, since, last)) if at == ipa && now.duration_since(last) < UNDECODABLE_GRACE => {
                             if now.duration_since(since) > UNDECODABLE_GRACE {
+                                let pc = self.get(ffi::HV_REG_PC).unwrap_or(0);
                                 return Err(Error::GuestFault(format!(
-                                    "undecodable MMIO access at {ipa:#x} (esr {esr:#x})"
+                                    "undecodable MMIO access at {ipa:#x} (esr {esr:#x}, pc {pc:#x})"
                                 )));
                             }
                             self.undecodable = Some((at, since, now));
