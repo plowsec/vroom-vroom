@@ -28,6 +28,8 @@ pub enum VcpuCmd {
     Pause(Sender<()>),
     Resume,
     Save(Sender<Result<VcpuState>>),
+    /// This CPU's interrupt controller registers; load the given ones first.
+    GicRegisters(Option<Vec<(u32, u64)>>, Sender<Result<Vec<(u32, u64)>>>),
     /// Load saved registers; `on` says whether the CPU should run on resume.
     Restore(Box<VcpuState>, bool, Sender<Result<()>>),
     /// Back to power-on state. Boot CPU gets `Some(regs)`.
@@ -45,6 +47,7 @@ impl std::fmt::Debug for VcpuCmd {
             VcpuCmd::Pause(_) => "Pause",
             VcpuCmd::Resume => "Resume",
             VcpuCmd::Save(_) => "Save",
+            VcpuCmd::GicRegisters(..) => "GicRegisters",
             VcpuCmd::Restore(..) => "Restore",
             VcpuCmd::Reset(..) => "Reset",
             VcpuCmd::Stop => "Stop",
@@ -78,6 +81,9 @@ pub struct VcpuShared {
     pub events: Sender<VmEvent>,
     /// Filled once all threads are up; used for CPU_ON.
     pub peers: OnceLock<Vec<Peer>>,
+    /// MMIO accesses vCPUs passed to devices (research resets skip the
+    /// device restore when none happened and the devices stayed paused).
+    pub device_exits: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for VcpuShared {
@@ -209,6 +215,14 @@ impl VcpuLoop {
     /// Returns false when the thread should exit.
     fn command(&mut self, cmd: VcpuCmd) -> bool {
         match cmd {
+            VcpuCmd::GicRegisters(restore, reply) => {
+                let result = if self.paused {
+                    self.vcpu.gic_cpu_registers(restore.as_deref()).map_err(Error::Hv)
+                } else {
+                    Err(Error::Setup("pause before touching interrupt registers".into()))
+                };
+                let _ = reply.send(result);
+            }
             VcpuCmd::WriteRegister(register, value, reply) => {
                 let result = if self.paused {
                     self.vcpu.debug_write_register(register, value).map_err(Error::Hv)
@@ -288,6 +302,7 @@ impl VcpuLoop {
             }
             VcpuExit::Kicked => {}
             VcpuExit::MmioRead { addr, len } => {
+                self.shared.device_exits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let mut buf = [0u8; 8];
                 let len = len.min(8);
                 if !self.shared.mmio.read(addr, &mut buf[..len]) {
@@ -296,6 +311,7 @@ impl VcpuLoop {
                 self.vcpu.complete_mmio_read(&buf[..len])?;
             }
             VcpuExit::MmioWrite { addr, len, data } => {
+                self.shared.device_exits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if !self.shared.mmio.write(addr, &data[..len.min(8)]) {
                     log::debug!("vcpu{}: write to unmapped {addr:#x}", self.index());
                 }

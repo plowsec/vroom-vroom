@@ -981,6 +981,7 @@ pub(crate) fn build(
         cpus: Mutex::new(CpuTable::new(mpidrs)),
         events,
         peers: OnceLock::new(),
+        device_exits: std::sync::atomic::AtomicU64::new(0),
     });
     let mut vcpus = Vec::new();
     for i in 0..config.cpus {

@@ -95,17 +95,16 @@ impl Vmm {
         Ok(self.mem.regions().map(|r| (r.start().0, r.len())).collect())
     }
 
-    /// Resume the devices and only the selected CPU: the others stay parked
-    /// (a snapshot fuzzer running one thread without the rest of the guest).
+    /// Resume only the selected CPU: the other CPUs and the device
+    /// workers stay parked (a snapshot fuzzer running one thread without
+    /// the rest of the guest). The CPU can still access devices; a research
+    /// reset then restores them.
     pub fn debug_resume_cpu(&mut self, cpu: usize) -> Result<()> {
         self.require_debug_pause()?;
         let v = self
             .vcpus
             .get(cpu)
             .ok_or_else(|| Error::Setup("invalid CPU index".into()))?;
-        for d in &self.devices {
-            d.lock().unwrap_or_else(|e| e.into_inner()).resume();
-        }
         v.peer.send(VcpuCmd::Resume)?;
         self.state = RunState::Running;
         Ok(())

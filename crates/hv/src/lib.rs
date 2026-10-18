@@ -175,6 +175,13 @@ pub trait Vm: Send + Sync {
     /// Save / restore the interrupt controller (VM must be paused).
     fn save_irqchip(&self) -> Result<IrqChipState>;
     fn restore_irqchip(&self, s: &IrqChipState) -> Result<()>;
+
+    /// Every readable shared interrupt controller register (GIC
+    /// distributor), as (register, value), loading `restore` first when
+    /// given. VM paused. See `Vcpu::gic_cpu_registers`.
+    fn gic_shared_registers(&self, _restore: Option<&[(u32, u64)]>) -> Result<Vec<(u32, u64)>> {
+        Err(Error::Unsupported("per-register interrupt controller access"))
+    }
 }
 
 /// Why the vCPU stopped running guest code.
@@ -224,6 +231,14 @@ pub trait Vcpu {
     /// Configure host debugging on the owning thread, while stopped.
     fn configure_debug(&mut self, _config: &debug::DebugConfig) -> Result<()> {
         Err(Error::Unsupported("host debugging on this backend"))
+    }
+    /// This CPU's interrupt controller registers that change at run time
+    /// (GIC redistributor: groups, enables, pending, active, priorities,
+    /// configuration), as (register, value). With `restore`, load those
+    /// first. On the owning thread, while stopped. A cheaper alternative to
+    /// `Vm::restore_irqchip` for snapshot fuzzing resets.
+    fn gic_cpu_registers(&mut self, _restore: Option<&[(u32, u64)]>) -> Result<Vec<(u32, u64)>> {
+        Err(Error::Unsupported("per-register interrupt controller access"))
     }
     fn index(&self) -> u32;
     fn run(&mut self) -> Result<VcpuExit>;

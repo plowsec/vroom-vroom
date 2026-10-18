@@ -456,6 +456,21 @@ impl Vcpu for HvfVcpu {
         }
     }
 
+    fn gic_cpu_registers(&mut self, restore: Option<&[(u32, u64)]>) -> Result<Vec<(u32, u64)>> {
+        // GICR_ISENABLER0/ISPENDR0/ISACTIVER0 have clear registers 0x80 up.
+        let pair = |reg: u32| matches!(reg, 0x10100 | 0x10200 | 0x10300);
+        if let Some(saved) = restore {
+            super::restore_gic_registers(saved, pair, |reg| self.gicr(reg), |reg, v| self.set_gicr(reg, v))?;
+            return Ok(saved.to_vec());
+        }
+        // IGROUPR0, the set registers, IPRIORITYR0..7, ICFGR0..1.
+        let registers = [0x10080u32, 0x10100, 0x10200, 0x10300]
+            .into_iter()
+            .chain((0..8).map(|i| 0x10400 + 4 * i))
+            .chain([0x10c00, 0x10c04]);
+        registers.map(|reg| Ok((reg, self.gicr(reg)?))).collect()
+    }
+
     fn configure_debug(&mut self, config: &DebugConfig) -> Result<()> {
         if self.el2 {
             return Err(Error::Unsupported("debugging nested EL2 guests"));

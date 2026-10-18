@@ -163,15 +163,28 @@ pub struct Vmm {
     research_baseline: Option<ResearchBaseline>,
 }
 
+/// Interrupt controller registers as (register, value).
+#[cfg(feature = "research")]
+type GicRegisters = Vec<(u32, u64)>;
+
 #[cfg(feature = "research")]
 struct ResearchBaseline {
     devices: Vec<Vec<u8>>,
     vcpus: Vec<VcpuState>,
     irqchip: Option<IrqChipState>,
+    /// Run-time interrupt controller registers, shared then per CPU: what
+    /// a reset restores when the devices stayed idle.
+    gic: Option<(GicRegisters, Vec<GicRegisters>)>,
     clock: u64,
     /// The hypervisor logs guest writes and RAM logs host writes: a reset
     /// copies back only those pages instead of remapping all RAM.
     logged: bool,
+    /// `device_exits` when the devices last held `devices`.
+    device_exits: u64,
+    /// Device workers resumed since then.
+    devices_ran: bool,
+    /// Devices whose saved state changes by itself (`VROOM_COW_VERIFY`).
+    drifting: Vec<bool>,
 }
 
 impl std::fmt::Debug for Vmm {
@@ -328,18 +341,19 @@ impl Vmm {
         if self.research_baseline.is_some() {
             return Err(Error::Setup("research baseline is already armed".into()));
         }
+        let verify = std::env::var_os("VROOM_COW_VERIFY").is_some();
         let mut devices = Vec::with_capacity(self.devices.len());
         for d in &self.devices {
             devices.push(d.lock().unwrap_or_else(|e| e.into_inner()).save()?);
         }
-        let mut vcpus = Vec::with_capacity(self.vcpus.len());
-        for v in &self.vcpus {
-            let (tx, rx) = mpsc::channel();
-            v.peer.send(VcpuCmd::Save(tx))?;
-            vcpus.push(rx.recv_timeout(PAUSE_TIMEOUT).map_err(|_| Error::Timeout)??);
-        }
+        let vcpus = ask_vcpus(&self.vcpus, VcpuCmd::Save)?;
         let irqchip = match self.vm.save_irqchip() {
             Ok(s) => Some(s),
+            Err(vroom_hv::Error::Unsupported(_)) => None,
+            Err(e) => return Err(e.into()),
+        };
+        let gic = match self.vm.gic_shared_registers(None) {
+            Ok(shared) => Some((shared, ask_vcpus(&self.vcpus, |tx| VcpuCmd::GicRegisters(None, tx))?)),
             Err(vroom_hv::Error::Unsupported(_)) => None,
             Err(e) => return Err(e.into()),
         };
@@ -361,8 +375,35 @@ impl Vmm {
         };
         // RAM goes back to here, so the page cache will: the disks must too.
         self.disks.arm_rollback()?;
-        self.research_baseline = Some(ResearchBaseline { devices, vcpus, irqchip, clock, logged });
+        // A device whose saved state moves on its own (the TPM's clock)
+        // can't be compared after a reset.
+        let mut drifting = vec![false; devices.len()];
+        if verify {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            for ((d, state), drifting) in self.devices.iter().zip(&devices).zip(&mut drifting) {
+                *drifting = &d.lock().unwrap_or_else(|e| e.into_inner()).save()? != state;
+            }
+        }
+        let device_exits = self.shared.device_exits.load(std::sync::atomic::Ordering::Relaxed);
+        self.research_baseline = Some(ResearchBaseline {
+            devices,
+            vcpus,
+            irqchip,
+            gic,
+            clock,
+            logged,
+            device_exits,
+            devices_ran: false,
+            drifting,
+        });
         Ok(())
+    }
+
+    #[cfg(feature = "research")]
+    pub(crate) fn research_devices_ran(&mut self) {
+        if let Some(baseline) = &mut self.research_baseline {
+            baseline.devices_ran = true;
+        }
     }
 
     #[cfg(feature = "research")]
@@ -375,13 +416,27 @@ impl Vmm {
 
     #[cfg(feature = "research")]
     /// Restore the armed baseline without rebuilding the VM or its mappings.
+    ///
+    /// When the devices stayed paused (`debug_resume_cpu`) and no vCPU
+    /// touched them, they still hold the baseline and nothing raised a
+    /// shared interrupt: their restore is skipped (it costs ~5 ms on the
+    /// HEVD VM, mostly PCI and the TPM) and the interrupt controller is put
+    /// back register by register (~0.1 ms instead of ~1.7 ms).
+    /// `VROOM_COW_VERIFY=1` checks RAM, those devices and the interrupt
+    /// controller registers against the baseline after every reset.
     pub fn research_reset(&mut self) -> Result<()> {
         if self.state != RunState::Paused {
             return Err(Error::Setup("research reset requires a paused VM".into()));
         }
-        let Some(baseline) = &self.research_baseline else {
+        let verify = std::env::var_os("VROOM_COW_VERIFY").is_some();
+        let device_exits = self.shared.device_exits.load(std::sync::atomic::Ordering::Relaxed);
+        let Some(baseline) = &mut self.research_baseline else {
             return Err(Error::Setup("research baseline is not armed".into()));
         };
+        let devices_idle = !baseline.devices_ran && baseline.device_exits == device_exits;
+        baseline.devices_ran = false;
+        baseline.device_exits = device_exits;
+        let baseline = &*baseline;
         let mem = &self.mem;
         if baseline.logged {
             // Copy back only the pages written since the last reset: by the
@@ -403,7 +458,7 @@ impl Vmm {
                 mem.restore_cow().map_err(|e| vroom_hv::Error::Invalid(format!("COW restore: {e}")))
             })?;
         }
-        if std::env::var_os("VROOM_COW_VERIFY").is_some() {
+        if verify {
             let differ = mem.cow_verify()?;
             if !differ.is_empty() {
                 let first: Vec<String> = differ.iter().take(8).map(|a| format!("{:#x}", a.0)).collect();
@@ -419,12 +474,26 @@ impl Vmm {
         if dropped > 0 {
             log::trace!("research reset: dropped {dropped} bytes of disk writes");
         }
-        if let Some(irqchip) = &baseline.irqchip {
+        let light_gic = baseline.gic.as_ref().filter(|_| devices_idle);
+        if let Some((shared, _)) = light_gic {
+            self.vm.gic_shared_registers(Some(shared))?;
+        } else if let Some(irqchip) = &baseline.irqchip {
             self.vm.restore_irqchip(irqchip)?;
         }
         self.vm.set_clock(baseline.clock);
-        for (d, state) in self.devices.iter().zip(&baseline.devices) {
-            d.lock().unwrap_or_else(|e| e.into_inner()).restore(state)?;
+        if devices_idle {
+            if verify {
+                for ((d, state), _) in self.devices.iter().zip(&baseline.devices).zip(&baseline.drifting).filter(|(_, drifting)| !**drifting) {
+                    let mut d = d.lock().unwrap_or_else(|e| e.into_inner());
+                    if &d.save()? != state {
+                        return Err(Error::Setup(format!("device {} changed without being accessed", d.snapshot_id())));
+                    }
+                }
+            }
+        } else {
+            for (d, state) in self.devices.iter().zip(&baseline.devices) {
+                d.lock().unwrap_or_else(|e| e.into_inner()).restore(state)?;
+            }
         }
         let mut cpus = self.shared.cpus.lock().unwrap_or_else(|e| e.into_inner()).clone();
         for (v, state) in self.vcpus.iter().zip(&baseline.vcpus) {
@@ -433,7 +502,30 @@ impl Vmm {
             v.peer.send(VcpuCmd::Restore(Box::new(state.clone()), state.powered_on, tx))?;
             rx.recv_timeout(PAUSE_TIMEOUT).map_err(|_| Error::Timeout)??;
         }
+        if let Some((_, gic_cpus)) = light_gic {
+            for (v, saved) in self.vcpus.iter().zip(gic_cpus) {
+                let (tx, rx) = mpsc::channel();
+                v.peer.send(VcpuCmd::GicRegisters(Some(saved.clone()), tx))?;
+                rx.recv_timeout(PAUSE_TIMEOUT).map_err(|_| Error::Timeout)??;
+            }
+        }
         *self.shared.cpus.lock().unwrap_or_else(|e| e.into_inner()) = cpus;
+        if verify {
+            // The irqchip blob can't be compared: reading registers reorders
+            // HVF's internal state. Every architectural register can.
+            if let Some((shared, gic_cpus)) = &baseline.gic {
+                let mut differ: Vec<String> = Vec::new();
+                let now = self.vm.gic_shared_registers(None)?;
+                differ.extend(now.iter().zip(shared).filter(|(a, b)| a != b).map(|(a, b)| format!("GICD+{:#x} {:#x}->{:#x}", a.0, b.1, a.1)));
+                let now = ask_vcpus(&self.vcpus, |tx| VcpuCmd::GicRegisters(None, tx))?;
+                for (cpu, (now, saved)) in now.iter().zip(gic_cpus).enumerate() {
+                    differ.extend(now.iter().zip(saved).filter(|(a, b)| a != b).map(|(a, b)| format!("cpu{cpu} GICR+{:#x} {:#x}->{:#x}", a.0, b.1, a.1)));
+                }
+                if !differ.is_empty() {
+                    return Err(Error::Setup(format!("interrupt controller off the baseline: {}", differ.join(", "))));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -513,6 +605,8 @@ impl Vmm {
         if self.state != RunState::Paused {
             return Ok(());
         }
+        #[cfg(feature = "research")]
+        self.research_devices_ran();
         for d in &self.devices {
             d.lock().unwrap_or_else(|e| e.into_inner()).resume();
         }
@@ -674,6 +768,18 @@ impl Drop for Vmm {
             self.shutdown();
         }
     }
+}
+
+#[cfg(feature = "research")]
+/// Send every vCPU a command and collect the answers in order.
+fn ask_vcpus<T>(vcpus: &[vcpu::VcpuHandle], command: impl Fn(mpsc::Sender<Result<T>>) -> VcpuCmd) -> Result<Vec<T>> {
+    let mut out = Vec::with_capacity(vcpus.len());
+    for v in vcpus {
+        let (tx, rx) = mpsc::channel();
+        v.peer.send(command(tx))?;
+        out.push(rx.recv_timeout(PAUSE_TIMEOUT).map_err(|_| Error::Timeout)??);
+    }
+    Ok(out)
 }
 
 /// The VM's hardware UUID (SMBIOS): random once, then kept in the state

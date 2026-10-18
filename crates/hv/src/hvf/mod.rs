@@ -11,6 +11,34 @@ mod dirty;
 mod ffi;
 mod vcpu;
 
+/// GIC registers that change at run time are restored by value, except
+/// set/clear pairs (the clear register sits 0x80 above the set one): only
+/// the bits that differ are cleared or set.
+fn restore_gic_registers(
+    saved: &[(u32, u64)],
+    pair: impl Fn(u32) -> bool,
+    get: impl Fn(u32) -> Result<u64>,
+    set: impl Fn(u32, u64) -> Result<()>,
+) -> Result<()> {
+    for &(reg, value) in saved {
+        let now = get(reg)?;
+        if now == value {
+            continue;
+        }
+        if pair(reg) {
+            if now & !value != 0 {
+                set(reg + 0x80, now & !value)?;
+            }
+            if value & !now != 0 {
+                set(reg, value & !now)?;
+            }
+        } else {
+            set(reg, value)?;
+        }
+    }
+    Ok(())
+}
+
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -373,6 +401,42 @@ impl Vm for HvfVm {
             ffi::hv_gic_state_get_data(st.0, blob.as_mut_ptr() as *mut c_void)
         })?;
         Ok(IrqChipState { backend: BACKEND.into(), blob })
+    }
+
+    fn gic_shared_registers(&self, restore: Option<&[(u32, u64)]>) -> Result<Vec<(u32, u64)>> {
+        // GICD_ISENABLER/ISPENDR/ISACTIVER: set registers with a clear
+        // register 0x80 above, left out of the list (they read the same).
+        let pair = |reg: u32| matches!(reg, 0x100..=0x17f | 0x200..=0x27f | 0x300..=0x37f);
+        let clear = |reg: u32| matches!(reg, 0x180..=0x1ff | 0x280..=0x2ff | 0x380..=0x3ff);
+        let get = |reg: u32| {
+            let mut v = 0;
+            // SAFETY: valid out pointer; the GIC exists once vCPUs do.
+            check("hv_gic_get_distributor_reg", unsafe { ffi::hv_gic_get_distributor_reg(reg, &mut v) })?;
+            Ok(v)
+        };
+        if let Some(saved) = restore {
+            restore_gic_registers(saved, pair, get, |reg, v| {
+                // SAFETY: plain register write; vCPUs are stopped.
+                check("hv_gic_set_distributor_reg", unsafe { ffi::hv_gic_set_distributor_reg(reg, v) })
+            })?;
+            return Ok(saved.to_vec());
+        }
+        // 32-bit registers, the 64-bit IROUTERs, the ID registers. HVF
+        // refuses offsets it doesn't implement and write-only ones.
+        let offsets = (0..0x6100u32)
+            .step_by(4)
+            .chain((0x6100..0x8000).step_by(8))
+            .chain((0xffd0..0x10000).step_by(4))
+            .filter(|reg| !clear(*reg));
+        let mut out = Vec::new();
+        for reg in offsets {
+            let mut v = 0;
+            // SAFETY: valid out pointer.
+            if unsafe { ffi::hv_gic_get_distributor_reg(reg, &mut v) } == 0 {
+                out.push((reg, v));
+            }
+        }
+        Ok(out)
     }
 
     fn restore_irqchip(&self, s: &IrqChipState) -> Result<()> {
