@@ -13,6 +13,7 @@
 //! access control, per-user limits, and source-MAC anti-spoofing on every
 //! guest frame.
 
+mod hostonly;
 mod port;
 mod usb;
 
@@ -22,33 +23,20 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use hostonly::{HostOnly, Subnet};
 use port::Port;
 use serde::Deserialize;
-use vroom_net::netd::{read_line, Attach, Hello, Request, Response, Status, UsbRequest, VERSION};
+use vroom_net::netd::{read_line, Attach, HostOnlyNet, Hello, PortInfo, Request, Response, Status, UsbRequest, VERSION};
 
 const MAX_PORTS_PER_USER: usize = 32;
 /// Connections handled at once (each holds a thread): a local user can't
 /// starve the daemon by opening sockets and saying nothing.
 const MAX_CONNS: usize = 64;
 const MAX_FRAME: usize = 65536;
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct HostOnly {
-    name: String,
-    /// e.g. "192.168.77.1/24" (Linux: bridge address; vmnet picks its own).
-    #[serde(default = "default_gateway")]
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    gateway: String,
-}
-
-fn default_gateway() -> String {
-    "192.168.77.1/24".into()
-}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -83,7 +71,8 @@ struct Config {
     /// ending in `*` stands for all that start that way (`en*`).
     #[serde(default)]
     bridge_interfaces: Vec<String>,
-    #[serde(default)]
+    /// None in the file: one, `lab` on 192.168.77.1/24.
+    #[serde(default = "hostonly::defaults")]
     host_only: Vec<HostOnly>,
     #[serde(default)]
     usb: UsbConfig,
@@ -112,9 +101,21 @@ fn iface_allowed(patterns: &[String], iface: &str) -> bool {
 
 struct State {
     cfg: Config,
+    /// `cfg.host_only`'s subnets, in order.
+    subnets: Vec<Subnet>,
     /// uid -> open ports
     per_user: Mutex<HashMap<u32, usize>>,
+    /// Open ports by id, with their user: what `status` lists.
+    ports: Mutex<HashMap<u64, (u32, PortInfo)>>,
+    next_port: AtomicU64,
     usb: usb::Usb,
+}
+
+impl State {
+    fn new(cfg: Config, usb: usb::Usb) -> Result<State, String> {
+        let subnets = hostonly::check(&cfg.host_only)?;
+        Ok(State { cfg, subnets, per_user: Mutex::new(HashMap::new()), ports: Mutex::new(HashMap::new()), next_port: AtomicU64::new(0), usb })
+    }
 }
 
 fn peer_uid(s: &UnixStream) -> Option<u32> {
@@ -162,7 +163,7 @@ fn open_port(st: &State, req: &Request) -> Result<Arc<dyn Port>, String> {
             #[cfg(target_os = "macos")]
             {
                 let _ = &req.mac;
-                port::vmnet::Vmnet::start(Some(interface), id, None).map(|p| Arc::new(p) as Arc<dyn Port>).map_err(|e| e.to_string())
+                port::vmnet::Vmnet::bridged(interface, id).map(|p| Arc::new(p) as Arc<dyn Port>).map_err(|e| e.to_string())
             }
             #[cfg(target_os = "linux")]
             {
@@ -171,18 +172,18 @@ fn open_port(st: &State, req: &Request) -> Result<Arc<dyn Port>, String> {
             }
         }
         Attach::HostOnly { network } => {
-            let Some(net) = st.cfg.host_only.iter().find(|n| &n.name == network) else {
-                return Err(format!("unknown host-only network {network}"));
+            let Some(i) = st.cfg.host_only.iter().position(|n| &n.name == network) else {
+                let have: Vec<&str> = st.cfg.host_only.iter().map(|n| n.name.as_str()).collect();
+                return Err(format!("no host-only network {network} in netd.toml (it has: {})", if have.is_empty() { "none".into() } else { have.join(", ") }));
             };
             #[cfg(target_os = "macos")]
             {
-                let _ = net;
-                let netid = port::uuid_of(&format!("hostonly/{network}"));
-                port::vmnet::Vmnet::start(None, id, Some(netid)).map(|p| Arc::new(p) as Arc<dyn Port>).map_err(|e| e.to_string())
+                port::vmnet::Vmnet::host_only(&st.subnets[i], id).map(|p| Arc::new(p) as Arc<dyn Port>).map_err(|e| e.to_string())
             }
             #[cfg(target_os = "linux")]
             {
                 let _ = id;
+                let net = &st.cfg.host_only[i];
                 let br = format!("bwh-{}", &network[..network.len().min(10)]);
                 port::tap::ensure_bridge(&br, &net.gateway).map_err(|e| e.to_string())?;
                 port::tap::Tap::open(&br, req.mac).map(|p| Arc::new(p) as Arc<dyn Port>).map_err(|e| e.to_string())
@@ -275,6 +276,15 @@ fn status(st: &State, mut s: UnixStream, uid: u32) {
         version: VERSION,
         bridge_interfaces: st.cfg.bridge_interfaces.clone(),
         host_only: st.cfg.host_only.iter().map(|h| h.name.clone()).collect(),
+        networks: st.cfg.host_only.iter().map(|h| HostOnlyNet { name: h.name.clone(), gateway: h.gateway.clone() }).collect(),
+        // Linux: the bridge has the host's address, but nothing serves DHCP yet.
+        host_only_dhcp: cfg!(target_os = "macos"),
+        ports: {
+            let ports = st.ports.lock().unwrap_or_else(|e| e.into_inner());
+            let mut mine: Vec<PortInfo> = ports.values().filter(|(u, _)| *u == uid).map(|(_, p)| p.clone()).collect();
+            mine.sort_by(|a, b| (&a.vm, a.nic).cmp(&(&b.vm, b.nic)));
+            mine
+        },
         usb: why.is_none(),
         usb_why: why.unwrap_or_default(),
     };
@@ -360,7 +370,11 @@ fn net(st: &State, mut s: UnixStream, uid: u32, req: Request) {
     let _ = std::io::Read::read(&mut s, &mut [0u8; 1]);
     drop(vmm_end);
     drop(s);
+    let pid = st.next_port.fetch_add(1, Ordering::Relaxed);
+    let info = PortInfo { vm: req.vm.clone(), nic: req.nic, attach: req.attach.clone(), mac: port.mac() };
+    st.ports.lock().unwrap_or_else(|e| e.into_inner()).insert(pid, (uid, info));
     pump(our_end, port);
+    st.ports.lock().unwrap_or_else(|e| e.into_inner()).remove(&pid);
     log::info!("uid {uid}: {} nic{} detached", req.vm, req.nic);
     release(st);
 }
@@ -422,7 +436,16 @@ fn main() {
     let lib = exe.with_file_name("libusb-1.0.0.dylib");
     let spawner = usb::Exec { libusb: (cfg!(target_os = "macos") && lib.exists()).then_some(lib), exe };
     let usb = usb::Usb::new(cfg.usb.enabled, cfg.usb.group.clone(), Box::new(spawner), Box::new(vroom_usb::list::list), Box::new(usb::in_group));
-    let st = Arc::new(State { cfg, per_user: Mutex::new(HashMap::new()), usb });
+    let st = match State::new(cfg, usb) {
+        Ok(st) => Arc::new(st),
+        Err(e) => {
+            eprintln!("vroom-netd: {path}: {e}");
+            std::process::exit(2);
+        }
+    };
+    for (n, s) in st.cfg.host_only.iter().zip(&st.subnets) {
+        log::info!("host-only {}: host {}/{}, DHCP to {}", n.name, s.host, s.prefix, s.dhcp_end());
+    }
     serve(listener, st);
 }
 
@@ -500,7 +523,7 @@ name = "lab"
         // SAFETY: getuid has no preconditions.
         let me = unsafe { libc::getuid() };
         let usb = usb::Usb::new(usb_on, "admin".into(), Box::new(Fake), Box::new(lister), Box::new(move |uid, _| uid == me));
-        Arc::new(State { cfg, per_user: Mutex::new(HashMap::new()), usb })
+        Arc::new(State::new(cfg, usb).unwrap())
     }
 
     /// One connection to the daemon, served on a thread.
@@ -519,6 +542,20 @@ name = "lab"
     }
 
     #[test]
+    fn host_only_out_of_the_box() {
+        // No [[host_only]]: `lab`, the host on 192.168.77.1/24.
+        let c: Config = toml::from_str("").unwrap();
+        assert_eq!((c.host_only.len(), c.host_only[0].name.as_str(), c.host_only[0].gateway.as_str()), (1, "lab", "192.168.77.1/24"));
+        // An empty list means none.
+        assert!(toml::from_str::<Config>("host_only = []").unwrap().host_only.is_empty());
+        // Overlapping or bad subnets keep netd from starting.
+        let usb = || usb::Usb::new(false, "admin".into(), Box::new(Fake), Box::new(Vec::new), Box::new(|_, _| false));
+        let two = "[[host_only]]\nname = \"a\"\n[[host_only]]\nname = \"b\"\ngateway = \"192.168.77.9/24\"\n";
+        assert!(State::new(toml::from_str(two).unwrap(), usb()).is_err_and(|e| e.contains("overlap")));
+        assert!(State::new(toml::from_str("[[host_only]]\nname = \"a\"\ngateway = \"1.2.3.1/24\"").unwrap(), usb()).is_err());
+    }
+
+    #[test]
     fn interface_patterns() {
         let p = vec!["en*".to_string(), "br0".into()];
         assert!(iface_allowed(&p, "en0") && iface_allowed(&p, "en12") && iface_allowed(&p, "br0"));
@@ -530,6 +567,18 @@ name = "lab"
         let st = state(true);
         let s = vroom_net::netd::status_on(&connect(&st)).unwrap();
         assert_eq!((s.bridge_interfaces.len(), s.host_only.as_slice(), s.usb), (2, &["lab".to_string()][..], true));
+        assert_eq!(s.networks, vec![HostOnlyNet { name: "lab".into(), gateway: "192.168.77.1/24".into() }]);
+        assert_eq!(s.host_only_dhcp, cfg!(target_os = "macos"));
+        // The user's open ports, not others'.
+        // SAFETY: getuid has no preconditions.
+        let me = unsafe { libc::getuid() };
+        let port = |vm: &str| PortInfo { vm: vm.into(), nic: 0, attach: Attach::HostOnly { network: "lab".into() }, mac: [2, 0, 0, 0, 0, 1] };
+        st.ports.lock().unwrap().extend([(1, (me, port("mine"))), (2, (me.wrapping_add(1), port("theirs")))]);
+        assert_eq!(vroom_net::netd::status_on(&connect(&st)).unwrap().ports, vec![port("mine")]);
+        // A user's every port, with the longest names, still fits.
+        let long = "v".repeat(64);
+        st.ports.lock().unwrap().extend((10..10 + MAX_PORTS_PER_USER as u64).map(|i| (i, (me, port(&long)))));
+        assert_eq!(vroom_net::netd::status_on(&connect(&st)).unwrap().ports.len(), MAX_PORTS_PER_USER + 1);
         let st = state(false);
         let s = vroom_net::netd::status_on(&connect(&st)).unwrap();
         assert!(!s.usb && s.usb_why.contains("turned off"));

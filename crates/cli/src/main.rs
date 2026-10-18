@@ -7,6 +7,7 @@ mod disk;
 mod gpu;
 mod import;
 mod log_limit;
+mod net;
 mod new;
 mod session;
 mod snap;
@@ -97,6 +98,8 @@ enum Cmd {
     /// Host USB devices a VM can be given.
     #[command(subcommand)]
     Usb(usb::UsbCmd),
+    /// Host-only networks and the addresses your running VMs got on them.
+    Net,
     /// Create a VM: write <name>.toml and its disk.
     New(new::NewArgs),
     /// Bring a VM over from VMware (copies its disks, VMware's copy stays).
@@ -194,6 +197,7 @@ fn main() -> ExitCode {
         Cmd::VideoHelper { args } => video::helper(&args),
         Cmd::UsbHost(a) => usb::host(a),
         Cmd::Usb(c) => usb::run(c),
+        Cmd::Net => net::run(),
         Cmd::Check { config } => load(&config).and_then(|c| {
             print!("{}", c.to_toml().map_err(|e| e.to_string())?);
             for w in c.warnings() {

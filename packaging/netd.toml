@@ -8,10 +8,12 @@ group = "staff"            # Linux: "vroom"
 # Linux: an existing bridge (br0) you created with your NIC enslaved.
 bridge_interfaces = ["en*"]
 
-# Private host-only networks (VMs + host, no outside access).
+# Private host-only networks (VMs + host, no outside access). gateway:
+# the host's address; macOS serves DHCP for the rest of the subnet. None
+# here: `lab` on 192.168.77.1/24.
 [[host_only]]
 name = "lab"
-gateway = "192.168.77.1/24"   # Linux bridge address; macOS vmnet picks its own
+gateway = "192.168.77.1/24"
 
 # USB devices macOS holds (keyboards, disks, webcams, serial chips): the
 # helper takes them from macOS for a VM. Only members of this group may ask.

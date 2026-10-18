@@ -14,6 +14,9 @@ use serde::{Deserialize, Serialize};
 pub const MAX_CPUS: u32 = 64;
 pub const MAX_DISKS: usize = 16;
 pub const MAX_NICS: usize = 8;
+/// The host-only network an adapter is on when its `network` is unset
+/// (vroom-netd offers it unless told otherwise).
+pub const DEFAULT_HOST_ONLY: &str = "lab";
 pub const MAX_USB: usize = 8;
 pub const MIN_MEMORY_MIB: u64 = 64;
 pub const MAX_MEMORY_MIB: u64 = 512 * 1024;
@@ -669,7 +672,8 @@ pub struct Net {
     /// Bridged: host interface (e.g. "en0").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface: Option<String>,
-    /// Host-only: network name shared between VMs.
+    /// Host-only: network name shared between VMs. Unset:
+    /// [`DEFAULT_HOST_ONLY`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<String>,
     /// NAT: forwarded ports.
@@ -734,10 +738,7 @@ impl Net {
                 if self.interface.is_some() || !self.port_forwards.is_empty() {
                     return bad("host-only takes only network");
                 }
-                match &self.network {
-                    Some(n) => Ok(NetMode::HostOnly { network: n.clone() }),
-                    None => bad("host-only needs network"),
-                }
+                Ok(NetMode::HostOnly { network: self.network.clone().unwrap_or_else(|| DEFAULT_HOST_ONLY.into()) })
             }
         }
     }
@@ -1382,6 +1383,10 @@ guest_to_host = false
         assert_eq!(c.cpus, 4);
         assert_eq!(c.nets.len(), 3);
         assert_eq!(c.nets[1].mode().unwrap(), NetMode::Bridged { interface: "en0".into() });
+        // Host-only without a network name: the default one.
+        let bare = VmConfig::from_toml(&SAMPLE.replace("network = \"lab\"\n", "")).unwrap();
+        assert_eq!(bare.nets[2].mode().unwrap(), NetMode::HostOnly { network: DEFAULT_HOST_ONLY.into() });
+        assert!(!bare.to_toml().unwrap().contains("network ="));
         let NetMode::Nat { port_forwards } = c.nets[0].mode().unwrap() else { panic!() };
         assert_eq!(port_forwards[0].host_addr, "127.0.0.1");
         assert!(c.clipboard.host_to_guest && !c.clipboard.guest_to_host);
@@ -1404,6 +1409,8 @@ guest_to_host = false
         assert!(VmConfig::from_toml(&name).is_err());
         let mixed = SAMPLE.replace("network = \"lab\"", "network = \"lab\"\ninterface = \"en0\"");
         assert!(VmConfig::from_toml(&mixed).is_err());
+        let fwd = SAMPLE.replace("network = \"lab\"", "port_forwards = [{ host_port = 2223, guest_port = 22 }]");
+        assert!(VmConfig::from_toml(&fwd).is_err());
         let cd = SAMPLE.replace("readonly = true\ncdrom", "cdrom");
         assert!(VmConfig::from_toml(&cd).is_err());
     }

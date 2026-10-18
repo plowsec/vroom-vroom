@@ -589,7 +589,8 @@ sudo rm -rf /Library/LaunchDaemons/org.vroom.netd.plist /usr/local/libexec/vroom
 
 `/etc/vroom/netd.toml`: `group` (networking, default `staff`),
 `[usb] group` (default `admin`), `[usb] enabled`, `bridge_interfaces`
-(default `["en*"]`). Restart:
+(default `["en*"]`), `[[host_only]]` (default `lab`, 192.168.77.1/24:
+[NETWORKING.md](NETWORKING.md#host-only)). Restart:
 `sudo launchctl kickstart -k system/org.vroom.netd`.
 
 Linux: `packaging/vroom-netd.service`, group `vroom`.
@@ -652,7 +653,8 @@ or 15 fps. Testing: `VROOM_CAMERA_TEST=1` sends color bars.
 ## Known limitations
 
 - x86_64 hosts build but can't run VMs.
-- Bridged / host-only not tested on real vmnet/tap.
+- Bridged tested on vmnet (Wi-Fi); host-only DHCP on vmnet untested by a
+  guest yet; tap (Linux) untested.
 - Windows 11 installs with hardware checks bypassed (no Secure Boot);
   `tpm = true` (`brew install swtpm`) gives a real TPM 2.0.
 - Windows 3D: Direct3D 11 only.

@@ -76,8 +76,56 @@ app sets it up; by hand: [GUIDE.md](GUIDE.md#the-root-helper-vroom-netd).
 - netd accepts only locally administered unicast MACs (`x2:`, `x6:`,
   `xA:`, `xE:`; the default `02:...` is one), refuses other source MACs,
   and caps 64 connections and 32 ports per user.
-- Host-only on macOS: a vmnet network by name, no DHCP and no host
-  address on it. Use static addresses.
+- Host-only: a private network of the host and its VMs, no way out.
+
+## Host-only
+
+```toml
+[[net]]
+mode = "host-only"     # network = "lab", the default
+```
+
+| Network | Host | Guests (DHCP) |
+|---|---|---|
+| `lab` (default) | `192.168.77.1` | `.2` to `.254`, the same one per VM adapter |
+
+```bash
+vroom net                         # each running VM's address
+ssh user@192.168.77.2
+```
+
+- macOS: vmnet host mode. vmnet makes a `bridgeN` with the host's address
+  and serves DHCP (`bootpd`, leases in `/var/db/dhcpd_leases`). The host
+  doesn't route or NAT for it: no way out.
+- The lease follows the MAC vmnet gives the adapter, fixed per VM name and
+  adapter number.
+- VMs on the same network reach each other; other networks are other
+  subnets, other bridges.
+- More networks, other subnets: `/etc/vroom/netd.toml`, private ranges,
+  /16 to /29, no overlaps; the host is the address given, DHCP the rest
+  above it:
+
+  ```toml
+  [[host_only]]
+  name = "lab"
+  gateway = "192.168.77.1/24"
+  [[host_only]]
+  name = "isolated"
+  gateway = "10.77.0.1/24"
+  ```
+
+  No `[[host_only]]` at all: `lab` as above. Restart:
+  `sudo launchctl kickstart -k system/org.vroom.netd`.
+- Windows names it an unidentified, public network: its firewall drops
+  ping and most inbound. `Set-NetConnectionProfile -NetworkCategory
+  Private`, or allow the rule (OpenSSH Server adds its own for 22).
+- macOS firewall with "Automatically allow built-in software" off: unblock
+  `/usr/libexec/bootpd`, or no DHCP.
+- A netd from before (`vroom net` says so) puts host-only VMs on an
+  isolated vmnet network: no DHCP, no host. Set it up again (the app asks
+  at the VM's start).
+- Linux: a `bwh-<name>` bridge with the gateway address; no DHCP yet,
+  static addresses in the guest.
 
 ## Limits
 

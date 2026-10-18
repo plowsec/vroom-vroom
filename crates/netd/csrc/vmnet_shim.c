@@ -15,18 +15,21 @@ typedef struct {
     uint8_t mac[6];
 } bw_vmnet;
 
-// mode: 0 = host-only, 1 = bridged. netid may be NULL (default host net).
+// mode: 0 = host-only, 1 = bridged. Host-only: the network's first and
+// last DHCP addresses and mask. vmnet gives the host `start` on a bridge
+// of its own per subnet and serves DHCP from start+1 to `end`. (A network
+// identifier would isolate it instead: no DHCP, no host address.)
 bw_vmnet *bw_vmnet_start(int mode, const char *bridge_if, const unsigned char *iface_uuid,
-                         const unsigned char *netid, char *err, size_t errlen) {
+                         const char *start, const char *end, const char *mask, char *err, size_t errlen) {
     xpc_object_t desc = xpc_dictionary_create(NULL, NULL, 0);
     xpc_dictionary_set_uint64(desc, vmnet_operation_mode_key, mode ? VMNET_BRIDGED_MODE : VMNET_HOST_MODE);
     if (mode && bridge_if)
         xpc_dictionary_set_string(desc, vmnet_shared_interface_name_key, bridge_if);
     xpc_dictionary_set_uuid(desc, vmnet_interface_id_key, iface_uuid);
-    if (!mode && netid) {
-        if (__builtin_available(macOS 11.0, *)) {
-            xpc_dictionary_set_uuid(desc, vmnet_network_identifier_key, netid);
-        }
+    if (!mode && start && end && mask) {
+        xpc_dictionary_set_string(desc, vmnet_start_address_key, start);
+        xpc_dictionary_set_string(desc, vmnet_end_address_key, end);
+        xpc_dictionary_set_string(desc, vmnet_subnet_mask_key, mask);
     }
     bw_vmnet *v = calloc(1, sizeof(*v));
     v->queue = dispatch_queue_create("org.vroom.vmnet", DISPATCH_QUEUE_SERIAL);
@@ -53,7 +56,11 @@ bw_vmnet *bw_vmnet_start(int mode, const char *bridge_if, const unsigned char *i
     }
     dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
     if (st != VMNET_SUCCESS) {
-        snprintf(err, errlen, "vmnet start failed: status %d", (int)st);
+        const char *why = st == VMNET_FAILURE ? " (not root?)"
+                        : st == VMNET_INVALID_ARGUMENT ? " (invalid argument: the subnet?)"
+                        : st == VMNET_INVALID_ACCESS ? " (not root)"
+                        : st == VMNET_SHARING_SERVICE_BUSY ? " (sharing service busy)" : "";
+        snprintf(err, errlen, "vmnet start failed: status %d%s", (int)st, why);
         free(v);
         return NULL;
     }

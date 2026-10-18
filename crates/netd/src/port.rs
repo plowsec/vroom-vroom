@@ -13,7 +13,7 @@ pub trait Port: Send + Sync {
     fn recv(&self, buf: &mut [u8], timeout: Duration) -> io::Result<usize>;
 }
 
-/// Stable 16-byte id from a string (vmnet interface / network ids).
+/// Stable 16-byte id from a string (vmnet interface ids).
 pub fn uuid_of(s: &str) -> [u8; 16] {
     let mut out = [0u8; 16];
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -36,7 +36,16 @@ pub mod vmnet {
     use std::ffi::{c_char, c_int, c_long, c_void, CString};
 
     extern "C" {
-        fn bw_vmnet_start(mode: c_int, bridge_if: *const c_char, uuid: *const u8, netid: *const u8, err: *mut c_char, errlen: usize) -> *mut c_void;
+        fn bw_vmnet_start(
+            mode: c_int,
+            bridge_if: *const c_char,
+            uuid: *const u8,
+            start: *const c_char,
+            end: *const c_char,
+            mask: *const c_char,
+            err: *mut c_char,
+            errlen: usize,
+        ) -> *mut c_void;
         fn bw_vmnet_info(v: *mut c_void, mac: *mut u8, max_packet: *mut u64);
         fn bw_vmnet_read(v: *mut c_void, buf: *mut u8, len: usize, timeout_ms: c_int) -> c_long;
         fn bw_vmnet_write(v: *mut c_void, buf: *const u8, len: usize) -> c_int;
@@ -56,18 +65,32 @@ pub mod vmnet {
     unsafe impl Sync for Vmnet {}
 
     impl Vmnet {
-        /// `bridge`: Some(ifname) for bridged, None for host-only.
-        pub fn start(bridge: Option<&str>, iface_id: [u8; 16], network: Option<[u8; 16]>) -> io::Result<Vmnet> {
-            let ifname = bridge.map(CString::new).transpose().map_err(|_| io::Error::other("bad interface name"))?;
+        /// Bridged onto `ifname`.
+        pub fn bridged(ifname: &str, iface_id: [u8; 16]) -> io::Result<Vmnet> {
+            let ifname = CString::new(ifname).map_err(|_| io::Error::other("bad interface name"))?;
+            Self::start(Some(&ifname), iface_id, None)
+        }
+
+        /// On host-only subnet `net`: the host has its address there and
+        /// vmnet serves DHCP. Every port on the same subnet shares one host
+        /// bridge, so the VMs on it see each other.
+        pub fn host_only(net: &crate::hostonly::Subnet, iface_id: [u8; 16]) -> io::Result<Vmnet> {
+            let s = |a: std::net::Ipv4Addr| CString::new(a.to_string()).expect("no NUL in an address");
+            Self::start(None, iface_id, Some([s(net.host), s(net.dhcp_end()), s(net.mask())]))
+        }
+
+        fn start(bridge: Option<&CString>, iface_id: [u8; 16], range: Option<[CString; 3]>) -> io::Result<Vmnet> {
             let mut err = [0 as c_char; 256];
-            let net_ptr = network.as_ref().map(|n| n.as_ptr()).unwrap_or(std::ptr::null());
+            let addr = |i: usize| range.as_ref().map_or(std::ptr::null(), |r| r[i].as_ptr());
             // SAFETY: valid pointers for the call's duration.
             let h = unsafe {
                 bw_vmnet_start(
                     bridge.is_some() as c_int,
-                    ifname.as_ref().map(|c| c.as_ptr()).unwrap_or(std::ptr::null()),
+                    bridge.map_or(std::ptr::null(), |c| c.as_ptr()),
                     iface_id.as_ptr(),
-                    net_ptr,
+                    addr(0),
+                    addr(1),
+                    addr(2),
                     err.as_mut_ptr(),
                     err.len(),
                 )
@@ -215,5 +238,20 @@ mod tests {
         assert_eq!(uuid_of("vm/0"), uuid_of("vm/0"));
         assert_ne!(uuid_of("vm/0"), uuid_of("vm/1"));
         assert_eq!(uuid_of("x")[6] >> 4, 4);
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod vmnet_tests {
+    /// Needs root: `sudo cargo test -p vroom-netd -- --ignored host_only_port`.
+    /// The host gets the subnet's first address on a bridge.
+    #[test]
+    #[ignore]
+    fn host_only_port() {
+        let net = crate::hostonly::Subnet::parse("192.168.79.1/24").unwrap();
+        let p = super::vmnet::Vmnet::host_only(&net, super::uuid_of("test/0")).unwrap();
+        let out = std::process::Command::new("/sbin/ifconfig").output().unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).contains("inet 192.168.79.1 "), "no host address on a bridge");
+        drop(p);
     }
 }

@@ -300,8 +300,8 @@ A guest needs a driver and an API its players use. What exists:
   to keep it in. Hot plug for disks (the slots take any virtio device;
   a save would record them as it does adapters) and for VMs on
   virtio-mmio (Linux booted straight into its kernel) isn't there yet.
-  Host-only on macOS gets no DHCP (see NETWORKING.md): netd could run a
-  small DHCP server per host-only network. The netd fixes (frame
+  Host-only on Linux gets no DHCP (see NETWORKING.md): netd could
+  answer guests' DHCP itself, per network. The netd fixes (frame
   buffers, a busy VMM drops frames, not the port) need netd set up
   again.
 - Rosetta for Linux guests (x86_64 Linux programs). Apple only offers it

@@ -51,7 +51,7 @@ video decoding and encoding get one each. [SECURITY.md](docs/SECURITY.md).
 - 3D: Vulkan 1.3 (about 90% of native speed, in windows too) and OpenGL 4.1 in Linux guests, OpenGL 4.4 per app through Zink, Direct3D 11 and OpenGL 4.1 in Windows guests
 - Coherence: Windows and Linux (X11) apps as windows of their own on the Mac
 - Snapshots, suspend/resume, reset
-- NAT with port forwards, several adapters; bridged and host-only via a root helper (one password prompt)
+- NAT with port forwards, several adapters; bridged, and host-only with DHCP (Mac ↔ VMs ↔ VMs), via a root helper (one password prompt)
 - Sound; microphone and camera, opt-in
 - Shared folders (Linux and Windows guests)
 - TPM 2.0 (Windows 11 needs it)
@@ -103,6 +103,7 @@ vroom snapshot list|delete|prune dev.toml
 vroom disk create x.qcow2 --size 64G
 vroom disk compact x.qcow2        # give freed space back to the host
 vroom usb list                    # host USB devices, the id for [[usb]]
+vroom net                         # host-only networks, each running VM's address
 ```
 
 | In the VM window | Keys |

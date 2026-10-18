@@ -58,6 +58,17 @@ impl Helper {
         }
     }
 
+    /// Set up, but from before host-only networks had DHCP and the Mac
+    /// on them (macOS).
+    pub fn host_only_old(&self) -> bool {
+        cfg!(target_os = "macos")
+            && match self {
+                Helper::Ready(s) => !s.host_only_dhcp,
+                Helper::Old => true,
+                _ => false,
+            }
+    }
+
     /// May this user have USB devices macOS holds? Err: why not.
     pub fn usb(&self) -> Result<(), String> {
         match self {

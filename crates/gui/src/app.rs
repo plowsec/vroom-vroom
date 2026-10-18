@@ -25,6 +25,8 @@ use crate::*;
 const TICK: Duration = Duration::from_millis(1500);
 const TOAST_FOR: Duration = Duration::from_secs(5);
 const ERROR_TOAST_FOR: Duration = Duration::from_secs(12);
+/// Asked this run whether to set up an old vroom-netd again.
+static NETD_OLD_ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 struct ToastEntry {
     toast: Toast,
@@ -572,7 +574,7 @@ impl App {
                 },
                 interface: s(n.interface.clone().unwrap_or_default()),
                 iface_index: n.interface.as_ref().and_then(|i| self.host_ifaces.iter().position(|h| h == i)).map_or(-1, |p| p as i32),
-                network: s(n.network.clone().unwrap_or_default()),
+                network: s(n.network.clone().unwrap_or_else(|| vroom_config::DEFAULT_HOST_ONLY.into())),
                 forwards: model(
                     n.port_forwards
                         .iter()
@@ -1551,11 +1553,24 @@ impl App {
         };
         // Bridged and host-only need the root helper: offer to set it up
         // rather than fail to start.
-        if cfg.nets.iter().any(|n| n.mode != vroom_config::NetKind::Nat) && matches!(rootd::state_now(), rootd::Helper::Missing | rootd::Helper::Stopped) {
+        let helper = if cfg.nets.iter().any(|n| n.mode != vroom_config::NetKind::Nat) { rootd::state_now() } else { rootd::Helper::Unknown };
+        if matches!(helper, rootd::Helper::Missing | rootd::Helper::Stopped) {
             return self.ask(
                 "Set up vroom-netd?",
                 "This VM has a bridged or host-only network adapter. Those go through vroom-netd, a small helper that runs as root. It's set up once; macOS asks for an admin password. Start the VM again once it's done.",
                 "Set up",
+                false,
+                "netd.setup",
+            );
+        }
+        // One from before host-only DHCP: the guest would get no address
+        // there. Asked once a run; after that the VM starts anyway.
+        let host_only = cfg.nets.iter().any(|n| n.mode == vroom_config::NetKind::HostOnly);
+        if host_only && helper.host_only_old() && !NETD_OLD_ASKED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            return self.ask(
+                "Set up vroom-netd again?",
+                "This VM has a host-only network adapter. The vroom-netd set up on this Mac is from an older vroom: its host-only networks give no addresses and the Mac isn't on them. The new one gives each VM an address by DHCP and puts the Mac on the network (192.168.77.1 on lab). macOS asks for an admin password. Start the VM again once it's done.",
+                "Set up again",
                 false,
                 "netd.setup",
             );
@@ -1963,7 +1978,12 @@ impl App {
         all.push(e("Import from VMware".into(), "", "upload", "vmware".into()));
         // vroom-netd, the root helper: bridged, host-only, USB devices macOS uses.
         match rootd::state() {
-            rootd::Helper::Ready(_) => all.push(e("Remove vroom-netd (root helper)".into(), "", "shield-off", "netd.remove".into())),
+            h @ rootd::Helper::Ready(_) => {
+                if h.host_only_old() {
+                    all.push(e("Set up vroom-netd again (DHCP on host-only networks)".into(), "", "shield", "netd.setup".into()));
+                }
+                all.push(e("Remove vroom-netd (root helper)".into(), "", "shield-off", "netd.remove".into()))
+            }
             rootd::Helper::Unknown => {}
             _ => all.push(e("Set up vroom-netd (root helper for bridged networking and USB)".into(), "", "shield", "netd.setup".into())),
         }
@@ -2095,7 +2115,7 @@ fn net_summary(n: &vroom_config::Net) -> String {
             }
         }
         NetKind::Bridged => format!("Bridged · {}", n.interface.as_deref().unwrap_or("?")),
-        NetKind::HostOnly => format!("Host-only · {}", n.network.as_deref().unwrap_or("?")),
+        NetKind::HostOnly => format!("Host-only · {}", n.network.as_deref().unwrap_or(vroom_config::DEFAULT_HOST_ONLY)),
     }
 }
 

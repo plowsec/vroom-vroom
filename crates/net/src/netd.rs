@@ -23,6 +23,8 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_SOCKET: &str = "/var/run/vroom/netd.sock";
 pub const VERSION: u32 = 1;
 const MAX_LINE: usize = 4096;
+/// A status line lists the asking user's ports (up to 32): more room.
+const MAX_STATUS: usize = 64 << 10;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "kebab-case", deny_unknown_fields)]
@@ -95,12 +97,39 @@ pub struct Status {
     /// Host-only network names.
     #[serde(default)]
     pub host_only: Vec<String>,
+    /// The same, with the host's address on each.
+    #[serde(default)]
+    pub networks: Vec<HostOnlyNet>,
+    /// Host-only networks give addresses by DHCP and the host has one on
+    /// each. False: a netd from before (no DHCP, the host not on them).
+    #[serde(default)]
+    pub host_only_dhcp: bool,
+    /// The asking user's ports open now.
+    #[serde(default)]
+    pub ports: Vec<PortInfo>,
     /// USB devices macOS holds: served to this user.
     #[serde(default)]
     pub usb: bool,
     /// Why not, if not.
     #[serde(default)]
     pub usb_why: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostOnlyNet {
+    pub name: String,
+    /// The host's address and the subnet's size: "192.168.77.1/24".
+    pub gateway: String,
+}
+
+/// A VM adapter netd has a port open for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortInfo {
+    pub vm: String,
+    pub nic: u32,
+    pub attach: Attach,
+    /// The MAC the port passes (vmnet's, on macOS): its DHCP lease's.
+    pub mac: [u8; 6],
 }
 
 /// Any first line netd takes.
@@ -126,12 +155,19 @@ pub fn usb_serial_ok(s: &str) -> bool {
 
 #[derive(Debug, thiserror::Error)]
 pub enum NetdError {
-    #[error("vroom-netd not reachable at {0} ({1}); is it installed and running?")]
+    #[error("vroom-netd not reachable at {0} ({1}): {hint}", hint = connect_hint(.1))]
     Connect(String, std::io::Error),
     #[error("netd: {0}")]
     Refused(String),
     #[error("netd protocol: {0}")]
     Proto(String),
+}
+
+fn connect_hint(e: &std::io::Error) -> &'static str {
+    match e.kind() {
+        std::io::ErrorKind::PermissionDenied => "you aren't in the group netd.toml allows (`group`, default staff)",
+        _ => "set it up from the app (⌘K, \"Set up vroom-netd\") or by hand (docs/GUIDE.md, \"The root helper\")",
+    }
 }
 
 /// Read one bounded line (hostile-peer safe).
@@ -152,7 +188,7 @@ fn connect(socket: &Path, timeout: Duration) -> Result<UnixStream, NetdError> {
 }
 
 /// Send one line, read one back.
-fn ask<T: serde::de::DeserializeOwned>(mut s: &UnixStream, req: &impl Serialize) -> Result<T, NetdError> {
+fn ask<T: serde::de::DeserializeOwned>(mut s: &UnixStream, req: &impl Serialize, max: usize) -> Result<T, NetdError> {
     let mut line = serde_json::to_string(req).map_err(|e| NetdError::Proto(e.to_string()))?;
     line.push('\n');
     s.write_all(line.as_bytes()).map_err(|e| NetdError::Proto(e.to_string()))?;
@@ -163,7 +199,7 @@ fn ask<T: serde::de::DeserializeOwned>(mut s: &UnixStream, req: &impl Serialize)
     loop {
         match s.read(&mut b) {
             Ok(1) if b[0] == b'\n' => break,
-            Ok(1) if buf.len() < MAX_LINE => buf.push(b[0]),
+            Ok(1) if buf.len() < max => buf.push(b[0]),
             Ok(1) => return Err(NetdError::Proto("line too long".into())),
             Ok(_) => return Err(NetdError::Proto("netd closed the connection".into())),
             Err(e) => return Err(NetdError::Proto(e.to_string())),
@@ -191,7 +227,7 @@ pub fn attach(socket: &Path, req: &Request) -> Result<(UnixDatagram, [u8; 6]), N
 
 fn attach_once(socket: &Path, req: &Request) -> Result<(UnixDatagram, [u8; 6]), NetdError> {
     let s = connect(socket, Duration::from_secs(10))?;
-    let resp: Response = ask(&s, req)?;
+    let resp: Response = ask(&s, req, MAX_LINE)?;
     if !resp.ok {
         return Err(NetdError::Refused(resp.error));
     }
@@ -210,7 +246,7 @@ pub fn status(socket: &Path) -> Result<Status, NetdError> {
 
 /// `status` on a connection made already.
 pub fn status_on(s: &UnixStream) -> Result<Status, NetdError> {
-    let st: Status = ask(s, &StatusRequest { version: VERSION, status: true })?;
+    let st: Status = ask(s, &StatusRequest { version: VERSION, status: true }, MAX_STATUS)?;
     if !st.ok {
         return Err(NetdError::Refused("status".into()));
     }
@@ -226,7 +262,7 @@ pub fn usb(socket: &Path, req: &UsbRequest) -> Result<UnixStream, NetdError> {
 
 /// `usb` on a connection made already.
 pub fn usb_on(s: &UnixStream, req: &UsbRequest) -> Result<UnixStream, NetdError> {
-    let resp: Response = ask(s, req)?;
+    let resp: Response = ask(s, req, MAX_LINE)?;
     if !resp.ok {
         return Err(NetdError::Refused(resp.error));
     }

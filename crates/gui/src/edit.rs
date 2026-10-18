@@ -136,13 +136,13 @@ pub fn set(c: &mut VmConfig, key: &str, v: &str, default_iface: Option<&str>) ->
                         *n = Net { mode, mac: n.mac.take(), connected: n.connected, ..empty_net() };
                         match mode {
                             NetKind::Bridged => n.interface = Some(default_iface.unwrap_or("en0").to_string()),
-                            NetKind::HostOnly => n.network = Some("lab".into()),
+                            NetKind::HostOnly => n.network = Some(vroom_config::DEFAULT_HOST_ONLY.into()),
                             NetKind::Nat => {}
                         }
                     }
                 }
                 "iface" => n.interface = Some(v.trim().to_string()),
-                "network" => n.network = Some(v.trim().to_string()),
+                "network" => n.network = Some(v.trim()).filter(|v| !v.is_empty()).map(str::to_string),
                 "loopback" => n.allow_host_loopback = bool_of(v)?,
                 "block" => n.block_private = bool_of(v)?,
                 "connected" => n.connected = bool_of(v)?,
