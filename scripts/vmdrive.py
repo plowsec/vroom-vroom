@@ -13,7 +13,7 @@ Commands, one per line, on <state-dir>.cmd (a fifo):
 Viewer events (mode, clipboard, status, mic, guest pointer: its picture as
 <state-dir>.cursor-N.png) go to <state-dir>.events.
 """
-import os, socket, struct, subprocess, sys, threading, time
+import base64, os, socket, struct, subprocess, sys, threading, time
 
 vroom, cfg, state = sys.argv[1:4]
 extra = sys.argv[4:]
@@ -205,6 +205,7 @@ if True:
                 elif c == "resize": send(5, u32s(*map(int, arg.split())))
                 elif c == "focus": send(6, bytes([int(arg)]))
                 elif c == "clip": send(7, arg.encode())
+                elif c == "clip64": send(7, base64.b64decode(arg))
                 elif c == "cmd": send(8, bytes([int(arg)]))
                 elif c == "serial": p.stdin.write(arg.replace("\\n", "\r").encode()); p.stdin.flush()
                 elif c == "drop":
