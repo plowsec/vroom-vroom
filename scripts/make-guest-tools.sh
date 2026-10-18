@@ -5,8 +5,9 @@
 #                    its systemd units, the session autostart entry, the
 #                    GNOME Shell extension
 #   windows/         vroom-agent.exe, vroom-setup.cmd, the OpenGL and Vulkan drivers if
-#                    scripts/build-windows-gl.sh made it, and with the
-#                    virtio-win ISO its ARM64 drivers
+#                    scripts/build-windows-gl.sh made it, the Direct3D
+#                    wrapper if scripts/build-windows-d3d.sh did, and with
+#                    the virtio-win ISO its ARM64 drivers
 #   vroom-tools.img  all of it on a FAT32 disk (MBR) labelled VRTOOLS, for
 #                    guests without an agent: the Windows files at the top
 #                    (D:\vroom-setup.cmd, as before), linux/ in a folder
@@ -61,6 +62,9 @@ if [ -n "$win" ]; then
   fi
   if [ -f target/windows-gl/vroom_vk_arm64.json ]; then
     for a in arm64 x64; do cp target/windows-gl/vroom_vk_$a.json target/windows-gl/vroom_vk_$a.dll "$out/windows/"; done
+  fi
+  if [ -f target/windows-gl/vroom_d3d.dll ]; then
+    cp target/windows-gl/vroom_d3d.dll target/windows-gl/vroom_d3d_arm64.dll target/windows-gl/vroom_d3d_x64.dll "$out/windows/"
   fi
   if [ -n "$vw" ]; then
     mkdir "$tmp/vw"

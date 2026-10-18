@@ -11,6 +11,11 @@
 //!   architecture). The 3D driver sets it to its own manifest, which names
 //!   its DLL without a path: the loader fails to open it (error 87) and
 //!   then fails every vkCreateInstance, ours too. So ours replaces it.
+//! - Direct3D loads the UMDs UserModeDriverName lists when the device
+//!   starts. Ours, vroom_d3d.dll, wraps the 3D driver's own
+//!   (neptune_umd.dll) so that apps survive the 3D display going off for
+//!   a save (scripts/guest/d3d/vroom_d3d.c). It takes that driver's path
+//!   from vroom_d3d.txt next to it, which the service writes.
 
 /// What to do with one of a device's driver values.
 #[derive(Debug, PartialEq, Eq)]
@@ -39,6 +44,36 @@ pub fn package_vk_manifest(value: &str) -> bool {
     value.lines().all(|v| v.rsplit(['\\', '/']).next().is_some_and(|f| f.eq_ignore_ascii_case("virtio_icd.json")))
 }
 
+/// The 3D driver's Direct3D UMD, which ours wraps.
+const STOCK_UMD: &str = "neptune_umd.dll";
+/// Next to our UMD: the path of the one it wraps.
+pub const D3D_STOCK_FILE: &str = "vroom_d3d.txt";
+/// Ours and its two builds.
+pub const D3D_FILES: [&str; 3] = ["vroom_d3d.dll", "vroom_d3d_arm64.dll", "vroom_d3d_x64.dll"];
+
+/// A new UserModeDriverName list (entries joined with '\n') and the stock
+/// UMD's path to save, or None to keep it. Installed, each entry naming
+/// the 3D driver's own UMD becomes ours; uninstalled, ours goes back to
+/// the saved stock path (kept as is without one). "<>" (no Direct3D 9
+/// driver) and anyone else's entries stay.
+pub fn d3d_plan(current: &str, ours: &str, installed: bool, saved: Option<&str>) -> Option<(String, Option<String>)> {
+    let stock = |e: &str| e.rsplit(['\\', '/']).next().is_some_and(|f| f.eq_ignore_ascii_case(STOCK_UMD));
+    let mut found = None;
+    let list: Vec<String> = current
+        .lines()
+        .map(|e| match (installed, saved) {
+            (true, _) if stock(e) => {
+                found.get_or_insert_with(|| e.to_string());
+                ours.to_string()
+            }
+            (false, Some(s)) if e.eq_ignore_ascii_case(ours) => s.to_string(),
+            _ => e.to_string(),
+        })
+        .collect();
+    let list = list.join("\n");
+    (list != current).then_some((list, found))
+}
+
 /// Our Vulkan manifests, in `dir`.
 pub const VK_MANIFESTS: [&str; 2] = ["vroom_vk_arm64.json", "vroom_vk_x64.json"];
 
@@ -63,9 +98,11 @@ pub fn apply() {
         Icd { value, installed: p.iter().all(|p| p.exists()), path }
     };
     let (gl, vk) = (icd("OpenGLDriverName", &["vroom_gl.dll"]), icd("VulkanDriverName", &VK_MANIFESTS));
-    match update(&gl, &vk) {
+    // Direct3D's value names the forwarder only.
+    let d3d = Icd { path: dir.join(D3D_FILES[0]).to_string_lossy().into_owned(), ..icd("UserModeDriverName", &D3D_FILES) };
+    match update(&gl, &vk, &d3d, &dir.join(D3D_STOCK_FILE)) {
         Ok(true) => {
-            log::info!("OpenGL driver {}: restarting the 3D display", if gl.installed { "registered" } else { "removed" });
+            log::info!("OpenGL or Direct3D driver changed: restarting the 3D display");
             crate::sys::gpu3d(false);
             crate::sys::gpu3d(true);
         }
@@ -74,9 +111,9 @@ pub fn apply() {
     }
 }
 
-/// Whether OpenGL's value changed on any device.
+/// Whether OpenGL's or Direct3D's value changed on any device.
 #[cfg(windows)]
-fn update(gl: &Icd, vk: &Icd) -> std::io::Result<bool> {
+fn update(gl: &Icd, vk: &Icd, d3d: &Icd, stock_file: &std::path::Path) -> std::io::Result<bool> {
     use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
         SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo, SetupDiGetClassDevsW, SetupDiGetDeviceRegistryPropertyW,
         SetupDiOpenDevRegKey, DICS_FLAG_GLOBAL, DIGCF_PRESENT, DIREG_DRV, GUID_DEVCLASS_DISPLAY, SPDRP_SERVICE, SP_DEVINFO_DATA,
@@ -128,6 +165,22 @@ fn update(gl: &Icd, vk: &Icd) -> std::io::Result<bool> {
         };
         if r.is_err() {
             result = r;
+        }
+        // Direct3D: the stock path first, then the value naming ours.
+        let saved = std::fs::read_to_string(stock_file).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        if let Some((list, stock)) = reg::get_list(key, d3d.value).and_then(|c| d3d_plan(&c, &d3d.path, d3d.installed, saved.as_deref())) {
+            let r = match &stock {
+                Some(s) if saved.as_deref() != Some(s.as_str()) => std::fs::write(stock_file, s),
+                _ => Ok(()),
+            }
+            .and_then(|_| reg::set_list(key, d3d.value, &list));
+            match r {
+                Ok(()) => {
+                    log::info!("Direct3D driver {}", if d3d.installed { "wrapped" } else { "unwrapped" });
+                    changed = true;
+                }
+                Err(e) => result = Err(e),
+            }
         }
         // Vulkan apps read it when they start: nothing to restart.
         let current = reg::get_list(key, vk.value);
@@ -244,6 +297,26 @@ mod tests {
         assert_eq!(plan(Some(OURS), OURS, false, never), Plan::Remove);
         assert_eq!(plan(None, OURS, false, never), Plan::Keep);
         assert_eq!(plan(Some("other.dll"), OURS, false, never), Plan::Keep);
+    }
+
+    #[test]
+    fn direct3d_wraps_the_package_umd() {
+        const STOCK: &str = r"C:\WINDOWS\System32\DriverStore\FileRepository\viogpu3d.inf_arm64_d990ba3bca64b8b0\neptune_umd.dll";
+        const MINE: &str = r"C:\Program Files\Vroom\vroom_d3d.dll";
+        let stock = format!("<>\n{STOCK}\n{STOCK}\n{STOCK}");
+        let mine = format!("<>\n{MINE}\n{MINE}\n{MINE}");
+        assert_eq!(d3d_plan(&stock, MINE, true, None), Some((mine.clone(), Some(STOCK.into()))));
+        assert_eq!(d3d_plan(&mine, MINE, true, Some(STOCK)), None);
+        // A driver update put its own back: wrap that one.
+        let newer = stock.replace("d990ba3bca64b8b0", "0123456789abcdef");
+        let p = d3d_plan(&newer, MINE, true, Some(STOCK)).unwrap();
+        assert_eq!((p.0, p.1), (mine.clone(), Some(STOCK.replace("d990ba3bca64b8b0", "0123456789abcdef"))));
+        // Uninstalled: back to the stock driver, if we know it.
+        assert_eq!(d3d_plan(&mine, MINE, false, Some(STOCK)), Some((stock.clone(), None)));
+        assert_eq!(d3d_plan(&mine, MINE, false, None), None);
+        assert_eq!(d3d_plan(&stock, MINE, false, Some(STOCK)), None);
+        // Someone else's driver stays.
+        assert_eq!(d3d_plan("<>\nC:\\other\\umd.dll", MINE, true, None), None);
     }
 
     #[test]

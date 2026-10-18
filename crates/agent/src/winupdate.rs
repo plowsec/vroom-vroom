@@ -174,7 +174,8 @@ fn swap_files(dir: &Path, dest: &Path) -> Result<(), String> {
         let l = n.to_ascii_lowercase();
         let gl = l.starts_with("vroom_gl") && l.ends_with(".dll");
         let vk = l.starts_with("vroom_vk") && (l.ends_with(".dll") || l.ends_with(".json"));
-        if l == "vroom-agent.exe" || gl || vk {
+        let d3d = l.starts_with("vroom_d3d") && l.ends_with(".dll");
+        if l == "vroom-agent.exe" || gl || vk || d3d {
             wanted.push((e.path(), n));
         }
     }

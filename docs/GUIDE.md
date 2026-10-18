@@ -783,6 +783,8 @@ and Windows restarts its graphics.
 brew install meson ninja molten-vk llvm@15
 scripts/build-virglrenderer.sh
 scripts/build-dxmt.sh             # Direct3D 11 on Metal (about a minute)
+scripts/build-windows-d3d.sh      # guest side, for suspend (seconds)
+scripts/make-guest-tools.sh       # puts it in the guest tools
 ```
 
 In the guest, the 3D driver replaces the plain display driver:
@@ -828,10 +830,25 @@ What works and what doesn't (Windows 11 24H2, M3 Max):
   go of all its Direct3D objects. After the save (snapshot) or on resume
   (suspend), the agent turns it back on and Windows redraws in 3D. Your
   apps and session stay as they were; a game or 3D app that was running
-  loses its GPU state (most rebuild it, like after a driver update).
-  Measured: suspend 8 s, resume 6 s, with 8 GB of guest memory. Needs the
-  current vroom tools in Windows (re-run `vroom-setup.cmd`); with older
-  ones vroom says so and doesn't save.
+  loses its GPU state (most rebuild it, like after a driver update; one
+  that doesn't stops with "device removed"). Needs the current vroom
+  tools in Windows (re-run `vroom-setup.cmd`); with older ones vroom says
+  so and doesn't save. The tools bring a small Direct3D driver of ours
+  that loads the 3D driver's own and keeps apps from crashing while the
+  3D display is off (Explorer, the Start menu, the desktop compositor
+  and apps did, at each save); it takes effect when Windows restarts.
+- Measured (M3 Max, 8 GB guest, Edge and a Direct3D app open, 20
+  suspends and resumes): before, 77 crash reports (about 4 per suspend:
+  Explorer, the Start menu, the text input host, DWM, the app), one
+  suspend refused, one resume that hung; after (42 suspends), no crash
+  in the Direct3D driver, no refusal, no hang. Suspend about 13 s,
+  resume about 10 s. In 2 to 4 resumes of 12, Windows shows nothing on
+  its 3D display for about a minute, then comes back by itself; vroom
+  turns the display device off and on meanwhile, which sometimes helps.
+  If it stays black, suspend and resume again. With an OpenGL (Zink)
+  and a Vulkan app open as well (8 suspends): no crash in the Direct3D
+  driver; the Vulkan app stops at each save (lost device), the OpenGL
+  one keeps running, except once when it crashed in our OpenGL driver.
 - DXMT keeps the Metal versions of the shaders it has converted in the
   VM's state folder (`shaders/`), so apps start faster the second time.
 

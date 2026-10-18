@@ -107,6 +107,9 @@ Windows guests:
   render workers, so the IOSurface would go from one worker to another
   through the GPU process, as mach ports, the way the screen now goes to
   the app. Guest driver, Neptune and Venus work all three.
+- **An OpenGL app on Zink crashed at a save** (1 in 8, October 18): a
+  write to address 0 in `vroom_gl_arm64.dll` (+0x733838) after its
+  Vulkan device was lost, called from the app's frame.
 - **Vulkan and OpenGL apps through a suspend**: the 3D display goes off
   for the save, so they lose their GPU (Vulkan apps get a lost device).
   Linux guests keep theirs (Venus snapshots). Windows would need the
@@ -117,11 +120,14 @@ Windows guests:
   and triangle, compute shaders, Direct3D 11 at the same time). Blender
   4.x, games and Qt apps not tried yet. Zink warns that MoltenVK lacks
   logic ops and custom border colors.
-- **Explorer restarts on every suspend or snapshot**: when the 3D display
-  goes off, Explorer, the Start menu and the text input host crash in the
-  3D driver's Direct3D part (`neptune_umd_arm64.dll`, the same offset
-  each time; Explorer doesn't load our drivers) and Windows starts them
-  again. Ours to look at with UTM's driver.
+- **Suspend with 3D, what's left** (crashes, refusals and hangs are fixed,
+  see ARCHITECTURE.md "Direct3D state can't be saved"): 32-bit apps keep
+  the stock Direct3D driver (no x86 build of `vroom_d3d`), and Windows'
+  lock screen (LogonUI) loads the stock one even with ours registered
+  (seen once). The cause in UTM's drivers is theirs to fix: the kernel
+  driver unmaps a live process's rings, and stops before Windows has
+  destroyed every context; with both fixed there, the wrapper and the
+  context drop could go.
 - **32-bit apps** get Microsoft's OpenGL 1.1 and no Vulkan: no x86
   builds of our drivers yet.
 
@@ -306,21 +312,32 @@ A guest needs a driver and an API its players use. What exists:
 - Windows: when the desktop's own Direct3D process dies, the screen
   freezes until Win+Ctrl+Shift+B. The guest driver should report a lost
   device for that context (Windows then rebuilds it by itself).
-- Windows with 3D and Edge open, suspend and resume (October 17): now
-  and then the guest's display stays off after resume (the guest runs,
-  its driver says OK, Windows sets no scanout): 3 of 10 resumes here,
-  never without Edge. The VMM now watches for it: 15 s after Windows
-  says its 3D display is on with nothing shown, it plugs the monitor in
-  again, then turns the display device off and on (twice at most). One
-  of those runs came back after the device was cycled; the replug step
-  hasn't met a failing resume yet. The cause in Windows is not known.
-- A Windows guest with 3D stopped once with "undecodable MMIO access at
-  0x8200010000" (October 16). The same error stopped a VM during a
-  snapshot with a Zink app (October 17): an access the VMM can't emulate
-  hit the GPU's host-visible window while its backing was being swapped.
-  Such an access now gets 100 ms of retries at one address before the VM
-  stops (`hv/src/hvf/vcpu.rs`). Not seen since; if it comes back, the
-  swap itself should keep the window mapped.
+- **Windows with 3D, a black display after some resumes** (October 18,
+  M3 Max): 2 to 4 resumes in 12 still show nothing for about a minute,
+  with no crash and nothing left over. Two causes are gone: a process
+  crashing in the Direct3D driver during the save (DWM above all; the
+  display stayed off in 3 of its 4 crashes), and the first suspend after
+  a boot when Windows was saved 1.5 s after its 3D display went off (4
+  of 4; 3 s and 6 s: 0 of 5). What is left: on a bad resume only two
+  Direct3D contexts come up instead of four, and turning the display
+  device off and on brings the same two back; after 60 to 70 s Windows
+  recovers on its own. It came every third resume in one run of 12,
+  which hints at something in Windows that cycles. The VMM's watchdog
+  (15 s after Windows says its 3D display is on with nothing shown, the
+  device goes off for 3 s and on, three times at most) brought it back
+  only once in these runs. Plugging the monitor in again, which it used
+  to try first, never did and is gone. Next: which processes own the two
+  contexts (the context names say only "neptune-win32"), and Windows'
+  display logs (Microsoft-Windows-Dxgkrnl, DWM) during a bad resume.
+- "Undecodable MMIO access at 0x8200020000" (October 18: three times in
+  about 30 saves) was Windows' basic display driver drawing into the 3D
+  GPU's registers when the 3D display went off (fixed: memory in BAR 0,
+  see ARCHITECTURE.md); the ones at 0x8200010000 (October 16 and 17,
+  during saves too) were most likely the same on a VM with another PCI
+  layout.
+  The 100 ms of retries for such accesses (`hv/src/hvf/vcpu.rs`) stay for
+  the host-visible window. The VMM still can't emulate a load or store
+  pair to device registers; a guest that does one stops.
 - Guest tools, what's left (the update button and ready-made VMs work,
   see GUIDE.md):
   - A real CD drive: the tools stick is a USB disk, so Windows shows
