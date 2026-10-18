@@ -6,10 +6,11 @@ import { Bus } from "bus.slint";
 import { VmItem, VmState, VmSettings, SnapRow, CardVis, HostInfo, Toast, PaletteItem, NewVm } from "types.slint";
 import { Sidebar, VmPage, EmptyState, States } from "library.slint";
 import { NewVmSheet, CommandPalette, ConfirmDialog, ConfirmInfo, Toasts } from "sheets.slint";
-import { Icon } from "controls.slint";
-import { ConsoleWindow } from "console.slint";
+import { Icon, Tips } from "controls.slint";
+import { ConsoleWindow, MonitorWindow } from "console.slint";
+import { CoherenceWindow, CoherenceBar, CohApp, CohChip } from "coherence.slint";
 
-export { Theme, Bus, VmState, ConsoleWindow }
+export { Theme, Bus, Tips, VmState, ConsoleWindow, MonitorWindow, CoherenceWindow, CoherenceBar, CohApp, CohChip }
 
 export component AppWindow inherits Window {
     in property <[VmItem]> vms;
@@ -25,6 +26,8 @@ export component AppWindow inherits Window {
     in property <string> newvm-dest;
     in property <string> newvm-error;
     in property <bool> newvm-creating;
+    in property <string> newvm-progress;
+    in property <[string]> newvm-keys;
 
     in-out property <bool> palette-open;
     in-out property <string> palette-query;
@@ -111,6 +114,8 @@ export component AppWindow inherits Window {
         dest: root.newvm-dest;
         error: root.newvm-error;
         creating: root.newvm-creating;
+        progress: root.newvm-progress;
+        keys: root.newvm-keys;
     }
     if root.palette-open: CommandPalette {
         items: root.palette-items;

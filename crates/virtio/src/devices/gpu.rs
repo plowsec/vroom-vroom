@@ -1,8 +1,10 @@
 //! virtio-gpu: 2D scanout, plus 3D through a host renderer (Venus).
 //!
 //! 2D: the guest creates resources, attaches guest-RAM backing, transfers
-//! pixels into our host copy, and flushes rects to the scanout. We push
-//! flushed rects to a [`DisplaySink`] (the shared framebuffer).
+//! pixels into our host copy, and flushes rects to the scanouts. We push
+//! flushed rects to a [`DisplaySink`] per scanout (a guest monitor each,
+//! up to [`MAX_SCANOUTS`]; a resource may show on several, at different
+//! places of it, as with X11's one big framebuffer).
 //!
 //! 3D (optional, see [`ThreeD`]): contexts, command submission, blob
 //! resources and fences go to a [`Renderer3d`]. Host-visible blobs are
@@ -26,7 +28,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::devices::gpu3d::{Blob, Box3d, Create3d, Renderer3d, ShmMapper, Transfer3d};
 use crate::devices::virgl_state::GlState;
-use crate::worker::{QueueCtx, QueueHandler, WorkerSlot, BACKEND_TOKEN_BASE};
+use crate::worker::{Poker, QueueCtx, QueueHandler, WorkerSlot, BACKEND_TOKEN_BASE};
 use crate::{types, ActivateContext, DeviceState, Error, Reader, Result, VirtioDevice, VirtioInterrupt, Writer};
 
 const GET_DISPLAY_INFO: u32 = 0x0100;
@@ -76,6 +78,8 @@ const F_CONTEXT_INIT: u64 = 1 << 4;
 
 /// VIRTIO_GPU_SHM_ID_HOST_VISIBLE.
 pub const SHM_HOST_VISIBLE: u8 = 1;
+/// Ours, not in the spec (drivers skip ids they don't know): `with_vram`.
+const SHM_VRAM: u8 = 0x7f;
 const BLOB_MEM_GUEST: u32 = 1;
 const BLOB_MEM_HOST3D: u32 = 2;
 const BLOB_MEM_HOST3D_GUEST: u32 = 3;
@@ -84,8 +88,12 @@ const BIND_RENDER_TARGET: u32 = 1 << 1;
 const RESOURCE_FLAG_Y_0_TOP: u32 = 1;
 /// virgl's GL capset: a context made with capset 0 (classic virgl) uses it.
 const CAPSET_VIRGL2: u32 = 2;
+/// Vulkan (Venus).
+const CAPSET_VENUS: u32 = 4;
 /// Direct3D (Windows guests).
 const CAPSET_NEPTUNE: u32 = 7;
+/// VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE.
+const BLOB_FLAG_MAPPABLE: u32 = 1;
 
 const MAX_RESOURCE_BYTES: usize = 512 << 20;
 const MAX_RESOURCES: usize = 4096;
@@ -95,8 +103,18 @@ const MAX_SUBMIT: usize = 16 << 20;
 const MAX_PENDING_FENCES: usize = 4096;
 /// How often to look for finished fences while some are pending. GL
 /// fences have no completion callback (no fence thread, see vroom-gpu3d),
-/// so this bounds how long a guest waits after the GPU is done.
-const FENCE_POLL: Duration = Duration::from_millis(1);
+/// so this bounds how long a guest waits after the GPU is done. A frame
+/// whose display doesn't wait for the GPU (IOSurfaces) waits for its fence
+/// instead: at 1 ms, glmark2's light scenes stopped near 1,200 frames a
+/// second; at 250 us they reach 2,900.
+const FENCE_POLL: Duration = Duration::from_micros(250);
+/// How often to look for a frame on its way from the GPU (or one waiting
+/// for its turn) when no fence is pending.
+const READ_POLL: Duration = Duration::from_millis(1);
+/// IOSurface frames go to the app at most this often (240 a second, more
+/// than any Mac screen shows); frames in between are skipped, the last
+/// one always goes. The guest doesn't wait for those at all.
+const SURFACE_EVERY: Duration = Duration::from_micros(4166);
 
 /// Where finished frames go.
 pub trait DisplaySink: Send + Sync {
@@ -106,6 +124,14 @@ pub trait DisplaySink: Send + Sync {
     fn flush(&self, x: u32, y: u32, w: u32, h: u32, rows: &[u8], stride: usize);
     /// The guest's pointer changed (cursor queue).
     fn cursor(&self, _c: &Cursor) {}
+    /// The app shows this monitor's GL frames from IOSurfaces itself (it
+    /// asked to): give it [`DisplaySink::surface`] instead of pixels.
+    fn wants_surfaces(&self) -> bool {
+        false
+    }
+    /// The monitor's frame is now in its IOSurface `slot` of generation
+    /// `gen` (whole); `x`, `y`, `w`, `h` changed since the one before.
+    fn surface(&self, _gen: u32, _slot: u32, _x: u32, _y: u32, _w: u32, _h: u32) {}
 }
 
 /// The pointer a guest shows through the cursor queue, for the host to
@@ -123,15 +149,34 @@ pub enum Cursor {
 
 /// Biggest cursor taken (drivers use 64x64).
 const MAX_CURSOR: u32 = 256;
+/// Most scanouts (monitors) a device offers. The spec allows 16.
+pub const MAX_SCANOUTS: usize = 4;
 
-/// Display size the host wants; read by GET_DISPLAY_INFO.
+/// A monitor after the first: the size the host wants, and whether it is
+/// plugged in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Head {
+    width: u32,
+    height: u32,
+    on: bool,
+}
+
+/// Display size the host wants; read by GET_DISPLAY_INFO. Scanout 0's
+/// size is `width` x `height`; the others are in `more`.
 struct Shared {
     width: u32,
     height: u32,
+    more: Vec<Head>,
     events_read: u32,
     irq: Option<Arc<dyn VirtioInterrupt>>,
     /// The guest has Direct3D contexts (Windows), which can't be saved.
     direct3d: bool,
+    /// Windows' 3D display device is off (the VMM turned it off for a
+    /// save): its driver is stopped and resets the GPU when it starts
+    /// again, so Direct3D contexts it left behind are dropped (by the
+    /// worker, woken through `poker`, or at the save).
+    driver_stopped: bool,
+    poker: Option<Poker>,
     /// Windows' Direct3D driver (viogpu3d) runs the display. It offers a
     /// new size as a mode, but Windows hides modes its monitor didn't list
     /// when it was plugged in, so a resize there unplugs the monitor and
@@ -169,8 +214,24 @@ const REPLUG_TRIES: u32 = 3;
 const REPLUG_SETTLE: Duration = Duration::from_millis(500);
 
 impl Shared {
-    fn new(width: u32, height: u32) -> Self {
-        Shared { width, height, events_read: 0, irq: None, direct3d: false, replug: false, plug: Plug::In, tries: 0, replugs: 0, shown: (0, 0) }
+    fn new(sizes: &[(u32, u32)]) -> Self {
+        let (width, height) = sizes.first().copied().unwrap_or((1280, 800));
+        let more = sizes.iter().skip(1).map(|&(width, height)| Head { width, height, on: true }).collect();
+        Shared {
+            width,
+            height,
+            more,
+            events_read: 0,
+            irq: None,
+            direct3d: false,
+            driver_stopped: false,
+            poker: None,
+            replug: false,
+            plug: Plug::In,
+            tries: 0,
+            replugs: 0,
+            shown: (0, 0),
+        }
     }
 
     fn display_event(&mut self) {
@@ -245,6 +306,43 @@ impl GpuControl {
         s.display_event();
     }
 
+    /// Monitor `head`'s window changed size: tell the guest. Head 0 is
+    /// [`resize`]; 0x0 unplugs a monitor after the first.
+    pub fn resize_head(&self, head: usize, width: u32, height: u32) {
+        if head == 0 {
+            return self.resize(width, height);
+        }
+        let mut s = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let want = match (width, height) {
+            (0, 0) => None,
+            (w, h) if w <= MAX_DIM && h <= MAX_DIM && w > 0 && h > 0 => Some((w, h)),
+            _ => return,
+        };
+        let Some(m) = s.more.get_mut(head - 1) else { return };
+        let before = *m;
+        match want {
+            Some((w, h)) => *m = Head { width: w, height: h, on: true },
+            None => m.on = false,
+        }
+        if *m != before {
+            s.display_event();
+        }
+    }
+
+    /// The size scanout `head` is offered at; None while unplugged.
+    pub fn head_size(&self, head: usize) -> Option<(u32, u32)> {
+        let s = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        match head {
+            0 => Some((s.width, s.height)),
+            h => s.more.get(h - 1).filter(|m| m.on).map(|m| (m.width, m.height)),
+        }
+    }
+
+    /// Scanouts the device has.
+    pub fn heads(&self) -> usize {
+        1 + self.0.lock().unwrap_or_else(|e| e.into_inner()).more.len()
+    }
+
     /// Replugs so far, once the last one has had time to take: the guest's
     /// agent should set the mode after each (a mode Windows' monitor
     /// doesn't list yet can't be set). None while one runs.
@@ -287,6 +385,38 @@ impl GpuControl {
     pub fn direct3d(&self) -> bool {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).direct3d
     }
+
+    /// The guest's 3D driver is stopped (Windows turned the device off for
+    /// a save) or running again. Stopped, a save drops the Direct3D
+    /// contexts it left behind instead of refusing.
+    pub fn set_driver_stopped(&self, stopped: bool) {
+        let mut s = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        s.driver_stopped = stopped;
+        let poker = s.poker.clone().filter(|_| stopped);
+        drop(s);
+        if let Some(p) = poker {
+            p.poke();
+        }
+    }
+
+    /// Unplug the monitor and plug it back in at the same size (Windows'
+    /// 3D driver; others get a display event): the guest sets a mode, and
+    /// a scanout, again.
+    pub fn replug(&self) {
+        let mut s = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if s.replug && s.plug == Plug::In {
+            let size = (s.width, s.height);
+            s.tries = 0;
+            s.unplug(size);
+        } else {
+            s.display_event();
+        }
+    }
+
+    /// The guest shows something on scanout 0.
+    pub fn showing(&self) -> bool {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).shown != (0, 0)
+    }
 }
 
 /// The 3D side: renderer, capsets, and the host-visible window.
@@ -320,8 +450,13 @@ impl ThreeD {
 }
 
 pub struct Gpu {
+    /// Which GPU of the VM (Windows guests get one per monitor).
+    index: u16,
+    /// Plain memory in BAR 0 (see `with_vram`), and what places it.
+    vram: Option<(Arc<dyn ShmMapper>, u64)>,
     shared: Arc<Mutex<Shared>>,
-    sink: Arc<dyn DisplaySink>,
+    /// One per scanout.
+    sinks: Vec<Arc<dyn DisplaySink>>,
     three_d: Option<ThreeD>,
     worker: WorkerSlot<GpuHandler>,
 }
@@ -334,8 +469,37 @@ impl std::fmt::Debug for Gpu {
 
 impl Gpu {
     pub fn new(width: u32, height: u32, sink: Arc<dyn DisplaySink>) -> (Self, GpuControl) {
-        let shared = Arc::new(Mutex::new(Shared::new(width, height)));
-        (Gpu { shared: shared.clone(), sink, three_d: None, worker: WorkerSlot::default() }, GpuControl(shared))
+        Self::with_heads(&[(width, height)], vec![sink])
+    }
+
+    /// A scanout per sink (1..=MAX_SCANOUTS), each starting at its size.
+    pub fn with_heads(sizes: &[(u32, u32)], sinks: Vec<Arc<dyn DisplaySink>>) -> (Self, GpuControl) {
+        let n = sinks.len().clamp(1, MAX_SCANOUTS);
+        let mut sizes = sizes.to_vec();
+        sizes.resize(n, sizes.first().copied().unwrap_or((1280, 800)));
+        let sinks: Vec<_> = sinks.into_iter().take(n).collect();
+        let shared = Arc::new(Mutex::new(Shared::new(&sizes)));
+        (Gpu { index: 0, vram: None, shared: shared.clone(), sinks, three_d: None, worker: WorkerSlot::default() }, GpuControl(shared))
+    }
+
+    /// Windows' 2D driver (viogpudo) on a GPU other than the boot one
+    /// clears "its framebuffer", BAR 0, with stores a hypervisor can't
+    /// decode, and the VM stops. Give 2D GPUs like that `size` bytes of
+    /// plain memory there (as QEMU's virtio-vga has), the registers next.
+    /// The device never reads it. Windows' 3D driver (viogpu3d) wants it
+    /// too: when it stops (vroom turns it off for a save) it hands
+    /// Windows' basic display driver a 1024x768 framebuffer at BAR 0,
+    /// which was the registers.
+    pub fn with_vram(mut self, mapper: Arc<dyn ShmMapper>, size: u64) -> Self {
+        self.vram = Some((mapper, size));
+        self
+    }
+
+    /// The VM's `n`th GPU (from 0): its PCI subsystem id is 0x1100 + n,
+    /// so a guest can tell which monitor it drives.
+    pub fn with_index(mut self, n: u16) -> Self {
+        self.index = n.min(0xff);
+        self
     }
 
     /// Offer 3D (Venus, and GL if the renderer has it) on top of 2D.
@@ -358,11 +522,11 @@ impl Gpu {
     fn handler(&self) -> GpuHandler {
         GpuHandler {
             shared: self.shared.clone(),
-            sink: self.sink.clone(),
+            sinks: self.sinks.clone(),
             resources: HashMap::new(),
             used_bytes: 0,
-            scanout: None,
-            mode: (0, 0),
+            scanouts: vec![None; self.sinks.len()],
+            modes: vec![(0, 0); self.sinks.len()],
             three_d: self.three_d.clone(),
             res3d: HashMap::new(),
             contexts: Vec::new(),
@@ -370,6 +534,9 @@ impl Gpu {
             pending: Vec::new(),
             ctx_info: HashMap::new(),
             reading: None,
+            surfaced: vec![false; self.sinks.len()],
+            surface_at: vec![None; self.sinks.len()],
+            surface_due: vec![None; self.sinks.len()],
             read_buf: Vec::new(),
             cursor: None,
             cursor_shown: None,
@@ -399,8 +566,11 @@ struct Res3d {
     create: Option<Create3d>,
     /// Its guest backing, as last attached.
     backing: Vec<(u64, u32)>,
-    /// A blob: memory the guest may map. Snapshots can't rebuild those.
+    /// A blob: memory the guest may map.
     blob: bool,
+    /// How a blob was made (a snapshot of a Vulkan context makes its
+    /// blobs again).
+    made: Option<Blob>,
 }
 
 /// What a snapshot needs to know about a renderer context.
@@ -423,6 +593,20 @@ enum Scanout {
     Gl { id: u32, view: Rect, format: u32 },
 }
 
+impl Scanout {
+    fn id(&self) -> u32 {
+        match *self {
+            Scanout::Cpu { id, .. } | Scanout::Blob { id, .. } | Scanout::Gl { id, .. } => id,
+        }
+    }
+
+    fn view(&self) -> Rect {
+        match *self {
+            Scanout::Cpu { view, .. } | Scanout::Blob { view, .. } | Scanout::Gl { view, .. } => view,
+        }
+    }
+}
+
 /// 2D state for snapshots. Pixels are not saved: they are re-read from
 /// the guest backing (restored with RAM), like a full-frame transfer.
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -430,6 +614,9 @@ struct Snap2d {
     resources: Vec<SnapRes>,
     /// (resource id, visible rect x, y, w, h) on scanout 0.
     scanout: Option<(u32, u32, u32, u32, u32)>,
+    /// The other scanouts: (scanout, resource, x, y, w, h).
+    #[serde(default)]
+    more: Vec<(u32, u32, u32, u32, u32, u32)>,
     /// The pointer: (resource id or 0 for hidden, hot x, hot y).
     #[serde(default)]
     cursor: Option<(u32, u32, u32)>,
@@ -454,9 +641,19 @@ struct Snap3d {
     contexts: Vec<SnapCtx>,
     /// A GL scanout: (resource, view x, y, w, h).
     gl_scanout: Option<(u32, u32, u32, u32, u32)>,
+    /// GL on the other scanouts: (scanout, resource, x, y, w, h).
+    #[serde(default)]
+    gl_more: Vec<(u32, u32, u32, u32, u32, u32)>,
     /// Fenced commands not yet given back: (queue, head, len). The GPU is
     /// done with them by the time we have read everything back.
     pending: Vec<(usize, u16, u32)>,
+    /// Blobs of Vulkan contexts.
+    #[serde(default)]
+    blobs: Vec<SnapBlob>,
+    /// Scanouts showing a blob: (scanout, resource, x, y, w, h, format,
+    /// stride, offset).
+    #[serde(default)]
+    blob_scanouts: Vec<[u32; 9]>,
 }
 
 const SNAP3D_MAGIC: &[u8; 4] = b"VG3D";
@@ -475,6 +672,34 @@ struct SnapRes3d {
 struct SnapCtx {
     id: u32,
     info: CtxInfo,
+    /// A Vulkan context: where the renderer's snapshot of it is, after
+    /// the JSON: (offset, length, complete). Length 0: none was taken.
+    #[serde(default)]
+    venus: Option<(u64, u64, bool)>,
+}
+
+/// A blob of a Vulkan context, made again after its context.
+#[derive(Debug, Serialize, Deserialize)]
+struct SnapBlob {
+    id: u32,
+    ctx: u32,
+    mem: u32,
+    flags: u32,
+    blob_id: u64,
+    size: u64,
+    /// Guest memory blobs: the guest RAM behind it.
+    guest: Vec<(u64, u32)>,
+    /// Where the guest had it mapped, from the start of the window.
+    map: Option<u64>,
+}
+
+impl SnapBlob {
+    /// Shared memory the context makes (rings, reply streams), or guest
+    /// RAM: made before the context's own state comes back. The rest is
+    /// Vulkan device memory, which needs that state.
+    fn early(&self) -> bool {
+        self.mem == BLOB_MEM_GUEST || (self.blob_id == 0 && self.flags == BLOB_FLAG_MAPPABLE)
+    }
 }
 
 /// How a level of a classic 3D resource is laid out for a transfer.
@@ -569,11 +794,12 @@ const FENCE_LATE: Duration = Duration::from_secs(5);
 
 pub struct GpuHandler {
     shared: Arc<Mutex<Shared>>,
-    sink: Arc<dyn DisplaySink>,
+    /// One per scanout, as are the next two.
+    sinks: Vec<Arc<dyn DisplaySink>>,
     resources: HashMap<u32, Resource>,
     used_bytes: usize,
-    scanout: Option<Scanout>,
-    mode: (u32, u32),
+    scanouts: Vec<Option<Scanout>>,
+    modes: Vec<(u32, u32)>,
     three_d: Option<ThreeD>,
     res3d: HashMap<u32, Res3d>,
     contexts: Vec<u32>,
@@ -583,6 +809,13 @@ pub struct GpuHandler {
     ctx_info: HashMap<u32, CtxInfo>,
     /// A GL scanout on its way back from the GPU, and where it lands.
     reading: Option<Reading>,
+    /// Scanouts whose last frame went into an IOSurface: the next one
+    /// read back is read whole (the shared frame buffer missed those).
+    surfaced: Vec<bool>,
+    /// Per scanout: when a frame last went into an IOSurface, and a later
+    /// one waiting for its turn (resource, changed rect).
+    surface_at: Vec<Option<std::time::Instant>>,
+    surface_due: Vec<Option<(u32, Rect)>>,
     read_buf: Vec<u8>,
     /// The pointer as last set: (resource id or 0, hot x, hot y), and
     /// what the sink was last given.
@@ -590,16 +823,15 @@ pub struct GpuHandler {
     cursor_shown: Option<Cursor>,
 }
 
-/// Where a GL frame being read back goes.
-#[derive(Debug, Clone, Copy)]
+/// Where a GL frame being read back goes: the rect of resource `id`
+/// read, and the scanouts that showed it (scanout, its view then).
+#[derive(Debug, Clone)]
 struct Reading {
     id: u32,
-    view: Rect,
-    /// Position in the visible view, and size.
-    x: u32,
-    y: u32,
-    w: u32,
-    h: u32,
+    rect: Rect,
+    to: Vec<(usize, Rect)>,
+    /// It goes into the one scanout's IOSurface, not back to us.
+    surface: bool,
 }
 
 impl std::fmt::Debug for GpuHandler {
@@ -624,6 +856,23 @@ impl Rect {
     /// Inside a w x h surface (no overflow)?
     fn inside(&self, w: u32, h: u32) -> bool {
         self.x.checked_add(self.w).is_some_and(|e| e <= w) && self.y.checked_add(self.h).is_some_and(|e| e <= h)
+    }
+
+    /// The part of this rect inside `v` (a scanout's view), if any.
+    fn clip(&self, v: Rect) -> Option<Rect> {
+        let x0 = self.x.max(v.x);
+        let y0 = self.y.max(v.y);
+        let x1 = self.x.saturating_add(self.w).min(v.x.saturating_add(v.w));
+        let y1 = self.y.saturating_add(self.h).min(v.y.saturating_add(v.h));
+        (x1 > x0 && y1 > y0).then(|| Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 })
+    }
+
+    /// The smallest rect holding both.
+    fn union(&self, o: Rect) -> Rect {
+        let (x0, y0) = (self.x.min(o.x), self.y.min(o.y));
+        let x1 = (self.x + self.w).max(o.x + o.w);
+        let y1 = (self.y + self.h).max(o.y + o.h);
+        Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }
     }
 }
 
@@ -714,6 +963,13 @@ impl GpuHandler {
                         b[12..16].copy_from_slice(&s.height.to_le_bytes());
                         b[16..20].copy_from_slice(&1u32.to_le_bytes()); // enabled
                     }
+                }
+                for (i, m) in s.more.iter().enumerate().filter(|(_, m)| m.on) {
+                    let o = (i + 1) * 24;
+                    log::debug!("gpu: display info {}: {}x{}", i + 1, m.width, m.height);
+                    b[o + 8..o + 12].copy_from_slice(&m.width.to_le_bytes());
+                    b[o + 12..o + 16].copy_from_slice(&m.height.to_le_bytes());
+                    b[o + 16..o + 20].copy_from_slice(&1u32.to_le_bytes());
                 }
                 (OK_DISPLAY_INFO, b)
             }
@@ -930,6 +1186,20 @@ impl GpuHandler {
         }
     }
 
+    /// Drop the Direct3D contexts a stopped driver left behind (see
+    /// `Shared::driver_stopped`). How many there were.
+    fn drop_direct3d(&mut self) -> usize {
+        let Some(t) = self.three_d.clone() else { return 0 };
+        let gone: Vec<u32> = self.ctx_info.iter().filter(|(_, c)| c.capset == CAPSET_NEPTUNE).map(|(&id, _)| id).collect();
+        for id in &gone {
+            self.contexts.retain(|c| c != id);
+            self.ctx_info.remove(id);
+            t.r().context_destroy(*id);
+        }
+        self.note_direct3d();
+        gone.len()
+    }
+
     fn note_direct3d(&self) {
         let on = self.ctx_info.values().any(|c| c.capset == CAPSET_NEPTUNE);
         self.shared.lock().unwrap_or_else(|e| e.into_inner()).direct3d = on;
@@ -1071,18 +1341,26 @@ impl GpuHandler {
             return bad;
         }
         let Some(entries) = Self::read_entries(mem, r, n) else { return bad };
-        let total: u64 = entries.iter().map(|e| e.1 as u64).sum();
-        if blob_mem != BLOB_MEM_HOST3D && total < size {
-            return bad;
-        }
-        let Some(iov) = Self::host_iov(mem, &entries) else { return bad };
         let blob = Blob { resource: id, ctx: hdr.ctx, mem: blob_mem, flags, id: blob_id, size };
-        if !t.r().create_blob(&blob, iov) {
-            return (ERR_UNSPEC, vec![]);
+        (self.make_blob(mem, t, blob, entries), vec![])
+    }
+
+    /// A blob, its guest RAM checked (`create_blob`, and snapshots).
+    fn make_blob(&mut self, mem: &GuestMemory, t: &ThreeD, blob: Blob, entries: Vec<(u64, u32)>) -> u32 {
+        let total: u64 = entries.iter().map(|e| e.1 as u64).sum();
+        if blob.mem != BLOB_MEM_HOST3D && total < blob.size {
+            return ERR_INVALID_PARAMETER;
         }
-        let guest = if blob_mem == BLOB_MEM_GUEST { entries } else { Vec::new() };
-        self.res3d.insert(id, Res3d { guest, blob: true, ..Default::default() });
-        (OK_NODATA, vec![])
+        if entries.len() > MAX_BACKING_ENTRIES as usize || entries.iter().any(|&(a, l)| !mem.check_range(GuestAddress(a), l as u64)) {
+            return ERR_INVALID_PARAMETER;
+        }
+        let Some(iov) = Self::host_iov(mem, &entries) else { return ERR_INVALID_PARAMETER };
+        if !t.r().create_blob(&blob, iov) {
+            return ERR_UNSPEC;
+        }
+        let guest = if blob.mem == BLOB_MEM_GUEST { entries } else { Vec::new() };
+        self.res3d.insert(blob.resource, Res3d { guest, blob: true, made: Some(blob), ..Default::default() });
+        OK_NODATA
     }
 
     fn map_blob(&mut self, t: &ThreeD, id: u32, offset: u64) -> (u32, Vec<u8>) {
@@ -1120,11 +1398,13 @@ impl GpuHandler {
     }
 
     fn unref(&mut self, id: u32) -> u32 {
-        if self.reading.is_some_and(|r| r.id == id) {
+        if self.reading.as_ref().is_some_and(|r| r.id == id) {
             self.finish_read(true);
         }
-        if matches!(self.scanout, Some(Scanout::Cpu { id: s, .. } | Scanout::Blob { id: s, .. } | Scanout::Gl { id: s, .. }) if s == id) {
-            self.scanout = None;
+        for s in self.scanouts.iter_mut() {
+            if s.is_some_and(|s| s.id() == id) {
+                *s = None;
+            }
         }
         if let Some(res) = self.resources.remove(&id) {
             self.used_bytes -= res.pixels.len();
@@ -1199,12 +1479,13 @@ impl GpuHandler {
         let Some(rect) = Rect::read(r) else { return ERR_INVALID_PARAMETER };
         let (Some(sid), Some(id)) = (rd32(r), rd32(r)) else { return ERR_INVALID_PARAMETER };
         log::trace!("gpu: set scanout {sid} to res {id} {rect:?}");
-        if sid != 0 {
+        let sid = sid as usize;
+        if sid >= self.scanouts.len() {
             return ERR_INVALID_SCANOUT_ID;
         }
         if id == 0 {
-            self.scanout = None;
-            self.set_mode(0, 0);
+            self.scanouts[sid] = None;
+            self.set_mode(sid, 0, 0);
             return OK_NODATA;
         }
         let (scanout, w, h) = match (self.resources.get(&id), self.res3d.get(&id).and_then(|r| r.tex)) {
@@ -1215,8 +1496,8 @@ impl GpuHandler {
         if !rect.inside(w, h) || rect.w == 0 || rect.h == 0 {
             return ERR_INVALID_PARAMETER;
         }
-        self.scanout = Some(scanout);
-        self.set_mode(rect.w, rect.h);
+        self.scanouts[sid] = Some(scanout);
+        self.set_mode(sid, rect.w, rect.h);
         OK_NODATA
     }
 
@@ -1230,12 +1511,13 @@ impl GpuHandler {
         }
         let [sid, id, width, height, format, _pad, stride, _, _, _, offset, ..] = v;
         log::trace!("gpu: set scanout blob {sid} to res {id} {width}x{height} format {format} stride {stride} offset {offset} {rect:?}");
-        if sid != 0 {
+        let sid = sid as usize;
+        if sid >= self.scanouts.len() {
             return ERR_INVALID_SCANOUT_ID;
         }
         if id == 0 {
-            self.scanout = None;
-            self.set_mode(0, 0);
+            self.scanouts[sid] = None;
+            self.set_mode(sid, 0, 0);
             return OK_NODATA;
         }
         if !self.res3d.contains_key(&id) {
@@ -1247,16 +1529,18 @@ impl GpuHandler {
         if (stride as u64) < width as u64 * 4 {
             return ERR_INVALID_PARAMETER;
         }
-        self.scanout = Some(Scanout::Blob { id, view: rect, format, stride, offset });
-        self.set_mode(rect.w, rect.h);
+        self.scanouts[sid] = Some(Scanout::Blob { id, view: rect, format, stride, offset });
+        self.set_mode(sid, rect.w, rect.h);
         OK_NODATA
     }
 
-    fn set_mode(&mut self, w: u32, h: u32) {
-        if self.mode != (w, h) {
-            self.shared.lock().unwrap_or_else(|e| e.into_inner()).shown = (w, h);
-            self.mode = (w, h);
-            self.sink.set_mode(w, h);
+    fn set_mode(&mut self, sid: usize, w: u32, h: u32) {
+        if self.modes.get(sid).is_some_and(|m| *m != (w, h)) {
+            if sid == 0 {
+                self.shared.lock().unwrap_or_else(|e| e.into_inner()).shown = (w, h);
+            }
+            self.modes[sid] = (w, h);
+            self.sinks[sid].set_mode(w, h);
         }
     }
 
@@ -1268,33 +1552,104 @@ impl GpuHandler {
     }
 
     fn flush_rect(&mut self, mem: &GuestMemory, rect: Rect, id: u32) -> u32 {
-        let Some(sc) = self.scanout else { return OK_NODATA };
-        let (sid, view) = match sc {
-            Scanout::Cpu { id, view } | Scanout::Blob { id, view, .. } | Scanout::Gl { id, view, .. } => (id, view),
-        };
-        if sid != id {
+        // Every scanout that shows this resource, with the part of `rect`
+        // it shows.
+        let targets: Vec<(usize, Scanout, Rect)> = self
+            .scanouts
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| {
+                let s = (*s)?;
+                (s.id() == id).then_some(())?;
+                Some((i, s, rect.clip(s.view())?))
+            })
+            .collect();
+        if targets.is_empty() {
             return OK_NODATA;
         }
-        // Clip to the visible part of the resource.
-        let x0 = rect.x.max(view.x);
-        let y0 = rect.y.max(view.y);
-        let x1 = rect.x.saturating_add(rect.w).min(view.x + view.w);
-        let y1 = rect.y.saturating_add(rect.h).min(view.y + view.h);
-        if x1 <= x0 || y1 <= y0 {
-            return OK_NODATA;
-        }
-        let (w, h) = (x1 - x0, y1 - y0);
-        let row = w as usize * 4;
-        let bx = Box3d { x: x0, y: y0, z: 0, w, h, d: 1 };
-        if let (Scanout::Gl { .. }, Some(t)) = (sc, self.three_d.clone()) {
+        if let (Scanout::Gl { .. }, Some(t)) = (targets[0].1, self.three_d.clone()) {
+            // One monitor the app draws from IOSurfaces: the whole view
+            // goes into one on the GPU, nothing comes back.
+            if let [(sid, _, part)] = targets[..] {
+                if self.sinks[sid].wants_surfaces() {
+                    let due = self.surface_due[sid].take().filter(|d| d.0 == id).map_or(part, |d| d.1.union(part));
+                    let soon = self.surface_at[sid].is_some_and(|at| at.elapsed() < SURFACE_EVERY);
+                    if soon || self.reading.as_ref().is_some_and(|r| r.surface) {
+                        // Its turn comes in tick().
+                        self.surface_due[sid] = Some((id, due));
+                        return OK_NODATA;
+                    }
+                    self.finish_read(true);
+                    if self.surface_start(sid, id, due) {
+                        return OK_NODATA;
+                    }
+                }
+            }
             // Show the frame before, then let the GPU copy this one while
-            // we go on with other commands.
+            // we go on with other commands: what all of them show, at once.
             self.finish_read(true);
+            let mut all = targets.iter().skip(1).fold(targets[0].2, |u, t| u.union(t.2));
+            // Back from IOSurfaces: everything, the frame buffer is old.
+            for &(sid, sc, _) in &targets {
+                if std::mem::take(&mut self.surfaced[sid]) {
+                    all = all.union(sc.view());
+                }
+            }
+            let bx = Box3d { x: all.x, y: all.y, z: 0, w: all.w, h: all.h, d: 1 };
             if t.r().scanout_start(id, bx) {
-                self.reading = Some(Reading { id, view, x: x0 - view.x, y: y0 - view.y, w, h });
+                let to = targets.iter().map(|&(i, s, _)| (i, s.view())).collect();
+                self.reading = Some(Reading { id, rect: all, to, surface: false });
                 return OK_NODATA;
             }
         }
+        for (sid, sc, part) in targets {
+            let r = self.flush_part(mem, sid, sc, part, id);
+            if r != OK_NODATA {
+                return r;
+            }
+        }
+        OK_NODATA
+    }
+
+    /// Frame `id` (`part` changed) of scanout `sid`, a GL one, into one of
+    /// its IOSurfaces. False if that can't be done (read it back then).
+    fn surface_start(&mut self, sid: usize, id: u32, part: Rect) -> bool {
+        let Some(t) = self.three_d.clone() else { return false };
+        let Some(Some(Scanout::Gl { id: shown, view, .. })) = self.scanouts.get(sid).copied() else { return false };
+        if shown != id || !t.r().surface_start(sid as u32, id, Box3d { x: view.x, y: view.y, z: 0, w: view.w, h: view.h, d: 1 }) {
+            return false;
+        }
+        self.surfaced[sid] = true;
+        self.surface_at[sid] = Some(std::time::Instant::now());
+        self.reading = Some(Reading { id, rect: part, to: vec![(sid, view)], surface: true });
+        true
+    }
+
+    /// Frames that waited for their turn (see SURFACE_EVERY).
+    fn surfaces_due(&mut self) {
+        for sid in 0..self.surface_due.len() {
+            if self.reading.is_some() {
+                return;
+            }
+            let Some((id, part)) = self.surface_due[sid] else { continue };
+            if self.surface_at[sid].is_some_and(|at| at.elapsed() < SURFACE_EVERY) {
+                continue;
+            }
+            self.surface_due[sid] = None;
+            if !self.sinks[sid].wants_surfaces() || !self.surface_start(sid, id, part) {
+                // The app stopped taking surfaces: the next frame is read
+                // back whole.
+                self.surfaced[sid] = true;
+            }
+        }
+    }
+
+    /// Show `part` (resource coordinates, inside the view) of scanout `sid`.
+    fn flush_part(&mut self, mem: &GuestMemory, sid: usize, sc: Scanout, part: Rect, id: u32) -> u32 {
+        let view = sc.view();
+        let Rect { x: x0, y: y0, w, h } = part;
+        let row = w as usize * 4;
+        let bx = Box3d { x: x0, y: y0, z: 0, w, h, d: 1 };
         let mut out = vec![0u8; row * h as usize];
         match sc {
             Scanout::Cpu { .. } => {
@@ -1335,24 +1690,50 @@ impl GpuHandler {
                 }
             }
         }
-        self.sink.flush(x0 - view.x, y0 - view.y, w, h, &out, row);
+        self.sinks[sid].flush(x0 - view.x, y0 - view.y, w, h, &out, row);
         OK_NODATA
     }
 
     /// Show the GL frame being read back, once the GPU has it (or now,
     /// with `wait`). Dropped if the scanout moved on meanwhile.
     fn finish_read(&mut self, wait: bool) {
-        let (Some(rd), Some(t)) = (self.reading, &self.three_d) else { return };
-        let row = rd.w as usize * 4;
+        let (Some(rd), Some(t)) = (&self.reading, &self.three_d) else { return };
+        if rd.surface {
+            let got = t.r().surface_poll(wait);
+            if got.is_none() && !wait {
+                return;
+            }
+            let Some(rd) = self.reading.take() else { return };
+            let Some(&(sid, view)) = rd.to.first() else { return };
+            let current = matches!(self.scanouts.get(sid), Some(Some(Scanout::Gl { id, view: v, .. })) if *id == rd.id && *v == view);
+            match got.flatten() {
+                Some(f) if current && f.head as usize == sid => {
+                    let p = rd.rect;
+                    self.sinks[sid].surface(f.gen, f.slot, p.x - view.x, p.y - view.y, p.w, p.h);
+                }
+                // Lost: the next one is read whole if read back.
+                _ => self.surfaced[sid] = true,
+            }
+            return;
+        }
+        let row = rd.rect.w as usize * 4;
         // Reused: frames come often and are large.
         let mut out = std::mem::take(&mut self.read_buf);
-        out.resize(row * rd.h as usize, 0);
+        out.resize(row * rd.rect.h as usize, 0);
         let got = t.r().scanout_poll(&mut out, wait);
         if got.is_some() || wait {
-            self.reading = None;
-            let current = matches!(self.scanout, Some(Scanout::Gl { id, view, .. }) if id == rd.id && view == rd.view);
-            if got == Some(true) && current {
-                self.sink.flush(rd.x, rd.y, rd.w, rd.h, &out, row);
+            let Some(rd) = self.reading.take() else { return };
+            for &(sid, view) in &rd.to {
+                let current = matches!(self.scanouts.get(sid), Some(Some(Scanout::Gl { id, view: v, .. })) if *id == rd.id && *v == view);
+                let Some(p) = rd.rect.clip(view) else { continue };
+                if got != Some(true) || !current {
+                    continue;
+                }
+                // The part this scanout shows, out of what was read.
+                let at = (p.y - rd.rect.y) as usize * row + (p.x - rd.rect.x) as usize * 4;
+                if let Some(px) = out.get(at..) {
+                    self.sinks[sid].flush(p.x - view.x, p.y - view.y, p.w, p.h, px, row);
+                }
             }
         }
         self.read_buf = out;
@@ -1375,6 +1756,11 @@ impl GpuHandler {
                 })();
                 if let Some(hdr) = hdr {
                     let (ty, body) = self.command(&ctx.mem, &mut r, &hdr);
+                    if hdr.ty == CTX_DESTROY && ty == OK_NODATA {
+                        for (q, head, len) in self.drop_context_fences(hdr.ctx) {
+                            ctx.add_used(q, head, len);
+                        }
+                    }
                     if ty >= ERR_UNSPEC {
                         log::debug!("gpu: command {:#x} ctx {} -> {ty:#x}", hdr.ty, hdr.ctx);
                     } else {
@@ -1397,6 +1783,20 @@ impl GpuHandler {
             }
             ctx.add_used(q, head, len);
         }
+    }
+
+    /// A context is gone: the renderer drops its fences, so commands still
+    /// waiting on one of its rings go back now (they would wait forever).
+    fn drop_context_fences(&mut self, id: u32) -> Vec<(usize, u16, u32)> {
+        let mut out = Vec::new();
+        self.pending.retain(|p| {
+            let gone = p.ring.is_some() && p.ctx == id;
+            if gone {
+                out.push((p.q, p.head, p.len));
+            }
+            !gone
+        });
+        out
     }
 
     fn complete_fences(&mut self, ctx: &mut QueueCtx) {
@@ -1429,7 +1829,8 @@ impl GpuHandler {
             *x = n;
         }
         let [scanout, _, _, _, id, hot_x, hot_y] = v;
-        if scanout != 0 {
+        // One pointer, whichever monitor it is on.
+        if scanout as usize >= self.scanouts.len() {
             return;
         }
         let before = self.cursor.replace((id, hot_x, hot_y));
@@ -1453,7 +1854,8 @@ impl GpuHandler {
             },
         };
         if self.cursor_shown.as_ref() != Some(&c) {
-            self.sink.cursor(&c);
+            // One pointer for all the monitors: through the first.
+            self.sinks[0].cursor(&c);
             self.cursor_shown = Some(c);
         }
         true
@@ -1500,11 +1902,12 @@ impl GpuHandler {
             .map(|(&id, r)| SnapRes { id, format: r.format, width: r.width, height: r.height, backing: r.backing.clone() })
             .collect();
         resources.sort_by_key(|r| r.id);
-        let scanout = match self.scanout {
+        let scanout = match self.scanouts[0] {
             Some(Scanout::Cpu { id, view }) => Some((id, view.x, view.y, view.w, view.h)),
             _ => None,
         };
-        Snap2d { resources, scanout, cursor: self.cursor }
+        let more = self.scanouts_of(|s| matches!(s, Scanout::Cpu { .. }));
+        Snap2d { resources, scanout, more, cursor: self.cursor }
     }
 
     /// Rebuild from a snapshot (untrusted input: same checks as commands).
@@ -1526,26 +1929,47 @@ impl GpuHandler {
                 let _ = self.transfer(mem, r.id, full, 0, None);
             }
         }
-        if let Some((id, x, y, w, h)) = s.scanout {
+        if s.more.iter().any(|m| m.0 == 0) {
+            return Err(bad("bad scanout"));
+        }
+        let all = s.scanout.map(|(id, x, y, w, h)| (0, id, x, y, w, h)).into_iter().chain(s.more.iter().copied());
+        for (sid, id, x, y, w, h) in all {
             let view = Rect { x, y, w, h };
             let ok = self.resources.get(&id).is_some_and(|r| view.inside(r.width, r.height) && w > 0 && h > 0);
-            if !ok {
+            let sid = sid as usize;
+            if !ok || sid >= self.scanouts.len() {
                 return Err(bad("bad scanout"));
             }
-            self.scanout = Some(Scanout::Cpu { id, view });
-            self.set_mode(w, h);
-            self.flush_all(mem);
+            self.scanouts[sid] = Some(Scanout::Cpu { id, view });
+            self.set_mode(sid, w, h);
         }
+        self.flush_all(mem);
         // Shown once every resource is back (it may be a 3D one).
         self.cursor = s.cursor;
         Ok(())
     }
 
-    /// Push the whole visible scanout to the sink.
+    /// Push every visible scanout to its sink.
     fn flush_all(&mut self, mem: &GuestMemory) {
-        if let Some(Scanout::Cpu { id, view } | Scanout::Gl { id, view, .. }) = self.scanout {
-            let _ = self.flush_rect(mem, view, id);
+        for sid in 0..self.scanouts.len() {
+            if let Some(sc @ (Scanout::Cpu { id, view } | Scanout::Gl { id, view, .. })) = self.scanouts[sid] {
+                self.finish_read(true);
+                let _ = self.flush_part(mem, sid, sc, view, id);
+            }
         }
+    }
+
+    /// (scanout, resource, view) of scanouts after the first that `keep`
+    /// says to save.
+    fn scanouts_of(&self, keep: impl Fn(&Scanout) -> bool) -> Vec<(u32, u32, u32, u32, u32, u32)> {
+        let mut v = Vec::new();
+        for (i, s) in self.scanouts.iter().enumerate().skip(1) {
+            if let Some(s) = s.filter(|s| keep(s)) {
+                let r = s.view();
+                v.push((i as u32, s.id(), r.x, r.y, r.w, r.h));
+            }
+        }
+        v
     }
 
     /// Why a snapshot can't capture the GPU right now, if it can't.
@@ -1553,22 +1977,25 @@ impl GpuHandler {
         if self.ctx_info.values().any(|c| c.capset == CAPSET_NEPTUNE) {
             return Some("Windows draws with Direct3D, and Direct3D state can't be saved. With the display set to 2D, it can".into());
         }
-        if self.ctx_info.values().any(|c| c.gl.is_none()) {
-            return Some("a Vulkan app is running, and Vulkan state can't be saved".into());
-        }
-        // Host blobs no context uses any more are left out: a stopped
-        // driver (Windows, with its 3D device turned off for a suspend)
-        // leaves them behind, its last frame still set as the scanout, and
-        // never touches them again. Guests' own scanouts are attached to
-        // the context that made them, or in guest memory.
+        // Vulkan contexts are saved by the renderer, their blobs made again
+        // after them. Other host blobs no context uses any more are left
+        // out: a stopped driver (Windows, with its 3D device turned off for
+        // a suspend) leaves them behind, its last frame still set as the
+        // scanout, and never touches them again. Guests' own scanouts are
+        // attached to the context that made them, or in guest memory.
         let in_use = |id: u32, r: &Res3d| !r.guest.is_empty() || self.ctx_info.values().any(|c| c.attached.contains(&id));
-        if self.res3d.iter().any(|(&id, r)| r.blob && in_use(id, r)) {
+        if self.res3d.iter().any(|(&id, r)| r.blob && !self.venus_blob(r) && in_use(id, r)) {
             return Some("an app shares GPU memory with the guest (a blob), and that can't be saved".into());
         }
         if let Some(why) = self.ctx_info.values().find_map(|c| c.gl.as_ref().and_then(GlState::broken)) {
             return Some(format!("an OpenGL app did something vroom can't save ({why})"));
         }
         None
+    }
+
+    /// A blob a Vulkan context made, the context still there.
+    fn venus_blob(&self, r: &Res3d) -> bool {
+        r.made.is_some_and(|b| self.ctx_info.get(&b.ctx).is_some_and(|c| c.capset == CAPSET_VENUS))
     }
 
     fn has_3d_state(&self) -> bool {
@@ -1620,18 +2047,68 @@ impl GpuHandler {
             }
             resources.push(SnapRes3d { id, create: a, backing: r.backing.clone(), levels });
         }
-        let mut contexts: Vec<SnapCtx> = self.ctx_info.iter().map(|(&id, info)| SnapCtx { id, info: info.clone() }).collect();
+        let mut contexts: Vec<SnapCtx> = self.ctx_info.iter().map(|(&id, info)| SnapCtx { id, info: info.clone(), venus: None }).collect();
         contexts.sort_unstable_by_key(|c| c.id);
-        let gl_scanout = match self.scanout {
+        // Vulkan contexts: the renderer stops each at a command boundary,
+        // waits for the GPU and hands back all it needs.
+        for c in contexts.iter_mut().filter(|c| c.info.capset == CAPSET_VENUS) {
+            let started = std::time::Instant::now();
+            match t.r().venus_save(c.id) {
+                Some((complete, data)) => {
+                    log::info!(
+                        "gpu snapshot: Vulkan context {} ({}): {} KiB in {} ms{}",
+                        c.id,
+                        String::from_utf8_lossy(&c.info.name),
+                        data.len() >> 10,
+                        started.elapsed().as_millis(),
+                        if complete { "" } else { ", saved as lost" }
+                    );
+                    c.venus = Some((blob.len() as u64, data.len() as u64, complete));
+                    blob.extend_from_slice(&data);
+                }
+                None => {
+                    log::warn!("gpu snapshot: Vulkan context {} ({}) not saved: its app will see the device lost", c.id, String::from_utf8_lossy(&c.info.name));
+                    c.venus = Some((0, 0, false));
+                }
+            }
+        }
+        let base = t.shm_base.load(Ordering::Acquire);
+        let mut blobs: Vec<SnapBlob> = self
+            .res3d
+            .iter()
+            .filter(|(_, r)| self.venus_blob(r))
+            .filter_map(|(&id, r)| {
+                let b = r.made?;
+                let map = r.mapped.and_then(|(gpa, _)| gpa.checked_sub(base));
+                Some(SnapBlob { id, ctx: b.ctx, mem: b.mem, flags: b.flags, blob_id: b.id, size: b.size, guest: r.guest.clone(), map })
+            })
+            .collect();
+        blobs.sort_unstable_by_key(|b| b.id);
+        let blob_scanouts: Vec<[u32; 9]> = self
+            .scanouts
+            .iter()
+            .enumerate()
+            .filter_map(|(sid, s)| match *s {
+                Some(Scanout::Blob { id, view, format, stride, offset }) if blobs.iter().any(|b| b.id == id) => {
+                    Some([sid as u32, id, view.x, view.y, view.w, view.h, format, stride, offset])
+                }
+                _ => None,
+            })
+            .collect();
+        let gl_scanout = match self.scanouts[0] {
             Some(Scanout::Gl { id, view, .. }) => Some((id, view.x, view.y, view.w, view.h)),
             _ => None,
         };
+        let gl_more = self.scanouts_of(|s| matches!(s, Scanout::Gl { .. }));
         let snap = Snap3d {
             cpu: self.save_2d(),
             resources,
             contexts,
             gl_scanout,
+            gl_more,
             pending: self.pending.iter().map(|p| (p.q, p.head, p.len)).collect(),
+            blobs,
+            blob_scanouts,
         };
         // Hand GL back to the worker thread.
         t.r().release_thread();
@@ -1688,7 +2165,25 @@ impl GpuHandler {
                 }
             }
         }
-        for c in &snap.contexts {
+        if snap.blobs.len() > MAX_RESOURCES {
+            return Err(bad("too many objects"));
+        }
+        // Vulkan contexts first: GL contexts may use their blobs (windows).
+        for c in snap.contexts.iter().filter(|c| c.info.capset == CAPSET_VENUS) {
+            self.restore_venus(mem, &t, c, &snap.blobs, blob)?;
+        }
+        for b in &snap.blobs {
+            if !self.res3d.contains_key(&b.id) {
+                return Err(bad("a blob without its context"));
+            }
+            if let Some(off) = b.map {
+                // As the guest had it: checked like its own request.
+                if self.map_blob(&t, b.id, off).0 != OK_MAP_INFO {
+                    return Err(bad("can't map a blob where the guest had it"));
+                }
+            }
+        }
+        for c in snap.contexts.iter().filter(|c| c.info.capset != CAPSET_VENUS) {
             if c.id == 0 || self.contexts.contains(&c.id) || c.info.name.len() > 64 {
                 return Err(bad("bad context"));
             }
@@ -1708,19 +2203,119 @@ impl GpuHandler {
             }
             self.ctx_info.insert(c.id, c.info.clone());
         }
-        if let Some((id, x, y, w, h)) = snap.gl_scanout {
+        if snap.gl_more.iter().any(|m| m.0 == 0) {
+            return Err(bad("bad scanout"));
+        }
+        let gl = snap.gl_scanout.map(|(id, x, y, w, h)| (0, id, x, y, w, h)).into_iter().chain(snap.gl_more.iter().copied());
+        let mut any = false;
+        for (sid, id, x, y, w, h) in gl {
             let view = Rect { x, y, w, h };
+            let sid = sid as usize;
             match self.res3d.get(&id).and_then(|r| r.tex) {
-                Some((format, rw, rh)) if view.inside(rw, rh) && w > 0 && h > 0 && swizzle(format).is_some() => {
-                    self.scanout = Some(Scanout::Gl { id, view, format });
-                    self.set_mode(w, h);
-                    self.flush_all(mem);
+                Some((format, rw, rh)) if sid < self.scanouts.len() && view.inside(rw, rh) && w > 0 && h > 0 && swizzle(format).is_some() => {
+                    self.scanouts[sid] = Some(Scanout::Gl { id, view, format });
+                    self.set_mode(sid, w, h);
+                    any = true;
                 }
                 _ => return Err(bad("bad scanout")),
             }
         }
+        for &[sid, id, x, y, w, h, format, stride, offset] in &snap.blob_scanouts {
+            let view = Rect { x, y, w, h };
+            let sid = sid as usize;
+            let ok = self.res3d.get(&id).is_some_and(|r| r.blob)
+                && sid < self.scanouts.len()
+                && swizzle(format).is_some()
+                && w > 0
+                && h > 0
+                && x.checked_add(w).is_some_and(|e| e <= MAX_DIM)
+                && y.checked_add(h).is_some_and(|e| e <= MAX_DIM)
+                // reads of the view stay inside the blob (read_mapped checks)
+                && (stride as u64) >= (x as u64 + w as u64) * 4;
+            if !ok {
+                return Err(bad("bad scanout"));
+            }
+            self.scanouts[sid] = Some(Scanout::Blob { id, view, format, stride, offset });
+            self.set_mode(sid, w, h);
+        }
+        if any {
+            self.flush_all(mem);
+        }
         t.r().release_thread();
         Ok(snap.pending)
+    }
+
+    /// A Vulkan context and its blobs, again (see `Snap3d::blobs`). A
+    /// context the renderer can't build again comes back empty, its blobs
+    /// plain shared memory: its app sees the device lost, nothing else
+    /// does.
+    fn restore_venus(&mut self, mem: &GuestMemory, t: &ThreeD, c: &SnapCtx, blobs: &[SnapBlob], data: &[u8]) -> Result<()> {
+        let bad = |m: &str| Error::Device(format!("gpu snapshot: {m}"));
+        if c.id == 0 || self.contexts.contains(&c.id) || c.info.name.len() > 64 {
+            return Err(bad("bad context"));
+        }
+        if !t.r().context_create(c.id, CAPSET_VENUS, &c.info.name) {
+            return Err(bad("can't make a context again"));
+        }
+        self.contexts.push(c.id);
+        self.ctx_info.insert(c.id, CtxInfo { capset: CAPSET_VENUS, name: c.info.name.clone(), attached: c.info.attached.clone(), gl: None });
+        let mine = || blobs.iter().filter(|b| b.ctx == c.id);
+        let check = |b: &SnapBlob| -> Result<Blob> {
+            if b.size == 0 || !matches!(b.mem, BLOB_MEM_GUEST | BLOB_MEM_HOST3D | BLOB_MEM_HOST3D_GUEST) {
+                return Err(bad("bad blob"));
+            }
+            Ok(Blob { resource: b.id, ctx: c.id, mem: b.mem, flags: b.flags, id: b.blob_id, size: b.size })
+        };
+        for b in mine().filter(|b| b.early()) {
+            if !self.id_free(b.id) || self.make_blob(mem, t, check(b)?, b.guest.clone()) != OK_NODATA {
+                return Err(bad("can't make a blob again"));
+            }
+        }
+        for &rid in c.info.attached.iter().filter(|r| self.res3d.contains_key(r)) {
+            t.r().context_attach(c.id, rid);
+        }
+        let name = String::from_utf8_lossy(&c.info.name).into_owned();
+        let state = c.venus.and_then(|(off, len, _)| {
+            let start = usize::try_from(off).ok()?;
+            data.get(start..start.checked_add(usize::try_from(len).ok()?)?)
+        });
+        let started = std::time::Instant::now();
+        let restored = match state {
+            Some(s) if !s.is_empty() => t.r().venus_restore(c.id, s),
+            _ => false,
+        };
+        if !restored {
+            log::warn!("gpu snapshot: Vulkan context {} ({name}) not built again: its app will see the device lost", c.id);
+        }
+        for b in mine().filter(|b| !b.early()) {
+            if !self.id_free(b.id) {
+                return Err(bad("bad blob"));
+            }
+            let blob = check(b)?;
+            if restored && self.make_blob(mem, t, blob, Vec::new()) == OK_NODATA {
+                continue;
+            }
+            // Plain shared memory where the guest maps it, so its pages
+            // stay backed.
+            let stand_in = Blob { mem: BLOB_MEM_HOST3D, flags: BLOB_FLAG_MAPPABLE, id: 0, ..blob };
+            if self.make_blob(mem, t, stand_in, Vec::new()) != OK_NODATA {
+                return Err(bad("can't make a blob again"));
+            }
+        }
+        if restored {
+            if !t.r().venus_resume(c.id) {
+                log::warn!("gpu snapshot: Vulkan context {} ({name}) didn't start again", c.id);
+            }
+            if c.venus.is_some_and(|v| v.2) {
+                log::info!("gpu snapshot: Vulkan context {} ({name}) built again in {} ms", c.id, started.elapsed().as_millis());
+            } else {
+                log::warn!("gpu snapshot: Vulkan context {} ({name}) came back lost: its app sees the device lost", c.id);
+            }
+        }
+        for &rid in c.info.attached.iter().filter(|r| self.res3d.contains_key(r)) {
+            t.r().context_attach(c.id, rid);
+        }
+        Ok(())
     }
 
     /// Submit a command stream in pieces the renderer takes, split between
@@ -1810,18 +2405,36 @@ impl QueueHandler for GpuHandler {
         }
     }
 
+    fn attach(&mut self, poker: Poker) {
+        self.shared.lock().unwrap_or_else(|e| e.into_inner()).poker = Some(poker);
+    }
+
     fn backend_ready(&mut self, ctx: &mut QueueCtx, _token: usize) {
         self.complete_fences(ctx);
         self.finish_read(false);
+        self.surfaces_due();
+        // Now, while the guest runs: its apps stuck waiting on those
+        // contexts' rings get the "fatal" status and let go.
+        if self.shared.lock().unwrap_or_else(|e| e.into_inner()).driver_stopped {
+            let n = self.drop_direct3d();
+            if n > 0 {
+                log::info!("gpu: {n} Direct3D contexts of the stopped driver dropped");
+            }
+        }
     }
 
     fn tick_interval(&mut self) -> Option<Duration> {
-        (!self.pending.is_empty() || self.reading.is_some()).then_some(FENCE_POLL)
+        if !self.pending.is_empty() {
+            Some(FENCE_POLL)
+        } else {
+            (self.reading.is_some() || self.surface_due.iter().any(Option::is_some)).then_some(READ_POLL)
+        }
     }
 
     fn tick(&mut self, ctx: &mut QueueCtx) {
         self.complete_fences(ctx);
         self.finish_read(false);
+        self.surfaces_due();
     }
 }
 
@@ -1834,6 +2447,12 @@ impl VirtioDevice for Gpu {
     }
     fn queue_max_sizes(&self) -> Vec<u16> {
         vec![256, 16]
+    }
+    fn pci_subsystem(&self) -> u16 {
+        0x1100 + self.index
+    }
+    fn pci_shm_first(&self) -> bool {
+        self.vram.is_some()
     }
     fn device_features(&self) -> u64 {
         let base = crate::features::RING_EVENT_IDX | crate::features::RING_INDIRECT_DESC;
@@ -1848,7 +2467,7 @@ impl VirtioDevice for Gpu {
         let ncaps = self.three_d.as_ref().map(|t| t.capsets.len() as u32).unwrap_or(0);
         let mut c = [0u8; 16];
         c[0..4].copy_from_slice(&s.events_read.to_le_bytes());
-        c[8..12].copy_from_slice(&1u32.to_le_bytes()); // num_scanouts
+        c[8..12].copy_from_slice(&(self.sinks.len() as u32).to_le_bytes()); // num_scanouts
         c[12..16].copy_from_slice(&ncaps.to_le_bytes());
         let o = offset as usize;
         data.fill(0);
@@ -1868,9 +2487,15 @@ impl VirtioDevice for Gpu {
         }
     }
     fn shm_regions(&self) -> Vec<(u8, u64)> {
-        self.three_d.as_ref().map(|t| vec![(SHM_HOST_VISIBLE, t.shm_size)]).unwrap_or_default()
+        // VRAM first: it goes in BAR 0 (`pci_shm_first`).
+        let vram = self.vram.as_ref().map(|(_, size)| (SHM_VRAM, *size));
+        let host = self.three_d.as_ref().map(|t| (SHM_HOST_VISIBLE, t.shm_size));
+        vram.into_iter().chain(host).collect()
     }
     fn set_shm_base(&mut self, id: u8, gpa: u64) {
+        if let (SHM_VRAM, Some((m, size))) = (id, &self.vram) {
+            m.place(gpa, *size);
+        }
         if let (SHM_HOST_VISIBLE, Some(t)) = (id, &self.three_d) {
             t.shm_base.store(gpa, Ordering::Release);
             t.mapper.place(gpa, t.shm_size);
@@ -1889,6 +2514,7 @@ impl VirtioDevice for Gpu {
         let mut s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
         s.irq = None;
         s.direct3d = false;
+        s.driver_stopped = false;
         // The next driver starts with the monitor plugged in.
         s.replug = false;
         if let Plug::Out { size, .. } | Plug::Back { next: Some(size), .. } = s.plug {
@@ -1896,8 +2522,10 @@ impl VirtioDevice for Gpu {
         }
         s.plug = Plug::In;
         drop(s);
-        self.sink.set_mode(0, 0);
-        self.sink.cursor(&Cursor::Unset);
+        for s in &self.sinks {
+            s.set_mode(0, 0);
+            s.cursor(&Cursor::Unset);
+        }
     }
     fn pause(&mut self) {
         self.worker.pause();
@@ -1906,6 +2534,12 @@ impl VirtioDevice for Gpu {
         self.worker.resume();
     }
     fn save_active(&mut self) -> Result<DeviceState> {
+        if self.shared.lock().unwrap_or_else(|e| e.into_inner()).driver_stopped {
+            let n = self.worker.with(|_, h| h.drop_direct3d()).unwrap_or(0);
+            if n > 0 {
+                log::info!("gpu: {n} Direct3D contexts of the stopped driver dropped");
+            }
+        }
         if let Some(why) = self.worker.with(|_, h| h.snapshot_blocker()).flatten() {
             return Err(Error::Device(format!("the GPU can't be saved: {why}")));
         }
@@ -1931,12 +2565,14 @@ impl VirtioDevice for Gpu {
         let mut pending = vec![];
         if data.starts_with(SNAP3D_MAGIC) {
             pending = h.restore_3d(&ctx.mem, data)?;
-            shown = (h.mode != (0, 0)).then_some(h.mode);
         } else if !data.is_empty() {
             let snap: Snap2d = serde_json::from_slice(data).map_err(|e| Error::Device(e.to_string()))?;
             h.restore_2d(&ctx.mem, &snap)?;
-            shown = snap.scanout.map(|(_, _, _, w, h)| (w, h));
         }
+        if !data.is_empty() {
+            shown = (h.modes[0] != (0, 0)).then_some(h.modes[0]);
+        }
+        let modes = h.modes.clone();
         h.show_cursor(&ctx.mem);
         self.worker.start("gpu", ctx, h, true)?;
         // Fenced commands the GPU finished before the snapshot: return them.
@@ -1953,6 +2589,11 @@ impl VirtioDevice for Gpu {
         // a picture restored, keep its mode: a viewer that wants another
         // size asks, which raises the event the normal way.
         let mut s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        for (m, &(w, h)) in s.more.iter_mut().zip(modes.iter().skip(1)) {
+            if w != 0 {
+                (m.width, m.height) = (w, h);
+            }
+        }
         match shown {
             Some((w, h)) => (s.width, s.height) = (w, h),
             None => {
@@ -2073,6 +2714,19 @@ mod tests {
     }
 
     #[test]
+    fn context_fences_go_back_with_the_context() {
+        let (gpu, _ctl) = Gpu::new(64, 64, Arc::new(Rec::default()));
+        let mut h = gpu.handler();
+        let now = std::time::Instant::now();
+        for (head, ctx, ring) in [(1, 3, Some(1)), (2, 3, None), (3, 4, Some(1)), (4, 3, Some(0))] {
+            h.pending.push(Pending { q: 0, head, len: 24, ctx, ring, fence: 7, since: now, late: false });
+        }
+        assert_eq!(h.drop_context_fences(3), [(0, 1, 24), (0, 4, 24)]);
+        // Global fences and other contexts' stay.
+        assert_eq!(h.pending.iter().map(|p| p.head).collect::<Vec<_>>(), [2, 3]);
+    }
+
+    #[test]
     fn gl_dumb_buffers_live_in_the_renderer() {
         // Xorg's glamor draws into dumb buffers (RESOURCE_CREATE_2D). With
         // GL they must exist in the renderer, or the first GL use of one
@@ -2140,15 +2794,141 @@ mod tests {
     }
 
     #[test]
-    fn vulkan_blocks_snapshots() {
+    fn direct3d_blocks_snapshots_vulkan_doesnt() {
         let log = Arc::new(Mutex::new(vec![]));
         let (gpu, _ctl) = Gpu::new(64, 64, Arc::new(Rec::default()));
         let gpu = gpu.with_3d(ThreeD::new(Box::new(FakeGl(log)), Arc::new(NoMap), 0));
         let mut h = gpu.handler();
-        h.ctx_info.insert(2, CtxInfo { capset: 4, name: vec![], attached: Default::default(), gl: None });
-        assert!(h.snapshot_blocker().unwrap().contains("Vulkan"));
+        h.ctx_info.insert(2, CtxInfo { capset: CAPSET_VENUS, name: vec![], attached: Default::default(), gl: None });
+        // A Vulkan context's blob, shown by a GL context (a window).
+        let blob = Blob { resource: 9, ctx: 2, mem: BLOB_MEM_HOST3D, flags: 1, id: 5, size: 4096 };
+        h.res3d.insert(9, Res3d { blob: true, made: Some(blob), ..Default::default() });
+        let mut attached = std::collections::BTreeSet::new();
+        attached.insert(9);
+        h.ctx_info.insert(1, CtxInfo { capset: 2, name: vec![], attached, gl: Some(GlState::default()) });
+        assert_eq!(h.snapshot_blocker(), None);
+        // Its context gone, nothing can make it again.
+        h.ctx_info.remove(&2);
+        assert!(h.snapshot_blocker().unwrap().contains("blob"));
         h.ctx_info.insert(3, CtxInfo { capset: CAPSET_NEPTUNE, name: vec![], attached: Default::default(), gl: None });
         assert!(h.snapshot_blocker().unwrap().contains("Direct3D"));
+    }
+
+    /// A Vulkan renderer that remembers what it was asked.
+    struct FakeVk {
+        log: Arc<Mutex<Vec<String>>>,
+        restores: bool,
+    }
+    impl Renderer3d for FakeVk {
+        fn capsets(&self) -> Vec<(u32, u32, u32)> {
+            vec![(CAPSET_VENUS, 0, 160)]
+        }
+        fn capset(&mut self, _: u32, _: u32) -> Option<Vec<u8>> {
+            None
+        }
+        fn context_create(&mut self, ctx: u32, capset: u32, _: &[u8]) -> bool {
+            self.log.lock().unwrap().push(format!("ctx {ctx} capset {capset}"));
+            true
+        }
+        fn context_destroy(&mut self, _: u32) {}
+        fn context_attach(&mut self, ctx: u32, res: u32) {
+            self.log.lock().unwrap().push(format!("attach {ctx} {res}"));
+        }
+        fn context_detach(&mut self, _: u32, _: u32) {}
+        fn submit(&mut self, _: u32, _: &mut [u8]) -> bool {
+            true
+        }
+        fn create_3d(&mut self, _: u32, _: &Create3d) -> bool {
+            false
+        }
+        fn attach_backing(&mut self, _: u32, _: crate::devices::gpu3d::HostIov) -> bool {
+            true
+        }
+        fn detach_backing(&mut self, _: u32) {}
+        fn transfer(&mut self, _: bool, _: u32, _: &Transfer3d) -> bool {
+            true
+        }
+        fn create_blob(&mut self, b: &Blob, _: crate::devices::gpu3d::HostIov) -> bool {
+            self.log.lock().unwrap().push(format!("blob {} ctx {} id {} flags {} size {}", b.resource, b.ctx, b.id, b.flags, b.size));
+            true
+        }
+        fn map_blob(&mut self, _: u32) -> Option<crate::devices::gpu3d::Mapping> {
+            None
+        }
+        fn unmap_blob(&mut self, _: u32) {}
+        fn read_mapped(&mut self, _: u32, _: u64, _: &mut [u8]) -> bool {
+            false
+        }
+        fn read_back(&mut self, _: u32, _: Box3d, _: u32, _: &mut [u8]) -> bool {
+            false
+        }
+        fn venus_save(&mut self, ctx: u32) -> Option<(bool, Vec<u8>)> {
+            Some((true, format!("state of {ctx}").into_bytes()))
+        }
+        fn venus_restore(&mut self, ctx: u32, data: &[u8]) -> bool {
+            self.log.lock().unwrap().push(format!("restore {ctx}: {}", String::from_utf8_lossy(data)));
+            self.restores
+        }
+        fn venus_resume(&mut self, ctx: u32) -> bool {
+            self.log.lock().unwrap().push(format!("resume {ctx}"));
+            true
+        }
+        fn unref(&mut self, _: u32) {}
+        fn create_fence(&mut self, _: u32, _: Option<u8>, _: u64) -> bool {
+            true
+        }
+        fn poll_fd(&self) -> Option<std::os::fd::RawFd> {
+            None
+        }
+        fn poll(&mut self) -> Vec<crate::devices::gpu3d::FenceDone> {
+            vec![]
+        }
+        fn reset(&mut self) {}
+    }
+
+    /// A Vulkan context with a ring (shared memory, blob id 0) and a
+    /// memory blob (blob id 9), saved, then built again in a fresh handler:
+    /// its shared memory first, then its state, then its memory, then it
+    /// starts. A context the renderer can't build again gets shared memory
+    /// where its memory was.
+    #[test]
+    fn vulkan_snapshot_order() {
+        for restores in [true, false] {
+            let mem = GuestMemory::new(&[(GuestAddress(0), 1 << 20)]).unwrap();
+            let log = Arc::new(Mutex::new(vec![]));
+            let vk = || ThreeD::new(Box::new(FakeVk { log: log.clone(), restores }), Arc::new(NoMap), 0);
+            let (gpu, _ctl) = Gpu::new(64, 64, Arc::new(Rec::default()));
+            let gpu = gpu.with_3d(vk());
+            let mut h = gpu.handler();
+            let mut create = vec![0u32, CAPSET_VENUS];
+            create.extend([0u32; 16]);
+            assert_eq!(run(&mut h, CTX_CREATE, 2, &create), OK_NODATA);
+            // id, mem, flags, entries, blob id (2 words), size (2 words)
+            assert_eq!(run(&mut h, RESOURCE_CREATE_BLOB, 2, &[3, BLOB_MEM_HOST3D, 1, 0, 0, 0, 65536, 0]), OK_NODATA);
+            assert_eq!(run(&mut h, RESOURCE_CREATE_BLOB, 2, &[4, BLOB_MEM_HOST3D, 1, 0, 9, 0, 4096, 0]), OK_NODATA);
+            assert_eq!(h.snapshot_blocker(), None);
+            let data = h.save_3d().unwrap();
+            log.lock().unwrap().clear();
+
+            let (gpu, _ctl) = Gpu::new(64, 64, Arc::new(Rec::default()));
+            let gpu = gpu.with_3d(vk());
+            let mut h = gpu.handler();
+            h.restore_3d(&mem, &data).unwrap();
+            let got = log.lock().unwrap().clone();
+            let mut want = vec![
+                "ctx 2 capset 4".to_string(),
+                "blob 3 ctx 2 id 0 flags 1 size 65536".into(),
+                "restore 2: state of 2".into(),
+            ];
+            if restores {
+                want.push("blob 4 ctx 2 id 9 flags 1 size 4096".into());
+                want.push("resume 2".into());
+            } else {
+                want.push("blob 4 ctx 2 id 0 flags 1 size 4096".into());
+            }
+            assert_eq!(got, want);
+            assert!(h.res3d.contains_key(&4) && h.ctx_info[&2].capset == CAPSET_VENUS);
+        }
     }
 
     #[test]
@@ -2159,7 +2939,7 @@ mod tests {
         let mut h = gpu.handler();
         // Left behind by a driver that stopped: no context, not ours to keep.
         h.res3d.insert(9, Res3d { blob: true, ..Default::default() });
-        h.scanout = Some(Scanout::Blob { id: 9, view: Rect { x: 0, y: 0, w: 8, h: 8 }, format: 1, stride: 32, offset: 0 });
+        h.scanouts[0] = Some(Scanout::Blob { id: 9, view: Rect { x: 0, y: 0, w: 8, h: 8 }, format: 1, stride: 32, offset: 0 });
         assert_eq!(h.snapshot_blocker(), None);
         // A context still uses it.
         let mut attached = std::collections::BTreeSet::new();
@@ -2258,7 +3038,7 @@ mod tests {
         h.resources.get_mut(&7).unwrap().backing = vec![(0x1000, 16), (0x3000, 16)];
         let full = Rect { x: 0, y: 0, w: 4, h: 2 };
         assert_eq!(h.transfer(mem, 7, full, 0, None), OK_NODATA);
-        h.scanout = Some(Scanout::Cpu { id: 7, view: full });
+        h.scanouts[0] = Some(Scanout::Cpu { id: 7, view: full });
         // Through JSON, like a real snapshot.
         serde_json::from_slice(&serde_json::to_vec(&h.save_2d()).unwrap()).unwrap()
     }
@@ -2307,8 +3087,62 @@ mod tests {
         assert_eq!(swizzle(999), None);
     }
 
+    /// Two monitors (X11's way: one resource, a part of it each).
+    #[test]
+    fn a_resource_on_two_scanouts() {
+        let mem = GuestMemory::new(&[(GuestAddress(0), 1 << 20)]).unwrap();
+        let (a, b) = (Arc::new(Rec::default()), Arc::new(Rec::default()));
+        let (mut gpu, ctl) = Gpu::with_heads(&[(4, 2), (2, 2)], vec![a.clone(), b.clone()]);
+        assert_eq!(ctl.heads(), 2);
+        let mut c = [0u8; 4];
+        gpu.read_config(8, &mut c);
+        assert_eq!(u32::from_le_bytes(c), 2, "num_scanouts");
+        let mut h = gpu.handler();
+        // Both plugged in at their sizes.
+        assert_eq!(display_info_at(&mut h, 1), (2, 2, 1));
+        // A 6x2 framebuffer: scanout 0 shows x 0..4, scanout 1 x 4..6.
+        assert_eq!(h.create_cpu(3, 2, 6, 2), OK_NODATA);
+        let px: Vec<u8> = (0..48).collect();
+        mem.write(GuestAddress(0x1000), &px).unwrap();
+        h.resources.get_mut(&3).unwrap().backing = vec![(0x1000, 48)];
+        assert_eq!(h.transfer(&mem, 3, Rect { x: 0, y: 0, w: 6, h: 2 }, 0, None), OK_NODATA);
+        assert_eq!(run(&mut h, SET_SCANOUT, 0, &[0, 0, 4, 2, 0, 3]), OK_NODATA);
+        assert_eq!(run(&mut h, SET_SCANOUT, 0, &[4, 0, 2, 2, 1, 3]), OK_NODATA);
+        assert_eq!(run(&mut h, SET_SCANOUT, 0, &[0, 0, 2, 2, 2, 3]), ERR_INVALID_SCANOUT_ID);
+        assert_eq!((a.modes.lock().unwrap().clone(), b.modes.lock().unwrap().clone()), (vec![(4, 2)], vec![(2, 2)]));
+        // A flush across both: each gets its part, at its own origin.
+        assert_eq!(h.flush_rect(&mem, Rect { x: 3, y: 1, w: 2, h: 1 }, 3), OK_NODATA);
+        let fa = a.frames.lock().unwrap().last().cloned().unwrap();
+        let fb = b.frames.lock().unwrap().last().cloned().unwrap();
+        assert_eq!((fa.0, fa.1, &fa.2[..3]), (1, 1, &px[36..39]), "pixel (3,1)");
+        assert_eq!((fb.0, fb.1, &fb.2[..3]), (1, 1, &px[40..43]), "pixel (4,1)");
+        // Both come back from a snapshot.
+        let snap: Snap2d = serde_json::from_slice(&serde_json::to_vec(&h.save_2d()).unwrap()).unwrap();
+        assert_eq!(snap.more, vec![(1, 3, 4, 0, 2, 2)]);
+        let mut h2 = gpu.handler();
+        h2.restore_2d(&mem, &snap).unwrap();
+        assert!(h2.scanouts[1].is_some_and(|s| s.view() == Rect { x: 4, y: 0, w: 2, h: 2 }));
+        let mut bad = serde_json::from_slice::<Snap2d>(&serde_json::to_vec(&snap).unwrap()).unwrap();
+        bad.more[0].0 = 5;
+        assert!(gpu.handler().restore_2d(&mem, &bad).is_err(), "no such scanout");
+        // Unplugging the second monitor is a display event.
+        gpu.write_config(4, &EVENT_DISPLAY.to_le_bytes());
+        ctl.resize_head(1, 0, 0);
+        assert_eq!(driver_reads(&mut gpu, &mut h).0, 4);
+        assert_eq!(display_info_at(&mut h, 1), (0, 0, 0));
+        ctl.resize_head(1, 800, 600);
+        assert_eq!(display_info_at(&mut h, 1), (800, 600, 1));
+        ctl.resize_head(7, 800, 600); // no such head: ignored
+        ctl.resize_head(1, 1 << 20, 600);
+        assert_eq!(display_info_at(&mut h, 1), (800, 600, 1));
+    }
+
     /// GET_DISPLAY_INFO: (width, height, enabled) of scanout 0.
     fn display_info(h: &mut GpuHandler) -> (u32, u32, u32) {
+        display_info_at(h, 0)
+    }
+
+    fn display_info_at(h: &mut GpuHandler, sid: usize) -> (u32, u32, u32) {
         use crate::queue::tests::*;
         let mut ring = TestRing::new(4);
         ring.add_chain(&[(4, false)]);
@@ -2317,7 +3151,7 @@ mod tests {
         let hdr = Hdr { ty: GET_DISPLAY_INFO, flags: 0, fence: 0, ctx: 0, ring: 0 };
         let (ty, b) = h.command(&mem, &mut r, &hdr);
         assert_eq!(ty, OK_DISPLAY_INFO);
-        let u = |i: usize| u32::from_le_bytes(b[i..i + 4].try_into().unwrap());
+        let u = |i: usize| u32::from_le_bytes(b[sid * 24 + i..sid * 24 + i + 4].try_into().unwrap());
         (u(8), u(12), u(16))
     }
 
@@ -2361,7 +3195,7 @@ mod tests {
         ctl.resize(1600, 1000);
         assert_eq!(events(&gpu), 0);
         assert_eq!(ctl.replugs_done(), None);
-        h.set_mode(1440, 900);
+        h.set_mode(0, 1440, 900);
         assert_eq!(ctl.replugs_done(), Some(1));
         ctl.tick();
         // Mid-replug: it comes back with the latest size.

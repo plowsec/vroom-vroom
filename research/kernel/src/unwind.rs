@@ -478,7 +478,7 @@ fn packed(data: u32) -> Result<Vec<Op>> {
         allocated = true;
         i += if pair { 2 } else { 1 };
     }
-    if cr == 1 && int.is_multiple_of(2) {
+    if cr == 1 && int % 2 == 0 {
         ops.push(save(
             30,
             None,

@@ -150,7 +150,9 @@ fn open_apple() -> Option<Egl> {
     };
     e.reader = Gl::load(&get_proc).and_then(|gl| {
         // Desktop GL reads BGRA without an extension.
-        Some(Mutex::new(Reader { gl, ctx: e.context(4, 1)?, fbo: 0, pbo: 0, pbo_size: 0, bgra: Some(true), pending: None }))
+        let ctx = e.context(4, 1)?;
+        let present = Present::load(&get_proc, ctx);
+        Some(Mutex::new(Reader { gl, ctx, fbo: 0, pbo: 0, pbo_size: 0, bgra: Some(true), pending: None, present }))
     });
     log::info!("gpu3d: Apple OpenGL 4.1 (CGL)");
     Some(e)
@@ -221,7 +223,7 @@ fn open(dir: &Path) -> Option<Egl> {
     let egl_get_proc: unsafe extern "C" fn(*const c_char) -> Ptr = sym!("eglGetProcAddress");
     // SAFETY: valid C string; ANGLE returns core entry points too.
     let get_proc = move |name: &CStr| unsafe { egl_get_proc(name.as_ptr()) };
-    e.reader = Gl::load(&get_proc).and_then(|gl| Some(Mutex::new(Reader { gl, ctx: e.context(3, 0)?, fbo: 0, pbo: 0, pbo_size: 0, bgra: None, pending: None })));
+    e.reader = Gl::load(&get_proc).and_then(|gl| Some(Mutex::new(Reader { gl, ctx: e.context(3, 0)?, fbo: 0, pbo: 0, pbo_size: 0, bgra: None, pending: None, present: None })));
     Some(e)
 }
 
@@ -324,6 +326,8 @@ struct Reader {
     /// GL_EXT_read_format_bgra, checked on first use.
     bgra: Option<bool>,
     pending: Option<Pending>,
+    /// Frames into IOSurfaces instead (Apple's GL only).
+    present: Option<Present>,
 }
 
 impl Reader {
@@ -493,6 +497,306 @@ pub(crate) fn read_poll(out: &mut [u8], wait: bool) -> Option<bool> {
         Some(r.finish(out))
     })
     .flatten()
+}
+
+const GL_DRAW_FRAMEBUFFER: u32 = 0x8CA9;
+const GL_TEXTURE_RECTANGLE: u32 = 0x84F5;
+const GL_RGBA8: u32 = 0x8058;
+const GL_UNSIGNED_INT_8_8_8_8_REV: u32 = 0x8367;
+const GL_COLOR_BUFFER_BIT: u32 = 0x4000;
+const GL_NEAREST: u32 = 0x2600;
+
+/// Surfaces per monitor: one shown, one on its way, one spare for the
+/// window server still showing an old one.
+const SURFACE_SLOTS: usize = vroom_ipc::surface::MAX_SLOTS as usize;
+/// Monitors (virtio-gpu scanouts) with surfaces of their own.
+const SURFACE_HEADS: usize = vroom_ipc::surface::MAX_HEADS as usize;
+
+/// A surface made for a monitor, for the app (through the VMM).
+#[derive(Debug)]
+pub struct NewSurface {
+    pub head: u32,
+    pub gen: u32,
+    pub slot: u32,
+    pub surface: vroom_ipc::surface::Surface,
+}
+
+/// One monitor's surfaces: all the same size, made together.
+struct Pool {
+    gen: u32,
+    size: (u32, u32),
+    slots: Vec<(vroom_ipc::surface::Surface, u32)>,
+    /// The slot last handed out (the app shows it, or soon will).
+    last: Option<usize>,
+}
+
+/// A frame on its way into a surface.
+struct PendingSurface {
+    sync: Ptr,
+    head: u32,
+    gen: u32,
+    slot: u32,
+}
+
+/// Scanout frames into IOSurfaces the app shows itself (a CALayer), with
+/// Apple's GL: a blit on the GPU, no pixels back to the CPU. The surfaces
+/// are made here and go to the app as mach ports, through the VMM.
+struct Present {
+    tex_image: unsafe extern "C" fn(Ptr, u32, u32, i32, i32, u32, u32, *const c_void, u32) -> c_int,
+    gen_textures: unsafe extern "C" fn(i32, *mut u32),
+    delete_textures: unsafe extern "C" fn(i32, *const u32),
+    bind_texture: unsafe extern "C" fn(u32, u32),
+    delete_framebuffers: unsafe extern "C" fn(i32, *const u32),
+    blit_framebuffer: unsafe extern "C" fn(i32, i32, i32, i32, i32, i32, i32, i32, u32, u32),
+    color_mask: unsafe extern "C" fn(u8, u8, u8, u8),
+    clear_color: unsafe extern "C" fn(f32, f32, f32, f32),
+    clear: unsafe extern "C" fn(u32),
+    flush: unsafe extern "C" fn(),
+    /// The reader's CGL context (the one these textures are made in).
+    cgl: Ptr,
+    draw_fbo: u32,
+    pools: [Option<Pool>; SURFACE_HEADS],
+    next_gen: u32,
+    /// Made, not yet collected by [`take_surfaces`].
+    new: Vec<NewSurface>,
+    pending: Option<PendingSurface>,
+}
+
+impl Present {
+    fn load(get_proc: &dyn Fn(&CStr) -> Ptr, cgl: Ptr) -> Option<Present> {
+        macro_rules! f {
+            ($name:literal) => {{
+                let c = CString::new($name).ok()?;
+                let f = get_proc(&c);
+                if f.is_null() {
+                    log::info!("gpu3d: {} missing: frames come back through the CPU", $name);
+                    return None;
+                }
+                // SAFETY: the CGL / GL 4.1 signature it is cast to.
+                #[allow(clippy::missing_transmute_annotations)]
+                unsafe {
+                    std::mem::transmute::<Ptr, _>(f)
+                }
+            }};
+        }
+        Some(Present {
+            tex_image: f!("CGLTexImageIOSurface2D"),
+            gen_textures: f!("glGenTextures"),
+            delete_textures: f!("glDeleteTextures"),
+            bind_texture: f!("glBindTexture"),
+            delete_framebuffers: f!("glDeleteFramebuffers"),
+            blit_framebuffer: f!("glBlitFramebuffer"),
+            color_mask: f!("glColorMask"),
+            clear_color: f!("glClearColor"),
+            clear: f!("glClear"),
+            flush: f!("glFlush"),
+            cgl,
+            draw_fbo: 0,
+            pools: Default::default(),
+            next_gen: 1,
+            new: Vec::new(),
+            pending: None,
+        })
+    }
+
+    /// Head `head`'s surfaces at `w` x `h`, made anew (a new generation)
+    /// if it has none of that size.
+    ///
+    /// # Safety
+    /// The reader's context must be current.
+    unsafe fn pool(&mut self, head: usize, w: u32, h: u32) -> Option<&mut Pool> {
+        if self.pools[head].as_ref().is_some_and(|p| p.size == (w, h)) {
+            return self.pools[head].as_mut();
+        }
+        if let Some(old) = self.pools[head].take() {
+            for (_, t) in &old.slots {
+                // SAFETY: a texture we made in this share group.
+                unsafe { (self.delete_textures)(1, t) };
+            }
+        }
+        let gen = self.next_gen;
+        self.next_gen = self.next_gen.wrapping_add(1).max(1);
+        let mut slots = Vec::new();
+        for _ in 0..SURFACE_SLOTS {
+            let s = vroom_ipc::surface::Surface::new(w, h)?;
+            let mut t = 0;
+            // SAFETY: GL calls on the current context; the surface lives as
+            // long as the texture (both in the pool).
+            let err = unsafe {
+                (self.gen_textures)(1, &mut t);
+                (self.bind_texture)(GL_TEXTURE_RECTANGLE, t);
+                let e = (self.tex_image)(self.cgl, GL_TEXTURE_RECTANGLE, GL_RGBA8, w as i32, h as i32, GL_BGRA_EXT, GL_UNSIGNED_INT_8_8_8_8_REV, s.as_ptr(), 0);
+                (self.bind_texture)(GL_TEXTURE_RECTANGLE, 0);
+                e
+            };
+            if err != 0 {
+                log::warn!("gpu3d: GL can't take an IOSurface ({err}): frames come back through the CPU");
+                // SAFETY: the texture just made.
+                unsafe { (self.delete_textures)(1, &t) };
+                for (_, t) in &slots {
+                    // SAFETY: textures made above.
+                    unsafe { (self.delete_textures)(1, t) };
+                }
+                return None;
+            }
+            slots.push((s, t));
+        }
+        for (i, (s, _)) in slots.iter().enumerate() {
+            self.new.push(NewSurface { head: head as u32, gen, slot: i as u32, surface: s.clone() });
+        }
+        log::info!("gpu3d: monitor {} on IOSurfaces, {w}x{h} (generation {gen})", head + 1);
+        self.pools[head] = Some(Pool { gen, size: (w, h), slots, last: None });
+        self.pools[head].as_mut()
+    }
+}
+
+impl Reader {
+    /// Queue a copy of `w` x `h` pixels at (`x`, `y`) of texture `tex`
+    /// into one of head `head`'s surfaces, made here first if it has none
+    /// of that size. `flip` as for [`Reader::start`].
+    ///
+    /// # Safety
+    /// `self.ctx` must be current on this thread.
+    unsafe fn surface_start(&mut self, head: u32, tex: u32, flip: Option<u32>, (x, y, w, h): (u32, u32, u32, u32)) -> bool {
+        let gl = &self.gl;
+        let Some(p) = self.present.as_mut() else { return false };
+        let hd = head as usize;
+        if hd >= SURFACE_HEADS || w == 0 || h == 0 {
+            return false;
+        }
+        // Bottom-up texture rows: the box's GL rows, the other way round.
+        let (src_y0, src_y1, dst_y0, dst_y1) = match flip {
+            Some(height) => match height.checked_sub(y).and_then(|top| top.checked_sub(h).map(|b| (b, top))) {
+                Some((b, t)) => (b as i32, t as i32, h as i32, 0),
+                None => return false,
+            },
+            None => (y as i32, (y + h) as i32, 0, h as i32),
+        };
+        // SAFETY: GL calls on the reader's current context (whole block),
+        // with names we made; the surfaces stay alive in the pool.
+        unsafe {
+            if let Some(old) = p.pending.take() {
+                (gl.delete_sync)(old.sync);
+            }
+            while (gl.get_error)() != 0 {}
+            let Some(pool) = p.pool(hd, w, h) else { return false };
+            // A slot the window server isn't showing, and not the last one
+            // handed out (the app may not have shown it yet).
+            let n = pool.slots.len();
+            let start = pool.last.map_or(0, |l| l + 1);
+            let slot = (0..n).map(|i| (start + i) % n).filter(|&i| Some(i) != pool.last).find(|&i| !pool.slots[i].0.in_use()).unwrap_or(start % n);
+            let (gen, dst) = (pool.gen, pool.slots[slot].1);
+            let _ = pool;
+            if self.fbo == 0 {
+                (gl.gen_framebuffers)(1, &mut self.fbo);
+            }
+            if p.draw_fbo == 0 {
+                (gl.gen_framebuffers)(1, &mut p.draw_fbo);
+            }
+            (gl.bind_framebuffer)(GL_READ_FRAMEBUFFER, self.fbo);
+            (gl.framebuffer_texture_2d)(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+            (gl.bind_framebuffer)(GL_DRAW_FRAMEBUFFER, p.draw_fbo);
+            (gl.framebuffer_texture_2d)(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_RECTANGLE, dst, 0);
+            let mut ok = (gl.check_framebuffer_status)(GL_READ_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE
+                && (gl.check_framebuffer_status)(GL_DRAW_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+            if ok {
+                (p.blit_framebuffer)(x as i32, src_y0, (x + w) as i32, src_y1, 0, dst_y0, w as i32, dst_y1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+                // Opaque: scanouts are BGRX, and the window server
+                // blends what alpha says.
+                (p.color_mask)(0, 0, 0, 1);
+                (p.clear_color)(0.0, 0.0, 0.0, 1.0);
+                (p.clear)(GL_COLOR_BUFFER_BIT);
+                (p.color_mask)(1, 1, 1, 1);
+                let sync = (gl.fence_sync)(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+                ok = !sync.is_null() && (gl.get_error)() == 0;
+                if ok {
+                    (p.flush)();
+                    if let Some(pool) = p.pools[hd].as_mut() {
+                        pool.last = Some(slot);
+                    }
+                    p.pending = Some(PendingSurface { sync, head, gen, slot: slot as u32 });
+                } else if !sync.is_null() {
+                    (gl.delete_sync)(sync);
+                }
+            }
+            // Never keep a guest texture alive through our framebuffers.
+            (gl.framebuffer_texture_2d)(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+            (gl.framebuffer_texture_2d)(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_RECTANGLE, 0, 0);
+            (gl.bind_framebuffer)(GL_READ_FRAMEBUFFER, 0);
+            (gl.bind_framebuffer)(GL_DRAW_FRAMEBUFFER, 0);
+            ok
+        }
+    }
+
+    /// The pending surface frame, once the GPU has it (or given up on
+    /// after a second, with `wait`): `Some(None)` when it failed.
+    ///
+    /// # Safety
+    /// A context of ours must be current on this thread.
+    unsafe fn surface_done(&mut self, wait: bool) -> Option<Option<(u32, u32, u32)>> {
+        let p = self.present.as_mut()?;
+        let pending = p.pending.as_ref()?;
+        let (flags, timeout) = if wait { (GL_SYNC_FLUSH_COMMANDS_BIT, READ_WAIT_NS) } else { (0, 0) };
+        // SAFETY: a live sync object of the share group.
+        let r = unsafe { (self.gl.client_wait_sync)(pending.sync, flags, timeout) };
+        let done = r == GL_ALREADY_SIGNALED || r == GL_CONDITION_SATISFIED;
+        if !done && !wait {
+            return None;
+        }
+        let pending = p.pending.take()?;
+        // SAFETY: the sync object, no longer used.
+        unsafe { (self.gl.delete_sync)(pending.sync) };
+        Some(done.then_some((pending.head, pending.gen, pending.slot)))
+    }
+}
+
+/// Start putting a rect of GL texture `tex` (what monitor `head` shows)
+/// into one of its IOSurfaces; [`surface_poll`] says which. False if that
+/// isn't possible here (no Apple GL): read it back instead.
+pub(crate) fn surface_start(head: u32, tex: u32, flip: Option<u32>, rect: (u32, u32, u32, u32)) -> bool {
+    // SAFETY: with_reader makes r.ctx current.
+    with_reader(|r| unsafe { r.surface_start(head, tex, flip, rect) }).unwrap_or(false)
+}
+
+/// The frame [`surface_start`] queued: None while the GPU is at it (unless
+/// `wait`) or if there is none, else (head, generation, slot), or None
+/// inside when it failed.
+pub(crate) fn surface_poll(wait: bool) -> Option<Option<(u32, u32, u32)>> {
+    {
+        let r = egl()?.reader.as_ref()?.lock().unwrap_or_else(|p| p.into_inner());
+        r.present.as_ref()?.pending.as_ref()?;
+    }
+    // SAFETY: with_reader makes r.ctx current.
+    with_reader(|r| unsafe { r.surface_done(wait) }).flatten()
+}
+
+/// Surfaces made since the last call, for the app.
+pub(crate) fn take_surfaces() -> Vec<NewSurface> {
+    let Some(reader) = egl().and_then(|e| e.reader.as_ref()) else { return Vec::new() };
+    let mut r = reader.lock().unwrap_or_else(|p| p.into_inner());
+    r.present.as_mut().map(|p| std::mem::take(&mut p.new)).unwrap_or_default()
+}
+
+/// Drop every monitor's surfaces (device reset): new ones next frame.
+pub(crate) fn surfaces_reset() {
+    // SAFETY: with_reader makes r.ctx current; textures of ours.
+    with_reader(|r| unsafe {
+        if let Some(p) = r.present.as_mut() {
+            if let Some(old) = p.pending.take() {
+                (r.gl.delete_sync)(old.sync);
+            }
+            for pool in p.pools.iter_mut().filter_map(Option::take) {
+                for (_, t) in &pool.slots {
+                    (p.delete_textures)(1, t);
+                }
+            }
+            if p.draw_fbo != 0 {
+                (p.delete_framebuffers)(1, &p.draw_fbo);
+                p.draw_fbo = 0;
+            }
+            p.new.clear();
+        }
+    });
 }
 
 impl Egl {

@@ -18,6 +18,7 @@ vroom-block = { path = "../crates/block" }
 vroom-fs = { path = "../crates/fs" }
 vroom-display = { path = "../crates/display" }
 vroom-usb = { path = "../crates/usb" }
+vroom-video = { path = "../crates/video" }
 tempfile = "3"
 
 # Not part of the main workspace (needs nightly + sanitizers).
@@ -140,5 +141,17 @@ doc = false
 [[bin]]
 name = "virgl_state"
 path = "fuzz_targets/virgl_state.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "video"
+path = "fuzz_targets/video.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "media"
+path = "fuzz_targets/media.rs"
 test = false
 doc = false

@@ -57,6 +57,9 @@ fn lock_down(cfg: &VmConfig, state_dir: &Path, clipboard: bool, helpers: Vec<u32
     let mut p = vroom_sandbox::Policy {
         write_dirs: vec![state_dir.to_path_buf()],
         clipboard,
+        // USB disks the app hands over while the VM runs (nothing else
+        // can be reached through these rules).
+        usb_storage: cfg!(target_os = "macos"),
         // With 3D the GPU is the GPU process's, unless it runs in here.
         gpu: cfg.display.gpu == vroom_config::Gpu::Virtio3d && vroom_vmm::gpu_in_process(),
         shared_ram: cfg.display.gpu == vroom_config::Gpu::Virtio3d,
@@ -371,7 +374,7 @@ pub fn run(o: RunOpts) -> Result<(), String> {
     let clipboard = if gui { None } else { o.clipboard };
     let has_clip = clipboard.is_some();
     let hv = vroom_hv::default_hypervisor().map_err(|e| e.to_string())?;
-    let opts = VmmOptions { serial_out: Box::new(std::io::stdout()), start, clipboard, ui, state_dir: o.state_dir.clone() };
+    let opts = VmmOptions { serial_out: Box::new(std::io::stdout()), start, clipboard, ui, state_dir: o.state_dir.clone(), sandbox: o.sandbox };
     let vmm = Vmm::start(o.config, hv, opts).map_err(|e| e.to_string())?;
     if resumed_suspend {
         // A suspend image is single use: the disks move on from here.

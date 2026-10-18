@@ -1,6 +1,7 @@
 //! Framed messages: type u8 | len u32 LE | payload.
 
-use crate::{Error, Result};
+use crate::{Error, Result, MAX_HEADS};
+pub use vroom_proto::{GuestApp, GuestWindow, WindowOp};
 
 /// Absolute pointer range (like a USB tablet).
 pub const POINTER_MAX: u16 = 32767;
@@ -12,6 +13,219 @@ const MAX_MSG: usize = 16 << 20;
 pub const DRAG_ITEMS_MAX: usize = 4096;
 /// Biggest guest pointer picture, in pixels on a side.
 pub const CURSOR_MAX: u32 = 256;
+/// Most host USB devices a VM lists (its port pairs).
+pub const USB_PORTS_MAX: usize = 16;
+
+/// A host USB device, as the viewer names it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UsbDev {
+    /// "vendor:product", 4 hex digits each.
+    pub id: String,
+    /// Empty: none.
+    pub serial: String,
+    /// A label for people.
+    pub name: String,
+}
+
+impl UsbDev {
+    /// Plain text only, and short: these end up in the VM file and on
+    /// screen.
+    pub fn valid(&self) -> bool {
+        let hex = |s: &str| s.len() == 4 && s.bytes().all(|b| b.is_ascii_hexdigit());
+        let id = self.id.split_once(':').is_some_and(|(v, p)| hex(v) && hex(p));
+        let text = |s: &str, max: usize| s.len() <= max && !s.chars().any(char::is_control);
+        id && text(&self.serial, 126) && text(&self.name, 128)
+    }
+
+    fn encode(&self, p: &mut Vec<u8>) {
+        for s in [&self.id, &self.serial, &self.name] {
+            p.extend_from_slice(&(s.len() as u16).to_le_bytes());
+            p.extend_from_slice(s.as_bytes());
+        }
+    }
+
+    fn decode(p: &[u8], o: &mut usize) -> Result<UsbDev> {
+        let mut f = || -> Result<String> {
+            let len = u16::from_le_bytes(p.get(*o..*o + 2).ok_or(Error::Proto("short"))?.try_into().map_err(|_| Error::Proto("short"))?) as usize;
+            let s = text(p.get(*o + 2..*o + 2 + len).ok_or(Error::Proto("short"))?)?;
+            *o += 2 + len;
+            Ok(s)
+        };
+        let d = UsbDev { id: f()?, serial: f()?, name: f()? };
+        if !d.valid() {
+            return Err(Error::Proto("usb device"));
+        }
+        Ok(d)
+    }
+}
+
+/// A host device on one of the VM's USB port pairs, or a USB disk's
+/// files on one of its removable shares (`port` from `FILES_PORT0`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsbPort {
+    pub port: u8,
+    pub dev: UsbDev,
+    /// Its helper has it open (else it was unplugged from the Mac, or
+    /// not found yet).
+    pub here: bool,
+    /// From the VM file (`[[usb]]`), connected at every start.
+    pub always: bool,
+    pub how: UsbHow,
+    /// "files" and "disk": the guest can't change it.
+    pub readonly: bool,
+}
+
+/// How a host USB device is in the VM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UsbHow {
+    /// The device itself (passthrough).
+    #[default]
+    Device,
+    /// A disk of it, as a plain USB stick.
+    Disk,
+    /// The files of its volumes, as a shared folder.
+    Files,
+}
+
+/// `UsbPort::port` of the first removable share (USB disks' files);
+/// `UsbDetach` takes these too.
+pub const FILES_PORT0: u8 = 64;
+/// Longest volume name `UsbFiles` carries, and longest sandbox token.
+pub const USB_LABEL_MAX: usize = 64;
+pub const USB_TOKEN_MAX: usize = 2048;
+
+/// A volume name fit for the guest to see (a mount point's last part).
+pub fn usb_label_ok(s: &str) -> bool {
+    !s.is_empty() && s.len() <= USB_LABEL_MAX && s != "." && s != ".." && !s.chars().any(|c| c.is_control() || c == '/' || c == '\\')
+}
+
+/// Most network adapters a VM has (the config's limit).
+pub const NET_PORTS_MAX: usize = 8;
+/// Most port forwards one adapter lists.
+pub const FORWARDS_MAX: usize = 64;
+
+/// What a network adapter is plugged into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetKind {
+    Nat,
+    Bridged,
+    HostOnly,
+}
+
+/// A NAT port forward: `host_addr:host_port` to the guest's `guest_port`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Forward {
+    pub host_addr: String,
+    pub host_port: u16,
+    pub guest_port: u16,
+}
+
+/// The other end of an adapter's cable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetLive {
+    pub kind: NetKind,
+    /// Bridged: the Mac's interface; host-only: the network. NAT: empty.
+    pub name: String,
+    /// NAT: the guest may reach the host's loopback, may not reach the LAN.
+    pub loopback: bool,
+    pub block_private: bool,
+    /// NAT: the port forwards it has.
+    pub forwards: Vec<Forward>,
+}
+
+/// One network adapter of the VM, as it is now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetPort {
+    /// Its index (`[[net]]` order at start).
+    pub nic: u8,
+    pub live: NetLive,
+    /// The cable is in.
+    pub connected: bool,
+    /// The MAC the guest uses.
+    pub mac: [u8; 6],
+    /// Added while the VM runs (in a hot plug slot): it can be taken out
+    /// again (`ToVmm::NetRemove`).
+    pub added: bool,
+}
+
+/// Interface and network names: what the VM file allows.
+fn net_name_ok(kind: NetKind, s: &str) -> bool {
+    let chars = s.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
+    match kind {
+        NetKind::Nat => s.is_empty(),
+        NetKind::Bridged => !s.is_empty() && s.len() <= 15 && chars,
+        NetKind::HostOnly => !s.is_empty() && s.len() <= 64 && !s.starts_with('.') && chars,
+    }
+}
+
+impl NetLive {
+    pub fn valid(&self) -> bool {
+        let fwd_ok = |f: &Forward| f.host_addr.len() <= 64 && f.host_addr.parse::<std::net::IpAddr>().is_ok();
+        net_name_ok(self.kind, &self.name)
+            && self.forwards.len() <= FORWARDS_MAX
+            && self.forwards.iter().all(fwd_ok)
+            && (self.kind == NetKind::Nat || (self.forwards.is_empty() && !self.loopback && !self.block_private))
+    }
+
+    /// kind u8 | flags u8 | name (u8 len) | forwards: n u8, then addr
+    /// (u8 len), host port u16, guest port u16 each.
+    fn encode(&self, p: &mut Vec<u8>) {
+        p.push(self.kind as u8);
+        p.push(self.loopback as u8 | (self.block_private as u8) << 1);
+        p.push(self.name.len() as u8);
+        p.extend_from_slice(self.name.as_bytes());
+        p.push(self.forwards.len() as u8);
+        for f in &self.forwards {
+            p.push(f.host_addr.len() as u8);
+            p.extend_from_slice(f.host_addr.as_bytes());
+            p.extend_from_slice(&f.host_port.to_le_bytes());
+            p.extend_from_slice(&f.guest_port.to_le_bytes());
+        }
+    }
+
+    fn decode(p: &[u8], o: &mut usize) -> Result<NetLive> {
+        let short = || Error::Proto("short");
+        let byte = |o: &mut usize| -> Result<u8> {
+            let b = *p.get(*o).ok_or_else(short)?;
+            *o += 1;
+            Ok(b)
+        };
+        let str8 = |o: &mut usize| -> Result<String> {
+            let n = *p.get(*o).ok_or_else(short)? as usize;
+            let s = text(p.get(*o + 1..*o + 1 + n).ok_or_else(short)?)?;
+            *o += 1 + n;
+            Ok(s)
+        };
+        let u16_at = |o: &mut usize| -> Result<u16> {
+            let b = p.get(*o..*o + 2).ok_or_else(short)?;
+            *o += 2;
+            Ok(u16::from_le_bytes([b[0], b[1]]))
+        };
+        let kind = match byte(o)? {
+            0 => NetKind::Nat,
+            1 => NetKind::Bridged,
+            2 => NetKind::HostOnly,
+            _ => return Err(Error::Proto("network mode")),
+        };
+        let flags = byte(o)?;
+        let name = str8(o)?;
+        let n = byte(o)? as usize;
+        if n > FORWARDS_MAX {
+            return Err(Error::Proto("port forwards"));
+        }
+        let mut forwards = Vec::with_capacity(n);
+        for _ in 0..n {
+            let host_addr = str8(o)?;
+            let (host_port, guest_port) = (u16_at(o)?, u16_at(o)?);
+            forwards.push(Forward { host_addr, host_port, guest_port });
+        }
+        let live = NetLive { kind, name, loopback: flags & 1 != 0, block_private: flags & 2 != 0, forwards };
+        if flags & !3 != 0 || !live.valid() {
+            return Err(Error::Proto("network adapter"));
+        }
+        Ok(live)
+    }
+}
 
 /// VMM -> viewer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +253,42 @@ pub enum ToViewer {
     /// The dropped files are in the guest (`ok`), or why not. `place`:
     /// where they went, without a live drag.
     DropDone { id: u32, ok: bool, place: String },
+    /// The host USB devices the VM has now. Sent once the VM has a USB
+    /// controller to plug them into, and whenever the list changes.
+    Usb(Vec<UsbPort>),
+    /// The guest agent said hello: what it can do (`vroom_proto::features`).
+    Agent { features: u64 },
+    /// Coherence: the guest's windows, front to back (checked like the
+    /// agent's message; the viewer still clips them to the screen).
+    Windows(Vec<GuestWindow>),
+    /// Files dragged out of the guest (answer to `ToVmm::DragOut`): their
+    /// top-level names and whether each is a folder; none when the guest
+    /// isn't dragging files.
+    DragOutItems { id: u32, items: Vec<(String, bool)> },
+    /// Coherence: the app icon of a guest window, `w` x `h` RGBA (not
+    /// premultiplied), at most `vroom_proto::ICON_MAX` on a side; 0 x 0:
+    /// none. Checked like the agent's message.
+    WindowIcon { id: u32, w: u32, h: u32, rgba: Vec<u8> },
+    /// Coherence can't work in the guest's session, and why.
+    CoherenceNo(String),
+    /// Coherence: the apps the guest can start by name (checked like the
+    /// agent's message), for the bar to suggest.
+    Apps(Vec<GuestApp>),
+    /// Another guest monitor's mode (`head` 1..MAX_HEADS; head 0 is
+    /// `Mode`). 0x0: the guest turned it off. Its pixels are in slot
+    /// `head` of the framebuffer.
+    HeadMode { head: u32, width: u32, height: u32 },
+    /// Pixels changed on another monitor.
+    HeadDamage { head: u32, x: u32, y: u32, w: u32, h: u32 },
+    /// The network adapters, as they are now: sent at start and whenever
+    /// one changes. `nat_ok`: an adapter can switch to NAT while the VM
+    /// runs (its sandbox allows the connections NAT makes). `hotplug`:
+    /// adapters can be added while it runs (`ToVmm::NetAdd`).
+    Net { nat_ok: bool, hotplug: bool, ports: Vec<NetPort> },
+    /// macOS: the first monitor's frame is in IOSurface `slot` of
+    /// generation `gen` (the app got the surfaces from the VMM as mach
+    /// ports); the rect changed. Only after `ToVmm::Surfaces(true)`.
+    Surface { gen: u32, slot: u32, x: u32, y: u32, w: u32, h: u32 },
 }
 
 /// What the guest's pointer looks like.
@@ -93,6 +343,67 @@ pub enum ToVmm {
     /// Dropped: comes with a pipe (SCM_RIGHTS) the viewer writes the
     /// files into, as guest agent frames (DropEntry, DropData, DropEnd).
     Drop { id: u32 },
+    /// Plug a host USB device in: comes with the socket of the helper the
+    /// viewer started for it (SCM_RIGHTS), which the VMM talks to as it
+    /// does to the helpers it starts itself.
+    UsbAttach(UsbDev),
+    /// Pull the device on this port pair out; its helper is told to go.
+    /// From `FILES_PORT0`: take that USB disk's files away.
+    UsbDetach { port: u8 },
+    /// Plug a USB disk in as a plain stick: comes with the disk's fd
+    /// (the raw disk the viewer opened, SCM_RIGHTS). `dev` is the USB
+    /// device it belongs to, for the list.
+    UsbDisk { dev: UsbDev, readonly: bool },
+    /// Share a USB disk's volume with the guest: comes with the
+    /// volume's directory fd (SCM_RIGHTS) and `token`, the sandbox
+    /// extension that lets the VMM in below it. `label`: the volume's
+    /// name, for the guest's mount point.
+    UsbFiles { dev: UsbDev, readonly: bool, label: String, token: String },
+    /// Coherence on or off (the guest agent shows and hides its taskbar).
+    Coherence(bool),
+    /// Coherence: do this to a guest window.
+    Window { id: u32, op: WindowOp },
+    /// The mouse left the window with the guest's button held (`end`
+    /// false): is the guest dragging files out? Or (`end`) that drag is
+    /// over, the guest may forget it.
+    DragOut { id: u32, end: bool },
+    /// The Mac drop wants item `item` of a drag out: comes with a pipe
+    /// (SCM_RIGHTS) the VMM writes it into, as guest agent frames
+    /// (DropEntry, DropData, DropEnd, or DragOutFail), checked.
+    DragOutGet { id: u32, item: u32 },
+    /// Start the guest app with this name (`vroom_proto::line_ok`).
+    StartApp(String),
+    /// Another monitor's window changed size (as `Resize`, for monitor
+    /// `head` 1..MAX_HEADS). 0x0: its window is closed, unplug it.
+    HeadResize { head: u32, width: u32, height: u32, scale: u32 },
+    /// Absolute pointer on another monitor's window, 0..=POINTER_MAX.
+    HeadPointer { head: u32, x: u16, y: u16 },
+    /// Plug network adapter `nic`'s cable in, or pull it out.
+    NetConnect { nic: u8, on: bool },
+    /// Put adapter `nic` on another network, same device and MAC. Bridged
+    /// and host-only come with the vroom-netd socket the viewer asked for
+    /// (SCM_RIGHTS); `port_mac` is the MAC that port passes (netd's
+    /// answer). NAT: none, `port_mac` unused; `forwards` are what the VM
+    /// file asks for.
+    NetSet { nic: u8, live: NetLive, port_mac: [u8; 6] },
+    /// Add an adapter on `live` with MAC `mac` while the VM runs (a VM on
+    /// PCI: `ToViewer::Net`'s `hotplug`). It gets the next number. Bridged
+    /// and host-only come with the vroom-netd socket, as `NetSet`, and the
+    /// guest uses `port_mac`. NAT: `port_mac` unused, no port forwards
+    /// until the next start.
+    NetAdd { live: NetLive, mac: [u8; 6], port_mac: [u8; 6] },
+    /// Take out adapter `nic`, one added while the VM ran; the ones
+    /// after it move up a number.
+    NetRemove { nic: u8 },
+    /// New guest tools for the agent: comes with a pipe (SCM_RIGHTS) the
+    /// viewer writes them into, as guest agent frames (`UpdateBegin`,
+    /// then `UpdateData`), which the VMM checks and passes on.
+    AgentUpdate,
+    /// macOS: the viewer shows the first monitor's GL frames from the
+    /// IOSurfaces the VMM passes it (it started the VMM, with a mach port
+    /// for them): send `ToViewer::Surface` instead of pixels. False: back
+    /// to pixels in the shared frame buffer.
+    Surfaces(bool),
 }
 
 fn frame(ty: u8, payload: &[u8]) -> Vec<u8> {
@@ -112,8 +423,53 @@ fn get_u32(p: &[u8], i: usize) -> Result<u32> {
     Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 
+/// A monitor other than the first.
+fn head(h: u32) -> Result<u32> {
+    if (1..MAX_HEADS as u32).contains(&h) {
+        Ok(h)
+    } else {
+        Err(Error::Proto("monitor"))
+    }
+}
+
+/// id u32, then dir u8 | len u16 | name for each item.
+fn items_payload(id: u32, items: &[(String, bool)]) -> Vec<u8> {
+    let mut p = id.to_le_bytes().to_vec();
+    for (name, dir) in items {
+        p.push(*dir as u8);
+        p.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        p.extend_from_slice(name.as_bytes());
+    }
+    p
+}
+
+fn parse_items(p: &[u8]) -> Result<(u32, Vec<(String, bool)>)> {
+    let id = get_u32(p, 0)?;
+    let mut items = Vec::new();
+    let mut o = 4;
+    while o < p.len() {
+        if items.len() >= DRAG_ITEMS_MAX {
+            return Err(Error::Proto("drag items"));
+        }
+        let len = u16::from_le_bytes(p.get(o + 1..o + 3).ok_or(Error::Proto("short"))?.try_into().map_err(|_| Error::Proto("short"))?) as usize;
+        let name = text(p.get(o + 3..o + 3 + len).ok_or(Error::Proto("short"))?)?;
+        items.push((name, p[o] != 0));
+        o += 3 + len;
+    }
+    Ok((id, items))
+}
+
 fn text(p: &[u8]) -> Result<String> {
     std::str::from_utf8(p).map(|s| s.to_string()).map_err(|_| Error::Proto("utf-8"))
+}
+
+/// One short line of plain text (`vroom_proto::line_ok`).
+fn line(p: &[u8]) -> Result<String> {
+    let s = text(p)?;
+    if !vroom_proto::line_ok(&s) {
+        return Err(Error::Proto("line"));
+    }
+    Ok(s)
 }
 
 impl ToViewer {
@@ -145,11 +501,49 @@ impl ToViewer {
                 p.extend_from_slice(place.as_bytes());
                 frame(9, &p)
             }
+            ToViewer::Usb(ports) => {
+                let mut p = vec![ports.len() as u8];
+                for u in ports {
+                    p.push(u.port);
+                    let how = match u.how {
+                        UsbHow::Device => 0,
+                        UsbHow::Disk => 1,
+                        UsbHow::Files => 2,
+                    };
+                    p.push(u.here as u8 | (u.always as u8) << 1 | how << 2 | (u.readonly as u8) << 4);
+                    u.dev.encode(&mut p);
+                }
+                frame(11, &p)
+            }
+            ToViewer::Agent { features } => frame(12, &features.to_le_bytes()),
+            ToViewer::Windows(list) => frame(13, &vroom_proto::encode_windows(list)),
+            ToViewer::DragOutItems { id, items } => frame(14, &items_payload(*id, items)),
+            ToViewer::WindowIcon { id, w, h, rgba } => frame(18, &vroom_proto::encode_icon(*id, *w, *h, rgba)),
+            ToViewer::CoherenceNo(s) => frame(19, s.as_bytes()),
+            // Well above the others (other work adds types in the 20s).
+            ToViewer::Apps(list) => frame(60, &vroom_proto::encode_apps(list)),
+            ToViewer::HeadMode { head, width, height } => frame(16, &u32s(&[*head, *width, *height])),
+            ToViewer::HeadDamage { head, x, y, w, h } => frame(17, &u32s(&[*head, *x, *y, *w, *h])),
+            ToViewer::Surface { gen, slot, x, y, w, h } => frame(110, &u32s(&[*gen, *slot, *x, *y, *w, *h])),
+            ToViewer::Net { nat_ok, hotplug, ports } => {
+                let mut p = vec![*nat_ok as u8 | (*hotplug as u8) << 1, ports.len() as u8];
+                for n in ports {
+                    p.push(n.nic);
+                    p.push(n.connected as u8 | (n.added as u8) << 1);
+                    p.extend_from_slice(&n.mac);
+                    n.live.encode(&mut p);
+                }
+                frame(40, &p)
+            }
         }
     }
 
     fn decode(ty: u8, p: &[u8]) -> Result<Self> {
         Ok(match ty {
+            16 if p.len() == 12 => ToViewer::HeadMode { head: head(get_u32(p, 0)?)?, width: get_u32(p, 1)?, height: get_u32(p, 2)? },
+            17 if p.len() == 20 => {
+                ToViewer::HeadDamage { head: head(get_u32(p, 0)?)?, x: get_u32(p, 1)?, y: get_u32(p, 2)?, w: get_u32(p, 3)?, h: get_u32(p, 4)? }
+            }
             1 => ToViewer::Mode { width: get_u32(p, 0)?, height: get_u32(p, 1)? },
             2 => ToViewer::Damage { x: get_u32(p, 0)?, y: get_u32(p, 1)?, w: get_u32(p, 2)?, h: get_u32(p, 3)? },
             3 => ToViewer::ClipboardSet(text(p)?),
@@ -175,7 +569,77 @@ impl ToViewer {
             }),
             10 => ToViewer::Camera(*p.first().ok_or(Error::Proto("short"))? != 0),
             8 if p.len() == 5 => ToViewer::DragReady { id: get_u32(p, 0)?, live: p[4] != 0 },
+            14 => {
+                let (id, items) = parse_items(p)?;
+                ToViewer::DragOutItems { id, items }
+            }
             9 if p.len() >= 5 => ToViewer::DropDone { id: get_u32(p, 0)?, ok: p[4] != 0, place: text(&p[5..])?.chars().take(256).collect() },
+            11 => {
+                let n = *p.first().ok_or(Error::Proto("short"))? as usize;
+                if n > USB_PORTS_MAX {
+                    return Err(Error::Proto("usb ports"));
+                }
+                let mut o = 1;
+                let mut ports = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let (port, flags) = (*p.get(o).ok_or(Error::Proto("short"))?, *p.get(o + 1).ok_or(Error::Proto("short"))?);
+                    o += 2;
+                    let dev = UsbDev::decode(p, &mut o)?;
+                    let how = match (flags >> 2) & 3 {
+                        0 => UsbHow::Device,
+                        1 => UsbHow::Disk,
+                        2 => UsbHow::Files,
+                        _ => return Err(Error::Proto("usb ports")),
+                    };
+                    if flags & 0xe0 != 0 {
+                        return Err(Error::Proto("usb ports"));
+                    }
+                    ports.push(UsbPort { port, dev, here: flags & 1 != 0, always: flags & 2 != 0, how, readonly: flags & 16 != 0 });
+                }
+                if o != p.len() {
+                    return Err(Error::Proto("usb ports"));
+                }
+                ToViewer::Usb(ports)
+            }
+            12 if p.len() == 8 => ToViewer::Agent { features: u64::from(get_u32(p, 0)?) | u64::from(get_u32(p, 1)?) << 32 },
+            13 => ToViewer::Windows(vroom_proto::decode_windows(p).ok_or(Error::Proto("windows"))?),
+            18 => {
+                let (id, w, h, rgba) = vroom_proto::decode_icon(p).ok_or(Error::Proto("window icon"))?;
+                ToViewer::WindowIcon { id, w, h, rgba }
+            }
+            19 => ToViewer::CoherenceNo(line(p)?),
+            110 if p.len() == 24 => {
+                let v: Vec<u32> = (0..6).map(|i| get_u32(p, i)).collect::<Result<_>>()?;
+                ToViewer::Surface { gen: v[0], slot: v[1], x: v[2], y: v[3], w: v[4], h: v[5] }
+            }
+            60 => ToViewer::Apps(vroom_proto::decode_apps(p).ok_or(Error::Proto("apps"))?),
+            40 => {
+                let (nat_ok, hotplug, n) = match p {
+                    [f @ 0..=3, n, ..] => (*f & 1 != 0, *f & 2 != 0, *n as usize),
+                    _ => return Err(Error::Proto("network adapters")),
+                };
+                if n > NET_PORTS_MAX {
+                    return Err(Error::Proto("network adapters"));
+                }
+                let mut o = 2;
+                let mut ports = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let head = p.get(o..o + 8).ok_or(Error::Proto("short"))?;
+                    let (nic, flags) = (head[0], head[1]);
+                    if nic as usize >= NET_PORTS_MAX || flags > 3 || ports.iter().any(|x: &NetPort| x.nic == nic) {
+                        return Err(Error::Proto("network adapters"));
+                    }
+                    let mut mac = [0u8; 6];
+                    mac.copy_from_slice(&head[2..8]);
+                    o += 8;
+                    let live = NetLive::decode(p, &mut o)?;
+                    ports.push(NetPort { nic, live, connected: flags & 1 != 0, mac, added: flags & 2 != 0 });
+                }
+                if o != p.len() {
+                    return Err(Error::Proto("network adapters"));
+                }
+                ToViewer::Net { nat_ok, hotplug, ports }
+            }
             _ => return Err(Error::Proto("unknown viewer message")),
         })
     }
@@ -192,17 +656,63 @@ impl ToVmm {
             ToVmm::Focus(f) => frame(6, &[*f as u8]),
             ToVmm::Clipboard(s) => frame(7, s.as_bytes()),
             ToVmm::Command(c) => frame(8, &[*c as u8]),
-            ToVmm::DragEnter { id, items } => {
-                let mut p = id.to_le_bytes().to_vec();
-                for (name, dir) in items {
-                    p.push(*dir as u8);
-                    p.extend_from_slice(&(name.len() as u16).to_le_bytes());
-                    p.extend_from_slice(name.as_bytes());
-                }
-                frame(9, &p)
-            }
+            ToVmm::DragEnter { id, items } => frame(9, &items_payload(*id, items)),
             ToVmm::DragCancel { id } => frame(10, &id.to_le_bytes()),
             ToVmm::Drop { id } => frame(11, &id.to_le_bytes()),
+            ToVmm::UsbAttach(d) => {
+                let mut p = Vec::new();
+                d.encode(&mut p);
+                frame(12, &p)
+            }
+            ToVmm::UsbDetach { port } => frame(13, &[*port]),
+            // Well above the others (other work adds types in the 20s
+            // to 40s).
+            ToVmm::UsbDisk { dev, readonly } => {
+                let mut p = vec![*readonly as u8];
+                dev.encode(&mut p);
+                frame(80, &p)
+            }
+            ToVmm::UsbFiles { dev, readonly, label, token } => {
+                let mut p = vec![*readonly as u8];
+                dev.encode(&mut p);
+                for s in [label, token] {
+                    p.extend_from_slice(&(s.len() as u16).to_le_bytes());
+                    p.extend_from_slice(s.as_bytes());
+                }
+                frame(81, &p)
+            }
+            ToVmm::Coherence(on) => frame(14, &[*on as u8]),
+            ToVmm::Window { id, op } => {
+                let mut p = id.to_le_bytes().to_vec();
+                p.extend_from_slice(&op.encode());
+                frame(15, &p)
+            }
+            ToVmm::DragOut { id, end } => {
+                let mut p = id.to_le_bytes().to_vec();
+                p.push(*end as u8);
+                frame(16, &p)
+            }
+            ToVmm::DragOutGet { id, item } => frame(17, &u32s(&[*id, *item])),
+            ToVmm::StartApp(s) => frame(20, s.as_bytes()),
+            ToVmm::HeadResize { head, width, height, scale } => frame(18, &u32s(&[*head, *width, *height, *scale])),
+            ToVmm::HeadPointer { head, x, y } => frame(19, &u32s(&[*head, *x as u32, *y as u32])),
+            ToVmm::NetConnect { nic, on } => frame(40, &[*nic, *on as u8]),
+            ToVmm::NetSet { nic, live, port_mac } => {
+                let mut p = vec![*nic];
+                p.extend_from_slice(port_mac);
+                live.encode(&mut p);
+                frame(41, &p)
+            }
+            // Well above the others.
+            ToVmm::AgentUpdate => frame(91, &[]),
+            ToVmm::Surfaces(on) => frame(110, &[*on as u8]),
+            ToVmm::NetAdd { live, mac, port_mac } => {
+                let mut p = mac.to_vec();
+                p.extend_from_slice(port_mac);
+                live.encode(&mut p);
+                frame(95, &p)
+            }
+            ToVmm::NetRemove { nic } => frame(96, &[*nic]),
         }
     }
 
@@ -237,22 +747,95 @@ impl ToVmm {
                 _ => return Err(Error::Proto("unknown command")),
             }),
             9 => {
-                let id = get_u32(p, 0)?;
-                let mut items = Vec::new();
-                let mut o = 4;
-                while o < p.len() {
-                    let len = u16::from_le_bytes(p.get(o + 1..o + 3).ok_or(Error::Proto("short"))?.try_into().map_err(|_| Error::Proto("short"))?) as usize;
-                    let name = text(p.get(o + 3..o + 3 + len).ok_or(Error::Proto("short"))?)?;
-                    items.push((name, p[o] != 0));
-                    o += 3 + len;
-                }
-                if items.is_empty() || items.len() > DRAG_ITEMS_MAX {
+                let (id, items) = parse_items(p)?;
+                if items.is_empty() {
                     return Err(Error::Proto("drag items"));
                 }
                 ToVmm::DragEnter { id, items }
             }
             10 if p.len() == 4 => ToVmm::DragCancel { id: get_u32(p, 0)? },
             11 if p.len() == 4 => ToVmm::Drop { id: get_u32(p, 0)? },
+            12 => {
+                let mut o = 0;
+                let d = UsbDev::decode(p, &mut o)?;
+                if o != p.len() {
+                    return Err(Error::Proto("usb device"));
+                }
+                ToVmm::UsbAttach(d)
+            }
+            13 if p.len() == 1 => ToVmm::UsbDetach { port: p[0] },
+            80 if !p.is_empty() && p[0] <= 1 => {
+                let mut o = 1;
+                let dev = UsbDev::decode(p, &mut o)?;
+                if o != p.len() {
+                    return Err(Error::Proto("usb disk"));
+                }
+                ToVmm::UsbDisk { dev, readonly: p[0] != 0 }
+            }
+            81 if !p.is_empty() && p[0] <= 1 => {
+                let mut o = 1;
+                let dev = UsbDev::decode(p, &mut o)?;
+                let mut field = |max: usize| -> Result<String> {
+                    let len = u16::from_le_bytes(p.get(o..o + 2).ok_or(Error::Proto("short"))?.try_into().map_err(|_| Error::Proto("short"))?) as usize;
+                    if len > max {
+                        return Err(Error::Proto("usb files"));
+                    }
+                    let s = text(p.get(o + 2..o + 2 + len).ok_or(Error::Proto("short"))?)?;
+                    o += 2 + len;
+                    Ok(s)
+                };
+                let (label, token) = (field(USB_LABEL_MAX)?, field(USB_TOKEN_MAX)?);
+                // The token is the kernel's to check (it ends in the path): text
+                // on one line, or nothing (no sandbox).
+                if o != p.len() || !usb_label_ok(&label) || token.chars().any(char::is_control) {
+                    return Err(Error::Proto("usb files"));
+                }
+                ToVmm::UsbFiles { dev, readonly: p[0] != 0, label, token }
+            }
+            14 if p.len() == 1 => ToVmm::Coherence(p[0] != 0),
+            15 if p.len() > 4 => ToVmm::Window { id: get_u32(p, 0)?, op: WindowOp::decode(&p[4..]).ok_or(Error::Proto("window op"))? },
+            16 if p.len() == 5 => ToVmm::DragOut { id: get_u32(p, 0)?, end: p[4] != 0 },
+            17 if p.len() == 8 => ToVmm::DragOutGet { id: get_u32(p, 0)?, item: get_u32(p, 1)? },
+            20 => ToVmm::StartApp(line(p)?),
+            18 if p.len() == 16 => {
+                let (width, height, scale) = (get_u32(p, 1)?, get_u32(p, 2)?, get_u32(p, 3)?);
+                if scale != 0 && !(SCALE_MIN..=SCALE_MAX).contains(&scale) {
+                    return Err(Error::Proto("scale"));
+                }
+                if (width == 0) != (height == 0) {
+                    return Err(Error::Proto("size"));
+                }
+                ToVmm::HeadResize { head: head(get_u32(p, 0)?)?, width, height, scale }
+            }
+            19 if p.len() == 12 => {
+                let (x, y) = (small(get_u32(p, 1)?)?, small(get_u32(p, 2)?)?);
+                ToVmm::HeadPointer { head: head(get_u32(p, 0)?)?, x: x.min(POINTER_MAX), y: y.min(POINTER_MAX) }
+            }
+            40 if p.len() == 2 && (p[0] as usize) < NET_PORTS_MAX && p[1] <= 1 => ToVmm::NetConnect { nic: p[0], on: p[1] != 0 },
+            91 if p.is_empty() => ToVmm::AgentUpdate,
+            110 if p.len() == 1 && p[0] <= 1 => ToVmm::Surfaces(p[0] != 0),
+            95 if p.len() >= 12 => {
+                let (mut mac, mut port_mac) = ([0u8; 6], [0u8; 6]);
+                mac.copy_from_slice(&p[..6]);
+                port_mac.copy_from_slice(&p[6..12]);
+                let mut o = 12;
+                let live = NetLive::decode(p, &mut o)?;
+                if o != p.len() || mac[0] & 1 != 0 || port_mac[0] & 1 != 0 {
+                    return Err(Error::Proto("network adapter"));
+                }
+                ToVmm::NetAdd { live, mac, port_mac }
+            }
+            96 if p.len() == 1 && (p[0] as usize) < NET_PORTS_MAX => ToVmm::NetRemove { nic: p[0] },
+            41 if p.len() >= 7 && (p[0] as usize) < NET_PORTS_MAX => {
+                let mut port_mac = [0u8; 6];
+                port_mac.copy_from_slice(&p[1..7]);
+                let mut o = 7;
+                let live = NetLive::decode(p, &mut o)?;
+                if o != p.len() || port_mac[0] & 1 != 0 {
+                    return Err(Error::Proto("network adapter"));
+                }
+                ToVmm::NetSet { nic: p[0], live, port_mac }
+            }
             _ => return Err(Error::Proto("unknown vmm message")),
         })
     }
@@ -322,6 +905,20 @@ mod tests {
             ToVmm::DragEnter { id: 4, items: vec![("a.txt".into(), false), ("dir".into(), true)] },
             ToVmm::DragCancel { id: 4 },
             ToVmm::Drop { id: 4 },
+            ToVmm::UsbAttach(UsbDev { id: "1209:000a".into(), serial: "A1".into(), name: "dev board".into() }),
+            ToVmm::UsbDetach { port: 3 },
+            ToVmm::UsbDisk { dev: UsbDev { id: "18a5:0302".into(), serial: "0703896E1A305748".into(), name: "stick".into() }, readonly: true },
+            ToVmm::UsbFiles { dev: UsbDev { id: "18a5:0302".into(), serial: String::new(), name: String::new() }, readonly: false, label: "TEST 1".into(), token: "ab;01;/Volumes/TEST 1".into() },
+            ToVmm::Coherence(true),
+            ToVmm::Window { id: 9, op: WindowOp::Activate },
+            ToVmm::Window { id: 9, op: WindowOp::Move { x: -3, y: 4, w: 100, h: 50 } },
+            ToVmm::DragOut { id: 5, end: false },
+            ToVmm::DragOut { id: 5, end: true },
+            ToVmm::DragOutGet { id: 5, item: 2 },
+            ToVmm::StartApp("Paint".into()),
+            ToVmm::HeadResize { head: 1, width: 1920, height: 1080, scale: 200 },
+            ToVmm::HeadResize { head: 3, width: 0, height: 0, scale: 0 },
+            ToVmm::HeadPointer { head: 2, x: 5, y: 32767 },
         ];
         let mut d = Decoder::default();
         for m in &vm {
@@ -341,6 +938,23 @@ mod tests {
             ToViewer::DragReady { id: 4, live: true },
             ToViewer::Camera(true),
             ToViewer::DropDone { id: 4, ok: false, place: "Desktop".into() },
+            ToViewer::Usb(vec![]),
+            ToViewer::Usb(vec![
+                UsbPort { port: 0, dev: UsbDev { id: "1209:000a".into(), serial: String::new(), name: "x".into() }, here: true, always: true, how: UsbHow::Device, readonly: false },
+                UsbPort { port: 5, dev: UsbDev { id: "05ac:12a8".into(), serial: "s".into(), name: String::new() }, here: false, always: false, how: UsbHow::Disk, readonly: true },
+                UsbPort { port: FILES_PORT0, dev: UsbDev { id: "18a5:0302".into(), serial: String::new(), name: "stick".into() }, here: true, always: false, how: UsbHow::Files, readonly: false },
+            ]),
+            ToViewer::Agent { features: 1 << 40 | 128 },
+            ToViewer::Windows(vec![GuestWindow { id: 1, x: 0, y: -2, w: 3, h: 4, flags: 4, title: "Paint".into() }]),
+            ToViewer::DragOutItems { id: 5, items: vec![("a b.txt".into(), false), ("dir".into(), true)] },
+            ToViewer::DragOutItems { id: 6, items: Vec::new() },
+            ToViewer::WindowIcon { id: 1, w: 1, h: 1, rgba: vec![1, 2, 3, 4] },
+            ToViewer::WindowIcon { id: 1, w: 0, h: 0, rgba: Vec::new() },
+            ToViewer::CoherenceNo("a Wayland session".into()),
+            ToViewer::Apps(vec![GuestApp { name: "Paint".into(), w: 1, h: 1, rgba: vec![1, 2, 3, 4] }]),
+            ToViewer::HeadMode { head: 1, width: 1024, height: 768 },
+            ToViewer::HeadMode { head: 3, width: 0, height: 0 },
+            ToViewer::HeadDamage { head: 2, x: 1, y: 2, w: 3, h: 4 },
         ];
         for m in &v {
             d.push(&m.encode());
@@ -379,5 +993,155 @@ mod tests {
         assert!(d.next_to_viewer().is_err());
         d.push(&img(2, 2, 1, 16));
         assert!(matches!(d.next_to_viewer().unwrap(), Some(ToViewer::Cursor(GuestCursor::Image { w: 2, h: 2, .. }))));
+        // Monitors: 1..MAX_HEADS only, sizes both or neither.
+        for h in [0, MAX_HEADS as u32, u32::MAX] {
+            d.push(&ToViewer::HeadMode { head: h, width: 1, height: 1 }.encode());
+            assert!(d.next_to_viewer().is_err(), "{h}");
+            d.push(&ToVmm::HeadPointer { head: h, x: 0, y: 0 }.encode());
+            assert!(d.next_to_vmm().is_err(), "{h}");
+        }
+        d.push(&ToVmm::HeadResize { head: 1, width: 0, height: 5, scale: 0 }.encode());
+        assert!(d.next_to_vmm().is_err());
+        d.push(&ToVmm::HeadResize { head: 1, width: 5, height: 5, scale: 7 }.encode());
+        assert!(d.next_to_vmm().is_err());
+        d.push(&frame(19, &u32s(&[1, 1 << 16, 0])));
+        assert!(d.next_to_vmm().is_err(), "pointer out of range");
+    }
+
+    #[test]
+    fn usb_devices_are_checked() {
+        let dev = |id: &str, serial: &str, name: &str| UsbDev { id: id.into(), serial: serial.into(), name: name.into() };
+        let mut d = Decoder::default();
+        for bad in [dev("1209:0a", "", ""), dev("1209:000g", "", ""), dev("1209000a", "", ""), dev("1209:000a", "a\nb", ""), dev("1209:000a", "", &"n".repeat(129))] {
+            assert!(!bad.valid(), "{bad:?}");
+            d.push(&ToVmm::UsbAttach(bad).encode());
+            assert!(d.next_to_vmm().is_err());
+        }
+        // Trailing bytes, a list longer than it says, too many ports.
+        let mut p = Vec::new();
+        dev("1209:000a", "", "").encode(&mut p);
+        p.push(0);
+        d.push(&frame(12, &p));
+        assert!(d.next_to_vmm().is_err());
+        d.push(&frame(11, &[1]));
+        assert!(d.next_to_viewer().is_err());
+        d.push(&frame(11, &[USB_PORTS_MAX as u8 + 1]));
+        assert!(d.next_to_viewer().is_err());
+        // USB disks' files: names that would leave the mount point, lines
+        // in the token, an unknown way to attach.
+        let ok = dev("18a5:0302", "", "");
+        for (label, token) in [("..", "t"), ("a/b", "t"), ("", "t"), ("x", "a\nb")] {
+            d.push(&ToVmm::UsbFiles { dev: ok.clone(), readonly: true, label: label.into(), token: token.into() }.encode());
+            assert!(d.next_to_vmm().is_err(), "{label:?} {token:?}");
+        }
+        let mut p = vec![2];
+        ok.encode(&mut p);
+        d.push(&frame(80, &p));
+        assert!(d.next_to_vmm().is_err(), "readonly is a bool");
+        let mut p = vec![1, 0, 0xc];
+        ok.encode(&mut p);
+        d.push(&frame(11, &p));
+        assert!(d.next_to_viewer().is_err(), "how 3");
+        d.push(&frame(13, &[1, 2]));
+        assert!(d.next_to_vmm().is_err());
+    }
+
+    fn nat(forwards: Vec<Forward>) -> NetLive {
+        NetLive { kind: NetKind::Nat, name: String::new(), loopback: false, block_private: true, forwards }
+    }
+
+    #[test]
+    fn network_adapters_roundtrip_and_are_checked() {
+        let fwd = Forward { host_addr: "127.0.0.1".into(), host_port: 2222, guest_port: 22 };
+        let bridged = NetLive { kind: NetKind::Bridged, name: "en0".into(), loopback: false, block_private: false, forwards: vec![] };
+        let msgs = [
+            ToVmm::NetConnect { nic: 1, on: false },
+            ToVmm::AgentUpdate,
+            ToVmm::Surfaces(true),
+            ToVmm::Surfaces(false),
+            ToVmm::NetSet { nic: 0, live: nat(vec![fwd.clone()]), port_mac: [0; 6] },
+            ToVmm::NetSet { nic: 7, live: bridged.clone(), port_mac: [0x3e, 1, 2, 3, 4, 5] },
+            ToVmm::NetAdd { live: nat(vec![]), mac: [2, 1, 2, 3, 4, 7], port_mac: [0; 6] },
+            ToVmm::NetAdd { live: bridged.clone(), mac: [2, 1, 2, 3, 4, 8], port_mac: [0x3e, 1, 2, 3, 4, 5] },
+            ToVmm::NetRemove { nic: 3 },
+        ];
+        let mut d = Decoder::default();
+        for m in &msgs {
+            d.push(&m.encode());
+            assert_eq!(d.next_to_vmm().unwrap().as_ref(), Some(m));
+        }
+        let v = ToViewer::Net {
+            nat_ok: true,
+            hotplug: true,
+            ports: vec![
+                NetPort { nic: 0, live: nat(vec![fwd.clone()]), connected: true, mac: [2, 1, 2, 3, 4, 5], added: false },
+                NetPort { nic: 1, live: bridged.clone(), connected: false, mac: [2, 1, 2, 3, 4, 6], added: true },
+            ],
+        };
+        d.push(&v.encode());
+        assert_eq!(d.next_to_viewer().unwrap(), Some(v));
+        let s = ToViewer::Surface { gen: 3, slot: 2, x: 0, y: 10, w: 640, h: 20 };
+        d.push(&s.encode());
+        assert_eq!(d.next_to_viewer().unwrap(), Some(s));
+        d.push(&frame(110, &[2]));
+        assert!(d.next_to_vmm().is_err(), "surfaces is a bool");
+        // Bad: adapter 8, a name for NAT, no name for bridged, odd names,
+        // forwards on a bridged adapter, a bad address, a multicast MAC,
+        // trailing bytes, the same adapter twice.
+        let bad_live = [
+            NetLive { name: "en0".into(), ..nat(vec![]) },
+            NetLive { name: String::new(), ..bridged.clone() },
+            NetLive { name: "en0/../x".into(), ..bridged.clone() },
+            NetLive { name: "a".repeat(16), ..bridged.clone() },
+            NetLive { forwards: vec![fwd.clone()], ..bridged.clone() },
+            NetLive { block_private: true, ..bridged.clone() },
+            nat(vec![Forward { host_addr: "localhost".into(), ..fwd.clone() }]),
+        ];
+        for l in bad_live {
+            assert!(!l.valid(), "{l:?}");
+            d.push(&ToVmm::NetSet { nic: 0, live: l, port_mac: [0; 6] }.encode());
+            assert!(d.next_to_vmm().is_err());
+        }
+        d.push(&ToVmm::NetConnect { nic: 8, on: true }.encode());
+        assert!(d.next_to_vmm().is_err());
+        d.push(&ToVmm::NetRemove { nic: 8 }.encode());
+        assert!(d.next_to_vmm().is_err());
+        d.push(&ToVmm::NetAdd { live: nat(vec![]), mac: [3, 0, 0, 0, 0, 1], port_mac: [0; 6] }.encode());
+        assert!(d.next_to_vmm().is_err(), "multicast MAC");
+        let mut f = ToVmm::NetAdd { live: nat(vec![]), mac: [2, 0, 0, 0, 0, 1], port_mac: [0; 6] }.encode();
+        f.push(0);
+        let n = f.len() as u32 - 5;
+        f[1..5].copy_from_slice(&n.to_le_bytes());
+        d.push(&f);
+        assert!(d.next_to_vmm().is_err(), "trailing byte");
+        d.push(&ToVmm::NetSet { nic: 0, live: bridged.clone(), port_mac: [1, 0, 0, 0, 0, 0] }.encode());
+        assert!(d.next_to_vmm().is_err());
+        let mut f = ToVmm::NetConnect { nic: 0, on: true }.encode();
+        f[1] = 3;
+        f.push(0);
+        d.push(&f);
+        assert!(d.next_to_vmm().is_err());
+        let port = |nic| NetPort { nic, live: bridged.clone(), connected: true, mac: [2; 6], added: false };
+        d.push(&ToViewer::Net { nat_ok: false, hotplug: false, ports: vec![port(1), port(1)] }.encode());
+        assert!(d.next_to_viewer().is_err());
+        d.push(&ToViewer::Net { nat_ok: false, hotplug: false, ports: (0..9).map(port).collect() }.encode());
+        assert!(d.next_to_viewer().is_err());
+        d.push(&frame(40, &[1, 1, 0, 1]));
+        assert!(d.next_to_viewer().is_err());
+    }
+
+    #[test]
+    fn icons_and_lines_are_checked() {
+        let mut d = Decoder::default();
+        d.push(&frame(18, &vroom_proto::encode_icon(1, 2, 2, &[0; 12])));
+        assert!(d.next_to_viewer().is_err());
+        d.push(&frame(18, &vroom_proto::encode_icon(1, 65, 1, &[0; 260])));
+        assert!(d.next_to_viewer().is_err());
+        for bad in ["", "a\nb", &"x".repeat(vroom_proto::START_MAX + 1)] {
+            d.push(&frame(20, bad.as_bytes()));
+            assert!(d.next_to_vmm().is_err(), "{bad:?}");
+            d.push(&frame(19, bad.as_bytes()));
+            assert!(d.next_to_viewer().is_err(), "{bad:?}");
+        }
     }
 }

@@ -419,7 +419,7 @@ pub fn unicode(memory: &impl VirtualMemory, address: u64) -> Result<String> {
     let mut s = [0; 16];
     memory.read(address, &mut s)?;
     let len = u16at(&s, 0) as usize;
-    if !len.is_multiple_of(2) || len > u16at(&s, 2) as usize || len > 32768 {
+    if len % 2 != 0 || len > u16at(&s, 2) as usize || len > 32768 {
         return Err(bad("invalid UNICODE_STRING"));
     }
     let ptr = u64::from_le_bytes(s[8..16].try_into().map_err(|_| bad("invalid pointer"))?);

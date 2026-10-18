@@ -444,7 +444,7 @@ mod tests {
     }
     #[test]
     fn kvm_core_state_uses_the_selected_stack_bank() {
-        let core = |off: u64| 0x6030_0000_0010_0000 | off / 4;
+        let core = |off: u64| 0x6030_0000_0010_0000 | (off / 4);
         let mut s = VcpuState {
             backend: "kvm".into(),
             index: 2,

@@ -5,11 +5,50 @@ Commands, one per line, on <state-dir>.cmd (a fifo):
   click X Y | rclick X Y | dclick X Y | move X Y   (guest pixels)
   key CODE[+CODE...]     press in order, release in reverse (evdev codes)
   type TEXT              US layout
-  shot                   screendump (path shows in <state-dir>.log)
+  shot                   screendump (path shows in <state-dir>.log; other
+                         monitors next to it, as -2.png, -3.png...)
+  snapshot | suspend     what Ctrl-A s / Ctrl-A z do on the console
   resize W H | focus 0|1 | clip TEXT | cmd N | quit
+  hmove N X Y | hclick N X Y   on monitor N (2, 3...), its guest pixels
+  hresize N W H          monitor N's window size (0 0: closed)
+  coherence 0|1          Coherence on/off (windows show as "windows N: ...")
+  win ID activate|minimize|close | win ID move X Y W H
+  startapp NAME          start a guest app by name (icons show as "icon ID ...";
+                         the apps it can start as "apps N: ...")
   serial TEXT            to the serial console (\\n for Enter)
   drop X Y X2 Y2 PATH... drag files in at X,Y, move to X2,Y2, drop there
                          (what the app does when files come from Finder)
+  usb ID [SERIAL]        plug a host USB device in, as the app does: start
+                         `vroom usb-host` for it, hand the VMM its socket
+                         (VROOM_USB_FAKE=acm in our environment: a pretend
+                         serial port)
+  usbnetd ID [SERIAL]    the same through vroom-netd's root helper (what the
+                         app does for a device a macOS driver holds)
+  usbdetach PORT         pull out the device on that port pair (64, 65: a
+                         USB disk's files)
+  update FILE            new guest tools for the agent, as the app sends them:
+                         FILE holds the agent frames (`vroom guest-tools bundle`)
+  usbdisk PATH [ro]      "Use as a disk": PATH (an image, or a /dev/rdiskN we
+                         may open) as a USB stick, as the app does
+  usbfiles DIR [ro]      "Share its files": DIR on a removable share, with
+                         the sandbox token the app would issue
+  net N on|off           network adapter N (0, 1...): cable in or out
+  netmode N nat [loopback] [block] [HOSTPORT:GUESTPORT...]
+  netmode N bridged IFACE | netmode N host-only NAME
+                         put adapter N on another network while the VM
+                         runs, as the app does (bridged and host-only: ask
+                         vroom-netd for a port, hand the VMM its socket).
+                         Adapters show as "net ..." events ("(added)": in a
+                         hot plug slot; "hotplug=1": adapters can be added).
+  netadd MAC nat [loopback] [block] | netadd MAC bridged IFACE |
+  netadd MAC host-only NAME
+                         add an adapter while the VM runs (a VM on PCI), as
+                         the app does; MAC like 02:12:34:56:78:9a
+  netdel N               take out adapter N (one added while it ran)
+  dragout X Y X2 Y2 DIR  press at X,Y, drag to X2,Y2 (an edge), ask the guest
+                         what it drags out (as the app does when the mouse
+                         leaves the window), cancel its drag with Escape and
+                         fetch every item into DIR (as the Mac drop would)
 Viewer events (mode, clipboard, status, mic, guest pointer: its picture as
 <state-dir>.cursor-N.png) go to <state-dir>.events.
 """
@@ -27,6 +66,7 @@ p = subprocess.Popen([vroom, "run", cfg, "--ui-fd", str(b.fileno()), "--state-di
 b.close()
 socket.recv_fds(a, 1, 1)  # framebuffer shm; we use screendumps instead
 mode = [800, 600]
+hmodes = {}
 cursors = [0]
 ev = open(evp, "a", buffering=1)
 
@@ -52,6 +92,8 @@ def reader():
             pl, buf = buf[5:5 + n], buf[5 + n:]
             if t == 1:
                 mode[:] = struct.unpack("<II", pl); ev.write(f"mode {mode[0]}x{mode[1]}\n")
+            elif t == 16:
+                h, w, hh = struct.unpack("<III", pl); hmodes[h] = (w, hh); ev.write(f"mode{h + 1} {w}x{hh}\n")
             elif t == 3:
                 ev.write("clipboard " + pl.decode(errors="replace").replace("\n", "\\n") + "\n")
             elif t == 4:
@@ -67,6 +109,74 @@ def reader():
                 i, ok = struct.unpack("<IB", pl[:5]); place = pl[5:].decode(errors="replace")
                 ev.write(f"dropdone {i} {ok} {place}\n")
                 drag_ev.append(("done", i, ok)); drag_cv.set()
+            elif t == 11:
+                n, o, out = pl[0], 1, []
+                for _ in range(n):
+                    port, flags = pl[o], pl[o + 1]; o += 2
+                    f = []
+                    for _ in range(3):
+                        ln = struct.unpack("<H", pl[o:o + 2])[0]; f.append(pl[o + 2:o + 2 + ln].decode()); o += 2 + ln
+                    how = ["", "(disk)", "(files)", "?"][(flags >> 2) & 3] + ("(ro)" if flags & 16 else "")
+                    out.append(f"{port}:{f[0]}{'' if flags & 1 else '(away)'}{'(always)' if flags & 2 else ''}{how}")
+                ev.write("usb " + " ".join(out) + "\n")
+            elif t == 10:
+                ev.write(f"camera {pl[0]}\n")
+            elif t == 12:
+                ev.write(f"agent features {struct.unpack('<Q', pl)[0]:#x}\n")
+            elif t == 13:
+                n, o, out = struct.unpack("<I", pl[:4])[0], 4, []
+                for _ in range(n):
+                    i, x, y, w, h, f, tl = struct.unpack("<IiiIIIH", pl[o:o + 26])
+                    out.append(f"{i:#x} {x},{y} {w}x{h} f{f} {pl[o + 26:o + 26 + tl].decode(errors='replace')!r}")
+                    o += 26 + tl
+                ev.write(f"windows {n}: " + " | ".join(out) + "\n")
+            elif t == 14:
+                i, = struct.unpack("<I", pl[:4]); items, o = [], 4
+                while o < len(pl):
+                    d, n = pl[o], struct.unpack("<H", pl[o + 1:o + 3])[0]
+                    items.append((pl[o + 3:o + 3 + n].decode(), bool(d))); o += 3 + n
+                ev.write(f"dragout {i}: {items}\n")
+                drag_ev.append(("out", i, items)); drag_cv.set()
+            elif t == 18:
+                i, w, h = struct.unpack("<IHH", pl[:8])
+                png = f"{state}.icon-{i:x}.png"
+                if w:
+                    write_png(png, w, h, pl[8:])
+                ev.write(f"icon {i:#x} {w}x{h} {png if w else 'none'}\n")
+            elif t == 19:
+                ev.write(f"no coherence: {pl.decode(errors='replace')}\n")
+            elif t == 60:
+                # The apps the guest can start: names in the events, icons
+                # (with their names) in a folder next to the state.
+                n, o, out, icons = struct.unpack("<I", pl[:4])[0], 4, [], 0
+                d = f"{state}.apps"
+                os.makedirs(d, exist_ok=True)
+                for _ in range(n):
+                    ln = struct.unpack("<H", pl[o:o + 2])[0]; name = pl[o + 2:o + 2 + ln].decode(); o += 2 + ln
+                    w, h = struct.unpack("<HH", pl[o:o + 4]); o += 4
+                    if w:
+                        icons += 1
+                        write_png(os.path.join(d, "".join(c if c.isalnum() else "_" for c in name)[:60] + ".png"), w, h, pl[o:o + w * h * 4])
+                    o += w * h * 4
+                    out.append(name)
+                ev.write(f"apps {n} ({icons} icons in {d}): " + " | ".join(out) + "\n")
+            elif t == 40:
+                n, o, out = pl[1], 2, []
+                for _ in range(n):
+                    nic, on, mac = pl[o], pl[o + 1], pl[o + 2:o + 8]; o += 8
+                    kind, flags, ln = pl[o], pl[o + 1], pl[o + 2]
+                    name = pl[o + 3:o + 3 + ln].decode(); o += 3 + ln
+                    nf = pl[o]; o += 1
+                    fw = []
+                    for _ in range(nf):
+                        al = pl[o]; addr = pl[o + 1:o + 1 + al].decode(); o += 1 + al
+                        hp, gp = struct.unpack("<HH", pl[o:o + 4]); o += 4
+                        fw.append(f"{addr}:{hp}->{gp}")
+                    macs[nic] = bytes(mac)
+                    out.append(f"{nic}:{('nat', 'bridged', 'host-only')[kind]}{':' + name if name else ''}"
+                               f"{'' if on & 1 else '(unplugged)'}{'(added)' if on & 2 else ''}{'(loopback)' if flags & 1 else ''}{'(block)' if flags & 2 else ''}"
+                               f" {mac.hex(':')} {' '.join(fw)}")
+                ev.write(f"net nat_ok={pl[0] & 1} hotplug={pl[0] >> 1} " + " | ".join(out) + "\n")
             elif t == 7:
                 if pl[0] != 2:
                     ev.write("cursor " + ("unset", "hidden")[pl[0]] + "\n"); continue
@@ -76,6 +186,7 @@ def reader():
                 write_png(png, w, h, pl[17:])
                 ev.write(f"cursor {w}x{h} hot {hx},{hy} {png}\n")
 drag_ev, drag_cv = [], threading.Event()
+macs = {}
 threading.Thread(target=reader, daemon=True).start()
 
 def send(t, payload):
@@ -86,6 +197,9 @@ def key(code, down):
     send(1, u32s(code, int(down))); time.sleep(0.03)
 def move(x, y):
     send(2, u32s(int(x * 32767 / max(mode[0] - 1, 1)), int(y * 32767 / max(mode[1] - 1, 1)))); time.sleep(0.05)
+def hmove(n, x, y):
+    w, h = hmodes.get(n - 1, (800, 600))
+    send(19, u32s(n - 1, int(x * 32767 / max(w - 1, 1)), int(y * 32767 / max(h - 1, 1)))); time.sleep(0.05)
 def button(code, down):
     send(3, u32s(code, int(down))); time.sleep(0.05)
 def click(x, y, btn=0x110, n=1):
@@ -165,6 +279,174 @@ def drop(x, y, x2, y2, paths):
     if live:
         button(0x110, False)
 
+helpers = []
+def usb_attach(id_, serial=""):
+    r, w = socket.socketpair()
+    args = [vroom, "usb-host", "--id", id_] + (["--serial", serial] if serial else [])
+    helpers.append(subprocess.Popen(args, stdin=w.fileno(), stdout=subprocess.DEVNULL,
+                                    stderr=open(state + ".log", "ab")))
+    w.close()
+    pl = b"".join(struct.pack("<H", len(x.encode())) + x.encode() for x in (id_, serial, "test " + id_))
+    socket.send_fds(a, [struct.pack("<BI", 12, len(pl)) + pl], [r.fileno()]); r.close()
+def usb_netd(id_, serial=""):
+    import json
+    c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    c.connect("/var/run/vroom/netd.sock")
+    req = {"version": 1, "vm": "vmdrive", "usb": {"id": id_, "serial": serial or None}}
+    c.sendall((json.dumps(req) + "\n").encode())
+    line = b""
+    while not line.endswith(b"\n"):
+        ch = c.recv(1)
+        if not ch:
+            break
+        line += ch
+    resp = json.loads(line or b"{}")
+    if not resp.get("ok"):
+        ev.write(f"usbnetd {id_}: {resp.get('error', 'no answer')}\n")
+        return
+    _, fds, _, _ = socket.recv_fds(c, 16, 1)
+    pl = b"".join(struct.pack("<H", len(x.encode())) + x.encode() for x in (id_, serial, "netd " + id_))
+    socket.send_fds(a, [struct.pack("<BI", 12, len(pl)) + pl], [fds[0]]); os.close(fds[0])
+def usb_dev(name):
+    return b"".join(struct.pack("<H", len(x.encode())) + x.encode() for x in ("1209:00ab", "", name))
+def usb_disk(path, ro=""):
+    # "Use as a disk", as the app does once it has the disk open (a disk
+    # image, or a /dev/rdiskN we may open: hdiutil attach's are ours).
+    fd = os.open(path, os.O_RDONLY if ro else os.O_RDWR)
+    pl = bytes([1 if ro else 0]) + usb_dev("disk " + os.path.basename(path))
+    socket.send_fds(a, [struct.pack("<BI", 80, len(pl)) + pl], [fd]); os.close(fd)
+def agent_update(path):
+    # New guest tools: a pipe the VMM forwards to the agent, checked.
+    r, w = socket.socketpair()
+    socket.send_fds(a, [struct.pack("<BI", 91, 0)], [r.fileno()]); r.close()
+    def writer():
+        with open(path, "rb") as f:
+            while True:
+                d = f.read(1 << 20)
+                if not d:
+                    break
+                w.sendall(d)
+        w.close()
+        ev.write(f"update sent: {os.path.getsize(path)} bytes\n")
+    threading.Thread(target=writer, daemon=True).start()
+def usb_files(path, ro=""):
+    # "Share its files": the directory's fd and the sandbox token that
+    # lets the VMM in below it (macOS).
+    import ctypes
+    lib = ctypes.CDLL(None)
+    lib.sandbox_extension_issue_file.restype = ctypes.c_void_p
+    cls = b"org.vroom.usb-files.read" if ro else b"org.vroom.usb-files.read-write"
+    t = lib.sandbox_extension_issue_file(cls, os.path.realpath(path).encode(), 0)
+    token = ctypes.string_at(t) if t else b""
+    fd = os.open(path, os.O_RDONLY)
+    label = (os.path.basename(path.rstrip("/")) or "USB").encode()
+    pl = bytes([1 if ro else 0]) + usb_dev("files " + label.decode())
+    pl += struct.pack("<H", len(label)) + label + struct.pack("<H", len(token)) + token
+    socket.send_fds(a, [struct.pack("<BI", 81, len(pl)) + pl], [fd]); os.close(fd)
+def fetch(i, idx, into):
+    r, w = socket.socketpair()
+    socket.send_fds(a, [struct.pack("<BI", 17, 8) + u32s(i, idx)], [w.fileno()]); w.close()
+    buf, f, t0, n = b"", None, time.time(), 0
+    r.settimeout(60)
+    while True:
+        try:
+            d = r.recv(1 << 20)
+        except socket.timeout:
+            return "timeout"
+        if not d:
+            return "pipe closed"
+        buf += d
+        while len(buf) >= 8:
+            t, ln = buf[3], struct.unpack("<I", buf[4:8])[0]
+            if len(buf) < 8 + ln:
+                break
+            pl, buf = buf[8:8 + ln], buf[8 + ln:]
+            if t == 13:
+                isdir, size, path = pl[4], struct.unpack("<Q", pl[5:13])[0], pl[13:].decode()
+                if ".." in path.split("/") or path.startswith("/"):
+                    return "bad path " + path
+                dst = os.path.join(into, path)
+                if f: f.close(); f = None
+                if isdir: os.makedirs(dst, exist_ok=True)
+                else: f = open(dst, "xb")
+            elif t == 14:
+                f.write(pl[4:]); n += len(pl) - 4
+            elif t == 15:
+                if f: f.close()
+                return f"ok {n} bytes in {time.time() - t0:.1f}s"
+            elif t == 24:
+                return "failed: " + pl[4:].decode(errors="replace")
+
+def net_live(kind, name=b"", flags=0, fwd=()):
+    f = b"".join(bytes([9]) + b"127.0.0.1" + struct.pack("<HH", h, g) for h, g in fwd)
+    return bytes([kind, flags, len(name)]) + name + bytes([len(fwd)]) + f
+def netmode(n, args, add=None):
+    kind = {"nat": 0, "bridged": 1, "host-only": 2}[args[0]]
+    if kind == 0:
+        flags = ("loopback" in args) | ("block" in args) << 1
+        fwd = [tuple(map(int, x.split(":"))) for x in args[1:] if ":" in x]
+        if add is not None:
+            send(95, add + bytes(6) + net_live(0, flags=flags)); return
+        send(41, bytes([n]) + bytes(6) + net_live(0, flags=flags, fwd=fwd)); return
+    import json
+    name = args[1]
+    import tomllib
+    with open(cfg, "rb") as f:
+        vm = tomllib.load(f).get("name", "vm")
+    attach = {"mode": "bridged", "interface": name} if kind == 1 else {"mode": "host-only", "network": name}
+    mac = add if add is not None else macs.get(n, b"\x02" + bytes(5))
+    req = {"version": 1, "vm": vm, "nic": n, "attach": attach, "mac": [(mac[0] | 2) & 0xfe] + list(mac[1:])}
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(os.environ.get("VROOM_NETD_SOCKET", "/var/run/vroom/netd.sock"))
+    s.sendall((json.dumps(req) + "\n").encode())
+    line = b""
+    while not line.endswith(b"\n"):
+        c = s.recv(1)
+        if not c: break
+        line += c
+    r = json.loads(line)
+    if not r.get("ok"):
+        ev.write(f"netd refused: {r.get('error')}\n"); return
+    _, fds, _, _ = socket.recv_fds(s, 1, 1)
+    s.close()
+    port_mac = bytes(r["mac"])
+    ev.write(f"netd: port {port_mac.hex(':')} for adapter {n}\n")
+    if add is not None:
+        pl = add + port_mac + net_live(kind, name.encode())
+        socket.send_fds(a, [struct.pack("<BI", 95, len(pl)) + pl], fds)
+    else:
+        pl = bytes([n]) + port_mac + net_live(kind, name.encode())
+        socket.send_fds(a, [struct.pack("<BI", 41, len(pl)) + pl], fds)
+    # Ours goes once the VMM has its copy (macOS can drop a socket whose
+    # other copies all close while it is in flight).
+    def let_go():
+        time.sleep(5)
+        for fd in fds:
+            os.close(fd)
+    threading.Thread(target=let_go, daemon=True).start()
+
+out_id = [500]
+def dragout(x, y, x2, y2, into):
+    out_id[0] += 1; i = out_id[0]
+    move(x, y); button(0x110, True)
+    for k in range(1, 21):
+        move(x + (x2 - x) * k // 20, y + (y2 - y) * k // 20); time.sleep(0.03)
+    time.sleep(0.3)
+    t0 = time.time()
+    send(16, u32s(i) + b"\x00")
+    e = wait_drag(("out",), i, 10)
+    ev.write(f"dragout {i}: answer after {time.time() - t0:.2f}s: {e}\n")
+    if os.path.exists(state + ".dropshot"):  # screenshot mid-drag (tests)
+        p.stdin.write(b"\x01g"); p.stdin.flush(); time.sleep(1.5)
+    items = e[2] if e else []
+    if items:
+        key(1, True); key(1, False)
+    button(0x110, False)
+    os.makedirs(into, exist_ok=True)
+    for idx, (name, d) in enumerate(items):
+        ev.write(f"dragout {i}: {name}: {fetch(i, idx, into)}\n")
+    send(16, u32s(i) + b"\x01")
+
 send(6, b"\x01")  # focused: lets clipboard flow
 import select
 def lines():
@@ -196,12 +478,22 @@ if True:
                     x, y = map(int, arg.split())
                     if c == "move": move(x, y)
                     else: click(x, y, 0x111 if c == "rclick" else 0x110, 2 if c == "dclick" else 1)
+                elif c in ("hmove", "hclick"):
+                    n, x, y = map(int, arg.split())
+                    hmove(n, x, y)
+                    if c == "hclick":
+                        button(0x110, True); button(0x110, False)
+                elif c == "hresize":
+                    n, w, h = map(int, arg.split())
+                    send(18, u32s(n - 1, w, h, 0))
                 elif c == "key":
                     codes = [int(k) for k in arg.split("+")]
                     for k in codes: key(k, True)
                     for k in reversed(codes): key(k, False)
                 elif c == "type": type_text(arg.replace("\\n", "\n"))
                 elif c == "shot": p.stdin.write(b"\x01g"); p.stdin.flush()
+                elif c == "snapshot": p.stdin.write(b"\x01s"); p.stdin.flush()
+                elif c == "suspend": p.stdin.write(b"\x01z"); p.stdin.flush()
                 elif c == "resize": send(5, u32s(*map(int, arg.split())))
                 elif c == "focus": send(6, bytes([int(arg)]))
                 elif c == "clip": send(7, arg.encode())
@@ -211,7 +503,38 @@ if True:
                 elif c == "drop":
                     v = arg.split(" ", 4)
                     drop(int(v[0]), int(v[1]), int(v[2]), int(v[3]), v[4].split("|"))
+                elif c == "usb": usb_attach(*arg.split())
+                elif c == "usbnetd": usb_netd(*arg.split())
+                elif c == "usbdetach": send(13, bytes([int(arg)]))
+                elif c == "usbdisk": usb_disk(*arg.split())
+                elif c == "update": agent_update(arg.strip())
+                elif c == "usbfiles": usb_files(*arg.split())
+                elif c == "net":
+                    n, on = arg.split()
+                    send(40, bytes([int(n), int(on == "on")]))
+                elif c == "netmode":
+                    v = arg.split()
+                    netmode(int(v[0]), v[1:])
+                elif c == "netadd":
+                    v = arg.split()
+                    netmode(len(macs), v[1:], add=bytes.fromhex(v[0].replace(":", "")))
+                elif c == "netdel":
+                    n = int(arg)
+                    send(96, bytes([n]))
+                    macs.clear()
+                elif c == "dragout":
+                    v = arg.split(" ", 4)
+                    dragout(int(v[0]), int(v[1]), int(v[2]), int(v[3]), v[4])
                 elif c == "quit": p.stdin.write(b"\x01x"); p.stdin.flush()
+                elif c == "coherence": send(14, bytes([int(arg)]))
+                elif c == "startapp": send(20, arg.strip().encode())
+                elif c == "win":
+                    v = arg.split()
+                    ops = {"activate": 1, "minimize": 2, "close": 3, "move": 4}
+                    pl = u32s(int(v[0], 0)) + bytes([ops[v[1]]])
+                    if v[1] == "move":
+                        pl += u32s(*[int(x) for x in v[2:6]])
+                    send(15, pl)
             except Exception as e:
                 ev.write(f"error {line.strip()}: {e}\n")
 p.wait()

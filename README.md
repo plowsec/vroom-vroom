@@ -16,76 +16,57 @@ The security design is better than the big three’s, at least on paper:
 - per-VM shared memory;
 - guest code can’t reach your files, other apps or the network stack.
 
-Who can touch what, one VM running:
-
 ```text
- your user, no sandbox
-+---------------------------------------------------------------------+
-| vroom-gui (the app)                                                 |
-|  window, keyboard and mouse, host clipboard (its rules are enforced |
-|  here), reads the files you drop on the window. Never maps guest    |
-|  memory; what the VMM sends is checked like untrusted input.        |
-+------------------+--------------------------------------------------+
-                   | socket + shared framebuffer
-                   v
-+---------------------------------------------------------------------+
-| vroom run: the VMM               Seatbelt sandbox, set before boot  |
-|  vCPUs (Hypervisor.framework), guest RAM, every device in Rust      |
-|  may:    its own disk images, the shared folders you listed,        |
-|          NAT (outbound IP only), its state dir                      |
-|  may not: start programs, open other files, listen, use the GPU,    |
-|           camera, microphone or USB devices                         |
-|  +---------------------------------------------------------------+  |
-|  | the guest (treated as hostile)                                |  |
-|  |  vroom agent on a virtio port: clipboard text (only while the |  |
-|  |  window has focus), screen size, dropped files, clean         |  |
-|  |  shutdown; shared folders through virtio-fs                   |  |
-|  +---------------------------------------------------------------+  |
-+---+-----------+------------+------------+------------+--------------+
-    | sockets   |            |            |            |
-    v           v            v            v            v
-+---------+ +----------+ +---------+ +---------+ +---------+
-| GPU     | | audio    | | camera  | | USB     | | TPM     |
-| process | | helper   | | helper  | | helper  | | swtpm   |
-|virgl,   | |speakers; | |the Mac  | |one per  | |its state|
-|DXMT,    | |mic only  | |camera,  | |device,  | |folder   |
-|MoltenVK | |if you    | |only if  | |that     | |only     |
-|GPU and  | |turned it | |you      | |device   | |         |
-|guest RAM| |on        | |turned it| |only     | |         |
-|         | |          | |on       | |         | |         |
-+---------+ +----------+ +---------+ +---------+ +---------+
-  each started by the VMM in its own Seatbelt sandbox: none of your
-  files, no network, no programs, only the one device it serves
-
-+---------------------------------------------------------------------+
-| vroom-netd (optional, root, a launchd daemon)                       |
-|  bridged and host-only networks (vmnet). Small; checks every frame  |
-|  (source MAC, allowed interfaces); VMs reach it over a socket.      |
-+---------------------------------------------------------------------+
+ ┌──────────────────────────── your Mac ─────────────────────────────┐
+ │                                                                   │
+ │   ┌───────────┐                                                   │
+ │   │ vroom-gui │◄──── window · keyboard · clipboard · drops        │
+ │   └─────┬─────┘                                                   │
+ │         │                                                         │
+ │   ╔═════╧═══════════════ VMM ════════════════╗                    │
+ │   ║                                          ╟──── disks          │
+ │   ║   ┌──────────── guest ──────────────┐    ╟──── shared folders │
+ │   ║   │  Linux / Windows      (hostile) │    ╟──── NAT            │
+ │   ║   └─────────────────────────────────┘    ║                    │
+ │   ╚═╤═══════╤═══════╤═══════╤═══════╤═══════╤╝                    │
+ │     │       │       │       │       │       │                     │
+ │  ╔══╧═══╗╔══╧═══╗╔══╧═══╗╔══╧═══╗╔══╧═══╗╔══╧═══╗  ┌──────────┐   │
+ │  ║  3D  ║║audio ║║camera║║video ║║ USB  ║║ TPM  ║  │   netd   │   │
+ │  ╚══╤═══╝╚══╤═══╝╚══╤═══╝╚══╤═══╝╚══╤═══╝╚══════╝  │  (root)  │   │
+ │  ╔══╧═══╗ sound  camera  codecs  device            └────┬─────┘   │
+ │  ║ apps ║ (mic)                                        LAN        │
+ │  ╚══╤═══╝                                                         │
+ │    GPU                                                            │
+ └───────────────────────────────────────────────────────────────────┘
+   ═══ own sandbox     ─── no sandbox     camera, mic, video: opt-in
 ```
 
-A guest that breaks a device lands in the VMM's sandbox, with its own
-disks and nothing else of yours. Breaking the 3D code lands in the GPU
-process, which can't even reach the disks. Camera and microphone are off
-unless you turn them on, run only while the window is open and the guest
-uses them, and the window says so. Details: [SECURITY.md](docs/SECURITY.md).
+A guest that breaks out lands in the VMM's sandbox: its own disks, nothing
+else of yours. Each Vulkan or Direct3D app in the guest gets a 3D process
+of its own (apps); video decoding and encoding, when on, get one each. Details in
+[SECURITY.md](docs/SECURITY.md).
 
 
 ## What works
 
 - Ubuntu, Debian, Alpine, Windows 11 ARM64
 - Window with clipboard both ways and auto resolution, sharp on Retina
-- 3D: Vulkan (about 90% of native speed) and OpenGL 4.1 in Linux guests, Direct3D 11 in Windows guests
+- 3D: Vulkan 1.3 (about 90% of native speed, in windows too) and OpenGL 4.1 in Linux guests, OpenGL 4.4 per app through Zink, Direct3D 11 and OpenGL 4.1 in Windows guests
+- Coherence: Windows and Linux (X11) apps as windows of their own on the Mac
 - Snapshots, suspend/resume, reset
-- NAT with port forwards, several network adapters. Bridged and host-only need a root helper.
+- NAT with port forwards, several network adapters. Bridged and host-only go through a small root helper the app sets up (one password prompt).
 - Sound in Linux and Windows guests; microphone if you turn it on
 - Shared folders (Linux and Windows guests)
 - TPM 2.0 (Windows 11 needs it)
 - Nested VMs (M3 or newer)
 - Import from VMware Fusion (ARM64 VMs)
-- USB devices from the host (those macOS has no driver for; needs libusb)
+- USB devices from the host, connected from the VM window while it runs (needs libusb; devices macOS uses go through the root helper); USB disks also as shared files or as a plain disk, with no root helper
 - Drag and drop files from the Mac into the guest
+- Drag and drop files between the Mac and the guest, both ways
+- Up to 4 guest monitors, a window each, full screen on several Mac screens
 - The Mac's camera as a webcam in the guest, if you turn it on
+- Video decoding on the Mac's hardware for Linux guests (H.264, HEVC, VP9, AV1), if you turn it on; Firefox and Chrome use it
+- Video encoding on the Mac's hardware for Linux guests (H.264, HEVC), if you turn it on; Chrome's video calls and FFmpeg use it
 - Fast disk and network I/O, measured against QEMU ([numbers](docs/PERFORMANCE.md))
 
 Not yet: x86_64 hosts (it builds, can't run VMs yet) and Secure Boot.
@@ -94,13 +75,19 @@ Not yet: x86_64 hosts (it builds, can't run VMs yet) and Secure Boot.
 
 ```bash
 brew install qemu            # only for its UEFI firmware file
-scripts/build.sh --release   # builds and signs vroom + vroom-gui
-target/release/vroom-gui     # the app: New VM, pick the ISO, Start
+scripts/make-guest-tools.sh images/virtio-win/virtio-win.iso   # the guest agent, drivers
+scripts/app.sh --install     # builds vroom.app and copies it to /Applications
 ```
+
+Then open vroom from Applications or Spotlight: New VM, pick Ubuntu (it
+downloads it) or the Windows 11 ARM64 ISO, Create: it comes up installed,
+with the guest tools. Or pick any installer ISO. Without `--install` the app is in `target/dist/vroom.app`. 3D needs
+its libraries built first ([GUIDE.md](docs/GUIDE.md#the-mac-app)).
 
 Or from the terminal:
 
 ```bash
+scripts/build.sh --release   # builds and signs vroom + vroom-gui
 target/release/vroom new dev --os linux --disk 32G --iso ubuntu-24.04-desktop-arm64.iso
 target/release/vroom-gui dev.toml
 ```
@@ -116,6 +103,8 @@ vroom-gui dev.toml                # open one VM in a window
 vroom run dev.toml                # no window: serial console in this terminal
 vroom check dev.toml              # validate a config, print it with defaults
 vroom new NAME --os linux|windows --disk 64G --iso FILE
+vroom new NAME --os ubuntu|windows --ready [--iso WIN.iso] --ssh-key ~/.ssh/id_ed25519.pub
+vroom guest-tools info            # the guest tools this vroom has
 vroom import ~/Virtual\ Machines.localized/X.vmwarevm   # from VMware Fusion
 vroom snapshot list|delete|prune dev.toml
 vroom disk create x.qcow2 --size 64G
@@ -127,6 +116,7 @@ vroom usb list                    # host USB devices, the id for [[usb]]
 |---|---|
 | snapshot / suspend / pause | `Ctrl+Alt+Shift` + `S` / `Z` / `P` |
 | reset / shut down / power off | `Ctrl+Alt+Shift` + `R` / `D` / `Q` |
+| Coherence (guest apps as Mac windows) | `Ctrl+Alt+Shift` + `C` |
 | toolbar in full screen | move the mouse to the top edge |
 | close the window | suspends the VM, next start resumes it |
 

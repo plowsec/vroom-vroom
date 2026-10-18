@@ -5,7 +5,7 @@ import { Theme, OsLook } from "theme.slint";
 import { Icons } from "icons.slint";
 import { Bus } from "bus.slint";
 import { NewVm, HostInfo, Toast, PaletteItem } from "types.slint";
-import { Button, IconButton, Toggle, Slider, Field, Icon, OsBadge, Banner, Row } from "controls.slint";
+import { Button, IconButton, Toggle, Slider, Field, Icon, OsBadge, Banner, Row, Select, Tip } from "controls.slint";
 
 component Scrim inherits Rectangle {
     callback dismiss;
@@ -31,8 +31,12 @@ component OsTile inherits Rectangle {
     in property <string> os;
     in property <string> label;
     in property <bool> selected;
+    in property <string> tip;
     callback clicked;
     height: 88px;
+    Tip {
+        text: root.tip;
+    }
     border-radius: Theme.r-lg;
     background: selected ? Theme.selected : ta.has-hover ? Theme.card-hover : Theme.card;
     border-width: selected ? 2px : 1px;
@@ -68,13 +72,17 @@ export component NewVmSheet inherits Rectangle {
     in property <string> dest;
     in property <string> error;
     in property <bool> creating;
+    // A ready-made VM being made: what it does now.
+    in property <string> progress;
+    // The Mac user's SSH public keys (~/.ssh/*.pub).
+    in property <[string]> keys;
     property <bool> windows: draft.os-index == 1;
-    property <[{os: string, label: string, index: int}]> tiles: [
-        { os: "ubuntu", label: "Ubuntu", index: 0 },
-        { os: "windows", label: "Windows 11", index: 1 },
-        { os: "debian", label: "Debian", index: 2 },
-        { os: "fedora", label: "Fedora", index: 3 },
-        { os: "linux", label: "Other Linux", index: 5 },
+    property <[{os: string, label: string, index: int, tip: string}]> tiles: [
+        { os: "ubuntu", label: "Ubuntu", index: 0, tip: "" },
+        { os: "windows", label: "Windows 11", index: 1, tip: "NVMe disks, a TPM and 8 GB of memory. Setup runs on its own and installs the guest tools." },
+        { os: "debian", label: "Debian", index: 2, tip: "" },
+        { os: "fedora", label: "Fedora", index: 3, tip: "" },
+        { os: "linux", label: "Other Linux", index: 5, tip: "" },
     ];
 
     Scrim {
@@ -88,23 +96,17 @@ export component NewVmSheet inherits Rectangle {
             spacing: 18px;
             HorizontalLayout {
                 spacing: 12px;
-                VerticalLayout {
+                Text {
                     horizontal-stretch: 1;
-                    spacing: 4px;
-                    Text {
-                        text: "New VM";
-                        font-size: 20px;
-                        font-weight: 700;
-                        color: Theme.text;
-                    }
-                    Text {
-                        text: "Pick a system and an installer. Everything can change later.";
-                        font-size: Theme.fs-md;
-                        color: Theme.text-2;
-                    }
+                    text: "New VM";
+                    font-size: 20px;
+                    font-weight: 700;
+                    color: Theme.text;
+                    vertical-alignment: center;
                 }
                 IconButton {
                     icon: Icons.x;
+                    tip: "Close (esc)";
                     clicked => { Bus.act("newvm.cancel"); }
                 }
             }
@@ -116,6 +118,7 @@ export component NewVmSheet inherits Rectangle {
                     min-width: 90px;
                     os: t.os;
                     label: t.label;
+                    tip: t.tip;
                     selected: root.draft.os-index == t.index;
                     clicked => { Bus.set("newvm.os", t.index); }
                 }
@@ -130,6 +133,12 @@ export component NewVmSheet inherits Rectangle {
                 ita := TouchArea {
                     mouse-cursor: pointer;
                     clicked => { Bus.act("newvm.pick"); }
+                }
+                Tip {
+                    text: root.windows ? (root.draft.ready ? "Installs on its own: virtio drivers (network at once), guest tools, SSH if on. Download the ISO from microsoft.com."
+                            : "The Windows 11 ARM64 ISO (installs on its own), or an install stick image.")
+                        : root.draft.ready ? "Downloads Ubuntu's cloud image (600 MB) and sets it up at first boot. Or choose an ISO or a cloud image (.img)."
+                        : "An ARM64 installer image. Optional: you can attach one later.";
                 }
                 HorizontalLayout {
                     padding-left: 18px;
@@ -149,20 +158,13 @@ export component NewVmSheet inherits Rectangle {
                     VerticalLayout {
                         horizontal-stretch: 1;
                         alignment: center;
-                        spacing: 3px;
                         Text {
                             text: root.draft.installer != "" ? root.draft.installer
-                                : root.windows ? "Choose the install stick image" : "Choose an installer ISO, or drop it here";
+                                : root.windows ? "Windows 11 ARM64 ISO"
+                                : root.draft.ready ? "Ubuntu 24.04, ready to use" : "Installer ISO";
                             font-size: Theme.fs-md;
                             font-weight: 600;
-                            color: Theme.text;
-                            overflow: elide;
-                        }
-                        Text {
-                            text: root.windows ? "Made from the Windows ISO with scripts/make-windows-stick.sh (see the guide)."
-                                : "ARM64 images. Optional: you can attach one later.";
-                            font-size: Theme.fs-xs;
-                            color: Theme.text-3;
+                            color: root.draft.installer != "" || root.draft.ready ? Theme.text : Theme.text-2;
                             overflow: elide;
                         }
                     }
@@ -186,15 +188,16 @@ export component NewVmSheet inherits Rectangle {
                         font-weight: 600;
                         color: Theme.text-2;
                     }
-                    Field {
-                        text: root.draft.name;
-                        mono: true;
-                        edited(t) => { root.draft.name = t; }
-                    }
-                    Text {
-                        text: "Letters, digits, . _ -";
-                        font-size: Theme.fs-xs;
-                        color: Theme.text-3;
+                    Rectangle {
+                        height: 32px;
+                        Field {
+                            text: root.draft.name;
+                            mono: true;
+                            edited(t) => { root.draft.name = t; }
+                        }
+                        Tip {
+                            text: "Letters, digits, . _ -";
+                        }
                     }
                 }
                 VerticalLayout {
@@ -246,19 +249,25 @@ export component NewVmSheet inherits Rectangle {
                         unit: "GB";
                         released(v) => { root.draft.memory-gib = round(v); }
                     }
-                    HorizontalLayout {
-                        Text {
-                            text: "Disk";
-                            font-size: Theme.fs-sm;
-                            font-weight: 600;
-                            color: Theme.text-2;
-                            horizontal-stretch: 1;
+                    Rectangle {
+                        height: dl.preferred-height;
+                        dl := HorizontalLayout {
+                            Text {
+                                text: "Disk";
+                                font-size: Theme.fs-sm;
+                                font-weight: 600;
+                                color: Theme.text-2;
+                                horizontal-stretch: 1;
+                            }
+                            Text {
+                                text: round(disk.shown) + " GB";
+                                font-size: Theme.fs-sm;
+                                font-weight: 700;
+                                color: Theme.text;
+                            }
                         }
-                        Text {
-                            text: round(disk.shown) + " GB, uses space as it fills";
-                            font-size: Theme.fs-sm;
-                            font-weight: 700;
-                            color: Theme.text;
+                        Tip {
+                            text: "The most it can hold. The file only takes the space the guest fills.";
                         }
                     }
                     disk := Slider {
@@ -271,20 +280,115 @@ export component NewVmSheet inherits Rectangle {
                     }
                 }
             }
+            // Ready-made: who uses it, and SSH.
+            if root.draft.ready: HorizontalLayout {
+                spacing: 18px;
+                VerticalLayout {
+                    width: 180px;
+                    spacing: 6px;
+                    alignment: start;
+                    Text {
+                        text: "User";
+                        font-size: Theme.fs-sm;
+                        font-weight: 600;
+                        color: Theme.text-2;
+                    }
+                    Field {
+                        text: root.draft.user;
+                        mono: true;
+                        edited(t) => { root.draft.user = t; }
+                    }
+                }
+                VerticalLayout {
+                    width: 180px;
+                    spacing: 6px;
+                    alignment: start;
+                    Text {
+                        text: "Password";
+                        font-size: Theme.fs-sm;
+                        font-weight: 600;
+                        color: Theme.text-2;
+                    }
+                    Field {
+                        text: root.draft.password;
+                        input-type: InputType.password;
+                        edited(t) => { root.draft.password = t; }
+                    }
+                }
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    spacing: 6px;
+                    alignment: start;
+                    Rectangle {
+                        height: sl.preferred-height;
+                        sl := HorizontalLayout {
+                            spacing: 8px;
+                            Toggle {
+                                y: (parent.height - self.height) / 2;
+                                checked: root.draft.ssh;
+                                toggled(v) => { root.draft.ssh = v; }
+                            }
+                            Text {
+                                text: "SSH";
+                                font-size: Theme.fs-sm;
+                                font-weight: 600;
+                                color: Theme.text-2;
+                                vertical-alignment: center;
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                        }
+                        Tip {
+                            text: "An SSH server with this key of yours, and a port on your Mac for it (in the VM's file).";
+                        }
+                    }
+                    if root.draft.ssh: Select {
+                        options: root.keys;
+                        current: root.draft.ssh-key;
+                        empty-text: "No key in ~/.ssh";
+                        selected(i) => { root.draft.ssh-key = i; }
+                    }
+                }
+            }
             HorizontalLayout {
                 spacing: 24px;
-                if !root.windows: HorizontalLayout {
-                    spacing: 10px;
-                    Toggle {
-                        y: (parent.height - self.height) / 2;
-                        checked: root.draft.gpu3d;
-                        toggled(v) => { root.draft.gpu3d = v; }
+                if root.draft.ready && !root.windows: Rectangle {
+                    width: dsk.preferred-width;
+                    dsk := HorizontalLayout {
+                        spacing: 10px;
+                        Toggle {
+                            y: (parent.height - self.height) / 2;
+                            checked: root.draft.desktop;
+                            toggled(v) => { root.draft.desktop = v; }
+                        }
+                        Text {
+                            text: "Desktop";
+                            font-size: Theme.fs-md;
+                            color: Theme.text;
+                            vertical-alignment: center;
+                        }
                     }
-                    Text {
-                        text: "3D graphics";
-                        font-size: Theme.fs-md;
-                        color: Theme.text;
-                        vertical-alignment: center;
+                    Tip {
+                        text: "Ubuntu's desktop (GNOME): about 10 more minutes at first boot.";
+                    }
+                }
+                if !root.windows: Rectangle {
+                    width: gl.preferred-width;
+                    gl := HorizontalLayout {
+                        spacing: 10px;
+                        Toggle {
+                            y: (parent.height - self.height) / 2;
+                            checked: root.draft.gpu3d;
+                            toggled(v) => { root.draft.gpu3d = v; }
+                        }
+                        Text {
+                            text: "3D graphics";
+                            font-size: Theme.fs-md;
+                            color: Theme.text;
+                            vertical-alignment: center;
+                        }
+                    }
+                    Tip {
+                        text: "Drawn by your Mac's GPU: Vulkan and OpenGL. Needs the 3D libraries (see the guide).";
                     }
                 }
                 HorizontalLayout {
@@ -303,9 +407,9 @@ export component NewVmSheet inherits Rectangle {
                 }
                 Rectangle { horizontal-stretch: 1; }
             }
-            if root.windows: Banner {
+            if root.creating && root.progress != "": Banner {
                 kind: 0;
-                text: "Windows 11 gets NVMe disks, a TPM and 8 GB of memory. Setup runs on its own and installs the guest tools.";
+                text: root.progress;
             }
             if root.error != "": Banner {
                 kind: 3;
@@ -317,14 +421,20 @@ export component NewVmSheet inherits Rectangle {
             }
             HorizontalLayout {
                 spacing: 10px;
-                Text {
+                Rectangle {
                     horizontal-stretch: 1;
-                    text: root.dest;
-                    font-size: Theme.fs-xs;
-                    font-family: Theme.mono;
-                    color: Theme.text-3;
-                    vertical-alignment: center;
-                    overflow: elide;
+                    Text {
+                        width: 100%;
+                        text: root.dest;
+                        font-size: Theme.fs-xs;
+                        font-family: Theme.mono;
+                        color: Theme.text-3;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    Tip {
+                        text: "Where the VM's file and disk go";
+                    }
                 }
                 Button {
                     text: "Cancel";
@@ -371,7 +481,8 @@ export component CommandPalette inherits Rectangle {
                     horizontal-stretch: 1;
                     height: 42px;
                     text <=> root.query;
-                    placeholder: "Start a VM, open a setting, take a snapshot...";
+                    placeholder: "Search";
+
                     edited(t) => {
                         root.query = t;
                         Bus.search("palette:" + t);
@@ -426,7 +537,7 @@ export component CommandPalette inherits Rectangle {
                 padding-top: 2px;
                 spacing: 14px;
                 Text {
-                    text: "↑ ↓ choose    enter run    esc close";
+                    text: "↑↓   ↵   esc";
                     font-size: Theme.fs-xs;
                     color: Theme.text-3;
                 }

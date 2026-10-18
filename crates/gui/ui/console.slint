@@ -6,7 +6,48 @@
 import { Theme } from "theme.slint";
 import { Icons } from "icons.slint";
 import { VmState } from "types.slint";
-import { IconButton, Icon, Spinner, OsBadge, StatusDot, Button } from "controls.slint";
+import { IconButton, Icon, Spinner, OsBadge, StatusDot, Button, Tip, InfoTip, Tips } from "controls.slint";
+
+// One host USB device in the VM window's USB menu.
+export struct UsbMenuRow {
+    label: string,
+    // Under the name, short: connected, why it can't be.
+    note: string,
+    // The rest, on hover: ids, how to mount it by hand.
+    tip: string,
+    // Connected to this VM.
+    on: bool,
+    // In the VM file: connected at every start.
+    always: bool,
+    // The note is a warning (needs the root helper, in use elsewhere).
+    warn: bool,
+    // Being connected or let go.
+    busy: bool,
+    enabled: bool,
+    // A disk: how it goes to the VM is being chosen (the three ways
+    // show under it).
+    choosing: bool,
+}
+
+// One network adapter in the VM window's network menu.
+export struct NetMenuRow {
+    // "Adapter 1 · NAT"
+    label: string,
+    // Connected, cable out, switching.
+    note: string,
+    tip: string,
+    // The cable is in.
+    on: bool,
+    // Being switched.
+    busy: bool,
+    // 0 NAT, 1 bridged, 2 host-only.
+    mode: int,
+    // NAT can be picked (the VM started with a NAT adapter).
+    nat-ok: bool,
+    // Taken out of the VM file: it stays, unplugged, until the next start.
+    removed: bool,
+    warn: bool,
+}
 
 component BarButton inherits IconButton {
     tint: #ffffffd0;
@@ -35,10 +76,30 @@ component VmBar inherits HorizontalLayout {
     in property <string> cpu-text;
     // "3D", "Direct3D 11"; empty without 3D.
     in property <string> gpu-text;
+    // The guest has more than one monitor (a window each).
+    in property <bool> monitors;
     // Spans the window: the indicators go to the right.
     in property <bool> wide;
+    // The VM has a USB controller to plug host devices into; how many are.
+    in property <bool> usb-shown;
+    in property <int> usb-count;
+    in property <bool> usb-open;
+    // The VM has network adapters; how many have their cable out.
+    in property <bool> net-shown;
+    in property <int> net-off;
+    in property <bool> net-open;
+    // Coherence: why it can't start (empty: it can).
+    in property <string> coherence-why;
+    // Guest tools: 0 nothing to do, 1 none in the guest, 2 newer ones
+    // here, 3 being installed. What it means is in the tip.
+    in property <int> tools;
+    in property <string> tools-tip;
     out property <bool> power-open: false;
     callback act(string);
+    // The USB button was clicked: where its bottom right corner is.
+    callback usb-at(length, length);
+    // The same for the network button.
+    callback net-at(length, length);
 
     padding-left: 8px;
     padding-right: 6px;
@@ -48,33 +109,48 @@ component VmBar inherits HorizontalLayout {
         size: 22px;
         y: (parent.height - self.height) / 2;
     }
-    HorizontalLayout {
+    // The name, a state dot, and a word only while it isn't plainly
+    // running; the keyboard mark while keys go to the guest.
+    namebox := Rectangle {
         horizontal-stretch: 0;
-        padding-left: 6px;
-        padding-right: 8px;
-        spacing: 7px;
-        Text {
-            text: root.vm-name;
-            color: #ffffff;
-            font-size: Theme.fs-md;
-            font-weight: 650;
-            vertical-alignment: center;
-            overflow: elide;
-            max-width: 220px;
+        width: nl.preferred-width;
+        property <string> what: root.state == VmState.paused ? "Paused" : root.state == VmState.starting ? "Starting"
+            : root.state == VmState.suspending ? "Saving state" : root.state == VmState.stopping ? "Shutting down" : "";
+        nl := HorizontalLayout {
+            padding-left: 6px;
+            padding-right: 8px;
+            spacing: 7px;
+            Text {
+                text: root.vm-name;
+                color: #ffffff;
+                font-size: Theme.fs-md;
+                font-weight: 650;
+                vertical-alignment: center;
+                overflow: elide;
+                max-width: 220px;
+            }
+            StatusDot {
+                width: 6px;
+                height: 6px;
+                y: (parent.height - self.height) / 2;
+                tint: root.state == VmState.running ? #34d399 : #fbbf24;
+            }
+            if namebox.what != "": Text {
+                text: namebox.what;
+                color: #ffffff99;
+                font-size: Theme.fs-xs;
+                vertical-alignment: center;
+            }
+            if namebox.what == "" && root.captured: Icon {
+                source: Icons.keyboard;
+                width: 14px;
+                height: 14px;
+                y: (parent.height - self.height) / 2;
+                tint: #ffffff80;
+            }
         }
-        StatusDot {
-            width: 6px;
-            height: 6px;
-            y: (parent.height - self.height) / 2;
-            tint: root.state == VmState.running ? #34d399 : #fbbf24;
-        }
-        Text {
-            text: root.state == VmState.paused ? "Paused" : root.state == VmState.starting ? "Starting"
-                : root.state == VmState.suspending ? "Saving state" : root.state == VmState.stopping ? "Shutting down"
-                : root.captured ? "Keyboard goes to the VM" : "Running";
-            color: #ffffff99;
-            font-size: Theme.fs-xs;
-            vertical-alignment: center;
+        Tip {
+            text: namebox.what != "" ? namebox.what : root.captured ? "Running. Keys go to the VM while this window has focus." : "Running";
         }
     }
     BarRule {
@@ -133,50 +209,73 @@ component VmBar inherits HorizontalLayout {
                 y: (parent.height - self.height) / 2;
                 tint: #ef4444;
             }
+            if root.camera-on: Icon {
+                source: Icons.camera;
+                width: 13px;
+                height: 13px;
+                y: (parent.height - self.height) / 2;
+                tint: #ffffffd0;
+            }
+            if root.mic-on: Icon {
+                source: Icons.mic;
+                width: 13px;
+                height: 13px;
+                y: (parent.height - self.height) / 2;
+                tint: #ffffffd0;
+            }
+        }
+        Tip {
+            text: root.mic-on && root.camera-on ? "The guest uses this Mac's camera and microphone" : root.camera-on ? "The guest uses this Mac's camera" : "The guest records from this Mac's microphone";
+        }
+    }
+    if root.wide && root.cpu-text != "": Rectangle {
+        horizontal-stretch: 0;
+        width: cl.preferred-width;
+        cl := HorizontalLayout {
+            padding-left: 8px;
+            spacing: 5px;
+            Icon {
+                source: Icons.cpu;
+                width: 14px;
+                height: 14px;
+                y: (parent.height - self.height) / 2;
+                tint: #ffffff80;
+            }
             Text {
-                text: root.mic-on && root.camera-on ? "Camera and microphone in use" : root.camera-on ? "Camera in use" : "Microphone in use";
-                color: #ffffffd0;
+                // Room for "100%": the bar doesn't twitch as it changes.
+                min-width: 30px;
+                text: root.cpu-text;
+                color: #ffffffb0;
                 font-size: Theme.fs-xs;
                 vertical-alignment: center;
             }
         }
-    }
-    if root.wide && root.cpu-text != "": HorizontalLayout {
-        horizontal-stretch: 0;
-        padding-left: 8px;
-        spacing: 5px;
-        Icon {
-            source: Icons.cpu;
-            width: 14px;
-            height: 14px;
-            y: (parent.height - self.height) / 2;
-            tint: #ffffff80;
-        }
-        Text {
-            // Room for "100%": the bar doesn't twitch as it changes.
-            min-width: 30px;
-            text: root.cpu-text;
-            color: #ffffffb0;
-            font-size: Theme.fs-xs;
-            vertical-alignment: center;
+        Tip {
+            text: "Mac CPU time the VM uses (100%: all its CPUs busy)";
         }
     }
-    if root.wide && root.gpu-text != "": HorizontalLayout {
+    if root.wide && root.gpu-text != "": Rectangle {
         horizontal-stretch: 0;
-        padding-left: 8px;
-        spacing: 5px;
-        Icon {
-            source: Icons.sparkles;
-            width: 14px;
-            height: 14px;
-            y: (parent.height - self.height) / 2;
-            tint: #ffffff80;
+        width: gl.preferred-width;
+        gl := HorizontalLayout {
+            padding-left: 8px;
+            spacing: 5px;
+            Icon {
+                source: Icons.sparkles;
+                width: 14px;
+                height: 14px;
+                y: (parent.height - self.height) / 2;
+                tint: #ffffff80;
+            }
+            Text {
+                text: root.gpu-text;
+                color: #ffffffb0;
+                font-size: Theme.fs-xs;
+                vertical-alignment: center;
+            }
         }
-        Text {
-            text: root.gpu-text;
-            color: #ffffffb0;
-            font-size: Theme.fs-xs;
-            vertical-alignment: center;
+        Tip {
+            text: "3D: the guest draws with this Mac's GPU";
         }
     }
     Rectangle {
@@ -185,11 +284,96 @@ component VmBar inherits HorizontalLayout {
     BarRule {
         y: (parent.height - self.height) / 2;
     }
+    if root.monitors: BarButton {
+        icon: Icons.display;
+        tip: "Show all displays";
+        y: (parent.height - self.height) / 2;
+        clicked => { root.act("displays"); }
+    }
+    if root.net-shown: Rectangle {
+        width: 30px;
+        height: 30px;
+        y: (parent.height - self.height) / 2;
+        BarButton {
+            icon: Icons.network;
+            tip: root.net-open ? "" : root.net-off == 0 ? "Network" : root.net-off == 1 ? "Network: 1 adapter unplugged" : "Network: " + root.net-off + " adapters unplugged";
+            active: root.net-open;
+            clicked => {
+                root.net-at(self.absolute-position.x + self.width, self.absolute-position.y + self.height);
+                root.act("net-menu");
+            }
+        }
+        // A cable is out: a small mark on the icon's corner.
+        if root.net-off > 0: Rectangle {
+            x: parent.width - self.width - 4px;
+            y: 4px;
+            width: 8px;
+            height: 8px;
+            border-radius: 4px;
+            background: #fbbf24;
+        }
+    }
+    if root.usb-shown: Rectangle {
+        width: 30px;
+        height: 30px;
+        y: (parent.height - self.height) / 2;
+        ub := BarButton {
+            icon: Icons.usb;
+            tip: root.usb-open ? "" : root.usb-count == 0 ? "USB devices" : root.usb-count == 1 ? "1 USB device connected" : root.usb-count + " USB devices connected";
+            active: root.usb-open;
+            clicked => {
+                root.usb-at(self.absolute-position.x + self.width, self.absolute-position.y + self.height);
+                root.act("usb-menu");
+            }
+        }
+        // How many are connected, on the icon's corner.
+        if root.usb-count > 0: Rectangle {
+            x: parent.width - self.width - 1px;
+            y: 2px;
+            width: max(13px, ct.preferred-width + 6px);
+            height: 13px;
+            border-radius: 6.5px;
+            background: Theme.accent;
+            ct := Text {
+                text: root.usb-count;
+                color: #ffffff;
+                font-size: 9px;
+                font-weight: 700;
+            }
+        }
+    }
+    if root.tools > 0: Rectangle {
+        width: 30px;
+        height: 30px;
+        y: (parent.height - self.height) / 2;
+        BarButton {
+            icon: Icons.package;
+            tip: root.tools-tip;
+            dim: root.tools == 3;
+            clicked => { root.act("tools"); }
+        }
+        // Newer tools: a dot on the icon's corner.
+        if root.tools == 2: Rectangle {
+            x: parent.width - self.width - 4px;
+            y: 4px;
+            width: 8px;
+            height: 8px;
+            border-radius: 4px;
+            background: Theme.accent;
+        }
+    }
     BarButton {
         icon: Icons.sliders;
         tip: "Settings";
         y: (parent.height - self.height) / 2;
         clicked => { root.act("settings"); }
+    }
+    BarButton {
+        icon: Icons.window;
+        tip: root.coherence-why == "" ? "Coherence: the VM's windows on your desktop" : root.coherence-why;
+        dim: root.coherence-why != "";
+        y: (parent.height - self.height) / 2;
+        clicked => { root.act("coherence"); }
     }
     BarButton {
         icon: Icons.maximize;
@@ -280,6 +464,12 @@ export component ConsoleWindow inherits Window {
     in property <string> suspend-error;
     in property <string> cpu-text;
     in property <string> gpu-text;
+    in property <bool> monitors;
+    // Why Coherence can't start now (empty: it can).
+    in property <string> coherence-why: "Coherence needs the guest tools";
+    // Guest tools (see VmBar).
+    in property <int> tools;
+    in property <string> tools-tip;
     // Height of the bar above the guest screen (none in full screen).
     // Rust takes it off the size it asks the guest for.
     out property <length> bar-height: root.fullscreen ? 0px : 38px;
@@ -294,12 +484,47 @@ export component ConsoleWindow inherits Window {
     in property <bool> drop-over;
     in property <string> drop-text;
     in property <float> drop-progress: -1;
+    // Host USB devices: the VM can take them (it has a USB controller),
+    // how many it has, the menu and what is in it.
+    in property <bool> usb-shown;
+    in property <int> usb-count;
+    in-out property <bool> usb-open;
+    in property <[UsbMenuRow]> usb-rows;
+    // Under the list: what the root helper is for, if a device needs it;
+    // with `usb-setup`, the button that sets it up.
+    in property <string> usb-note;
+    in property <string> usb-note-tip;
+    in property <bool> usb-setup;
+    in property <bool> usb-setup-busy;
+    // "Remember for this device", under a disk's three ways.
+    in property <bool> usb-remember;
+    // Where the menu hangs from (the USB button's bottom right corner).
+    in-out property <length> usb-x: root.width - 120px;
+    in-out property <length> usb-y: root.bar-height;
+    // Network adapters: the button, the menu and what is in it.
+    in property <bool> net-shown;
+    in property <int> net-off;
+    in-out property <bool> net-open;
+    in property <[NetMenuRow]> net-rows;
+    in-out property <length> net-x: root.width - 150px;
+    in-out property <length> net-y: root.bar-height;
     callback mouse-move(float, float);
     callback button(int, bool);
     callback wheel(length, length);
     callback act(string);
     // The mouse went over the guest screen (true) or left it.
     callback pointer-over(bool);
+    // macOS: the screen may show from a layer of Rust's over this place
+    // (frames straight from the GPU); it goes whenever something here is
+    // drawn over the screen. Rust follows these.
+    in-out property <bool> bar-menu;
+    out property <bool> screen-covered: root.state != VmState.running || root.mode-w == 0 || root.suspend-error != "" || root.float-out || root.drop-over || root.drop-text != "" || root.usb-open || root.net-open || root.toast != "" || root.bar-menu || Tips.demo != "" || ((root.mic-on || root.camera-on) && root.fullscreen);
+    callback screen-moved();
+    changed screen-covered => { root.screen-moved(); }
+    changed screen-x => { root.screen-moved(); }
+    changed screen-y => { root.screen-moved(); }
+    changed screen-width => { root.screen-moved(); }
+    changed screen-height => { root.screen-moved(); }
 
     title: vm-name + " — vroom";
     icon: Icons.logo;
@@ -313,7 +538,7 @@ export component ConsoleWindow inherits Window {
     property <float> ar: mode-w > 0 && mode-h > 0 ? mode-w / mode-h : 1.6;
     property <length> avail-h: root.height - root.bar-height;
     property <bool> near-top: screen-ta.has-hover && screen-ta.mouse-y + screen.y < 8px;
-    property <bool> float-out: root.fullscreen && (root.bar-pinned || root.near-top || float-ta.has-hover || float-bar.power-open || root.state != VmState.running);
+    property <bool> float-out: root.fullscreen && (root.bar-pinned || root.near-top || float-ta.has-hover || float-bar.power-open || root.usb-open || root.net-open || root.state != VmState.running);
 
     screen := Rectangle {
         width: min(root.width, root.avail-h * root.ar);
@@ -448,11 +673,19 @@ export component ConsoleWindow inherits Window {
                 y: (parent.height - self.height) / 2;
                 tint: #ef4444;
             }
-            Text {
-                text: root.mic-on && root.camera-on ? "Cam, mic" : root.camera-on ? "Cam" : "Mic";
-                color: #ffffffd0;
-                font-size: 10px;
-                vertical-alignment: center;
+            if root.camera-on: Icon {
+                source: Icons.camera;
+                width: 12px;
+                height: 12px;
+                y: (parent.height - self.height) / 2;
+                tint: #ffffffd0;
+            }
+            if root.mic-on: Icon {
+                source: Icons.mic;
+                width: 12px;
+                height: 12px;
+                y: (parent.height - self.height) / 2;
+                tint: #ffffffd0;
             }
         }
     }
@@ -529,7 +762,26 @@ export component ConsoleWindow inherits Window {
             camera-on: root.camera-on;
             cpu-text: root.cpu-text;
             gpu-text: root.gpu-text;
+            monitors: root.monitors;
+            coherence-why: root.coherence-why;
+            tools: root.tools;
+            tools-tip: root.tools-tip;
             wide: true;
+            changed power-open => { root.bar-menu = self.power-open; }
+            usb-shown: root.usb-shown;
+            usb-count: root.usb-count;
+            usb-open: root.usb-open;
+            usb-at(x, y) => {
+                root.usb-x = x;
+                root.usb-y = y;
+            }
+            net-shown: root.net-shown;
+            net-off: root.net-off;
+            net-open: root.net-open;
+            net-at(x, y) => {
+                root.net-x = x;
+                root.net-y = y;
+            }
             act(a) => { root.act(a); }
         }
     }
@@ -561,7 +813,25 @@ export component ConsoleWindow inherits Window {
             fullscreen: root.fullscreen;
             mic-on: root.mic-on;
             camera-on: root.camera-on;
+            monitors: root.monitors;
             wide: false;
+            usb-shown: root.usb-shown;
+            usb-count: root.usb-count;
+            usb-open: root.usb-open;
+            usb-at(x, y) => {
+                root.usb-x = x;
+                root.usb-y = y;
+            }
+            net-shown: root.net-shown;
+            net-off: root.net-off;
+            net-open: root.net-open;
+            net-at(x, y) => {
+                root.net-x = x;
+                root.net-y = y;
+            }
+            coherence-why: root.coherence-why;
+            tools: root.tools;
+            tools-tip: root.tools-tip;
             act(a) => { root.act(a); }
         }
     }
@@ -611,6 +881,378 @@ export component ConsoleWindow inherits Window {
         }
     }
 
+    // Host USB devices, under the bar's USB button. A click outside
+    // closes it.
+    if root.usb-open: TouchArea {
+        clicked => { root.usb-open = false; }
+    }
+    if root.usb-open: Rectangle {
+        width: min(360px, root.width - 16px);
+        height: ul.preferred-height;
+        x: clamp(root.usb-x - self.width, 8px, root.width - self.width - 8px);
+        y: root.usb-y + 4px;
+        background: #242427f2;
+        border-radius: Theme.r-lg;
+        border-width: 1px;
+        border-color: #ffffff24;
+        TouchArea { }
+        ul := VerticalLayout {
+            padding: 5px;
+            spacing: 0px;
+            Text {
+                text: "USB devices on this Mac";
+                color: #ffffff80;
+                font-size: Theme.fs-xs;
+                font-weight: 600;
+                height: 26px;
+                vertical-alignment: center;
+                x: 10px;
+            }
+            if root.usb-rows.length == 0: Text {
+                text: "Nothing plugged in.";
+                color: #ffffffb0;
+                font-size: Theme.fs-md;
+                height: 34px;
+                vertical-alignment: center;
+                x: 10px;
+            }
+            for it[i] in root.usb-rows: VerticalLayout {
+                Rectangle {
+                    height: it.note != "" ? 44px : 34px;
+                    border-radius: Theme.r-sm;
+                    background: rta.has-hover && it.enabled ? #ffffff14 : transparent;
+                    opacity: it.enabled ? 1 : 0.5;
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        spacing: 10px;
+                        Rectangle {
+                            width: 16px;
+                            if it.busy: Spinner {
+                                tint: #ffffffb0;
+                                y: (parent.height - self.height) / 2;
+                            }
+                            if it.on && !it.busy: Icon {
+                                source: Icons.check;
+                                width: 16px;
+                                height: 16px;
+                                y: (parent.height - self.height) / 2;
+                                tint: Theme.accent;
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 2px;
+                            Text {
+                                text: it.label;
+                                color: #ffffff;
+                                font-size: Theme.fs-md;
+                                overflow: elide;
+                            }
+                            if it.note != "": Text {
+                                text: it.note;
+                                color: it.warn ? #fbbf24 : #ffffff80;
+                                font-size: Theme.fs-xs;
+                                overflow: elide;
+                            }
+                        }
+                        if it.always: Icon {
+                            source: Icons.pin;
+                            width: 13px;
+                            height: 13px;
+                            y: (parent.height - self.height) / 2;
+                            tint: #ffffff80;
+                        }
+                    }
+                    rta := TouchArea {
+                        enabled: it.enabled && !it.busy;
+                        mouse-cursor: pointer;
+                        clicked => { root.act("usb.toggle." + i); }
+                    }
+                    Tip {
+                        text: it.tip;
+                    }
+                }
+                // A disk: the three ways it can go to the VM, each
+                // explained in its tip.
+                if it.choosing: VerticalLayout {
+                    padding-left: 36px;
+                    padding-right: 10px;
+                    padding-bottom: 4px;
+                    spacing: 2px;
+                    HorizontalLayout {
+                        height: 30px;
+                        spacing: 4px;
+                        alignment: start;
+                        for w in [
+                            { key: "files", title: "Its files", text: "Share its files: the Mac keeps the disk, the VM sees its files as a shared folder." },
+                            { key: "disk", title: "Whole disk", text: "Use as a disk: the Mac lets go of it, the VM gets the whole disk to use, format or partition." },
+                            { key: "device", title: "USB device", text: "Pass the USB device itself. macOS 15.3 and later refuse this for disks unless vroom-netd has Full Disk Access." },
+                        ]: Rectangle {
+                            width: wt.preferred-width + 18px;
+                            height: 24px;
+                            y: (parent.height - self.height) / 2;
+                            border-radius: 12px;
+                            background: cta.has-hover ? #ffffff30 : #ffffff14;
+                            wt := Text {
+                                text: w.title;
+                                color: #ffffff;
+                                font-size: Theme.fs-xs;
+                            }
+                            cta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.act("usb.how." + i + "." + w.key); }
+                            }
+                            Tip {
+                                text: w.text;
+                            }
+                        }
+                    }
+                    Rectangle {
+                        height: 26px;
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Rectangle {
+                                width: 14px;
+                                height: 14px;
+                                y: (parent.height - self.height) / 2;
+                                border-radius: 3px;
+                                border-width: root.usb-remember ? 0px : 1px;
+                                border-color: #ffffff60;
+                                background: root.usb-remember ? Theme.accent : transparent;
+                                if root.usb-remember: Icon {
+                                    source: Icons.check;
+                                    width: 11px;
+                                    height: 11px;
+                                    tint: #ffffff;
+                                }
+                            }
+                            Text {
+                                text: "Remember";
+                                color: rma.has-hover ? #ffffff : #ffffffb0;
+                                font-size: Theme.fs-sm;
+                                vertical-alignment: center;
+                            }
+                        }
+                        rma := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.act("usb.remember"); }
+                        }
+                        Tip {
+                            text: "Use this choice for this device from now on, in every VM";
+                        }
+                    }
+                }
+                // Connected, or in the VM file: keep it there, or not.
+                if it.on || it.always: Rectangle {
+                    height: 26px;
+                    HorizontalLayout {
+                        padding-left: 36px;
+                        spacing: 8px;
+                        Rectangle {
+                            width: 14px;
+                            height: 14px;
+                            y: (parent.height - self.height) / 2;
+                            border-radius: 3px;
+                            border-width: it.always ? 0px : 1px;
+                            border-color: #ffffff60;
+                            background: it.always ? Theme.accent : transparent;
+                            if it.always: Icon {
+                                source: Icons.check;
+                                width: 11px;
+                                height: 11px;
+                                tint: #ffffff;
+                            }
+                        }
+                        Text {
+                            text: "Always connect";
+                            color: ata.has-hover ? #ffffff : #ffffffb0;
+                            font-size: Theme.fs-sm;
+                            vertical-alignment: center;
+                        }
+                    }
+                    ata := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.act("usb.always." + i); }
+                    }
+                    Tip {
+                        text: "Saved in the VM file: it connects at every start";
+                    }
+                }
+            }
+            if root.usb-note != "": Rectangle {
+                height: nl.preferred-height + 6px;
+                Rectangle {
+                    y: 2px;
+                    height: 1px;
+                    background: #ffffff14;
+                }
+                nl := HorizontalLayout {
+                    y: 6px;
+                    padding: 10px;
+                    padding-top: 8px;
+                    spacing: 8px;
+                    if root.usb-note-tip != "": InfoTip {
+                        y: 1px;
+                        icon: Icons.warning;
+                        tint: #fbbf24;
+                        text: root.usb-note-tip;
+                    }
+                    Text {
+                        horizontal-stretch: 1;
+                        text: root.usb-note;
+                        color: #ffffffb0;
+                        font-size: Theme.fs-sm;
+                        wrap: word-wrap;
+                    }
+                    if root.usb-setup: Button {
+                        kind: "primary";
+                        small: true;
+                        text: root.usb-setup-busy ? "Waiting..." : "Set up";
+                        tip: "Installs vroom-netd. macOS asks for an admin password.";
+                        busy: root.usb-setup-busy;
+                        clicked => { root.act("usb.setup"); }
+                    }
+                }
+            }
+        }
+    }
+
+    // Network adapters, under the bar's network button: plug a cable in
+    // or out, put an adapter on another network. A click outside closes it.
+    if root.net-open: TouchArea {
+        clicked => { root.net-open = false; }
+    }
+    if root.net-open: Rectangle {
+        width: min(340px, root.width - 16px);
+        height: nl2.preferred-height;
+        x: clamp(root.net-x - self.width, 8px, root.width - self.width - 8px);
+        y: root.net-y + 4px;
+        background: #242427f2;
+        border-radius: Theme.r-lg;
+        border-width: 1px;
+        border-color: #ffffff24;
+        TouchArea { }
+        nl2 := VerticalLayout {
+            padding: 5px;
+            spacing: 0px;
+            Text {
+                text: "Network adapters";
+                color: #ffffff80;
+                font-size: Theme.fs-xs;
+                font-weight: 600;
+                height: 26px;
+                vertical-alignment: center;
+                x: 10px;
+            }
+            for it[i] in root.net-rows: VerticalLayout {
+                Rectangle {
+                    height: 44px;
+                    border-radius: Theme.r-sm;
+                    background: nta.has-hover && !it.busy ? #ffffff14 : transparent;
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        spacing: 10px;
+                        Rectangle {
+                            width: 16px;
+                            if it.busy: Spinner {
+                                tint: #ffffffb0;
+                                y: (parent.height - self.height) / 2;
+                            }
+                            if it.on && !it.busy: Icon {
+                                source: Icons.check;
+                                width: 16px;
+                                height: 16px;
+                                y: (parent.height - self.height) / 2;
+                                tint: Theme.accent;
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 2px;
+                            Text {
+                                text: it.label;
+                                color: #ffffff;
+                                font-size: Theme.fs-md;
+                                overflow: elide;
+                            }
+                            Text {
+                                text: it.note;
+                                color: it.warn ? #fbbf24 : #ffffff80;
+                                font-size: Theme.fs-xs;
+                                overflow: elide;
+                            }
+                        }
+                    }
+                    nta := TouchArea {
+                        enabled: !it.busy;
+                        mouse-cursor: pointer;
+                        clicked => { root.act("net.toggle." + i); }
+                    }
+                    Tip {
+                        text: it.tip;
+                    }
+                }
+                // What the cable is plugged into.
+                if !it.removed: HorizontalLayout {
+                    height: 30px;
+                    padding-left: 36px;
+                    padding-right: 10px;
+                    spacing: 4px;
+                    alignment: start;
+                    for m[j] in ["NAT", "Bridged", "Host-only"]: Rectangle {
+                        width: mt.preferred-width + 16px;
+                        height: 22px;
+                        y: (parent.height - self.height) / 2;
+                        border-radius: 11px;
+                        background: it.mode == j ? Theme.accent : mta.has-hover ? #ffffff24 : #ffffff10;
+                        opacity: j == 0 && !it.nat-ok && it.mode != 0 ? 0.4 : 1;
+                        mt := Text {
+                            text: m;
+                            color: it.mode == j ? #ffffff : #ffffffc0;
+                            font-size: Theme.fs-xs;
+                        }
+                        mta := TouchArea {
+                            enabled: !it.busy && it.mode != j;
+                            mouse-cursor: pointer;
+                            clicked => { root.act("net.mode." + i + "." + j); }
+                        }
+                        Tip {
+                            text: j == 0 && !it.nat-ok ? "NAT needs a VM started with a NAT adapter"
+                                : j == 0 ? "Through this Mac: the internet, nothing reaches the guest"
+                                : j == 1 ? "On your network, like a real machine"
+                                : "A private network for VMs and this Mac";
+                        }
+                    }
+                }
+            }
+            Rectangle {
+                height: 1px;
+                background: #ffffff14;
+            }
+            Rectangle {
+                height: 34px;
+                border-radius: Theme.r-sm;
+                background: sta.has-hover ? #ffffff14 : transparent;
+                Text {
+                    x: 36px;
+                    text: "Settings...";
+                    color: #ffffffb0;
+                    font-size: Theme.fs-sm;
+                    vertical-alignment: center;
+                }
+                sta := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => {
+                        root.net-open = false;
+                        root.act("settings");
+                    }
+                }
+            }
+        }
+    }
+
     // Status pill from the VMM ("guest agent connected", "snapshot saved").
     if root.toast != "": Rectangle {
         x: (root.width - self.width) / 2;
@@ -629,6 +1271,78 @@ export component ConsoleWindow inherits Window {
             color: #ffffff;
             font-size: Theme.fs-md;
             overflow: elide;
+        }
+    }
+}
+
+
+// Another guest monitor: its screen only. The VM's bar is on the first
+// monitor's window. Closing this one turns the monitor off in the guest
+// ("Show all displays" on the bar brings it back).
+export component MonitorWindow inherits Window {
+    in property <string> vm-name;
+    // 2, 3, 4.
+    in property <int> number;
+    in property <image> frame;
+    in property <int> mode-w;
+    in property <int> mode-h;
+    in property <bool> paused;
+    out property <length> screen-width: screen.width;
+    callback mouse-move(float, float);
+    callback button(int, bool);
+    callback wheel(length, length);
+    callback pointer-over(bool);
+
+    title: vm-name + " — display " + root.number;
+    icon: Icons.logo;
+    background: #000000;
+    preferred-width: 1024px;
+    preferred-height: 768px;
+    min-width: 320px;
+    min-height: 200px;
+
+    property <float> ar: mode-w > 0 && mode-h > 0 ? mode-w / mode-h : root.width / max(1px, root.height);
+
+    screen := Rectangle {
+        width: min(root.width, root.height * root.ar);
+        height: self.width / root.ar;
+        x: (root.width - self.width) / 2;
+        y: (root.height - self.height) / 2;
+        Image {
+            width: 100%;
+            height: 100%;
+            source: root.frame;
+            image-fit: fill;
+            image-rendering: smooth;
+        }
+        ta := TouchArea {
+            mouse-cursor: none;
+            changed has-hover => { root.pointer-over(self.has-hover); }
+            changed mouse-x => { root.mouse-move(self.mouse-x / self.width, self.mouse-y / self.height); }
+            changed mouse-y => { root.mouse-move(self.mouse-x / self.width, self.mouse-y / self.height); }
+            pointer-event(ev) => {
+                let code = ev.button == PointerEventButton.left ? 272 : ev.button == PointerEventButton.right ? 273 : ev.button == PointerEventButton.middle ? 274 : 0;
+                if code != 0 && ev.kind == PointerEventKind.down {
+                    root.button(code, true);
+                }
+                if code != 0 && ev.kind == PointerEventKind.up {
+                    root.button(code, false);
+                }
+            }
+            scroll-event(ev) => {
+                root.wheel(ev.delta-x, ev.delta-y);
+                accept
+            }
+        }
+    }
+
+    if root.mode-w == 0 || root.paused: Rectangle {
+        background: root.mode-w == 0 ? #000000 : #00000099;
+        Text {
+            text: root.mode-w == 0 ? "The guest isn't using display " + root.number + " yet" : "Paused";
+            color: #ffffffb0;
+            font-size: Theme.fs-lg;
+            font-weight: 600;
         }
     }
 }

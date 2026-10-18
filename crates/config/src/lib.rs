@@ -100,7 +100,56 @@ pub struct Usb {
     /// A label for the app; the guest never sees it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// How a USB disk goes to the guest (other devices: always as the
+    /// device). "files" and "disk" are macOS only, and the app does them.
+    #[serde(default, skip_serializing_if = "UsbMode::is_device")]
+    pub mode: UsbMode,
+    /// "files" and "disk": the guest may read, not change.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub readonly: bool,
 }
+
+/// How a USB disk reaches the guest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UsbMode {
+    /// The USB device itself (passthrough). macOS 15.3 and later keep USB
+    /// disks from it without Full Disk Access.
+    #[default]
+    Device,
+    /// macOS keeps the disk mounted; its volumes are a shared folder.
+    Files,
+    /// Unmounted on the Mac; the guest gets the whole disk as a plain
+    /// USB stick (not the device itself).
+    Disk,
+}
+
+impl UsbMode {
+    pub fn is_device(&self) -> bool {
+        *self == UsbMode::Device
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            UsbMode::Device => "device",
+            UsbMode::Files => "files",
+            UsbMode::Disk => "disk",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<UsbMode> {
+        Some(match s {
+            "device" => UsbMode::Device,
+            "files" => UsbMode::Files,
+            "disk" => UsbMode::Disk,
+            _ => return None,
+        })
+    }
+}
+
+/// Tags of the shares a USB disk's files come through (`vroom-usb0`...):
+/// not for `[[share]]`.
+pub const USB_SHARE_PREFIX: &str = "vroom-usb";
 
 impl Usb {
     /// (vendor, product) from `id`.
@@ -168,6 +217,8 @@ pub struct Identity {
     /// PCI IDs, "vendor:device" or "vendor:device:subvendor:subdevice" in
     /// hex. Without the subsystem part it is vendor:0000.
     pub pci_bridge_id: String,
+    /// The hot plug root ports (PCI Express root port).
+    pub pcie_port_id: String,
     pub nvme_pci_id: String,
     pub usb_pci_id: String,
     /// Sound card (HD Audio controller), when `[audio]` uses one.
@@ -220,6 +271,7 @@ impl Default for Identity {
             disk_serial: "VRM".into(),
             disk_firmware: "1.0".into(),
             pci_bridge_id: "1b36:0008".into(),
+            pcie_port_id: "1b36:000c".into(),
             nvme_pci_id: "1b36:0010".into(),
             usb_pci_id: "1b36:000d".into(),
             hda_pci_id: "8086:2668:1af4:1100".into(),
@@ -279,6 +331,7 @@ impl Identity {
         }
         for (what, v) in [
             ("pci_bridge_id", &self.pci_bridge_id),
+            ("pcie_port_id", &self.pcie_port_id),
             ("nvme_pci_id", &self.nvme_pci_id),
             ("usb_pci_id", &self.usb_pci_id),
             ("hda_pci_id", &self.hda_pci_id),
@@ -328,6 +381,19 @@ impl Identity {
         m[..prefix.len()].copy_from_slice(&prefix);
         m[prefix.len()..].copy_from_slice(&fill[..6 - prefix.len()]);
         m
+    }
+
+    /// The MAC adapter `nic` of VM `name` gets when the file sets none:
+    /// the same at every boot (the guest keeps its DHCP identity) without
+    /// storing anything. Starts with `mac_prefix`.
+    pub fn nic_mac(&self, name: &str, nic: usize) -> [u8; 6] {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in name.bytes().chain([0, nic as u8]) {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+        let b = h.to_le_bytes();
+        self.mac([b[0], b[1], b[2], b[3], b[4], b[5]])
     }
 
     /// NAT addresses of adapter `nic`: (guest, gateway, DNS).
@@ -619,9 +685,26 @@ pub struct Net {
     /// "02:12:34:56:78:9a". Generated if absent (`identity.mac_prefix`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mac: Option<String>,
+    /// The cable is plugged in. False: the guest sees no link and no
+    /// frames go either way (VMware's "Connected" box).
+    #[serde(default = "yes", skip_serializing_if = "is_yes")]
+    pub connected: bool,
+}
+
+fn is_yes(b: &bool) -> bool {
+    *b
 }
 
 impl Net {
+    /// The adapter's MAC: the file's, or the one generated for adapter
+    /// `nic` of VM `name` (see [`Identity::nic_mac`]).
+    pub fn mac_of(&self, ident: &Identity, name: &str, nic: usize) -> Result<[u8; 6]> {
+        match &self.mac {
+            Some(m) => parse_mac(m),
+            None => Ok(ident.nic_mac(name, nic)),
+        }
+    }
+
     /// Typed view. Fails if fields don't match the mode.
     pub fn mode(&self) -> Result<NetMode> {
         let bad = |m: &str| Err(Error::Invalid(format!("net ({:?}): {m}", self.mode)));
@@ -694,6 +777,29 @@ pub struct Display {
     /// What runs the guest's OpenGL on the host (see [`OpenglHost`]).
     #[serde(default)]
     pub opengl_host: OpenglHost,
+    /// Hardware video decoding: a V4L2 decoder in the guest (H.264, HEVC)
+    /// backed by the Mac's VideoToolbox, in a helper process. Linux guests
+    /// with the virtio-media driver. Off by default for now.
+    #[serde(default)]
+    pub video_decode: bool,
+    /// Hardware video encoding: a V4L2 encoder in the guest (H.264, HEVC)
+    /// backed by VideoToolbox, in a helper process of its own. For video
+    /// calls and recording. Off by default for now.
+    #[serde(default)]
+    pub video_encode: bool,
+    /// Guest monitors, 1 to [`MAX_MONITORS`]: the app shows each in a
+    /// window of its own. Linux guests get one GPU with that many
+    /// outputs; Windows guests one GPU per monitor (its drivers drive one
+    /// output each). UEFI's firmware screen stays on the first.
+    #[serde(default = "one")]
+    pub monitors: u32,
+}
+
+/// Most guest monitors a VM can have.
+pub const MAX_MONITORS: u32 = 4;
+
+fn one() -> u32 {
+    1
 }
 
 /// What runs guest OpenGL on the host.
@@ -718,7 +824,7 @@ fn default_h() -> u32 {
 
 impl Default for Display {
     fn default() -> Self {
-        Display { gpu: Gpu::None, width: default_w(), height: default_h(), hidpi: true, opengl: true, opengl_host: OpenglHost::Apple }
+        Display { gpu: Gpu::None, width: default_w(), height: default_h(), hidpi: true, opengl: true, opengl_host: OpenglHost::Apple, video_decode: false, video_encode: false, monitors: 1 }
     }
 }
 
@@ -933,6 +1039,9 @@ impl VmConfig {
             if self.shares[..i].iter().any(|o| o.tag == s.tag) {
                 return bad(format!("share tag {:?} used twice", s.tag));
             }
+            if s.tag.starts_with(USB_SHARE_PREFIX) {
+                return bad(format!("share tag {:?}: tags starting with {USB_SHARE_PREFIX} are for USB disks", s.tag));
+            }
         }
         if self.shares.len() > 8 {
             return bad("at most 8 shares".into());
@@ -1012,6 +1121,12 @@ impl VmConfig {
         if d.width < 320 || d.height < 200 || d.width > 7680 || d.height > 4320 {
             return bad("display size out of range".into());
         }
+        if !(1..=MAX_MONITORS).contains(&d.monitors) {
+            return bad(format!("display.monitors: 1 to {MAX_MONITORS}"));
+        }
+        if d.monitors > 1 && d.gpu == Gpu::None {
+            return bad("display.monitors needs a GPU (display.gpu)".into());
+        }
         if self.clipboard.max_bytes > 64 << 20 {
             return bad("clipboard.max_bytes too large (max 64 MiB)".into());
         }
@@ -1089,9 +1204,19 @@ mod tests {
             "[[usb]]\nid = \"1050:0407\"\nserial = \"\"\n",
             "[[usb]]\nid = \"1050:0407\"\nbus = 1\n",
             "[[usb]]\nid = \"1050:0407\"\n[[usb]]\nid = \"1050:0407\"\n",
+            "[[usb]]\nid = \"1050:0407\"\nmode = \"raw\"\n",
+            "[[share]]\npath = \"/tmp\"\ntag = \"vroom-usb0\"\n",
         ] {
             assert!(super::VmConfig::from_toml(&format!("{base}{bad}")).is_err(), "{bad}");
         }
+        // The mode: "device" unless set, and only written when it isn't.
+        assert_eq!(ok.usb[0].mode, super::UsbMode::Device);
+        let m = super::VmConfig::from_toml(&format!("{base}[[usb]]\nid = \"18a5:0302\"\nmode = \"files\"\nreadonly = true\n")).unwrap();
+        assert_eq!((m.usb[0].mode, m.usb[0].readonly), (super::UsbMode::Files, true));
+        let t = toml::to_string(&ok).unwrap();
+        assert!(!t.contains("mode") && !t.contains("readonly"), "{t}");
+        assert!(toml::to_string(&m).unwrap().contains("mode = \"files\""));
+        assert_eq!(super::UsbMode::parse("disk"), Some(super::UsbMode::Disk));
     }
 
     #[test]

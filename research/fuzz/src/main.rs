@@ -107,7 +107,7 @@ fn main() -> Result<()> {
             count,
         } => {
             let data = std::fs::read(seed)?;
-            let mut m = Mutator::new(0x7632_6f6f_6d_u64, max_len);
+            let mut m = Mutator::new(0x0076_326f_6f6d_u64, max_len);
             for _ in 0..count {
                 let out = m.mutate(&data);
                 println!("{}", hex::encode(out));
@@ -196,7 +196,7 @@ fn main() -> Result<()> {
                     }
                 }
             }
-            let mut mutator = Mutator::new(0x7632_6f6f_6d_u64, engine.harness.max_input);
+            let mut mutator = Mutator::new(0x0076_326f_6f6d_u64, engine.harness.max_input);
             let campaign_start = Instant::now();
             let mut recoveries = 0;
             let mut inputs_since_reopen = 0;

@@ -39,16 +39,82 @@ handles both layouts and matches outstanding requests before returning replies.
 See the [Linux ICMP documentation](https://man7.org/linux/man-pages/man7/icmp.7.html)
 and [Darwin ICMP implementation](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/netinet/ip_icmp.c).
 
+## Changing adapters while the VM runs
+
+The VM window's network button lists the adapters. Click one to pull its
+cable out or put it back; under each, NAT, Bridged and Host-only put it
+on another network. The settings page does the same, and both write the
+VM file, so the change stays.
+
+- **Cable out** (`connected = false`): the guest sees the link go down
+  (virtio-net's link status and a config interrupt, as with a real
+  cable: `ip link` shows `NO-CARRIER`, Windows "Network cable
+  unplugged"). No frame goes either way. Back in, the guest asks DHCP
+  again.
+- **Another network**: same virtio-net device, same MAC, another backend
+  behind it. The link goes down for two seconds and comes back, so the
+  guest's DHCP client asks again and gets an address on the new network.
+  Connections open on the old network end.
+- vmnet on macOS only passes frames from the MAC it picked for a port.
+  When the adapter's MAC is another one (it started on NAT), the VMM
+  rewrites the MAC between the two: in the Ethernet header, ARP, the
+  DHCP client address and IPv6 neighbor discovery. The guest keeps its
+  MAC.
+- NAT while the VM runs needs a VM that started with a NAT adapter: the
+  sandbox lets the VMM make connections out only then. Otherwise NAT
+  waits for the next start, and the settings page says so.
+- Port forwards need listening sockets, which the sandboxed VMM can't
+  open. An adapter keeps the NAT it started with, forwards and all,
+  while it is on another network, and gets it back when it returns to
+  NAT with the same forwards (the app puts them back in the file).
+  Meanwhile a connection to a forwarded port waits. New or changed
+  forwards apply at the next start.
+- **A new adapter** comes at once on a VM on PCI (UEFI boot, or
+  `virtio_transport = "pci"`): a new virtio-net device goes into one of
+  the VM's four PCI Express hot plug slots, and the guest's own hot plug
+  driver brings it up (Linux and Windows: a few seconds, then DHCP). One
+  at a time; NAT needs a VM that started with NAT (above); its port
+  forwards wait for the next start. On a VM on virtio-mmio (Linux with
+  direct kernel boot and the default transport) it comes at the next
+  start.
+- **Removing an adapter added that way** takes it out: vroom presses the
+  slot's attention button, the guest lets go of the device and turns the
+  slot off (Linux waits 5 seconds first), and the device goes. A guest
+  that hasn't let go after 15 seconds loses it anyway. An adapter the VM
+  started with stays: it is unplugged at once and gone at the next
+  start.
+- A new MAC waits for the next start (the guest read the old one when
+  its driver started).
+- At the next start, every adapter in the file is an ordinary one on the
+  root bus again, the added ones included.
+- A suspended VM resumes with the adapters it was saved with, the added
+  ones in their slots (the guest knows them), set up as the file says
+  then: a new mode or cable state applies on resume (the link bounces if
+  the network changed), an adapter added while it was suspended waits
+  for the next start, a removed one stays unplugged until then. The
+  guest keeps the MAC it had.
+
+The VMM can't reach vroom-netd once it is sandboxed (no Unix sockets).
+For bridged and host-only the app asks netd for the port and hands the
+VMM its socket over the window's connection, as it does for USB
+devices. See [SECURITY.md](SECURITY.md#network-changes-while-the-vm-runs).
+
 ## Limits and unfinished work
 
 - IPv6, router advertisements, DHCPv6 and NAT64 are not implemented.
 - Bridged and host-only go through `vroom-netd` (root): vmnet on macOS,
-  tap + bridge on Linux. The plumbing is tested, but not yet against a real
-  vmnet/tap (needs root). netd only accepts locally administered unicast
+  tap + bridge on Linux. The app sets it up when a VM needs it (macOS
+  asks for an admin password once); by hand: [GUIDE.md](GUIDE.md#the-root-helper-vroom-netd).
+  Bridged is tested with vmnet on a Mac's Wi-Fi (`en0`): a LAN address
+  from the router, the internet, the Mac and the guest reach each other.
+  netd only accepts locally administered unicast
   MACs (`x2:`, `x6:`, `xA:`, `xE:`...), so a VM can't take a real device's
   address on the LAN; the default per-VM MACs (`02:...`) are such. It
   refuses frames from any other source MAC, and serves at most 64
   connections at once and 32 ports per user.
+- Host-only on macOS is a vmnet network of its own (by name), and vmnet
+  runs no DHCP server there and gives the Mac no address on it: VMs on
+  it see each other at layer 2 but need static addresses.
 - Port forwarding supports TCP only. UDP inbound forwarding is not implemented.
 - This is an echo relay, not general ICMP forwarding. Remote ICMP errors,
   end-to-end traceroute, and guest-visible path MTU discovery remain incomplete.

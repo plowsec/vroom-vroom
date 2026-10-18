@@ -153,6 +153,12 @@ impl T {
         }
     }
 
+    /// `d` after stream `sd` started: the tests' clock, so a slow or
+    /// loaded machine doesn't change what a tick moves.
+    fn after(&self, sd: usize, d: Duration) -> Instant {
+        self.hda.sds[sd].clock.map_or_else(Instant::now, |c| c.t0) + d
+    }
+
     /// Program stream `sd` (0 in, 1 out) with tag 1, 48 kHz stereo 16-bit.
     fn stream(&mut self, sd: u64, cbl: u32, lvi: u16) {
         let b = 0x80 + sd * 0x20;
@@ -213,9 +219,9 @@ fn playback_moves_buffers_at_real_time() {
     let lead = t.sink.0.lock().unwrap().data.len();
     assert_eq!(lead, 48 * 30 * 4, "silence ahead of the stream");
     // 10 ms: 480 frames, 1920 bytes.
-    t.hda.tick(Instant::now() + Duration::from_millis(10));
+    t.hda.tick(t.after(1, Duration::from_millis(10)));
     let got = t.sink.0.lock().unwrap().data[lead..].to_vec();
-    assert!((1900..=2048).contains(&got.len()), "{}", got.len());
+    assert_eq!(got.len(), 1920);
     assert_eq!(got[..], pcm[..got.len()]);
     let lpib = t.r(0x84 + 0x20, 4);
     assert_eq!(lpib as usize, got.len());
@@ -224,7 +230,7 @@ fn playback_moves_buffers_at_real_time() {
     t.mem.read(GuestAddress(POS + 8), &mut p).unwrap();
     assert_eq!(u32::from_le_bytes(p) as u64, lpib, "position buffer");
     // 30 ms: wrapped past both entries, completion interrupts raised.
-    t.hda.tick(Instant::now() + Duration::from_millis(30));
+    t.hda.tick(t.after(1, Duration::from_millis(30)));
     assert_ne!(t.r(0xa3, 1) & 4, 0);
     assert_ne!(t.r(0x24, 4) & 2, 0);
     assert!(t.line.0.load(Ordering::SeqCst));
@@ -249,7 +255,7 @@ fn capture_writes_the_source_into_guest_buffers() {
     t.bdl(&[(BUF, 1920, true)]);
     t.stream(0, 1920, 0);
     assert_eq!(t.mic.0.lock().unwrap().started, Some((48000, 2)));
-    t.hda.tick(Instant::now() + Duration::from_millis(5));
+    t.hda.tick(t.after(0, Duration::from_millis(5)));
     let lpib = t.r(0x84, 4) as usize;
     assert!(lpib > 800, "{lpib}");
     let mut b = vec![0u8; lpib];
@@ -257,7 +263,7 @@ fn capture_writes_the_source_into_guest_buffers() {
     assert!(b.chunks(2).all(|c| c == [0x34, 0x12]));
     // Muting the ADC records silence.
     t.verbs(&[0x0043_7080]);
-    t.hda.tick(Instant::now() + Duration::from_millis(9));
+    t.hda.tick(t.after(0, Duration::from_millis(9)));
     let lpib2 = t.r(0x84, 4) as usize;
     let mut b = vec![0u8; lpib2 - lpib];
     t.mem.read(GuestAddress(BUF + lpib as u64), &mut b).unwrap();

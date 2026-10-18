@@ -189,6 +189,14 @@ impl ConfigSpace {
         &mut self.regs
     }
 
+    /// Mark bits guest-writable (or not) from `off` on: a bridge's
+    /// header, device-owned capabilities.
+    pub fn set_wmask(&mut self, off: usize, mask: &[u8]) {
+        if let Some(w) = self.wmask.get_mut(off..off + mask.len()) {
+            w.copy_from_slice(mask);
+        }
+    }
+
     pub fn command(&self) -> u16 {
         self.get16(COMMAND)
     }

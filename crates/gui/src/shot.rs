@@ -1,9 +1,17 @@
 //! `VROOM_SHOT=out.png vroom-gui`: render the library window to a PNG and
 //! quit. `VROOM_SHOT_DO="act;act"` runs UI actions first ("newvm",
 //! "palette", "search:net", "select:1", "set:cpus=2", "wait:30" seconds,
-//! "console:suspend" to a VM window, "vmkey:57" a key to the guest (evdev
-//! code), "vmmove:X,Y" the mouse to a VM window's point, "shot:out.png" a
-//! picture now). `VROOM_SHOT_VM=1`: picture the VM window instead. Used
+//! "console:suspend" to a VM window, "monshot:2:out.png" a picture of a
+//! VM's second monitor window, "vmkey:57" a key to the guest (evdev
+//! code; "vmkey:125+19" a combination), "vmtype:notepad" text,
+//! "cohclick:X,Y[,title]" a click on a Coherence window, "tip:Text" the
+//! tooltip with that exact text shown, "vmmove:X,Y"
+//! the mouse to a VM window's point, "shot:out.png" a
+//! picture now, "libshot:out.png" one of the library window, "barshot:out.png"
+//! one of the Coherence bar, "cohstart:Calculator" a name in its app field
+//! and Enter, "cohtype:calc" a name there without Enter (suggestions);
+//! "console:net-menu", "console:net.toggle.N" and "console:net.mode.N.M" work
+//! the network menu). `VROOM_SHOT_VM=1`: picture the VM window instead. Used
 //! for the README pictures and
 //! to check the UI without a person at the screen.
 
@@ -54,12 +62,51 @@ fn run(acts: Vec<String>, i: usize, out: PathBuf, delay: f64) {
             return;
         } else if let Some(c) = a.strip_prefix("console:") {
             crate::console::command_any(c);
-        } else if let Some(k) = a.strip_prefix("vmkey:").and_then(|k| k.parse().ok()) {
-            crate::console::key_any(k);
+        } else if let Some(k) = a.strip_prefix("vmkey:") {
+            let codes: Vec<u16> = k.split('+').filter_map(|c| c.parse().ok()).collect();
+            crate::console::keys_any(&codes);
+        } else if let Some(p) = a.strip_prefix("cohclick:") {
+            // cohclick:X,Y[,title]
+            let v: Vec<&str> = p.splitn(3, ',').collect();
+            let n = |i: usize| v.get(i).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            crate::console::coh_click_any(n(0), n(1), v.get(2).copied().unwrap_or(""));
+        } else if let Some(t) = a.strip_prefix("vmtype:") {
+            crate::console::type_any(t);
         } else if let Some((x, y)) = a.strip_prefix("vmmove:").and_then(|p| p.split_once(',')) {
             crate::console::move_any(x.parse().unwrap_or(0.0), y.parse().unwrap_or(0.0));
         } else if let Some(p) = a.strip_prefix("shot:") {
             picture(&PathBuf::from(p));
+        } else if let Some(p) = a.strip_prefix("libshot:") {
+            // The library window, whatever VROOM_SHOT_VM says.
+            if let Some(Ok(buf)) = TARGET.with(|t| t.borrow().as_ref().map(|ui| ui.window().take_snapshot())) {
+                let _ = crate::console::write_png(std::path::Path::new(p), &buf, buf.width(), buf.height());
+            }
+        } else if let Some((n, p)) = a.strip_prefix("monshot:").and_then(|s| s.split_once(':')) {
+            // Another monitor's window (2, 3...).
+            match crate::console::snapshot_monitor(n.parse().unwrap_or(0)) {
+                Some(Ok(buf)) => {
+                    if let Err(e) = crate::console::write_png(std::path::Path::new(p), &buf, buf.width(), buf.height()) {
+                        eprintln!("shot: {e}");
+                    }
+                }
+                _ => eprintln!("shot: no window for monitor {n}"),
+            }
+        } else if let Some(t) = a.strip_prefix("tip:") {
+            // The tooltip with exactly this text, as keyboard focus shows it.
+            TARGET.with(|w| {
+                if let Some(ui) = w.borrow().as_ref() {
+                    ui.global::<crate::Tips>().set_demo(t.into());
+                }
+            });
+            crate::console::tip_any(t);
+        } else if let Some(t) = a.strip_prefix("cohtype:") {
+            crate::console::coh_type_any(t);
+        } else if let Some(n) = a.strip_prefix("cohstart:") {
+            crate::console::coh_start_any(n);
+        } else if let Some(p) = a.strip_prefix("barshot:") {
+            if let Some(Ok(buf)) = crate::console::snapshot_bar() {
+                let _ = crate::console::write_png(std::path::Path::new(p), &buf, buf.width(), buf.height());
+            }
         } else if let Some(i) = a.strip_prefix("select:") {
             msg::send(Msg::Select(i.parse().unwrap_or(0)));
         } else if let Some((k, v)) = a.strip_prefix("set:").and_then(|kv| kv.split_once('=')) {

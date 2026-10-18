@@ -1,12 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- sudo cp org.vroom.netd.plist /Library/LaunchDaemons/ && sudo launchctl load -w /Library/LaunchDaemons/org.vroom.netd.plist -->
+<!-- The app installs this (Settings, "Set up"). By hand: see docs/GUIDE.md. -->
 <plist version="1.0">
 <dict>
     <key>Label</key><string>org.vroom.netd</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/libexec/vroom-netd</string>
+        <string>/usr/local/libexec/vroom/vroom-netd</string>
         <string>/etc/vroom/netd.toml</string>
     </array>
     <key>RunAtLoad</key><true/>

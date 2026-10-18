@@ -29,10 +29,14 @@ pub enum Msg {
     ConsoleGone { key: String, error: Option<String> },
     /// The library window, on this VM (its key) if given.
     ShowLibrary(Option<String>),
+    /// A file opened from Finder or dropped on the Dock icon.
+    Open(PathBuf),
     // From background jobs.
     Toast { text: String, kind: i32, action: String },
     Refresh,
     Created(Result<PathBuf, String>, bool),
+    /// A ready-made VM being made: what it does now.
+    NewVmProgress(String),
     /// VMware import: percent done, then the result.
     ImportProgress(u32),
     Imported(Result<PathBuf, String>),

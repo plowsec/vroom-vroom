@@ -1,7 +1,13 @@
-//! Pass one fd over a unix stream (SCM_RIGHTS).
+//! Pass one fd over a unix stream (SCM_RIGHTS), and mach ports between
+//! our processes on macOS ([`mach`]).
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
+
+#[cfg(target_os = "macos")]
+pub mod mach;
+#[cfg(target_os = "macos")]
+pub mod surface;
 
 #[derive(Debug)]
 pub enum Error {
@@ -84,6 +90,9 @@ pub fn recv_fd(sock: &UnixStream) -> Result<OwnedFd> {
         if fd < 0 {
             return Err(Error::Proto("bad fd"));
         }
+        // Not for the helpers we start later: a vroom-netd socket a
+        // helper inherited would keep its port open after we're gone.
+        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
         Ok(OwnedFd::from_raw_fd(fd))
     }
 }

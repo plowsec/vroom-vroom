@@ -5385,9 +5385,14 @@ dependencies = [
  "env_logger",
  "libc",
  "log",
+ "png 0.17.16",
+ "roxmltree",
  "serde_json",
+ "sha2",
+ "tempfile",
  "vroom-proto",
  "windows-sys 0.59.0",
+ "x11rb",
 ]
 
 [[package]]
@@ -5448,9 +5453,12 @@ dependencies = [
  "vroom-gpu3d",
  "vroom-hv",
  "vroom-import",
+ "vroom-ipc",
  "vroom-net",
  "vroom-sandbox",
+ "vroom-tools",
  "vroom-usb",
+ "vroom-video",
  "vroom-vmm",
 ]
 
@@ -5486,6 +5494,7 @@ dependencies = [
  "libc",
  "thiserror 2.0.21",
  "vroom-ipc",
+ "vroom-proto",
 ]
 
 [[package]]
@@ -5518,6 +5527,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "log",
+ "vroom-ipc",
  "vroom-memory",
  "vroom-sandbox",
  "vroom-virtio",
@@ -5528,10 +5538,14 @@ name = "vroom-gui"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "block2 0.6.2",
  "env_logger",
  "i-slint-backend-testing",
  "libc",
  "log",
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
  "png 0.17.16",
  "rfd",
  "serde",
@@ -5545,8 +5559,12 @@ dependencies = [
  "vroom-config",
  "vroom-display",
  "vroom-import",
+ "vroom-ipc",
+ "vroom-net",
  "vroom-proto",
+ "vroom-sandbox",
  "vroom-state",
+ "vroom-tools",
  "vroom-usb",
 ]
 
@@ -5579,6 +5597,7 @@ name = "vroom-ipc"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "log",
 ]
 
 [[package]]
@@ -5632,9 +5651,12 @@ dependencies = [
  "log",
  "serde",
  "serde_json",
+ "tempfile",
  "toml 0.8.23",
  "vroom-ipc",
  "vroom-net",
+ "vroom-sandbox",
+ "vroom-usb",
 ]
 
 [[package]]
@@ -5652,6 +5674,7 @@ dependencies = [
  "libc",
  "log",
  "seccompiler",
+ "tempfile",
  "thiserror 2.0.21",
 ]
 
@@ -5682,12 +5705,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "vroom-tools"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "sha2",
+ "tempfile",
+ "vroom-block",
+ "vroom-config",
+ "vroom-proto",
+]
+
+[[package]]
 name = "vroom-usb"
 version = "0.1.0"
 dependencies = [
  "libc",
  "log",
+ "tempfile",
 ]
+
+[[package]]
+name = "vroom-video"
+version = "0.1.0"
 
 [[package]]
 name = "vroom-virtio"
@@ -5706,6 +5746,7 @@ dependencies = [
  "vroom-memory",
  "vroom-net",
  "vroom-snapshot",
+ "vroom-video",
 ]
 
 [[package]]
@@ -5725,6 +5766,7 @@ dependencies = [
  "vroom-config",
  "vroom-devices",
  "vroom-display",
+ "vroom-fs",
  "vroom-gpu3d",
  "vroom-hv",
  "vroom-ipc",
@@ -5735,6 +5777,7 @@ dependencies = [
  "vroom-snapshot",
  "vroom-state",
  "vroom-usb",
+ "vroom-video",
  "vroom-virtio",
 ]
 

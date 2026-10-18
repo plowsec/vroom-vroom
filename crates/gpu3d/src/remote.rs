@@ -11,16 +11,27 @@
 //! and a second one the GPU process writes a byte to when fences may have
 //! finished. Guest RAM is shared memory both map; buffers the guest maps
 //! (blobs) are shared memory the GPU process hands over as fds. Frames
-//! come back as bytes.
+//! come back as bytes, or on macOS stay on the GPU: the GPU process puts
+//! them into IOSurfaces it sends the VMM as mach ports (the VMM started it
+//! with a send right to a port of its own), and the VMM passes them on to
+//! the app, which shows them itself.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::raw::c_void;
 use std::os::unix::net::UnixStream;
+#[cfg(target_os = "macos")]
+use std::sync::OnceLock;
 
 use vroom_memory::GuestMemory;
 use vroom_virtio::devices::gpu3d::{Blob, Box3d, Create3d, FenceDone, HostIov, Mapping, Renderer3d, Transfer3d};
+#[cfg(target_os = "macos")]
+use vroom_virtio::devices::gpu3d::SurfaceFrame;
+
+/// The largest Vulkan context snapshot taken from the GPU process (its
+/// device memory and images, read back).
+const MAX_VENUS_SNAPSHOT: u64 = 64 << 30;
 
 /// No call or answer is bigger (a frame of 16384² pixels is 1 GiB; GL
 /// scanouts are far smaller, snapshot levels are read in pieces).
@@ -55,6 +66,11 @@ enum Op {
     Reset,
     Remap,
     Frame,
+    VenusSave,
+    VenusRestore,
+    VenusResume,
+    SurfaceStart,
+    SurfacePoll,
 }
 
 impl Op {
@@ -87,6 +103,11 @@ impl Op {
             24 => Reset,
             25 => Remap,
             26 => Frame,
+            27 => VenusSave,
+            28 => VenusRestore,
+            29 => VenusResume,
+            30 => SurfaceStart,
+            31 => SurfacePoll,
             _ => return None,
         })
     }
@@ -241,12 +262,49 @@ fn unmap(p: *mut u8, size: u64) {
     unsafe { libc::munmap(p as *mut c_void, size as usize) };
 }
 
+/// The size of a shared memory object.
+#[allow(unsafe_code)]
+fn fd_size(fd: RawFd) -> Option<u64> {
+    // SAFETY: stat is plain old data; all zeroes is a valid value.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: fd is open; st is a valid out buffer.
+    (unsafe { libc::fstat(fd, &mut st) } == 0).then_some(st.st_size as u64)
+}
+
 /// Read a non-blocking fd until it is empty.
 #[allow(unsafe_code)]
 fn drain(fd: RawFd) {
     let mut buf = [0u8; 256];
     // SAFETY: reads into a local buffer.
     while unsafe { libc::read(fd, buf.as_mut_ptr() as *mut c_void, buf.len()) } > 0 {}
+}
+
+/// Move a socket we got as stdin to a fd of its own, and give stdin
+/// /dev/null. For the GPU process, the render server and its workers.
+#[allow(unsafe_code)]
+pub fn take_stdin() -> std::io::Result<OwnedFd> {
+    // SAFETY: plain fcntl/open/dup2 on fd 0, which our parent set up for
+    // us and nothing else in this process uses.
+    unsafe {
+        let fd = libc::fcntl(0, libc::F_DUPFD_CLOEXEC, 3);
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
+        if null >= 0 {
+            libc::dup2(null, 0);
+            libc::close(null);
+        }
+        Ok(OwnedFd::from_raw_fd(fd))
+    }
+}
+
+/// The GPU process's start: what [`Remote::spawn`] sends over the call
+/// socket (its stdin), the fence socket and one fd per guest RAM region.
+pub fn helper_fds(sock: &UnixStream, ram_regions: usize) -> std::io::Result<(UnixStream, Vec<OwnedFd>)> {
+    let events = UnixStream::from(recv_fd(sock)?);
+    let ram = (0..ram_regions).map(|_| recv_fd(sock)).collect::<std::io::Result<Vec<_>>>()?;
+    Ok((events, ram))
 }
 
 // ---- the VMM's side ----
@@ -271,6 +329,12 @@ pub struct Remote {
     /// None in tests (the other side is a thread).
     child: Option<std::process::Child>,
     dead: bool,
+    /// Where the GPU process sends the monitors' IOSurfaces (macOS).
+    #[cfg(target_os = "macos")]
+    surfaces: Option<vroom_ipc::mach::Port>,
+    /// Passing them on failed: frames come back as bytes from then on.
+    #[cfg(target_os = "macos")]
+    surfaces_broken: bool,
 }
 
 // SAFETY: the pointers are our own mappings, used from the GPU worker
@@ -294,48 +358,51 @@ pub struct HelperArgs<'a> {
     pub gl_renderer: Option<&'a str>,
     pub map_granule: u64,
     /// Where DXMT keeps the Metal versions of guest shaders (the only
-    /// place the GPU process may write).
+    /// place the GPU process, or its Direct3D workers, may write).
     pub shaders: &'a std::path::Path,
 }
 
 impl Remote {
     /// Start the GPU process and wait until its renderer is up.
-    #[allow(unsafe_code)]
     pub fn spawn(a: &HelperArgs, mem: GuestMemory) -> std::io::Result<Remote> {
         let (fds, _) = mem.shared_fds().ok_or_else(|| std::io::Error::other("guest RAM isn't shared memory"))?;
         let (sock, theirs) = UnixStream::pair()?;
         let (events, their_events) = UnixStream::pair()?;
         let mut cmd = std::process::Command::new(a.exe);
-        cmd.arg("gpu-helper")
-            .arg("--sock")
-            .arg(theirs.as_raw_fd().to_string())
-            .arg("--events")
-            .arg(their_events.as_raw_fd().to_string())
-            .arg("--granule")
-            .arg(a.map_granule.to_string())
-            .arg("--shaders")
-            .arg(a.shaders);
+        cmd.arg("gpu-helper").arg("--granule").arg(a.map_granule.to_string()).arg("--shaders").arg(a.shaders);
         if let Some(g) = a.gl {
             cmd.arg("--gl").arg(g);
         }
         if let Some(r) = a.gl_renderer {
             cmd.arg("--gl-renderer").arg(r);
         }
-        for (fd, size) in &fds {
-            cmd.arg("--ram").arg(format!("{fd}:{size}"));
+        for (_, size) in &fds {
+            cmd.arg("--ram-size").arg(size.to_string());
         }
-        let keep: Vec<RawFd> = [theirs.as_raw_fd(), their_events.as_raw_fd()].into_iter().chain(fds.iter().map(|f| f.0)).collect();
-        // SAFETY: only clears close-on-exec on fds we own, in the child.
-        unsafe {
-            std::os::unix::process::CommandExt::pre_exec(&mut cmd, move || {
-                for &fd in &keep {
-                    libc::fcntl(fd, libc::F_SETFD, 0);
-                }
-                Ok(())
-            });
+        // The call socket is its stdin; the rest comes over it once it
+        // runs (helper_fds). Nothing else is inherited, and no fd numbers
+        // on the command line. No pre_exec either: on macOS a process
+        // forked then exec'd doesn't keep the mach port bequeathed below.
+        cmd.stdin(std::process::Stdio::from(OwnedFd::from(theirs)));
+        // A port of ours for the IOSurfaces it makes, when there is an app
+        // to pass them to: it inherits a send right (vroom_ipc::mach).
+        #[cfg(target_os = "macos")]
+        let surfaces = viewer_port().and_then(|_| vroom_ipc::mach::Port::receiver().ok());
+        #[cfg(target_os = "macos")]
+        let mut child = match surfaces.as_ref().map(|rx| rx.sender()) {
+            Some(Ok(tx)) => vroom_ipc::mach::bequeath(&tx, || cmd.spawn())?,
+            _ => cmd.spawn()?,
+        };
+        #[cfg(not(target_os = "macos"))]
+        let mut child = cmd.spawn()?;
+        // Its fence socket, then guest RAM.
+        let sent = std::iter::once(their_events.as_raw_fd()).chain(fds.iter().map(|f| f.0)).try_for_each(|fd| send_fd(&sock, fd));
+        drop(their_events);
+        if let Err(e) = sent {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
         }
-        let mut child = cmd.stdin(std::process::Stdio::null()).spawn()?;
-        drop((theirs, their_events));
         let pid = child.id();
         // Hello: the capsets, once its renderer is up.
         if let Err(e) = sock.set_read_timeout(Some(std::time::Duration::from_secs(30))) {
@@ -345,6 +412,10 @@ impl Remote {
         match Remote::connect(sock, events, mem, a.map_granule) {
             Ok(mut r) => {
                 r.child = Some(child);
+                #[cfg(target_os = "macos")]
+                {
+                    r.surfaces = surfaces;
+                }
                 log::info!("gpu: GPU process {pid} up, capsets {:?}", r.capsets);
                 Ok(r)
             }
@@ -372,6 +443,10 @@ impl Remote {
             frame: None,
             child: None,
             dead: false,
+            #[cfg(target_os = "macos")]
+            surfaces: None,
+            #[cfg(target_os = "macos")]
+            surfaces_broken: false,
         };
         let hello = read_frame(&mut r.sock)?;
         r.sock.set_read_timeout(None)?;
@@ -472,6 +547,72 @@ impl Remote {
         let size = d.u64()?;
         let fd = recv_fd(&self.sock).ok()?;
         Some((fd, size))
+    }
+}
+
+/// The app's port for the screen's IOSurfaces (vroom_ipc::mach): set by
+/// the VMM at start, from what the app that started it left it.
+#[cfg(target_os = "macos")]
+static VIEWER: OnceLock<vroom_ipc::mach::Port> = OnceLock::new();
+
+/// Where the screen's IOSurfaces go on to (the VMM: a send right to the
+/// app's port). Without it, frames come back as bytes.
+#[cfg(target_os = "macos")]
+pub fn set_viewer_port(p: vroom_ipc::mach::Port) {
+    let _ = VIEWER.set(p);
+}
+
+#[cfg(target_os = "macos")]
+fn viewer_port() -> Option<&'static vroom_ipc::mach::Port> {
+    VIEWER.get()
+}
+
+/// The app that started this VMM can take the screen as IOSurfaces.
+#[cfg(target_os = "macos")]
+pub fn surfaces_possible() -> bool {
+    VIEWER.get().is_some()
+}
+
+#[cfg(target_os = "macos")]
+impl Remote {
+    /// `n` surface messages the GPU process just sent: each checked (from
+    /// our GPU process, numbers in range) and handed to the app as is. The
+    /// VMM never looks inside a surface (its sandbox has no IOSurface).
+    fn pass_surfaces(&mut self, n: u32) -> bool {
+        use vroom_ipc::surface::{MAX_HEADS, MAX_SIDE, MAX_SLOTS, MSG_SURFACE};
+        let (Some(rx), Some(app)) = (self.surfaces.as_ref(), viewer_port()) else { return false };
+        let pid = self.pid() as i32;
+        for _ in 0..n.min(MAX_HEADS * MAX_SLOTS) {
+            let m = match rx.recv(Some(std::time::Duration::from_secs(1))) {
+                Ok(Some(m)) => m,
+                Ok(None) => {
+                    log::warn!("gpu: the GPU process said it sent a surface, none came");
+                    return false;
+                }
+                Err(e) => {
+                    log::warn!("gpu: surfaces: {e}");
+                    return false;
+                }
+            };
+            let [head, gen, slot, w, h, _] = m.data;
+            let ok = m.id == MSG_SURFACE
+                && m.pid == pid
+                && head < MAX_HEADS as u64
+                && slot < MAX_SLOTS as u64
+                && gen > 0
+                && gen <= u32::MAX as u64
+                && (1..=MAX_SIDE as u64).contains(&w)
+                && (1..=MAX_SIDE as u64).contains(&h);
+            let Some(port) = m.port.filter(|_| ok) else {
+                log::warn!("gpu: a bad surface message from pid {}", m.pid);
+                return false;
+            };
+            if let Err(e) = app.send_moving(MSG_SURFACE, port, m.data) {
+                log::warn!("gpu: a surface to the app: {e}");
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -726,6 +867,41 @@ impl Renderer3d for Remote {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    fn surface_start(&mut self, head: u32, resource: u32, bx: Box3d) -> bool {
+        if self.surfaces.is_none() || self.surfaces_broken {
+            return false;
+        }
+        let Some(b) = self.call(Op::SurfaceStart, |e| {
+            e.u32(head).u32(resource).bx(&bx);
+        }) else {
+            return false;
+        };
+        let mut d = Dec(&b);
+        let (ok, new) = (d.u8() == Some(1), d.u32().unwrap_or(0));
+        // New surfaces (a new size) came first, by mach: on to the app.
+        if new > 0 && !self.pass_surfaces(new) {
+            log::warn!("gpu: can't pass the screen's IOSurfaces to the app: frames come back through the CPU");
+            self.surfaces_broken = true;
+            return false;
+        }
+        ok
+    }
+
+    #[cfg(target_os = "macos")]
+    fn surface_poll(&mut self, wait: bool) -> Option<Option<SurfaceFrame>> {
+        self.surfaces.as_ref()?;
+        let b = self.call(Op::SurfacePoll, |e| {
+            e.u8(wait as u8);
+        })?;
+        let mut d = Dec(&b);
+        match d.u8()? {
+            1 => Some(Some(SurfaceFrame { head: d.u32()?, gen: d.u32()?, slot: d.u32()? })),
+            2 => Some(None),
+            _ => None,
+        }
+    }
+
     fn unref(&mut self, resource: u32) {
         if let Some((p, n)) = self.maps.remove(&resource) {
             unmap(p, n);
@@ -758,6 +934,56 @@ impl Renderer3d for Remote {
             out.push(FenceDone { ctx, ring: ring.checked_sub(1), fence });
         }
         out
+    }
+
+    fn venus_save(&mut self, ctx: u32) -> Option<(bool, Vec<u8>)> {
+        let b = self.call(Op::VenusSave, |e| {
+            e.u32(ctx);
+        })?;
+        let mut d = Dec(&b);
+        let (status, size) = (d.u8()?, d.u64()?);
+        if status == 0 {
+            return None;
+        }
+        let fd = recv_fd(&self.sock).ok()?;
+        if size == 0 || size > MAX_VENUS_SNAPSHOT || fd_size(fd.as_raw_fd()) < Some(size) {
+            log::warn!("gpu: context {ctx}: bad snapshot from the GPU process ({size} bytes)");
+            return None;
+        }
+        let p = map_fd(fd.as_raw_fd(), size, false)?;
+        // SAFETY: our own read-only mapping of `size` bytes (at most the
+        // object's size, checked above).
+        #[allow(unsafe_code)]
+        let data = unsafe { std::slice::from_raw_parts(p, size as usize) }.to_vec();
+        unmap(p, size);
+        Some((status == 1, data))
+    }
+
+    fn venus_restore(&mut self, ctx: u32, data: &[u8]) -> bool {
+        if self.dead {
+            return false;
+        }
+        let Some((fd, size)) = crate::shm_with(data) else {
+            log::warn!("gpu: context {ctx}: no shared memory for its snapshot ({} bytes)", data.len());
+            return false;
+        };
+        let mut e = Enc::default();
+        e.u8(Op::VenusRestore as u8).u32(ctx).u64(size);
+        let r = write_frame(&mut self.sock, &e.0).and_then(|_| send_fd(&self.sock, fd.as_raw_fd())).and_then(|_| read_frame(&mut self.sock));
+        match r {
+            Ok(b) => b.first() == Some(&1),
+            Err(e) => {
+                log::error!("gpu: the GPU process is gone ({e}): no more 3D for this VM until it restarts");
+                self.dead = true;
+                false
+            }
+        }
+    }
+
+    fn venus_resume(&mut self, ctx: u32) -> bool {
+        self.ok(Op::VenusResume, |e| {
+            e.u32(ctx);
+        })
     }
 
     fn reset(&mut self) {
@@ -841,12 +1067,68 @@ fn frame_slice<'a>(frame: Option<(*mut u8, u64)>, n: u64) -> Option<&'a mut [u8]
 pub trait Export {
     /// A blob's shared memory and its size.
     fn export(&mut self, resource: u32) -> Option<(OwnedFd, u64)>;
+    /// A Vulkan context's snapshot as shared memory: (complete, it, size).
+    fn save_context(&mut self, _ctx: u32) -> Option<(bool, OwnedFd, u64)> {
+        None
+    }
+    /// The way back; takes the fd.
+    fn restore_context(&mut self, _ctx: u32, _fd: OwnedFd, _size: u64) -> bool {
+        false
+    }
+    /// IOSurfaces made for the monitors since the last call (macOS).
+    #[cfg(target_os = "macos")]
+    fn take_surfaces(&mut self) -> Vec<crate::NewSurface> {
+        Vec::new()
+    }
 }
 
 impl Export for crate::Virgl {
     fn export(&mut self, resource: u32) -> Option<(OwnedFd, u64)> {
         crate::Virgl::export(self, resource)
     }
+    fn save_context(&mut self, ctx: u32) -> Option<(bool, OwnedFd, u64)> {
+        crate::Virgl::save_context(self, ctx)
+    }
+    fn restore_context(&mut self, ctx: u32, fd: OwnedFd, size: u64) -> bool {
+        crate::Virgl::restore_context(self, ctx, fd, size)
+    }
+    #[cfg(target_os = "macos")]
+    fn take_surfaces(&mut self) -> Vec<crate::NewSurface> {
+        crate::gl::take_surfaces()
+    }
+}
+
+/// The VMM's port for the screen's IOSurfaces, in the GPU process (it
+/// inherits a send right when the VMM has an app to pass them to).
+#[cfg(target_os = "macos")]
+static VMM_PORT: OnceLock<vroom_ipc::mach::Port> = OnceLock::new();
+
+/// The GPU process: where its IOSurfaces go. Call before [`serve`].
+#[cfg(target_os = "macos")]
+pub fn set_vmm_port(p: vroom_ipc::mach::Port) {
+    let _ = VMM_PORT.set(p);
+}
+
+/// Whether frames may go into IOSurfaces here (someone takes them).
+#[cfg(target_os = "macos")]
+pub(crate) fn surfaces_wanted() -> bool {
+    VMM_PORT.get().is_some()
+}
+
+/// The surfaces made since the last call, to the VMM; how many went.
+#[cfg(target_os = "macos")]
+fn send_surfaces<R: Export>(r: &mut R) -> u32 {
+    let (new, Some(vmm)) = (r.take_surfaces(), VMM_PORT.get()) else { return 0 };
+    let mut sent = 0;
+    for s in new {
+        let Some(port) = s.surface.port() else { continue };
+        let data = [s.head as u64, s.gen as u64, s.slot as u64, s.surface.width() as u64, s.surface.height() as u64, 0];
+        match vmm.send_moving(vroom_ipc::surface::MSG_SURFACE, port, data) {
+            Ok(()) => sent += 1,
+            Err(e) => log::warn!("gpu process: a surface to the VMM: {e}"),
+        }
+    }
+    sent
 }
 
 /// Serve the VMM until it goes away. `ram`: guest RAM's shared memory.
@@ -1112,6 +1394,49 @@ pub fn serve<R: Renderer3d + Export>(mut r: R, mut sock: UnixStream, mut events:
                     new.is_some()
                 };
                 ok(&mut out, b)
+            }
+            Op::VenusSave => match d.u32().and_then(|ctx| r.save_context(ctx)) {
+                Some((complete, fd, size)) => {
+                    out.u8(if complete { 1 } else { 2 }).u64(size);
+                    fd_after = Some(fd);
+                }
+                None => {
+                    out.u8(0).u64(0);
+                }
+            },
+            Op::VenusRestore => {
+                let (ctx, size) = (d.u32(), d.u64());
+                let fd = recv_fd(&sock)?;
+                let b = match (ctx, size) {
+                    (Some(ctx), Some(size)) => r.restore_context(ctx, fd, size),
+                    _ => false,
+                };
+                ok(&mut out, b)
+            }
+            Op::VenusResume => {
+                let b = d.u32().is_some_and(|ctx| r.venus_resume(ctx));
+                ok(&mut out, b)
+            }
+            Op::SurfaceStart => {
+                let b = match (d.u32(), d.u32(), d.bx()) {
+                    (Some(head), Some(res), Some(bx)) => r.surface_start(head, res, bx),
+                    _ => false,
+                };
+                // Surfaces made for it go first, so the VMM has them by
+                // the time it reads the answer.
+                #[cfg(target_os = "macos")]
+                let sent = send_surfaces(&mut r);
+                #[cfg(not(target_os = "macos"))]
+                let sent = 0;
+                out.u8(b as u8).u32(sent);
+            }
+            Op::SurfacePoll => {
+                let wait = d.u8().unwrap_or(0) != 0;
+                match r.surface_poll(wait) {
+                    None => out.u8(0),
+                    Some(Some(f)) => out.u8(1).u32(f.head).u32(f.gen).u32(f.slot),
+                    Some(None) => out.u8(2),
+                };
             }
             Op::Remap => {
                 let n = d.u32().unwrap_or(0).min(64) as usize;

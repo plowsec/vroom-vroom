@@ -151,7 +151,7 @@ pub fn spawn(index: u32, shared: Arc<VcpuShared>) -> Result<VcpuHandle> {
             };
             // Everyone waits for PowerOn / Start: with KVM the irqchip must
             // be initialised before any vCPU enters KVM_RUN.
-            VcpuLoop { vcpu: pristine.0, pristine: pristine.1, shared, rx, running: false, paused: false }.run();
+            VcpuLoop { vcpu: pristine.0, pristine: pristine.1, shared, rx, running: false, paused: false, stopped_by: None }.run();
         })
         .map_err(|e| Error::Setup(format!("spawn vcpu thread: {e}")))?;
     let (kicker, in_kernel_psci) = ready_rx.recv().map_err(|_| Error::VcpuGone)??;
@@ -165,6 +165,9 @@ struct VcpuLoop {
     rx: Receiver<VcpuCmd>,
     running: bool,
     paused: bool,
+    /// Why this CPU stopped on a fault it can't go past: it is not saved
+    /// then (a snapshot would bring the VM back without it).
+    stopped_by: Option<String>,
 }
 
 impl VcpuLoop {
@@ -196,6 +199,7 @@ impl VcpuLoop {
             }
             if let Err(e) = self.step() {
                 log::error!("vcpu{}: {e}", self.index());
+                self.stopped_by = Some(e.to_string());
                 let _ = self.shared.events.send(VmEvent::Crashed(e.to_string()));
                 self.running = false;
             }
@@ -230,6 +234,10 @@ impl VcpuLoop {
             }
             VcpuCmd::Resume => self.paused = false,
             VcpuCmd::Save(reply) => {
+                if let Some(why) = &self.stopped_by {
+                    let _ = reply.send(Err(Error::CantSave(format!("CPU {} stopped: {why}", self.index()))));
+                    return true;
+                }
                 let kernel_psci = self.vcpu.in_kernel_psci();
                 let r = self.vcpu.save_state().map(|mut s| {
                     if !kernel_psci { s.powered_on = self.running; }
@@ -262,6 +270,7 @@ impl VcpuLoop {
     }
 
     fn reset(&mut self, regs: Option<&BootRegs>) -> Result<()> {
+        self.stopped_by = None;
         self.vcpu.restore_state(&self.pristine)?;
         self.running = self.vcpu.in_kernel_psci() && self.index() != 0;
         if let Some(r) = regs {

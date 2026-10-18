@@ -48,6 +48,10 @@ export struct NetRow {
     block-private: bool,
     mac: string,
     summary: string,
+    // The cable is in.
+    connected: bool,
+    // What of it waits (for the next start, a resume), or why.
+    note: string,
 }
 
 export struct ShareRow {
@@ -57,11 +61,25 @@ export struct ShareRow {
     readonly: bool,
 }
 
-// A `[[usb]]` device of the VM.
+// A USB device of the VM: one in its file (`[[usb]]`), or one connected
+// to it now for this run only.
 export struct UsbRow {
     label: string,
-    note: string,   // id, plugged in or not, held by the host
+    // Short, on screen: connected, plugged in or not.
+    note: string,
+    // On hover: ids, how to mount its files by hand.
+    tip: string,
+    // A disk, and how it goes to the VM: 0 its files, 1 the disk, 2 the
+    // device.
+    storage: bool,
+    mode: int,
     warn: bool,
+    // In the VM file: connected at every start. `index` is its place
+    // there; else its place in the list of this run's devices.
+    pinned: bool,
+    index: int,
+    // Connected to the running VM now.
+    on: bool,
 }
 
 // A device plugged into this machine (the Add list).
@@ -93,6 +111,9 @@ export struct VmSettings {
     width: string,
     height: string,
     hidpi: bool,
+    video-decode: bool,
+    video-encode: bool,
+    monitors: int,
     disks: [DiskRow],
     nets: [NetRow],
     shares: [ShareRow],
@@ -120,9 +141,21 @@ export struct VmSettings {
     initrd: string,
     cmdline: string,
     warnings: [string],
+    // Each warning's first words, for the banner (the rest in its tip).
+    warn-short: [string],
     // Running or suspended: hardware can't change.
     locked: bool,
     lock-reason: string,
+    // A word or two of it, on screen.
+    lock-short: string,
+    // Why, in each card that can't change now.
+    lock-why: string,
+    // Network and USB devices can change now (off, suspended, or running
+    // in this app).
+    live: bool,
+    // What waits in those two cards (adapters removed, the next start).
+    net-note: string,
+    usb-note: string,
     config-path: string,
     state-path: string,
     snapshots-cpu-mem: string,
@@ -159,6 +192,10 @@ export struct HostInfo {
     memory-gib: int,
     interfaces: [string],
     free: string,
+    // vroom-netd, the root helper: "ready", "old", "stopped", "missing",
+    // "" (not known yet). Busy: being set up or removed.
+    netd: string,
+    netd-busy: bool,
 }
 
 export struct Toast {
@@ -185,4 +222,12 @@ export struct NewVm {
     disk-gib: int,
     gpu3d: bool,
     start: bool,
+    // Ready-made (Ubuntu from its cloud image, Windows from its ISO): the
+    // account, SSH with a key of ~/.ssh, Ubuntu's desktop.
+    ready: bool,
+    user: string,
+    password: string,
+    ssh: bool,
+    ssh-key: int,
+    desktop: bool,
 }

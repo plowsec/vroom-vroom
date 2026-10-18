@@ -1,6 +1,7 @@
 # vroom guest agent, system part: owns the host channel (root only),
 # syncs the clock, handles clean shutdown, relays clipboard/resolution to
-# the session helper of the user on screen.
+# the session helper of the user on screen. Updates from the host are
+# staged in /var/lib/vroom-agent and installed by vroom-agent-update.
 [Unit]
 Description=vroom guest agent
 After=systemd-udevd.service
@@ -15,6 +16,8 @@ ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 ReadWritePaths=/run
+StateDirectory=vroom-agent
+StateDirectoryMode=0700
 RestrictAddressFamilies=AF_UNIX
 SystemCallArchitectures=native
 

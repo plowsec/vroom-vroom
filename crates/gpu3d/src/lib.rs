@@ -20,15 +20,19 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
-use vroom_virtio::devices::gpu3d::{Blob, Box3d, Create3d, FenceDone, HostIov, Mapping, Renderer3d, Transfer3d};
+use vroom_virtio::devices::gpu3d::{Blob, Box3d, Create3d, FenceDone, HostIov, Mapping, Renderer3d, SurfaceFrame, Transfer3d};
 
 #[cfg(target_os = "macos")]
 mod gl;
 #[cfg(unix)]
 pub mod remote;
+#[cfg(target_os = "macos")]
+pub mod server;
 
 #[cfg(target_os = "macos")]
 pub use gl::Host as GlHost;
+#[cfg(target_os = "macos")]
+pub use gl::NewSurface;
 
 const CAPSET_VIRGL: u32 = 1;
 const CAPSET_VIRGL2: u32 = 2;
@@ -135,6 +139,16 @@ struct Lib {
     /// virgl_renderer_resource_export_blob: an fd for a blob (the render
     /// server's are shared memory).
     export_blob: Option<unsafe extern "C" fn(u32, *mut u32, *mut c_int) -> c_int>,
+    /// virgl_renderer_render_worker_main (our patch 0009): one render
+    /// server context in this process. Without it the library runs Venus
+    /// and Direct3D in a thread of its own (an older build).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    worker_main: Option<unsafe extern "C" fn(c_int, u32, u32, *const c_char) -> c_int>,
+    /// virgl_renderer_context_save/restore/resume (our patch 0010):
+    /// snapshots of Venus contexts.
+    ctx_save: Option<unsafe extern "C" fn(u32, *mut c_int, *mut u64) -> c_int>,
+    ctx_restore: Option<unsafe extern "C" fn(u32, c_int, u64) -> c_int>,
+    ctx_resume: Option<unsafe extern "C" fn(u32) -> c_int>,
 }
 
 // SAFETY: plain function pointers into a library that stays loaded.
@@ -144,17 +158,28 @@ unsafe impl Sync for Lib {}
 
 static LIB: OnceLock<Option<Lib>> = OnceLock::new();
 
+/// Our patched build (scripts/build-virglrenderer.sh) ships next to the
+/// binary; whoever can write there can replace the binary anyway. In
+/// vroom.app the libraries are in Contents/Frameworks, next to
+/// Contents/MacOS: still our own bundle, not a search path.
+fn own_copy() -> Vec<String> {
+    let lib = if cfg!(target_os = "macos") { "libvirglrenderer.1.dylib" } else { "libvirglrenderer.so.1" };
+    let mut v = Vec::new();
+    if let Some(dir) = std::env::current_exe().and_then(std::fs::canonicalize).ok().and_then(|e| e.parent().map(|d| d.to_path_buf())) {
+        v.push(dir.join(lib).to_string_lossy().into_owned());
+        if let Some(fw) = bundle_frameworks(&dir) {
+            v.push(fw.join(lib).to_string_lossy().into_owned());
+        }
+    }
+    v
+}
+
 fn candidates() -> Vec<String> {
     let mut v = Vec::new();
     if let Ok(p) = std::env::var("VROOM_VIRGLRENDERER") {
         v.push(p);
     }
-    // Our patched build (scripts/build-virglrenderer.sh) ships next to the
-    // binary; whoever can write there can replace the binary anyway.
-    let lib = if cfg!(target_os = "macos") { "libvirglrenderer.1.dylib" } else { "libvirglrenderer.so.1" };
-    if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.to_path_buf())) {
-        v.push(dir.join(lib).to_string_lossy().into_owned());
-    }
+    v.extend(own_copy());
     if cfg!(target_os = "macos") {
         v.extend(
             ["/opt/homebrew/lib/libvirglrenderer.1.dylib", "/usr/local/lib/libvirglrenderer.1.dylib", "libvirglrenderer.1.dylib"]
@@ -166,8 +191,18 @@ fn candidates() -> Vec<String> {
     v
 }
 
-fn open_lib() -> Option<Lib> {
-    let (handle, path) = candidates().into_iter().find_map(|p| {
+/// `X.app/Contents/Frameworks` for a binary in `X.app/Contents/MacOS`.
+fn bundle_frameworks(exe_dir: &std::path::Path) -> Option<PathBuf> {
+    let contents = exe_dir.parent()?;
+    let app = contents.parent()?;
+    let is_bundle = exe_dir.file_name()? == "MacOS"
+        && contents.file_name()? == "Contents"
+        && app.extension().is_some_and(|e| e == "app");
+    is_bundle.then(|| contents.join("Frameworks"))
+}
+
+fn open_lib(candidates: Vec<String>) -> Option<Lib> {
+    let (handle, path) = candidates.into_iter().find_map(|p| {
         let c = CString::new(p.clone()).ok()?;
         // SAFETY: dlopen with a valid C string.
         let h = unsafe { libc::dlopen(c.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
@@ -247,6 +282,34 @@ fn open_lib() -> Option<Lib> {
             // SAFETY: signature from virglrenderer.h.
             (!f.is_null()).then(|| unsafe { std::mem::transmute::<*mut c_void, unsafe extern "C" fn(u32, *mut u32, *mut c_int) -> c_int>(f) })
         },
+        worker_main: {
+            let c = CString::new("virgl_renderer_render_worker_main").ok()?;
+            // SAFETY: valid handle and name.
+            let f = unsafe { libc::dlsym(handle, c.as_ptr()) };
+            // SAFETY: signature from our patched virglrenderer.h.
+            (!f.is_null()).then(|| unsafe { std::mem::transmute::<*mut c_void, unsafe extern "C" fn(c_int, u32, u32, *const c_char) -> c_int>(f) })
+        },
+        ctx_save: {
+            let c = CString::new("virgl_renderer_context_save").ok()?;
+            // SAFETY: valid handle and name.
+            let f = unsafe { libc::dlsym(handle, c.as_ptr()) };
+            // SAFETY: signature from our patched virglrenderer.h.
+            (!f.is_null()).then(|| unsafe { std::mem::transmute::<*mut c_void, unsafe extern "C" fn(u32, *mut c_int, *mut u64) -> c_int>(f) })
+        },
+        ctx_restore: {
+            let c = CString::new("virgl_renderer_context_restore").ok()?;
+            // SAFETY: valid handle and name.
+            let f = unsafe { libc::dlsym(handle, c.as_ptr()) };
+            // SAFETY: signature from our patched virglrenderer.h.
+            (!f.is_null()).then(|| unsafe { std::mem::transmute::<*mut c_void, unsafe extern "C" fn(u32, c_int, u64) -> c_int>(f) })
+        },
+        ctx_resume: {
+            let c = CString::new("virgl_renderer_context_resume").ok()?;
+            // SAFETY: valid handle and name.
+            let f = unsafe { libc::dlsym(handle, c.as_ptr()) };
+            // SAFETY: signature from our patched virglrenderer.h.
+            (!f.is_null()).then(|| unsafe { std::mem::transmute::<*mut c_void, unsafe extern "C" fn(u32) -> c_int>(f) })
+        },
     })
 }
 
@@ -255,7 +318,7 @@ fn open_lib() -> Option<Lib> {
 /// whether 3D is usable (GL or not).
 #[cfg(target_os = "macos")]
 pub fn load(gl: Option<GlHost>) -> bool {
-    let Some(lib) = LIB.get_or_init(open_lib) else { return false };
+    let Some(lib) = LIB.get_or_init(|| open_lib(candidates())) else { return false };
     if let Some(host) = gl {
         GL.get_or_init(|| load_gl(lib, host));
     }
@@ -286,10 +349,50 @@ fn preload(dir: &std::path::Path, name: &str, what: &str) {
     }
 }
 
+/// For a render server worker (`vroom gpu-worker`, see [`server`]): the
+/// library from our own directory only (no override, no search path), and
+/// the one driver its context needs, MoltenVK for Venus or DXMT for
+/// Direct3D, from there too. Call before the sandbox.
+#[cfg(target_os = "macos")]
+pub fn load_worker(capset: u32) -> Result<(), String> {
+    let flags = server::worker_flags(capset).ok_or_else(|| format!("capset {capset} doesn't run in a worker"))?;
+    let lib = LIB.get_or_init(|| open_lib(own_copy())).as_ref().ok_or("no virglrenderer next to vroom")?;
+    if lib.worker_main.is_none() {
+        return Err("this virglrenderer has no render worker (scripts/build-virglrenderer.sh)".into());
+    }
+    let dir = lib.dir.as_ref().ok_or("virglrenderer: no directory")?;
+    if flags & VENUS as u32 != 0 {
+        preload(dir, "libMoltenVK.dylib", "Vulkan");
+    }
+    if flags & NEPTUNE as u32 != 0 {
+        preload(dir, "libdxmt-native.dylib", "Direct3D 11 for Windows guests");
+    }
+    Ok(())
+}
+
+/// Serve one guest context on `sock` (the proxy's peer in the GPU
+/// process) until the GPU process closes it. After [`load_worker`] and the
+/// sandbox.
+#[cfg(target_os = "macos")]
+pub fn run_worker(sock: OwnedFd, ctx: u32, capset: u32, name: &str) -> Result<(), String> {
+    use std::os::fd::IntoRawFd;
+    let flags = server::worker_flags(capset).ok_or_else(|| format!("capset {capset} doesn't run in a worker"))?;
+    let main = lib().and_then(|l| l.worker_main).ok_or("no render worker in virglrenderer")?;
+    let name = CString::new(name).unwrap_or_default();
+    // SAFETY: the library takes the fd (and closes it); the name is a
+    // valid C string for the call.
+    let r = unsafe { main(sock.into_raw_fd(), ctx, flags, name.as_ptr()) };
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(format!("context {ctx} ended with an error"))
+    }
+}
+
 /// Load the library (no GL off macOS). See the macOS one.
 #[cfg(not(target_os = "macos"))]
 pub fn load(gl: bool) -> bool {
-    let Some(_lib) = LIB.get_or_init(open_lib) else { return false };
+    let Some(_lib) = LIB.get_or_init(|| open_lib(candidates())) else { return false };
     if gl {
         log::info!("gpu3d: OpenGL (virgl) is only wired up on macOS for now");
     }
@@ -462,6 +565,21 @@ fn page_size() -> u64 {
     unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
 }
 
+/// Shared memory holding `data`, for a snapshot going back to a context.
+pub fn shm_with(data: &[u8]) -> Option<(OwnedFd, u64)> {
+    // whole pages (64 KiB covers every host page size)
+    let region = vroom_memory::MmapRegion::new_shared(data.len().max(1).next_multiple_of(1 << 16)).ok()?;
+    // SAFETY: our own fresh mapping, at least data.len() bytes.
+    unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), region.as_ptr(), data.len()) };
+    // SAFETY: dup of the region's fd; the copy is ours.
+    let fd = unsafe { libc::fcntl(region.shared_fd()?, libc::F_DUPFD_CLOEXEC, 3) };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: a fresh fd, ours from here on.
+    Some((unsafe { OwnedFd::from_raw_fd(fd) }, data.len() as u64))
+}
+
 /// Bind the GL context to the calling thread (see egl.rs). No-op without GL.
 fn enter() {
     #[cfg(target_os = "macos")]
@@ -497,14 +615,19 @@ fn init(lib: &Lib, gl: bool, proxy: bool) -> c_int {
         make_current: current,
         get_drm_fd: None,
         write_context_fence: Some(on_context_fence),
+        // Our render server (see `server`), when it runs: the library then
+        // runs each Venus and Direct3D context in a worker process.
+        #[cfg(target_os = "macos")]
+        get_server_fd: server::server_fd_callback(),
+        #[cfg(not(target_os = "macos"))]
         get_server_fd: None,
     }));
     // With GL, no fence thread: ANGLE serializes the contexts of a share
     // group, so a thread blocked on a GL fence would stall every submit.
     // GL fences are polled by the GPU worker instead (`poll`).
-    // The render server's contexts only get a fence thread with
-    // THREAD_SYNC, and with ASYNC_FENCE_CB the poll skips them: with GL
-    // and the server, no async callbacks, so the poll retires those too.
+    // The render server's contexts always have a fence thread of their own
+    // (our patch 0013), which calls back from that thread; the poll may
+    // retire their fences too.
     // (Venus in place has fence threads of its own either way.)
     let async_cb = if gl && proxy { 0 } else { ASYNC_FENCE_CB };
     let flags = VENUS | async_cb | if gl { 0 } else { NO_VIRGL | THREAD_SYNC } | if proxy { RENDER_SERVER | NEPTUNE } else { 0 };
@@ -580,6 +703,42 @@ impl Virgl {
         Some((fd, st.st_size as u64))
     }
 
+    /// Snapshot of a Venus context: (complete, shared memory, its size).
+    /// Not complete: enough that its app sees the device lost after a
+    /// restore. None if the library can't (or the context has failed for
+    /// good).
+    pub fn save_context(&mut self, ctx: u32) -> Option<(bool, OwnedFd, u64)> {
+        let Some(save) = self.lib.ctx_save else {
+            log::warn!("gpu3d: this virglrenderer can't save Vulkan contexts (scripts/build-virglrenderer.sh)");
+            return None;
+        };
+        let (mut fd, mut size) = (-1 as c_int, 0u64);
+        // SAFETY: valid out pointers; a returned fd is ours to close.
+        let r = unsafe { save(ctx, &mut fd, &mut size) };
+        if r < 0 || fd < 0 {
+            log::warn!("gpu3d: context {ctx}: snapshot failed ({r})");
+            return None;
+        }
+        // SAFETY: a fresh fd, ours from here on.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        Some((r == 0, fd, size))
+    }
+
+    /// The way back (see `virgl_renderer_context_restore`). Takes `fd`.
+    pub fn restore_context(&mut self, ctx: u32, fd: OwnedFd, size: u64) -> bool {
+        use std::os::fd::IntoRawFd;
+        let Some(restore) = self.lib.ctx_restore else {
+            log::warn!("gpu3d: this virglrenderer can't restore Vulkan contexts");
+            return false;
+        };
+        // SAFETY: the library takes the fd (closes it in any case).
+        let r = unsafe { restore(ctx, fd.into_raw_fd(), size) };
+        if r != 0 {
+            log::warn!("gpu3d: context {ctx}: not built again from its snapshot ({r})");
+        }
+        r == 0
+    }
+
     fn drop_view(&mut self, resource: u32) {
         if let Some((p, len)) = self.views.remove(&resource) {
             // SAFETY: a mapping view() made, used by nothing else now.
@@ -599,9 +758,10 @@ impl Virgl {
                 let _ = sink();
                 enter();
                 let mut gl = GL.get().copied().unwrap_or(false);
-                // Venus and Neptune through the render server (a thread
-                // in this process) where the library has one; older
-                // libraries run Venus in place and have no Neptune.
+                // Venus and Neptune through the render server: one worker
+                // process per context when ours runs (`server::start`),
+                // else a thread of the library's. Without a server at all
+                // Venus runs in place and there is no Neptune.
                 let mut r = -1;
                 for proxy in [true, false] {
                     if gl && r != 0 {
@@ -937,6 +1097,61 @@ impl Renderer3d for Virgl {
         }
     }
 
+    fn surface_start(&mut self, head: u32, resource: u32, bx: Box3d) -> bool {
+        enter();
+        // Only where the surfaces can reach the app (the GPU process,
+        // with a port to the VMM).
+        #[cfg(target_os = "macos")]
+        if remote::surfaces_wanted() {
+            let mut info = [0u32; 16];
+            // SAFETY: the buffer is larger than the struct the library fills.
+            if unsafe { (self.lib.get_info)(resource as c_int, info.as_mut_ptr() as *mut c_void) } != 0 || info[6] == 0 {
+                return false;
+            }
+            const Y_0_TOP: u32 = 1;
+            let flip = (info[5] & Y_0_TOP != 0).then_some(info[3]);
+            return gl::surface_start(head, info[6], flip, (bx.x, bx.y, bx.w, bx.h));
+        }
+        let _ = (head, resource, bx);
+        false
+    }
+
+    fn surface_poll(&mut self, wait: bool) -> Option<Option<SurfaceFrame>> {
+        enter();
+        #[cfg(target_os = "macos")]
+        return gl::surface_poll(wait).map(|f| f.map(|(head, gen, slot)| SurfaceFrame { head, gen, slot }));
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = wait;
+            None
+        }
+    }
+
+    fn venus_save(&mut self, ctx: u32) -> Option<(bool, Vec<u8>)> {
+        let (complete, fd, size) = self.save_context(ctx)?;
+        let len = usize::try_from(size).ok().filter(|&n| n > 0)?;
+        // SAFETY: a fresh read-only shared mapping of the whole object.
+        let p = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, fd.as_raw_fd(), 0) };
+        if p == libc::MAP_FAILED {
+            return None;
+        }
+        // SAFETY: the mapping is `len` bytes and stays until the munmap.
+        let data = unsafe { std::slice::from_raw_parts(p as *const u8, len) }.to_vec();
+        // SAFETY: the mapping made above, no longer used.
+        unsafe { libc::munmap(p, len) };
+        Some((complete, data))
+    }
+
+    fn venus_restore(&mut self, ctx: u32, data: &[u8]) -> bool {
+        let Some((fd, size)) = shm_with(data) else { return false };
+        self.restore_context(ctx, fd, size)
+    }
+
+    fn venus_resume(&mut self, ctx: u32) -> bool {
+        // SAFETY: plain call with an id.
+        self.lib.ctx_resume.is_some_and(|f| unsafe { f(ctx) } == 0)
+    }
+
     fn unref(&mut self, resource: u32) {
         enter();
         self.unmap_blob(resource);
@@ -987,10 +1202,27 @@ impl Renderer3d for Virgl {
             self.drop_view(id);
         }
         sink().done.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(target_os = "macos")]
+        gl::surfaces_reset();
         leave();
     }
 
     fn release_thread(&mut self) {
         leave();
+    }
+}
+
+#[cfg(test)]
+mod bundle_tests {
+    use super::bundle_frameworks;
+    use std::path::Path;
+
+    #[test]
+    fn frameworks_only_inside_an_app() {
+        let fw = bundle_frameworks(Path::new("/Applications/vroom.app/Contents/MacOS"));
+        assert_eq!(fw.as_deref(), Some(Path::new("/Applications/vroom.app/Contents/Frameworks")));
+        assert_eq!(bundle_frameworks(Path::new("/x/target/release")), None);
+        assert_eq!(bundle_frameworks(Path::new("/x/Contents/MacOS")), None);
+        assert_eq!(bundle_frameworks(Path::new("/MacOS")), None);
     }
 }

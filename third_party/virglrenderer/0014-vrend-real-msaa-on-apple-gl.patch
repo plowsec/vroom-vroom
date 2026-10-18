@@ -1,0 +1,22 @@
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -13343,11 +13343,14 @@
+     * multisample support, causing MaxSamples=0. Reporting 1 triggers fake_sw_msaa workaround.
+     * Apply to both desktop GL and GLES (ANGLE) modes. */
+    const char *version = (const char *)glGetString(GL_VERSION);
+-   bool is_metal = (version && strstr(version, "Metal"));
++   /* vroom: not on macOS's own GL ("4.1 Metal - ..."): it makes
++    * multisample textures with glTexImage2DMultisample (0002), so the
++    * format checks pass and the real count stays. One sample left the
++    * guest's OpenGL ES 3.0 short of the 4 its spec wants, and ANGLE (so
++    * Chrome's GPU process) refused to give ES 3.0 on it. */
+    bool is_angle = (version && strstr(version, "ANGLE"));
+-   if ((is_metal || is_angle) && caps->v1.max_samples > 1) {
+-      virgl_debug("[VREND CAPS] %s backend: Overriding max_samples %u -> 1 for fake_sw_msaa\n", 
+-                  is_angle ? "ANGLE" : "Metal",
++   if (is_angle && caps->v1.max_samples > 1) {
++      virgl_debug("[VREND CAPS] ANGLE backend: Overriding max_samples %u -> 1 for fake_sw_msaa\n",
+                   caps->v1.max_samples);
+       caps->v1.max_samples = 1;
+    }

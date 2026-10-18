@@ -61,6 +61,54 @@ pub(crate) fn disk_plan(dir: &Path) -> Result<BTreeMap<usize, PathBuf>> {
     Ok(layers)
 }
 
+/// Saved network adapters have a control queue (saves from before it
+/// don't say so, and have none).
+const NET_CTRL: &str = "net.ctrl_vq";
+/// How many removable shares for USB disks' files it has (saves from
+/// before them have none).
+const USB_FILES: &str = "usb.file_shares";
+/// Network adapters in hot plug slots: "adapter:slot,..." (0-based).
+const NET_HOT: &str = "net.hotplug";
+/// Windows' 3D GPU has memory in BAR 0, the registers after the host
+/// window (saves from before have the registers in BAR 0).
+const GPU3D_VRAM: &str = "gpu.bar0_vram";
+
+/// The network adapters the VM saved in `dir` had in hot plug slots:
+/// adapter index to slot.
+pub(crate) fn saved_hot_nets(dir: &Path) -> Result<BTreeMap<usize, usize>> {
+    let snap = SnapshotDir::open(dir)?;
+    let mut m = BTreeMap::new();
+    let Some(v) = snap.manifest.meta.get(NET_HOT) else { return Ok(m) };
+    for pair in v.split(',').filter(|p| !p.is_empty()) {
+        let bad = || Error::Setup(format!("bad {NET_HOT}: {v}"));
+        let (a, b) = pair.split_once(':').ok_or_else(bad)?;
+        let (a, b) = (a.parse::<usize>().map_err(|_| bad())?, b.parse::<usize>().map_err(|_| bad())?);
+        if b >= crate::hotplug::PORTS || m.values().any(|&x| x == b) || m.insert(a, b).is_some() {
+            return Err(bad());
+        }
+    }
+    Ok(m)
+}
+
+/// Whether the VM saved in `dir` has memory in its 3D GPU's BAR 0.
+pub(crate) fn saved_gpu3d_vram(dir: &Path) -> bool {
+    SnapshotDir::open(dir).is_ok_and(|s| s.manifest.meta.get(GPU3D_VRAM).is_some_and(|v| v == "1"))
+}
+
+/// The removable shares the VM saved in `dir` has.
+pub(crate) fn saved_usb_file_slots(dir: &Path) -> usize {
+    let Ok(snap) = SnapshotDir::open(dir) else { return 0 };
+    snap.manifest.meta.get(USB_FILES).and_then(|n| n.parse::<usize>().ok()).unwrap_or(0).min(crate::usb::FILE_SLOTS)
+}
+
+/// The VM file as it was when `dir` was saved, and whether its network
+/// adapters had a control queue.
+pub(crate) fn saved_config(dir: &Path) -> Result<(vroom_config::VmConfig, bool)> {
+    let snap = SnapshotDir::open(dir)?;
+    let c = serde_json::from_value(snap.manifest.config.clone()).map_err(|e| Error::Setup(format!("snapshot config: {e}")))?;
+    Ok((c, snap.manifest.meta.contains_key(NET_CTRL)))
+}
+
 pub(crate) fn save(vmm: &mut Vmm, dir: &Path, description: &str, kind: Kind) -> Result<()> {
     let mut snap = SnapshotDir::create(dir)?;
     match kind {
@@ -78,12 +126,35 @@ pub(crate) fn save(vmm: &mut Vmm, dir: &Path, description: &str, kind: Kind) -> 
             }
         }
     }
+    // The network adapters as they are now, held still until the devices
+    // are saved: none comes or goes meanwhile. One still on its way out
+    // goes now (a snapshot holds none half gone).
+    let nics = vmm.net_ports.clone();
+    let nics = nics.hold();
+    if let Some(h) = &vmm.hotplug {
+        h.settle();
+    }
+    let (nets, hot) = crate::net::saved(&nics);
+    vmm.config.nets = nets;
     let m = &mut snap.manifest;
     m.description = description.to_string();
     m.arch = "aarch64".into();
     m.backend = vmm.hv.name().into();
     m.config = serde_json::to_value(&vmm.config).map_err(|e| Error::Setup(e.to_string()))?;
+    if !hot.is_empty() {
+        let v: Vec<String> = hot.iter().map(|(a, b)| format!("{a}:{b}")).collect();
+        m.meta.insert(NET_HOT.into(), v.join(","));
+    }
     m.meta.insert("vcpus".into(), vmm.vcpus.len().to_string());
+    if vmm.net_ctrl {
+        m.meta.insert(NET_CTRL.into(), "1".into());
+    }
+    if vmm.usb_file_slots > 0 {
+        m.meta.insert(USB_FILES.into(), vmm.usb_file_slots.to_string());
+    }
+    if vmm.gpu3d_vram {
+        m.meta.insert(GPU3D_VRAM.into(), "1".into());
+    }
 
     for (i, v) in vmm.vcpus.iter().enumerate() {
         let (tx, rx) = mpsc::channel();
@@ -196,6 +267,16 @@ pub(crate) fn restore(vmm: &mut Vmm, dir: &Path) -> Result<()> {
     // Before vCPU restore: each vCPU picks the VM clock up as it restores.
     vmm.vm.set_clock(clock);
 
+    // Devices before vCPUs: a vCPU runs as soon as it is restored, and the
+    // guest must not see a device half back (the GPU's shared memory window
+    // stays empty until its buffers are made again: a Vulkan driver reading
+    // its ring there gave up).
+    for d in &vmm.devices {
+        let mut d = d.lock().unwrap_or_else(|e| e.into_inner());
+        let id = d.snapshot_id();
+        d.restore(&snap.get_blob(&dev_blob(&id))?)?;
+    }
+
     let mut cpus = vmm.shared.cpus.lock().unwrap_or_else(|e| e.into_inner()).clone();
     for (i, v) in vmm.vcpus.iter().enumerate() {
         let st: VcpuState = serde_json::from_slice(&snap.get_blob(&vcpu_blob(i))?)
@@ -211,11 +292,6 @@ pub(crate) fn restore(vmm: &mut Vmm, dir: &Path) -> Result<()> {
     }
     *vmm.shared.cpus.lock().unwrap_or_else(|e| e.into_inner()) = cpus;
 
-    for d in &vmm.devices {
-        let mut d = d.lock().unwrap_or_else(|e| e.into_inner());
-        let id = d.snapshot_id();
-        d.restore(&snap.get_blob(&dev_blob(&id))?)?;
-    }
     log::info!("restored snapshot from {}", dir.display());
     Ok(())
 }

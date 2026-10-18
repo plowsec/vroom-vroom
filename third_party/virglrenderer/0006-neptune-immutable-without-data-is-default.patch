@@ -1,0 +1,196 @@
+diff --git a/src/meson.build b/src/meson.build
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -118,6 +118,7 @@
+    'neptune/npt_profile.c',
+    'neptune/npt_overrides_d3d11_fence.c',
+    'neptune/npt_overrides_d3d11_query.c',
++   'neptune/npt_overrides_d3d11_immutable.c',
+    'neptune/npt_queue.c',
+    'neptune/npt_renderer.c',
+    'neptune/npt_resource.c',
+diff --git a/src/neptune/npt_context.c b/src/neptune/npt_context.c
+--- a/src/neptune/npt_context.c
++++ b/src/neptune/npt_context.c
+@@ -147,6 +147,7 @@
+    d->idxgiresource1_dispatch_overrides = &npt_idxgiresource1_overrides;
+    d->id3d11device_dispatch_overrides = &npt_id3d11device_overrides;
+    d->id3d11device1_dispatch_overrides = &npt_id3d11device1_overrides;
++   d->id3d11device3_dispatch_overrides = &npt_id3d11device3_overrides;
+    d->id3d11device5_dispatch_overrides = &npt_id3d11device5_overrides;
+    d->id3d11fence_dispatch_overrides = &npt_id3d11fence_overrides;
+    d->id3d12device_dispatch_overrides = &npt_id3d12device_overrides;
+diff --git a/src/neptune/npt_overrides.h b/src/neptune/npt_overrides.h
+--- a/src/neptune/npt_overrides.h
++++ b/src/neptune/npt_overrides.h
+@@ -21,6 +21,27 @@
+ extern struct npt_dispatch_id3d11device5_overrides npt_id3d11device5_overrides;
+ extern struct npt_dispatch_id3d11fence_overrides npt_id3d11fence_overrides;
+ 
++/* IMMUTABLE resources created without initial data are created DEFAULT
++ * (npt_overrides_d3d11_immutable.c).  The ID3D11Device ones sit in
++ * npt_id3d11device_overrides. */
++HRESULT npt_override_ID3D11Device_CreateBuffer(
++   struct npt_dispatch_context *ctx,
++   struct npt_command_ID3D11Device_CreateBuffer *args,
++   PFN_ID3D11Device_CreateBuffer original);
++HRESULT npt_override_ID3D11Device_CreateTexture1D(
++   struct npt_dispatch_context *ctx,
++   struct npt_command_ID3D11Device_CreateTexture1D *args,
++   PFN_ID3D11Device_CreateTexture1D original);
++HRESULT npt_override_ID3D11Device_CreateTexture2D(
++   struct npt_dispatch_context *ctx,
++   struct npt_command_ID3D11Device_CreateTexture2D *args,
++   PFN_ID3D11Device_CreateTexture2D original);
++HRESULT npt_override_ID3D11Device_CreateTexture3D(
++   struct npt_dispatch_context *ctx,
++   struct npt_command_ID3D11Device_CreateTexture3D *args,
++   PFN_ID3D11Device_CreateTexture3D original);
++extern struct npt_dispatch_id3d11device3_overrides npt_id3d11device3_overrides;
++
+ /* ID3D12Device: the shared-HANDLE rejections plus the FEATURE_LEVELS blob
+  * repack (npt_overrides_d3d12_device.c). */
+ extern struct npt_dispatch_id3d12device_overrides npt_id3d12device_overrides;
+diff --git a/src/neptune/npt_overrides_d3d11_immutable.c b/src/neptune/npt_overrides_d3d11_immutable.c
+new file mode 100644
+--- /dev/null
++++ b/src/neptune/npt_overrides_d3d11_immutable.c
+@@ -0,0 +1,122 @@
++/*
++ * SPDX-License-Identifier: MIT
++ *
++ * IMMUTABLE resources created without initial data.
++ *
++ * The guest creates IMMUTABLE buffers and textures without initial data
++ * and uploads their contents right after with RESOURCE_UPDATE
++ * (UpdateSubresource on the host).  D3D11 forbids writing an IMMUTABLE
++ * resource, and a backend may rely on it: DXMT tracks no GPU dependencies
++ * on IMMUTABLE resources, so a copy or draw that reads one can run before
++ * the upload has landed and read zeros.  In D2D/XAML apps that left glyph
++ * atlases without their white texel (copied from a 1x1 IMMUTABLE texture),
++ * and text and shapes drawn with them missing.
++ *
++ * An IMMUTABLE resource that arrives without initial data is created
++ * DEFAULT instead: its uploads are then ordered like any other write.
++ */
++
++#include "npt_overrides.h"
++
++#include "neptune-protocol/npt_protocol_host_id3d11device.h"
++
++HRESULT
++npt_override_ID3D11Device_CreateBuffer(
++   UNUSED struct npt_dispatch_context *ctx,
++   struct npt_command_ID3D11Device_CreateBuffer *args,
++   PFN_ID3D11Device_CreateBuffer original)
++{
++   if (args->pDesc && args->pDesc->Usage == D3D11_USAGE_IMMUTABLE &&
++       !args->pInitialData) {
++      D3D11_BUFFER_DESC desc = *args->pDesc;
++      desc.Usage = D3D11_USAGE_DEFAULT;
++      return original(args->_self, &desc, NULL, args->ppBuffer);
++   }
++   return original(args->_self, args->pDesc, args->pInitialData,
++                   args->ppBuffer);
++}
++
++HRESULT
++npt_override_ID3D11Device_CreateTexture1D(
++   UNUSED struct npt_dispatch_context *ctx,
++   struct npt_command_ID3D11Device_CreateTexture1D *args,
++   PFN_ID3D11Device_CreateTexture1D original)
++{
++   if (args->pDesc && args->pDesc->Usage == D3D11_USAGE_IMMUTABLE &&
++       !args->pInitialData) {
++      D3D11_TEXTURE1D_DESC desc = *args->pDesc;
++      desc.Usage = D3D11_USAGE_DEFAULT;
++      return original(args->_self, &desc, NULL, args->ppTexture1D);
++   }
++   return original(args->_self, args->pDesc, args->pInitialData,
++                   args->ppTexture1D);
++}
++
++HRESULT
++npt_override_ID3D11Device_CreateTexture2D(
++   UNUSED struct npt_dispatch_context *ctx,
++   struct npt_command_ID3D11Device_CreateTexture2D *args,
++   PFN_ID3D11Device_CreateTexture2D original)
++{
++   if (args->pDesc && args->pDesc->Usage == D3D11_USAGE_IMMUTABLE &&
++       !args->pInitialData) {
++      D3D11_TEXTURE2D_DESC desc = *args->pDesc;
++      desc.Usage = D3D11_USAGE_DEFAULT;
++      return original(args->_self, &desc, NULL, args->ppTexture2D);
++   }
++   return original(args->_self, args->pDesc, args->pInitialData,
++                   args->ppTexture2D);
++}
++
++HRESULT
++npt_override_ID3D11Device_CreateTexture3D(
++   UNUSED struct npt_dispatch_context *ctx,
++   struct npt_command_ID3D11Device_CreateTexture3D *args,
++   PFN_ID3D11Device_CreateTexture3D original)
++{
++   if (args->pDesc && args->pDesc->Usage == D3D11_USAGE_IMMUTABLE &&
++       !args->pInitialData) {
++      D3D11_TEXTURE3D_DESC desc = *args->pDesc;
++      desc.Usage = D3D11_USAGE_DEFAULT;
++      return original(args->_self, &desc, NULL, args->ppTexture3D);
++   }
++   return original(args->_self, args->pDesc, args->pInitialData,
++                   args->ppTexture3D);
++}
++
++static HRESULT
++override_ID3D11Device3_CreateTexture2D1(
++   UNUSED struct npt_dispatch_context *ctx,
++   struct npt_command_ID3D11Device3_CreateTexture2D1 *args,
++   PFN_ID3D11Device3_CreateTexture2D1 original)
++{
++   if (args->pDesc1 && args->pDesc1->Usage == D3D11_USAGE_IMMUTABLE &&
++       !args->pInitialData) {
++      D3D11_TEXTURE2D_DESC1 desc = *args->pDesc1;
++      desc.Usage = D3D11_USAGE_DEFAULT;
++      return original(args->_self, &desc, NULL, args->ppTexture2D);
++   }
++   return original(args->_self, args->pDesc1, args->pInitialData,
++                   args->ppTexture2D);
++}
++
++static HRESULT
++override_ID3D11Device3_CreateTexture3D1(
++   UNUSED struct npt_dispatch_context *ctx,
++   struct npt_command_ID3D11Device3_CreateTexture3D1 *args,
++   PFN_ID3D11Device3_CreateTexture3D1 original)
++{
++   if (args->pDesc1 && args->pDesc1->Usage == D3D11_USAGE_IMMUTABLE &&
++       !args->pInitialData) {
++      D3D11_TEXTURE3D_DESC1 desc = *args->pDesc1;
++      desc.Usage = D3D11_USAGE_DEFAULT;
++      return original(args->_self, &desc, NULL, args->ppTexture3D);
++   }
++   return original(args->_self, args->pDesc1, args->pInitialData,
++                   args->ppTexture3D);
++}
++
++struct npt_dispatch_id3d11device3_overrides npt_id3d11device3_overrides = {
++   .CreateTexture2D1 = override_ID3D11Device3_CreateTexture2D1,
++   .CreateTexture3D1 = override_ID3D11Device3_CreateTexture3D1,
++};
+diff --git a/src/neptune/npt_overrides_shared_handle.c b/src/neptune/npt_overrides_shared_handle.c
+--- a/src/neptune/npt_overrides_shared_handle.c
++++ b/src/neptune/npt_overrides_shared_handle.c
+@@ -132,6 +132,11 @@
+ 
+ struct npt_dispatch_id3d11device_overrides npt_id3d11device_overrides = {
+    .OpenSharedResource = reject_ID3D11Device_OpenSharedResource,
++   /* npt_overrides_d3d11_immutable.c */
++   .CreateBuffer = npt_override_ID3D11Device_CreateBuffer,
++   .CreateTexture1D = npt_override_ID3D11Device_CreateTexture1D,
++   .CreateTexture2D = npt_override_ID3D11Device_CreateTexture2D,
++   .CreateTexture3D = npt_override_ID3D11Device_CreateTexture3D,
+ };
+ 
+ struct npt_dispatch_id3d11device1_overrides npt_id3d11device1_overrides = {
+

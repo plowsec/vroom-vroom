@@ -1,0 +1,12 @@
+# Installs the guest tools the agent service staged (checked against the
+# host's SHA-256 manifest, in a folder only root can write). Runs as root
+# without the agent service's fences: it replaces files in /usr/local and
+# /etc and restarts the agent.
+[Unit]
+Description=vroom guest tools update
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/rm -f /var/lib/vroom-agent/update/ready
+WorkingDirectory=/var/lib/vroom-agent/update
+ExecStart=/bin/sh /var/lib/vroom-agent/update/install-agent.sh --update

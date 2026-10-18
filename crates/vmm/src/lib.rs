@@ -20,8 +20,10 @@ pub(crate) fn note_helper(pid: u32) {
 pub use vroom_state as state;
 mod display;
 mod firmware;
+mod hotplug;
 mod irq;
 mod machine;
+mod net;
 pub use machine::gpu_in_process;
 pub mod psci;
 mod ramfb;
@@ -29,6 +31,7 @@ mod snapshot;
 mod tpm;
 mod usb;
 mod vcpu;
+mod video;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -101,6 +104,9 @@ pub struct VmmOptions {
     pub ui: Option<std::os::unix::net::UnixStream>,
     /// Per-VM state directory (disk layers live in `disks/`).
     pub state_dir: PathBuf,
+    /// The frontend sandboxes the VMM once it is built (what a network
+    /// adapter changed later may still reach).
+    pub sandbox: bool,
 }
 
 impl std::fmt::Debug for VmmOptions {
@@ -133,16 +139,26 @@ pub struct Vmm {
     devices: Vec<StatefulDevice>,
     uart: Arc<Mutex<Pl011>>,
     agent: agent::Agent,
-    gpu: Option<vroom_virtio::devices::gpu::GpuControl>,
+    gpus: Vec<vroom_virtio::devices::gpu::GpuControl>,
     disks: disks::DiskSet,
     viewer: Option<display::ViewerTx>,
-    screen: Option<Arc<display::FbSink>>,
+    screens: Vec<Arc<display::FbSink>>,
     /// Captured right after build; reset = restore these.
     pristine_devices: Vec<Vec<u8>>,
     /// None when the backend can't save its irqchip (KVM for now).
     pristine_irqchip: Option<IrqChipState>,
     boot: machine::BootImage,
     state: RunState,
+    /// The network adapters have a control queue (what a save records).
+    net_ctrl: bool,
+    /// Removable shares for USB disks' files (what a save records).
+    usb_file_slots: usize,
+    /// Windows' 3D GPU has memory in BAR 0 (see `machine::GPU3D_VRAM`).
+    gpu3d_vram: bool,
+    /// The network adapters now (a save records them).
+    net_ports: Arc<net::NetPorts>,
+    /// Hot plug slots (a VM on PCI).
+    hotplug: Option<Arc<hotplug::Hotplug>>,
     #[cfg(feature = "research")]
     research_baseline: Option<ResearchBaseline>,
 }
@@ -166,7 +182,12 @@ const PAUSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long Windows gets to turn its 3D display off before a save, and
 /// to settle on its basic display afterwards.
 const PARK_TIMEOUT: Duration = Duration::from_secs(20);
-const PARK_SETTLE: Duration = Duration::from_millis(1500);
+/// Saved 1.5 s after its 3D display went off, Windows showed nothing on
+/// it after the first resume after a boot (4 of 4); 3 s and more, never.
+const PARK_SETTLE: Duration = Duration::from_secs(3);
+/// Once the device is off, how long its driver's Direct3D contexts get to
+/// go before the save drops them (see `GpuControl::set_driver_stopped`).
+const PARK_LEFTOVERS: Duration = Duration::from_secs(3);
 
 impl Vmm {
     /// Build the machine and start it.
@@ -184,12 +205,44 @@ impl Vmm {
         };
         let disks = disks::DiskSet::open(&config, &opts.state_dir, &layers)?;
         let uuid = machine_uuid(&opts.state_dir)?;
+        let saved = match &opts.start {
+            StartMode::Restore(dir) | StartMode::RestorePaused(dir) => Some(snapshot::saved_config(dir)?),
+            StartMode::Boot | StartMode::BootPaused => None,
+        };
+        let net_ctrl = saved.as_ref().is_none_or(|s| s.1);
+        // USB disks' files go to removable shares a VM started on a Mac
+        // has; a resumed one has those it was saved with.
+        let usb_file_slots = match &opts.start {
+            StartMode::Restore(dir) | StartMode::RestorePaused(dir) => snapshot::saved_usb_file_slots(dir),
+            StartMode::Boot | StartMode::BootPaused if cfg!(target_os = "macos") => usb::FILE_SLOTS,
+            StartMode::Boot | StartMode::BootPaused => 0,
+        };
+        let saved = saved.map(|s| s.0);
+        let hot_nets = match &opts.start {
+            StartMode::Restore(dir) | StartMode::RestorePaused(dir) => snapshot::saved_hot_nets(dir)?,
+            StartMode::Boot | StartMode::BootPaused => Default::default(),
+        };
+        // Windows' 3D GPU has memory in BAR 0; saves from before have not.
+        let gpu3d_vram = match &opts.start {
+            StartMode::Restore(dir) | StartMode::RestorePaused(dir) => snapshot::saved_gpu3d_vram(dir),
+            StartMode::Boot | StartMode::BootPaused => true,
+        };
         let env = machine::BuildEnv {
             uuid,
             state_dir: opts.state_dir.clone(),
             resuming: matches!(opts.start, StartMode::Restore(_) | StartMode::RestorePaused(_)),
+            saved,
+            net_ctrl,
+            usb_file_slots,
+            sandbox: opts.sandbox && config.security.sandbox,
+            hot_nets,
+            gpu3d_vram,
         };
         let m = machine::build(&config, hv.as_ref(), opts.serial_out, opts.clipboard, ui, &disks, ev_tx, &env)?;
+        // A save records the hardware the guest has: a resumed VM keeps
+        // the network adapters it was saved with until it restarts.
+        let mut config = config;
+        config.nets = m.nets;
         let mut vmm = Vmm {
             _lock: lock,
             config,
@@ -202,14 +255,19 @@ impl Vmm {
             devices: m.devices,
             uart: m.uart,
             agent: m.agent,
-            gpu: m.gpu,
+            gpus: m.gpus,
             disks,
             viewer: m.viewer,
-            screen: m.screen,
+            screens: m.screens,
             pristine_devices: Vec::new(),
             pristine_irqchip: None,
             boot: m.boot,
             state: RunState::Paused,
+            net_ctrl,
+            usb_file_slots,
+            gpu3d_vram,
+            net_ports: m.net_ports,
+            hotplug: m.hotplug,
             #[cfg(feature = "research")]
             research_baseline: None,
         };
@@ -316,12 +374,17 @@ impl Vmm {
         Ok(())
     }
 
-    /// Save the guest screen as PNG. Returns the mode.
+    /// Save the guest screen as PNG. Returns the mode. Other monitors
+    /// that are on go next to it, as `<name>-2.png` and so on.
     pub fn screendump(&self, path: &Path) -> Result<(u32, u32)> {
-        match &self.screen {
-            Some(s) => Ok(s.screendump(path)?),
-            None => Err(Error::Setup("VM has no display".into())),
+        let Some(first) = self.screens.first() else { return Err(Error::Setup("VM has no display".into())) };
+        for (i, s) in self.screens.iter().enumerate().skip(1) {
+            if s.mode().0 > 0 {
+                let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                let _ = s.screendump(&path.with_file_name(format!("{stem}-{}.png", i + 1)));
+            }
         }
+        Ok(first.screendump(path)?)
     }
 
     /// Tell the viewer something (status line).
@@ -428,13 +491,21 @@ impl Vmm {
         let parked = self.park_direct3d()?;
         self.pause()?;
         let r = snapshot::save(self, dir, description, snapshot::Kind::Snapshot);
+        if parked {
+            self.unpark_direct3d();
+        }
         if was_running {
             self.resume()?;
         }
-        if parked {
-            self.agent.send(agent::AgentCmd::Gpu3d(true));
-        }
         r
+    }
+
+    /// Ask for the 3D display back (delivered once the VM runs).
+    fn unpark_direct3d(&mut self) {
+        for g in &self.gpus {
+            g.set_driver_stopped(false);
+        }
+        self.agent.send(agent::AgentCmd::Gpu3d(true));
     }
 
     /// Windows' Direct3D state lives on the host GPU and can't be saved.
@@ -443,8 +514,9 @@ impl Vmm {
     /// every Direct3D object; the agent turns it back on when it next
     /// connects, or right after a snapshot. Whether it was parked.
     fn park_direct3d(&mut self) -> Result<bool> {
-        let Some(gpu) = self.gpu.clone() else { return Ok(false) };
-        if !gpu.direct3d() || self.state == RunState::Stopped {
+        let gpus = self.gpus.clone();
+        let direct3d = || gpus.iter().any(|g| g.direct3d());
+        if !direct3d() || self.state == RunState::Stopped {
             return Ok(false);
         }
         let s = self.agent.status();
@@ -462,9 +534,27 @@ impl Vmm {
         log::info!("turning the guest's 3D display off for the save");
         self.agent.send(agent::AgentCmd::Gpu3d(false));
         let deadline = Instant::now() + PARK_TIMEOUT;
-        while gpu.direct3d() || self.agent.status().gpu3d != Some(false) {
+        let mut off_since = None;
+        let mut dropping = false;
+        loop {
+            let off = self.agent.status().gpu3d == Some(false);
+            if off && !direct3d() {
+                break;
+            }
+            // Off, the driver is stopped and resets the GPU when it starts
+            // again: what it didn't destroy is nobody's. Windows destroys a
+            // process's contexts after the driver can no longer send that
+            // (a suspend waited for them in vain), and the process may be
+            // stuck waiting on them: drop them, which tells it so.
+            if off && !dropping && off_since.get_or_insert_with(Instant::now).elapsed() > PARK_LEFTOVERS {
+                log::info!("the guest's 3D driver stopped with Direct3D contexts left: dropping them");
+                for g in &self.gpus {
+                    g.set_driver_stopped(true);
+                }
+                dropping = true;
+            }
             if Instant::now() > deadline {
-                self.agent.send(agent::AgentCmd::Gpu3d(true));
+                self.unpark_direct3d();
                 if paused {
                     self.pause()?;
                 }
@@ -490,8 +580,7 @@ impl Vmm {
         self.pause()?;
         if let Err(e) = snapshot::save(self, dir, "suspend", snapshot::Kind::Suspend) {
             if parked {
-                // Delivered once the VM runs again.
-                self.agent.send(agent::AgentCmd::Gpu3d(true));
+                self.unpark_direct3d();
             }
             return Err(e);
         }

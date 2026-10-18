@@ -1,7 +1,8 @@
 //! Display channel between the (sandboxed) VMM and the viewer process.
 //!
-//! - Pixels: one shared-memory framebuffer, created by the VMM before it
-//!   sandboxes itself, passed once to the viewer with SCM_RIGHTS.
+//! - Pixels: one shared-memory framebuffer (a slot per guest monitor),
+//!   created by the VMM before it sandboxes itself, passed once to the
+//!   viewer with SCM_RIGHTS.
 //!   Format: 32-bit little endian XRGB (bytes B,G,R,X).
 //! - Everything else: small framed messages on a unix stream.
 //!
@@ -11,7 +12,7 @@
 mod fb;
 mod proto;
 
-pub use fb::{SharedFb, MAX_HEIGHT, MAX_WIDTH};
+pub use fb::{SharedFb, MAX_HEADS, MAX_HEIGHT, MAX_WIDTH};
 /// fd passing helpers; errors mapped to this crate's error type.
 pub fn send_fd(sock: &std::os::unix::net::UnixStream, fd: std::os::fd::RawFd) -> Result<()> {
     vroom_ipc::send_fd(sock, fd).map_err(ipc_err)
@@ -32,7 +33,11 @@ fn ipc_err(e: vroom_ipc::Error) -> Error {
         vroom_ipc::Error::Proto(m) => Error::Proto(m),
     }
 }
-pub use proto::{Command, Decoder, GuestCursor, ToViewer, ToVmm, CURSOR_MAX, DRAG_ITEMS_MAX, POINTER_MAX, SCALE_MAX, SCALE_MIN};
+pub use proto::{
+    usb_label_ok, Command, Decoder, Forward, GuestApp, GuestCursor, GuestWindow, NetKind, NetLive, NetPort, ToViewer, ToVmm, UsbDev, UsbHow, UsbPort, WindowOp,
+    CURSOR_MAX, FILES_PORT0,
+    DRAG_ITEMS_MAX, FORWARDS_MAX, NET_PORTS_MAX, POINTER_MAX, SCALE_MAX, SCALE_MIN, USB_PORTS_MAX,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

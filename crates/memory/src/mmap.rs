@@ -198,6 +198,8 @@ impl MmapRegion {
         use std::os::fd::AsRawFd;
         // Copy through a temporary shared mapping. `pwrite` is not portable
         // for the anonymous shared-memory objects used on macOS.
+        // SAFETY: a new mapping of the object we just made, `size` bytes;
+        // the result is checked below.
         let tmp = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -218,10 +220,13 @@ impl MmapRegion {
 
         // MAP_FIXED is only used after removing our own central mapping. The
         // guard pages stay intact, so host overrun checks remain effective.
+        // SAFETY: our own central mapping, remapped at once below; the VM
+        // is paused (the caller's rule), so nothing touches it meanwhile.
         let rc = unsafe { libc::munmap(self.base.cast(), self.size) };
         if rc != 0 {
             return Err(Error::Mmap(errno()));
         }
+        // SAFETY: MAP_FIXED over the range we just unmapped, same size.
         let mapped = unsafe {
             libc::mmap(
                 self.base.cast(),
@@ -249,10 +254,13 @@ impl MmapRegion {
         use std::os::fd::AsRawFd;
         // Remapping the same private file is portable: macOS treats
         // MADV_DONTNEED as advisory and may retain dirty private pages.
+        // SAFETY: our own central mapping, remapped at once below; the VM
+        // is paused (the caller's rule), so nothing touches it meanwhile.
         let rc = unsafe { libc::munmap(self.base.cast(), self.size) };
         if rc != 0 {
             return Err(Error::Mmap(errno()));
         }
+        // SAFETY: MAP_FIXED over the range we just unmapped, same size.
         let mapped = unsafe {
             libc::mmap(
                 self.base.cast(),
@@ -323,7 +331,6 @@ fn shm_object(size: usize) -> Result<std::os::fd::OwnedFd> {
 
 #[cfg(feature = "research")]
 fn cow_object(size: usize) -> Result<std::os::fd::OwnedFd> {
-    use std::os::fd::{FromRawFd, IntoRawFd};
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!("vroom-cow-{}-{n:x}", std::process::id()));
@@ -336,7 +343,7 @@ fn cow_object(size: usize) -> Result<std::os::fd::OwnedFd> {
     let _ = std::fs::remove_file(&path);
     file.set_len(size as u64)
         .map_err(|e| Error::Mmap(e.raw_os_error().unwrap_or(libc::EIO)))?;
-    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(file.into_raw_fd()) })
+    Ok(std::os::fd::OwnedFd::from(file))
 }
 
 fn errno() -> i32 {

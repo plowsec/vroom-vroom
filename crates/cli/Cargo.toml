@@ -24,7 +24,10 @@ vroom-sandbox.workspace = true
 vroom-display.workspace = true
 vroom-import.workspace = true
 vroom-usb.workspace = true
+vroom-video.workspace = true
+vroom-ipc.workspace = true
 vroom-gpu3d.workspace = true
+vroom-tools.workspace = true
 arboard = { version = "3", default-features = false }
 
 # The camera helper (`vroom camera-helper`): the Mac's camera via AVFoundation.

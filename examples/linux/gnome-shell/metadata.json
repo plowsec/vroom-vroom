@@ -1,0 +1,7 @@
+{
+  "uuid": "vroom-coherence@vroom",
+  "name": "vroom Coherence",
+  "description": "Hides the top bar while the vroom host shows this desktop's windows on the Mac (Coherence). The vroom guest agent turns it on and off.",
+  "shell-version": ["42", "43", "44", "45", "46", "47", "48", "49"],
+  "version": 1
+}

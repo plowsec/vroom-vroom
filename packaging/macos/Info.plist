@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>vroom-gui</string>
+    <key>CFBundleIdentifier</key>
+    <string>org.vroom.app</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>vroom</string>
+    <key>CFBundleDisplayName</key>
+    <string>vroom</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>@VERSION@</string>
+    <key>CFBundleVersion</key>
+    <string>@VERSION@</string>
+    <key>CFBundleIconFile</key>
+    <string>vroom</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.developer-tools</string>
+    <!-- Hypervisor.framework's GIC (hv_gic_*) is macOS 15 and later. -->
+    <key>LSMinimumSystemVersion</key>
+    <string>15.0</string>
+    <key>LSArchitecturePriority</key>
+    <array>
+        <string>arm64</string>
+    </array>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSSupportsAutomaticGraphicsSwitching</key>
+    <true/>
+    <key>NSCameraUsageDescription</key>
+    <string>A VM with the camera turned on uses it as its webcam, only while its window is open and an app in the VM reads from it.</string>
+    <key>NSRemovableVolumesUsageDescription</key>
+    <string>A USB disk you connect to a VM is shared with it as files, or given to it as a whole disk, only when you choose so in the VM window's USB menu.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>A VM with the microphone turned on records from it, only while its window is open and an app in the VM records.</string>
+    <!-- Files Finder can open with vroom. Alternate: we never take .toml
+         or .iso away from the app that opens them today. -->
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>VM file</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>CFBundleTypeExtensions</key>
+            <array>
+                <string>toml</string>
+            </array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>Disc image</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>public.iso-image</string>
+            </array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>VMware VM</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>LSTypeIsPackage</key>
+            <true/>
+            <key>CFBundleTypeExtensions</key>
+            <array>
+                <string>vmwarevm</string>
+            </array>
+        </dict>
+    </array>
+</dict>
+</plist>

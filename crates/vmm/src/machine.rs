@@ -6,7 +6,7 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use vroom_arch::aarch64::{self as board, layout};
-use vroom_config::{Boot, DiskBus, Gpu, GuestOs, Identity, SoundDevice, VmConfig};
+use vroom_config::{Boot, DiskBus, Gpu, GuestOs, SoundDevice, VmConfig};
 use vroom_devices::audio::{AudioSink, AudioSource, NullSink, Silence};
 use vroom_devices::hda::{codec::CodecIds, Hda, HdaIds};
 use vroom_virtio::devices::sound::Sound;
@@ -16,10 +16,6 @@ use vroom_hv::{
 };
 use vroom_memory::{GuestAddress, GuestMemory};
 use vroom_snapshot::Snapshottable;
-use vroom_config::NetMode;
-use vroom_net::nat::{Nat, NatConfig, NatPolicy, TcpForward};
-use vroom_net::socket::FrameSocket;
-use vroom_net::{netd, NetBackend};
 use vroom_virtio::devices::gpu::{DisplaySink, Gpu as GpuDev, GpuControl, ThreeD};
 use vroom_virtio::devices::gpu3d::{Mapping, Renderer3d, ShmMapper};
 use vroom_virtio::devices::input::{Input, InputKind};
@@ -27,7 +23,7 @@ use vroom_virtio::devices::{block::Block, console::Console, fs::Fs, net::Net, rn
 use vroom_devices::nvme::{Namespace, Nvme};
 use vroom_devices::usb::hid::UsbIds;
 use vroom_devices::usb::xhci::Xhci;
-use vroom_devices::pci::{Intx, IntxRouter, MsiSender, PciRoot, SharedPciDevice, VendorIds};
+use vroom_devices::pci::{Intx, IntxRouter, MsiSender, PciRoot, RootPort, SharedPciDevice, VendorIds};
 use vroom_devices::IrqLine;
 use vroom_virtio::mmio::{ShmRegion, VirtioMmio};
 use vroom_virtio::{pci::VirtioPci, VirtioDevice};
@@ -35,6 +31,7 @@ use vroom_virtio::{pci::VirtioPci, VirtioDevice};
 use crate::agent::{self, Agent, ClipboardProvider};
 use crate::disks::DiskSet;
 use crate::display::{DisplayServer, FbSink, InputPipes, ViewerTx};
+use crate::hotplug::{self, Hotplug};
 use crate::irq::{GicMsi, SpiLine};
 use crate::psci::CpuTable;
 use crate::vcpu::{self, VcpuHandle, VcpuShared, VmEvent};
@@ -72,6 +69,8 @@ struct Board {
     next_pci_slot: u8,
     intx: Arc<IntxRouter>,
     msi: Arc<GicMsi>,
+    /// Devices a resumed VM had in hot plug slots: (port, device).
+    hot: Vec<(usize, Box<dyn VirtioDevice>)>,
 }
 
 impl Board {
@@ -92,6 +91,7 @@ impl Board {
             next_pci_slot: 1,
             intx,
             msi,
+            hot: Vec::new(),
         }
     }
 
@@ -134,12 +134,37 @@ impl Board {
         Ok(())
     }
 
-    /// Put the root complex on the bus if anything needs it.
-    fn finish_pci(&mut self, host_ids: VendorIds) -> Result<bool> {
+    /// Put the root complex on the bus if anything needs it. A machine on
+    /// PCI gets the hot plug root ports, last (the other devices keep
+    /// their slots), with a resumed VM's devices in them.
+    fn finish_pci(&mut self, host_ids: VendorIds, port_ids: VendorIds) -> Result<Option<Arc<PciRoot>>> {
         if self.pci.is_empty() && !self.use_pci {
-            return Ok(false);
+            return Ok(None);
         }
-        let root = PciRoot::with_host_ids(std::mem::take(&mut self.pci), host_ids);
+        let mut ports = Vec::new();
+        if self.use_pci {
+            let mut hot = std::mem::take(&mut self.hot);
+            for i in 0..hotplug::PORTS {
+                let slot = self.next_pci_slot;
+                if slot > 31 {
+                    log::warn!("pci: no slot left for hot plug port {}", i + 1);
+                    break;
+                }
+                self.next_pci_slot += 1;
+                let mut port = RootPort::new(slot, i as u8, port_ids, self.intx.pin(slot, 1), self.msi.clone());
+                if let Some(k) = hot.iter().position(|(p, _)| *p == i) {
+                    let (_, dev) = hot.remove(k);
+                    let f = hotplug::function_in(slot, i, dev, &self.mem, &self.msi, &self.intx);
+                    let pristine = f.lock().unwrap_or_else(|e| e.into_inner()).save()?;
+                    port.plug(f, pristine, true).map_err(|e| Error::Setup(e.into()))?;
+                }
+                ports.push((slot, Arc::new(Mutex::new(port))));
+            }
+            if !hot.is_empty() {
+                return Err(Error::Setup("the snapshot has a device in a hot plug slot this VM doesn't have".into()));
+            }
+        }
+        let root = PciRoot::with_ports(std::mem::take(&mut self.pci), host_ids, ports);
         self.reg.add(layout::PCI_ECAM_BASE, layout::PCI_ECAM_SIZE, Arc::new(Mutex::new(root.ecam_port())))?;
         self.reg.add_concurrent(layout::PCI_MMIO_BASE, layout::PCI_MMIO_SIZE, Arc::new(root.window_port(layout::PCI_MMIO_BASE)))?;
         self.reg.add_concurrent(layout::PCI_MMIO64_BASE, layout::PCI_MMIO64_SIZE, Arc::new(root.window_port(layout::PCI_MMIO64_BASE)))?;
@@ -148,7 +173,7 @@ impl Board {
             ecam_size: layout::PCI_ECAM_SIZE,
             buses: (layout::PCI_ECAM_SIZE >> 20) as u32,
         });
-        Ok(true)
+        Ok(Some(root))
     }
 }
 
@@ -160,11 +185,19 @@ pub(crate) struct Machine {
     pub devices: Vec<StatefulDevice>,
     pub uart: Arc<Mutex<Pl011>>,
     pub agent: Agent,
-    /// The virtio-gpu's control handle (window size, Direct3D state).
-    pub gpu: Option<GpuControl>,
+    /// Each virtio-gpu's control handle (window size, Direct3D state).
+    pub gpus: Vec<GpuControl>,
     pub viewer: Option<ViewerTx>,
-    pub screen: Option<Arc<FbSink>>,
+    /// Every monitor, the first (with the firmware screen) first.
+    pub screens: Vec<Arc<FbSink>>,
     pub boot: BootImage,
+    /// The network adapters built (a resumed VM: the ones it was saved
+    /// with), as the VM file had them: what a later save records.
+    pub nets: Vec<vroom_config::Net>,
+    /// The adapters while the VM runs (and those plugged in since).
+    pub net_ports: Arc<crate::net::NetPorts>,
+    /// The hot plug slots (a VM on PCI).
+    pub hotplug: Option<Arc<Hotplug>>,
 }
 
 /// Registers MMIO devices on the bus and in the snapshot list in one go,
@@ -203,6 +236,22 @@ pub(crate) struct BuildEnv {
     pub state_dir: std::path::PathBuf,
     /// Restoring a snapshot / suspend image rather than cold booting.
     pub resuming: bool,
+    /// The config the snapshot was taken with, when restoring: its
+    /// network adapters are the guest's.
+    pub saved: Option<VmConfig>,
+    /// Network adapters get a control queue (not when the snapshot's had
+    /// none).
+    pub net_ctrl: bool,
+    /// The VMM will lock itself down (what NAT may reach later).
+    pub sandbox: bool,
+    /// Removable shares for USB disks' files (`usb::FILE_SLOTS` on a
+    /// Mac; a resumed VM: as many as it was saved with).
+    pub usb_file_slots: usize,
+    /// A resumed VM's network adapters in hot plug slots: adapter index
+    /// to port.
+    pub hot_nets: std::collections::BTreeMap<usize, usize>,
+    /// Windows' 3D GPU gets memory in BAR 0 (a resumed VM: if it had it).
+    pub gpu3d_vram: bool,
 }
 
 /// What gets loaded into RAM at (re)boot. Kept so reset can reload it.
@@ -272,6 +321,14 @@ fn viewer_socket(state_dir: &std::path::Path) -> std::io::Result<std::os::unix::
 
 /// Host-visible window size for GPU buffers (address space, not memory).
 const GPU_SHM_SIZE: u64 = 8 << 30;
+/// Windows' extra GPUs: the most its 2D driver's framebuffer takes
+/// (16 MiB, `agent::WINDOWS_MAX_PIXELS`), with room. Only what the guest
+/// writes is ever memory.
+const EXTRA_GPU_VRAM: u64 = 32 << 20;
+/// Windows' 3D GPU: when its driver stops (vroom turns it off for a save)
+/// it hands Windows' basic display driver a 1024x768 framebuffer at BAR 0
+/// (3 MiB). Under 16 MiB, which the driver would take as video memory.
+const GPU3D_VRAM: u64 = 8 << 20;
 
 /// Whether the renderer runs in the VMM (`VROOM_GPU_IN_PROCESS=1`, for
 /// debugging, and off macOS) rather than in a GPU process of its own.
@@ -304,6 +361,11 @@ fn in_process(vm: &Arc<dyn Vm>, config: &VmConfig) -> Result<Box<dyn Renderer3d>
         return Err(Error::Setup(NO_VIRGL.into()));
     }
     vroom_gpu3d::set_map_granule(vm.map_granule());
+    // Venus and Direct3D contexts still get processes of their own.
+    #[cfg(target_os = "macos")]
+    if let Err(e) = std::env::current_exe().and_then(|exe| vroom_gpu3d::server::start(&exe)) {
+        log::warn!("gpu: no render server ({e}): Venus runs in here, no Direct3D");
+    }
     let r = vroom_gpu3d::Virgl::new(config.identity.gl_renderer.clone())
         .ok_or_else(|| Error::Setup("virglrenderer: Venus init failed (no Vulkan driver?)".into()))?;
     log::warn!("gpu: the 3D renderer runs inside the VMM (VROOM_GPU_IN_PROCESS)");
@@ -400,6 +462,13 @@ impl ShmMapper for VmShm {
         if gpa == 0 || size == 0 || !gpa.is_multiple_of(size) || gpa.checked_add(size).is_none() {
             return;
         }
+        // Halfway through sizing a 64-bit BAR (all ones in its low half
+        // only) a small BAR sits just under 4 GiB, which is RAM: the
+        // filler went there, and moving it on unmapped the guest's RAM.
+        let inside = |base: u64, len: u64| gpa >= base && gpa + size <= base + len;
+        if !inside(layout::PCI_MMIO_BASE, layout::PCI_MMIO_SIZE) && !inside(layout::PCI_MMIO64_BASE, layout::PCI_MMIO64_SIZE) {
+            return;
+        }
         let mut f = self.filler.lock().unwrap_or_else(|e| e.into_inner());
         let host = match *f {
             Some((old, host, len)) if len == size => {
@@ -426,19 +495,6 @@ impl ShmMapper for VmShm {
         drop(f);
         self.fill(gpa, size);
     }
-}
-
-/// Deterministic MAC per (VM, NIC index), so the guest keeps the same DHCP
-/// identity across boots without storing state. Starts with
-/// `identity.mac_prefix` (default 02: locally administered).
-fn stable_mac(ident: &Identity, name: &str, idx: usize) -> [u8; 6] {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in name.bytes().chain([0, idx as u8]) {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100_0000_01b3);
-    }
-    let b = h.to_le_bytes();
-    ident.mac([b[0], b[1], b[2], b[3], b[4], b[5]])
 }
 
 /// A `*_pci_id` from `[identity]` (the config checked it already).
@@ -507,46 +563,6 @@ fn sound_card(
     }
     Ok(helper)
 }
-
-/// Backend for one NIC, and the MAC the guest must use.
-fn net_backend(
-    vm: &str,
-    ident: &Identity,
-    idx: usize,
-    n: &vroom_config::Net,
-    mac: [u8; 6],
-) -> Result<(Box<dyn NetBackend>, [u8; 6])> {
-    let via_netd = |attach: netd::Attach| -> Result<(Box<dyn NetBackend>, [u8; 6])> {
-        let sock = std::env::var_os("VROOM_NETD_SOCKET")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| netd::DEFAULT_SOCKET.into());
-        let req = netd::Request { version: netd::VERSION, vm: vm.to_string(), nic: idx as u32, attach, mac };
-        let (s, assigned) = netd::attach(&sock, &req).map_err(|e| Error::Setup(e.to_string()))?;
-        let fs = FrameSocket::new(s).map_err(|e| Error::Setup(format!("netd socket: {e}")))?;
-        Ok((Box::new(fs), assigned))
-    };
-    match n.mode()? {
-        NetMode::Nat { port_forwards } => {
-            let mut cfg = NatConfig::new(mac);
-            // Adapter N: the first adapter's /24 plus N (10.0.(2+N).0/24 by
-            // default): two NICs never share a subnet in the guest's
-            // routing table.
-            (cfg.guest, cfg.gateway, cfg.dns) = ident.nat_addrs(idx);
-            cfg.gateway_mac = vroom_config::parse_mac(&ident.nat_gateway_mac)?;
-            cfg.policy = NatPolicy { allow_host_loopback: n.allow_host_loopback, block_private: n.block_private };
-            for p in port_forwards {
-                let ip: std::net::IpAddr =
-                    p.host_addr.parse().map_err(|_| Error::Setup(format!("bad host_addr {}", p.host_addr)))?;
-                cfg.forwards.push(TcpForward { host: (ip, p.host_port).into(), guest_port: p.guest_port });
-            }
-            let nat = Nat::new(cfg).map_err(|e| Error::Setup(format!("nat: {e}")))?;
-            Ok((Box::new(nat), mac))
-        }
-        NetMode::Bridged { interface } => via_netd(netd::Attach::Bridged { interface }),
-        NetMode::HostOnly { network } => via_netd(netd::Attach::HostOnly { network }),
-    }
-}
-
 fn read_file(p: &std::path::Path, what: &str, max: u64) -> Result<Vec<u8>> {
     let meta = std::fs::metadata(p).map_err(|e| Error::Setup(format!("{what} {}: {e}", p.display())))?;
     if meta.len() > max {
@@ -659,24 +675,62 @@ pub(crate) fn build(
 
     // Display. UEFI always gets ramfb (firmware / installer screen);
     // virtio-gpu takes over once a guest driver drives it.
+    // Several monitors: Linux gets one GPU with a scanout each; Windows
+    // a GPU each (its drivers drive one scanout; the others 2D), added
+    // last so the other devices keep their PCI slots.
     let uefi = matches!(config.boot, Boot::Uefi { .. });
-    let screen = if config.display.gpu != Gpu::None || uefi {
-        Some(match &ui {
-            Some(ds) => ds.sink()?,
-            None => FbSink::headless()?,
-        })
-    } else {
-        None
-    };
-    let mut gpu_ctl = None;
-    if let (Some(fb), true) = (&screen, config.display.gpu != Gpu::None) {
-        let sink: Arc<dyn DisplaySink> = fb.clone();
-        let (mut gpu, ctl) = GpuDev::new(config.display.width, config.display.height, sink);
-        if config.display.gpu == Gpu::Virtio3d {
-            gpu = gpu.with_3d(three_d(&vm, config, &mem, &env.state_dir)?);
+    let monitors = if config.display.gpu == Gpu::None { 1 } else { config.display.monitors.clamp(1, vroom_config::MAX_MONITORS) as usize };
+    let screens: Vec<Arc<FbSink>> = if config.display.gpu != Gpu::None || uefi {
+        match &ui {
+            Some(ds) => ds.sinks(monitors)?,
+            None => FbSink::headless(monitors)?,
         }
-        board.add_virtio(Box::new(gpu))?;
-        gpu_ctl = Some(ctl);
+    } else {
+        Vec::new()
+    };
+    let screen = screens.first().cloned();
+    let mut gpus = Vec::new();
+    let mut heads: Vec<(GpuControl, usize)> = Vec::new();
+    let mut later_gpus = Vec::new();
+    if config.display.gpu != Gpu::None {
+        let size = (config.display.width, config.display.height);
+        let sinks: Vec<Arc<dyn DisplaySink>> = screens.iter().map(|s| s.clone() as Arc<dyn DisplaySink>).collect();
+        let per_gpu = if config.guest_os() == GuestOs::Windows { 1 } else { sinks.len() };
+        for (n, group) in sinks.chunks(per_gpu).enumerate() {
+            let (gpu, ctl) = GpuDev::with_heads(&vec![size; group.len()], group.to_vec());
+            let mut gpu = gpu.with_index(n as u16);
+            // Windows' extra GPUs stay 2D: Direct3D can't share frames
+            // between two 3D GPUs (cross-adapter surfaces), so Windows
+            // draws on the first and copies to the others.
+            if config.display.gpu == Gpu::Virtio3d && n == 0 {
+                gpu = gpu.with_3d(three_d(&vm, config, &mem, &env.state_dir)?);
+                if config.guest_os() == GuestOs::Windows && env.gpu3d_vram {
+                    gpu = gpu.with_vram(Arc::new(VmShm { vm: vm.clone(), filler: Mutex::new(None) }), GPU3D_VRAM);
+                }
+            }
+            if n > 0 {
+                // Room for the framebuffer Windows' 2D driver clears.
+                gpu = gpu.with_vram(Arc::new(VmShm { vm: vm.clone(), filler: Mutex::new(None) }), EXTRA_GPU_VRAM);
+            }
+            heads.extend((0..group.len()).map(|sid| (ctl.clone(), sid)));
+            gpus.push(ctl);
+            if n == 0 {
+                board.add_virtio(Box::new(gpu))?;
+            } else {
+                later_gpus.push(gpu);
+            }
+        }
+    }
+    // Hardware video decoding: a V4L2 decoder whose work happens in the
+    // video helper (VideoToolbox, sandboxed on its own).
+    // Encoding: a second device, a V4L2 encoder, and a helper of its own.
+    use vroom_virtio::devices::media::{Media, Role};
+    for (on, role) in [(config.display.video_decode, Role::Decoder), (config.display.video_encode, Role::Encoder)] {
+        if on {
+            let (window, window_mem) = crate::video::Window::new(vm.clone())?;
+            let (helper, codecs) = crate::video::Helper::spawn(&window_mem, role)?;
+            board.add_virtio(Box::new(Media::new(helper, codecs, window_mem, window, role)))?;
+        }
     }
     // Input: virtio-input for direct-boot Linux, USB HID otherwise (UEFI,
     // Windows setup: works with zero drivers). Never both: no doubled keys.
@@ -684,6 +738,7 @@ pub(crate) fn build(
     // helper process (started here, before the sandbox).
     let mut input = None;
     let mut xhci = None;
+    let mut usb_ports = None;
     // The camera: a USB device on the xHCI, fed by its helper.
     let camera = if config.camera {
         let feed = Arc::new(vroom_devices::usb::uvc::CameraFeed::default());
@@ -696,7 +751,12 @@ pub(crate) fn build(
         let mut helpers = Vec::new();
         let mut links = Vec::new();
         for u in &config.usb {
-            let (h, link) = crate::usb::spawn(u)?;
+            if u.mode != vroom_config::UsbMode::Device {
+                // The app does those: it opens the disk or the volume.
+                log::info!("usb {}: as {}, connected by the app when it shows this VM", u.id, u.mode.as_str());
+                continue;
+            }
+            let (h, link) = crate::usb::spawn(&config.name, u)?;
             helpers.push(h);
             links.push(link);
         }
@@ -713,9 +773,8 @@ pub(crate) fn build(
             x
         })?;
         if let Some(x) = &xhci {
-            for (i, h) in helpers.into_iter().enumerate() {
-                h.run(i, x.clone())?;
-            }
+            let viewer = ui.as_ref().map(|d| d.tx());
+            usb_ports = Some(crate::usb::UsbPorts::new(x.clone(), helpers, viewer)?);
             if let Some((c, _)) = &camera {
                 c.run(x.clone())?;
             }
@@ -743,8 +802,45 @@ pub(crate) fn build(
     };
     let max_pixels = if config.guest_os() == GuestOs::Windows { agent::WINDOWS_MAX_PIXELS } else { 0 };
     let viewer = ui.as_ref().map(|d| d.tx());
-    let screen_ctl = agent::Screen { gpu: gpu_ctl.clone(), max_pixels, gpu3d: config.display.gpu == Gpu::Virtio3d, viewer: viewer.clone() };
+    let screen_ctl = agent::Screen { heads, max_pixels, gpu3d: config.display.gpu == Gpu::Virtio3d, viewer: viewer.clone() };
     let agent = agent::spawn(host_end, config.clipboard.clone(), clipboard, screen_ctl)?;
+    // Network adapters (right after the console: the device order is the
+    // guest's layout). The viewer can change them while the VM runs.
+    let planned = crate::net::plan(config, env.saved.as_ref())?;
+    let reach = crate::net::Reach::of(planned.iter().map(|p| &p.net), env.sandbox);
+    let mut nics = Vec::new();
+    let mut nets = Vec::new();
+    for (i, p) in planned.into_iter().enumerate() {
+        let (backend, mac) = crate::net::boot_backend(&config.name, ident, i, &p.net, p.mac, reach.dns)?;
+        let live = crate::net::live_of(&p.net)?;
+        let mut dev = Net::with_link(&format!("eth{i}"), mac, backend, &crate::net::label(&live), p.net.connected && !p.removed);
+        if !env.net_ctrl {
+            dev = dev.without_ctrl();
+        }
+        let port = env.hot_nets.get(&i).copied();
+        nics.push(crate::net::Nic::new(dev.control(), live, p.net.clone(), port));
+        match port {
+            Some(port) if board.use_pci => board.hot.push((port, Box::new(dev))),
+            Some(_) => return Err(Error::Setup("the snapshot has an adapter in a hot plug slot, and this VM isn't on PCI".into())),
+            None => board.add_virtio(Box::new(dev))?,
+        }
+        nets.push(p.net);
+    }
+    // Removable shares for USB disks' files (no hotplug: there from the
+    // start; a resumed VM has as many as it was saved with).
+    let mut usb_files = Vec::new();
+    if let Some(u) = &usb_ports {
+        let mut slots = Vec::new();
+        for i in 0..env.usb_file_slots {
+            let tag = format!("{}{i}", vroom_config::USB_SHARE_PREFIX);
+            let (fs, slot) = Fs::removable(&tag).map_err(|e| Error::Setup(e.to_string()))?;
+            usb_files.push(fs);
+            slots.push((tag, slot));
+        }
+        u.set_files(slots, agent.clone());
+        crate::usb::test_seam(u);
+    }
+    let net_ports = crate::net::NetPorts::new(nics, viewer.clone(), reach, ident.clone(), env.net_ctrl);
     if let Some(ds) = ui {
         if screen.is_none() {
             return Err(Error::Setup("a viewer needs a display (display.gpu or UEFI boot)".into()));
@@ -766,25 +862,31 @@ pub(crate) fn build(
             }) as Box<dyn Fn(bool) + Send + Sync>
         });
         // A viewer can come back (the app crashed, then started again).
-        let listener = match (viewer_socket(&env.state_dir), &screen) {
-            (Ok(l), Some(fb)) => Some((l, fb.clone())),
-            (Err(e), _) => {
+        let listener = match viewer_socket(&env.state_dir) {
+            Ok(l) => Some(l),
+            Err(e) => {
                 log::warn!("display: no viewer socket in the state dir ({e}): a window lost can't be reopened");
                 None
             }
-            _ => None,
         };
-        ds.run(input, agent.clone(), events.clone(), window, listener)?;
+        let windows = config.guest_os() == GuestOs::Windows;
+        ds.run(input, agent.clone(), events.clone(), window, listener, screens.clone(), windows, usb_ports, Some(net_ports.clone()))?;
     }
-    for (i, n) in config.nets.iter().enumerate() {
-        let mac = match &n.mac {
-            Some(m) => vroom_config::parse_mac(m)?,
-            None => stable_mac(ident, &config.name, i),
-        };
-        let (backend, mac) = net_backend(&config.name, ident, i, n, mac)?;
-        board.add_virtio(Box::new(Net::new(&format!("eth{i}"), mac, backend)))?;
+    for gpu in later_gpus {
+        board.add_virtio(Box::new(gpu))?;
     }
-    let need_pci = board.finish_pci(vendor_ids(&ident.pci_bridge_id)?)?;
+    // Last, so the devices before keep their places in VMs made before.
+    for fs in usb_files {
+        board.add_virtio(Box::new(fs))?;
+    }
+    let root = board.finish_pci(vendor_ids(&ident.pci_bridge_id)?, vendor_ids(&ident.pcie_port_id)?)?;
+    let need_pci = root.is_some();
+    let hotplug = root
+        .filter(|r| r.ports() > 0)
+        .map(|r| Hotplug::new(r, mem.clone(), board.msi.clone(), board.intx.clone()));
+    if let Some(h) = &hotplug {
+        net_ports.set_hotplug(h.clone());
+    }
     let Board { mut reg, fdt: mut fdt_devices, .. } = board;
     if config.tpm {
         let backend = crate::tpm::Swtpm::start(&env.state_dir.join("tpm"), !env.resuming)?;
@@ -887,7 +989,7 @@ pub(crate) fn build(
     let _ = shared.peers.set(vcpus.iter().map(|v| v.peer.clone()).collect());
     vm.finalize()?;
 
-    Ok(Machine { vm, mem, shared, vcpus, devices: reg.stateful, uart, agent, gpu: gpu_ctl, viewer, screen, boot })
+    Ok(Machine { vm, mem, shared, vcpus, devices: reg.stateful, uart, agent, gpus, viewer, screens, boot, nets, net_ports, hotplug })
 }
 
 #[cfg(test)]
@@ -896,13 +998,13 @@ mod tests {
 
     #[test]
     fn macs_and_pci_ids_from_identity() {
-        let mut ident = Identity::default();
+        let mut ident = vroom_config::Identity::default();
         // Same MAC as before mac_prefix existed: 02 then five hash bytes.
-        let m = stable_mac(&ident, "dev", 0);
+        let m = ident.nic_mac("dev", 0);
         assert_eq!(m[0], 0x02);
-        assert_ne!(stable_mac(&ident, "dev", 1), m);
+        assert_ne!(ident.nic_mac("dev", 1), m);
         ident.mac_prefix = "00:1b:21".into();
-        let v = stable_mac(&ident, "dev", 0);
+        let v = ident.nic_mac("dev", 0);
         assert_eq!((&v[..3], &v[3..]), (&[0x00, 0x1b, 0x21][..], &m[1..4]));
         let ids = vendor_ids(&ident.nvme_pci_id).unwrap();
         assert_eq!(ids, VendorIds { vendor: 0x1b36, device: 0x0010, subsys_vendor: 0x1b36, subsys: 0 });

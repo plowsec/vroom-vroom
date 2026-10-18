@@ -3,6 +3,7 @@ name = "vroom-fuzz"
 description = "Optional snapshot fuzzer and coverage laboratory for vroom"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [[bin]]

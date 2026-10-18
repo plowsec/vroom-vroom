@@ -55,6 +55,19 @@ pub trait VirtioDevice: Send {
     }
     /// The transport placed region `id` at guest physical `gpa`.
     fn set_shm_base(&mut self, _id: u8, _gpa: u64) {}
+    /// The first shared memory region goes in BAR 0, the virtio registers
+    /// in BAR 2 (the usual way round is the other), or in BAR 4 with a
+    /// second region in BAR 2. Windows' GPU drivers take BAR 0 for a
+    /// framebuffer they write with stores the hypervisor can't decode
+    /// (see `Gpu::with_vram`).
+    fn pci_shm_first(&self) -> bool {
+        false
+    }
+    /// PCI subsystem id. Devices of a kind that come several times may
+    /// number themselves (the Windows guest agent tells GPUs apart so).
+    fn pci_subsystem(&self) -> u16 {
+        0x1100
+    }
     /// Driver kicked `queue`. Called on a vCPU thread: keep it cheap.
     fn queue_notify(&mut self, queue: u16);
     /// Device reset by the driver: stop everything, forget queues.

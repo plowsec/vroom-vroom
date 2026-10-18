@@ -38,6 +38,7 @@ pub mod types {
     pub const INPUT: u32 = 18;
     pub const VSOCK: u32 = 19;
     pub const SOUND: u32 = 25;
+    pub const MEDIA: u32 = 48;
 }
 
 #[derive(Debug, thiserror::Error)]

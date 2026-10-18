@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::desc::{Config, Endpoint};
-use crate::proto::{self, Done, Event, Request, Speed, Status, Submit, XferType, MAX_INFLIGHT};
+use crate::proto::{self, Done, Event, IsoDone, IsoSubmit, Request, Speed, Status, Submit, XferType, MAX_INFLIGHT};
 
 /// Where completions and attach/detach notices go (to the VMM).
 pub type Sink = Sender<Event>;
@@ -26,6 +26,9 @@ pub trait Device: Send {
     /// Start a transfer. Its completion goes to the sink, later or
     /// right away; an error here means it never started.
     fn submit(&mut self, s: Submit) -> Result<(), Status>;
+    /// Start an isochronous transfer, the same way (its completion is an
+    /// [`Event::IsoDone`]).
+    fn submit_iso(&mut self, s: IsoSubmit) -> Result<(), Status>;
     /// Stop a transfer; its completion (Cancelled, or done after all)
     /// still comes.
     fn cancel(&mut self, id: u32);
@@ -92,13 +95,16 @@ impl Session {
     /// One request from the VMM. `dev` is None while nothing is plugged in.
     pub fn request(&mut self, dev: Option<&mut (dyn Device + '_)>, r: Request) {
         let Some(dev) = dev else {
-            if let Request::Submit(s) = r {
-                self.done(s.id, Status::NoDevice);
+            match r {
+                Request::Submit(s) => self.done(s.id, Status::NoDevice),
+                Request::IsoSubmit(s) => self.iso_done(s.id, Status::NoDevice),
+                _ => {}
             }
             return;
         };
         match r {
             Request::Submit(s) => self.submit(dev, s),
+            Request::IsoSubmit(s) => self.submit_iso(dev, s),
             Request::Cancel { id } => dev.cancel(id),
             Request::Reset => {
                 if let Err(e) = dev.reset() {
@@ -109,6 +115,37 @@ impl Session {
         }
     }
 
+    fn iso_done(&self, id: u32, status: Status) {
+        let _ = self.sink.send(Event::IsoDone(IsoDone::failed(id, status)));
+    }
+
+    /// Isochronous: an endpoint of that type in use, and no packet
+    /// larger than it moves per interval.
+    fn submit_iso(&mut self, dev: &mut dyn Device, s: IsoSubmit) {
+        let id = s.id;
+        if dev.in_flight() >= MAX_INFLIGHT || dev.busy(id) {
+            log::debug!("usb: transfer {id} refused (too many, or id in use)");
+            return self.iso_done(id, Status::Error);
+        }
+        let r = match self.endpoint(s.ep) {
+            Some(Endpoint { kind: Some(XferType::Iso), per_interval, .. }) => {
+                if s.packets.iter().all(|&n| n <= per_interval) {
+                    dev.submit_iso(s)
+                } else {
+                    log::debug!("usb: transfer {id}: packets larger than endpoint {:#x} takes ({per_interval})", s.ep);
+                    Err(Status::Error)
+                }
+            }
+            _ => {
+                log::debug!("usb: transfer {id} for endpoint {:#x} (isochronous), not in use", s.ep);
+                Err(Status::Stall)
+            }
+        };
+        if let Err(st) = r {
+            self.iso_done(id, st);
+        }
+    }
+
     fn submit(&mut self, dev: &mut dyn Device, s: Submit) {
         let id = s.id;
         if dev.in_flight() >= MAX_INFLIGHT || dev.busy(id) {
@@ -116,6 +153,8 @@ impl Session {
             return self.done(id, Status::Error);
         }
         let r = match s.kind {
+            // Isochronous has its own request.
+            XferType::Iso => Err(Status::Error),
             XferType::Control => match self.standard(dev, &s) {
                 Some(r) => r.map(|_| self.done(id, Status::Ok)),
                 None => dev.submit(s),
@@ -182,6 +221,9 @@ impl Session {
 struct Shared {
     dev: Option<Box<dyn Device>>,
     session: Session,
+    /// The VMM went away: the watcher ends too (the helper may be a
+    /// thread of a longer-lived process, the VMM's own for a disk).
+    stop: bool,
 }
 
 /// Serve the VMM on `sock` until it goes away. The device comes and goes
@@ -196,11 +238,14 @@ pub fn serve(sock: UnixStream, mut opener: Box<dyn Opener>) -> io::Result<()> {
             }
         }
     })?;
-    let shared = Arc::new(Mutex::new(Shared { dev: None, session: Session::new(tx.clone()) }));
+    let shared = Arc::new(Mutex::new(Shared { dev: None, session: Session::new(tx.clone()), stop: false }));
     let watch = shared.clone();
     std::thread::Builder::new().name("usb-watch".into()).spawn(move || loop {
         {
             let mut s = watch.lock().unwrap_or_else(|e| e.into_inner());
+            if s.stop {
+                break;
+            }
             let gone = s.dev.as_ref().is_some_and(|d| d.gone());
             if s.dev.is_some() && (gone || !opener.present()) {
                 log::info!("usb: device unplugged");
@@ -223,7 +268,7 @@ pub fn serve(sock: UnixStream, mut opener: Box<dyn Opener>) -> io::Result<()> {
         match proto::read_request(&mut r) {
             Ok(Some(req)) => {
                 let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
-                let Shared { dev, session } = &mut *s;
+                let Shared { dev, session, .. } = &mut *s;
                 session.request(dev.as_deref_mut(), req);
             }
             Ok(None) => break Ok(()),
@@ -231,7 +276,9 @@ pub fn serve(sock: UnixStream, mut opener: Box<dyn Opener>) -> io::Result<()> {
         }
     };
     // Let go of the device (release interfaces, close) before exiting.
-    shared.lock().unwrap_or_else(|e| e.into_inner()).dev = None;
+    let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
+    s.stop = true;
+    s.dev = None;
     res
 }
 
@@ -310,5 +357,123 @@ mod tests {
         }
         let d = done(&rx);
         assert_eq!((d.id, d.status), (MAX_INFLIGHT as u32 + 1, Status::Error));
+    }
+}
+
+#[cfg(test)]
+mod iso_tests {
+    use super::*;
+    use crate::fake::{Audio, FakeKind, FakeOpener};
+    use crate::proto::IsoPacket;
+
+    const SET_CONFIG: [u8; 8] = [0, SET_CONFIGURATION, 1, 0, 0, 0, 0, 0];
+
+    fn set_alt(iface: u8, alt: u8) -> [u8; 8] {
+        [1, SET_INTERFACE, alt, 0, iface, 0, 0, 0]
+    }
+
+    fn iso(id: u32, ep: u8, packets: Vec<u32>) -> Request {
+        let data = if ep & 0x80 != 0 { Vec::new() } else { vec![1; packets.iter().sum::<u32>() as usize] };
+        Request::IsoSubmit(IsoSubmit { id, ep, packets, data })
+    }
+
+    fn iso_done(rx: &mpsc::Receiver<Event>) -> IsoDone {
+        match rx.try_recv() {
+            Ok(Event::IsoDone(d)) => d,
+            other => panic!("expected an isochronous completion, got {other:?}"),
+        }
+    }
+
+    fn done(rx: &mpsc::Receiver<Event>) -> Done {
+        match rx.try_recv() {
+            Ok(Event::Done(d)) => d,
+            other => panic!("expected a completion, got {other:?}"),
+        }
+    }
+
+    /// Samples the pretend microphone sent: they count up by one.
+    fn check_ramp(data: &[u8], from: u16) -> u16 {
+        let mut want = from;
+        for c in data.as_chunks::<2>().0 {
+            assert_eq!(u16::from_le_bytes([c[0], c[1]]), want);
+            want = want.wrapping_add(1);
+        }
+        want
+    }
+
+    #[test]
+    fn checks_isochronous_requests() {
+        let (tx, rx) = mpsc::channel();
+        let mut dev = Audio::new(tx.clone(), 0x1209, 0x0002, false);
+        let mut s = Session::new(tx);
+        // Not configured: no such endpoint.
+        s.request(Some(&mut dev), iso(1, 0x82, vec![96]));
+        assert_eq!(iso_done(&rx).status, Status::Stall);
+        s.request(Some(&mut dev), Request::Submit(Submit::control(2, SET_CONFIG, vec![])));
+        assert_eq!(done(&rx).status, Status::Ok);
+        // Alternate setting 0 has no endpoint.
+        s.request(Some(&mut dev), iso(3, 0x82, vec![96]));
+        assert_eq!(iso_done(&rx).status, Status::Stall);
+        s.request(Some(&mut dev), Request::Submit(Submit::control(4, set_alt(2, 1), vec![])));
+        assert_eq!(done(&rx).status, Status::Ok);
+        s.request(Some(&mut dev), iso(5, 0x82, vec![96, 96, 40, 0]));
+        let d = iso_done(&rx);
+        let ok = |actual| IsoPacket { status: Status::Ok, actual };
+        assert_eq!((d.status, d.packets.clone()), (Status::Ok, vec![ok(96), ok(96), ok(40), ok(0)]));
+        assert_eq!(check_ramp(&d.data, 0), 116);
+        // A packet larger than the endpoint moves per frame (100).
+        s.request(Some(&mut dev), iso(6, 0x82, vec![96, 101]));
+        assert_eq!(iso_done(&rx).status, Status::Error);
+        // Isochronous dressed as a plain transfer.
+        s.request(Some(&mut dev), Request::Submit(Submit { id: 7, ep: 0x82, kind: XferType::Iso, setup: [0; 8], len: 96, data: vec![], zero_packet: false }));
+        assert_eq!(done(&rx).status, Status::Error);
+        // Speakers: once their alternate setting is on.
+        s.request(Some(&mut dev), iso(8, 0x01, vec![192; 2]));
+        assert_eq!(iso_done(&rx).status, Status::Stall);
+        s.request(Some(&mut dev), Request::Submit(Submit::control(9, set_alt(1, 1), vec![])));
+        assert_eq!(done(&rx).status, Status::Ok);
+        s.request(Some(&mut dev), iso(10, 0x01, vec![192, 200]));
+        let d = iso_done(&rx);
+        assert_eq!((d.packets, d.data.len()), (vec![ok(192), ok(200)], 0));
+        assert_eq!(dev.played, 392);
+        // Unplugged.
+        s.request(None, iso(11, 0x01, vec![192]));
+        assert_eq!(iso_done(&rx).status, Status::NoDevice);
+    }
+
+    /// The whole helper over its socket, the pretend sound card in real
+    /// time: transfers queued ahead complete in order, one packet per
+    /// millisecond, with the samples in sequence across them.
+    #[test]
+    fn isochronous_over_the_socket() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        std::thread::spawn(move || serve(theirs, Box::new(FakeOpener::new(FakeKind::Audio, 0x1209, 0x0002, None))));
+        ours.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut r = io::BufReader::new(ours.try_clone().unwrap());
+        let mut w = ours;
+        let mut next = || proto::read_event(&mut r).unwrap().expect("helper still there");
+        assert!(matches!(next(), Event::Attached { speed: Speed::Full, vendor: 0x1209, product: 0x0002 }));
+        for (id, setup) in [(1, SET_CONFIG), (2, set_alt(2, 1))] {
+            w.write_all(&Request::Submit(Submit::control(id, setup, vec![])).encode()).unwrap();
+            assert!(matches!(next(), Event::Done(Done { status: Status::Ok, .. })));
+        }
+        let t0 = std::time::Instant::now();
+        for id in 10..13 {
+            w.write_all(&iso(id, 0x82, vec![96; 10]).encode()).unwrap();
+        }
+        let mut ramp = 0;
+        for id in 10..13 {
+            let Event::IsoDone(d) = next() else { panic!("expected a completion") };
+            assert_eq!((d.id, d.status, d.packets.len()), (id, Status::Ok, 10));
+            ramp = check_ramp(&d.data, ramp);
+        }
+        assert_eq!(ramp, 3 * 10 * 48);
+        let took = t0.elapsed();
+        assert!(took >= Duration::from_millis(29), "30 frames took {took:?}");
+        // A long one, cancelled.
+        w.write_all(&iso(20, 0x82, vec![96; 100]).encode()).unwrap();
+        w.write_all(&Request::Cancel { id: 20 }.encode()).unwrap();
+        let Event::IsoDone(d) = next() else { panic!("expected a completion") };
+        assert_eq!((d.id, d.status), (20, Status::Cancelled));
     }
 }

@@ -1008,6 +1008,8 @@ fn run() -> Result<(), String> {
             clipboard: None,
             ui: Some(vmm_viewer),
             state_dir,
+            // The lab doesn't sandbox the VMM it drives.
+            sandbox: false,
         },
     )
     .map_err(|e| e.to_string())?;
@@ -1087,7 +1089,7 @@ fn run() -> Result<(), String> {
                     if stop.reason == vroom_hv::debug::DebugReason::Breakpoint {
                         let regs = session.registers(stop.cpu as usize, false)?;
                         let user_hit = session.breakpoints.contains(&stop.pc)
-                            && session.breakpoint_contexts.get(&stop.pc).is_none_or(|p| {
+                            && session.breakpoint_contexts.get(&stop.pc).map_or(true, |p| {
                                 p.directory_table & 0x0000_ffff_ffff_f000
                                     == regs.ttbr0 & 0x0000_ffff_ffff_f000
                             });

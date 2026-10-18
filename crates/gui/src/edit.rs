@@ -65,6 +65,9 @@ pub fn set(c: &mut VmConfig, key: &str, v: &str, default_iface: Option<&str>) ->
         ["width"] => c.display.width = num(v, "width")?,
         ["height"] => c.display.height = num(v, "height")?,
         ["hidpi"] => c.display.hidpi = bool_of(v)?,
+        ["monitors"] => c.display.monitors = num(v, "monitors")?,
+        ["video_decode"] => c.display.video_decode = bool_of(v)?,
+        ["video_encode"] => c.display.video_encode = bool_of(v)?,
         ["clip", "in"] => c.clipboard.host_to_guest = bool_of(v)?,
         ["clip", "out"] => c.clipboard.guest_to_host = bool_of(v)?,
         ["clip", "max"] => c.clipboard.max_bytes = num::<u32>(v, "size")?.saturating_mul(1024),
@@ -130,7 +133,7 @@ pub fn set(c: &mut VmConfig, key: &str, v: &str, default_iface: Option<&str>) ->
                     let mode = [NetKind::Nat, NetKind::Bridged, NetKind::HostOnly][choice(v, 3, "network mode")?];
                     if mode != n.mode {
                         // Keep only what the new mode takes.
-                        *n = Net { mode, mac: n.mac.take(), ..empty_net() };
+                        *n = Net { mode, mac: n.mac.take(), connected: n.connected, ..empty_net() };
                         match mode {
                             NetKind::Bridged => n.interface = Some(default_iface.unwrap_or("en0").to_string()),
                             NetKind::HostOnly => n.network = Some("lab".into()),
@@ -142,6 +145,7 @@ pub fn set(c: &mut VmConfig, key: &str, v: &str, default_iface: Option<&str>) ->
                 "network" => n.network = Some(v.trim().to_string()),
                 "loopback" => n.allow_host_loopback = bool_of(v)?,
                 "block" => n.block_private = bool_of(v)?,
+                "connected" => n.connected = bool_of(v)?,
                 "mac" => n.mac = Some(v.trim().to_ascii_lowercase()).filter(|m| !m.is_empty()),
                 _ => return Err(format!("unknown setting {key}")),
             }
@@ -164,6 +168,24 @@ pub fn set(c: &mut VmConfig, key: &str, v: &str, default_iface: Option<&str>) ->
                 _ => return Err(format!("unknown setting {key}")),
             }
         }
+        // How a USB disk goes to the guest ("device", "files", "disk").
+        ["usb", i, f] => {
+            let i = idx(&mut c.usb, i, "USB device")?;
+            let u = &mut c.usb[i];
+            match *f {
+                // The settings page sends its choice's number.
+                "mode" => {
+                    u.mode = match v {
+                        "0" => vroom_config::UsbMode::Files,
+                        "1" => vroom_config::UsbMode::Disk,
+                        "2" => vroom_config::UsbMode::Device,
+                        v => vroom_config::UsbMode::parse(v).ok_or_else(|| format!("unknown USB mode {v:?}"))?,
+                    }
+                }
+                "readonly" => u.readonly = bool_of(v)?,
+                _ => return Err(format!("unknown setting {key}")),
+            }
+        }
         _ => return Err(format!("unknown setting {key}")),
     }
     Ok(())
@@ -178,6 +200,7 @@ fn empty_net() -> Net {
         allow_host_loopback: false,
         block_private: false,
         mac: None,
+        connected: true,
     }
 }
 
@@ -255,7 +278,7 @@ pub fn add_usb(c: &mut VmConfig, id: &str, serial: Option<&str>, name: Option<&s
     if c.usb.iter().any(|u| u.id == id && u.serial == serial) {
         return Err("That device is already in the list".into());
     }
-    c.usb.push(Usb { id: id.to_string(), serial, name });
+    c.usb.push(Usb { id: id.to_string(), serial, name, mode: Default::default(), readonly: false });
     Ok(())
 }
 
@@ -663,11 +686,14 @@ gpu = "virtio2d"
         ("nested", "true"),
         ("os", "1"),
         ("gpu", "2"),
+        ("monitors", "2"),
         ("opengl", "false"),
         ("opengl_host", "1"),
         ("width", "1600"),
         ("height", "900"),
         ("hidpi", "false"),
+        ("video_decode", "true"),
+        ("video_encode", "true"),
         ("disk.0.bus", "1"),
         ("disk.0.readonly", "true"),
         ("disk.0.sync", "0"),
@@ -677,6 +703,7 @@ gpu = "virtio2d"
         ("net.0.fwd.0.lan", "true"),
         ("net.0.loopback", "true"),
         ("net.0.block", "true"),
+        ("net.0.connected", "false"),
         ("net.0.mac", "52:54:00:aa:bb:cc"),
         ("share.0.tag", "work"),
         ("share.0.writable", "true"),
@@ -756,7 +783,7 @@ gpu = "virtio2d"
             match call {
                 "set" => assert!(UI_SETS.iter().any(|(k, _)| k == &key), "Bus.set({key:?}) not tested"),
                 "act" => assert!(
-                    UI_ACTS.contains(&key) || ["disk.add-new", "disk.add-existing", "disk.add-iso", "share.add", "usb.add", "edit-file"].contains(&key),
+                    UI_ACTS.contains(&key) || ["disk.add-new", "disk.add-existing", "disk.add-iso", "share.add", "usb.add", "edit-file", "netd.setup", "netd.remove"].contains(&key),
                     "Bus.act({key:?}) not tested"
                 ),
                 _ => {}

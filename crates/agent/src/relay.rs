@@ -4,8 +4,9 @@
 //! unprivileged helper in the console session, over a local pipe.
 //!
 //! The helper is less trusted than the service: it may only send
-//! clipboard text and answers about dropped files towards the host,
-//! size-capped like everything else.
+//! clipboard text, answers about dropped files and files dragged out of
+//! the guest towards the host, size-capped like everything else (the
+//! host checks those again).
 
 use std::io::{self, Write};
 use std::sync::mpsc::Receiver;
@@ -31,9 +32,30 @@ pub trait System {
     fn shutdown(&mut self, reboot: bool);
     /// Turn the 3D display device on or off; whether it is on now.
     fn gpu3d(&mut self, on: bool) -> Option<bool>;
+    /// A USB disk's files came to removable share `tag` (`on`), or left.
+    fn usb_share(&mut self, tag: &str, label: &str, on: bool);
+    /// A new host: forget what the last one shared.
+    fn usb_reset(&mut self) {}
+    /// Whether updates can be installed here (update.rs).
+    fn can_update(&self) -> bool {
+        false
+    }
+    /// A frame of an update from the host; the answer once it is in (or
+    /// failed).
+    fn update(&mut self, _m: Message) -> Option<Message> {
+        None
+    }
 }
 
-pub struct RealSystem;
+pub struct RealSystem {
+    updater: crate::update::Updater,
+}
+
+impl Default for RealSystem {
+    fn default() -> RealSystem {
+        RealSystem { updater: crate::update::Updater::new(crate::update::root()) }
+    }
+}
 
 impl System for RealSystem {
     fn set_time(&mut self, secs: u64, nanos: u32) {
@@ -45,7 +67,23 @@ impl System for RealSystem {
         crate::sys::shutdown(reboot);
     }
     fn gpu3d(&mut self, on: bool) -> Option<bool> {
+        // The host has 3D: the first GPU wants the 3D driver.
+        if on {
+            crate::sys::gpu_drivers(true);
+        }
         crate::sys::gpu3d(on)
+    }
+    fn usb_share(&mut self, tag: &str, label: &str, on: bool) {
+        crate::shares::usb_share(tag, label, on);
+    }
+    fn usb_reset(&mut self) {
+        crate::shares::usb_reset();
+    }
+    fn can_update(&self) -> bool {
+        crate::can_update(crate::Role::Service)
+    }
+    fn update(&mut self, m: Message) -> Option<Message> {
+        self.updater.handle(m, crate::update::apply)
     }
 }
 
@@ -56,17 +94,19 @@ pub struct Relay<S: System> {
     /// The host's last resolution and scale: a helper that starts later
     /// (logon) gets them, so the desktop matches the window right away.
     display: (Option<Message>, Option<Message>),
+    /// The host's window is in Coherence: a later helper starts it too.
+    coherence: bool,
 }
 
 impl<S: System> Relay<S> {
     pub fn new(sys: S, max: usize) -> Self {
-        Relay { sys, helper: None, max, display: (None, None) }
+        Relay { sys, helper: None, max, display: (None, None), coherence: false }
     }
 
     /// Serve one host connection until it goes away. Helper state
     /// survives, so a reconnecting host finds the helper still there.
     pub fn run(&mut self, host: &mut Writer, rx: &Receiver<Ev>) -> io::Result<()> {
-        host.write_all(&crate::hello().encode())?;
+        host.write_all(&crate::hello(self.sys.can_update()).encode())?;
         let mut dec = Decoder::new(self.max + 64);
         loop {
             match rx.recv().map_err(|_| io::Error::other("event channel closed"))? {
@@ -83,9 +123,17 @@ impl<S: System> Relay<S> {
                 Ev::HostGone => return Err(io::Error::other("port closed")),
                 Ev::HelperUp(id, w) => {
                     log::info!("session helper {id} connected");
+                    // A helper it replaces (started twice in a session)
+                    // leaves Coherence, or two would fight over the taskbar.
+                    if self.coherence {
+                        self.send_helper(&Message::Coherence { on: false });
+                    }
                     self.helper = Some((id, w, Decoder::new(self.max + 64)));
                     for m in [self.display.0.clone(), self.display.1.clone()].into_iter().flatten() {
                         self.send_helper(&m);
+                    }
+                    if self.coherence {
+                        self.send_helper(&Message::Coherence { on: true });
                     }
                 }
                 Ev::Helper(id, b) => self.on_helper(id, &b, host)?,
@@ -93,6 +141,10 @@ impl<S: System> Relay<S> {
                     if self.helper.as_ref().is_some_and(|h| h.0 == id) {
                         log::info!("session helper {id} left");
                         self.helper = None;
+                        // Logged off: no windows to show any more.
+                        if self.coherence {
+                            host.write_all(&Message::Windows(Vec::new()).encode())?;
+                        }
                     }
                 }
             }
@@ -103,12 +155,22 @@ impl<S: System> Relay<S> {
         match m {
             Message::Hello { agent, .. } => {
                 log::info!("host: {agent}");
-                host.write_all(&crate::hello().encode())?;
+                // A host that (re)starts has none of the last one's USB
+                // disks: it tells us again about those still shared.
+                self.sys.usb_reset();
+                host.write_all(&crate::hello(self.sys.can_update()).encode())?;
             }
+            // New guest tools: the service's alone, never the helper's.
+            m @ (Message::UpdateBegin { .. } | Message::UpdateData { .. }) => {
+                if let Some(r) = self.sys.update(m) {
+                    host.write_all(&r.encode())?;
+                }
+            }
+            Message::UsbShare { tag, label, on } => self.sys.usb_share(&tag, &label, on),
             Message::Ping(v) => host.write_all(&Message::Pong(v).encode())?,
             Message::TimeSync { unix_secs, nanos } => self.sys.set_time(unix_secs, nanos),
             Message::Shutdown { reboot } => self.sys.shutdown(reboot),
-            Message::SetResolution { .. } => {
+            Message::SetResolution { .. } | Message::SetLayout { .. } => {
                 self.display.0 = Some(m.clone());
                 self.send_helper(&m);
             }
@@ -116,7 +178,7 @@ impl<S: System> Relay<S> {
                 self.display.1 = Some(m.clone());
                 self.send_helper(&m);
             }
-            m @ Message::ClipboardText(_) => self.send_helper(&m),
+            m @ (Message::ClipboardText(_) | Message::Mouse { .. }) => self.send_helper(&m),
             // Dropped files are written by the user, in their session.
             Message::DragEnter { id, .. } if self.helper.is_none() => {
                 let place = "nobody is logged in to the guest".to_string();
@@ -127,12 +189,35 @@ impl<S: System> Relay<S> {
             | Message::DropEntry { .. }
             | Message::DropData { .. }
             | Message::DropEnd { .. }) => self.send_helper(&m),
+            // Files dragged out are the user's, read in their session.
+            Message::DragOutQuery { id } if self.helper.is_none() => {
+                host.write_all(&Message::DragOutItems { id, items: Vec::new() }.encode())?;
+            }
+            m @ (Message::DragOutQuery { .. } | Message::DragOutGet { .. } | Message::DragOutEnd { .. }) => self.send_helper(&m),
             Message::Gpu3d { on } => {
                 if let Some(on) = self.sys.gpu3d(on) {
                     host.write_all(&Message::Gpu3d { on }.encode())?;
                 }
             }
-            Message::Pong(_) | Message::DragReady { .. } | Message::DropDone { .. } => {}
+            // Windows are the user's: the helper has them.
+            Message::Coherence { on } => {
+                self.coherence = on;
+                if on && self.helper.is_none() {
+                    host.write_all(&Message::Windows(Vec::new()).encode())?;
+                }
+                self.send_helper(&m);
+            }
+            m @ (Message::WindowDo { .. } | Message::StartApp(_)) => self.send_helper(&m),
+            Message::Pong(_)
+            | Message::DragReady { .. }
+            | Message::DropDone { .. }
+            | Message::Windows(_)
+            | Message::WindowIcon { .. }
+            | Message::CoherenceNo(_)
+            | Message::Apps(_)
+            | Message::DragOutItems { .. }
+            | Message::DragOutFail { .. }
+            | Message::UpdateDone { .. } => {}
         }
         Ok(())
     }
@@ -157,7 +242,17 @@ impl<S: System> Relay<S> {
                 Ok(Some(Message::ClipboardText(t))) if t.len() <= self.max => {
                     host.write_all(&Message::ClipboardText(t).encode())?;
                 }
-                Ok(Some(m @ (Message::DragReady { .. } | Message::DropDone { .. }))) => host.write_all(&m.encode())?,
+                // Checked by the decoder (count, sizes); the host checks again.
+                Ok(Some(m @ (Message::Windows(_) | Message::WindowIcon { .. } | Message::CoherenceNo(_) | Message::Apps(_)))) if self.coherence => host.write_all(&m.encode())?,
+                Ok(Some(
+                    m @ (Message::DragReady { .. }
+                    | Message::DropDone { .. }
+                    | Message::DragOutItems { .. }
+                    | Message::DropEntry { .. }
+                    | Message::DropData { .. }
+                    | Message::DropEnd { .. }
+                    | Message::DragOutFail { .. }),
+                )) => host.write_all(&m.encode())?,
                 Ok(Some(_)) => log::debug!("session helper {id}: ignoring a message it may not send"),
                 Ok(None) => return Ok(()),
                 Err(e) => {
@@ -181,6 +276,8 @@ mod tests {
         time: Vec<u64>,
         shutdown: Vec<bool>,
         gpu3d: Vec<bool>,
+        usb: Vec<(String, bool)>,
+        updates: usize,
     }
     struct Fake(Arc<Mutex<Seen>>);
     impl System for Fake {
@@ -193,6 +290,19 @@ mod tests {
         fn gpu3d(&mut self, on: bool) -> Option<bool> {
             self.0.lock().unwrap().gpu3d.push(on);
             Some(on)
+        }
+        fn usb_share(&mut self, tag: &str, _label: &str, on: bool) {
+            self.0.lock().unwrap().usb.push((tag.to_string(), on));
+        }
+        fn usb_reset(&mut self) {
+            self.0.lock().unwrap().usb.clear();
+        }
+        fn update(&mut self, m: Message) -> Option<Message> {
+            self.0.lock().unwrap().updates += 1;
+            match m {
+                Message::UpdateBegin { id, .. } => Some(Message::UpdateDone { id, ok: true, why: String::new() }),
+                _ => None,
+            }
         }
     }
 
@@ -260,6 +370,41 @@ mod tests {
     }
 
     #[test]
+    fn usb_shares_are_mounted_by_the_service() {
+        let helper = Sink::default();
+        let share = |tag: &str, on| host(Message::UsbShare { tag: tag.into(), label: "STICK".into(), on });
+        let (_, seen) = run(vec![
+            Ev::HelperUp(1, Box::new(helper.clone())),
+            share("vroom-usb0", true),
+            // A new host forgets the last one's.
+            host(Message::Hello { features: 0, agent: "h".into() }),
+            share("vroom-usb1", true),
+            share("vroom-usb1", false),
+        ]);
+        assert_eq!(seen.lock().unwrap().usb, vec![("vroom-usb1".to_string(), true), ("vroom-usb1".to_string(), false)]);
+        assert!(helper.msgs().is_empty(), "not the session's business");
+    }
+
+    #[test]
+    fn updates_come_only_from_the_host() {
+        let helper = Sink::default();
+        let begin = Message::UpdateBegin {
+            id: 3,
+            version: "0.1.0".into(),
+            files: vec![vroom_proto::UpdateFile { path: "a".into(), size: 0, sha256: [0; 32] }],
+        };
+        let (out, seen) = run(vec![
+            Ev::HelperUp(1, Box::new(helper.clone())),
+            // A helper can't send one in.
+            Ev::Helper(1, begin.encode()),
+            host(begin),
+        ]);
+        assert_eq!(seen.lock().unwrap().updates, 1);
+        assert_eq!(out[1..], [Message::UpdateDone { id: 3, ok: true, why: String::new() }]);
+        assert!(helper.msgs().is_empty(), "never relayed to the session");
+    }
+
+    #[test]
     fn desktop_messages_go_to_the_helper() {
         let helper = Sink::default();
         run(vec![
@@ -315,6 +460,62 @@ mod tests {
         ]);
         assert_eq!(helper.msgs().len(), 4);
         assert_eq!(out[1..], [Message::DragReady { id: 2, live: true }, Message::DropDone { id: 2, ok: true, place: String::new() }]);
+    }
+
+    #[test]
+    fn coherence_goes_to_the_helper_and_windows_come_back() {
+        let w = vroom_proto::GuestWindow { id: 5, x: 0, y: 0, w: 9, h: 9, flags: 0, title: "a".into() };
+        // No helper (nobody logged in): an empty list at once.
+        let (out, _) = run(vec![host(Message::Coherence { on: true })]);
+        assert_eq!(out[1..], [Message::Windows(Vec::new())]);
+        let (h1, h2) = (Sink::default(), Sink::default());
+        let (out, _) = run(vec![
+            // Not in Coherence: a helper's list goes nowhere.
+            Ev::HelperUp(1, Box::new(h1.clone())),
+            Ev::Helper(1, Message::Windows(vec![w.clone()]).encode()),
+            host(Message::Coherence { on: true }),
+            host(Message::WindowDo { id: 5, op: vroom_proto::WindowOp::Close }),
+            Ev::Helper(1, Message::Windows(vec![w.clone()]).encode()),
+            Ev::Helper(1, Message::WindowIcon { id: 5, w: 0, h: 0, rgba: Vec::new() }.encode()),
+            // Logged off: the windows went; the next helper starts in Coherence.
+            Ev::HelperGone(1),
+            Ev::HelperUp(2, Box::new(h2.clone())),
+        ]);
+        assert_eq!(out[1..], [Message::Windows(vec![w]), Message::WindowIcon { id: 5, w: 0, h: 0, rgba: Vec::new() }, Message::Windows(Vec::new())]);
+        assert_eq!(h1.msgs(), vec![Message::Coherence { on: true }, Message::WindowDo { id: 5, op: vroom_proto::WindowOp::Close }]);
+        assert_eq!(h2.msgs(), vec![Message::Coherence { on: true }]);
+    }
+
+    #[test]
+    fn drags_out_go_through_the_helper() {
+        let (out, _) = run(vec![host(Message::DragOutQuery { id: 1 })]);
+        assert_eq!(out[1..], [Message::DragOutItems { id: 1, items: Vec::new() }]);
+        let helper = Sink::default();
+        let frames = [
+            Message::DragOutItems { id: 2, items: vec![("a".into(), false)] },
+            Message::DropEntry { id: 3, path: "a".into(), dir: false, size: 1 },
+            Message::DropData { id: 3, data: vec![1] },
+            Message::DropEnd { id: 3 },
+            Message::DragOutFail { stream: 4, why: "x".into() },
+        ];
+        let mut evs = vec![
+            Ev::HelperUp(1, Box::new(helper.clone())),
+            host(Message::DragOutQuery { id: 2 }),
+            host(Message::DragOutGet { id: 2, item: 0, stream: 3 }),
+            host(Message::DragOutEnd { id: 2 }),
+        ];
+        evs.extend(frames.iter().map(|m| Ev::Helper(1, m.encode())));
+        let (out, _) = run(evs);
+        assert_eq!(helper.msgs().len(), 3);
+        assert_eq!(out[1..], frames);
+    }
+
+    #[test]
+    fn a_replaced_helper_leaves_coherence() {
+        let (old, new) = (Sink::default(), Sink::default());
+        run(vec![host(Message::Coherence { on: true }), Ev::HelperUp(1, Box::new(old.clone())), Ev::HelperUp(2, Box::new(new.clone()))]);
+        assert_eq!(old.msgs(), vec![Message::Coherence { on: true }, Message::Coherence { on: false }]);
+        assert_eq!(new.msgs(), vec![Message::Coherence { on: true }]);
     }
 
     #[test]

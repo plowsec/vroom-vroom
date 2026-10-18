@@ -140,6 +140,32 @@ pub fn virtual_size(p: &Path) -> Option<u64> {
     Some(len)
 }
 
+/// A state dir, its suspend manifest's time, and the VM file in it.
+type SuspendedRead = (PathBuf, Option<SystemTime>, Option<VmConfig>);
+
+thread_local! {
+    /// The last suspend image's VM file read, by its manifest's time.
+    static SUSPENDED: std::cell::RefCell<Option<SuspendedRead>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The VM file a suspended VM was saved with (what it resumes with:
+/// its network adapters, its MACs). Read again only when it changes.
+pub fn suspended_config(state: &Path) -> Option<VmConfig> {
+    let at = mtime(&state.join("suspend").join("manifest.json"));
+    SUSPENDED.with(|s| {
+        let mut s = s.borrow_mut();
+        if let Some((p, t, c)) = s.as_ref() {
+            if p == state && *t == at {
+                return c.clone();
+            }
+        }
+        // The VMM wrote it: a VmConfig parse checks what we use.
+        let c = vroom_state::suspended_config(state).and_then(|v| serde_json::from_value::<VmConfig>(v).ok());
+        *s = Some((state.to_path_buf(), at, c.clone()));
+        c
+    })
+}
+
 /// Bytes the file really takes on the host (sparse files take less).
 pub fn used_bytes(p: &Path) -> Option<u64> {
     use std::os::unix::fs::MetadataExt;

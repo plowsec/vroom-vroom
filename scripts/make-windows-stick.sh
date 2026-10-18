@@ -39,7 +39,7 @@ if [ -f "$wim" ] && [ "$(stat -f %z "$wim")" -ge 4294967295 ]; then
 else
   rsync -a --exclude boot.catalog "$tmp/iso/" "$tmp/usb/"
 fi
-for d in viogpudo NetKVM vioserial vioinput viorng viostor viofs Balloon; do
+for d in viogpudo NetKVM vioserial vioinput viorng viostor vioscsi viofs Balloon; do
   if [ -d "$tmp/vw/$d/w11/ARM64" ]; then
     mkdir -p "$tmp/usb/$d/w11"
     cp -R "$tmp/vw/$d/w11/ARM64" "$tmp/usb/$d/w11/"

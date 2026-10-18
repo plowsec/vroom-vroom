@@ -1,13 +1,14 @@
 // The settings column. One card per area; a closed card says in one line
 // what is set, an open card shows every option, the rare ones under
-// "Advanced". There is no separate expert mode.
+// "Advanced". There is no separate expert mode. Labels stay short: what
+// an option does is in its tooltip, with its config key.
 
 import { ScrollView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { Icons } from "icons.slint";
 import { Bus } from "bus.slint";
 import { VmSettings, CardVis, HostInfo, NetRow } from "types.slint";
-import { Button, IconButton, Toggle, Segmented, Slider, Field, Select, Row, SectionCard, Divider, Banner, Icon } from "controls.slint";
+import { Button, IconButton, Toggle, Segmented, Slider, Field, Select, Row, SectionCard, Divider, Banner, Icon, Tip, InfoTip, StatusDot } from "controls.slint";
 
 component SubCard inherits Rectangle {
     border-radius: Theme.r-md;
@@ -23,6 +24,35 @@ component SubCard inherits Rectangle {
     }
 }
 
+// What waits (for the next start, a resume): a short line, the rest in
+// its tip.
+component Note inherits Rectangle {
+    in property <string> text;
+    in property <string> tip;
+    in property <image> icon: Icons.history;
+    height: l.preferred-height;
+    l := HorizontalLayout {
+        spacing: 8px;
+        Icon {
+            source: root.icon;
+            width: 14px;
+            height: 14px;
+            y: 1px;
+            tint: Theme.text-3;
+        }
+        Text {
+            horizontal-stretch: 1;
+            text: root.text;
+            font-size: Theme.fs-xs;
+            color: Theme.text-2;
+            overflow: elide;
+        }
+    }
+    Tip {
+        text: root.tip != "" ? root.tip : root.text;
+    }
+}
+
 component Value inherits Text {
     font-size: Theme.fs-md;
     font-weight: 600;
@@ -30,6 +60,59 @@ component Value inherits Text {
     vertical-alignment: center;
     horizontal-alignment: right;
     min-width: 54px;
+}
+
+// vroom-netd, the root helper bridged and host-only networks need: a
+// line that says whether it runs, and the button that sets it up.
+component NetdLine inherits Rectangle {
+    in property <HostInfo> host;
+    property <bool> ready: host.netd == "ready";
+    height: max(30px, l.preferred-height);
+    Tip {
+        text: root.ready ? "vroom-netd, vroom's helper that runs as root, is running. Bridged and host-only networks go through it."
+            : root.host.netd == "stopped" ? "vroom-netd, the helper this needs (it runs as root), is installed but doesn't answer. Setting it up again starts it."
+            : root.host.netd == "old" ? "vroom-netd, the helper this needs (it runs as root), is from an older vroom. Set it up again."
+            : "This needs vroom-netd, a small helper that runs as root. It's set up once; macOS asks for an admin password.";
+    }
+    l := HorizontalLayout {
+        spacing: 8px;
+        if root.ready: StatusDot {
+            y: (parent.height - self.height) / 2;
+            tint: Theme.green;
+        }
+        if !root.ready: Icon {
+            source: Icons.warning;
+            width: 14px;
+            height: 14px;
+            y: (parent.height - self.height) / 2;
+            tint: Theme.amber;
+        }
+        Text {
+            horizontal-stretch: 1;
+            text: root.ready ? "vroom-netd" : root.host.netd == "stopped" ? "vroom-netd doesn't answer" : root.host.netd == "old" ? "vroom-netd is out of date" : "Needs vroom-netd";
+            font-size: Theme.fs-sm;
+            color: root.ready ? Theme.text-2 : Theme.amber;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+        if root.ready: Button {
+            small: true;
+            kind: "ghost";
+            text: "Remove";
+            tip: "Uninstall vroom-netd. macOS asks for an admin password.";
+            y: (parent.height - self.height) / 2;
+            clicked => { Bus.act("netd.remove"); }
+        }
+        if !root.ready: Button {
+            small: true;
+            kind: "primary";
+            text: root.host.netd-busy ? "Waiting..." : "Set up";
+            tip: "Installs vroom-netd. macOS asks for an admin password.";
+            busy: root.host.netd-busy;
+            y: (parent.height - self.height) / 2;
+            clicked => { Bus.act("netd.setup"); }
+        }
+    }
 }
 
 component NetCard inherits SubCard {
@@ -48,6 +131,20 @@ component NetCard inherits SubCard {
             vertical-alignment: center;
             horizontal-stretch: 1;
         }
+        // The cable: in or out.
+        Rectangle {
+            width: 38px;
+            Toggle {
+                y: (parent.height - self.height) / 2;
+                checked: root.net.connected;
+                enabled: !root.locked;
+                toggled(v) => { Bus.set(root.k + ".connected", v ? "true" : "false"); }
+            }
+            Tip {
+                text: root.net.connected ? "Cable in" : "Cable out: the guest sees no network on this adapter";
+                key: "connected";
+            }
+        }
         IconButton {
             icon: Icons.trash;
             tip: "Remove adapter";
@@ -58,17 +155,21 @@ component NetCard inherits SubCard {
     }
     Segmented {
         options: ["NAT", "Bridged", "Host-only"];
+        tips: [
+            "The guest reaches the internet through this Mac. Nothing reaches the guest unless you forward a port.",
+            "The guest sits on your network like a real machine.",
+            "A private network for VMs and this Mac. No internet.",
+        ];
         selected: root.net.mode;
         enabled: !root.locked;
         changed(i) => { Bus.set(root.k + ".mode", i); }
     }
-    Text {
-        text: root.net.mode == 0 ? "The guest reaches the internet through this Mac. Nothing reaches the guest unless you forward a port."
-            : root.net.mode == 1 ? "The guest sits on your network like a real machine. Needs vroom-netd (root)."
-            : "A private network for VMs and this Mac. No internet. Needs vroom-netd (root).";
-        font-size: Theme.fs-xs;
-        color: Theme.text-3;
-        wrap: word-wrap;
+    if root.net.note != "": Note {
+        text: root.net.note;
+    }
+    // Bridged and host-only go through vroom-netd, which runs as root.
+    if root.net.mode != 0 && root.host.netd != "": NetdLine {
+        host: root.host;
     }
     if root.net.mode == 0: VerticalLayout {
         spacing: 4px;
@@ -100,21 +201,32 @@ component NetCard inherits SubCard {
                 committed(t) => { Bus.set(root.k + ".fwd." + j + ".guest", t); }
             }
             Rectangle { horizontal-stretch: 1; }
-            Text {
-                text: "LAN";
-                font-size: Theme.fs-xs;
-                color: f.lan ? Theme.amber : Theme.text-3;
-                vertical-alignment: center;
-            }
-            Toggle {
-                y: (parent.height - self.height) / 2;
-                checked: f.lan;
-                danger: true;
-                enabled: !root.locked;
-                toggled(v) => { Bus.set(root.k + ".fwd." + j + ".lan", v ? "true" : "false"); }
+            Rectangle {
+                width: lan.preferred-width;
+                lan := HorizontalLayout {
+                    spacing: 6px;
+                    Text {
+                        text: "LAN";
+                        font-size: Theme.fs-xs;
+                        color: f.lan ? Theme.amber : Theme.text-3;
+                        vertical-alignment: center;
+                    }
+                    Toggle {
+                        y: (parent.height - self.height) / 2;
+                        checked: f.lan;
+                        danger: true;
+                        enabled: !root.locked;
+                        toggled(v) => { Bus.set(root.k + ".fwd." + j + ".lan", v ? "true" : "false"); }
+                    }
+                }
+                Tip {
+                    text: f.lan ? "Open to your network, not only this Mac" : "Only this Mac can connect. On: your network too.";
+                    key: "host_addr";
+                }
             }
             IconButton {
                 icon: Icons.x;
+                tip: "Remove";
                 size: 28px;
                 y: (parent.height - self.height) / 2;
                 enabled: !root.locked;
@@ -126,7 +238,8 @@ component NetCard inherits SubCard {
             Button {
                 small: true;
                 kind: "ghost";
-                text: "Add port forward";
+                text: "Port forward";
+                tip: "A port on this Mac that leads to one in the guest";
                 icon: Icons.plus;
                 has-icon: true;
                 enabled: !root.locked;
@@ -135,7 +248,7 @@ component NetCard inherits SubCard {
         }
         Row {
             label: "Reach this Mac's localhost";
-            hint: "Services on 127.0.0.1 often have no password.";
+            tip: "The guest can connect to services on 127.0.0.1 of this Mac. They often have no password.";
             key: "allow_host_loopback";
             warn: root.net.loopback;
             Toggle {
@@ -148,7 +261,7 @@ component NetCard inherits SubCard {
         }
         Row {
             label: "Internet only";
-            hint: "Block your local network.";
+            tip: "Block your local network: the guest reaches the internet only.";
             key: "block_private";
             Toggle {
                 y: (parent.height - self.height) / 2;
@@ -160,6 +273,7 @@ component NetCard inherits SubCard {
     }
     if root.net.mode == 1: Row {
         label: "Host interface";
+        tip: "The network of this Mac the guest joins.";
         key: "interface";
         Select {
             width: 150px;
@@ -172,7 +286,7 @@ component NetCard inherits SubCard {
     }
     if root.net.mode == 2: Row {
         label: "Network name";
-        hint: "VMs with the same name see each other.";
+        tip: "VMs with the same name see each other.";
         key: "network";
         Field {
             width: 150px;
@@ -185,6 +299,7 @@ component NetCard inherits SubCard {
     Divider { text: "ADVANCED"; }
     Row {
         label: "MAC address";
+        tip: "Empty: one made from the VM's identity.";
         key: "mac";
         HorizontalLayout {
             spacing: 4px;
@@ -215,6 +330,9 @@ export component SettingsPanel inherits Rectangle {
     in-out property <string> query;
     property <bool> lk: s.locked;
     property <bool> open-all: vis.searching;
+    // The lock on each card that can't change now, and why in its tip.
+    property <string> lock-tip: lk ? s.lock-why : "";
+    property <string> live-tip: s.live ? "" : s.lock-why;
 
     VerticalLayout {
         spacing: 12px;
@@ -223,7 +341,7 @@ export component SettingsPanel inherits Rectangle {
             search := Field {
                 horizontal-stretch: 1;
                 text <=> root.query;
-                placeholder: "Search settings: port, 3d, mac, tpm...";
+                placeholder: "Search settings";
                 edited(t) => {
                     root.query = t;
                     Bus.search(t);
@@ -233,11 +351,13 @@ export component SettingsPanel inherits Rectangle {
         if root.s.locked: Banner {
             kind: 0;
             icon: Icons.lock;
-            text: root.s.lock-reason;
+            text: root.s.lock-short != "" ? root.s.lock-short : root.s.lock-reason;
+            tip: root.s.lock-short != "" ? root.s.lock-reason : "";
         }
-        for w in root.s.warnings: Banner {
+        for w[i] in root.s.warnings: Banner {
             kind: 2;
-            text: w;
+            text: i < root.s.warn-short.length ? root.s.warn-short[i] : w;
+            tip: w;
         }
         ScrollView {
             vertical-stretch: 1;
@@ -252,10 +372,11 @@ export component SettingsPanel inherits Rectangle {
                     title: "Processor and memory";
                     summary: root.s.sum-hw;
                     force-open: root.open-all;
+                    lock-tip: root.lock-tip;
                     Row {
                         label: "CPUs";
                         key: "cpus";
-                        hint: root.s.snapshots-cpu-mem;
+                        tip: root.s.snapshots-cpu-mem != "" ? root.s.snapshots-cpu-mem : "Shaded: more than this Mac can spare.";
                         Value { text: cpus.shown; }
                     }
                     cpus := Slider {
@@ -270,6 +391,7 @@ export component SettingsPanel inherits Rectangle {
                     Row {
                         label: "Memory";
                         key: "memory_mib";
+                        tip: root.s.snapshots-cpu-mem != "" ? root.s.snapshots-cpu-mem : "Shaded: more than this Mac can spare.";
                         Value { text: mem.shown + " GB"; }
                     }
                     mem := Slider {
@@ -284,7 +406,7 @@ export component SettingsPanel inherits Rectangle {
                     Divider { text: "ADVANCED"; }
                     Row {
                         label: "Nested virtualization";
-                        hint: "Run VMs inside this VM. M3 or newer. No snapshots then.";
+                        tip: "Run VMs inside this VM. M3 or newer. No snapshots then.";
                         key: "nested";
                         Toggle {
                             y: (parent.height - self.height) / 2;
@@ -295,7 +417,7 @@ export component SettingsPanel inherits Rectangle {
                     }
                     Row {
                         label: "Guest system";
-                        hint: "Only changes the icon and defaults.";
+                        tip: "Only changes the icon and defaults.";
                         key: "os";
                         Select {
                             width: 130px;
@@ -311,24 +433,34 @@ export component SettingsPanel inherits Rectangle {
                     title: "Display";
                     summary: root.s.sum-display;
                     force-open: root.open-all;
+                    lock-tip: root.lock-tip;
                     Segmented {
                         options: ["None", "2D", "3D"];
+                        tips: [
+                            "No screen. Use the serial console (vroom run).",
+                            "Works everywhere. The guest follows the window size.",
+                            "Drawn by your Mac's GPU: Vulkan and OpenGL in Linux, Direct3D 11 in Windows (with its 3D driver). Needs the 3D libraries (see the guide).",
+                        ];
                         selected: root.s.gpu;
                         enabled: !root.lk;
                         changed(i) => { Bus.set("gpu", i); }
                     }
-                    Text {
-                        text: root.s.gpu == 2 ? "Drawn by your Mac's GPU: Vulkan and OpenGL in Linux, Direct3D 11 in Windows (with its 3D driver). Needs the 3D libraries (see guide)."
-                            : root.s.gpu == 1 ? "Works everywhere. The guest follows the window size."
-                            : "No screen. Use the serial console (vroom run).";
-                        font-size: Theme.fs-xs;
-                        color: Theme.text-3;
-                        wrap: word-wrap;
+                    if root.s.gpu != 0: Row {
+                        label: "Monitors";
+                        tip: "Screens the guest gets, a window each. Closing one turns it off in the guest. The display button brings it back.";
+                        key: "display.monitors";
+                        Segmented {
+                            y: (parent.height - self.height) / 2;
+                            options: ["1", "2", "3", "4"];
+                            selected: root.s.monitors - 1;
+                            enabled: !root.lk;
+                            changed(i) => { Bus.set("monitors", i + 1); }
+                        }
                     }
                     if root.s.gpu != 0: Row {
                         label: "Full resolution on Retina";
-                        hint: "The guest gets every pixel of the window and its tools scale its UI, so text is sharp. Guests without the tools get half and are scaled up.";
-                        key: "hidpi";
+                        tip: "The guest gets every pixel of the window and its tools scale its UI, so text is sharp. Guests without the tools get half and are scaled up.";
+                        key: "display.hidpi";
                         Toggle {
                             y: (parent.height - self.height) / 2;
                             checked: root.s.hidpi;
@@ -337,7 +469,7 @@ export component SettingsPanel inherits Rectangle {
                     }
                     if root.s.gpu == 2: Row {
                         label: "OpenGL";
-                        hint: "Off: Vulkan only, and less host code faces the guest.";
+                        tip: "Off: Vulkan only, and less host code faces the guest.";
                         key: "display.opengl";
                         Toggle {
                             y: (parent.height - self.height) / 2;
@@ -348,22 +480,57 @@ export component SettingsPanel inherits Rectangle {
                     }
                     if root.s.gpu == 2 && root.s.opengl: Row {
                         label: "OpenGL driver";
-                        hint: root.s.opengl-host == 0
-                            ? "Your Mac's own OpenGL. The guest gets OpenGL 4.1, enough for most Linux apps."
-                            : "ANGLE checks every call before your Mac's GPU sees it, but the guest only gets OpenGL 2.1: many apps won't start.";
                         key: "display.opengl_host";
-                        Segmented {
+                        HorizontalLayout {
+                            spacing: 8px;
+                            // ANGLE's OpenGL ES 3.0 has no multisample
+                            // textures: Chrome draws without the GPU.
+                            if root.s.opengl-host == 1: InfoTip {
+                                y: (parent.height - self.height) / 2;
+                                icon: Icons.warning;
+                                tint: Theme.amber;
+                                text: "Chrome and Chromium fall back to software rendering with ANGLE.";
+                            }
+                            Segmented {
+                                y: (parent.height - self.height) / 2;
+                                width: 170px;
+                                options: ["Apple", "ANGLE"];
+                                tips: [
+                                    "Your Mac's own OpenGL. The guest gets OpenGL 4.1, enough for most Linux apps.",
+                                    "ANGLE checks every call before your Mac's GPU sees it, but the guest only gets OpenGL 2.1: many apps won't start, and Chrome and Chromium draw without the GPU.",
+                                ];
+                                selected: root.s.opengl-host;
+                                enabled: !root.lk;
+                                changed(i) => { Bus.set("opengl_host", i); }
+                            }
+                        }
+                    }
+                    Row {
+                        label: "Hardware video decoding";
+                        tip: "Linux guests: H.264 and HEVC decoded by your Mac's hardware. The guest needs a driver (see the guide).";
+                        key: "display.video_decode";
+                        Toggle {
                             y: (parent.height - self.height) / 2;
-                            width: 170px;
-                            options: ["Apple", "ANGLE"];
-                            selected: root.s.opengl-host;
+                            checked: root.s.video-decode;
                             enabled: !root.lk;
-                            changed(i) => { Bus.set("opengl_host", i); }
+                            toggled(v) => { Bus.set("video_decode", v ? "true" : "false"); }
+                        }
+                    }
+                    Row {
+                        label: "Hardware video encoding";
+                        tip: "Linux guests: H.264 and HEVC encoded by your Mac's hardware, for video calls and recording. The guest needs a driver (see the guide).";
+                        key: "display.video_encode";
+                        Toggle {
+                            y: (parent.height - self.height) / 2;
+                            checked: root.s.video-encode;
+                            enabled: !root.lk;
+                            toggled(v) => { Bus.set("video_encode", v ? "true" : "false"); }
                         }
                     }
                     Row {
                         label: "Starting size";
-                        key: "width, height";
+                        tip: "The guest's screen when it starts. It follows the window after that.";
+                        key: "display.width, height";
                         HorizontalLayout {
                             spacing: 6px;
                             alignment: end;
@@ -399,6 +566,7 @@ export component SettingsPanel inherits Rectangle {
                     title: "Storage";
                     summary: root.s.sum-storage;
                     force-open: root.open-all;
+                    lock-tip: root.lock-tip;
                     for d[i] in root.s.disks: SubCard {
                         HorizontalLayout {
                             spacing: 10px;
@@ -407,20 +575,25 @@ export component SettingsPanel inherits Rectangle {
                                 y: (parent.height - self.height) / 2;
                                 tint: d.missing ? Theme.red : Theme.text-2;
                             }
-                            VerticalLayout {
+                            Rectangle {
                                 horizontal-stretch: 1;
-                                alignment: center;
-                                Text {
-                                    text: d.file;
-                                    font-size: Theme.fs-md;
-                                    font-weight: 600;
-                                    color: Theme.text;
-                                    overflow: elide;
+                                VerticalLayout {
+                                    alignment: center;
+                                    Text {
+                                        text: d.file;
+                                        font-size: Theme.fs-md;
+                                        font-weight: 600;
+                                        color: Theme.text;
+                                        overflow: elide;
+                                    }
+                                    Text {
+                                        text: d.missing ? "File not found" : d.size;
+                                        font-size: Theme.fs-xs;
+                                        color: d.missing ? Theme.red : Theme.text-3;
+                                    }
                                 }
-                                Text {
-                                    text: d.missing ? "File not found" : d.size + (d.used != "" ? "  ·  " + d.used + " on disk" : "");
-                                    font-size: Theme.fs-xs;
-                                    color: d.missing ? Theme.red : Theme.text-3;
+                                Tip {
+                                    text: d.path + (d.used != "" ? "\n" + d.used + " on disk" : "");
                                 }
                             }
                             IconButton {
@@ -445,6 +618,7 @@ export component SettingsPanel inherits Rectangle {
                             Segmented {
                                 width: 150px;
                                 options: ["VirtIO", "NVMe"];
+                                tips: ["Fastest. Linux has the driver; Windows needs the guest tools.", "Windows setup has this driver built in."];
                                 selected: d.bus;
                                 enabled: !root.lk;
                                 changed(v) => { Bus.set("disk." + i + ".bus", v); }
@@ -452,6 +626,7 @@ export component SettingsPanel inherits Rectangle {
                         }
                         if !d.cdrom: Row {
                             label: "Read-only";
+                            tip: "The guest can read the disk but not change it.";
                             key: "readonly";
                             Toggle {
                                 y: (parent.height - self.height) / 2;
@@ -462,7 +637,7 @@ export component SettingsPanel inherits Rectangle {
                         }
                         if !d.cdrom && !d.readonly: Row {
                             label: "Write safety";
-                            hint: d.sync == 0 ? "Survives a power cut. Slow on macOS." : d.sync == 1 ? "Survives a Mac crash." : "Fast, for scratch disks only.";
+                            tip: d.sync == 0 ? "Power cut: survives one. Slow on macOS." : d.sync == 1 ? "Mac crash: survives one, not a power cut." : "None: fast, for scratch disks only.";
                             key: "sync";
                             Select {
                                 width: 130px;
@@ -474,7 +649,7 @@ export component SettingsPanel inherits Rectangle {
                         }
                         if d.qcow2 && !d.readonly: Row {
                             label: "Free unused space";
-                            hint: "Shrinks the file to what the guest uses. VM must be off.";
+                            tip: "Shrinks the file to what the guest uses. The VM must be off.";
                             Button {
                                 small: true;
                                 text: "Compact";
@@ -493,6 +668,7 @@ export component SettingsPanel inherits Rectangle {
                             small: true;
                             kind: "ghost";
                             text: "New disk";
+                            tip: "An empty disk image that grows as it fills";
                             icon: Icons.plus;
                             has-icon: true;
                             enabled: !root.lk;
@@ -501,7 +677,8 @@ export component SettingsPanel inherits Rectangle {
                         Button {
                             small: true;
                             kind: "ghost";
-                            text: "Existing image";
+                            text: "Image";
+                            tip: "Attach a disk image you have (qcow2 or raw)";
                             icon: Icons.disk;
                             has-icon: true;
                             enabled: !root.lk;
@@ -511,6 +688,7 @@ export component SettingsPanel inherits Rectangle {
                             small: true;
                             kind: "ghost";
                             text: "ISO";
+                            tip: "Attach an installer or other CD image";
                             icon: Icons.disc;
                             has-icon: true;
                             enabled: !root.lk;
@@ -524,21 +702,26 @@ export component SettingsPanel inherits Rectangle {
                     title: "Network";
                     summary: root.s.sum-net;
                     force-open: root.open-all;
+                    lock-tip: root.live-tip;
+                    if root.s.net-note != "": Note {
+                        text: root.s.net-note;
+                    }
                     for n[i] in root.s.nets: NetCard {
                         net: n;
                         index: i;
                         host: root.host;
-                        locked: root.lk;
+                        locked: !root.s.live;
                     }
                     HorizontalLayout {
                         alignment: start;
                         Button {
                             small: true;
                             kind: "ghost";
-                            text: "Add adapter";
+                            text: "Adapter";
+                            tip: "Add a network adapter. It comes at the next start.";
                             icon: Icons.plus;
                             has-icon: true;
-                            enabled: !root.lk;
+                            enabled: root.s.live;
                             clicked => { Bus.act("net.add"); }
                         }
                     }
@@ -549,33 +732,52 @@ export component SettingsPanel inherits Rectangle {
                     title: "Shared folders";
                     summary: root.s.sum-share;
                     force-open: root.open-all;
+                    lock-tip: root.lock-tip;
                     for sh[i] in root.s.shares: SubCard {
                         HorizontalLayout {
-                            spacing: 10px;
-                            Icon {
-                                source: Icons.folder;
-                                y: (parent.height - self.height) / 2;
-                                tint: Theme.text-2;
-                            }
-                            Text {
+                            spacing: 8px;
+                            Rectangle {
                                 horizontal-stretch: 1;
-                                text: sh.short;
-                                font-size: Theme.fs-md;
-                                font-weight: 600;
-                                color: Theme.text;
-                                vertical-alignment: center;
-                                overflow: elide;
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    Icon {
+                                        source: Icons.folder;
+                                        y: (parent.height - self.height) / 2;
+                                        tint: Theme.text-2;
+                                    }
+                                    Text {
+                                        horizontal-stretch: 1;
+                                        text: sh.short;
+                                        font-size: Theme.fs-md;
+                                        font-weight: 600;
+                                        color: Theme.text;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                    }
+                                }
+                                Tip {
+                                    text: sh.path;
+                                }
+                            }
+                            IconButton {
+                                icon: Icons.copy;
+                                tip: "Copy the Linux mount command: sudo mount -t virtiofs " + sh.tag + " /mnt. Windows: a drive letter (Z: first) once vroom-setup.cmd ran.";
+                                size: 28px;
+                                y: (parent.height - self.height) / 2;
+                                clicked => { Bus.copy("sudo mount -t virtiofs " + sh.tag + " /mnt"); }
                             }
                             IconButton {
                                 icon: Icons.trash;
                                 tip: "Stop sharing";
                                 size: 28px;
+                                y: (parent.height - self.height) / 2;
                                 enabled: !root.lk;
                                 clicked => { Bus.act("share." + i + ".remove"); }
                             }
                         }
                         Row {
                             label: "Name in the guest";
+                            tip: "The tag the guest mounts it by.";
                             key: "tag";
                             Field {
                                 width: 120px;
@@ -587,6 +789,7 @@ export component SettingsPanel inherits Rectangle {
                         }
                         Row {
                             label: "Guest can change files";
+                            tip: "Off: the guest only reads them.";
                             key: "readonly = false";
                             warn: !sh.readonly;
                             Toggle {
@@ -597,37 +800,14 @@ export component SettingsPanel inherits Rectangle {
                                 toggled(v) => { Bus.set("share." + i + ".writable", v ? "true" : "false"); }
                             }
                         }
-                        HorizontalLayout {
-                            spacing: 6px;
-                            Text {
-                                horizontal-stretch: 1;
-                                text: "sudo mount -t virtiofs " + sh.tag + " /mnt";
-                                font-family: Theme.mono;
-                                font-size: Theme.fs-xs;
-                                color: Theme.text-2;
-                                vertical-alignment: center;
-                                overflow: elide;
-                            }
-                            IconButton {
-                                icon: Icons.copy;
-                                tip: "Copy";
-                                size: 26px;
-                                clicked => { Bus.copy("sudo mount -t virtiofs " + sh.tag + " /mnt"); }
-                            }
-                        }
-                    }
-                    Text {
-                        text: "Linux: the command above. Windows: each share is a drive letter (Z: first) once vroom-setup.cmd ran. Read-only unless you allow changes.";
-                        wrap: word-wrap;
-                        font-size: Theme.fs-xs;
-                        color: Theme.text-3;
                     }
                     HorizontalLayout {
                         alignment: start;
                         Button {
                             small: true;
                             kind: "ghost";
-                            text: "Share a folder";
+                            text: "Folder";
+                            tip: "Share a folder of this Mac with the guest. Read-only unless you allow changes.";
                             icon: Icons.plus;
                             has-icon: true;
                             enabled: !root.lk;
@@ -637,49 +817,110 @@ export component SettingsPanel inherits Rectangle {
                 }
 
                 if root.vis.usb: SectionCard {
-                    icon: Icons.link;
+                    icon: Icons.usb;
                     title: "USB devices";
                     summary: root.s.sum-usb;
                     force-open: root.open-all || root.s.usb-picking;
-                    for u[i] in root.s.usb: Row {
-                        label: u.label;
-                        hint: u.note;
-                        key: "usb";
-                        warn: u.warn;
-                        IconButton {
-                            icon: Icons.trash;
-                            tip: "Remove";
-                            size: 28px;
-                            y: (parent.height - self.height) / 2;
-                            enabled: !root.lk;
-                            clicked => { Bus.act("usb." + i + ".remove"); }
+                    lock-tip: root.live-tip;
+                    if root.s.usb-note != "": Note {
+                        text: root.s.usb-note;
+                    }
+                    // The VM file's devices (a pin: connected at every
+                    // start), then those connected for this run only.
+                    for u[i] in root.s.usb: VerticalLayout {
+                        spacing: 6px;
+                        HorizontalLayout {
+                            spacing: 6px;
+                            min-height: 38px;
+                            StatusDot {
+                                y: (parent.height - self.height) / 2;
+                                tint: u.on ? Theme.green : Theme.border-strong;
+                            }
+                            Rectangle {
+                                horizontal-stretch: 1;
+                                VerticalLayout {
+                                    alignment: center;
+                                    spacing: 1px;
+                                    padding-left: 4px;
+                                    Text {
+                                        text: u.label;
+                                        font-size: Theme.fs-md;
+                                        color: Theme.text;
+                                        overflow: elide;
+                                    }
+                                    Text {
+                                        text: u.note;
+                                        font-size: Theme.fs-xs;
+                                        color: u.warn ? Theme.amber : Theme.text-3;
+                                        overflow: elide;
+                                    }
+                                }
+                                Tip {
+                                    text: u.tip;
+                                    key: u.pinned ? "[[usb]]" : "";
+                                }
+                            }
+                            IconButton {
+                                icon: Icons.pin;
+                                tip: u.pinned ? "Always connected: in the VM file. Click to keep it for this run only." : "Always connect: save it in the VM file";
+                                tint: u.pinned ? Theme.accent : Theme.text-3;
+                                size: 28px;
+                                y: (parent.height - self.height) / 2;
+                                // Out of the file but connected still: only while it is.
+                                enabled: root.s.live && (!u.pinned || u.on);
+                                clicked => { Bus.act((u.pinned ? "usb." : "usbnow.") + u.index + (u.pinned ? ".unpin" : ".pin")); }
+                            }
+                            IconButton {
+                                icon: u.pinned ? Icons.trash : Icons.x;
+                                tip: u.pinned ? "Remove from the VM" : "Disconnect";
+                                size: 28px;
+                                y: (parent.height - self.height) / 2;
+                                enabled: root.s.live;
+                                clicked => { Bus.act((u.pinned ? "usb." : "usbnow.") + u.index + (u.pinned ? ".remove" : ".disconnect")); }
+                            }
+                        }
+                        // A disk: how it goes to the VM (`mode`); connected
+                        // now, it connects again that way.
+                        if u.storage: Segmented {
+                            options: ["Its files", "Whole disk", "USB device"];
+                            tips: [
+                                "Share its files: the Mac keeps the disk, the VM sees its files as a shared folder.",
+                                "Use as a disk: the Mac lets go of it, the VM gets the whole disk to use, format or partition.",
+                                "Pass the USB device itself. macOS 15.3 and later refuse this for disks unless vroom-netd has Full Disk Access.",
+                            ];
+                            selected: u.mode;
+                            enabled: root.s.live;
+                            changed(m) => { Bus.set((u.pinned ? "usb." : "usbnow.") + u.index + ".mode", m); }
                         }
                     }
-                    // What's plugged in, while "Add device" is open (a
+                    // What's plugged in, while the list is open (a
                     // repeater: an `if` here wouldn't grow the card).
                     for h[j] in root.s.usb-host: Row {
                         label: h.label;
-                        hint: h.note;
+                        tip: h.note;
                         Button {
                             small: true;
                             text: h.taken ? "Added" : "Add";
                             y: (parent.height - self.height) / 2;
-                            enabled: !h.taken && !root.lk;
+                            enabled: !h.taken && root.s.live;
                             clicked => { Bus.act("usb.pick." + j); }
                         }
                     }
-                    Row {
-                        label: "Host devices";
-                        hint: root.s.usb-picking && root.s.usb-host.length == 0 ? "Nothing plugged in." : "Taken from this Mac while the VM runs.";
-                        key: "[[usb]]";
+                    if root.s.usb-picking && root.s.usb-host.length == 0: Text {
+                        text: "Nothing plugged in";
+                        font-size: Theme.fs-sm;
+                        color: Theme.text-3;
+                    }
+                    HorizontalLayout {
+                        alignment: start;
                         Button {
                             small: true;
                             kind: "ghost";
-                            text: root.s.usb-picking ? "Done" : "Add device";
+                            text: root.s.usb-picking ? "Done" : "Device";
+                            tip: root.s.usb-picking ? "" : "Give the VM a device plugged into this Mac. It's taken from the Mac while the VM runs.";
                             icon: root.s.usb-picking ? Icons.check : Icons.plus;
                             has-icon: true;
-                            y: (parent.height - self.height) / 2;
-                            enabled: !root.lk;
+                            enabled: root.s.live;
                             clicked => { Bus.act("usb.add"); }
                         }
                     }
@@ -690,9 +931,10 @@ export component SettingsPanel inherits Rectangle {
                     title: "Sound and camera";
                     summary: root.s.sum-sound;
                     force-open: root.open-all;
+                    lock-tip: root.lock-tip;
                     Row {
                         label: "Play guest sound";
-                        hint: "Through this Mac's speakers.";
+                        tip: "Through this Mac's speakers.";
                         key: "audio.output";
                         Toggle {
                             y: (parent.height - self.height) / 2;
@@ -703,7 +945,7 @@ export component SettingsPanel inherits Rectangle {
                     }
                     Row {
                         label: "Microphone";
-                        hint: root.s.audio-in ? "The guest hears this Mac's microphone while its window is open and it records. The window shows when." : "For video calls. Off: the guest has no microphone.";
+                        tip: root.s.audio-in ? "The guest hears this Mac's microphone while its window is open and it records. The window shows when." : "For video calls. Off: the guest has no microphone.";
                         key: "audio.input";
                         warn: root.s.audio-in;
                         Toggle {
@@ -716,7 +958,7 @@ export component SettingsPanel inherits Rectangle {
                     }
                     Row {
                         label: "Camera";
-                        hint: root.s.camera ? "The guest sees this Mac's camera as a USB webcam while its window is open and an app uses it. The window shows when." : "For video calls. Off: the guest has no camera.";
+                        tip: root.s.camera ? "The guest sees this Mac's camera as a USB webcam while its window is open and an app uses it. The window shows when." : "For video calls. Off: the guest has no camera.";
                         key: "camera";
                         warn: root.s.camera;
                         Toggle {
@@ -736,7 +978,7 @@ export component SettingsPanel inherits Rectangle {
                     force-open: root.open-all;
                     Row {
                         label: "Mac to guest";
-                        hint: "Only while the VM window has focus.";
+                        tip: "Only while the VM window has focus.";
                         key: "clipboard.host_to_guest";
                         Toggle {
                             y: (parent.height - self.height) / 2;
@@ -746,6 +988,7 @@ export component SettingsPanel inherits Rectangle {
                     }
                     Row {
                         label: "Guest to Mac";
+                        tip: "What the guest copies lands on this Mac's clipboard.";
                         key: "clipboard.guest_to_host";
                         Toggle {
                             y: (parent.height - self.height) / 2;
@@ -756,7 +999,7 @@ export component SettingsPanel inherits Rectangle {
                     Divider { text: "ADVANCED"; }
                     Row {
                         label: "Size limit";
-                        hint: "Text only. Bigger copies are dropped.";
+                        tip: "Text only. Bigger copies are dropped.";
                         key: "clipboard.max_bytes";
                         Field {
                             width: 100px;
@@ -776,9 +1019,10 @@ export component SettingsPanel inherits Rectangle {
                     summary: root.s.sum-security;
                     warn: !root.s.sandbox;
                     force-open: root.open-all;
+                    lock-tip: root.lock-tip;
                     Row {
                         label: "Sandbox";
-                        hint: root.s.sandbox ? "The VM process can only touch its own files." : "Off: a guest that breaks out gets your user's access.";
+                        tip: root.s.sandbox ? "The VM process can only touch its own files." : "Off: a guest that breaks out gets your user's access.";
                         key: "security.sandbox";
                         warn: !root.s.sandbox;
                         Toggle {
@@ -790,7 +1034,7 @@ export component SettingsPanel inherits Rectangle {
                     }
                     Row {
                         label: "TPM 2.0";
-                        hint: "Windows 11 needs it. Needs swtpm (brew install swtpm).";
+                        tip: "Windows 11 needs it. Needs swtpm (brew install swtpm).";
                         key: "tpm";
                         Toggle {
                             y: (parent.height - self.height) / 2;
@@ -802,11 +1046,11 @@ export component SettingsPanel inherits Rectangle {
                     Divider { text: "ADVANCED"; }
                     Row {
                         label: "Device transport";
-                        hint: "Auto: PCI with UEFI, MMIO with kernel boot.";
                         key: "virtio_transport";
                         Segmented {
                             width: 170px;
                             options: ["Auto", "MMIO", "PCI"];
+                            tips: ["PCI with UEFI, MMIO with kernel boot.", "Memory-mapped devices: kernel boot only.", "PCI devices: what UEFI and Windows need."];
                             selected: root.s.transport;
                             enabled: !root.lk;
                             changed(v) => { Bus.set("transport", v); }
@@ -814,7 +1058,7 @@ export component SettingsPanel inherits Rectangle {
                     }
                     Row {
                         label: "Hardware maker";
-                        hint: "What firmware tables and devices tell the guest.";
+                        tip: "What firmware tables and devices tell the guest. ACPI, disk, USB and agent names: [identity] in the config file.";
                         key: "identity.vendor";
                         Field {
                             width: 150px;
@@ -835,7 +1079,7 @@ export component SettingsPanel inherits Rectangle {
                     }
                     Row {
                         label: "Tell the guest it's a VM";
-                        hint: "Off hides the VM flags in the firmware tables. Other signs stay (virtio devices, CPU).";
+                        tip: "Off hides the VM flags in the firmware tables. Other signs stay (virtio devices, CPU).";
                         key: "identity.announce_vm";
                         Toggle {
                             y: (parent.height - self.height) / 2;
@@ -846,27 +1090,20 @@ export component SettingsPanel inherits Rectangle {
                     }
                     Row {
                         label: "Serial numbers";
-                        hint: root.s.id-serials;
+                        tip: root.s.id-serials;
                         key: "identity.serial, disk_serial";
-                        Button {
-                            small: true;
-                            text: "New random";
+                        IconButton {
                             icon: Icons.dice;
-                            has-icon: true;
+                            tip: "New random serial numbers";
+                            size: 30px;
                             y: (parent.height - self.height) / 2;
                             enabled: !root.lk;
                             clicked => { Bus.act("identity.random"); }
                         }
                     }
-                    Text {
-                        text: "ACPI, disk, USB and agent names: [identity] in the config file.";
-                        font-size: Theme.fs-xs;
-                        color: Theme.text-3;
-                        wrap: word-wrap;
-                    }
                     Row {
                         label: "Serial console";
-                        hint: "Terminal: the VM log when started from here.";
+                        tip: "Terminal: the VM log when started from here.";
                         key: "serial.type";
                         Select {
                             width: 130px;
@@ -883,15 +1120,17 @@ export component SettingsPanel inherits Rectangle {
                     title: "Boot";
                     summary: root.s.sum-boot;
                     force-open: root.open-all;
+                    lock-tip: root.lock-tip;
                     Segmented {
-                        options: ["UEFI firmware", "Linux kernel"];
+                        options: ["UEFI", "Linux kernel"];
+                        tips: ["Firmware boots the disk or installer, like a PC.", "Start a kernel and initrd directly. Fastest; Linux only."];
                         selected: root.s.boot-kernel ? 1 : 0;
                         enabled: !root.lk;
                         changed(v) => { Bus.set("boot.kind", v); }
                     }
                     if !root.s.boot-kernel: Row {
                         label: "Firmware";
-                        hint: root.s.firmware == "" ? "Found automatically (Homebrew qemu)." : "";
+                        tip: root.s.firmware == "" ? "Empty: found automatically (Homebrew qemu)." : "";
                         key: "boot.firmware";
                         Field {
                             width: 180px;
@@ -904,7 +1143,7 @@ export component SettingsPanel inherits Rectangle {
                     }
                     if !root.s.boot-kernel: Row {
                         label: "NVRAM";
-                        hint: root.s.vars;
+                        tip: root.s.vars;
                         key: "boot.vars";
                     }
                     if root.s.boot-kernel: Row {
@@ -945,11 +1184,17 @@ export component SettingsPanel inherits Rectangle {
                     }
                 }
 
-                if root.vis.searching && !(root.vis.hw || root.vis.display || root.vis.storage || root.vis.net || root.vis.share || root.vis.usb || root.vis.sound || root.vis.clip || root.vis.security || root.vis.boot): Text {
-                    text: "Nothing matches. The config file has every option: ⋯ → Open config file.";
-                    font-size: Theme.fs-sm;
-                    color: Theme.text-3;
-                    wrap: word-wrap;
+                if root.vis.searching && !(root.vis.hw || root.vis.display || root.vis.storage || root.vis.net || root.vis.share || root.vis.usb || root.vis.sound || root.vis.clip || root.vis.security || root.vis.boot): HorizontalLayout {
+                    spacing: 8px;
+                    alignment: start;
+                    Text {
+                        text: "Nothing matches";
+                        font-size: Theme.fs-sm;
+                        color: Theme.text-3;
+                    }
+                    InfoTip {
+                        text: "The config file has every option: ⋯ → Open config file.";
+                    }
                 }
                 HorizontalLayout {
                     alignment: start;
@@ -957,18 +1202,11 @@ export component SettingsPanel inherits Rectangle {
                     Button {
                         small: true;
                         kind: "ghost";
-                        text: "Open config file";
+                        text: "Config file";
+                        tip: root.s.config-path;
                         icon: Icons.file;
                         has-icon: true;
                         clicked => { Bus.act("edit-file"); }
-                    }
-                    Text {
-                        text: root.s.config-path;
-                        font-family: Theme.mono;
-                        font-size: 10px;
-                        color: Theme.text-3;
-                        vertical-alignment: center;
-                        overflow: elide;
                     }
                 }
             }

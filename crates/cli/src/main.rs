@@ -11,7 +11,14 @@ mod new;
 mod session;
 mod snap;
 mod term;
+mod tools;
 mod usb;
+mod venc;
+mod video;
+#[cfg(target_os = "macos")]
+mod vt;
+#[cfg(target_os = "macos")]
+mod vtenc;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -70,6 +77,20 @@ enum Cmd {
     #[cfg(unix)]
     #[command(hide = true)]
     GpuHelper(gpu::HelperArgs),
+    /// Render server started by the GPU process (internal).
+    #[cfg(target_os = "macos")]
+    #[command(hide = true)]
+    GpuServer,
+    /// One guest 3D context, started by the render server (internal).
+    #[cfg(target_os = "macos")]
+    #[command(hide = true)]
+    GpuWorker(gpu::WorkerArgs),
+    /// Video decoding helper started by the VMM (internal).
+    #[command(hide = true)]
+    VideoHelper {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// USB passthrough helper started by the VMM (internal).
     #[command(hide = true)]
     UsbHost(usb::HostArgs),
@@ -83,6 +104,9 @@ enum Cmd {
     /// Snapshot housekeeping (list, delete, prune disk layers).
     #[command(subcommand)]
     Snapshot(snap::SnapCmd),
+    /// The guest tools: where they are, their versions, updates.
+    #[command(subcommand)]
+    GuestTools(tools::ToolsCmd),
 }
 
 /// Apps started from the Dock or Finder get 256 open files. A Windows
@@ -120,7 +144,20 @@ fn raise_open_files() {
 
 fn main() -> ExitCode {
     log_limit::Limited::install(env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).build());
-    let r = match Cli::parse().cmd {
+    let cli = Cli::parse();
+    // A mach port our parent left us (vroom_ipc::mach), taken before we
+    // start anything: the app's, for the VMM it starts (the screen's
+    // IOSurfaces go there); the VMM's, for its GPU process. Everyone
+    // else drops whatever came.
+    #[cfg(target_os = "macos")]
+    if let Some(p) = vroom_ipc::mach::inherited(false) {
+        match &cli.cmd {
+            Cmd::Run { .. } => vroom_gpu3d::remote::set_viewer_port(p),
+            Cmd::GpuHelper(_) => vroom_gpu3d::remote::set_vmm_port(p),
+            _ => drop(p),
+        }
+    }
+    let r = match cli.cmd {
         Cmd::Run { config, restore, fresh, state_dir, host_clipboard_file, no_sandbox, ui_fd } => {
             raise_open_files();
             load(&config).and_then(|cfg| {
@@ -145,10 +182,16 @@ fn main() -> ExitCode {
         Cmd::Snapshot(s) => snap::run(s, load, default_state_dir),
         Cmd::New(a) => new::run(a, load),
         Cmd::Import(a) => import::run(a),
+        Cmd::GuestTools(c) => tools::run(c),
         Cmd::AudioOut { input } => audio_out(input),
         Cmd::CameraHelper => camera::helper(),
         #[cfg(unix)]
         Cmd::GpuHelper(a) => gpu::helper(a),
+        #[cfg(target_os = "macos")]
+        Cmd::GpuServer => gpu::server(),
+        #[cfg(target_os = "macos")]
+        Cmd::GpuWorker(a) => gpu::worker(a),
+        Cmd::VideoHelper { args } => video::helper(&args),
         Cmd::UsbHost(a) => usb::host(a),
         Cmd::Usb(c) => usb::run(c),
         Cmd::Check { config } => load(&config).and_then(|c| {

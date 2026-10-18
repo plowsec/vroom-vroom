@@ -246,6 +246,7 @@ impl App {
                 }
             }
             Msg::Drop(p) => self.dropped(&p),
+            Msg::Open(p) => self.opened(&p),
             Msg::DropHover(b) => self.ui.set_drop_hover(b),
             Msg::PaletteKey(k) => self.palette_key(k),
             Msg::Tick => self.tick(),
@@ -319,8 +320,10 @@ impl App {
                     Err(e) => self.toast(format!("Import failed: {e}"), 3),
                 }
             }
+            Msg::NewVmProgress(t) => self.ui.set_newvm_progress(s(t)),
             Msg::Created(r, start) => {
                 self.ui.set_newvm_creating(false);
+                self.ui.set_newvm_progress(s(""));
                 match r {
                     Ok(p) => {
                         self.ui.set_newvm_open(false);
@@ -377,7 +380,28 @@ impl App {
             memory_gib: (host::memory_bytes() >> 30) as i32,
             interfaces: model(self.host_ifaces.iter().map(s).collect()),
             free: s(free.map(|f| format!("{} free on this machine", fmt::bytes(f))).unwrap_or_default()),
+            netd: s(rootd::state().word()),
+            netd_busy: rootd::busy(),
         });
+    }
+
+    /// Set up (`true`) or remove vroom-netd; macOS asks for the password.
+    fn netd(&mut self, install: bool) {
+        if rootd::busy() {
+            return;
+        }
+        let f: fn() -> Result<(), String> = if install { rootd::install } else { rootd::uninstall };
+        rootd::in_background(f, move |r| {
+            let (text, kind) = match r {
+                Ok(()) if install => ("vroom-netd is set up: bridged and host-only networks and USB devices macOS uses work now".to_string(), 1),
+                Ok(()) => ("vroom-netd is removed".to_string(), 1),
+                Err(e) if e == "cancelled" => return msg::send(Msg::Refresh),
+                Err(e) => (format!("vroom-netd: {e}"), 3),
+            };
+            msg::send(Msg::Toast { text, kind, action: String::new() });
+            msg::send(Msg::Refresh);
+        });
+        self.push_host();
     }
 
     fn item(&self, i: usize, v: &Vm) -> VmItem {
@@ -477,18 +501,37 @@ impl App {
         // Not a full listing: this runs every tick, and each snapshot's
         // manifest can be megabytes.
         let has_snaps = std::fs::read_dir(v.state_dir().join("snapshots")).is_ok_and(|mut d| d.next().is_some());
-        let (locked, lock_reason) = match state {
-            VmState::Off => (false, ""),
+        let (locked, lock_short, lock_reason, lock_why) = match state {
+            VmState::Off => (false, "", "", ""),
             VmState::Suspended => (
                 true,
-                "Suspended. Hardware settings apply after a fresh boot: resume and shut down, or discard the saved state (⋯ menu).",
+                "Suspended: hardware is locked",
+                "Suspended. Network and USB changes apply when it resumes. Other hardware changes after a fresh boot: resume and shut down, or discard the saved state (⋯ menu).",
+                "The VM was saved with this hardware: it changes after a fresh boot.",
             ),
-            _ if !console::is_running(&v.key) && console::viewer_socket(&v.state_dir()).is_some() => {
-                (true, "Running without a window. Show brings it back; shut it down to change hardware.")
+            _ if !console::is_running(&v.key) && console::viewer_socket(&v.state_dir()).is_some() => (
+                true,
+                "Running without a window",
+                "Running without a window. Show brings it back; shut it down to change hardware.",
+                "Can't change while the VM runs without a window.",
+            ),
+            _ if !console::is_running(&v.key) => {
+                (
+                    true,
+                    "Running from a terminal",
+                    "Running from a terminal (vroom run). Stop it there to change settings.",
+                    "Can't change while the VM runs from a terminal.",
+                )
             }
-            _ if !console::is_running(&v.key) => (true, "Running from a terminal (vroom run). Stop it there to change settings."),
-            _ => (true, "Running. Shut it down to change hardware. Clipboard settings apply right away."),
+            _ => (
+                true,
+                "Running: hardware is locked",
+                "Running. Network, USB devices and the clipboard change right away; the rest needs the VM shut down.",
+                "The guest found this hardware when it started: shut the VM down to change it.",
+            ),
         };
+        let live = self.live_now(v);
+        let (net_notes, net_note) = self.net_notes(v, c, state);
 
         let disks: Vec<DiskRow> = c
             .disks
@@ -520,7 +563,8 @@ impl App {
         let nets: Vec<NetRow> = c
             .nets
             .iter()
-            .map(|n| NetRow {
+            .zip(net_notes)
+            .map(|(n, note)| NetRow {
                 mode: match n.mode {
                     NetKind::Nat => 0,
                     NetKind::Bridged => 1,
@@ -543,6 +587,8 @@ impl App {
                 block_private: n.block_private,
                 mac: s(n.mac.clone().unwrap_or_default()),
                 summary: s(net_summary(n)),
+                connected: n.connected,
+                note: s(note),
             })
             .collect();
         let shares: Vec<ShareRow> = c
@@ -556,24 +602,7 @@ impl App {
                 readonly: sh.readonly,
             })
             .collect();
-        let host_usb = if c.usb.is_empty() { Vec::new() } else { vroom_usb::list::list() };
-        let usb: Vec<UsbRow> = c
-            .usb
-            .iter()
-            .map(|u| {
-                let ids = u.ids();
-                let here = host_usb.iter().find(|d| Some((d.vendor, d.product)) == ids && (u.serial.is_none() || d.serial == u.serial));
-                let held = here.is_some_and(|d| !d.claimed_by.is_empty());
-                let state = match here {
-                    None => "not plugged in".to_string(),
-                    Some(d) if held => format!("held by {} (a VM can't take it without root)", d.claimed_by.join(", ")),
-                    Some(_) => "plugged in".to_string(),
-                };
-                let label = u.name.clone().or_else(|| here.map(|d| d.label())).unwrap_or_else(|| u.id.clone());
-                let serial = u.serial.as_ref().map(|sn| format!(" · serial {sn}")).unwrap_or_default();
-                UsbRow { label: s(label), note: s(format!("{}{serial} · {state}", u.id)), warn: held }
-            })
-            .collect();
+        let usb = usb_rows(c, console::usb_now(&v.key));
         let usb_host: Vec<UsbHostRow> = self
             .usb_host
             .iter()
@@ -592,6 +621,7 @@ impl App {
             })
             .collect();
         let warnings: Vec<SharedString> = r.warnings().into_iter().map(|w| s(capitalize(&w))).collect();
+        let warn_short: Vec<SharedString> = r.warnings().iter().map(|w| s(warn_short(w))).collect();
 
         let (boot_kernel, firmware, vars, kernel, initrd, cmdline) = match &c.boot {
             Boot::Uefi { firmware, vars } => (
@@ -637,14 +667,19 @@ impl App {
             width: s(c.display.width.to_string()),
             height: s(c.display.height.to_string()),
             hidpi: c.display.hidpi,
+            video_decode: c.display.video_decode,
+            video_encode: c.display.video_encode,
+            monitors: c.display.monitors as i32,
             disks: model(disks),
             nets: model(nets),
             shares: model(shares),
             usb_picking: self.usb_picking,
-            sum_usb: s(match c.usb.len() {
-                0 => "None".to_string(),
-                1 => usb[0].label.to_string(),
-                n => format!("{n} devices"),
+            sum_usb: s(match (usb.len(), usb.iter().filter(|u| u.on).count()) {
+                (0, _) => "None".to_string(),
+                (1, 0) => usb[0].label.to_string(),
+                (1, _) => format!("{} · connected", usb[0].label),
+                (n, 0) => format!("{n} devices"),
+                (n, on) => format!("{n} devices · {on} connected"),
             }),
             usb: model(usb),
             usb_host: model(usb_host),
@@ -684,8 +719,14 @@ impl App {
             initrd: s(initrd),
             cmdline: s(cmdline),
             warnings: model(warnings),
+            warn_short: model(warn_short),
             locked,
+            lock_short: s(lock_short),
             lock_reason: s(lock_reason),
+            lock_why: s(lock_why),
+            live,
+            net_note: s(net_note),
+            usb_note: s(if state == VmState::Suspended && live { "Changes apply when the VM resumes." } else { "" }),
             config_path: s(paths::tilde(&v.path)),
             state_path: s(paths::tilde(&v.state_dir())),
             snapshots_cpu_mem: s(if has_snaps { "Snapshots only restore with the CPUs and memory they were taken with." } else { "" }),
@@ -699,7 +740,7 @@ impl App {
             sum_display: s(match gpu {
                 0 => "No screen".to_string(),
                 g => format!(
-                    "{} · starts at {}×{}{}",
+                    "{} · {}×{}{}",
                     match (g, c.display.opengl, c.display.opengl_host) {
                         (1, ..) => "2D",
                         _ if c.os == Some(GuestOs::Windows) => "3D (Direct3D 11)",
@@ -709,7 +750,7 @@ impl App {
                     },
                     c.display.width,
                     c.display.height,
-                    if c.display.hidpi { " · full resolution" } else { "" }
+                    if c.display.monitors > 1 { format!(" · {} monitors", c.display.monitors) } else { String::new() },
                 ),
             }),
             sum_storage: s(format!(
@@ -769,7 +810,7 @@ impl App {
         self.ui.set_vis(CardVis {
             searching: !any,
             hw: any || hit(&format!("processor cpu cpus core memory ram nested virtualization guest system os {}", st.sum_hw.to_lowercase())),
-            display: any || hit("display screen gpu 3d 2d graphics vulkan opengl angle apple driver resolution width height size monitor retina hidpi scale scaling sharp blurry"),
+            display: any || hit("display screen gpu 3d 2d graphics vulkan opengl angle apple driver resolution width height size monitor retina hidpi scale scaling sharp blurry video decode decoding h264 hevc videotoolbox"),
             storage: any || hit("storage disk disks iso cdrom installer drive nvme virtio bus sync write safety readonly read-only compact image qcow2 space"),
             net: any || hit("network net nat bridged host-only hostonly port forward forwarding ssh mac address interface internet lan localhost loopback adapter"),
             share: any || hit("shared folders share folder virtiofs mount files tag"),
@@ -883,17 +924,151 @@ impl App {
         locked
     }
 
+    /// Network and USB devices can change now: the VM is off, suspended
+    /// (they apply when it resumes) or runs in a window of ours (they
+    /// apply right away, as far as they can).
+    fn live_now(&self, v: &Vm) -> bool {
+        match self.state_of(v) {
+            VmState::Off | VmState::Suspended => true,
+            _ => console::is_running(&v.key),
+        }
+    }
+
+    /// `live_now` for the selected VM; says why not if not.
+    fn live_ok(&mut self) -> bool {
+        let ok = self.cur().is_none_or(|v| self.live_now(v));
+        if !ok {
+            self.toast("This VM runs without a window here: show it (or stop it) first.", 0);
+        }
+        ok
+    }
+
+    /// Per adapter of `c` (the VM file), what waits and why; and a line
+    /// for the whole card.
+    fn net_notes(&self, v: &Vm, c: &VmConfig, state: VmState) -> (Vec<String>, String) {
+        let mut notes = vec![String::new(); c.nets.len()];
+        let mac = |n: &vroom_config::Net| n.mac.as_deref().map(|m| m.to_ascii_lowercase());
+        match state {
+            VmState::Suspended => {
+                let Some(saved) = vm::suspended_config(&v.state_dir()) else { return (notes, String::new()) };
+                for (i, n) in c.nets.iter().enumerate() {
+                    notes[i] = match saved.nets.get(i) {
+                        None => "Added: it comes when the VM next starts (a resumed VM keeps the adapters it was saved with).".into(),
+                        Some(o) if mac(o) != mac(n) => "The new MAC address applies when the VM next starts.".into(),
+                        Some(o) if o != n => "Applies when the VM resumes.".into(),
+                        Some(_) => String::new(),
+                    };
+                }
+                let gone = saved.nets.len().saturating_sub(c.nets.len());
+                let card = match gone {
+                    0 => String::new(),
+                    1 => "1 adapter removed: the VM keeps it, unplugged, until it next starts.".into(),
+                    n => format!("{n} adapters removed: the VM keeps them, unplugged, until it next starts."),
+                };
+                (notes, card)
+            }
+            VmState::Off => (notes, String::new()),
+            _ => {
+                let Some(view) = console::net_view(&v.key) else { return (notes, String::new()) };
+                for (i, n) in c.nets.iter().enumerate() {
+                    let Some(Some(nic)) = view.map.get(i) else {
+                        notes[i] = if view.adding == Some(i) { "Adding...".into() } else { "Added: it comes when the VM next starts.".into() };
+                        continue;
+                    };
+                    let (Some(p), Some(want)) = (view.ports.iter().find(|p| p.nic == *nic), console::net_live_of(n)) else { continue };
+                    let started = view.start.get(*nic as usize);
+                    notes[i] = if want.kind != p.live.kind || want.name != p.live.name {
+                        if want.kind == vroom_display::NetKind::Nat && !view.nat_ok {
+                            "NAT applies when the VM next starts: it started without a NAT adapter, so its sandbox allows no connections out.".into()
+                        } else {
+                            format!("Still {}: switching, or it couldn't (see the VM window).", console::net_mode_text(&p.live))
+                        }
+                    } else if want.kind == vroom_display::NetKind::Nat && want.loopback && !p.live.loopback {
+                        "Reaching this Mac's localhost applies when the VM next starts (its sandbox allows it only then).".into()
+                    } else if want.kind == vroom_display::NetKind::Nat && want.forwards != p.live.forwards {
+                        "Port forward changes apply when the VM next starts.".into()
+                    } else if started.is_some_and(|o| mac(o) != mac(n)) {
+                        "The new MAC address applies when the VM next starts.".into()
+                    } else {
+                        String::new()
+                    };
+                }
+                let gone = view.ports.iter().filter(|p| !view.map.contains(&Some(p.nic))).count();
+                let card = match gone {
+                    0 => String::new(),
+                    1 => "1 adapter removed: unplugged now, gone when the VM next starts.".into(),
+                    n => format!("{n} adapters removed: unplugged now, gone when the VM next starts."),
+                };
+                (notes, card)
+            }
+        }
+    }
+
     fn set(&mut self, key: &str, v: &str) {
         if let Some(k) = key.strip_prefix("newvm.") {
             return self.newvm_set(k, v);
         }
+        if key.starts_with("usbnow.") {
+            return self.usb_now_act(key, Some(v));
+        }
         let locked = self.cur().is_some_and(|vm| self.state_of(vm) != VmState::Off);
-        // Not hardware: these apply to a running VM's window.
-        if locked && !key.starts_with("clip.") && key != "hidpi" {
+        // Not hardware: these apply to a running VM's window. Network
+        // adapters apply to it too (or when it resumes).
+        let net = key.strip_prefix("net.").and_then(|r| r.split('.').next()).and_then(|i| i.parse::<usize>().ok());
+        // How a USB disk connects applies at its next connect.
+        let usb = key.starts_with("usb.") && self.live_ok();
+        if locked && !key.starts_with("clip.") && key != "hidpi" && !(net.is_some() && self.live_ok()) && !usb {
             return;
         }
         let iface = self.host_ifaces.first().cloned();
-        self.change(|c| edit::set(c, key, v, iface.as_deref()));
+        let vm = self.cur().map(|v| v.key.clone()).unwrap_or_default();
+        let saved = match (net, key.ends_with(".mode"), v.parse::<usize>()) {
+            // Port forwards set aside while on another network come back.
+            (Some(i), true, Ok(m)) => self.change(|c| console::net_set_mode(&vm, c, i, m, iface.as_deref())),
+            _ => self.change(|c| edit::set(c, key, v, iface.as_deref())),
+        };
+        if let (true, Some(i)) = (saved, net) {
+            console::net_apply(&vm, i);
+        }
+        // A USB disk connected now another way: again, this way.
+        if let (true, Some(i)) = (saved && key.ends_with(".mode"), key.strip_prefix("usb.").and_then(|r| r.split('.').next()).and_then(|i| i.parse::<usize>().ok())) {
+            if let Some(u) = self.cur().and_then(|v| v.raw.as_ref()).and_then(|c| c.usb.get(i).cloned()) {
+                let d = vroom_display::UsbDev { id: u.id.clone(), serial: u.serial.clone().unwrap_or_default(), name: u.name.clone().unwrap_or_default() };
+                console::usb_set_mode(&vm, d, u.mode, u.readonly);
+            }
+        }
+    }
+
+    /// A device connected for this run only, by its place in that list.
+    fn run_only_dev(&self, j: &str) -> Option<vroom_display::UsbPort> {
+        let v = self.cur()?;
+        let (ports, _) = console::usb_now(&v.key)?;
+        run_only(v.raw.as_ref()?, &ports).into_iter().nth(j.parse().ok()?)
+    }
+
+    /// The USB card's rows for this run's devices: how one connects (it
+    /// connects again that way), "always connect", let go.
+    fn usb_now_act(&mut self, a: &str, v: Option<&str>) {
+        let Some((j, what)) = a.strip_prefix("usbnow.").and_then(|r| r.split_once('.')) else { return };
+        let Some(p) = self.run_only_dev(j) else { return };
+        let Some(key) = self.cur().map(|v| v.key.clone()) else { return };
+        match (what, v) {
+            ("mode", Some(m)) => {
+                let mode = match m {
+                    "0" => vroom_config::UsbMode::Files,
+                    "1" => vroom_config::UsbMode::Disk,
+                    _ => vroom_config::UsbMode::Device,
+                };
+                console::usb_set_mode(&key, p.dev, mode, p.readonly);
+            }
+            ("pin", None) => {
+                if self.change(|c| crate::hostusb::apply_always(c, &p.dev, true, how_mode(p.how))) {
+                    self.toast("Saved: it connects at every start", 1);
+                }
+            }
+            ("disconnect", None) => console::usb_disconnect(&key, &p.dev),
+            _ => {}
+        }
     }
 
     fn act(&mut self, a: &str) {
@@ -996,8 +1171,8 @@ impl App {
             "newvm.cancel" => self.ui.set_newvm_open(false),
             "newvm.pick" => {
                 let windows = self.ui.get_draft().os_index == 1;
-                let mut d = rfd::FileDialog::new().set_title(if windows { "Install stick image" } else { "Installer ISO" });
-                d = if windows { d.add_filter("Disk image", &["raw", "img"]) } else { d.add_filter("ISO image", &["iso", "img"]) };
+                let mut d = rfd::FileDialog::new().set_title(if windows { "Windows 11 ARM64 ISO" } else { "Installer ISO or cloud image" });
+                d = if windows { d.add_filter("ISO or install stick", &["iso", "raw", "img"]) } else { d.add_filter("ISO or cloud image", &["iso", "img"]) };
                 if let Some(p) = d.pick_file() {
                     self.set_installer(Some(p));
                 }
@@ -1017,6 +1192,17 @@ impl App {
                 }
             }
             "do.vmware" => self.vmware_run(),
+            // vroom-netd, the root helper (bridged, host-only, USB devices
+            // macOS holds).
+            "netd.setup" => self.netd(true),
+            "netd.remove" => self.ask(
+                "Remove vroom-netd?",
+                "Bridged and host-only networks, and USB devices macOS uses, stop working until you set it up again. macOS asks for an admin password.",
+                "Remove",
+                true,
+                "do.netd.remove",
+            ),
+            "do.netd.remove" => self.netd(false),
             "import" => {
                 if let Some(p) = rfd::FileDialog::new().set_title("Add a VM file").add_filter("VM file", &["toml"]).pick_file() {
                     self.import(&p);
@@ -1110,20 +1296,41 @@ impl App {
                     self.push_all();
                 }
             }
-            "share.add" | "disk.add-iso" | "disk.add-existing" | "disk.add-new" | "usb.add" if self.hw_locked() => {}
+            "share.add" | "disk.add-iso" | "disk.add-existing" | "disk.add-new" if self.hw_locked() => {}
+            _ if a.starts_with("usbnow.") => self.usb_now_act(a, None),
+            // Out of the VM file, but connected still (it was for this run).
+            _ if a.starts_with("usb.") && a.ends_with(".unpin") => {
+                let i = &a["usb.".len()..a.len() - ".unpin".len()];
+                if self.live_ok() {
+                    self.change(|c| edit::act(c, &format!("usb.{i}.remove")));
+                }
+            }
+            "usb.add" if !self.live_ok() => {}
             "usb.add" => {
                 // Open or close the list of what's plugged in.
                 self.usb_picking = !self.usb_picking;
-                self.usb_host = if self.usb_picking { vroom_usb::list::list() } else { Vec::new() };
+                self.usb_host = if self.usb_picking { crate::hostusb::host_list() } else { Vec::new() };
                 self.push_all();
+            }
+            // The same by id ("usb.pick-id.1209:00aa"; scripts, VROOM_SHOT).
+            _ if a.starts_with("usb.pick-id.") => {
+                let id = &a["usb.pick-id.".len()..];
+                if let Some(j) = self.usb_host.iter().position(|d| d.id() == id) {
+                    self.act(&format!("usb.pick.{j}"));
+                }
             }
             _ if a.starts_with("usb.pick.") => {
                 let j: usize = a["usb.pick.".len()..].parse().unwrap_or(usize::MAX);
-                if self.hw_locked() {
+                if !self.live_ok() {
                     return;
                 }
                 if let Some(d) = self.usb_host.get(j).cloned() {
-                    self.change(|c| edit::add_usb(c, &d.id(), d.serial.as_deref(), Some(&d.label())));
+                    // A running VM gets it now too, as from its USB menu.
+                    if self.change(|c| edit::add_usb(c, &d.id(), d.serial.as_deref(), Some(&d.label()))) {
+                        if let Some(v) = self.cur() {
+                            console::usb_plug(&v.key, crate::hostusb::dev_of(&d));
+                        }
+                    }
                 }
             }
             "share.add" => {
@@ -1169,11 +1376,32 @@ impl App {
                         _ => {}
                     }
                 }
-                if self.hw_locked() {
+                // Network adapters and USB devices change while the VM
+                // runs (or is suspended) too.
+                let live = a.starts_with("net.") || a.starts_with("usb.");
+                if if live { !self.live_ok() } else { self.hw_locked() } {
                     return;
                 }
+                let gone_usb = a
+                    .strip_prefix("usb.")
+                    .and_then(|r| r.strip_suffix(".remove"))
+                    .and_then(|i| i.parse::<usize>().ok())
+                    .and_then(|i| self.cur().and_then(|v| v.raw.as_ref()).and_then(|c| c.usb.get(i).cloned()));
                 let a = a.to_string();
-                self.change(|c| edit::act(c, &a));
+                if !self.change(|c| edit::act(c, &a)) {
+                    return;
+                }
+                let Some(key) = self.cur().map(|v| v.key.clone()) else { return };
+                let parts: Vec<&str> = a.split('.').collect();
+                match parts.as_slice() {
+                    ["net", "add"] => console::net_added(&key),
+                    ["net", i, "remove"] => console::net_removed(&key, i.parse().unwrap_or(usize::MAX)),
+                    ["net", i, ..] => console::net_apply(&key, i.parse().unwrap_or(usize::MAX)),
+                    _ => {}
+                }
+                if let Some(u) = gone_usb {
+                    console::usb_unplug(&key, &u.id, u.serial.as_deref());
+                }
             }
         }
     }
@@ -1251,6 +1479,17 @@ impl App {
         let Some(cfg) = v.resolved() else {
             return self.toast("Fix the VM file first: it has an error.", 3);
         };
+        // Bridged and host-only need the root helper: offer to set it up
+        // rather than fail to start.
+        if cfg.nets.iter().any(|n| n.mode != vroom_config::NetKind::Nat) && matches!(rootd::state_now(), rootd::Helper::Missing | rootd::Helper::Stopped) {
+            return self.ask(
+                "Set up vroom-netd?",
+                "This VM has a bridged or host-only network adapter. Those go through vroom-netd, a small helper that runs as root. It's set up once; macOS asks for an admin password. Start the VM again once it's done.",
+                "Set up",
+                false,
+                "netd.setup",
+            );
+        }
         let (path, name) = (v.path.clone(), cfg.name.clone());
         match console::start(&path, &cfg, extra) {
             Ok(_) => {}
@@ -1445,6 +1684,19 @@ impl App {
         }
     }
 
+    /// From Finder: a VM file starts (as `vroom-gui vm.toml` does), the
+    /// rest is a drop on the library.
+    fn opened(&mut self, p: &Path) {
+        let vm = p.extension().is_some_and(|e| e.eq_ignore_ascii_case("toml")) && VmConfig::load_raw(p).is_ok();
+        if vm {
+            self.add_vm(p);
+            self.start_current(&[]);
+        } else {
+            self.update(Msg::ShowLibrary(None));
+            self.dropped(p);
+        }
+    }
+
     fn dropped(&mut self, p: &Path) {
         let ext = p.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
         match ext.as_str() {
@@ -1474,6 +1726,17 @@ impl App {
         self.installer = installer;
         self.ui.set_newvm_error(s(""));
         self.ui.set_newvm_creating(false);
+        self.ui.set_newvm_progress(s(""));
+        // Ready-made VMs: the Mac user's name, their SSH keys.
+        let keys = ssh_keys();
+        self.ui.set_newvm_keys(model(keys.iter().map(|p| s(paths::tilde(p))).collect()));
+        let mut d = self.ui.get_draft();
+        if d.user.is_empty() {
+            d.user = s(std::env::var("USER").unwrap_or_default().to_ascii_lowercase());
+        }
+        d.ssh_key = 0;
+        d.ssh = false;
+        self.ui.set_draft(d);
         self.newvm_set("os", &os_index(os).to_string());
         self.ui.set_newvm_open(true);
     }
@@ -1481,11 +1744,16 @@ impl App {
     fn newvm_set(&mut self, k: &str, v: &str) {
         match k {
             "installer" => return self.set_installer(Some(PathBuf::from(v))),
-            "start" => {
+            "start" | "ssh" | "desktop" => {
                 let mut d = self.ui.get_draft();
-                d.start = v == "true";
+                match k {
+                    "start" => d.start = v == "true",
+                    "ssh" => d.ssh = v == "true",
+                    _ => d.desktop = v == "true",
+                }
                 return self.ui.set_draft(d);
             }
+
             "os" => {}
             _ => return,
         }
@@ -1516,6 +1784,7 @@ impl App {
     fn set_installer(&mut self, p: Option<PathBuf>) {
         let mut d = self.ui.get_draft();
         d.installer = s(p.as_ref().map(|p| paths::tilde(p)).unwrap_or_default());
+        d.ready = ready_kind(GuestOs::ALL.get(d.os_index.max(0) as usize).copied().unwrap_or(GuestOs::Linux), p.as_deref()).is_some();
         self.installer = p;
         self.ui.set_draft(d.clone());
         self.ui.set_newvm_dest(s(format!("Goes in {}", paths::tilde(&paths::vms_dir().join(d.name.as_str())))));
@@ -1532,11 +1801,71 @@ impl App {
         }
         let os = GuestOs::ALL.get(d.os_index.max(0) as usize).copied().unwrap_or(GuestOs::Linux);
         let installer = self.installer.clone();
+        if d.ready {
+            return self.newvm_ready(&name, os, installer);
+        }
         let (cpus, mem, disk, gpu3d, start) = (d.cpus.max(1) as u32, d.memory_gib.max(1) as u64, d.disk_gib.max(1) as u64, d.gpu3d, d.start);
         self.ui.set_newvm_error(s(""));
         self.ui.set_newvm_creating(true);
         std::thread::spawn(move || {
             let r = create_vm(&name, os, installer.as_deref(), cpus, mem, disk, gpu3d);
+            msg::post(move || Msg::Created(r, start));
+        });
+    }
+
+    /// A ready-made VM (vroom_tools::ready), made off the UI thread.
+    fn newvm_ready(&mut self, name: &str, os: GuestOs, installer: Option<PathBuf>) {
+        use vroom_tools::ready::{Account, Spec};
+        let d = self.ui.get_draft();
+        let ssh_key = if d.ssh {
+            let keys = ssh_keys();
+            let Some(k) = keys.get(d.ssh_key.max(0) as usize) else {
+                return self.ui.set_newvm_error(s("No SSH key in ~/.ssh (make one: ssh-keygen -t ed25519)."));
+            };
+            match std::fs::read_to_string(k) {
+                Ok(t) => Some(t.trim().to_string()),
+                Err(e) => return self.ui.set_newvm_error(s(format!("{}: {e}", paths::tilde(k)))),
+            }
+        } else {
+            None
+        };
+        // Ports other VMs forward: SSH gets another one.
+        let taken_ports: Vec<u16> = self.vms.iter().filter_map(|v| v.raw.as_ref()).flat_map(|c| c.nets.iter().flat_map(|n| n.port_forwards.iter().map(|f| f.host_port))).collect();
+        let spec = Spec {
+            name: name.to_string(),
+            dir: paths::vms_dir().join(name),
+            cpus: d.cpus.max(1) as u32,
+            memory_mib: d.memory_gib.max(1) as u64 * 1024,
+            disk_gib: d.disk_gib.max(8) as u64,
+            gpu3d: d.gpu3d && os != GuestOs::Windows,
+            account: Account { user: d.user.trim().to_string(), password: d.password.to_string(), ssh_key },
+            taken_ports,
+        };
+        // Checked now, so mistakes show before a download.
+        if let Some(Err(e)) = ready_kind(os, installer.as_deref()).map(|k| vroom_tools::ready::check(&spec, &k)) {
+            return self.ui.set_newvm_error(s(e));
+        }
+        let (start, desktop) = (d.start, d.desktop);
+        self.ui.set_newvm_error(s(""));
+        self.ui.set_newvm_creating(true);
+        std::thread::spawn(move || {
+            let mut say = |t: &str| {
+                let t = t.to_string();
+                msg::post(move || Msg::NewVmProgress(t));
+            };
+            let r = (|| {
+                let kind = match ready_kind(os, installer.as_deref()) {
+                    Some(vroom_tools::ready::Kind::Ubuntu { image, .. }) if image.as_os_str().is_empty() => {
+                        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/tmp"));
+                        let image = vroom_tools::ready::ubuntu_image(&home.join("Library/Caches/vroom"), &mut say)?;
+                        vroom_tools::ready::Kind::Ubuntu { image, desktop }
+                    }
+                    Some(vroom_tools::ready::Kind::Ubuntu { image, .. }) => vroom_tools::ready::Kind::Ubuntu { image, desktop },
+                    Some(k) => k,
+                    None => return Err("not a ready-made VM".to_string()),
+                };
+                vroom_tools::ready::create(&spec, &kind, &mut say)
+            })();
             msg::post(move || Msg::Created(r, start));
         });
     }
@@ -1562,6 +1891,12 @@ impl App {
         all.push(e("New VM".into(), "⌘N", "plus", "newvm".into()));
         all.push(e("Add a VM file".into(), "", "file", "import".into()));
         all.push(e("Import from VMware".into(), "", "upload", "vmware".into()));
+        // vroom-netd, the root helper: bridged, host-only, USB devices macOS uses.
+        match rootd::state() {
+            rootd::Helper::Ready(_) => all.push(e("Remove vroom-netd (root helper)".into(), "", "shield-off", "netd.remove".into())),
+            rootd::Helper::Unknown => {}
+            _ => all.push(e("Set up vroom-netd (root helper for bridged networking and USB)".into(), "", "shield", "netd.setup".into())),
+        }
         for (i, v) in self.vms.iter().enumerate() {
             all.push(e(format!("Go to {}", v.name()), "", "arrow-right", format!("vm:{i}:select")));
         }
@@ -1627,6 +1962,30 @@ impl App {
     }
 }
 
+/// What a ready-made VM is made from, if this is one: Ubuntu with no
+/// installer (the cloud image, downloaded: an empty path) or a cloud
+/// image (.img); Windows with its ISO.
+fn ready_kind(os: GuestOs, installer: Option<&Path>) -> Option<vroom_tools::ready::Kind> {
+    use vroom_tools::ready::Kind;
+    let ext = installer.and_then(|p| p.extension()).map(|e| e.to_string_lossy().to_ascii_lowercase());
+    match (os, ext.as_deref()) {
+        (GuestOs::Ubuntu, None) => Some(Kind::Ubuntu { image: PathBuf::new(), desktop: false }),
+        (GuestOs::Ubuntu, Some("img")) => Some(Kind::Ubuntu { image: installer?.to_path_buf(), desktop: false }),
+        (GuestOs::Windows, Some("iso")) => Some(Kind::Windows { iso: installer?.to_path_buf() }),
+        _ => None,
+    }
+}
+
+/// The Mac user's SSH public keys (~/.ssh/*.pub), ed25519 first.
+fn ssh_keys() -> Vec<PathBuf> {
+    let Some(home) = std::env::var_os("HOME") else { return Vec::new() };
+    let mut keys: Vec<PathBuf> = std::fs::read_dir(PathBuf::from(home).join(".ssh"))
+        .map(|rd| rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "pub")).collect())
+        .unwrap_or_default();
+    keys.sort_by_key(|p| (!p.to_string_lossy().contains("ed25519"), p.clone()));
+    keys
+}
+
 /// Identity changed by hand? Random serials (every new VM has them) don't count.
 fn same_names(id: &vroom_config::Identity) -> bool {
     let mut id = id.clone();
@@ -1678,6 +2037,141 @@ fn capitalize(w: &str) -> String {
     }
 }
 
+/// A config warning in a few words, for its banner (the whole of it goes
+/// in the tooltip).
+fn warn_short(w: &str) -> String {
+    let short = if w.starts_with("security.sandbox") {
+        "Sandbox is off"
+    } else if w.starts_with("net.allow_host_loopback") {
+        "Guest reaches this Mac's localhost"
+    } else if w.starts_with("port forward") {
+        "Port forward open to your network"
+    } else if w.starts_with("audio.input") {
+        "Microphone on"
+    } else if w.starts_with("share") && w.contains("home folder") {
+        "Share exposes your home folder"
+    } else if w.starts_with("share") && w.contains("writable") {
+        "Writable share"
+    } else {
+        return capitalize(w.split_once(": ").map_or(w, |(a, _)| a));
+    };
+    short.to_string()
+}
+
+/// The VM file's entry for `d`? One without a serial number matches any.
+fn in_file(c: &VmConfig, d: &vroom_display::UsbDev) -> Option<usize> {
+    c.usb.iter().position(|u| u.id == d.id && !u.serial.as_deref().is_some_and(|s| s != d.serial))
+}
+
+/// The devices the running VM has connected for this run only (not in
+/// its file), once each, in the order the VMM lists them.
+fn run_only(c: &VmConfig, ports: &[vroom_display::UsbPort]) -> Vec<vroom_display::UsbPort> {
+    let mut out: Vec<vroom_display::UsbPort> = Vec::new();
+    for p in ports.iter().filter(|p| in_file(c, &p.dev).is_none()) {
+        if !out.iter().any(|o| o.dev.id == p.dev.id && o.dev.serial == p.dev.serial) {
+            out.push(p.clone());
+        }
+    }
+    out
+}
+
+fn usb_mode_index(m: vroom_config::UsbMode) -> i32 {
+    match m {
+        vroom_config::UsbMode::Files => 0,
+        vroom_config::UsbMode::Disk => 1,
+        vroom_config::UsbMode::Device => 2,
+    }
+}
+
+fn how_mode(h: vroom_display::UsbHow) -> vroom_config::UsbMode {
+    match h {
+        vroom_display::UsbHow::Files => vroom_config::UsbMode::Files,
+        vroom_display::UsbHow::Disk => vroom_config::UsbMode::Disk,
+        vroom_display::UsbHow::Device => vroom_config::UsbMode::Device,
+    }
+}
+
+/// The USB card: the VM file's devices ("always connect"), then those
+/// connected now for this run only. `now`: what the running VM has
+/// connected, and whether its guest tools answer.
+fn usb_rows(c: &VmConfig, now: Option<(Vec<vroom_display::UsbPort>, bool)>) -> Vec<UsbRow> {
+    let running = now.is_some();
+    let (ports, agent) = now.unwrap_or_default();
+    let host = if c.usb.is_empty() && ports.is_empty() { Vec::new() } else { crate::hostusb::host_list() };
+    usb_rows_with(c, &ports, agent, running, &host)
+}
+
+fn usb_rows_with(
+    c: &VmConfig,
+    ports: &[vroom_display::UsbPort],
+    agent: bool,
+    running: bool,
+    host: &[vroom_usb::list::HostDevice],
+) -> Vec<UsbRow> {
+    use crate::console::usbmenu::{connected_note, CAPTURED};
+    use vroom_config::UsbMode;
+    let ids = |id: &str, serial: &str| format!("{id}{}", if serial.is_empty() { String::new() } else { format!(" · serial {serial}") });
+    let same = |d: &vroom_display::UsbDev, id: &str, serial: Option<&str>| d.id == id && serial.is_none_or(|s| s == d.serial || d.serial.is_empty());
+    let files_of = |h: Option<&vroom_usb::list::HostDevice>| -> Vec<String> {
+        h.map(|h| crate::usbdisk::volumes(h).into_iter().map(|(_, p)| p.display().to_string()).collect()).unwrap_or_default()
+    };
+    let mut rows = Vec::new();
+    for (i, u) in c.usb.iter().enumerate() {
+        let here = host.iter().find(|d| Some((d.vendor, d.product)) == u.ids() && (u.serial.is_none() || d.serial == u.serial));
+        let mine: Vec<vroom_display::UsbPort> = ports.iter().filter(|p| same(&p.dev, &u.id, u.serial.as_deref())).cloned().collect();
+        let on = !mine.is_empty();
+        let storage = cfg!(target_os = "macos")
+            && (here.is_some_and(crate::hostusb::is_disk) || u.mode != UsbMode::Device || mine.iter().any(|p| p.how != vroom_display::UsbHow::Device));
+        let id_line = ids(&u.id, u.serial.as_deref().unwrap_or(""));
+        let (note, tip, warn) = if on {
+            connected_note(&mine, &files_of(here), agent)
+        } else {
+            match here {
+                None => ("Not plugged in".to_string(), String::new(), false),
+                Some(h) if storage && h.captured && u.mode != UsbMode::Device => ("Unplug it and plug it in again".into(), CAPTURED.into(), true),
+                Some(h) if u.mode == UsbMode::Device && h.needs_root() => (
+                    "Used by macOS".into(),
+                    "macOS holds it: the VM takes it through vroom-netd, the root helper (USB menu of the VM window).".into(),
+                    true,
+                ),
+                Some(_) if running => ("Not connected".into(), "Plugged in. Connect it from the VM window's USB menu.".into(), false),
+                Some(_) => ("Plugged in".into(), "Connects when the VM starts.".into(), false),
+            }
+        };
+        let label = u.name.clone().or_else(|| here.map(|d| d.label())).unwrap_or_else(|| u.id.clone());
+        let mode = mine.first().map(|p| how_mode(p.how)).unwrap_or(u.mode);
+        rows.push(UsbRow {
+            label: s(label),
+            note: s(note),
+            tip: s(if tip.is_empty() { id_line } else { format!("{tip}\n{id_line}") }),
+            storage,
+            mode: usb_mode_index(mode),
+            warn,
+            pinned: true,
+            index: i as i32,
+            on,
+        });
+    }
+    for (j, p) in run_only(c, ports).into_iter().enumerate() {
+        let here = host.iter().find(|h| h.id() == p.dev.id && (p.dev.serial.is_empty() || h.serial.as_deref() == Some(p.dev.serial.as_str())));
+        let mine: Vec<vroom_display::UsbPort> = ports.iter().filter(|q| q.dev == p.dev).cloned().collect();
+        let (note, tip, warn) = connected_note(&mine, &files_of(here), agent);
+        let storage = cfg!(target_os = "macos") && (p.how != vroom_display::UsbHow::Device || here.is_some_and(crate::hostusb::is_disk));
+        rows.push(UsbRow {
+            label: s(if p.dev.name.is_empty() { p.dev.id.clone() } else { p.dev.name.clone() }),
+            note: s(format!("{note} · this run")),
+            tip: s(format!("{tip}\nConnected for this run only.\n{}", ids(&p.dev.id, &p.dev.serial))),
+            storage,
+            mode: usb_mode_index(how_mode(p.how)),
+            warn,
+            pinned: false,
+            index: j as i32,
+            on: true,
+        });
+    }
+    rows
+}
+
 /// Config errors as people would say them.
 fn plain_error(e: &str) -> String {
     let e = e.strip_prefix("invalid config: ").unwrap_or(e);
@@ -1686,7 +2180,7 @@ fn plain_error(e: &str) -> String {
 
 fn open_text(p: &Path) {
     let r = if cfg!(target_os = "macos") {
-        std::process::Command::new("open").arg("-t").arg(p).status()
+        std::process::Command::new("/usr/bin/open").arg("-t").arg(p).status()
     } else {
         std::process::Command::new("xdg-open").arg(p).status()
     };
@@ -1697,7 +2191,7 @@ fn open_text(p: &Path) {
 
 fn reveal(p: &Path) {
     let r = if cfg!(target_os = "macos") {
-        std::process::Command::new("open").arg("-R").arg(p).status()
+        std::process::Command::new("/usr/bin/open").arg("-R").arg(p).status()
     } else {
         std::process::Command::new("xdg-open").arg(p.parent().unwrap_or(p)).status()
     };
@@ -1816,12 +2310,17 @@ mod tests {
         a.update(Msg::Refresh);
         assert!(a.ui.get_settings().locked);
         let before = std::fs::read_to_string(&file).unwrap();
-        for k in ["net.add", "net.0.remove", "net.0.fwd.add", "identity.random", "disk.add-new", "disk.0.compact"] {
+        for k in ["identity.random", "disk.add-new", "disk.0.compact"] {
             act(&mut a, k);
             assert_eq!(std::fs::read_to_string(&file).unwrap(), before, "{k}");
         }
         a.update(Msg::Set("cpus".into(), "4".into()));
         assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
+        // Network adapters apply when it resumes (or wait for the next
+        // start, which the card says).
+        assert!(a.ui.get_settings().live);
+        act(&mut a, "net.add");
+        assert_ne!(std::fs::read_to_string(&file).unwrap(), before);
         // Clipboard rules aren't hardware.
         a.update(Msg::Set("clip.out".into(), "false".into()));
         assert!(std::fs::read_to_string(&file).unwrap().contains("guest_to_host = false"));
@@ -1836,6 +2335,54 @@ mod tests {
         a.update(Msg::Set("cpus".into(), "3".into()));
         let now = std::fs::read_to_string(&file).unwrap();
         assert!(now.contains("memory_mib = 8192 # by hand") && now.contains("cpus = 3"), "{now}");
+    }
+
+    #[test]
+    fn monitors_from_the_display_card() {
+        let (t, mut a) = app(&["a"]);
+        a.update(Msg::Set("gpu".into(), "1".into()));
+        a.update(Msg::Set("monitors".into(), "3".into()));
+        assert!(std::fs::read_to_string(t.path().join("a.toml")).unwrap().contains("monitors = 3"));
+        assert_eq!(a.ui.get_settings().monitors, 3);
+        // Out of range: refused, the file keeps 3.
+        a.update(Msg::Set("monitors".into(), "9".into()));
+        assert_eq!(a.ui.get_settings().monitors, 3);
+    }
+
+    #[test]
+    fn warnings_in_a_few_words() {
+        assert_eq!(warn_short("bridged network: the guest sits on your LAN like a physical machine"), "Bridged network");
+        assert_eq!(warn_short("audio.input: the guest hears your microphone"), "Microphone on");
+        assert_eq!(warn_short("port forward 0.0.0.0:2222 -> guest 22: reachable from other machines"), "Port forward open to your network");
+        assert_eq!(warn_short("clipboard both ways with no sandbox"), "Clipboard both ways with no sandbox");
+    }
+
+    #[test]
+    fn usb_card_has_the_file_and_this_run() {
+        use vroom_display::{UsbDev, UsbHow, UsbPort};
+        let c = VmConfig::from_toml(
+            "name = \"a\"\n[boot]\ntype = \"uefi\"\nvars = \"a.state/v.fd\"\n\n[[usb]]\nid = \"18a5:0302\"\nserial = \"V1\"\nname = \"Verbatim\"\n\n[[usb]]\nid = \"0951:1666\"\nname = \"Kingston\"\nmode = \"files\"\n",
+        )
+        .unwrap();
+        let dev = |id: &str, serial: &str, name: &str| UsbDev { id: id.into(), serial: serial.into(), name: name.into() };
+        let port = |port, d: UsbDev, how| UsbPort { port, dev: d, here: true, always: false, how, readonly: false };
+        let ports = vec![
+            // The Kingston (in the file, by id only) as files, a stick for
+            // this run only as a whole disk.
+            port(64, dev("0951:1666", "K9", "Kingston"), UsbHow::Files),
+            port(3, dev("1209:00ac", "disk8", "Test disk"), UsbHow::Disk),
+        ];
+        let rows = usb_rows_with(&c, &ports, false, true, &[]);
+        assert_eq!(rows.len(), 3);
+        let (v, k, run) = (&rows[0], &rows[1], &rows[2]);
+        assert!(v.pinned && !v.on && v.note == "Not plugged in" && v.tip.contains("18a5:0302 · serial V1"));
+        assert!(k.pinned && k.on && k.mode == 0 && k.warn, "files, no guest tools: a warning");
+        assert!(k.tip.contains("sudo mount -t virtiofs vroom-usb0 /mnt"), "{}", k.tip);
+        assert!(!run.pinned && run.on && run.index == 0 && run.mode == 1);
+        assert!(run.note.ends_with("this run"));
+        // A disk connected some way is a disk, whatever macOS says now.
+        assert_eq!(run.storage, cfg!(target_os = "macos"));
+        assert_eq!(run_only(&c, &ports).len(), 1);
     }
 
     #[test]

@@ -16,3 +16,6 @@ landlock = "0.4"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile = "3"

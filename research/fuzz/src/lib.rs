@@ -734,6 +734,8 @@ impl Engine {
                 clipboard: None,
                 ui: None,
                 state_dir: harness.state_dir.clone(),
+                // The harness doesn't sandbox the VMM it drives.
+                sandbox: false,
             },
         )?;
         Ok(Self {

@@ -1,0 +1,17 @@
+--- a/src/neptune/npt_context.c
++++ b/src/neptune/npt_context.c
+@@ -1090,6 +1090,14 @@
+    /* Stop the ring monitor before the rings so it can't touch a ring
+     * mid-teardown. */
+    npt_context_ring_monitor_fini(ctx);
++
++   /* The guest may still have the rings mapped with threads waiting on
++    * them: a context destroyed under a driver that stopped (its device
++    * turned off) is never destroyed by the guest.  Tell them the host is
++    * gone, as a fatal decode error would, so their waits fail now
++    * instead of after the heartbeat watchdog. */
++   list_for_each_entry (struct npt_ring, ring, &ctx->rings, head)
++      npt_ring_set_status_bits(ring, NPT_RING_STATUS_FATAL_BIT);
+ 
+    /* Context destruction is single-threaded; no ring_mutex needed. */
+    list_for_each_entry_safe (struct npt_ring, ring, &ctx->rings, head) {

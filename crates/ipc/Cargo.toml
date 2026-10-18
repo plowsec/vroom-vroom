@@ -1,12 +1,13 @@
 [package]
 name = "vroom-ipc"
-description = "Small IPC helpers shared by vroom processes (fd passing)."
+description = "Small IPC helpers shared by vroom processes (fd passing, mach ports)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 libc.workspace = true
+log.workspace = true
 
 [lints]
 workspace = true
