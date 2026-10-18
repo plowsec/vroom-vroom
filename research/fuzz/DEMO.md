@@ -39,8 +39,7 @@ target/debug/vroom import "/Users/vladimir/Virtual Machines.localized/Windows 11
 3. Tools disk (agent, ARM64 drivers, WinFsp for the share):
 
 ```bash
-WINFSP_MSI=target/research/hevd-stage/winfsp-2.2.26286.msi scripts/make-windows-tools.sh \
-  target/research/hevd-stage/windows-tools.raw target/research/hevd-stage/virtio-win-0.1.302.iso
+scripts/make-windows-tools.sh target/research/hevd-stage/windows-tools.raw
 ```
 
 4. Guest prep, normal boot, once (`vmdrive.py`: commands on the `.cmd` FIFO, `shot` PNG path in `.log`):

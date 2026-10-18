@@ -10,7 +10,7 @@
 # Base: the Mesa fork viogpu3d's user-mode drivers come from
 # (osy/virtio-win-mesa), pinned by commit and hash, with our patches in
 # third_party/mesa/. Cross-compiled from macOS with clang-cl, the Windows
-# SDK and CRT cargo-xwin downloaded (scripts/make-windows-tools.sh runs
+# SDK and CRT cargo-xwin downloaded (scripts/make-guest-tools.sh runs
 # cargo xwin first), and rust-lld.
 # Needs: meson ninja bison llvm (brew install meson ninja bison llvm),
 # rustup's stable toolchain; Python's mako, yaml and packaging come in a
@@ -35,7 +35,7 @@ BISON=$(brew --prefix bison)/bin
 RUST=$(rustc +stable --print sysroot)
 log=$WORK/build.log
 
-[ -d "$XWIN/sdk/include/um" ] || { echo "no Windows SDK in $XWIN: run scripts/make-windows-tools.sh once"; exit 1; }
+[ -d "$XWIN/sdk/include/um" ] || { echo "no Windows SDK in $XWIN: run scripts/make-guest-tools.sh once"; exit 1; }
 LLD=$(find "$RUST/lib/rustlib" -name rust-lld -type f | head -1)
 [ -n "$LLD" ] || { echo "no rust-lld in $RUST"; exit 1; }
 mkdir -p "$WORK/bin" "$OUT"

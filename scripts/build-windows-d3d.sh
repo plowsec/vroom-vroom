@@ -3,7 +3,7 @@
 # apps from crashing when vroom turns the 3D display off for a save
 # (scripts/guest/d3d/vroom_d3d.c). Cross-compiled from macOS with clang-cl,
 # the Windows SDK and CRT cargo-xwin downloaded (run
-# scripts/make-windows-tools.sh once), and rust-lld. A few seconds.
+# scripts/make-guest-tools.sh once), and rust-lld. A few seconds.
 #
 # Output in target/windows-gl/: vroom_d3d_arm64.dll (ARM64 apps),
 # vroom_d3d_x64.dll (x64 apps, emulated) and vroom_d3d.dll, the ARM64X
@@ -17,7 +17,7 @@ XWIN=${XWIN_CACHE_DIR:-$HOME/Library/Caches/cargo-xwin}/xwin
 LLVM=$(brew --prefix llvm)/bin
 RUST=$(rustc +stable --print sysroot)
 
-[ -d "$XWIN/sdk/include/um" ] || { echo "no Windows SDK in $XWIN: run scripts/make-windows-tools.sh once"; exit 1; }
+[ -d "$XWIN/sdk/include/um" ] || { echo "no Windows SDK in $XWIN: run scripts/make-guest-tools.sh once"; exit 1; }
 LLD=$(find "$RUST/lib/rustlib" -name rust-lld -type f | head -1)
 [ -n "$LLD" ] || { echo "no rust-lld in $RUST"; exit 1; }
 lld() { DYLD_FALLBACK_LIBRARY_PATH="$RUST/lib" "$LLD" -flavor link "$@"; }

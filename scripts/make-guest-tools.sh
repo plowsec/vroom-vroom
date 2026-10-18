@@ -4,31 +4,41 @@
 #   linux/           vroom-agent (static, any distribution), install-agent.sh,
 #                    its systemd units, the session autostart entry, the
 #                    GNOME Shell extension
-#   windows/         vroom-agent.exe, vroom-setup.cmd, the OpenGL and Vulkan drivers if
-#                    scripts/build-windows-gl.sh made it, the Direct3D
-#                    wrapper if scripts/build-windows-d3d.sh did, and with
-#                    the virtio-win ISO its ARM64 drivers
+#   windows/         vroom-agent.exe, vroom-setup.cmd, the OpenGL, Vulkan and
+#                    Direct3D drivers (scripts/build-windows-gl.sh and
+#                    scripts/build-windows-d3d.sh, run when their inputs
+#                    changed), the virtio-win ARM64 drivers and the WinFsp
+#                    MSI (both pinned, scripts/fetch.sh)
 #   vroom-tools.img  all of it on a FAT32 disk (MBR) labelled VRTOOLS, for
 #                    guests without an agent: the Windows files at the top
-#                    (D:\vroom-setup.cmd, as before), linux/ in a folder
+#                    (D:\vroom-setup.cmd), linux/ in a folder
 #
-#   scripts/make-guest-tools.sh [virtio-win.iso]        (macOS)
+#   scripts/make-guest-tools.sh        (macOS; needs cargo-xwin)
 #
 # The agent's version comes from git (crates/agent/build.rs); the app
 # offers an update to guests whose agent is older.
 set -e
 cd "$(dirname "$0")/.."
-vw=${1:-$VIRTIO_WIN_ISO}
+. scripts/stamp.sh
 out=target/guest-tools
 lin=target/aarch64-unknown-linux-musl/release/vroom-agent
 win=target/aarch64-pc-windows-msvc/release/vroom-agent.exe
+gl=target/windows-gl
 
+command -v cargo-xwin >/dev/null 2>&1 || { echo "needs cargo-xwin: cargo install cargo-xwin" >&2; exit 1; }
+rustup target add aarch64-unknown-linux-musl aarch64-pc-windows-msvc >/dev/null 2>&1
 cargo build --release -p vroom-agent --target aarch64-unknown-linux-musl
-if command -v cargo-xwin >/dev/null 2>&1; then
-  cargo xwin build --release -p vroom-agent --target aarch64-pc-windows-msvc
-else
-  echo "no cargo-xwin: Windows tools left out (cargo install cargo-xwin)" >&2
-  win=
+cargo xwin build --release -p vroom-agent --target aarch64-pc-windows-msvc
+vw=$(scripts/fetch.sh virtio-win)
+winfsp=$(scripts/fetch.sh winfsp)
+# The Windows 3D drivers: long builds, redone only when their inputs change.
+if ! fresh $gl/.gl-inputs scripts/build-windows-gl.sh third_party/mesa; then
+  scripts/build-windows-gl.sh
+  stamp $gl/.gl-inputs scripts/build-windows-gl.sh third_party/mesa
+fi
+if ! fresh $gl/.d3d-inputs scripts/build-windows-d3d.sh scripts/guest/d3d; then
+  scripts/build-windows-d3d.sh
+  stamp $gl/.d3d-inputs scripts/build-windows-d3d.sh scripts/guest/d3d
 fi
 
 rm -rf "$out/linux" "$out/windows" "$out/vroom-tools.img"
@@ -54,58 +64,42 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if [ -n "$win" ]; then
-  mkdir -p "$out/windows"
-  cp "$win" examples/windows/vroom-setup.cmd "$out/windows/"
-  if [ -f target/windows-gl/vroom_gl.dll ]; then
-    cp target/windows-gl/vroom_gl.dll target/windows-gl/vroom_gl_arm64.dll target/windows-gl/vroom_gl_x64.dll "$out/windows/"
-  fi
-  if [ -f target/windows-gl/vroom_vk_arm64.json ]; then
-    for a in arm64 x64; do cp target/windows-gl/vroom_vk_$a.json target/windows-gl/vroom_vk_$a.dll "$out/windows/"; done
-  fi
-  if [ -f target/windows-gl/vroom_d3d.dll ]; then
-    cp target/windows-gl/vroom_d3d.dll target/windows-gl/vroom_d3d_arm64.dll target/windows-gl/vroom_d3d_x64.dll "$out/windows/"
-  fi
-  if [ -n "$vw" ]; then
-    mkdir "$tmp/vw"
-    vwdev=$(attach -readonly -mountpoint "$tmp/vw" "$vw")
-    devs="$vwdev $devs"
-    # What vroom's devices need: display, network, serial (the agent's
-    # port), input, RNG, disks (virtio-blk, virtio-scsi), shared folders,
-    # memory balloon.
-    for d in viogpudo NetKVM vioserial vioinput viorng viostor vioscsi viofs Balloon; do
-      if [ -d "$tmp/vw/$d/w11/ARM64" ]; then
-        mkdir -p "$out/windows/$d/w11/ARM64"
-        find "$tmp/vw/$d/w11/ARM64" -type f ! -name '*.pdb' -exec cp {} "$out/windows/$d/w11/ARM64/" \;
-      fi
-    done
-  else
-    echo "no virtio-win ISO given: the Windows tools have no drivers" >&2
-  fi
-  if [ -n "$WINFSP_MSI" ]; then cp "$WINFSP_MSI" "$out/windows/"; fi
-fi
+mkdir -p "$out/windows"
+cp "$win" examples/windows/vroom-setup.cmd "$out/windows/"
+cp $gl/vroom_gl.dll $gl/vroom_gl_arm64.dll $gl/vroom_gl_x64.dll "$out/windows/"
+for a in arm64 x64; do cp $gl/vroom_vk_$a.json $gl/vroom_vk_$a.dll "$out/windows/"; done
+cp $gl/vroom_d3d.dll $gl/vroom_d3d_arm64.dll $gl/vroom_d3d_x64.dll "$out/windows/"
+# Setup takes WinFsp from next to it: guests need no internet for it.
+cp "$winfsp" "$out/windows/"
+mkdir "$tmp/vw"
+vwdev=$(attach -readonly -mountpoint "$tmp/vw" "$vw")
+devs="$vwdev $devs"
+# What vroom's devices need: display, network, serial (the agent's port),
+# input, RNG, disks (virtio-blk, virtio-scsi), shared folders, memory
+# balloon.
+for d in viogpudo NetKVM vioserial vioinput viorng viostor vioscsi viofs Balloon; do
+  [ -d "$tmp/vw/$d/w11/ARM64" ] || { echo "virtio-win has no $d/w11/ARM64" >&2; exit 1; }
+  mkdir -p "$out/windows/$d/w11/ARM64"
+  find "$tmp/vw/$d/w11/ARM64" -type f ! -name '*.pdb' -exec cp {} "$out/windows/$d/w11/ARM64/" \;
+done
 
-# The disk image (macOS: hdiutil).
-if [ "$(uname)" = Darwin ]; then
-  mb=$(( $(du -sm "$out/linux" | cut -f1) + $( [ -d "$out/windows" ] && du -sm "$out/windows" | cut -f1 || echo 0) + 32 ))
-  hdiutil create -quiet -size ${mb}m -layout MBRSPUD -fs "MS-DOS FAT32" -volname VRTOOLS "$tmp/t.dmg"
-  hdiutil convert -quiet "$tmp/t.dmg" -format UDTO -o "$tmp/t"
-  # Windows ignores MBR disks whose signature is zero.
-  printf 'VRT1' | dd of="$tmp/t.cdr" bs=1 seek=440 conv=notrunc 2>/dev/null
-  mkdir "$tmp/mnt"
-  tdev=$(attach -imagekey diskimage-class=CRawDiskImage "$tmp/t.cdr" -mountpoint "$tmp/mnt")
-  devs="$tdev $devs"
-  if [ -d "$out/windows" ]; then
-    cp -R "$out/windows/" "$tmp/mnt/"
-    printf '[autorun]\r\nshellexecute=vroom-setup.cmd\r\nicon=vroom-agent.exe\r\nlabel=vroom tools\r\n' > "$tmp/mnt/autorun.inf"
-  fi
-  cp -R "$out/linux" "$tmp/mnt/linux"
-  printf 'vroom guest tools\r\n\r\nWindows: run vroom-setup.cmd (it asks for administrator rights).\r\nLinux: sudo sh linux/install-agent.sh\r\n' > "$tmp/mnt/README.txt"
-  # macOS leaves ._ files next to copies; pnputil chokes on ._x.inf.
-  find "$tmp/mnt" -name "._*" -delete
-  sync
-  hdiutil detach -quiet "$tdev" || { sleep 3; hdiutil detach -quiet -force "$tdev"; }
-  mv "$tmp/t.cdr" "$out/vroom-tools.img"
-fi
+# The disk image (hdiutil).
+mb=$(( $(du -sm "$out/linux" | cut -f1) + $(du -sm "$out/windows" | cut -f1) + 32 ))
+hdiutil create -quiet -size ${mb}m -layout MBRSPUD -fs "MS-DOS FAT32" -volname VRTOOLS "$tmp/t.dmg"
+hdiutil convert -quiet "$tmp/t.dmg" -format UDTO -o "$tmp/t"
+# Windows ignores MBR disks whose signature is zero.
+printf 'VRT1' | dd of="$tmp/t.cdr" bs=1 seek=440 conv=notrunc 2>/dev/null
+mkdir "$tmp/mnt"
+tdev=$(attach -imagekey diskimage-class=CRawDiskImage "$tmp/t.cdr" -mountpoint "$tmp/mnt")
+devs="$tdev $devs"
+cp -R "$out/windows/" "$tmp/mnt/"
+printf '[autorun]\r\nshellexecute=vroom-setup.cmd\r\nicon=vroom-agent.exe\r\nlabel=vroom tools\r\n' > "$tmp/mnt/autorun.inf"
+cp -R "$out/linux" "$tmp/mnt/linux"
+printf 'vroom guest tools\r\n\r\nWindows: run vroom-setup.cmd (it asks for administrator rights).\r\nLinux: sudo sh linux/install-agent.sh\r\n' > "$tmp/mnt/README.txt"
+# macOS leaves ._ files next to copies; pnputil chokes on ._x.inf.
+find "$tmp/mnt" -name "._*" -delete
+sync
+hdiutil detach -quiet "$tdev" || { sleep 3; hdiutil detach -quiet -force "$tdev"; }
+mv "$tmp/t.cdr" "$out/vroom-tools.img"
 ver=$(strings "$lin" | sed -n 's/^VROOM_AGENT_VERSION=//p' | head -1)
 echo "built $out (agent $ver)"

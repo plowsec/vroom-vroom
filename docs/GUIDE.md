@@ -3,9 +3,13 @@
 ## Prerequisites (macOS, Apple Silicon)
 
 ```bash
-brew install qemu            # only for the UEFI firmware file and qemu-img
+brew install qemu meson ninja bison pkg-config llvm llvm@15 molten-vk
+cargo install cargo-xwin
 scripts/app.sh --install     # vroom.app, in /Applications
 ```
+
+qemu: only its UEFI firmware and qemu-img. The rest builds 3D and the
+guest tools.
 
 `scripts/build.sh [--release]` builds just `vroom` and `vroom-gui` into
 `target/debug` (or `target/release`).
@@ -13,8 +17,11 @@ scripts/app.sh --install     # vroom.app, in /Applications
 ## The Mac app
 
 `scripts/app.sh` builds `target/dist/vroom.app`; `--install` copies it to
-`/Applications` (refused while VMs run from there). Build the 3D libraries
-and the guest tools first if you want them in the app.
+`/Applications` (refused while VMs run from there). Everything is in it:
+3D (ANGLE, DXMT, virglrenderer), the guest tools with the Windows 3D
+drivers, virtio-win drivers and WinFsp (pinned downloads,
+`scripts/fetch.sh`, in `target/downloads/`). Long builds rerun only when
+their inputs change; `--no-build` packages what `target/` has.
 
 - Open a VM file with vroom (Open With, or drop it on the Dock icon) to
   start it. Drop an ISO: New VM with that installer. Drop a `.vmwarevm`:
@@ -115,12 +122,7 @@ Linux guests boot as they are; remove `open-vm-tools` if you like.
 Windows boots (from NVMe) but has no virtio drivers yet: no network, basic
 display, clock off by your time zone. To fix:
 
-1. Build the tools with drivers (needs `cargo install cargo-xwin` and the
-   [virtio-win ISO](https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/)):
-   ```bash
-   scripts/make-guest-tools.sh virtio-win.iso
-   scripts/app.sh --install          # so the app carries them
-   ```
+1. `scripts/app.sh --install` (the app carries the tools with drivers).
 2. Start the VM in the app, log in. After 90 s the guest tools button
    offers the tools as a USB stick, `VRTOOLS`. (Or attach
    `target/guest-tools/vroom-tools.img` as a disk: `readonly = true`,
@@ -141,7 +143,7 @@ display, clock off by your time zone. To fix:
 
 The vroom agent: clipboard, resize with the window, UI scale, time sync,
 clean shutdown, drag and drop, Coherence, USB disks' files. Ready-made VMs
-have it. Built by `scripts/make-guest-tools.sh [virtio-win.iso]`;
+have it. Built by `scripts/make-guest-tools.sh` (`app.sh` runs it);
 `vroom guest-tools info` shows the app's version.
 
 The VM window's box icon shows when there's something to do:
@@ -224,8 +226,8 @@ Ubuntu 22.04: repeated `tracker-extract-3` crash dialogs are a tracker bug
 
 The New VM sheet does all this ([Ready-made VMs](#ready-made-vms)). By hand:
 
-1. Get a Windows 11 ARM64 ISO and the virtio-win ISO.
-2. `scripts/make-windows-stick.sh win11-arm64.iso virtio-win.iso winusb.raw`
+1. Get a Windows 11 ARM64 ISO.
+2. `scripts/make-windows-stick.sh win11-arm64.iso winusb.raw`
    (FAT32/MBR install stick with drivers, unattend file, setup script and
    agent; an ISO can't boot Setup on NVMe).
 3. Config:
@@ -284,13 +286,8 @@ only. Windows' 2D driver tops out around 2560x1600 per monitor.
 
 ## 3D acceleration (Linux guests)
 
-```bash
-brew install meson ninja molten-vk
-scripts/build-virglrenderer.sh
-scripts/build-angle.sh            # only for opengl_host = "angle" (~10 min)
-```
-
-`[display] gpu = "virtio3d"`. Stock Ubuntu works.
+`scripts/app.sh` builds it (alone: `scripts/build-angle.sh`, then
+`scripts/build-virglrenderer.sh`). `[display] gpu = "virtio3d"`. Stock Ubuntu works.
 
 - **OpenGL** (virgl): up to 4.1 on macOS's OpenGL.
 - **Vulkan** (Venus): 1.3. Needs `mesa-vulkan-drivers` (Mesa ≥ 24) and the
@@ -336,13 +333,8 @@ vertex formats read wrong.
 
 ## 3D in Windows guests (Direct3D 11)
 
-```bash
-brew install meson ninja molten-vk llvm@15
-scripts/build-virglrenderer.sh
-scripts/build-dxmt.sh             # Direct3D 11 on Metal
-scripts/build-windows-d3d.sh      # guest side, for suspend
-scripts/make-guest-tools.sh
-```
+`scripts/app.sh` builds it (DXMT, Direct3D 11 on Metal, and the guest
+side).
 
 In the guest, install `viogpu3d-arm64x-signed.zip` from
 [osy/kvm-guest-drivers-windows](https://github.com/osy/kvm-guest-drivers-windows/releases),
@@ -364,13 +356,7 @@ VirtIO GPU 3D controller", feature level 11_1.
 
 ## OpenGL and Vulkan in Windows guests
 
-```bash
-brew install meson ninja bison llvm
-scripts/build-windows-gl.sh
-scripts/make-windows-tools.sh
-```
-
-`vroom-setup.cmd` installs them; apps get Vulkan 1.3 (Venus) and OpenGL
+In the guest tools (`scripts/app.sh`). `vroom-setup.cmd` installs them; apps get Vulkan 1.3 (Venus) and OpenGL
 4.4 (Zink; virgl 4.1 fallback). ARM64 and x64 apps; 32-bit apps don't.
 
 - `GALLIUM_DRIVER=virgl`: the virgl driver for one app.
@@ -468,9 +454,8 @@ nodes created; existing symlinks aren't followed on the host.
 ### Windows guests
 
 Drive letters from Z: down. `vroom-setup.cmd` sets up the viofs driver,
-[WinFsp](https://winfsp.dev) (downloaded and checked, or
-`WINFSP_MSI=path/to.msi scripts/make-windows-tools.sh ...` for offline
-guests) and one `VroomShare_<tag>` service per share. New or removed
+[WinFsp](https://winfsp.dev) (its MSI is on the tools disk; no internet
+needed) and one `VroomShare_<tag>` service per share. New or removed
 shares take effect after a reboot.
 
 Mount on a folder instead (must not exist yet):

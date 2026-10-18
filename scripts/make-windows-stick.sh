@@ -2,18 +2,22 @@
 # Windows 11 ARM64 install "stick" for vroom (macOS): a raw FAT32 image
 # with an MBR (Windows Setup on NVMe can't read 2 KiB-sector ISOs, and a
 # GPT image's EFI partition confuses it), holding the ISO's files, the
-# virtio-win ARM64 drivers, the unattend file, setup script and agent.
+# virtio-win ARM64 drivers (pinned, scripts/fetch.sh), the unattend file,
+# setup script, agent and WinFsp.
 #
-#   scripts/make-windows-stick.sh <win11-arm64.iso> <virtio-win.iso> [out.raw]
+#   scripts/make-windows-stick.sh <win11-arm64.iso> [out.raw]
 #
 # Then attach it (readonly = true, format = "raw", bus = "nvme") next to an
 # empty NVMe disk and boot: the install is unattended and WIPES DISK 0.
 set -e
-[ $# -ge 2 ] || { sed -n '2,10p' "$0"; exit 2; }
-iso=$1; vw=$2; out=${3:-winusb.raw}
+[ $# -ge 1 ] || { sed -n '2,11p' "$0"; exit 2; }
+[ -f "$1" ] || { echo "$1: no such ISO" >&2; exit 1; }
+iso=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
+out=${2:-winusb.raw}
+case "$out" in /*) ;; *) out="$(pwd)/$out" ;; esac
 cd "$(dirname "$0")/.."
-root=$(pwd)
-[ -f "$iso" ] && [ -f "$vw" ] || { echo "missing ISO" >&2; exit 1; }
+vw=$(scripts/fetch.sh virtio-win)
+winfsp=$(scripts/fetch.sh winfsp)
 exe=target/aarch64-pc-windows-msvc/release/vroom-agent.exe
 [ -f "$exe" ] || cargo xwin build --release -p vroom-agent --target aarch64-pc-windows-msvc
 tmp=$(mktemp -d)
@@ -40,12 +44,11 @@ else
   rsync -a --exclude boot.catalog "$tmp/iso/" "$tmp/usb/"
 fi
 for d in viogpudo NetKVM vioserial vioinput viorng viostor vioscsi viofs Balloon; do
-  if [ -d "$tmp/vw/$d/w11/ARM64" ]; then
-    mkdir -p "$tmp/usb/$d/w11"
-    cp -R "$tmp/vw/$d/w11/ARM64" "$tmp/usb/$d/w11/"
-  fi
+  [ -d "$tmp/vw/$d/w11/ARM64" ] || { echo "virtio-win has no $d/w11/ARM64" >&2; exit 1; }
+  mkdir -p "$tmp/usb/$d/w11"
+  cp -R "$tmp/vw/$d/w11/ARM64" "$tmp/usb/$d/w11/"
 done
-cp examples/windows/autounattend.xml examples/windows/vroom-setup.cmd "$exe" "$tmp/usb/"
+cp examples/windows/autounattend.xml examples/windows/vroom-setup.cmd "$exe" "$winfsp" "$tmp/usb/"
 find "$tmp/usb" -name "._*" -delete
 hdiutil detach -quiet "$tmp/usb"
 hdiutil convert -quiet "$tmp/usb.dmg" -format UDTO -o "$tmp/usb"
@@ -53,6 +56,5 @@ hdiutil convert -quiet "$tmp/usb.dmg" -format UDTO -o "$tmp/usb"
 # the partition marked active.
 printf 'VRMK' | dd of="$tmp/usb.cdr" bs=1 seek=440 conv=notrunc 2>/dev/null
 printf '\200' | dd of="$tmp/usb.cdr" bs=1 seek=446 conv=notrunc 2>/dev/null
-case "$out" in /*) ;; *) out="$root/$out" ;; esac
 mv "$tmp/usb.cdr" "$out"
 echo "built $out"

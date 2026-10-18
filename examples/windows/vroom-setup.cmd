@@ -63,9 +63,8 @@ rem Running share services hold virtiofs.exe open.
 if defined SHARES for /f "tokens=2" %%s in ('sc query state^= all ^| findstr /b /c:"SERVICE_NAME: VroomShare_"') do sc stop %%s >nul 2>&1
 if defined SHARES timeout /t 2 /nobreak >nul
 if defined SHARES copy /y "%VIOFS%" "%ProgramFiles%\Vroom\" >nul || set SHARES=
-rem WinFsp (winfsp.dev, GPLv3 with a FLOSS exception) isn't ours to ship:
-rem take winfsp-*.msi from next to this script if it's there, else
-rem download that release from GitHub. Either way the SHA-256 must match.
+rem WinFsp (winfsp.dev, GPLv3 with a FLOSS exception): its MSI comes next
+rem to this script (scripts/fetch.sh pins it); the SHA-256 must match.
 set WINFSP_MSI=winfsp-2.1.25156.msi
 set WINFSP_SHA256=073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a
 set WINFSP_TMP=%TEMP%\%WINFSP_MSI%
@@ -73,9 +72,8 @@ set NEED=
 if defined SHARES if not exist "%ProgramFiles(x86)%\WinFsp\bin\winfsp-a64.dll" set NEED=1
 if defined NEED del "%WINFSP_TMP%" 2>nul
 if defined NEED if exist "%~dp0%WINFSP_MSI%" copy /y "%~dp0%WINFSP_MSI%" "%WINFSP_TMP%" >nul
-if defined NEED if not exist "%WINFSP_TMP%" curl.exe -fsSL --retry 5 --retry-delay 5 --retry-all-errors -o "%WINFSP_TMP%" https://github.com/winfsp/winfsp/releases/download/v2.1/%WINFSP_MSI%
 if defined NEED (
-  certutil -hashfile "%WINFSP_TMP%" SHA256 | findstr /i /x "%WINFSP_SHA256%" >nul || (echo vroom: no WinFsp ^(download failed or wrong hash^), no shared folders & set SHARES=)
+  certutil -hashfile "%WINFSP_TMP%" SHA256 | findstr /i /x "%WINFSP_SHA256%" >nul || (echo vroom: no WinFsp ^(missing or wrong hash^), no shared folders & set SHARES=)
 )
 if defined NEED if defined SHARES msiexec /i "%WINFSP_TMP%" /qn /norestart
 if defined NEED del "%WINFSP_TMP%" 2>nul

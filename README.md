@@ -68,15 +68,17 @@ Not yet: x86_64 hosts (it builds, can't run VMs yet) and Secure Boot.
 ## Try it
 
 ```bash
-brew install qemu            # only for its UEFI firmware file
-scripts/make-guest-tools.sh images/virtio-win/virtio-win.iso   # the guest agent, drivers
-scripts/app.sh --install     # builds vroom.app and copies it to /Applications
+brew install qemu meson ninja bison pkg-config llvm llvm@15 molten-vk
+cargo install cargo-xwin
+scripts/app.sh --install     # vroom.app with 3D and guest tools, in /Applications
 ```
+
+The first build fetches and builds the 3D libraries and Windows drivers
+(about an hour); later ones redo only what changed.
 
 Open vroom, New VM, pick Ubuntu (downloaded for you) or a Windows 11
 ARM64 ISO: it comes up installed, with the guest tools. Any installer ISO
-works too. 3D needs its libraries built first
-([GUIDE.md](docs/GUIDE.md#the-mac-app)).
+works too.
 
 Or from the terminal:
 
