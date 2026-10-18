@@ -37,6 +37,20 @@ uuid.bios = "56 4d 01 02 03 04 05 06-07 08 09 0a 0b 0c 0d 0e"
 "#;
 
 #[test]
+fn windows_keeps_sound_and_shares() {
+    let t = tempfile::tempdir().unwrap();
+    let iso = t.path().join("win.iso");
+    std::fs::write(&iso, b"").unwrap();
+    let vmx = WIN.replace("ISO_PATH", &iso.display().to_string())
+        + "sound.present = \"TRUE\"\nsharedFolder0.present = \"TRUE\"\nsharedFolder0.hostPath = \"/Users/me/src\"\nsharedFolder0.guestName = \"src\"\n";
+    let b = bundle(t.path(), "Windows 11 64-bit Arm 2", &vmx, &["Virtual Disk-000003.vmdk"]);
+    let p = plan(&b).unwrap();
+    assert!(p.audio);
+    assert!(p.notes.iter().any(|n| n.contains("drive letters")));
+    assert!(p.notes.iter().any(|n| n.contains("vroom-setup.cmd")));
+}
+
+#[test]
 fn windows_11_from_fusion() {
     let t = tempfile::tempdir().unwrap();
     let iso = t.path().join("win.iso");

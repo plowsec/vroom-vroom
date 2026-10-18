@@ -283,8 +283,8 @@ pub fn plan(path: &Path) -> Result<Plan> {
             ));
         }
     }
-    if windows && nets > 0 {
-        notes.push("Windows needs the virtio-win drivers and the vroom tools for network, clipboard and resizing: attach the tools disk and run vroom-setup.cmd (see the guide).".into());
+    if windows {
+        notes.push("Windows has no drivers yet for network, display, clipboard and resizing: start it, click the guest tools button (or attach the tools disk) and run vroom-setup.cmd. Guide: \"Windows guests from VMware\".".into());
     }
 
     // Shared folders.
@@ -310,14 +310,14 @@ pub fn plan(path: &Path) -> Result<Plan> {
         }
     }
     if !shares.is_empty() && windows {
-        notes.push("Shared folders only work in Linux guests for now; they're in the file but Windows won't see them.".into());
+        notes.push("Windows sees the shared folders as drive letters (Z: first) once vroom-setup.cmd has run.".into());
     }
 
     let tpm = v.flag("vtpm.present", false);
     if tpm || encrypted {
         notes.push("The TPM's contents can't come along (VMware encrypts them). If BitLocker is on in the guest, have the recovery key ready.".into());
     }
-    let audio = v.flag("sound.present", false) && !windows;
+    let audio = v.flag("sound.present", false);
 
     let raw_uuid = v.get("uuid.bios").and_then(parse_uuid_bios);
     let vmware_serial = v.get("uuid.bios").map(|u| format!("VMware-{}", u.trim()));
