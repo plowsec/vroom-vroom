@@ -53,6 +53,16 @@ pub struct GuestMemory {
     /// Bumped when shared RAM gets new objects (reset): whoever maps it
     /// elsewhere must map again.
     generation: Arc<AtomicU64>,
+    #[cfg(feature = "research")]
+    host_writes: Arc<HostWrites>,
+}
+
+/// Pages host code wrote while a snapshot fuzzer logs them.
+#[cfg(feature = "research")]
+#[derive(Debug, Default)]
+struct HostWrites {
+    on: std::sync::atomic::AtomicBool,
+    pages: std::sync::Mutex<std::collections::BTreeSet<u64>>,
 }
 
 impl GuestMemory {
@@ -109,6 +119,8 @@ impl GuestMemory {
             regions: Arc::new(regions),
             mapping_lock: Arc::default(),
             generation: Arc::default(),
+            #[cfg(feature = "research")]
+            host_writes: Arc::default(),
         })
     }
 
@@ -150,6 +162,8 @@ impl GuestMemory {
             Ok(())
         })
         .ok()?;
+        // Whoever holds the pointers may write through them.
+        self.log_write(addr, len);
         Some(out)
     }
 
@@ -188,6 +202,7 @@ impl GuestMemory {
             .mapping_lock
             .read()
             .unwrap_or_else(|error| error.into_inner());
+        self.log_write(addr, buf.len() as u64);
         self.walk(addr, buf.len() as u64, |r, off, span| {
             r.mmap.write_at(off, &buf[span]);
             Ok(())
@@ -199,6 +214,7 @@ impl GuestMemory {
             .mapping_lock
             .read()
             .unwrap_or_else(|error| error.into_inner());
+        self.log_write(addr, len);
         self.walk(addr, len, |r, off, span| {
             r.mmap.fill_at(off, span.len(), val);
             Ok(())
@@ -269,6 +285,9 @@ impl GuestMemory {
         offset: u64,
         segs: &[(GuestAddress, usize)],
     ) -> std::io::Result<()> {
+        for &(addr, len) in segs {
+            self.log_write(addr, len as u64);
+        }
         let mut iov = self.iovecs(segs)?;
         file_io(file, offset, &mut iov, false)
     }
@@ -311,6 +330,7 @@ impl GuestMemory {
     /// visible to the guest before the index.
     pub fn store_u16_release(&self, addr: GuestAddress, v: u16) -> Result<()> {
         let p = self.aligned_u16_ptr(addr)?;
+        self.log_write(addr, 2);
         // SAFETY: as above.
         unsafe { (*(p as *const AtomicU16)).store(v.to_le(), Ordering::Release) };
         Ok(())
@@ -366,6 +386,76 @@ impl GuestMemory {
             r.mmap.restore_cow()?;
         }
         Ok(())
+    }
+
+    #[cfg(feature = "research")]
+    /// Start (or stop) logging the pages host code writes: devices, the
+    /// debugger, anyone holding `host_ranges`. Guest writes are the
+    /// hypervisor's to log.
+    pub fn log_host_writes(&self, on: bool) {
+        self.host_writes.on.store(on, Ordering::Release);
+        self.host_writes.pages.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
+    #[cfg(feature = "research")]
+    /// Pages (address, length) host code wrote since the log started or
+    /// was last taken.
+    pub fn take_host_writes(&self) -> Vec<(GuestAddress, u64)> {
+        let pages = std::mem::take(&mut *self.host_writes.pages.lock().unwrap_or_else(|e| e.into_inner()));
+        let ps = page_size() as u64;
+        let mut out: Vec<(GuestAddress, u64)> = Vec::new();
+        for page in pages {
+            match out.last_mut() {
+                Some((start, len)) if start.0 + *len == page => *len += ps,
+                _ => out.push((GuestAddress(page), ps)),
+            }
+        }
+        out
+    }
+
+    #[cfg(feature = "research")]
+    fn log_write(&self, addr: GuestAddress, len: u64) {
+        if len == 0 || !self.host_writes.on.load(Ordering::Acquire) {
+            return;
+        }
+        let ps = page_size() as u64;
+        let mut pages = self.host_writes.pages.lock().unwrap_or_else(|e| e.into_inner());
+        let mut page = addr.0 & !(ps - 1);
+        while page < addr.0.saturating_add(len) {
+            pages.insert(page);
+            page += ps;
+        }
+    }
+
+    #[cfg(not(feature = "research"))]
+    fn log_write(&self, _addr: GuestAddress, _len: u64) {}
+
+    #[cfg(feature = "research")]
+    /// Copy the COW baseline back over the given ranges (the pages logged
+    /// as written), without remapping RAM.
+    pub fn restore_cow_copy(&self, ranges: &[(GuestAddress, u64)]) -> Result<()> {
+        let _mapping = self
+            .mapping_lock
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        for &(addr, len) in ranges {
+            self.walk(addr, len, |r, off, span| r.mmap.restore_cow_copy(off, span.len()))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "research")]
+    /// Pages that differ from the COW baseline (slow: reads all RAM).
+    pub fn cow_verify(&self) -> Result<Vec<GuestAddress>> {
+        let _mapping = self
+            .mapping_lock
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut differ = Vec::new();
+        for r in self.regions.iter() {
+            differ.extend(r.mmap.cow_verify()?.into_iter().map(|off| GuestAddress(r.start.0 + off as u64)));
+        }
+        Ok(differ)
     }
 }
 
@@ -586,5 +676,34 @@ mod tests {
         let mut got = [0u8; 4];
         m.read(GuestAddress(0), &mut got).unwrap();
         assert_eq!(got, [1, 2, 3, 4]);
+    }
+
+    #[cfg(feature = "research")]
+    #[test]
+    fn logged_host_writes_are_copied_back_from_the_baseline() {
+        let ps = page_size() as u64;
+        let base = GuestAddress(0x4000_0000);
+        let m = GuestMemory::new(&[(base, 64 * ps)]).unwrap();
+        for page in 0..64 {
+            m.write(GuestAddress(base.0 + page * ps), &[page as u8 + 1]).unwrap();
+        }
+        m.snapshot_cow().unwrap();
+        m.log_host_writes(true);
+        let mut b = [0u8; 1];
+        m.read(GuestAddress(base.0 + 7 * ps), &mut b).unwrap();
+        assert_eq!(m.take_host_writes(), vec![]);
+        m.write(GuestAddress(base.0 + 3 * ps), &[0xaa]).unwrap();
+        m.fill(GuestAddress(base.0 + 4 * ps + 9), ps, 0xbb).unwrap();
+        m.store_u16_release(GuestAddress(base.0 + 40 * ps), 7).unwrap();
+        let written = m.take_host_writes();
+        assert_eq!(written, vec![(GuestAddress(base.0 + 3 * ps), 3 * ps), (GuestAddress(base.0 + 40 * ps), ps)]);
+        assert_eq!(m.cow_verify().unwrap().len(), 4);
+        m.restore_cow_copy(&written).unwrap();
+        assert_eq!(m.cow_verify().unwrap(), vec![]);
+        assert_eq!(m.take_host_writes(), vec![]);
+        for page in 0..64 {
+            m.read(GuestAddress(base.0 + page * ps), &mut b).unwrap();
+            assert_eq!(b[0], page as u8 + 1);
+        }
     }
 }

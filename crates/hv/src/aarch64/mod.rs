@@ -38,6 +38,23 @@ pub fn exception_class(esr: u64) -> ExceptionClass {
     }
 }
 
+/// A stage-2 fault on a write: a data write (WnR), or a stage-1 table walk
+/// updating a descriptor (S1PTW, data or instruction side). HVF reports a
+/// write to a read-only page as a translation fault, so both count.
+pub fn is_stage2_write_fault(esr: u64) -> bool {
+    let class = exception_class(esr);
+    let status = esr & 0x3c; // DFSC/IFSC without the level
+    let translation_or_permission = status == 0x04 || status == 0x0c;
+    let s1ptw = (esr >> 7) & 1 == 1;
+    let wnr = (esr >> 6) & 1 == 1;
+    translation_or_permission
+        && match class {
+            ExceptionClass::DataAbortLower => wnr || s1ptw,
+            ExceptionClass::InstAbortLower => s1ptw,
+            _ => false,
+        }
+}
+
 /// Decoded MMIO data abort (only valid when ISV=1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DataAbort {
@@ -153,6 +170,23 @@ pub mod psci {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stage2_write_faults() {
+        // Data abort, translation fault level 2, write (what HVF reports
+        // for a write to a read-only page).
+        assert!(is_stage2_write_fault(0x92000046));
+        // Same, a read.
+        assert!(!is_stage2_write_fault(0x92000006));
+        // Permission fault level 3, write.
+        assert!(is_stage2_write_fault(0x9200004f));
+        // Instruction abort, translation fault during a stage-1 walk.
+        assert!(is_stage2_write_fault(0x82000086));
+        // Instruction abort, plain fetch.
+        assert!(!is_stage2_write_fault(0x82000006));
+        // Alignment fault on a write.
+        assert!(!is_stage2_write_fault(0x92000061));
+    }
 
     #[test]
     fn mpidr_layout() {

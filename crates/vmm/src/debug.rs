@@ -95,6 +95,22 @@ impl Vmm {
         Ok(self.mem.regions().map(|r| (r.start().0, r.len())).collect())
     }
 
+    /// Resume the devices and only the selected CPU: the others stay parked
+    /// (a snapshot fuzzer running one thread without the rest of the guest).
+    pub fn debug_resume_cpu(&mut self, cpu: usize) -> Result<()> {
+        self.require_debug_pause()?;
+        let v = self
+            .vcpus
+            .get(cpu)
+            .ok_or_else(|| Error::Setup("invalid CPU index".into()))?;
+        for d in &self.devices {
+            d.lock().unwrap_or_else(|e| e.into_inner()).resume();
+        }
+        v.peer.send(VcpuCmd::Resume)?;
+        self.state = RunState::Running;
+        Ok(())
+    }
+
     /// Run only the selected CPU; all other CPUs and device workers stay parked.
     /// The caller consumes the Debug event, then calls pause() to acknowledge
     /// the completed stop before reading memory again.
@@ -113,7 +129,7 @@ impl Vmm {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn sync_instruction_cache(pointer: *mut u8, length: usize) {
+pub(crate) unsafe fn sync_instruction_cache(pointer: *mut u8, length: usize) {
     unsafe extern "C" {
         fn sys_icache_invalidate(start: *mut std::ffi::c_void, length: usize);
     }
@@ -123,7 +139,7 @@ unsafe fn sync_instruction_cache(pointer: *mut u8, length: usize) {
     }
 }
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-unsafe fn sync_instruction_cache(pointer: *mut u8, length: usize) {
+pub(crate) unsafe fn sync_instruction_cache(pointer: *mut u8, length: usize) {
     let ctr: u64;
     // SAFETY: ARM64 EL0 cache-maintenance sequence over the caller's mapped range.
     unsafe {
@@ -143,4 +159,4 @@ unsafe fn sync_instruction_cache(pointer: *mut u8, length: usize) {
     }
 }
 #[cfg(not(target_arch = "aarch64"))]
-unsafe fn sync_instruction_cache(_pointer: *mut u8, _length: usize) {}
+pub(crate) unsafe fn sync_instruction_cache(_pointer: *mut u8, _length: usize) {}

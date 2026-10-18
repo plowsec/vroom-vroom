@@ -131,6 +131,25 @@ pub trait Vm: Send + Sync {
         mem.discard_all().map_err(|e| Error::Invalid(format!("discard: {e}")))
     }
 
+    /// Run `replace`, which swaps the host pages behind `mem` (remaps it),
+    /// so the guest sees the new pages afterwards. vCPUs must be stopped.
+    /// The default suits backends that follow host page table changes.
+    fn replace_memory(&self, _mem: &GuestMemory, replace: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+        replace()
+    }
+
+    /// Start logging which pages of `mem` the guest writes (snapshot
+    /// resets copy back only those). vCPUs must be stopped.
+    fn start_dirty_log(&self, _mem: &GuestMemory) -> Result<()> {
+        Err(Error::Unsupported("logging guest writes to RAM"))
+    }
+
+    /// Guest pages (address, length) written since the log started or was
+    /// last taken; logging goes on from here. vCPUs must be stopped.
+    fn take_dirty_log(&self) -> Result<Vec<(u64, u64)>> {
+        Err(Error::Unsupported("logging guest writes to RAM"))
+    }
+
     /// Create the vCPU `index`. On HVF this MUST run on the thread that will
     /// drive the vCPU forever; the returned object is deliberately `!Send`.
     fn create_vcpu(&self, index: u32) -> Result<Box<dyn Vcpu>>;

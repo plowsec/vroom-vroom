@@ -169,6 +169,9 @@ struct ResearchBaseline {
     vcpus: Vec<VcpuState>,
     irqchip: Option<IrqChipState>,
     clock: u64,
+    /// The hypervisor logs guest writes and RAM logs host writes: a reset
+    /// copies back only those pages instead of remapping all RAM.
+    logged: bool,
 }
 
 impl std::fmt::Debug for Vmm {
@@ -341,8 +344,22 @@ impl Vmm {
             Err(e) => return Err(e.into()),
         };
         let clock = self.vm.clock();
-        self.mem.snapshot_cow()?;
-        self.research_baseline = Some(ResearchBaseline { devices, vcpus, irqchip, clock });
+        let mem = &self.mem;
+        self.vm.replace_memory(mem, &mut || {
+            mem.snapshot_cow().map_err(|e| vroom_hv::Error::Invalid(format!("COW snapshot: {e}")))
+        })?;
+        let logged = match self.vm.start_dirty_log(mem) {
+            Ok(()) => {
+                mem.log_host_writes(true);
+                true
+            }
+            Err(vroom_hv::Error::Unsupported(why)) => {
+                log::info!("research resets remap all RAM: no {why}");
+                false
+            }
+            Err(e) => return Err(e.into()),
+        };
+        self.research_baseline = Some(ResearchBaseline { devices, vcpus, irqchip, clock, logged });
         Ok(())
     }
 
@@ -355,7 +372,38 @@ impl Vmm {
         let Some(baseline) = &self.research_baseline else {
             return Err(Error::Setup("research baseline is not armed".into()));
         };
-        self.mem.restore_cow()?;
+        let mem = &self.mem;
+        if baseline.logged {
+            // Copy back only the pages written since the last reset: by the
+            // guest (the hypervisor logs them) or by host code (RAM does).
+            // Remapping all RAM costs ~130 ms for 8 GiB, and every page the
+            // guest touches next faults in again.
+            let mut written: Vec<(vroom_memory::GuestAddress, u64)> =
+                self.vm.take_dirty_log()?.into_iter().map(|(gpa, len)| (vroom_memory::GuestAddress(gpa), len)).collect();
+            written.extend(mem.take_host_writes());
+            mem.restore_cow_copy(&written)?;
+            for &(gpa, len) in &written {
+                if let Some(r) = mem.regions().find(|r| gpa >= r.start() && gpa.0 < r.end().0) {
+                    // SAFETY: inside that region's mapping; every CPU is paused.
+                    unsafe { debug::sync_instruction_cache(r.host_ptr().add((gpa.0 - r.start().0) as usize), len as usize) };
+                }
+            }
+        } else {
+            self.vm.replace_memory(mem, &mut || {
+                mem.restore_cow().map_err(|e| vroom_hv::Error::Invalid(format!("COW restore: {e}")))
+            })?;
+        }
+        if std::env::var_os("VROOM_COW_VERIFY").is_some() {
+            let differ = mem.cow_verify()?;
+            if !differ.is_empty() {
+                let first: Vec<String> = differ.iter().take(8).map(|a| format!("{:#x}", a.0)).collect();
+                return Err(Error::Setup(format!(
+                    "COW reset left {} pages off the baseline: {}",
+                    differ.len(),
+                    first.join(" ")
+                )));
+            }
+        }
         if let Some(irqchip) = &baseline.irqchip {
             self.vm.restore_irqchip(irqchip)?;
         }

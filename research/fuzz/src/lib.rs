@@ -112,6 +112,13 @@ pub struct Harness {
     /// stale mappings across remaps.
     #[serde(default)]
     pub reopen_after: usize,
+    /// Run each testcase on `cpu` alone, with its IRQs and FIQs masked and
+    /// the other CPUs parked, so the target thread is never preempted and
+    /// the rest of the guest doesn't run (or dirty RAM) meanwhile. The VM
+    /// is reset after each testcase, so the masking never leaks. A target
+    /// that waits on another CPU or an interrupt times out instead.
+    #[serde(default)]
+    pub isolate_cpu: bool,
     #[serde(default = "default_timeout")]
     pub timeout_ms: u64,
     #[serde(default)]
@@ -707,7 +714,7 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn open(mut harness: Harness) -> Result<Self> {
+    pub fn open(harness: Harness) -> Result<Self> {
         let input_capacity = harness.input_capacity;
         let config = vroom_config::VmConfig::load(&harness.config)
             .map_err(|e| Error::Config(e.to_string()))?;
@@ -718,13 +725,9 @@ impl Engine {
             )));
         }
         let hv = vroom_hv::default_hypervisor()?;
-        // HVF may retain stage-2 mappings after the COW layer swaps the host
-        // backing pages. For this backend, run one testcase per checkpoint
-        // restore and arm COW only after writing the testcase into restored RAM.
-        let cow_enabled = hv.name() != "hvf" && harness.reopen_after != 1;
-        if hv.name() == "hvf" {
-            harness.reopen_after = 1;
-        }
+        // COW resets restore the VM in place (`Vmm::research_reset`).
+        // `reopen_after: 1` opts out and restores the checkpoint each time.
+        let cow_enabled = harness.reopen_after != 1;
         let vm = vroom_vmm::Vmm::start(
             config,
             hv,
@@ -870,6 +873,7 @@ impl Engine {
             return Err(Error::Invalid("input exceeds max_input".into()));
         }
         let arm_after_patch = !self.cow_enabled && self.checkpoint_fresh;
+        let reset_start = Instant::now();
         if self.checkpoint_fresh {
             // RestorePaused already supplied the exact checkpoint state. Do
             // not COW-reset before its first testcase: HVF can retain stage-2
@@ -882,6 +886,7 @@ impl Engine {
                 "reopen_after must be 1 when COW resets are disabled".into(),
             ));
         }
+        let reset_us = reset_start.elapsed().as_micros() as u64;
         let (ioctl, payload) = if self.harness.ioctl_prefix {
             if input.len() < 4 {
                 return Err(Error::Invalid(
@@ -1068,6 +1073,16 @@ impl Engine {
             .map_err(|error| Error::Invalid(format!("ARM64 register state: {error}")))?;
         trace_dispatch_state(&self.vm, &registers, self.harness.ioctl_va)?;
         let entry_pc = self.harness.entry_pc.unwrap_or(registers.pc);
+        let entry_sp = registers.sp;
+        let entry_ttbr0 = registers.ttbr0;
+        // The one CPU that runs alone, single-stepping a foreign thread past
+        // a shared site or the testcase's thread across a call site.
+        let mut foreign_step = None;
+        let mut own_step = None;
+        // Where the testcase's thread resumes after an exception taken
+        // during one of its steps.
+        let mut exception_return = None;
+        let mut foreign_threads = 0u64;
         if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
             eprintln!("start pc={:#x} entry={entry_pc:#x}", registers.pc);
         }
@@ -1095,16 +1110,18 @@ impl Engine {
         if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
             eprintln!("initial breakpoints={initial_breakpoints:?}");
         }
-        self.vm.debug_configure(
-            self.harness.cpu,
-            vroom_hv::debug::DebugConfig {
-                enabled: true,
-                breakpoints: initial_breakpoints,
-                watchpoints: hv_watchpoints(&case_watchpoints),
-                ..Default::default()
-            },
-        )?;
-        self.vm.resume()?;
+        let mut armed = initial_breakpoints;
+        configure_all(&self.vm, &armed, &case_watchpoints)?;
+        let isolate = self.harness.isolate_cpu.then_some(self.harness.cpu);
+        if isolate.is_some() {
+            // PSTATE.I and F: no interrupt can preempt the target thread.
+            self.vm.debug_write_register(
+                self.harness.cpu,
+                vroom_hv::debug::Register::Pstate,
+                registers.pstate | 0xc0,
+            )?;
+        }
+        resume_vm(&mut self.vm, isolate)?;
         let start = Instant::now();
         let token = CorpusStore::hash(input);
         let mut new_blocks = 0;
@@ -1145,7 +1162,89 @@ impl Engine {
             };
             match event {
                 vroom_vmm::VmEvent::Debug(stop) => {
+                    if own_step.or(foreign_step).is_some_and(|cpu| cpu != stop.cpu) {
+                        // A stop queued before the step began: that CPU
+                        // stays parked on a still-armed breakpoint and stops
+                        // there again once every CPU resumes.
+                        continue;
+                    }
                     self.vm.pause()?;
+                    let stepped_own = own_step.take().is_some();
+                    if foreign_step.take().is_some()
+                        || (stop.reason == vroom_hv::debug::DebugReason::SingleStep && !stepped_own)
+                    {
+                        // A foreign thread is past the shared site (or a
+                        // step a re-arm already cancelled): re-arm, resume.
+                        configure_all(&self.vm, &armed, &case_watchpoints)?;
+                        resume_vm(&mut self.vm, isolate)?;
+                        continue;
+                    }
+                    if stepped_own && stop.reason == vroom_hv::debug::DebugReason::SingleStep {
+                        let state = self.vm.debug_registers(stop.cpu as usize)?;
+                        let registers = Registers::from_state(&state).map_err(|error| {
+                            Error::Invalid(format!("ARM64 step registers: {error}"))
+                        })?;
+                        if is_exception_vector(stop.pc, registers.vbar) {
+                            // An interrupt (or fault) was taken before the
+                            // stepped instruction ran; ELR_EL1 holds it. Let
+                            // the handler and any preemption run, then step
+                            // that instruction again when the thread is back.
+                            let elr = elr_el1(&state)
+                                .ok_or_else(|| Error::Invalid("ELR_EL1 missing".into()))?;
+                            if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
+                                eprintln!("step took an exception at {:#x}; resume at {elr:#x}", stop.pc);
+                            }
+                            exception_return = Some(elr);
+                            armed = breakpoint_set(
+                                &[elr],
+                                watch_target,
+                                self.harness.stop_pc,
+                                &active_exception_sites,
+                            );
+                            configure_all(&self.vm, &armed, &case_watchpoints)?;
+                            resume_vm(&mut self.vm, isolate)?;
+                            continue;
+                        }
+                    }
+                    if exception_return == Some(stop.pc)
+                        && stop.reason == vroom_hv::debug::DebugReason::Breakpoint
+                    {
+                        exception_return = None;
+                        self.vm.debug_step(stop.cpu as usize, step_debug_config(&case_watchpoints))?;
+                        own_step = Some(stop.cpu);
+                        continue;
+                    }
+                    // stop_pc and exception sites sit in shared kernel code:
+                    // any thread scheduled after a preemption can reach them.
+                    // Only the testcase's thread (its stack, its address
+                    // space) ends the run or reports a finding.
+                    let shared_site = self.harness.stop_pc == Some(stop.pc)
+                        || self.harness.exception_sites.contains(&stop.pc);
+                    if shared_site {
+                        let state = self.vm.debug_registers(stop.cpu as usize)?;
+                        let registers = Registers::from_state(&state).map_err(|error| {
+                            Error::Invalid(format!("ARM64 stop registers: {error}"))
+                        })?;
+                        let returned = self.harness.stop_pc == Some(stop.pc);
+                        let ours = registers.ttbr0 == entry_ttbr0
+                            && if returned {
+                                registers.sp > entry_sp && registers.sp - entry_sp <= RETURN_FRAMES
+                            } else {
+                                registers.sp.abs_diff(entry_sp) <= KERNEL_STACK
+                            };
+                        if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
+                            eprintln!(
+                                "shared site cpu={} pc={:#x} sp={:#x} entry_sp={entry_sp:#x} ours={ours}",
+                                stop.cpu, stop.pc, registers.sp
+                            );
+                        }
+                        if !ours {
+                            foreign_threads += 1;
+                            foreign_step = Some(stop.cpu);
+                            self.vm.debug_step(stop.cpu as usize, step_debug_config(&[]))?;
+                            continue;
+                        }
+                    }
                     if self.harness.stop_pc == Some(stop.pc) {
                         break;
                     }
@@ -1187,21 +1286,14 @@ impl Engine {
                             })
                             .map(|block| block.successors.as_slice())
                             .unwrap_or(&[]);
-                        self.vm.debug_configure(
-                            stop.cpu as usize,
-                            vroom_hv::debug::DebugConfig {
-                                enabled: true,
-                                breakpoints: breakpoint_set(
-                                    successors,
-                                    watch_target,
-                                    self.harness.stop_pc,
-                                    &active_exception_sites,
-                                ),
-                                watchpoints: hv_watchpoints(&case_watchpoints),
-                                ..Default::default()
-                            },
-                        )?;
-                        self.vm.resume()?;
+                        armed = breakpoint_set(
+                            successors,
+                            watch_target,
+                            self.harness.stop_pc,
+                            &active_exception_sites,
+                        );
+                        configure_all(&self.vm, &armed, &case_watchpoints)?;
+                        resume_vm(&mut self.vm, isolate)?;
                         continue;
                     }
                     if self.harness.exception_sites.contains(&stop.pc) {
@@ -1222,21 +1314,14 @@ impl Engine {
                             })
                             .map(|block| block.successors.as_slice())
                             .unwrap_or(&[]);
-                        self.vm.debug_configure(
-                            stop.cpu as usize,
-                            vroom_hv::debug::DebugConfig {
-                                enabled: true,
-                                breakpoints: breakpoint_set(
-                                    successors,
-                                    watch_target,
-                                    self.harness.stop_pc,
-                                    &active_exception_sites,
-                                ),
-                                watchpoints: hv_watchpoints(&case_watchpoints),
-                                ..Default::default()
-                            },
-                        )?;
-                        self.vm.resume()?;
+                        armed = breakpoint_set(
+                            successors,
+                            watch_target,
+                            self.harness.stop_pc,
+                            &active_exception_sites,
+                        );
+                        configure_all(&self.vm, &armed, &case_watchpoints)?;
+                        resume_vm(&mut self.vm, isolate)?;
                         continue;
                     }
                     if watch_target == Some(stop.pc) {
@@ -1309,6 +1394,7 @@ impl Engine {
                                         stop.cpu as usize,
                                         step_debug_config(&case_watchpoints),
                                     )?;
+                                    own_step = Some(stop.cpu);
                                     continue;
                                 }
                                 call_step_targets.clear();
@@ -1340,6 +1426,7 @@ impl Engine {
                                     stop.cpu as usize,
                                     step_debug_config(&case_watchpoints),
                                 )?;
+                                own_step = Some(stop.cpu);
                                 continue;
                             }
                             let breakpoints = breakpoint_set(
@@ -1351,16 +1438,9 @@ impl Engine {
                             if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
                                 eprintln!("arm block {} successors {:?}", block.id, breakpoints);
                             }
-                            self.vm.debug_configure(
-                                stop.cpu as usize,
-                                vroom_hv::debug::DebugConfig {
-                                    enabled: true,
-                                    breakpoints,
-                                    watchpoints: hv_watchpoints(&case_watchpoints),
-                                    ..Default::default()
-                                },
-                            )?;
-                            self.vm.resume()?;
+                            armed = breakpoints;
+                            configure_all(&self.vm, &armed, &case_watchpoints)?;
+                            resume_vm(&mut self.vm, isolate)?;
                         }
                     } else if stop.reason == vroom_hv::debug::DebugReason::SingleStep {
                         if let Some(block) = block {
@@ -1375,6 +1455,7 @@ impl Engine {
                                     stop.cpu as usize,
                                     step_debug_config(&case_watchpoints),
                                 )?;
+                                own_step = Some(stop.cpu);
                                 continue;
                             }
                             step_successors_once = false;
@@ -1384,32 +1465,18 @@ impl Engine {
                                 self.harness.stop_pc,
                                 &active_exception_sites,
                             );
-                            self.vm.debug_configure(
-                                stop.cpu as usize,
-                                vroom_hv::debug::DebugConfig {
-                                    enabled: true,
-                                    breakpoints,
-                                    watchpoints: hv_watchpoints(&case_watchpoints),
-                                    ..Default::default()
-                                },
-                            )?;
-                            self.vm.resume()?;
+                            armed = breakpoints;
+                            configure_all(&self.vm, &armed, &case_watchpoints)?;
+                            resume_vm(&mut self.vm, isolate)?;
                         } else {
-                            self.vm.debug_configure(
-                                stop.cpu as usize,
-                                vroom_hv::debug::DebugConfig {
-                                    enabled: true,
-                                    breakpoints: breakpoint_set(
-                                        &[],
-                                        watch_target,
-                                        self.harness.stop_pc,
-                                        &active_exception_sites,
-                                    ),
-                                    watchpoints: hv_watchpoints(&case_watchpoints),
-                                    ..Default::default()
-                                },
-                            )?;
-                            self.vm.resume()?;
+                            armed = breakpoint_set(
+                                &[],
+                                watch_target,
+                                self.harness.stop_pc,
+                                &active_exception_sites,
+                            );
+                            configure_all(&self.vm, &armed, &case_watchpoints)?;
+                            resume_vm(&mut self.vm, isolate)?;
                         }
                     }
                 }
@@ -1448,6 +1515,8 @@ impl Engine {
             finding,
             findings,
             elapsed_us: start.elapsed().as_micros() as u64,
+            foreign_threads,
+            reset_us,
         })
     }
 }
@@ -1526,6 +1595,58 @@ fn breakpoint_set(
     breakpoints
 }
 
+/// How far above the checkpoint's SP the caller's frame at `stop_pc` may be
+/// (the frames between the target call and the entry block).
+const RETURN_FRAMES: u64 = 0x4000;
+/// How far an exception-dispatch site can be from the entry SP on the same
+/// kernel stack.
+const KERNEL_STACK: u64 = 0x8000;
+
+/// Resume every CPU, or only the isolated one.
+fn resume_vm(vm: &mut vroom_vmm::Vmm, isolate: Option<usize>) -> Result<()> {
+    match isolate {
+        Some(cpu) => vm.debug_resume_cpu(cpu)?,
+        None => vm.resume()?,
+    }
+    Ok(())
+}
+
+/// The first instruction of an AArch64 exception vector entry.
+fn is_exception_vector(pc: u64, vbar: u64) -> bool {
+    pc.checked_sub(vbar)
+        .is_some_and(|offset| offset < 0x800 && offset % 0x80 == 0)
+}
+
+fn elr_el1(state: &vroom_hv::VcpuState) -> Option<u64> {
+    if state.backend == "kvm" {
+        let id = 0x6030_0000_0013_0000u64 | 0xc201;
+        let bytes = &state.raw.iter().find(|(r, _)| *r == id)?.1;
+        return Some(u64::from_le_bytes(bytes.as_slice().try_into().ok()?));
+    }
+    state.regs.iter().find(|r| r.0 == 0x1c201).map(|r| r.1)
+}
+
+/// Arm the same breakpoints on every vCPU: the testcase's thread can be
+/// preempted and resumed on another CPU.
+fn configure_all(
+    vm: &vroom_vmm::Vmm,
+    breakpoints: &[u64],
+    watches: &[MemoryWatch],
+) -> Result<()> {
+    for cpu in 0..vm.config().cpus as usize {
+        vm.debug_configure(
+            cpu,
+            vroom_hv::debug::DebugConfig {
+                enabled: true,
+                breakpoints: breakpoints.to_vec(),
+                watchpoints: hv_watchpoints(watches),
+                ..Default::default()
+            },
+        )?;
+    }
+    Ok(())
+}
+
 fn hv_watchpoints(watches: &[MemoryWatch]) -> Vec<vroom_hv::debug::Watchpoint> {
     watches
         .iter()
@@ -1564,6 +1685,13 @@ pub struct RunResult {
     /// execution. Keeping it beside coverage makes target comparisons
     /// reproducible instead of relying on console timing.
     pub elapsed_us: u64,
+    /// Times another thread reached `stop_pc` or an exception site during
+    /// this input and was stepped past.
+    #[serde(default)]
+    pub foreign_threads: u64,
+    /// Time spent restoring the COW baseline before this input.
+    #[serde(default)]
+    pub reset_us: u64,
 }
 
 #[cfg(test)]

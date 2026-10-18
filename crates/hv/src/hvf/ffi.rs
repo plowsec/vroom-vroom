@@ -91,6 +91,7 @@ extern "C" {
     pub fn hv_vm_destroy() -> hv_return_t;
     pub fn hv_vm_map(addr: *mut c_void, ipa: hv_ipa_t, size: usize, flags: hv_memory_flags_t) -> hv_return_t;
     pub fn hv_vm_unmap(ipa: hv_ipa_t, size: usize) -> hv_return_t;
+    pub fn hv_vm_protect(ipa: hv_ipa_t, size: usize, flags: hv_memory_flags_t) -> hv_return_t;
     pub fn hv_vm_get_max_vcpu_count(count: *mut u32) -> hv_return_t;
 
     pub fn hv_vcpu_create(vcpu: *mut hv_vcpu_t, exit: *mut *const hv_vcpu_exit_t, cfg: os_object_t) -> hv_return_t;

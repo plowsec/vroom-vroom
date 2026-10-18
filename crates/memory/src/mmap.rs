@@ -16,6 +16,9 @@ pub struct MmapRegion {
     /// Immutable baseline behind a private mapping. Reset remaps the file so
     /// pages dirtied by the guest are dropped without copying RAM.
     cow: std::sync::Mutex<Option<std::os::fd::OwnedFd>>,
+    #[cfg(feature = "research")]
+    /// A read-only shared view of that baseline, to copy pages back from.
+    cow_view: std::sync::atomic::AtomicPtr<u8>,
 }
 
 // SAFETY: the mapping is plain memory, owned by this struct; concurrent access
@@ -65,6 +68,8 @@ impl MmapRegion {
             shared: None,
             #[cfg(feature = "research")]
             cow: std::sync::Mutex::new(None),
+            #[cfg(feature = "research")]
+            cow_view: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
         })
     }
 
@@ -215,8 +220,14 @@ impl MmapRegion {
         }
         // SAFETY: both mappings cover `size` bytes and do not overlap.
         unsafe { std::ptr::copy_nonoverlapping(self.base, tmp.cast(), self.size) };
-        // SAFETY: this is the temporary mapping returned above.
-        unsafe { libc::munmap(tmp, self.size) };
+        // Keep it, read-only, to copy pages back from (`restore_cow_copy`).
+        // SAFETY: the mapping returned above.
+        unsafe { libc::mprotect(tmp, self.size, libc::PROT_READ) };
+        let old = self.cow_view.swap(tmp.cast(), std::sync::atomic::Ordering::AcqRel);
+        if !old.is_null() {
+            // SAFETY: the view of an earlier baseline, `size` bytes.
+            unsafe { libc::munmap(old.cast(), self.size) };
+        }
 
         // MAP_FIXED is only used after removing our own central mapping. The
         // guard pages stay intact, so host overrun checks remain effective.
@@ -276,10 +287,63 @@ impl MmapRegion {
         }
         Ok(())
     }
+
+    #[cfg(feature = "research")]
+    /// Copy the COW baseline back over `len` bytes at `off` (pages a reset
+    /// knows were written), without remapping anything.
+    pub fn restore_cow_copy(&self, off: usize, len: usize) -> Result<()> {
+        // Copy from the shared view, not read(2) from the file: a page of
+        // ours that isn't resident faults in from that same file, which a
+        // read of it into our pages can deadlock on.
+        let view = self.cow_view.load(std::sync::atomic::Ordering::Acquire);
+        if view.is_null() {
+            return Err(Error::Cow("no COW baseline is armed"));
+        }
+        if off.checked_add(len).is_none_or(|e| e > self.size) {
+            return Err(Error::Overflow);
+        }
+        // SAFETY: both ranges are inside their `size`-byte mappings and
+        // don't overlap; the VM is paused (the caller's rule).
+        unsafe { std::ptr::copy_nonoverlapping(view.add(off), self.base.add(off), len) };
+        Ok(())
+    }
+
+    #[cfg(feature = "research")]
+    /// Offsets of pages that differ from the COW baseline (a slow check of
+    /// a reset: it reads all of RAM and the baseline).
+    pub fn cow_verify(&self) -> Result<Vec<usize>> {
+        let held = self.cow.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(fd) = held.as_ref() else {
+            return Err(Error::Cow("no COW baseline is armed"));
+        };
+        use std::os::unix::fs::FileExt;
+        let file = std::fs::File::from(fd.try_clone().map_err(|e| Error::Mmap(e.raw_os_error().unwrap_or(libc::EIO)))?);
+        let ps = page_size();
+        let mut want = vec![0u8; ps];
+        let mut differ = Vec::new();
+        for off in (0..self.size).step_by(ps) {
+            file.read_exact_at(&mut want, off as u64)
+                .map_err(|e| Error::Mmap(e.raw_os_error().unwrap_or(libc::EIO)))?;
+            // SAFETY: inside our mapping; the VM is paused (the caller's rule).
+            let have = unsafe { std::slice::from_raw_parts(self.base.add(off), ps) };
+            if have != want.as_slice() {
+                differ.push(off);
+            }
+        }
+        Ok(differ)
+    }
 }
 
 impl Drop for MmapRegion {
     fn drop(&mut self) {
+        #[cfg(feature = "research")]
+        {
+            let view = *self.cow_view.get_mut();
+            if !view.is_null() {
+                // SAFETY: the baseline view made by snapshot_cow, `size` bytes.
+                unsafe { libc::munmap(view.cast(), self.size) };
+            }
+        }
         // SAFETY: unmapping exactly the mapping created in new().
         unsafe {
             libc::munmap(

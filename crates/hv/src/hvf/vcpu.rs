@@ -77,10 +77,16 @@ pub struct HvfVcpu {
     /// The address an access we can't emulate faulted at, since when,
     /// and when last.
     undecodable: Option<(u64, Instant, Instant)>,
+    dirty: Arc<super::dirty::DirtyLog>,
 }
 
 impl HvfVcpu {
-    pub(super) fn new(index: u32, vtimer_offset: Arc<AtomicU64>, el2: bool) -> Result<Self> {
+    pub(super) fn new(
+        index: u32,
+        vtimer_offset: Arc<AtomicU64>,
+        el2: bool,
+        dirty: Arc<super::dirty::DirtyLog>,
+    ) -> Result<Self> {
         let mut id = 0u64;
         let mut exit: *const ffi::hv_vcpu_exit_t = std::ptr::null();
         // SAFETY: out pointers valid; default config.
@@ -107,6 +113,7 @@ impl HvfVcpu {
             guest_debug: Vec::new(),
             pending_debug_step: false,
             undecodable: None,
+            dirty,
         };
         v.set_sys(ffi::HV_SYS_REG_MPIDR_EL1, mpidr)?;
         v.apply_vm_clock()?;
@@ -299,6 +306,10 @@ impl HvfVcpu {
             ExceptionClass::Hvc64 | ExceptionClass::Smc64 | ExceptionClass::SysReg)
         {
             self.pending_debug_step = true;
+        }
+        if aarch64::is_stage2_write_fault(esr) && self.dirty.fault(ipa)? {
+            // First guest write to a logged page: it's writable now.
+            return Ok(None);
         }
         match aarch64::exception_class(esr) {
             ExceptionClass::DataAbortLower => {

@@ -7,6 +7,7 @@
 //! - We use the in-kernel GICv3 (`hv_gic_*`), so distributor/redistributor
 //!   MMIO never exits to us.
 
+mod dirty;
 mod ffi;
 mod vcpu;
 
@@ -101,6 +102,8 @@ pub struct HvfVm {
     spi_count: u32,
     msi: Option<crate::GicMsiConfig>,
     el2: bool,
+    /// Guest writes to RAM, when a snapshot fuzzer logs them.
+    dirty: Arc<dirty::DirtyLog>,
 }
 
 impl std::fmt::Debug for HvfVm {
@@ -201,6 +204,7 @@ impl HvfVm {
             spi_count: info.spi_count,
             msi,
             el2: params.nested,
+            dirty: Arc::new(dirty::DirtyLog::new(granule)),
         })
     }
 
@@ -279,18 +283,31 @@ impl Vm for HvfVm {
     }
 
     fn zero_memory(&self, mem: &GuestMemory) -> Result<()> {
+        self.replace_memory(mem, &mut || mem.discard_all().map_err(|e| Error::Invalid(format!("discard: {e}"))))
+    }
+
+    fn replace_memory(&self, mem: &GuestMemory, replace: &mut dyn FnMut() -> Result<()>) -> Result<()> {
         // HVF keeps the pages it mapped: replacing them under it (discard
-        // remaps) would leave the guest on the old contents. Unmap first.
+        // and COW resets remap) would leave the guest on the old contents.
+        // Unmap first, map the new pages after.
         let flags = ffi::HV_MEMORY_READ | ffi::HV_MEMORY_WRITE | ffi::HV_MEMORY_EXEC;
         for r in mem.regions() {
             // SAFETY: unmapping a range we mapped; vCPUs are stopped.
             check("hv_vm_unmap", unsafe { ffi::hv_vm_unmap(r.start().raw(), r.len() as usize) })?;
         }
-        mem.discard_all().map_err(|e| Error::Invalid(format!("discard: {e}")))?;
+        let replaced = replace();
         for r in mem.regions() {
             self.map(r.host_ptr(), r.start().raw(), r.len() as usize, flags)?;
         }
-        Ok(())
+        replaced
+    }
+
+    fn start_dirty_log(&self, mem: &GuestMemory) -> Result<()> {
+        self.dirty.start(mem)
+    }
+
+    fn take_dirty_log(&self) -> Result<Vec<(u64, u64)>> {
+        self.dirty.take()
     }
 
     fn map_readonly(&self, gpa: u64, region: Arc<MmapRegion>) -> Result<()> {
@@ -300,7 +317,7 @@ impl Vm for HvfVm {
     }
 
     fn create_vcpu(&self, index: u32) -> Result<Box<dyn Vcpu>> {
-        let v = HvfVcpu::new(index, self.vtimer_offset.clone(), self.el2)?;
+        let v = HvfVcpu::new(index, self.vtimer_offset.clone(), self.el2, self.dirty.clone())?;
         self.kickers.lock().unwrap_or_else(|e| e.into_inner()).push(v.hvf_kicker());
         Ok(Box::new(v))
     }

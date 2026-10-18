@@ -46,6 +46,10 @@ pub struct PFlash {
     data: Vec<u8>,
     file: Option<File>,
     st: State,
+    /// The snapshot `data` was last restored from, until the guest writes
+    /// flash: restoring it again (snapshot fuzzing) skips rewriting the
+    /// whole store and its file.
+    restored: Option<Vec<u8>>,
 }
 
 impl std::fmt::Debug for PFlash {
@@ -102,10 +106,11 @@ impl PFlash {
             return Err("bad flash size".into());
         }
         contents.resize(size as usize, 0xff);
-        Ok(PFlash { base, data: contents, file, st: State { mode: Mode::ReadArray, buf: Vec::new() } })
+        Ok(PFlash { base, data: contents, file, st: State { mode: Mode::ReadArray, buf: Vec::new() }, restored: None })
     }
 
-    fn persist(&self, off: u64, len: usize) {
+    fn persist(&mut self, off: u64, len: usize) {
+        self.restored = None;
         if let Some(f) = &self.file {
             if let Err(e) = f.write_all_at(&self.data[off as usize..off as usize + len], off) {
                 log::warn!("pflash: persist: {e}");
@@ -255,6 +260,16 @@ impl Snapshottable for PFlash {
 
     fn restore(&mut self, d: &[u8]) -> vroom_snapshot::Result<()> {
         let bad = |m: &str| vroom_snapshot::Error::Invalid(format!("pflash snapshot: {m}"));
+        if d.starts_with(MAGIC) && self.restored.as_deref() == Some(d) {
+            // Same contents as now: only the command state can differ.
+            let st_len = d
+                .get(MAGIC.len()..MAGIC.len() + 4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap_or_default()) as usize)
+                .ok_or_else(|| bad("truncated"))?;
+            let st = d.get(MAGIC.len() + 4..MAGIC.len() + 4 + st_len).ok_or_else(|| bad("truncated"))?;
+            self.st = decode(st)?;
+            return Ok(());
+        }
         let (st, data) = if d.starts_with(MAGIC) {
             let mut r = &d[MAGIC.len()..];
             let mut take = |n: usize| -> vroom_snapshot::Result<&[u8]> {
@@ -291,6 +306,7 @@ impl Snapshottable for PFlash {
         self.data[..data.len()].copy_from_slice(&data);
         self.persist(0, self.data.len());
         self.st = st;
+        self.restored = Some(d.to_vec());
         Ok(())
     }
 
@@ -370,5 +386,23 @@ mod tests {
         assert_eq!(r(&mut g, 0x200), 0);
         assert_eq!(r(&mut g, 3 * BLOCK_SIZE), 0xffff_ffff);
         assert!(g.restore(&blob[..blob.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn restoring_the_same_snapshot_again_undoes_writes() {
+        let mut f = PFlash::new(0, 4 * BLOCK_SIZE, vec![0; 2 * BLOCK_SIZE as usize], None).unwrap();
+        let blob = f.save().unwrap();
+        f.restore(&blob).unwrap();
+        // Unchanged since: only the command mode comes back.
+        w(&mut f, 0, 0x0090_0090);
+        f.restore(&blob).unwrap();
+        assert_eq!(r(&mut f, 0x100), 0);
+        // Written since: the contents come back too.
+        w(&mut f, 0x100, 0x0040_0040);
+        w(&mut f, 0x100, 0x1234_5678);
+        w(&mut f, 0, 0x00ff_00ff);
+        assert_eq!(r(&mut f, 0x100), 0x1234_5678);
+        f.restore(&blob).unwrap();
+        assert_eq!(r(&mut f, 0x100), 0);
     }
 }

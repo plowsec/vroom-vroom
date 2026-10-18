@@ -12,7 +12,7 @@ cargo run -p vroom-fuzz -- probe harness.json payload.bin --output runs/probe
 cargo run -p vroom-fuzz -- run harness.json payload.bin --ioctl 0x222003 --iterations 100 --output runs/test
 ```
 
-`probe` tries the IOCTL range in the harness and compares blocks with its invalid-code baseline. `run --ioctl` fixes the code and mutates only the payload. Runs try common payload sizes first; `--no-boundary-seeds` skips them. `--repeat-seed` replays the seed while rotating hardware breakpoints across function entries. The mutator favors corpus inputs that recently add blocks, edges, or findings, then spends that score over time. `--duration-secs 3600` runs for an hour instead of a fixed input count. Set `reopen_after` in the harness to restore the checkpoint after a fixed number of inputs; use `1` if repeated COW resets become unreliable. After a timeout or guest reset, the runner saves the finding and restores the checkpoint before continuing. Results and completion counts are JSON under the output directory. Use a new output directory for each run.
+`probe` tries the IOCTL range in the harness and compares blocks with its invalid-code baseline. `run --ioctl` fixes the code and mutates only the payload. Runs try common payload sizes first; `--no-boundary-seeds` skips them. `--repeat-seed` replays the seed while rotating hardware breakpoints across function entries. The mutator favors corpus inputs that recently add blocks, edges, or findings, then spends that score over time. `--duration-secs 3600` runs for an hour instead of a fixed input count. Set `reopen_after` in the harness to restore the checkpoint after a fixed number of inputs; `1` restores it from disk for every input (seconds each), `0` keeps one VM and resets it in place. After a timeout or guest reset, the runner saves the finding and restores the checkpoint before continuing. Results and completion counts are JSON under the output directory. Use a new output directory for each run.
 
 For extra signals, add driver-specific `exception_sites` addresses to stop when the kernel dispatches an exception. This only confirms that dispatch was reached; it does not prove the exception was caught. Add a `watchpoints` entry with `address`, `size`, `read`, and `write` to watch memory. Set `input_end_offset: 0`, `poison_value: 241`, and `poisoned: true` to poison and watch the first byte after each input. Set `double_fetch: true` with `read: true` to report its second read. Hardware watches cover at most 8 bytes in one aligned 8-byte range. This does not discover allocators or maintain a full shadow map automatically.
 
@@ -24,6 +24,14 @@ Open results in the kernel TUI:
 coverage runs/test/coverage.json
 coverage-diff runs/a/coverage.json runs/b/coverage.json
 ```
+
+## Speed
+
+The VM is reset in place between inputs: the hypervisor logs the pages the guest writes (write-protected on stage 2, HVF), RAM logs what host code writes, and a reset copies only those pages back from the frozen checkpoint. Backends without the log remap all RAM instead. `VROOM_COW_VERIFY=1` compares all RAM with the checkpoint after every reset and stops on any difference; it is slow (about a second for 8 GiB), so use it to check a new target, not to fuzz.
+
+Set `isolate_cpu: true` for a handler checkpoint: each input then runs on `cpu` alone, with its interrupts masked and the other CPUs parked. The target thread is never preempted and the rest of Windows doesn't run meanwhile, so an input takes milliseconds instead of a scheduler quantum. A path that waits for another CPU or an interrupt times out instead; a bugcheck still resets the guest (after about 3 s). On the HEVD dispatch checkpoint (8 GiB, 2 CPUs) this runs about 100 inputs/s; without it, about 5.
+
+`stop_pc` usually sits in shared kernel code (after `IofCallDriver`). Only the testcase's thread ends an input there: the same address space, and a stack frame just above the entry frame. Other threads that pass it are stepped over and counted as `foreign_threads` in each result; breakpoints are armed on every CPU, so the thread is followed if it migrates. Exception sites are filtered the same way. `reset_us` in each result is the time the reset before that input took.
 
 ## HEVD
 
