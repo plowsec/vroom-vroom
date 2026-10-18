@@ -48,6 +48,8 @@
 /research/*.local.toml
 /research/captures/
 /research/checkpoints/
+/HEVD-LAB-CHEATSHEET.md
+/.vm-ssh/
 
 # Local credentials.
 .env

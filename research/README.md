@@ -16,11 +16,11 @@ cargo run -p vroom-fuzz -- run harness.json seed.bin --iterations 1000
 cargo run -p vroom-fuzz -- coverage STATE/fuzz/coverage.json STATE/fuzz/blocks.json
 ```
 
-The harness declares the checkpoint, input buffer, analysed basic blocks and
-detectors. Each run records block hits, edges, first-seen inputs, function
-coverage and findings as JSON. A campaign is auditable when the block manifest
-is tied to the disassembly or symbol evidence used to create it and the
-resulting `coverage.json` is kept with the corpus.
+The harness declares the checkpoint, input buffer, target-specific IOCTL field,
+analysed function and detectors. angr_tui exports basic blocks from the driver
+binary; the runner translates their guest virtual addresses through the
+restored page tables and traps each block entry. Each run records block hits,
+edges, first-seen inputs, function coverage and findings as JSON.
 
 The VMM side is opt-in:
 
@@ -34,14 +34,15 @@ file-backed RAM baselines and the paused restore API used by `vroom-fuzz`.
 
 ## targets
 
-`hevd/` contains the first end-to-end target notes, an ARM64 call-site client,
-the Ghidra block exporter and a manifest verifier for HackSys Extreme
-Vulnerable Driver. Target source, driver binaries, checkpoints and generated
-coverage stay outside the repository.
+`hevd/` contains the first target harness for HackSys Extreme Vulnerable
+Driver. Target source, driver binaries, checkpoints and generated coverage
+stay outside the repository.
 
-To inspect a completed campaign, run `coverage /path/to/state/fuzz/coverage.json`
-at the kernel TUI command bar. The Coverage tab shows per-function progress
-and block hit counts; selecting a block with a VA jumps to it in the debugger.
+To inspect a run, enter `coverage /path/to/run/coverage.json` at the kernel TUI
+command bar. To compare two runs that share the same block manifest, enter
+`coverage-diff /path/to/baseline/coverage.json /path/to/current/coverage.json`.
+The Coverage tab shows newly reached blocks and hit-count changes per function
+and block.
 
 ## run
 

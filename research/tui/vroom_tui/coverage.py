@@ -13,6 +13,8 @@ class FunctionCoverage:
     total: int
     covered: int
     hits: int
+    baseline_covered: int | None = None
+    baseline_hits: int | None = None
 
     @property
     def percent(self) -> float:
@@ -60,6 +62,43 @@ def load_artifacts(coverage_path: str | Path, blocks_path: str | Path | None = N
         "total_blocks": len(block_rows),
     }
     return summary, rows, block_rows
+
+
+def compare_artifacts(baseline_path: str | Path, current_path: str | Path):
+    """Compare two run files that use the same stable block manifest."""
+    base, base_functions, base_blocks = load_artifacts(baseline_path)
+    current, current_functions, current_blocks = load_artifacts(current_path)
+    base_by_id = {str(block["id"]): block for block in base_blocks}
+    current_by_id = {str(block["id"]): block for block in current_blocks}
+    if base_by_id.keys() != current_by_id.keys():
+        raise ValueError("coverage runs use different block sets")
+    for ident in base_by_id:
+        left, right = base_by_id[ident], current_by_id[ident]
+        if (left.get("va"), left.get("gpa"), left.get("size")) != (
+            right.get("va"), right.get("gpa"), right.get("size")
+        ):
+            raise ValueError(f"coverage block {ident} changed between runs")
+        right["baseline_hits"] = left["hits"]
+        right["delta_hits"] = right["hits"] - left["hits"]
+        right["coverage_change"] = (
+            "new" if left["hits"] == 0 and right["hits"] > 0 else
+            "lost" if left["hits"] > 0 and right["hits"] == 0 else
+            "both" if left["hits"] > 0 else "neither"
+        )
+    base_functions_by_name = {(row.module, row.name): row for row in base_functions}
+    functions = []
+    for row in current_functions:
+        prior = base_functions_by_name.get((row.module, row.name))
+        functions.append(FunctionCoverage(
+            row.name, row.module, row.total, row.covered, row.hits,
+            prior.covered if prior else 0, prior.hits if prior else 0,
+        ))
+    newly_covered = sum(block["coverage_change"] == "new" for block in current_blocks)
+    lost = sum(block["coverage_change"] == "lost" for block in current_blocks)
+    current["baseline_covered_blocks"] = base["covered_blocks"]
+    current["newly_covered_blocks"] = newly_covered
+    current["lost_blocks"] = lost
+    return current, functions, current_blocks
 
 
 def render(summary: dict[str, Any]) -> str:

@@ -5,8 +5,17 @@ description = "Optional Windows kernel debugger frontend for vroom-lab"
 requires-python = ">=3.12"
 dependencies = ["textual>=6.0,<7", "capstone>=5,<6"]
 
+[project.optional-dependencies]
+angr = [
+    "angr-tui @ git+ssh://git@github.com/plowsec/angr_tui.git@39a029bba907784d948d48284fd7212e5b975ac4",
+    "bitstring<5",
+]
+
 [project.scripts]
 vroom-kernel = "vroom_tui.app:main"
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [build-system]
 requires = ["hatchling"]

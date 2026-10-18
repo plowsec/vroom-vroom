@@ -2,6 +2,7 @@
 import argparse
 import asyncio
 import json
+import shutil
 import shlex
 import os
 import signal
@@ -20,7 +21,7 @@ from textual.widgets import Button, DataTable, Footer, Header, Input, Label, Ric
 
 from .client import Client
 from .analysis import prepare_rva_image
-from .coverage import load_artifacts
+from .coverage import compare_artifacts, load_artifacts
 
 
 class KernelApp(App):
@@ -114,6 +115,7 @@ class KernelApp(App):
         self.coverage_blocks = []
         self.all_coverage_blocks = []
         self.coverage_summary = None
+        self.coverage_comparison = False
         self.generation = 0
         self.view_revision = 0
         self.view_context = True
@@ -207,7 +209,8 @@ class KernelApp(App):
         self.query_one('#cfg-blocks', DataTable).add_columns('Block', 'Size', 'Insns', 'In', 'Out')
         self.query_one('#cfg-edges', DataTable).add_columns('From', 'Kind', 'To')
         self.query_one('#coverage-functions', DataTable).add_columns('Module / function', 'Blocks', 'Coverage', 'Hits')
-        self.query_one('#coverage-blocks', DataTable).add_columns('VA / GPA', 'Hits', 'Size', 'First input')
+        self.query_one('#coverage-blocks', DataTable).add_columns(
+            'VA / GPA', 'Hits', 'Size', 'Change', 'First input')
         self.query_one('#functions', DataTable).add_columns('Function', 'Address')
         self.query_one('#processes', DataTable).add_columns('PID', 'Image', 'Parent', 'EPROCESS')
         self.query_one('#peb', DataTable).add_columns('Field', 'Value')
@@ -849,7 +852,11 @@ class KernelApp(App):
                 if not args or len(args) > 2:
                     raise RuntimeError('usage: coverage COVERAGE.json [BLOCKS.json]')
                 await self.load_coverage(args[0], args[1] if len(args) > 1 else None)
-            else: self.log_message('reg NAME VALUE · write ADDRESS HEX · into/over/out · ps · process PID · peb · modules · symbols MODULE · functions MODULE PREFIX · next/prev · stack · bp/dis/mem/x SYMBOL · watch ADDRESS SIZE r/w/rw · bc/wc · dec/dec-file/dec-partial SYMBOL · cfg/xrefs [SYMBOL] · coverage COVERAGE.json [BLOCKS.json] · back/forward · image MODULE [PATH] · dump ADDRESS N · callbacks · event · cpu N · checkpoint PATH')
+            elif op == 'coverage-diff':
+                if len(args) != 2:
+                    raise RuntimeError('usage: coverage-diff BASELINE.json CURRENT.json')
+                await self.load_coverage(args[1], comparison_base=args[0])
+            else: self.log_message('reg NAME VALUE · write ADDRESS HEX · into/over/out · ps · process PID · peb · modules · symbols MODULE · functions MODULE PREFIX · next/prev · stack · bp/dis/mem/x SYMBOL · watch ADDRESS SIZE r/w/rw · bc/wc · dec/dec-file/dec-partial SYMBOL · cfg/xrefs [SYMBOL] · coverage FILE [BLOCKS] · coverage-diff BASE CURRENT · back/forward · image MODULE [PATH] · dump ADDRESS N · callbacks · event · cpu N · checkpoint PATH')
         except Exception as error:
             self.status(str(error), error=True)
             self.log_message(error)
@@ -868,9 +875,14 @@ class KernelApp(App):
             return int(table.ordered_rows[table.cursor_row].key.value)
         return self.address
 
-    async def load_coverage(self, coverage_path, blocks_path=None):
-        summary, functions, blocks = await asyncio.to_thread(
-            load_artifacts, coverage_path, blocks_path)
+    async def load_coverage(self, coverage_path, blocks_path=None, comparison_base=None):
+        if comparison_base:
+            summary, functions, blocks = await asyncio.to_thread(
+                compare_artifacts, comparison_base, coverage_path)
+        else:
+            summary, functions, blocks = await asyncio.to_thread(
+                load_artifacts, coverage_path, blocks_path)
+        self.coverage_comparison = comparison_base is not None
         self.coverage_summary = summary
         self.coverage_functions = functions
         self.all_coverage_blocks = blocks
@@ -882,12 +894,20 @@ class KernelApp(App):
             color = 'green' if row.percent >= 70 else 'yellow' if row.percent >= 30 else 'red'
             progress = Text('█' * filled + '·' * (width - filled), style=color)
             progress.append(f' {row.percent:5.1f}%')
-            table.add_row(f'{row.module}!{row.name}', f'{row.covered}/{row.total}', progress,
-                          f'{row.hits:,}', key=str(index))
+            block_count = (f'{row.baseline_covered}/{row.total} → {row.covered}/{row.total}'
+                           if self.coverage_comparison else f'{row.covered}/{row.total}')
+            hit_count = (f'{row.baseline_hits:,} → {row.hits:,} ({row.hits-row.baseline_hits:+,})'
+                         if self.coverage_comparison else f'{row.hits:,}')
+            table.add_row(f'{row.module}!{row.name}', block_count, progress,
+                          hit_count, key=str(index))
+        title = (f"{summary['baseline_covered_blocks']}/{summary['total_blocks']} → "
+                 f"{summary['covered_blocks']}/{summary['total_blocks']} blocks · "
+                 f"+{summary['newly_covered_blocks']} new · -{summary['lost_blocks']} lost · "
+                 if self.coverage_comparison else
+                 f"{summary['covered_blocks']}/{summary['total_blocks']} blocks · "
+                 f"{summary['executions']:,} runs · {summary['new_edges']:,} new edges · ")
         self.query_one('#coverage-title', Static).update(
-            f"{summary['covered_blocks']}/{summary['total_blocks']} blocks · "
-            f"{summary['executions']:,} runs · {summary['new_edges']:,} new edges · "
-            f"{len(functions)} functions · {coverage_path}")
+            f"{title}{len(functions)} functions · {coverage_path}")
         if functions:
             table.move_cursor(row=0)
             self.show_coverage_blocks(functions[0])
@@ -908,8 +928,11 @@ class KernelApp(App):
             va = block.get('va')
             address = int(va if va is not None else block['gpa'])
             first = block.get('first_input')
+            hit_text = (f"{block['baseline_hits']:,} → {int(block['hits']):,}"
+                        if self.coverage_comparison else f"{int(block['hits']):,}")
+            change = block.get('coverage_change', '') if self.coverage_comparison else ''
             table.add_row(f"{address:016x}" + ('' if va is not None else ' GPA'),
-                          f"{int(block['hits']):,}", str(block['size']),
+                          hit_text, str(block['size']), change,
                           first[:12] if first else '', key=str(index))
             indexes.append(block)
         self.coverage_blocks = indexes
@@ -1137,4 +1160,6 @@ def main():
     parser.add_argument('--restore', type=Path, help='vroom checkpoint directory')
     parser.add_argument('--ex-callback-demo', action='store_true', help='load symbols and Ex callback arguments from a paused checkpoint')
     args = parser.parse_args()
-    KernelApp(args.backend.resolve(), args.config.resolve(), atui=args.atui.resolve() if args.atui else None, restore=args.restore, ex_callback_demo=args.ex_callback_demo).run()
+    atui = args.atui.resolve() if args.atui else shutil.which('atui')
+    KernelApp(args.backend.resolve(), args.config.resolve(), atui=Path(atui) if atui else None,
+              restore=args.restore, ex_callback_demo=args.ex_callback_demo).run()

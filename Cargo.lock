@@ -5508,6 +5508,7 @@ dependencies = [
  "thiserror 2.0.21",
  "vroom-config",
  "vroom-hv",
+ "vroom-kernel",
  "vroom-vmm",
 ]
 

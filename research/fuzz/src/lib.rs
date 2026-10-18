@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use vroom_kernel::arm64::{AddressSpace, Registers};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -29,15 +30,21 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// A basic block known to the coverage database. `gpa` is used by the first
-/// runner because it is unambiguous before a guest page-table resolver is
-/// selected; `va` and symbol fields preserve the analysis provenance.
+/// A basic block known to the coverage database. Analysis manifests can keep
+/// portable VAs; instrumentation resolves them to GPAs for this checkpoint.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CoverageBlock {
     pub id: u64,
-    pub gpa: u64,
+    /// Resolved from `va` when the campaign opens. Keeping GPA optional lets
+    /// the analysis manifest stay portable across guest runs and ASLR bases.
+    #[serde(default)]
+    pub gpa: Option<u64>,
     pub va: Option<u64>,
     pub size: u32,
+    /// In-function CFG successors used to rearm a small set of hardware
+    /// breakpoints after a block is reached. Empty for older manifests.
+    #[serde(default)]
+    pub successors: Vec<u64>,
     #[serde(default)]
     pub module: String,
     #[serde(default)]
@@ -54,8 +61,12 @@ pub struct Harness {
     pub state_dir: PathBuf,
     pub input_gpa: u64,
     pub input_capacity: usize,
-    /// Optional guest virtual address passed to the target call. The runner
-    /// writes it to `input_register` when a testcase is inserted.
+    /// CPU whose saved execution context owns the target call. Kernel dispatch
+    /// can be entered on any CPU; this defaults to CPU 0 for older harnesses.
+    #[serde(default)]
+    pub cpu: usize,
+    /// Optional guest virtual address of the input buffer. It must translate
+    /// to `input_gpa`; the runner passes or stores it for each testcase.
     #[serde(default)]
     pub input_va: Option<u64>,
     /// Treat the first four testcase bytes as a little-endian IOCTL code.
@@ -65,6 +76,22 @@ pub struct Harness {
     /// x1/x2/x3 DeviceIoControl arguments).
     #[serde(default)]
     pub ioctl_register: Option<String>,
+    /// Optional target-specific IOCTL field in the saved handler state. When
+    /// set, testcase IOCTL values are written here instead of to a call ABI
+    /// register. This supports a checkpoint taken at a driver's IRP handler.
+    #[serde(default)]
+    pub ioctl_va: Option<u64>,
+    /// Optional guest VA of a saved pointer field that should point at
+    /// `input_va` for each testcase (for example an IRP buffer pointer).
+    #[serde(default)]
+    pub input_pointer_va: Option<u64>,
+    /// Optional guest VA of a saved 32-bit input-length field.
+    #[serde(default)]
+    pub input_length_va: Option<u64>,
+    /// Optional guest VA of a saved 32-bit output-length field. Some drivers
+    /// use this field as the copy size for METHOD_NEITHER requests.
+    #[serde(default)]
+    pub output_length_va: Option<u64>,
     #[serde(default)]
     pub input_register: Option<String>,
     #[serde(default)]
@@ -73,18 +100,93 @@ pub struct Harness {
     /// successful iteration instead of waiting for the timeout.
     #[serde(default)]
     pub stop_pc: Option<u64>,
+    /// First instrumented block to stop at. If omitted, use the checkpoint PC.
+    #[serde(default)]
+    pub entry_pc: Option<u64>,
     /// Treat a guest reset as a kernel bugcheck. This is useful for drivers
     /// such as HEVD whose deliberate faults reset the lab guest.
     #[serde(default)]
     pub reset_is_bugcheck: bool,
+    /// Reopen the VM after this many completed inputs. Zero keeps the COW VM
+    /// resident; small values are useful on hosts whose hypervisor retains
+    /// stale mappings across remaps.
+    #[serde(default)]
+    pub reopen_after: usize,
     #[serde(default = "default_timeout")]
     pub timeout_ms: u64,
     #[serde(default)]
     pub max_input: usize,
     #[serde(default)]
     pub coverage: Vec<CoverageBlock>,
+    /// Optional block manifest. Relative paths are resolved next to the
+    /// harness, which keeps target block lists separate from run settings.
+    #[serde(default)]
+    pub coverage_file: Option<PathBuf>,
+    /// Optional CTL_CODE range for one-IOCTL-at-a-time snapshot probing.
+    #[serde(default)]
+    pub ioctl_probe: Option<IoctlProbe>,
     #[serde(default)]
     pub detectors: Vec<String>,
+    /// Driver-specific exception dispatch PCs. Reaching one records a
+    /// exception-dispatch finding even when the guest continues normally.
+    #[serde(default)]
+    pub exception_sites: Vec<u64>,
+    /// Hardware watched memory ranges. Use `poisoned` for allocator redzones
+    /// or freed objects whose address is known from a target harness.
+    #[serde(default)]
+    pub watchpoints: Vec<MemoryWatch>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryWatch {
+    #[serde(default)]
+    pub address: u64,
+    pub size: u8,
+    #[serde(default)]
+    pub read: bool,
+    #[serde(default)]
+    pub write: bool,
+    #[serde(default)]
+    pub poisoned: bool,
+    #[serde(default)]
+    pub double_fetch: bool,
+    /// When set, watch this offset from the current input's end instead of
+    /// `address`. A negative value watches within the input buffer.
+    #[serde(default)]
+    pub input_end_offset: Option<i32>,
+    /// Fill the watched bytes with this value before running the testcase.
+    /// This makes a redzone watch an actual poison marker, not just a label.
+    #[serde(default)]
+    pub poison_value: Option<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IoctlProbe {
+    pub device_type: u16,
+    pub function_start: u16,
+    pub function_end: u16,
+    pub methods: Vec<u8>,
+    pub access: Vec<u8>,
+    /// A known-invalid code used to identify the driver's default path.
+    pub baseline_ioctl: u32,
+}
+
+impl IoctlProbe {
+    pub fn codes(&self) -> Vec<u32> {
+        let mut codes = BTreeSet::new();
+        for function in self.function_start..=self.function_end {
+            for &method in &self.methods {
+                for &access in &self.access {
+                    let code = ((self.device_type as u32) << 16)
+                        | ((access as u32) << 14)
+                        | ((function as u32) << 2)
+                        | method as u32;
+                    codes.insert(code);
+                }
+            }
+        }
+        codes.into_iter().collect()
+    }
 }
 
 fn default_timeout() -> u64 {
@@ -95,6 +197,14 @@ impl Harness {
     pub fn load(path: &Path) -> Result<Self> {
         let bytes = fs::read(path)?;
         let mut h: Self = serde_json::from_slice(&bytes)?;
+        if let Some(blocks) = &h.coverage_file {
+            let blocks = if blocks.is_absolute() {
+                blocks.clone()
+            } else {
+                path.parent().unwrap_or_else(|| Path::new(".")).join(blocks)
+            };
+            h.coverage = serde_json::from_slice(&fs::read(blocks)?)?;
+        }
         if h.name.trim().is_empty() || h.input_capacity == 0 {
             return Err(Error::Invalid(
                 "name and input_capacity are required".into(),
@@ -114,21 +224,123 @@ impl Harness {
                 "max_input payload exceeds input_capacity".into(),
             ));
         }
-        if h.ioctl_prefix && h.ioctl_register.is_none() {
-            return Err(Error::Invalid("ioctl_prefix needs ioctl_register".into()));
-        }
-        if h.input_va.is_some() != h.input_register.is_some() {
+        if h.ioctl_prefix && h.ioctl_register.is_none() && h.ioctl_va.is_none() {
             return Err(Error::Invalid(
-                "input_va and input_register must be paired".into(),
+                "ioctl_prefix needs ioctl_register or ioctl_va".into(),
             ));
         }
-        if h.stop_pc.is_some_and(|pc| pc & 3 != 0) {
-            return Err(Error::Invalid("stop_pc must be instruction aligned".into()));
-        }
-        if h.coverage.iter().any(|b| b.size == 0 || b.gpa & 3 != 0) {
+        if h.ioctl_register.is_some() && h.ioctl_va.is_some() {
             return Err(Error::Invalid(
-                "coverage blocks must be aligned and non-empty".into(),
+                "choose ioctl_register or ioctl_va, not both".into(),
             ));
+        }
+        if h.input_register.is_some() && h.input_pointer_va.is_some() {
+            return Err(Error::Invalid(
+                "choose input_register or input_pointer_va, not both".into(),
+            ));
+        }
+        if h.input_length_register.is_some() && h.input_length_va.is_some() {
+            return Err(Error::Invalid(
+                "choose input_length_register or input_length_va, not both".into(),
+            ));
+        }
+        if h.input_va.is_some() != (h.input_register.is_some() || h.input_pointer_va.is_some()) {
+            return Err(Error::Invalid(
+                "input_va needs input_register or input_pointer_va".into(),
+            ));
+        }
+        if h.input_pointer_va.is_some_and(|va| va & 7 != 0)
+            || h.input_length_va.is_some_and(|va| va & 3 != 0)
+            || h.output_length_va.is_some_and(|va| va & 3 != 0)
+        {
+            return Err(Error::Invalid(
+                "input pointer fields must be 8-byte aligned and length fields 4-byte aligned"
+                    .into(),
+            ));
+        }
+        if h.stop_pc.is_some_and(|pc| pc & 3 != 0) || h.entry_pc.is_some_and(|pc| pc & 3 != 0) {
+            return Err(Error::Invalid(
+                "entry_pc and stop_pc must be instruction aligned".into(),
+            ));
+        }
+        if h.coverage.iter().any(|b| {
+            b.size == 0
+                || b.va.is_some_and(|va| va & 3 != 0)
+                || b.gpa.is_some_and(|gpa| gpa & 3 != 0)
+                || (b.va.is_none() && b.gpa.is_none())
+        }) {
+            return Err(Error::Invalid(
+                "coverage blocks need an aligned GPA or VA and a non-zero size".into(),
+            ));
+        }
+        if h.coverage.iter().any(|block| block.successors.len() > 4) {
+            return Err(Error::Invalid(
+                "a coverage block has more than four successors; split its branch table".into(),
+            ));
+        }
+        if h.stop_pc.is_some() && h.coverage.iter().any(|block| block.successors.len() == 4) {
+            return Err(Error::Invalid(
+                "stop_pc leaves room for at most three block successors".into(),
+            ));
+        }
+        if h.exception_sites.iter().any(|pc| pc & 3 != 0) {
+            return Err(Error::Invalid(
+                "exception_sites must be instruction aligned".into(),
+            ));
+        }
+        // DebugStop does not expose the fired WVR index yet, so one watched
+        // range is the only unambiguous configuration supported by the runner.
+        if h.exception_sites.len() > 4 || h.watchpoints.len() > 1 {
+            return Err(Error::Invalid(
+                "ARM64 supports four exception sites and one unambiguous watched range".into(),
+            ));
+        }
+        for watch in &h.watchpoints {
+            if watch.input_end_offset.is_some() && h.input_va.is_none() {
+                return Err(Error::Invalid(
+                    "input_end_offset needs input_va in the harness".into(),
+                ));
+            }
+            vroom_hv::debug::Watchpoint {
+                address: watch.address,
+                size: watch.size,
+                read: watch.read,
+                write: watch.write,
+            }
+            .arm64_control()
+            .map_err(|error| Error::Invalid(error.to_string()))?;
+            if watch.poisoned && !watch.read && !watch.write {
+                return Err(Error::Invalid(
+                    "poisoned watchpoints need read or write enabled".into(),
+                ));
+            }
+            if watch.double_fetch && (!watch.read || watch.write) {
+                return Err(Error::Invalid(
+                    "double_fetch needs a read-only watchpoint".into(),
+                ));
+            }
+        }
+        if let Some(probe) = &h.ioctl_probe {
+            if !h.ioctl_prefix {
+                return Err(Error::Invalid("ioctl_probe needs ioctl_prefix".into()));
+            }
+            if probe.function_start > probe.function_end || probe.function_end > 0x0fff {
+                return Err(Error::Invalid(
+                    "ioctl_probe function range must be ordered and at most 0xfff".into(),
+                ));
+            }
+            if probe.methods.is_empty()
+                || probe.methods.iter().any(|value| *value > 3)
+                || probe.access.is_empty()
+                || probe.access.iter().any(|value| *value > 3)
+            {
+                return Err(Error::Invalid(
+                    "ioctl_probe needs method and access values from 0 through 3".into(),
+                ));
+            }
+            if probe.codes().len() > 65_536 {
+                return Err(Error::Invalid("ioctl_probe has too many candidates".into()));
+            }
         }
         let mut ids = BTreeSet::new();
         let mut gpas = BTreeSet::new();
@@ -140,9 +352,9 @@ impl Harness {
                     block.id
                 )));
             }
-            if !gpas.insert(block.gpa) {
+            if block.gpa.is_some_and(|gpa| !gpas.insert(gpa)) {
                 return Err(Error::Invalid(format!(
-                    "duplicate coverage GPA {:#x}",
+                    "duplicate coverage GPA {:?}",
                     block.gpa
                 )));
             }
@@ -247,6 +459,9 @@ pub enum BugClass {
     OutOfBounds,
     IntegerOverflow,
     Uninitialized,
+    ExceptionDispatch,
+    PoisonedAccess,
+    DoubleFetch,
     Timeout,
     Unknown,
 }
@@ -332,7 +547,7 @@ impl Mutator {
         let operations = 1 + (self.next() % 8) as usize;
         for _ in 0..operations {
             let editable = out.len().saturating_sub(prefix_len);
-            match self.next() % 5 {
+            match self.next() % 8 {
                 0 if editable != 0 => {
                     let i = prefix_len + (self.next() as usize) % editable;
                     out[i] ^= 1 << (self.next() % 8);
@@ -349,9 +564,28 @@ impl Mutator {
                     let i = prefix_len + (self.next() as usize) % editable;
                     out.remove(i);
                 }
-                _ if editable != 0 => {
+                4 if editable != 0 => {
                     let i = prefix_len + (self.next() as usize) % editable;
                     out[i] = out[i].wrapping_add((self.next() & 0xff) as u8);
+                }
+                5 if editable != 0 => {
+                    const INTERESTING: [u8; 14] =
+                        [0, 1, 2, 3, 4, 7, 8, 16, 32, 64, 0x7f, 0x80, 0xfe, 0xff];
+                    let i = prefix_len + (self.next() as usize) % editable;
+                    out[i] = INTERESTING[(self.next() as usize) % INTERESTING.len()];
+                }
+                6 if editable >= 4 => {
+                    const INTERESTING: [u32; 12] =
+                        [0, 1, 2, 4, 8, 16, 32, 64, 127, 128, 0x7fff_ffff, u32::MAX];
+                    let i = prefix_len + (self.next() as usize) % (editable - 3);
+                    out[i..i + 4].copy_from_slice(
+                        &INTERESTING[(self.next() as usize) % INTERESTING.len()].to_le_bytes(),
+                    );
+                }
+                7 if editable != 0 => {
+                    let i = prefix_len + (self.next() as usize) % editable;
+                    let n = (1 + self.next() as usize % 8).min(out.len() - i);
+                    out[i..i + n].fill(if self.next() & 1 == 0 { 0 } else { 0xff });
                 }
                 _ => {}
             }
@@ -369,6 +603,22 @@ impl Mutator {
         } else {
             (self.next() as usize) % count
         }
+    }
+
+    pub fn choose_weighted(&mut self, weights: &[u32]) -> usize {
+        let total: u64 = weights.iter().map(|weight| u64::from(*weight)).sum();
+        if total == 0 {
+            return self.choose(weights.len());
+        }
+        let mut pick = self.next() % total;
+        for (index, weight) in weights.iter().enumerate() {
+            let weight = u64::from(*weight);
+            if pick < weight {
+                return index;
+            }
+            pick -= weight;
+        }
+        weights.len().saturating_sub(1)
     }
 }
 
@@ -446,17 +696,35 @@ pub struct Engine {
     pub vm: vroom_vmm::Vmm,
     pub harness: Harness,
     pub coverage: CoverageMap,
-    originals: HashMap<u64, u32>,
     block_by_pc: HashMap<u64, usize>,
+    /// One function-entry breakpoint is rotated across runs to catch handlers
+    /// reached through unresolved indirect dispatch branches.
+    watch_targets: Vec<u64>,
+    watch_cursor: usize,
+    checkpoint_fresh: bool,
+    cow_enabled: bool,
     input_buffer: Vec<u8>,
 }
 
 impl Engine {
-    pub fn open(harness: Harness) -> Result<Self> {
+    pub fn open(mut harness: Harness) -> Result<Self> {
         let input_capacity = harness.input_capacity;
         let config = vroom_config::VmConfig::load(&harness.config)
             .map_err(|e| Error::Config(e.to_string()))?;
+        if harness.cpu >= config.cpus as usize {
+            return Err(Error::Invalid(format!(
+                "harness CPU {} is outside VM CPU count {}",
+                harness.cpu, config.cpus
+            )));
+        }
         let hv = vroom_hv::default_hypervisor()?;
+        // HVF may retain stage-2 mappings after the COW layer swaps the host
+        // backing pages. For this backend, run one testcase per checkpoint
+        // restore and arm COW only after writing the testcase into restored RAM.
+        let cow_enabled = hv.name() != "hvf" && harness.reopen_after != 1;
+        if hv.name() == "hvf" {
+            harness.reopen_after = 1;
+        }
         let vm = vroom_vmm::Vmm::start(
             config,
             hv,
@@ -472,37 +740,146 @@ impl Engine {
             vm,
             harness,
             coverage: CoverageMap::default(),
-            originals: HashMap::new(),
             block_by_pc: HashMap::new(),
+            watch_targets: Vec::new(),
+            watch_cursor: 0,
+            checkpoint_fresh: true,
+            cow_enabled,
             input_buffer: vec![0; input_capacity],
         })
     }
 
-    /// Patch each declared block with an ARM64 BRK before arming the COW
-    /// baseline. The original words are kept for precise single stepping.
+    /// Resolve declared blocks and prepare the coverage map for hardware
+    /// breakpoints on each reached block's successors.
     pub fn instrument(&mut self) -> Result<()> {
-        for (index, block) in self.harness.coverage.iter().enumerate() {
-            let mut bytes = [0u8; 4];
-            self.vm.debug_read_physical(block.gpa, &mut bytes)?;
-            let original = u32::from_le_bytes(bytes);
-            self.originals.insert(block.gpa, original);
-            self.block_by_pc.insert(block.gpa, index);
+        let state = self.vm.debug_registers(self.harness.cpu)?;
+        let registers = Registers::from_state(&state)
+            .map_err(|error| Error::Invalid(format!("ARM64 register state: {error}")))?;
+        let address_space = AddressSpace {
+            memory: &self.vm,
+            registers: &registers,
+        };
+        for index in 0..self.harness.coverage.len() {
+            let block = self.harness.coverage[index].clone();
+            let gpa = match (block.gpa, block.va) {
+                (Some(gpa), _) => Some(gpa),
+                (None, Some(va)) => match address_space.translate(va) {
+                    Ok(translated) => Some(translated.physical),
+                    // Driver code can be pageable. Keep its VA breakpoint in
+                    // the manifest even when that code page is not resident
+                    // at the checkpoint; it may be loaded before execution.
+                    Err(_) => None,
+                },
+                (None, None) => {
+                    return Err(Error::Invalid(format!(
+                        "coverage block {} needs either gpa or va",
+                        block.id
+                    )))
+                }
+            };
+            if let Some(gpa) = gpa {
+                self.block_by_pc.insert(gpa, index);
+            }
             if let Some(va) = block.va {
                 self.block_by_pc.insert(va, index);
             }
-            let trap = 0xd420_0000u32 | ((block.id as u32 & 0xffff) << 5);
-            self.vm
-                .debug_write_physical(&[(block.gpa, &trap.to_le_bytes())])?;
+            self.harness.coverage[index].gpa = gpa;
         }
-        self.vm.research_arm()?;
+        let entry_pc = self.harness.entry_pc.unwrap_or(registers.pc);
+        let entry_function = self
+            .block_by_pc
+            .get(&entry_pc)
+            .and_then(|index| self.harness.coverage.get(*index))
+            .map(|block| block.function.clone());
+        let mut function_entries = BTreeMap::<String, u64>::new();
+        for block in &self.harness.coverage {
+            if block.function.is_empty() {
+                continue;
+            }
+            if let Some(va) = block.va {
+                function_entries
+                    .entry(block.function.clone())
+                    .and_modify(|entry| *entry = (*entry).min(va))
+                    .or_insert(va);
+            }
+        }
+        self.watch_targets = function_entries
+            .into_iter()
+            .filter_map(|(function, entry)| {
+                (Some(function.as_str()) != entry_function.as_deref()
+                    && entry != self.harness.stop_pc.unwrap_or(0))
+                .then_some(entry)
+            })
+            .collect();
+        if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
+            eprintln!(
+                "function-entry watches: {}",
+                self.watch_targets
+                    .iter()
+                    .map(|va| format!("{va:#x}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        if self.cow_enabled {
+            self.vm.research_arm()?;
+        }
         Ok(())
+    }
+
+    /// Replace a VM that timed out or reset with a fresh restore of the same
+    /// checkpoint. COW reset is fast for normal cases, but cannot be trusted
+    /// after a guest bugcheck or a wedged kernel path.
+    pub fn reopen(self) -> Result<Self> {
+        let Engine {
+            vm,
+            harness,
+            coverage,
+            watch_cursor,
+            ..
+        } = self;
+        drop(vm);
+        let mut fresh = Self::open(harness)?;
+        fresh.coverage = coverage;
+        fresh.instrument()?;
+        fresh.watch_cursor = watch_cursor;
+        Ok(fresh)
+    }
+
+    pub fn watch_cursor(&self) -> usize {
+        self.watch_cursor
+    }
+
+    pub fn set_watch_cursor(&mut self, cursor: usize) {
+        self.watch_cursor = cursor;
+    }
+
+    fn next_watch_target(&mut self) -> Option<u64> {
+        if self.watch_targets.is_empty() {
+            return None;
+        }
+        let target = self.watch_targets[self.watch_cursor % self.watch_targets.len()];
+        self.watch_cursor = self.watch_cursor.wrapping_add(1);
+        Some(target)
     }
 
     pub fn run_input(&mut self, input: &[u8]) -> Result<RunResult> {
         if input.len() > self.harness.max_input {
             return Err(Error::Invalid("input exceeds max_input".into()));
         }
-        self.vm.research_reset()?;
+        let arm_after_patch = !self.cow_enabled && self.checkpoint_fresh;
+        if self.checkpoint_fresh {
+            // RestorePaused already supplied the exact checkpoint state. Do
+            // not COW-reset before its first testcase: HVF can retain stage-2
+            // host mappings across that remap and execute against stale RAM.
+            self.checkpoint_fresh = false;
+        } else if self.cow_enabled {
+            self.vm.research_reset()?;
+        } else {
+            return Err(Error::Invalid(
+                "reopen_after must be 1 when COW resets are disabled".into(),
+            ));
+        }
         let (ioctl, payload) = if self.harness.ioctl_prefix {
             if input.len() < 4 {
                 return Err(Error::Invalid(
@@ -525,40 +902,203 @@ impl Engine {
         self.input_buffer[..payload.len()].copy_from_slice(payload);
         self.vm
             .debug_write_physical(&[(self.harness.input_gpa, &self.input_buffer)])?;
+        let mut case_watchpoints = self.harness.watchpoints.clone();
+        if !case_watchpoints.is_empty() {
+            let state = self.vm.debug_registers(self.harness.cpu)?;
+            let registers = Registers::from_state(&state)
+                .map_err(|error| Error::Invalid(format!("ARM64 watchpoint state: {error}")))?;
+            let address_space = AddressSpace {
+                memory: &self.vm,
+                registers: &registers,
+            };
+            for watch in &mut case_watchpoints {
+                if let Some(offset) = watch.input_end_offset {
+                    let base = self
+                        .harness
+                        .input_va
+                        .ok_or_else(|| Error::Invalid("input_end_offset needs input_va".into()))?;
+                    watch.address = if offset < 0 {
+                        base.checked_add(payload.len() as u64)
+                            .and_then(|end| end.checked_sub(offset.unsigned_abs() as u64))
+                    } else {
+                        base.checked_add(payload.len() as u64)
+                            .and_then(|end| end.checked_add(offset as u64))
+                    }
+                    .ok_or_else(|| Error::Invalid("input-relative watchpoint overflow".into()))?;
+                }
+                if let Some(value) = watch.poison_value {
+                    let physical = address_space
+                        .translate(watch.address)
+                        .map_err(|error| {
+                            Error::Invalid(format!("translate poisoned range: {error}"))
+                        })?
+                        .physical;
+                    let poison = vec![value; watch.size as usize];
+                    self.vm.debug_write_physical(&[(physical, &poison)])?;
+                    trace_field(
+                        &self.vm,
+                        "poison marker",
+                        watch.address,
+                        physical,
+                        poison.len(),
+                    )?;
+                }
+            }
+        }
         if let Some(value) = ioctl {
-            let register = self
-                .harness
-                .ioctl_register
-                .as_deref()
-                .ok_or_else(|| Error::Invalid("ioctl_prefix needs ioctl_register".into()))?;
-            self.vm.debug_write_register(
-                0,
-                vroom_hv::debug::Register::parse(register)?,
-                value.into(),
-            )?;
+            if let Some(address) = self.harness.ioctl_va {
+                let state = self.vm.debug_registers(self.harness.cpu)?;
+                let registers = Registers::from_state(&state)
+                    .map_err(|error| Error::Invalid(format!("ARM64 register state: {error}")))?;
+                let address_space = AddressSpace {
+                    memory: &self.vm,
+                    registers: &registers,
+                };
+                let physical = address_space
+                    .translate(address)
+                    .map_err(|error| Error::Invalid(format!("translate IOCTL field: {error}")))?
+                    .physical;
+                self.vm
+                    .debug_write_physical(&[(physical, &value.to_le_bytes())])?;
+                trace_field(&self.vm, "IOCTL", address, physical, 4)?;
+            } else {
+                let register = self.harness.ioctl_register.as_deref().ok_or_else(|| {
+                    Error::Invalid("IOCTL testcase needs ioctl_register or ioctl_va".into())
+                })?;
+                self.vm.debug_write_register(
+                    self.harness.cpu,
+                    vroom_hv::debug::Register::parse(register)?,
+                    value.into(),
+                )?;
+            }
         }
         if let Some(value) = self.harness.input_va {
-            let register = self
-                .harness
-                .input_register
-                .as_deref()
-                .ok_or_else(|| Error::Invalid("input_va needs input_register".into()))?;
+            let state = self.vm.debug_registers(self.harness.cpu)?;
+            let registers = Registers::from_state(&state)
+                .map_err(|error| Error::Invalid(format!("ARM64 register state: {error}")))?;
+            let address_space = AddressSpace {
+                memory: &self.vm,
+                registers: &registers,
+            };
+            let physical = address_space
+                .translate(value)
+                .map_err(|error| Error::Invalid(format!("translate input buffer: {error}")))?
+                .physical;
+            if physical != self.harness.input_gpa {
+                return Err(Error::Invalid(format!(
+                    "input_va {value:#x} resolves to {physical:#x}, not input_gpa {:#x}",
+                    self.harness.input_gpa
+                )));
+            }
+            if let Some(register) = self.harness.input_register.as_deref() {
+                self.vm.debug_write_register(
+                    self.harness.cpu,
+                    vroom_hv::debug::Register::parse(register)?,
+                    value,
+                )?;
+            } else if let Some(address) = self.harness.input_pointer_va {
+                let state = self.vm.debug_registers(self.harness.cpu)?;
+                let registers = Registers::from_state(&state)
+                    .map_err(|error| Error::Invalid(format!("ARM64 register state: {error}")))?;
+                let address_space = AddressSpace {
+                    memory: &self.vm,
+                    registers: &registers,
+                };
+                let physical = address_space
+                    .translate(address)
+                    .map_err(|error| {
+                        Error::Invalid(format!("translate input pointer field: {error}"))
+                    })?
+                    .physical;
+                self.vm
+                    .debug_write_physical(&[(physical, &value.to_le_bytes())])?;
+                trace_field(&self.vm, "input pointer", address, physical, 8)?;
+            }
+        }
+        if let Some(address) = self.harness.input_length_va {
+            let state = self.vm.debug_registers(self.harness.cpu)?;
+            let registers = Registers::from_state(&state)
+                .map_err(|error| Error::Invalid(format!("ARM64 register state: {error}")))?;
+            let address_space = AddressSpace {
+                memory: &self.vm,
+                registers: &registers,
+            };
+            let physical = address_space
+                .translate(address)
+                .map_err(|error| Error::Invalid(format!("translate input length field: {error}")))?
+                .physical;
+            let length = u32::try_from(payload.len())
+                .map_err(|_| Error::Invalid("input length does not fit in 32 bits".into()))?;
             self.vm
-                .debug_write_register(0, vroom_hv::debug::Register::parse(register)?, value)?;
+                .debug_write_physical(&[(physical, &length.to_le_bytes())])?;
+            trace_field(&self.vm, "input length", address, physical, 4)?;
+        }
+        if let Some(address) = self.harness.output_length_va {
+            let state = self.vm.debug_registers(self.harness.cpu)?;
+            let registers = Registers::from_state(&state)
+                .map_err(|error| Error::Invalid(format!("ARM64 register state: {error}")))?;
+            let address_space = AddressSpace {
+                memory: &self.vm,
+                registers: &registers,
+            };
+            let physical = address_space
+                .translate(address)
+                .map_err(|error| Error::Invalid(format!("translate output length field: {error}")))?
+                .physical;
+            let length = u32::try_from(payload.len())
+                .map_err(|_| Error::Invalid("input length does not fit in 32 bits".into()))?;
+            self.vm
+                .debug_write_physical(&[(physical, &length.to_le_bytes())])?;
+            trace_field(&self.vm, "output length", address, physical, 4)?;
         }
         if let Some(register) = self.harness.input_length_register.as_deref() {
             self.vm.debug_write_register(
-                0,
+                self.harness.cpu,
                 vroom_hv::debug::Register::parse(register)?,
                 payload.len() as u64,
             )?;
         }
+        if arm_after_patch {
+            self.vm.research_arm()?;
+        }
+        let state = self.vm.debug_registers(self.harness.cpu)?;
+        let registers = Registers::from_state(&state)
+            .map_err(|error| Error::Invalid(format!("ARM64 register state: {error}")))?;
+        trace_dispatch_state(&self.vm, &registers, self.harness.ioctl_va)?;
+        let entry_pc = self.harness.entry_pc.unwrap_or(registers.pc);
+        if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
+            eprintln!("start pc={:#x} entry={entry_pc:#x}", registers.pc);
+        }
+        if !self.block_by_pc.contains_key(&entry_pc) {
+            return Err(Error::Invalid(format!(
+                "entry_pc {entry_pc:#x} is not in the coverage block list"
+            )));
+        }
+        // The checkpoint is already stopped at the first block. Do not plant
+        // a software trap there: resume directly and use hardware execution
+        // breakpoints on its CFG successors to observe the next block.
+        let entry_index = *self.block_by_pc.get(&entry_pc).expect("checked above");
+        let entry_successors = self.harness.coverage[entry_index].successors.clone();
+        let mut active_exception_sites = self.harness.exception_sites.clone();
+        let mut watch_target = self.next_watch_target();
+        if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
+            eprintln!("watch target={watch_target:?}");
+        }
+        let initial_breakpoints = breakpoint_set(
+            &entry_successors,
+            watch_target,
+            self.harness.stop_pc,
+            &active_exception_sites,
+        );
+        if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
+            eprintln!("initial breakpoints={initial_breakpoints:?}");
+        }
         self.vm.debug_configure(
-            0,
+            self.harness.cpu,
             vroom_hv::debug::DebugConfig {
                 enabled: true,
-                trap_software_breakpoints: true,
-                breakpoints: self.harness.stop_pc.into_iter().collect(),
+                breakpoints: initial_breakpoints,
+                watchpoints: hv_watchpoints(&case_watchpoints),
                 ..Default::default()
             },
         )?;
@@ -567,12 +1107,35 @@ impl Engine {
         let token = CorpusStore::hash(input);
         let mut new_blocks = 0;
         let mut new_edges = 0;
+        let mut block_hits = BTreeMap::<u64, u64>::new();
+        let mut edges_hit = BTreeSet::<(u64, u64)>::new();
         let mut finding = None;
-        let mut previous_pc = None;
+        let mut findings = Vec::<Finding>::new();
+        let mut watch_hits = BTreeMap::<usize, u64>::new();
+        let entry_block = &self.harness.coverage[entry_index];
+        let mut previous_pc = Some(entry_block.id);
+        let mut call_step_targets = Vec::new();
+        let mut call_step_remaining = 0usize;
+        let mut step_to_call_target = false;
+        let mut step_successors_once = false;
+        *block_hits.entry(entry_block.id).or_default() += 1;
+        if self.coverage.observe(entry_block, &token) {
+            new_blocks += 1;
+        }
         loop {
             if start.elapsed() > Duration::from_millis(self.harness.timeout_ms) {
                 self.vm.pause()?;
+                if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
+                    let state = self.vm.debug_registers(self.harness.cpu)?;
+                    let registers = Registers::from_state(&state).map_err(|error| {
+                        Error::Invalid(format!("ARM64 register state: {error}"))
+                    })?;
+                    eprintln!("timeout at pc={:#x}", registers.pc);
+                }
                 finding = detect("execution timeout", None, &token, true);
+                if let Some(found) = &finding {
+                    findings.push(found.clone());
+                }
                 break;
             }
             let Some(event) = self.vm.next_event(Duration::from_millis(5)) else {
@@ -584,65 +1147,276 @@ impl Engine {
                     if self.harness.stop_pc == Some(stop.pc) {
                         break;
                     }
+                    if stop.reason == vroom_hv::debug::DebugReason::Watchpoint {
+                        let watch_index = (case_watchpoints.len() == 1).then_some(0);
+                        if let Some(index) = watch_index {
+                            let watch = &case_watchpoints[index];
+                            let count = watch_hits.entry(index).or_default();
+                            *count += 1;
+                            if watch.poisoned && *count == 1 {
+                                findings.push(Finding {
+                                    class: BugClass::PoisonedAccess,
+                                    detail: format!(
+                                        "watched memory access at {:#x}",
+                                        watch.address
+                                    ),
+                                    pc: Some(stop.pc),
+                                    input: token.clone(),
+                                });
+                            }
+                            if watch.double_fetch && watch.read && *count == 2 {
+                                findings.push(Finding {
+                                    class: BugClass::DoubleFetch,
+                                    detail: format!(
+                                        "second read from watched address {:#x}",
+                                        watch.address
+                                    ),
+                                    pc: Some(stop.pc),
+                                    input: token.clone(),
+                                });
+                            }
+                            if finding.is_none() {
+                                finding = findings.first().cloned();
+                            }
+                        }
+                        let successors = previous_pc
+                            .and_then(|id| {
+                                self.harness.coverage.iter().find(|block| block.id == id)
+                            })
+                            .map(|block| block.successors.as_slice())
+                            .unwrap_or(&[]);
+                        self.vm.debug_configure(
+                            stop.cpu as usize,
+                            vroom_hv::debug::DebugConfig {
+                                enabled: true,
+                                breakpoints: breakpoint_set(
+                                    successors,
+                                    watch_target,
+                                    self.harness.stop_pc,
+                                    &active_exception_sites,
+                                ),
+                                watchpoints: hv_watchpoints(&case_watchpoints),
+                                ..Default::default()
+                            },
+                        )?;
+                        self.vm.resume()?;
+                        continue;
+                    }
+                    if self.harness.exception_sites.contains(&stop.pc) {
+                        active_exception_sites.retain(|site| *site != stop.pc);
+                        let exception_finding = Finding {
+                            class: BugClass::ExceptionDispatch,
+                            detail: "configured exception-dispatch site reached".into(),
+                            pc: Some(stop.pc),
+                            input: token.clone(),
+                        };
+                        if finding.is_none() {
+                            finding = Some(exception_finding.clone());
+                        }
+                        findings.push(exception_finding);
+                        let successors = previous_pc
+                            .and_then(|id| {
+                                self.harness.coverage.iter().find(|block| block.id == id)
+                            })
+                            .map(|block| block.successors.as_slice())
+                            .unwrap_or(&[]);
+                        self.vm.debug_configure(
+                            stop.cpu as usize,
+                            vroom_hv::debug::DebugConfig {
+                                enabled: true,
+                                breakpoints: breakpoint_set(
+                                    successors,
+                                    watch_target,
+                                    self.harness.stop_pc,
+                                    &active_exception_sites,
+                                ),
+                                watchpoints: hv_watchpoints(&case_watchpoints),
+                                ..Default::default()
+                            },
+                        )?;
+                        self.vm.resume()?;
+                        continue;
+                    }
+                    if watch_target == Some(stop.pc) {
+                        watch_target = self.next_watch_target();
+                    }
                     let block = self
                         .block_by_pc
                         .get(&stop.pc)
                         .and_then(|index| self.harness.coverage.get(*index));
+                    if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
+                        eprintln!(
+                            "stop cpu={} pc={:#x} reason={:?} block={:?}",
+                            stop.cpu,
+                            stop.pc,
+                            stop.reason,
+                            block.map(|row| row.id)
+                        );
+                        let state = self.vm.debug_registers(stop.cpu as usize)?;
+                        let registers = Registers::from_state(&state).map_err(|error| {
+                            Error::Invalid(format!("ARM64 stop registers: {error}"))
+                        })?;
+                        let address_space = AddressSpace {
+                            memory: &self.vm,
+                            registers: &registers,
+                        };
+                        if let Ok(translated) = address_space.translate(registers.pc) {
+                            trace_field(
+                                &self.vm,
+                                "stopped code",
+                                registers.pc,
+                                translated.physical,
+                                16,
+                            )?;
+                        }
+                        eprintln!(
+                            "stop registers: pc={:#x} x1={:#x} x3={:#x} x19={:#x} x21={:#x}",
+                            registers.pc,
+                            registers.x[1],
+                            registers.x[3],
+                            registers.x[19],
+                            registers.x[21]
+                        );
+                    }
                     if let Some(block) = block {
                         if let Some(previous) = previous_pc {
+                            edges_hit.insert((previous, block.id));
                             if self.coverage.observe_edge(previous, block.id) {
                                 new_edges += 1;
                             }
                         }
                         previous_pc = Some(block.id);
+                        *block_hits.entry(block.id).or_default() += 1;
                         if self.coverage.observe(block, &token) {
                             new_blocks += 1;
                         }
                     }
-                    if stop.reason == vroom_hv::debug::DebugReason::SoftwareBreakpoint {
-                        if let Some(block) = block {
-                            let gpa = block.gpa;
-                            if let Some(original) = self.originals.get(&gpa) {
-                                self.vm
-                                    .debug_write_physical(&[(gpa, &original.to_le_bytes())])?;
-                                self.vm.debug_step(
-                                    0,
-                                    vroom_hv::debug::DebugConfig {
-                                        enabled: true,
-                                        trap_software_breakpoints: true,
-                                        breakpoints: self.harness.stop_pc.into_iter().collect(),
-                                        ..Default::default()
-                                    },
-                                )?;
-                                while let Some(next) = self.vm.next_event(Duration::from_millis(20))
-                                {
-                                    if matches!(next, vroom_vmm::VmEvent::Debug(_)) {
-                                        break;
-                                    }
+                    if stop.reason == vroom_hv::debug::DebugReason::SingleStep {
+                        if !call_step_targets.is_empty() {
+                            if call_step_targets.contains(&stop.pc) {
+                                call_step_targets.clear();
+                                call_step_remaining = 0;
+                                if step_to_call_target {
+                                    step_to_call_target = false;
+                                    step_successors_once = true;
                                 }
-                                self.vm.pause()?;
-                                self.vm.debug_configure(
-                                    0,
-                                    vroom_hv::debug::DebugConfig {
-                                        enabled: true,
-                                        trap_software_breakpoints: true,
-                                        breakpoints: self.harness.stop_pc.into_iter().collect(),
-                                        ..Default::default()
-                                    },
-                                )?;
-                                self.vm.debug_write_physical(&[(
-                                    gpa,
-                                    &(0xd420_0000u32 | ((block.id as u32 & 0xffff) << 5))
-                                        .to_le_bytes(),
-                                )])?;
-                                self.vm.resume()?;
+                            } else if call_step_remaining > 0 {
+                                call_step_remaining -= 1;
+                                if call_step_remaining > 0 {
+                                    self.vm.debug_step(
+                                        stop.cpu as usize,
+                                        step_debug_config(&case_watchpoints),
+                                    )?;
+                                    continue;
+                                }
+                                call_step_targets.clear();
+                                step_to_call_target = false;
+                            } else {
+                                call_step_targets.clear();
+                                step_to_call_target = false;
                             }
+                        }
+                    }
+                    if stop.reason == vroom_hv::debug::DebugReason::Breakpoint {
+                        if let Some(block) = block {
+                            // Hardware execution breakpoints can miss a direct
+                            // call target on some hypervisor/page combinations.
+                            // Step only across the short call-site block, then
+                            // resume ordinary successor breakpoints in the callee.
+                            let call_target = block.successors.iter().copied().find(|target| {
+                                self.block_by_pc
+                                    .get(target)
+                                    .and_then(|index| self.harness.coverage.get(*index))
+                                    .is_some_and(|callee| callee.function != block.function)
+                            });
+                            if let Some(target) = call_target {
+                                let steps = (block.size as usize / 4).clamp(1, 64);
+                                call_step_targets = vec![target];
+                                call_step_remaining = steps;
+                                step_to_call_target = true;
+                                self.vm.debug_step(
+                                    stop.cpu as usize,
+                                    step_debug_config(&case_watchpoints),
+                                )?;
+                                continue;
+                            }
+                            let breakpoints = breakpoint_set(
+                                &block.successors,
+                                watch_target,
+                                self.harness.stop_pc,
+                                &active_exception_sites,
+                            );
+                            if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
+                                eprintln!("arm block {} successors {:?}", block.id, breakpoints);
+                            }
+                            self.vm.debug_configure(
+                                stop.cpu as usize,
+                                vroom_hv::debug::DebugConfig {
+                                    enabled: true,
+                                    breakpoints,
+                                    watchpoints: hv_watchpoints(&case_watchpoints),
+                                    ..Default::default()
+                                },
+                            )?;
+                            self.vm.resume()?;
+                        }
+                    } else if stop.reason == vroom_hv::debug::DebugReason::SingleStep {
+                        if let Some(block) = block {
+                            if step_successors_once
+                                && block.gpa.is_some()
+                                && !block.successors.is_empty()
+                            {
+                                step_successors_once = false;
+                                call_step_targets.clone_from(&block.successors);
+                                call_step_remaining = (block.size as usize / 4).clamp(1, 64);
+                                self.vm.debug_step(
+                                    stop.cpu as usize,
+                                    step_debug_config(&case_watchpoints),
+                                )?;
+                                continue;
+                            }
+                            step_successors_once = false;
+                            let breakpoints = breakpoint_set(
+                                &block.successors,
+                                watch_target,
+                                self.harness.stop_pc,
+                                &active_exception_sites,
+                            );
+                            self.vm.debug_configure(
+                                stop.cpu as usize,
+                                vroom_hv::debug::DebugConfig {
+                                    enabled: true,
+                                    breakpoints,
+                                    watchpoints: hv_watchpoints(&case_watchpoints),
+                                    ..Default::default()
+                                },
+                            )?;
+                            self.vm.resume()?;
+                        } else {
+                            self.vm.debug_configure(
+                                stop.cpu as usize,
+                                vroom_hv::debug::DebugConfig {
+                                    enabled: true,
+                                    breakpoints: breakpoint_set(
+                                        &[],
+                                        watch_target,
+                                        self.harness.stop_pc,
+                                        &active_exception_sites,
+                                    ),
+                                    watchpoints: hv_watchpoints(&case_watchpoints),
+                                    ..Default::default()
+                                },
+                            )?;
+                            self.vm.resume()?;
                         }
                     }
                 }
                 vroom_vmm::VmEvent::Crashed(detail) => {
                     self.vm.pause()?;
                     finding = detect(&detail, None, &token, false);
+                    if let Some(found) = &finding {
+                        findings.push(found.clone());
+                    }
                     break;
                 }
                 vroom_vmm::VmEvent::Shutdown => {
@@ -653,6 +1427,9 @@ impl Engine {
                     self.vm.pause()?;
                     if self.harness.reset_is_bugcheck {
                         finding = detect("guest reset after bugcheck", None, &token, false);
+                        if let Some(found) = &finding {
+                            findings.push(found.clone());
+                        }
                     }
                     break;
                 }
@@ -664,9 +1441,107 @@ impl Engine {
             input_hash: token,
             new_blocks,
             new_edges,
+            block_hits,
+            edges_hit,
             finding,
+            findings,
             elapsed_us: start.elapsed().as_micros() as u64,
         })
+    }
+}
+
+fn trace_field(
+    vm: &vroom_vmm::Vmm,
+    label: &str,
+    virtual_address: u64,
+    physical_address: u64,
+    size: usize,
+) -> Result<()> {
+    if std::env::var_os("VROOM_FUZZ_TRACE").is_none() {
+        return Ok(());
+    }
+    let mut bytes = vec![0; size];
+    vm.debug_read_physical(physical_address, &mut bytes)?;
+    eprintln!(
+        "patched {label}: VA={virtual_address:#x} PA={physical_address:#x} bytes={}",
+        hex::encode(bytes)
+    );
+    Ok(())
+}
+
+fn trace_dispatch_state(
+    vm: &vroom_vmm::Vmm,
+    registers: &Registers,
+    ioctl_va: Option<u64>,
+) -> Result<()> {
+    if std::env::var_os("VROOM_FUZZ_TRACE").is_none() {
+        return Ok(());
+    }
+    let irp = registers.x[1];
+    let current_stack_va = irp + 0xb8;
+    let address_space = AddressSpace {
+        memory: vm,
+        registers,
+    };
+    let current_stack_pa = address_space
+        .translate(current_stack_va)
+        .map_err(|error| Error::Invalid(format!("trace current stack pointer: {error}")))?
+        .physical;
+    let mut pointer_bytes = [0; 8];
+    vm.debug_read_physical(current_stack_pa, &mut pointer_bytes)?;
+    let current_stack = u64::from_le_bytes(pointer_bytes);
+    let current_ioctl_va = current_stack + 0x18;
+    let current_ioctl_pa = address_space
+        .translate(current_ioctl_va)
+        .map_err(|error| Error::Invalid(format!("trace dispatch IOCTL field: {error}")))?
+        .physical;
+    let mut ioctl_bytes = [0; 4];
+    vm.debug_read_physical(current_ioctl_pa, &mut ioctl_bytes)?;
+    eprintln!(
+        "dispatch args: IRP={irp:#x} stack_va={current_stack:#x} code_va={current_ioctl_va:#x} code={} harness_code_va={ioctl_va:?}",
+        hex::encode(ioctl_bytes)
+    );
+    Ok(())
+}
+
+fn breakpoint_set(
+    successors: &[u64],
+    watch_target: Option<u64>,
+    stop_pc: Option<u64>,
+    exception_sites: &[u64],
+) -> Vec<u64> {
+    let mut breakpoints = Vec::with_capacity(4);
+    for address in stop_pc
+        .into_iter()
+        .chain(exception_sites.iter().copied())
+        .chain(successors.iter().copied())
+        .chain(watch_target)
+    {
+        if !breakpoints.contains(&address) && breakpoints.len() < 4 {
+            breakpoints.push(address);
+        }
+    }
+    breakpoints
+}
+
+fn hv_watchpoints(watches: &[MemoryWatch]) -> Vec<vroom_hv::debug::Watchpoint> {
+    watches
+        .iter()
+        .map(|watch| vroom_hv::debug::Watchpoint {
+            address: watch.address,
+            size: watch.size,
+            read: watch.read,
+            write: watch.write,
+        })
+        .collect()
+}
+
+fn step_debug_config(watches: &[MemoryWatch]) -> vroom_hv::debug::DebugConfig {
+    vroom_hv::debug::DebugConfig {
+        enabled: true,
+        single_step: true,
+        watchpoints: hv_watchpoints(watches),
+        ..Default::default()
     }
 }
 
@@ -675,7 +1550,14 @@ pub struct RunResult {
     pub input_hash: String,
     pub new_blocks: usize,
     pub new_edges: usize,
+    /// Per-input hit counts and edges, independent of earlier campaign inputs.
+    pub block_hits: BTreeMap<u64, u64>,
+    pub edges_hit: BTreeSet<(u64, u64)>,
     pub finding: Option<Finding>,
+    /// All independent signals observed for this input. `finding` remains the
+    /// first one for older result consumers.
+    #[serde(default)]
+    pub findings: Vec<Finding>,
     /// Wall-clock iteration time, including reset, instrumentation and guest
     /// execution. Keeping it beside coverage makes target comparisons
     /// reproducible instead of relying on console timing.
@@ -690,18 +1572,20 @@ mod tests {
         let blocks = vec![
             CoverageBlock {
                 id: 1,
-                gpa: 0x1000,
+                gpa: Some(0x1000),
                 va: Some(0x8000),
                 size: 4,
+                successors: vec![0x8004],
                 module: "driver".into(),
                 function: "dispatch".into(),
                 source: None,
             },
             CoverageBlock {
                 id: 2,
-                gpa: 0x1004,
+                gpa: Some(0x1004),
                 va: Some(0x8004),
                 size: 4,
+                successors: vec![],
                 module: "driver".into(),
                 function: "dispatch".into(),
                 source: None,
@@ -748,5 +1632,29 @@ mod tests {
             assert_eq!(&input[..4], &seed[..4]);
             assert!(input.len() <= 32);
         }
+    }
+
+    #[test]
+    fn weighted_parent_choice_uses_positive_weights() {
+        let mut mutator = Mutator::new(13, 32);
+        for _ in 0..32 {
+            assert_eq!(mutator.choose_weighted(&[0, 0, 7]), 2);
+        }
+    }
+
+    #[test]
+    fn breakpoint_set_reserves_a_slot_for_unresolved_targets() {
+        assert_eq!(
+            breakpoint_set(&[10, 11, 12], Some(20), Some(30), &[]),
+            vec![30, 10, 11, 12]
+        );
+    }
+
+    #[test]
+    fn breakpoint_set_keeps_exception_sites_armed() {
+        assert_eq!(
+            breakpoint_set(&[10, 11, 12], None, None, &[40]),
+            vec![40, 10, 11, 12]
+        );
     }
 }

@@ -19,6 +19,7 @@ thiserror.workspace = true
 vroom-config.workspace = true
 vroom-hv.workspace = true
 vroom-vmm = { workspace = true, features = ["research"] }
+vroom-kernel = { path = "../kernel" }
 
 [lints]
 workspace = true

@@ -9,6 +9,10 @@
   "input_va": 0,
   "ioctl_prefix": true,
   "ioctl_register": "x1",
+  "ioctl_va": null,
+  "input_pointer_va": null,
+  "input_length_va": null,
+  "output_length_va": null,
   "input_register": "x2",
   "input_length_register": "x3",
   "stop_pc": 0,
@@ -16,6 +20,14 @@
   "timeout_ms": 250,
   "max_input": 4096,
   "coverage": [],
+  "ioctl_probe": {
+    "device_type": 34,
+    "function_start": 2048,
+    "function_end": 2303,
+    "methods": [0, 1, 2, 3],
+    "access": [0],
+    "baseline_ioctl": 4294967295
+  },
   "detectors": [
     "access-violation",
     "bugcheck",
