@@ -205,10 +205,35 @@ const PARK_SETTLE: Duration = Duration::from_secs(3);
 /// go before the save drops them (see `GpuControl::set_driver_stopped`).
 const PARK_LEFTOVERS: Duration = Duration::from_secs(3);
 
+/// A snapshot comes back with the hardware it was taken with: its devices
+/// and their state are in it. From the VM file now only what the host does
+/// around them: network attachments (planned against the saved adapters),
+/// clipboard, serial, sandbox and the window's size.
+fn restore_hardware(now: VmConfig, saved: &VmConfig) -> VmConfig {
+    VmConfig {
+        name: now.name,
+        nets: now.nets,
+        clipboard: now.clipboard,
+        serial: now.serial,
+        security: now.security,
+        os: now.os,
+        display: vroom_config::Display { width: now.display.width, height: now.display.height, hidpi: now.display.hidpi, ..saved.display.clone() },
+        ..saved.clone()
+    }
+}
+
 impl Vmm {
     /// Build the machine and start it.
     pub fn start(config: VmConfig, hv: Arc<dyn Hypervisor>, opts: VmmOptions) -> Result<Vmm> {
         config.validate()?;
+        let saved = match &opts.start {
+            StartMode::Restore(dir) | StartMode::RestorePaused(dir) => Some(snapshot::saved_config(dir)?),
+            StartMode::Boot | StartMode::BootPaused => None,
+        };
+        let config = match &saved {
+            Some((s, _)) => restore_hardware(config, s),
+            None => config,
+        };
         let (ev_tx, ev_rx) = mpsc::channel();
         let ui = match opts.ui {
             Some(s) => Some(display::DisplayServer::new(s)?),
@@ -221,10 +246,6 @@ impl Vmm {
         };
         let disks = disks::DiskSet::open(&config, &opts.state_dir, &layers)?;
         let uuid = machine_uuid(&opts.state_dir)?;
-        let saved = match &opts.start {
-            StartMode::Restore(dir) | StartMode::RestorePaused(dir) => Some(snapshot::saved_config(dir)?),
-            StartMode::Boot | StartMode::BootPaused => None,
-        };
         let net_ctrl = saved.as_ref().is_none_or(|s| s.1);
         // USB disks' files go to removable shares a VM started on a Mac
         // has; a resumed one has those it was saved with.

@@ -76,6 +76,24 @@ fn fmt_of(f: DiskFormat) -> Option<Format> {
     }
 }
 
+/// A layer something is built on (a snapshot's, an overlay's base) can't
+/// change any more: take its write permission, so nothing writes to it by
+/// mistake (a VM run from a copy of the config, with another state dir).
+fn freeze_file(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(m) = std::fs::metadata(path) {
+        let mode = m.permissions().mode();
+        if mode & 0o222 != 0 {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & !0o222));
+        }
+    }
+}
+
+fn is_frozen(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o200 == 0)
+}
+
 fn stamp() -> String {
     let d = std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
     format!("{}-{:09}", d.as_secs(), d.subsec_nanos())
@@ -139,10 +157,26 @@ impl DiskSet {
                             )))
                         }
                     },
+                    // A base a snapshot froze is read-only: another state dir
+                    // (a copied config) must not write under that snapshot.
+                    None if is_frozen(&d.path) => {
+                        return Err(Error::Setup(format!(
+                            "disk {}: frozen by a snapshot (read-only); run its VM from its own config, or copy the image",
+                            d.path.display()
+                        )))
+                    }
                     None => (std::path::absolute(&d.path)?, fmt_of(d.format).unwrap_or(Format::Raw)),
                 }
             };
-            let fmt = if active == std::path::absolute(&d.path)? { fmt_of(d.format) } else { Some(fmt) };
+            let on_base = active == std::path::absolute(&d.path)?;
+            if !on_base {
+                // Under an overlay the base never changes again.
+                freeze_file(&d.path);
+            }
+            if let Some(layer) = restore.get(&i) {
+                freeze_file(layer);
+            }
+            let fmt = if on_base { fmt_of(d.format) } else { Some(fmt) };
             let img = vroom_block::open_with(&active, fmt, false, &policy)
                 .map_err(|e| Error::Setup(format!("disk {}: {e}", active.display())))?;
             let active_fmt = fmt.unwrap_or(Format::Raw);
@@ -243,6 +277,7 @@ impl DiskSet {
                 .with_sync(d.sync);
             d.image.swap(Arc::new(top)).map_err(|e| Error::Setup(e.to_string()))?;
             write_pointer(&self.dir.join(format!("disk{}.json", d.index)), &top_path)?;
+            freeze_file(&frozen);
             d.active = Some(top_path);
             d.active_fmt = Format::Qcow2;
             out.insert(d.index, frozen);
@@ -312,6 +347,23 @@ mod tests {
         .unwrap();
         c.disks[0].path = disk.to_path_buf();
         c
+    }
+
+    #[test]
+    fn a_snapshot_freezes_its_base_for_other_state_dirs() {
+        let td = tempfile::tempdir().unwrap();
+        let disk = td.path().join("disk.qcow2");
+        Qcow2Image::create(&disk, 1 << 20, None).unwrap();
+        let c = cfg(&disk);
+        let mut ds = DiskSet::open(&c, &td.path().join("vm.state"), &BTreeMap::new()).unwrap();
+        ds.freeze().unwrap();
+        drop(ds);
+        assert!(is_frozen(&disk), "the snapshot's layer is read-only now");
+        // Its own state dir goes on, on the overlay.
+        assert!(DiskSet::open(&c, &td.path().join("vm.state"), &BTreeMap::new()).is_ok());
+        // A copy of the config elsewhere would write the snapshot's base.
+        let e = DiskSet::open(&c, &td.path().join("copy.state"), &BTreeMap::new()).err().expect("refused");
+        assert!(e.to_string().contains("frozen by a snapshot"), "{e}");
     }
 
     #[test]

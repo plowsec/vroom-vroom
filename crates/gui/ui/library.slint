@@ -420,68 +420,72 @@ component SnapCard inherits Rectangle {
     in property <bool> can-restore;
     width: 176px;
     height: 150px;
-    ta := TouchArea { }
-    VerticalLayout {
-        spacing: 7px;
-        Rectangle {
-            height: 110px;
-            border-radius: Theme.r-lg;
-            background: Theme.card;
-            border-width: 1px;
-            border-color: ta.has-hover ? Theme.border-strong : Theme.border;
-            clip: true;
-            if root.snap.has-thumb: Image {
-                width: parent.width;
-                height: parent.height;
-                source: root.snap.thumb;
-                image-fit: cover;
-            }
-            if !root.snap.has-thumb: Icon {
-                source: Icons.camera;
-                width: 26px;
-                height: 26px;
-                tint: Theme.text-3;
-            }
-            if ta.has-hover: Rectangle {
-                background: #0000008c;
-                HorizontalLayout {
-                    alignment: center;
-                    spacing: 8px;
-                    padding-top: 37px;
-                    padding-bottom: 37px;
-                    Button {
-                        small: true;
-                        kind: "primary";
-                        text: "Restore";
-                        icon: Icons.history;
-                        has-icon: true;
-                        enabled: root.can-restore;
-                        tip: root.can-restore ? "" : "Shut the VM down first";
-                        clicked => { Bus.act("snap.restore:" + root.snap.name); }
-                    }
-                    IconButton {
-                        icon: Icons.trash;
-                        tip: "Delete";
-                        tint: #ffffff;
-                        size: 30px;
-                        clicked => { Bus.act("snap.delete:" + root.snap.name); }
+    // The card's content is inside: hovering its buttons still hovers it
+    // (a sibling TouchArea lost the hover to them, and the buttons, shown
+    // only on hover, flickered away under the pointer).
+    ta := TouchArea {
+        VerticalLayout {
+            spacing: 7px;
+            Rectangle {
+                height: 110px;
+                border-radius: Theme.r-lg;
+                background: Theme.card;
+                border-width: 1px;
+                border-color: ta.has-hover ? Theme.border-strong : Theme.border;
+                clip: true;
+                if root.snap.has-thumb: Image {
+                    width: parent.width;
+                    height: parent.height;
+                    source: root.snap.thumb;
+                    image-fit: cover;
+                }
+                if !root.snap.has-thumb: Icon {
+                    source: Icons.camera;
+                    width: 26px;
+                    height: 26px;
+                    tint: Theme.text-3;
+                }
+                if ta.has-hover: Rectangle {
+                    background: #0000008c;
+                    HorizontalLayout {
+                        alignment: center;
+                        spacing: 8px;
+                        padding-top: 37px;
+                        padding-bottom: 37px;
+                        Button {
+                            small: true;
+                            kind: "primary";
+                            text: "Restore";
+                            icon: Icons.history;
+                            has-icon: true;
+                            enabled: root.can-restore;
+                            tip: root.can-restore ? "" : "Shut the VM down first";
+                            clicked => { Bus.act("snap.restore:" + root.snap.name); }
+                        }
+                        IconButton {
+                            icon: Icons.trash;
+                            tip: "Delete";
+                            tint: #ffffff;
+                            size: 30px;
+                            clicked => { Bus.act("snap.delete:" + root.snap.name); }
+                        }
                     }
                 }
             }
-        }
-        VerticalLayout {
-            spacing: 1px;
-            Text {
-                text: root.snap.when;
-                font-size: Theme.fs-sm;
-                font-weight: 600;
-                color: Theme.text;
-                overflow: elide;
-            }
-            Text {
-                text: root.snap.size;
-                font-size: Theme.fs-xs;
-                color: Theme.text-3;
+            VerticalLayout {
+                spacing: 1px;
+                Text {
+                    text: root.snap.when;
+                    font-size: Theme.fs-sm;
+                    font-weight: 600;
+                    color: Theme.text;
+                    overflow: elide;
+                }
+                Text {
+                    text: root.snap.size;
+                    font-size: Theme.fs-xs;
+                    color: Theme.text-3;
+                }
             }
         }
     }

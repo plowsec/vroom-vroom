@@ -156,9 +156,12 @@ export struct VmSettings {
     // What waits in those two cards (adapters removed, the next start).
     net-note: string,
     usb-note: string,
+    // Guest tools of the running VM (empty action: none to show).
+    tools-have: string,
+    tools-new: string,
+    tools-action: string,
     config-path: string,
     state-path: string,
-    snapshots-cpu-mem: string,
     // One-line summaries for the collapsed cards.
     sum-hw: string,
     sum-display: string,
@@ -183,6 +186,7 @@ export struct CardVis {
     usb: bool,
     sound: bool,
     clip: bool,
+    tools: bool,
     security: bool,
     boot: bool,
 }

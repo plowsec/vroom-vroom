@@ -500,9 +500,6 @@ impl App {
             };
         };
         let r = v.resolved().unwrap_or_else(|| c.clone());
-        // Not a full listing: this runs every tick, and each snapshot's
-        // manifest can be megabytes.
-        let has_snaps = std::fs::read_dir(v.state_dir().join("snapshots")).is_ok_and(|mut d| d.next().is_some());
         let (locked, lock_short, lock_reason, lock_why) = match state {
             VmState::Off => (false, "", "", ""),
             VmState::Suspended => (
@@ -605,6 +602,11 @@ impl App {
             })
             .collect();
         let usb = usb_rows(c, console::usb_now(&v.key));
+        let tools = if state == VmState::Off || state == VmState::Suspended {
+            Default::default()
+        } else {
+            console::tools_info(&v.key).unwrap_or_default()
+        };
         let usb_host: Vec<UsbHostRow> = self
             .usb_host
             .iter()
@@ -731,7 +733,9 @@ impl App {
             usb_note: s(if state == VmState::Suspended && live { "Changes apply when the VM resumes." } else { "" }),
             config_path: s(paths::tilde(&v.path)),
             state_path: s(paths::tilde(&v.state_dir())),
-            snapshots_cpu_mem: s(if has_snaps { "Snapshots only restore with the CPUs and memory they were taken with." } else { "" }),
+            tools_have: s(tools.0),
+            tools_new: s(tools.1),
+            tools_action: s(tools.2),
             sum_hw: s(format!(
                 "{} CPU{} · {} GB memory{}",
                 c.cpus,
@@ -821,6 +825,7 @@ impl App {
             clip: any || hit("clipboard copy paste"),
             security: any || hit("security sandbox tpm transport mmio pci serial console identity fingerprint hardware maker vendor model product smbios acpi hide vm detection"),
             boot: any || hit("boot uefi firmware kernel initrd cmdline command line nvram efi"),
+            tools: any || hit("guest tools agent update install reinstall vroom-setup drivers"),
         });
     }
 
@@ -1195,6 +1200,13 @@ impl App {
         }
         match a {
             "start" => self.start_current(&[]),
+            "tools" => {
+                if let Some(v) = self.cur() {
+                    console::tools_act(&v.key.clone());
+                    self.last_settings = None;
+                    self.push_all();
+                }
+            }
             "show" | "pause" | "resume" | "snapshot" | "suspend" | "shutdown" | "reset" => {
                 if !self.ensure_window() {
                     return;
@@ -1968,6 +1980,9 @@ impl App {
                 _ if console::is_running(&v.key) => {
                     all.push(e(format!("Show {n}"), "VM", "window", format!("vm:{i}:show")));
                     all.push(e(format!("Snapshot {n}"), "VM", "camera", format!("vm:{i}:snapshot")));
+                    if let Some((_, _, act @ ("Update" | "Install" | "Reinstall"))) = console::tools_info(&v.key) {
+                        all.push(e(format!("{act} guest tools in {n}"), "VM", "package", format!("vm:{i}:tools")));
+                    }
                     all.push(e(format!("Suspend {n}"), "VM", "moon", format!("vm:{i}:suspend")));
                 }
                 _ => {}

@@ -140,6 +140,32 @@ impl Console {
         self.win.set_tools_tip(tip.into());
     }
 
+    /// For the settings: the guest's tools version, ours, and what the
+    /// button does ("" while updating).
+    pub(super) fn tools_info(&self) -> (String, String, &'static str) {
+        let have = self.tools.agent.as_deref().and_then(Version::from_hello).map(|v| v.to_string()).unwrap_or_default();
+        let ours = tools_version(self.tools_os()).map(|v| v.to_string()).unwrap_or_default();
+        let action = match &self.tools.state {
+            State::Updating { .. } => "",
+            State::Old { .. } => "Update",
+            State::Missing => "Install",
+            State::Hidden if self.tools.agent.is_some() => "Reinstall",
+            State::Hidden => "Install",
+        };
+        (have, ours, action)
+    }
+
+    /// The settings' button: the toolbar's, and a reinstall when current.
+    pub(super) fn tools_act(&mut self) {
+        match self.tools.state.clone() {
+            State::Hidden => match tools_version(self.tools_os()) {
+                Some(ours) if self.tools.agent.is_some() && self.features & vroom_proto::features::UPDATE != 0 => self.tools_push(ours),
+                _ => self.tools_plug(),
+            },
+            _ => self.tools_click(),
+        }
+    }
+
     /// The button.
     pub(super) fn tools_click(&mut self) {
         match self.tools.state.clone() {

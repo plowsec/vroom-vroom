@@ -470,6 +470,17 @@ pub fn usb_plug(key: &str, d: vroom_display::UsbDev) -> bool {
     with(key, |c| c.usb_plug(d)).is_some()
 }
 
+/// The running VM's guest tools: installed version, this app's, and the
+/// settings button's action ("" while updating).
+pub fn tools_info(key: &str) -> Option<(String, String, &'static str)> {
+    with(key, |c| c.tools_info())
+}
+
+/// Install, update or reinstall its guest tools.
+pub fn tools_act(key: &str) {
+    with(key, |c| c.tools_act());
+}
+
 /// Whether `tag` is one of the folders shared with it this run.
 pub fn live_shared(key: &str, tag: &str) -> bool {
     with(key, |c| c.live_shares.iter().any(|t| t == tag)).unwrap_or(false)

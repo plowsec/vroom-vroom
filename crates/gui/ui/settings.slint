@@ -376,7 +376,7 @@ export component SettingsPanel inherits Rectangle {
                     Row {
                         label: "CPUs";
                         key: "cpus";
-                        tip: root.s.snapshots-cpu-mem != "" ? root.s.snapshots-cpu-mem : "Shaded: more than this Mac can spare.";
+                        tip: "Shaded: more than this Mac can spare.";
                         Value { text: cpus.shown; }
                     }
                     cpus := Slider {
@@ -391,7 +391,7 @@ export component SettingsPanel inherits Rectangle {
                     Row {
                         label: "Memory";
                         key: "memory_mib";
-                        tip: root.s.snapshots-cpu-mem != "" ? root.s.snapshots-cpu-mem : "Shaded: more than this Mac can spare.";
+                        tip: "Shaded: more than this Mac can spare.";
                         Value { text: mem.shown + " GB"; }
                     }
                     mem := Slider {
@@ -1008,6 +1008,25 @@ export component SettingsPanel inherits Rectangle {
                             mono: true;
                             input-type: number;
                             committed(t) => { Bus.set("clip.max", t); }
+                        }
+                    }
+                }
+
+                if root.vis.tools && root.s.tools-action != "": SectionCard {
+                    icon: Icons.package;
+                    title: "Guest tools";
+                    summary: root.s.tools-have != "" ? root.s.tools-have : "none";
+                    force-open: root.open-all;
+                    Row {
+                        label: root.s.tools-have != "" ? root.s.tools-have : "none";
+                        tip: "Agent and drivers: clipboard, resizing, shared folders.";
+                        key: "tools";
+                        Button {
+                            small: true;
+                            text: root.s.tools-action;
+                            tip: root.s.tools-new != "" ? "→ " + root.s.tools-new : "";
+                            y: (parent.height - self.height) / 2;
+                            clicked => { Bus.act("tools"); }
                         }
                     }
                 }

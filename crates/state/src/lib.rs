@@ -292,6 +292,11 @@ pub fn prune(state: &Path, base_dirs: &[PathBuf]) -> Result<PruneReport> {
             _ => None,
         });
         let Some(child) = fold else { break };
+        // Snapshots froze it (read-only); nothing names it now.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o600))?;
+        }
         let gone = fold_backing(&child, &policy).map_err(|e| Error::Setup(format!("fold into {}: {e}", child.display())))?;
         std::fs::remove_file(&gone)?;
         report.folded.push(gone);
