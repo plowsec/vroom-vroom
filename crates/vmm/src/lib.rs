@@ -540,12 +540,19 @@ impl Vmm {
             // guest touches next faults in again.
             let mut written: Vec<(vroom_memory::GuestAddress, u64)> =
                 self.vm.take_dirty_log()?.into_iter().map(|(gpa, len)| (vroom_memory::GuestAddress(gpa), len)).collect();
-            written.extend(mem.take_host_writes());
+            let host = mem.take_host_writes();
+            written.extend(host.iter().copied());
             pages = written.iter().map(|(_, len)| len / 4096).sum();
             marks.push(("dirty log", t0.elapsed()));
             mem.restore_cow_copy(&written)?;
             marks.push(("copy back", t0.elapsed()));
-            for &(gpa, len) in &written {
+            // The instruction cache can only hold stale code where code
+            // went in during the input and ran: pages the host wrote (disk
+            // reads into RAM: paged-in images). Pages the guest wrote are
+            // its data (it invalidates what it writes as code itself, and
+            // writes the same again next input); syncing those cost half a
+            // reset, and as a broadcast slowed every worker on the host.
+            for &(gpa, len) in &host {
                 if let Some(r) = mem.regions().find(|r| gpa >= r.start() && gpa.0 < r.end().0) {
                     // SAFETY: inside that region's mapping; every CPU is paused.
                     unsafe { debug::sync_instruction_cache(r.host_ptr().add((gpa.0 - r.start().0) as usize), len as usize) };
