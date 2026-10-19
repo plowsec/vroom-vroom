@@ -98,9 +98,15 @@ echo "built: $app ($ver)"
 
 if [ $install = 1 ]; then
   dest=/Applications/vroom.app
-  # macOS kills a VM whose binary is replaced under it.
-  if pgrep -f "^$dest/Contents/MacOS/vroom " >/dev/null 2>&1; then
-    echo "VMs are running from $dest: suspend or stop them first" >&2
+  # macOS kills a VM whose binary is replaced under it. Name them: the
+  # build has just taken a minute, and "stop them first" without saying
+  # which means hunting through ps.
+  running=$(pgrep -f "^$dest/Contents/MacOS/vroom run " | while read -r pid; do
+    ps -o args= -p "$pid" | sed -n 's|.*/vroom run \(.*\) --ui-fd.*|\1|p; s|.*/vroom run \(.*\)$|\1|p'
+  done)
+  if [ -n "$running" ]; then
+    echo "these VMs are running from $dest: suspend or stop them first" >&2
+    echo "$running" | sed 's|^|  |' >&2
     exit 1
   fi
   rm -rf "$dest"
