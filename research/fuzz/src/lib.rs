@@ -141,6 +141,11 @@ pub struct Harness {
     pub isolate_cpu: bool,
     #[serde(default = "default_timeout")]
     pub timeout_ms: u64,
+    /// Client harnesses: keep the guest running this long after `stop_pc`,
+    /// so what the calls left in flight (asynchronous completions, flushes,
+    /// workers) runs within the input: its coverage and faults count.
+    #[serde(default)]
+    pub settle_ms: u64,
     #[serde(default)]
     pub max_input: usize,
     /// `edges` (default): follow the path with hardware breakpoints on each
@@ -365,6 +370,9 @@ impl Harness {
             return Err(Error::Invalid(
                 "exception_sites must be instruction aligned".into(),
             ));
+        }
+        if h.settle_ms != 0 && (!h.client() || h.settle_ms >= h.timeout_ms) {
+            return Err(Error::Invalid("settle_ms is for client harnesses, below timeout_ms".into()));
         }
         if h.client() {
             if h.coverage_mode != CoverageMode::Blocks || h.isolate_cpu || h.target.is_none() || h.stop_pc.is_none() {
@@ -995,6 +1003,9 @@ pub struct Engine {
     /// `nt!KiDispatchException`, when the harness detects exceptions: every
     /// exception passes there first, the ones an `__except` swallows too.
     exception_hook: Option<u64>,
+    /// Blocks the last comparison log reached first (blocks mode): the
+    /// input it logged covers them.
+    pub cmplog_blocks: Vec<u64>,
 }
 
 /// One input, in place and ready to run (`Engine::load_case`).
@@ -1049,8 +1060,8 @@ pub fn function_names(blocks: &[CoverageBlock]) -> Vec<(u64, String)> {
     starts.into_iter().map(|(name, at)| (at, name)).collect()
 }
 
-/// The same exception (code and address) this often in one input is an
-/// exception storm.
+/// The same exception (code, PC and faulting address) this often in one
+/// input is an exception storm.
 const MAX_EXCEPTIONS: usize = 8;
 
 /// What every debug configuration of an input keeps.
@@ -1130,6 +1141,7 @@ impl Engine {
             symbols: None,
             target_image: None,
             exception_hook: None,
+            cmplog_blocks: Vec::new(),
         })
     }
 
@@ -1829,7 +1841,9 @@ impl Engine {
         // during one of its steps.
         let mut exception_return = None;
         let mut foreign_threads = 0u64;
-        let mut exceptions = BTreeMap::<(u32, u64), usize>::new();
+        let mut exceptions = BTreeMap::<(u32, u64, u64), usize>::new();
+        // Past stop_pc, running until then (settle_ms).
+        let mut settle: Option<Instant> = None;
         if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
             eprintln!("start pc={:#x} entry={entry_pc:#x}", registers.pc);
         }
@@ -1906,6 +1920,10 @@ impl Engine {
             }
         }
         loop {
+            if settle.is_some_and(|deadline| Instant::now() >= deadline) {
+                self.vm.pause()?;
+                break;
+            }
             if start.elapsed() > Duration::from_millis(self.harness.timeout_ms) {
                 self.vm.pause()?;
                 if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
@@ -2046,10 +2064,16 @@ impl Engine {
                         let record = Registers::from_state(&state).map(|r| r.x[0]).unwrap_or(0);
                         let mut word = [0u8; 4];
                         let mut address = [0u8; 8];
+                        let mut fault = [0u8; 8];
                         let space = AddressSpace { memory: &self.vm, registers: &Registers::from_state(&state).map_err(|e| Error::Invalid(format!("ARM64 registers: {e}")))? };
                         let _ = vroom_kernel::windows::VirtualMemory::read(&space, record, &mut word);
                         let _ = vroom_kernel::windows::VirtualMemory::read(&space, record + 0x10, &mut address);
-                        let seen = exceptions.entry((u32::from_le_bytes(word), u64::from_le_bytes(address))).or_default();
+                        let _ = vroom_kernel::windows::VirtualMemory::read(&space, record + 0x28, &mut fault);
+                        // The identical fault: the memory manager's handled
+                        // page-table faults (another process starting) repeat
+                        // the PC, not the faulting address.
+                        let key = (u32::from_le_bytes(word), u64::from_le_bytes(address), u64::from_le_bytes(fault));
+                        let seen = exceptions.entry(key).or_default();
                         *seen += 1;
                         if *seen > MAX_EXCEPTIONS {
                             // The same fault over and over (a smashed frame
@@ -2108,6 +2132,13 @@ impl Engine {
                                 let _ = vroom_kernel::windows::VirtualMemory::read(&space, r.x[0], &mut words);
                                 eprintln!("stop_pc x0={:#x}: {}", r.x[0], words.chunks(4).map(|w| format!("{:08x}", u32::from_le_bytes(w.try_into().expect("four")))).collect::<Vec<_>>().join(" "));
                             }
+                        }
+                        if client && self.harness.settle_ms > 0 && settle.is_none() {
+                            // Past the breakpoint; the client parks again.
+                            settle = Some(Instant::now() + Duration::from_millis(self.harness.settle_ms));
+                            foreign_step = Some(stop.cpu);
+                            self.vm.debug_step(stop.cpu as usize, step_debug_config(&[], always))?;
+                            continue;
                         }
                         break;
                     }

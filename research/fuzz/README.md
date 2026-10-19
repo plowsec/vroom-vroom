@@ -66,7 +66,7 @@ Detector `exceptions` (or `access-violation`): a breakpoint on `nt!KiDispatchExc
 
 - User-address faults inside `__try` (probing user buffers) aren't findings.
 - Bugchecks stop at `KeBugCheck2` (every bugcheck goes through it; `bugcheck_pc` = `KeBugCheckEx` is moved there) with the exception's stack.
-- The same exception (code, address) 9 times in one input ends it: a fault in its own dispatch.
+- The same exception (code, PC, faulting address) 9 times in one input ends it: a fault in its own dispatch.
 Kernel TUI: `coverage runs/a/coverage.json`, `coverage-diff runs/a/coverage.json runs/b/coverage.json`.
 
 ## Harness fields

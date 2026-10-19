@@ -306,6 +306,7 @@ impl Engine {
                 if self.unplant(index)? {
                     let block = self.harness.coverage[index].clone();
                     self.coverage.observe(&block, "cmplog");
+                    self.cmplog_blocks.push(block.id);
                 }
                 if ours && target.is_some_and(|(lo, hi)| (lo..hi).contains(&r.pc)) {
                     return Ok(Some(cpu));
@@ -357,6 +358,7 @@ impl Engine {
     /// (`ENTRY_STEPS` at most), until `stop_pc`.
     pub fn compare_log(&mut self, input: &[u8], max_steps: usize, budget: Duration) -> Result<Vec<Cmp>> {
         let deadline = Instant::now() + budget;
+        self.cmplog_blocks.clear();
         self.load_case(input)?;
         let mut cpu = self.harness.cpu;
         let (_, first) = self.registers_of(cpu)?;
@@ -469,6 +471,7 @@ impl Engine {
                     if self.unplant(index)? {
                         let block = self.harness.coverage[index].clone();
                         self.coverage.observe(&block, "cmplog");
+                        self.cmplog_blocks.push(block.id);
                     }
                     continue;
                 }

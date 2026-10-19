@@ -136,7 +136,10 @@ impl Campaign {
             corpus_inputs.push(seed.clone());
             corpus_energy.push(1);
         }
+        // The seed, then the corpus as it was: a resumed campaign knows its
+        // coverage again (and its master learns it) before mutating.
         let mut scheduled = VecDeque::from([seed.clone()]);
+        scheduled.extend(corpus_inputs.iter().filter(|input| **input != seed).cloned());
         if options.boundary_seeds {
             let max_payload_len =
                 (engine.harness.max_input - prefix_len).min(engine.harness.input_capacity);
@@ -223,6 +226,20 @@ impl Campaign {
                 return;
             }
         };
+        // Blocks only the logged run reached (it runs the whole input,
+        // other threads included): the parent covers them; share them like
+        // a new input's, or they'd be covered here and nowhere else.
+        let reached = std::mem::take(&mut self.engine_mut().cmplog_blocks);
+        if !reached.is_empty() {
+            self.stats.last_new_cov = Some(now());
+            self.outbox.push(Entry {
+                hash: CorpusStore::hash(parent),
+                data: parent.to_vec(),
+                blocks: Some(reached),
+                edges: Vec::new(),
+                findings: Vec::new(),
+            });
+        }
         let mut per_site = HashMap::<u64, usize>::new();
         let cmps: Vec<_> = cmps
             .into_iter()

@@ -123,7 +123,12 @@ pub struct Hub {
     pub stop: bool,
     /// Distributed (a master) rather than one local instance.
     pub master: bool,
+    /// When `series.jsonl` last got a row.
+    series_at: std::cell::Cell<f64>,
 }
+
+/// Seconds between `series.jsonl` rows.
+const SERIES_EVERY: f64 = 60.0;
 
 impl Hub {
     /// `store`: where accepted inputs and findings are saved (a master's
@@ -154,6 +159,7 @@ impl Hub {
             output,
             stop: false,
             master: false,
+            series_at: std::cell::Cell::new(0.0),
         }
     }
 
@@ -191,6 +197,28 @@ impl Hub {
                 continue;
             };
             if self.hashes.contains(&entry.hash) {
+                // A known input reported again: a resumed one run now, or
+                // one whose comparison log reached more. What it covers
+                // that the campaign hasn't is campaign coverage.
+                let mut grew = Vec::new();
+                for id in blocks {
+                    let row = self.covered.entry(*id).or_default();
+                    if row.hits == 0 {
+                        grew.push(*id);
+                    }
+                    row.hits += 1;
+                    row.first_input.get_or_insert_with(|| entry.hash.clone());
+                }
+                self.edges.extend(entry.edges.iter().copied());
+                if let Some(shared) = self.corpus.iter_mut().find(|s| s.entry.hash == entry.hash) {
+                    match &mut shared.entry.blocks {
+                        Some(known) => known.extend(grew.iter().copied()),
+                        None => shared.entry.blocks = Some(blocks.clone()),
+                    }
+                }
+                if !grew.is_empty() {
+                    self.last_new_cov = Some(at);
+                }
                 continue;
             }
             let new_blocks = blocks
@@ -380,6 +408,41 @@ impl Hub {
             "instances": self.instances.values().collect::<Vec<_>>(),
         });
         write_atomic(output.join("stats.json"), &serde_json::to_vec_pretty(&stats)?)?;
+        if now() - self.series_at.get() >= SERIES_EVERY {
+            // The campaign as a time series: one line a minute, appended.
+            self.series_at.set(now());
+            let row = serde_json::json!({
+                "t": now(),
+                "execs": self.execs(),
+                "execs_per_sec": self.execs_per_sec(),
+                "corpus": self.corpus_size(),
+                "blocks": self.covered.len(),
+                "edges": self.edges.len(),
+                "findings": self.findings.len(),
+                "redundant": self.redundant,
+                "instances": self.instances.values().map(|r| serde_json::json!({
+                    "name": r.stats.name,
+                    "execs": r.stats.execs,
+                    "execs_per_sec": r.stats.execs_per_sec,
+                    "exec_us": r.stats.exec_us,
+                    "reset_us": r.stats.reset_us,
+                    "blocks": r.stats.blocks,
+                    "corpus": r.stats.corpus,
+                    "crashes": r.stats.crashes,
+                    "timeouts": r.stats.timeouts,
+                    "restores": r.stats.restores,
+                    "cmplog": r.stats.cmplog,
+                    "foreign_threads": r.stats.foreign_threads,
+                    "live": !r.stats.done && now() - r.last_seen < LOST_AFTER_SECS,
+                })).collect::<Vec<_>>(),
+            });
+            let mut line = serde_json::to_vec(&row)?;
+            line.push(b'\n');
+            std::io::Write::write_all(
+                &mut std::fs::OpenOptions::new().create(true).append(true).open(output.join("series.jsonl"))?,
+                &line,
+            )?;
+        }
         if self.store.is_some() {
             write_atomic(
                 output.join("coverage.json"),
@@ -457,6 +520,19 @@ mod tests {
         assert_eq!(hub.entries_since(cursor, "a", 100).0.len(), 0);
         let (to_b, _) = hub.entries_since(0, "b", 1);
         assert_eq!(to_b[0].data, b"1");
+    }
+
+    #[test]
+    fn resumed_inputs_count_once_run() {
+        let mut hub = Hub::new("t", Vec::new(), None, None);
+        hub.add_unverified(vec![b"old".to_vec()]);
+        assert_eq!(hub.covered_blocks(), 0);
+        hub.submit(stats("a"), vec![entry(b"old", &[1, 2, 3], &[])], vec![]).unwrap();
+        assert_eq!(hub.covered_blocks(), 3, "a resumed input's coverage counts");
+        assert_eq!(hub.corpus_len(), 1, "and it isn't added twice");
+        hub.submit(stats("b"), vec![entry(b"old", &[3, 4], &[])], vec![]).unwrap();
+        assert_eq!(hub.covered_blocks(), 4, "more it reaches (a comparison log) counts too");
+        assert_eq!(hub.corpus_len(), 1);
     }
 
     #[test]
