@@ -77,7 +77,7 @@ fuzz      check run* probe* coverage blocks diff crashes          * jobs.start o
 - Addresses: integers or `"0x..."`. Inspection needs a paused VM.
 - `events.poll` without `after` waits for the next event (stop, fault, shutdown). Events carry `seq`.
 - Arrays over `limit` (200) return `{items, total, handle, next_offset}`: page with `results.page`.
-- `fuzz.run`/`fuzz.probe` start `vroom-fuzz` (its own VM, signed; `$VROOM_FUZZ` or `target/release/vroom-fuzz`). Output and progress: `OUTPUT.agent.jsonl`, `OUTPUT.agent.log`.
+- `fuzz.run`/`fuzz.probe`/`fuzz.trace` start `vroom-fuzz` (its own VM, signed; `$VROOM_FUZZ` or `target/release/vroom-fuzz`). Output and progress: `OUTPUT.agent.jsonl`, `OUTPUT.agent.log`. `fuzz.trace`'s OUTPUT is the trace file.
 - `fuzz.coverage|blocks|diff|crashes` read a run directory; no VM.
 - Results and jobs belong to the actor that made them.
 - Socket paths: under 104 bytes. A path in a deep temp dir fails: use a relative one.

@@ -466,6 +466,7 @@ mod tests {
                 detail: name.into(),
                 pc: Some(4),
                 input: String::new(),
+                stack: Vec::new(),
             },
             data: vec![1],
         };

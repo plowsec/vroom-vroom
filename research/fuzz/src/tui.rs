@@ -528,6 +528,7 @@ mod tests {
             detail: "bugcheck 0x1e".into(),
             pc: Some(0x1234),
             input: String::new(),
+            stack: Vec::new(),
         };
         hub.submit(
             InstanceStats {

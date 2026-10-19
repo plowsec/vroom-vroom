@@ -4,6 +4,7 @@ pub mod binary;
 pub mod cache;
 pub mod control;
 pub mod process;
+pub mod symbolize;
 pub mod symbols;
 pub mod unwind;
 pub mod windows;

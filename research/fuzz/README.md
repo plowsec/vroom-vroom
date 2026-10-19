@@ -14,7 +14,18 @@ vroom-fuzz serve harness.json --listen 0.0.0.0:7979 --output runs/shared --tui  
 vroom-fuzz fleet harness.json payload.bin --ioctl 0x222003 --workers 6 --output runs/l --master host:7979
 vroom-fuzz run harness.json payload.bin --master host:7979 --state-dir w0.state --output runs/w0   # one worker
 vroom-fuzz coverage runs/a/coverage.json runs/a/blocks.json     # per-function summary
+vroom-fuzz trace harness.json runs/a/crashes/<hash>-BugCheck.bin --blocks all-blocks.json   # replay, symbolized
 ```
+
+| `trace` flag | |
+|---|---|
+| `--out FILE` | default `<input>.trace.txt` |
+| `--max N` | instructions at most (200000; ~0.5 ms each) |
+| `--registers` | x0–x30, sp, pstate on every line |
+| `--blocks FILE` | function names from this block list too (no PDB: Ghidra's `sub_…`) |
+| `--state-dir DIR` | VM state dir (default the harness's) |
+
+Trace file: `N  PC  module!function+0xoff` per instruction from the snapshot to `stop_pc`, the bugcheck or `--max`; then `# end`, `# calls` (indented by depth, repeats `×N`, exceptions inline), `# stack`. Symbols: PDBs from `<vm>.state/symbols` (the lab's cache; the symbol server fills it), else the harness's block names, else exports.
 
 | `run` flag | |
 |---|---|
@@ -25,7 +36,7 @@ vroom-fuzz coverage runs/a/coverage.json runs/a/blocks.json     # per-function s
 | `--tui` | dashboard instead of JSON lines; `q` stops |
 | `--master ADDR` `--name` `--state-dir` `--salt` | worker of a master |
 
-Output dir: `inputs/`, `crashes/<hash>-<class>.{bin,json}`, `coverage.json`, `blocks.json`, `stats.json` (every 5 s).
+Output dir: `inputs/`, `crashes/<hash>-<class>.{bin,json}` (`stack`: symbolized), `coverage.json`, `blocks.json`, `stats.json` (every 5 s).
 Kernel TUI: `coverage runs/a/coverage.json`, `coverage-diff runs/a/coverage.json runs/b/coverage.json`.
 
 ## Harness fields

@@ -120,6 +120,30 @@ enum Command {
         #[arg(long)]
         state_dir: Option<PathBuf>,
     },
+    /// Replay one input (a saved crash) an instruction at a time: each one
+    /// symbolized, then how it ended, the call tree and the stack there.
+    Trace {
+        harness: PathBuf,
+        /// The input as the fuzzer saved it (with the IOCTL prefix when the
+        /// harness uses one).
+        input: PathBuf,
+        /// Trace file (default: the input's name + .trace.txt).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Instructions at most.
+        #[arg(long, default_value_t = 200_000)]
+        max: u64,
+        /// The general registers on every line.
+        #[arg(long)]
+        registers: bool,
+        /// Name functions from this block list too (e.g. the whole
+        /// driver's), for modules without a PDB.
+        #[arg(long)]
+        blocks: Option<PathBuf>,
+        /// Use this VM state directory instead of the harness's.
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
 }
 
 /// Input selection shared by `run` and `fleet`.
@@ -267,6 +291,29 @@ fn main() -> Result<()> {
             listen,
             tui: !no_tui,
         })?,
+        Command::Trace { harness, input, out, max, registers, blocks, state_dir } => {
+            let mut h = Harness::load(&harness)?;
+            if let Some(dir) = state_dir {
+                h.state_dir = dir;
+            }
+            let data = std::fs::read(&input)?;
+            let out = out.unwrap_or_else(|| PathBuf::from(format!("{}.trace.txt", input.display())));
+            let symbols = vroom_fuzz::symbol_cache(&h);
+            let mut names = vroom_fuzz::function_names(&h.coverage);
+            if let Some(b) = blocks {
+                let list: Vec<vroom_fuzz::CoverageBlock> = serde_json::from_slice(&std::fs::read(b)?)?;
+                names.extend(vroom_fuzz::function_names(&list));
+            }
+            let mut engine = Engine::open(h)?;
+            let mut file = std::io::BufWriter::new(std::fs::File::create(&out)?);
+            let options = vroom_fuzz::trace::TraceOptions { max, registers, symbols, names };
+            let summary = engine.trace(&data, &mut file, &options)?;
+            std::io::Write::flush(&mut file)?;
+            println!(
+                "{}",
+                serde_json::json!({"trace": out, "end": summary.end, "instructions": summary.instructions, "stack": summary.stack})
+            );
+        }
         Command::Probe {
             harness,
             payload,

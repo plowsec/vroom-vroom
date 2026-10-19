@@ -241,11 +241,18 @@ $F run $OUT/fleet.json $CK/one-byte-payload.bin --ioctl 0x222003 \
 | | |
 |---|---|
 | `inputs/<sha256>` | corpus (IOCTL prefix included) |
-| `crashes/<hash>-BugCheck.{bin,json}` | input + bugcheck code, args, caller |
+| `crashes/<hash>-BugCheck.{bin,json}` | input + bugcheck code, args, caller, symbolized stack |
 | `coverage.json` | block hits, edges, first input per block |
 | `blocks.json` | block manifest with resolved GPAs |
 | `stats.json` | every 5 s |
 | `workers/<i>/worker.log` | `fleet` only |
+
+Replay a crash, one instruction at a time (12.5k instructions, ~7 s):
+
+```bash
+target/release/vroom-fuzz trace $CK/hevd-harness.json $OUT/a/crashes/<hash>-BugCheck.bin --blocks $VM/hevd-all-driver-blocks.json
+# … HEVD!sub_140088a30+0x28 → 0x4141414141414141 → nt!KiKernelSp0ExceptionHandler … nt!KeBugCheckEx
+```
 
 ## 4. Coverage TUI (Lighthouse-style)
 

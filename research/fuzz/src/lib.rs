@@ -15,6 +15,7 @@ use vroom_kernel::arm64::{AddressSpace, Registers};
 pub mod campaign;
 pub mod hub;
 pub mod sync;
+pub mod trace;
 pub mod tui;
 
 #[derive(Debug, thiserror::Error)]
@@ -536,6 +537,10 @@ pub struct Finding {
     pub detail: String,
     pub pc: Option<u64>,
     pub input: String,
+    /// The crashing thread's call stack, symbolized (bugchecks, exception
+    /// sites).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stack: Vec<String>,
 }
 
 /// Findings with the same signature are the same bug for corpus novelty.
@@ -581,6 +586,7 @@ pub fn detect(text: &str, pc: Option<u64>, input: &str, timeout: bool) -> Option
         detail: text.to_string(),
         pc,
         input: input.to_string(),
+        stack: Vec::new(),
     })
 }
 
@@ -780,6 +786,38 @@ pub struct Engine {
     /// an input has faulted its page in: resets bring back the same
     /// physical page every time.
     pending: BTreeMap<u64, Vec<usize>>,
+    /// Names for findings' stacks: made at the first one (a PDB load).
+    symbols: Option<vroom_kernel::symbolize::Symbolizer>,
+}
+
+/// One input, in place and ready to run (`Engine::load_case`).
+struct Case {
+    /// The first input after the snapshot: arm the in-place reset now.
+    arm_after_patch: bool,
+    reset_us: u64,
+    /// The harness's watchpoints, at this input's addresses.
+    watchpoints: Vec<MemoryWatch>,
+}
+
+/// The PDB cache the lab fills for the harness's VM (`<state>/symbols`).
+pub fn symbol_cache(harness: &Harness) -> PathBuf {
+    vroom_config::VmConfig::load(&harness.config)
+        .map(|c| c.default_state_dir(&harness.config))
+        .unwrap_or_else(|_| harness.state_dir.clone())
+        .join("symbols")
+}
+
+/// Function start addresses from block lists' `function` names: a function
+/// starts at its lowest block.
+pub fn function_names(blocks: &[CoverageBlock]) -> Vec<(u64, String)> {
+    let mut starts = BTreeMap::<String, u64>::new();
+    for b in blocks {
+        if let (Some(va), false) = (b.va, b.function.is_empty()) {
+            let at = starts.entry(b.function.clone()).or_insert(va);
+            *at = (*at).min(va);
+        }
+    }
+    starts.into_iter().map(|(name, at)| (at, name)).collect()
 }
 
 /// What every debug configuration of an input keeps.
@@ -852,6 +890,7 @@ impl Engine {
             input_buffer: vec![0; input_capacity],
             planted: HashMap::new(),
             pending: BTreeMap::new(),
+            symbols: None,
         })
     }
 
@@ -1132,7 +1171,28 @@ impl Engine {
         Some(target)
     }
 
-    pub fn run_input(&mut self, input: &[u8]) -> Result<RunResult> {
+    /// The symbolized call stack of a stopped thread (the VM paused). A
+    /// stack that can't be had is one line saying why: a finding stays a
+    /// finding.
+    fn stack_of(&mut self, registers: &Registers) -> Vec<String> {
+        let space = AddressSpace { memory: &self.vm, registers };
+        if self.symbols.is_none() {
+            match vroom_kernel::symbolize::Symbolizer::new(&space, registers, &symbol_cache(&self.harness)) {
+                Ok(mut s) => {
+                    s.add_names(function_names(&self.harness.coverage));
+                    self.symbols = Some(s);
+                }
+                Err(e) => return vec![format!("(no symbols: {e})")],
+            }
+        }
+        self.symbols.as_mut().map(|s| s.stack(&space, registers)).unwrap_or_default()
+    }
+
+    /// Put `input` in place for one execution, as every run does: reset
+    /// to the snapshot (not before its first), the payload at
+    /// `input_gpa`, then the IOCTL code, pointers, lengths and poisoned
+    /// ranges the harness declares.
+    fn load_case(&mut self, input: &[u8]) -> Result<Case> {
         if input.len() > self.harness.max_input {
             return Err(Error::Invalid("input exceeds max_input".into()));
         }
@@ -1329,6 +1389,11 @@ impl Engine {
                 payload.len() as u64,
             )?;
         }
+        Ok(Case { arm_after_patch, reset_us, watchpoints: case_watchpoints })
+    }
+
+    pub fn run_input(&mut self, input: &[u8]) -> Result<RunResult> {
+        let Case { arm_after_patch, reset_us, watchpoints: case_watchpoints } = self.load_case(input)?;
         if arm_after_patch {
             self.vm.research_arm()?;
         }
@@ -1460,6 +1525,7 @@ impl Engine {
                             ),
                             pc: Some(stop.pc),
                             input: token.clone(),
+                            stack: self.stack_of(&registers),
                         };
                         if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
                             eprintln!("{}", bugcheck.detail);
@@ -1579,26 +1645,33 @@ impl Engine {
                             let watch = &case_watchpoints[index];
                             let count = watch_hits.entry(index).or_default();
                             *count += 1;
-                            if watch.poisoned && *count == 1 {
+                            let poisoned = watch.poisoned && *count == 1;
+                            let double = watch.double_fetch && watch.read && *count == 2;
+                            let address = watch.address;
+                            let stack = if poisoned || double {
+                                match self.vm.debug_registers(stop.cpu as usize).map(|s| Registers::from_state(&s)) {
+                                    Ok(Ok(registers)) => self.stack_of(&registers),
+                                    _ => Vec::new(),
+                                }
+                            } else {
+                                Vec::new()
+                            };
+                            if poisoned {
                                 findings.push(Finding {
                                     class: BugClass::PoisonedAccess,
-                                    detail: format!(
-                                        "watched memory access at {:#x}",
-                                        watch.address
-                                    ),
+                                    detail: format!("watched memory access at {address:#x}"),
                                     pc: Some(stop.pc),
                                     input: token.clone(),
+                                    stack: stack.clone(),
                                 });
                             }
-                            if watch.double_fetch && watch.read && *count == 2 {
+                            if double {
                                 findings.push(Finding {
                                     class: BugClass::DoubleFetch,
-                                    detail: format!(
-                                        "second read from watched address {:#x}",
-                                        watch.address
-                                    ),
+                                    detail: format!("second read from watched address {address:#x}"),
                                     pc: Some(stop.pc),
                                     input: token.clone(),
+                                    stack,
                                 });
                             }
                             if finding.is_none() {
@@ -1623,11 +1696,16 @@ impl Engine {
                     }
                     if self.harness.exception_sites.contains(&stop.pc) {
                         active_exception_sites.retain(|site| *site != stop.pc);
+                        let stack = match self.vm.debug_registers(stop.cpu as usize).map(|s| Registers::from_state(&s)) {
+                            Ok(Ok(registers)) => self.stack_of(&registers),
+                            _ => Vec::new(),
+                        };
                         let exception_finding = Finding {
                             class: BugClass::ExceptionDispatch,
                             detail: "configured exception-dispatch site reached".into(),
                             pc: Some(stop.pc),
                             input: token.clone(),
+                            stack,
                         };
                         if finding.is_none() {
                             finding = Some(exception_finding.clone());

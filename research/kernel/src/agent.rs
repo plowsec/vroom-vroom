@@ -129,6 +129,7 @@ enum Target {
     FuzzCheck,
     FuzzRun,
     FuzzProbe,
+    FuzzTrace,
     FuzzCoverage,
     FuzzBlocks,
     FuzzDiff,
@@ -252,6 +253,15 @@ static COMMANDS: &[Command] = &[
         p("output", "path", true, "new probe directory"),
         p("state_dir", "path", false, "VM state directory, one per parallel run"),
     ], "control", Target::FuzzProbe)),
+    job(c("fuzz.trace", "fuzz", "Replay one input (a saved crash) an instruction at a time from the snapshot: a symbolized trace file, how it ended, the call tree and stack", &[
+        p("harness", "path", true, "harness JSON"),
+        p("input", "path", true, "input file as the fuzzer saved it"),
+        p("output", "path", true, "new trace file"),
+        p("max", "integer", false, "instructions at most, default 200000"),
+        p("registers", "boolean", false, "general registers on every line"),
+        p("blocks", "path", false, "block list to name functions from too"),
+        p("state_dir", "path", false, "VM state directory, one per parallel run"),
+    ], "control", Target::FuzzTrace)),
     c("fuzz.coverage", "fuzz", "Per-function block coverage of a run", &[p("run", "path", true, "run directory (coverage.json, blocks.json)")], "read", Target::FuzzCoverage),
     c("fuzz.blocks", "fuzz", "Blocks of a run with hit counts; filter by function or covered", &[p("run", "path", true, "run directory"), p("function", "string", false, "only this function"), p("covered", "boolean", false, "only covered (true) or uncovered (false)")], "read", Target::FuzzBlocks),
     c("fuzz.diff", "fuzz", "Blocks covered by one run and not the other", &[p("a", "path", true, "run directory"), p("b", "path", true, "run directory")], "read", Target::FuzzDiff),
@@ -376,7 +386,7 @@ impl Shared {
             Target::FuzzBlocks => blocks(&path(&args, "run")?, args.get("function").and_then(Value::as_str), args.get("covered").and_then(Value::as_bool)),
             Target::FuzzDiff => diff(&path(&args, "a")?, &path(&args, "b")?),
             Target::FuzzCrashes => crashes(&path(&args, "run")?),
-            Target::FuzzRun | Target::FuzzProbe => Err(format!("{} is long running: start it with jobs.start", c.name)),
+            Target::FuzzRun | Target::FuzzProbe | Target::FuzzTrace => Err(format!("{} is long running: start it with jobs.start", c.name)),
         }
     }
 
@@ -386,11 +396,11 @@ impl Shared {
         })
     }
 
-    /// The vroom-fuzz process for a fuzz.run or fuzz.probe job.
+    /// The vroom-fuzz process for a fuzz.run, fuzz.probe or fuzz.trace job.
     fn spawn_fuzzer(&self, c: &Command, args: &Map<String, Value>) -> Result<(Child, PathBuf), String> {
         let output = path(args, "output")?;
         if output.exists() {
-            return Err(format!("output already exists: {}; choose a new directory", output.display()));
+            return Err(format!("output already exists: {}; choose a new path", output.display()));
         }
         let fuzz = self.fuzz()?;
         if cfg!(target_os = "macos") {
@@ -404,8 +414,27 @@ impl Shared {
                 return Err(format!("{} lacks the hypervisor entitlement: scripts/sign.sh {}", fuzz.display(), fuzz.display()));
             }
         }
-        std::fs::create_dir_all(&output).map_err(|e| e.to_string())?;
         let mut cmd = Process::new(fuzz);
+        if matches!(c.target, Target::FuzzTrace) {
+            // A file: its directory must be there.
+            if let Some(dir) = output.parent() {
+                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            }
+            cmd.arg("trace").arg(path(args, "harness")?).arg(path(args, "input")?).arg("--out").arg(&output);
+            if let Some(v) = args.get("max") {
+                cmd.arg("--max").arg(crate::number(v)?.to_string());
+            }
+            if args.get("registers").and_then(Value::as_bool) == Some(true) {
+                cmd.arg("--registers");
+            }
+            for (name, flag) in [("blocks", "--blocks"), ("state_dir", "--state-dir")] {
+                if let Some(v) = args.get(name).and_then(Value::as_str) {
+                    cmd.arg(flag).arg(v);
+                }
+            }
+        } else {
+            std::fs::create_dir_all(&output).map_err(|e| e.to_string())?;
+        }
         if matches!(c.target, Target::FuzzRun) {
             cmd.arg("run").arg(path(args, "harness")?).arg(path(args, "seed")?).arg("--output").arg(&output);
             if let Some(v) = args.get("ioctl") {
@@ -424,7 +453,7 @@ impl Shared {
                     cmd.arg(flag);
                 }
             }
-        } else {
+        } else if matches!(c.target, Target::FuzzProbe) {
             // probe refuses an existing output directory: it makes its own.
             std::fs::remove_dir(&output).map_err(|e| e.to_string())?;
             cmd.arg("probe").arg(path(args, "harness")?).arg(path(args, "payload")?).arg("--output").arg(&output);
@@ -682,7 +711,7 @@ impl Connection {
 
     fn start_job(&self, command: &'static Command, args: Map<String, Value>, actor: &str) -> Result<Value, Error> {
         let handle = self.shared.handle("job");
-        let (child, log) = if matches!(command.target, Target::FuzzRun | Target::FuzzProbe) {
+        let (child, log) = if matches!(command.target, Target::FuzzRun | Target::FuzzProbe | Target::FuzzTrace) {
             let (child, log) = self.shared.spawn_fuzzer(command, &args).map_err(|e| error(INTERNAL_ERROR, e))?;
             (Some(child), Some(log))
         } else {
