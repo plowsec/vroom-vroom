@@ -250,18 +250,36 @@ impl HvfVm {
 }
 
 /// Stage-2 pages of `bytes` (4096). macOS 15 has this only as a private
-/// call taking the size; macOS 26 makes it public (with an enum), and
-/// keeps the private one.
+/// call taking the size; macOS 26 makes it public, taking `hv_ipa_granule_t`
+/// instead, and drops the private one (26.0 exports only the public name),
+/// so try the public call first and keep the private one for macOS 15.
 fn set_ipa_granule(cfg: &ffi::OsObject, bytes: u32) -> Result<()> {
     type SetGranule = unsafe extern "C" fn(*mut c_void, u32) -> ffi::hv_return_t;
     // SAFETY: dlsym with a valid C string; RTLD_DEFAULT searches loaded images.
-    let f = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"_hv_vm_config_set_ipa_granule".as_ptr()) };
-    if f.is_null() {
+    let public = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"hv_vm_config_set_ipa_granule".as_ptr()) };
+    if !public.is_null() {
+        // hv_ipa_granule_t: HV_IPA_GRANULE_4KB, then HV_IPA_GRANULE_16KB.
+        let granule = match bytes {
+            4096 => 0,
+            16384 => 1,
+            _ => return Err(Error::Unsupported("guest pages: 4 KiB or 16 KiB")),
+        };
+        // SAFETY: the symbol takes (config, granule enum) and both are
+        // passed by value; cfg is a live config object.
+        return check("hv_vm_config_set_ipa_granule", unsafe {
+            std::mem::transmute::<*mut c_void, SetGranule>(public)(cfg.0, granule)
+        });
+    }
+    // SAFETY: dlsym with a valid C string; RTLD_DEFAULT searches loaded images.
+    let private = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"_hv_vm_config_set_ipa_granule".as_ptr()) };
+    if private.is_null() {
         return Err(Error::Unsupported("4 KiB guest pages: this macOS has no way to set them"));
     }
     // SAFETY: the symbol has this signature (config, granule in bytes);
     // cfg is a live config object.
-    check("hv_vm_config_set_ipa_granule", unsafe { std::mem::transmute::<*mut c_void, SetGranule>(f)(cfg.0, bytes) })
+    check("hv_vm_config_set_ipa_granule", unsafe {
+        std::mem::transmute::<*mut c_void, SetGranule>(private)(cfg.0, bytes)
+    })
 }
 
 /// Destroys the VM if creation fails half way.
