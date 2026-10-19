@@ -26,6 +26,11 @@ win=target/aarch64-pc-windows-msvc/release/vroom-agent.exe
 gl=target/windows-gl
 
 command -v cargo-xwin >/dev/null 2>&1 || { echo "needs cargo-xwin: cargo install cargo-xwin" >&2; exit 1; }
+# cargo-xwin links with lld-link. Homebrew's lld loads Homebrew's libLLVM,
+# so an lld left behind by an llvm upgrade aborts instead of linking; say
+# so now rather than after the agent has compiled.
+lld-link --version >/dev/null 2>&1 ||
+  { echo "lld-link does not run: brew upgrade lld (it must match brew's llvm)" >&2; exit 1; }
 rustup target add aarch64-unknown-linux-musl aarch64-pc-windows-msvc >/dev/null 2>&1
 cargo build --release -p vroom-agent --target aarch64-unknown-linux-musl
 cargo xwin build --release -p vroom-agent --target aarch64-pc-windows-msvc

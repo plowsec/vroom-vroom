@@ -6,15 +6,22 @@
 # Source: chromium.googlesource.com/angle/angle at the commit Chrome's
 # stable release ships, fetched shallow with depot_tools. Tests, traces,
 # other backends and their dependencies are left out.
-# Needs: Xcode, python3, ninja. The checkout takes about 3 GB in
-# target/angle-build while building (removed afterwards; KEEP=1 keeps
-# it). Output: 6 MB. Takes about 10 minutes, mostly downloading.
+# Needs: Xcode with the Metal toolchain (Xcode 26 downloads it separately:
+# xcodebuild -downloadComponent MetalToolchain), python3, ninja. The
+# checkout takes about 3 GB in target/angle-build while building (removed
+# afterwards; KEEP=1 keeps it). Output: 6 MB. Takes about 10 minutes,
+# mostly downloading.
 #
 # Output: target/angle/lib{EGL,GLESv2}.dylib, also copied next to
 # target/{debug,release}/vroom where the VMM looks for them.
 set -eu
 cd "$(dirname "$0")/.."
 ROOT=$(pwd)
+# ANGLE's Metal backend compiles its internal shaders with `metal`, which
+# Xcode 26 no longer installs with itself. Say so now: the failure comes
+# 10 minutes in, after the checkout.
+xcrun metal --version >/dev/null 2>&1 ||
+  { echo "no Metal compiler: xcodebuild -downloadComponent MetalToolchain" >&2; exit 1; }
 # Chrome 156 (stable, October 2026).
 REV=3b89d84e9d59f75675ac4e2bef58fc068a9f0577
 WORK=$ROOT/target/angle-build

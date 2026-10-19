@@ -68,7 +68,8 @@ Not yet: x86_64 hosts (it builds, can't run VMs yet) and Secure Boot.
 ## Try it
 
 ```bash
-brew install qemu meson ninja bison pkg-config llvm llvm@15 molten-vk
+xcodebuild -downloadComponent MetalToolchain
+brew install qemu meson ninja bison pkg-config llvm llvm@15 molten-vk lld uv
 cargo install cargo-xwin
 scripts/app.sh --install     # vroom.app with 3D and guest tools, in /Applications
 ```

@@ -3,8 +3,9 @@
 # Spotlight, complete from a fresh clone: the VMM, GUI and root helper,
 # 3D on the Mac (ANGLE, DXMT, virglrenderer) and the guest tools. Long
 # builds run only when their inputs changed. Output: target/dist/vroom.app.
-# Needs: Xcode, rustup, cargo-xwin, and brew install meson ninja bison
-# pkg-config llvm llvm@15 molten-vk.
+# Needs: Xcode with the Metal toolchain (xcodebuild -downloadComponent
+# MetalToolchain), rustup, cargo-xwin, and brew install meson ninja bison
+# pkg-config llvm llvm@15 molten-vk lld uv.
 #
 # Usage: scripts/app.sh [--install] [--no-build]
 #   --install    also copy it to /Applications (replaces an older copy)

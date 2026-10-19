@@ -3,13 +3,28 @@
 ## Prerequisites (macOS, Apple Silicon)
 
 ```bash
-brew install qemu meson ninja bison pkg-config llvm llvm@15 molten-vk
+xcodebuild -downloadComponent MetalToolchain   # Xcode 26: a separate download
+brew install qemu meson ninja bison pkg-config llvm llvm@15 molten-vk lld uv
 cargo install cargo-xwin
 scripts/app.sh --install     # vroom.app, in /Applications
 ```
 
-qemu: only its UEFI firmware and qemu-img. The rest builds 3D and the
-guest tools.
+Xcode itself (not just the command line tools), and rustup. qemu: only its
+UEFI firmware and qemu-img. The rest builds 3D and the guest tools.
+
+ANGLE compiles Metal shaders, and Xcode 26 no longer installs the `metal`
+compiler with itself -- hence the download above. `xcrun metal --version`
+says whether you have it.
+
+The Mesa and virglrenderer code generators run on a pinned Python that uv
+fetches into `target/pyenv` (`scripts/pyenv.sh`), not on whatever `python3`
+is on PATH -- a Homebrew python can carry a `pyexpat` built against a newer
+libexpat than the `/usr/lib` one it loads, and then `python3 -m venv` dies
+in `ensurepip`.
+
+`lld` and `llvm` have to be the same version: Homebrew's `lld` loads
+Homebrew's `libLLVM`, so an `llvm` upgrade on its own leaves `lld-link`
+aborting, and cargo-xwin cannot link the Windows agent. `brew upgrade lld`.
 
 `scripts/build.sh [--release]` builds just `vroom` and `vroom-gui` into
 `target/debug` (or `target/release`).
