@@ -102,7 +102,24 @@ devs="$tdev $devs"
 cp -R "$out/windows/" "$tmp/mnt/"
 printf '[autorun]\r\nshellexecute=vroom-setup.cmd\r\nicon=vroom-agent.exe\r\nlabel=vroom tools\r\n' > "$tmp/mnt/autorun.inf"
 cp -R "$out/linux" "$tmp/mnt/linux"
-printf 'vroom guest tools\r\n\r\nWindows: run vroom-setup.cmd (it asks for administrator rights).\r\nLinux: sudo sh linux/install-agent.sh\r\n' > "$tmp/mnt/README.txt"
+printf 'vroom guest tools\r\n\r\nWindows: run vroom-setup.cmd (it asks for administrator rights).\r\nLinux: double-click "Install vroom guest tools", or sudo sh linux/install-agent.sh\r\n' > "$tmp/mnt/README.txt"
+# Linux has no autorun.inf, and the command can't be pasted in (the Mac's
+# clipboard reaches the guest through the agent this installs). So give
+# the desktop something to click: GNOME, KDE and Xfce all run a .desktop
+# from a mounted volume once the user allows it, and pkexec asks for the
+# password itself rather than needing a terminal.
+cat > "$tmp/mnt/install-vroom-tools.desktop" <<'DESKTOP'
+[Desktop Entry]
+Type=Application
+Name=Install vroom guest tools
+Comment=Clipboard, a guest that follows the window, shared folders
+Icon=drive-removable-media
+Terminal=true
+Exec=sh -c 'd=$(dirname "$(readlink -f "%k")"); pkexec sh "$d/linux/install-agent.sh" || sudo sh "$d/linux/install-agent.sh"; echo; echo Done. This window can be closed.; read x'
+Categories=System;
+DESKTOP
+# FAT32 keeps no execute bit; the desktops ask the user to allow it.
+chmod 755 "$tmp/mnt/install-vroom-tools.desktop" 2>/dev/null || true
 # macOS leaves ._ files next to copies; pnputil chokes on ._x.inf.
 find "$tmp/mnt" -name "._*" -delete
 sync
