@@ -21,14 +21,17 @@ use super::{with, Console, VmState};
 /// The tools stick's USB id (pid.codes' test product): ours, never a
 /// device of the Mac's.
 pub(super) const STICK_ID: &str = "1209:0001";
-/// Running this long without an agent: offer the tools.
-const MISSING_AFTER: Duration = Duration::from_secs(90);
 /// An update that hasn't brought the new agent by then didn't work.
 const UPDATE_WAIT: Duration = Duration::from_secs(180);
 /// How long the instructions stay up.
 const HOW_LONG: Duration = Duration::from_secs(20);
 
-/// What to run in a Linux guest with the stick in.
+/// What to run in a Linux guest with the stick in. Two lines, not one
+/// joined by `&&`: vroom types these on the guest's keyboard and `&`
+/// is not a key it can reach.
+pub(super) const LINUX_LINES: [&str; 2] =
+    ["sudo mount -o ro LABEL=VRTOOLS /mnt", "sudo sh /mnt/linux/install-agent.sh"];
+/// The same, to show and to copy.
 pub(super) const LINUX_COMMAND: &str = "sudo mount -o ro LABEL=VRTOOLS /mnt && sudo sh /mnt/linux/install-agent.sh";
 
 #[derive(Debug, Default)]
@@ -36,7 +39,6 @@ pub(super) struct Tools {
     /// The agent's hello text, once one came.
     agent: Option<String>,
     state: State,
-    running_since: Option<Instant>,
     /// The tools stick is in: taken out once the new agent is there.
     stick: bool,
     updates: u32,
@@ -111,12 +113,14 @@ impl Console {
 
     pub(super) fn tools_tick(&mut self, now: Instant) {
         if self.state != VmState::Running {
-            self.tools.running_since = None;
             return;
         }
-        let since = *self.tools.running_since.get_or_insert(now);
         match &self.tools.state {
-            State::Hidden if self.tools.agent.is_none() && now.duration_since(since) > MISSING_AFTER => {
+            // No agent has said hello, so there are no tools to speak of
+            // yet: offer them now rather than leaving the window bare
+            // while a timer the user can't see runs down. An agent that
+            // answers later takes the button away itself (`tools_agent`).
+            State::Hidden if self.tools.agent.is_none() => {
                 self.tools.state = State::Missing;
                 self.tools_show();
             }
@@ -220,6 +224,42 @@ impl Console {
         }
     }
 
+    /// Type a line on this guest's keyboard, then Enter. US layout, the
+    /// characters the install command needs; anything else would be
+    /// dropped silently, so the command is kept to these on purpose.
+    fn type_line(&mut self, line: &str) {
+        const ROWS: [(&str, u16); 4] =
+            [("1234567890-=", 2), ("qwertyuiop[]", 16), ("asdfghjkl;'", 30), ("zxcvbnm,./", 44)];
+        const SHIFT: u16 = 42;
+        const ENTER: u16 = 28;
+        let mut io = self.io.borrow_mut();
+        let mut tap = |codes: &[u16]| {
+            for &k in codes {
+                io.key(k, true);
+            }
+            for &k in codes.iter().rev() {
+                io.key(k, false);
+            }
+        };
+        for ch in line.chars() {
+            let lower = ch.to_ascii_lowercase();
+            let code = match lower {
+                ' ' => Some(57),
+                _ => ROWS.iter().find_map(|(row, r)| row.find(lower).map(|i| r + i as u16)),
+            };
+            let Some(code) = code else {
+                log::warn!("gui: guest tools: no key for {ch:?}; the typed command would be wrong");
+                return;
+            };
+            if ch.is_ascii_uppercase() {
+                tap(&[SHIFT, code]);
+            } else {
+                tap(&[code]);
+            }
+        }
+        tap(&[ENTER]);
+    }
+
     /// Put the tools disk in as a USB stick and say what to run.
     fn tools_plug(&mut self) {
         let Some(img) = vroom_tools::image() else {
@@ -231,6 +271,7 @@ impl Console {
             self.toast_for(&format!("This VM has no USB: attach {} as a disk in its settings", img.display()), HOW_LONG);
             return;
         }
+        let already_in = self.tools.stick;
         if !self.tools.stick {
             let file = match std::fs::File::open(&img) {
                 Ok(f) => f,
@@ -248,11 +289,26 @@ impl Console {
             self.tools.stick = true;
         }
         match os {
+            // The command can't be pasted: the host's clipboard only
+            // reaches the guest through the agent we are installing. So
+            // vroom types it, the way it types anything else into a
+            // guest -- but into whatever has focus, which has to be a
+            // terminal. Hence two presses: one puts the disk in and says
+            // what to open, the next types the command and runs it.
+            Os::Linux if already_in => {
+                self.toast_for("Typing the install command into the guest's terminal", HOW_LONG);
+                for line in LINUX_LINES {
+                    self.type_line(line);
+                }
+            }
             Os::Linux => {
                 if let Some(cb) = self.clipboard.as_mut() {
                     let _ = cb.set_text(LINUX_COMMAND.to_string());
                 }
-                self.toast_for(&format!("Tools disk in. In the guest (copied): {LINUX_COMMAND}"), HOW_LONG);
+                self.toast_for(
+                    "Tools disk in. Open a terminal in the guest, then press this button again and vroom types the command.                      (It is on the Mac's clipboard too, for a guest whose keyboard isn't US.)",
+                    HOW_LONG,
+                )
             }
             Os::Windows => self.toast_for("Tools disk in. In Windows: open the VRTOOLS drive, run vroom-setup", HOW_LONG),
         }
