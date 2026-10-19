@@ -11,13 +11,13 @@ R="target/debug/vroom-rpc --socket $VM/lab.sock"
 
 ## 1. VM
 
-Clone of S1 at its `checkpoint-ssh-ready` snapshot (agent with `guest.exec`): base disk, its frozen layer, EFI vars, TPM state and the snapshot as APFS clones, names changed to `clfs-windows-arm64`, NAT, shares `$VM/shared`, `$VM/shared-rw`.
+Clone of S1 at its `checkpoint-ssh-ready` snapshot (agent with `guest.exec`): base disk, its frozen layer, EFI vars, TPM state and the snapshot as APFS clones (`cp -c -p`: snapshots check layer mtimes), names changed to `clfs-windows-arm64`, NAT, shares `$VM/shared`, `$VM/shared-rw`. Snapshots: `checkpoint` (the guest idle, agent up), `clfs-park` (the client parked); both in the state dir (`vroom snapshot list`), where pruning sees them.
 
 ```bash
 T=/tmp/vroom-lab-build    # any target dir: not target/ while another lab runs from it
 CARGO_TARGET_DIR=$T research/build.sh --release
 VROOM_GUEST_TOOLS=$PWD/target/guest-tools VROOM_FUZZ=$PWD/$F \
-  $T/research/release/vroom-lab $VM/clfs-windows-arm64.toml --restore $VM/snapshots/checkpoint-ssh-ready \
+  $T/research/release/vroom-lab $VM/clfs-windows-arm64.toml --restore checkpoint \
   --agent-socket $VM/lab.sock --daemon
 $R run vm.resume '{}'
 ```
@@ -80,6 +80,7 @@ $F run $VM/clfs-harness.json $VM/seeds/append-read.bin --duration-secs 600 --no-
 $F triage $VM/clfs-harness.json $VM/runs/a/crashes/HASH-CLASS.bin --state-dir $VM/fuzz.state
 ```
 
-- Seeds: `seeds/append-read.bin` (create, container, area, append, flush, read, info, close), `seeds/create.bin`.
+- Seeds: `seeds/rich.bin` (47 calls: two containers, records, reads in each mode, tails, reservations, reopen, a multiplexed log with two streams, BLF bytes then reopen, delete), `seeds/append-read.bin`, `seeds/create.bin`.
+- M3 Max, 10 min: `append-read.bin` 36k programs (60/s), 4529/18003 blocks; `rich.bin` 19.6k (33/s), 4696. No findings.
 - The whole guest runs (CLFS does disk I/O); each reset restores RAM, disks and devices.
 - `VROOM_FUZZ_TRACE=1`: the client's per-call results at `stop_pc` (op in the top byte, Win32 error below).
