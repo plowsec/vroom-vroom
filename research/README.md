@@ -12,6 +12,12 @@ cargo check -p vroom-vmm                        # product build
 cargo check -p vroom-vmm --features research    # + file-backed RAM baselines, paused restore API
 ```
 
+## demo
+
+Paused on an EDR's process-notify callback, with the arguments it was
+called with: [DEMO.md](DEMO.md), which also covers making the checkpoint
+(the demo refuses any other).
+
 ## targets
 
 `hevd/`: HackSys Extreme Vulnerable Driver ([hevd/README.md](hevd/README.md)). Target binaries, checkpoints and coverage stay outside the repo.
@@ -24,7 +30,7 @@ TUI: `coverage RUN/coverage.json`; `coverage-diff BASE/coverage.json CUR/coverag
 research/run.sh /path/to/lab.toml
 research/run.sh /path/to/lab.toml --restore /path/to/checkpoint
 research/run.sh /path/to/lab.toml --atui /path/to/run-atui-macos.sh
-research/demo.sh CONFIG CHECKPOINT       # paused Ex callback
+research/demo.sh CONFIG CHECKPOINT       # paused Ex callback: DEMO.md
 research/build.sh                        # build + sign
 ```
 
