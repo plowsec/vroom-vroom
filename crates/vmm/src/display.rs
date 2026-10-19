@@ -149,6 +149,13 @@ impl ViewerTx {
         *self.sock.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
+    /// Hang up on the viewer: its reader sees the end too.
+    fn close(&self) {
+        if let Some(s) = self.sock.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
     /// The viewer wants IOSurfaces, or pixels again. Only the app that
     /// started this VMM can have them: it left us a mach port for them.
     fn set_surfaces(&self, on: bool) {
@@ -604,7 +611,10 @@ impl DisplayServer {
         windows: bool,
         usb: Option<Arc<UsbPorts>>,
         net: Option<Arc<NetPorts>>,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<DisplayStop> {
+        let closing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let wake = listener.as_ref().and_then(|l| l.local_addr().ok()).and_then(|a| a.as_pathname().map(std::path::Path::to_path_buf));
+        let stop = DisplayStop { closing: closing.clone(), tx: self.tx.clone(), wake };
         let ctx = Arc::new(Serve { input, agent, events, window, latest: self.clip_latest, tx: self.tx, screens, windows, ptr: Mutex::default(), usb, net });
         let c = ctx.clone();
         let first = self.stream;
@@ -612,6 +622,9 @@ impl DisplayServer {
         if let Some(l) = listener {
             std::thread::Builder::new().name("viewer-listen".into()).spawn(move || {
                 for v in l.incoming() {
+                    if closing.load(std::sync::atomic::Ordering::Acquire) {
+                        break;
+                    }
                     let Ok(v) = v else { continue };
                     if ctx.tx.attached() {
                         // Someone is watching already.
@@ -634,7 +647,28 @@ impl DisplayServer {
                 }
             })?;
         }
-        Ok(())
+        Ok(stop)
+    }
+}
+
+/// Ends the viewer threads when the VM goes: they hold its devices (the
+/// network ports, USB), which a VM started again in this process (the
+/// lab's restore) needs back.
+pub(crate) struct DisplayStop {
+    closing: Arc<std::sync::atomic::AtomicBool>,
+    tx: ViewerTx,
+    /// The socket a later viewer attaches on: a connection wakes its
+    /// listener.
+    wake: Option<std::path::PathBuf>,
+}
+
+impl DisplayStop {
+    pub fn stop(&self) {
+        self.closing.store(true, std::sync::atomic::Ordering::Release);
+        self.tx.close();
+        if let Some(p) = &self.wake {
+            let _ = UnixStream::connect(p);
+        }
     }
 }
 

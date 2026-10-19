@@ -188,6 +188,8 @@ pub(crate) struct Machine {
     /// Each virtio-gpu's control handle (window size, Direct3D state).
     pub gpus: Vec<GpuControl>,
     pub viewer: Option<ViewerTx>,
+    /// Ends the viewer threads (shutdown).
+    pub display: Option<crate::display::DisplayStop>,
     /// Every monitor, the first (with the firmware screen) first.
     pub screens: Vec<Arc<FbSink>>,
     pub boot: BootImage,
@@ -852,6 +854,7 @@ pub(crate) fn build(
         crate::usb::test_seam(u);
     }
     let net_ports = crate::net::NetPorts::new(nics, viewer.clone(), reach, ident.clone(), env.net_ctrl);
+    let mut display = None;
     if let Some(ds) = ui {
         if screen.is_none() {
             return Err(Error::Setup("a viewer needs a display (display.gpu or UEFI boot)".into()));
@@ -881,7 +884,7 @@ pub(crate) fn build(
             }
         };
         let windows = config.guest_os() == GuestOs::Windows;
-        ds.run(input, agent.clone(), events.clone(), window, listener, screens.clone(), windows, usb_ports, Some(net_ports.clone()))?;
+        display = Some(ds.run(input, agent.clone(), events.clone(), window, listener, screens.clone(), windows, usb_ports, Some(net_ports.clone()))?);
     }
     for gpu in later_gpus {
         board.add_virtio(Box::new(gpu))?;
@@ -1001,7 +1004,7 @@ pub(crate) fn build(
     let _ = shared.peers.set(vcpus.iter().map(|v| v.peer.clone()).collect());
     vm.finalize()?;
 
-    Ok(Machine { vm, mem, shared, vcpus, devices: reg.stateful, uart, agent, gpus, viewer, screens, boot, nets, net_ports, hotplug })
+    Ok(Machine { vm, mem, shared, vcpus, devices: reg.stateful, uart, agent, gpus, viewer, display, screens, boot, nets, net_ports, hotplug })
 }
 
 #[cfg(test)]

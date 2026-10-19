@@ -212,7 +212,9 @@ fn ask<T: serde::de::DeserializeOwned>(mut s: &UnixStream, req: &impl Serialize,
 pub fn attach(socket: &Path, req: &Request) -> Result<(UnixDatagram, [u8; 6]), NetdError> {
     // The same adapter's last port (a VM restarted or resumed at once, an
     // adapter switched back) may still be closing: vmnet refuses a second
-    // interface with its id until then.
+    // interface with its id until then, or never answers at all when asked
+    // while the first is still up. netd lists a port until vmnet let it go.
+    wait_gone(socket, &req.vm, req.nic);
     let mut tries = 0;
     loop {
         match attach_once(socket, req) {
@@ -221,6 +223,19 @@ pub fn attach(socket: &Path, req: &Request) -> Result<(UnixDatagram, [u8; 6]), N
                 std::thread::sleep(Duration::from_millis(800));
             }
             r => return r,
+        }
+    }
+}
+
+/// Until netd no longer lists a port of `vm`'s adapter `nic` (at most a
+/// few seconds: a closing port's pump notices within half a second, and
+/// vmnet stops it within five).
+fn wait_gone(socket: &Path, vm: &str, nic: u32) {
+    let t0 = std::time::Instant::now();
+    while t0.elapsed() < Duration::from_secs(10) {
+        match status(socket) {
+            Ok(st) if st.ports.iter().any(|p| p.vm == vm && p.nic == nic) => std::thread::sleep(Duration::from_millis(200)),
+            _ => return,
         }
     }
 }

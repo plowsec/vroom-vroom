@@ -143,6 +143,8 @@ pub struct Vmm {
     gpus: Vec<vroom_virtio::devices::gpu::GpuControl>,
     disks: disks::DiskSet,
     viewer: Option<display::ViewerTx>,
+    /// Ends the viewer threads at shutdown.
+    display: Option<display::DisplayStop>,
     screens: Vec<Arc<display::FbSink>>,
     /// Captured right after build; reset = restore these.
     pristine_devices: Vec<Vec<u8>>,
@@ -296,6 +298,7 @@ impl Vmm {
             gpus: m.gpus,
             disks,
             viewer: m.viewer,
+            display: m.display,
             screens: m.screens,
             pristine_devices: Vec::new(),
             pristine_irqchip: None,
@@ -470,9 +473,9 @@ impl Vmm {
     }
 
     #[cfg(feature = "research")]
-    /// The disk overlays this VM started on its checkpoint are scratch:
+    /// The disk overlays this VM started on its snapshot are scratch:
     /// delete them when the VM goes away (a fuzzer that restores the same
-    /// checkpoint again would otherwise leave one behind per restore).
+    /// snapshot again would otherwise leave one behind per restore).
     pub fn research_discard_disk_layers(&mut self) {
         self.disks.discard_fresh_layers();
     }
@@ -821,8 +824,19 @@ impl Vmm {
         for v in &mut self.vcpus {
             v.join();
         }
+        if let Some(d) = &self.display {
+            d.stop();
+        }
         self.state = RunState::Stopped;
     }
+}
+
+/// Whether a VM can start from snapshot `dir`: its manifest and saved
+/// VM file read, and its disk layers are as they were saved.
+pub fn check_snapshot(dir: &Path) -> Result<()> {
+    snapshot::saved_config(dir)?;
+    snapshot::disk_plan(dir)?;
+    Ok(())
 }
 
 impl Drop for Vmm {

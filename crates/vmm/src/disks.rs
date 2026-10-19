@@ -212,7 +212,7 @@ impl DiskSet {
     }
 
     /// The overlays `open` started on snapshot layers are scratch (a
-    /// fuzzer restoring the same checkpoint again and again): delete them
+    /// fuzzer restoring the same snapshot again and again): delete them
     /// when the disks close and put the state's disk pointers back, instead
     /// of leaving one more overlay behind per restore.
     #[cfg(feature = "research")]
@@ -446,7 +446,7 @@ mod tests {
         let state = td.path().join("vm.state");
         let c = cfg(&disk);
         let mut ds = DiskSet::open(&c, &state, &BTreeMap::new()).unwrap();
-        // Revert to a frozen layer, as the fuzzer's checkpoint restore does.
+        // Revert to a frozen layer, as the fuzzer's snapshot restore does.
         ds.disks[0].image.write_at(b"base", 0).unwrap();
         let layers = ds.freeze().unwrap();
         drop(ds);
