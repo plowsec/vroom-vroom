@@ -972,9 +972,17 @@ fn open(key: String, path: &Path, cfg: &VmConfig, ours: UnixStream, child: Optio
 fn wire(win: &ConsoleWindow, key: &str, io: &Rc<RefCell<Io>>) {
     {
         let io = io.clone();
+        // Slint tells us about mouse-x and mouse-y apart, so a move across
+        // both sends the same point twice. The guest's kernel drops the
+        // repeat (an absolute axis that didn't change is no event), having
+        // paid for an interrupt: keep the last point and say nothing.
+        let last = std::cell::Cell::new(None);
         win.on_mouse_move(move |fx, fy| {
             let x = (fx.clamp(0.0, 1.0) * POINTER_MAX as f32) as u16;
             let y = (fy.clamp(0.0, 1.0) * POINTER_MAX as f32) as u16;
+            if last.replace(Some((x, y))) == Some((x, y)) {
+                return;
+            }
             io.borrow_mut().send(ToVmm::Pointer { x, y });
         });
     }
