@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use vroom_kernel::arm64::{AddressSpace, Registers};
 
 pub mod campaign;
+pub mod cmplog;
 pub mod hub;
 pub mod sync;
 pub mod trace;
@@ -594,14 +595,62 @@ pub fn detect(text: &str, pc: Option<u64>, input: &str, timeout: bool) -> Option
 pub struct Mutator {
     state: u64,
     max_len: usize,
+    /// Values the target compared inputs with (comparison logging).
+    dictionary: Vec<u32>,
 }
+
+/// Dictionary words kept at most.
+const DICTIONARY: usize = 4096;
 
 impl Mutator {
     pub fn new(seed: u64, max_len: usize) -> Self {
         Self {
             state: seed | 1,
             max_len,
+            dictionary: Vec::new(),
         }
+    }
+
+    /// Remember a value the target compares with (not tiny ones: those
+    /// the byte operations reach anyway).
+    pub fn learn(&mut self, value: u32) {
+        if value > 0xff && self.dictionary.len() < DICTIONARY && !self.dictionary.contains(&value) {
+            self.dictionary.push(value);
+        }
+    }
+
+    pub fn dictionary(&self) -> &[u32] {
+        &self.dictionary
+    }
+
+    /// A dictionary word (the dictionary must not be empty).
+    fn word(&mut self) -> u32 {
+        let i = self.next() as usize % self.dictionary.len();
+        self.dictionary[i]
+    }
+
+    /// A mutation of `seed` whose first four bytes are a Windows IOCTL code
+    /// (`device << 16 | access << 14 | function << 2 | method`): one time in
+    /// four the code changes, to a compared value or a neighbouring
+    /// function or another method; the payload after it is mutated as by
+    /// `mutate_preserving_prefix`.
+    pub fn mutate_ioctl(&mut self, seed: &[u8]) -> Vec<u8> {
+        let mut out = self.mutate_preserving_prefix(seed, 4);
+        if out.len() >= 4 && self.next() % 4 == 0 {
+            let code = u32::from_le_bytes(out[..4].try_into().expect("four bytes"));
+            let code = match self.next() % 4 {
+                0 | 1 if !self.dictionary.is_empty() => self.word(),
+                2 => {
+                    let step = 1 + (self.next() % 4) as u32;
+                    let function = (code >> 2) & 0xfff;
+                    let function = if self.next() & 1 == 0 { function.wrapping_add(step) } else { function.wrapping_sub(step) } & 0xfff;
+                    (code & !(0xfff << 2)) | (function << 2)
+                }
+                _ => (code & !3) | (self.next() % 4) as u32,
+            };
+            out[..4].copy_from_slice(&code.to_le_bytes());
+        }
+        out
     }
     fn next(&mut self) -> u64 {
         self.state ^= self.state << 7;
@@ -622,7 +671,7 @@ impl Mutator {
         let operations = 1 + (self.next() % 8) as usize;
         for _ in 0..operations {
             let editable = out.len().saturating_sub(prefix_len);
-            match self.next() % 8 {
+            match self.next() % 9 {
                 0 if editable != 0 => {
                     let i = prefix_len + (self.next() as usize) % editable;
                     out[i] ^= 1 << (self.next() % 8);
@@ -661,6 +710,11 @@ impl Mutator {
                     let i = prefix_len + (self.next() as usize) % editable;
                     let n = (1 + self.next() as usize % 8).min(out.len() - i);
                     out[i..i + n].fill(if self.next() & 1 == 0 { 0 } else { 0xff });
+                }
+                8 if editable >= 4 && !self.dictionary.is_empty() => {
+                    let i = prefix_len + (self.next() as usize) % (editable - 3);
+                    let word = self.word();
+                    out[i..i + 4].copy_from_slice(&word.to_le_bytes());
                 }
                 _ => {}
             }
@@ -788,6 +842,8 @@ pub struct Engine {
     pending: BTreeMap<u64, Vec<usize>>,
     /// Names for findings' stacks: made at the first one (a PDB load).
     symbols: Option<vroom_kernel::symbolize::Symbolizer>,
+    /// The target's image (`entry_pc`'s), found by the first compare log.
+    target_image: Option<(u64, u64)>,
 }
 
 /// One input, in place and ready to run (`Engine::load_case`).
@@ -797,6 +853,16 @@ struct Case {
     reset_us: u64,
     /// The harness's watchpoints, at this input's addresses.
     watchpoints: Vec<MemoryWatch>,
+}
+
+/// The 4-byte fields comparison logging shifts by the operands'
+/// difference: the IOCTL code (the prefix) and the payload's first
+/// aligned words, where structure headers, sizes and magic values sit.
+pub fn cmp_fields(harness: &Harness, len: usize) -> Vec<usize> {
+    let prefix = if harness.ioctl_prefix { 4 } else { 0 };
+    let mut fields: Vec<usize> = if harness.ioctl_prefix { vec![0] } else { Vec::new() };
+    fields.extend((prefix..len.min(prefix + 32)).step_by(4).filter(|f| f + 4 <= len));
+    fields
 }
 
 /// The PDB cache the lab fills for the harness's VM (`<state>/symbols`).
@@ -891,6 +957,7 @@ impl Engine {
             planted: HashMap::new(),
             pending: BTreeMap::new(),
             symbols: None,
+            target_image: None,
         })
     }
 
@@ -1454,7 +1521,7 @@ impl Engine {
             self.vm.debug_write_register(
                 self.harness.cpu,
                 vroom_hv::debug::Register::Pstate,
-                registers.pstate | 0xc0,
+                isolated_pstate(registers.pstate),
             )?;
         }
         resume_vm(&mut self.vm, isolate)?;
@@ -2020,6 +2087,13 @@ fn resume_vm(vm: &mut vroom_vmm::Vmm, isolate: Option<usize>) -> Result<()> {
     Ok(())
 }
 
+/// PSTATE for the testcase's thread running alone: IRQs and FIQs masked
+/// (I, F), and no software step pending (SS: a comparison log or trace
+/// stepped this CPU before the reset).
+pub(crate) fn isolated_pstate(pstate: u64) -> u64 {
+    (pstate | 0xc0) & !(1 << 21)
+}
+
 /// The first instruction of an AArch64 exception vector entry.
 fn is_exception_vector(pc: u64, vbar: u64) -> bool {
     pc.checked_sub(vbar)
@@ -2168,6 +2242,20 @@ mod tests {
             BugClass::Timeout
         );
     }
+    #[test]
+    fn ioctl_mutations_keep_device_and_learn_codes() {
+        let mut m = Mutator::new(7, 64);
+        let seed = [0x03, 0x20, 0x22, 0x00, b'A', b'A'];
+        let codes: std::collections::BTreeSet<u32> =
+            (0..2000).map(|_| u32::from_le_bytes(m.mutate_ioctl(&seed)[..4].try_into().unwrap())).collect();
+        assert!(codes.len() > 4, "the code changes");
+        assert!(codes.iter().all(|c| c >> 14 == 0x222003 >> 14), "only function and method move: {codes:x?}");
+        m.learn(0x0022_206f);
+        m.learn(3);
+        assert_eq!(m.dictionary(), [0x0022_206f], "tiny values aren't kept");
+        assert!((0..2000).any(|_| m.mutate_ioctl(&seed)[..4] == 0x0022_206fu32.to_le_bytes()));
+    }
+
     #[test]
     fn mutator_is_bounded_and_reproducible() {
         let a = Mutator::new(7, 32).mutate(b"seed");

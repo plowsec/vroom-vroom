@@ -3,8 +3,8 @@
 //! and recovers the VM. Instances share corpus entries through a `Hub`.
 
 use crate::hub::{now, Entry, FindingReport, InstanceStats};
-use crate::{signature, BugClass, CorpusStore, CoverageBlock, Engine, Error, Mutator, Result};
-use std::collections::{BTreeSet, VecDeque};
+use crate::{cmp_fields, cmplog, signature, BugClass, CorpusStore, CoverageBlock, Engine, Error, Mutator, Result};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -17,6 +17,8 @@ pub struct CampaignOptions {
     pub ioctl: Option<u32>,
     pub boundary_seeds: bool,
     pub repeat_seed: bool,
+    /// Log each new corpus input's comparisons (Redqueen-style).
+    pub cmplog: bool,
     /// Mixed into the mutator seed so parallel instances don't all try the
     /// same mutations. Zero keeps a single run reproducible.
     pub salt: u64,
@@ -24,8 +26,33 @@ pub struct CampaignOptions {
     pub verbose: bool,
 }
 
+/// Parent weights: energy (novelty) scaled by speed against the corpus
+/// median, from 1/16 (16x slower) to 4x (4x faster). A handler that loops
+/// for seconds is picked rarely; inputs not timed yet count as typical.
+fn speed_weights(energy: &[u32], us: &[u64]) -> Vec<u32> {
+    let mut timed: Vec<u64> = us.iter().copied().filter(|&t| t != 0).collect();
+    timed.sort_unstable();
+    let mean = timed.get(timed.len() / 2).copied().unwrap_or(1).max(1);
+    energy
+        .iter()
+        .zip(us)
+        .map(|(&e, &t)| {
+            let t = if t == 0 { mean } else { t.clamp(mean / 4, mean * 16).max(1) };
+            ((u64::from(e) * 16 * mean / t) as u32).max(1)
+        })
+        .collect()
+}
+
 /// Rate window for `execs_per_sec`.
 const RATE_WINDOW: Duration = Duration::from_secs(5);
+/// Comparison logging: target instructions stepped at most per input, and
+/// the time it may take (each step ~0.5 ms).
+const CMP_STEPS: usize = 20_000;
+const CMP_BUDGET: Duration = Duration::from_millis(200);
+/// A loop compares at one site again and again: its first few pairs.
+const CMP_PER_SITE: usize = 4;
+/// Inputs one comparison log may suggest.
+const CMP_CANDIDATES: usize = 512;
 
 #[derive(Debug)]
 pub struct Campaign {
@@ -38,8 +65,14 @@ pub struct Campaign {
     fixed_prefix: Option<Vec<u8>>,
     corpus_inputs: Vec<Vec<u8>>,
     corpus_energy: Vec<u32>,
+    /// Each corpus input's last run time (µs; 0: not run here yet).
+    corpus_us: Vec<u64>,
     corpus_hashes: BTreeSet<String>,
     scheduled: VecDeque<Vec<u8>>,
+    /// Corpus inputs whose comparisons haven't been logged yet.
+    cmp_queue: VecDeque<Vec<u8>>,
+    /// Inputs comparison logging suggested, once each.
+    cmp_tried: BTreeSet<String>,
     mutator: Mutator,
     finding_novelty: BTreeSet<String>,
     iteration: usize,
@@ -124,6 +157,7 @@ impl Campaign {
             }
         }
         let mutator = Mutator::new(0x0076_326f_6f6d_u64 ^ options.salt, engine.harness.max_input);
+        let cmp_queue = VecDeque::from([seed.clone()]);
         let stats = InstanceStats {
             name: options.name.clone(),
             started: now(),
@@ -138,9 +172,12 @@ impl Campaign {
             prefix_len,
             fixed_prefix,
             corpus_inputs,
+            corpus_us: vec![0; corpus_energy.len()],
             corpus_energy,
             corpus_hashes,
             scheduled,
+            cmp_queue,
+            cmp_tried: BTreeSet::new(),
             mutator,
             finding_novelty: BTreeSet::new(),
             iteration: 0,
@@ -170,21 +207,67 @@ impl Campaign {
         self.iteration
     }
 
+    /// Log `parent`'s comparisons and queue the inputs that would turn them
+    /// the other way; keep the compared values for mutation.
+    fn compare(&mut self, parent: &[u8]) {
+        let fields = cmp_fields(&self.engine().harness, parent.len());
+        let cmps = match self.engine_mut().compare_log(parent, CMP_STEPS, CMP_BUDGET) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("comparison logging: {e}");
+                return;
+            }
+        };
+        let mut per_site = HashMap::<u64, usize>::new();
+        let cmps: Vec<_> = cmps
+            .into_iter()
+            .filter(|c| {
+                let n = per_site.entry(c.pc).or_default();
+                *n += 1;
+                *n <= CMP_PER_SITE
+            })
+            .collect();
+        for c in &cmps {
+            if let Ok(value) = u32::try_from(c.b) {
+                self.mutator.learn(value);
+            }
+        }
+        for input in cmplog::candidates(parent, &cmps, &fields, CMP_CANDIDATES) {
+            if self.fixed_prefix.as_ref().is_some_and(|p| !input.starts_with(p)) {
+                continue;
+            }
+            let hash = CorpusStore::hash(&input);
+            if !self.corpus_hashes.contains(&hash) && self.cmp_tried.insert(hash) {
+                self.scheduled.push_back(input);
+            }
+        }
+        self.stats.cmplog += 1;
+    }
+
     /// Run one input.
     pub fn step(&mut self) -> Result<()> {
+        if self.scheduled.is_empty() && self.options.cmplog && !self.options.repeat_seed {
+            if let Some(parent) = self.cmp_queue.pop_front() {
+                self.compare(&parent);
+            }
+        }
         let mut selected_parent = None;
         let input = if let Some(input) = self.scheduled.pop_front() {
             input
         } else if self.options.repeat_seed {
             self.seed.clone()
         } else {
-            let parent_index = self.mutator.choose_weighted(&self.corpus_energy);
+            let weights = speed_weights(&self.corpus_energy, &self.corpus_us);
+            let parent_index = self.mutator.choose_weighted(&weights);
             selected_parent = Some(parent_index);
             self.corpus_energy[parent_index] =
                 self.corpus_energy[parent_index].saturating_sub(1).max(1);
             let parent = &self.corpus_inputs[parent_index];
-            self.mutator
-                .mutate_preserving_prefix(parent, self.prefix_len)
+            if self.prefix_len == 4 && self.fixed_prefix.is_none() {
+                self.mutator.mutate_ioctl(parent)
+            } else {
+                self.mutator.mutate_preserving_prefix(parent, self.prefix_len)
+            }
         };
         let result = self.engine_mut().run_input(&input)?;
         let mut new_signatures = Vec::new();
@@ -211,6 +294,7 @@ impl Campaign {
                 self.store.save_input(&input, result.new_blocks)?;
                 self.corpus_inputs.push(input.clone());
                 self.corpus_energy.push(score);
+                self.corpus_us.push(result.elapsed_us);
             } else if let Some(index) = self
                 .corpus_inputs
                 .iter()
@@ -224,6 +308,7 @@ impl Campaign {
             }
             if result.new_blocks != 0 || result.new_edges != 0 {
                 self.stats.last_new_cov = Some(now());
+                self.cmp_queue.push_back(input.clone());
             }
             self.outbox.push(Entry {
                 hash: result.input_hash.clone(),
@@ -346,6 +431,7 @@ impl Campaign {
         self.corpus_hashes.insert(entry.hash);
         self.corpus_inputs.push(entry.data);
         self.corpus_energy.push(score);
+        self.corpus_us.push(0);
         Ok(())
     }
 
@@ -406,5 +492,19 @@ impl Campaign {
             engine.coverage.executions as f64 / self.started.elapsed().as_secs_f64()
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::speed_weights;
+
+    #[test]
+    fn slow_parents_are_picked_less() {
+        // Same energy; 1 ms, 2 ms, 4 s, and one not timed yet.
+        let w = speed_weights(&[4, 4, 4, 4], &[1000, 2000, 4_000_000, 0]);
+        assert!(w[0] > w[1] && w[1] > w[2], "{w:?}");
+        assert_eq!(w[3], 4 * 16, "untimed counts as typical");
+        assert!(w[2] >= 1);
     }
 }

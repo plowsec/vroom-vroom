@@ -351,6 +351,24 @@ pub fn discover_kernel(memory: &impl VirtualMemory, anchors: &[u64]) -> Result<I
     ))
 }
 
+/// The PE image `address` is in: the closest `MZ` below it, at 64 KiB
+/// steps (where Windows maps images), whose size covers it.
+pub fn image_containing(memory: &impl VirtualMemory, address: u64) -> Result<Image> {
+    for offset in 0..4096u64 {
+        let Some(base) = (address & !0xffff).checked_sub(offset * 65536) else { break };
+        let mut magic = [0; 2];
+        if memory.read(base, &mut magic).is_err() || &magic != b"MZ" {
+            continue;
+        }
+        if let Ok(image) = Image::read(memory, base) {
+            if address < base + u64::from(image.size) {
+                return Ok(image);
+            }
+        }
+    }
+    Err(bad("no PE image around this address"))
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Module {
     pub base: u64,

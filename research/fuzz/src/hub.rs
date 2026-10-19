@@ -70,6 +70,9 @@ pub struct InstanceStats {
     pub exec_us: u64,
     pub reset_us: u64,
     pub foreign_threads: u64,
+    /// Inputs whose comparisons were logged.
+    #[serde(default)]
+    pub cmplog: u64,
     pub done: bool,
 }
 

@@ -13,6 +13,8 @@ vroom-fuzz fleet harness.json payload.bin --ioctl 0x222003 --workers 4 --output 
 vroom-fuzz serve harness.json --listen 0.0.0.0:7979 --output runs/shared --tui            # master for other machines
 vroom-fuzz fleet harness.json payload.bin --ioctl 0x222003 --workers 6 --output runs/l --master host:7979
 vroom-fuzz run harness.json payload.bin --master host:7979 --state-dir w0.state --output runs/w0   # one worker
+vroom-fuzz run harness.json seed.bin --output runs/d --duration-secs 60           # no --ioctl: the seed's code is mutated too
+vroom-fuzz cmplog harness.json input.bin                        # one input's comparisons, candidates
 vroom-fuzz coverage runs/a/coverage.json runs/a/blocks.json     # per-function summary
 vroom-fuzz trace harness.json runs/a/crashes/<hash>-BugCheck.bin --blocks all-blocks.json   # replay, symbolized
 ```
@@ -33,8 +35,11 @@ Trace file: `N  PC  module!function+0xoff` per instruction from the snapshot to 
 | `--iterations N` / `--duration-secs S` | stop condition (default 100 inputs) |
 | `--no-boundary-seeds` | skip the payload-size seeds |
 | `--repeat-seed` | replay the seed, rotating function-entry breakpoints |
+| `--no-cmplog` | no comparison logging |
 | `--tui` | dashboard instead of JSON lines; `q` stops |
 | `--master ADDR` `--name` `--state-dir` `--salt` | worker of a master |
+
+Comparison logging (Redqueen-style): each new corpus input runs once stepped through the target's image (≤200 ms); its comparisons (`cmp`, `cmn`, `ccmp`, `cbz`, `tbz`) become inputs that turn them the other way (operand found in the input → the other operand ±1; IOCTL and first payload words shifted by the operands' difference) and dictionary words. Without `--ioctl`, one mutation in four changes the code (dictionary, function ±1–4, method). Parents: novelty × speed (median-relative). HEVD: 29/29 IOCTLs from a zero code in ~0.1 s (blocks mode).
 
 Output dir: `inputs/`, `crashes/<hash>-<class>.{bin,json}` (`stack`: symbolized), `coverage.json`, `blocks.json`, `stats.json` (every 5 s).
 Kernel TUI: `coverage runs/a/coverage.json`, `coverage-diff runs/a/coverage.json runs/b/coverage.json`.

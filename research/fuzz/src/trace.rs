@@ -101,7 +101,7 @@ impl Engine {
         let (_, first) = registers(self)?;
         if self.harness.isolate_cpu {
             // As a run: nothing preempts the testcase's thread.
-            self.vm.debug_write_register(cpu, vroom_hv::debug::Register::Pstate, first.pstate | 0xc0)?;
+            self.vm.debug_write_register(cpu, vroom_hv::debug::Register::Pstate, crate::isolated_pstate(first.pstate))?;
         }
         let mut symbols = {
             let space = AddressSpace { memory: &self.vm, registers: &first };

@@ -120,6 +120,18 @@ enum Command {
         #[arg(long)]
         state_dir: Option<PathBuf>,
     },
+    /// The comparisons an input makes in the target's code (operands as
+    /// they were), and how many new inputs they suggest.
+    Cmplog {
+        harness: PathBuf,
+        input: PathBuf,
+        /// Target instructions to step at most.
+        #[arg(long, default_value_t = 20_000)]
+        max_steps: usize,
+        /// Use this VM state directory instead of the harness's.
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
     /// Replay one input (a saved crash) an instruction at a time: each one
     /// symbolized, then how it ended, the call tree and the stack there.
     Trace {
@@ -158,6 +170,10 @@ struct FuzzArgs {
     /// Replay the seed while rotating unresolved-branch breakpoints.
     #[arg(long)]
     repeat_seed: bool,
+    /// No comparison logging (operands of the target's comparisons turned
+    /// into inputs and dictionary words).
+    #[arg(long)]
+    no_cmplog: bool,
     /// Keep fuzzing until this many seconds have elapsed (overrides iterations).
     #[arg(long)]
     duration_secs: Option<u64>,
@@ -291,6 +307,26 @@ fn main() -> Result<()> {
             listen,
             tui: !no_tui,
         })?,
+        Command::Cmplog { harness, input, max_steps, state_dir } => {
+            let mut h = Harness::load(&harness)?;
+            if let Some(dir) = state_dir {
+                h.state_dir = dir;
+            }
+            let data = std::fs::read(&input)?;
+            let fields = vroom_fuzz::cmp_fields(&h, data.len());
+            let mut engine = Engine::open(h)?;
+            engine.instrument()?;
+            // As in a campaign: the input runs first.
+            engine.run_input(&data)?;
+            let started = std::time::Instant::now();
+            let cmps = engine.compare_log(&data, max_steps, std::time::Duration::from_secs(60))?;
+            for c in &cmps {
+                println!("{}", serde_json::json!({"pc": format!("{:#x}", c.pc), "a": format!("{:#x}", c.a), "b": format!("{:#x}", c.b), "bits": c.bits}));
+            }
+            let candidates = vroom_fuzz::cmplog::candidates(&data, &cmps, &fields, usize::MAX);
+            eprintln!("{} comparisons, {} candidate inputs, {:.0} ms", cmps.len(), candidates.len(), started.elapsed().as_secs_f64() * 1e3);
+
+        }
         Command::Trace { harness, input, out, max, registers, blocks, state_dir } => {
             let mut h = Harness::load(&harness)?;
             if let Some(dir) = state_dir {
@@ -535,6 +571,7 @@ fn run(args: RunArgs) -> Result<()> {
             ioctl: args.fuzz.ioctl,
             boundary_seeds: !args.fuzz.no_boundary_seeds,
             repeat_seed: args.fuzz.repeat_seed,
+            cmplog: !args.fuzz.no_cmplog,
             salt,
             verbose,
         },

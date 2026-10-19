@@ -141,7 +141,7 @@ uv run --project research/tui --extra angr python research/fuzz/tools/angr_ioctl
 | `$CK/hevd-harness-all-safe.json` | 5-byte inputs, no crash, fastest |
 | `$CK/hevd-harness-all-30s.json` | 4068-byte inputs, finds the BugCheck (`state_dir`: `$VM/fuzz.state`) |
 
-Seed `$CK/one-byte-payload.bin` (one `00`), IOCTL `0x222003` (stack overflow).
+Seed `$CK/one-byte-payload.bin` (one `00`), IOCTL `0x222003` (stack overflow), except in step 3.
 
 1. Check:
 
@@ -160,7 +160,21 @@ head -3 $OUT/probe/results.jsonl
 
 - New `--output` each time; edges mode only; `--state-dir` optional.
 
-3. Run, edges (default), dashboard:
+3. Discover the IOCTLs: no `--ioctl`, the seed carries a code (any: `00000000` here) and the code is mutated too:
+
+```bash
+jq '. + {coverage_mode: "blocks"}' $CK/hevd-harness-all-safe.json > $OUT/blocks-safe.json
+printf '\0\0\0\0\0' > $OUT/zero.bin
+$F run $OUT/blocks-safe.json $OUT/zero.bin --duration-secs 20 --tui --state-dir $OUT/state-d --output $OUT/discover
+for f in $OUT/discover/inputs/*; do od -An -tx4 -N4 "$f"; done | sort -u   # 0x222003..0x222073, and a few neighbours
+```
+
+- 29/29 IOCTLs in ~0.1 s; 527/600 blocks, ~950 exec/s.
+- Comparison logging: each new corpus input runs once stepped through HEVD's code. Its comparisons (`cmp w3, w8`: the code against a literal; `cmp w8, #3` after `sub w8, w3, #0x222000`) become inputs that turn them the other way, and dictionary words. `--no-cmplog`: 0/29 from this seed.
+- `$F cmplog $OUT/blocks-safe.json $OUT/zero.bin`: one input's comparisons.
+- Edges mode reaches them too, but exits on every loop iteration of a handler (one takes ~2 s): blocks mode.
+
+4. Run, edges (default), dashboard:
 
 ```bash
 $F run $CK/hevd-harness-all-safe.json $CK/one-byte-payload.bin --ioctl 0x222003 \
@@ -170,7 +184,7 @@ $F run $CK/hevd-harness-all-safe.json $CK/one-byte-payload.bin --ioctl 0x222003 
 - Dashboard: progress, coverage (blocks/600, functions/49), throughput (exec/s, exec ms, reset ms), findings, per-function bars. `q` / Esc / Ctrl-C: stop and save.
 - ~10 s start (2.4 GB snapshot), then inputs.
 
-4. Blocks mode (one-shot BRK per uncovered block):
+5. Blocks mode (one-shot BRK per uncovered block):
 
 ```bash
 jq '. + {coverage_mode: "blocks"}' $CK/hevd-harness-all-safe.json > $OUT/blocks-safe.json
@@ -193,7 +207,7 @@ $F run $OUT/blocks-safe.json $CK/one-byte-payload.bin --ioctl 0x222003 \
 | 3 workers, blocks | ~2,800 exec/s |
 | crash | <1 ms to the bugcheck, ~0.5 ms reset (was ~11 s) |
 
-5. Show a crash:
+6. Show a crash:
 
 ```bash
 $F run $CK/hevd-harness-all-30s.json $CK/one-byte-payload.bin --ioctl 0x222003 \
@@ -213,14 +227,14 @@ $F run $CK/hevd-harness-all-30s.json $(ls $OUT/crash/crashes/*-BugCheck.bin | he
   --no-boundary-seeds --iterations 1 --state-dir $OUT/state-c --output $OUT/replay
 ```
 
-6. Correctness: RAM, untouched devices and GIC registers checked against the snapshot after every reset (~1 s per input). Silent = pass; a mismatch stops the run and lists the pages.
+7. Correctness: RAM, untouched devices and GIC registers checked against the snapshot after every reset (~1 s per input). Silent = pass; a mismatch stops the run and lists the pages.
 
 ```bash
 VROOM_COW_VERIFY=1 $F run $CK/hevd-harness-all-30s.json $CK/one-byte-payload.bin --ioctl 0x222003 \
   --iterations 20 --state-dir $OUT/state-c --output $OUT/verify
 ```
 
-7. Workers (one VM each, ~9 GB). Fuzz VMs drop host port forwards and keep their own EFI vars, so they run beside each other and beside the lab.
+8. Workers (one VM each, ~9 GB). Fuzz VMs drop host port forwards and keep their own EFI vars, so they run beside each other and beside the lab.
 
 ```bash
 jq '. + {coverage_mode: "blocks"}' $CK/hevd-harness-all-safe.json > $OUT/fleet.json
@@ -236,7 +250,7 @@ $F run $OUT/fleet.json $CK/one-byte-payload.bin --ioctl 0x222003 \
 
 - Other machines: same snapshot, disk layers and config at the same paths; `VROOM_FUZZ_TOKEN` on both.
 
-8. Output (`--output`):
+9. Output (`--output`):
 
 | | |
 |---|---|
