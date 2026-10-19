@@ -311,7 +311,16 @@ only. Windows' 2D driver tops out around 2560x1600 per monitor.
 ## 3D acceleration (Linux guests)
 
 `scripts/app.sh` builds it (alone: `scripts/build-angle.sh`, then
-`scripts/build-virglrenderer.sh`). `[display] gpu = "virtio3d"`. Stock Ubuntu works.
+`scripts/build-virglrenderer.sh`). `[display] gpu = "virtio3d"`.
+
+Known broken: GNOME on Ubuntu 26.04 draws nothing with `virtio3d`. Its
+shell makes a guest-memory blob (`BLOB_MEM_GUEST`, no host GL object) on
+context 0 and then blits it from its own context; `vrend_renderer_blit`
+answers `Illegal resource N`, and virglrenderer marks that context broken
+for good, so every later command buffer is refused and the desktop stays
+black. The VMM says so once, with the context and its name, and the way
+out is `gpu = "virtio2d"`: a plain framebuffer, GNOME on llvmpipe, no 3D.
+Older guests whose Mesa does not take that path are unaffected.
 
 - **OpenGL** (virgl): up to 4.1 on macOS's OpenGL.
 - **Vulkan** (Venus): 1.3. Needs `mesa-vulkan-drivers` (Mesa ≥ 24) and the
