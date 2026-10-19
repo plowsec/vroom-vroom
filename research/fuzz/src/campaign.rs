@@ -322,7 +322,8 @@ impl Campaign {
                 findings: result.findings.iter().map(signature).collect(),
             });
         }
-        for finding in &result.findings {
+        // One input per signature: the first that made it.
+        for finding in result.findings.iter().filter(|f| new_signatures.contains(&signature(f))) {
             self.store.save_finding(finding, &input)?;
         }
         self.stats.execs += 1;

@@ -51,7 +51,7 @@ Trace file: `N  PC  module!function+0xoff` per instruction from the snapshot to 
 
 Comparison logging (Redqueen-style): each new corpus input runs once stepped through the target's image (≤200 ms); its comparisons (`cmp`, `cmn`, `ccmp`, `cbz`, `tbz`) become inputs that turn them the other way (operand found in the input → the other operand ±1; IOCTL and first payload words shifted by the operands' difference) and dictionary words. Without `--ioctl`, one mutation in four changes the code (dictionary, function ±1–4, method). Parents: novelty × speed (median-relative). HEVD: 29/29 IOCTLs from a zero code in ~0.1 s (blocks mode).
 
-Output dir: `inputs/`, `crashes/<hash>-<class>.{bin,json}` (`stack`: symbolized), `coverage.json`, `blocks.json`, `stats.json` (every 5 s).
+Output dir: `inputs/`, `crashes/<hash>-<class>.{bin,json}` (first input per signature; `stack`: symbolized), `coverage.json`, `blocks.json`, `stats.json` (every 5 s).
 
 Signature (dedupe): class + the 3 innermost functions of the faulting code (offsets dropped; frames above the kernel's exception entry and `KeBugCheck*` skipped); `<wild jump>` for a PC outside every image; else class + PC. Functions without a PDB: the block list's names, else `.pdata` starts as `sub_<address at 0x140000000>`.
 

@@ -169,7 +169,8 @@ $F run $OUT/blocks-safe.json $OUT/zero.bin --duration-secs 20 --tui --state-dir 
 for f in $OUT/discover/inputs/*; do od -An -tx4 -N4 "$f"; done | sort -u   # 0x222003..0x222073, and a few neighbours
 ```
 
-- 29/29 IOCTLs in ~0.1 s; 527/600 blocks, ~950 exec/s.
+- 29/29 IOCTLs in ~0.1 s; 527/600 blocks, ~900 exec/s.
+- 7 bugs in 20 s from 5-byte inputs, most caught by HEVD's own `__try` (`crashes/`, one input per signature): NULL dereference (`0x22202b`), type confusion (`0x222023`, jump to 0), uninitialized stack (`0x22202f`, bugcheck 0x50) and heap (`0x222033`, wild jump) variables, NULL write-what-where (`0x22200b`), `0x222047`, `0x222073`. Then `$F triage $OUT/blocks-safe.json $OUT/discover/crashes/HASH-CLASS.bin`.
 - Comparison logging: each new corpus input runs once stepped through HEVD's code. Its comparisons (`cmp w3, w8`: the code against a literal; `cmp w8, #3` after `sub w8, w3, #0x222000`) become inputs that turn them the other way, and dictionary words. `--no-cmplog`: 0/29 from this seed.
 - `$F cmplog $OUT/blocks-safe.json $OUT/zero.bin`: one input's comparisons.
 - Edges mode reaches them too, but exits on every loop iteration of a handler (one takes ~2 s): blocks mode.

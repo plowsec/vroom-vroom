@@ -1538,7 +1538,12 @@ impl Engine {
         // The target's, or a jump out of all code (a smashed return
         // address, a corrupt function pointer).
         let wild = !symbols.in_module(address);
-        if !wild && !(lo..hi).contains(&address) && !frames.iter().any(|(pc, _)| (lo..hi).contains(pc)) {
+        let theirs = !wild && !(lo..hi).contains(&address) && !frames.iter().any(|(pc, _)| (lo..hi).contains(pc));
+        if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
+            let names: Vec<&str> = frames.iter().take(6).map(|(_, n)| n.as_str()).collect();
+            eprintln!("exception {code:#x} at {address:#x}{}: {names:?}", if theirs { " (not the target's)" } else { "" });
+        }
+        if theirs {
             return Ok(None);
         }
         let what = match (code, kind) {
