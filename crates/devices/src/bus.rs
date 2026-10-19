@@ -94,7 +94,8 @@ impl BusBuilder {
 
     pub fn build(mut self) -> Bus {
         self.entries.sort_by_key(|(r, _)| r.base);
-        Bus { entries: Arc::new(self.entries) }
+        let accesses = Arc::new(self.entries.iter().map(|_| std::sync::atomic::AtomicU64::new(0)).collect());
+        Bus { entries: Arc::new(self.entries), accesses }
     }
 }
 
@@ -103,6 +104,8 @@ impl BusBuilder {
 #[derive(Clone, Default)]
 pub struct Bus {
     entries: Arc<Vec<(BusRange, Entry)>>,
+    /// Guest accesses per entry, ever: whether a device was touched since.
+    accesses: Arc<Vec<std::sync::atomic::AtomicU64>>,
 }
 
 impl std::fmt::Debug for Bus {
@@ -112,13 +115,24 @@ impl std::fmt::Debug for Bus {
 }
 
 impl Bus {
-    fn find(&self, addr: u64) -> Option<(u64, &Entry)> {
+    fn index(&self, addr: u64) -> Option<usize> {
         let i = self.entries.partition_point(|(r, _)| r.base <= addr);
-        if i == 0 {
-            return None;
+        (i != 0 && addr < self.entries[i - 1].0.end()).then(|| i - 1)
+    }
+
+    fn find(&self, addr: u64) -> Option<(u64, &Entry)> {
+        let i = self.index(addr)?;
+        if let Some(n) = self.accesses.get(i) {
+            n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        let (r, d) = &self.entries[i - 1];
-        (addr < r.end()).then(|| (addr - r.base, d))
+        let (r, d) = &self.entries[i];
+        Some((addr - r.base, d))
+    }
+
+    /// Guest accesses so far to the device mapped at `addr`.
+    pub fn accesses(&self, addr: u64) -> Option<u64> {
+        let i = self.index(addr)?;
+        self.accesses.get(i).map(|n| n.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     /// Returns false if nothing is mapped at `addr`.

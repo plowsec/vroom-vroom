@@ -49,6 +49,25 @@ extern "system" {
     fn FreeReservedLog(marshal: *mut c_void, count: u32, adjustment: *mut i64) -> Bool;
     fn CreateLogContainerScanContext(log: Handle, from: u32, count: u32, mode: u8, scan: *mut c_void, overlapped: *mut c_void) -> Bool;
     fn ScanLogContainers(scan: *mut c_void, mode: u8, reserved: *mut c_void) -> Bool;
+    fn WriteLogRestartArea(marshal: *mut c_void, buffer: *const c_void, size: u32, base: *const Lsn, flags: u32, written: *mut u32, next: *mut Lsn, overlapped: *mut c_void) -> Bool;
+    fn ReadLogRestartArea(marshal: *mut c_void, buffer: *mut *mut c_void, size: *mut u32, lsn: *mut Lsn, context: *mut *mut c_void, overlapped: *mut c_void) -> Bool;
+    fn ReadPreviousLogRestartArea(context: *mut c_void, buffer: *mut *mut c_void, size: *mut u32, lsn: *mut Lsn, overlapped: *mut c_void) -> Bool;
+    fn PrepareLogArchive(log: Handle, name: *mut u16, len: u32, low: *const Lsn, high: *const Lsn, actual: *mut u32, offset: *mut u64, length: *mut u64, base: *mut Lsn, last: *mut Lsn, tail: *mut Lsn, context: *mut *mut c_void) -> Bool;
+    fn GetNextLogArchiveExtent(context: *mut c_void, extents: *mut c_void, count: u32, returned: *mut u32) -> Bool;
+    fn ReadLogArchiveMetadata(context: *mut c_void, offset: u32, size: u32, buffer: *mut u8, read: *mut u32) -> Bool;
+    fn TerminateLogArchive(context: *mut c_void) -> Bool;
+    fn AddLogContainerSet(log: Handle, count: u16, size: *mut u64, paths: *const *const u16, reserved: *mut c_void) -> Bool;
+    fn RemoveLogContainerSet(log: Handle, count: u16, paths: *const *const u16, force: Bool, reserved: *mut c_void) -> Bool;
+    fn GetLogContainerName(log: Handle, container: u32, name: *mut u16, len: u32, actual: *mut u32) -> Bool;
+    fn AlignReservedLog(marshal: *mut c_void, count: u32, sizes: *const i64, aligned: *mut i64) -> Bool;
+    fn ReserveAndAppendLogAligned(marshal: *mut c_void, entries: *const WriteEntry, count: u32, alignment: u32, undo: *const Lsn, previous: *const Lsn, reserve: u32, reservations: *mut i64, flags: u32, lsn: *mut Lsn, overlapped: *mut c_void) -> Bool;
+    fn SetEndOfLog(log: Handle, end: *const Lsn, overlapped: *mut c_void) -> Bool;
+    fn InstallLogPolicy(log: Handle, policy: *const c_void) -> Bool;
+    fn RemoveLogPolicy(log: Handle, kind: u32) -> Bool;
+    fn QueryLogPolicy(log: Handle, kind: u32, policy: *mut c_void, size: *mut u32) -> Bool;
+    fn SetLogFileSizeWithPolicy(log: Handle, desired: *const u64, resulting: *mut u64) -> Bool;
+    fn HandleLogFull(log: Handle) -> Bool;
+    fn SetLogArchiveMode(log: Handle, mode: u32) -> Bool;
 }
 
 #[link(name = "kernel32")]
@@ -301,6 +320,136 @@ impl State {
                 ScanLogContainers(scan.as_mut_ptr().cast(), CLFS_SCAN_CLOSE, null_mut());
                 SetLastError(error);
                 ok
+            }
+            // Restart areas: write one (flags, base LSN, bytes), or read the
+            // latest and the ones before it.
+            15 => {
+                let marshal = self.marshal(a.u8());
+                let flags = a.u8() as u32;
+                let base = self.lsn(&mut a);
+                let data = a.rest();
+                let (mut written, mut next) = (0, 0);
+                let ok = WriteLogRestartArea(marshal, data.as_ptr().cast(), data.len() as u32, &base, flags, &mut written, &mut next, null_mut());
+                self.lsns[13] = next;
+                ok
+            }
+            16 => {
+                let marshal = self.marshal(a.u8());
+                let more = a.u8() % 8;
+                let (mut buffer, mut size, mut lsn, mut context) = (null_mut(), 0, 0, null_mut());
+                if ReadLogRestartArea(marshal, &mut buffer, &mut size, &mut lsn, &mut context, null_mut()) == 0 {
+                    return 0;
+                }
+                self.lsns[12] = lsn;
+                for _ in 0..more {
+                    if ReadPreviousLogRestartArea(context, &mut buffer, &mut size, &mut lsn, null_mut()) == 0 {
+                        break;
+                    }
+                }
+                TerminateReadLog(context)
+            }
+            // Archive: between two LSNs, extents, base log metadata.
+            17 => {
+                let log = self.log(a.u8());
+                let (low, high) = (self.lsn(&mut a), self.lsn(&mut a));
+                let extents = a.u8() as u32 % 5;
+                let (offset, length) = (a.u32() % 0x10_0000, a.u16() as u32);
+                let mut name = [0u16; 260];
+                let (mut actual, mut off, mut len, mut base, mut last, mut tail, mut context) = (0, 0, 0, 0, 0, 0, null_mut());
+                let bounds = a.u8();
+                let (pl, ph) = (if bounds & 1 != 0 { &low as *const Lsn } else { null() }, if bounds & 2 != 0 { &high as *const Lsn } else { null() });
+                if PrepareLogArchive(log, name.as_mut_ptr(), name.len() as u32, pl, ph, &mut actual, &mut off, &mut len, &mut base, &mut last, &mut tail, &mut context) == 0 {
+                    return 0;
+                }
+                let mut descriptors = vec![0u8; 1024 * 4];
+                let mut returned = 0;
+                GetNextLogArchiveExtent(context, descriptors.as_mut_ptr().cast(), extents, &mut returned);
+                let mut buffer = vec![0u8; length as usize];
+                let mut read = 0;
+                ReadLogArchiveMetadata(context, offset, length, buffer.as_mut_ptr(), &mut read);
+                TerminateLogArchive(context)
+            }
+            // Container sets: add (size) or remove (force) up to 4 at once.
+            18 => {
+                let log = self.log(a.u8());
+                let how = a.u8();
+                let count = 1 + a.u8() % 4;
+                let mut size = u64::from(a.u32() % (8 << 20));
+                let names: Vec<Vec<u16>> = (0..count).map(|_| wide(&format!("C:\\clfs\\c{}", a.u8() % 8))).collect();
+                let paths: Vec<*const u16> = names.iter().map(|n| n.as_ptr()).collect();
+                if how & 1 == 0 {
+                    AddLogContainerSet(log, count as u16, &mut size, paths.as_ptr(), null_mut())
+                } else {
+                    RemoveLogContainerSet(log, count as u16, paths.as_ptr(), i32::from(how & 2 != 0), null_mut())
+                }
+            }
+            19 => {
+                let log = self.log(a.u8());
+                let container = a.u32();
+                let mut name = vec![0u16; a.u16() as usize % 1025];
+                let mut actual = 0;
+                GetLogContainerName(log, container, name.as_mut_ptr(), name.len() as u32, &mut actual)
+            }
+            // Aligned reservations, then an aligned append with them.
+            20 => {
+                let marshal = self.marshal(a.u8());
+                let count = 1 + a.u8() as usize % 4;
+                let mut sizes: Vec<i64> = (0..count).map(|_| (a.u32() % (8 << 20)) as i64).collect();
+                let mut aligned = 0;
+                if AlignReservedLog(marshal, count as u32, sizes.as_ptr(), &mut aligned) == 0 {
+                    return 0;
+                }
+                let alignment = a.u32() % 0x1_0001;
+                let flags = a.u8() as u32;
+                let into = a.u8() as usize % 16;
+                let undo = self.lsn(&mut a);
+                let previous = self.lsn(&mut a);
+                let data = a.rest();
+                let entry = WriteEntry { buffer: data.as_ptr().cast(), length: data.len() as u32 };
+                let mut lsn = 0;
+                let ok = ReserveAndAppendLogAligned(marshal, &entry, 1, alignment, &undo, &previous, count as u32, sizes.as_mut_ptr(), flags, &mut lsn, null_mut());
+                self.lsns[into] = lsn;
+                ok
+            }
+            21 => {
+                let log = self.log(a.u8());
+                let end = self.lsn(&mut a);
+                SetEndOfLog(log, &end, null_mut())
+            }
+            // Management policies: install one from raw bytes (version,
+            // length, flags, type, parameters, as the payload says), remove
+            // or query one by type.
+            22 => {
+                let log = self.log(a.u8());
+                let mut policy = vec![0u8; 1024];
+                let raw = a.rest();
+                policy[..raw.len().min(1024)].copy_from_slice(&raw[..raw.len().min(1024)]);
+                InstallLogPolicy(log, policy.as_ptr().cast())
+            }
+            23 => {
+                let log = self.log(a.u8());
+                let kind = a.u8() as u32 % 11;
+                if a.u8() & 1 == 0 {
+                    RemoveLogPolicy(log, kind)
+                } else {
+                    let mut policy = vec![0u8; 1024];
+                    let mut size = a.u16() as u32 % 1025;
+                    QueryLogPolicy(log, kind, policy.as_mut_ptr().cast(), &mut size)
+                }
+            }
+            24 => {
+                let log = self.log(a.u8());
+                if a.u8() & 1 == 0 {
+                    let desired = u64::from(a.u32() % 64);
+                    let mut resulting = 0;
+                    SetLogFileSizeWithPolicy(log, &desired, &mut resulting)
+                } else {
+                    HandleLogFull(log)
+                }
+            }
+            25 => {
+                let log = self.log(a.u8());
+                SetLogArchiveMode(log, a.u8() as u32 % 4)
             }
             _ => 1,
         }

@@ -188,6 +188,10 @@ struct ResearchBaseline {
     devices_ran: bool,
     /// Devices whose saved state changes by itself (`VROOM_COW_VERIFY`).
     drifting: Vec<bool>,
+    /// Per device, guest accesses to its registers when it last held its
+    /// saved state; None for devices that also change by themselves
+    /// (behind the PCI root: workers, DMA).
+    accesses: Vec<Option<u64>>,
 }
 
 impl std::fmt::Debug for Vmm {
@@ -410,7 +414,9 @@ impl Vmm {
             }
         }
         let device_exits = self.shared.device_exits.load(std::sync::atomic::Ordering::Relaxed);
+        let accesses = self.device_accesses();
         self.research_baseline = Some(ResearchBaseline {
+            accesses,
             devices,
             vcpus,
             irqchip,
@@ -422,6 +428,20 @@ impl Vmm {
             drifting,
         });
         Ok(())
+    }
+
+    #[cfg(feature = "research")]
+    /// Guest accesses so far to each device that changes only through its
+    /// registers (an MMIO device: `name@base`).
+    fn device_accesses(&self) -> Vec<Option<u64>> {
+        self.devices
+            .iter()
+            .map(|d| {
+                let id = d.lock().unwrap_or_else(|e| e.into_inner()).snapshot_id();
+                let base = u64::from_str_radix(id.split_once('@')?.1, 16).ok()?;
+                self.shared.mmio.accesses(base)
+            })
+            .collect()
     }
 
     #[cfg(feature = "research")]
@@ -495,13 +515,22 @@ impl Vmm {
             return Err(Error::Setup("research reset requires a paused VM".into()));
         }
         let verify = std::env::var_os("VROOM_COW_VERIFY").is_some();
+        let profile = std::env::var_os("VROOM_RESET_PROFILE").is_some();
+        let t0 = std::time::Instant::now();
+        let mut marks: Vec<(&str, std::time::Duration)> = Vec::new();
+        let mut pages = 0u64;
         let device_exits = self.shared.device_exits.load(std::sync::atomic::Ordering::Relaxed);
+        let accesses = self.device_accesses();
         let Some(baseline) = &mut self.research_baseline else {
             return Err(Error::Setup("research baseline is not armed".into()));
         };
         let devices_idle = !baseline.devices_ran && baseline.device_exits == device_exits;
         baseline.devices_ran = false;
         baseline.device_exits = device_exits;
+        // MMIO devices the guest didn't touch still hold their state: the
+        // TPM's restore alone (its state to swtpm) costs ~3 ms.
+        let untouched: Vec<bool> = baseline.accesses.iter().zip(&accesses).map(|(was, now)| was.is_some() && was == now).collect();
+        baseline.accesses = accesses;
         let baseline = &*baseline;
         let mem = &self.mem;
         if baseline.logged {
@@ -512,7 +541,10 @@ impl Vmm {
             let mut written: Vec<(vroom_memory::GuestAddress, u64)> =
                 self.vm.take_dirty_log()?.into_iter().map(|(gpa, len)| (vroom_memory::GuestAddress(gpa), len)).collect();
             written.extend(mem.take_host_writes());
+            pages = written.iter().map(|(_, len)| len / 4096).sum();
+            marks.push(("dirty log", t0.elapsed()));
             mem.restore_cow_copy(&written)?;
+            marks.push(("copy back", t0.elapsed()));
             for &(gpa, len) in &written {
                 if let Some(r) = mem.regions().find(|r| gpa >= r.start() && gpa.0 < r.end().0) {
                     // SAFETY: inside that region's mapping; every CPU is paused.
@@ -536,7 +568,9 @@ impl Vmm {
             }
         }
         // Paused devices have no request running.
+        marks.push(("icache", t0.elapsed()));
         let dropped = self.disks.rollback()?;
+        marks.push(("disks", t0.elapsed()));
         if dropped > 0 {
             log::trace!("research reset: dropped {dropped} bytes of disk writes");
         }
@@ -547,6 +581,7 @@ impl Vmm {
             self.vm.restore_irqchip(irqchip)?;
         }
         self.vm.set_clock(baseline.clock);
+        marks.push(("gic+clock", t0.elapsed()));
         if devices_idle {
             if verify {
                 for ((d, state), _) in self.devices.iter().zip(&baseline.devices).zip(&baseline.drifting).filter(|(_, drifting)| !**drifting) {
@@ -557,10 +592,19 @@ impl Vmm {
                 }
             }
         } else {
-            for (d, state) in self.devices.iter().zip(&baseline.devices) {
-                d.lock().unwrap_or_else(|e| e.into_inner()).restore(state)?;
+            for ((d, state), untouched) in self.devices.iter().zip(&baseline.devices).zip(&untouched) {
+                if *untouched {
+                    continue;
+                }
+                let t = std::time::Instant::now();
+                let mut d = d.lock().unwrap_or_else(|e| e.into_inner());
+                d.restore(state)?;
+                if profile && t.elapsed() > std::time::Duration::from_micros(200) {
+                    eprintln!("  restore {} {:.2} ms ({} bytes)", d.snapshot_id(), t.elapsed().as_secs_f64() * 1e3, state.len());
+                }
             }
         }
+        marks.push(("devices", t0.elapsed()));
         let mut cpus = self.shared.cpus.lock().unwrap_or_else(|e| e.into_inner()).clone();
         for (v, state) in self.vcpus.iter().zip(&baseline.vcpus) {
             cpus.set_on(state.index as usize, state.powered_on);
@@ -576,6 +620,12 @@ impl Vmm {
             }
         }
         *self.shared.cpus.lock().unwrap_or_else(|e| e.into_inner()) = cpus;
+        if profile {
+            marks.push(("vcpus", t0.elapsed()));
+            let mut last = std::time::Duration::ZERO;
+            let parts: Vec<String> = marks.iter().map(|(n, t)| { let d = *t - last; last = *t; format!("{n} {:.2}", d.as_secs_f64() * 1e3) }).collect();
+            eprintln!("reset {:.2} ms: {} pages, devices {}; {}", t0.elapsed().as_secs_f64() * 1e3, pages, if devices_idle { "idle" } else { "ran" }, parts.join(", "));
+        }
         if verify {
             // The irqchip blob can't be compared: reading registers reorders
             // HVF's internal state. Every architectural register can.
