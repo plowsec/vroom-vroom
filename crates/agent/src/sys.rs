@@ -94,7 +94,35 @@ pub fn single_display() {
     log::info!("{paths} active displays; internal-only topology: {r}");
 }
 
-#[cfg(not(windows))]
+/// Linux (GNOME on Wayland): the firmware framebuffer (ramfb) comes up as
+/// a monitor of its own (simpledrm's `Unknown-1`, next to virtio-gpu's
+/// `Virtual-1`) and stays, so Mutter lays the desktop over both. Windows
+/// open on the one nobody sees, and it takes the pointer with it: the USB
+/// tablet spans the whole desktop, so the guest's pointer sits right of
+/// the host's by as much as that monitor is wide, and disappears into it
+/// past the right edge. Keep ours, as on Windows.
+///
+/// The session can start before the compositor answers, so keep trying
+/// for a while, on a thread of its own.
+#[cfg(target_os = "linux")]
+pub fn single_display() {
+    if !crate::scale::wayland() {
+        return;
+    }
+    std::thread::spawn(|| {
+        for _ in 0..30 {
+            match crate::scale::only_ours() {
+                Ok(true) => return log::info!("monitors: ours is the desktop now"),
+                Ok(false) => return,
+                Err(e) => log::debug!("monitors: {e}"),
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+        log::info!("monitors: left as they are; the compositor never said what it had");
+    });
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn single_display() {}
 
 /// Turn Windows' 3D display device (UTM's viogpu3d, service VioGpu3D) off
