@@ -636,6 +636,9 @@ there: drop its `.toml` on vroom. Inside the folder everything is named
 relative to it (disk layers, snapshots, suspend image); a disk outside
 it keeps its path. Copy with Finder or `cp -p`: a snapshot checks its
 layers' modification times.
+VMs made by older builds: run `scripts/relative-paths.py` once (dry run;
+`--apply`, then `--undo LOG` if needed; all VMs in the library by
+default).
 
 ## Disks
 
