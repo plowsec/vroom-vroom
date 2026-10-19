@@ -59,6 +59,7 @@ extern "system" {
     fn SetFilePointerEx(file: Handle, distance: i64, new: *mut i64, method: u32) -> Bool;
     fn WriteFile(file: Handle, buffer: *const c_void, size: u32, written: *mut u32, overlapped: *mut c_void) -> Bool;
     fn GetLastError() -> u32;
+    fn SetLastError(error: u32);
     fn VirtualAlloc(address: *mut c_void, size: usize, kind: u32, protect: u32) -> *mut c_void;
     fn VirtualLock(address: *mut c_void, size: usize) -> Bool;
     fn CreateDirectoryW(path: *const u16, security: *const c_void) -> Bool;
@@ -67,6 +68,9 @@ extern "system" {
 const GENERIC_READ: u32 = 0x8000_0000;
 const GENERIC_WRITE: u32 = 0x4000_0000;
 const SHARE_ALL: u32 = 7;
+const CLFS_SCAN_FORWARD: u8 = 0x02;
+const CLFS_SCAN_BACKWARD: u8 = 0x04;
+const CLFS_SCAN_CLOSE: u8 = 0x08;
 
 /// The input page: one page, so the fuzzer writes it at one physical
 /// address.
@@ -281,16 +285,21 @@ impl State {
                     FreeReservedLog(marshal, count, &mut adjustment)
                 }
             }
+            // Scan containers forward or backward (mode bit 0): the
+            // context comes with the first ones; the next, then close.
             14 => {
                 let log = self.log(a.u8());
                 let from = a.u8() as u32;
                 let count = 1 + a.u8() as u32 % 8;
+                let direction = if a.u8() & 1 == 0 { CLFS_SCAN_FORWARD } else { CLFS_SCAN_BACKWARD };
                 let mut scan = [0u64; 16];
-                if CreateLogContainerScanContext(log, from, count, 1, scan.as_mut_ptr().cast(), null_mut()) == 0 {
+                if CreateLogContainerScanContext(log, from, count, direction, scan.as_mut_ptr().cast(), null_mut()) == 0 {
                     return 0;
                 }
-                let ok = ScanLogContainers(scan.as_mut_ptr().cast(), 2, null_mut());
-                ScanLogContainers(scan.as_mut_ptr().cast(), 8, null_mut());
+                let ok = ScanLogContainers(scan.as_mut_ptr().cast(), direction, null_mut());
+                let error = GetLastError();
+                ScanLogContainers(scan.as_mut_ptr().cast(), CLFS_SCAN_CLOSE, null_mut());
+                SetLastError(error);
                 ok
             }
             _ => 1,

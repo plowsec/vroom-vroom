@@ -3,13 +3,13 @@
 //! way. Exact values such as IOCTL codes and magic numbers, which random
 //! mutation never hits, come out of the code itself.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use vroom_hv::debug::{DebugConfig, DebugReason};
 use vroom_kernel::arm64::{AddressSpace, Registers};
 use vroom_vmm::VmEvent;
 
-use crate::{elr_el1, is_exception_vector, step_debug_config, Engine, Error, Result};
+use crate::{configure_all, elr_el1, function_names, is_exception_vector, step_debug_config, Engine, Error, Result};
 
 /// One comparison, as the CPU was about to run it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -124,8 +124,11 @@ pub fn decode(word: u32, pc: u64, r: &Registers) -> Option<Cmp> {
 ///   replaced by the other operand, and by it ±1 (for `<`, `>`);
 /// - each 4-byte field at `fields` shifted by the operands' difference
 ///   (and ±1): a field the code transforms before comparing (`code -
-///   0x222000 == 3`) lands on the value that matches.
-pub fn candidates(input: &[u8], cmps: &[Cmp], fields: &[usize], cap: usize) -> Vec<Vec<u8>> {
+///   0x222000 == 3`) lands on the value that matches. With `related` (a
+///   sequence: many fields, many comparisons), only by the comparisons
+///   whose register side holds the field's value: the word, its low half
+///   or its low byte.
+pub fn candidates(input: &[u8], cmps: &[Cmp], fields: &[usize], related: bool, cap: usize) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut push = |c: Vec<u8>, out: &mut Vec<Vec<u8>>| {
@@ -164,6 +167,9 @@ pub fn candidates(input: &[u8], cmps: &[Cmp], fields: &[usize], cap: usize) -> V
         }
         let v = u32::from_le_bytes(input[f..f + 4].try_into().expect("four bytes"));
         for c in &unique {
+            if related && ![u32::MAX, 0xffff, 0xff].iter().any(|m| c.a as u32 == v & m) {
+                continue;
+            }
             let delta = (c.b as u32).wrapping_sub(c.a as u32);
             for t in [0u32, 1, u32::MAX] {
                 let mut x = input.to_vec();
@@ -182,6 +188,22 @@ fn is_call(word: u32) -> bool {
 /// How long a callee outside the target, or an exception handler, gets to
 /// come back.
 const RUN_UNTIL: Duration = Duration::from_secs(2);
+
+/// A client's entry into the target: instructions stepped at most, the
+/// rest of that call at full speed. Every call of a sequence gets its turn.
+const ENTRY_STEPS: usize = 300;
+
+/// How a stretch of stepping ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stepped {
+    /// The thread left the target (its dispatch returned).
+    Left,
+    /// The steps ran out in the target.
+    Steps,
+    /// The input ended (stop_pc, the bugcheck, the budget) or the thread
+    /// was lost.
+    Over,
+}
 
 impl Engine {
     fn registers_of(&self, cpu: usize) -> Result<(vroom_hv::VcpuState, Registers)> {
@@ -221,16 +243,122 @@ impl Engine {
         Ok(stop.is_some_and(|s| s.pc == address && s.reason == DebugReason::Breakpoint))
     }
 
+    /// A client: run the whole guest (the client's calls need the disks,
+    /// other CPUs, the driver's workers) until the client's thread (its
+    /// address space, `ttbr0`) stops at one of `breakpoints`, with its
+    /// stack at `sp` if given, or, with `target`, at a new block there (a
+    /// coverage BRK). New blocks on the way are recorded; other threads
+    /// step past the breakpoints. The CPU it stopped on; None if the input
+    /// ended (stop_pc, the bugcheck) or `deadline` passed.
+    fn run_client(
+        &mut self,
+        breakpoints: &[u64],
+        ttbr0: u64,
+        sp: Option<u64>,
+        target: Option<(u64, u64)>,
+        deadline: Instant,
+    ) -> Result<Option<usize>> {
+        let trace = std::env::var_os("VROOM_FUZZ_TRACE").is_some();
+        let mut armed = breakpoints.to_vec();
+        armed.extend(self.harness.stop_pc);
+        let always = self.always();
+        configure_all(&self.vm, &armed, always, &[])?;
+        self.vm.resume()?;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                self.vm.pause()?;
+                if trace {
+                    eprintln!("cmplog: out of time running to {breakpoints:x?}");
+                }
+                return Ok(None);
+            }
+            let stop = match self.vm.next_event(left.min(Duration::from_millis(5))) {
+                Some(VmEvent::Debug(stop)) => stop,
+                None | Some(VmEvent::Ui(_) | VmEvent::ViewerClosed | VmEvent::ViewerAttached) => continue,
+                Some(other) => {
+                    self.vm.pause()?;
+                    if trace {
+                        eprintln!("cmplog: the VM ended: {other:?}");
+                    }
+                    return Ok(None);
+                }
+            };
+            self.vm.pause()?;
+            let cpu = stop.cpu as usize;
+            let (_, r) = self.registers_of(cpu)?;
+            if r.pc != stop.pc {
+                // Queued before an earlier stop moved that CPU on.
+                self.vm.resume()?;
+                continue;
+            }
+            if self.harness.bugcheck_pc == Some(r.pc) {
+                return Ok(None);
+            }
+            let ours = r.ttbr0 == ttbr0;
+            if stop.reason == DebugReason::SoftwareBreakpoint {
+                let Some(&index) = self.block_by_pc.get(&r.pc) else {
+                    if trace {
+                        eprintln!("cmplog: a guest BRK at {:#x}", r.pc);
+                    }
+                    return Ok(None);
+                };
+                if self.unplant(index)? {
+                    let block = self.harness.coverage[index].clone();
+                    self.coverage.observe(&block, "cmplog");
+                }
+                if ours && target.is_some_and(|(lo, hi)| (lo..hi).contains(&r.pc)) {
+                    return Ok(Some(cpu));
+                }
+                self.vm.resume()?;
+                continue;
+            }
+            if ours && self.harness.stop_pc == Some(r.pc) {
+                return Ok(None);
+            }
+            if ours && sp.map_or(true, |sp| r.sp == sp) && breakpoints.contains(&r.pc) {
+                return Ok(Some(cpu));
+            }
+            // Another thread (or ours deeper down): past the breakpoint.
+            self.vm
+                .debug_step(cpu, step_debug_config(&[], always))
+                .map_err(|e| Error::Invalid(format!("cmplog: step past {:#x}: {e}", r.pc)))?;
+            self.stop_of(cpu, RUN_UNTIL)?;
+            configure_all(&self.vm, &armed, always, &[])?;
+            self.vm.resume()?;
+        }
+    }
+
+    /// The target's functions a client enters by (`Harness::entries`).
+    fn client_entries(&self) -> Result<Vec<u64>> {
+        let functions = function_names(&self.harness.coverage);
+        let mut out = Vec::new();
+        for name in &self.harness.entries {
+            let (va, _) = functions
+                .iter()
+                .find(|(_, f)| f == name)
+                .or_else(|| functions.iter().find(|(_, f)| f.contains(name.as_str())))
+                .ok_or_else(|| Error::Invalid(format!("entry {name} isn't a function in the block list")))?;
+            out.push(*va);
+        }
+        if out.len() > 3 {
+            return Err(Error::Invalid("at most three entries (hardware breakpoints)".into()));
+        }
+        Ok(out)
+    }
+
     /// The comparisons `input` makes in the target's own code (the image
-    /// `entry_pc` is in), from the snapshot until the target returns, the
-    /// bugcheck, `stop_pc`, `max_steps` instructions or `budget` (a step
-    /// costs ~0.5 ms: a copy loop would eat a fuzzing session). Calls into
-    /// other images and exception handlers run at full speed: only the
-    /// target is stepped.
+    /// `entry_pc` is in, or `target`), from the snapshot until the target
+    /// returns, the bugcheck, `stop_pc`, `max_steps` instructions or
+    /// `budget` (a step costs ~0.5 ms: a copy loop would eat a fuzzing
+    /// session). Calls into other images and exception handlers run at
+    /// full speed: only the target is stepped. A client runs at full
+    /// speed to each entry into the target, which is stepped from there
+    /// (`ENTRY_STEPS` at most), until `stop_pc`.
     pub fn compare_log(&mut self, input: &[u8], max_steps: usize, budget: Duration) -> Result<Vec<Cmp>> {
-        let started = std::time::Instant::now();
+        let deadline = Instant::now() + budget;
         self.load_case(input)?;
-        let cpu = self.harness.cpu;
+        let mut cpu = self.harness.cpu;
         let (_, first) = self.registers_of(cpu)?;
         if self.harness.isolate_cpu {
             // As a run: nothing preempts the testcase's thread.
@@ -238,20 +366,84 @@ impl Engine {
                 .debug_write_register(cpu, vroom_hv::debug::Register::Pstate, crate::isolated_pstate(first.pstate))
                 .map_err(|e| Error::Invalid(format!("cmplog: mask interrupts: {e}")))?;
         }
-        let (lo, hi) = self.target_range(&first)?;
-        let always = self.always();
+        let target = self.target_range(&first)?;
         let mut cmps = Vec::new();
-        for _ in 0..max_steps {
-            if started.elapsed() > budget {
-                break;
-            }
-            let (_, regs) = self.registers_of(cpu)?;
-            let pc = regs.pc;
-            if !(lo..hi).contains(&pc) || self.harness.stop_pc == Some(pc) || self.harness.bugcheck_pc == Some(pc) {
-                if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
-                    eprintln!("cmplog: done at {pc:#x} (target {lo:#x}..{hi:#x})");
+        if self.harness.client() {
+            let entries = self.client_entries()?;
+            let mut steps = 0;
+            while steps < max_steps {
+                match self.run_client(&entries, first.ttbr0, None, Some(target), deadline)? {
+                    Some(c) => cpu = c,
+                    None => break,
                 }
-                break;
+                let n = ENTRY_STEPS.min(max_steps - steps);
+                let at = self.registers_of(cpu)?.1.pc;
+                let (taken, how) = self.step_target(&mut cpu, target, n, deadline, Some(first.ttbr0), &mut cmps)?;
+                steps += taken;
+                if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
+                    eprintln!("cmplog: entry at {at:#x}: {taken} steps, {how:?}, {} comparisons so far", cmps.len());
+                }
+                if how == Stepped::Over {
+                    break;
+                }
+            }
+        } else {
+            self.step_target(&mut cpu, target, max_steps, deadline, None, &mut cmps)?;
+        }
+        // The reset doesn't clear a pending software step (PSTATE.SS): a
+        // run without isolation would trap on its first instruction.
+        for cpu in 0..self.vm.config().cpus as usize {
+            let (_, last) = self.registers_of(cpu)?;
+            if last.pstate & (1 << 21) != 0 {
+                self.vm.debug_write_register(cpu, vroom_hv::debug::Register::Pstate, last.pstate & !(1 << 21))?;
+            }
+        }
+        Ok(cmps)
+    }
+
+    /// Step the target's code on `cpu` from where it stands, logging its
+    /// comparisons, for at most `max_steps` instructions. Calls out of the
+    /// target and exception handlers run at full speed: on `cpu` alone, or
+    /// for a client (`ttbr0`, its address space) the whole guest, after
+    /// which its thread may go on on another CPU. The steps taken.
+    fn step_target(
+        &mut self,
+        cpu: &mut usize,
+        (lo, hi): (u64, u64),
+        max_steps: usize,
+        deadline: Instant,
+        client: Option<u64>,
+        cmps: &mut Vec<Cmp>,
+    ) -> Result<(usize, Stepped)> {
+        let trace = std::env::var_os("VROOM_FUZZ_TRACE").is_some();
+        let always = self.always();
+        let entry_sp = self.registers_of(*cpu)?.1.sp;
+        for step in 0..max_steps {
+            if Instant::now() > deadline {
+                return Ok((step, Stepped::Over));
+            }
+            let (_, regs) = self.registers_of(*cpu)?;
+            let pc = regs.pc;
+            if self.harness.stop_pc == Some(pc) || self.harness.bugcheck_pc == Some(pc) {
+                return Ok((step, Stepped::Over));
+            }
+            if !(lo..hi).contains(&pc) {
+                // A branch out deeper than the entry (a tail call, an
+                // import thunk) comes back to the link register.
+                let lr = regs.x[30];
+                if let Some(ttbr0) = client.filter(|_| regs.sp < entry_sp && (lo..hi).contains(&lr)) {
+                    match self.run_client(&[lr], ttbr0, Some(regs.sp), None, deadline)? {
+                        Some(c) => {
+                            *cpu = c;
+                            continue;
+                        }
+                        None => return Ok((step, Stepped::Over)),
+                    }
+                }
+                if trace {
+                    eprintln!("cmplog: left the target at {pc:#x} (target {lo:#x}..{hi:#x})");
+                }
+                return Ok((step, if client.is_some() { Stepped::Left } else { Stepped::Over }));
             }
             let mut bytes = [0u8; 4];
             let space = AddressSpace { memory: &self.vm, registers: &regs };
@@ -262,13 +454,13 @@ impl Engine {
                 cmps.push(c);
             }
             self.vm
-                .debug_step(cpu, step_debug_config(&[], always))
+                .debug_step(*cpu, step_debug_config(&[], always))
                 .map_err(|e| Error::Invalid(format!("cmplog: step at {pc:#x}: {e}")))?;
-            let Some(stop) = self.stop_of(cpu, RUN_UNTIL)? else {
-                if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
+            let Some(stop) = self.stop_of(*cpu, RUN_UNTIL)? else {
+                if trace {
                     eprintln!("cmplog: the step at {pc:#x} didn't finish");
                 }
-                break;
+                return Ok((step, Stepped::Over));
             };
             if stop.reason == DebugReason::SoftwareBreakpoint {
                 // A coverage BRK (blocks mode): this input reaches the block;
@@ -280,37 +472,37 @@ impl Engine {
                     }
                     continue;
                 }
-                if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
+                if trace {
                     eprintln!("cmplog: a guest BRK at {:#x}", stop.pc);
                 }
-                break;
+                return Ok((step, Stepped::Over));
             }
-            let (state, after) = self.registers_of(cpu)?;
+            let (state, after) = self.registers_of(*cpu)?;
+            // A fault (or an interrupt) before the instruction ran, or a
+            // call out of the target: back where it would have gone on.
             let back = if is_exception_vector(after.pc, after.vbar) {
-                // A fault (or an interrupt) before the instruction ran.
-                match elr_el1(&state) {
-                    Some(elr) => self.run_until(cpu, elr)?,
-                    None => false,
-                }
+                elr_el1(&state)
             } else if word.is_some_and(is_call) && !(lo..hi).contains(&after.pc) {
-                self.run_until(cpu, pc + 4)?
+                Some(pc + 4)
             } else {
-                true
+                continue;
             };
-            if !back {
-                if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
-                    eprintln!("cmplog: lost the thread after {pc:#x} (now {:#x})", after.pc);
+            let back = match (back, client) {
+                (None, _) => None,
+                (Some(address), None) => self.run_until(*cpu, address)?.then_some(*cpu),
+                (Some(address), Some(ttbr0)) => self.run_client(&[address], ttbr0, Some(regs.sp), None, deadline)?,
+            };
+            match back {
+                Some(c) => *cpu = c,
+                None => {
+                    if trace {
+                        eprintln!("cmplog: lost the thread after {pc:#x} (now {:#x})", after.pc);
+                    }
+                    return Ok((step, Stepped::Over));
                 }
-                break;
             }
         }
-        // The reset doesn't clear a pending software step (PSTATE.SS): a
-        // run without isolation would trap on its first instruction.
-        let (_, last) = self.registers_of(cpu)?;
-        if last.pstate & (1 << 21) != 0 {
-            self.vm.debug_write_register(cpu, vroom_hv::debug::Register::Pstate, last.pstate & !(1 << 21))?;
-        }
-        Ok(cmps)
+        Ok((max_steps, Stepped::Steps))
     }
 }
 
@@ -348,15 +540,27 @@ mod tests {
     fn a_transformed_field_lands_on_the_compared_value() {
         let input = [0x03, 0x20, 0x22, 0x00, b'A', b'A'];
         // The code compared (IOCTL - 0x222000) = 3 with 0x3b.
-        let c = candidates(&input, &[Cmp { pc: 0, a: 3, b: 0x3b, bits: 32 }], &[0], 64);
+        let c = candidates(&input, &[Cmp { pc: 0, a: 3, b: 0x3b, bits: 32 }], &[0], false, 64);
         assert!(c.iter().any(|x| x[..4] == 0x22203bu32.to_le_bytes()), "{c:x?}");
+    }
+
+    #[test]
+    fn a_sequence_field_moves_with_its_own_comparisons() {
+        // Field 0 holds 0x105; the code compared 5 (its low byte) with 9,
+        // and an unrelated 0x77 with 0x80.
+        let input = [0x05, 0x01, 0, 0];
+        let cmps = [Cmp { pc: 0, a: 5, b: 9, bits: 32 }, Cmp { pc: 4, a: 0x77, b: 0x80, bits: 32 }];
+        let c = candidates(&input, &cmps, &[0], true, 64);
+        assert!(c.iter().any(|x| x[..] == 0x109u32.to_le_bytes()), "{c:x?}");
+        assert_eq!(c.len(), 3, "the unrelated comparison moves nothing: {c:x?}");
+        assert_eq!(candidates(&input, &cmps, &[0], false, 64).len(), 6);
     }
 
     #[test]
     fn an_operand_in_the_input_is_replaced() {
         let mut input = 0x222003u32.to_le_bytes().to_vec();
         input.extend_from_slice(b"AAAA");
-        let c = candidates(&input, &[Cmp { pc: 0, a: 0x222003, b: 0x22203b, bits: 32 }], &[], 64);
+        let c = candidates(&input, &[Cmp { pc: 0, a: 0x222003, b: 0x22203b, bits: 32 }], &[], false, 64);
         for v in [0x22203bu32, 0x22203c, 0x22203a] {
             assert!(c.iter().any(|x| x[..4] == v.to_le_bytes()), "{v:#x}");
         }

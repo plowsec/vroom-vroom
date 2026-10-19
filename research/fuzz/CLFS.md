@@ -49,7 +49,7 @@ $R run guest.exec '{"command":"rd /s /q C:\\clfs & start \"\" /b C:\\clfs-client
 | 11 | name, offset u32, bytes | write into `C:\clfs\l<name>.blf` (read when opened again) |
 | 12 | name | `DeleteLogFile` |
 | 13 | area, count, adjustment u32 (mod 8 MiB), free | `AllocReservedLog` / `FreeReservedLog` |
-| 14 | log, from, count | `CreateLogContainerScanContext` + `ScanLogContainers` |
+| 14 | log, from, count, direction (bit 0: backward) | `CreateLogContainerScanContext` (the first containers) + `ScanLogContainers` (the next) + close |
 
 Call: `u32 op | u16 length | payload`. An LSN: a slot byte, or bit 7 set and 8 bytes. Slots are taken modulo their count; missing ones are null handles.
 
@@ -58,10 +58,12 @@ Call: `u32 op | u16 length | payload`. An LSN: a slot byte, or bit 7 set and 8 b
 ```bash
 python3 research/fuzz/tools/client_harness.py --socket $VM/lab.sock --pid PID \
   --report "$(cat client.txt line)" --target CLFS.SYS --snapshot clfs-park \
-  --blocks clfs-blocks.json --output $VM/clfs-harness.json --sequence
+  --blocks clfs-blocks.json --output $VM/clfs-harness.json --sequence --entry LogIoDispatch@CClfsDriver
 ```
 
-Breaks at `entry_pc` (`park`) in the client's process, snapshots there (`$VM/clfs-windows-arm64.state/snapshots/clfs-park`), and writes the harness: `cpu` of the stop, `input_gpa`, the client's addresses, `bugcheck_pc`, `target`, blocks mode, no isolation, detectors `exceptions`, `bugcheck`, `timeout`; `config` and `state_dir` kept from an existing harness.
+Breaks at `entry_pc` (`park`) in the client's process, snapshots there (`$VM/clfs-windows-arm64.state/snapshots/clfs-park`), and writes the harness: `cpu` of the stop, `input_gpa`, the client's addresses, `bugcheck_pc`, `target`, `entries` (cmplog), blocks mode, no isolation, detectors `exceptions`, `bugcheck`, `timeout`; `config` and `state_dir` kept from an existing harness.
+
+A rebuilt client moves its addresses: steps 2–3 again, after `vroom snapshot delete $VM/clfs-windows-arm64.toml clfs-park` (a CLI from 956acff on).
 
 ## 4. Blocks
 
@@ -81,6 +83,16 @@ $F triage $VM/clfs-harness.json $VM/runs/a/crashes/HASH-CLASS.bin --state-dir $V
 ```
 
 - Seeds: `seeds/rich.bin` (47 calls: two containers, records, reads in each mode, tails, reservations, reopen, a multiplexed log with two streams, BLF bytes then reopen, delete), `seeds/append-read.bin`, `seeds/create.bin`.
-- M3 Max, 10 min: `append-read.bin` 36k programs (60/s), 4529/18003 blocks; `rich.bin` 19.6k (33/s), 4696. No findings.
+- Cmplog (`$F cmplog $VM/clfs-harness.json $VM/seeds/rich.bin`): 91 entries into `LogIoDispatch`, 300 steps each, ~2.1k comparisons, ~1.3k candidates (128 run per log), 1.6 s.
 - The whole guest runs (CLFS does disk I/O); each reset restores RAM, disks and devices.
 - `VROOM_FUZZ_TRACE=1`: the client's per-call results at `stop_pc` (op in the top byte, Win32 error below).
+
+10 min from `rich.bin`, M3 Max, another lab VM alongside (blocks of 18003):
+
+| | programs | blocks |
+|---|---|---|
+| before: op 14 always error 87, no cmplog for clients | 15.0k (25/s) | 4643 |
+| op 14 fixed, `--no-cmplog` | 19.6k (33/s) | 4748 |
+| op 14 fixed, cmplog (130 logs, ~1.6 s each) | 20.6k (34/s) | 5738 |
+
+Cmplog's extra blocks: the management IOCTLs (`ClfsMgmtDispatchIo`, managed-log policies, container growth), archival and restart requests. Earlier: `append-read.bin` 36k (60/s), 4529. No findings.

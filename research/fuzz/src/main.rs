@@ -352,7 +352,8 @@ fn main() -> Result<()> {
                 h.state_dir = dir;
             }
             let data = std::fs::read(&input)?;
-            let fields = vroom_fuzz::cmp_fields(&h, data.len());
+            let fields = vroom_fuzz::cmp_fields(&h, &data);
+            let sequence = h.sequence;
             let mut engine = Engine::open(h)?;
             engine.instrument()?;
             // As in a campaign: the input runs first.
@@ -362,7 +363,7 @@ fn main() -> Result<()> {
             for c in &cmps {
                 println!("{}", serde_json::json!({"pc": format!("{:#x}", c.pc), "a": format!("{:#x}", c.a), "b": format!("{:#x}", c.b), "bits": c.bits}));
             }
-            let candidates = vroom_fuzz::cmplog::candidates(&data, &cmps, &fields, usize::MAX);
+            let candidates = vroom_fuzz::cmplog::candidates(&data, &cmps, &fields, sequence, usize::MAX);
             eprintln!("{} comparisons, {} candidate inputs, {:.0} ms", cmps.len(), candidates.len(), started.elapsed().as_secs_f64() * 1e3);
 
         }

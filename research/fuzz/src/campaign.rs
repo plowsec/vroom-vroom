@@ -46,13 +46,17 @@ fn speed_weights(energy: &[u32], us: &[u64]) -> Vec<u32> {
 /// Rate window for `execs_per_sec`.
 const RATE_WINDOW: Duration = Duration::from_secs(5);
 /// Comparison logging: target instructions stepped at most per input, and
-/// the time it may take (each step ~0.5 ms).
-const CMP_STEPS: usize = 20_000;
+/// the time it may take (each step ~0.5 ms; a client's program also runs
+/// at full speed between its entries into the target).
+const CMP_STEPS: usize = 40_000;
 const CMP_BUDGET: Duration = Duration::from_millis(200);
+const CMP_CLIENT_BUDGET: Duration = Duration::from_secs(3);
 /// A loop compares at one site again and again: its first few pairs.
 const CMP_PER_SITE: usize = 4;
-/// Inputs one comparison log may suggest.
+/// Inputs one comparison log may suggest; a sequence's (a program that
+/// runs ~30 ms) fewer: its direct matches come first.
 const CMP_CANDIDATES: usize = 512;
+const CMP_SEQUENCE_CANDIDATES: usize = 128;
 
 #[derive(Debug)]
 pub struct Campaign {
@@ -210,8 +214,9 @@ impl Campaign {
     /// Log `parent`'s comparisons and queue the inputs that would turn them
     /// the other way; keep the compared values for mutation.
     fn compare(&mut self, parent: &[u8]) {
-        let fields = cmp_fields(&self.engine().harness, parent.len());
-        let cmps = match self.engine_mut().compare_log(parent, CMP_STEPS, CMP_BUDGET) {
+        let fields = cmp_fields(&self.engine().harness, parent);
+        let budget = if self.engine().harness.client() { CMP_CLIENT_BUDGET } else { CMP_BUDGET };
+        let cmps = match self.engine_mut().compare_log(parent, CMP_STEPS, budget) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("comparison logging: {e}");
@@ -232,7 +237,9 @@ impl Campaign {
                 self.mutator.learn(value);
             }
         }
-        for input in cmplog::candidates(parent, &cmps, &fields, CMP_CANDIDATES) {
+        let sequence = self.engine().harness.sequence;
+        let cap = if sequence { CMP_SEQUENCE_CANDIDATES } else { CMP_CANDIDATES };
+        for input in cmplog::candidates(parent, &cmps, &fields, sequence, cap) {
             if self.fixed_prefix.as_ref().is_some_and(|p| !input.starts_with(p)) {
                 continue;
             }
@@ -246,8 +253,7 @@ impl Campaign {
 
     /// Run one input.
     pub fn step(&mut self) -> Result<()> {
-        // A client's snapshot stands outside the target: nothing to step.
-        if self.scheduled.is_empty() && self.options.cmplog && !self.options.repeat_seed && !self.engine().harness.client() {
+        if self.scheduled.is_empty() && self.options.cmplog && !self.options.repeat_seed {
             if let Some(parent) = self.cmp_queue.pop_front() {
                 self.compare(&parent);
             }

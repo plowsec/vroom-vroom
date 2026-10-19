@@ -170,6 +170,13 @@ pub struct Harness {
     /// `entry_pc` is in.
     #[serde(default)]
     pub target: Option<String>,
+    /// A client harness: the target's functions its calls enter by (the
+    /// IRP dispatch), by name in the block list (a part of it will do), at
+    /// most three. Comparison logging runs the guest at full speed to one
+    /// and steps the target from there; with none, from the first new
+    /// block (BRK) the client's thread reaches in the target.
+    #[serde(default)]
+    pub entries: Vec<String>,
     /// The input is calls for a client to make, one after the other (state
     /// carries from call to call): each `u32 code | u16 length | payload`,
     /// little-endian. Mutations also insert, drop, repeat, swap and splice
@@ -1001,10 +1008,19 @@ struct Case {
 
 /// The 4-byte fields comparison logging shifts by the operands'
 /// difference: the IOCTL code (the prefix) and the payload's first
-/// aligned words, where structure headers, sizes and magic values sit.
-pub fn cmp_fields(harness: &Harness, len: usize) -> Vec<usize> {
+/// aligned words, where structure headers, sizes and magic values sit;
+/// in a sequence, each call's code and its payload's first two words.
+pub fn cmp_fields(harness: &Harness, input: &[u8]) -> Vec<usize> {
+    let len = input.len();
     if harness.sequence {
-        return Vec::new();
+        let mut fields = Vec::new();
+        let mut at = 0;
+        for (_, payload) in calls(input) {
+            fields.push(at);
+            fields.extend([0, 4].into_iter().filter(|w| w + 4 <= payload.len()).map(|w| at + 6 + w));
+            at += 6 + payload.len();
+        }
+        return fields;
     }
     let prefix = if harness.ioctl_prefix { 4 } else { 0 };
     let mut fields: Vec<usize> = if harness.ioctl_prefix { vec![0] } else { Vec::new() };
@@ -2672,6 +2688,18 @@ mod tests {
         assert!(lengths.len() > 3, "calls are inserted and dropped: {lengths:?}");
         // A cut-short last call keeps its bytes.
         assert_eq!(calls(&seed[..seed.len() - 2]).last().unwrap().1, b"hel");
+    }
+
+    #[test]
+    fn a_sequence_compares_by_call_codes_and_first_words() {
+        let h: Harness = serde_json::from_value(serde_json::json!({
+            "name": "s", "config": "c", "snapshot": "s", "state_dir": "d",
+            "input_gpa": 0, "input_capacity": 4096, "sequence": true,
+        }))
+        .unwrap();
+        let input = sequence(&[(0, vec![0, 0, 3]), (10, vec![0; 9]), (4, vec![0; 5])]);
+        // Codes at 0, 9, 24; words at 15, 19 (9 bytes) and 30 (5 bytes).
+        assert_eq!(cmp_fields(&h, &input), vec![0, 9, 15, 19, 24, 30]);
     }
 
     #[test]

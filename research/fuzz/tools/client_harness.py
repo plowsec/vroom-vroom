@@ -10,7 +10,7 @@ write the harness (blocks mode, the whole guest running).
 
   client_harness.py --socket lab.sock --pid PID --report "input_va=0x..." \\
       --target CLFS.SYS --snapshot clfs-client-park --blocks clfs-blocks.json \\
-      --output clfs-harness.json [--sequence]
+      --output clfs-harness.json [--sequence] [--entry LogIoDispatch@CClfsDriver]
 """
 import argparse
 import json
@@ -52,6 +52,7 @@ def main():
     p.add_argument("--output", required=True)
     p.add_argument("--sequence", action="store_true", help="inputs are call sequences")
     p.add_argument("--timeout-ms", type=int, default=3000)
+    p.add_argument("--entry", action="append", help="a target function the client's calls enter by (comparison logging steps from there)")
     a = p.parse_args()
 
     report = dict(kv.split("=", 1) for kv in a.report.split())
@@ -106,6 +107,8 @@ def main():
         "sequence": a.sequence,
         "detectors": ["exceptions", "bugcheck", "timeout"],
     }
+    if a.entry:
+        harness["entries"] = a.entry
     try:
         old = json.load(open(a.output))
         harness = {**old, **harness}
