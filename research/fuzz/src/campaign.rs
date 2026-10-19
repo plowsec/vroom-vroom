@@ -37,7 +37,9 @@ fn speed_weights(energy: &[u32], us: &[u64]) -> Vec<u32> {
         .iter()
         .zip(us)
         .map(|(&e, &t)| {
-            let t = if t == 0 { mean } else { t.clamp(mean / 4, mean * 16).max(1) };
+            // A parent 100 times slower than most is 100 times less
+            // worth mutating: what it finds costs that much.
+            let t = if t == 0 { mean } else { t.clamp(mean / 4, mean * 256).max(1) };
             ((u64::from(e) * 16 * mean / t) as u32).max(1)
         })
         .collect()
@@ -60,7 +62,7 @@ const CMP_SEQUENCE_CANDIDATES: usize = 128;
 
 /// A client harness resets in place after this many timeouts in a row
 /// minus one; then it restores the snapshot.
-const CLIENT_TIMEOUTS_IN_PLACE: usize = 3;
+const CLIENT_TIMEOUTS_IN_PLACE: usize = 20;
 
 #[derive(Debug)]
 pub struct Campaign {
@@ -397,6 +399,10 @@ impl Campaign {
         // restores devices) resets in place too, unless it keeps happening:
         // a restore costs ~15 s.
         let timeout = result.findings.iter().any(|f| f.class == BugClass::Timeout);
+        if let (true, Some(parent)) = (timeout, selected_parent) {
+            // Its children run out of time: a parent near the limit.
+            self.corpus_energy[parent] = 1;
+        }
         self.timeouts_in_a_row = if timeout { self.timeouts_in_a_row + 1 } else { 0 };
         let in_place = timeout && self.engine().harness.client() && self.timeouts_in_a_row < CLIENT_TIMEOUTS_IN_PLACE;
         if result.reopen && !in_place {
