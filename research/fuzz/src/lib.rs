@@ -1063,6 +1063,8 @@ pub fn function_names(blocks: &[CoverageBlock]) -> Vec<(u64, String)> {
 /// The same exception (code, PC and faulting address) this often in one
 /// input is an exception storm.
 const MAX_EXCEPTIONS: usize = 8;
+/// The same for an exception outside the target (the system's own).
+const MAX_SYSTEM_EXCEPTIONS: usize = 256;
 
 /// What every debug configuration of an input keeps.
 #[derive(Debug, Clone, Copy)]
@@ -1162,6 +1164,8 @@ impl Engine {
                 self.harness.exception_sites.push(hook);
             }
             self.exception_hook = Some(hook);
+            // Whose an exception is, from the first one on.
+            self.target_range(&registers)?;
         }
         let address_space = AddressSpace {
             memory: &self.vm,
@@ -1276,11 +1280,16 @@ impl Engine {
             harness,
             coverage,
             watch_cursor,
+            symbols,
+            target_image,
             ..
         } = self;
         drop(vm);
         let mut fresh = Self::open(harness)?;
         fresh.coverage = coverage;
+        // The same snapshot: the same modules, PDBs already loaded.
+        fresh.symbols = symbols;
+        fresh.target_image = target_image;
         fresh.instrument()?;
         fresh.watch_cursor = watch_cursor;
         Ok(fresh)
@@ -1556,24 +1565,27 @@ impl Engine {
         let space = AddressSpace { memory: &self.vm, registers };
         let symbols = self.symbols.as_mut().expect("loaded above");
         let faulting = symbols.trap_registers(&space, registers.x[2], registers).ok();
-        let (frames, stop) = match &faulting {
-            Some(r) => {
-                let space = AddressSpace { memory: &self.vm, registers: r };
-                symbols.frames(&space, r)
-            }
-            None => (vec![(address, symbols.name(&space, address))], None),
+        // Whose it is from the PCs alone: naming loads PDBs (seconds for
+        // tcpip's), and most exceptions are the system's own.
+        let (pcs, stop) = match &faulting {
+            Some(r) => symbols.pcs(&AddressSpace { memory: &self.vm, registers: r }, r),
+            None => (vec![address], None),
         };
         // The target's, or a jump out of all code (a smashed return
         // address, a corrupt function pointer).
         let wild = !symbols.in_module(address);
-        let theirs = !wild && !(lo..hi).contains(&address) && !frames.iter().any(|(pc, _)| (lo..hi).contains(pc));
-        if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
-            let names: Vec<&str> = frames.iter().take(6).map(|(_, n)| n.as_str()).collect();
-            eprintln!("exception {code:#x} at {address:#x}{}: {names:?}", if theirs { " (not the target's)" } else { "" });
-        }
+        let theirs = !wild && !(lo..hi).contains(&address) && !pcs.iter().any(|pc| (lo..hi).contains(pc));
         if theirs {
+            if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
+                eprintln!("exception {code:#x} at {address:#x} (not the target's)");
+            }
             return Ok(None);
         }
+        let frames: Vec<(u64, String)> = {
+            let r = faulting.as_ref().unwrap_or(registers);
+            let space = AddressSpace { memory: &self.vm, registers: r };
+            pcs.iter().map(|&pc| (pc, symbols.name(&space, pc))).collect()
+        };
         let what = match (code, kind) {
             (0xc000_0005, 0) => format!("reading {fault:#x}"),
             (0xc000_0005, 1) => format!("writing {fault:#x}"),
@@ -1844,6 +1856,9 @@ impl Engine {
         let mut exceptions = BTreeMap::<(u32, u64, u64), usize>::new();
         // Past stop_pc, running until then (settle_ms).
         let mut settle: Option<Instant> = None;
+        let slow_trace = std::env::var_os("VROOM_FUZZ_TRACE").is_some_and(|v| v == "slow");
+        let mut iteration = Instant::now();
+        let mut last_event = String::new();
         if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
             eprintln!("start pc={:#x} entry={entry_pc:#x}", registers.pc);
         }
@@ -1920,6 +1935,13 @@ impl Engine {
             }
         }
         loop {
+            if slow_trace {
+                let took = iteration.elapsed();
+                if took > Duration::from_millis(200) {
+                    eprintln!("slow iteration {} ms after {last_event}", took.as_millis());
+                }
+                iteration = Instant::now();
+            }
             if settle.is_some_and(|deadline| Instant::now() >= deadline) {
                 self.vm.pause()?;
                 break;
@@ -1941,7 +1963,15 @@ impl Engine {
                 }
                 break;
             }
-            let Some(event) = self.vm.next_event(Duration::from_millis(5)) else {
+            let event = self.vm.next_event(Duration::from_millis(5));
+            if slow_trace {
+                last_event = match &event {
+                    Some(vroom_vmm::VmEvent::Debug(stop)) => format!("stop cpu {} pc {:#x} {:?}", stop.cpu, stop.pc, stop.reason),
+                    Some(other) => format!("{other:?}").chars().take(60).collect(),
+                    None => "no event".into(),
+                };
+            }
+            let Some(event) = event else {
                 continue;
             };
             match event {
@@ -2075,10 +2105,22 @@ impl Engine {
                         let key = (u32::from_le_bytes(word), u64::from_le_bytes(address), u64::from_le_bytes(fault));
                         let seen = exceptions.entry(key).or_default();
                         *seen += 1;
-                        if *seen > MAX_EXCEPTIONS {
+                        // The system's own handled faults repeat too (the
+                        // memory manager's while a process starts): only
+                        // many more of those make a storm.
+                        // User-mode exceptions (x3, PreviousMode) are the
+                        // processes' own business.
+                        let kernel = Registers::from_state(&state).is_ok_and(|r| r.x[3] & 0xff == 0);
+                        let pc = u64::from_le_bytes(address);
+                        let ours_pc = self.target_image.is_none_or(|(lo, hi)| (lo..hi).contains(&pc))
+                            || (pc >> 63 == 1 && self.symbols.as_ref().is_some_and(|s| !s.in_module(pc)));
+                        if kernel && *seen > if ours_pc { MAX_EXCEPTIONS } else { MAX_SYSTEM_EXCEPTIONS } {
                             // The same fault over and over (a smashed frame
                             // faulting in its own dispatch): it won't end,
                             // and what started it is reported already.
+                            if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
+                                eprintln!("exception storm: {key:x?} {} times", *seen);
+                            }
                             break;
                         }
                     }

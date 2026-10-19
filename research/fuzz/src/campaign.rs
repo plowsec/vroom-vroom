@@ -58,6 +58,10 @@ const CMP_PER_SITE: usize = 4;
 const CMP_CANDIDATES: usize = 512;
 const CMP_SEQUENCE_CANDIDATES: usize = 128;
 
+/// A client harness resets in place after this many timeouts in a row
+/// minus one; then it restores the snapshot.
+const CLIENT_TIMEOUTS_IN_PLACE: usize = 3;
+
 #[derive(Debug)]
 pub struct Campaign {
     engine: Option<Engine>,
@@ -82,6 +86,8 @@ pub struct Campaign {
     iteration: usize,
     recoveries: usize,
     inputs_since_reopen: usize,
+    /// Inputs in a row that timed out.
+    timeouts_in_a_row: usize,
     started: Instant,
     stats: InstanceStats,
     rate: VecDeque<(Instant, u64)>,
@@ -190,6 +196,7 @@ impl Campaign {
             iteration: 0,
             recoveries: 0,
             inputs_since_reopen: 0,
+            timeouts_in_a_row: 0,
             started: Instant::now(),
             stats,
             rate: VecDeque::new(),
@@ -385,8 +392,14 @@ impl Campaign {
             }
         }
         // A bugcheck stopped at `bugcheck_pc` resets in place like a clean
-        // input; a timeout or a guest reset restores from disk.
-        if result.reopen {
+        // input; a timeout or a guest reset restores from disk. A client's
+        // timeout (its calls blocked; the whole guest runs, every reset
+        // restores devices) resets in place too, unless it keeps happening:
+        // a restore costs ~15 s.
+        let timeout = result.findings.iter().any(|f| f.class == BugClass::Timeout);
+        self.timeouts_in_a_row = if timeout { self.timeouts_in_a_row + 1 } else { 0 };
+        let in_place = timeout && self.engine().harness.client() && self.timeouts_in_a_row < CLIENT_TIMEOUTS_IN_PLACE;
+        if result.reopen && !in_place {
             if self.options.verbose {
                 eprintln!(
                     "restoring the clean snapshot after {:?} ({})",

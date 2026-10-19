@@ -183,13 +183,25 @@ impl SnapshotDir {
             .files
             .get(name)
             .ok_or_else(|| Error::Invalid(format!("missing blob {name}")))?;
-        let mut r = BufReader::with_capacity(1 << 20, File::open(self.root.join(name))?);
+        let file = File::open(self.root.join(name))?;
+        // This process checked this very file already (a fuzzer restoring
+        // its snapshot after each timeout: 25 s to hash 7 GB of RAM).
+        let seen = identity(&file, want);
+        if seen.as_ref().is_some_and(|id| verified().lock().unwrap_or_else(|e| e.into_inner()).contains(id)) {
+            return Ok(BufReader::with_capacity(1 << 20, file));
+        }
+        let mut r = BufReader::with_capacity(1 << 20, file);
         let mut h = Sha256::new();
         std::io::copy(&mut r, &mut h)?;
         if &hex::encode(h.finalize()) != want {
             return Err(Error::Invalid(format!("blob {name} hash mismatch")));
         }
-        Ok(BufReader::with_capacity(1 << 20, File::open(self.root.join(name))?))
+        let file = r.into_inner();
+        if let Some(id) = seen.filter(|id| identity(&file, want).as_ref() == Some(id)) {
+            verified().lock().unwrap_or_else(|e| e.into_inner()).insert(id);
+        }
+        std::io::Seek::rewind(&mut &file)?;
+        Ok(BufReader::with_capacity(1 << 20, file))
     }
 
     /// Write the manifest atomically. Snapshot is complete after this.
@@ -206,6 +218,28 @@ impl SnapshotDir {
         fs::rename(&tmp, self.root.join(MANIFEST))?;
         Ok(())
     }
+}
+
+/// A file as it is now (device, inode, size, modification and change
+/// times) and the digest it was checked against.
+type Identity = (u64, u64, u64, i64, i64, i64, i64, String);
+
+#[cfg(unix)]
+fn identity(file: &File, digest: &str) -> Option<Identity> {
+    use std::os::unix::fs::MetadataExt;
+    let m = file.metadata().ok()?;
+    Some((m.dev(), m.ino(), m.len(), m.mtime(), m.mtime_nsec(), m.ctime(), m.ctime_nsec(), digest.to_string()))
+}
+
+#[cfg(not(unix))]
+fn identity(_file: &File, _digest: &str) -> Option<Identity> {
+    None
+}
+
+/// Blobs this process hashed and found right, unchanged since.
+fn verified() -> &'static std::sync::Mutex<std::collections::HashSet<Identity>> {
+    static VERIFIED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<Identity>>> = std::sync::OnceLock::new();
+    VERIFIED.get_or_init(Default::default)
 }
 
 #[cfg(unix)]

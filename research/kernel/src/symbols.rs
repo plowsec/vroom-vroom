@@ -58,6 +58,15 @@ pub fn fetch(cache: &Path, identity: &PdbIdentity) -> Result<PathBuf> {
         verify(&mut pdb, identity)?;
         return Ok(final_path);
     }
+    // A download that failed lately isn't tried again (a fuzzer naming a
+    // stack would wait on it every input, every restart).
+    let missing = directory.join("missing");
+    if std::fs::metadata(&missing)
+        .and_then(|m| m.modified())
+        .is_ok_and(|at| at.elapsed().is_ok_and(|age| age < MISSING_FOR))
+    {
+        return Err(err(format!("{}: not on the symbol server (or no network) at the last try", identity.name)));
+    }
     let temporary = directory.join(format!("download-{}.part", std::process::id()));
     let file = std::fs::OpenOptions::new()
         .create_new(true)
@@ -79,9 +88,9 @@ pub fn fetch(cache: &Path, identity: &PdbIdentity) -> Result<PathBuf> {
                 "--proto-redir",
                 "=https",
                 "--connect-timeout",
-                "20",
+                "5",
                 "--max-time",
-                "180",
+                "120",
                 "--max-filesize",
                 "536870912",
             ])
@@ -101,8 +110,14 @@ pub fn fetch(cache: &Path, identity: &PdbIdentity) -> Result<PathBuf> {
         Ok(final_path)
     })();
     let _ = std::fs::remove_file(&temporary);
+    if result.is_err() {
+        let _ = std::fs::write(&missing, b"");
+    }
     result
 }
+
+/// How long a failed download stays failed.
+const MISSING_FOR: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 
 impl Symbols {
     pub fn load(path: &Path, identity: &PdbIdentity, base: u64) -> Result<Self> {

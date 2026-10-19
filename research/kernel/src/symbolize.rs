@@ -171,11 +171,18 @@ impl Symbolizer {
 
     /// The call stack as (pc, name), and why the walk stopped early.
     pub fn frames(&mut self, memory: &impl VirtualMemory, registers: &Registers) -> (Vec<(u64, String)>, Option<String>) {
+        let (pcs, stop) = self.pcs(memory, registers);
+        let frames = pcs.into_iter().map(|pc| (pc, self.name(memory, pc))).collect();
+        (frames, stop)
+    }
+
+    /// The call stack's PCs, unnamed (no PDB loaded), and why the walk
+    /// stopped early.
+    pub fn pcs(&mut self, memory: &impl VirtualMemory, registers: &Registers) -> (Vec<u64>, Option<String>) {
         let modules = self.modules.clone();
         let mut tables = std::mem::take(&mut self.unwind);
         let stack = unwind::walk(memory, registers, &modules, &mut tables);
         self.unwind = tables;
-        let frames = stack.frames.iter().map(|f| (f.pc, self.name(memory, f.pc))).collect();
-        (frames, stack.stop)
+        (stack.frames.iter().map(|f| f.pc).collect(), stack.stop)
     }
 }

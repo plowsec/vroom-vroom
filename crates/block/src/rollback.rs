@@ -25,6 +25,8 @@ enum Held {
     Memory(Box<[u8]>),
     /// In the scratch file, at the block's own disk offset (sparse).
     Spilled,
+    /// All zeroes (write-zeroes of whole blocks: no copy of them).
+    Zero,
 }
 
 #[derive(Debug, Default)]
@@ -113,7 +115,7 @@ impl RollbackDisk {
 
     /// Change part of the disk, copying a block up from below the first
     /// time only part of it is written.
-    fn update(&self, offset: u64, len: u64, mut fill: impl FnMut(&mut [u8], usize)) -> Result<()> {
+    fn update(&self, offset: u64, len: u64, zeroes: bool, mut fill: impl FnMut(&mut [u8], usize)) -> Result<()> {
         if self.lower.read_only() {
             return Err(Error::ReadOnly);
         }
@@ -123,8 +125,27 @@ impl RollbackDisk {
         let mut done = 0;
         for (b, o, n) in Self::pieces(offset, len) {
             let size = self.block_len(b);
+            if zeroes && n == size {
+                // A whole block zeroed: nothing to keep but that.
+                if let Some(Held::Memory(_)) = w.blocks.insert(b, Held::Zero) {
+                    w.memory -= size as u64;
+                }
+                done += n;
+                continue;
+            }
             match w.blocks.get_mut(&b) {
                 Some(Held::Memory(blk)) => fill(&mut blk[o..o + n], done),
+                Some(Held::Zero) => {
+                    let mut data = vec![0u8; size];
+                    fill(&mut data[o..o + n], done);
+                    if w.memory + size as u64 <= self.memory_limit {
+                        w.memory += size as u64;
+                        w.blocks.insert(b, Held::Memory(data.into_boxed_slice()));
+                    } else {
+                        self.spill_file(w)?.write_all_at(&data, b * BLOCK)?;
+                        w.blocks.insert(b, Held::Spilled);
+                    }
+                }
                 Some(Held::Spilled) => {
                     let f = w.spill.as_ref().expect("spilled blocks have a file");
                     let mut data = vec![0u8; size];
@@ -186,6 +207,7 @@ impl DiskImage for RollbackDisk {
                             .as_ref()
                             .expect("spilled blocks have a file")
                             .read_exact_at(&mut buf[done..done + n], b * BLOCK + o as u64)?,
+                        Held::Zero => buf[done..done + n].fill(0),
                     }
                 }
                 None => {
@@ -201,7 +223,7 @@ impl DiskImage for RollbackDisk {
     }
 
     fn write_at(&self, buf: &[u8], offset: u64) -> Result<()> {
-        self.update(offset, buf.len() as u64, |dst, at| dst.copy_from_slice(&buf[at..at + dst.len()]))
+        self.update(offset, buf.len() as u64, false, |dst, at| dst.copy_from_slice(&buf[at..at + dst.len()]))
     }
 
     /// Nothing to push down: the writes only ever live here.
@@ -235,7 +257,7 @@ impl DiskImage for RollbackDisk {
     }
 
     fn write_zeroes(&self, offset: u64, len: u64) -> Result<()> {
-        self.update(offset, len, |dst, _| dst.fill(0))
+        self.update(offset, len, true, |dst, _| dst.fill(0))
     }
 }
 
@@ -308,6 +330,27 @@ mod tests {
         rb.read_to_guest(&mem, 0, &segs).unwrap();
         mem.read(crate::GuestAddress(0x2000), &mut got[..1000]).unwrap();
         assert_eq!(got[..1000], before[..1000]);
+    }
+
+    #[test]
+    fn zeroed_blocks_take_no_memory() {
+        let size = 4 * BLOCK as usize;
+        let (_f, lower) = disk(size);
+        let before = read(&*lower, 0, size);
+        let rb = RollbackDisk::new(lower.clone(), std::env::temp_dir(), u64::MAX);
+        rb.write_at(&[7u8; 100], 10).unwrap();
+        assert_eq!(rb.memory_bytes(), BLOCK);
+        // Block 0 (written) and 1 whole, part of block 2.
+        rb.write_zeroes(0, 2 * BLOCK + 50).unwrap();
+        assert_eq!(rb.memory_bytes(), BLOCK, "only the part-zeroed block takes memory");
+        assert_eq!(read(&rb, 0, 2 * BLOCK as usize + 50), vec![0u8; 2 * BLOCK as usize + 50]);
+        assert_eq!(read(&rb, 2 * BLOCK + 50, 10), before[2 * BLOCK as usize + 50..2 * BLOCK as usize + 60]);
+        rb.write_at(&[9u8; 4], BLOCK + 8).unwrap();
+        let mut want = vec![0u8; BLOCK as usize];
+        want[8..12].copy_from_slice(&[9; 4]);
+        assert_eq!(read(&rb, BLOCK, BLOCK as usize), want, "writing into a zeroed block keeps the zeroes");
+        rb.rollback().unwrap();
+        assert_eq!(read(&rb, 0, size), before);
     }
 
     #[test]

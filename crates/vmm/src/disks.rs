@@ -61,7 +61,7 @@ pub(crate) struct DiskSet {
 /// RAM a disk's research rollback layer may hold; more spills to a
 /// scratch file in the disks dir.
 #[cfg(feature = "research")]
-const ROLLBACK_MEMORY: u64 = 64 << 20;
+const ROLLBACK_MEMORY: u64 = 512 << 20;
 
 fn sync_of(s: DiskSync) -> SyncMode {
     match s {
