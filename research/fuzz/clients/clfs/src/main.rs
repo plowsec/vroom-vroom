@@ -82,6 +82,8 @@ extern "system" {
     fn VirtualAlloc(address: *mut c_void, size: usize, kind: u32, protect: u32) -> *mut c_void;
     fn VirtualLock(address: *mut c_void, size: usize) -> Bool;
     fn CreateDirectoryW(path: *const u16, security: *const c_void) -> Bool;
+    fn CreateEventW(security: *const c_void, manual: Bool, initial: Bool, name: *const u16) -> Handle;
+    fn WaitForSingleObject(handle: Handle, ms: u32) -> u32;
 }
 
 const GENERIC_READ: u32 = 0x8000_0000;
@@ -125,6 +127,13 @@ fn wide(s: &str) -> Vec<u16> {
 struct State {
     logs: [Handle; 8],
     marshals: [*mut c_void; 8],
+    /// Logs opened for overlapped I/O, and areas on them: their calls go
+    /// asynchronous (completion paths).
+    async_logs: [bool; 8],
+    async_areas: [bool; 8],
+    /// OVERLAPPEDs handed out (Internal, InternalHigh, Offset, hEvent):
+    /// alive for good, a late completion writes into them.
+    overlapped: Vec<Box<[u64; 4]>>,
     lsns: [Lsn; 16],
     /// Each call's result: 0, or the Win32 error (op in the top byte).
     results: Vec<u32>,
@@ -155,6 +164,33 @@ impl Args<'_> {
 }
 
 impl State {
+    /// An OVERLAPPED with its own event, when `on`; else none.
+    unsafe fn ov(&mut self, on: bool) -> *mut c_void {
+        if !on {
+            return null_mut();
+        }
+        let event = CreateEventW(null(), 1, 0, null());
+        self.overlapped.push(Box::new([0, 0, 0, event as u64]));
+        self.overlapped.last_mut().expect("just pushed").as_mut_ptr().cast()
+    }
+
+    /// A call's result, waiting (a second at most) for one that went
+    /// asynchronous: its status then.
+    unsafe fn finish(&self, ok: Bool, ov: *mut c_void) -> Bool {
+        if ok != 0 || ov.is_null() || GetLastError() != 997 {
+            return ok;
+        }
+        let o = ov.cast::<u64>();
+        if WaitForSingleObject(*o.add(3) as Handle, 1000) != 0 {
+            return 0;
+        }
+        i32::from(*o == 0)
+    }
+
+    fn area_async(&self, slot: u8) -> bool {
+        self.async_areas[slot as usize % 8]
+    }
+
     fn log(&self, slot: u8) -> Handle {
         self.logs[slot as usize % 8]
     }
@@ -180,12 +216,15 @@ impl State {
                 let name = a.u8() % 4;
                 let disposition = 1 + a.u8() as u32 % 5;
                 let stream = a.u8();
+                let overlapped = a.u8() & 1 != 0;
                 let path = if stream == 0 { format!("LOG:C:\\clfs\\l{name}") } else { format!("LOG:C:\\clfs\\l{name}::s{}", stream % 4) };
-                let h = CreateLogFile(wide(&path).as_ptr(), GENERIC_READ | GENERIC_WRITE, SHARE_ALL, null(), disposition, 0);
+                let flags = if overlapped { 0x4000_0000 } else { 0 };
+                let h = CreateLogFile(wide(&path).as_ptr(), GENERIC_READ | GENERIC_WRITE, SHARE_ALL, null(), disposition, flags);
                 if h == INVALID {
                     return 0;
                 }
                 self.logs[slot as usize % 8] = h;
+                self.async_logs[slot as usize % 8] = overlapped;
                 1
             }
             1 => {
@@ -202,8 +241,10 @@ impl State {
                 RemoveLogContainer(log, wide(&format!("C:\\clfs\\c{name}")).as_ptr(), i32::from(a.u8() & 1), null_mut())
             }
             3 => {
-                let log = self.log(a.u8());
+                let log_slot = a.u8();
+                let log = self.log(log_slot);
                 let slot = a.u8() as usize % 8;
+                self.async_areas[slot] = self.async_logs[log_slot as usize % 8];
                 let size = a.u32() % (1 << 20);
                 let (writes, reads) = (a.u8() as u32, a.u8() as u32);
                 CreateLogMarshallingArea(log, null(), null(), null_mut(), size, writes, reads, &mut self.marshals[slot])
@@ -211,7 +252,8 @@ impl State {
             // Append a record: flags, where its LSN goes, its undo-next and
             // previous LSNs, its bytes.
             4 => {
-                let marshal = self.marshal(a.u8());
+                let area = a.u8();
+                let marshal = self.marshal(area);
                 let flags = a.u8() as u32;
                 let into = a.u8() as usize % 16;
                 let undo = self.lsn(&mut a);
@@ -219,25 +261,33 @@ impl State {
                 let data = a.rest();
                 let entry = WriteEntry { buffer: data.as_ptr().cast(), length: data.len() as u32 };
                 let mut lsn = 0;
-                let ok = ReserveAndAppendLog(marshal, &entry, 1, &undo, &previous, 0, null_mut(), flags, &mut lsn, null_mut());
+                let o = self.ov(self.area_async(area));
+                let ok = self.finish(ReserveAndAppendLog(marshal, &entry, 1, &undo, &previous, 0, null_mut(), flags, &mut lsn, o), o);
                 self.lsns[into] = lsn;
                 ok
             }
-            5 => FlushLogBuffers(self.marshal(a.u8()), null_mut()),
+            5 => {
+                let area = a.u8();
+                let o = self.ov(self.area_async(area));
+                self.finish(FlushLogBuffers(self.marshal(area), o), o)
+            }
             // Read from an LSN in a mode, then the next records.
             6 => {
-                let marshal = self.marshal(a.u8());
+                let area = a.u8();
+                let marshal = self.marshal(area);
                 let mode = 1 + a.u8() as u32 % 3;
                 let first = self.lsn(&mut a);
                 let more = a.u8() % 8;
                 let (mut buffer, mut size, mut kind, mut undo, mut previous, mut context) = (null_mut(), 0, 0u8, 0, 0, null_mut());
-                if ReadLogRecord(marshal, &first, mode, &mut buffer, &mut size, &mut kind, &mut undo, &mut previous, &mut context, null_mut()) == 0 {
+                let o = self.ov(self.area_async(area));
+                if self.finish(ReadLogRecord(marshal, &first, mode, &mut buffer, &mut size, &mut kind, &mut undo, &mut previous, &mut context, o), o) == 0 {
                     return 0;
                 }
                 self.lsns[15] = undo;
                 for _ in 0..more {
                     let mut record = 0;
-                    if ReadNextLogRecord(context, &mut buffer, &mut size, &mut kind, null(), &mut undo, &mut previous, &mut record, null_mut()) == 0 {
+                    let o = self.ov(self.area_async(area));
+                    if self.finish(ReadNextLogRecord(context, &mut buffer, &mut size, &mut kind, null(), &mut undo, &mut previous, &mut record, o), o) == 0 {
                         break;
                     }
                     self.lsns[14] = record;
@@ -261,8 +311,14 @@ impl State {
                 let lsn = self.lsn(&mut a);
                 match which {
                     0 => SetLogArchiveTail(self.log(slot), &lsn, null_mut()),
-                    1 => AdvanceLogBase(self.marshal(slot), &lsn, 0, null_mut()),
-                    _ => TruncateLog(self.marshal(slot), &lsn, null_mut()),
+                    1 => {
+                        let o = self.ov(self.area_async(slot));
+                        self.finish(AdvanceLogBase(self.marshal(slot), &lsn, 0, o), o)
+                    }
+                    _ => {
+                        let o = self.ov(self.area_async(slot));
+                        self.finish(TruncateLog(self.marshal(slot), &lsn, o), o)
+                    }
                 }
             }
             9 => {
@@ -324,25 +380,30 @@ impl State {
             // Restart areas: write one (flags, base LSN, bytes), or read the
             // latest and the ones before it.
             15 => {
-                let marshal = self.marshal(a.u8());
+                let area = a.u8();
+                let marshal = self.marshal(area);
                 let flags = a.u8() as u32;
                 let base = self.lsn(&mut a);
                 let data = a.rest();
                 let (mut written, mut next) = (0, 0);
-                let ok = WriteLogRestartArea(marshal, data.as_ptr().cast(), data.len() as u32, &base, flags, &mut written, &mut next, null_mut());
+                let o = self.ov(self.area_async(area));
+                let ok = self.finish(WriteLogRestartArea(marshal, data.as_ptr().cast(), data.len() as u32, &base, flags, &mut written, &mut next, o), o);
                 self.lsns[13] = next;
                 ok
             }
             16 => {
-                let marshal = self.marshal(a.u8());
+                let area = a.u8();
+                let marshal = self.marshal(area);
                 let more = a.u8() % 8;
                 let (mut buffer, mut size, mut lsn, mut context) = (null_mut(), 0, 0, null_mut());
-                if ReadLogRestartArea(marshal, &mut buffer, &mut size, &mut lsn, &mut context, null_mut()) == 0 {
+                let o = self.ov(self.area_async(area));
+                if self.finish(ReadLogRestartArea(marshal, &mut buffer, &mut size, &mut lsn, &mut context, o), o) == 0 {
                     return 0;
                 }
                 self.lsns[12] = lsn;
                 for _ in 0..more {
-                    if ReadPreviousLogRestartArea(context, &mut buffer, &mut size, &mut lsn, null_mut()) == 0 {
+                    let o = self.ov(self.area_async(area));
+                    if self.finish(ReadPreviousLogRestartArea(context, &mut buffer, &mut size, &mut lsn, o), o) == 0 {
                         break;
                     }
                 }
@@ -392,7 +453,8 @@ impl State {
             }
             // Aligned reservations, then an aligned append with them.
             20 => {
-                let marshal = self.marshal(a.u8());
+                let area = a.u8();
+                let marshal = self.marshal(area);
                 let count = 1 + a.u8() as usize % 4;
                 let mut sizes: Vec<i64> = (0..count).map(|_| (a.u32() % (8 << 20)) as i64).collect();
                 let mut aligned = 0;
@@ -407,14 +469,17 @@ impl State {
                 let data = a.rest();
                 let entry = WriteEntry { buffer: data.as_ptr().cast(), length: data.len() as u32 };
                 let mut lsn = 0;
-                let ok = ReserveAndAppendLogAligned(marshal, &entry, 1, alignment, &undo, &previous, count as u32, sizes.as_mut_ptr(), flags, &mut lsn, null_mut());
+                let o = self.ov(self.area_async(area));
+                let ok = self.finish(ReserveAndAppendLogAligned(marshal, &entry, 1, alignment, &undo, &previous, count as u32, sizes.as_mut_ptr(), flags, &mut lsn, o), o);
                 self.lsns[into] = lsn;
                 ok
             }
             21 => {
-                let log = self.log(a.u8());
+                let slot = a.u8();
+                let log = self.log(slot);
                 let end = self.lsn(&mut a);
-                SetEndOfLog(log, &end, null_mut())
+                let o = self.ov(self.async_logs[slot as usize % 8]);
+                self.finish(SetEndOfLog(log, &end, o), o)
             }
             // Management policies: install one from raw bytes (version,
             // length, flags, type, parameters, as the payload says), remove
@@ -473,7 +538,16 @@ impl State {
 }
 
 fn state(verbose: bool) -> State {
-    State { logs: [null_mut(); 8], marshals: [null_mut(); 8], lsns: [0; 16], results: Vec::with_capacity(1024), verbose }
+    State {
+        logs: [null_mut(); 8],
+        marshals: [null_mut(); 8],
+        async_logs: [false; 8],
+        async_areas: [false; 8],
+        overlapped: Vec::new(),
+        lsns: [0; 16],
+        results: Vec::with_capacity(1024),
+        verbose,
+    }
 }
 
 fn main() {
