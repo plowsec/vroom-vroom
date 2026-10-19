@@ -18,6 +18,7 @@ vroom-fuzz cmplog harness.json input.bin                        # one input's co
 vroom-fuzz coverage runs/a/coverage.json runs/a/blocks.json     # per-function summary
 vroom-fuzz trace harness.json runs/a/crashes/<hash>-BugCheck.bin --blocks all-blocks.json   # replay, symbolized
 vroom-fuzz triage harness.json runs/a/crashes/<hash>-BugCheck.bin   # reproduce + minimize
+vroom-fuzz blocks clfs.sys --base 0xfffff804000d0000 --output blocks.json   # block list from the driver file
 ```
 
 | `triage` flag | |
@@ -79,6 +80,7 @@ Kernel TUI: `coverage runs/a/coverage.json`, `coverage-diff runs/a/coverage.json
 | `input_register` / `input_pointer_va`, `input_length_register` / `input_length_va`, `output_length_va` | saved fields patched per input |
 | `entry_pc`, `stop_pc` | first block; return address that ends an input (testcase thread only). User-mode `entry_pc`: a client harness (needs `blocks`, no `isolate_cpu`, `target`, `stop_pc` in the client) |
 | `target` | module under test (`clfs.sys`); default the image of `entry_pc` |
+| `sequence` | input = calls `u32 code \| u16 length \| payload` for a client; mutations insert, drop, repeat, swap, splice calls |
 | `bugcheck_pc` | `KeBugCheckEx` VA: crash = finding + in-place reset (~1 ms, not ~11 s); 5th HW breakpoint |
 | `reset_is_bugcheck` | guest reset counts as a bugcheck |
 | `reopen_after` | `0` reset in place, `1` restore from disk every input |
@@ -110,7 +112,15 @@ sc.exe start HEVD
 C:\HEVD-Lab\HevdFuzzClient.exe 0x222003 1
 ```
 
-## Blocks (angr)
+## Clients, sequences
+
+Stateful drivers (CLFS): the snapshot stands in a user-mode client parked in a loop; each input is a program of calls it makes (`sequence`), the whole guest running; the input ends at the client's `stop_pc`. Coverage is the target's blocks (`blocks` mode, any thread); exceptions are the target's, any thread. No cmplog (the snapshot is outside the target). Example: [CLFS.md](CLFS.md).
+
+## Blocks
+
+`vroom-fuzz blocks FILE --base RUNTIME_BASE [--module NAME] [--symbols DIR] --output blocks.json`: every `.pdata` function swept; blocks start at the function, branch targets, after conditional branches (not after `b`/`br`/`ret`: switch tables live in code, a BRK there corrupts them); names from the PDB (symbol server), else `sub_<VA>`. clfs.sys: 18003 blocks, 1305 functions, ~2 s.
+
+angr (one function and its callees, CFG successors for `edges` mode):
 
 ```sh
 uv sync --project research/tui --extra angr

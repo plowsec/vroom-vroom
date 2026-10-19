@@ -246,7 +246,8 @@ impl Campaign {
 
     /// Run one input.
     pub fn step(&mut self) -> Result<()> {
-        if self.scheduled.is_empty() && self.options.cmplog && !self.options.repeat_seed {
+        // A client's snapshot stands outside the target: nothing to step.
+        if self.scheduled.is_empty() && self.options.cmplog && !self.options.repeat_seed && !self.engine().harness.client() {
             if let Some(parent) = self.cmp_queue.pop_front() {
                 self.compare(&parent);
             }
@@ -263,7 +264,10 @@ impl Campaign {
             self.corpus_energy[parent_index] =
                 self.corpus_energy[parent_index].saturating_sub(1).max(1);
             let parent = &self.corpus_inputs[parent_index];
-            if self.prefix_len == 4 && self.fixed_prefix.is_none() {
+            if self.engine().harness.sequence {
+                let donor = &self.corpus_inputs[self.mutator.choose(self.corpus_inputs.len())];
+                self.mutator.mutate_sequence(parent, donor)
+            } else if self.prefix_len == 4 && self.fixed_prefix.is_none() {
                 self.mutator.mutate_ioctl(parent)
             } else {
                 self.mutator.mutate_preserving_prefix(parent, self.prefix_len)

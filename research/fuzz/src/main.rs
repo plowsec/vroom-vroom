@@ -156,6 +156,23 @@ enum Command {
         #[arg(long)]
         state_dir: Option<PathBuf>,
     },
+    /// A driver's blocks from its file (`.pdata` functions, split at
+    /// branches; PDB names): a block list for the harness.
+    Blocks {
+        /// The driver file (as in the guest: same build).
+        image: PathBuf,
+        /// Its base in the guest (`kernel.modules`).
+        #[arg(long, value_parser = parse_u64)]
+        base: u64,
+        /// Module label (default: the file name).
+        #[arg(long)]
+        module: Option<String>,
+        /// PDB cache (default: `symbols` next to the output).
+        #[arg(long)]
+        symbols: Option<PathBuf>,
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Run a saved finding's input again: does it come back, under which
     /// signature, and the least input that still makes it.
     Triage {
@@ -371,6 +388,15 @@ fn main() -> Result<()> {
                 "{}",
                 serde_json::json!({"trace": out, "end": summary.end, "instructions": summary.instructions, "stack": summary.stack})
             );
+        }
+        Command::Blocks { image, base, module, symbols, output } => {
+            let module = module.unwrap_or_else(|| image.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+            let symbols = symbols.unwrap_or_else(|| output.parent().unwrap_or(std::path::Path::new(".")).join("symbols"));
+            let list = vroom_fuzz::blocks::blocks(&image, base, &module, &symbols)?;
+            let functions: std::collections::BTreeSet<&str> = list.iter().map(|b| b.function.as_str()).collect();
+            let named = functions.iter().filter(|f| !f.starts_with("sub_")).count();
+            std::fs::write(&output, serde_json::to_vec_pretty(&list)?)?;
+            println!("{}", serde_json::json!({"output": output, "blocks": list.len(), "functions": functions.len(), "named": named}));
         }
         Command::Triage { harness, input, out, min, runs, budget, state_dir } => {
             let mut h = Harness::load(&harness)?;
@@ -930,6 +956,14 @@ fn parse_u32(value: &str) -> std::result::Result<u32, String> {
         .map(|hex| u32::from_str_radix(hex, 16))
         .unwrap_or_else(|| value.parse::<u32>());
     parsed.map_err(|error| format!("invalid 32-bit number {value:?}: {error}"))
+}
+
+fn parse_u64(value: &str) -> std::result::Result<u64, String> {
+    let parsed = value
+        .strip_prefix("0x")
+        .map(|hex| u64::from_str_radix(hex, 16))
+        .unwrap_or_else(|| value.parse::<u64>());
+    parsed.map_err(|error| format!("invalid 64-bit number {value:?}: {error}"))
 }
 
 fn write_probe_profile(

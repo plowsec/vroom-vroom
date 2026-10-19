@@ -36,7 +36,27 @@ impl VirtualMemory for DiskImage {
     }
 }
 impl DiskImage {
+    /// `path` exactly as the module `expected` (read from guest memory).
     pub fn load(path: &Path, expected: &Image) -> Result<Self> {
+        let loaded = Self::open(path)?;
+        let actual = &loaded.image;
+        if actual.size != expected.size || actual.timestamp != expected.timestamp {
+            return Err(bad("architecture, timestamp or SizeOfImage mismatch"));
+        }
+        match (&actual.pdb, &expected.pdb) {
+            (Some(a), Some(b)) if a.guid == b.guid && a.age == b.age => (),
+            _ => {
+                return Err(bad(
+                    "CodeView GUID/age mismatch or absent; cannot verify exact build",
+                ))
+            }
+        }
+        Ok(loaded)
+    }
+
+    /// An ARM64 PE file mapped as the loader would (sections at their
+    /// RVAs, at its linked base).
+    pub fn open(path: &Path) -> Result<Self> {
         let file = std::fs::File::open(path).map_err(bad)?;
         let mut data = Vec::new();
         std::io::Read::read_to_end(
@@ -55,13 +75,8 @@ impl DiskImage {
         let count = header >> 16;
         let size = word(&data, pe + 80)?;
         let timestamp = word(&data, pe + 8)?;
-        if header & 65535 != 0xaa64
-            || !(1..=96).contains(&count)
-            || size != expected.size
-            || timestamp != expected.timestamp
-            || !(4096..=64 * 1024 * 1024).contains(&size)
-        {
-            return Err(bad("architecture, timestamp or SizeOfImage mismatch"));
+        if header & 65535 != 0xaa64 || !(1..=96).contains(&count) || !(4096..=64 * 1024 * 1024).contains(&size) {
+            return Err(bad("not an ARM64 image, or an invalid section count or SizeOfImage"));
         }
         let optional = (word(&data, pe + 20)? & 65535) as usize;
         if optional < 240 || word(&data, pe + 24)? & 65535 != 0x20b {
@@ -104,19 +119,16 @@ impl DiskImage {
             bytes,
             image: Image {
                 base,
-                ..expected.clone()
+                size,
+                timestamp,
+                image_base: base,
+                name: String::new(),
+                pdb: None,
+                exports: Default::default(),
+                relocation_directory: (0, 0),
             },
         };
-        let actual = Image::read(&loaded, base)?;
-        match (&actual.pdb, &expected.pdb) {
-            (Some(a), Some(b)) if a.guid == b.guid && a.age == b.age => (),
-            _ => {
-                return Err(bad(
-                    "CodeView GUID/age mismatch or absent; cannot verify exact build",
-                ))
-            }
-        }
-        loaded.image = actual;
+        loaded.image = Image::read(&loaded, base)?;
         Ok(loaded)
     }
 }

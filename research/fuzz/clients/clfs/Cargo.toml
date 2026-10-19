@@ -1,0 +1,13 @@
+[package]
+name = "clfs-client"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Built for the guest (Windows ARM64), apart from the workspace:
+#   cargo xwin build --release --target aarch64-pc-windows-msvc
+[workspace]
+
+[profile.release]
+panic = "abort"
+debug = 1

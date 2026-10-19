@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use vroom_kernel::arm64::{AddressSpace, Registers};
 
+pub mod blocks;
 pub mod campaign;
 pub mod cmplog;
 pub mod hub;
@@ -169,6 +170,12 @@ pub struct Harness {
     /// `entry_pc` is in.
     #[serde(default)]
     pub target: Option<String>,
+    /// The input is calls for a client to make, one after the other (state
+    /// carries from call to call): each `u32 code | u16 length | payload`,
+    /// little-endian. Mutations also insert, drop, repeat, swap and splice
+    /// calls.
+    #[serde(default)]
+    pub sequence: bool,
     /// Hardware watched memory ranges. Use `poisoned` for allocator redzones
     /// or freed objects whose address is known from a target harness.
     #[serde(default)]
@@ -643,6 +650,38 @@ pub struct Mutator {
     dictionary: Vec<u32>,
 }
 
+/// The calls of a sequence input: (code, payload). A last call cut short
+/// keeps what's there; bytes too few for a header are dropped.
+pub fn calls(input: &[u8]) -> Vec<(u32, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at + 6 <= input.len() {
+        let code = u32::from_le_bytes(input[at..at + 4].try_into().expect("four bytes"));
+        let length = u16::from_le_bytes(input[at + 4..at + 6].try_into().expect("two bytes")) as usize;
+        let end = (at + 6 + length).min(input.len());
+        out.push((code, input[at + 6..end].to_vec()));
+        at = end;
+    }
+    out
+}
+
+fn calls_or(input: &[u8], fallback: &[(u32, Vec<u8>)]) -> Vec<(u32, Vec<u8>)> {
+    let c = calls(input);
+    if c.is_empty() { fallback.to_vec() } else { c }
+}
+
+/// A sequence input from calls.
+pub fn sequence(calls: &[(u32, Vec<u8>)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (code, payload) in calls {
+        let payload = &payload[..payload.len().min(u16::MAX as usize)];
+        out.extend_from_slice(&code.to_le_bytes());
+        out.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+        out.extend_from_slice(payload);
+    }
+    out
+}
+
 /// Dictionary words kept at most.
 const DICTIONARY: usize = 4096;
 
@@ -696,6 +735,64 @@ impl Mutator {
         }
         out
     }
+    /// A mutation of the call sequence `seed` (see `Harness::sequence`):
+    /// a call's payload or code changes, or calls are inserted (from the
+    /// seed or `donor`), dropped, repeated, swapped, or the tail replaced
+    /// by `donor`'s. Whole calls past `max_len` are dropped.
+    pub fn mutate_sequence(&mut self, seed: &[u8], donor: &[u8]) -> Vec<u8> {
+        let mut calls = calls(seed);
+        if calls.is_empty() {
+            calls.push((0, Vec::new()));
+        }
+        let donors = calls_or(donor, &calls);
+        for _ in 0..1 + self.next() % 3 {
+            let i = self.choose(calls.len());
+            match self.next() % 9 {
+                0..=2 => calls[i].1 = self.mutate(&calls[i].1),
+                3 => {
+                    let code = calls[i].0;
+                    calls[i].0 = match self.next() % 4 {
+                        0 if !self.dictionary.is_empty() => self.word(),
+                        1 => {
+                            let other = &donors[self.choose(donors.len())];
+                            other.0
+                        }
+                        2 => code ^ (1 << (self.next() % 32)),
+                        _ => code.wrapping_add(1 + (self.next() % 4) as u32).wrapping_sub(if self.next() & 1 == 0 { 0 } else { 2 + 2 * (self.next() % 4) as u32 }),
+                    };
+                }
+                4 => {
+                    let call = donors[self.choose(donors.len())].clone();
+                    let at = self.choose(calls.len() + 1);
+                    calls.insert(at, call);
+                }
+                5 if calls.len() > 1 => {
+                    calls.remove(i);
+                }
+                6 => {
+                    let call = calls[i].clone();
+                    calls.insert(i, call);
+                }
+                7 => {
+                    let j = self.choose(calls.len());
+                    calls.swap(i, j);
+                }
+                _ => {
+                    let j = self.choose(donors.len());
+                    calls.truncate(i);
+                    calls.extend(donors[j..].iter().cloned());
+                }
+            }
+        }
+        let mut out = sequence(&calls);
+        while out.len() > self.max_len && calls.len() > 1 {
+            calls.pop();
+            out = sequence(&calls);
+        }
+        out.truncate(self.max_len);
+        out
+    }
+
     fn next(&mut self) -> u64 {
         self.state ^= self.state << 7;
         self.state ^= self.state >> 9;
@@ -906,6 +1003,9 @@ struct Case {
 /// difference: the IOCTL code (the prefix) and the payload's first
 /// aligned words, where structure headers, sizes and magic values sit.
 pub fn cmp_fields(harness: &Harness, len: usize) -> Vec<usize> {
+    if harness.sequence {
+        return Vec::new();
+    }
     let prefix = if harness.ioctl_prefix { 4 } else { 0 };
     let mut fields: Vec<usize> = if harness.ioctl_prefix { vec![0] } else { Vec::new() };
     fields.extend((prefix..len.min(prefix + 32)).step_by(4).filter(|f| f + 4 <= len));
@@ -945,11 +1045,15 @@ struct Always {
 }
 
 /// A fuzzing VM is disposable: no host port forwards (they would clash
-/// between workers, and with the lab), and its own copy of the EFI
-/// variables, since restoring a snapshot writes them back.
+/// between workers, and with the lab), its own copy of the EFI variables,
+/// since restoring a snapshot writes them back, and no flushes to the
+/// host's disk (every reset drops what the guest wrote).
 fn disposable(config: &mut vroom_config::VmConfig, state_dir: &Path) -> Result<()> {
     for net in &mut config.nets {
         net.port_forwards.clear();
+    }
+    for disk in &mut config.disks {
+        disk.sync = vroom_config::DiskSync::None;
     }
     if let vroom_config::Boot::Uefi { vars, .. } = &mut config.boot {
         let copy = state_dir.join("fuzz-efivars.fd");
@@ -1690,7 +1794,9 @@ impl Engine {
         let state = self.vm.debug_registers(self.harness.cpu)?;
         let registers = Registers::from_state(&state)
             .map_err(|error| Error::Invalid(format!("ARM64 register state: {error}")))?;
-        trace_dispatch_state(&self.vm, &registers, self.harness.ioctl_va)?;
+        if !self.harness.client() {
+            trace_dispatch_state(&self.vm, &registers, self.harness.ioctl_va)?;
+        }
         let entry_pc = self.harness.entry_pc.unwrap_or(registers.pc);
         let entry_sp = registers.sp;
         let entry_ttbr0 = registers.ttbr0;
@@ -1801,6 +1907,9 @@ impl Engine {
             };
             match event {
                 vroom_vmm::VmEvent::Debug(stop) => {
+                    if std::env::var_os("VROOM_FUZZ_TRACE").is_some_and(|v| v == "2") {
+                        eprintln!("debug stop cpu={} pc={:#x} {:?}", stop.cpu, stop.pc, stop.reason);
+                    }
                     if own_step.or(foreign_step).is_some_and(|cpu| cpu != stop.cpu) {
                         // A stop queued before the step began: that CPU
                         // stays parked on a still-armed breakpoint and stops
@@ -1970,6 +2079,15 @@ impl Engine {
                         }
                     }
                     if self.harness.stop_pc == Some(stop.pc) {
+                        if client && std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
+                            // What the client says (its first argument).
+                            if let Ok(Ok(r)) = self.vm.debug_registers(stop.cpu as usize).map(|s| Registers::from_state(&s)) {
+                                let mut words = [0u8; 64];
+                                let space = AddressSpace { memory: &self.vm, registers: &r };
+                                let _ = vroom_kernel::windows::VirtualMemory::read(&space, r.x[0], &mut words);
+                                eprintln!("stop_pc x0={:#x}: {}", r.x[0], words.chunks(4).map(|w| format!("{:08x}", u32::from_le_bytes(w.try_into().expect("four")))).collect::<Vec<_>>().join(" "));
+                            }
+                        }
                         break;
                     }
                     if stop.reason == vroom_hv::debug::DebugReason::Watchpoint {
@@ -2531,6 +2649,26 @@ mod tests {
             BugClass::Timeout
         );
     }
+    #[test]
+    fn sequences_mutate_by_calls() {
+        let seed = sequence(&[(0, vec![0, 0, 3, 0]), (1, vec![0, 0, 0, 8, 0, 0]), (4, b"hello".to_vec())]);
+        assert_eq!(calls(&seed).len(), 3);
+        assert_eq!(sequence(&calls(&seed)), seed);
+        let mut m = Mutator::new(7, 256);
+        let mut lengths = std::collections::BTreeSet::new();
+        for _ in 0..500 {
+            let out = m.mutate_sequence(&seed, &seed);
+            assert!(out.len() <= 256);
+            let c = calls(&out);
+            assert!(!c.is_empty());
+            assert_eq!(sequence(&c), out, "every mutation is whole calls");
+            lengths.insert(c.len());
+        }
+        assert!(lengths.len() > 3, "calls are inserted and dropped: {lengths:?}");
+        // A cut-short last call keeps its bytes.
+        assert_eq!(calls(&seed[..seed.len() - 2]).last().unwrap().1, b"hel");
+    }
+
     #[test]
     fn signatures_start_at_the_faulting_code() {
         let f = |stack: &[&str]| Finding {
