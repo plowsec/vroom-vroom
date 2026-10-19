@@ -36,7 +36,7 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// A basic block known to the coverage database. Analysis manifests can keep
-/// portable VAs; instrumentation resolves them to GPAs for this checkpoint.
+/// portable VAs; instrumentation resolves them to GPAs for this snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CoverageBlock {
     pub id: u64,
@@ -62,7 +62,7 @@ pub struct CoverageBlock {
 pub struct Harness {
     pub name: String,
     pub config: PathBuf,
-    pub checkpoint: PathBuf,
+    pub snapshot: PathBuf,
     pub state_dir: PathBuf,
     pub input_gpa: u64,
     pub input_capacity: usize,
@@ -83,7 +83,7 @@ pub struct Harness {
     pub ioctl_register: Option<String>,
     /// Optional target-specific IOCTL field in the saved handler state. When
     /// set, testcase IOCTL values are written here instead of to a call ABI
-    /// register. This supports a checkpoint taken at a driver's IRP handler.
+    /// register. This supports a snapshot taken at a driver's IRP handler.
     #[serde(default)]
     pub ioctl_va: Option<u64>,
     /// Optional guest VA of a saved pointer field that should point at
@@ -105,7 +105,7 @@ pub struct Harness {
     /// successful iteration instead of waiting for the timeout.
     #[serde(default)]
     pub stop_pc: Option<u64>,
-    /// First instrumented block to stop at. If omitted, use the checkpoint PC.
+    /// First instrumented block to stop at. If omitted, use the snapshot PC.
     #[serde(default)]
     pub entry_pc: Option<u64>,
     /// Treat a guest reset as a kernel bugcheck. This is useful for drivers
@@ -770,12 +770,12 @@ pub struct Engine {
     /// reached through unresolved indirect dispatch branches.
     watch_targets: Vec<u64>,
     watch_cursor: usize,
-    checkpoint_fresh: bool,
+    snapshot_fresh: bool,
     cow_enabled: bool,
     input_buffer: Vec<u8>,
     /// `blocks` mode: block index -> the instruction its BRK replaced.
     planted: HashMap<usize, [u8; 4]>,
-    /// `blocks` mode: blocks whose code page isn't mapped at the checkpoint
+    /// `blocks` mode: blocks whose code page isn't mapped at the snapshot
     /// (pageable code in transition), by 4 KiB VA page. Each is planted once
     /// an input has faulted its page in: resets bring back the same
     /// physical page every time.
@@ -791,7 +791,7 @@ struct Always {
 
 /// A fuzzing VM is disposable: no host port forwards (they would clash
 /// between workers, and with the lab), and its own copy of the EFI
-/// variables, since restoring a checkpoint writes them back.
+/// variables, since restoring a snapshot writes them back.
 fn disposable(config: &mut vroom_config::VmConfig, state_dir: &Path) -> Result<()> {
     for net in &mut config.nets {
         net.port_forwards.clear();
@@ -823,14 +823,14 @@ impl Engine {
         }
         let hv = vroom_hv::default_hypervisor()?;
         // COW resets restore the VM in place (`Vmm::research_reset`).
-        // `reopen_after: 1` opts out and restores the checkpoint each time.
+        // `reopen_after: 1` opts out and restores the snapshot each time.
         let cow_enabled = harness.reopen_after != 1;
         let mut vm = vroom_vmm::Vmm::start(
             config,
             hv,
             vroom_vmm::VmmOptions {
                 serial_out: Box::new(std::io::sink()),
-                start: vroom_vmm::StartMode::RestorePaused(harness.checkpoint.clone()),
+                start: vroom_vmm::StartMode::RestorePaused(harness.snapshot.clone()),
                 clipboard: None,
                 ui: None,
                 state_dir: harness.state_dir.clone(),
@@ -838,7 +838,7 @@ impl Engine {
                 sandbox: false,
             },
         )?;
-        // Each reopen restores the checkpoint onto a new disk overlay.
+        // Each reopen restores the snapshot onto a new disk overlay.
         vm.research_discard_disk_layers();
         Ok(Self {
             vm,
@@ -847,7 +847,7 @@ impl Engine {
             block_by_pc: HashMap::new(),
             watch_targets: Vec::new(),
             watch_cursor: 0,
-            checkpoint_fresh: true,
+            snapshot_fresh: true,
             cow_enabled,
             input_buffer: vec![0; input_capacity],
             planted: HashMap::new(),
@@ -873,7 +873,7 @@ impl Engine {
                     Ok(translated) => Some(translated.physical),
                     // Driver code can be pageable. Keep its VA breakpoint in
                     // the manifest even when that code page is not resident
-                    // at the checkpoint; it may be loaded before execution.
+                    // at the snapshot; it may be loaded before execution.
                     Err(_) => None,
                 },
                 (None, None) => {
@@ -956,7 +956,7 @@ impl Engine {
     }
 
     /// Replace a VM that timed out or reset with a fresh restore of the same
-    /// checkpoint. COW reset is fast for normal cases, but cannot be trusted
+    /// snapshot. COW reset is fast for normal cases, but cannot be trusted
     /// after a guest bugcheck or a wedged kernel path.
     pub fn reopen(self) -> Result<Self> {
         let Engine {
@@ -975,7 +975,7 @@ impl Engine {
     }
 
     /// `blocks` mode: a BRK on every resolved block not covered yet, except
-    /// the entry block (the checkpoint stands on it) and the hardware
+    /// the entry block (the snapshot stands on it) and the hardware
     /// breakpoint sites. Covered blocks stay as they are after a reopen.
     fn plant(&mut self, entry_pc: u64) -> Result<()> {
         let brk = brk_instruction(COVERAGE_BRK);
@@ -1046,7 +1046,7 @@ impl Engine {
         }
         let brk = brk_instruction(COVERAGE_BRK);
         for (page, physical) in mapped {
-            // A page the checkpoint already held (in transition) comes back
+            // A page the snapshot already held (in transition) comes back
             // at this frame every input. One the input filled in has other
             // contents in the baseline: a BRK there would corrupt them.
             if !self.vm.research_matches_baseline(physical, 0x1000)? {
@@ -1136,13 +1136,13 @@ impl Engine {
         if input.len() > self.harness.max_input {
             return Err(Error::Invalid("input exceeds max_input".into()));
         }
-        let arm_after_patch = !self.cow_enabled && self.checkpoint_fresh;
+        let arm_after_patch = !self.cow_enabled && self.snapshot_fresh;
         let reset_start = Instant::now();
-        if self.checkpoint_fresh {
-            // RestorePaused already supplied the exact checkpoint state. Do
+        if self.snapshot_fresh {
+            // RestorePaused already supplied the exact snapshot state. Do
             // not COW-reset before its first testcase: HVF can retain stage-2
             // host mappings across that remap and execute against stale RAM.
-            self.checkpoint_fresh = false;
+            self.snapshot_fresh = false;
         } else if self.cow_enabled {
             self.vm.research_reset()?;
         } else {
@@ -1355,7 +1355,7 @@ impl Engine {
                 "entry_pc {entry_pc:#x} is not in the coverage block list"
             )));
         }
-        // The checkpoint is already stopped at the first block. Do not plant
+        // The snapshot is already stopped at the first block. Do not plant
         // a software trap there: resume directly and use hardware execution
         // breakpoints on its CFG successors to observe the next block.
         let entry_index = *self.block_by_pc.get(&entry_pc).expect("checked above");
@@ -1402,8 +1402,8 @@ impl Engine {
         let mut finding = None;
         let mut findings = Vec::<Finding>::new();
         let mut watch_hits = BTreeMap::<usize, u64>::new();
-        // The VM left the checkpoint's machine (a timeout, a guest reset, a
-        // VMM failure): restore the checkpoint rather than reset in place.
+        // The VM left the snapshot's machine (a timeout, a guest reset, a
+        // VMM failure): restore the snapshot rather than reset in place.
         let mut reopen = false;
         let entry_block = &self.harness.coverage[entry_index];
         let mut previous_pc = Some(entry_block.id);
@@ -1926,7 +1926,7 @@ fn breakpoint_set(
     breakpoints
 }
 
-/// How far above the checkpoint's SP the caller's frame at `stop_pc` may be
+/// How far above the snapshot's SP the caller's frame at `stop_pc` may be
 /// (the frames between the target call and the entry block).
 const RETURN_FRAMES: u64 = 0x4000;
 /// How far an exception-dispatch site can be from the entry SP on the same
@@ -2033,7 +2033,7 @@ pub struct RunResult {
     #[serde(default)]
     pub reset_us: u64,
     /// The input ended in a timeout, a guest reset or a VMM failure, so the
-    /// in-place reset can't be trusted: restore the checkpoint before the
+    /// in-place reset can't be trusted: restore the snapshot before the
     /// next input. A bugcheck stopped at `bugcheck_pc` doesn't need this.
     #[serde(default)]
     pub reopen: bool,

@@ -15,6 +15,7 @@ vroom-hv.workspace = true
 vroom-memory.workspace = true
 vroom-vmm.workspace = true
 vroom-config.workspace = true
+vroom-state.workspace = true
 vroom-tools.workspace = true
 vroom-display.workspace = true
 clap.workspace = true

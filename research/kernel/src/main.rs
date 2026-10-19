@@ -21,8 +21,8 @@ use vroom_vmm::{RunState, StartMode, VmEvent, Vmm, VmmOptions};
 struct Args {
     /// A disposable vroom VM config. Boots paused; resume explicitly.
     config: PathBuf,
-    /// Restore a vroom checkpoint (or snapshot) instead of cold booting: its
-    /// folder, or the name of one of this VM's snapshots (snap-...).
+    /// Restore a vroom snapshot instead of cold booting: its folder, or the
+    /// name of one of this VM's snapshots (snap-...).
     #[arg(long)]
     restore: Option<PathBuf>,
     /// Also serve agents (JSON-RPC 2.0, one object per line) on this
@@ -40,6 +40,7 @@ struct Args {
 /// Anything else is explained (a path with a space split in two by the
 /// shell looks like this), with the VM's snapshots to pick from.
 fn restore_dir(given: &std::path::Path, state_dir: &std::path::Path) -> Result<PathBuf, String> {
+    // A snapshot folder holds manifest.json.
     let snapshots = state_dir.join("snapshots");
     if given.join("manifest.json").is_file() {
         return Ok(given.to_path_buf());
@@ -51,8 +52,8 @@ fn restore_dir(given: &std::path::Path, state_dir: &std::path::Path) -> Result<P
         .map(|d| d.flatten().filter(|e| e.path().join("manifest.json").is_file()).map(|e| e.file_name().to_string_lossy().into_owned()).collect())
         .unwrap_or_default();
     names.sort();
-    let what = if given.exists() { "not a vroom checkpoint or snapshot (no manifest.json in it)" } else { "no such folder" };
-    let mut why = format!("--restore {}: {what}. Quote paths with spaces.", given.display());
+    let what = if given.exists() { "not a vroom snapshot (no manifest.json in it)" } else { "no such folder" };
+    let mut why = format!("{}: {what}. Quote paths with spaces.", given.display());
     if names.is_empty() {
         why.push_str(&format!(" This VM has no snapshots in {}.", snapshots.display()));
     } else {
@@ -209,6 +210,7 @@ struct Session {
     module_symbols: BTreeMap<(u64, u64), Symbols>,
     cache: PathBuf,
     exports: PathBuf,
+    state_dir: PathBuf,
     continue_cpus: std::collections::VecDeque<usize>,
     continuing: bool,
     input: std::os::unix::net::UnixStream,
@@ -334,7 +336,7 @@ impl Session {
     fn command(&mut self, request: &Value) -> Result<Value, String> {
         let cpu = request.get("cpu").map(number).transpose()?.unwrap_or(0) as usize;
         let op = request["op"].as_str().ok_or("missing op")?;
-        if !matches!(op, "status" | "pause" | "shutdown" | "key")
+        if !matches!(op, "status" | "pause" | "shutdown" | "key" | "snapshot" | "snapshots")
             && self.vm.state() != RunState::Paused
         {
             return Err("pause the VM before inspection or control".into());
@@ -1062,25 +1064,45 @@ impl Session {
                     .map_err(|e| e.to_string())?;
                 Ok(json!(true))
             }
-            "checkpoint" => {
-                let path = request["path"]
-                    .as_str()
-                    .ok_or("missing checkpoint directory")?;
-                if self.vm.state() != RunState::Paused {
-                    return Err("pause before saving a checkpoint".into());
+            "snapshot" => {
+                // Into this VM's snapshots (the app lists them), unless a
+                // folder is given.
+                let dir = match (request["path"].as_str(), request["name"].as_str()) {
+                    (Some(p), _) => PathBuf::from(p),
+                    (None, Some(n)) if !n.is_empty() && !n.contains('/') && !n.starts_with('.') => self.state_dir.join("snapshots").join(n),
+                    (None, Some(n)) => return Err(format!("bad snapshot name {n:?}")),
+                    (None, None) => {
+                        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                        self.state_dir.join("snapshots").join(format!("snap-{t}"))
+                    }
+                };
+                if dir.exists() {
+                    return Err(format!("{} exists already", dir.display()));
                 }
+                let running = self.vm.state() == RunState::Running;
+                if running {
+                    self.vm.pause().map_err(|e| e.to_string())?;
+                }
+                // Saved without the debugger's traps.
                 for cpu in 0..self.vm.config().cpus as usize {
-                    self.vm
-                        .debug_configure(cpu, DebugConfig::default())
-                        .map_err(|e| e.to_string())?;
+                    self.vm.debug_configure(cpu, DebugConfig::default()).map_err(|e| e.to_string())?;
                 }
-                let saved = self
-                    .vm
-                    .snapshot(std::path::Path::new(path), "kernel debugger checkpoint")
-                    .map_err(|e| e.to_string());
+                let saved = self.vm.snapshot(&dir, request["description"].as_str().unwrap_or("vroom-lab")).map_err(|e| e.to_string());
                 self.configure()?;
+                if running {
+                    self.vm.resume().map_err(|e| e.to_string())?;
+                }
                 saved?;
-                Ok(json!("checkpoint saved"))
+                let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                Ok(json!({"name": name, "path": dir}))
+            }
+            "snapshots" => {
+                let list = vroom_state::list(&self.state_dir).map_err(|e| e.to_string())?;
+                Ok(Value::Array(
+                    list.into_iter()
+                        .map(|s| json!({"name": s.name, "path": s.path, "created_unix": s.created_unix, "description": s.description, "bytes": s.bytes}))
+                        .collect(),
+                ))
             }
             "shutdown" => {
                 self.vm.shutdown();
@@ -1110,13 +1132,14 @@ impl Session {
     }
 }
 
-fn run(args: Args) -> Result<(), String> {
-    let args_agent_socket = args.agent_socket.clone();
-    let config = vroom_config::VmConfig::load(&args.config).map_err(|e| e.to_string())?;
+/// Start the VM, paused (cold boot, or `restore`: a snapshot's folder or
+/// name), and the session around it.
+fn boot(config_path: &std::path::Path, restore: Option<&std::path::Path>) -> Result<Session, String> {
+    let config = vroom_config::VmConfig::load(config_path).map_err(|e| e.to_string())?;
     if config.nested {
         return Err("disable nested virtualization for kernel debugging".into());
     }
-    let state_dir = config.default_state_dir(&args.config);
+    let state_dir = config.default_state_dir(config_path);
     std::fs::create_dir_all(&state_dir).map_err(|e| e.to_string())?;
     // Never send guest serial bytes into the debugger protocol.
     let serial = std::fs::OpenOptions::new()
@@ -1134,9 +1157,8 @@ fn run(args: Args) -> Result<(), String> {
     // to the lab without adding a second input implementation to the VMM.
     let (viewer, vmm_viewer) = std::os::unix::net::UnixStream::pair().map_err(|e| e.to_string())?;
     let input = viewer.try_clone().map_err(|e| e.to_string())?;
-    let start = args
-        .restore
-        .map(|r| restore_dir(&r, &state_dir).map(StartMode::RestorePaused))
+    let start = restore
+        .map(|r| restore_dir(r, &state_dir).map(StartMode::RestorePaused))
         .transpose()?
         .unwrap_or(StartMode::BootPaused);
     let mut vm = Vmm::start(
@@ -1147,7 +1169,7 @@ fn run(args: Args) -> Result<(), String> {
             start,
             clipboard: None,
             ui: Some(vmm_viewer),
-            state_dir,
+            state_dir: state_dir.clone(),
             // The lab doesn't sandbox the VMM it drives.
             sandbox: false,
         },
@@ -1160,7 +1182,7 @@ fn run(args: Args) -> Result<(), String> {
         }
     });
     vm.pause().map_err(|e| e.to_string())?;
-    let mut session = Session {
+    let session = Session {
         vm,
         breakpoints: Vec::new(),
         breakpoint_contexts: BTreeMap::new(),
@@ -1180,11 +1202,18 @@ fn run(args: Args) -> Result<(), String> {
         symbols: None,
         cache,
         exports,
+        state_dir,
         continue_cpus: Default::default(),
         continuing: false,
         input,
     };
     session.configure()?;
+    Ok(session)
+}
+
+fn run(args: Args) -> Result<(), String> {
+    let args_agent_socket = args.agent_socket.clone();
+    let mut session = boot(&args.config, args.restore.as_deref())?;
     output(json!({"event":"ready", "state":"Paused", "cpus": session.vm.config().cpus, "note": "paused: vm.resume runs the guest"}))?;
     let (tx, rx) = mpsc::sync_channel::<Input>(8);
     let _endpoint = match &args_agent_socket {
@@ -1316,7 +1345,20 @@ fn run(args: Args) -> Result<(), String> {
         match rx.recv_timeout(Duration::from_millis(20)) {
             Ok(Input::Stdio(Ok(request))) => {
                 let id = request.get("id").cloned().unwrap_or(Value::Null);
-                let response = match session.command(&request) {
+                let result = if request["op"] == "restore" {
+                    let mut slot = Some(session);
+                    let r = restore_in(&mut slot, &args.config, &request);
+                    let Some(s) = slot else {
+                        output(json!({"id":id,"error":r.err()}))?;
+                        output(json!({"event":"shutdown"}))?;
+                        return Ok(());
+                    };
+                    session = s;
+                    r
+                } else {
+                    session.command(&request)
+                };
+                let response = match result {
                     Ok(result) => json!({"id":id,"result":result}),
                     Err(error) => json!({"id":id,"error":error}),
                 };
@@ -1330,6 +1372,16 @@ fn run(args: Args) -> Result<(), String> {
             Ok(Input::Agent(forward)) if forward.request["op"].as_str().is_some_and(|op| op.starts_with("guest_")) => {
                 guest::run(&session.vm, &session.exports, forward);
             }
+            Ok(Input::Agent(forward)) if forward.request["op"] == "restore" => {
+                let mut slot = Some(session);
+                let r = restore_in(&mut slot, &args.config, &forward.request);
+                let _ = forward.reply.send(r);
+                let Some(s) = slot else {
+                    output(json!({"event":"shutdown"}))?;
+                    return Ok(());
+                };
+                session = s;
+            }
             Ok(Input::Agent(forward)) => {
                 let _ = forward.reply.send(session.command(&forward.request));
                 if session.vm.state() == RunState::Stopped {
@@ -1341,6 +1393,22 @@ fn run(args: Args) -> Result<(), String> {
             Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
         }
     }
+}
+
+/// `restore`: this VM again, from one of its snapshots (or a snapshot
+/// folder), paused. Checked first: a snapshot that can't start leaves the
+/// running VM alone. Past that, a failure ends the lab: `slot` is empty
+/// after it.
+fn restore_in(slot: &mut Option<Session>, config_path: &std::path::Path, request: &Value) -> Result<Value, String> {
+    let state_dir = slot.as_ref().map(|s| s.state_dir.clone()).ok_or("no VM")?;
+    let given = request["name"].as_str().or(request["path"].as_str()).ok_or("missing name (or path)")?;
+    let dir = restore_dir(std::path::Path::new(given), &state_dir)?;
+    vroom_vmm::check_snapshot(&dir).map_err(|e| e.to_string())?;
+    // The old VM lets go of its state dir, disks and network ports first.
+    drop(slot.take());
+    let session = boot(config_path, Some(&dir)).map_err(|e| format!("{e} (the lab stops: its VM is gone)"))?;
+    *slot = Some(session);
+    Ok(json!({"restored": dir, "state": "Paused", "note": "paused: vm.resume runs the guest"}))
 }
 
 fn main() {

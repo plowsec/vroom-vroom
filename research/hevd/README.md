@@ -1,7 +1,7 @@
 # HackSys Extreme Vulnerable Driver
 
 First Windows kernel target. Disposable VM only. HEVD source, driver,
-checkpoints and guest state stay outside the repo. Pinned upstream:
+snapshots and guest state stay outside the repo. Pinned upstream:
 `b1cc756e55f69530f6468a6c3c310ed7b967bada`. Walkthrough:
 [../fuzz/DEMO.md](../fuzz/DEMO.md).
 
@@ -14,7 +14,7 @@ Builder\Build_HEVD_Vulnerable_arm64.bat
 Install in the guest. [client.c](client.c) opens
 `\\.\HackSysExtremeVulnerableDriver` and calls `DeviceIoControl`.
 
-## Checkpoint
+## Snapshot
 
 Two places to stop; fill the addresses into
 [harness.example.json](harness.example.json).
@@ -28,7 +28,7 @@ Two places to stop; fill the addresses into
 | always | `input_gpa`, `input_va` | `input_gpa`, `input_va`; clear call-site fields |
 
 Testcase: `u32 LE IOCTL | input bytes`. Block VAs are translated through
-the restored page tables, so a harness survives a new checkpoint.
+the restored page tables, so a harness survives a new snapshot.
 
 ## Blocks and IOCTLs (angr)
 
@@ -59,10 +59,10 @@ cargo run -p vroom-fuzz -- probe research/hevd/harness.example.json payload.bin 
 
 - Coverage: only blocks in the map. Unresolved indirect branches: one HW
   breakpoint rotates over function entries across inputs.
-- Bugcheck or timeout: input saved, checkpoint restored.
+- Bugcheck or timeout: input saved, snapshot restored.
 - `reopen_after: 2` if in-place resets misbehave. `--no-boundary-seeds`
   skips the size seeds.
-- `probe`: every IOCTL in range from the checkpoint; `results.jsonl` plus
+- `probe`: every IOCTL in range from the snapshot; `results.jsonl` plus
   coverage for those that differ from the invalid-code baseline.
 
 Harness fields: [../fuzz/README.md](../fuzz/README.md).

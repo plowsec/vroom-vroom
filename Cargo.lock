@@ -5666,6 +5666,7 @@ dependencies = [
  "vroom-display",
  "vroom-hv",
  "vroom-memory",
+ "vroom-state",
  "vroom-tools",
  "vroom-vmm",
 ]

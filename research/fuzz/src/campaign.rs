@@ -276,7 +276,7 @@ impl Campaign {
         if result.reopen {
             if self.options.verbose {
                 eprintln!(
-                    "restoring the clean checkpoint after {:?} ({})",
+                    "restoring the clean snapshot after {:?} ({})",
                     result.finding.as_ref().map(|finding| finding.class),
                     self.iteration + 1
                 );
@@ -288,7 +288,7 @@ impl Campaign {
             if reopen_after != 0 && self.inputs_since_reopen >= reopen_after {
                 if self.options.verbose {
                     eprintln!(
-                        "reopening the checkpoint after {} inputs",
+                        "reopening the snapshot after {} inputs",
                         self.inputs_since_reopen
                     );
                 }
@@ -397,7 +397,7 @@ impl Campaign {
             serde_json::to_vec_pretty(&engine.harness.coverage)?,
         )?;
         eprintln!(
-            "campaign: {} executions, {} blocks, {} corpus inputs, {} finding signatures, {} checkpoint restores, {:.1} executions/s",
+            "campaign: {} executions, {} blocks, {} corpus inputs, {} finding signatures, {} snapshot restores, {:.1} executions/s",
             engine.coverage.executions,
             engine.coverage.covered(),
             self.corpus_inputs.len(),

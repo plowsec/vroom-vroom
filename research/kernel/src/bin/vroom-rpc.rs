@@ -43,7 +43,7 @@ fn run() -> Result<(), String> {
     let stream = UnixStream::connect(&args.socket).map_err(|e| {
         let hint = match e.kind() {
             std::io::ErrorKind::ConnectionRefused => {
-                "\n  nothing listens there: the lab that made it has exited (killed with the shell that started it?).\n  Start it with: vroom-lab CONFIG [--restore CHECKPOINT] --agent-socket PATH --daemon"
+                "\n  nothing listens there: the lab that made it has exited (killed with the shell that started it?).\n  Start it with: vroom-lab CONFIG [--restore SNAPSHOT] --agent-socket PATH --daemon"
             }
             std::io::ErrorKind::NotFound => "\n  no lab socket there yet: start vroom-lab with --agent-socket PATH (--daemon to background it)",
             _ => "",

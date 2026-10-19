@@ -44,10 +44,10 @@
 *.vmxf
 *.vmrs
 
-# Local debugger configs, captures, and checkpoints.
+# Local debugger configs, captures, and snapshots.
 /research/*.local.toml
 /research/captures/
-/research/checkpoints/
+/research/snapshots/
 /HEVD-LAB-CHEATSHEET.md
 /.vm-ssh/
 

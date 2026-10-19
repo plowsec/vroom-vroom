@@ -1,6 +1,6 @@
 # Fuzz lab
 
-Snapshot fuzzing: every input starts from the same checkpoint.
+Snapshot fuzzing: every input starts from the same snapshot.
 
 ## Commands
 
@@ -32,7 +32,7 @@ Kernel TUI: `coverage runs/a/coverage.json`, `coverage-diff runs/a/coverage.json
 
 | field | |
 |---|---|
-| `config`, `checkpoint`, `state_dir` | VM config, checkpoint dir, VM state dir (one per instance) |
+| `config`, `snapshot`, `state_dir` | VM config, snapshot dir, VM state dir (one per instance) |
 | `cpu`, `isolate_cpu` | CPU of the target call; run it alone, IRQs masked, devices paused (~150x faster) |
 | `input_gpa`, `input_capacity`, `input_va`, `max_input` | input buffer |
 | `ioctl_prefix`, `ioctl_register` / `ioctl_va` | first 4 input bytes = IOCTL, and where it goes |
@@ -50,13 +50,13 @@ Kernel TUI: `coverage runs/a/coverage.json`, `coverage-diff runs/a/coverage.json
 
 ## Notes
 
-- `VROOM_COW_VERIFY=1`: after each reset, check RAM, untouched devices and GIC registers against the checkpoint (~1 s each).
+- `VROOM_COW_VERIFY=1`: after each reset, check RAM, untouched devices and GIC registers against the snapshot (~1 s each).
 - `VROOM_FUZZ_TRACE=1`: per-stop trace on stderr.
 - `VROOM_FUZZ_TOKEN`: master/worker shared secret. Plaintext protocol: trusted network or SSH tunnel.
-- Distributed: every machine needs the checkpoint, its disk layers and the VM config at the same paths; the master refuses other harness names or block counts.
+- Distributed: every machine needs the snapshot, its disk layers and the VM config at the same paths; the master refuses other harness names or block counts.
 - Workers import a shared input (with its coverage, not re-run) only if it is new to them.
 - Reset with `isolate_cpu` (HEVD): dirty pages only, pages written every input stay writable (hot), device restore skipped if no MMIO, GIC restored per register: ~0.5 ms.
-- `blocks` mode: BRK `#0x766d` in RAM and the checkpoint baseline (other BRKs still reach the guest; HVF only). Pageable code not mapped at the checkpoint is planted once an input maps it. Shared inputs remove their blocks' BRKs.
+- `blocks` mode: BRK `#0x766d` in RAM and the snapshot baseline (other BRKs still reach the guest; HVF only). Pageable code not mapped at the snapshot is planted once an input maps it. Shared inputs remove their blocks' BRKs.
 - HEVD, M3 Max, edges: ~750 inputs/s per worker, ~545/s each with 3 (1640/s). Blocks: ~1360/s, ~950/s each with 3 (2840/s). ~9 GB RAM and ~10 s start per worker.
 
 ## HEVD

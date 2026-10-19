@@ -175,7 +175,16 @@ static COMMANDS: &[Command] = &[
     c("vm.step", "vm", "Execute one instruction on a CPU", &[CPU], "control", Target::Op("step")),
     c("vm.step_over", "vm", "Step over a call (runs to the next instruction)", &[CPU, VL], "control", Target::Op("step_over")),
     c("vm.step_out", "vm", "Run until the current function returns", &[CPU, VL], "control", Target::Op("step_out")),
-    c("vm.checkpoint", "vm", "Save a vroom checkpoint (restorable, fuzzable) to a new directory", &[p("path", "path", true, "new checkpoint directory")], "write", Target::Op("checkpoint")),
+    c("vm.snapshot", "vm", "Save a snapshot (the VM keeps its state; running or paused). Into this VM's snapshots, where the app lists them, unless path is given", &[
+        p("name", "string", false, "folder name under the VM's snapshots, default snap-<unix time>"),
+        p("path", "path", false, "a folder elsewhere instead (e.g. for vroom-fuzz)"),
+        p("description", "string", false, "default vroom-lab"),
+    ], "write", Target::Op("snapshot")),
+    c("vm.snapshots", "vm", "This VM's snapshots, oldest first", &[], "read", Target::Op("snapshots")),
+    c("vm.restore", "vm", "Restart this VM from a snapshot (paused, breakpoints and caches cleared); refused if its disk layers changed since", &[
+        p("name", "string", false, "a snapshot of this VM (snap-...)"),
+        p("path", "path", false, "or a snapshot folder"),
+    ], "destructive", Target::Op("restore")),
     c("vm.screenshot", "vm", "Save the guest screen as PNG", &[p("path", "path", true, "PNG file to write")], "write", Target::Op("screen")),
     c("vm.key", "vm", "Press or release a key (USB HID usage code)", &[p("code", "integer", true, "HID usage code"), p("down", "boolean", true, "true = press, false = release")], "control", Target::Op("key")),
     c("vm.shutdown", "vm", "Stop the VM and end the lab", &[], "destructive", Target::Op("shutdown")),
@@ -226,7 +235,7 @@ static COMMANDS: &[Command] = &[
     c("kernel.cache", "kernel", "Debugger page and symbol cache sizes", &[], "read", Target::Op("cache")),
     // Snapshot fuzzer.
     c("fuzz.check", "fuzz", "Validate a harness and show what it declares", &[p("harness", "path", true, "harness JSON")], "read", Target::FuzzCheck),
-    job(c("fuzz.run", "fuzz", "Fuzzing campaign from a checkpoint (its own VM); results under output", &[
+    job(c("fuzz.run", "fuzz", "Fuzzing campaign from a snapshot (its own VM); results under output", &[
         p("harness", "path", true, "harness JSON"),
         p("seed", "path", true, "seed file (payload bytes with ioctl)"),
         p("output", "path", true, "new run directory"),
@@ -237,7 +246,7 @@ static COMMANDS: &[Command] = &[
         p("repeat_seed", "boolean", false, "replay the seed"),
         p("no_boundary_seeds", "boolean", false, "skip size boundary inputs"),
     ], "control", Target::FuzzRun)),
-    job(c("fuzz.probe", "fuzz", "Try every IOCTL in the harness range from the checkpoint", &[
+    job(c("fuzz.probe", "fuzz", "Try every IOCTL in the harness range from the snapshot", &[
         p("harness", "path", true, "harness JSON"),
         p("payload", "path", true, "payload bytes"),
         p("output", "path", true, "new probe directory"),
@@ -620,7 +629,7 @@ impl Connection {
                         "The lab starts paused (restore too): vm.resume runs the guest; its network, agent and screen are frozen until then.",
                         "guest.* needs a running VM and a guest agent (vm.status: guest_agent); guest.exec needs current guest tools: guest.update_tools installs them.",
                         "Commands with mutates=true change the guest, the VM or files; risk says how much.",
-                        "fuzz.run and fuzz.probe start their own VM from a checkpoint: run them with jobs.start."
+                        "fuzz.run and fuzz.probe start their own VM from a snapshot: run them with jobs.start."
                     ],
                 }))
             }

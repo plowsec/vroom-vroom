@@ -7,7 +7,7 @@ from ghidra.program.model.block import BasicBlockModel
 
 
 # Set this to the physical GPA corresponding to the driver's image base in the
-# paused checkpoint. Ghidra knows virtual addresses; vroom deliberately keeps
+# paused snapshot. Ghidra knows virtual addresses; vroom deliberately keeps
 # physical translation explicit so a stale page table cannot silently patch a
 # different page.
 GPA_IMAGE_BASE = 0

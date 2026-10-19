@@ -51,7 +51,7 @@ def verify(header: Path, harness_path: Path) -> dict:
     if set(required.values()) != set(required):
         raise ValueError("HEVD harness must use x1, x2 and x3 for the ARM64 call")
     if harness.get("input_va") in (None, 0) or harness.get("stop_pc") in (None, 0):
-        raise ValueError("replace input_va and stop_pc with addresses from the checkpoint")
+        raise ValueError("replace input_va and stop_pc with addresses from the snapshot")
     if not harness.get("reset_is_bugcheck"):
         raise ValueError("HEVD harness must classify a guest reset as a bugcheck")
     missing = REQUIRED_DETECTORS - set(harness.get("detectors", []))

@@ -3,7 +3,7 @@
 set -eu
 cd "$(dirname "$0")/.."
 if pgrep -f "^($(pwd)/)?target/(debug|release)/vroom-lab " >/dev/null 2>&1; then
-  echo "a lab is running from target/: save a checkpoint and stop it before rebuilding" >&2
+  echo "a lab is running from target/: save a snapshot and stop it before rebuilding" >&2
   exit 1
 fi
 cargo build -p vroom-kernel "$@"

@@ -23,7 +23,7 @@ pub const LOST_AFTER_SECS: f64 = 15.0;
 /// Execs/s samples kept for the dashboard's history (one per second).
 const HISTORY: usize = 600;
 
-/// One corpus input and the coverage it reached. The checkpoint is the same
+/// One corpus input and the coverage it reached. The snapshot is the same
 /// everywhere, so a receiver takes the coverage instead of running it.
 /// `blocks: None` asks the receiver to run it (a corpus resumed from disk).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,7 +60,7 @@ pub struct InstanceStats {
     /// Inputs that produced any finding.
     pub crashes: u64,
     pub timeouts: u64,
-    /// Checkpoint restores from disk (timeouts, guest resets).
+    /// Snapshot restores from disk (timeouts, guest resets).
     pub restores: u64,
     pub corpus: usize,
     pub blocks: usize,

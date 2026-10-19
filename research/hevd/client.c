@@ -1,4 +1,4 @@
-// Small, non-exploit client used to prepare an HEVD call-site checkpoint.
+// Small, non-exploit client used to prepare an HEVD call-site snapshot.
 // Build inside the Windows guest with: cl /W4 /DUNICODE /D_UNICODE client.c
 
 #define WIN32_LEAN_AND_MEAN

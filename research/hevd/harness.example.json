@@ -2,7 +2,7 @@
   "name": "hevd-arm64",
   "source_revision": "b1cc756e55f69530f6468a6c3c310ed7b967bada",
   "config": "hevd.toml",
-  "checkpoint": "checkpoint.state",
+  "snapshot": "snapshot.state",
   "state_dir": "state",
   "input_gpa": 4096,
   "input_capacity": 4096,

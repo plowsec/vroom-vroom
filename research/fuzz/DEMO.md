@@ -1,6 +1,6 @@
 # HEVD demo
 
-vroom-fuzz against HEVD on Windows 11 ARM64 (HVF, M3 Max). One checkpoint at the IOCTL handler, every input starts from it.
+vroom-fuzz against HEVD on Windows 11 ARM64 (HVF, M3 Max). One snapshot at the IOCTL handler, every input starts from it.
 TUI commands: `:` opens the command bar; they take literal paths (no `$VM`).
 
 ## 0. Every terminal
@@ -8,7 +8,7 @@ TUI commands: `:` opens the command bar; they take literal paths (no `$VM`).
 ```bash
 cd /Users/vladimir/ctf/vroom-vroom
 VM=/Users/vladimir/VMs/hevd-windows-arm64
-CK=$VM/checkpoints                  # read only: never write here
+CK=$VM/snapshots                  # read only: never write here
 OUT=$VM/demo                        # all demo output
 F=target/release/vroom-fuzz
 mkdir -p $OUT
@@ -25,7 +25,7 @@ uv sync --project research/tui --extra angr        # kernel TUI, angr_tui (atui)
 
 `research/run.sh` runs `research/build.sh` itself; it refuses while a lab runs from `target/`.
 
-## 2. Checkpoint (prep, already done: `hevd-dispatch-buffer`)
+## 2. Snapshot (prep, already done: `hevd-dispatch-buffer`)
 
 1. VM from VMware (`stage_vm.py`: plan only without `--copy`; external disk to internal):
 
@@ -92,15 +92,15 @@ C:\HEVD-Lab\HevdFuzzClient.exe 0x222003 1
 stack                                         frame 0 HEVD.sys+0x870a8
 x nt!KeBugCheckEx                             bugcheck_pc
 mem 0xffffc50aa8c7dd10 48                     IrpSp = X1 + 0xd0: +0x10 length, +0x18 IOCTL, +0x20 buffer
-checkpoint /Users/vladimir/VMs/hevd-windows-arm64/checkpoints/hevd-dispatch-NEW
+snapshot /Users/vladimir/VMs/hevd-windows-arm64/snapshots/hevd-dispatch-NEW
 ```
 
 8. Harness fields (JSON wants decimal: `python3 -c 'print(0xfffff80275ff70a8)'`):
 
-| field | from | this checkpoint |
+| field | from | this snapshot |
 |---|---|---|
 | `cpu` | CPU in the stop status | `1` |
-| `entry_pc` | breakpoint = checkpoint PC | `0xfffff80275ff70a8` |
+| `entry_pc` | breakpoint = snapshot PC | `0xfffff80275ff70a8` |
 | `stop_pc` | X30 at entry (return into nt) | `0xfffff80278446948` |
 | `bugcheck_pc` | `x nt!KeBugCheckEx` | `0xfffff8027845bb70` |
 | `ioctl_va` | IrpSp+0x18 IoControlCode (X1+0xe8) | `0xffffc50aa8c7dd28` |
@@ -168,7 +168,7 @@ $F run $CK/hevd-harness-all-safe.json $CK/one-byte-payload.bin --ioctl 0x222003 
 ```
 
 - Dashboard: progress, coverage (blocks/600, functions/49), throughput (exec/s, exec ms, reset ms), findings, per-function bars. `q` / Esc / Ctrl-C: stop and save.
-- ~10 s start (2.4 GB checkpoint), then inputs.
+- ~10 s start (2.4 GB snapshot), then inputs.
 
 4. Blocks mode (one-shot BRK per uncovered block):
 
@@ -213,7 +213,7 @@ $F run $CK/hevd-harness-all-30s.json $(ls $OUT/crash/crashes/*-BugCheck.bin | he
   --no-boundary-seeds --iterations 1 --state-dir $OUT/state-c --output $OUT/replay
 ```
 
-6. Correctness: RAM, untouched devices and GIC registers checked against the checkpoint after every reset (~1 s per input). Silent = pass; a mismatch stops the run and lists the pages.
+6. Correctness: RAM, untouched devices and GIC registers checked against the snapshot after every reset (~1 s per input). Silent = pass; a mismatch stops the run and lists the pages.
 
 ```bash
 VROOM_COW_VERIFY=1 $F run $CK/hevd-harness-all-30s.json $CK/one-byte-payload.bin --ioctl 0x222003 \
@@ -234,7 +234,7 @@ $F run $OUT/fleet.json $CK/one-byte-payload.bin --ioctl 0x222003 \
   --master HOST:7979 --name w0 --state-dir $OUT/state-w0 --output $OUT/w0     # worker, any machine
 ```
 
-- Other machines: same checkpoint, disk layers and config at the same paths; `VROOM_FUZZ_TOKEN` on both.
+- Other machines: same snapshot, disk layers and config at the same paths; `VROOM_FUZZ_TOKEN` on both.
 
 8. Output (`--output`):
 
@@ -249,7 +249,7 @@ $F run $OUT/fleet.json $CK/one-byte-payload.bin --ioctl 0x222003 \
 
 ## 4. Coverage TUI (Lighthouse-style)
 
-1. Start on the checkpoint (paused, HEVD mapped: live disassembly). Don't F5.
+1. Start on the snapshot (paused, HEVD mapped: live disassembly). Don't F5.
 
 ```bash
 research/run.sh $VM/hevd-windows-arm64.toml --restore $CK/hevd-dispatch-buffer

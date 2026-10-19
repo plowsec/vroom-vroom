@@ -341,7 +341,7 @@ fn main() -> Result<()> {
                 && inputs_since_reopen >= engine.harness.reopen_after
             {
                 eprintln!(
-                    "reopening the checkpoint after {} probe inputs",
+                    "reopening the snapshot after {} probe inputs",
                     inputs_since_reopen
                 );
                 engine = engine.reopen()?;
@@ -374,7 +374,7 @@ fn main() -> Result<()> {
                 tested_candidates += 1;
                 if result.reopen {
                     eprintln!(
-                        "restoring the clean checkpoint after IOCTL {ioctl:#010x}: {:?}",
+                        "restoring the clean snapshot after IOCTL {ioctl:#010x}: {:?}",
                         result.finding.as_ref().map(|finding| finding.class)
                     );
                     engine = engine.reopen()?;
@@ -386,7 +386,7 @@ fn main() -> Result<()> {
                         && inputs_since_reopen >= engine.harness.reopen_after
                     {
                         eprintln!(
-                            "reopening the checkpoint after {} probe inputs",
+                            "reopening the snapshot after {} probe inputs",
                             inputs_since_reopen
                         );
                         engine = engine.reopen()?;
@@ -416,7 +416,7 @@ fn main() -> Result<()> {
                 })?,
             )?;
             eprintln!(
-                "probe tested {}/{} IOCTLs with {} checkpoint restores in {:.1}s; see {}",
+                "probe tested {}/{} IOCTLs with {} snapshot restores in {:.1}s; see {}",
                 tested_candidates,
                 candidate_count,
                 recoveries,

@@ -14,7 +14,7 @@ cargo check -p vroom-vmm --features research    # + file-backed RAM baselines, p
 
 ## targets
 
-`hevd/`: HackSys Extreme Vulnerable Driver ([hevd/README.md](hevd/README.md)). Target binaries, checkpoints and coverage stay outside the repo.
+`hevd/`: HackSys Extreme Vulnerable Driver ([hevd/README.md](hevd/README.md)). Target binaries, snapshots and coverage stay outside the repo.
 
 TUI: `coverage RUN/coverage.json`; `coverage-diff BASE/coverage.json CUR/coverage.json` (same block manifest): new blocks and hit changes per function.
 
@@ -22,14 +22,14 @@ TUI: `coverage RUN/coverage.json`; `coverage-diff BASE/coverage.json CUR/coverag
 
 ```sh
 research/run.sh /path/to/lab.toml
-research/run.sh /path/to/lab.toml --restore /path/to/checkpoint
+research/run.sh /path/to/lab.toml --restore /path/to/snapshot
 research/run.sh /path/to/lab.toml --atui /path/to/run-atui-macos.sh
-research/demo.sh CONFIG CHECKPOINT       # paused Ex callback
+research/demo.sh CONFIG SNAPSHOT       # paused Ex callback
 research/build.sh                        # build + sign
 ```
 
 Requires `uv`. UEFI: QEMU firmware; TPM: swtpm. Nested virtualization off.
-Linux: `/dev/kvm` access. HVF checkpoints cannot restore on KVM.
+Linux: `/dev/kvm` access. HVF snapshots cannot restore on KVM.
 Use a disposable overlay. Separate state directory. Starts paused.
 
 ## agents
@@ -38,8 +38,8 @@ JSON-RPC 2.0, one object per line, owner-only Unix socket. Same protocol as angr
 
 ```sh
 research/build.sh --release                                                # signed: target/research/release/vroom-lab
-research/run.sh LAB.toml --restore CHECKPOINT --agent-socket lab.sock     # beside the TUI
-target/research/release/vroom-lab LAB.toml --restore CHECKPOINT --agent-socket lab.sock --daemon   # headless
+research/run.sh LAB.toml --restore SNAPSHOT --agent-socket lab.sock     # beside the TUI
+target/research/release/vroom-lab LAB.toml --restore SNAPSHOT --agent-socket lab.sock --daemon   # headless
 kill PID                                                                   # stops the VM, removes the socket
 vroom-rpc --socket lab.sock describe
 vroom-rpc --socket lab.sock commands.list '{"category":"kernel"}'
@@ -53,7 +53,7 @@ Methods: `initialize {actor}` first, `describe`, `commands.list {category?}`,
 `jobs.status|result|cancel {handle}`.
 
 ```text
-vm        status pause resume step step_over step_out checkpoint screenshot key shutdown
+vm        status pause resume step step_over step_out snapshot snapshots restore screenshot key shutdown
 guest     exec upload download update_tools                       VM running
 cpu       registers write_register
 memory    regions read_virtual read_physical translate write_virtual write_physical dump
@@ -77,7 +77,7 @@ fuzz      check run* probe* coverage blocks diff crashes          * jobs.start o
 - Socket paths: under 104 bytes. A path in a deep temp dir fails: use a relative one.
 - `--daemon`: own session, returns when the socket accepts (prints pid, log `PATH.log`). Use it from agents: their shells often kill what a command started, which leaves a dead socket (`Connection refused`).
 - `target/debug/vroom-lab` is unsigned (cargo tests relink it): run the `target/research/` builds.
-- `--restore` takes a lab checkpoint or a GUI snapshot (same format): its folder, or just its name (`snap-...`) for the VM's own snapshots. One VM runs once: the lab and the app can't both run it.
+- Snapshots are one format everywhere (app, `vroom`, lab, fuzzer). `vm.snapshot` saves into the VM's own snapshots (the app lists them) or `path`; `vm.restore` restarts the lab's VM from one (`name` or `path`), paused; `--restore` does it at start. Refused when a disk layer under the snapshot changed since. One VM runs once: the lab and the app can't both run it.
 
 Function-calling adapter (one tool):
 
@@ -156,7 +156,7 @@ back / forward                 address history
 dump ADDRESS 4096              raw memory file in state/exports
 callbacks                      process callback registrations
 event                          Ex/Ex2 arguments at entry
-checkpoint /new/directory       save paused VM
+snapshot [/new/directory]     save the VM (default: its snapshots)
 ```
 
 ## semantics

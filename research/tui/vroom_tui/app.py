@@ -325,7 +325,7 @@ class KernelApp(App):
             index = next((i for i, callback in enumerate(self.callbacks)
                           if callback['function'] == regs['pc']), None)
             if index is None:
-                raise RuntimeError('Demo needs a checkpoint stopped at a registered Ex callback entry')
+                raise RuntimeError('Demo needs a snapshot stopped at a registered Ex callback entry')
             callback = self.callbacks[index]
             self.query_one('#callbacks', DataTable).move_cursor(row=index)
             await self.show_address(regs['pc'])
@@ -852,7 +852,7 @@ class KernelApp(App):
                 else:
                     await self.show_memory(address, int(args[1],0) if len(args)>1 else 256, op == 'mem-phys')
             elif op == 'dump': self.log_message(await self.client.call('dump', cpu=self.cpu, address=await self.symbol_address(args[0]), length=int(args[1],0)))
-            elif op == 'checkpoint': self.log_message(await self.client.call('checkpoint', path=args[0]))
+            elif op == 'snapshot': self.log_message(await self.client.call('snapshot', **({'path': args[0]} if args else {})))
             elif op == 'coverage':
                 if not args or len(args) > 2:
                     raise RuntimeError('usage: coverage COVERAGE.json [BLOCKS.json]')
@@ -861,7 +861,7 @@ class KernelApp(App):
                 if len(args) != 2:
                     raise RuntimeError('usage: coverage-diff BASELINE.json CURRENT.json')
                 await self.load_coverage(args[1], comparison_base=args[0])
-            else: self.log_message('reg NAME VALUE · write ADDRESS HEX · into/over/out · ps · process PID · peb · modules · symbols MODULE · functions MODULE PREFIX · next/prev · stack · bp/dis/mem/x SYMBOL · watch ADDRESS SIZE r/w/rw · bc/wc · dec/dec-file/dec-partial SYMBOL · cfg/xrefs [SYMBOL] · coverage FILE [BLOCKS] · coverage-diff BASE CURRENT · back/forward · image MODULE [PATH] · dump ADDRESS N · callbacks · event · cpu N · checkpoint PATH')
+            else: self.log_message('reg NAME VALUE · write ADDRESS HEX · into/over/out · ps · process PID · peb · modules · symbols MODULE · functions MODULE PREFIX · next/prev · stack · bp/dis/mem/x SYMBOL · watch ADDRESS SIZE r/w/rw · bc/wc · dec/dec-file/dec-partial SYMBOL · cfg/xrefs [SYMBOL] · coverage FILE [BLOCKS] · coverage-diff BASE CURRENT · back/forward · image MODULE [PATH] · dump ADDRESS N · callbacks · event · cpu N · snapshot PATH')
         except Exception as error:
             self.status(str(error), error=True)
             self.log_message(error)
@@ -1162,8 +1162,8 @@ def main():
     parser.add_argument('config', type=Path)
     parser.add_argument('--backend', type=Path, default=Path(__file__).resolve().parents[3]/'target/research/debug/vroom-lab')
     parser.add_argument('--atui', type=Path, help='angr_tui executable or run-atui-macos.sh')
-    parser.add_argument('--restore', type=Path, help='vroom checkpoint directory')
-    parser.add_argument('--ex-callback-demo', action='store_true', help='load symbols and Ex callback arguments from a paused checkpoint')
+    parser.add_argument('--restore', type=Path, help='vroom snapshot directory')
+    parser.add_argument('--ex-callback-demo', action='store_true', help='load symbols and Ex callback arguments from a paused snapshot')
     parser.add_argument('--agent-socket', type=Path, help='also serve agents (JSON-RPC) on this Unix socket')
     args = parser.parse_args()
     atui = args.atui.resolve() if args.atui else shutil.which('atui')
