@@ -180,7 +180,12 @@ fn roots(state: &Path) -> Result<(BTreeSet<PathBuf>, BTreeSet<PathBuf>)> {
     let mut dirs: Vec<PathBuf> = std::fs::read_dir(snapshots_dir(state)).map(|it| it.flatten().map(|e| e.path()).collect()).unwrap_or_default();
     dirs.push(state.join("suspend"));
     for d in dirs {
-        let Ok(s) = SnapshotDir::open(&d) else { continue };
+        if !d.join("manifest.json").exists() {
+            continue;
+        }
+        // One we can't read (damaged, or a newer vroom's) would make the
+        // layers it uses look unused, and get them deleted.
+        let s = SnapshotDir::open(&d).map_err(|e| Error::Setup(format!("{}: {e}; nothing pruned", d.display())))?;
         for (k, v) in &s.manifest.meta {
             if k.starts_with("disk.") {
                 roots.insert(present(&d, recorded(&d, v))?);
@@ -417,5 +422,15 @@ mod tests {
         std::fs::create_dir(&disks).unwrap();
         mkfifo(&disks.join("vda.json"));
         assert!(prune(&state, &[]).is_err());
+
+        // A snapshot this vroom can't read: its layers stay.
+        std::fs::remove_file(disks.join("vda.json")).unwrap();
+        let kept = disks.join("kept.qcow2");
+        vroom_block::qcow2::Qcow2Image::create(&kept, 1 << 20, None).unwrap();
+        let snap = state.join("snapshots").join("future");
+        std::fs::create_dir_all(&snap).unwrap();
+        std::fs::write(snap.join("manifest.json"), r#"{"format": 99}"#).unwrap();
+        assert!(prune(&state, &[]).is_err());
+        assert!(kept.exists(), "deleted a layer an unreadable snapshot may use");
     }
 }
