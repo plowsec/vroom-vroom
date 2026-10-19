@@ -17,6 +17,7 @@ pub mod cmplog;
 pub mod hub;
 pub mod sync;
 pub mod trace;
+pub mod triage;
 pub mod tui;
 
 #[derive(Debug, thiserror::Error)]
@@ -108,14 +109,18 @@ pub struct Harness {
     #[serde(default)]
     pub stop_pc: Option<u64>,
     /// First instrumented block to stop at. If omitted, use the snapshot PC.
+    /// A user-mode address makes a client harness: the snapshot stands in a
+    /// program that calls into the target (`target`) with each input, and
+    /// stops at `stop_pc` in it; blocks coverage, the whole guest running.
     #[serde(default)]
     pub entry_pc: Option<u64>,
     /// Treat a guest reset as a kernel bugcheck. This is useful for drivers
     /// such as HEVD whose deliberate faults reset the lab guest.
     #[serde(default)]
     pub reset_is_bugcheck: bool,
-    /// Guest VA of the kernel's bugcheck entry (Windows: `KeBugCheckEx`).
-    /// Any thread reaching it ends the input with a bugcheck finding before
+    /// Guest VA of the kernel's bugcheck entry (Windows: `KeBugCheckEx`,
+    /// moved to `KeBugCheck2` when the PDB has it: some bugchecks, like
+    /// an exception in a system service, start there). Any thread reaching it ends the input with a bugcheck finding before
     /// the guest crashes, and the VM is reset in place instead of restored
     /// from disk. Takes a hardware breakpoint beyond the four the coverage
     /// breakpoints use.
@@ -159,10 +164,22 @@ pub struct Harness {
     /// exception-dispatch finding even when the guest continues normally.
     #[serde(default)]
     pub exception_sites: Vec<u64>,
+    /// The module under test, by name (`clfs.sys`), when `entry_pc` isn't
+    /// in it (a user-mode client calling into a driver). Default: the image
+    /// `entry_pc` is in.
+    #[serde(default)]
+    pub target: Option<String>,
     /// Hardware watched memory ranges. Use `poisoned` for allocator redzones
     /// or freed objects whose address is known from a target harness.
     #[serde(default)]
     pub watchpoints: Vec<MemoryWatch>,
+}
+
+impl Harness {
+    /// The snapshot stands in a user-mode program calling into the target.
+    pub fn client(&self) -> bool {
+        self.entry_pc.is_some_and(|pc| pc >> 63 == 0)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -334,6 +351,13 @@ impl Harness {
             return Err(Error::Invalid(
                 "exception_sites must be instruction aligned".into(),
             ));
+        }
+        if h.client() {
+            if h.coverage_mode != CoverageMode::Blocks || h.isolate_cpu || h.target.is_none() || h.stop_pc.is_none() {
+                return Err(Error::Invalid(
+                    "a client harness (user-mode entry_pc) needs coverage_mode blocks, isolate_cpu off, target and stop_pc".into(),
+                ));
+            }
         }
         // DebugStop does not expose the fired WVR index yet, so one watched
         // range is the only unambiguous configuration supported by the runner.
@@ -544,9 +568,29 @@ pub struct Finding {
     pub stack: Vec<String>,
 }
 
-/// Findings with the same signature are the same bug for corpus novelty.
+/// Findings with the same signature are the same bug: the class and the
+/// three innermost frames of the faulting code, by function (where in the
+/// function, and the input that got there, vary between hits of one bug);
+/// without a stack, the PC. A stack that runs through the kernel's
+/// exception entry (`KeBugCheckEx` <- `MmAccessFault` <- ... <-
+/// `Ki*ExceptionHandler` <- the faulting code) counts from below it.
 pub fn signature(finding: &Finding) -> String {
-    format!("{:?}:{:?}", finding.class, finding.pc)
+    let stack: Vec<&str> = finding.stack.iter().map(String::as_str).filter(|f| !f.starts_with('(')).collect();
+    let entry = stack.iter().rposition(|f| {
+        let name = f.split_once('+').map_or(*f, |(function, _)| function);
+        name.ends_with("ExceptionHandler") || name.ends_with("SynchronousException") || name.ends_with("DispatchException")
+    });
+    let frames: Vec<&str> = stack[entry.map_or(0, |i| i + 1)..]
+        .iter()
+        .filter(|f| !f.starts_with("nt!KeBugCheck"))
+        .map(|f| if f.starts_with("<wild jump") { "<wild jump>" } else { f.split_once('+').map_or(*f, |(function, _)| function) })
+        .take(3)
+        .collect();
+    if frames.is_empty() {
+        format!("{:?}:{:?}", finding.class, finding.pc)
+    } else {
+        format!("{:?}:{}", finding.class, frames.join("<"))
+    }
 }
 
 /// Classifies hypervisor and guest diagnostics without guessing from a mere
@@ -844,6 +888,9 @@ pub struct Engine {
     symbols: Option<vroom_kernel::symbolize::Symbolizer>,
     /// The target's image (`entry_pc`'s), found by the first compare log.
     target_image: Option<(u64, u64)>,
+    /// `nt!KiDispatchException`, when the harness detects exceptions: every
+    /// exception passes there first, the ones an `__except` swallows too.
+    exception_hook: Option<u64>,
 }
 
 /// One input, in place and ready to run (`Engine::load_case`).
@@ -885,6 +932,10 @@ pub fn function_names(blocks: &[CoverageBlock]) -> Vec<(u64, String)> {
     }
     starts.into_iter().map(|(name, at)| (at, name)).collect()
 }
+
+/// The same exception (code and address) this often in one input is an
+/// exception storm.
+const MAX_EXCEPTIONS: usize = 8;
 
 /// What every debug configuration of an input keeps.
 #[derive(Debug, Clone, Copy)]
@@ -958,6 +1009,7 @@ impl Engine {
             pending: BTreeMap::new(),
             symbols: None,
             target_image: None,
+            exception_hook: None,
         })
     }
 
@@ -967,6 +1019,18 @@ impl Engine {
         let state = self.vm.debug_registers(self.harness.cpu)?;
         let registers = Registers::from_state(&state)
             .map_err(|error| Error::Invalid(format!("ARM64 register state: {error}")))?;
+        if self.harness.detectors.iter().any(|d| d == "exceptions" || d == "access-violation") && self.exception_hook.is_none() {
+            self.load_symbols(&registers)?;
+            let hook = self
+                .symbols
+                .as_ref()
+                .and_then(|s| s.resolve("KiDispatchException"))
+                .ok_or_else(|| Error::Invalid("exceptions: nt!KiDispatchException not in the kernel PDB".into()))?;
+            if !self.harness.exception_sites.contains(&hook) {
+                self.harness.exception_sites.push(hook);
+            }
+            self.exception_hook = Some(hook);
+        }
         let address_space = AddressSpace {
             memory: &self.vm,
             registers: &registers,
@@ -1035,6 +1099,16 @@ impl Engine {
         }
         if self.harness.coverage_mode == CoverageMode::Blocks {
             self.plant(entry_pc)?;
+        }
+        if let Some(bugcheck) = self.harness.bugcheck_pc {
+            if self.load_symbols(&registers).is_ok() {
+                let symbols = self.symbols.as_ref().expect("loaded");
+                if let (Some(ex), Some(two)) = (symbols.resolve("KeBugCheckEx"), symbols.resolve("KeBugCheck2")) {
+                    if ex == bugcheck {
+                        self.harness.bugcheck_pc = Some(two);
+                    }
+                }
+            }
         }
         if let Some(bugcheck) = self.harness.bugcheck_pc {
             // The bugcheck breakpoint sits beyond the four coverage slots.
@@ -1242,17 +1316,166 @@ impl Engine {
     /// stack that can't be had is one line saying why: a finding stays a
     /// finding.
     fn stack_of(&mut self, registers: &Registers) -> Vec<String> {
+        if let Err(e) = self.load_symbols(registers) {
+            return vec![format!("(no symbols: {e})")];
+        }
         let space = AddressSpace { memory: &self.vm, registers };
+        self.symbols.as_mut().map(|s| s.stack(&space, registers)).unwrap_or_default()
+    }
+
+    /// The symbolizer, made once (a PDB load; the VM paused).
+    fn load_symbols(&mut self, registers: &Registers) -> Result<()> {
         if self.symbols.is_none() {
-            match vroom_kernel::symbolize::Symbolizer::new(&space, registers, &symbol_cache(&self.harness)) {
-                Ok(mut s) => {
-                    s.add_names(function_names(&self.harness.coverage));
-                    self.symbols = Some(s);
-                }
-                Err(e) => return vec![format!("(no symbols: {e})")],
+            let space = AddressSpace { memory: &self.vm, registers };
+            let mut s = vroom_kernel::symbolize::Symbolizer::new(&space, registers, &symbol_cache(&self.harness))
+                .map_err(|e| Error::Invalid(format!("symbols: {e}")))?;
+            s.add_names(function_names(&self.harness.coverage));
+            self.symbols = Some(s);
+        }
+        Ok(())
+    }
+
+    /// The target's code: the image `entry_pc` is in, or the module the
+    /// harness names (`target`) when the entry is elsewhere (a user-mode
+    /// client calling into a driver).
+    fn target_range(&mut self, registers: &Registers) -> Result<(u64, u64)> {
+        if let Some(range) = self.target_image {
+            return Ok(range);
+        }
+        let range = match self.harness.target.clone() {
+            Some(name) => {
+                self.load_symbols(registers)?;
+                self.symbols
+                    .as_ref()
+                    .and_then(|s| s.module_range(&name))
+                    .ok_or_else(|| Error::Invalid(format!("target module {name} isn't loaded")))?
+            }
+            None => {
+                let entry = self.harness.entry_pc.unwrap_or(registers.pc);
+                let space = AddressSpace { memory: &self.vm, registers };
+                let image = vroom_kernel::windows::image_containing(&space, entry)
+                    .map_err(|e| Error::Invalid(format!("target image: {e}")))?;
+                (image.base, image.base + u64::from(image.size))
+            }
+        };
+        self.target_image = Some(range);
+        Ok(range)
+    }
+
+    /// At `nt!KiDispatchException` (x0 the exception record, x2 the trap
+    /// frame, x3 the previous mode, x4 first chance): a finding if this is
+    /// a first-chance kernel-mode fault a bug makes (an access to a kernel
+    /// address, a stack overrun, an illegal or misaligned instruction) in
+    /// the target's code or below a call from it. Accesses to user
+    /// addresses are probes of user buffers, which fault by design.
+    /// The stack pointer of the code an exception came from (the trap
+    /// frame KiDispatchException's x2 points to).
+    fn trap_sp(&mut self, registers: &Registers) -> Option<u64> {
+        self.load_symbols(registers).ok()?;
+        let space = AddressSpace { memory: &self.vm, registers };
+        let symbols = self.symbols.as_ref()?;
+        symbols.trap_registers(&space, registers.x[2], registers).ok().map(|r| r.sp)
+    }
+
+    fn exception_finding(&mut self, registers: &Registers, input: &str) -> Result<Option<Finding>> {
+        if registers.x[3] & 0xff != 0 || registers.x[4] & 0xff == 0 {
+            return Ok(None);
+        }
+        let record = registers.x[0];
+        let (code, address, kind, fault) = {
+            let space = AddressSpace { memory: &self.vm, registers };
+            let mut word = [0u8; 4];
+            if vroom_kernel::windows::VirtualMemory::read(&space, record, &mut word).is_err() {
+                return Ok(None);
+            }
+            let code = u32::from_le_bytes(word);
+            let u64_at = |at: u64| vroom_kernel::windows::VirtualMemory::u64(&space, record + at).ok();
+            (code, u64_at(0x10).unwrap_or(0), u64_at(0x20).unwrap_or(0), u64_at(0x28).unwrap_or(0))
+        };
+        if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
+            eprintln!("exception {code:#x} at {address:#x} info {kind:#x} {fault:#x} mode {:#x} first {:#x}", registers.x[3], registers.x[4]);
+        }
+        // The trap handlers pass the kernel's internal codes
+        // (KI_EXCEPTION_*), translated after this.
+        let code = match code {
+            0x1000_0004 => 0xc000_0005,
+            0x1000_0002 => 0xc000_001d,
+            0x1000_0003 => 0xc000_0094,
+            0x1000_0001 => 0xc000_0096,
+            c => c,
+        };
+        let internal = code & 0xffff_ff00 == 0x1000_0000;
+        let class = match code {
+            // A kernel address, or the NULL page (a NULL dereference, user
+            // half or not).
+            0xc000_0005 if fault >> 63 == 1 || fault < 0x1_0000 => BugClass::AccessViolation,
+            // Stack overrun (fast fail), illegal and privileged instruction,
+            // data and instruction misalignment, stack overflow, divide.
+            0xc000_0409 | 0xc000_001d | 0xc000_0096 | 0x8000_0002 | 0xc000_00aa | 0xc000_00fd | 0xc000_0094 => {
+                BugClass::ExceptionDispatch
+            }
+            // Other faults the trap handlers raise (an address size fault
+            // on a non-canonical pointer: 0x10000011).
+            _ if internal => BugClass::ExceptionDispatch,
+            _ => return Ok(None),
+        };
+        self.load_symbols(registers)?;
+        let (lo, hi) = self.target_range(registers)?;
+        let space = AddressSpace { memory: &self.vm, registers };
+        let symbols = self.symbols.as_mut().expect("loaded above");
+        let faulting = symbols.trap_registers(&space, registers.x[2], registers).ok();
+        let (frames, stop) = match &faulting {
+            Some(r) => {
+                let space = AddressSpace { memory: &self.vm, registers: r };
+                symbols.frames(&space, r)
+            }
+            None => (vec![(address, symbols.name(&space, address))], None),
+        };
+        // The target's, or a jump out of all code (a smashed return
+        // address, a corrupt function pointer).
+        let wild = !symbols.in_module(address);
+        if !wild && !(lo..hi).contains(&address) && !frames.iter().any(|(pc, _)| (lo..hi).contains(pc)) {
+            return Ok(None);
+        }
+        let what = match (code, kind) {
+            (0xc000_0005, 0) => format!("reading {fault:#x}"),
+            (0xc000_0005, 1) => format!("writing {fault:#x}"),
+            (0xc000_0005, _) => format!("executing {fault:#x}"),
+            (_, 0) if internal => format!("reading {fault:#x}"),
+            (_, 1) if internal => format!("writing {fault:#x}"),
+            _ => String::new(),
+        };
+        // Nothing to unwind from a wild PC, and where it went depends on
+        // the input: one frame that says so.
+        let mut stack: Vec<String> = if wild {
+            vec![format!("<wild jump to {address:#x}>")]
+        } else {
+            frames.into_iter().map(|(_, n)| n).collect()
+        };
+        stack.extend(stop.filter(|_| !wild).map(|s| format!("({s})")));
+        let at = stack.first().cloned().unwrap_or_else(|| format!("{address:#x}"));
+        Ok(Some(Finding {
+            class,
+            detail: format!("exception {code:#x} {what} at {at} (first chance: an __except may swallow it)").replace("  ", " "),
+            pc: Some(address),
+            input: input.to_string(),
+            stack,
+        }))
+    }
+
+    /// The stack a bugcheck is about. KERNEL_SECURITY_CHECK_FAILURE (0x139,
+    /// a fast fail) passes the trap frame of the failing code (third
+    /// parameter): unwind from there. Else from `KeBugCheckEx`.
+    fn bugcheck_stack(&mut self, registers: &Registers) -> Vec<String> {
+        if registers.x[0] == 0x139 && self.load_symbols(registers).is_ok() {
+            let space = AddressSpace { memory: &self.vm, registers };
+            let symbols = self.symbols.as_mut().expect("loaded");
+            if let Ok(r) = symbols.trap_registers(&space, registers.x[2], registers) {
+                let space = AddressSpace { memory: &self.vm, registers: &r };
+                return symbols.stack(&space, &r);
             }
         }
-        self.symbols.as_mut().map(|s| s.stack(&space, registers)).unwrap_or_default()
+        self.stack_of(registers)
     }
 
     /// Put `input` in place for one execution, as every run does: reset
@@ -1479,25 +1702,27 @@ impl Engine {
         // during one of its steps.
         let mut exception_return = None;
         let mut foreign_threads = 0u64;
+        let mut exceptions = BTreeMap::<(u32, u64), usize>::new();
         if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
             eprintln!("start pc={:#x} entry={entry_pc:#x}", registers.pc);
         }
-        if !self.block_by_pc.contains_key(&entry_pc) {
+        let client = self.harness.client();
+        if !client && !self.block_by_pc.contains_key(&entry_pc) {
             return Err(Error::Invalid(format!(
                 "entry_pc {entry_pc:#x} is not in the coverage block list"
             )));
         }
         // The snapshot is already stopped at the first block. Do not plant
         // a software trap there: resume directly and use hardware execution
-        // breakpoints on its CFG successors to observe the next block.
-        let entry_index = *self.block_by_pc.get(&entry_pc).expect("checked above");
+        // breakpoints on its CFG successors to observe the next block. A
+        // client stands outside the blocks.
+        let entry_index = self.block_by_pc.get(&entry_pc).copied();
         let always = self.always();
         let blocks_mode = always.brk.is_some();
         // Blocks mode needs no path following: BRKs mark every new block.
-        let entry_successors = if blocks_mode {
-            Vec::new()
-        } else {
-            self.harness.coverage[entry_index].successors.clone()
+        let entry_successors = match entry_index {
+            Some(index) if !blocks_mode => self.harness.coverage[index].successors.clone(),
+            _ => Vec::new(),
         };
         let mut active_exception_sites = self.harness.exception_sites.clone();
         let mut watch_target = if blocks_mode { None } else { self.next_watch_target() };
@@ -1533,19 +1758,25 @@ impl Engine {
         let mut edges_hit = BTreeSet::<(u64, u64)>::new();
         let mut finding = None;
         let mut findings = Vec::<Finding>::new();
+        // The faulting stack of this input's exception, for a bugcheck it
+        // ends in.
+        let mut fault_stack: Option<Vec<String>> = None;
         let mut watch_hits = BTreeMap::<usize, u64>::new();
         // The VM left the snapshot's machine (a timeout, a guest reset, a
         // VMM failure): restore the snapshot rather than reset in place.
         let mut reopen = false;
-        let entry_block = &self.harness.coverage[entry_index];
-        let mut previous_pc = Some(entry_block.id);
+        let mut previous_pc = None;
         let mut call_step_targets = Vec::new();
         let mut call_step_remaining = 0usize;
         let mut step_to_call_target = false;
         let mut step_successors_once = false;
-        *block_hits.entry(entry_block.id).or_default() += 1;
-        if self.coverage.observe(entry_block, &token) {
-            new_blocks += 1;
+        if let Some(index) = entry_index {
+            let entry_block = &self.harness.coverage[index];
+            previous_pc = Some(entry_block.id);
+            *block_hits.entry(entry_block.id).or_default() += 1;
+            if self.coverage.observe(entry_block, &token) {
+                new_blocks += 1;
+            }
         }
         loop {
             if start.elapsed() > Duration::from_millis(self.harness.timeout_ms) {
@@ -1555,7 +1786,8 @@ impl Engine {
                     let registers = Registers::from_state(&state).map_err(|error| {
                         Error::Invalid(format!("ARM64 register state: {error}"))
                     })?;
-                    eprintln!("timeout at pc={:#x}", registers.pc);
+                    let stack = self.stack_of(&registers);
+                    eprintln!("timeout at pc={:#x} {stack:?}", registers.pc);
                 }
                 reopen = true;
                 finding = detect("execution timeout", None, &token, true);
@@ -1592,7 +1824,10 @@ impl Engine {
                             ),
                             pc: Some(stop.pc),
                             input: token.clone(),
-                            stack: self.stack_of(&registers),
+                            stack: match fault_stack.clone() {
+                                Some(stack) => stack,
+                                None => self.bugcheck_stack(&registers),
+                            },
                         };
                         if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
                             eprintln!("{}", bugcheck.detail);
@@ -1676,6 +1911,23 @@ impl Engine {
                     // any thread scheduled after a preemption can reach them.
                     // Only the testcase's thread (its stack, its address
                     // space) ends the run or reports a finding.
+                    if self.exception_hook == Some(stop.pc) {
+                        let state = self.vm.debug_registers(stop.cpu as usize)?;
+                        let record = Registers::from_state(&state).map(|r| r.x[0]).unwrap_or(0);
+                        let mut word = [0u8; 4];
+                        let mut address = [0u8; 8];
+                        let space = AddressSpace { memory: &self.vm, registers: &Registers::from_state(&state).map_err(|e| Error::Invalid(format!("ARM64 registers: {e}")))? };
+                        let _ = vroom_kernel::windows::VirtualMemory::read(&space, record, &mut word);
+                        let _ = vroom_kernel::windows::VirtualMemory::read(&space, record + 0x10, &mut address);
+                        let seen = exceptions.entry((u32::from_le_bytes(word), u64::from_le_bytes(address))).or_default();
+                        *seen += 1;
+                        if *seen > MAX_EXCEPTIONS {
+                            // The same fault over and over (a smashed frame
+                            // faulting in its own dispatch): it won't end,
+                            // and what started it is reported already.
+                            break;
+                        }
+                    }
                     let shared_site = self.harness.stop_pc == Some(stop.pc)
                         || self.harness.exception_sites.contains(&stop.pc);
                     if shared_site {
@@ -1684,16 +1936,30 @@ impl Engine {
                             Error::Invalid(format!("ARM64 stop registers: {error}"))
                         })?;
                         let returned = self.harness.stop_pc == Some(stop.pc);
-                        let ours = registers.ttbr0 == entry_ttbr0
+                        // KiDispatchException runs on the exception stack:
+                        // whose exception it is, the trap frame says.
+                        let sp = if self.exception_hook == Some(stop.pc) {
+                            self.trap_sp(&registers).unwrap_or(registers.sp)
+                        } else {
+                            registers.sp
+                        };
+                        // A client's stop_pc is in its own process; its
+                        // input's exceptions may be any thread's (the
+                        // driver's workers): the target range decides.
+                        let ours = if client {
+                            returned.then_some(registers.ttbr0 == entry_ttbr0).unwrap_or(true)
+                        } else {
+                            registers.ttbr0 == entry_ttbr0
                             && if returned {
                                 registers.sp > entry_sp && registers.sp - entry_sp <= RETURN_FRAMES
                             } else {
-                                registers.sp.abs_diff(entry_sp) <= KERNEL_STACK
-                            };
+                                sp.abs_diff(entry_sp) <= KERNEL_STACK
+                            }
+                        };
                         if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
                             eprintln!(
-                                "shared site cpu={} pc={:#x} sp={:#x} entry_sp={entry_sp:#x} ours={ours}",
-                                stop.cpu, stop.pc, registers.sp
+                                "shared site cpu={} pc={:#x} sp={sp:#x} entry_sp={entry_sp:#x} ours={ours}",
+                                stop.cpu, stop.pc
                             );
                         }
                         if !ours {
@@ -1759,6 +2025,29 @@ impl Engine {
                         );
                         configure_all(&self.vm, &armed, always, &case_watchpoints)?;
                         resume_vm(&mut self.vm, isolate)?;
+                        continue;
+                    }
+                    if self.exception_hook == Some(stop.pc) {
+                        let state = self.vm.debug_registers(stop.cpu as usize)?;
+                        let registers = Registers::from_state(&state).map_err(|error| {
+                            Error::Invalid(format!("ARM64 exception registers: {error}"))
+                        })?;
+                        if let Some(found) = self.exception_finding(&registers, &token)? {
+                            if !findings.iter().any(|f| f.class == found.class && f.pc == found.pc) {
+                                if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
+                                    eprintln!("{}", found.detail);
+                                }
+                                fault_stack = Some(found.stack.clone());
+                                if finding.is_none() {
+                                    finding = Some(found.clone());
+                                }
+                                findings.push(found);
+                            }
+                        }
+                        // Step past the hook and keep it armed: the next
+                        // exception may be the one that matters.
+                        foreign_step = Some(stop.cpu);
+                        self.vm.debug_step(stop.cpu as usize, step_debug_config(&[], always))?;
                         continue;
                     }
                     if self.harness.exception_sites.contains(&stop.pc) {
@@ -2242,6 +2531,25 @@ mod tests {
             BugClass::Timeout
         );
     }
+    #[test]
+    fn signatures_start_at_the_faulting_code() {
+        let f = |stack: &[&str]| Finding {
+            class: BugClass::BugCheck,
+            detail: String::new(),
+            pc: Some(1),
+            input: String::new(),
+            stack: stack.iter().map(|s| s.to_string()).collect(),
+        };
+        let a = f(&["nt!KeBugCheckEx", "nt!MiSystemFault+0x8b0", "nt!KiKernelSp0ExceptionHandler+0x5c", "HEVD!sub_a+0x10", "HEVD!sub_b+0x4", "nt!IofCallDriver+0x78"]);
+        assert_eq!(signature(&a), "BugCheck:HEVD!sub_a<HEVD!sub_b<nt!IofCallDriver");
+        let b = f(&["nt!KeBugCheckEx", "nt!MiSystemFault+0x8b0", "nt!KiKernelSp0ExceptionHandler+0x5c", "HEVD!sub_a+0x14", "HEVD!sub_b+0x4", "nt!IofCallDriver+0x78"]);
+        assert_eq!(signature(&a), signature(&b), "same function, another offset: the same bug");
+        let c = f(&["clfs!X+0x8", "clfs!Y+0x4"]);
+        assert_eq!(signature(&c), "BugCheck:clfs!X<clfs!Y");
+        assert_eq!(signature(&f(&[])), "BugCheck:Some(1)");
+        assert_eq!(signature(&f(&["<wild jump to 0x4141414141414141>"])), "BugCheck:<wild jump>");
+    }
+
     #[test]
     fn ioctl_mutations_keep_device_and_learn_codes() {
         let mut m = Mutator::new(7, 64);

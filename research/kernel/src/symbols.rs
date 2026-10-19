@@ -163,6 +163,7 @@ impl Symbols {
                             | "_TEB"
                             | "_PS_CREATE_NOTIFY_INFO"
                             | "_EX_CALLBACK_ROUTINE_BLOCK"
+                            | "_KTRAP_FRAME"
                     )
                 {
                     if let Some(fields) = c.fields {

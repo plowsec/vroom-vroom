@@ -578,6 +578,15 @@ impl Tables {
         }
         Ok(&self.0[&(context, module.base)])
     }
+    /// The start of the function (its `.pdata` entry) holding `address`
+    /// in kernel module `module`.
+    pub fn function_start(&mut self, m: &impl VirtualMemory, module: &Module, address: u64) -> Option<u64> {
+        let rva = address.checked_sub(module.base)?;
+        let table = self.table(m, module, 0).ok()?;
+        let index = table.partition_point(|(start, _)| *start as u64 <= rva);
+        Some(module.base + table.get(index.checked_sub(1)?)?.0 as u64)
+    }
+
     pub fn step(
         &mut self,
         m: &impl VirtualMemory,

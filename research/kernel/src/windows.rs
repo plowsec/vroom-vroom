@@ -52,6 +52,8 @@ pub struct Image {
     pub base: u64,
     pub size: u32,
     pub timestamp: u32,
+    /// The optional header's ImageBase as mapped.
+    pub image_base: u64,
     pub name: String,
     pub pdb: Option<PdbIdentity>,
     pub exports: BTreeMap<String, u64>,
@@ -185,6 +187,7 @@ impl Image {
             base,
             size,
             timestamp: u32at(&header, 8),
+            image_base: u64::from_le_bytes(header[48..56].try_into().expect("eight bytes")),
             name: String::new(),
             pdb: None,
             exports: BTreeMap::new(),

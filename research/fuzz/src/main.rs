@@ -156,6 +156,28 @@ enum Command {
         #[arg(long)]
         state_dir: Option<PathBuf>,
     },
+    /// Run a saved finding's input again: does it come back, under which
+    /// signature, and the least input that still makes it.
+    Triage {
+        harness: PathBuf,
+        /// The input as the fuzzer saved it.
+        input: PathBuf,
+        /// Report (default: the input's name + .triage.json).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Minimized input (default: the input's name + .min.bin).
+        #[arg(long)]
+        min: Option<PathBuf>,
+        /// Runs of the input as given.
+        #[arg(long, default_value_t = 3)]
+        runs: usize,
+        /// Executions for minimizing at most; 0: don't minimize.
+        #[arg(long, default_value_t = 2000)]
+        budget: usize,
+        /// Use this VM state directory instead of the harness's.
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
 }
 
 /// Input selection shared by `run` and `fleet`.
@@ -348,6 +370,25 @@ fn main() -> Result<()> {
             println!(
                 "{}",
                 serde_json::json!({"trace": out, "end": summary.end, "instructions": summary.instructions, "stack": summary.stack})
+            );
+        }
+        Command::Triage { harness, input, out, min, runs, budget, state_dir } => {
+            let mut h = Harness::load(&harness)?;
+            if let Some(dir) = state_dir {
+                h.state_dir = dir;
+            }
+            let data = std::fs::read(&input)?;
+            let out = out.unwrap_or_else(|| PathBuf::from(format!("{}.triage.json", input.display())));
+            let min = min.unwrap_or_else(|| PathBuf::from(format!("{}.min.bin", input.display())));
+            let mut engine = Engine::open(h)?;
+            engine.instrument()?;
+            let options = vroom_fuzz::triage::TriageOptions { runs, budget };
+            let (report, minimized) = vroom_fuzz::triage::triage(engine, &data, &options, |line| eprintln!("{line}"))?;
+            std::fs::write(&min, &minimized)?;
+            std::fs::write(&out, serde_json::to_vec_pretty(&report)?)?;
+            println!(
+                "{}",
+                serde_json::json!({"report": out, "minimized": min, "signature": report.signature, "reproduced": report.reproduced, "runs": report.runs, "length": report.length, "minimized_length": report.minimized_length})
             );
         }
         Command::Probe {

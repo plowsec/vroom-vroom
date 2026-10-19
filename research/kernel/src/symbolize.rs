@@ -19,6 +19,11 @@ struct Names {
     pdb: Option<Symbols>,
     /// Exports and the caller's names, by address.
     other: BTreeMap<u64, String>,
+    /// The base the image was linked for: functions known only from
+    /// `.pdata` are `sub_<linked address>`, as disassemblers name them. The
+    /// loader rewrites ImageBase when it relocates, so then the linker's
+    /// default (0x140000000).
+    linked: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -43,7 +48,7 @@ impl Symbolizer {
         let modules = windows::modules(memory, pdb.resolve("PsLoadedModuleList")?, &pdb.module_layout()?)?;
         let mut names = HashMap::new();
         let other = kernel.exports.iter().map(|(n, &a)| (a, n.clone())).collect();
-        names.insert(kernel.base, Names { pdb: Some(pdb), other });
+        names.insert(kernel.base, Names { pdb: Some(pdb), other, linked: None });
         Ok(Symbolizer { cache: cache.to_path_buf(), kernel: kernel.base, modules, names, extra: BTreeMap::new(), seen: HashMap::new(), unwind: Tables::default() })
     }
 
@@ -56,6 +61,42 @@ impl Symbolizer {
 
     pub fn modules(&self) -> &[Module] {
         &self.modules
+    }
+
+    /// A kernel symbol's address (`KiDispatchException`).
+    pub fn resolve(&self, name: &str) -> Option<u64> {
+        self.names.get(&self.kernel)?.pdb.as_ref()?.resolve(name).ok()
+    }
+
+    /// The loaded module named `name` (case-insensitive): base, end.
+    pub fn module_range(&self, name: &str) -> Option<(u64, u64)> {
+        self.modules
+            .iter()
+            .find(|m| m.name.eq_ignore_ascii_case(name))
+            .map(|m| (m.base, m.base + u64::from(m.size)))
+    }
+
+    /// The registers a kernel trap frame (`_KTRAP_FRAME` at `frame`) holds:
+    /// where the thread was when the exception came. `like` gives what the
+    /// frame doesn't (translation registers, x19-x28).
+    pub fn trap_registers(&self, memory: &impl VirtualMemory, frame: u64, like: &Registers) -> Result<Registers> {
+        let pdb = self.names.get(&self.kernel).and_then(|n| n.pdb.as_ref()).ok_or_else(|| Error::Invalid("no kernel PDB".into()))?;
+        let field = |name: &str| pdb.field("_KTRAP_FRAME", name);
+        let mut r = like.clone();
+        r.pc = memory.u64(frame + field("Pc")?)?;
+        r.sp = memory.u64(frame + field("Sp")?)?;
+        let x0 = field("X0")?;
+        for i in 0..19 {
+            r.x[i] = memory.u64(frame + x0 + 8 * i as u64)?;
+        }
+        r.x[29] = memory.u64(frame + field("Fp")?)?;
+        r.x[30] = memory.u64(frame + field("Lr")?)?;
+        Ok(r)
+    }
+
+    /// Whether `address` is in a loaded module.
+    pub fn in_module(&self, address: u64) -> bool {
+        self.module(address).is_some()
     }
 
     fn module(&self, address: u64) -> Option<&Module> {
@@ -82,6 +123,7 @@ impl Symbolizer {
             let found = self.load(memory, &module);
             self.names.insert(module.base, found);
         }
+        let pdata = self.unwind.function_start(memory, &module, address);
         let names = &self.names[&module.base];
         let range = module.base..=address;
         let pdb = names.pdb.as_ref().and_then(|s| s.addresses.range(range.clone()).next_back());
@@ -92,6 +134,15 @@ impl Symbolizer {
             (Some(o), Some(e)) => Some(if e.0 >= o.0 { e } else { o }),
             (o, e) => o.or(e),
         });
+        // Without a PDB, a name below the function's start is another
+        // function's.
+        let unnamed = match (names.pdb.is_none(), pdata, names.linked) {
+            (true, Some(start), Some(linked)) if best.is_none_or(|(&at, _)| at < start) => Some((start, format!("sub_{:x}", (start - module.base).wrapping_add(linked)))),
+            _ => None,
+        };
+        if let Some((at, name)) = unnamed {
+            return if at == address { format!("{short}!{name}") } else { format!("{short}!{name}+{:#x}", address - at) };
+        }
         match best {
             Some((&at, name)) if at == address => format!("{short}!{name}"),
             Some((&at, name)) => format!("{short}!{name}+{:#x}", address - at),
@@ -101,24 +152,30 @@ impl Symbolizer {
 
     fn load(&self, memory: &impl VirtualMemory, module: &Module) -> Names {
         let Ok(image) = Image::read(memory, module.base) else { return Names::default() };
+        let linked = Some(if image.image_base == module.base { 0x1_4000_0000 } else { image.image_base });
         let pdb = image
             .pdb
             .as_ref()
             .and_then(|id| symbols::fetch(&self.cache, id).ok().and_then(|p| Symbols::load(&p, id, module.base).ok()));
         let other = image.exports.iter().map(|(n, &a)| (a, n.clone())).collect();
-        Names { pdb, other }
+        Names { pdb, other, linked }
     }
 
     /// The call stack of `registers`' thread, innermost first, named.
     pub fn stack(&mut self, memory: &impl VirtualMemory, registers: &Registers) -> Vec<String> {
+        let (frames, stop) = self.frames(memory, registers);
+        let mut out: Vec<String> = frames.into_iter().map(|(_, n)| n).collect();
+        out.extend(stop.map(|s| format!("({s})")));
+        out
+    }
+
+    /// The call stack as (pc, name), and why the walk stopped early.
+    pub fn frames(&mut self, memory: &impl VirtualMemory, registers: &Registers) -> (Vec<(u64, String)>, Option<String>) {
         let modules = self.modules.clone();
         let mut tables = std::mem::take(&mut self.unwind);
         let stack = unwind::walk(memory, registers, &modules, &mut tables);
         self.unwind = tables;
-        let mut out: Vec<String> = stack.frames.iter().map(|f| self.name(memory, f.pc)).collect();
-        if let Some(stop) = stack.stop {
-            out.push(format!("({stop})"));
-        }
-        out
+        let frames = stack.frames.iter().map(|f| (f.pc, self.name(memory, f.pc))).collect();
+        (frames, stack.stop)
     }
 }

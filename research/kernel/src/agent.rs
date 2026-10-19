@@ -130,6 +130,7 @@ enum Target {
     FuzzRun,
     FuzzProbe,
     FuzzTrace,
+    FuzzTriage,
     FuzzCoverage,
     FuzzBlocks,
     FuzzDiff,
@@ -262,6 +263,14 @@ static COMMANDS: &[Command] = &[
         p("blocks", "path", false, "block list to name functions from too"),
         p("state_dir", "path", false, "VM state directory, one per parallel run"),
     ], "control", Target::FuzzTrace)),
+    job(c("fuzz.triage", "fuzz", "Run a saved finding's input again: whether it reproduces, its signature, and the least input that still makes it (written beside the report as .min.bin)", &[
+        p("harness", "path", true, "harness JSON"),
+        p("input", "path", true, "input file as the fuzzer saved it"),
+        p("output", "path", true, "new report file (JSON)"),
+        p("runs", "integer", false, "runs of the input as given, default 3"),
+        p("budget", "integer", false, "executions for minimizing at most, default 2000; 0 doesn't minimize"),
+        p("state_dir", "path", false, "VM state directory, one per parallel run"),
+    ], "control", Target::FuzzTriage)),
     c("fuzz.coverage", "fuzz", "Per-function block coverage of a run", &[p("run", "path", true, "run directory (coverage.json, blocks.json)")], "read", Target::FuzzCoverage),
     c("fuzz.blocks", "fuzz", "Blocks of a run with hit counts; filter by function or covered", &[p("run", "path", true, "run directory"), p("function", "string", false, "only this function"), p("covered", "boolean", false, "only covered (true) or uncovered (false)")], "read", Target::FuzzBlocks),
     c("fuzz.diff", "fuzz", "Blocks covered by one run and not the other", &[p("a", "path", true, "run directory"), p("b", "path", true, "run directory")], "read", Target::FuzzDiff),
@@ -386,7 +395,7 @@ impl Shared {
             Target::FuzzBlocks => blocks(&path(&args, "run")?, args.get("function").and_then(Value::as_str), args.get("covered").and_then(Value::as_bool)),
             Target::FuzzDiff => diff(&path(&args, "a")?, &path(&args, "b")?),
             Target::FuzzCrashes => crashes(&path(&args, "run")?),
-            Target::FuzzRun | Target::FuzzProbe | Target::FuzzTrace => Err(format!("{} is long running: start it with jobs.start", c.name)),
+            Target::FuzzRun | Target::FuzzProbe | Target::FuzzTrace | Target::FuzzTriage => Err(format!("{} is long running: start it with jobs.start", c.name)),
         }
     }
 
@@ -396,7 +405,8 @@ impl Shared {
         })
     }
 
-    /// The vroom-fuzz process for a fuzz.run, fuzz.probe or fuzz.trace job.
+    /// The vroom-fuzz process for a fuzz.run, fuzz.probe, fuzz.trace or
+    /// fuzz.triage job.
     fn spawn_fuzzer(&self, c: &Command, args: &Map<String, Value>) -> Result<(Child, PathBuf), String> {
         let output = path(args, "output")?;
         if output.exists() {
@@ -415,11 +425,24 @@ impl Shared {
             }
         }
         let mut cmd = Process::new(fuzz);
-        if matches!(c.target, Target::FuzzTrace) {
+        if matches!(c.target, Target::FuzzTrace | Target::FuzzTriage) {
             // A file: its directory must be there.
             if let Some(dir) = output.parent() {
                 std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
             }
+        }
+        if matches!(c.target, Target::FuzzTriage) {
+            let min = output.with_extension("min.bin");
+            cmd.arg("triage").arg(path(args, "harness")?).arg(path(args, "input")?).arg("--out").arg(&output).arg("--min").arg(min);
+            for name in ["runs", "budget"] {
+                if let Some(v) = args.get(name) {
+                    cmd.arg(format!("--{name}")).arg(crate::number(v)?.to_string());
+                }
+            }
+            if let Some(v) = args.get("state_dir").and_then(Value::as_str) {
+                cmd.arg("--state-dir").arg(v);
+            }
+        } else if matches!(c.target, Target::FuzzTrace) {
             cmd.arg("trace").arg(path(args, "harness")?).arg(path(args, "input")?).arg("--out").arg(&output);
             if let Some(v) = args.get("max") {
                 cmd.arg("--max").arg(crate::number(v)?.to_string());
@@ -711,7 +734,7 @@ impl Connection {
 
     fn start_job(&self, command: &'static Command, args: Map<String, Value>, actor: &str) -> Result<Value, Error> {
         let handle = self.shared.handle("job");
-        let (child, log) = if matches!(command.target, Target::FuzzRun | Target::FuzzProbe | Target::FuzzTrace) {
+        let (child, log) = if matches!(command.target, Target::FuzzRun | Target::FuzzProbe | Target::FuzzTrace | Target::FuzzTriage) {
             let (child, log) = self.shared.spawn_fuzzer(command, &args).map_err(|e| error(INTERNAL_ERROR, e))?;
             (Some(child), Some(log))
         } else {

@@ -238,18 +238,7 @@ impl Engine {
                 .debug_write_register(cpu, vroom_hv::debug::Register::Pstate, crate::isolated_pstate(first.pstate))
                 .map_err(|e| Error::Invalid(format!("cmplog: mask interrupts: {e}")))?;
         }
-        let (lo, hi) = match self.target_image {
-            Some(range) => range,
-            None => {
-                let entry = self.harness.entry_pc.unwrap_or(first.pc);
-                let space = AddressSpace { memory: &self.vm, registers: &first };
-                let image = vroom_kernel::windows::image_containing(&space, entry)
-                    .map_err(|e| Error::Invalid(format!("target image: {e}")))?;
-                let range = (image.base, image.base + u64::from(image.size));
-                self.target_image = Some(range);
-                range
-            }
-        };
+        let (lo, hi) = self.target_range(&first)?;
         let always = self.always();
         let mut cmps = Vec::new();
         for _ in 0..max_steps {

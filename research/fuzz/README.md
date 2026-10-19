@@ -17,7 +17,16 @@ vroom-fuzz run harness.json seed.bin --output runs/d --duration-secs 60         
 vroom-fuzz cmplog harness.json input.bin                        # one input's comparisons, candidates
 vroom-fuzz coverage runs/a/coverage.json runs/a/blocks.json     # per-function summary
 vroom-fuzz trace harness.json runs/a/crashes/<hash>-BugCheck.bin --blocks all-blocks.json   # replay, symbolized
+vroom-fuzz triage harness.json runs/a/crashes/<hash>-BugCheck.bin   # reproduce + minimize
 ```
+
+| `triage` flag | |
+|---|---|
+| `--runs N` | runs of the input as given (3) |
+| `--budget N` | executions for minimizing (2000); `0` doesn't |
+| `--out FILE`, `--min FILE` | default `<input>.triage.json`, `<input>.min.bin` |
+
+Triage: the most frequent first finding over the runs is the one; minimizing keeps each change that still makes its signature: shortest prefix, zeroed spans (64, 8 bytes), dropped chunks, zeroed bytes. The IOCTL prefix stays. Candidates time out at 20× the input's run (≥250 ms). Report: `signature`, `reproduced`/`runs`, every signature seen, `finding`, lengths, executions. HEVD stack overflow: 2308 → 2096 bytes, 4 non-zero, ~11 s.
 
 | `trace` flag | |
 |---|---|
@@ -42,6 +51,21 @@ Trace file: `N  PC  module!function+0xoff` per instruction from the snapshot to 
 Comparison logging (Redqueen-style): each new corpus input runs once stepped through the target's image (≤200 ms); its comparisons (`cmp`, `cmn`, `ccmp`, `cbz`, `tbz`) become inputs that turn them the other way (operand found in the input → the other operand ±1; IOCTL and first payload words shifted by the operands' difference) and dictionary words. Without `--ioctl`, one mutation in four changes the code (dictionary, function ±1–4, method). Parents: novelty × speed (median-relative). HEVD: 29/29 IOCTLs from a zero code in ~0.1 s (blocks mode).
 
 Output dir: `inputs/`, `crashes/<hash>-<class>.{bin,json}` (`stack`: symbolized), `coverage.json`, `blocks.json`, `stats.json` (every 5 s).
+
+Signature (dedupe): class + the 3 innermost functions of the faulting code (offsets dropped; frames above the kernel's exception entry and `KeBugCheck*` skipped); `<wild jump>` for a PC outside every image; else class + PC. Functions without a PDB: the block list's names, else `.pdata` starts as `sub_<address at 0x140000000>`.
+
+## Exceptions
+
+Detector `exceptions` (or `access-violation`): a breakpoint on `nt!KiDispatchException` sees every exception at first chance, before an `__except` swallows it. Reported when the faulting PC or a frame of its stack (unwound from the trap frame) is in the target, or the PC is in no image:
+
+| class | |
+|---|---|
+| `AccessViolation` | `0xc0000005` on a kernel address or the NULL page (`reading`/`writing`/`executing ADDR`) |
+| `ExceptionDispatch` | stack overrun `0xc0000409`, illegal/privileged instruction, misalignment, stack overflow, divide, the trap handlers' other `0x100000xx` codes (`0x10000011`: non-canonical address) |
+
+- User-address faults inside `__try` (probing user buffers) aren't findings.
+- Bugchecks stop at `KeBugCheck2` (every bugcheck goes through it; `bugcheck_pc` = `KeBugCheckEx` is moved there) with the exception's stack.
+- The same exception (code, address) 9 times in one input ends it: a fault in its own dispatch.
 Kernel TUI: `coverage runs/a/coverage.json`, `coverage-diff runs/a/coverage.json runs/b/coverage.json`.
 
 ## Harness fields
@@ -53,7 +77,8 @@ Kernel TUI: `coverage runs/a/coverage.json`, `coverage-diff runs/a/coverage.json
 | `input_gpa`, `input_capacity`, `input_va`, `max_input` | input buffer |
 | `ioctl_prefix`, `ioctl_register` / `ioctl_va` | first 4 input bytes = IOCTL, and where it goes |
 | `input_register` / `input_pointer_va`, `input_length_register` / `input_length_va`, `output_length_va` | saved fields patched per input |
-| `entry_pc`, `stop_pc` | first block; return address that ends an input (testcase thread only) |
+| `entry_pc`, `stop_pc` | first block; return address that ends an input (testcase thread only). User-mode `entry_pc`: a client harness (needs `blocks`, no `isolate_cpu`, `target`, `stop_pc` in the client) |
+| `target` | module under test (`clfs.sys`); default the image of `entry_pc` |
 | `bugcheck_pc` | `KeBugCheckEx` VA: crash = finding + in-place reset (~1 ms, not ~11 s); 5th HW breakpoint |
 | `reset_is_bugcheck` | guest reset counts as a bugcheck |
 | `reopen_after` | `0` reset in place, `1` restore from disk every input |
