@@ -173,7 +173,7 @@ fn roots(state: &Path) -> Result<(BTreeSet<PathBuf>, BTreeSet<PathBuf>)> {
         if p.extension().is_some_and(|x| x == "json") {
             let v: serde_json::Value = serde_json::from_slice(&read_small(&p)?).map_err(|e| Error::Setup(e.to_string()))?;
             if let Some(a) = v.get("active").and_then(|a| a.as_str()) {
-                roots.insert(canon(Path::new(a)));
+                roots.insert(present(&p, recorded(state, a))?);
             }
         }
     }
@@ -183,11 +183,11 @@ fn roots(state: &Path) -> Result<(BTreeSet<PathBuf>, BTreeSet<PathBuf>)> {
         let Ok(s) = SnapshotDir::open(&d) else { continue };
         for (k, v) in &s.manifest.meta {
             if k.starts_with("disk.") {
-                roots.insert(canon(Path::new(v)));
+                roots.insert(present(&d, recorded(state, v))?);
             } else if k.starts_with("chain.") {
                 // "stamp|path" per file, the save's top layer first.
                 for (n, line) in v.lines().enumerate() {
-                    let p = canon(Path::new(line.split_once('|').map(|(_, p)| p).unwrap_or(line)));
+                    let p = present(&d, recorded(state, line.split_once('|').map(|(_, p)| p).unwrap_or(line)))?;
                     if n == 0 {
                         roots.insert(p.clone());
                     }
@@ -231,6 +231,27 @@ fn real_dir(p: &Path) -> Result<()> {
 
 fn canon(p: &Path) -> PathBuf {
     p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// What `record` names must be there: one gone missing (a VM moved
+/// while its records named files by their old place) would make the
+/// layers it uses look unused, and get them deleted.
+fn present(record: &Path, p: PathBuf) -> Result<PathBuf> {
+    if p.exists() {
+        Ok(p)
+    } else {
+        Err(Error::Setup(format!("{} names {}, which is missing: nothing pruned", record.display(), p.display())))
+    }
+}
+
+/// A path the VM's records (disk pointers, saves) name: relative ones are
+/// in the VM's folder, the state dir's parent.
+fn recorded(state: &Path, p: &str) -> PathBuf {
+    let p = Path::new(p);
+    match (p.is_relative(), state.parent()) {
+        (true, Some(vm)) => canon(&vm.join(p)),
+        _ => canon(p),
+    }
 }
 
 /// Backing file of a layer. A layer we can't open stops everything: guessing

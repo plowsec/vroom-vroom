@@ -230,7 +230,7 @@ impl Vmm {
     pub fn start(config: VmConfig, hv: Arc<dyn Hypervisor>, opts: VmmOptions) -> Result<Vmm> {
         config.validate()?;
         let saved = match &opts.start {
-            StartMode::Restore(dir) | StartMode::RestorePaused(dir) => Some(snapshot::saved_config(dir)?),
+            StartMode::Restore(dir) | StartMode::RestorePaused(dir) => Some(snapshot::saved_config(dir, &opts.state_dir)?),
             StartMode::Boot | StartMode::BootPaused => None,
         };
         let config = match &saved {
@@ -244,7 +244,7 @@ impl Vmm {
         };
         let lock = state::StateLock::acquire(&opts.state_dir)?;
         let layers = match &opts.start {
-            StartMode::Restore(dir) | StartMode::RestorePaused(dir) => snapshot::disk_plan(dir)?,
+            StartMode::Restore(dir) | StartMode::RestorePaused(dir) => snapshot::disk_plan(dir, &opts.state_dir)?,
             StartMode::Boot | StartMode::BootPaused => Default::default(),
         };
         let disks = disks::DiskSet::open(&config, &opts.state_dir, &layers)?;
@@ -831,11 +831,12 @@ impl Vmm {
     }
 }
 
-/// Whether a VM can start from snapshot `dir`: its manifest and saved
-/// VM file read, and its disk layers are as they were saved.
-pub fn check_snapshot(dir: &Path) -> Result<()> {
-    snapshot::saved_config(dir)?;
-    snapshot::disk_plan(dir)?;
+/// Whether the VM with state dir `state_dir` can start from snapshot
+/// `dir`: its manifest and saved VM file read, and its disk layers are as
+/// they were saved.
+pub fn check_snapshot(dir: &Path, state_dir: &Path) -> Result<()> {
+    snapshot::saved_config(dir, state_dir)?;
+    snapshot::disk_plan(dir, state_dir)?;
     Ok(())
 }
 

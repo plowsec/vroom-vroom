@@ -937,11 +937,28 @@ impl VmConfig {
 
     /// Make relative paths absolute against `base` (the config's directory).
     pub fn rebase_paths(&mut self, base: &std::path::Path) {
-        let fix = |p: &mut PathBuf| {
+        self.each_path(|p| {
             if p.is_relative() {
                 *p = base.join(&*p);
             }
-        };
+        });
+    }
+
+    /// The inverse, for what is saved next to the VM (snapshots): paths
+    /// inside `base` (the VM's folder) relative to it, so the folder can
+    /// move. Paths elsewhere (a share, a disk on another drive) stay.
+    pub fn relative_paths(&mut self, base: &std::path::Path) {
+        let base = std::fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
+        self.each_path(|p| {
+            let real = std::fs::canonicalize(&*p).unwrap_or_else(|_| p.clone());
+            if let Ok(rest) = real.strip_prefix(&base) {
+                *p = rest.to_path_buf();
+            }
+        });
+    }
+
+    /// Every host path the file names.
+    fn each_path(&mut self, mut fix: impl FnMut(&mut PathBuf)) {
         match &mut self.boot {
             Boot::Kernel { kernel, initrd, .. } => {
                 fix(kernel);

@@ -809,6 +809,28 @@ impl Runs {
 /// Fill the part of a v3 header (first 4 KiB of cluster 0) that names
 /// the backing file: bytes 8..20 and everything from 104 on. Layout as
 /// we create it: backing-format extension, end marker, then the name.
+/// How an overlay names its backing file: relative to the overlay's own
+/// directory when the backing sits at most two directories up (a VM's
+/// state dir overlays on the VM folder's base image), so the VM folder can
+/// move; absolute otherwise (a base on another disk, which doesn't move
+/// with it).
+fn backing_name(image: &Path, backing: &Path) -> String {
+    let (Ok(from), Ok(to)) = (dir_of(image).canonicalize(), dir_of(backing).canonicalize()) else {
+        return backing.to_string_lossy().into_owned();
+    };
+    let file = backing.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    for (ups, up) in from.ancestors().take(3).enumerate() {
+        if let Ok(rest) = to.strip_prefix(up) {
+            let mut p = PathBuf::new();
+            for _ in 0..ups {
+                p.push("..");
+            }
+            return p.join(rest).join(file).to_string_lossy().into_owned();
+        }
+    }
+    backing.to_string_lossy().into_owned()
+}
+
 fn write_backing_area(hdr: &mut [u8], image: &Path, backing: Option<(&Path, Format)>) -> Result<()> {
     let put32 = |b: &mut [u8], o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_be_bytes());
     let put64 = |b: &mut [u8], o: usize, v: u64| b[o..o + 8].copy_from_slice(&v.to_be_bytes());
@@ -825,12 +847,7 @@ fn write_backing_area(hdr: &mut [u8], image: &Path, backing: Option<(&Path, Form
     put32(hdr, off, EXT_END);
     put32(hdr, off + 4, 0);
     off += 8;
-    let same_dir = dir_of(bp).canonicalize().ok() == dir_of(image).canonicalize().ok();
-    let name = if same_dir {
-        bp.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
-    } else {
-        bp.to_string_lossy().into_owned()
-    };
+    let name = backing_name(image, bp);
     if name.len() > 1023 || off + name.len() > HEADER_AREA {
         return Err(bad("backing path too long"));
     }
@@ -1192,6 +1209,22 @@ impl Qcow2Image {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backing_names_are_relative_up_to_two_levels() {
+        let td = tempfile::tempdir().unwrap();
+        let vm = td.path().join("other/vm");
+        std::fs::create_dir_all(vm.join("vm.state/disks")).unwrap();
+        let base = vm.join("vm.qcow2");
+        let far = td.path().join("far.qcow2");
+        for f in [&base, &far] {
+            std::fs::write(f, b"").unwrap();
+        }
+        let top = vm.join("vm.state/disks/top.qcow2");
+        assert_eq!(backing_name(&top, &vm.join("vm.state/disks/x.qcow2")), "x.qcow2");
+        assert_eq!(backing_name(&top, &base), "../../vm.qcow2");
+        assert_eq!(backing_name(&top, &far), far.to_string_lossy(), "outside the VM folder: absolute");
+    }
     use crate::raw::RawImage;
 
     #[test]

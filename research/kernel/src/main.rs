@@ -1403,7 +1403,7 @@ fn restore_in(slot: &mut Option<Session>, config_path: &std::path::Path, request
     let state_dir = slot.as_ref().map(|s| s.state_dir.clone()).ok_or("no VM")?;
     let given = request["name"].as_str().or(request["path"].as_str()).ok_or("missing name (or path)")?;
     let dir = restore_dir(std::path::Path::new(given), &state_dir)?;
-    vroom_vmm::check_snapshot(&dir).map_err(|e| e.to_string())?;
+    vroom_vmm::check_snapshot(&dir, &state_dir).map_err(|e| e.to_string())?;
     // The old VM lets go of its state dir, disks and network ports first.
     drop(slot.take());
     let session = boot(config_path, Some(&dir)).map_err(|e| format!("{e} (the lab stops: its VM is gone)"))?;

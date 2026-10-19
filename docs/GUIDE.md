@@ -629,6 +629,14 @@ or 15 fps. Testing: `VROOM_CAMERA_TEST=1` sends color bars.
   since (another program wrote one) is refused: restoring it corrupts
   the guest's disk.
 
+## Moving a VM
+
+Stop it, move its folder anywhere (another disk too), then add it from
+there: drop its `.toml` on vroom. Inside the folder everything is named
+relative to it (disk layers, snapshots, suspend image); a disk outside
+it keeps its path. Copy with Finder or `cp -p`: a snapshot checks its
+layers' modification times.
+
 ## Disks
 
 - Under 2 GiB free in the state dir: the VM pauses. Free space, resume

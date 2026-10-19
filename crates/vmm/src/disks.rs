@@ -211,6 +211,11 @@ impl DiskSet {
         })
     }
 
+    /// The VM's state dir (the disk layers are in its `disks/`).
+    pub fn state_dir(&self) -> &Path {
+        self.dir.parent().unwrap_or(&self.dir)
+    }
+
     /// The overlays `open` started on snapshot layers are scratch (a
     /// fuzzer restoring the same snapshot again and again): delete them
     /// when the disks close and put the state's disk pointers back, instead
@@ -344,9 +349,36 @@ impl Drop for DiskSet {
     }
 }
 
+/// The VM's folder (its state dir's parent): its own records (disk
+/// pointers, saves) name the files in it relative to it, so the folder can
+/// move.
+pub(crate) fn vm_dir(state_dir: &Path) -> PathBuf {
+    let d = state_dir.parent().unwrap_or(state_dir);
+    std::fs::canonicalize(d).unwrap_or_else(|_| d.to_path_buf())
+}
+
+/// `p` as a record names it: relative inside the VM's folder `vm`.
+pub(crate) fn recorded(p: &Path, vm: &Path) -> String {
+    let real = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    real.strip_prefix(vm).unwrap_or(&real).display().to_string()
+}
+
+/// A path a record names, where it is now.
+pub(crate) fn found(s: &str, vm: &Path) -> PathBuf {
+    let p = Path::new(s);
+    if p.is_relative() {
+        vm.join(p)
+    } else {
+        p.to_path_buf()
+    }
+}
+
+/// `path`: `<state>/disks/disk<N>.json`.
 fn write_pointer(path: &Path, active: &Path) -> Result<()> {
     let tmp = path.with_extension("json.tmp");
-    let data = serde_json::to_vec(&Pointer { active: active.to_path_buf() }).map_err(|e| Error::Setup(e.to_string()))?;
+    let state = path.parent().and_then(Path::parent).unwrap_or(path);
+    let active = PathBuf::from(recorded(active, &vm_dir(state)));
+    let data = serde_json::to_vec(&Pointer { active }).map_err(|e| Error::Setup(e.to_string()))?;
     std::fs::write(&tmp, data)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
@@ -404,6 +436,35 @@ mod tests {
         std::fs::OpenOptions::new().append(true).open(&disk).unwrap().write_all(&[0]).unwrap();
         assert_ne!(file_stamp(&snap[1].0).unwrap(), snap[1].1);
         assert_eq!(file_stamp(&snap[0].0).unwrap(), snap[0].1, "the frozen layer stayed as it was");
+    }
+
+    #[test]
+    fn a_vm_folder_can_move() {
+        let td = tempfile::tempdir().unwrap();
+        let (a, b) = (td.path().join("a/vm"), td.path().join("b/vm"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(b.parent().unwrap()).unwrap();
+        Qcow2Image::create(&a.join("disk.qcow2"), 1 << 20, None).unwrap();
+        let mut ds = DiskSet::open(&cfg(&a.join("disk.qcow2")), &a.join("vm.state"), &BTreeMap::new()).unwrap();
+        ds.disks[0].image.write_at(b"base", 0).unwrap();
+        ds.freeze().unwrap();
+        ds.disks[0].image.write_at(b"snap", 0).unwrap();
+        let layer = ds.freeze().unwrap()[&0].clone();
+        ds.disks[0].image.write_at(b"live", 0).unwrap();
+        drop(ds);
+        std::fs::rename(&a, &b).unwrap();
+        // Its own run: the pointer and every overlay's backing name.
+        let ds = DiskSet::open(&cfg(&b.join("disk.qcow2")), &b.join("vm.state"), &BTreeMap::new()).unwrap();
+        let mut buf = [0u8; 4];
+        ds.disks[0].image.read_at(&mut buf, 0).unwrap();
+        assert_eq!(&buf, b"live");
+        assert!(ds.disks[0].below.iter().all(|f| f.starts_with(b.canonicalize().unwrap())), "{:?}", ds.disks[0].below);
+        drop(ds);
+        // A revert to the snapshot's layer, where it is now.
+        let moved = b.join("vm.state/disks").join(layer.file_name().unwrap());
+        let ds = DiskSet::open(&cfg(&b.join("disk.qcow2")), &b.join("vm.state"), &BTreeMap::from([(0, moved)])).unwrap();
+        ds.disks[0].image.read_at(&mut buf, 0).unwrap();
+        assert_eq!(&buf, b"snap");
     }
 
     #[test]
