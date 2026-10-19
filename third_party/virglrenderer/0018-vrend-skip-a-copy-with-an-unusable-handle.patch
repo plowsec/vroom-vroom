@@ -1,0 +1,72 @@
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -11407,6 +11407,37 @@
+    return resource_contains_box(dst_res, &dst_box, dst_level);
+ }
+ 
++/* A handle the context has no host object for used to go through
++ * vrend_report_context_error, which sets ctx->in_error.  Nothing ever
++ * clears that: every later context switch fails, so every command buffer
++ * after it is refused and the guest draws nothing more for the life of
++ * the context.  GNOME on Ubuntu 26.04 walks into it on its first frame --
++ * its shell blits a VIRGL_RENDERER_BLOB_MEM_GUEST blob, which has guest
++ * storage and no GL object -- and the desktop is black from then on.
++ *
++ * One unusable handle should cost that one copy, not the session.  Skip
++ * the copy and leave the context alive: the pixels it would have written
++ * are missing or stale, which is visible but recoverable, and everything
++ * else the guest draws still arrives.
++ */
++static bool vrend_copy_operands_usable(struct vrend_context *ctx, const char *what,
++                                       struct vrend_resource *src_res, uint32_t src_handle,
++                                       struct vrend_resource *dst_res, uint32_t dst_handle)
++{
++   if (src_res && dst_res)
++      return true;
++
++   static bool said;
++   if (!said) {
++      said = true;
++      virgl_warn("%s: context %d \"%s\" names resource %d, which has no host object; "
++                 "skipping it rather than failing the context for good. "
++                 "Quiet from here.\n",
++                 what, ctx->ctx_id, ctx->debug_name, src_res ? dst_handle : src_handle);
++   }
++   return false;
++}
++
+ void vrend_renderer_resource_copy_region(struct vrend_context *ctx,
+                                          uint32_t dst_handle, uint32_t dst_level,
+                                          uint32_t dstx, uint32_t dsty, uint32_t dstz,
+@@ -11424,14 +11455,8 @@
+    src_res = vrend_renderer_ctx_res_lookup(ctx, src_handle);
+    dst_res = vrend_renderer_ctx_res_lookup(ctx, dst_handle);
+ 
+-   if (!src_res) {
+-      vrend_report_context_error(ctx, VIRGL_ERROR_CTX_ILLEGAL_RESOURCE, src_handle);
+-      return;
+-   }
+-   if (!dst_res) {
+-      vrend_report_context_error(ctx, VIRGL_ERROR_CTX_ILLEGAL_RESOURCE, dst_handle);
++   if (!vrend_copy_operands_usable(ctx, __func__, src_res, src_handle, dst_res, dst_handle))
+       return;
+-   }
+ 
+    vrend_resource_shm_refresh(src_res);
+ 
+@@ -11980,14 +12005,8 @@
+    src_res = vrend_renderer_ctx_res_lookup(ctx, src_handle);
+    dst_res = vrend_renderer_ctx_res_lookup(ctx, dst_handle);
+ 
+-   if (!src_res) {
+-      vrend_report_context_error(ctx, VIRGL_ERROR_CTX_ILLEGAL_RESOURCE, src_handle);
+-      return;
+-   }
+-   if (!dst_res) {
+-      vrend_report_context_error(ctx, VIRGL_ERROR_CTX_ILLEGAL_RESOURCE, dst_handle);
++   if (!vrend_copy_operands_usable(ctx, __func__, src_res, src_handle, dst_res, dst_handle))
+       return;
+-   }
+ 
+    if (ctx->in_error)
+       return;

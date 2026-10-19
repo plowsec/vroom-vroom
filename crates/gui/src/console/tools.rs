@@ -21,14 +21,13 @@ use super::{with, Console, VmState};
 /// The tools stick's USB id (pid.codes' test product): ours, never a
 /// device of the Mac's.
 pub(super) const STICK_ID: &str = "1209:0001";
-/// Running this long without an agent: offer the tools.
-const MISSING_AFTER: Duration = Duration::from_secs(90);
 /// An update that hasn't brought the new agent by then didn't work.
 const UPDATE_WAIT: Duration = Duration::from_secs(180);
 /// How long the instructions stay up.
 const HOW_LONG: Duration = Duration::from_secs(20);
 
-/// What to run in a Linux guest with the stick in.
+/// What to run in a Linux guest with the stick in, for whoever would
+/// rather type it than double-click the disk's installer.
 pub(super) const LINUX_COMMAND: &str = "sudo mount -o ro LABEL=VRTOOLS /mnt && sudo sh /mnt/linux/install-agent.sh";
 
 #[derive(Debug, Default)]
@@ -36,7 +35,6 @@ pub(super) struct Tools {
     /// The agent's hello text, once one came.
     agent: Option<String>,
     state: State,
-    running_since: Option<Instant>,
     /// The tools stick is in: taken out once the new agent is there.
     stick: bool,
     updates: u32,
@@ -111,12 +109,14 @@ impl Console {
 
     pub(super) fn tools_tick(&mut self, now: Instant) {
         if self.state != VmState::Running {
-            self.tools.running_since = None;
             return;
         }
-        let since = *self.tools.running_since.get_or_insert(now);
         match &self.tools.state {
-            State::Hidden if self.tools.agent.is_none() && now.duration_since(since) > MISSING_AFTER => {
+            // No agent has said hello, so there are no tools to speak of
+            // yet: offer them now rather than leaving the window bare
+            // while a timer the user can't see runs down. An agent that
+            // answers later takes the button away itself (`tools_agent`).
+            State::Hidden if self.tools.agent.is_none() => {
                 self.tools.state = State::Missing;
                 self.tools_show();
             }
@@ -248,11 +248,18 @@ impl Console {
             self.tools.stick = true;
         }
         match os {
+            // Nothing to type and nothing to paste: the Mac's clipboard
+            // only reaches the guest through the agent being installed,
+            // and typing it would be a guess at the guest's keyboard
+            // layout. The disk carries something to double-click.
             Os::Linux => {
                 if let Some(cb) = self.clipboard.as_mut() {
                     let _ = cb.set_text(LINUX_COMMAND.to_string());
                 }
-                self.toast_for(&format!("Tools disk in. In the guest (copied): {LINUX_COMMAND}"), HOW_LONG);
+                self.toast_for(
+                    "Tools disk in. Open VRTOOLS in the guest and double-click \"Install vroom guest tools\"                      (the command is on the Mac's clipboard too).",
+                    HOW_LONG,
+                )
             }
             Os::Windows => self.toast_for("Tools disk in. In Windows: open the VRTOOLS drive, run vroom-setup", HOW_LONG),
         }

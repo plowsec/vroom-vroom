@@ -103,6 +103,13 @@ pub fn wayland() -> bool {
     mutter::wayland()
 }
 
+/// Keep only vroom's monitors on the desktop (GNOME on Wayland). Whether
+/// that changed anything.
+#[cfg(target_os = "linux")]
+pub fn only_ours() -> io::Result<bool> {
+    mutter::only_ours()
+}
+
 /// The desktop's backend, if we know how to scale it.
 pub fn system() -> Option<Box<dyn Backend>> {
     #[cfg(windows)]
@@ -323,6 +330,48 @@ mod mutter {
         }
         a.push("0".into());
         change.then_some(a)
+    }
+
+    /// ApplyMonitorsConfig arguments that leave only vroom's monitors
+    /// (`Virtual-N`) on the desktop: side by side from the origin in the
+    /// order they come, each in the mode and at the scale it has now, the
+    /// first one primary. None: they are already the only ones there.
+    pub fn only_config(s: &State) -> Option<Vec<String>> {
+        let ours = |o: &&Output| crate::layout::virtual_index(&o.connector).is_some();
+        let keep: Vec<(&Logical, Vec<&Output>)> =
+            s.logical.iter().map(|l| (l, l.monitors.iter().filter(ours).collect::<Vec<_>>())).filter(|(_, m)| !m.is_empty()).collect();
+        let (all, mine) = (s.logical.iter().map(|l| l.monitors.len()).sum::<usize>(), keep.iter().map(|(_, m)| m.len()).sum::<usize>());
+        if keep.is_empty() || (keep.len() == s.logical.len() && mine == all) {
+            return None;
+        }
+        let mut a = vec!["uua(iiduba(ssa{sv}))a{sv}".to_string(), s.serial.to_string(), "1".into(), keep.len().to_string()];
+        let mut x = 0i64;
+        for (i, (l, mons)) in keep.iter().enumerate() {
+            a.extend([x.to_string(), "0".into(), l.scale.to_string(), l.transform.to_string(), (i == 0).to_string(), mons.len().to_string()]);
+            for m in mons {
+                a.extend([m.connector.clone(), m.mode.clone(), "0".into()]);
+            }
+            // Logical pixels: the mode divided by the scale.
+            let k = if l.scale > 0.0 { l.scale } else { 1.0 };
+            x += (mons.first().map_or(0, |m| m.size.0) as f64 / k).round() as i64;
+        }
+        a.push("0".into());
+        Some(a)
+    }
+
+    /// Take every monitor that isn't ours off the desktop. Whether that
+    /// changed anything; an error while none of ours is there yet (the
+    /// compositor may still be coming up).
+    pub fn only_ours() -> io::Result<bool> {
+        let s = state()?;
+        if !s.logical.iter().flat_map(|l| &l.monitors).any(|m| crate::layout::virtual_index(&m.connector).is_some()) {
+            return Err(io::Error::other("no Virtual-N monitor on the desktop"));
+        }
+        let Some(args) = only_config(&s) else { return Ok(false) };
+        let mut call = vec!["ApplyMonitorsConfig"];
+        call.extend(args.iter().map(String::as_str));
+        busctl(&call)?;
+        Ok(true)
     }
 
     impl super::Backend for Mutter {
@@ -568,6 +617,36 @@ mod tests {
         assert_eq!(config(&s, 1.2), None, "already at the nearest scale");
         assert_eq!(config(&s, 9.0).unwrap()[6], "3");
         assert!(parse("{}").is_none() && parse("not json").is_none());
+    }
+
+    /// The firmware framebuffer next to virtio-gpu: two monitors, and the
+    /// phantom one is where Mutter put the desktop's origin.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_our_monitors() {
+        use super::mutter::{only_config, parse};
+        let j = r#"{"type":"x","data":[7,
+            [[["Unknown-1","unknown","unknown","unknown"],
+              [["800x600@60",800,600,60.0,1.0,[1.0,2.0],{"is-current":{"type":"b","data":true}}]],{}],
+             [["Virtual-1","unknown","unknown","unknown"],
+              [["3456x2026@60",3456,2026,60.0,1.0,[1.0,2.0],{"is-current":{"type":"b","data":true}}]],{}]],
+            [[0,0,1.0,0,true,[["Unknown-1","unknown","unknown","unknown"]],{}],
+             [800,0,1.0,0,false,[["Virtual-1","unknown","unknown","unknown"]],{}]],
+            {}]}"#;
+        let s = parse(j).unwrap();
+        assert_eq!(s.logical.len(), 2);
+        let a = only_config(&s).unwrap();
+        assert_eq!(a[1..].join(" "), "7 1 1 0 0 1 0 true 1 Virtual-1 3456x2026@60 0 0", "ours alone, at the origin, primary");
+        // Only ours already: nothing to apply.
+        let one = r#"{"type":"x","data":[7,
+            [[["Virtual-1","unknown","unknown","unknown"],
+              [["3456x2026@60",3456,2026,60.0,1.0,[1.0,2.0],{"is-current":{"type":"b","data":true}}]],{}]],
+            [[0,0,1.0,0,true,[["Virtual-1","unknown","unknown","unknown"]],{}]],
+            {}]}"#;
+        assert_eq!(only_config(&parse(one).unwrap()), None);
+        // None of ours (no GPU at all): the caller leaves the screen be.
+        let none = one.replace("Virtual-1", "Unknown-1");
+        assert_eq!(only_config(&parse(&none).unwrap()), None);
     }
 
     #[test]

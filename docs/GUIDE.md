@@ -311,7 +311,19 @@ only. Windows' 2D driver tops out around 2560x1600 per monitor.
 ## 3D acceleration (Linux guests)
 
 `scripts/app.sh` builds it (alone: `scripts/build-angle.sh`, then
-`scripts/build-virglrenderer.sh`). `[display] gpu = "virtio3d"`. Stock Ubuntu works.
+`scripts/build-virglrenderer.sh`). `[display] gpu = "virtio3d"`.
+
+Stock Ubuntu works, 26.04 included, but 26.04 needs patch 0018: its
+GNOME blits a `BLOB_MEM_GUEST` blob, which has guest storage and no GL
+object, from the shell's own context. virglrenderer used to answer
+`Illegal resource N` through `vrend_report_context_error`, which sets
+`in_error` on the context; nothing clears it, so every later command
+buffer was refused and the desktop stayed black from the first frame.
+The patch skips a copy whose handles have no host object instead of
+failing the context for good: the pixels that copy would have written
+are missing or stale, and the guest draws everything else. The copy is
+logged once. If a guest still ends up with a dead context the VMM says
+so, names it, and tells you to fall back to `gpu = "virtio2d"`.
 
 - **OpenGL** (virgl): up to 4.1 on macOS's OpenGL.
 - **Vulkan** (Venus): 1.3. Needs `mesa-vulkan-drivers` (Mesa ≥ 24) and the

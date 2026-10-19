@@ -69,7 +69,7 @@ pub fn parse_xrandr(s: &str) -> Vec<Output> {
 
 /// The virtio GPU's outputs in its order: `Virtual-1`, `Virtual-2`...
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn virtual_index(name: &str) -> Option<usize> {
+pub(crate) fn virtual_index(name: &str) -> Option<usize> {
     let n = name.strip_prefix("Virtual")?.trim_start_matches('-');
     n.parse::<usize>().ok()?.checked_sub(1)
 }

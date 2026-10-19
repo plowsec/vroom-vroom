@@ -533,6 +533,7 @@ impl Gpu {
             cpu_contexts: Vec::new(),
             pending: Vec::new(),
             ctx_info: HashMap::new(),
+            submit_refused: Default::default(),
             reading: None,
             surfaced: vec![false; self.sinks.len()],
             surface_at: vec![None; self.sinks.len()],
@@ -807,6 +808,10 @@ pub struct GpuHandler {
     cpu_contexts: Vec<u32>,
     pending: Vec<Pending>,
     ctx_info: HashMap<u32, CtxInfo>,
+    /// Contexts the renderer has already refused a command buffer for.
+    /// virglrenderer marks such a context broken for good, so the guest
+    /// draws nothing from then on: say so once, and only once.
+    submit_refused: std::collections::HashSet<u32>,
     /// A GL scanout on its way back from the GPU, and where it lands.
     reading: Option<Reading>,
     /// Scanouts whose last frame went into an IOSurface: the next one
@@ -979,6 +984,7 @@ impl GpuHandler {
             },
             RESOURCE_UNREF => {
                 let Some(id) = rd32(r) else { return (ERR_INVALID_PARAMETER, vec![]) };
+                log::debug!("gpu3d: unref res {} (3d={} cpu={})", id, self.res3d.contains_key(&id), self.resources.contains_key(&id));
                 (self.unref(id), vec![])
             }
             SET_SCANOUT => (self.set_scanout(r), vec![]),
@@ -1052,6 +1058,7 @@ impl GpuHandler {
                 if capset == 0 && !t.gl {
                     // Classic virgl (Linux makes one for its own use). No GL
                     // here: a context that only ever touches CPU resources.
+                    log::debug!("gpu3d: ctx {} cpu-only (capset 0, no GL)", hdr.ctx);
                     self.cpu_contexts.push(hdr.ctx);
                     return (OK_NODATA, vec![]);
                 }
@@ -1060,6 +1067,7 @@ impl GpuHandler {
                 if !t.r().context_create(hdr.ctx, capset, &name[..n]) {
                     return (ERR_UNSPEC, vec![]);
                 }
+                log::debug!("gpu3d: ctx {} created, capset {}, {:?}", hdr.ctx, capset, String::from_utf8_lossy(&name[..n]));
                 self.contexts.push(hdr.ctx);
                 if capset == CAPSET_NEPTUNE {
                     self.shared.lock().unwrap_or_else(|e| e.into_inner()).replug = true;
@@ -1078,6 +1086,7 @@ impl GpuHandler {
                     Some(i) => {
                         self.contexts.swap_remove(i);
                         self.ctx_info.remove(&hdr.ctx);
+                        self.submit_refused.remove(&hdr.ctx);
                         t.r().context_destroy(hdr.ctx);
                         self.note_direct3d();
                         (OK_NODATA, vec![])
@@ -1088,6 +1097,7 @@ impl GpuHandler {
             CTX_ATTACH_RESOURCE | CTX_DETACH_RESOURCE => {
                 let Some(id) = rd32(r) else { return bad };
                 if self.cpu_contexts.contains(&hdr.ctx) && (self.resources.contains_key(&id) || self.res3d.contains_key(&id)) {
+                    log::debug!("gpu3d: ctx {} attach/detach res {}: cpu-only ctx, not forwarded", hdr.ctx, id);
                     return (OK_NODATA, vec![]);
                 }
                 if !self.contexts.contains(&hdr.ctx) {
@@ -1096,6 +1106,8 @@ impl GpuHandler {
                 if self.res3d.contains_key(&id) {
                     let attached = self.ctx_info.get_mut(&hdr.ctx).map(|c| &mut c.attached);
                     if hdr.ty == CTX_ATTACH_RESOURCE {
+                        log::debug!("gpu3d: ctx {} attach res {} -> renderer (blob={})", hdr.ctx, id,
+                            self.res3d.get(&id).map(|r| r.blob).unwrap_or(false));
                         t.r().context_attach(hdr.ctx, id);
                         attached.map(|a| a.insert(id));
                     } else {
@@ -1104,8 +1116,10 @@ impl GpuHandler {
                     }
                     (OK_NODATA, vec![])
                 } else if self.resources.contains_key(&id) {
+                    log::debug!("gpu3d: ctx {} attach/detach res {}: cpu resource, not forwarded", hdr.ctx, id);
                     (OK_NODATA, vec![]) // CPU resource: nothing to share
                 } else {
+                    log::debug!("gpu3d: ctx {} attach/detach res {}: unknown resource", hdr.ctx, id);
                     (ERR_INVALID_RESOURCE_ID, vec![])
                 }
             }
@@ -1164,6 +1178,19 @@ impl GpuHandler {
                     }
                     (OK_NODATA, vec![])
                 } else {
+                    if self.submit_refused.insert(hdr.ctx) {
+                        let who = self
+                            .ctx_info
+                            .get(&hdr.ctx)
+                            .map(|c| String::from_utf8_lossy(&c.name).trim_end_matches('\0').to_string())
+                            .unwrap_or_default();
+                        log::warn!(
+                            "gpu3d: the renderer refused a command buffer from context {} ({:?}); \
+                             it stays broken, so this guest will draw nothing. \
+                             Set [display] gpu = \"virtio2d\" to get a usable desktop without 3D.",
+                            hdr.ctx, who
+                        );
+                    }
                     (ERR_UNSPEC, vec![])
                 }
             }
@@ -1242,6 +1269,7 @@ impl GpuHandler {
     }
 
     fn create_cpu(&mut self, id: u32, format: u32, w: u32, h: u32) -> u32 {
+        log::debug!("gpu3d: res {} created CPU-only, {}x{} fmt {}", id, w, h, format);
         if !self.id_free(id) || swizzle(format).is_none() {
             return ERR_INVALID_PARAMETER;
         }
@@ -1289,11 +1317,14 @@ impl GpuHandler {
 
     fn create_tex(&mut self, id: u32, a: &Create3d, t: &ThreeD) -> u32 {
         if !self.id_free(id) || self.resource_count() >= MAX_RESOURCES {
+            log::debug!("gpu3d: create res {} refused: id taken or too many resources", id);
             return ERR_INVALID_PARAMETER;
         }
         if !t.r().create_3d(id, a) {
+            log::debug!("gpu3d: create res {} refused by the renderer", id);
             return ERR_UNSPEC;
         }
+        log::debug!("gpu3d: res {} created in the renderer, {}x{} target {} fmt {}", id, a.width, a.height, a.target, a.format);
         self.res3d.insert(id, Res3d { tex: Some((a.format, a.width, a.height)), create: Some(*a), ..Default::default() });
         OK_NODATA
     }
@@ -1342,6 +1373,10 @@ impl GpuHandler {
         }
         let Some(entries) = Self::read_entries(mem, r, n) else { return bad };
         let blob = Blob { resource: id, ctx: hdr.ctx, mem: blob_mem, flags, id: blob_id, size };
+        log::debug!(
+            "gpu3d: res {} blob: mem {} flags {:#x} blob_id {} size {} ctx {}",
+            id, blob_mem, flags, blob_id, size, hdr.ctx
+        );
         (self.make_blob(mem, t, blob, entries), vec![])
     }
 

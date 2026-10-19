@@ -47,9 +47,14 @@ export component AppWindow inherits Window {
     background: Theme.bg;
     preferred-width: 1320px;
     preferred-height: 840px;
-    // Sidebar, the VM page's left column and its settings column (360).
-    min-width: 1120px;
-    min-height: 660px;
+    // The window opens at this, not at preferred-width above: Slint sizes
+    // it from the layout and redoes that on every relayout, so a size
+    // handed to set_size is dropped the next time what is on screen
+    // changes (picking a VM used to shrink the window to this floor).
+    // Until that is untangled the floor is what the user gets, so it is
+    // the size the sidebar's names and the VM page's two columns need.
+    min-width: 1320px;
+    min-height: 840px;
     default-font-size: 13px;
 
     HorizontalLayout {

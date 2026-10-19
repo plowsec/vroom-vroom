@@ -6,13 +6,20 @@ TUI commands: `:` opens the command bar; they take literal paths (no `$VM`).
 ## 0. Every terminal
 
 ```bash
-cd /Users/vladimir/ctf/vroom-vroom
-VM=/Users/vladimir/VMs/hevd-windows-arm64
+cd "$(git rev-parse --show-toplevel)"   # the vroom-vroom checkout
+VM=~/VMs/hevd-windows-arm64             # the VM folder
 CK=$VM/snapshots                  # read only: never write here
 OUT=$VM/demo                        # all demo output
 F=target/release/vroom-fuzz
 mkdir -p $OUT
 ```
+
+A snapshot records its disk layers relative to the VM's folder, and the
+folder is taken to be the state directory's parent. So `--state-dir` goes
+directly in `$VM` (`$VM/demo-a.state`), never one level down in `$OUT`:
+under `$OUT` the layers are looked for in `$OUT` and the restore fails with
+`snapshot layer ...: No such file or directory`. The harnesses here already
+point at `$VM/fuzz.state` and `$VM/fuzz-coverage-run2.state`.
 
 ## 1. Build + sign
 
@@ -118,7 +125,7 @@ snapshot /Users/vladimir/VMs/hevd-windows-arm64/snapshots/hevd-dispatch-NEW
 ```bash
 jq '. + {input_gpa: 1073741824}' $CK/hevd-harness-all-safe.json > $OUT/gpa.json
 $F run $OUT/gpa.json $CK/one-byte-payload.bin --ioctl 0x222003 --iterations 1 --no-boundary-seeds \
-  --state-dir $OUT/state-x --output $OUT/gpa
+  --state-dir $VM/demo-x.state --output $OUT/gpa
 # Error: input_va 0x1f93110d020 resolves to 0x159df5020, not input_gpa 0x40000000
 ```
 
@@ -179,7 +186,7 @@ for f in $OUT/discover/inputs/*; do od -An -tx4 -N4 "$f"; done | sort -u   # 0x2
 
 ```bash
 $F run $CK/hevd-harness-all-safe.json $CK/one-byte-payload.bin --ioctl 0x222003 \
-  --duration-secs 60 --tui --state-dir $OUT/state-a --output $OUT/edges
+  --duration-secs 60 --tui --state-dir $VM/demo-a.state --output $OUT/edges
 ```
 
 - Dashboard: progress, coverage (blocks/600, functions/49), throughput (exec/s, exec ms, reset ms), findings, per-function bars. `q` / Esc / Ctrl-C: stop and save.
@@ -190,7 +197,7 @@ $F run $CK/hevd-harness-all-safe.json $CK/one-byte-payload.bin --ioctl 0x222003 
 ```bash
 jq '. + {coverage_mode: "blocks"}' $CK/hevd-harness-all-safe.json > $OUT/blocks-safe.json
 $F run $OUT/blocks-safe.json $CK/one-byte-payload.bin --ioctl 0x222003 \
-  --duration-secs 60 --tui --state-dir $OUT/state-b --output $OUT/blocks
+  --duration-secs 60 --tui --state-dir $VM/demo-b.state --output $OUT/blocks
 ```
 
 | speed field | |
@@ -212,7 +219,7 @@ $F run $OUT/blocks-safe.json $CK/one-byte-payload.bin --ioctl 0x222003 \
 
 ```bash
 $F run $CK/hevd-harness-all-30s.json $CK/one-byte-payload.bin --ioctl 0x222003 \
-  --duration-secs 30 --tui --state-dir $OUT/state-c --output $OUT/crash
+  --duration-secs 30 --tui --state-dir $VM/demo-c.state --output $OUT/crash
 ls $OUT/crash/crashes
 cat $(ls $OUT/crash/crashes/*-BugCheck.json | head -1)
 xxd $(ls $OUT/crash/crashes/*-BugCheck.bin | head -1) | head -2
@@ -225,14 +232,14 @@ xxd $(ls $OUT/crash/crashes/*-BugCheck.bin | head -1) | head -2
 
 ```bash
 $F run $CK/hevd-harness-all-30s.json $(ls $OUT/crash/crashes/*-BugCheck.bin | head -1) \
-  --no-boundary-seeds --iterations 1 --state-dir $OUT/state-c --output $OUT/replay
+  --no-boundary-seeds --iterations 1 --state-dir $VM/demo-c.state --output $OUT/replay
 ```
 
 7. Correctness: RAM, untouched devices and GIC registers checked against the snapshot after every reset (~1 s per input). Silent = pass; a mismatch stops the run and lists the pages.
 
 ```bash
 VROOM_COW_VERIFY=1 $F run $CK/hevd-harness-all-30s.json $CK/one-byte-payload.bin --ioctl 0x222003 \
-  --iterations 20 --state-dir $OUT/state-c --output $OUT/verify
+  --iterations 20 --state-dir $VM/demo-c.state --output $OUT/verify
 ```
 
 8. Workers (one VM each, ~9 GB). Fuzz VMs drop host port forwards and keep their own EFI vars, so they run beside each other and beside the lab.
@@ -246,7 +253,7 @@ $F fleet $OUT/fleet.json $CK/one-byte-payload.bin --ioctl 0x222003 --workers 3 \
 ```bash
 $F serve $OUT/fleet.json --listen 0.0.0.0:7979 --output $OUT/shared --tui     # master
 $F run $OUT/fleet.json $CK/one-byte-payload.bin --ioctl 0x222003 \
-  --master HOST:7979 --name w0 --state-dir $OUT/state-w0 --output $OUT/w0     # worker, any machine
+  --master HOST:7979 --name w0 --state-dir $VM/demo-w0.state --output $OUT/w0     # worker, any machine
 ```
 
 - Other machines: same snapshot, disk layers and config at the same paths; `VROOM_FUZZ_TOKEN` on both.
