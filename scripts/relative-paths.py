@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Make VMs made by older vroom builds movable: their own records (disk
 overlays' backing names, disk pointers, snapshots, suspend images) name the
-files inside the VM's folder relative to it, as vroom writes them now.
-Files outside the folder keep their absolute paths. Disk contents and
-modification times stay as they are (snapshots check them).
+files inside the VM's folder relative to where the record is, as vroom
+writes them now. Files outside the folder keep their absolute paths. Disk
+contents and modification times stay as they are (snapshots check them).
 
   scripts/relative-paths.py [VM.toml ...]          what would change
   scripts/relative-paths.py --apply [VM.toml ...]  change it, log for undo
@@ -41,12 +41,27 @@ def library():
         return []
 
 
-def inside(p, vm):
-    """`p` relative to the VM folder, if it names a file there that exists."""
-    if not p or not os.path.isabs(p) or not os.path.exists(p):
+def inside(p, here, vm):
+    """What a record in directory `here` should say for `p`, if it should
+    change: a file in the VM folder, relative to `here`. Relative paths
+    are taken as relative to `here`, or else (written by a build between)
+    to the VM folder."""
+    if not p:
         return None
-    r = os.path.realpath(p)
-    return os.path.relpath(r, vm) if r.startswith(vm + "/") else None
+    here = os.path.realpath(here)
+    if os.path.isabs(p):
+        target = p
+    elif os.path.exists(os.path.join(here, p)):
+        return None
+    else:
+        target = os.path.join(vm, p)
+    if not os.path.exists(target):
+        return None
+    r = os.path.realpath(target)
+    if not r.startswith(vm + "/") or not here.startswith(vm):
+        return None
+    new = os.path.relpath(r, here)
+    return new if new != p else None
 
 
 def backing_name(image, backing):
@@ -161,7 +176,7 @@ class Vm:
     def pointer(self, f):
         old = open(f).read()
         d = json.loads(old)
-        r = inside(d.get("active"), self.dir)
+        r = inside(d.get("active"), os.path.dirname(f), self.dir)
         if r:
             d["active"] = r
             self.text(f, old, json.dumps(d, separators=(",", ":")))
@@ -171,9 +186,11 @@ class Vm:
         m = json.loads(old)
         changed = False
 
+        here = os.path.dirname(f)
+
         def fix(obj, key):
             nonlocal changed
-            r = inside(obj.get(key), self.dir) if isinstance(obj, dict) else None
+            r = inside(obj.get(key), here, self.dir) if isinstance(obj, dict) else None
             if r:
                 obj[key] = r
                 changed = True
@@ -194,7 +211,7 @@ class Vm:
                 lines = []
                 for line in v.splitlines():
                     stamp, p = line.split("|", 1)
-                    r = inside(p, self.dir)
+                    r = inside(p, here, self.dir)
                     changed |= bool(r)
                     lines.append(f"{stamp}|{r or p}")
                 meta[k] = "\n".join(lines)

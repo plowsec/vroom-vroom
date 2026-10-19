@@ -349,25 +349,26 @@ impl Drop for DiskSet {
     }
 }
 
-/// The VM's folder (its state dir's parent): its own records (disk
-/// pointers, saves) name the files in it relative to it, so the folder can
-/// move.
+/// The VM's folder: its state dir's parent.
 pub(crate) fn vm_dir(state_dir: &Path) -> PathBuf {
-    let d = state_dir.parent().unwrap_or(state_dir);
-    std::fs::canonicalize(d).unwrap_or_else(|_| d.to_path_buf())
+    state_dir.parent().unwrap_or(state_dir).to_path_buf()
 }
 
-/// `p` as a record names it: relative inside the VM's folder `vm`.
-pub(crate) fn recorded(p: &Path, vm: &Path) -> String {
-    let real = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    real.strip_prefix(vm).unwrap_or(&real).display().to_string()
+/// `p` as a record in directory `dir` names it: relative to `dir` when both
+/// are in the VM's folder `vm` (the folder can move, and whoever reads the
+/// record finds the file from where the record is); absolute otherwise.
+pub(crate) fn recorded(p: &Path, dir: &Path, vm: &Path) -> String {
+    match vroom_config::relative_within(p, dir, vm) {
+        Some(r) => r.display().to_string(),
+        None => std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()).display().to_string(),
+    }
 }
 
-/// A path a record names, where it is now.
-pub(crate) fn found(s: &str, vm: &Path) -> PathBuf {
+/// A path a record in directory `dir` names, where it is now.
+pub(crate) fn found(s: &str, dir: &Path) -> PathBuf {
     let p = Path::new(s);
     if p.is_relative() {
-        vm.join(p)
+        dir.join(p)
     } else {
         p.to_path_buf()
     }
@@ -376,8 +377,8 @@ pub(crate) fn found(s: &str, vm: &Path) -> PathBuf {
 /// `path`: `<state>/disks/disk<N>.json`.
 fn write_pointer(path: &Path, active: &Path) -> Result<()> {
     let tmp = path.with_extension("json.tmp");
-    let state = path.parent().and_then(Path::parent).unwrap_or(path);
-    let active = PathBuf::from(recorded(active, &vm_dir(state)));
+    let disks = path.parent().unwrap_or(path);
+    let active = PathBuf::from(recorded(active, disks, &vm_dir(disks.parent().unwrap_or(disks))));
     let data = serde_json::to_vec(&Pointer { active }).map_err(|e| Error::Setup(e.to_string()))?;
     std::fs::write(&tmp, data)?;
     std::fs::rename(&tmp, path)?;

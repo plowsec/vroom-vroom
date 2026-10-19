@@ -695,6 +695,23 @@ pub struct Net {
     pub connected: bool,
 }
 
+/// `target` relative to the directory `from` (`..` as needed), when both
+/// are inside `root` (a VM's folder): a record there that names the file
+/// so keeps working when the folder moves. None otherwise.
+pub fn relative_within(target: &Path, from: &Path, root: &Path) -> Option<PathBuf> {
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let (target, from, root) = (real(target), real(from), real(root));
+    if !target.starts_with(&root) || !from.starts_with(&root) {
+        return None;
+    }
+    let common = from.ancestors().find(|a| target.starts_with(a))?;
+    let mut rel = PathBuf::new();
+    for _ in from.strip_prefix(common).ok()?.components() {
+        rel.push("..");
+    }
+    Some(rel.join(target.strip_prefix(common).ok()?))
+}
+
 fn is_yes(b: &bool) -> bool {
     *b
 }
@@ -944,15 +961,14 @@ impl VmConfig {
         });
     }
 
-    /// The inverse, for what is saved next to the VM (snapshots): paths
-    /// inside `base` (the VM's folder) relative to it, so the folder can
-    /// move. Paths elsewhere (a share, a disk on another drive) stay.
-    pub fn relative_paths(&mut self, base: &std::path::Path) {
-        let base = std::fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
+    /// The inverse, for a copy saved inside the VM's folder `root` (a
+    /// snapshot in `base`): paths inside `root` relative to `base`, so the
+    /// folder can move (`rebase_paths(base)` reads them back). Paths
+    /// elsewhere (a share, a disk on another drive) stay.
+    pub fn relative_paths(&mut self, base: &std::path::Path, root: &std::path::Path) {
         self.each_path(|p| {
-            let real = std::fs::canonicalize(&*p).unwrap_or_else(|_| p.clone());
-            if let Ok(rest) = real.strip_prefix(&base) {
-                *p = rest.to_path_buf();
+            if let Some(r) = relative_within(p, base, root) {
+                *p = r;
             }
         });
     }
@@ -1210,6 +1226,24 @@ pub fn format_mac(m: &[u8; 6]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn records_name_files_relative_inside_the_vm_folder() {
+        let td = tempfile::tempdir().unwrap();
+        let vm = td.path().join("vm");
+        let snap = vm.join("vm.state/snapshots/s1");
+        std::fs::create_dir_all(&snap).unwrap();
+        std::fs::create_dir_all(vm.join("vm.state/disks")).unwrap();
+        for f in ["vm.qcow2", "vm.state/disks/d.qcow2"] {
+            std::fs::write(vm.join(f), b"").unwrap();
+        }
+        std::fs::write(td.path().join("far.qcow2"), b"").unwrap();
+        let rel = |t: &str| super::relative_within(&vm.join(t), &snap, &vm).map(|p| p.display().to_string());
+        assert_eq!(rel("vm.qcow2").as_deref(), Some("../../../vm.qcow2"));
+        assert_eq!(rel("vm.state/disks/d.qcow2").as_deref(), Some("../../disks/d.qcow2"));
+        assert_eq!(super::relative_within(&td.path().join("far.qcow2"), &snap, &vm), None, "outside the folder");
+        assert_eq!(super::relative_within(&vm.join("vm.qcow2"), td.path(), &vm), None, "a record outside it");
+    }
+
     #[test]
     fn usb_entries() {
         let base = "name = \"u\"\n[boot]\ntype = \"kernel\"\nkernel = \"/k\"\n";

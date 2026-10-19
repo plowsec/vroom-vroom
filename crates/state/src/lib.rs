@@ -173,7 +173,7 @@ fn roots(state: &Path) -> Result<(BTreeSet<PathBuf>, BTreeSet<PathBuf>)> {
         if p.extension().is_some_and(|x| x == "json") {
             let v: serde_json::Value = serde_json::from_slice(&read_small(&p)?).map_err(|e| Error::Setup(e.to_string()))?;
             if let Some(a) = v.get("active").and_then(|a| a.as_str()) {
-                roots.insert(present(&p, recorded(state, a))?);
+                roots.insert(present(&p, recorded(&disks, a))?);
             }
         }
     }
@@ -183,11 +183,11 @@ fn roots(state: &Path) -> Result<(BTreeSet<PathBuf>, BTreeSet<PathBuf>)> {
         let Ok(s) = SnapshotDir::open(&d) else { continue };
         for (k, v) in &s.manifest.meta {
             if k.starts_with("disk.") {
-                roots.insert(present(&d, recorded(state, v))?);
+                roots.insert(present(&d, recorded(&d, v))?);
             } else if k.starts_with("chain.") {
                 // "stamp|path" per file, the save's top layer first.
                 for (n, line) in v.lines().enumerate() {
-                    let p = present(&d, recorded(state, line.split_once('|').map(|(_, p)| p).unwrap_or(line)))?;
+                    let p = present(&d, recorded(&d, line.split_once('|').map(|(_, p)| p).unwrap_or(line)))?;
                     if n == 0 {
                         roots.insert(p.clone());
                     }
@@ -244,13 +244,14 @@ fn present(record: &Path, p: PathBuf) -> Result<PathBuf> {
     }
 }
 
-/// A path the VM's records (disk pointers, saves) name: relative ones are
-/// in the VM's folder, the state dir's parent.
-fn recorded(state: &Path, p: &str) -> PathBuf {
+/// A path a record in directory `dir` names (a disk pointer, a save):
+/// relative ones are relative to `dir`.
+fn recorded(dir: &Path, p: &str) -> PathBuf {
     let p = Path::new(p);
-    match (p.is_relative(), state.parent()) {
-        (true, Some(vm)) => canon(&vm.join(p)),
-        _ => canon(p),
+    if p.is_relative() {
+        canon(&dir.join(p))
+    } else {
+        canon(p)
     }
 }
 

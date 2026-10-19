@@ -36,8 +36,7 @@ pub(crate) enum Kind {
 /// What to do with the disks when starting from `dir`: for a snapshot,
 /// the frozen layers to revert to; for a suspend image, nothing (but the
 /// disks must not have changed since).
-pub(crate) fn disk_plan(dir: &Path, state_dir: &Path) -> Result<BTreeMap<usize, PathBuf>> {
-    let vm = crate::disks::vm_dir(state_dir);
+pub(crate) fn disk_plan(dir: &Path) -> Result<BTreeMap<usize, PathBuf>> {
     let snap = SnapshotDir::open(dir)?;
     let m = &snap.manifest.meta;
     let mut layers = BTreeMap::new();
@@ -46,7 +45,7 @@ pub(crate) fn disk_plan(dir: &Path, state_dir: &Path) -> Result<BTreeMap<usize, 
     for (k, v) in m.iter().filter(|(k, _)| k.starts_with("chain.")) {
         for line in v.lines() {
             let (stamp, path) = line.split_once('|').ok_or_else(|| Error::Setup(format!("bad {k}")))?;
-            let path = crate::disks::found(path, &vm);
+            let path = crate::disks::found(path, dir);
             let now = crate::disks::file_stamp(&path).unwrap_or_default();
             let path = path.display();
             if now != stamp {
@@ -64,7 +63,7 @@ pub(crate) fn disk_plan(dir: &Path, state_dir: &Path) -> Result<BTreeMap<usize, 
     for (k, v) in m.iter() {
         if let Some(i) = k.strip_prefix("disk.") {
             let i: usize = i.parse().map_err(|_| Error::Setup(format!("bad {k}")))?;
-            layers.insert(i, crate::disks::found(v, &vm));
+            layers.insert(i, crate::disks::found(v, dir));
         }
     }
     Ok(layers)
@@ -112,11 +111,12 @@ pub(crate) fn saved_usb_file_slots(dir: &Path) -> usize {
 
 /// The VM file as it was when `dir` was saved, and whether its network
 /// adapters had a control queue.
-pub(crate) fn saved_config(dir: &Path, state_dir: &Path) -> Result<(vroom_config::VmConfig, bool)> {
+pub(crate) fn saved_config(dir: &Path) -> Result<(vroom_config::VmConfig, bool)> {
     let snap = SnapshotDir::open(dir)?;
     let mut c: vroom_config::VmConfig =
         serde_json::from_value(snap.manifest.config.clone()).map_err(|e| Error::Setup(format!("snapshot config: {e}")))?;
-    c.rebase_paths(&crate::disks::vm_dir(state_dir));
+    // Paths in the VM's folder are relative to the save's own folder.
+    c.rebase_paths(dir);
     Ok((c, snap.manifest.meta.contains_key(NET_CTRL)))
 }
 
@@ -128,7 +128,7 @@ pub(crate) fn save(vmm: &mut Vmm, dir: &Path, description: &str, kind: Kind) -> 
             // Disk state at this instant becomes read-only; the VM goes on
             // writing to a fresh overlay.
             for (i, layer) in vmm.disks.freeze()? {
-                snap.manifest.meta.insert(format!("disk.{i}"), crate::disks::recorded(&layer, &vm));
+                snap.manifest.meta.insert(format!("disk.{i}"), crate::disks::recorded(&layer, dir, &vm));
             }
         }
         Kind::Suspend => {
@@ -136,7 +136,7 @@ pub(crate) fn save(vmm: &mut Vmm, dir: &Path, description: &str, kind: Kind) -> 
         }
     }
     for (i, files) in vmm.disks.chain_stamps(kind == Kind::Suspend)? {
-        let lines: Vec<String> = files.iter().map(|(p, stamp)| format!("{stamp}|{}", crate::disks::recorded(p, &vm))).collect();
+        let lines: Vec<String> = files.iter().map(|(p, stamp)| format!("{stamp}|{}", crate::disks::recorded(p, dir, &vm))).collect();
         snap.manifest.meta.insert(format!("chain.{i}"), lines.join("\n"));
     }
     // The network adapters as they are now, held still until the devices
@@ -154,7 +154,7 @@ pub(crate) fn save(vmm: &mut Vmm, dir: &Path, description: &str, kind: Kind) -> 
     m.arch = "aarch64".into();
     m.backend = vmm.hv.name().into();
     let mut config = vmm.config.clone();
-    config.relative_paths(&vm);
+    config.relative_paths(dir, &vm);
     m.config = serde_json::to_value(&config).map_err(|e| Error::Setup(e.to_string()))?;
     if !hot.is_empty() {
         let v: Vec<String> = hot.iter().map(|(a, b)| format!("{a}:{b}")).collect();
