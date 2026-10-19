@@ -12,9 +12,9 @@
 # third_party/mesa/. Cross-compiled from macOS with clang-cl, the Windows
 # SDK and CRT cargo-xwin downloaded (scripts/make-guest-tools.sh runs
 # cargo xwin first), and rust-lld.
-# Needs: meson ninja bison llvm (brew install meson ninja bison llvm),
-# rustup's stable toolchain; Python's mako, yaml and packaging come in a
-# venv under target/.
+# Needs: meson ninja bison llvm uv (brew install meson ninja bison llvm uv),
+# rustup's stable toolchain; uv makes the venv Mesa's generators run in
+# (scripts/pyenv.sh).
 #
 # Output in target/windows-gl/: vroom_gl_arm64.dll (ARM64 apps),
 # vroom_gl_x64.dll (x64 apps, emulated), and vroom_gl.dll, the one Windows
@@ -25,6 +25,7 @@
 set -eu
 cd "$(dirname "$0")/.."
 ROOT=$(pwd)
+. scripts/pyenv.sh
 URL=https://codeload.github.com/osy/virtio-win-mesa/tar.gz/bf536bba65454900d782fa7417bc95c1608d7483
 SHA=f3863c3720f8e0b74bc648f703803656984d9fcee6615ad0e9f8c01365abc1b1
 WORK=$ROOT/target/windows-gl-build
@@ -66,9 +67,7 @@ EOF
 chmod +x "$WORK/bin/clang-cl"
 ln -sf "$LLVM/llvm-lib" "$WORK/bin/llvm-lib"
 
-[ -x "$ROOT/target/pyenv/bin/python3" ] || python3 -m venv "$ROOT/target/pyenv"
-"$ROOT/target/pyenv/bin/python3" -c 'import mako, yaml, packaging' 2>/dev/null ||
-  "$ROOT/target/pyenv/bin/pip" -q install mako pyyaml packaging
+pyvenv "$ROOT/target/pyenv"
 export PATH="$WORK/bin:$ROOT/target/pyenv/bin:$BISON:$PATH"
 
 cd "$WORK"
