@@ -196,6 +196,7 @@ const DEFAULT_TRACE_CAPACITY: usize = 4096;
 const MAX_TRACE_CAPACITY: u64 = 1 << 20;
 /// Debug events handled before the loop looks at requests again.
 const EVENT_BURST: usize = 256;
+const MAX_TRACE_ACTIONS: usize = 16;
 
 /// An execution breakpoint that records the CPU and continues.
 struct Tracepoint {
@@ -205,6 +206,8 @@ struct Tracepoint {
     length: u64,
     max_hits: Option<u64>,
     stop: bool,
+    /// Applied in order on every hit, before the record is appended.
+    actions: Vec<Action>,
     hits: u64,
     /// A user-address tracepoint's process (None: any).
     context: Option<process::Process>,
@@ -216,9 +219,18 @@ impl Tracepoint {
     }
     fn json(&self) -> Value {
         json!({"address": self.address, "register": self.register.as_ref().map(|r| &r.0), "length": self.length,
-            "max_hits": self.max_hits, "stop": self.stop, "hits": self.hits, "armed": self.armed(),
+            "max_hits": self.max_hits, "stop": self.stop,
+            "actions": self.actions.iter().map(|a| &a.source).collect::<Vec<_>>(), "hits": self.hits, "armed": self.armed(),
             "pid": self.context.as_ref().map(|p| p.pid)})
     }
+}
+
+/// What a tracepoint hit asks of the stopped CPU.
+struct TraceHit {
+    stop: bool,
+    /// An action moved its PC off the tracepoint: it resumes from there
+    /// without a step, so a breakpoint at the new PC still hits.
+    moved: bool,
 }
 
 struct TraceRecord {
@@ -228,13 +240,18 @@ struct TraceRecord {
     regs: Registers,
     pointer: Option<u64>,
     data: Option<Result<Vec<u8>, String>>,
+    actions_applied: usize,
+    action_error: Option<String>,
 }
 
 impl TraceRecord {
     fn json(&self) -> Value {
         let r = &self.regs;
         let mut v = json!({"seq": self.seq, "tracepoint": self.tracepoint, "hit": self.hit, "cpu": r.cpu, "pc": r.pc,
-            "sp": r.sp, "pstate": r.pstate, "ttbr0": r.ttbr0, "x": r.x});
+            "sp": r.sp, "pstate": r.pstate, "ttbr0": r.ttbr0, "x": r.x, "actions_applied": self.actions_applied});
+        if let Some(e) = &self.action_error {
+            v["action_error"] = json!(e);
+        }
         if let Some(pointer) = self.pointer {
             v["pointer"] = json!(pointer);
         }
@@ -262,6 +279,176 @@ fn register_value(regs: &Registers, register: vroom_hv::debug::Register) -> u64 
     }
 }
 
+fn set_register_value(regs: &mut Registers, register: vroom_hv::debug::Register, value: u64) {
+    use vroom_hv::debug::Register as R;
+    *match register {
+        R::X(n) => &mut regs.x[n as usize],
+        R::Pc => &mut regs.pc,
+        R::Sp => &mut regs.sp,
+        R::Pstate => &mut regs.pstate,
+        R::Ttbr0 => &mut regs.ttbr0,
+        R::Ttbr1 => &mut regs.ttbr1,
+        R::Tcr => &mut regs.tcr,
+        R::Sctlr => &mut regs.sctlr,
+        R::Vbar => &mut regs.vbar,
+    } = value;
+}
+
+/// A register an action names: wN is xN's low half, written zero-extended.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ActionRegister {
+    register: vroom_hv::debug::Register,
+    w: bool,
+}
+
+impl ActionRegister {
+    fn parse(v: &Value) -> Result<Self, String> {
+        let name = v.as_str().ok_or("register: expected a name like \"x0\", \"w0\" or \"pc\"")?.to_ascii_lowercase();
+        if let Some(n) = name.strip_prefix('w').and_then(|n| n.parse::<u8>().ok()).filter(|&n| n <= 30) {
+            return Ok(Self { register: vroom_hv::debug::Register::X(n), w: true });
+        }
+        let register = vroom_hv::debug::Register::parse(&name).map_err(|e| format!("register {name}: {e}"))?;
+        Ok(Self { register, w: false })
+    }
+    fn width(&self, value: u64) -> u64 {
+        if self.w { value as u32 as u64 } else { value }
+    }
+    fn get(&self, regs: &Registers) -> u64 {
+        self.width(register_value(regs, self.register))
+    }
+}
+
+/// A number, hex string, or negative (wrapping) number or string.
+fn action_value(v: &Value) -> Result<u64, String> {
+    if let Some(n) = v.as_i64().filter(|n| *n < 0) {
+        return Ok(n as u64);
+    }
+    match v.as_str().and_then(|s| s.strip_prefix('-')) {
+        Some(s) => number(&json!(s)).map(u64::wrapping_neg),
+        None => number(v),
+    }
+}
+
+fn hex_bytes(hex: &str) -> Result<Vec<u8>, String> {
+    if hex.len() % 2 != 0 || !hex.is_ascii() {
+        return Err("expected an even number of hex digits".into());
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).map_err(|_| "invalid hex byte".to_owned()))
+        .collect()
+}
+
+#[derive(Debug, PartialEq)]
+enum Operation {
+    Set(ActionRegister, u64),
+    Add(ActionRegister, u64),
+    Write { register: ActionRegister, offset: u64, bytes: Vec<u8> },
+}
+
+/// What an action does to a stopped CPU.
+#[derive(Debug, PartialEq)]
+enum Effect {
+    Register(vroom_hv::debug::Register, u64),
+    Memory(u64, Vec<u8>),
+}
+
+/// One entry of a tracepoint's actions.
+struct Action {
+    operation: Operation,
+    /// Only when this register holds this value.
+    skip_if: Option<(ActionRegister, u64)>,
+    /// A failure stops the VM instead of only being recorded.
+    stop: bool,
+    source: Value,
+}
+
+impl Action {
+    fn parse(v: &Value) -> Result<Self, String> {
+        const KEYS: &str = "set_register, add_register, write_memory, value, skip_if, stop";
+        let object = v.as_object().ok_or("expected an object")?;
+        if let Some(key) = object.keys().find(|k| !KEYS.split(", ").any(|known| known == k.as_str())) {
+            return Err(format!("unknown key {key} ({KEYS})"));
+        }
+        let present = |k: &str| object.get(k).filter(|v| !v.is_null());
+        let value = present("value").map(|v| action_value(v).map_err(|e| format!("value: {e}"))).transpose()?;
+        let operation = match (present("set_register"), present("add_register"), present("write_memory")) {
+            (Some(r), None, None) => Operation::Set(ActionRegister::parse(r)?, value.ok_or("set_register needs a value")?),
+            (None, Some(r), None) => Operation::Add(ActionRegister::parse(r)?, value.ok_or("add_register needs a value")?),
+            (None, None, Some(w)) => {
+                if value.is_some() {
+                    return Err("write_memory takes hex, not value".into());
+                }
+                let w = w.as_object().ok_or("write_memory: expected {register, offset, hex}")?;
+                if let Some(key) = w.keys().find(|k| !matches!(k.as_str(), "register" | "offset" | "hex")) {
+                    return Err(format!("write_memory: unknown key {key} (register, offset, hex)"));
+                }
+                let register = ActionRegister::parse(w.get("register").ok_or("write_memory needs the register holding the address")?)?;
+                let offset = w.get("offset").filter(|v| !v.is_null()).map(action_value).transpose().map_err(|e| format!("offset: {e}"))?.unwrap_or(0);
+                let bytes = hex_bytes(w.get("hex").and_then(Value::as_str).ok_or("write_memory needs hex bytes")?)
+                    .map_err(|e| format!("write_memory hex: {e}"))?;
+                if bytes.is_empty() || bytes.len() as u64 > MAX_TRACE_BYTES {
+                    return Err(format!("write_memory writes 1..{MAX_TRACE_BYTES} bytes"));
+                }
+                Operation::Write { register, offset, bytes }
+            }
+            (None, None, None) => return Err("needs one of set_register, add_register, write_memory".into()),
+            _ => return Err("only one of set_register, add_register, write_memory per action".into()),
+        };
+        let skip_if = present("skip_if")
+            .map(|c| {
+                let c = c.as_object().ok_or("skip_if: expected {register, equals}")?;
+                if let Some(key) = c.keys().find(|k| !matches!(k.as_str(), "register" | "equals")) {
+                    return Err(format!("skip_if: unknown key {key} (register, equals)"));
+                }
+                let register = ActionRegister::parse(c.get("register").ok_or("skip_if needs a register")?)?;
+                let equals = action_value(c.get("equals").ok_or("skip_if needs equals")?).map_err(|e| format!("equals: {e}"))?;
+                Ok::<_, String>((register, register.width(equals)))
+            })
+            .transpose()?;
+        let stop = present("stop").map(|v| v.as_bool().ok_or("stop: expected a boolean")).transpose()?.unwrap_or(false);
+        Ok(Action { operation, skip_if, stop, source: v.clone() })
+    }
+
+    /// The effect at these registers; None: skip_if's register does not
+    /// hold its value.
+    fn effect(&self, regs: &Registers) -> Result<Option<Effect>, String> {
+        if self.skip_if.is_some_and(|(register, equals)| register.get(regs) != equals) {
+            return Ok(None);
+        }
+        let effect = match &self.operation {
+            Operation::Set(r, value) => Effect::Register(r.register, r.width(*value)),
+            Operation::Add(r, value) => Effect::Register(r.register, r.width(r.get(regs).wrapping_add(*value))),
+            Operation::Write { register, offset, bytes } => Effect::Memory(register.get(regs).wrapping_add(*offset), bytes.clone()),
+        };
+        if let Effect::Register(register, value) = effect {
+            register.validate(value).map_err(|e| format!("{register:?} = {value:#x}: {e}"))?;
+        }
+        Ok(Some(effect))
+    }
+}
+
+/// Apply an effect to a stopped CPU and to its registers as recorded.
+fn apply_effect(vm: &Vmm, regs: &mut Registers, effect: Effect) -> Result<(), String> {
+    match effect {
+        Effect::Register(register, value) => {
+            vm.debug_write_register(regs.cpu as usize, register, value).map_err(|e| e.to_string())?;
+            set_register_value(regs, register, value);
+        }
+        Effect::Memory(address, bytes) => {
+            // A kernel stop may still write its caller's user pointers.
+            let mut walk = regs.clone();
+            walk.tcr &= !(1 << 7);
+            let mappings = AddressSpace { memory: vm, registers: &walk }
+                .write_spans(address, bytes.len())
+                .map_err(|e| format!("write {address:#x}: {e}"))?;
+            let spans: Vec<_> = mappings.iter().map(|(pa, range)| (*pa, &bytes[range.clone()])).collect();
+            vm.debug_write_physical(&spans).map_err(|e| format!("write {address:#x}: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
 /// Hardware breakpoint slots these breakpoints and tracepoints take.
 fn breakpoint_slots(breakpoints: &[u64], tracepoints: &[Tracepoint]) -> usize {
     let mut addresses: Vec<u64> = breakpoints.to_vec();
@@ -279,8 +466,8 @@ fn same_space(process: &process::Process, regs: &Registers) -> bool {
 fn parse_tracepoint(i: usize, t: &Value, previous: &[Tracepoint], selected: Option<&process::Process>) -> Result<Tracepoint, String> {
     let fail = |e: String| format!("tracepoint {i}: {e}");
     let object = t.as_object().ok_or_else(|| fail("expected an object".into()))?;
-    if let Some(key) = object.keys().find(|k| !matches!(k.as_str(), "address" | "register" | "length" | "max_hits" | "stop")) {
-        return Err(fail(format!("unknown key {key} (address, register, length, max_hits, stop)")));
+    if let Some(key) = object.keys().find(|k| !matches!(k.as_str(), "address" | "register" | "length" | "max_hits" | "stop" | "actions")) {
+        return Err(fail(format!("unknown key {key} (address, register, length, max_hits, stop, actions)")));
     }
     let present = |k: &str| object.get(k).filter(|v| !v.is_null());
     let address = number(present("address").ok_or_else(|| fail("missing address".into()))?).map_err(fail)?;
@@ -307,13 +494,26 @@ fn parse_tracepoint(i: usize, t: &Value, previous: &[Tracepoint], selected: Opti
         return Err(fail("max_hits is at least 1 (omit it for no limit)".into()));
     }
     let stop = present("stop").map(|v| v.as_bool().ok_or("stop: expected a boolean")).transpose().map_err(|e| fail(e.into()))?.unwrap_or(false);
+    let actions = match present("actions") {
+        None => Vec::new(),
+        Some(list) => {
+            let list = list.as_array().ok_or_else(|| fail("actions: expected an array".into()))?;
+            if list.len() > MAX_TRACE_ACTIONS {
+                return Err(fail(format!("at most {MAX_TRACE_ACTIONS} actions")));
+            }
+            list.iter()
+                .enumerate()
+                .map(|(j, a)| Action::parse(a).map_err(|e| fail(format!("action {j}: {e}"))))
+                .collect::<Result<_, _>>()?
+        }
+    };
     // A user address traces in the selected process; with none, in all.
     let context = if address >> 63 == 0 {
         previous.iter().find(|t| t.address == address).map_or(selected, |t| t.context.as_ref()).cloned()
     } else {
         None
     };
-    Ok(Tracepoint { address, register, length, max_hits, stop, hits: 0, context })
+    Ok(Tracepoint { address, register, length, max_hits, stop, actions, hits: 0, context })
 }
 
 struct Session {
@@ -553,13 +753,7 @@ impl Session {
                 if hex.is_empty() || hex.len() > 32768 || hex.len() % 2 != 0 || !hex.is_ascii() {
                     return Err("write requires 1..16384 hex-encoded bytes".into());
                 }
-                let data = (0..hex.len())
-                    .step_by(2)
-                    .map(|i| {
-                        u8::from_str_radix(&hex[i..i + 2], 16)
-                            .map_err(|_| "invalid hex byte".to_owned())
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
+                let data = hex_bytes(hex)?;
                 let mappings = if op == "write_physical" {
                     vec![(address, 0..data.len())]
                 } else {
@@ -1345,16 +1539,15 @@ impl Session {
         Ok(())
     }
 
-    /// A breakpoint stop at a tracepoint's address: record it if it is
-    /// armed and in its process. None: no tracepoint there; Some(true): it
-    /// asks to stop.
-    fn trace_hit(&mut self, regs: &Registers) -> Result<Option<bool>, String> {
+    /// A breakpoint stop at a tracepoint's address: run its actions and
+    /// record it if it is armed and in its process. None: no tracepoint there.
+    fn trace_hit(&mut self, regs: &Registers) -> Result<Option<TraceHit>, String> {
         let Some(index) = self.tracepoints.iter().position(|t| t.address == regs.pc) else {
             return Ok(None);
         };
         let t = &self.tracepoints[index];
         if !t.armed() || t.context.as_ref().is_some_and(|p| !same_space(p, regs)) {
-            return Ok(Some(false));
+            return Ok(Some(TraceHit { stop: false, moved: false }));
         }
         let pointer = t.register.as_ref().map(|r| register_value(regs, r.1));
         let data = pointer.filter(|_| t.length > 0).map(|pointer| {
@@ -1367,19 +1560,34 @@ impl Session {
                 .map(|_| bytes)
                 .map_err(|e| e.to_string())
         });
+        // The record keeps the registers as hit; actions see earlier ones' writes.
+        let mut current = regs.clone();
+        let (mut actions_applied, mut action_error, mut failed_stop) = (0, None, false);
+        for (j, action) in t.actions.iter().enumerate() {
+            match action.effect(&current).and_then(|e| e.map(|e| apply_effect(&self.vm, &mut current, e)).transpose()) {
+                Ok(Some(())) => actions_applied += 1,
+                Ok(None) => {}
+                Err(e) => {
+                    action_error = Some(format!("action {j}: {e}"));
+                    failed_stop = action.stop;
+                    break;
+                }
+            }
+        }
         let t = &mut self.tracepoints[index];
         t.hits += 1;
-        let (hit, stop, exhausted) = (t.hits, t.stop, !t.armed());
+        let (hit, stop, exhausted) = (t.hits, t.stop || failed_stop, !t.armed());
         self.trace_seq += 1;
         if self.traces.len() >= self.trace_capacity {
             self.traces.pop_front();
             self.trace_dropped += 1;
         }
-        self.traces.push_back(TraceRecord { seq: self.trace_seq, tracepoint: index, hit, regs: regs.clone(), pointer, data });
+        self.traces.push_back(TraceRecord { seq: self.trace_seq, tracepoint: index, hit, regs: regs.clone(), pointer, data,
+            actions_applied, action_error });
         if exhausted {
             self.configure()?;
         }
-        Ok(Some(stop))
+        Ok(Some(TraceHit { stop, moved: current.pc != regs.pc }))
     }
 
     /// A step that a stop on another CPU paused before it ran: that CPU
@@ -1597,13 +1805,13 @@ fn run(args: Args) -> Result<(), String> {
                                 .expect("matched temporary")
                                 .reason
                                 .into();
-                        } else if !user_hit && traced == Some(true) {
+                        } else if !user_hit && traced.as_ref().is_some_and(|t| t.stop) {
                             reason = "Tracepoint".into();
-                        } else if !user_hit && traced.is_some() {
+                        } else if let Some(traced) = traced.filter(|_| !user_hit) {
                             // Recorded; a pause already asked for keeps the VM paused.
                             if was_running {
                                 session.requeue_step(stepping)?;
-                                if !session.continue_cpus.contains(&(stop.cpu as usize)) {
+                                if !traced.moved && !session.continue_cpus.contains(&(stop.cpu as usize)) {
                                     session.continue_cpus.push_back(stop.cpu as usize);
                                 }
                                 session.continuing = true;
@@ -1760,5 +1968,108 @@ mod tests {
         traced[0].hits = 1;
         traced[0].max_hits = Some(1);
         assert_eq!(breakpoint_slots(&[0xfffff80000002000, 0xfffff80000003000], &traced), 4, "a spent tracepoint frees its slot");
+    }
+
+    fn regs() -> Registers {
+        let mut x = [0; 31];
+        x[0] = 0xffff_ffff_0000_0005;
+        x[21] = 0xfffff800_0000_2000;
+        Registers { cpu: 1, x, pc: 0xfffff800_0000_1000, sp: 0xfffff800_0000_8000, pstate: 0x3c5, ttbr0: 0, ttbr1: 0, tcr: 0, sctlr: 0, vbar: 0, sve_vl: None }
+    }
+
+    fn action(v: Value) -> Action {
+        Action::parse(&v).unwrap_or_else(|e| panic!("{v}: {e}"))
+    }
+
+    #[test]
+    fn tracepoint_actions_parse() {
+        use vroom_hv::debug::Register as R;
+        let t = parse_tracepoint(0, &json!({"address": "0xfffff80000001000", "actions": [
+            {"set_register": "x0", "value": 0},
+            {"add_register": "PC", "value": 4},
+            {"set_register": "w0", "value": "0xc0000022"},
+            {"set_register": "x21", "value": "0x10"},
+            {"write_memory": {"register": "x0", "offset": 0, "hex": "01000000"}},
+            {"skip_if": {"register": "x0", "equals": 0}, "add_register": "pc", "value": 4, "stop": true},
+        ]}), &[], None).unwrap();
+        let ops: Vec<_> = t.actions.iter().map(|a| &a.operation).collect();
+        let x0 = ActionRegister { register: R::X(0), w: false };
+        assert_eq!(ops[0], &Operation::Set(x0, 0));
+        assert_eq!(ops[1], &Operation::Add(ActionRegister { register: R::Pc, w: false }, 4));
+        assert_eq!(ops[2], &Operation::Set(ActionRegister { register: R::X(0), w: true }, 0xc0000022));
+        assert_eq!(ops[3], &Operation::Set(ActionRegister { register: R::X(21), w: false }, 0x10));
+        assert_eq!(ops[4], &Operation::Write { register: x0, offset: 0, bytes: vec![1, 0, 0, 0] });
+        assert_eq!((t.actions[5].skip_if, t.actions[5].stop), (Some((x0, 0)), true));
+        assert_eq!(t.json()["actions"][1], json!({"add_register": "PC", "value": 4}));
+        assert_eq!(action(json!({"add_register": "x1", "value": -8})).operation, Operation::Add(ActionRegister { register: R::X(1), w: false }, (-8i64) as u64));
+        assert_eq!(action(json!({"add_register": "x1", "value": "-0x8"})).operation, Operation::Add(ActionRegister { register: R::X(1), w: false }, (-8i64) as u64));
+        for (bad, message) in [
+            (json!({"set_regsiter": "x0", "value": 0}), "unknown key set_regsiter"),
+            (json!({"set_register": "x0"}), "needs a value"),
+            (json!({"set_register": "x31", "value": 0}), "register x31"),
+            (json!({"set_register": "w31", "value": 0}), "register w31"),
+            (json!({"set_register": "x0", "add_register": "x1", "value": 0}), "only one of"),
+            (json!({"value": 0}), "needs one of"),
+            (json!({"write_memory": {"register": "x0", "hex": "010"}}), "write_memory hex"),
+            (json!({"write_memory": {"register": "x0", "hex": ""}}), "1..4096 bytes"),
+            (json!({"write_memory": {"register": "x0", "hex": "00", "length": 1}}), "write_memory: unknown key length"),
+            (json!({"write_memory": {"hex": "00"}}), "needs the register"),
+            (json!({"write_memory": {"register": "x0", "hex": "00"}, "value": 1}), "takes hex"),
+            (json!({"skip_if": {"register": "x0", "equal": 0}, "add_register": "pc", "value": 4}), "skip_if: unknown key equal"),
+            (json!({"skip_if": {"register": "x0"}, "add_register": "pc", "value": 4}), "needs equals"),
+            (json!({"set_register": "x0", "value": 0, "stop": "yes"}), "stop: expected a boolean"),
+        ] {
+            let e = parse_tracepoint(2, &json!({"address": "0xfffff80000001000", "actions": [{"set_register": "x1", "value": 1}, bad]}), &[], None)
+                .err()
+                .unwrap_or_else(|| panic!("{bad} parsed"));
+            assert!(e.starts_with("tracepoint 2: action 1: ") && e.contains(message), "{bad}: {e}");
+        }
+        assert!(parse_tracepoint(0, &json!({"address": "0xfffff80000001000", "actions": {}}), &[], None).err().unwrap().contains("expected an array"));
+        let many = vec![json!({"set_register": "x0", "value": 0}); MAX_TRACE_ACTIONS + 1];
+        assert!(parse_tracepoint(0, &json!({"address": "0xfffff80000001000", "actions": many}), &[], None).is_err());
+    }
+
+    #[test]
+    fn tracepoint_actions_set_and_add_registers() {
+        use vroom_hv::debug::Register as R;
+        let r = regs();
+        let effect = |v: Value| action(v).effect(&r);
+        assert_eq!(effect(json!({"set_register": "x0", "value": 0})), Ok(Some(Effect::Register(R::X(0), 0))));
+        assert_eq!(effect(json!({"set_register": "x21", "value": "0x1234"})), Ok(Some(Effect::Register(R::X(21), 0x1234))));
+        // wN writes zero-extend; adds wrap at 32 bits.
+        assert_eq!(effect(json!({"set_register": "w0", "value": "0x100000001"})), Ok(Some(Effect::Register(R::X(0), 1))));
+        assert_eq!(effect(json!({"add_register": "w0", "value": "0xfffffffc"})), Ok(Some(Effect::Register(R::X(0), 1))));
+        assert_eq!(effect(json!({"add_register": "x0", "value": 1})), Ok(Some(Effect::Register(R::X(0), 0xffff_ffff_0000_0006))));
+        assert_eq!(effect(json!({"add_register": "pc", "value": 4})), Ok(Some(Effect::Register(R::Pc, 0xfffff800_0000_1004))));
+        assert_eq!(effect(json!({"add_register": "pc", "value": -4})), Ok(Some(Effect::Register(R::Pc, 0xfffff800_0000_0ffc))));
+        assert!(effect(json!({"add_register": "pc", "value": 2})).unwrap_err().contains("Pc"), "misaligned PC");
+        assert_eq!(
+            effect(json!({"write_memory": {"register": "x21", "offset": -16, "hex": "01000000"}})),
+            Ok(Some(Effect::Memory(0xfffff800_0000_1ff0, vec![1, 0, 0, 0])))
+        );
+        let mut r = regs();
+        set_register_value(&mut r, R::Pc, 0x4000);
+        set_register_value(&mut r, R::X(30), 7);
+        assert_eq!((r.pc, r.x[30]), (0x4000, 7));
+    }
+
+    #[test]
+    fn tracepoint_actions_skip_if() {
+        use vroom_hv::debug::Register as R;
+        let skip = action(json!({"skip_if": {"register": "x0", "equals": 0}, "add_register": "pc", "value": 4}));
+        let mut r = regs();
+        assert_eq!(skip.effect(&r), Ok(None), "x0 is not 0");
+        r.x[0] = 0;
+        assert_eq!(skip.effect(&r), Ok(Some(Effect::Register(R::Pc, 0xfffff800_0000_1004))));
+        // wN compares the low half; equals is truncated to it.
+        let w = action(json!({"skip_if": {"register": "w0", "equals": "0x100000005"}, "set_register": "x1", "value": 1}));
+        let r = regs();
+        assert_eq!(w.effect(&r), Ok(Some(Effect::Register(R::X(1), 1))));
+        let x = action(json!({"skip_if": {"register": "x0", "equals": 5}, "set_register": "x1", "value": 1}));
+        assert_eq!(x.effect(&r), Ok(None), "x0's high half differs");
+        let negative = action(json!({"skip_if": {"register": "x0", "equals": -1}, "set_register": "x1", "value": 1}));
+        let mut r = regs();
+        r.x[0] = u64::MAX;
+        assert_eq!(negative.effect(&r), Ok(Some(Effect::Register(R::X(1), 1))));
     }
 }

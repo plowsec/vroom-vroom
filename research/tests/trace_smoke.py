@@ -101,6 +101,37 @@ def run(binary):
                 assert [p['hits'] for p in t['tracepoints']] == [5, 3] and not any(p['armed'] for p in t['tracepoints']), t
                 assert len(t['records']) == 4 and t['recorded'] == len(records)+8 and t['dropped'] == 4, t
                 print('max_hits disarms; stop: true stops like a breakpoint; ring buffer drops the oldest')
+                # Actions: skip_if + set_register, write_memory, a PC move onto another tracepoint, a failure that continues.
+                call('traces', clear=True)
+                call('write_register', register='pc', value=base+0x100)
+                call('tracepoints', capacity=100, tracepoints=[
+                    {'address': base+0x10c, 'max_hits': 6, 'actions': [
+                        {'skip_if': {'register': 'w0', 'equals': 3}, 'set_register': 'x0', 'value': 100},
+                        {'write_memory': {'register': 'x1', 'offset': 8, 'hex': 'efbeadde'}}]},
+                    {'address': func, 'register': 'x1', 'length': 12, 'max_hits': 6, 'actions': [{'add_register': 'pc', 'value': 4}]},
+                    {'address': func+4, 'max_hits': 6, 'actions': [{'write_memory': {'register': 'x0', 'hex': '00'}}, {'set_register': 'x2', 'value': 1}]}])
+                call('resume'); time.sleep(0.5)
+                assert call('status')['state'] == 'Running'
+                call('pause')
+                assert not [e for e in events if e.get('event') == 'stopped'], events
+                records = call('traces', clear=True)['records']
+                assert [r['tracepoint'] for r in records] == [0, 1, 2]*6, records
+                counted, called, returned = records[0::3], records[1::3], records[2::3]
+                assert [r['x'][0] for r in counted] == [0, 1, 2, 3, 101, 102], counted
+                assert [r['actions_applied'] for r in counted] == [1, 1, 1, 2, 1, 1] and not any('action_error' in r for r in counted), counted
+                for r in called:
+                    assert r['actions_applied'] == 1 and r['hex'] == r['x'][0].to_bytes(8, 'little').hex()+'efbeadde', r
+                assert [r['x'][0] for r in called] == [1, 2, 3, 101, 102, 103], called
+                for r in returned:
+                    assert r['pc'] == func+4 and r['actions_applied'] == 0 and 'action 0: write' in r['action_error'] and r['x'][2] != 1, r
+                print('actions: skip_if, set/add register, write_memory, PC moved onto a tracepoint, failures recorded without a stop')
+                call('tracepoints', tracepoints=[{'address': func+4, 'actions': [{'write_memory': {'register': 'x0', 'hex': '00'}, 'stop': True}]}])
+                call('resume'); hit = stop('Tracepoint')
+                assert hit['pc'] == func+4, hit
+                assert 'action_error' in call('traces', clear=True)['records'][-1]
+                refused('tracepoints', 'unknown key set_regster', tracepoints=[{'address': func, 'actions': [{'set_regster': 'x0', 'value': 0}]}])
+                refused('tracepoints', 'register w31', tracepoints=[{'address': func, 'actions': [{'set_register': 'w31', 'value': 0}]}])
+                print('actions: a failing stop: true action stops; unknown keys refused when armed')
                 # Four hardware slots, shared with breakpoints.
                 five = [{'address': 0xfffff80000001000+i*4} for i in range(5)]
                 refused('tracepoints', 'hardware breakpoint slots', tracepoints=five)

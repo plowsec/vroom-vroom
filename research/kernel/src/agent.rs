@@ -220,7 +220,7 @@ static COMMANDS: &[Command] = &[
     c("debug.breakpoints", "debug", "Replace the hardware execution breakpoints (at most 4, aligned)", &[p("addresses", "array", true, "addresses; [] clears")], "control", Target::Op("breakpoints")),
     c("debug.watchpoints", "debug", "Replace the hardware watchpoints (at most 2)", &[p("watches", "array", true, "[{address, size, mode: r|w|rw}]; [] clears")], "control", Target::Op("watchpoints")),
     c("debug.tracepoints", "debug", "Replace the tracepoints: execution breakpoints that record the CPU's registers (and bytes at a register's pointer) and continue; they share the 4 slots with debug.breakpoints", &[
-        p("tracepoints", "array", true, "[{address, register: \"x0\", length: bytes (0..4096), max_hits, stop: true = stop like a breakpoint after recording}]; [] clears"),
+        p("tracepoints", "array", true, "[{address, register: \"x0\", length: bytes (0..4096), max_hits, stop: true = stop like a breakpoint after recording, actions: [{set_register|add_register: \"x0\"|\"w0\"|\"pc\", value} | {write_memory: {register, offset, hex}}, each with optional skip_if: {register, equals} (apply only when equal) and stop: true (stop if it fails)]}]; [] clears"),
         p("capacity", "integer", false, "records kept, oldest dropped first (default 4096)"),
     ], "control", Target::Op("tracepoints")),
     c("debug.traces", "debug", "Tracepoint records, oldest first; also while the VM runs", &[
