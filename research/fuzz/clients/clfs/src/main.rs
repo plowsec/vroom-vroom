@@ -174,14 +174,14 @@ impl State {
         self.overlapped.last_mut().expect("just pushed").as_mut_ptr().cast()
     }
 
-    /// A call's result, waiting (a second at most) for one that went
+    /// A call's result, waiting (100 ms at most) for one that went
     /// asynchronous: its status then.
     unsafe fn finish(&self, ok: Bool, ov: *mut c_void) -> Bool {
         if ok != 0 || ov.is_null() || GetLastError() != 997 {
             return ok;
         }
         let o = ov.cast::<u64>();
-        if WaitForSingleObject(*o.add(3) as Handle, 1000) != 0 {
+        if WaitForSingleObject(*o.add(3) as Handle, 100) != 0 {
             return 0;
         }
         i32::from(*o == 0)
