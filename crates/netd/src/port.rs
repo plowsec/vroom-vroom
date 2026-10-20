@@ -13,6 +13,11 @@ pub trait Port: Send + Sync {
     fn recv(&self, buf: &mut [u8], timeout: Duration) -> io::Result<usize>;
 }
 
+/// The source of netd's DHCP replies when the bridge's own MAC can't be
+/// read (locally administered).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub const FALLBACK_SERVER_MAC: [u8; 6] = [0x02, 0x76, 0x72, 0x6f, 0x6f, 0x6d];
+
 /// Stable 16-byte id from a string (vmnet interface ids).
 pub fn uuid_of(s: &str) -> [u8; 16] {
     let mut out = [0u8; 16];
@@ -173,6 +178,17 @@ pub mod tap {
         } else {
             Err(io::Error::other(format!("ip {}: failed", args.join(" "))))
         }
+    }
+
+    /// An interface's MAC (`/sys/class/net/<name>/address`).
+    pub fn mac_of(ifname: &str) -> Option<[u8; 6]> {
+        let s = std::fs::read_to_string(format!("/sys/class/net/{ifname}/address")).ok()?;
+        let mut out = [0u8; 6];
+        let mut parts = s.trim().split(':');
+        for o in &mut out {
+            *o = u8::from_str_radix(parts.next()?, 16).ok()?;
+        }
+        parts.next().is_none().then_some(out)
     }
 
     /// Ensure a host-only bridge exists with the gateway address.

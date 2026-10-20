@@ -8,14 +8,13 @@
 //! the host's loopback services, link-local, multicast or our own subnet.
 //! Every table is capped so a hostile guest can't exhaust host memory.
 
-mod dhcp;
 mod fragment;
 mod ping;
 
 /// Pure guest-input parsers, exposed for the fuzz targets only.
 #[doc(hidden)]
 pub mod fuzzing {
-    pub use super::dhcp::{handle as dhcp, Lease};
+    pub use crate::dhcp::{handle as dhcp, Lease};
 
     #[derive(Default)]
     #[allow(missing_debug_implementations)]
@@ -369,8 +368,15 @@ impl Nat {
     }
 
     fn handle_dhcp(&mut self, eth: &Eth, payload: &[u8]) {
-        let lease = dhcp::Lease { client: self.cfg.guest, server: self.cfg.gateway, mask: NETMASK, dns: self.cfg.dns, seconds: 86400 };
-        if let Some(reply) = dhcp::handle(payload, &lease) {
+        let lease = crate::dhcp::Lease {
+            client: self.cfg.guest,
+            server: self.cfg.gateway,
+            mask: NETMASK,
+            router: Some(self.cfg.gateway),
+            dns: Some(self.cfg.dns),
+            seconds: 86400,
+        };
+        if let Some(reply) = crate::dhcp::handle(payload, &lease) {
             let f = build_udp(eth.src, self.cfg.gateway_mac, (self.cfg.gateway, 67), (Ipv4Addr::BROADCAST, 68), &reply);
             self.push_guest(f);
         }

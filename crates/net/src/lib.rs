@@ -6,6 +6,7 @@
 //!   bridged / host-only interfaces. The VMM never needs root.
 #![forbid(unsafe_code)]
 
+pub mod dhcp;
 pub mod leases;
 pub mod mac;
 pub mod nat;

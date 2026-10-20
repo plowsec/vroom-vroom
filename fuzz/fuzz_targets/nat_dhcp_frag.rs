@@ -11,7 +11,8 @@ fuzz_target!(|data: &[u8]| {
         client: Ipv4Addr::new(10, 0, 2, 15),
         server: Ipv4Addr::new(10, 0, 2, 2),
         mask: Ipv4Addr::new(255, 255, 255, 0),
-        dns: Ipv4Addr::new(10, 0, 2, 3),
+        router: Some(Ipv4Addr::new(10, 0, 2, 2)),
+        dns: Some(Ipv4Addr::new(10, 0, 2, 3)),
         seconds: 86400,
     };
     if let Some(r) = dhcp(data, &lease) {

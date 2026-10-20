@@ -97,8 +97,13 @@ ssh user@192.168.77.2
 - macOS: vmnet host mode. vmnet makes a `bridgeN` with the host's address
   and serves DHCP (`bootpd`, leases in `/var/db/dhcpd_leases`). The host
   doesn't route or NAT for it: no way out.
-- The lease follows the MAC vmnet gives the adapter, fixed per VM name and
-  adapter number.
+- Linux: a `bwh-<name>` bridge with the host's address; netd answers the
+  guests' DHCP itself (no router, no DNS) and keeps it off the bridge.
+  The host's firewall still decides what reaches the host.
+- The lease follows the adapter's MAC (macOS: the one vmnet gives it,
+  fixed per VM name and adapter number). Linux: the same address from a
+  hash of the MAC, also after netd restarts; a full pool reuses the
+  address of a MAC silent for an hour.
 - VMs on the same network reach each other; other networks are other
   subnets, other bridges.
 - More networks, other subnets: `/etc/vroom/netd.toml`, private ranges,
@@ -115,17 +120,16 @@ ssh user@192.168.77.2
   ```
 
   No `[[host_only]]` at all: `lab` as above. Restart:
-  `sudo launchctl kickstart -k system/org.vroom.netd`.
+  `sudo launchctl kickstart -k system/org.vroom.netd` (Linux:
+  `sudo systemctl restart vroom-netd`).
 - Windows names it an unidentified, public network: its firewall drops
   ping and most inbound. `Set-NetConnectionProfile -NetworkCategory
   Private`, or allow the rule (OpenSSH Server adds its own for 22).
 - macOS firewall with "Automatically allow built-in software" off: unblock
   `/usr/libexec/bootpd`, or no DHCP.
-- A netd from before (`vroom net` says so) puts host-only VMs on an
-  isolated vmnet network: no DHCP, no host. Set it up again (the app asks
-  at the VM's start).
-- Linux: a `bwh-<name>` bridge with the gateway address; no DHCP yet,
-  static addresses in the guest.
+- A netd from before (`vroom net` says so) gives no DHCP on host-only
+  (macOS: an isolated vmnet network, the host not on it either). Set it up
+  again (the app asks at the VM's start; Linux: install it again).
 
 ## Limits
 

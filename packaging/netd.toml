@@ -9,8 +9,8 @@ group = "staff"            # Linux: "vroom"
 bridge_interfaces = ["en*"]
 
 # Private host-only networks (VMs + host, no outside access). gateway:
-# the host's address; macOS serves DHCP for the rest of the subnet. None
-# here: `lab` on 192.168.77.1/24.
+# the host's address; DHCP for the rest of the subnet. None here: `lab`
+# on 192.168.77.1/24.
 [[host_only]]
 name = "lab"
 gateway = "192.168.77.1/24"

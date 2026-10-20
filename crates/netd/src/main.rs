@@ -13,6 +13,7 @@
 //! access control, per-user limits, and source-MAC anti-spoofing on every
 //! guest frame.
 
+mod dhcp;
 mod hostonly;
 mod port;
 mod usb;
@@ -25,7 +26,7 @@ use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hostonly::{HostOnly, Subnet};
 use port::Port;
@@ -103,6 +104,8 @@ struct State {
     cfg: Config,
     /// `cfg.host_only`'s subnets, in order.
     subnets: Vec<Subnet>,
+    /// Their DHCP leases, where netd serves them (Linux).
+    pools: Vec<Mutex<dhcp::Pool>>,
     /// uid -> open ports
     per_user: Mutex<HashMap<u32, usize>>,
     /// Open ports by id, with their user: what `status` lists.
@@ -114,7 +117,15 @@ struct State {
 impl State {
     fn new(cfg: Config, usb: usb::Usb) -> Result<State, String> {
         let subnets = hostonly::check(&cfg.host_only)?;
-        Ok(State { cfg, subnets, per_user: Mutex::new(HashMap::new()), ports: Mutex::new(HashMap::new()), next_port: AtomicU64::new(0), usb })
+        let pools = subnets.iter().map(|s| Mutex::new(dhcp::Pool::new(*s))).collect();
+        Ok(State { cfg, subnets, pools, per_user: Mutex::new(HashMap::new()), ports: Mutex::new(HashMap::new()), next_port: AtomicU64::new(0), usb })
+    }
+
+    /// The leased address and host name of `mac` on host-only `network`,
+    /// where netd serves DHCP.
+    fn lease(&self, network: &str, mac: &[u8; 6]) -> Option<(std::net::Ipv4Addr, String)> {
+        let i = self.cfg.host_only.iter().position(|n| n.name == network)?;
+        self.pools[i].lock().unwrap_or_else(|e| e.into_inner()).of(mac)
     }
 }
 
@@ -153,7 +164,14 @@ fn refuse(s: &mut UnixStream, msg: &str) {
     reply(s, &Response { ok: false, error: msg.into(), mac: [0; 6], mtu: 0 });
 }
 
-fn open_port(st: &State, req: &Request) -> Result<Arc<dyn Port>, String> {
+/// netd answering a port's DHCP requests: the network's pool, and the
+/// host's MAC on it (the replies' source).
+struct Dhcp<'a> {
+    pool: &'a Mutex<dhcp::Pool>,
+    server: [u8; 6],
+}
+
+fn open_port<'a>(st: &'a State, req: &Request) -> Result<(Arc<dyn Port>, Option<Dhcp<'a>>), String> {
     let id = port::uuid_of(&format!("{}/{}", req.vm, req.nic));
     match &req.attach {
         Attach::Bridged { interface } => {
@@ -163,12 +181,12 @@ fn open_port(st: &State, req: &Request) -> Result<Arc<dyn Port>, String> {
             #[cfg(target_os = "macos")]
             {
                 let _ = &req.mac;
-                port::vmnet::Vmnet::bridged(interface, id).map(|p| Arc::new(p) as Arc<dyn Port>).map_err(|e| e.to_string())
+                port::vmnet::Vmnet::bridged(interface, id).map(|p| (Arc::new(p) as Arc<dyn Port>, None)).map_err(|e| e.to_string())
             }
             #[cfg(target_os = "linux")]
             {
                 let _ = id;
-                port::tap::Tap::open(interface, req.mac).map(|p| Arc::new(p) as Arc<dyn Port>).map_err(|e| e.to_string())
+                port::tap::Tap::open(interface, req.mac).map(|p| (Arc::new(p) as Arc<dyn Port>, None)).map_err(|e| e.to_string())
             }
         }
         Attach::HostOnly { network } => {
@@ -178,7 +196,8 @@ fn open_port(st: &State, req: &Request) -> Result<Arc<dyn Port>, String> {
             };
             #[cfg(target_os = "macos")]
             {
-                port::vmnet::Vmnet::host_only(&st.subnets[i], id).map(|p| Arc::new(p) as Arc<dyn Port>).map_err(|e| e.to_string())
+                // vmnet's bootpd serves DHCP.
+                port::vmnet::Vmnet::host_only(&st.subnets[i], id).map(|p| (Arc::new(p) as Arc<dyn Port>, None)).map_err(|e| e.to_string())
             }
             #[cfg(target_os = "linux")]
             {
@@ -186,7 +205,10 @@ fn open_port(st: &State, req: &Request) -> Result<Arc<dyn Port>, String> {
                 let net = &st.cfg.host_only[i];
                 let br = format!("bwh-{}", &network[..network.len().min(10)]);
                 port::tap::ensure_bridge(&br, &net.gateway).map_err(|e| e.to_string())?;
-                port::tap::Tap::open(&br, req.mac).map(|p| Arc::new(p) as Arc<dyn Port>).map_err(|e| e.to_string())
+                // Nothing else serves DHCP on the bridge: we do.
+                let server = port::tap::mac_of(&br).unwrap_or(port::FALLBACK_SERVER_MAC);
+                let tap = port::tap::Tap::open(&br, req.mac).map_err(|e| e.to_string())?;
+                Ok((Arc::new(tap) as Arc<dyn Port>, Some(Dhcp { pool: &st.pools[i], server })))
             }
         }
     }
@@ -198,8 +220,9 @@ fn buffer_full(e: &std::io::Error) -> bool {
     e.kind() == std::io::ErrorKind::WouldBlock || e.raw_os_error() == Some(libc::ENOBUFS)
 }
 
-/// Shuttle frames until the VMM goes away.
-fn pump(guest: UnixDatagram, port: Arc<dyn Port>) {
+/// Shuttle frames until the VMM goes away. With `dhcp`, the guest's DHCP
+/// requests are answered here and go no further.
+fn pump(guest: UnixDatagram, port: Arc<dyn Port>, dhcp: Option<Dhcp<'_>>) {
     let mac = port.mac();
     let stop = Arc::new(AtomicBool::new(false));
     let g2 = match guest.try_clone() {
@@ -242,6 +265,15 @@ fn pump(guest: UnixDatagram, port: Arc<dyn Port>) {
                 if buf[6..12] != mac {
                     continue;
                 }
+                if let Some(d) = &dhcp {
+                    if dhcp::request(&buf[..n]).is_some() {
+                        let r = d.pool.lock().unwrap_or_else(|e| e.into_inner()).answer(&buf[..n], d.server, Instant::now());
+                        if let Some(r) = r {
+                            let _ = guest.send(&r);
+                        }
+                        continue;
+                    }
+                }
                 let _ = port.send(&buf[..n]);
             }
             Ok(_) => {}
@@ -277,11 +309,17 @@ fn status(st: &State, mut s: UnixStream, uid: u32) {
         bridge_interfaces: st.cfg.bridge_interfaces.clone(),
         host_only: st.cfg.host_only.iter().map(|h| h.name.clone()).collect(),
         networks: st.cfg.host_only.iter().map(|h| HostOnlyNet { name: h.name.clone(), gateway: h.gateway.clone() }).collect(),
-        // Linux: the bridge has the host's address, but nothing serves DHCP yet.
-        host_only_dhcp: cfg!(target_os = "macos"),
+        host_only_dhcp: true,
         ports: {
             let ports = st.ports.lock().unwrap_or_else(|e| e.into_inner());
             let mut mine: Vec<PortInfo> = ports.values().filter(|(u, _)| *u == uid).map(|(_, p)| p.clone()).collect();
+            for p in &mut mine {
+                if let Attach::HostOnly { network } = &p.attach {
+                    if let Some((ip, name)) = st.lease(network, &p.mac) {
+                        (p.ip, p.host_name) = (Some(ip), name);
+                    }
+                }
+            }
             mine.sort_by(|a, b| (&a.vm, a.nic).cmp(&(&b.vm, b.nic)));
             mine
         },
@@ -343,7 +381,7 @@ fn net(st: &State, mut s: UnixStream, uid: u32, req: Request) {
             *n = n.saturating_sub(1);
         }
     };
-    let port = match open_port(st, &req) {
+    let (port, dhcp) = match open_port(st, &req) {
         Ok(p) => p,
         Err(e) => {
             release(st);
@@ -371,9 +409,9 @@ fn net(st: &State, mut s: UnixStream, uid: u32, req: Request) {
     drop(vmm_end);
     drop(s);
     let pid = st.next_port.fetch_add(1, Ordering::Relaxed);
-    let info = PortInfo { vm: req.vm.clone(), nic: req.nic, attach: req.attach.clone(), mac: port.mac() };
+    let info = PortInfo { vm: req.vm.clone(), nic: req.nic, attach: req.attach.clone(), mac: port.mac(), ip: None, host_name: String::new() };
     st.ports.lock().unwrap_or_else(|e| e.into_inner()).insert(pid, (uid, info));
-    pump(our_end, port);
+    pump(our_end, port, dhcp);
     st.ports.lock().unwrap_or_else(|e| e.into_inner()).remove(&pid);
     log::info!("uid {uid}: {} nic{} detached", req.vm, req.nic);
     release(st);
@@ -568,13 +606,19 @@ name = "lab"
         let s = vroom_net::netd::status_on(&connect(&st)).unwrap();
         assert_eq!((s.bridge_interfaces.len(), s.host_only.as_slice(), s.usb), (2, &["lab".to_string()][..], true));
         assert_eq!(s.networks, vec![HostOnlyNet { name: "lab".into(), gateway: "192.168.77.1/24".into() }]);
-        assert_eq!(s.host_only_dhcp, cfg!(target_os = "macos"));
+        assert!(s.host_only_dhcp);
         // The user's open ports, not others'.
         // SAFETY: getuid has no preconditions.
         let me = unsafe { libc::getuid() };
-        let port = |vm: &str| PortInfo { vm: vm.into(), nic: 0, attach: Attach::HostOnly { network: "lab".into() }, mac: [2, 0, 0, 0, 0, 1] };
+        let port = |vm: &str| PortInfo { vm: vm.into(), nic: 0, attach: Attach::HostOnly { network: "lab".into() }, mac: [2, 0, 0, 0, 0, 1], ip: None, host_name: String::new() };
         st.ports.lock().unwrap().extend([(1, (me, port("mine"))), (2, (me.wrapping_add(1), port("theirs")))]);
         assert_eq!(vroom_net::netd::status_on(&connect(&st)).unwrap().ports, vec![port("mine")]);
+        // A lease netd gave it shows.
+        st.pools[0].lock().unwrap().answer(&discover([2, 0, 0, 0, 0, 1], Some("deb")), [2, 0, 0, 0, 0, 0xee], Instant::now()).unwrap();
+        let p = vroom_net::netd::status_on(&connect(&st)).unwrap().ports.remove(0);
+        assert!(p.ip.is_some_and(|ip| st.subnets[0].contains(ip)), "{p:?}");
+        st.ports.lock().unwrap().clear();
+        st.ports.lock().unwrap().insert(1, (me, port("mine")));
         // A user's every port, with the longest names, still fits.
         let long = "v".repeat(64);
         st.ports.lock().unwrap().extend((10..10 + MAX_PORTS_PER_USER as u64).map(|i| (i, (me, port(&long)))));
@@ -582,6 +626,70 @@ name = "lab"
         let st = state(false);
         let s = vroom_net::netd::status_on(&connect(&st)).unwrap();
         assert!(!s.usb && s.usb_why.contains("turned off"));
+    }
+
+    /// A guest's DHCPDISCOVER frame, with a host name option if given.
+    fn discover(mac: [u8; 6], name: Option<&str>) -> Vec<u8> {
+        let mut b = vec![0u8; 240];
+        (b[0], b[1], b[2]) = (1, 1, 6);
+        b[28..34].copy_from_slice(&mac);
+        b[236..240].copy_from_slice(&[99, 130, 83, 99]);
+        b.extend_from_slice(&[53, 1, 1]);
+        if let Some(n) = name {
+            b.extend_from_slice(&[12, n.len() as u8]);
+            b.extend_from_slice(n.as_bytes());
+        }
+        b.push(255);
+        vroom_net::packet::build_udp([0xff; 6], mac, (std::net::Ipv4Addr::UNSPECIFIED, 68), (std::net::Ipv4Addr::BROADCAST, 67), &b)
+    }
+
+    /// A port that keeps what it is sent and has nothing to give.
+    struct Sink([u8; 6], Mutex<Vec<Vec<u8>>>);
+    impl Port for Sink {
+        fn mac(&self) -> [u8; 6] {
+            self.0
+        }
+        fn mtu(&self) -> u16 {
+            1500
+        }
+        fn send(&self, f: &[u8]) -> std::io::Result<()> {
+            self.1.lock().unwrap().push(f.to_vec());
+            Ok(())
+        }
+        fn recv(&self, _: &mut [u8], t: Duration) -> std::io::Result<usize> {
+            std::thread::sleep(t.min(Duration::from_millis(20)));
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn pump_answers_dhcp_and_passes_the_rest() {
+        let st = state(false);
+        let mac = [2, 0, 0, 0, 0, 7];
+        let port = Arc::new(Sink(mac, Mutex::new(Vec::new())));
+        let (vmm, ours) = UnixDatagram::pair().unwrap();
+        vmm.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        std::thread::scope(|s| {
+            let p = port.clone() as Arc<dyn Port>;
+            let st = &st;
+            s.spawn(move || pump(ours, p, Some(Dhcp { pool: &st.pools[0], server: [2, 0, 0, 0, 0, 0xee] })));
+            vmm.send(&discover(mac, None)).unwrap();
+            let mut buf = [0u8; 2048];
+            let n = vmm.recv(&mut buf).unwrap();
+            let ip = vroom_net::packet::parse_ipv4(&buf[..n]).unwrap();
+            assert_eq!(ip.src, st.subnets[0].host);
+            // Not DHCP: on to the bridge. Another MAC's: dropped.
+            let other = vroom_net::packet::build_udp([0xff; 6], mac, (ip.dst, 5000), (ip.dst, 5001), b"hi");
+            vmm.send(&other).unwrap();
+            vmm.send(&discover([2, 0, 0, 0, 0, 8], None)).unwrap();
+            let t0 = Instant::now();
+            while port.1.lock().unwrap().is_empty() && t0.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            drop(vmm);
+        });
+        assert_eq!(*port.1.lock().unwrap(), vec![vroom_net::packet::build_udp([0xff; 6], mac, (std::net::Ipv4Addr::BROADCAST, 5000), (std::net::Ipv4Addr::BROADCAST, 5001), b"hi")]);
+        assert!(st.pools[0].lock().unwrap().of(&mac).is_some());
     }
 
     #[test]

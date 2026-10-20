@@ -688,8 +688,8 @@ default).
 ## Known limitations
 
 - x86_64 hosts build but can't run VMs.
-- Bridged tested on vmnet (Wi-Fi); host-only DHCP on vmnet untested by a
-  guest yet; tap (Linux) untested.
+- Bridged tested on vmnet (Wi-Fi), host-only on vmnet (Windows guests);
+  tap and netd's DHCP (Linux) untested on a real host.
 - Windows 11 installs with hardware checks bypassed (no Secure Boot);
   `tpm = true` (`brew install swtpm`) gives a real TPM 2.0.
 - Windows 3D: Direct3D 11 only.

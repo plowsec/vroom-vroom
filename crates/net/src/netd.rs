@@ -130,6 +130,12 @@ pub struct PortInfo {
     pub attach: Attach,
     /// The MAC the port passes (vmnet's, on macOS): its DHCP lease's.
     pub mac: [u8; 6],
+    /// Host-only, where netd serves DHCP itself (Linux): the address it
+    /// leased, and the host name the guest gave.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip: Option<std::net::Ipv4Addr>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub host_name: String,
 }
 
 /// Any first line netd takes.

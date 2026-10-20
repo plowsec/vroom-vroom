@@ -1,5 +1,6 @@
 //! `vroom net`: the host-only networks vroom-netd offers, and the address
-//! each of your running VMs' adapters on them got.
+//! each of your running VMs' adapters on them got (macOS: vmnet's leases
+//! file; Linux: netd leased it and says so).
 
 use std::path::Path;
 
@@ -17,7 +18,7 @@ fn report(st: &Status, leases_text: &str) -> String {
         out += if cfg!(target_os = "macos") {
             "vroom-netd is from an older vroom: host-only networks give no addresses and the Mac isn't on them. Set it up again (app: ⌘K, \"Set up vroom-netd again\").\n"
         } else {
-            "host-only: no DHCP on Linux yet; give guests static addresses.\n"
+            "vroom-netd is from an older vroom: no DHCP on host-only networks. Install the new one (docs/GUIDE.md, \"The root helper\").\n"
         };
     }
     for n in &st.networks {
@@ -37,9 +38,10 @@ fn report(st: &Status, leases_text: &str) -> String {
             Attach::HostOnly { network } => format!("host-only:{network}"),
             Attach::Bridged { interface } => format!("bridged:{interface}"),
         };
-        let addr = match (leases::of(&leases, p.mac), &p.attach) {
-            (Some(l), _) if l.name.is_empty() => l.ip.to_string(),
-            (Some(l), _) => format!("{} ({})", l.ip, l.name),
+        let lease = p.ip.map(|ip| (ip, p.host_name.as_str())).or_else(|| leases::of(&leases, p.mac).map(|l| (l.ip, l.name.as_str())));
+        let addr = match (lease, &p.attach) {
+            (Some((ip, "")), _) => ip.to_string(),
+            (Some((ip, name)), _) => format!("{ip} ({name})"),
             // The LAN's DHCP server knows, not this machine.
             (None, Attach::Bridged { .. }) => "-".into(),
             (None, Attach::HostOnly { .. }) => "no lease yet".into(),
@@ -63,7 +65,7 @@ mod tests {
 
     #[test]
     fn report_lists_addresses() {
-        let p = |vm: &str, m: u8, attach: Attach| PortInfo { vm: vm.into(), nic: 0, attach, mac: [2, 0, 0, 0, 0, m] };
+        let p = |vm: &str, m: u8, attach: Attach| PortInfo { vm: vm.into(), nic: 0, attach, mac: [2, 0, 0, 0, 0, m], ip: None, host_name: String::new() };
         let st = Status {
             ok: true,
             host_only: vec!["lab".into()],
@@ -73,6 +75,7 @@ mod tests {
                 p("win", 1, Attach::HostOnly { network: "lab".into() }),
                 p("deb", 2, Attach::HostOnly { network: "lab".into() }),
                 p("lan", 3, Attach::Bridged { interface: "en0".into() }),
+                PortInfo { ip: Some("192.168.77.4".parse().unwrap()), host_name: "tux".into(), ..p("lin", 4, Attach::HostOnly { network: "lab".into() }) },
             ],
             ..Default::default()
         };
@@ -81,6 +84,8 @@ mod tests {
         assert!(r.contains("02:00:00:00:00:01") && r.contains("192.168.77.2 (WIN-1)"), "{r}");
         assert!(r.lines().any(|l| l.starts_with("deb") && l.ends_with("no lease yet")), "{r}");
         assert!(r.lines().any(|l| l.starts_with("lan") && l.contains("bridged:en0") && l.ends_with(" -")), "{r}");
+        // netd's own lease (Linux).
+        assert!(r.lines().any(|l| l.starts_with("lin") && l.ends_with("192.168.77.4 (tux)")), "{r}");
         let old = report(&Status { ok: true, host_only: vec!["lab".into()], ..Default::default() }, "");
         assert!(old.contains("host-only") && old.contains("no running VM"), "{old}");
     }
