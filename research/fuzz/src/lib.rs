@@ -793,11 +793,13 @@ impl Mutator {
     }
     /// A mutation of the call sequence `seed` (see `Harness::sequence`):
     /// by type when the calls are described (`typed`), else (and
-    /// `typed::BYTE_SHARE` percent of the time) as bytes.
-    pub fn mutate_sequence(&mut self, seed: &[u8], donor: &[u8]) -> Vec<u8> {
+    /// `typed::BYTE_SHARE` percent of the time) as bytes. Each input with
+    /// its calls' results when it last ran (`RunResult::calls`; empty: not
+    /// known).
+    pub fn mutate_sequence(&mut self, seed: (&[u8], &[u32]), donor: (&[u8], &[u32])) -> Vec<u8> {
         match self.calls.clone() {
             Some(calls) if self.next() % 100 >= typed::BYTE_SHARE => self.mutate_program(&calls, seed, donor),
-            _ => self.mutate_sequence_bytes(seed, donor),
+            _ => self.mutate_sequence_bytes(seed.0, donor.0),
         }
     }
 
@@ -1971,6 +1973,7 @@ impl Engine {
         let mut edges_hit = BTreeSet::<(u64, u64)>::new();
         let mut finding = None;
         let mut findings = Vec::<Finding>::new();
+        let mut call_results = Vec::new();
         // The faulting stack of this input's exception, for a bugcheck it
         // ends in.
         let mut fault_stack: Option<Vec<String>> = None;
@@ -2223,15 +2226,21 @@ impl Engine {
                         }
                     }
                     if self.harness.stop_pc == Some(stop.pc) {
-                        if client && std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
+                        let trace = std::env::var_os("VROOM_FUZZ_TRACE").is_some();
+                        if client && (self.harness.sequence || trace) {
                             // What the client says (its first argument):
                             // a result per call of a sequence.
                             if let Ok(Ok(r)) = self.vm.debug_registers(stop.cpu as usize).map(|s| Registers::from_state(&s)) {
                                 let count = if self.harness.sequence { calls(input).len() } else { 16 };
                                 let mut words = vec![0u8; 4 * count];
                                 let space = AddressSpace { memory: &self.vm, registers: &r };
-                                let _ = vroom_kernel::windows::VirtualMemory::read(&space, r.x[0], &mut words);
-                                eprintln!("stop_pc x0={:#x}: {}", r.x[0], words.chunks(4).map(|w| format!("{:08x}", u32::from_le_bytes(w.try_into().expect("four")))).collect::<Vec<_>>().join(" "));
+                                let read = vroom_kernel::windows::VirtualMemory::read(&space, r.x[0], &mut words).is_ok();
+                                if read && self.harness.sequence && call_results.is_empty() {
+                                    call_results = words.chunks(4).map(|w| u32::from_le_bytes(w.try_into().expect("four"))).collect();
+                                }
+                                if trace {
+                                    eprintln!("stop_pc x0={:#x}: {}", r.x[0], words.chunks(4).map(|w| format!("{:08x}", u32::from_le_bytes(w.try_into().expect("four")))).collect::<Vec<_>>().join(" "));
+                                }
                             }
                         }
                         if client && self.harness.settle_ms > 0 && settle.is_none() {
@@ -2553,6 +2562,7 @@ impl Engine {
             foreign_threads,
             reset_us,
             reopen,
+            calls: call_results,
         })
     }
 }
@@ -2749,6 +2759,10 @@ pub struct RunResult {
     /// next input. A bugcheck stopped at `bugcheck_pc` doesn't need this.
     #[serde(default)]
     pub reopen: bool,
+    /// A sequence client's result per call at `stop_pc`: op in the top
+    /// byte, 0 or the Win32 error below (empty: it didn't get there).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calls: Vec<u32>,
 }
 
 #[cfg(test)]
@@ -2810,7 +2824,7 @@ mod tests {
         let mut m = Mutator::new(7, 256);
         let mut lengths = std::collections::BTreeSet::new();
         for _ in 0..500 {
-            let out = m.mutate_sequence(&seed, &seed);
+            let out = m.mutate_sequence((&seed, &[]), (&seed, &[]));
             assert!(out.len() <= 256);
             let c = calls(&out);
             assert!(!c.is_empty());

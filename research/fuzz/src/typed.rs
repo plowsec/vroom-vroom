@@ -4,6 +4,10 @@
 //! preceded by the producers they need, splices that keep resources
 //! consistent, and which call to insert learned from the corpus (a
 //! choice table). A minority of mutations stay byte-level (parsers).
+//! A call that failed when its program last ran fills no slot: what
+//! follows it uses (mostly) slots that hold something, and calls that
+//! failed on such a dead slot are pointed at live ones (most of the time),
+//! a new producer first when there is none.
 
 use crate::calls::{Call, Calls, Dir, Slots, Type, Value};
 use crate::Mutator;
@@ -11,6 +15,11 @@ use std::collections::BTreeSet;
 
 /// Share of mutations (percent) done on bytes instead of by type.
 pub const BYTE_SHARE: u64 = 15;
+/// Share of mutations (percent) of a program with failed calls that
+/// repair them first (`repair`).
+const REPAIR_SHARE: u64 = 90;
+/// Producers a repair inserts at most.
+const REPAIR_INSERTS: usize = 4;
 /// Calls a program has before inserting gives way to removing.
 const LONG: usize = 48;
 /// Calls apart that still count as used together (choice table).
@@ -95,8 +104,13 @@ impl Mutator {
     /// A mutation of `seed` by type (one time in `BYTE_SHARE` per hundred
     /// on bytes): arguments, calls inserted (with their producers),
     /// removed, duplicated, swapped, replaced, or a splice with `donor`.
-    pub(crate) fn mutate_program(&mut self, calls: &Calls, seed: &[u8], donor: &[u8]) -> Vec<u8> {
-        let mut p = calls.decode(seed);
+    /// Each with its calls' results when it last ran (empty: not known;
+    /// all succeeded).
+    pub(crate) fn mutate_program(&mut self, calls: &Calls, (seed, results): (&[u8], &[u32]), donor: (&[u8], &[u32])) -> Vec<u8> {
+        let mut p = calls.decode_run(seed, results);
+        if p.iter().any(|c| c.failed) && self.next() % 100 < REPAIR_SHARE {
+            self.repair(calls, &mut p);
+        }
         let mut out = seed.to_vec();
         // Until it differs (a mutation can be a no-op: a removal of the
         // only call, a value drawn again).
@@ -117,7 +131,7 @@ impl Mutator {
         out
     }
 
-    fn mutate_once(&mut self, calls: &Calls, p: &mut Vec<Call>, donor: &[u8]) {
+    fn mutate_once(&mut self, calls: &Calls, p: &mut Vec<Call>, donor: (&[u8], &[u32])) {
         if p.is_empty() {
             self.insert_call(calls, p);
             return;
@@ -211,7 +225,7 @@ impl Mutator {
     pub(crate) fn gen_call(&mut self, calls: &Calls, d: usize, state: &Slots) -> Call {
         let desc = &calls.descs[d];
         let args = desc.args.iter().map(|a| self.gen_value(&a.ty, state)).collect();
-        let mut call = Call { op: desc.op, desc: Some(d), args, extra: Vec::new() };
+        let mut call = Call { op: desc.op, desc: Some(d), args, extra: Vec::new(), failed: false };
         calls.fit_arrays(&mut call, |ty| self.gen_value(ty, state));
         calls.fix_lens(&mut call);
         call
@@ -265,13 +279,15 @@ impl Mutator {
         if self.next() % 10 != 0 {
             calls.fix_lens(&mut p[i]);
         }
+        // Other arguments: it may not fail now.
+        p[i].failed = false;
     }
 
     /// Replace the program from a point with `donor`'s calls from a
     /// point; their resources that name no live slot then name one (most
     /// of the time).
-    fn splice(&mut self, calls: &Calls, p: &mut Vec<Call>, donor: &[u8]) {
-        let tail = calls.decode(donor);
+    fn splice(&mut self, calls: &Calls, p: &mut Vec<Call>, donor: (&[u8], &[u32])) {
+        let tail = calls.decode_run(donor.0, donor.1);
         if tail.is_empty() {
             return;
         }
@@ -283,6 +299,38 @@ impl Mutator {
             self.fix_resources(calls, &mut call, &state);
             state.apply(calls, &call);
             p.push(call);
+        }
+    }
+
+    /// Failed calls' resource arguments that name no live slot (a producer
+    /// failed, a slot closed, none filled) point at a live one
+    /// (`fix_resources`): the calls may not fail now. Before the first one
+    /// whose first resource (its handle) is of a kind no slot holds, a
+    /// producer of it (and its own). Corpus
+    /// programs keep such calls otherwise: each child fails them again.
+    pub(crate) fn repair(&mut self, calls: &Calls, p: &mut Vec<Call>) {
+        let mut state = Slots::default();
+        let mut inserted = 0;
+        let mut i = 0;
+        while i < p.len() {
+            if p[i].failed {
+                let first = calls.uses(&p[i]).into_iter().find(|u| u.dir != Dir::Out);
+                let missing = first.filter(|u| state.live(u.kind).is_empty()).map(|u| u.kind.to_string());
+                if let (true, Some(kind)) = (inserted < REPAIR_INSERTS, missing) {
+                    let producers = calls.producers.get(&kind).map_or(&[][..], Vec::as_slice);
+                    if !producers.is_empty() {
+                        let q = producers[self.choose(producers.len())];
+                        i = self.place(calls, p, i, q, 1);
+                        state = Slots::after(calls, &p[..i]);
+                        inserted += 1;
+                    }
+                }
+                let args = p[i].args.clone();
+                self.fix_resources(calls, &mut p[i], &state);
+                p[i].failed = p[i].args == args;
+            }
+            state.apply(calls, &p[i]);
+            i += 1;
         }
     }
 
@@ -353,8 +401,9 @@ impl Mutator {
     }
 
     /// A slot of the resource's kind. Used: most often a live one (the
-    /// latest half the time), sometimes a closed one or any (never
-    /// filled), or a value inline. Filled: mostly a free slot.
+    /// latest half the time), sometimes a dead one (closed, or its
+    /// producer failed) or any, or a value inline. Filled: mostly a free
+    /// slot.
     fn gen_res(&mut self, ty: &Type, state: &Slots) -> Value {
         let Type::Res { kind, dir, slots, tag, inline, .. } = ty else { return Value::Res(0, None) };
         let slots = *slots;
@@ -369,7 +418,7 @@ impl Mutator {
                     r if r < 85 && !live.is_empty() => {
                         if r < 45 { live[live.len() - 1] } else { live[self.choose(live.len())] }
                     }
-                    r if r < 93 && !closed.is_empty() => closed[self.choose(closed.len())],
+                    85..=92 if !closed.is_empty() => closed[self.choose(closed.len())],
                     _ => self.choose(usize::from(slots)) as u8,
                 }
             }
@@ -527,7 +576,7 @@ mod tests {
         m.describe(c.clone(), std::slice::from_ref(&seed));
         let (mut live, mut all, mut differ) = (0, 0, 0);
         for _ in 0..2000 {
-            let out = m.mutate_program(&c, &seed, &seed);
+            let out = m.mutate_program(&c, (&seed, &[]), (&seed, &[]));
             assert_eq!(sequence(&crate::calls(&out)), out, "whole calls");
             differ += usize::from(out != seed);
             let (l, a) = live_share(&c, &out);
@@ -537,6 +586,90 @@ mod tests {
         assert!(differ > 1900, "{differ}");
         let share = live as f64 / all as f64;
         assert!((0.75..0.99).contains(&share), "{share}");
+    }
+
+    /// Log 1, area 2 on it (failed), an append and a read on the area.
+    fn failed_area() -> (Vec<u8>, Vec<u32>) {
+        let seed = sequence(&[(0, vec![1, 0]), (3, vec![1, 2, 0, 16, 0, 0]), (4, vec![2, 0, 3, 0, b'x']), (6, vec![2, 3])]);
+        (seed, vec![0, 3 << 24 | 87, 4 << 24 | 6, 6 << 24 | 6])
+    }
+
+    #[test]
+    fn calls_inserted_after_a_failed_producer_get_their_own() {
+        let c = sample();
+        let (seed, results) = failed_area();
+        let read = c.descs.iter().position(|d| d.name == "read").unwrap();
+        let mut m = Mutator::new(3, 4096);
+        let areas = |p: &[Call]| p.iter().filter(|call| c.descs[call.desc.unwrap()].name == "area").count();
+        let mut live = 0;
+        for _ in 0..100 {
+            let mut p = c.decode_run(&seed, &results);
+            m.place(&c, &mut p, 4, read, 0);
+            assert_eq!(areas(&p), 2, "{:?}", c.show(&p));
+            let state = Slots::after(&c, &p[..p.len() - 1]);
+            let u = c.uses(p.last().unwrap())[0];
+            live += usize::from(state.live(u.kind).contains(&u.slot));
+            // Not known to fail: area 2 does.
+            let mut p = c.decode(&seed);
+            m.place(&c, &mut p, 4, read, 0);
+            assert_eq!(areas(&p), 1, "{:?}", c.show(&p));
+        }
+        assert!(live > 75, "the read's area is the new one: {live}");
+    }
+
+    #[test]
+    fn slots_of_failed_producers_are_used_now_and_then() {
+        let c = sample();
+        // Area 4, then area 2 (failed) and its uses.
+        let seed = sequence(&[(0, vec![1, 0]), (3, vec![1, 4, 0, 16, 0, 0]), (3, vec![1, 2, 0, 16, 0, 0]), (4, vec![2, 0, 3, 0, b'x']), (6, vec![2, 3])]);
+        let results = [0, 3 << 24, 3 << 24 | 87, 4 << 24 | 6, 6 << 24 | 6];
+        let ty = &c.descs.iter().find(|d| d.name == "read").unwrap().args[0].ty;
+        let mut m = Mutator::new(5, 4096);
+        let mut share = |p: &[Call]| {
+            let state = Slots::after(&c, p);
+            (0..1000).filter(|_| m.gen_value(ty, &state) == Value::Res(2, None)).count()
+        };
+        // 8% dead slots, 7% any (one in 8 is area 2).
+        let dead = share(&c.decode_run(&seed, &results));
+        assert!((40..150).contains(&dead), "{dead}");
+        // Live and the latest: about two times in three.
+        let live = share(&c.decode(&seed));
+        assert!(live > 550, "{live}");
+    }
+
+    #[test]
+    fn failed_calls_on_dead_slots_are_repaired_mostly() {
+        let c = sample();
+        // Area 4, then area 2 (failed), an append and a read on area 2
+        // (failed), a read on area 4.
+        let seed = sequence(&[(0, vec![1, 0]), (3, vec![1, 4, 0, 16, 0, 0]), (3, vec![1, 2, 0, 16, 0, 0]), (4, vec![2, 0, 3, 0, b'x']), (6, vec![2, 3]), (6, vec![4, 3])]);
+        let results = [0, 3 << 24, 3 << 24 | 87, 4 << 24 | 87, 6 << 24 | 87, 6 << 24];
+        let mut m = Mutator::new(13, 4096);
+        let mut repaired = 0;
+        for _ in 0..200 {
+            let mut p = c.decode_run(&seed, &results);
+            m.repair(&c, &mut p);
+            assert_eq!(c.show(&p[..3]), c.show(&c.decode(&seed)[..3]), "the failed area has no dead slot to fix");
+            assert_eq!(p[5].args[0], Value::Res(4, None), "calls that succeeded stay");
+            for call in &p[3..5] {
+                let fixed = call.args[0] == Value::Res(4, None);
+                assert_eq!(call.failed, !fixed);
+                repaired += usize::from(fixed);
+            }
+        }
+        assert!((280..360).contains(&repaired), "4 in 5: {repaired}");
+        // No area at all: one comes first.
+        let (seed, results) = failed_area();
+        let mut repaired = 0;
+        for _ in 0..200 {
+            let mut p = c.decode_run(&seed, &results);
+            m.repair(&c, &mut p);
+            let names: Vec<&str> = p.iter().map(|call| c.descs[call.desc.unwrap()].name.as_str()).collect();
+            assert_eq!(names, ["open", "area", "area", "append", "read"]);
+            let state = Slots::after(&c, &p[..3]);
+            repaired += usize::from(state.live("area").contains(&c.uses(&p[3])[0].slot));
+        }
+        assert!(repaired > 140, "{repaired}");
     }
 
     #[test]
@@ -549,7 +682,7 @@ mod tests {
         let (mut live, mut all) = (0, 0);
         for _ in 0..500 {
             let mut p = c.decode(&seed);
-            m.splice(&c, &mut p, &donor);
+            m.splice(&c, &mut p, (&donor, &[]));
             let (l, a) = live_share(&c, &c.encode(&p));
             live += l;
             all += a;

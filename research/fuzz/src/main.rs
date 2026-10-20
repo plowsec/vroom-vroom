@@ -303,7 +303,7 @@ fn main() -> Result<()> {
             for _ in 0..count {
                 match &h {
                     Some(h) if h.sequence => {
-                        for line in vroom_fuzz::calls::show(calls.as_ref(), &m.mutate_sequence(&data, &data)) {
+                        for line in vroom_fuzz::calls::show(calls.as_ref(), &m.mutate_sequence((&data, &[]), (&data, &[]))) {
                             println!("{line}");
                         }
                         println!();
@@ -810,6 +810,22 @@ fn master_hub(h: &Harness, output: &Path, listener: std::net::TcpListener) -> Re
 /// Worker restarts a fleet makes at most (a crash loop stops there).
 const MAX_RESTARTS: usize = 20;
 
+/// Start again the workers that failed (a crash: the campaign goes on
+/// without their share otherwise), from their own corpus, until
+/// `MAX_RESTARTS` in all.
+fn restart_failed(children: &mut [std::process::Child], spawn: &dyn Fn(usize) -> Result<std::process::Child>, restarts: &mut usize) -> Result<()> {
+    for (i, child) in children.iter_mut().enumerate() {
+        if let Ok(Some(status)) = child.try_wait() {
+            if !status.success() && *restarts < MAX_RESTARTS {
+                *restarts += 1;
+                eprintln!("worker {i} ended with {status}; starting it again ({restarts} of {MAX_RESTARTS})");
+                *child = spawn(i)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Run a master until its duration, `q`, or (for a fleet) the end of every
 /// local worker; then stop the workers and save.
 fn supervise(
@@ -863,24 +879,14 @@ fn supervise(
                 );
             }
         }
-        if stop.load(Ordering::Relaxed)
-            || duration_secs.is_some_and(|d| started.elapsed() >= Duration::from_secs(d))
-            || all_exited(&mut children)
-        {
+        if stop.load(Ordering::Relaxed) || duration_secs.is_some_and(|d| started.elapsed() >= Duration::from_secs(d)) {
             break;
         }
-        // A worker that failed (a crash: the campaign goes on without
-        // its share otherwise) starts again, from its own corpus.
         if let (Some(children), Some(spawn)) = (children.as_mut(), spawn) {
-            for (i, child) in children.iter_mut().enumerate() {
-                if let Ok(Some(status)) = child.try_wait() {
-                    if !status.success() && restarts < MAX_RESTARTS {
-                        restarts += 1;
-                        eprintln!("worker {i} ended with {status}; starting it again ({restarts} of {MAX_RESTARTS})");
-                        *child = spawn(i)?;
-                    }
-                }
-            }
+            restart_failed(children, spawn, &mut restarts)?;
+        }
+        if all_exited(&mut children) {
+            break;
         }
     }
     lock(hub).stop = true;
@@ -1097,5 +1103,29 @@ mod tests {
     fn command_line_is_consistent() {
         use clap::CommandFactory;
         super::Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn workers_that_fail_together_start_again() {
+        let run = |code: &str| std::process::Command::new("sh").arg("-c").arg(code).spawn().unwrap();
+        let mut children = vec![run("exit 1"), run("exit 1"), run("exit 0")];
+        for child in &mut children {
+            child.wait().unwrap();
+        }
+        let spawn = |_: usize| Ok(run("sleep 30"));
+        let mut restarts = 0;
+        super::restart_failed(&mut children, &spawn, &mut restarts).unwrap();
+        assert_eq!(restarts, 2);
+        assert!(children[..2].iter_mut().all(|c| c.try_wait().unwrap().is_none()), "the failed ones run again");
+        assert!(children[2].try_wait().unwrap().is_some(), "a worker that finished stays finished");
+        for child in &mut children[..2] {
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+        let mut children = vec![run("exit 1")];
+        children[0].wait().unwrap();
+        let mut restarts = super::MAX_RESTARTS;
+        super::restart_failed(&mut children, &spawn, &mut restarts).unwrap();
+        assert!(children[0].try_wait().unwrap().is_some(), "no more restarts past the limit");
     }
 }

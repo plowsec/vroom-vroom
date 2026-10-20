@@ -119,13 +119,16 @@ pub enum Value {
 }
 
 /// A call of a program: its description (`None`: no description fits;
-/// the payload is all in `extra`), arguments, and bytes past them.
+/// the payload is all in `extra`), arguments, and bytes past them;
+/// `failed`: it returned an error when the program last ran (its outputs
+/// hold nothing).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Call {
     pub op: u32,
     pub desc: Option<usize>,
     pub args: Vec<Value>,
     pub extra: Vec<u8>,
+    pub failed: bool,
 }
 
 /// A use of a resource slot by an argument.
@@ -292,10 +295,10 @@ impl Calls {
     pub fn decode_call(&self, op: u32, payload: &[u8]) -> Call {
         for &d in self.by_op.get(&op).map(Vec::as_slice).unwrap_or(&[]) {
             if let Some((args, extra)) = self.decode_with(d, payload) {
-                return Call { op, desc: Some(d), args, extra };
+                return Call { op, desc: Some(d), args, extra, failed: false };
             }
         }
-        Call { op, desc: None, args: Vec::new(), extra: payload.to_vec() }
+        Call { op, desc: None, args: Vec::new(), extra: payload.to_vec(), failed: false }
     }
 
     fn decode_with(&self, d: usize, payload: &[u8]) -> Option<(Vec<Value>, Vec<u8>)> {
@@ -363,6 +366,17 @@ impl Calls {
 
     pub fn decode(&self, input: &[u8]) -> Vec<Call> {
         crate::calls(input).into_iter().map(|(op, payload)| self.decode_call(op, &payload)).collect()
+    }
+
+    /// `input` as calls, each `failed` as `results` say (the client's word
+    /// per call: op in the top byte, the error below; a word for another op
+    /// ends them).
+    pub fn decode_run(&self, input: &[u8], results: &[u32]) -> Vec<Call> {
+        let mut p = self.decode(input);
+        for (call, &r) in p.iter_mut().zip(results).take_while(|(c, &r)| r >> 24 == c.op & 0xff) {
+            call.failed = r & 0xff_ffff != 0;
+        }
+        p
     }
 
     pub fn encode_call(&self, call: &Call) -> (u32, Vec<u8>) {
@@ -503,7 +517,8 @@ fn show_value(ty: &Type, v: &Value) -> String {
 }
 
 /// Which slots of each kind hold something at a point of a program:
-/// filled by an earlier call (`live`), closed since, or neither.
+/// filled by an earlier call (`live`), dead (closed since, or the call
+/// filling it failed), or neither.
 #[derive(Debug, Clone, Default)]
 pub struct Slots {
     /// Live slots per kind, most recently filled last.
@@ -526,12 +541,12 @@ impl Slots {
             let closed = self.closed.entry(u.kind.to_string()).or_default();
             match u.dir {
                 Dir::In => {}
-                Dir::Out => {
+                Dir::Out if !call.failed => {
                     live.retain(|&s| s != u.slot);
                     live.push(u.slot);
                     closed.retain(|&s| s != u.slot);
                 }
-                Dir::Close => {
+                Dir::Out | Dir::Close => {
                     live.retain(|&s| s != u.slot);
                     if !closed.contains(&u.slot) {
                         closed.push(u.slot);
@@ -664,6 +679,23 @@ pub(crate) mod tests {
         assert_eq!(s.live("area"), [1]);
         assert_eq!(s.live("lsn"), [15], "a fixed output");
         assert_eq!(c.producers["lsn"].iter().map(|&d| c.descs[d].op).collect::<Vec<_>>(), [4, 6]);
+    }
+
+    #[test]
+    fn failed_producers_fill_no_slot() {
+        let c = sample();
+        let input = sequence(&[(0, vec![1, 0]), (3, vec![1, 2, 0, 16, 0, 0]), (3, vec![1, 4, 0, 16, 0, 0]), (6, vec![2, 3])]);
+        // The first area and the read fail (87, 6).
+        let p = c.decode_run(&input, &[0, 3 << 24 | 87, 3 << 24, 6 << 24 | 6]);
+        assert_eq!(p.iter().map(|call| call.failed).collect::<Vec<_>>(), [false, true, false, true]);
+        let s = Slots::after(&c, &p);
+        assert_eq!(s.live("area"), [4]);
+        assert_eq!(s.closed("area"), [2]);
+        assert!(s.live("lsn").is_empty(), "the read's fixed output");
+        // Words for other ops are another program's: from there, not known.
+        let p = c.decode_run(&input, &[0, 3 << 24 | 87, 7 << 24 | 87, 6 << 24 | 6]);
+        assert_eq!(p.iter().map(|call| call.failed).collect::<Vec<_>>(), [false, true, false, false]);
+        assert!(c.decode_run(&input, &[]).iter().all(|call| !call.failed));
     }
 
     #[test]

@@ -144,7 +144,9 @@ Typed mutation (85% of a described sequence's; 15% byte-level, as without descri
 - arguments by type: values, boundaries, cmplog words, ±1–16, bit flips; bytes byte-mutated, regenerated, resized
 - a call inserted (half at the end), after producers for the kinds no slot holds yet (≤3 deep); removed, duplicated, swapped, replaced
 - splice: another input's calls from a point; their resources naming no live slot point at one (4 in 5)
-- resources used: a live slot 85% (the latest half of that), else a closed one, any (never filled), or a value inline (15%); filled: a free slot 70%
+- resources used: a live slot 85% (the latest half of that), else a dead one 8% (closed, or its producer failed), any (never filled), or a value inline (15%); filled: a free slot 70%
+- runtime results: the client's word per call at `stop_pc` (op in the top byte, Win32 error below), kept per corpus input (imported ones run once for it); a call that failed fills no slot
+- repair (90% of mutations of a program with failed calls): failed calls' resources naming no live slot point at one (4 in 5); before a failed call whose handle (first resource) has no live slot, a producer (≤4 a program)
 - over 48 calls: half the insertions become removals
 - which call to insert: syzkaller's choice table, static (shared resource kinds) × dynamic (calls within 8 of each other in the corpus), rows 10–1000; relearned every 500 inputs once the corpus grew; 1 in 10 any call
 

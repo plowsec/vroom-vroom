@@ -75,6 +75,9 @@ pub struct Campaign {
     corpus_energy: Vec<u32>,
     /// Each corpus input's last run time (µs; 0: not run here yet).
     corpus_us: Vec<u64>,
+    /// A sequence's calls' results when it last ran here (empty: not run
+    /// here yet, or no results).
+    corpus_calls: Vec<Vec<u32>>,
     corpus_hashes: BTreeSet<String>,
     scheduled: VecDeque<Vec<u8>>,
     /// Corpus inputs whose comparisons haven't been logged yet.
@@ -191,6 +194,7 @@ impl Campaign {
             fixed_prefix,
             corpus_inputs,
             corpus_us: vec![0; corpus_energy.len()],
+            corpus_calls: vec![Vec::new(); corpus_energy.len()],
             corpus_energy,
             corpus_hashes,
             scheduled,
@@ -306,7 +310,9 @@ impl Campaign {
             }
             let parent = &self.corpus_inputs[parent_index];
             if self.engine().harness.sequence {
-                let donor = &self.corpus_inputs[self.mutator.choose(self.corpus_inputs.len())];
+                let d = self.mutator.choose(self.corpus_inputs.len());
+                let parent = (parent.as_slice(), self.corpus_calls[parent_index].as_slice());
+                let donor = (self.corpus_inputs[d].as_slice(), self.corpus_calls[d].as_slice());
                 self.mutator.mutate_sequence(parent, donor)
             } else if self.prefix_len == 4 && self.fixed_prefix.is_none() {
                 self.mutator.mutate_ioctl(parent)
@@ -315,6 +321,12 @@ impl Campaign {
             }
         };
         let result = self.engine_mut().run_input(&input)?;
+        if selected_parent.is_none() && !result.calls.is_empty() {
+            // A corpus input run again (a resumed or imported one).
+            if let Some(i) = self.corpus_inputs.iter().position(|c| *c == input) {
+                self.corpus_calls[i] = result.calls.clone();
+            }
+        }
         let mut new_signatures = Vec::new();
         for finding in &result.findings {
             let signature = signature(finding);
@@ -340,6 +352,7 @@ impl Campaign {
                 self.corpus_inputs.push(input.clone());
                 self.corpus_energy.push(score);
                 self.corpus_us.push(result.elapsed_us);
+                self.corpus_calls.push(result.calls.clone());
             } else if let Some(index) = self
                 .corpus_inputs
                 .iter()
@@ -421,6 +434,7 @@ impl Campaign {
                 self.corpus_inputs.remove(i);
                 self.corpus_energy.remove(i);
                 self.corpus_us.remove(i);
+                self.corpus_calls.remove(i);
                 self.store.remove_input(&input)?;
             }
         }
@@ -496,9 +510,14 @@ impl Campaign {
             (1 + new_blocks as u32 * 16 + new_edges as u32 * 4 + new_findings as u32 * 8).min(256);
         self.store.save_input(&entry.data, new_blocks)?;
         self.corpus_hashes.insert(entry.hash);
+        if !self.engine().harness.calls.is_empty() {
+            // Run once for its calls' results (typed mutation's slots).
+            self.scheduled.push_back(entry.data.clone());
+        }
         self.corpus_inputs.push(entry.data);
         self.corpus_energy.push(score);
         self.corpus_us.push(0);
+        self.corpus_calls.push(Vec::new());
         Ok(())
     }
 

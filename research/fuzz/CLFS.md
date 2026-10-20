@@ -83,11 +83,17 @@ Cmplog's extra blocks: the management IOCTLs (`ClfsMgmtDispatchIo`, managed-log 
 
 First night (3 workers, ~8 h, resumed sessions; seeds also `rich2.bin`: ops 15-25, `rich3.bin`: an overlapped log): 6763 blocks (~1000 more are the kernel-mode marshalling API, unreachable from user mode), 40-60 programs/s. One finding: `CClfsManagedLogClientUser::QueryRegistration` reads `0x28` (a NULL client) on management IOCTLs `0x80077018` then `0x8007b020` on a fresh log, swallowed by CLFS's own `__except`, caught at first chance; 98-byte reproducer in `runs/night/triage/`.
 
-Typed mutation (`calls_file`), 30 min, 2 workers, `--no-cmplog`, a fresh output seeded with the night's 593 inputs (6797 blocks); same binary, harness with and without `calls_file`:
+Typed mutation (`calls_file`), 30 min, 2 workers, `--no-cmplog`, a fresh output seeded with the night's 593 inputs (6797 blocks); harness with and without `calls_file`, then later builds. Calls ok and errors: the workers' `VROOM_FUZZ_TRACE` `stop_pc` lines past each one's first 300 (the corpus), errors of all calls:
 
-| | execs | blocks after the corpus → 30 min | new vs the night | corpus | calls ok (ops 0–25) | error 87 / 6 |
+| | execs | blocks at 5 / 10 / 20 / 30 min | new vs the night | corpus | calls ok (ops 0–25) | error 87 / 6 |
 |---|---|---|---|---|---|---|
-| bytes (no descriptions) | 43.2k | 6795 → 6803 (+8) | 6 | +6 | 51.9% | 21.3% / 9.9% |
-| typed | 41.7k | 6807 → 6861 (+54) | 68 | +31 | 53.4% | 20.0% / 8.2% |
+| bytes (no descriptions) | 43.2k | 6795 / 6796 / 6802 / 6803 | 6 | +6 | 52.0% | 21.3% / 9.8% |
+| typed (846399c) | 41.7k | 6819 / 6838 / 6858 / 6861 | 68 | +31 | 53.5% | 20.0% / 8.2% |
+| + runtime results: a failed call fills no slot | 48.3k | 6810 / 6831 / 6851 / 6868 | 75 | +36 | 52.7% | 20.9% / 8.3% |
+| + repair 50%, retarget only | 50.2k | 6819 / 6828 / 6840 / 6854 | 62 | +23 | 54.2% | 20.1% / 8.1% |
+| + repair 50%, one producer inserted | 54.7k | 6832 / 6833 / 6848 / 6859 | 66 | +28 | 53.0% | 20.3% / 8.2% |
+| + repair 90%, ≤4 producers (committed) | 50.2k | 6806 / 6810 / 6833 / 6862 | 70 | +30 | 52.9% | 19.2% / 8.2% |
 
-Typed's new blocks: `AdjustReservation`, `ReserveAdjustment`, `ReadNotification`, `ReadMgmtNotificationDone`, `ClfsMgmtUserModeRegister`, `GetIoStatistics`. Calls ok barely moves: a mutation changes a few calls of a corpus program, the rest run as before; most 87s are calls on an area whose `CreateLogMarshallingArea` failed (static resource tracking counts it live).
+Typed's new blocks: `AdjustReservation`, `ReserveAdjustment`, `ReadNotification`, `ReadMgmtNotificationDone`, `ClfsMgmtUserModeRegister`, `GetIoStatistics`.
+
+Runtime results change neither calls ok nor coverage within 30 min (typed variants: 6854–6868, the noise between runs). The corpus programs' 87s (their `stop_pc` lines matched to inputs by op sequence, 80k calls): 89% are calls on an area that is dead (its `CreateLogMarshallingArea` failed) or never made, 64% with no area live at all (retargeting alone can't fix those: repair inserts producers). Offline, on the same programs: handle uses naming no live slot are 31% of parents', 24.5% of children's (one producer), 19% (≤4). Live, 87s only go 20.0% → 19.2%. Calls ok falls during every run (~55% at 10 min, ~53% at 30).
