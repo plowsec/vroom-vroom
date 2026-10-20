@@ -290,7 +290,9 @@ impl Campaign {
         let mut selected_parent = None;
         let input = if let Some(input) = self.scheduled.pop_front() {
             input
-        } else if self.options.repeat_seed {
+        } else if self.options.repeat_seed || self.corpus_inputs.is_empty() {
+            // An empty corpus: its inputs timed out when run again (a
+            // worker's seed too), the master's not imported yet.
             self.seed.clone()
         } else {
             let weights = speed_weights(&self.corpus_energy, &self.corpus_us);

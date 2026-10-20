@@ -82,3 +82,12 @@ $F triage $VM/clfs-harness.json $VM/runs/a/crashes/HASH-CLASS.bin --state-dir $V
 Cmplog's extra blocks: the management IOCTLs (`ClfsMgmtDispatchIo`, managed-log policies, container growth), archival and restart requests. Earlier: `append-read.bin` 36k (60/s), 4529. No findings.
 
 First night (3 workers, ~8 h, resumed sessions; seeds also `rich2.bin`: ops 15-25, `rich3.bin`: an overlapped log): 6763 blocks (~1000 more are the kernel-mode marshalling API, unreachable from user mode), 40-60 programs/s. One finding: `CClfsManagedLogClientUser::QueryRegistration` reads `0x28` (a NULL client) on management IOCTLs `0x80077018` then `0x8007b020` on a fresh log, swallowed by CLFS's own `__except`, caught at first chance; 98-byte reproducer in `runs/night/triage/`.
+
+Typed mutation (`calls_file`), 30 min, 2 workers, `--no-cmplog`, a fresh output seeded with the night's 593 inputs (6797 blocks); same binary, harness with and without `calls_file`:
+
+| | execs | blocks after the corpus → 30 min | new vs the night | corpus | calls ok (ops 0–25) | error 87 / 6 |
+|---|---|---|---|---|---|---|
+| bytes (no descriptions) | 43.2k | 6795 → 6803 (+8) | 6 | +6 | 51.9% | 21.3% / 9.9% |
+| typed | 41.7k | 6807 → 6861 (+54) | 68 | +31 | 53.4% | 20.0% / 8.2% |
+
+Typed's new blocks: `AdjustReservation`, `ReserveAdjustment`, `ReadNotification`, `ReadMgmtNotificationDone`, `ClfsMgmtUserModeRegister`, `GetIoStatistics`. Calls ok barely moves: a mutation changes a few calls of a corpus program, the rest run as before; most 87s are calls on an area whose `CreateLogMarshallingArea` failed (static resource tracking counts it live).
