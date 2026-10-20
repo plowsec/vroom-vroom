@@ -59,6 +59,8 @@ const CMP_PER_SITE: usize = 4;
 /// runs ~30 ms) fewer: its direct matches come first.
 const CMP_CANDIDATES: usize = 512;
 const CMP_SEQUENCE_CANDIDATES: usize = 128;
+/// Inputs between learning the call priorities again (a grown corpus).
+const PRIORITIES_EVERY: usize = 500;
 
 #[derive(Debug)]
 pub struct Campaign {
@@ -80,6 +82,9 @@ pub struct Campaign {
     /// Inputs comparison logging suggested, once each.
     cmp_tried: BTreeSet<String>,
     mutator: Mutator,
+    /// Corpus inputs and the iteration when the call priorities were last
+    /// learned.
+    priorities: (usize, usize),
     finding_novelty: BTreeSet<String>,
     iteration: usize,
     recoveries: usize,
@@ -165,7 +170,11 @@ impl Campaign {
                 }
             }
         }
-        let mutator = Mutator::new(0x0076_326f_6f6d_u64 ^ options.salt, engine.harness.max_input);
+        let mut mutator = Mutator::new(0x0076_326f_6f6d_u64 ^ options.salt, engine.harness.max_input);
+        if !engine.harness.calls.is_empty() {
+            mutator.describe(crate::calls::Calls::new(engine.harness.calls.clone())?, &corpus_inputs);
+        }
+        let priorities_corpus = corpus_inputs.len();
         let cmp_queue = VecDeque::from([seed.clone()]);
         let stats = InstanceStats {
             name: options.name.clone(),
@@ -188,6 +197,7 @@ impl Campaign {
             cmp_queue,
             cmp_tried: BTreeSet::new(),
             mutator,
+            priorities: (priorities_corpus, 0),
             finding_novelty: BTreeSet::new(),
             iteration: 0,
             recoveries: 0,
@@ -288,6 +298,10 @@ impl Campaign {
             selected_parent = Some(parent_index);
             self.corpus_energy[parent_index] =
                 self.corpus_energy[parent_index].saturating_sub(1).max(1);
+            if self.iteration >= self.priorities.1 + PRIORITIES_EVERY && self.corpus_inputs.len() != self.priorities.0 {
+                self.mutator.learn_priorities(&self.corpus_inputs);
+                self.priorities = (self.corpus_inputs.len(), self.iteration);
+            }
             let parent = &self.corpus_inputs[parent_index];
             if self.engine().harness.sequence {
                 let donor = &self.corpus_inputs[self.mutator.choose(self.corpus_inputs.len())];

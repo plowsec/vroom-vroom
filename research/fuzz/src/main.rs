@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use vroom_fuzz::campaign::{Campaign, CampaignOptions};
+use vroom_fuzz::calls::Calls;
 use vroom_fuzz::hub::Hub;
 use vroom_fuzz::sync::{Client, Hello, PROTOCOL};
 use vroom_fuzz::{
@@ -34,6 +35,17 @@ enum Command {
         max_len: usize,
         #[arg(long, default_value_t = 1)]
         count: usize,
+        /// Mutate as this harness's runs do (a sequence: by its calls'
+        /// descriptions); programs shown a call a line.
+        #[arg(long)]
+        harness: Option<PathBuf>,
+    },
+    /// Sequence inputs a call a line: names and arguments from the
+    /// harness's call descriptions (else op codes and payloads).
+    Show {
+        harness: PathBuf,
+        #[arg(required = true)]
+        inputs: Vec<PathBuf>,
     },
     /// Summarize a coverage map emitted by a run.
     Coverage { map: PathBuf, blocks: PathBuf },
@@ -276,12 +288,40 @@ fn main() -> Result<()> {
             seed,
             max_len,
             count,
+            harness,
         } => {
             let data = std::fs::read(seed)?;
-            let mut m = Mutator::new(0x0076_326f_6f6d_u64, max_len);
+            let h = harness.map(|h| Harness::load(&h)).transpose()?;
+            let calls = match &h {
+                Some(h) if !h.calls.is_empty() => Some(Calls::new(h.calls.clone())?),
+                _ => None,
+            };
+            let mut m = Mutator::new(0x0076_326f_6f6d_u64, h.as_ref().map_or(max_len, |h| h.max_input));
+            if let Some(c) = &calls {
+                m.describe(c.clone(), std::slice::from_ref(&data));
+            }
             for _ in 0..count {
-                let out = m.mutate(&data);
-                println!("{}", hex::encode(out));
+                match &h {
+                    Some(h) if h.sequence => {
+                        for line in vroom_fuzz::calls::show(calls.as_ref(), &m.mutate_sequence(&data, &data)) {
+                            println!("{line}");
+                        }
+                        println!();
+                    }
+                    _ => println!("{}", hex::encode(m.mutate(&data))),
+                }
+            }
+        }
+        Command::Show { harness, inputs } => {
+            let h = Harness::load(&harness)?;
+            let calls = if h.calls.is_empty() { None } else { Some(Calls::new(h.calls)?) };
+            for input in &inputs {
+                if inputs.len() > 1 {
+                    println!("# {}", input.display());
+                }
+                for (i, line) in vroom_fuzz::calls::show(calls.as_ref(), &std::fs::read(input)?).iter().enumerate() {
+                    println!("{i:>3}  {line}");
+                }
             }
         }
         Command::Coverage { map, blocks } => {
@@ -935,6 +975,9 @@ fn fleet(args: FleetArgs) -> Result<()> {
         }
         if args.fuzz.repeat_seed {
             command.arg("--repeat-seed");
+        }
+        if args.fuzz.no_cmplog {
+            command.arg("--no-cmplog");
         }
         if hub.is_none() {
             if let Some(seconds) = args.fuzz.duration_secs {

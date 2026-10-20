@@ -19,6 +19,8 @@ vroom-fuzz cmplog harness.json input.bin                        # one input's co
 vroom-fuzz coverage runs/a/coverage.json runs/a/blocks.json     # per-function summary
 vroom-fuzz trace harness.json runs/a/crashes/<hash>-BugCheck.bin --blocks all-blocks.json   # replay, symbolized
 vroom-fuzz triage harness.json runs/a/crashes/<hash>-BugCheck.bin   # reproduce + minimize
+vroom-fuzz show harness.json runs/a/inputs/<hash>.bin          # a sequence, a call a line
+vroom-fuzz mutate seed.bin --harness harness.json --count 5    # mutations as runs make them, no VM
 vroom-fuzz blocks clfs.sys --base 0xfffff804000d0000 --output blocks.json   # block list from the driver file
 ```
 
@@ -28,7 +30,7 @@ vroom-fuzz blocks clfs.sys --base 0xfffff804000d0000 --output blocks.json   # bl
 | `--budget N` | executions for minimizing (2000); `0` doesn't |
 | `--out FILE`, `--min FILE` | default `<input>.triage.json`, `<input>.min.bin` |
 
-Triage: the most frequent first finding over the runs is the one; minimizing keeps each change that still makes its signature: shortest prefix, zeroed spans (64, 8 bytes), dropped chunks, zeroed bytes. The IOCTL prefix stays. Candidates time out at 20× the input's run (≥250 ms). Report: `signature`, `reproduced`/`runs`, every signature seen, `finding`, lengths, executions. HEVD stack overflow: 2308 → 2096 bytes, 4 non-zero, ~11 s.
+Triage: the most frequent first finding over the runs is the one; minimizing keeps each change that still makes its signature. Sequences first: shortest call prefix, each call dropped (last first), then (described calls) arguments simpler by type: ints and inline values 0, flags fewer, bytes empty or halved, array elements 0, no bytes past the arguments; resource slots and lens stay. Then bytes: shortest prefix, zeroed spans (64, 8 bytes), dropped chunks, zeroed bytes. The IOCTL prefix stays. Candidates time out at 20× the input's run (≥250 ms). Report: `signature`, `reproduced`/`runs`, every signature seen, `finding`, lengths, executions, `program` (sequences: the minimized one, as `show` prints it). HEVD stack overflow: 2308 → 2096 bytes, 4 non-zero, ~11 s.
 
 | `trace` flag | |
 |---|---|
@@ -83,6 +85,7 @@ Kernel TUI: `coverage runs/a/coverage.json`, `coverage-diff runs/a/coverage.json
 | `target` | module under test (`clfs.sys`); default the image of `entry_pc` |
 | `entries` | client: ≤3 target functions its calls enter by (IRP dispatch), names from the block list (substring); cmplog steps from there. None: from the first new block the client's thread reaches |
 | `sequence` | input = calls `u32 code \| u16 length \| payload` for a client; mutations insert, drop, repeat, swap, splice calls |
+| `calls` / `calls_file` | a sequence's call descriptions (below): typed mutation, call-aware triage, `show`. File relative to the harness |
 | `bugcheck_pc` | `KeBugCheckEx` VA: crash = finding + in-place reset (~1 ms, not ~11 s); 5th HW breakpoint |
 | `reset_is_bugcheck` | guest reset counts as a bugcheck |
 | `reopen_after` | `0` reset in place, `1` restore from disk every input |
@@ -97,7 +100,7 @@ Kernel TUI: `coverage runs/a/coverage.json`, `coverage-diff runs/a/coverage.json
 ## Notes
 
 - `VROOM_COW_VERIFY=1`: after each reset, check RAM, untouched devices and GIC registers against the snapshot (~1 s each).
-- `VROOM_FUZZ_TRACE=1`: per-stop trace on stderr; `=slow`: run loop iterations over 200 ms; `=2`: every debug stop.
+- `VROOM_FUZZ_TRACE=1`: per-stop trace on stderr (a client's per-call results at `stop_pc`, a word per call); `=slow`: run loop iterations over 200 ms; `=2`: every debug stop.
 - `VROOM_RESET_PROFILE=1`: each reset's phases (dirty log, copy back, icache, disks, GIC, devices, vCPUs) and devices restored over 0.2 ms.
 - `series.jsonl` (master, a row a minute): coverage, execs, corpus, findings; per worker exec and reset ms, restores, timeouts, comparison logs, live.
 - Resume: same `--output`. Workers run their corpus first (dropping inputs that time out), the master learns its coverage again; a failed worker restarts (20 times at most).
@@ -121,6 +124,29 @@ C:\HEVD-Lab\HevdFuzzClient.exe 0x222003 1
 ## Clients, sequences
 
 Stateful drivers (CLFS): the snapshot stands in a user-mode client parked in a loop; each input is a program of calls it makes (`sequence`), the whole guest running; the input ends at the client's `stop_pc`. Coverage is the target's blocks (`blocks` mode, any thread); exceptions are the target's, any thread. Cmplog: from each entry into the target (`entries`). Example: [CLFS.md](CLFS.md).
+
+### Call descriptions
+
+`calls_file`: a JSON list, one entry per call: `op`, `name`, `args` (payload order), `outputs` (`{kind, slot}` filled without an argument). An op may have several entries (variants): a payload is the first whose `const`s and resource tags match. Past the payload's end the client reads zeros; bytes past the arguments are kept. Example: [clients/clfs/calls.json](clients/clfs/calls.json).
+
+| `type` | fields | |
+|---|---|---|
+| `int` | `size` 1/2/4/8, `min`, `max`, `modulo`, `values`, `names` | `modulo`: client takes `min + raw % (max-min+1)`; `values` tried first, `names` theirs |
+| `flags` | `size`, `values` | any OR |
+| `const` | `size`, `value`, `mask` / `modulo` | selects the variant |
+| `res` | `kind`, `dir` `in`/`out`/`close`, `slots`, `tag`, `tag_mask`, `inline` | one byte `slot \| tag`; `inline` N: bit 7 set, N value bytes follow |
+| `len` | `size`, `of` | byte length of the named args |
+| `array` | `len`, `elem` | as many elements as the earlier int `len` says |
+| `bytes` | `min`, `max` | the rest of the payload (last) |
+
+Typed mutation (85% of a described sequence's; 15% byte-level, as without descriptions):
+
+- arguments by type: values, boundaries, cmplog words, ±1–16, bit flips; bytes byte-mutated, regenerated, resized
+- a call inserted (half at the end), after producers for the kinds no slot holds yet (≤3 deep); removed, duplicated, swapped, replaced
+- splice: another input's calls from a point; their resources naming no live slot point at one (4 in 5)
+- resources used: a live slot 85% (the latest half of that), else a closed one, any (never filled), or a value inline (15%); filled: a free slot 70%
+- over 48 calls: half the insertions become removals
+- which call to insert: syzkaller's choice table, static (shared resource kinds) × dynamic (calls within 8 of each other in the corpus), rows 10–1000; relearned every 500 inputs once the corpus grew; 1 in 10 any call
 
 ## Blocks
 

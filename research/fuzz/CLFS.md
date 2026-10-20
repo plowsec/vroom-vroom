@@ -33,23 +33,7 @@ $R run guest.upload "{\"host_path\":\"$VM/shared/clfs-client.exe\",\"guest_path\
 $R run guest.exec '{"command":"rd /s /q C:\\clfs & start \"\" /b C:\\clfs-client.exe wait & ping -n 3 127.0.0.1 >nul & type C:\\clfs\\client.txt & tasklist /fi \"imagename eq clfs-client.exe\""}'
 ```
 
-| op | payload | call |
-|---|---|---|
-| 0 | slot, name, disposition, stream | `CreateLogFile("LOG:C:\clfs\l<name>[::s<stream>]")` |
-| 1 | log, name, size u32 (mod 8 MiB) | `AddLogContainer("C:\clfs\c<name>")` |
-| 2 | log, name, force | `RemoveLogContainer` |
-| 3 | log, slot, buffer size u32 (mod 1 MiB), writes, reads | `CreateLogMarshallingArea` |
-| 4 | area, flags, LSN slot, undo LSN, previous LSN, data | `ReserveAndAppendLog` |
-| 5 | area | `FlushLogBuffers` |
-| 6 | area, mode, LSN, next count | `ReadLogRecord` + `ReadNextLogRecord`… + `TerminateReadLog` |
-| 7 | slot (bit 7: area) | `CloseHandle` / `DeleteLogMarshallingArea` |
-| 8 | slot, which, LSN | `SetLogArchiveTail` / `AdvanceLogBase` / `TruncateLog` |
-| 9 | size u16, log | `GetLogFileInformation` |
-| 10 | log, code u32, output size u16, input | `DeviceIoControl` |
-| 11 | name, offset u32, bytes | write into `C:\clfs\l<name>.blf` (read when opened again) |
-| 12 | name | `DeleteLogFile` |
-| 13 | area, count, adjustment u32 (mod 8 MiB), free | `AllocReservedLog` / `FreeReservedLog` |
-| 14 | log, from, count, direction (bit 0: backward) | `CreateLogContainerScanContext` (the first containers) + `ScanLogContainers` (the next) + close |
+Ops 0–25 (34 calls with their variants), typed: [clients/clfs/calls.json](clients/clfs/calls.json), from `src/main.rs`'s payload reads. A client change that moves a payload changes it too.
 
 Call: `u32 op | u16 length | payload`. An LSN: a slot byte, or bit 7 set and 8 bytes. Slots are taken modulo their count; missing ones are null handles.
 
@@ -61,7 +45,7 @@ python3 research/fuzz/tools/client_harness.py --socket $VM/lab.sock --pid PID \
   --blocks clfs-blocks.json --output $VM/clfs-harness.json --sequence --entry LogIoDispatch@CClfsDriver
 ```
 
-Breaks at `entry_pc` (`park`) in the client's process, snapshots there (`$VM/clfs-windows-arm64.state/snapshots/clfs-park`), and writes the harness: `cpu` of the stop, `input_gpa`, the client's addresses, `bugcheck_pc`, `target`, `entries` (cmplog), blocks mode, no isolation, detectors `exceptions`, `bugcheck`, `timeout`; `config` and `state_dir` kept from an existing harness.
+Breaks at `entry_pc` (`park`) in the client's process, snapshots there (`$VM/clfs-windows-arm64.state/snapshots/clfs-park`), and writes the harness: `cpu` of the stop, `input_gpa`, the client's addresses, `bugcheck_pc`, `target`, `entries` (cmplog), blocks mode, no isolation, detectors `exceptions`, `bugcheck`, `timeout`; `config`, `state_dir` and `calls_file` kept from an existing harness. Call descriptions: `cp research/fuzz/clients/clfs/calls.json $VM/clfs-calls.json`, `"calls_file": "clfs-calls.json"`; `$F show $VM/clfs-harness.json FILE` prints a program.
 
 A rebuilt client moves its addresses: steps 2–3 again, after `vroom snapshot delete $VM/clfs-windows-arm64.toml clfs-park` (a CLI from 956acff on).
 

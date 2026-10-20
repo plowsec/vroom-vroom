@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use vroom_kernel::arm64::{AddressSpace, Registers};
 
 pub mod blocks;
+pub mod calls;
 pub mod campaign;
 pub mod cmplog;
 pub mod hub;
@@ -20,6 +21,7 @@ pub mod sync;
 pub mod trace;
 pub mod triage;
 pub mod tui;
+pub mod typed;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -188,6 +190,15 @@ pub struct Harness {
     /// calls.
     #[serde(default)]
     pub sequence: bool,
+    /// A sequence's calls described (`calls::CallDesc`: typed arguments,
+    /// resources): programs are then mutated by type and minimized by
+    /// call and argument.
+    #[serde(default)]
+    pub calls: Vec<calls::CallDesc>,
+    /// The descriptions from a file; relative paths are next to the
+    /// harness.
+    #[serde(default)]
+    pub calls_file: Option<PathBuf>,
     /// Hardware watched memory ranges. Use `poisoned` for allocator redzones
     /// or freed objects whose address is known from a target harness.
     #[serde(default)]
@@ -284,6 +295,16 @@ impl Harness {
                 path.parent().unwrap_or_else(|| Path::new(".")).join(blocks)
             };
             h.coverage = serde_json::from_slice(&fs::read(blocks)?)?;
+        }
+        if let Some(file) = &h.calls_file {
+            let file = if file.is_absolute() { file.clone() } else { path.parent().unwrap_or_else(|| Path::new(".")).join(file) };
+            h.calls = serde_json::from_slice(&fs::read(file)?)?;
+        }
+        if !h.calls.is_empty() {
+            if !h.sequence {
+                return Err(Error::Invalid("calls describe a sequence harness's calls".into()));
+            }
+            calls::Calls::new(h.calls.clone())?;
         }
         if h.name.trim().is_empty() || h.input_capacity == 0 {
             return Err(Error::Invalid(
@@ -663,6 +684,10 @@ pub struct Mutator {
     max_len: usize,
     /// Values the target compared inputs with (comparison logging).
     dictionary: Vec<u32>,
+    /// A sequence harness's call descriptions: programs mutate by type.
+    calls: Option<std::sync::Arc<calls::Calls>>,
+    /// Which call to insert after which, from the corpus.
+    table: Option<typed::ChoiceTable>,
 }
 
 /// The calls of a sequence input: (code, payload). A last call cut short
@@ -706,6 +731,22 @@ impl Mutator {
             state: seed | 1,
             max_len,
             dictionary: Vec::new(),
+            calls: None,
+            table: None,
+        }
+    }
+
+    /// Mutate sequences by type, with these descriptions; call pairs
+    /// weighted as in `corpus`.
+    pub fn describe(&mut self, calls: calls::Calls, corpus: &[Vec<u8>]) {
+        self.calls = Some(std::sync::Arc::new(calls));
+        self.learn_priorities(corpus);
+    }
+
+    /// Learn which call follows which again (syzkaller's choice table).
+    pub fn learn_priorities(&mut self, corpus: &[Vec<u8>]) {
+        if let Some(calls) = &self.calls {
+            self.table = Some(typed::ChoiceTable::new(calls, corpus));
         }
     }
 
@@ -751,10 +792,19 @@ impl Mutator {
         out
     }
     /// A mutation of the call sequence `seed` (see `Harness::sequence`):
-    /// a call's payload or code changes, or calls are inserted (from the
+    /// by type when the calls are described (`typed`), else (and
+    /// `typed::BYTE_SHARE` percent of the time) as bytes.
+    pub fn mutate_sequence(&mut self, seed: &[u8], donor: &[u8]) -> Vec<u8> {
+        match self.calls.clone() {
+            Some(calls) if self.next() % 100 >= typed::BYTE_SHARE => self.mutate_program(&calls, seed, donor),
+            _ => self.mutate_sequence_bytes(seed, donor),
+        }
+    }
+
+    /// A call's payload or code changes, or calls are inserted (from the
     /// seed or `donor`), dropped, repeated, swapped, or the tail replaced
     /// by `donor`'s. Whole calls past `max_len` are dropped.
-    pub fn mutate_sequence(&mut self, seed: &[u8], donor: &[u8]) -> Vec<u8> {
+    fn mutate_sequence_bytes(&mut self, seed: &[u8], donor: &[u8]) -> Vec<u8> {
         let mut calls = calls(seed);
         if calls.is_empty() {
             calls.push((0, Vec::new()));
@@ -2174,9 +2224,11 @@ impl Engine {
                     }
                     if self.harness.stop_pc == Some(stop.pc) {
                         if client && std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
-                            // What the client says (its first argument).
+                            // What the client says (its first argument):
+                            // a result per call of a sequence.
                             if let Ok(Ok(r)) = self.vm.debug_registers(stop.cpu as usize).map(|s| Registers::from_state(&s)) {
-                                let mut words = [0u8; 64];
+                                let count = if self.harness.sequence { calls(input).len() } else { 16 };
+                                let mut words = vec![0u8; 4 * count];
                                 let space = AddressSpace { memory: &self.vm, registers: &r };
                                 let _ = vroom_kernel::windows::VirtualMemory::read(&space, r.x[0], &mut words);
                                 eprintln!("stop_pc x0={:#x}: {}", r.x[0], words.chunks(4).map(|w| format!("{:08x}", u32::from_le_bytes(w.try_into().expect("four")))).collect::<Vec<_>>().join(" "));

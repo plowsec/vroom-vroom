@@ -1,0 +1,196 @@
+[
+  {"op": 0, "name": "CreateLogFile", "args": [
+    {"name": "slot", "type": "res", "kind": "log", "dir": "out", "slots": 8},
+    {"name": "name", "type": "int", "size": 1, "max": 3, "modulo": true},
+    {"name": "disposition", "type": "int", "size": 1, "min": 1, "max": 5, "modulo": true,
+     "values": [1, 2, 3, 4, 5], "names": ["create_new", "create_always", "open_existing", "open_always", "truncate_existing"]},
+    {"name": "stream", "type": "int", "size": 1, "max": 4, "values": [0], "names": ["none"]},
+    {"name": "overlapped", "type": "flags", "size": 1, "values": [1]}
+  ]},
+  {"op": 1, "name": "AddLogContainer", "args": [
+    {"name": "log", "type": "res", "kind": "log", "slots": 8},
+    {"name": "name", "type": "int", "size": 1, "max": 7, "modulo": true},
+    {"name": "size", "type": "int", "size": 4, "max": 8388607, "modulo": true, "values": [0, 524288, 1048576, 4194304, 8388607]}
+  ]},
+  {"op": 2, "name": "RemoveLogContainer", "args": [
+    {"name": "log", "type": "res", "kind": "log", "slots": 8},
+    {"name": "name", "type": "int", "size": 1, "max": 7, "modulo": true},
+    {"name": "force", "type": "flags", "size": 1, "values": [1]}
+  ]},
+  {"op": 3, "name": "CreateLogMarshallingArea", "args": [
+    {"name": "log", "type": "res", "kind": "log", "slots": 8},
+    {"name": "slot", "type": "res", "kind": "area", "dir": "out", "slots": 8},
+    {"name": "size", "type": "int", "size": 4, "max": 1048575, "modulo": true, "values": [0, 512, 4096, 65536, 524288]},
+    {"name": "writes", "type": "int", "size": 1, "max": 255, "values": [0, 1, 2, 8]},
+    {"name": "reads", "type": "int", "size": 1, "max": 255, "values": [0, 1, 2, 8]}
+  ]},
+  {"op": 4, "name": "ReserveAndAppendLog", "args": [
+    {"name": "area", "type": "res", "kind": "area", "slots": 8},
+    {"name": "flags", "type": "flags", "size": 1, "values": [1, 2, 4]},
+    {"name": "into", "type": "res", "kind": "lsn", "dir": "out", "slots": 16},
+    {"name": "undo", "type": "res", "kind": "lsn", "slots": 16, "inline": 8},
+    {"name": "previous", "type": "res", "kind": "lsn", "slots": 16, "inline": 8},
+    {"name": "data", "type": "bytes", "max": 1024}
+  ]},
+  {"op": 5, "name": "FlushLogBuffers", "args": [
+    {"name": "area", "type": "res", "kind": "area", "slots": 8}
+  ]},
+  {"op": 6, "name": "ReadLogRecord", "outputs": [{"kind": "lsn", "slot": 15}, {"kind": "lsn", "slot": 14}], "args": [
+    {"name": "area", "type": "res", "kind": "area", "slots": 8},
+    {"name": "mode", "type": "int", "size": 1, "min": 1, "max": 3, "modulo": true,
+     "values": [1, 2, 3], "names": ["undo_next", "previous", "forward"]},
+    {"name": "first", "type": "res", "kind": "lsn", "slots": 16, "inline": 8},
+    {"name": "more", "type": "int", "size": 1, "max": 7, "modulo": true}
+  ]},
+  {"op": 7, "name": "CloseHandle", "args": [
+    {"name": "log", "type": "res", "kind": "log", "dir": "close", "slots": 8, "tag_mask": 128}
+  ]},
+  {"op": 7, "name": "DeleteLogMarshallingArea", "args": [
+    {"name": "area", "type": "res", "kind": "area", "dir": "close", "slots": 8, "tag": 128, "tag_mask": 128}
+  ]},
+  {"op": 8, "name": "SetLogArchiveTail", "args": [
+    {"name": "log", "type": "res", "kind": "log", "slots": 8},
+    {"name": "which", "type": "const", "size": 1, "value": 0, "modulo": 3},
+    {"name": "tail", "type": "res", "kind": "lsn", "slots": 16, "inline": 8}
+  ]},
+  {"op": 8, "name": "AdvanceLogBase", "args": [
+    {"name": "area", "type": "res", "kind": "area", "slots": 8},
+    {"name": "which", "type": "const", "size": 1, "value": 1, "modulo": 3},
+    {"name": "base", "type": "res", "kind": "lsn", "slots": 16, "inline": 8}
+  ]},
+  {"op": 8, "name": "TruncateLog", "args": [
+    {"name": "area", "type": "res", "kind": "area", "slots": 8},
+    {"name": "which", "type": "const", "size": 1, "value": 2, "modulo": 3},
+    {"name": "end", "type": "res", "kind": "lsn", "slots": 16, "inline": 8}
+  ]},
+  {"op": 9, "name": "GetLogFileInformation", "args": [
+    {"name": "size", "type": "int", "size": 2, "max": 512, "modulo": true, "values": [0, 64, 256, 512]},
+    {"name": "log", "type": "res", "kind": "log", "slots": 8}
+  ]},
+  {"op": 10, "name": "DeviceIoControl", "args": [
+    {"name": "log", "type": "res", "kind": "log", "slots": 8},
+    {"name": "code", "type": "int", "size": 4, "values": [2147971096, 2147987488]},
+    {"name": "output", "type": "int", "size": 2, "max": 4096, "modulo": true, "values": [0, 8, 64, 512, 4096]},
+    {"name": "input", "type": "bytes", "max": 512}
+  ]},
+  {"op": 11, "name": "WriteBaseLogFile", "args": [
+    {"name": "name", "type": "int", "size": 1, "max": 3, "modulo": true},
+    {"name": "offset", "type": "int", "size": 4, "max": 1048575, "modulo": true, "values": [0, 112, 512, 1024, 2048, 32768]},
+    {"name": "data", "type": "bytes", "max": 512}
+  ]},
+  {"op": 12, "name": "DeleteLogFile", "args": [
+    {"name": "name", "type": "int", "size": 1, "max": 3, "modulo": true}
+  ]},
+  {"op": 13, "name": "AllocReservedLog", "args": [
+    {"name": "area", "type": "res", "kind": "area", "slots": 8},
+    {"name": "count", "type": "int", "size": 1, "max": 7, "modulo": true},
+    {"name": "adjustment", "type": "int", "size": 4, "max": 8388607, "modulo": true, "values": [0, 512, 4096, 65536]},
+    {"name": "free", "type": "const", "size": 1, "value": 0, "mask": 1}
+  ]},
+  {"op": 13, "name": "FreeReservedLog", "args": [
+    {"name": "area", "type": "res", "kind": "area", "slots": 8},
+    {"name": "count", "type": "int", "size": 1, "max": 7, "modulo": true},
+    {"name": "adjustment", "type": "int", "size": 4, "max": 8388607, "modulo": true, "values": [0, 512, 4096, 65536]},
+    {"name": "free", "type": "const", "size": 1, "value": 1, "mask": 1}
+  ]},
+  {"op": 14, "name": "ScanLogContainers", "args": [
+    {"name": "log", "type": "res", "kind": "log", "slots": 8},
+    {"name": "from", "type": "int", "size": 1, "max": 255, "values": [0, 1, 2, 7]},
+    {"name": "count", "type": "int", "size": 1, "min": 1, "max": 8, "modulo": true},
+    {"name": "backward", "type": "flags", "size": 1, "values": [1]}
+  ]},
+  {"op": 15, "name": "WriteLogRestartArea", "outputs": [{"kind": "lsn", "slot": 13}], "args": [
+    {"name": "area", "type": "res", "kind": "area", "slots": 8},
+    {"name": "flags", "type": "flags", "size": 1, "values": [1, 2, 4]},
+    {"name": "base", "type": "res", "kind": "lsn", "slots": 16, "inline": 8},
+    {"name": "data", "type": "bytes", "max": 512}
+  ]},
+  {"op": 16, "name": "ReadLogRestartArea", "outputs": [{"kind": "lsn", "slot": 12}], "args": [
+    {"name": "area", "type": "res", "kind": "area", "slots": 8},
+    {"name": "more", "type": "int", "size": 1, "max": 7, "modulo": true}
+  ]},
+  {"op": 17, "name": "PrepareLogArchive", "args": [
+    {"name": "log", "type": "res", "kind": "log", "slots": 8},
+    {"name": "low", "type": "res", "kind": "lsn", "slots": 16, "inline": 8},
+    {"name": "high", "type": "res", "kind": "lsn", "slots": 16, "inline": 8},
+    {"name": "extents", "type": "int", "size": 1, "max": 4, "modulo": true},
+    {"name": "offset", "type": "int", "size": 4, "max": 1048575, "modulo": true, "values": [0, 512, 1024, 2048]},
+    {"name": "length", "type": "int", "size": 2, "values": [0, 512, 4096]},
+    {"name": "bounds", "type": "flags", "size": 1, "values": [1, 2]}
+  ]},
+  {"op": 18, "name": "AddLogContainerSet", "args": [
+    {"name": "log", "type": "res", "kind": "log", "slots": 8},
+    {"name": "how", "type": "const", "size": 1, "value": 0, "mask": 1},
+    {"name": "count", "type": "int", "size": 1, "min": 1, "max": 4, "modulo": true},
+    {"name": "size", "type": "int", "size": 4, "max": 8388607, "modulo": true, "values": [0, 524288, 1048576]},
+    {"name": "names", "type": "array", "len": "count", "elem": {"type": "int", "size": 1, "max": 7, "modulo": true}}
+  ]},
+  {"op": 18, "name": "RemoveLogContainerSet", "args": [
+    {"name": "log", "type": "res", "kind": "log", "slots": 8},
+    {"name": "how", "type": "const", "size": 1, "value": 1, "mask": 3},
+    {"name": "count", "type": "int", "size": 1, "min": 1, "max": 4, "modulo": true},
+    {"name": "size", "type": "int", "size": 4, "max": 8388607, "modulo": true, "values": [0]},
+    {"name": "names", "type": "array", "len": "count", "elem": {"type": "int", "size": 1, "max": 7, "modulo": true}}
+  ]},
+  {"op": 18, "name": "RemoveLogContainerSetForce", "args": [
+    {"name": "log", "type": "res", "kind": "log", "slots": 8},
+    {"name": "how", "type": "const", "size": 1, "value": 3, "mask": 3},
+    {"name": "count", "type": "int", "size": 1, "min": 1, "max": 4, "modulo": true},
+    {"name": "size", "type": "int", "size": 4, "max": 8388607, "modulo": true, "values": [0]},
+    {"name": "names", "type": "array", "len": "count", "elem": {"type": "int", "size": 1, "max": 7, "modulo": true}}
+  ]},
+  {"op": 19, "name": "GetLogContainerName", "args": [
+    {"name": "log", "type": "res", "kind": "log", "slots": 8},
+    {"name": "container", "type": "int", "size": 4, "values": [0, 1, 2, 4294967295]},
+    {"name": "length", "type": "int", "size": 2, "max": 1024, "modulo": true, "values": [0, 1, 32, 1024]}
+  ]},
+  {"op": 20, "name": "ReserveAndAppendLogAligned", "args": [
+    {"name": "area", "type": "res", "kind": "area", "slots": 8},
+    {"name": "count", "type": "int", "size": 1, "min": 1, "max": 4, "modulo": true},
+    {"name": "sizes", "type": "array", "len": "count", "elem": {"type": "int", "size": 4, "max": 8388607, "modulo": true, "values": [0, 1, 512, 4096]}},
+    {"name": "alignment", "type": "int", "size": 4, "max": 65536, "modulo": true, "values": [0, 1, 8, 512, 4096, 65536]},
+    {"name": "flags", "type": "flags", "size": 1, "values": [1, 2, 4]},
+    {"name": "into", "type": "res", "kind": "lsn", "dir": "out", "slots": 16},
+    {"name": "undo", "type": "res", "kind": "lsn", "slots": 16, "inline": 8},
+    {"name": "previous", "type": "res", "kind": "lsn", "slots": 16, "inline": 8},
+    {"name": "data", "type": "bytes", "max": 1024}
+  ]},
+  {"op": 21, "name": "SetEndOfLog", "args": [
+    {"name": "log", "type": "res", "kind": "log", "slots": 8},
+    {"name": "end", "type": "res", "kind": "lsn", "slots": 16, "inline": 8}
+  ]},
+  {"op": 22, "name": "InstallLogPolicy", "args": [
+    {"name": "log", "type": "res", "kind": "log", "slots": 8},
+    {"name": "version", "type": "int", "size": 4, "values": [1]},
+    {"name": "length", "type": "len", "size": 4, "of": ["version", "length", "flags", "kind", "parameters"]},
+    {"name": "flags", "type": "int", "size": 4, "values": [0, 1]},
+    {"name": "kind", "type": "int", "size": 4, "max": 10,
+     "names": ["maximum_size", "minimum_size", "new_container_size", "growth_rate", "log_tail", "auto_shrink", "auto_grow", "new_container_prefix", "new_container_suffix", "new_container_extension", "invalid"],
+     "values": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]},
+    {"name": "parameters", "type": "bytes", "min": 8, "max": 512}
+  ]},
+  {"op": 23, "name": "RemoveLogPolicy", "args": [
+    {"name": "log", "type": "res", "kind": "log", "slots": 8},
+    {"name": "kind", "type": "int", "size": 1, "max": 10, "modulo": true},
+    {"name": "query", "type": "const", "size": 1, "value": 0, "mask": 1}
+  ]},
+  {"op": 23, "name": "QueryLogPolicy", "args": [
+    {"name": "log", "type": "res", "kind": "log", "slots": 8},
+    {"name": "kind", "type": "int", "size": 1, "max": 10, "modulo": true},
+    {"name": "query", "type": "const", "size": 1, "value": 1, "mask": 1},
+    {"name": "size", "type": "int", "size": 2, "max": 1024, "modulo": true, "values": [0, 24, 32, 1024]}
+  ]},
+  {"op": 24, "name": "SetLogFileSizeWithPolicy", "args": [
+    {"name": "log", "type": "res", "kind": "log", "slots": 8},
+    {"name": "full", "type": "const", "size": 1, "value": 0, "mask": 1},
+    {"name": "desired", "type": "int", "size": 4, "max": 63, "modulo": true}
+  ]},
+  {"op": 24, "name": "HandleLogFull", "args": [
+    {"name": "log", "type": "res", "kind": "log", "slots": 8},
+    {"name": "full", "type": "const", "size": 1, "value": 1, "mask": 1}
+  ]},
+  {"op": 25, "name": "SetLogArchiveMode", "args": [
+    {"name": "log", "type": "res", "kind": "log", "slots": 8},
+    {"name": "mode", "type": "int", "size": 1, "max": 3, "modulo": true, "values": [1, 2], "names": ["enabled", "disabled"]}
+  ]}
+]
