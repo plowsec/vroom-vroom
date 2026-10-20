@@ -219,6 +219,14 @@ static COMMANDS: &[Command] = &[
     // Breakpoints.
     c("debug.breakpoints", "debug", "Replace the hardware execution breakpoints (at most 4, aligned)", &[p("addresses", "array", true, "addresses; [] clears")], "control", Target::Op("breakpoints")),
     c("debug.watchpoints", "debug", "Replace the hardware watchpoints (at most 2)", &[p("watches", "array", true, "[{address, size, mode: r|w|rw}]; [] clears")], "control", Target::Op("watchpoints")),
+    c("debug.tracepoints", "debug", "Replace the tracepoints: execution breakpoints that record the CPU's registers (and bytes at a register's pointer) and continue; they share the 4 slots with debug.breakpoints", &[
+        p("tracepoints", "array", true, "[{address, register: \"x0\", length: bytes (0..4096), max_hits, stop: true = stop like a breakpoint after recording}]; [] clears"),
+        p("capacity", "integer", false, "records kept, oldest dropped first (default 4096)"),
+    ], "control", Target::Op("tracepoints")),
+    c("debug.traces", "debug", "Tracepoint records, oldest first; also while the VM runs", &[
+        p("limit", "integer", false, "at most this many (default all)"),
+        p("clear", "boolean", false, "remove the returned records from the buffer"),
+    ], "read", Target::Op("traces")),
     // Windows kernel.
     c("kernel.info", "kernel", "Find ntoskrnl: base, size, PDB", &[CPU], "read", Target::Op("kernel")),
     c("kernel.symbols", "kernel", "Load PDB symbols for the kernel or a module base (slow the first time)", &[CPU, p("base", "address", false, "module base; kernel if omitted"), CONTEXT], "read", Target::Op("symbols")),
@@ -681,6 +689,7 @@ impl Connection {
                         "The lab starts paused (restore too): vm.resume runs the guest; its network, agent and screen are frozen until then.",
                         "guest.* needs a running VM and a guest agent (vm.status: guest_agent); guest.exec needs current guest tools: guest.update_tools installs them.",
                         "Commands with mutates=true change the guest, the VM or files; risk says how much.",
+                        "A command is also a method: {\"method\": \"debug.traces\", \"params\": {...}} is commands.run with those args.",
                         "fuzz.run and fuzz.probe start their own VM from a snapshot: run them with jobs.start."
                     ],
                 }))
@@ -728,7 +737,17 @@ impl Connection {
                 let limit = limit(&params, DEFAULT_ITEMS)?;
                 self.job(method, &handle, &actor, limit)
             }
-            _ => Err(error(METHOD_NOT_FOUND, format!("unknown method: {method}"))),
+            _ => {
+                let Some(command) = COMMANDS.iter().find(|c| c.name == method) else {
+                    return Err(error(METHOD_NOT_FOUND, format!("unknown method: {method}")));
+                };
+                if command.job_only {
+                    return Err(error(INVALID_PARAMS, format!("{} is long running: start it with jobs.start", command.name)));
+                }
+                check_args(command, &params)?;
+                let value = self.shared.run(command, params).map_err(|e| error(INTERNAL_ERROR, e))?;
+                Ok(self.shared.finish(value, DEFAULT_ITEMS, &actor))
+            }
         }
     }
 
@@ -1027,6 +1046,25 @@ mod tests {
         assert_eq!(ok["result"]["hex"], "00");
         lab.join().unwrap();
         let job = call(&mut c, r#"{"jsonrpc":"2.0","id":4,"method":"commands.run","params":{"command":"fuzz.run","args":{"harness":"h","seed":"s","output":"o"}}}"#);
+        assert_eq!(job["error"]["code"], INVALID_PARAMS);
+    }
+
+    #[test]
+    fn commands_are_methods() {
+        let (mut c, rx) = connection();
+        call(&mut c, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"actor":"a"}}"#);
+        let bad = call(&mut c, r#"{"jsonrpc":"2.0","id":2,"method":"debug.traces","params":{"nope":1}}"#);
+        assert_eq!(bad["error"]["code"], INVALID_PARAMS);
+        let lab = std::thread::spawn(move || {
+            let f = rx.recv().unwrap();
+            assert_eq!(f.request["op"], "tracepoints");
+            assert_eq!(f.request["tracepoints"][0]["register"], "x0");
+            f.reply.send(Ok(json!({"slots":1}))).unwrap();
+        });
+        let ok = call(&mut c, r#"{"jsonrpc":"2.0","id":3,"method":"debug.tracepoints","params":{"tracepoints":[{"address":"0x1000","register":"x0","length":8}]}}"#);
+        assert_eq!(ok["result"]["slots"], 1);
+        lab.join().unwrap();
+        let job = call(&mut c, r#"{"jsonrpc":"2.0","id":4,"method":"fuzz.run","params":{"harness":"h","seed":"s","output":"o"}}"#);
         assert_eq!(job["error"]["code"], INVALID_PARAMS);
     }
 

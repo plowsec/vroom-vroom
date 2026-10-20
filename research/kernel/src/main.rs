@@ -190,10 +190,141 @@ fn output(v: Value) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// Bytes a tracepoint may read per hit.
+const MAX_TRACE_BYTES: u64 = 4096;
+const DEFAULT_TRACE_CAPACITY: usize = 4096;
+const MAX_TRACE_CAPACITY: u64 = 1 << 20;
+/// Debug events handled before the loop looks at requests again.
+const EVENT_BURST: usize = 256;
+
+/// An execution breakpoint that records the CPU and continues.
+struct Tracepoint {
+    address: u64,
+    /// The register holding the pointer to read, as named by the caller.
+    register: Option<(String, vroom_hv::debug::Register)>,
+    length: u64,
+    max_hits: Option<u64>,
+    stop: bool,
+    hits: u64,
+    /// A user-address tracepoint's process (None: any).
+    context: Option<process::Process>,
+}
+
+impl Tracepoint {
+    fn armed(&self) -> bool {
+        !self.max_hits.is_some_and(|max| self.hits >= max)
+    }
+    fn json(&self) -> Value {
+        json!({"address": self.address, "register": self.register.as_ref().map(|r| &r.0), "length": self.length,
+            "max_hits": self.max_hits, "stop": self.stop, "hits": self.hits, "armed": self.armed(),
+            "pid": self.context.as_ref().map(|p| p.pid)})
+    }
+}
+
+struct TraceRecord {
+    seq: u64,
+    tracepoint: usize,
+    hit: u64,
+    regs: Registers,
+    pointer: Option<u64>,
+    data: Option<Result<Vec<u8>, String>>,
+}
+
+impl TraceRecord {
+    fn json(&self) -> Value {
+        let r = &self.regs;
+        let mut v = json!({"seq": self.seq, "tracepoint": self.tracepoint, "hit": self.hit, "cpu": r.cpu, "pc": r.pc,
+            "sp": r.sp, "pstate": r.pstate, "ttbr0": r.ttbr0, "x": r.x});
+        if let Some(pointer) = self.pointer {
+            v["pointer"] = json!(pointer);
+        }
+        match &self.data {
+            Some(Ok(bytes)) => v["hex"] = json!(bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+            Some(Err(e)) => v["read_error"] = json!(e),
+            None => {}
+        }
+        v
+    }
+}
+
+fn register_value(regs: &Registers, register: vroom_hv::debug::Register) -> u64 {
+    use vroom_hv::debug::Register as R;
+    match register {
+        R::X(n) => regs.x[n as usize],
+        R::Pc => regs.pc,
+        R::Sp => regs.sp,
+        R::Pstate => regs.pstate,
+        R::Ttbr0 => regs.ttbr0,
+        R::Ttbr1 => regs.ttbr1,
+        R::Tcr => regs.tcr,
+        R::Sctlr => regs.sctlr,
+        R::Vbar => regs.vbar,
+    }
+}
+
+/// Hardware breakpoint slots these breakpoints and tracepoints take.
+fn breakpoint_slots(breakpoints: &[u64], tracepoints: &[Tracepoint]) -> usize {
+    let mut addresses: Vec<u64> = breakpoints.to_vec();
+    addresses.extend(tracepoints.iter().filter(|t| t.armed()).map(|t| t.address));
+    addresses.sort_unstable();
+    addresses.dedup();
+    addresses.len()
+}
+
+fn same_space(process: &process::Process, regs: &Registers) -> bool {
+    process.directory_table & 0x0000_ffff_ffff_f000 == regs.ttbr0 & 0x0000_ffff_ffff_f000
+}
+
+/// One entry of debug.tracepoints.
+fn parse_tracepoint(i: usize, t: &Value, previous: &[Tracepoint], selected: Option<&process::Process>) -> Result<Tracepoint, String> {
+    let fail = |e: String| format!("tracepoint {i}: {e}");
+    let object = t.as_object().ok_or_else(|| fail("expected an object".into()))?;
+    if let Some(key) = object.keys().find(|k| !matches!(k.as_str(), "address" | "register" | "length" | "max_hits" | "stop")) {
+        return Err(fail(format!("unknown key {key} (address, register, length, max_hits, stop)")));
+    }
+    let present = |k: &str| object.get(k).filter(|v| !v.is_null());
+    let address = number(present("address").ok_or_else(|| fail("missing address".into()))?).map_err(fail)?;
+    if address & 3 != 0 {
+        return Err(fail("address must be 4-byte aligned".into()));
+    }
+    let register = present("register")
+        .map(|v| {
+            let name = v.as_str().ok_or("register: expected a name like \"x0\"")?.to_ascii_lowercase();
+            let register = vroom_hv::debug::Register::parse(&name).map_err(|e| format!("register {name}: {e}"))?;
+            Ok::<_, String>((name, register))
+        })
+        .transpose()
+        .map_err(fail)?;
+    let length = present("length").map(number).transpose().map_err(fail)?.unwrap_or(0);
+    if length > MAX_TRACE_BYTES {
+        return Err(fail(format!("length is at most {MAX_TRACE_BYTES}")));
+    }
+    if length > 0 && register.is_none() {
+        return Err(fail("length needs the register holding the pointer to read".into()));
+    }
+    let max_hits = present("max_hits").map(number).transpose().map_err(fail)?;
+    if max_hits == Some(0) {
+        return Err(fail("max_hits is at least 1 (omit it for no limit)".into()));
+    }
+    let stop = present("stop").map(|v| v.as_bool().ok_or("stop: expected a boolean")).transpose().map_err(|e| fail(e.into()))?.unwrap_or(false);
+    // A user address traces in the selected process; with none, in all.
+    let context = if address >> 63 == 0 {
+        previous.iter().find(|t| t.address == address).map_or(selected, |t| t.context.as_ref()).cloned()
+    } else {
+        None
+    };
+    Ok(Tracepoint { address, register, length, max_hits, stop, hits: 0, context })
+}
+
 struct Session {
     vm: Vmm,
     breakpoints: Vec<u64>,
     breakpoint_contexts: BTreeMap<u64, process::Process>,
+    tracepoints: Vec<Tracepoint>,
+    traces: std::collections::VecDeque<TraceRecord>,
+    trace_capacity: usize,
+    trace_seq: u64,
+    trace_dropped: u64,
     watchpoints: Vec<Watchpoint>,
     watch_stopped: Option<usize>,
     step_cpu: Option<usize>,
@@ -302,6 +433,11 @@ impl Session {
     }
     fn execution_breakpoints(&self) -> Vec<u64> {
         let mut addresses = self.breakpoints.clone();
+        for t in self.tracepoints.iter().filter(|t| t.armed()) {
+            if !addresses.contains(&t.address) {
+                addresses.push(t.address);
+            }
+        }
         if let Some(run) = &self.run_to {
             if !addresses.contains(&run.address) {
                 addresses.push(run.address);
@@ -336,7 +472,7 @@ impl Session {
     fn command(&mut self, request: &Value) -> Result<Value, String> {
         let cpu = request.get("cpu").map(number).transpose()?.unwrap_or(0) as usize;
         let op = request["op"].as_str().ok_or("missing op")?;
-        if !matches!(op, "status" | "pause" | "shutdown" | "key" | "snapshot" | "snapshots")
+        if !matches!(op, "status" | "pause" | "shutdown" | "key" | "snapshot" | "snapshots" | "traces")
             && self.vm.state() != RunState::Paused
         {
             return Err("pause the VM before inspection or control".into());
@@ -344,7 +480,7 @@ impl Session {
         match op {
             "status" => {
                 let agent = self.vm.agent().status();
-                let mut s = json!({"state": format!("{:?}", self.vm.state()), "cpus": self.vm.config().cpus, "breakpoints": self.breakpoints, "temporary":self.run_to.as_ref().map(|r|r.address), "guest_agent": agent.connected.then_some(agent.agent)});
+                let mut s = json!({"state": format!("{:?}", self.vm.state()), "cpus": self.vm.config().cpus, "breakpoints": self.breakpoints, "temporary":self.run_to.as_ref().map(|r|r.address), "tracepoints": self.tracepoints.iter().filter(|t| t.armed()).count(), "traces": self.traces.len(), "guest_agent": agent.connected.then_some(agent.agent)});
                 if self.vm.state() == RunState::Paused {
                     s["note"] = json!("paused: vm.resume runs the guest; its network, agent and screen are frozen until then");
                 }
@@ -368,6 +504,16 @@ impl Session {
                             .iter()
                             .find(|p| p.eprocess == process.eprocess && p.pid == process.pid)
                             .ok_or("breakpoint process exited; clear its breakpoint")?
+                            .clone();
+                    }
+                }
+                if self.tracepoints.iter().any(|t| t.context.is_some()) {
+                    let active = self.processes(cpu)?;
+                    for process in self.tracepoints.iter_mut().filter_map(|t| t.context.as_mut()) {
+                        *process = active
+                            .iter()
+                            .find(|p| p.eprocess == process.eprocess && p.pid == process.pid)
+                            .ok_or("tracepoint process exited; clear its tracepoint")?
                             .clone();
                     }
                 }
@@ -497,7 +643,9 @@ impl Session {
                 }
                 // Validate the destination while stopped, before arming any control.
                 space.translate(address).map_err(|e| e.to_string())?;
-                if self.breakpoints.len() == 4 && !self.breakpoints.contains(&address) {
+                if breakpoint_slots(&self.breakpoints, &self.tracepoints) >= 4
+                    && !self.execution_breakpoints().contains(&address)
+                {
                     return Err("step-over/out needs one free hardware breakpoint slot".into());
                 }
                 self.run_to = Some(vroom_kernel::control::RunTo {
@@ -1002,6 +1150,14 @@ impl Session {
                 if addresses.len() > 4 || addresses.iter().any(|a| a & 3 != 0) {
                     return Err("at most four 4-byte-aligned addresses".into());
                 }
+                let slots = breakpoint_slots(&addresses, &self.tracepoints);
+                if slots > 4 {
+                    return Err(format!(
+                        "{} breakpoints and {} tracepoints need {slots} of the 4 hardware breakpoint slots; clear some (debug.tracepoints [])",
+                        addresses.len(),
+                        self.tracepoints.iter().filter(|t| t.armed()).count()
+                    ));
+                }
                 let mut contexts = BTreeMap::new();
                 for &address in &addresses {
                     if address >> 63 == 0 {
@@ -1021,6 +1177,64 @@ impl Session {
                 }
                 self.breakpoint_contexts = contexts;
                 Ok(json!(self.breakpoints))
+            }
+            "tracepoints" => {
+                let list = request["tracepoints"]
+                    .as_array()
+                    .ok_or("expected tracepoints array")?;
+                let capacity = request.get("capacity").filter(|v| !v.is_null()).map(number).transpose()?;
+                if capacity.is_some_and(|c| !(1..=MAX_TRACE_CAPACITY).contains(&c)) {
+                    return Err(format!("capacity: 1..{MAX_TRACE_CAPACITY} records"));
+                }
+                let tracepoints = list
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| parse_tracepoint(i, t, &self.tracepoints, self.process.as_ref()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                for (i, t) in tracepoints.iter().enumerate() {
+                    if tracepoints[..i].iter().any(|u| u.address == t.address) {
+                        return Err(format!("tracepoint {i}: {:#x} is traced already", t.address));
+                    }
+                }
+                let slots = breakpoint_slots(&self.breakpoints, &tracepoints);
+                if slots > 4 {
+                    return Err(format!(
+                        "{} tracepoints and {} breakpoints need {slots} hardware breakpoint slots; there are 4 (a tracepoint at a breakpoint's address shares its slot)",
+                        tracepoints.len(),
+                        self.breakpoints.len()
+                    ));
+                }
+                let old = std::mem::replace(&mut self.tracepoints, tracepoints);
+                if let Err(e) = self.configure() {
+                    self.tracepoints = old;
+                    let rollback = self.configure();
+                    return Err(format!("{e}; rollback: {rollback:?}; VM remains paused"));
+                }
+                if let Some(capacity) = capacity {
+                    self.trace_capacity = capacity as usize;
+                    while self.traces.len() > self.trace_capacity {
+                        self.traces.pop_front();
+                        self.trace_dropped += 1;
+                    }
+                }
+                Ok(json!({"tracepoints": self.tracepoints.iter().map(Tracepoint::json).collect::<Vec<_>>(),
+                    "capacity": self.trace_capacity, "slots": slots}))
+            }
+            "traces" => {
+                let limit = request.get("limit").filter(|v| !v.is_null()).map(number).transpose()?;
+                let clear = match request.get("clear").filter(|v| !v.is_null()) {
+                    Some(v) => v.as_bool().ok_or("clear: expected a boolean")?,
+                    None => false,
+                };
+                let n = limit.map_or(self.traces.len(), |l| (l as usize).min(self.traces.len()));
+                let records: Vec<Value> = if clear {
+                    self.traces.drain(..n).map(|r| r.json()).collect()
+                } else {
+                    self.traces.iter().take(n).map(TraceRecord::json).collect()
+                };
+                Ok(json!({"records": records, "remaining": self.traces.len(), "recorded": self.trace_seq,
+                    "dropped": self.trace_dropped, "capacity": self.trace_capacity,
+                    "tracepoints": self.tracepoints.iter().map(Tracepoint::json).collect::<Vec<_>>()}))
             }
             "step" => {
                 self.cancel_run_to()?;
@@ -1130,6 +1344,62 @@ impl Session {
         }
         Ok(())
     }
+
+    /// A breakpoint stop at a tracepoint's address: record it if it is
+    /// armed and in its process. None: no tracepoint there; Some(true): it
+    /// asks to stop.
+    fn trace_hit(&mut self, regs: &Registers) -> Result<Option<bool>, String> {
+        let Some(index) = self.tracepoints.iter().position(|t| t.address == regs.pc) else {
+            return Ok(None);
+        };
+        let t = &self.tracepoints[index];
+        if !t.armed() || t.context.as_ref().is_some_and(|p| !same_space(p, regs)) {
+            return Ok(Some(false));
+        }
+        let pointer = t.register.as_ref().map(|r| register_value(regs, r.1));
+        let data = pointer.filter(|_| t.length > 0).map(|pointer| {
+            // A kernel stop may still read its caller's user pointers.
+            let mut walk = regs.clone();
+            walk.tcr &= !(1 << 7);
+            let mut bytes = vec![0; t.length as usize];
+            AddressSpace { memory: &self.vm, registers: &walk }
+                .read(pointer, &mut bytes)
+                .map(|_| bytes)
+                .map_err(|e| e.to_string())
+        });
+        let t = &mut self.tracepoints[index];
+        t.hits += 1;
+        let (hit, stop, exhausted) = (t.hits, t.stop, !t.armed());
+        self.trace_seq += 1;
+        if self.traces.len() >= self.trace_capacity {
+            self.traces.pop_front();
+            self.trace_dropped += 1;
+        }
+        self.traces.push_back(TraceRecord { seq: self.trace_seq, tracepoint: index, hit, regs: regs.clone(), pointer, data });
+        if exhausted {
+            self.configure()?;
+        }
+        Ok(Some(stop))
+    }
+
+    /// A step that a stop on another CPU paused before it ran: that CPU
+    /// still sits on its breakpoint, so step it first.
+    fn requeue_step(&mut self, stepping: Option<usize>) -> Result<(), String> {
+        let Some(cpu) = stepping.filter(|c| !self.continue_cpus.contains(c)) else {
+            return Ok(());
+        };
+        let state = self.vm.debug_registers(cpu).map_err(|e| e.to_string())?;
+        let pc = Registers::from_state(&state).map_err(|e| e.to_string())?.pc;
+        if self.execution_breakpoints().contains(&pc) {
+            self.continue_cpus.push_front(cpu);
+        }
+        Ok(())
+    }
+
+    /// Tracepoints keep the event loop polling the VM instead of requests.
+    fn tracing(&self) -> bool {
+        self.continuing || (!self.tracepoints.is_empty() && self.vm.state() == RunState::Running)
+    }
 }
 
 /// Start the VM, paused (cold boot, or `restore`: a snapshot's folder or
@@ -1186,6 +1456,11 @@ fn boot(config_path: &std::path::Path, restore: Option<&std::path::Path>) -> Res
         vm,
         breakpoints: Vec::new(),
         breakpoint_contexts: BTreeMap::new(),
+        tracepoints: Vec::new(),
+        traces: Default::default(),
+        trace_capacity: DEFAULT_TRACE_CAPACITY,
+        trace_seq: 0,
+        trace_dropped: 0,
         watchpoints: Vec::new(),
         watch_stopped: None,
         step_cpu: None,
@@ -1269,15 +1544,34 @@ fn run(args: Args) -> Result<(), String> {
             return Ok(());
         }
         // Consume debug events first: RAM reads only happen after all-stop.
-        while let Some(event) = session.vm.next_event(Duration::ZERO) {
+        // While tracing, wait on the VM's events and only peek at requests.
+        let mut wait = if session.tracing() { Duration::from_millis(5) } else { Duration::ZERO };
+        for _ in 0..EVENT_BURST {
+            let Some(event) = session.vm.next_event(wait) else { break };
+            wait = Duration::ZERO;
             match event {
                 VmEvent::Debug(stop) => {
+                    let was_running = session.vm.state() == RunState::Running;
+                    let stepping = session.step_cpu.take();
                     session.vm.pause().map_err(|e| e.to_string())?;
                     session.configure()?;
-                    session.step_cpu = None;
                     session.watch_stopped = (stop.reason
                         == vroom_hv::debug::DebugReason::Watchpoint)
                         .then_some(stop.cpu as usize);
+                    if stop.reason == vroom_hv::debug::DebugReason::SingleStep
+                        && stepping != Some(stop.cpu as usize)
+                        && was_running
+                        && (session.continuing || stepping.is_none())
+                    {
+                        // The end of a step that another stop overtook.
+                        if session.continuing {
+                            session.requeue_step(stepping)?;
+                            session.continue_next()?;
+                        } else {
+                            session.vm.resume().map_err(|e| e.to_string())?;
+                        }
+                        continue;
+                    }
                     if session.continuing && stop.reason == vroom_hv::debug::DebugReason::SingleStep
                     {
                         session.continue_next()?;
@@ -1286,6 +1580,7 @@ fn run(args: Args) -> Result<(), String> {
                     let mut reason = format!("{:?}", stop.reason);
                     if stop.reason == vroom_hv::debug::DebugReason::Breakpoint {
                         let regs = session.registers(stop.cpu as usize, false)?;
+                        let traced = session.trace_hit(&regs)?;
                         let user_hit = session.breakpoints.contains(&stop.pc)
                             && session.breakpoint_contexts.get(&stop.pc).map_or(true, |p| {
                                 p.directory_table & 0x0000_ffff_ffff_f000
@@ -1302,6 +1597,19 @@ fn run(args: Args) -> Result<(), String> {
                                 .expect("matched temporary")
                                 .reason
                                 .into();
+                        } else if !user_hit && traced == Some(true) {
+                            reason = "Tracepoint".into();
+                        } else if !user_hit && traced.is_some() {
+                            // Recorded; a pause already asked for keeps the VM paused.
+                            if was_running {
+                                session.requeue_step(stepping)?;
+                                if !session.continue_cpus.contains(&(stop.cpu as usize)) {
+                                    session.continue_cpus.push_back(stop.cpu as usize);
+                                }
+                                session.continuing = true;
+                                session.continue_next()?;
+                            }
+                            continue;
                         } else if !user_hit
                             && (session.breakpoints.contains(&stop.pc)
                                 || session
@@ -1342,7 +1650,8 @@ fn run(args: Args) -> Result<(), String> {
                 _ => {}
             }
         }
-        match rx.recv_timeout(Duration::from_millis(20)) {
+        let wait = if session.tracing() { Duration::ZERO } else { Duration::from_millis(20) };
+        match rx.recv_timeout(wait) {
             Ok(Input::Stdio(Ok(request))) => {
                 let id = request.get("id").cloned().unwrap_or(Value::Null);
                 let result = if request["op"] == "restore" {
@@ -1425,5 +1734,31 @@ fn main() {
     if let Err(e) = run(args) {
         eprintln!("vroom-lab: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tracepoints_parse_and_share_breakpoint_slots() {
+        let t = parse_tracepoint(0, &json!({"address": "0xfffff80000001000", "register": "X1", "length": 16, "max_hits": 2}), &[], None).unwrap();
+        assert_eq!((t.address, t.length, t.max_hits, t.stop), (0xfffff80000001000, 16, Some(2), false));
+        assert_eq!(t.register.as_ref().unwrap().0, "x1");
+        for bad in [
+            json!({"address": "0xfffff80000001002"}),
+            json!({"address": "0xfffff80000001000", "length": 8}),
+            json!({"address": "0xfffff80000001000", "register": "x0", "length": 4097}),
+            json!({"address": "0xfffff80000001000", "max_hits": 0}),
+            json!({"address": "0xfffff80000001000", "lenght": 8}),
+        ] {
+            assert!(parse_tracepoint(0, &bad, &[], None).is_err(), "{bad}");
+        }
+        let mut traced: Vec<Tracepoint> = (0..3).map(|i| parse_tracepoint(0, &json!({"address": 0xfffff80000001000u64 + i * 4}), &[], None).unwrap()).collect();
+        assert_eq!(breakpoint_slots(&[0xfffff80000001000, 0xfffff80000002000], &traced), 4);
+        traced[0].hits = 1;
+        traced[0].max_hits = Some(1);
+        assert_eq!(breakpoint_slots(&[0xfffff80000002000, 0xfffff80000003000], &traced), 4, "a spent tracepoint frees its slot");
     }
 }

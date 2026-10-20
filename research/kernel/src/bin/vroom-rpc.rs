@@ -1,5 +1,6 @@
 //! One call to a vroom-lab agent endpoint, for agents with a shell:
-//! `vroom-rpc --socket S METHOD [PARAMS]` or `vroom-rpc --socket S run COMMAND [ARGS]`.
+//! `vroom-rpc --socket S METHOD [PARAMS]` or `vroom-rpc --socket S run COMMAND [ARGS]`;
+//! `vroom-rpc --socket S traces [follow]` drains tracepoint records as JSON lines.
 use clap::Parser;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
@@ -16,7 +17,9 @@ struct Args {
     #[arg(long, default_value = "vroom-rpc")]
     actor: String,
     /// A method (describe, commands.list, events.poll, jobs.status...), or
-    /// `run` to run a command: `run memory.read_virtual '{"address":"0x..."}'`.
+    /// `run` to run a command: `run memory.read_virtual '{"address":"0x..."}'`,
+    /// or `traces` to drain tracepoint records, one JSON line each
+    /// (`traces follow`: until interrupted).
     method: String,
     /// JSON params (or, after `run`, the command name then its JSON args).
     rest: Vec<String>,
@@ -53,6 +56,33 @@ fn run() -> Result<(), String> {
     let mut write = stream.try_clone().map_err(|e| e.to_string())?;
     let mut read = BufReader::new(stream);
     call(&mut read, &mut write, 1, "initialize", json!({"actor": args.actor}))?;
+    if args.method == "traces" {
+        let follow = match args.rest.first().map(String::as_str) {
+            None => false,
+            Some("follow") => true,
+            Some(other) => return Err(format!("traces: expected `follow`, not {other}")),
+        };
+        let mut out = std::io::stdout().lock();
+        for id in 2.. {
+            let result = call(&mut read, &mut write, id, "debug.traces", json!({"clear": true, "limit": 1024}))?;
+            let records = result["records"].as_array().cloned().unwrap_or_default();
+            for record in &records {
+                writeln!(out, "{record}").map_err(|e| e.to_string())?;
+            }
+            if result["dropped"].as_u64().is_some_and(|d| d > 0) && id == 2 {
+                eprintln!("vroom-rpc: {} records were dropped before this drain (ring buffer full)", result["dropped"]);
+            }
+            if result["remaining"].as_u64().is_some_and(|r| r > 0) {
+                continue;
+            }
+            if !follow {
+                break;
+            }
+            out.flush().map_err(|e| e.to_string())?;
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        return Ok(());
+    }
     let (method, params) = if args.method == "run" {
         let command = args.rest.first().ok_or("run: name a command (see commands.list)")?;
         ("commands.run".to_string(), json!({"command": command, "args": json_arg(args.rest.get(1))?}))
