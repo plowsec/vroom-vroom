@@ -10,6 +10,7 @@ vroom-fuzz check harness.json                                   # validate, list
 vroom-fuzz probe harness.json payload.bin --output runs/probe   # IOCTL range vs baseline
 vroom-fuzz run harness.json payload.bin --ioctl 0x222003 --output runs/a --duration-secs 3600 --tui
 vroom-fuzz fleet harness.json payload.bin --ioctl 0x222003 --workers 4 --output runs/f    # local master + 4 workers
+python3 research/fuzz/tools/series.py runs/f/series.jsonl --every 5   # the campaign over time
 vroom-fuzz serve harness.json --listen 0.0.0.0:7979 --output runs/shared --tui            # master for other machines
 vroom-fuzz fleet harness.json payload.bin --ioctl 0x222003 --workers 6 --output runs/l --master host:7979
 vroom-fuzz run harness.json payload.bin --master host:7979 --state-dir w0.state --output runs/w0   # one worker
@@ -85,7 +86,8 @@ Kernel TUI: `coverage runs/a/coverage.json`, `coverage-diff runs/a/coverage.json
 | `bugcheck_pc` | `KeBugCheckEx` VA: crash = finding + in-place reset (~1 ms, not ~11 s); 5th HW breakpoint |
 | `reset_is_bugcheck` | guest reset counts as a bugcheck |
 | `reopen_after` | `0` reset in place, `1` restore from disk every input |
-| `timeout_ms` | per input; a timeout restores from disk |
+| `timeout_ms` | per input; a timeout restores from disk (a client's resets in place) |
+| `settle_ms` | client harnesses: keep running this long past `stop_pc` (async completions within the input) |
 | `coverage` / `coverage_file` | block manifest (`angr_blocks.py`); ≤4 successors per block |
 | `coverage_mode` | `edges` (default): HW breakpoints follow the path, edges + hit counts, one exit per block. `blocks`: one-shot BRK per uncovered block, known paths run exit-free, new blocks only (~1.8x faster; not for `probe`) |
 | `exception_sites` | ≤4 exception-dispatch PCs, reported when reached |
@@ -95,7 +97,10 @@ Kernel TUI: `coverage runs/a/coverage.json`, `coverage-diff runs/a/coverage.json
 ## Notes
 
 - `VROOM_COW_VERIFY=1`: after each reset, check RAM, untouched devices and GIC registers against the snapshot (~1 s each).
-- `VROOM_FUZZ_TRACE=1`: per-stop trace on stderr.
+- `VROOM_FUZZ_TRACE=1`: per-stop trace on stderr; `=slow`: run loop iterations over 200 ms; `=2`: every debug stop.
+- `VROOM_RESET_PROFILE=1`: each reset's phases (dirty log, copy back, icache, disks, GIC, devices, vCPUs) and devices restored over 0.2 ms.
+- `series.jsonl` (master, a row a minute): coverage, execs, corpus, findings; per worker exec and reset ms, restores, timeouts, comparison logs, live.
+- Resume: same `--output`. Workers run their corpus first (dropping inputs that time out), the master learns its coverage again; a failed worker restarts (20 times at most).
 - `VROOM_FUZZ_TOKEN`: master/worker shared secret. Plaintext protocol: trusted network or SSH tunnel.
 - Distributed: every machine needs the snapshot, its disk layers and the VM config at the same paths; the master refuses other harness names or block counts.
 - Workers import a shared input (with its coverage, not re-run) only if it is new to them.
