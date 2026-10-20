@@ -767,14 +767,22 @@ fn master_hub(h: &Harness, output: &Path, listener: std::net::TcpListener) -> Re
     Ok(hub)
 }
 
+/// Worker restarts a fleet makes at most (a crash loop stops there).
+const MAX_RESTARTS: usize = 20;
+
 /// Run a master until its duration, `q`, or (for a fleet) the end of every
 /// local worker; then stop the workers and save.
 fn supervise(
     hub: &Arc<Mutex<Hub>>,
     duration_secs: Option<u64>,
     dashboard: bool,
-    mut children: Option<&mut Vec<std::process::Child>>,
+    workers: Option<(&mut Vec<std::process::Child>, &dyn Fn(usize) -> Result<std::process::Child>)>,
 ) -> Result<()> {
+    let (mut children, spawn) = match workers {
+        Some((children, spawn)) => (Some(children), Some(spawn)),
+        None => (None, None),
+    };
+    let mut restarts = 0usize;
     let stop = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicBool::new(false));
     let dashboard = dashboard.then(|| tui::spawn(hub.clone(), stop.clone(), done.clone()));
@@ -820,6 +828,19 @@ fn supervise(
             || all_exited(&mut children)
         {
             break;
+        }
+        // A worker that failed (a crash: the campaign goes on without
+        // its share otherwise) starts again, from its own corpus.
+        if let (Some(children), Some(spawn)) = (children.as_mut(), spawn) {
+            for (i, child) in children.iter_mut().enumerate() {
+                if let Ok(Some(status)) = child.try_wait() {
+                    if !status.success() && restarts < MAX_RESTARTS {
+                        restarts += 1;
+                        eprintln!("worker {i} ended with {status}; starting it again ({restarts} of {MAX_RESTARTS})");
+                        *child = spawn(i)?;
+                    }
+                }
+            }
         }
     }
     lock(hub).stop = true;
@@ -884,10 +905,11 @@ fn fleet(args: FleetArgs) -> Result<()> {
     let program = std::env::current_exe()?;
     let host = host_name();
     let mut children = Vec::new();
-    for i in 0..args.workers {
+    let spawn = |i: usize| -> Result<std::process::Child> {
         let dir = args.output.join("workers").join(i.to_string());
         std::fs::create_dir_all(&dir)?;
-        let log = std::fs::File::create(dir.join("worker.log"))?;
+        // Appended: a restarted worker's log follows its last one.
+        let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("worker.log"))?;
         let mut command = std::process::Command::new(&program);
         command
             .arg("run")
@@ -919,7 +941,10 @@ fn fleet(args: FleetArgs) -> Result<()> {
                 command.arg("--duration-secs").arg(seconds.to_string());
             }
         }
-        children.push(command.spawn()?);
+        Ok(command.spawn()?)
+    };
+    for i in 0..args.workers {
+        children.push(spawn(i)?);
     }
     eprintln!(
         "{} workers on {address}; logs in {}",
@@ -927,7 +952,7 @@ fn fleet(args: FleetArgs) -> Result<()> {
         args.output.join("workers").display()
     );
     if let Some(hub) = &hub {
-        supervise(hub, args.fuzz.duration_secs, args.tui, Some(&mut children))?;
+        supervise(hub, args.fuzz.duration_secs, args.tui, Some((&mut children, &spawn)))?;
     }
     let deadline = Instant::now() + Duration::from_secs(if hub.is_some() { 30 } else { u64::MAX / 4 });
     for (i, child) in children.iter_mut().enumerate() {

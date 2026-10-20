@@ -1537,7 +1537,7 @@ impl Engine {
                 return Ok(None);
             }
             let code = u32::from_le_bytes(word);
-            let u64_at = |at: u64| vroom_kernel::windows::VirtualMemory::u64(&space, record + at).ok();
+            let u64_at = |at: u64| vroom_kernel::windows::VirtualMemory::u64(&space, record.wrapping_add(at)).ok();
             (code, u64_at(0x10).unwrap_or(0), u64_at(0x20).unwrap_or(0), u64_at(0x28).unwrap_or(0))
         };
         if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
@@ -2104,8 +2104,8 @@ impl Engine {
                         let mut fault = [0u8; 8];
                         let space = AddressSpace { memory: &self.vm, registers: &Registers::from_state(&state).map_err(|e| Error::Invalid(format!("ARM64 registers: {e}")))? };
                         let _ = vroom_kernel::windows::VirtualMemory::read(&space, record, &mut word);
-                        let _ = vroom_kernel::windows::VirtualMemory::read(&space, record + 0x10, &mut address);
-                        let _ = vroom_kernel::windows::VirtualMemory::read(&space, record + 0x28, &mut fault);
+                        let _ = vroom_kernel::windows::VirtualMemory::read(&space, record.wrapping_add(0x10), &mut address);
+                        let _ = vroom_kernel::windows::VirtualMemory::read(&space, record.wrapping_add(0x28), &mut fault);
                         // The identical fault: the memory manager's handled
                         // page-table faults (another process starting) repeat
                         // the PC, not the faulting address.
