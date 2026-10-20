@@ -943,6 +943,13 @@ impl CorpusStore {
             path,
         })
     }
+    /// Take an input out of the corpus (it no longer runs in time).
+    pub fn remove_input(&self, data: &[u8]) -> Result<()> {
+        match fs::remove_file(self.root.join("inputs").join(Self::hash(data))) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+            _ => Ok(()),
+        }
+    }
     pub fn load_inputs(&self) -> Result<Vec<Vec<u8>>> {
         let mut paths = Vec::new();
         for entry in fs::read_dir(self.root.join("inputs"))? {

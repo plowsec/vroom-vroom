@@ -403,6 +403,16 @@ impl Campaign {
             // Its children run out of time: a parent near the limit.
             self.corpus_energy[parent] = 1;
         }
+        if timeout && selected_parent.is_none() {
+            // A corpus input run again (a resumed campaign) that no longer
+            // finishes in time: every resume would wait it out again.
+            if let Some(i) = self.corpus_inputs.iter().position(|c| *c == input) {
+                self.corpus_inputs.remove(i);
+                self.corpus_energy.remove(i);
+                self.corpus_us.remove(i);
+                self.store.remove_input(&input)?;
+            }
+        }
         self.timeouts_in_a_row = if timeout { self.timeouts_in_a_row + 1 } else { 0 };
         let in_place = timeout && self.engine().harness.client() && self.timeouts_in_a_row < CLIENT_TIMEOUTS_IN_PLACE;
         if result.reopen && !in_place {
