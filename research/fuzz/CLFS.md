@@ -96,3 +96,5 @@ $F triage $VM/clfs-harness.json $VM/runs/a/crashes/HASH-CLASS.bin --state-dir $V
 | op 14 fixed, cmplog (130 logs, ~1.6 s each) | 20.6k (34/s) | 5738 |
 
 Cmplog's extra blocks: the management IOCTLs (`ClfsMgmtDispatchIo`, managed-log policies, container growth), archival and restart requests. Earlier: `append-read.bin` 36k (60/s), 4529. No findings.
+
+First night (3 workers, ~8 h, resumed sessions; seeds also `rich2.bin`: ops 15-25, `rich3.bin`: an overlapped log): 6763 blocks (~1000 more are the kernel-mode marshalling API, unreachable from user mode), 40-60 programs/s. One finding: `CClfsManagedLogClientUser::QueryRegistration` reads `0x28` (a NULL client) on management IOCTLs `0x80077018` then `0x8007b020` on a fresh log, swallowed by CLFS's own `__except`, caught at first chance; 98-byte reproducer in `runs/night/triage/`.
