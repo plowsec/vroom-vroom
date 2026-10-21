@@ -1959,8 +1959,9 @@ impl Session {
         if !self.tracepoints.iter().any(|t| due(t) && (t.armed() || t.planted)) {
             return Ok(());
         }
-        if self.vm.state() == RunState::Paused && (all || self.trace_walk.is_none()) {
-            self.trace_walk = Some(self.registers(0, false)?);
+        let paused = self.vm.state() == RunState::Paused;
+        if paused && (all || self.trace_walk.is_none()) {
+            self.trace_walk = Some(self.kernel_walk()?);
         }
         let Some(kernel) = self.trace_walk.clone() else { return Ok(()) };
         let targets: Vec<(usize, Result<Option<u64>, String>)> = self
@@ -1984,7 +1985,9 @@ impl Session {
         for (i, target) in targets {
             let t = &self.tracepoints[i];
             let want = target.as_ref().ok().copied().flatten();
-            if t.planted && t.physical == want {
+            // A running walk may race the guest's tables: only a paused one
+            // says an address is gone.
+            if (t.planted && t.physical == want) || (!paused && target.is_err()) {
                 continue;
             }
             if let Some(old) = t.physical.filter(|_| t.planted) {
@@ -2005,6 +2008,21 @@ impl Session {
             t.pending = planted.err();
         }
         Ok(())
+    }
+
+    /// CPU 0's registers to walk kernel addresses with, through the System
+    /// process's tables when known: Windows gives every process its own
+    /// TTBR1 root, which a CPU's current process frees when it exits.
+    fn kernel_walk(&self) -> Result<Registers, String> {
+        let mut walk = self.registers(0, false)?;
+        let mask = 0x0000_ffff_ffff_f000;
+        let offset = (walk.ttbr1 & 0x0000_ffff_ffff_ffff).wrapping_sub(walk.ttbr0 & mask);
+        if offset < 0x1000 && self.symbols.is_some() {
+            if let Some(system) = self.processes(0)?.into_iter().find(|p| p.pid == 4) {
+                walk.ttbr1 = (system.directory_table & mask) + offset;
+            }
+        }
+        Ok(walk)
     }
 
     /// Catch the BRKs' pages up with RAM written around them (DMA, the
