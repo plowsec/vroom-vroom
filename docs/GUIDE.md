@@ -179,7 +179,9 @@ Linux: a root systemd service plus an unprivileged session helper
 Commands in a running guest, no guest network needed:
 `vroom guest exec <vm.toml | name> [-p] [-t secs] -- ipconfig /all`
 (cmd.exe as SYSTEM, `-p` PowerShell; Linux: sh as root). Exits with the
-command's code. Files: `vroom guest push <vm> <file> <guest path>`,
+command's code. Linux runs it in the agent's sandbox (read-only system,
+Unix sockets only); apt, Docker and such through systemd:
+`-- systemd-run --wait --pipe --collect sh -c '...'`. Files: `vroom guest push <vm> <file> <guest path>`,
 `vroom guest pull <vm> <guest path> <file or dir>` (size and SHA-256
 checked). vroom-lab: `guest.exec`, `guest.upload`, `guest.download`.
 Newer tools without a window:
