@@ -21,6 +21,11 @@ def run(binary):
         # mov x0,#0; x1 = base+0x800; loop: add x0,x0,#1; str x0,[x1]; bl +0x2c; b loop
         struct.pack_into('<7I', image, 0x100, 0xd2800000, 0xd2810001, 0xf2a80001, 0x91000400, 0xf9000020, 0x9400000b, 0x17fffffd)
         struct.pack_into('<II', image, 0x140, 0xd503201f, 0xd65f03c0)  # nop; ret
+        # x0 = 0; x1 = base+0x900; x5 = base+0x240; loop: add x0,x0,#1; str x0,[x1];
+        # ldr w3,[x5]; str w3,[x1,#16]; ldp x6,x7,[x5]; bl +0x18; b loop; at +0x240: nop; ret
+        struct.pack_into('<12I', image, 0x200, 0xd2800000, 0xd2812001, 0xf2a80001, 0xd2804805, 0xf2a80005,
+                         0x91000400, 0xf9000020, 0xb94000a3, 0xb9001023, 0xa9401ca6, 0x94000006, 0x17fffffa)
+        struct.pack_into('<II', image, 0x240, 0xd503201f, 0xd65f03c0)
         (root/'Image').write_bytes(image)
         (root/'lab.toml').write_text(f'name = "trace-smoke"\ncpus = 1\nmemory_mib = 64\n[display]\ngpu = "virtio2d"\nwidth = 640\nheight = 480\n[boot]\ntype = "kernel"\nkernel = "{root / "Image"}"\n')
         with (root/'stderr.log').open('w+') as errors:
@@ -144,6 +149,54 @@ def run(binary):
                 call('breakpoints', addresses=[]); call('tracepoints', tracepoints=[])
                 assert call('status')['tracepoints'] == 0
                 print('slots: 4 shared with breakpoints, clear errors')
+                # Software tracepoints: no slots; the BRKs are only executed, never read.
+                loop, func = base+0x214, base+0x240
+                every = [loop+i*4 for i in range(7)] + [func, func+4]
+                call('write_register', register='pc', value=base+0x200)
+                set_ = call('tracepoints', capacity=100000, tracepoints=[{'address': a, 'kind': 'software'} for a in every])
+                assert set_['slots'] == 0, set_
+                assert all(t['kind'] == 'software' and t['planted'] and t['physical'] == t['address'] for t in set_['tracepoints']), set_
+                call('breakpoints', addresses=[0xfffff80000002000+i*4 for i in range(4)])
+                call('breakpoints', addresses=[])
+                call('resume'); time.sleep(1)
+                assert call('status')['state'] == 'Running'
+                call('pause')
+                assert not [e for e in events if e.get('event') == 'stopped'], events
+                records = call('traces', clear=True)['records']
+                n = len(records) - len(records) % 9
+                assert n >= 270, len(records)
+                cycle = [0, 1, 2, 3, 4, 5, 7, 8, 6]
+                assert [r['tracepoint'] for r in records[:n]] == cycle*(n//9), [r['tracepoint'] for r in records[:27]]
+                assert [r['x'][0] for r in records[:n:9]] == list(range(n//9)), 'a hit was missed'
+                nop_ret = 0xd65f03c0d503201f
+                assert all(r['x'][3] == 0xd503201f for r in records[3:n:9]), records[3]
+                assert all(r['x'][6] == nop_ret for r in records[5:n:9]), records[5]
+                assert call('read_physical', address=func, length=8)['hex'] == '1f2003d5c0035fd6'
+                assert call('read_physical', address=base+0x910, length=4)['hex'] == '1f2003d5'
+                print(f'software: 9 tracepoints, no slots, {n} hits in 1 s in order; the guest reads its instructions, RAM keeps them')
+                call('tracepoints', tracepoints=[{'address': func, 'kind': 'software', 'stop': True, 'max_hits': 2}, {'address': func+4, 'kind': 'software'}])
+                call('resume'); hit = stop('Tracepoint')
+                assert hit['pc'] == func, hit
+                call('step'); stepped = stop('SingleStep')
+                assert stepped['pc'] == func+4, stepped
+                call('resume'); hit = stop('Tracepoint')
+                assert hit['pc'] == func, hit
+                call('resume'); time.sleep(0.3); call('pause')
+                t = call('traces', clear=True)
+                first, second = t['tracepoints']
+                assert first['hits'] == 2 and not first['armed'] and not first['planted'] and first['pending'] == 'spent', first
+                assert second['hits'] > 10 and second['planted'], second
+                # The guest rewrites a traced instruction: the BRK follows it.
+                call('write_physical', address=func+4, hex='c0035fd6')
+                call('write_physical', address=func, hex='08050091')  # add x8, x8, #1
+                call('tracepoints', tracepoints=[{'address': func+4, 'kind': 'software'}])
+                call('resume'); time.sleep(0.3); call('pause')
+                eights = [r['x'][8] for r in call('traces', clear=True)['records']]
+                assert len(eights) > 10 and eights == list(range(eights[0], eights[0]+len(eights))), eights[:10]
+                call('write_physical', address=func, hex='1f2003d5')
+                call('tracepoints', tracepoints=[])
+                assert call('read_physical', address=func, length=8)['hex'] == '1f2003d5c0035fd6'
+                print('software: stop: true, step and resume past the BRK, max_hits removes it, RAM edits keep it')
                 call('shutdown')
                 assert process.wait(timeout=10)==0
             finally:

@@ -200,6 +200,25 @@ const MAX_TRACE_ACTIONS: usize = 16;
 const MAX_TRACE_CAPTURES: usize = 16;
 /// Hardware data watchpoint slots, shared by debug.watchpoints and debug.hwatch.
 const DATA_SLOTS: usize = 2;
+/// The immediate of software tracepoints' BRKs; other BRKs go to the guest.
+const TRACE_BRK: u16 = 0x7674;
+/// How often a running VM's software tracepoints follow its page tables.
+const PLANT_EVERY: Duration = Duration::from_millis(250);
+
+fn trace_brk() -> [u8; 4] {
+    (0xd420_0000u32 | (u32::from(TRACE_BRK) << 5)).to_le_bytes()
+}
+
+/// Guest RAM read while the VM runs: for page tables only, racing the CPUs.
+struct LiveMemory<'a>(&'a Vmm);
+
+impl vroom_kernel::PhysicalMemory for LiveMemory<'_> {
+    fn read_physical(&self, address: u64, data: &mut [u8]) -> vroom_kernel::Result<()> {
+        self.0
+            .debug_read_physical_running(address, data)
+            .map_err(|e| vroom_kernel::Error::Memory { address, message: e.to_string() })
+    }
+}
 /// What the allocator wrapper writes into a freed block's header:
 /// 0xbadbadfabadbadfa, little-endian.
 const FREE_POISON: [u8; 8] = [0xfa, 0xad, 0xdb, 0xba, 0xfa, 0xad, 0xdb, 0xba];
@@ -396,6 +415,15 @@ impl Record {
 /// An execution breakpoint that records the CPU and continues.
 struct Tracepoint {
     address: u64,
+    /// A BRK the CPUs execute instead of the instruction, invisible to the
+    /// guest's reads (an execute patch), not a hardware slot.
+    software: bool,
+    /// Software: where the address translated and the BRK is patched (or
+    /// lifted for a step over it).
+    physical: Option<u64>,
+    planted: bool,
+    /// Software: why it is not planted.
+    pending: Option<String>,
     /// The register holding the pointer to read, as named by the caller.
     register: Option<(String, vroom_hv::debug::Register)>,
     length: u64,
@@ -415,10 +443,19 @@ impl Tracepoint {
         !self.max_hits.is_some_and(|max| self.hits >= max)
     }
     fn json(&self) -> Value {
-        json!({"address": self.address, "register": self.register.as_ref().map(|r| &r.0), "length": self.length,
+        let mut v = json!({"address": self.address, "kind": if self.software { "software" } else { "hardware" },
+            "register": self.register.as_ref().map(|r| &r.0), "length": self.length,
             "captures": self.captures.iter().map(|c| &c.source).collect::<Vec<_>>(), "max_hits": self.max_hits, "stop": self.stop,
             "actions": self.actions.iter().map(|a| &a.source).collect::<Vec<_>>(), "hits": self.hits, "armed": self.armed(),
-            "pid": self.context.as_ref().map(|p| p.pid)})
+            "pid": self.context.as_ref().map(|p| p.pid)});
+        if self.software {
+            v["physical"] = json!(self.physical.filter(|_| self.planted));
+            v["planted"] = json!(self.planted);
+            if let Some(why) = &self.pending {
+                v["pending"] = json!(why);
+            }
+        }
+        v
     }
 }
 
@@ -739,7 +776,7 @@ fn apply_effect(vm: &Vmm, regs: &mut Registers, effect: Effect) -> Result<(), St
 /// Hardware breakpoint slots these breakpoints and tracepoints take.
 fn breakpoint_slots(breakpoints: &[u64], tracepoints: &[Tracepoint]) -> usize {
     let mut addresses: Vec<u64> = breakpoints.to_vec();
-    addresses.extend(tracepoints.iter().filter(|t| t.armed()).map(|t| t.address));
+    addresses.extend(tracepoints.iter().filter(|t| t.armed() && !t.software).map(|t| t.address));
     addresses.sort_unstable();
     addresses.dedup();
     addresses.len()
@@ -753,14 +790,19 @@ fn same_space(process: &process::Process, regs: &Registers) -> bool {
 fn parse_tracepoint(i: usize, t: &Value, previous: &[Tracepoint], selected: Option<&process::Process>) -> Result<Tracepoint, String> {
     let fail = |e: String| format!("tracepoint {i}: {e}");
     let object = t.as_object().ok_or_else(|| fail("expected an object".into()))?;
-    if let Some(key) = object.keys().find(|k| !matches!(k.as_str(), "address" | "register" | "length" | "captures" | "max_hits" | "stop" | "actions")) {
-        return Err(fail(format!("unknown key {key} (address, register, length, captures, max_hits, stop, actions)")));
+    if let Some(key) = object.keys().find(|k| !matches!(k.as_str(), "address" | "kind" | "register" | "length" | "captures" | "max_hits" | "stop" | "actions")) {
+        return Err(fail(format!("unknown key {key} (address, kind, register, length, captures, max_hits, stop, actions)")));
     }
     let present = |k: &str| object.get(k).filter(|v| !v.is_null());
     let address = number(present("address").ok_or_else(|| fail("missing address".into()))?).map_err(fail)?;
     if address & 3 != 0 {
         return Err(fail("address must be 4-byte aligned".into()));
     }
+    let software = match present("kind").map(|v| v.as_str()) {
+        None | Some(Some("hardware")) => false,
+        Some(Some("software")) => true,
+        Some(_) => return Err(fail("kind: hardware (default) or software".into())),
+    };
     let register = present("register")
         .map(|v| {
             let name = v.as_str().ok_or("register: expected a name like \"x0\"")?.to_ascii_lowercase();
@@ -818,7 +860,7 @@ fn parse_tracepoint(i: usize, t: &Value, previous: &[Tracepoint], selected: Opti
     } else {
         None
     };
-    Ok(Tracepoint { address, register, length, captures, max_hits, stop, actions, hits: 0, context })
+    Ok(Tracepoint { address, software, physical: None, planted: false, pending: None, register, length, captures, max_hits, stop, actions, hits: 0, context })
 }
 
 struct Session {
@@ -826,6 +868,9 @@ struct Session {
     breakpoints: Vec<u64>,
     breakpoint_contexts: BTreeMap<u64, process::Process>,
     tracepoints: Vec<Tracepoint>,
+    /// Kernel page tables software tracepoints translate through, from the last stop.
+    trace_walk: Option<Registers>,
+    planted_at: std::time::Instant,
     hwatches: Vec<Hwatch>,
     /// By CPU: hwatch stops waiting for their instruction to execute.
     hwatch_pending: BTreeMap<usize, HwatchPending>,
@@ -941,7 +986,7 @@ impl Session {
     }
     fn execution_breakpoints(&self) -> Vec<u64> {
         let mut addresses = self.breakpoints.clone();
-        for t in self.tracepoints.iter().filter(|t| t.armed()) {
+        for t in self.tracepoints.iter().filter(|t| t.armed() && !t.software) {
             if !addresses.contains(&t.address) {
                 addresses.push(t.address);
             }
@@ -961,17 +1006,19 @@ impl Session {
         let addresses = self.execution_breakpoints();
         let mut watchpoints = self.watchpoints.clone();
         watchpoints.extend(hwatch_slots(&self.hwatches));
+        // Software tracepoints may be planted while the VM runs.
+        let software = self.tracepoints.iter().any(|t| t.software);
         for cpu in 0..self.vm.config().cpus as usize {
             self.vm
                 .debug_configure(
                     cpu,
                     DebugConfig {
-                        enabled: !addresses.is_empty() || !watchpoints.is_empty(),
+                        enabled: !addresses.is_empty() || !watchpoints.is_empty() || software,
                         single_step: false,
                         breakpoints: addresses.clone(),
                         watchpoints: watchpoints.clone(),
                         trap_software_breakpoints: false,
-                        trap_brk_immediate: None,
+                        trap_brk_immediate: software.then_some(TRACE_BRK),
                     },
                 )
                 .map_err(|e| e.to_string())?;
@@ -1000,6 +1047,8 @@ impl Session {
                 self.continue_cpus.clear();
                 self.continuing = false;
                 self.vm.pause().map_err(|e| e.to_string())?;
+                // A step over a BRK this pause cut short plants it again.
+                self.plant(false)?;
                 self.cancel_run_to()?;
                 Ok(json!("paused"))
             }
@@ -1037,15 +1086,12 @@ impl Session {
                             .clone();
                     }
                 }
+                self.refresh_planted()?;
+                self.plant(true)?;
                 self.configure()?;
                 self.continue_cpus.clear();
                 for cpu in 0..self.vm.config().cpus as usize {
-                    let state = self.vm.debug_registers(cpu).map_err(|e| e.to_string())?;
-                    let regs = Registers::from_state(&state).map_err(|e| e.to_string())?;
-                    if state.powered_on
-                        && (self.execution_breakpoints().contains(&regs.pc)
-                            || self.watch_stopped == Some(cpu))
-                    {
+                    if self.at_tracepoint(cpu)? || self.watch_stopped == Some(cpu) {
                         self.continue_cpus.push_back(cpu);
                     }
                 }
@@ -1093,6 +1139,7 @@ impl Session {
                     .debug_write_physical(&spans)
                     .map_err(|e| e.to_string())?;
                 self.invalidate();
+                self.refresh_planted()?;
                 Ok(json!({"address":address, "written":data.len()}))
             }
             "step_over" | "step_out" => {
@@ -1719,10 +1766,12 @@ impl Session {
                         self.breakpoints.len()
                     ));
                 }
+                self.unplant()?;
                 let old = std::mem::replace(&mut self.tracepoints, tracepoints);
-                if let Err(e) = self.configure() {
+                if let Err(e) = self.plant(true).and_then(|()| self.configure()) {
+                    let _ = self.unplant();
                     self.tracepoints = old;
-                    let rollback = self.configure();
+                    let rollback = self.plant(true).and_then(|()| self.configure());
                     return Err(format!("{e}; rollback: {rollback:?}; VM remains paused"));
                 }
                 if let Some(capacity) = capacity {
@@ -1787,6 +1836,7 @@ impl Session {
                 self.cancel_run_to()?;
                 self.invalidate();
                 self.configure()?;
+                self.lift(cpu)?;
                 // Temporarily remove breakpoints on the selected CPU so the
                 // stopped instruction can execute; rearm them at the stop.
                 self.vm
@@ -1875,6 +1925,7 @@ impl Session {
 
     fn continue_next(&mut self) -> Result<(), String> {
         if let Some(cpu) = self.continue_cpus.pop_front() {
+            self.lift(cpu)?;
             self.vm
                 .debug_step(
                     cpu,
@@ -1892,12 +1943,154 @@ impl Session {
         Ok(())
     }
 
+    /// The physical address `va` executes from on this stopped CPU.
+    fn physical_pc(&self, regs: &Registers, va: u64) -> Option<u64> {
+        let mut walk = regs.clone();
+        walk.tcr &= !(1 << 7);
+        AddressSpace { memory: &self.vm, registers: &walk }.translate(va).ok().map(|t| t.physical)
+    }
+
+    /// Plant the BRK of every armed software tracepoint whose address now
+    /// translates, remove spent ones, and with `all` move planted ones
+    /// whose address translates elsewhere now. Paused, or running: then
+    /// through the page tables as they are, the kernel's from the last stop.
+    fn plant(&mut self, all: bool) -> Result<(), String> {
+        let due = |t: &Tracepoint| t.software && (all || !t.planted || !t.armed());
+        if !self.tracepoints.iter().any(|t| due(t) && (t.armed() || t.planted)) {
+            return Ok(());
+        }
+        if self.vm.state() == RunState::Paused && (all || self.trace_walk.is_none()) {
+            self.trace_walk = Some(self.registers(0, false)?);
+        }
+        let Some(kernel) = self.trace_walk.clone() else { return Ok(()) };
+        let targets: Vec<(usize, Result<Option<u64>, String>)> = self
+            .tracepoints
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| due(t))
+            .map(|(i, t)| {
+                if !t.armed() {
+                    return (i, Ok(None));
+                }
+                let mut walk = kernel.clone();
+                if let Some(process) = &t.context {
+                    walk.ttbr0 = process.directory_table;
+                }
+                walk.tcr &= !(1 << 7);
+                let space = AddressSpace { memory: &LiveMemory(&self.vm), registers: &walk };
+                (i, space.translate(t.address).map(|t| Some(t.physical)).map_err(|e| e.to_string()))
+            })
+            .collect();
+        for (i, target) in targets {
+            let t = &self.tracepoints[i];
+            let want = target.as_ref().ok().copied().flatten();
+            if t.planted && t.physical == want {
+                continue;
+            }
+            if let Some(old) = t.physical.filter(|_| t.planted) {
+                self.vm.debug_execute_patch(old, None).map_err(|e| e.to_string())?;
+            }
+            let shared = want.and_then(|gpa| {
+                self.tracepoints.iter().position(|u| u.software && u.planted && u.physical == Some(gpa))
+            });
+            let planted = match (target, shared) {
+                (Ok(None), _) => Err("spent".to_owned()),
+                (Err(e), _) => Err(e),
+                (Ok(Some(gpa)), Some(j)) if j != i => Err(format!("{gpa:#x} is tracepoint {j}'s instruction too")),
+                (Ok(Some(gpa)), _) => self.vm.debug_execute_patch(gpa, Some(trace_brk())).map(|()| gpa).map_err(|e| e.to_string()),
+            };
+            let t = &mut self.tracepoints[i];
+            t.planted = planted.is_ok();
+            t.physical = planted.as_ref().ok().copied();
+            t.pending = planted.err();
+        }
+        Ok(())
+    }
+
+    /// Catch the BRKs' pages up with RAM written around them (DMA, the
+    /// lab's writes). Software tracepoints whose RAM changed under the BRK
+    /// (the page was paged out and reused, or rewritten) lost it: plant
+    /// them again.
+    fn refresh_planted(&mut self) -> Result<(), String> {
+        if !self.tracepoints.iter().any(|t| t.planted) {
+            return Ok(());
+        }
+        for gpa in self.vm.debug_refresh_execute_patches().map_err(|e| e.to_string())? {
+            for t in self.tracepoints.iter_mut().filter(|t| t.planted && t.physical == Some(gpa)) {
+                t.planted = false;
+                t.physical = None;
+                t.pending = Some("its RAM changed".into());
+            }
+        }
+        self.plant(false)
+    }
+
+    /// Remove every software tracepoint's BRK.
+    fn unplant(&mut self) -> Result<(), String> {
+        for t in self.tracepoints.iter_mut().filter(|t| t.planted) {
+            self.vm.debug_execute_patch(t.physical.expect("planted"), None).map_err(|e| e.to_string())?;
+            t.planted = false;
+        }
+        Ok(())
+    }
+
+    /// The software tracepoint whose BRK this stopped CPU sits on (planted
+    /// or lifted).
+    fn software_at(&self, regs: &Registers) -> Option<usize> {
+        if !self.tracepoints.iter().any(|t| t.software && t.physical.is_some()) {
+            return None;
+        }
+        let gpa = self.physical_pc(regs, regs.pc)?;
+        self.tracepoints.iter().position(|t| t.software && t.physical == Some(gpa))
+    }
+
+    /// Whether this stopped CPU sits on a breakpoint or tracepoint and must
+    /// step past it before running.
+    fn at_tracepoint(&self, cpu: usize) -> Result<bool, String> {
+        let state = self.vm.debug_registers(cpu).map_err(|e| e.to_string())?;
+        let regs = Registers::from_state(&state).map_err(|e| e.to_string())?;
+        Ok(state.powered_on && (self.execution_breakpoints().contains(&regs.pc) || self.software_at(&regs).is_some()))
+    }
+
+    /// Before stepping this CPU alone: lift the BRK it sits on, so it runs
+    /// the instruction. The next stop plants it again.
+    fn lift(&mut self, cpu: usize) -> Result<(), String> {
+        let regs = self.registers(cpu, false)?;
+        if let Some(i) = self.software_at(&regs).filter(|&i| self.tracepoints[i].planted) {
+            self.vm.debug_execute_patch(self.tracepoints[i].physical.expect("planted"), None).map_err(|e| e.to_string())?;
+            self.tracepoints[i].planted = false;
+        }
+        Ok(())
+    }
+
+    /// A trace BRK stop: run its tracepoint's actions and record it if it
+    /// is the address in its process (not an alias of the instruction).
+    /// None: not a software tracepoint's.
+    fn software_hit(&mut self, regs: &Registers) -> Result<Option<TraceHit>, String> {
+        let Some(index) = self.software_at(regs) else {
+            let gpa = self.physical_pc(regs, regs.pc);
+            let mut word = [0u8; 4];
+            let guest = gpa.is_some_and(|gpa| self.vm.debug_read_physical(gpa, &mut word).is_ok() && word == trace_brk());
+            // A BRK whose tracepoint moved before this stop came in: the
+            // instruction is back, run it.
+            return Ok((!guest).then_some(TraceHit { stop: false, moved: true }));
+        };
+        if self.tracepoints[index].address != regs.pc {
+            return Ok(Some(TraceHit { stop: false, moved: false }));
+        }
+        self.record_hit(index, regs)
+    }
+
     /// A breakpoint stop at a tracepoint's address: run its actions and
     /// record it if it is armed and in its process. None: no tracepoint there.
     fn trace_hit(&mut self, regs: &Registers) -> Result<Option<TraceHit>, String> {
-        let Some(index) = self.tracepoints.iter().position(|t| t.address == regs.pc) else {
+        let Some(index) = self.tracepoints.iter().position(|t| t.address == regs.pc && !t.software) else {
             return Ok(None);
         };
+        self.record_hit(index, regs)
+    }
+
+    fn record_hit(&mut self, index: usize, regs: &Registers) -> Result<Option<TraceHit>, String> {
         let t = &self.tracepoints[index];
         if !t.armed() || t.context.as_ref().is_some_and(|p| !same_space(p, regs)) {
             return Ok(Some(TraceHit { stop: false, moved: false }));
@@ -1926,6 +2119,10 @@ impl Session {
                 }
             }
         }
+        if actions_applied > 0 {
+            // A write_memory action may have written a BRK's page.
+            self.refresh_planted()?;
+        }
         let t = &mut self.tracepoints[index];
         t.hits += 1;
         let (hit, stop, exhausted) = (t.hits, t.stop || failed_stop, !t.armed());
@@ -1933,6 +2130,7 @@ impl Session {
         self.traces.push_back(Record::Trace(TraceRecord { seq, tracepoint: index, hit, regs: regs.clone(), pointer, data,
             captures, actions_applied, action_error }));
         if exhausted {
+            self.plant(false)?;
             self.configure()?;
         }
         Ok(Some(TraceHit { stop, moved: current.pc != regs.pc }))
@@ -2012,9 +2210,7 @@ impl Session {
         let Some(cpu) = stepping.filter(|c| !self.continue_cpus.contains(c)) else {
             return Ok(());
         };
-        let state = self.vm.debug_registers(cpu).map_err(|e| e.to_string())?;
-        let pc = Registers::from_state(&state).map_err(|e| e.to_string())?.pc;
-        if self.execution_breakpoints().contains(&pc) || self.hwatch_pending.contains_key(&cpu) {
+        if self.at_tracepoint(cpu)? || self.hwatch_pending.contains_key(&cpu) {
             self.continue_cpus.push_front(cpu);
         }
         Ok(())
@@ -2081,6 +2277,8 @@ fn boot(config_path: &std::path::Path, restore: Option<&std::path::Path>) -> Res
         breakpoints: Vec::new(),
         breakpoint_contexts: BTreeMap::new(),
         tracepoints: Vec::new(),
+        trace_walk: None,
+        planted_at: std::time::Instant::now(),
         hwatches: Vec::new(),
         hwatch_pending: BTreeMap::new(),
         traces: Default::default(),
@@ -2180,6 +2378,7 @@ fn run(args: Args) -> Result<(), String> {
                     let was_running = session.vm.state() == RunState::Running;
                     let stepping = session.step_cpu.take();
                     session.vm.pause().map_err(|e| e.to_string())?;
+                    session.plant(false)?;
                     session.configure()?;
                     session.watch_stopped = (stop.reason
                         == vroom_hv::debug::DebugReason::Watchpoint)
@@ -2223,18 +2422,21 @@ fn run(args: Args) -> Result<(), String> {
                         continue;
                     }
                     let mut reason = format!("{:?}", stop.reason);
-                    if stop.reason == vroom_hv::debug::DebugReason::Breakpoint {
+                    let software = stop.reason == vroom_hv::debug::DebugReason::SoftwareBreakpoint;
+                    if stop.reason == vroom_hv::debug::DebugReason::Breakpoint || software {
                         let regs = session.registers(stop.cpu as usize, false)?;
-                        let traced = session.trace_hit(&regs)?;
-                        let user_hit = session.breakpoints.contains(&stop.pc)
+                        let traced = if software { session.software_hit(&regs)? } else { session.trace_hit(&regs)? };
+                        let user_hit = !software
+                            && session.breakpoints.contains(&stop.pc)
                             && session.breakpoint_contexts.get(&stop.pc).map_or(true, |p| {
                                 p.directory_table & 0x0000_ffff_ffff_f000
                                     == regs.ttbr0 & 0x0000_ffff_ffff_f000
                             });
-                        let temporary_hit = session
-                            .run_to
-                            .as_ref()
-                            .is_some_and(|run| run.matches(&regs));
+                        let temporary_hit = !software
+                            && session
+                                .run_to
+                                .as_ref()
+                                .is_some_and(|run| run.matches(&regs));
                         if temporary_hit {
                             reason = session
                                 .run_to
@@ -2256,6 +2458,7 @@ fn run(args: Args) -> Result<(), String> {
                             }
                             continue;
                         } else if !user_hit
+                            && !software
                             && (session.breakpoints.contains(&stop.pc)
                                 || session
                                     .run_to
@@ -2294,6 +2497,17 @@ fn run(args: Args) -> Result<(), String> {
                 }
                 _ => {}
             }
+        }
+        if session.vm.state() == RunState::Running
+            && !session.continuing
+            && session.step_cpu.is_none()
+            && session.planted_at.elapsed() >= PLANT_EVERY
+            && session.tracepoints.iter().any(|t| t.software)
+        {
+            // Pages come and go under a running guest.
+            session.planted_at = std::time::Instant::now();
+            session.refresh_planted()?;
+            session.plant(true)?;
         }
         let wait = if session.tracing() { Duration::ZERO } else { Duration::from_millis(20) };
         match rx.recv_timeout(wait) {
@@ -2405,6 +2619,21 @@ mod tests {
         traced[0].hits = 1;
         traced[0].max_hits = Some(1);
         assert_eq!(breakpoint_slots(&[0xfffff80000002000, 0xfffff80000003000], &traced), 4, "a spent tracepoint frees its slot");
+    }
+
+    #[test]
+    fn software_tracepoints_take_no_slot() {
+        let many: Vec<Tracepoint> = (0..64)
+            .map(|i| parse_tracepoint(0, &json!({"address": 0xfffff80000001000u64 + i * 4, "kind": "software"}), &[], None).unwrap())
+            .collect();
+        assert!(many.iter().all(|t| t.software && !t.planted && t.physical.is_none()));
+        assert_eq!(breakpoint_slots(&[0xfffff80000001000], &many), 1);
+        let json = many[0].json();
+        assert_eq!((json["kind"].as_str(), json["planted"].as_bool()), (Some("software"), Some(false)));
+        assert_eq!(parse_tracepoint(0, &json!({"address": "0xfffff80000001000"}), &[], None).unwrap().json()["kind"], "hardware");
+        assert!(parse_tracepoint(0, &json!({"address": "0xfffff80000001000"}), &[], None).unwrap().json().get("planted").is_none());
+        assert!(parse_tracepoint(0, &json!({"address": "0xfffff80000001000", "kind": "soft"}), &[], None).err().unwrap().contains("kind"));
+        assert_eq!(u32::from_le_bytes(trace_brk()), 0xd42ece80, "brk #0x7674");
     }
 
     fn regs() -> Registers {

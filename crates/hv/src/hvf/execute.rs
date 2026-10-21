@@ -88,18 +88,21 @@ impl ExecutePatches {
         let Pages { pages, stale } = &mut *pages;
         match word {
             Some(word) => {
-                let p = match pages.entry(page) {
-                    std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
+                // A page patched already changes in place: its copy stays mapped.
+                let (p, new) = match pages.entry(page) {
+                    std::collections::btree_map::Entry::Occupied(e) => (e.into_mut(), false),
                     std::collections::btree_map::Entry::Vacant(e) => {
                         let copy = MmapRegion::new((self.granule as usize).max(vroom_memory::page_size()))
                             .map_err(|e| Error::Invalid(format!("execute copy: {e}")))?;
-                        e.insert(Page { ram: ram as usize, copy, patches: BTreeMap::new(), view: View::Execute })
+                        (e.insert(Page { ram: ram as usize, copy, patches: BTreeMap::new(), view: View::Execute }), true)
                     }
                 };
                 let under = p.ram_word(offset);
                 p.patches.insert(offset, (word, under));
                 p.refresh(page, self.granule, stale);
-                map(page, p, self.granule)?;
+                if new {
+                    map(page, p, self.granule)?;
+                }
             }
             None => {
                 let Some(p) = pages.get_mut(&page) else { return Ok(()) };

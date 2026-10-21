@@ -90,6 +90,27 @@ impl Vmm {
         Ok(())
     }
 
+    /// CPUs execute `word` at `gpa` while their reads and writes there see
+    /// RAM unchanged (None: RAM's instruction again). Also while running:
+    /// a CPU touching the page meanwhile waits. See
+    /// `vroom_hv::Vm::set_execute_patch`.
+    pub fn debug_execute_patch(&self, gpa: u64, word: Option<[u8; 4]>) -> Result<()> {
+        Ok(self.vm.set_execute_patch(gpa, word)?)
+    }
+
+    /// Read RAM while the guest may be running: no consistency with the
+    /// CPUs (page tables to place execute patches, say).
+    pub fn debug_read_physical_running(&self, address: u64, buf: &mut [u8]) -> Result<()> {
+        self.mem.read(GuestAddress(address), buf)?;
+        Ok(())
+    }
+
+    /// Execute patches caught up with RAM; those whose RAM word changed
+    /// since the last call, dropped. Also while running.
+    pub fn debug_refresh_execute_patches(&self) -> Result<Vec<u64>> {
+        Ok(self.vm.refresh_execute_patches()?)
+    }
+
     pub fn debug_memory_regions(&self) -> Result<Vec<(u64, u64)>> {
         self.require_debug_pause()?;
         Ok(self.mem.regions().map(|r| (r.start().0, r.len())).collect())
