@@ -197,6 +197,7 @@ const MAX_TRACE_CAPACITY: u64 = 1 << 20;
 /// Debug events handled before the loop looks at requests again.
 const EVENT_BURST: usize = 256;
 const MAX_TRACE_ACTIONS: usize = 16;
+const MAX_TRACE_CAPTURES: usize = 16;
 
 /// An execution breakpoint that records the CPU and continues.
 struct Tracepoint {
@@ -204,6 +205,8 @@ struct Tracepoint {
     /// The register holding the pointer to read, as named by the caller.
     register: Option<(String, vroom_hv::debug::Register)>,
     length: u64,
+    /// Recorded on every hit, before the actions run.
+    captures: Vec<Capture>,
     max_hits: Option<u64>,
     stop: bool,
     /// Applied in order on every hit, before the record is appended.
@@ -219,7 +222,7 @@ impl Tracepoint {
     }
     fn json(&self) -> Value {
         json!({"address": self.address, "register": self.register.as_ref().map(|r| &r.0), "length": self.length,
-            "max_hits": self.max_hits, "stop": self.stop,
+            "captures": self.captures.iter().map(|c| &c.source).collect::<Vec<_>>(), "max_hits": self.max_hits, "stop": self.stop,
             "actions": self.actions.iter().map(|a| &a.source).collect::<Vec<_>>(), "hits": self.hits, "armed": self.armed(),
             "pid": self.context.as_ref().map(|p| p.pid)})
     }
@@ -240,6 +243,8 @@ struct TraceRecord {
     regs: Registers,
     pointer: Option<u64>,
     data: Option<Result<Vec<u8>, String>>,
+    /// One per capture, in the tracepoint's order.
+    captures: Vec<(String, Captured)>,
     actions_applied: usize,
     action_error: Option<String>,
 }
@@ -256,12 +261,38 @@ impl TraceRecord {
             v["pointer"] = json!(pointer);
         }
         match &self.data {
-            Some(Ok(bytes)) => v["hex"] = json!(bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+            Some(Ok(bytes)) => v["hex"] = json!(hex_string(bytes)),
             Some(Err(e)) => v["read_error"] = json!(e),
             None => {}
         }
+        if !self.captures.is_empty() {
+            let (mut values, mut errors, mut addresses) = (serde_json::Map::new(), serde_json::Map::new(), serde_json::Map::new());
+            for (name, captured) in &self.captures {
+                match captured {
+                    Captured::Register(value) => {
+                        values.insert(name.clone(), json!(value));
+                    }
+                    Captured::Memory { address, data } => {
+                        if let Some(address) = address {
+                            addresses.insert(name.clone(), json!(address));
+                        }
+                        match data {
+                            Ok(bytes) => values.insert(name.clone(), json!(hex_string(bytes))),
+                            Err(e) => errors.insert(name.clone(), json!(e)),
+                        };
+                    }
+                }
+            }
+            v["captures"] = Value::Object(values);
+            v["capture_errors"] = Value::Object(errors);
+            v["capture_addresses"] = Value::Object(addresses);
+        }
         v
     }
+}
+
+fn hex_string(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn register_value(regs: &Registers, register: vroom_hv::debug::Register) -> u64 {
@@ -315,6 +346,12 @@ impl ActionRegister {
     }
     fn get(&self, regs: &Registers) -> u64 {
         self.width(register_value(regs, self.register))
+    }
+    fn name(&self) -> String {
+        match self.register {
+            vroom_hv::debug::Register::X(n) => format!("{}{n}", if self.w { 'w' } else { 'x' }),
+            r => format!("{r:?}").to_ascii_lowercase(),
+        }
     }
 }
 
@@ -428,6 +465,62 @@ impl Action {
     }
 }
 
+/// One entry of a tracepoint's captures: a register's value, or bytes at
+/// the address a register holds plus an offset.
+struct Capture {
+    name: String,
+    register: ActionRegister,
+    /// (offset, length) of a memory capture.
+    memory: Option<(u64, u64)>,
+    source: Value,
+}
+
+/// What a capture recorded at one hit.
+#[derive(Debug, PartialEq)]
+enum Captured {
+    Register(u64),
+    /// address: None when the register held no pointer.
+    Memory { address: Option<u64>, data: Result<Vec<u8>, String> },
+}
+
+impl Capture {
+    fn parse(v: &Value) -> Result<Self, String> {
+        let object = v.as_object().ok_or("expected an object")?;
+        if let Some(key) = object.keys().find(|k| !matches!(k.as_str(), "name" | "register" | "offset" | "length")) {
+            return Err(format!("unknown key {key} (name, register, offset, length)"));
+        }
+        let present = |k: &str| object.get(k).filter(|v| !v.is_null());
+        let name = present("name").and_then(Value::as_str).filter(|n| !n.is_empty()).ok_or("needs a name")?.to_owned();
+        let length = present("length").map(number).transpose().map_err(|e| format!("length: {e}"))?;
+        let offset = present("offset").map(action_value).transpose().map_err(|e| format!("offset: {e}"))?;
+        let register = match present("register") {
+            Some(r) => ActionRegister::parse(r)?,
+            None if length.is_some() || offset.is_some() => return Err("a memory capture needs the register holding the address".into()),
+            None => ActionRegister::parse(&json!(name)).map_err(|e| format!("{e} (a memory capture names a register and a length)"))?,
+        };
+        let memory = match length {
+            Some(length) if length == 0 || length > MAX_TRACE_BYTES => return Err(format!("length is 1..{MAX_TRACE_BYTES}")),
+            Some(length) => Some((offset.unwrap_or(0), length)),
+            None if offset.is_some() => return Err("offset needs a length".into()),
+            None => None,
+        };
+        Ok(Capture { name, register, memory, source: v.clone() })
+    }
+
+    fn capture(&self, regs: &Registers, read: impl Fn(u64, &mut [u8]) -> Result<(), String>) -> Captured {
+        let value = self.register.get(regs);
+        let Some((offset, length)) = self.memory else {
+            return Captured::Register(value);
+        };
+        if value == 0 {
+            return Captured::Memory { address: None, data: Err(format!("{} is a null pointer", self.register.name())) };
+        }
+        let address = value.wrapping_add(offset);
+        let mut bytes = vec![0; length as usize];
+        Captured::Memory { address: Some(address), data: read(address, &mut bytes).map(|_| bytes).map_err(|e| format!("read {address:#x}: {e}")) }
+    }
+}
+
 /// Apply an effect to a stopped CPU and to its registers as recorded.
 fn apply_effect(vm: &Vmm, regs: &mut Registers, effect: Effect) -> Result<(), String> {
     match effect {
@@ -466,8 +559,8 @@ fn same_space(process: &process::Process, regs: &Registers) -> bool {
 fn parse_tracepoint(i: usize, t: &Value, previous: &[Tracepoint], selected: Option<&process::Process>) -> Result<Tracepoint, String> {
     let fail = |e: String| format!("tracepoint {i}: {e}");
     let object = t.as_object().ok_or_else(|| fail("expected an object".into()))?;
-    if let Some(key) = object.keys().find(|k| !matches!(k.as_str(), "address" | "register" | "length" | "max_hits" | "stop" | "actions")) {
-        return Err(fail(format!("unknown key {key} (address, register, length, max_hits, stop, actions)")));
+    if let Some(key) = object.keys().find(|k| !matches!(k.as_str(), "address" | "register" | "length" | "captures" | "max_hits" | "stop" | "actions")) {
+        return Err(fail(format!("unknown key {key} (address, register, length, captures, max_hits, stop, actions)")));
     }
     let present = |k: &str| object.get(k).filter(|v| !v.is_null());
     let address = number(present("address").ok_or_else(|| fail("missing address".into()))?).map_err(fail)?;
@@ -488,6 +581,24 @@ fn parse_tracepoint(i: usize, t: &Value, previous: &[Tracepoint], selected: Opti
     }
     if length > 0 && register.is_none() {
         return Err(fail("length needs the register holding the pointer to read".into()));
+    }
+    let captures: Vec<Capture> = match present("captures") {
+        None => Vec::new(),
+        Some(list) => {
+            let list = list.as_array().ok_or_else(|| fail("captures: expected an array".into()))?;
+            if list.len() > MAX_TRACE_CAPTURES {
+                return Err(fail(format!("at most {MAX_TRACE_CAPTURES} captures")));
+            }
+            list.iter()
+                .enumerate()
+                .map(|(j, c)| Capture::parse(c).map_err(|e| fail(format!("capture {j}: {e}"))))
+                .collect::<Result<_, _>>()?
+        }
+    };
+    for (j, c) in captures.iter().enumerate() {
+        if captures[..j].iter().any(|d| d.name == c.name) {
+            return Err(fail(format!("capture {j}: name {} is taken", c.name)));
+        }
     }
     let max_hits = present("max_hits").map(number).transpose().map_err(fail)?;
     if max_hits == Some(0) {
@@ -513,7 +624,7 @@ fn parse_tracepoint(i: usize, t: &Value, previous: &[Tracepoint], selected: Opti
     } else {
         None
     };
-    Ok(Tracepoint { address, register, length, max_hits, stop, actions, hits: 0, context })
+    Ok(Tracepoint { address, register, length, captures, max_hits, stop, actions, hits: 0, context })
 }
 
 struct Session {
@@ -1549,17 +1660,16 @@ impl Session {
         if !t.armed() || t.context.as_ref().is_some_and(|p| !same_space(p, regs)) {
             return Ok(Some(TraceHit { stop: false, moved: false }));
         }
+        // A kernel stop may still read its caller's user pointers.
+        let mut walk = regs.clone();
+        walk.tcr &= !(1 << 7);
+        let read = |address: u64, bytes: &mut [u8]| AddressSpace { memory: &self.vm, registers: &walk }.read(address, bytes).map_err(|e| e.to_string());
         let pointer = t.register.as_ref().map(|r| register_value(regs, r.1));
         let data = pointer.filter(|_| t.length > 0).map(|pointer| {
-            // A kernel stop may still read its caller's user pointers.
-            let mut walk = regs.clone();
-            walk.tcr &= !(1 << 7);
             let mut bytes = vec![0; t.length as usize];
-            AddressSpace { memory: &self.vm, registers: &walk }
-                .read(pointer, &mut bytes)
-                .map(|_| bytes)
-                .map_err(|e| e.to_string())
+            read(pointer, &mut bytes).map(|_| bytes)
         });
+        let captures = t.captures.iter().map(|c| (c.name.clone(), c.capture(regs, read))).collect();
         // The record keeps the registers as hit; actions see earlier ones' writes.
         let mut current = regs.clone();
         let (mut actions_applied, mut action_error, mut failed_stop) = (0, None, false);
@@ -1583,7 +1693,7 @@ impl Session {
             self.trace_dropped += 1;
         }
         self.traces.push_back(TraceRecord { seq: self.trace_seq, tracepoint: index, hit, regs: regs.clone(), pointer, data,
-            actions_applied, action_error });
+            captures, actions_applied, action_error });
         if exhausted {
             self.configure()?;
         }
@@ -2071,5 +2181,109 @@ mod tests {
         let mut r = regs();
         r.x[0] = u64::MAX;
         assert_eq!(negative.effect(&r), Ok(Some(Effect::Register(R::X(1), 1))));
+    }
+    fn tracepoint(v: Value) -> Result<Tracepoint, String> {
+        let mut v = v;
+        v["address"] = json!("0xfffff80000001000");
+        parse_tracepoint(0, &v, &[], None)
+    }
+
+    #[test]
+    fn tracepoint_captures_parse() {
+        use vroom_hv::debug::Register as R;
+        let t = tracepoint(json!({"register": "x0", "length": 8, "captures": [
+            {"name": "w2"},
+            {"name": "X2"},
+            {"name": "lr"},
+            {"name": "fp"},
+            {"name": "stack", "register": "sp", "offset": 8, "length": 16},
+            {"name": "ptr", "register": "x0", "length": 32},
+            {"name": "back", "register": "x21", "offset": "-0x10", "length": 4},
+            {"name": "status", "register": "w0"},
+        ]}))
+        .unwrap();
+        let parsed: Vec<_> = t.captures.iter().map(|c| (c.name.as_str(), c.register, c.memory)).collect();
+        let reg = |register, w| ActionRegister { register, w };
+        assert_eq!(parsed, [
+            ("w2", reg(R::X(2), true), None),
+            ("X2", reg(R::X(2), false), None),
+            ("lr", reg(R::X(30), false), None),
+            ("fp", reg(R::X(29), false), None),
+            ("stack", reg(R::Sp, false), Some((8, 16))),
+            ("ptr", reg(R::X(0), false), Some((0, 32))),
+            ("back", reg(R::X(21), false), Some(((-16i64) as u64, 4))),
+            ("status", reg(R::X(0), true), None),
+        ]);
+        assert_eq!((t.register.as_ref().unwrap().0.as_str(), t.length), ("x0", 8), "register/length still parse");
+        assert_eq!(t.json()["captures"][4], json!({"name": "stack", "register": "sp", "offset": 8, "length": 16}));
+        for (bad, message) in [
+            (json!({"name": "w31"}), "register w31"),
+            (json!({"name": "x31"}), "register x31"),
+            (json!({"name": "r0"}), "register r0"),
+            (json!({"name": "buf", "length": 8}), "needs the register"),
+            (json!({"name": "buf", "register": "x0", "offset": 8}), "offset needs a length"),
+            (json!({"name": "buf", "register": "x0", "length": 0}), "length is 1..4096"),
+            (json!({"name": "buf", "register": "x0", "length": 4097}), "length is 1..4096"),
+            (json!({"name": "buf", "register": "q0", "length": 8}), "register q0"),
+            (json!({"register": "x0"}), "needs a name"),
+            (json!({"name": ""}), "needs a name"),
+            (json!({"name": "x0", "lenght": 8}), "unknown key lenght"),
+            (json!("x0"), "expected an object"),
+        ] {
+            let e = tracepoint(json!({"captures": [{"name": "x1"}, bad]})).err().unwrap_or_else(|| panic!("{bad} parsed"));
+            assert!(e.starts_with("tracepoint 0: capture 1: ") && e.contains(message), "{bad}: {e}");
+        }
+        let e = tracepoint(json!({"captures": [{"name": "a", "register": "x0"}, {"name": "a", "register": "x1"}]})).err().unwrap();
+        assert!(e.contains("capture 1: name a is taken"), "{e}");
+        assert!(tracepoint(json!({"captures": {}})).err().unwrap().contains("expected an array"));
+        assert!(tracepoint(json!({"captures": vec![json!({"name": "x0"}); MAX_TRACE_CAPTURES + 1]})).is_err());
+    }
+
+    fn no_memory(address: u64, _: &mut [u8]) -> Result<(), String> {
+        Err(format!("{address:#x} is not mapped"))
+    }
+
+    #[test]
+    fn tracepoint_captures_truncate_w_registers() {
+        let mut r = regs();
+        r.x[2] = 0xdead_beef_8000_0001;
+        let captured = |name: &str| tracepoint(json!({"captures": [{"name": name}]})).unwrap().captures[0].capture(&r, no_memory);
+        assert_eq!(captured("w2"), Captured::Register(0x8000_0001), "low half, zero-extended");
+        assert_eq!(captured("x2"), Captured::Register(0xdead_beef_8000_0001));
+        assert_eq!(captured("w0"), Captured::Register(5));
+        assert_eq!(captured("sp"), Captured::Register(0xfffff800_0000_8000));
+    }
+
+    #[test]
+    fn tracepoint_captures_several_and_a_failing_one() {
+        let t = tracepoint(json!({"captures": [
+            {"name": "w0"},
+            {"name": "x0"},
+            {"name": "stack", "register": "sp", "offset": 8, "length": 4},
+            {"name": "unmapped", "register": "x21", "length": 4},
+            {"name": "null", "register": "x3", "length": 4},
+            {"name": "ptr", "register": "x21", "offset": "0x100", "length": 2},
+        ]}))
+        .unwrap();
+        let r = regs();
+        // Mapped: the 64 bytes above sp, and x21 + 0x100.
+        let read = |address: u64, bytes: &mut [u8]| {
+            let mapped = |base: u64, size: u64| address >= base && address + bytes.len() as u64 <= base + size;
+            if !(mapped(r.sp, 64) || mapped(r.x[21] + 0x100, 16)) {
+                return no_memory(address, bytes);
+            }
+            for (i, b) in bytes.iter_mut().enumerate() {
+                *b = (address as u8).wrapping_add(i as u8);
+            }
+            Ok(())
+        };
+        let record = TraceRecord { seq: 1, tracepoint: 0, hit: 1, regs: r.clone(), pointer: None, data: None,
+            captures: t.captures.iter().map(|c| (c.name.clone(), c.capture(&r, read))).collect(), actions_applied: 0, action_error: None };
+        let v = record.json();
+        assert_eq!(v["captures"], json!({"w0": 5, "x0": 0xffff_ffff_0000_0005u64, "stack": "08090a0b", "ptr": "0001"}));
+        assert_eq!(v["capture_errors"], json!({"unmapped": "read 0xfffff80000002000: 0xfffff80000002000 is not mapped", "null": "x3 is a null pointer"}));
+        assert_eq!(v["capture_addresses"], json!({"stack": 0xfffff800_0000_8008u64, "unmapped": 0xfffff800_0000_2000u64, "ptr": 0xfffff800_0000_2100u64}));
+        let plain = TraceRecord { captures: Vec::new(), ..record };
+        assert!(plain.json().get("captures").is_none(), "records of tracepoints without captures are unchanged");
     }
 }
