@@ -81,6 +81,21 @@ pub struct HvfVcpu {
     /// and when last.
     undecodable: Option<(u64, Instant, Instant)>,
     dirty: Arc<super::dirty::DirtyLog>,
+    execute: Arc<super::execute::ExecutePatches>,
+    /// The PC and patched page of the last instruction fetch that mapped
+    /// that page's execute view.
+    fetched: Option<(u64, u64)>,
+    /// A step of one instruction on a patched page's RAM (native view).
+    native_step: Option<NativeStep>,
+}
+
+/// An instruction on a patched page that reads or writes the page in a way
+/// we can't emulate: it steps once with RAM mapped with every permission.
+#[derive(Debug, Clone, Copy)]
+struct NativeStep {
+    page: u64,
+    /// MDSCR_EL1 before the step, when we armed it (not the debugger).
+    mdscr: Option<u64>,
 }
 
 impl HvfVcpu {
@@ -89,6 +104,7 @@ impl HvfVcpu {
         vtimer_offset: Arc<AtomicU64>,
         el2: bool,
         dirty: Arc<super::dirty::DirtyLog>,
+        execute: Arc<super::execute::ExecutePatches>,
     ) -> Result<Self> {
         let mut id = 0u64;
         let mut exit: *const ffi::hv_vcpu_exit_t = std::ptr::null();
@@ -118,6 +134,9 @@ impl HvfVcpu {
             pending_debug_step: false,
             undecodable: None,
             dirty,
+            execute,
+            fetched: None,
+            native_step: None,
         };
         v.set_sys(ffi::HV_SYS_REG_MPIDR_EL1, mpidr)?;
         v.apply_vm_clock()?;
@@ -282,7 +301,92 @@ impl HvfVcpu {
         }
     }
 
+    /// A fault on a page with execute patches: see `execute`.
+    fn execute_fault(&mut self, esr: u64, ipa: u64) -> Result<Option<VcpuExit>> {
+        use super::execute::View;
+        let class = aarch64::exception_class(esr);
+        let walk = (esr >> 7) & 1 == 1;
+        let pc = self.get(ffi::HV_REG_PC)?;
+        let page = self.execute.page(ipa);
+        if class == ExceptionClass::InstAbortLower && !walk {
+            self.execute.show(ipa, View::Execute)?;
+            self.fetched = Some((pc, page));
+            return Ok(None);
+        }
+        if let Some(da) = aarch64::decode_data_abort(esr).filter(|da| !walk && self.execute.fits(ipa, da.len)) {
+            let emulated = if da.write {
+                let value = self.get_x(da.reg)?.to_le_bytes();
+                self.execute.write(ipa, &value[..da.len])?
+            } else {
+                let mut bytes = [0u8; 8];
+                let read = self.execute.read(ipa, &mut bytes[..da.len]);
+                if read {
+                    self.set_x(da.reg, da.read_value(&bytes[..da.len]))?;
+                }
+                read
+            };
+            if emulated {
+                self.advance_pc()?;
+                if self.debug.single_step {
+                    self.pending_debug_step = true;
+                }
+            }
+            return Ok(None);
+        }
+        if self.fetched == Some((pc, page)) {
+            // Fetching it needs the execute view, its access the data
+            // view: run it once on RAM.
+            self.execute.show(ipa, View::Native)?;
+            let mdscr = if self.debug.single_step {
+                None
+            } else {
+                let mdscr = self.get_sys(MDSCR)?;
+                if !self.debug.enabled {
+                    // SAFETY: owning thread, live vCPU.
+                    check("trap debug exceptions", unsafe { ffi::hv_vcpu_set_trap_debug_exceptions(self.id, true) })?;
+                }
+                self.set_sys(MDSCR, mdscr | 1 | (1 << 13))?;
+                let ps = self.get(ffi::HV_REG_CPSR)?;
+                self.set(ffi::HV_REG_CPSR, ps | PSTATE_SS)?;
+                Some(mdscr)
+            };
+            self.native_step = Some(NativeStep { page, mdscr });
+            self.fetched = None;
+        } else {
+            self.execute.show(ipa, View::Data)?;
+        }
+        Ok(None)
+    }
+
+    /// End a native step (it ran, or the vCPU leaves run() before it did):
+    /// map the execute view again.
+    fn end_native_step(&mut self) -> Result<()> {
+        let Some(step) = self.native_step.take() else { return Ok(()) };
+        if let Some(mdscr) = step.mdscr {
+            self.set_sys(MDSCR, mdscr)?;
+            let ps = self.get(ffi::HV_REG_CPSR)?;
+            self.set(ffi::HV_REG_CPSR, ps & !PSTATE_SS)?;
+            if !self.debug.enabled {
+                // SAFETY: owning thread, live vCPU.
+                check("trap debug exceptions", unsafe { ffi::hv_vcpu_set_trap_debug_exceptions(self.id, false) })?;
+            }
+        }
+        self.execute.show(step.page, super::execute::View::Execute)
+    }
+
     fn handle_exception(&mut self, esr: u64, ipa: u64, va: u64) -> Result<Option<VcpuExit>> {
+        if self.native_step.is_some() && arm64_reason(esr) == Some(DebugReason::SingleStep) {
+            let ours = self.native_step.is_some_and(|s| s.mdscr.is_some());
+            self.end_native_step()?;
+            if ours {
+                return Ok(None);
+            }
+        }
+        if matches!(aarch64::exception_class(esr), ExceptionClass::DataAbortLower | ExceptionClass::InstAbortLower)
+            && self.execute.covers(ipa)
+        {
+            return self.execute_fault(esr, ipa);
+        }
         if self.debug.enabled {
             if let Some(reason) = arm64_reason(esr) {
                 if reason == DebugReason::SoftwareBreakpoint && !self.debug.traps_brk(esr) {
@@ -421,6 +525,44 @@ impl HvfVcpu {
         }
     }
 
+    fn run_guest(&mut self) -> Result<VcpuExit> {
+        loop {
+            if std::mem::take(&mut self.pending_debug_step) {
+                return Ok(VcpuExit::Debug(DebugStop {
+                    cpu: self.index, pc: self.get(ffi::HV_REG_PC)?, syndrome: 0,
+                    reason: crate::debug::DebugReason::SingleStep, fault_address: None,
+                }));
+            }
+            if self.kicker.take_kick() {
+                return Ok(VcpuExit::Kicked);
+            }
+            self.sync_vtimer()?;
+            // SAFETY: own vcpu, own thread.
+            check("hv_vcpu_run", unsafe { ffi::hv_vcpu_run(self.id) })?;
+            // SAFETY: HVF keeps `exit` valid for the vcpu's lifetime and
+            // fills it before hv_vcpu_run returns.
+            let exit = unsafe { *self.exit };
+            match exit.reason {
+                ffi::HV_EXIT_REASON_CANCELED => {
+                    if self.kicker.take_kick() {
+                        return Ok(VcpuExit::Kicked);
+                    }
+                }
+                ffi::HV_EXIT_REASON_VTIMER_ACTIVATED => {
+                    self.set_gicr(ffi::GICR_ISPENDR0, 1 << ffi::HV_GIC_INT_EL1_VIRTUAL_TIMER)?;
+                    self.vtimer_masked = true;
+                }
+                ffi::HV_EXIT_REASON_EXCEPTION => {
+                    let e = exit.exception;
+                    if let Some(x) = self.handle_exception(e.syndrome, e.physical_address, e.virtual_address)? {
+                        return Ok(x);
+                    }
+                }
+                r => return Err(Error::GuestFault(format!("unknown exit reason {r}"))),
+            }
+        }
+    }
+
     fn hypercall_exit(&mut self) -> Result<Option<VcpuExit>> {
         let func = self.get_x(0)?;
         let args = [self.get_x(1)?, self.get_x(2)?, self.get_x(3)?];
@@ -543,41 +685,10 @@ impl Vcpu for HvfVcpu {
     }
 
     fn run(&mut self) -> Result<VcpuExit> {
-        loop {
-            if std::mem::take(&mut self.pending_debug_step) {
-                return Ok(VcpuExit::Debug(DebugStop {
-                    cpu: self.index, pc: self.get(ffi::HV_REG_PC)?, syndrome: 0,
-                    reason: crate::debug::DebugReason::SingleStep, fault_address: None,
-                }));
-            }
-            if self.kicker.take_kick() {
-                return Ok(VcpuExit::Kicked);
-            }
-            self.sync_vtimer()?;
-            // SAFETY: own vcpu, own thread.
-            check("hv_vcpu_run", unsafe { ffi::hv_vcpu_run(self.id) })?;
-            // SAFETY: HVF keeps `exit` valid for the vcpu's lifetime and
-            // fills it before hv_vcpu_run returns.
-            let exit = unsafe { *self.exit };
-            match exit.reason {
-                ffi::HV_EXIT_REASON_CANCELED => {
-                    if self.kicker.take_kick() {
-                        return Ok(VcpuExit::Kicked);
-                    }
-                }
-                ffi::HV_EXIT_REASON_VTIMER_ACTIVATED => {
-                    self.set_gicr(ffi::GICR_ISPENDR0, 1 << ffi::HV_GIC_INT_EL1_VIRTUAL_TIMER)?;
-                    self.vtimer_masked = true;
-                }
-                ffi::HV_EXIT_REASON_EXCEPTION => {
-                    let e = exit.exception;
-                    if let Some(x) = self.handle_exception(e.syndrome, e.physical_address, e.virtual_address)? {
-                        return Ok(x);
-                    }
-                }
-                r => return Err(Error::GuestFault(format!("unknown exit reason {r}"))),
-            }
-        }
+        let exit = self.run_guest();
+        // A native step the vCPU leaves unfinished faults and runs again.
+        self.end_native_step()?;
+        exit
     }
 
     fn complete_mmio_read(&mut self, data: &[u8]) -> Result<()> {

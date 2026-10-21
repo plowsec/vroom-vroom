@@ -47,6 +47,10 @@ impl DirtyLog {
         }
     }
 
+    pub(super) fn is_on(&self) -> bool {
+        self.on.load(Ordering::Acquire)
+    }
+
     /// Write-protect all of `mem` and start logging. vCPUs must be stopped.
     pub(super) fn start(&self, mem: &GuestMemory) -> Result<()> {
         let mut regions = self.regions.lock().unwrap_or_else(|e| e.into_inner());

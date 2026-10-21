@@ -8,6 +8,7 @@
 //!   MMIO never exits to us.
 
 mod dirty;
+mod execute;
 mod ffi;
 mod vcpu;
 
@@ -132,6 +133,7 @@ pub struct HvfVm {
     el2: bool,
     /// Guest writes to RAM, when a snapshot fuzzer logs them.
     dirty: Arc<dirty::DirtyLog>,
+    execute: Arc<execute::ExecutePatches>,
 }
 
 impl std::fmt::Debug for HvfVm {
@@ -233,6 +235,7 @@ impl HvfVm {
             msi,
             el2: params.nested,
             dirty: Arc::new(dirty::DirtyLog::new(granule)),
+            execute: Arc::new(execute::ExecutePatches::new(granule)),
         })
     }
 
@@ -345,11 +348,34 @@ impl Vm for HvfVm {
         for r in mem.regions() {
             self.map(r.host_ptr(), r.start().raw(), r.len() as usize, flags)?;
         }
+        self.execute.remap()?;
         replaced
     }
 
     fn start_dirty_log(&self, mem: &GuestMemory) -> Result<()> {
+        if !self.execute.is_empty() {
+            return Err(Error::Unsupported("logging writes to RAM with execute patches"));
+        }
         self.dirty.start(mem)
+    }
+
+    fn set_execute_patch(&self, gpa: u64, word: Option<[u8; 4]>) -> Result<()> {
+        if self.dirty.is_on() {
+            return Err(Error::Unsupported("execute patches while logging writes to RAM"));
+        }
+        let page = self.execute.page(gpa);
+        let memory = self.memory.lock().unwrap_or_else(|e| e.into_inner());
+        let ram = memory
+            .iter()
+            .flat_map(|m| m.regions())
+            .find(|r| page >= r.start().raw() && page + self.granule <= r.start().raw() + r.len())
+            .map(|r| r.host_ptr().wrapping_add((page - r.start().raw()) as usize))
+            .ok_or_else(|| Error::Invalid(format!("execute patch outside RAM at {gpa:#x}")))?;
+        self.execute.set(gpa, ram, word)
+    }
+
+    fn refresh_execute_patches(&self) -> Result<Vec<u64>> {
+        self.execute.refresh()
     }
 
     fn take_dirty_log(&self) -> Result<Vec<(u64, u64)>> {
@@ -363,7 +389,7 @@ impl Vm for HvfVm {
     }
 
     fn create_vcpu(&self, index: u32) -> Result<Box<dyn Vcpu>> {
-        let v = HvfVcpu::new(index, self.vtimer_offset.clone(), self.el2, self.dirty.clone())?;
+        let v = HvfVcpu::new(index, self.vtimer_offset.clone(), self.el2, self.dirty.clone(), self.execute.clone())?;
         self.kickers.lock().unwrap_or_else(|e| e.into_inner()).push(v.hvf_kicker());
         Ok(Box::new(v))
     }

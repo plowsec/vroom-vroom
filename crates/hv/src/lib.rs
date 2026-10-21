@@ -150,6 +150,21 @@ pub trait Vm: Send + Sync {
         Err(Error::Unsupported("logging guest writes to RAM"))
     }
 
+    /// Make the guest execute `word` at `gpa` (4-byte aligned RAM) instead
+    /// of RAM's instruction, while its reads and writes there still see RAM
+    /// unchanged; None executes RAM's again. Not while logging writes.
+    /// vCPUs must be stopped.
+    fn set_execute_patch(&self, _gpa: u64, _word: Option<[u8; 4]>) -> Result<()> {
+        Err(Error::Unsupported("execute patches"))
+    }
+
+    /// Catch execute patches up with RAM written behind their back (device
+    /// DMA). Returns the patched addresses whose RAM word changed since the
+    /// last call: their patches are gone. Safe while vCPUs run.
+    fn refresh_execute_patches(&self) -> Result<Vec<u64>> {
+        Ok(Vec::new())
+    }
+
     /// Create the vCPU `index`. On HVF this MUST run on the thread that will
     /// drive the vCPU forever; the returned object is deliberately `!Send`.
     fn create_vcpu(&self, index: u32) -> Result<Box<dyn Vcpu>>;

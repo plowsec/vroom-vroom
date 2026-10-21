@@ -80,6 +80,10 @@ pub struct mach_timebase_info_data_t {
     pub denom: u32,
 }
 
+extern "C" {
+    pub fn sys_icache_invalidate(start: *mut c_void, len: usize);
+}
+
 #[link(name = "Hypervisor", kind = "framework")]
 extern "C" {
     pub fn hv_vm_config_create() -> os_object_t;
