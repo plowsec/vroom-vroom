@@ -282,7 +282,7 @@ impl HvfVcpu {
         }
     }
 
-    fn handle_exception(&mut self, esr: u64, ipa: u64) -> Result<Option<VcpuExit>> {
+    fn handle_exception(&mut self, esr: u64, ipa: u64, va: u64) -> Result<Option<VcpuExit>> {
         if self.debug.enabled {
             if let Some(reason) = arm64_reason(esr) {
                 if reason == DebugReason::SoftwareBreakpoint && !self.debug.traps_brk(esr) {
@@ -303,6 +303,7 @@ impl HvfVcpu {
                 }
                 return Ok(Some(VcpuExit::Debug(DebugStop {
                     cpu: self.index, pc: self.get(ffi::HV_REG_PC)?, syndrome: esr, reason,
+                    fault_address: (reason == DebugReason::Watchpoint).then_some(va),
                 })));
             }
         }
@@ -546,7 +547,7 @@ impl Vcpu for HvfVcpu {
             if std::mem::take(&mut self.pending_debug_step) {
                 return Ok(VcpuExit::Debug(DebugStop {
                     cpu: self.index, pc: self.get(ffi::HV_REG_PC)?, syndrome: 0,
-                    reason: crate::debug::DebugReason::SingleStep,
+                    reason: crate::debug::DebugReason::SingleStep, fault_address: None,
                 }));
             }
             if self.kicker.take_kick() {
@@ -570,7 +571,7 @@ impl Vcpu for HvfVcpu {
                 }
                 ffi::HV_EXIT_REASON_EXCEPTION => {
                     let e = exit.exception;
-                    if let Some(x) = self.handle_exception(e.syndrome, e.physical_address)? {
+                    if let Some(x) = self.handle_exception(e.syndrome, e.physical_address, e.virtual_address)? {
                         return Ok(x);
                     }
                 }

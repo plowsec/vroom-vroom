@@ -100,6 +100,15 @@ pub struct DebugStop {
     pub pc: u64,
     pub syndrome: u64,
     pub reason: DebugReason,
+    /// A watchpoint stop's faulting virtual address (FAR): within the
+    /// naturally aligned block the instruction accessed, not necessarily
+    /// inside the watched bytes.
+    pub fault_address: Option<u64>,
+}
+
+/// A watchpoint syndrome's WnR bit: the access was a write.
+pub fn arm64_watchpoint_write(esr: u64) -> bool {
+    esr & (1 << 6) != 0
 }
 
 /// Both lower-EL and same-EL architectural syndromes.

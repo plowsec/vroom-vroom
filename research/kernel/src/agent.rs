@@ -218,12 +218,16 @@ static COMMANDS: &[Command] = &[
     c("memory.dump", "memory", "Dump a virtual range to a file under the lab's exports directory", &[CPU, ADDRESS, p("length", "integer", true, "bytes")], "write", Target::Op("dump")),
     // Breakpoints.
     c("debug.breakpoints", "debug", "Replace the hardware execution breakpoints (at most 4, aligned)", &[p("addresses", "array", true, "addresses; [] clears")], "control", Target::Op("breakpoints")),
-    c("debug.watchpoints", "debug", "Replace the hardware watchpoints (at most 2)", &[p("watches", "array", true, "[{address, size, mode: r|w|rw}]; [] clears")], "control", Target::Op("watchpoints")),
+    c("debug.watchpoints", "debug", "Replace the hardware watchpoints (at most 2, less those debug.hwatch takes)", &[p("watches", "array", true, "[{address, size, mode: r|w|rw}]; [] clears")], "control", Target::Op("watchpoints")),
     c("debug.tracepoints", "debug", "Replace the tracepoints: execution breakpoints that record the CPU's registers (and bytes at a register's pointer) and continue; they share the 4 slots with debug.breakpoints", &[
         p("tracepoints", "array", true, "[{address, register: \"x0\", length: bytes (0..4096), max_hits, stop: true = stop like a breakpoint after recording, actions: [{set_register|add_register: \"x0\"|\"w0\"|\"pc\", value} | {write_memory: {register, offset, hex}}, each with optional skip_if: {register, equals} (apply only when equal) and stop: true (stop if it fails)]}]; [] clears"),
         p("capacity", "integer", false, "records kept, oldest dropped first (default 4096)"),
     ], "control", Target::Op("tracepoints")),
-    c("debug.traces", "debug", "Tracepoint records, oldest first; also while the VM runs", &[
+    c("debug.hwatch", "debug", "Replace the hwatches: data watchpoints on memory addresses that record the CPU's registers and the 8 watched bytes after the access, then continue; they share the 2 data slots with debug.watchpoints (watches at one address share a slot), not the 4 execution slots", &[
+        p("watches", "array", true, "[{address: 8-byte aligned, length: 1..8 (default 8), on: write|read|access|free, name}]; free (heuristic): a write after which the watched bytes hold the poison fa ad db ba fa ad db ba, so any write of those bytes fires it; [] clears"),
+        p("capacity", "integer", false, "records kept, shared with debug.tracepoints (default 4096)"),
+    ], "control", Target::Op("hwatch")),
+    c("debug.traces", "debug", "Tracepoint and hwatch records (kind), oldest first; also while the VM runs", &[
         p("limit", "integer", false, "at most this many (default all)"),
         p("clear", "boolean", false, "remove the returned records from the buffer"),
     ], "read", Target::Op("traces")),
@@ -1066,6 +1070,20 @@ mod tests {
         lab.join().unwrap();
         let job = call(&mut c, r#"{"jsonrpc":"2.0","id":4,"method":"fuzz.run","params":{"harness":"h","seed":"s","output":"o"}}"#);
         assert_eq!(job["error"]["code"], INVALID_PARAMS);
+        let (mut c, rx) = connection();
+        call(&mut c, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"actor":"a"}}"#);
+        let bad = call(&mut c, r#"{"jsonrpc":"2.0","id":2,"method":"debug.hwatch","params":{"watch":[]}}"#);
+        assert_eq!(bad["error"]["code"], INVALID_PARAMS);
+        let lab = std::thread::spawn(move || {
+            let f = rx.recv().unwrap();
+            assert_eq!(f.request["op"], "hwatch");
+            assert_eq!(f.request["watches"][0]["on"], "free");
+            assert_eq!(f.request["capacity"], 262144);
+            f.reply.send(Ok(json!({"slots":1}))).unwrap();
+        });
+        let ok = call(&mut c, r#"{"jsonrpc":"2.0","id":3,"method":"debug.hwatch","params":{"capacity":262144,"watches":[{"address":"0x1e2a27fc7e0","length":1,"on":"free"}]}}"#);
+        assert_eq!(ok["result"]["slots"], 1);
+        lab.join().unwrap();
     }
 
     #[test]

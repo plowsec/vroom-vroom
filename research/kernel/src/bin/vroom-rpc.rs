@@ -1,6 +1,6 @@
 //! One call to a vroom-lab agent endpoint, for agents with a shell:
 //! `vroom-rpc --socket S METHOD [PARAMS]` or `vroom-rpc --socket S run COMMAND [ARGS]`;
-//! `vroom-rpc --socket S traces [follow]` drains tracepoint records as JSON lines.
+//! `vroom-rpc --socket S traces [follow]` drains tracepoint and hwatch records as JSON lines.
 use clap::Parser;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
@@ -18,7 +18,7 @@ struct Args {
     actor: String,
     /// A method (describe, commands.list, events.poll, jobs.status...), or
     /// `run` to run a command: `run memory.read_virtual '{"address":"0x..."}'`,
-    /// or `traces` to drain tracepoint records, one JSON line each
+    /// or `traces` to drain tracepoint and hwatch records, one JSON line each
     /// (`traces follow`: until interrupted).
     method: String,
     /// JSON params (or, after `run`, the command name then its JSON args).

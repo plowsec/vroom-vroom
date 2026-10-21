@@ -198,6 +198,200 @@ const MAX_TRACE_CAPACITY: u64 = 1 << 20;
 const EVENT_BURST: usize = 256;
 const MAX_TRACE_ACTIONS: usize = 16;
 const MAX_TRACE_CAPTURES: usize = 16;
+/// Hardware data watchpoint slots, shared by debug.watchpoints and debug.hwatch.
+const DATA_SLOTS: usize = 2;
+/// What the allocator wrapper writes into a freed block's header:
+/// 0xbadbadfabadbadfa, little-endian.
+const FREE_POISON: [u8; 8] = [0xfa, 0xad, 0xdb, 0xba, 0xfa, 0xad, 0xdb, 0xba];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WatchOn {
+    Write,
+    Read,
+    Access,
+    /// A heuristic: a write after which the watched bytes hold the start of
+    /// FREE_POISON. Any write of those bytes fires it, not only a free.
+    Free,
+}
+
+impl WatchOn {
+    fn parse(s: &str) -> Result<Self, String> {
+        Ok(match s {
+            "write" => Self::Write,
+            "read" => Self::Read,
+            "access" => Self::Access,
+            "free" => Self::Free,
+            _ => return Err(format!("on: {s} is not write, read, access or free")),
+        })
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Self::Write => "write",
+            Self::Read => "read",
+            Self::Access => "access",
+            Self::Free => "free",
+        }
+    }
+    fn reads(self) -> bool {
+        matches!(self, Self::Read | Self::Access)
+    }
+    fn writes(self) -> bool {
+        !matches!(self, Self::Read)
+    }
+    fn matches(self, write: bool) -> bool {
+        if write { self.writes() } else { self.reads() }
+    }
+}
+
+/// A data watchpoint that records the CPU and continues.
+struct Hwatch {
+    address: u64,
+    length: u64,
+    on: WatchOn,
+    name: Option<String>,
+    hits: u64,
+    /// A user-address watch's process (None: any).
+    context: Option<process::Process>,
+}
+
+impl Hwatch {
+    fn json(&self) -> Value {
+        json!({"address": self.address, "length": self.length, "on": self.on.name(), "name": self.name, "hits": self.hits,
+            "pid": self.context.as_ref().map(|p| p.pid)})
+    }
+    /// Whether the bytes after the access fire this watch.
+    fn fires(&self, after: &Result<[u8; 8], String>) -> bool {
+        match (self.on, after) {
+            (WatchOn::Free, Ok(bytes)) => bytes[..self.length as usize] == FREE_POISON[..self.length as usize],
+            // Unreadable: record it with its read_error.
+            _ => true,
+        }
+    }
+}
+
+/// One entry of debug.hwatch.
+fn parse_hwatch(i: usize, w: &Value, previous: &[Hwatch], selected: Option<&process::Process>) -> Result<Hwatch, String> {
+    let fail = |e: String| format!("hwatch {i}: {e}");
+    let object = w.as_object().ok_or_else(|| fail("expected an object".into()))?;
+    if let Some(key) = object.keys().find(|k| !matches!(k.as_str(), "address" | "length" | "on" | "name")) {
+        return Err(fail(format!("unknown key {key} (address, length, on, name)")));
+    }
+    let present = |k: &str| object.get(k).filter(|v| !v.is_null());
+    let address = number(present("address").ok_or_else(|| fail("missing address".into()))?).map_err(fail)?;
+    if address & 7 != 0 {
+        return Err(fail(format!("address {address:#x} must be 8-byte aligned")));
+    }
+    let length = present("length").map(number).transpose().map_err(fail)?.unwrap_or(8);
+    if !(1..=8).contains(&length) {
+        return Err(fail("length: 1..8 bytes".into()));
+    }
+    let on = present("on").ok_or_else(|| fail("missing on: write, read, access or free".into()))?;
+    let on = WatchOn::parse(on.as_str().ok_or_else(|| fail("on: expected a string".into()))?).map_err(fail)?;
+    let name = present("name").map(|v| v.as_str().map(str::to_owned).ok_or_else(|| fail("name: expected a string".into()))).transpose()?;
+    // A user address watches in the selected process; with none, in all.
+    let context = if address >> 63 == 0 {
+        previous.iter().find(|w| w.address == address).map_or(selected, |w| w.context.as_ref()).cloned()
+    } else {
+        None
+    };
+    Ok(Hwatch { address, length, on, name, hits: 0, context })
+}
+
+/// A debug.hwatch list, checked as a whole.
+fn parse_hwatches(list: &[Value], previous: &[Hwatch], selected: Option<&process::Process>) -> Result<Vec<Hwatch>, String> {
+    let watches = list.iter().enumerate().map(|(i, w)| parse_hwatch(i, w, previous, selected)).collect::<Result<Vec<_>, _>>()?;
+    for (i, w) in watches.iter().enumerate() {
+        if let Some(name) = &w.name {
+            if watches[..i].iter().any(|u| u.name.as_ref() == Some(name)) {
+                return Err(format!("hwatch {i}: name {name} is taken"));
+            }
+        }
+    }
+    let slots = hwatch_slots(&watches).len();
+    if slots > DATA_SLOTS {
+        return Err(format!(
+            "{} hwatches need {slots} hardware data watchpoint slots; there are {DATA_SLOTS} (watches at the same address share one)",
+            watches.len()
+        ));
+    }
+    Ok(watches)
+}
+
+/// Hardware watchpoints these hwatches take: one per watched address.
+fn hwatch_slots(watches: &[Hwatch]) -> Vec<Watchpoint> {
+    let mut slots: Vec<Watchpoint> = Vec::new();
+    for w in watches {
+        match slots.iter_mut().find(|s| s.address == w.address) {
+            Some(slot) => {
+                slot.size = slot.size.max(w.length as u8);
+                slot.read |= w.on.reads();
+                slot.write |= w.on.writes();
+            }
+            None => slots.push(Watchpoint { address: w.address, size: w.length as u8, read: w.on.reads(), write: w.on.writes() }),
+        }
+    }
+    slots
+}
+
+/// An hwatch stop, recorded once its instruction has executed.
+struct HwatchPending {
+    regs: Registers,
+    fault_address: Option<u64>,
+    write: bool,
+    /// Matching watches and the 8 bytes at each one's address before the access.
+    watches: Vec<(usize, Result<[u8; 8], String>)>,
+}
+
+struct HwatchRecord {
+    seq: u64,
+    hwatch: usize,
+    name: Option<String>,
+    hit: u64,
+    regs: Registers,
+    fault_address: Option<u64>,
+    write: bool,
+    address: u64,
+    length: u64,
+    on: WatchOn,
+    before: Result<[u8; 8], String>,
+    after: Result<[u8; 8], String>,
+}
+
+impl HwatchRecord {
+    fn json(&self) -> Value {
+        let r = &self.regs;
+        let mut v = json!({"seq": self.seq, "kind": "hwatch", "hwatch": self.hwatch, "hit": self.hit, "cpu": r.cpu, "pc": r.pc,
+            "lr": r.x[30], "sp": r.sp, "pstate": r.pstate, "ttbr0": r.ttbr0, "x": r.x, "fault_address": self.fault_address,
+            "access": if self.write { "write" } else { "read" }, "address": self.address, "length": self.length, "on": self.on.name()});
+        if let Some(name) = &self.name {
+            v["name"] = json!(name);
+        }
+        match &self.before {
+            Ok(bytes) => v["before"] = json!(hex_string(bytes)),
+            Err(e) => v["before_error"] = json!(e),
+        }
+        match &self.after {
+            Ok(bytes) => v["hex"] = json!(hex_string(bytes)),
+            Err(e) => v["read_error"] = json!(e),
+        }
+        v
+    }
+}
+
+/// One entry of the ring buffer debug.traces drains.
+enum Record {
+    Trace(TraceRecord),
+    Hwatch(HwatchRecord),
+}
+
+impl Record {
+    fn json(&self) -> Value {
+        match self {
+            Self::Trace(r) => r.json(),
+            Self::Hwatch(r) => r.json(),
+        }
+    }
+}
 
 /// An execution breakpoint that records the CPU and continues.
 struct Tracepoint {
@@ -252,7 +446,7 @@ struct TraceRecord {
 impl TraceRecord {
     fn json(&self) -> Value {
         let r = &self.regs;
-        let mut v = json!({"seq": self.seq, "tracepoint": self.tracepoint, "hit": self.hit, "cpu": r.cpu, "pc": r.pc,
+        let mut v = json!({"seq": self.seq, "kind": "tracepoint", "tracepoint": self.tracepoint, "hit": self.hit, "cpu": r.cpu, "pc": r.pc,
             "sp": r.sp, "pstate": r.pstate, "ttbr0": r.ttbr0, "x": r.x, "actions_applied": self.actions_applied});
         if let Some(e) = &self.action_error {
             v["action_error"] = json!(e);
@@ -632,7 +826,10 @@ struct Session {
     breakpoints: Vec<u64>,
     breakpoint_contexts: BTreeMap<u64, process::Process>,
     tracepoints: Vec<Tracepoint>,
-    traces: std::collections::VecDeque<TraceRecord>,
+    hwatches: Vec<Hwatch>,
+    /// By CPU: hwatch stops waiting for their instruction to execute.
+    hwatch_pending: BTreeMap<usize, HwatchPending>,
+    traces: std::collections::VecDeque<Record>,
     trace_capacity: usize,
     trace_seq: u64,
     trace_dropped: u64,
@@ -762,15 +959,17 @@ impl Session {
     }
     fn configure(&self) -> Result<(), String> {
         let addresses = self.execution_breakpoints();
+        let mut watchpoints = self.watchpoints.clone();
+        watchpoints.extend(hwatch_slots(&self.hwatches));
         for cpu in 0..self.vm.config().cpus as usize {
             self.vm
                 .debug_configure(
                     cpu,
                     DebugConfig {
-                        enabled: !addresses.is_empty() || !self.watchpoints.is_empty(),
+                        enabled: !addresses.is_empty() || !watchpoints.is_empty(),
                         single_step: false,
                         breakpoints: addresses.clone(),
-                        watchpoints: self.watchpoints.clone(),
+                        watchpoints: watchpoints.clone(),
                         trap_software_breakpoints: false,
                         trap_brk_immediate: None,
                     },
@@ -791,7 +990,7 @@ impl Session {
         match op {
             "status" => {
                 let agent = self.vm.agent().status();
-                let mut s = json!({"state": format!("{:?}", self.vm.state()), "cpus": self.vm.config().cpus, "breakpoints": self.breakpoints, "temporary":self.run_to.as_ref().map(|r|r.address), "tracepoints": self.tracepoints.iter().filter(|t| t.armed()).count(), "traces": self.traces.len(), "guest_agent": agent.connected.then_some(agent.agent)});
+                let mut s = json!({"state": format!("{:?}", self.vm.state()), "cpus": self.vm.config().cpus, "breakpoints": self.breakpoints, "temporary":self.run_to.as_ref().map(|r|r.address), "tracepoints": self.tracepoints.iter().filter(|t| t.armed()).count(), "hwatch": self.hwatches.len(), "traces": self.traces.len(), "guest_agent": agent.connected.then_some(agent.agent)});
                 if self.vm.state() == RunState::Paused {
                     s["note"] = json!("paused: vm.resume runs the guest; its network, agent and screen are frozen until then");
                 }
@@ -825,6 +1024,16 @@ impl Session {
                             .iter()
                             .find(|p| p.eprocess == process.eprocess && p.pid == process.pid)
                             .ok_or("tracepoint process exited; clear its tracepoint")?
+                            .clone();
+                    }
+                }
+                if self.hwatches.iter().any(|w| w.context.is_some()) {
+                    let active = self.processes(cpu)?;
+                    for process in self.hwatches.iter_mut().filter_map(|w| w.context.as_mut()) {
+                        *process = active
+                            .iter()
+                            .find(|p| p.eprocess == process.eprocess && p.pid == process.pid)
+                            .ok_or("hwatch process exited; clear its hwatch")?
                             .clone();
                     }
                 }
@@ -1412,8 +1621,9 @@ impl Session {
                 let watches = request["watches"]
                     .as_array()
                     .ok_or("expected watches array")?;
-                if watches.len() > 2 {
-                    return Err("at most two hardware watchpoints".into());
+                let taken = hwatch_slots(&self.hwatches).len();
+                if watches.len() + taken > DATA_SLOTS {
+                    return Err(format!("at most {DATA_SLOTS} hardware watchpoints; debug.hwatch takes {taken} (clear it with debug.hwatch [])"));
                 }
                 let watches = watches
                     .iter()
@@ -1525,6 +1735,37 @@ impl Session {
                 Ok(json!({"tracepoints": self.tracepoints.iter().map(Tracepoint::json).collect::<Vec<_>>(),
                     "capacity": self.trace_capacity, "slots": slots}))
             }
+            "hwatch" => {
+                let list = request["watches"].as_array().ok_or("expected watches array ([] clears)")?;
+                let capacity = request.get("capacity").filter(|v| !v.is_null()).map(number).transpose()?;
+                if capacity.is_some_and(|c| !(1..=MAX_TRACE_CAPACITY).contains(&c)) {
+                    return Err(format!("capacity: 1..{MAX_TRACE_CAPACITY} records"));
+                }
+                let watches = parse_hwatches(list, &self.hwatches, self.process.as_ref())?;
+                let slots = hwatch_slots(&watches).len();
+                if slots + self.watchpoints.len() > DATA_SLOTS {
+                    return Err(format!(
+                        "hwatches need {slots} hardware data watchpoint slots and debug.watchpoints holds {}; there are {DATA_SLOTS} (clear them with debug.watchpoints [])",
+                        self.watchpoints.len()
+                    ));
+                }
+                let old = std::mem::replace(&mut self.hwatches, watches);
+                if let Err(e) = self.configure() {
+                    self.hwatches = old;
+                    let rollback = self.configure();
+                    return Err(format!("{e}; rollback: {rollback:?}; VM remains paused"));
+                }
+                self.hwatch_pending.clear();
+                if let Some(capacity) = capacity {
+                    self.trace_capacity = capacity as usize;
+                    while self.traces.len() > self.trace_capacity {
+                        self.traces.pop_front();
+                        self.trace_dropped += 1;
+                    }
+                }
+                Ok(json!({"hwatch": self.hwatches.iter().map(Hwatch::json).collect::<Vec<_>>(),
+                    "capacity": self.trace_capacity, "slots": slots}))
+            }
             "traces" => {
                 let limit = request.get("limit").filter(|v| !v.is_null()).map(number).transpose()?;
                 let clear = match request.get("clear").filter(|v| !v.is_null()) {
@@ -1535,11 +1776,12 @@ impl Session {
                 let records: Vec<Value> = if clear {
                     self.traces.drain(..n).map(|r| r.json()).collect()
                 } else {
-                    self.traces.iter().take(n).map(TraceRecord::json).collect()
+                    self.traces.iter().take(n).map(Record::json).collect()
                 };
                 Ok(json!({"records": records, "remaining": self.traces.len(), "recorded": self.trace_seq,
                     "dropped": self.trace_dropped, "capacity": self.trace_capacity,
-                    "tracepoints": self.tracepoints.iter().map(Tracepoint::json).collect::<Vec<_>>()}))
+                    "tracepoints": self.tracepoints.iter().map(Tracepoint::json).collect::<Vec<_>>(),
+                    "hwatch": self.hwatches.iter().map(Hwatch::json).collect::<Vec<_>>()}))
             }
             "step" => {
                 self.cancel_run_to()?;
@@ -1687,17 +1929,81 @@ impl Session {
         let t = &mut self.tracepoints[index];
         t.hits += 1;
         let (hit, stop, exhausted) = (t.hits, t.stop || failed_stop, !t.armed());
+        let seq = self.next_record();
+        self.traces.push_back(Record::Trace(TraceRecord { seq, tracepoint: index, hit, regs: regs.clone(), pointer, data,
+            captures, actions_applied, action_error }));
+        if exhausted {
+            self.configure()?;
+        }
+        Ok(Some(TraceHit { stop, moved: current.pc != regs.pc }))
+    }
+
+    /// The next record's sequence number, making room for it.
+    fn next_record(&mut self) -> u64 {
         self.trace_seq += 1;
         if self.traces.len() >= self.trace_capacity {
             self.traces.pop_front();
             self.trace_dropped += 1;
         }
-        self.traces.push_back(TraceRecord { seq: self.trace_seq, tracepoint: index, hit, regs: regs.clone(), pointer, data,
-            captures, actions_applied, action_error });
-        if exhausted {
-            self.configure()?;
+        self.trace_seq
+    }
+
+    /// The 8 bytes at a watched address, through the stopped CPU's tables.
+    fn watched_bytes(&self, regs: &Registers, address: u64) -> Result<[u8; 8], String> {
+        // A kernel access may still touch its caller's user memory.
+        let mut walk = regs.clone();
+        walk.tcr &= !(1 << 7);
+        let mut bytes = [0; 8];
+        AddressSpace { memory: &self.vm, registers: &walk }.read(address, &mut bytes).map_err(|e| e.to_string())?;
+        Ok(bytes)
+    }
+
+    /// A watchpoint stop: false if it is a debug.watchpoints stop. Otherwise
+    /// the matching hwatches wait for the instruction to execute (pending
+    /// on this CPU), since a watchpoint stops before the access.
+    fn hwatch_hit(&mut self, stop: &vroom_hv::debug::DebugStop, regs: &Registers) -> bool {
+        if self.hwatches.is_empty() {
+            return false;
         }
-        Ok(Some(TraceHit { stop, moved: current.pc != regs.pc }))
+        // FAR lies in the block the instruction accessed: a wide store may
+        // report an address outside the watched granule, then any slot may
+        // have fired.
+        let granule = stop.fault_address.map(|a| a & !7);
+        let watched = |address: u64| granule == Some(address);
+        let ours = self.hwatches.iter().any(|w| watched(w.address));
+        if !self.watchpoints.is_empty() && (!ours || self.watchpoints.iter().any(|w| watched(w.address & !7))) {
+            return false;
+        }
+        let write = vroom_hv::debug::arm64_watchpoint_write(stop.syndrome);
+        let watches = self
+            .hwatches
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| (!ours || watched(w.address)) && w.on.matches(write))
+            .filter(|(_, w)| !w.context.as_ref().is_some_and(|p| !same_space(p, regs)))
+            .map(|(i, w)| (i, self.watched_bytes(regs, w.address)))
+            .collect();
+        self.hwatch_pending.insert(regs.cpu as usize, HwatchPending { regs: regs.clone(), fault_address: stop.fault_address, write, watches });
+        true
+    }
+
+    /// This CPU executed its hwatch stop's instruction: record the watches
+    /// the bytes after it fire.
+    fn hwatch_done(&mut self, cpu: usize) {
+        let Some(pending) = self.hwatch_pending.remove(&cpu) else { return };
+        for (index, before) in pending.watches {
+            let Some(w) = self.hwatches.get(index) else { continue };
+            let after = self.watched_bytes(&pending.regs, w.address);
+            if !w.fires(&after) {
+                continue;
+            }
+            let w = &mut self.hwatches[index];
+            w.hits += 1;
+            let (hit, name, address, length, on) = (w.hits, w.name.clone(), w.address, w.length, w.on);
+            let seq = self.next_record();
+            self.traces.push_back(Record::Hwatch(HwatchRecord { seq, hwatch: index, name, hit, regs: pending.regs.clone(),
+                fault_address: pending.fault_address, write: pending.write, address, length, on, before, after }));
+        }
     }
 
     /// A step that a stop on another CPU paused before it ran: that CPU
@@ -1708,15 +2014,15 @@ impl Session {
         };
         let state = self.vm.debug_registers(cpu).map_err(|e| e.to_string())?;
         let pc = Registers::from_state(&state).map_err(|e| e.to_string())?.pc;
-        if self.execution_breakpoints().contains(&pc) {
+        if self.execution_breakpoints().contains(&pc) || self.hwatch_pending.contains_key(&cpu) {
             self.continue_cpus.push_front(cpu);
         }
         Ok(())
     }
 
-    /// Tracepoints keep the event loop polling the VM instead of requests.
+    /// Tracepoints and hwatches keep the event loop polling the VM instead of requests.
     fn tracing(&self) -> bool {
-        self.continuing || (!self.tracepoints.is_empty() && self.vm.state() == RunState::Running)
+        self.continuing || ((!self.tracepoints.is_empty() || !self.hwatches.is_empty()) && self.vm.state() == RunState::Running)
     }
 }
 
@@ -1775,6 +2081,8 @@ fn boot(config_path: &std::path::Path, restore: Option<&std::path::Path>) -> Res
         breakpoints: Vec::new(),
         breakpoint_contexts: BTreeMap::new(),
         tracepoints: Vec::new(),
+        hwatches: Vec::new(),
+        hwatch_pending: BTreeMap::new(),
         traces: Default::default(),
         trace_capacity: DEFAULT_TRACE_CAPACITY,
         trace_seq: 0,
@@ -1876,6 +2184,25 @@ fn run(args: Args) -> Result<(), String> {
                     session.watch_stopped = (stop.reason
                         == vroom_hv::debug::DebugReason::Watchpoint)
                         .then_some(stop.cpu as usize);
+                    if stop.reason == vroom_hv::debug::DebugReason::SingleStep {
+                        session.hwatch_done(stop.cpu as usize);
+                    }
+                    if stop.reason == vroom_hv::debug::DebugReason::Watchpoint {
+                        let regs = session.registers(stop.cpu as usize, false)?;
+                        if session.hwatch_hit(&stop, &regs) {
+                            // Recorded after a step past the access; a pause
+                            // already asked for keeps the VM paused (vm.resume steps it).
+                            if was_running {
+                                session.requeue_step(stepping)?;
+                                if !session.continue_cpus.contains(&(stop.cpu as usize)) {
+                                    session.continue_cpus.push_back(stop.cpu as usize);
+                                }
+                                session.continuing = true;
+                                session.continue_next()?;
+                            }
+                            continue;
+                        }
+                    }
                     if stop.reason == vroom_hv::debug::DebugReason::SingleStep
                         && stepping != Some(stop.cpu as usize)
                         && was_running
@@ -2285,5 +2612,109 @@ mod tests {
         assert_eq!(v["capture_addresses"], json!({"stack": 0xfffff800_0000_8008u64, "unmapped": 0xfffff800_0000_2000u64, "ptr": 0xfffff800_0000_2100u64}));
         let plain = TraceRecord { captures: Vec::new(), ..record };
         assert!(plain.json().get("captures").is_none(), "records of tracepoints without captures are unchanged");
+    }
+
+    fn hwatches(v: Value) -> Result<Vec<Hwatch>, String> {
+        parse_hwatches(v.as_array().unwrap(), &[], None)
+    }
+
+    #[test]
+    fn hwatch_parses_and_shares_data_slots() {
+        let w = hwatches(json!([
+            {"address": "0x1e2a27fc7e0", "length": 8, "on": "write", "name": "heap16_a"},
+            {"address": "0x1e2a27fc7e0", "length": 1, "on": "free", "name": "heap16_free"},
+            {"address": "0x1e2a281f500", "length": 8, "on": "access"}]))
+        .unwrap();
+        assert_eq!((w[0].address, w[0].length, w[0].on, w[0].name.as_deref()), (0x1e2a27fc7e0, 8, WatchOn::Write, Some("heap16_a")));
+        assert_eq!((w[1].length, w[1].on), (1, WatchOn::Free));
+        assert_eq!((w[2].on, w[2].name.as_deref()), (WatchOn::Access, None));
+        assert_eq!(
+            hwatch_slots(&w),
+            vec![
+                Watchpoint { address: 0x1e2a27fc7e0, size: 8, read: false, write: true },
+                Watchpoint { address: 0x1e2a281f500, size: 8, read: true, write: true },
+            ],
+            "watches at one address share a slot"
+        );
+        for slot in hwatch_slots(&w) {
+            slot.arm64_control().unwrap();
+        }
+        assert_eq!(hwatches(json!([{"address": 0x1000, "on": "read"}])).unwrap()[0].length, 8, "length defaults to 8");
+        assert!(hwatches(json!([])).unwrap().is_empty(), "[] clears");
+        let three = hwatches(json!([{"address": "0x1000", "on": "write"}, {"address": "0x2000", "on": "write"}, {"address": "0x3000", "on": "free"}]));
+        assert!(three.err().unwrap().contains("3 hwatches need 3 hardware data watchpoint slots; there are 2"));
+    }
+
+    #[test]
+    fn hwatch_refuses_bad_entries() {
+        for (bad, message) in [
+            (json!({"address": "0x1004", "on": "write"}), "8-byte aligned"),
+            (json!({"address": "0x1001", "length": 1, "on": "write"}), "8-byte aligned"),
+            (json!({"address": "0x1000", "length": 0, "on": "write"}), "length: 1..8"),
+            (json!({"address": "0x1000", "length": 9, "on": "write"}), "length: 1..8"),
+            (json!({"address": "0x1000", "on": "execute"}), "not write, read, access or free"),
+            (json!({"address": "0x1000", "on": 1}), "on: expected a string"),
+            (json!({"address": "0x1000"}), "missing on"),
+            (json!({"on": "write"}), "missing address"),
+            (json!({"address": "0x1000", "on": "write", "size": 8}), "unknown key size"),
+            (json!({"address": "0x1000", "on": "write", "name": 3}), "name: expected a string"),
+            (json!("0x1000"), "expected an object"),
+        ] {
+            let e = hwatches(json!([{"address": "0x2000", "on": "write"}, bad])).err().unwrap_or_else(|| panic!("{bad} parsed"));
+            assert!(e.starts_with("hwatch 1: ") && e.contains(message), "{bad}: {e}");
+        }
+        let e = hwatches(json!([{"address": "0x1000", "on": "write", "name": "a"}, {"address": "0x2000", "on": "read", "name": "a"}]));
+        assert!(e.err().unwrap().contains("name a is taken"));
+    }
+
+    #[test]
+    fn hwatch_on_matches_accesses_and_free_matches_the_poison() {
+        assert!(WatchOn::Write.matches(true) && !WatchOn::Write.matches(false));
+        assert!(WatchOn::Read.matches(false) && !WatchOn::Read.matches(true));
+        assert!(WatchOn::Access.matches(false) && WatchOn::Access.matches(true));
+        assert!(WatchOn::Free.matches(true) && !WatchOn::Free.matches(false));
+        let watch = |length, on| Hwatch { address: 0x1000, length, on, name: None, hits: 0, context: None };
+        let poison = Ok(0xbadbadfabadbadfa_u64.to_le_bytes());
+        assert_eq!(poison, Ok(FREE_POISON));
+        assert!(watch(8, WatchOn::Free).fires(&poison));
+        assert!(watch(1, WatchOn::Free).fires(&Ok([0xfa, 0, 0, 0, 0, 0, 0, 0])), "a 1-byte free watch only sees fa");
+        assert!(!watch(8, WatchOn::Free).fires(&Ok([0xfa, 0, 0, 0, 0, 0, 0, 0])));
+        assert!(!watch(1, WatchOn::Free).fires(&Ok([0; 8])));
+        assert!(watch(8, WatchOn::Free).fires(&Err("unmapped".into())), "unreadable: recorded with read_error");
+        assert!(watch(8, WatchOn::Write).fires(&Ok([0; 8])));
+    }
+
+    #[test]
+    fn hwatch_records_are_trace_records_with_kind() {
+        let mut r = regs();
+        r.x[30] = 0xfffff800_0000_3000;
+        let record = HwatchRecord { seq: 7, hwatch: 1, name: Some("heap16_free".into()), hit: 2, regs: r.clone(),
+            fault_address: Some(0x1e2a27fc7e0), write: true, address: 0x1e2a27fc7e0, length: 1, on: WatchOn::Free,
+            before: Ok([0x10, 0, 0, 0, 0, 0, 0, 0]), after: Ok(FREE_POISON) };
+        let v = Record::Hwatch(record).json();
+        assert_eq!(v["kind"], "hwatch");
+        assert_eq!((v["seq"].as_u64(), v["hwatch"].as_u64(), v["hit"].as_u64()), (Some(7), Some(1), Some(2)));
+        assert_eq!(v["name"], "heap16_free");
+        assert_eq!((v["cpu"].as_u64(), v["pc"].as_u64(), v["sp"].as_u64()), (Some(1), Some(r.pc), Some(r.sp)));
+        assert_eq!(v["lr"], json!(0xfffff800_0000_3000u64));
+        assert_eq!(v["x"], json!(r.x));
+        assert_eq!(v["x"].as_array().unwrap().len(), 31, "x0..x30");
+        assert_eq!(v["fault_address"], json!(0x1e2a27fc7e0u64));
+        assert_eq!(v["access"], "write");
+        assert_eq!((v["address"].as_u64(), v["length"].as_u64(), v["on"].as_str()), (Some(0x1e2a27fc7e0), Some(1), Some("free")));
+        assert_eq!(v["hex"], "faaddbbafaaddbba");
+        assert_eq!(v["before"], "1000000000000000");
+        for key in ["pstate", "ttbr0"] {
+            assert!(v.get(key).is_some(), "{key}");
+        }
+        let unnamed = HwatchRecord { seq: 8, hwatch: 0, name: None, hit: 1, regs: r, fault_address: None, write: false,
+            address: 0x2000, length: 8, on: WatchOn::Access, before: Err("unmapped".into()), after: Err("unmapped".into()) };
+        let v = unnamed.json();
+        assert!(v.get("name").is_none());
+        assert_eq!((v["access"].as_str(), v["read_error"].as_str(), v["before_error"].as_str()), (Some("read"), Some("unmapped"), Some("unmapped")));
+        assert!(v.get("hex").is_none());
+        let trace = TraceRecord { seq: 1, tracepoint: 0, hit: 1, regs: regs(), pointer: None, data: None, captures: Vec::new(),
+            actions_applied: 0, action_error: None };
+        assert_eq!(Record::Trace(trace).json()["kind"], "tracepoint");
     }
 }

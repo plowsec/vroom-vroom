@@ -173,7 +173,8 @@ impl Vcpu for KvmVcpu {
                     let syndrome = (debug.hsr as u64) | ((debug.hsr_high as u64) << 32);
                     let reason = crate::debug::arm64_reason(syndrome)
                         .ok_or_else(|| Error::GuestFault(format!("unknown KVM debug syndrome {syndrome:#x}")))?;
-                    VcpuExit::Debug(crate::debug::DebugStop { cpu: self.index, pc: self.get(PC)?, syndrome, reason })
+                    let fault_address = (reason == crate::debug::DebugReason::Watchpoint).then_some(debug.far);
+                    VcpuExit::Debug(crate::debug::DebugStop { cpu: self.index, pc: self.get(PC)?, syndrome, reason, fault_address })
                 }
                 Ok(KExit::SystemEvent(ty, _)) => {
                     if ty == KVM_SYSTEM_EVENT_RESET {
