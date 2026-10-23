@@ -887,10 +887,13 @@ impl DrainRead {
     /// The address to read for one record (`v`, its JSON).
     fn address(&self, record: &Record, v: &Value) -> Result<u64, String> {
         let at = self.at.as_str();
+        // A memory capture's address, or a register capture's value.
         let base = if let Some(address) = v["capture_addresses"].get(at).and_then(Value::as_u64) {
             address
+        } else if let Some(value) = v["captures"].get(at).and_then(Value::as_u64) {
+            value
         } else if v["captures"].get(at).is_some() || v["capture_errors"].get(at).is_some() {
-            return Err(format!("capture {at} holds no address (a register capture, or a null pointer)"));
+            return Err(format!("capture {at} holds no address (a null pointer, or unreadable)"));
         } else if matches!(at, "pointer" | "address") {
             v[at].as_u64().ok_or_else(|| format!("this record has no {at}"))?
         } else {
@@ -2005,6 +2008,9 @@ impl Session {
                 if memory.is_some() && self.vm.state() != RunState::Paused {
                     return Err("memory reads guest memory: vm.pause, then debug.traces with memory (and vm.resume after)".into());
                 }
+                if clear && limit == Some(0) {
+                    return Err("limit 0 returns no records, so clear would remove none: omit limit to drain them all".into());
+                }
                 let n = limit.map_or(self.traces.len(), |l| (l as usize).min(self.traces.len()));
                 let json = |r: &Record| {
                     let mut v = r.json();
@@ -3012,7 +3018,7 @@ mod tests {
         assert_eq!(at("chunk", -0x10), Ok(0x8ff0));
         assert_eq!(at("pointer", 0), Ok(0x5000));
         assert_eq!(at("x21", 8), Ok(0xfffff800_0000_2008), "a register as recorded");
-        assert!(at("w0", 0).err().unwrap().contains("holds no address"));
+        assert_eq!(at("w0", 0x10), Ok(0x15), "a register capture's value");
         assert!(at("address", 0).err().unwrap().contains("no address"));
         assert!(at("heap", 0).err().unwrap().contains("not a capture"));
     }

@@ -228,9 +228,9 @@ static COMMANDS: &[Command] = &[
         p("capacity", "integer", false, "records kept, shared with debug.tracepoints (default 4096)"),
     ], "control", Target::Op("hwatch")),
     c("debug.traces", "debug", "Tracepoint and hwatch records (kind), oldest first, each with cntvct (the guest's CNTVCT_EL0) and time_ns (host, since the lab started; both include the debugger's time at stops); also while the VM runs", &[
-        p("limit", "integer", false, "at most this many (default all)"),
+        p("limit", "integer", false, "at most this many (default all; 0 only reports, and with clear is refused)"),
         p("clear", "boolean", false, "remove the returned records from the buffer"),
-        p("memory", "object", false, "{at: a capture's name | \"pointer\" | \"address\" (an hwatch's) | a register, offset, length: 1..4096}: each record also gets memory {address, hex} read now, through its own process's tables, to compare with what the hit captured; needs a paused VM"),
+        p("memory", "object", false, "{at: a capture's name (a memory capture's address, a register capture's value) | \"pointer\" | \"address\" (an hwatch's) | a register, offset, length: 1..4096}: each record also gets memory {address, hex} read now, through its own process's tables, to compare with what the hit captured; needs a paused VM"),
     ], "read", Target::Op("traces")),
     // Windows kernel.
     c("kernel.info", "kernel", "Find ntoskrnl: base, size, PDB", &[CPU], "read", Target::Op("kernel")),
