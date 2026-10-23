@@ -156,6 +156,14 @@ def run(binary):
                 assert t['tracepoints'][0]['hits'] == 0, t['tracepoints'][0]
                 call('tracepoints', tracepoints=[]); call('traces', clear=True)
                 print('tracepoints: record_if filters (counted), status while running, traces memory reads now')
+                # A 16-byte software watch shows all 16 bytes; limit 0 with clear is refused.
+                call('hwatch', watches=[{'address': counter, 'length': 16, 'on': 'write', 'kind': 'software'}])
+                records = run_for(0.2)['records']
+                assert records and all(r['address'] == counter and r['length'] == 16 and len(r['hex']) == 32 for r in records), records[:1]
+                assert all(r['hex'][:16] == r['x'][0].to_bytes(8, 'little').hex() for r in records if r['pc'] == base+0x218)
+                call('hwatch', watches=[])
+                refused('traces', 'omit limit', limit=0, clear=True)
+                print('software watch records show the watched bytes (16 here); limit 0 + clear refused')
                 call('shutdown')
                 assert process.wait(timeout=10)==0
             finally:

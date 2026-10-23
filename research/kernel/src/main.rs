@@ -301,11 +301,28 @@ impl Hwatch {
         }
         v
     }
-    /// Whether the `length` bytes after the access fire this watch.
-    fn fires(&self, after: &Result<[u8; 8], String>, length: u64) -> bool {
-        let n = length.min(8) as usize;
+    /// The bytes a record shows: a hardware watch's 8, all of a software
+    /// watch up to 64 bytes, or up to 64 from the access (`block`, its
+    /// 8-byte block) in a longer one.
+    fn shown(&self, block: Option<u64>) -> (u64, u64) {
+        match block {
+            None => (self.address, 8),
+            Some(_) if self.length <= 64 => (self.address, self.length),
+            Some(block) => {
+                let start = block.max(self.address);
+                (start, (self.address + self.length - start).min(64))
+            }
+        }
+    }
+    /// Whether the bytes after the access (`after`, at `address`) fire
+    /// this watch: free looks for the poison where the access wrote.
+    fn fires(&self, after: &Result<Vec<u8>, String>, address: u64, block: Option<u64>) -> bool {
         match (self.on, after) {
-            (WatchOn::Free, Ok(bytes)) => bytes[..n] == FREE_POISON[..n],
+            (WatchOn::Free, Ok(bytes)) => {
+                let at = block.map_or(0, |b| b.saturating_sub(address) as usize).min(bytes.len());
+                let n = if block.is_some() { (bytes.len() - at).min(8) } else { self.length.min(8) as usize };
+                bytes[at..at + n] == FREE_POISON[..n]
+            }
             // Unreadable: record it with its read_error.
             _ => true,
         }
@@ -398,12 +415,13 @@ struct HwatchPending {
     regs: Registers,
     fault_address: Option<u64>,
     write: bool,
-    /// A software watch stop: the 8-byte block of the access, whose bytes
-    /// the record shows, and the access's size if the syndrome gives it.
+    /// A software watch stop: the 8-byte block of the access (where its
+    /// records' bytes start in a long watch), and the access's size if the
+    /// syndrome gives it.
     block: Option<u64>,
     access_length: Option<u64>,
-    /// Matching watches and the 8 bytes at each one's address before the access.
-    watches: Vec<(usize, Result<[u8; 8], String>)>,
+    /// Matching watches, and the bytes each one's record shows before the access.
+    watches: Vec<(usize, Result<Vec<u8>, String>)>,
 }
 
 struct HwatchRecord {
@@ -420,8 +438,8 @@ struct HwatchRecord {
     address: u64,
     length: u64,
     on: WatchOn,
-    before: Result<[u8; 8], String>,
-    after: Result<[u8; 8], String>,
+    before: Result<Vec<u8>, String>,
+    after: Result<Vec<u8>, String>,
 }
 
 impl HwatchRecord {
@@ -2390,12 +2408,12 @@ impl Session {
         json!({"stops": stops, "passes": passes})
     }
 
-    /// The 8 bytes at a watched address, through the stopped CPU's tables.
-    fn watched_bytes(&self, regs: &Registers, address: u64) -> Result<[u8; 8], String> {
+    /// The bytes at a watched address, through the stopped CPU's tables.
+    fn watched_bytes(&self, regs: &Registers, (address, length): (u64, u64)) -> Result<Vec<u8>, String> {
         // A kernel access may still touch its caller's user memory.
         let mut walk = regs.clone();
         walk.tcr &= !(1 << 7);
-        let mut bytes = [0; 8];
+        let mut bytes = vec![0; length as usize];
         AddressSpace { memory: &self.vm, registers: &walk }.read(address, &mut bytes).map_err(|e| e.to_string())?;
         Ok(bytes)
     }
@@ -2424,7 +2442,7 @@ impl Session {
                 .filter(|(_, w)| w.software && w.on.matches(write))
                 .filter(|(_, w)| gpa.is_some_and(|gpa| w.covers(gpa, access_length.unwrap_or(UNKNOWN_ACCESS))))
                 .filter(|(_, w)| !w.context.as_ref().is_some_and(|p| !same_space(p, regs)))
-                .map(|(i, _)| (i, self.watched_bytes(regs, block)))
+                .map(|(i, w)| (i, self.watched_bytes(regs, w.shown(Some(block)))))
                 .collect();
             self.hwatch_pending.insert(
                 regs.cpu as usize,
@@ -2448,7 +2466,7 @@ impl Session {
             .enumerate()
             .filter(|(_, w)| (!ours || watched(w.address)) && w.on.matches(write))
             .filter(|(_, w)| !w.context.as_ref().is_some_and(|p| !same_space(p, regs)))
-            .map(|(i, w)| (i, self.watched_bytes(regs, w.address)))
+            .map(|(i, w)| (i, self.watched_bytes(regs, w.shown(None))))
             .collect();
         self.hwatch_pending
             .insert(regs.cpu as usize, HwatchPending { regs: regs.clone(), fault_address: stop.fault_address, write, block: None, access_length: None, watches });
@@ -2462,14 +2480,12 @@ impl Session {
         let mut stop = false;
         for (index, before) in pending.watches {
             let Some(w) = self.hwatches.get(index) else { continue };
-            let (address, length) = match pending.block {
-                Some(block) => (block, 8),
-                None => (w.address, w.length),
-            };
-            let after = self.watched_bytes(&pending.regs, address);
-            if !w.fires(&after, length) {
+            let shown = w.shown(pending.block);
+            let after = self.watched_bytes(&pending.regs, shown);
+            if !w.fires(&after, shown.0, pending.block) {
                 continue;
             }
+            let (address, length) = if w.software { shown } else { (w.address, w.length) };
             let w = &mut self.hwatches[index];
             w.hits += 1;
             stop |= w.stop;
@@ -3003,6 +3019,16 @@ mod tests {
     }
 
     #[test]
+    fn hwatch_records_show_the_watch_or_the_access() {
+        let watch = |address, length, software| Hwatch { address, length, on: WatchOn::Write, name: None, software, stop: false, hits: 0, context: None, spans: Vec::new(), pending: None };
+        assert_eq!(watch(0x1000, 8, false).shown(None), (0x1000, 8));
+        assert_eq!(watch(0x1003, 16, true).shown(Some(0x1008)), (0x1003, 16), "a short watch shows whole");
+        assert_eq!(watch(0x1000, 0x1000, true).shown(Some(0x1800)), (0x1800, 64));
+        assert_eq!(watch(0x1000, 0x1000, true).shown(Some(0x1fe0)), (0x1fe0, 32), "clipped at the watch's end");
+        assert_eq!(watch(0x1004, 0x1000, true).shown(Some(0x1000)), (0x1004, 64), "an access before the start");
+    }
+
+    #[test]
     fn traces_memory_reads_at_a_record_address() {
         let read = |v: Value| DrainRead::parse(&v);
         assert!(read(json!({"at": "chunk"})).err().unwrap().contains("length"));
@@ -3279,14 +3305,21 @@ mod tests {
         assert!(WatchOn::Access.matches(false) && WatchOn::Access.matches(true));
         assert!(WatchOn::Free.matches(true) && !WatchOn::Free.matches(false));
         let watch = |length, on| Hwatch { address: 0x1000, length, on, name: None, software: false, stop: false, hits: 0, context: None, spans: Vec::new(), pending: None };
-        let poison = Ok(0xbadbadfabadbadfa_u64.to_le_bytes());
-        assert_eq!(poison, Ok(FREE_POISON));
-        assert!(watch(8, WatchOn::Free).fires(&poison, 8));
-        assert!(watch(1, WatchOn::Free).fires(&Ok([0xfa, 0, 0, 0, 0, 0, 0, 0]), 1), "a 1-byte free watch only sees fa");
-        assert!(!watch(8, WatchOn::Free).fires(&Ok([0xfa, 0, 0, 0, 0, 0, 0, 0]), 8));
-        assert!(!watch(1, WatchOn::Free).fires(&Ok([0; 8]), 1));
-        assert!(watch(8, WatchOn::Free).fires(&Err("unmapped".into()), 8), "unreadable: recorded with read_error");
-        assert!(watch(8, WatchOn::Write).fires(&Ok([0; 8]), 8));
+        assert_eq!(0xbadbadfabadbadfa_u64.to_le_bytes(), FREE_POISON);
+        let poison = Ok(FREE_POISON.to_vec());
+        let fa = Ok(vec![0xfa, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(watch(8, WatchOn::Free).fires(&poison, 0x1000, None));
+        assert!(watch(1, WatchOn::Free).fires(&fa, 0x1000, None), "a 1-byte free watch only sees fa");
+        assert!(!watch(8, WatchOn::Free).fires(&fa, 0x1000, None));
+        assert!(!watch(1, WatchOn::Free).fires(&Ok(vec![0; 8]), 0x1000, None));
+        assert!(watch(8, WatchOn::Free).fires(&Err("unmapped".into()), 0x1000, None), "unreadable: recorded with read_error");
+        assert!(watch(8, WatchOn::Write).fires(&Ok(vec![0; 8]), 0x1000, None));
+        // Software: the poison where the access wrote, inside what the record shows.
+        let mut soft = watch(16, WatchOn::Free);
+        soft.software = true;
+        let shown: Vec<u8> = [vec![0x10, 0, 0, 0, 0, 0, 0, 0], FREE_POISON.to_vec()].concat();
+        assert!(soft.fires(&Ok(shown.clone()), 0x1000, Some(0x1008)));
+        assert!(!soft.fires(&Ok(shown), 0x1000, Some(0x1000)));
     }
 
     #[test]
@@ -3295,7 +3328,7 @@ mod tests {
         r.x[30] = 0xfffff800_0000_3000;
         let record = HwatchRecord { seq: 7, stamp: Stamp::default(), access_length: None, hwatch: 1, name: Some("heap16_free".into()), hit: 2, regs: r.clone(),
             fault_address: Some(0x1e2a27fc7e0), write: true, address: 0x1e2a27fc7e0, length: 1, on: WatchOn::Free,
-            before: Ok([0x10, 0, 0, 0, 0, 0, 0, 0]), after: Ok(FREE_POISON) };
+            before: Ok(vec![0x10, 0, 0, 0, 0, 0, 0, 0]), after: Ok(FREE_POISON.to_vec()) };
         let v = Record::Hwatch(record).json();
         assert_eq!(v["kind"], "hwatch");
         assert_eq!((v["seq"].as_u64(), v["hwatch"].as_u64(), v["hit"].as_u64()), (Some(7), Some(1), Some(2)));
