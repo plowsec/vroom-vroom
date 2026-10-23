@@ -62,7 +62,7 @@ Methods: `initialize {actor}` first, `describe`, `commands.list {category?}`,
 vm        status pause resume step step_over step_out snapshot snapshots restore screenshot key shutdown
 guest     exec upload download update_tools                       VM running
 cpu       registers write_register
-memory    regions read_virtual read_physical translate write_virtual write_physical dump
+memory    regions read_virtual read_physical translate write_virtual write_physical dump search
 debug     breakpoints watchpoints tracepoints hwatch traces faults
 kernel    info symbols functions resolve processes process peb user_modules modules
           callbacks stack image export process_event cache
