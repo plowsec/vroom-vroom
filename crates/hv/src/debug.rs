@@ -23,6 +23,16 @@ impl DebugConfig {
     }
 }
 
+/// A guest-physical range whose reads or writes stop the vCPU, on stage-2
+/// page permissions rather than a hardware slot (`Vm::set_memory_watches`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryWatch {
+    pub gpa: u64,
+    pub length: u64,
+    pub read: bool,
+    pub write: bool,
+}
+
 /// A byte range within one aligned 8-byte granule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Watchpoint {
@@ -102,7 +112,9 @@ pub struct DebugStop {
     pub reason: DebugReason,
     /// A watchpoint stop's faulting virtual address (FAR): within the
     /// naturally aligned block the instruction accessed, not necessarily
-    /// inside the watched bytes.
+    /// inside the watched bytes. A memory watch's stop (a Watchpoint whose
+    /// syndrome is a data abort's, EC 0x24) gives the first byte the
+    /// access touches on the watched page.
     pub fault_address: Option<u64>,
 }
 

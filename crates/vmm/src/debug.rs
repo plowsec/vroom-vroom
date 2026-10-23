@@ -98,6 +98,19 @@ impl Vmm {
         Ok(self.vm.set_execute_patch(gpa, word)?)
     }
 
+    /// Replace the memory watches (guest-physical ranges whose accesses
+    /// stop a CPU like a watchpoint, any number). See
+    /// `vroom_hv::Vm::set_memory_watches`.
+    pub fn debug_memory_watches(&self, watches: &[vroom_hv::debug::MemoryWatch]) -> Result<()> {
+        self.require_debug_pause()?;
+        Ok(self.vm.set_memory_watches(watches)?)
+    }
+
+    /// Memory watch faults so far: (stops, passes).
+    pub fn debug_memory_watch_counts(&self) -> (u64, u64) {
+        self.vm.memory_watch_counts()
+    }
+
     /// Read RAM while the guest may be running: no consistency with the
     /// CPUs (page tables to place execute patches, say).
     pub fn debug_read_physical_running(&self, address: u64, buf: &mut [u8]) -> Result<()> {

@@ -11,6 +11,7 @@ mod dirty;
 mod execute;
 mod ffi;
 mod vcpu;
+mod watch;
 
 /// GIC registers that change at run time are restored by value, except
 /// set/clear pairs (the clear register sits 0x80 above the set one): only
@@ -134,6 +135,7 @@ pub struct HvfVm {
     /// Guest writes to RAM, when a snapshot fuzzer logs them.
     dirty: Arc<dirty::DirtyLog>,
     execute: Arc<execute::ExecutePatches>,
+    watches: Arc<watch::MemoryWatches>,
 }
 
 impl std::fmt::Debug for HvfVm {
@@ -143,6 +145,17 @@ impl std::fmt::Debug for HvfVm {
 }
 
 impl HvfVm {
+    /// The host address of the stage-2 page of RAM at `page`.
+    fn ram_page(&self, page: u64) -> Option<*mut u8> {
+        let memory = self.memory.lock().unwrap_or_else(|e| e.into_inner());
+        let ram = memory
+            .iter()
+            .flat_map(|m| m.regions())
+            .find(|r| page >= r.start().raw() && page + self.granule <= r.start().raw() + r.len())
+            .map(|r| r.host_ptr().wrapping_add((page - r.start().raw()) as usize));
+        ram
+    }
+
     fn create(params: &VmParams) -> Result<Self> {
         let IrqChipConfig::GicV3 { dist_base, redist_base, msi } = params.irqchip else {
             return Err(Error::Unsupported("HVF needs a GICv3 layout"));
@@ -236,6 +249,7 @@ impl HvfVm {
             el2: params.nested,
             dirty: Arc::new(dirty::DirtyLog::new(granule)),
             execute: Arc::new(execute::ExecutePatches::new(granule)),
+            watches: Arc::new(watch::MemoryWatches::new(granule)),
         })
     }
 
@@ -349,12 +363,16 @@ impl Vm for HvfVm {
             self.map(r.host_ptr(), r.start().raw(), r.len() as usize, flags)?;
         }
         self.execute.remap()?;
+        self.watches.reprotect()?;
         replaced
     }
 
     fn start_dirty_log(&self, mem: &GuestMemory) -> Result<()> {
         if !self.execute.is_empty() {
             return Err(Error::Unsupported("logging writes to RAM with execute patches"));
+        }
+        if !self.watches.is_empty() {
+            return Err(Error::Unsupported("logging writes to RAM with memory watches"));
         }
         self.dirty.start(mem)
     }
@@ -363,15 +381,31 @@ impl Vm for HvfVm {
         if self.dirty.is_on() {
             return Err(Error::Unsupported("execute patches while logging writes to RAM"));
         }
-        let page = self.execute.page(gpa);
-        let memory = self.memory.lock().unwrap_or_else(|e| e.into_inner());
-        let ram = memory
-            .iter()
-            .flat_map(|m| m.regions())
-            .find(|r| page >= r.start().raw() && page + self.granule <= r.start().raw() + r.len())
-            .map(|r| r.host_ptr().wrapping_add((page - r.start().raw()) as usize))
-            .ok_or_else(|| Error::Invalid(format!("execute patch outside RAM at {gpa:#x}")))?;
+        if word.is_some() && self.watches.covers(gpa) {
+            return Err(Error::Unsupported("execute patches on a memory-watched page"));
+        }
+        let ram = self.ram_page(self.execute.page(gpa)).ok_or_else(|| Error::Invalid(format!("execute patch outside RAM at {gpa:#x}")))?;
         self.execute.set(gpa, ram, word)
+    }
+
+    fn set_memory_watches(&self, watches: &[crate::debug::MemoryWatch]) -> Result<()> {
+        if self.dirty.is_on() && !watches.is_empty() {
+            return Err(Error::Unsupported("memory watches while logging writes to RAM"));
+        }
+        if let Some(w) = watches.iter().find(|w| {
+            let last = w.gpa.saturating_add(w.length.saturating_sub(1));
+            (self.watches.page(w.gpa)..=last).step_by(self.granule as usize).any(|page| self.execute.covers(page))
+        }) {
+            return Err(Error::Invalid(format!(
+                "memory watch at {:#x}: its page has execute patches (software tracepoints)",
+                w.gpa
+            )));
+        }
+        self.watches.set(watches, |page| self.ram_page(page))
+    }
+
+    fn memory_watch_counts(&self) -> (u64, u64) {
+        (self.watches.stops.load(Ordering::Relaxed), self.watches.passes.load(Ordering::Relaxed))
     }
 
     fn refresh_execute_patches(&self) -> Result<Vec<u64>> {
@@ -389,7 +423,7 @@ impl Vm for HvfVm {
     }
 
     fn create_vcpu(&self, index: u32) -> Result<Box<dyn Vcpu>> {
-        let v = HvfVcpu::new(index, self.vtimer_offset.clone(), self.el2, self.dirty.clone(), self.execute.clone())?;
+        let v = HvfVcpu::new(index, self.vtimer_offset.clone(), self.el2, self.dirty.clone(), self.execute.clone(), self.watches.clone())?;
         self.kickers.lock().unwrap_or_else(|e| e.into_inner()).push(v.hvf_kicker());
         Ok(Box::new(v))
     }

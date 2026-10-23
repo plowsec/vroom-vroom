@@ -85,8 +85,13 @@ pub struct HvfVcpu {
     /// The PC and patched page of the last instruction fetch that mapped
     /// that page's execute view.
     fetched: Option<(u64, u64)>,
-    /// A step of one instruction on a patched page's RAM (native view).
+    /// A step of one instruction on a patched page's RAM (native view),
+    /// or with a memory-watched page open.
     native_step: Option<NativeStep>,
+    watches: Arc<super::watch::MemoryWatches>,
+    /// The PC and page of the memory watch stop last reported: the next
+    /// watch fault, if it is that access again, passes.
+    watch_pass: Option<(u64, u64)>,
 }
 
 /// An instruction on a patched page that reads or writes the page in a way
@@ -94,6 +99,8 @@ pub struct HvfVcpu {
 #[derive(Debug, Clone, Copy)]
 struct NativeStep {
     page: u64,
+    /// A memory-watched page (open for the step), not a patched one.
+    watched: bool,
     /// MDSCR_EL1 before the step, when we armed it (not the debugger).
     mdscr: Option<u64>,
 }
@@ -105,6 +112,7 @@ impl HvfVcpu {
         el2: bool,
         dirty: Arc<super::dirty::DirtyLog>,
         execute: Arc<super::execute::ExecutePatches>,
+        watches: Arc<super::watch::MemoryWatches>,
     ) -> Result<Self> {
         let mut id = 0u64;
         let mut exit: *const ffi::hv_vcpu_exit_t = std::ptr::null();
@@ -137,6 +145,8 @@ impl HvfVcpu {
             execute,
             fetched: None,
             native_step: None,
+            watches,
+            watch_pass: None,
         };
         v.set_sys(ffi::HV_SYS_REG_MPIDR_EL1, mpidr)?;
         v.apply_vm_clock()?;
@@ -337,20 +347,8 @@ impl HvfVcpu {
             // Fetching it needs the execute view, its access the data
             // view: run it once on RAM.
             self.execute.show(ipa, View::Native)?;
-            let mdscr = if self.debug.single_step {
-                None
-            } else {
-                let mdscr = self.get_sys(MDSCR)?;
-                if !self.debug.enabled {
-                    // SAFETY: owning thread, live vCPU.
-                    check("trap debug exceptions", unsafe { ffi::hv_vcpu_set_trap_debug_exceptions(self.id, true) })?;
-                }
-                self.set_sys(MDSCR, mdscr | 1 | (1 << 13))?;
-                let ps = self.get(ffi::HV_REG_CPSR)?;
-                self.set(ffi::HV_REG_CPSR, ps | PSTATE_SS)?;
-                Some(mdscr)
-            };
-            self.native_step = Some(NativeStep { page, mdscr });
+            let mdscr = self.arm_native_step()?;
+            self.native_step = Some(NativeStep { page, watched: false, mdscr });
             self.fetched = None;
         } else {
             self.execute.show(ipa, View::Data)?;
@@ -358,8 +356,77 @@ impl HvfVcpu {
         Ok(None)
     }
 
+    /// A fault on a memory-watched page: see `watch`.
+    fn watch_fault(&mut self, esr: u64, ipa: u64, va: u64) -> Result<Option<VcpuExit>> {
+        let pc = self.get(ffi::HV_REG_PC)?;
+        let page = self.watches.page(ipa);
+        let walk = (esr >> 7) & 1 == 1;
+        let data = aarch64::exception_class(esr) == ExceptionClass::DataAbortLower && !walk;
+        let da = aarch64::decode_data_abort(esr).filter(|_| data);
+        if data && self.watch_pass.take() != Some((pc, page)) {
+            let write = (esr >> 6) & 1 == 1;
+            if self.watches.matches(ipa, da.map_or(super::watch::UNKNOWN_ACCESS, |da| da.len), write) {
+                self.watch_pass = Some((pc, page));
+                self.watches.stops.fetch_add(1, Ordering::Relaxed);
+                return Ok(Some(VcpuExit::Debug(DebugStop {
+                    cpu: self.index, pc, syndrome: esr, reason: DebugReason::Watchpoint, fault_address: Some(va),
+                })));
+            }
+        }
+        self.watches.passes.fetch_add(1, Ordering::Relaxed);
+        // An emulated access never meets the hardware watchpoints: one
+        // that may touch a watched address runs on the CPU instead.
+        let len = da.map_or(super::watch::UNKNOWN_ACCESS, |da| da.len) as u64;
+        let watched = self.debug.watchpoints.iter().any(|w| {
+            let start = w.address & !7;
+            va < start + 8 && start < va.saturating_add(len)
+        });
+        if let Some(da) = da.filter(|da| !watched && self.watches.fits(ipa, da.len)) {
+            let emulated = if da.write {
+                let value = self.get_x(da.reg)?.to_le_bytes();
+                self.watches.write(ipa, &value[..da.len])
+            } else {
+                let mut bytes = [0u8; 8];
+                let read = self.watches.read(ipa, &mut bytes[..da.len]);
+                if read {
+                    self.set_x(da.reg, da.read_value(&bytes[..da.len]))?;
+                }
+                read
+            };
+            if emulated {
+                self.advance_pc()?;
+                if self.debug.single_step {
+                    self.pending_debug_step = true;
+                }
+            }
+            return Ok(None);
+        }
+        // Run it once with the page open.
+        self.watches.open(ipa)?;
+        let mdscr = self.arm_native_step()?;
+        self.native_step = Some(NativeStep { page, watched: true, mdscr });
+        Ok(None)
+    }
+
+    /// Step the next instruction ourselves, unless the debugger steps:
+    /// MDSCR_EL1 to put back after.
+    fn arm_native_step(&mut self) -> Result<Option<u64>> {
+        if self.debug.single_step {
+            return Ok(None);
+        }
+        let mdscr = self.get_sys(MDSCR)?;
+        if !self.debug.enabled {
+            // SAFETY: owning thread, live vCPU.
+            check("trap debug exceptions", unsafe { ffi::hv_vcpu_set_trap_debug_exceptions(self.id, true) })?;
+        }
+        self.set_sys(MDSCR, mdscr | 1 | (1 << 13))?;
+        let ps = self.get(ffi::HV_REG_CPSR)?;
+        self.set(ffi::HV_REG_CPSR, ps | PSTATE_SS)?;
+        Ok(Some(mdscr))
+    }
+
     /// End a native step (it ran, or the vCPU leaves run() before it did):
-    /// map the execute view again.
+    /// map the execute view again, or watch the page again.
     fn end_native_step(&mut self) -> Result<()> {
         let Some(step) = self.native_step.take() else { return Ok(()) };
         if let Some(mdscr) = step.mdscr {
@@ -370,6 +437,9 @@ impl HvfVcpu {
                 // SAFETY: owning thread, live vCPU.
                 check("trap debug exceptions", unsafe { ffi::hv_vcpu_set_trap_debug_exceptions(self.id, false) })?;
             }
+        }
+        if step.watched {
+            return self.watches.close(step.page);
         }
         self.execute.show(step.page, super::execute::View::Execute)
     }
@@ -386,6 +456,11 @@ impl HvfVcpu {
             && self.execute.covers(ipa)
         {
             return self.execute_fault(esr, ipa);
+        }
+        if matches!(aarch64::exception_class(esr), ExceptionClass::DataAbortLower | ExceptionClass::InstAbortLower)
+            && self.watches.covers(ipa)
+        {
+            return self.watch_fault(esr, ipa, va);
         }
         if self.debug.enabled {
             if let Some(reason) = arm64_reason(esr) {

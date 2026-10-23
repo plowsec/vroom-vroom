@@ -158,6 +158,25 @@ pub trait Vm: Send + Sync {
         Err(Error::Unsupported("execute patches"))
     }
 
+    /// Replace the memory watches: any number of RAM ranges whose guest
+    /// reads or writes stop the vCPU before the access with a Watchpoint
+    /// whose syndrome is the data abort's; run again, it passes. Not while
+    /// logging writes, nor on pages with execute patches. vCPUs must be
+    /// stopped.
+    fn set_memory_watches(&self, watches: &[debug::MemoryWatch]) -> Result<()> {
+        if watches.is_empty() {
+            return Ok(());
+        }
+        Err(Error::Unsupported("memory watches"))
+    }
+
+    /// Memory watch faults so far: (stops, passes). A pass is an access to
+    /// a watched page outside the watched ranges or kinds: the cost of
+    /// watching that page.
+    fn memory_watch_counts(&self) -> (u64, u64) {
+        (0, 0)
+    }
+
     /// Catch execute patches up with RAM written behind their back (device
     /// DMA). Returns the patched addresses whose RAM word changed since the
     /// last call: their patches are gone. Safe while vCPUs run.
