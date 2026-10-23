@@ -202,6 +202,10 @@ const MAX_TRACE_CAPTURES: usize = 16;
 const DATA_SLOTS: usize = 2;
 /// memory.search reads at most this much virtual memory per call.
 const MAX_SEARCH_BYTES: u64 = 1 << 30;
+/// debug.faults records kept, oldest dropped first.
+const FAULT_CAPACITY: usize = 1024;
+/// Frames of a fault's stack.
+const FAULT_FRAMES: usize = 32;
 /// Software hwatches: at most this many, each at most this long.
 const MAX_SOFTWARE_WATCHES: usize = 4096;
 const MAX_SOFTWARE_WATCH_BYTES: u64 = 16 << 20;
@@ -533,6 +537,9 @@ struct Tracepoint {
     /// the selected process; `pid` names one.
     context: Option<process::Process>,
     source_record_if: Option<Value>,
+    /// debug.faults' tracepoint at nt!KiDispatchException: its hits are
+    /// fault records, and debug.tracepoints neither lists nor replaces it.
+    fault: bool,
 }
 
 impl Tracepoint {
@@ -616,6 +623,123 @@ impl TraceRecord {
             v["captures"] = Value::Object(values);
             v["capture_errors"] = Value::Object(errors);
             v["capture_addresses"] = Value::Object(addresses);
+        }
+        v
+    }
+}
+
+/// How debug.faults records: `user` Some(true) only exceptions from user
+/// mode, Some(false) only kernel mode; `codes` only these (empty: all);
+/// `stop` stops at the recorded ones. `request` arms it again after a
+/// restore.
+struct FaultCatch {
+    user: Option<bool>,
+    codes: Vec<u32>,
+    stop: bool,
+    request: Value,
+    /// Exceptions not recorded: from the other mode, with another code.
+    other_mode: u64,
+    other_code: u64,
+}
+
+/// An exception record's code as handlers see it: the trap handlers pass
+/// the kernel's internal codes (KI_EXCEPTION_*), translated after
+/// KiDispatchException.
+fn exception_code(code: u32) -> u32 {
+    match code {
+        0x1000_0004 => 0xc000_0005,
+        0x1000_0002 => 0xc000_001d,
+        0x1000_0003 => 0xc000_0094,
+        0x1000_0001 => 0xc000_0096,
+        c => c,
+    }
+}
+
+/// An exception the guest's kernel dispatched: nt!KiDispatchException's
+/// arguments (x0 the exception record, x2 the trap frame, x3 the previous
+/// mode, x4 first chance), read at its entry.
+struct FaultRecord {
+    seq: u64,
+    stamp: Stamp,
+    cpu: u32,
+    user: bool,
+    first_chance: bool,
+    /// The record's code (the trap handlers' internal KI_EXCEPTION_* codes
+    /// translated), address and parameters.
+    code: u32,
+    address: u64,
+    information: Vec<u64>,
+    process: Option<(u64, String)>,
+    /// The faulting code's registers, from the trap frame.
+    registers: Option<Registers>,
+    /// `module!function+0xoff` (or `module+0xoff`) from the faulting PC.
+    stack: Vec<String>,
+    /// Where something could not be read.
+    errors: Vec<String>,
+}
+
+fn exception_name(code: u32) -> Option<&'static str> {
+    Some(match code {
+        0xc000_0005 => "access violation",
+        0xc000_0006 => "in-page error",
+        0x8000_0001 => "guard page",
+        0x8000_0002 => "misalignment",
+        0x8000_0003 => "breakpoint",
+        0x8000_0004 => "single step",
+        0xc000_001d => "illegal instruction",
+        0xc000_0096 => "privileged instruction",
+        0xc000_0094 => "integer divide by zero",
+        0xc000_00fd => "stack overflow",
+        0xc000_0409 => "fast fail (stack buffer overrun)",
+        0xc000_0374 => "heap corruption",
+        0xe06d_7363 => "C++ exception",
+        _ => return None,
+    })
+}
+
+impl FaultRecord {
+    /// The access an access violation (or in-page error) made, from its
+    /// first two parameters.
+    fn access(&self) -> Option<(&'static str, u64)> {
+        if !matches!(self.code, 0xc000_0005 | 0xc000_0006) || self.information.len() < 2 {
+            return None;
+        }
+        let kind = match self.information[0] {
+            0 => "read",
+            1 => "write",
+            8 => "execute",
+            _ => "access",
+        };
+        Some((kind, self.information[1]))
+    }
+    /// One line: what, where, whose.
+    fn summary(&self) -> String {
+        let what = exception_name(self.code).map_or_else(|| format!("exception {:#x}", self.code), str::to_owned);
+        let what = match self.access() {
+            Some((kind, address)) => format!("{what}: {kind} of {address:#x}"),
+            None => what,
+        };
+        let at = self.stack.first().map_or_else(|| format!("{:#x}", self.address), |f| format!("{f} ({:#x})", self.address));
+        let whose = self.process.as_ref().map_or_else(String::new, |(pid, name)| format!(", {name} pid {pid}"));
+        let mode = if self.user { "user" } else { "kernel" };
+        let chance = if self.first_chance { "first" } else { "second" };
+        format!("{what} at {at}{whose}, {mode} mode, {chance} chance")
+    }
+    fn json(&self) -> Value {
+        let mut v = json!({"seq": self.seq, "cntvct": self.stamp.cntvct, "time_ns": self.stamp.time_ns, "cpu": self.cpu,
+            "summary": self.summary(), "code": self.code, "code_hex": format!("{:#010x}", self.code), "name": exception_name(self.code),
+            "pc": self.address, "information": self.information, "mode": if self.user { "user" } else { "kernel" },
+            "first_chance": self.first_chance, "pid": self.process.as_ref().map(|p| p.0),
+            "process": self.process.as_ref().map(|p| &p.1), "stack": self.stack});
+        if let Some((kind, address)) = self.access() {
+            v["access"] = json!(kind);
+            v["address"] = json!(address);
+        }
+        if let Some(r) = &self.registers {
+            v["registers"] = json!({"x0_x18": &r.x[..19], "fp": r.x[29], "lr": r.x[30], "sp": r.sp, "pc": r.pc});
+        }
+        if !self.errors.is_empty() {
+            v["errors"] = json!(self.errors);
         }
         v
     }
@@ -1116,7 +1240,7 @@ fn parse_tracepoint(i: usize, t: &Value, previous: &[Tracepoint], selected: Opti
     let kept = previous.iter().find(|t| t.address == address).map(|t| t.context.as_ref());
     let context = process_context(present("pid"), address, kept, selected, processes).map_err(fail)?;
     Ok(Tracepoint { address, software, physical: None, planted: false, pending: None, register, length, captures, max_hits, stop, actions, hits: 0,
-        record_if, other_process: 0, unmatched: 0, context, source_record_if: present("record_if").cloned() })
+        record_if, other_process: 0, unmatched: 0, context, source_record_if: present("record_if").cloned(), fault: false })
 }
 
 struct Session {
@@ -1133,6 +1257,11 @@ struct Session {
     /// Software hwatches have memory watches in vroom-hv.
     watching: bool,
     traces: std::collections::VecDeque<Record>,
+    /// debug.faults: how it records (None: off), and its records.
+    fault_catch: Option<FaultCatch>,
+    faults: std::collections::VecDeque<FaultRecord>,
+    fault_seq: u64,
+    fault_dropped: u64,
     trace_capacity: usize,
     trace_seq: u64,
     trace_dropped: u64,
@@ -1289,7 +1418,8 @@ impl Session {
     fn command(&mut self, request: &Value) -> Result<Value, String> {
         let cpu = request.get("cpu").map(number).transpose()?.unwrap_or(0) as usize;
         let op = request["op"].as_str().ok_or("missing op")?;
-        let query = op == "tracepoints" && request.get("tracepoints").is_none_or(Value::is_null);
+        let query = (op == "tracepoints" && request.get("tracepoints").is_none_or(Value::is_null))
+            || (op == "faults" && request.get("enable").is_none_or(Value::is_null));
         if !matches!(op, "status" | "pause" | "shutdown" | "key" | "snapshot" | "snapshots" | "traces")
             && !query
             && self.vm.state() != RunState::Paused
@@ -1299,7 +1429,7 @@ impl Session {
         match op {
             "status" => {
                 let agent = self.vm.agent().status();
-                let mut s = json!({"state": format!("{:?}", self.vm.state()), "cpus": self.vm.config().cpus, "breakpoints": self.breakpoints, "temporary":self.run_to.as_ref().map(|r|r.address), "tracepoints": self.tracepoints.iter().filter(|t| t.armed()).count(), "hwatch": self.hwatches.len(), "traces": self.traces.len(), "guest_agent": agent.connected.then_some(agent.agent)});
+                let mut s = json!({"state": format!("{:?}", self.vm.state()), "cpus": self.vm.config().cpus, "breakpoints": self.breakpoints, "temporary":self.run_to.as_ref().map(|r|r.address), "tracepoints": self.tracepoints.iter().filter(|t| t.armed() && !t.fault).count(), "hwatch": self.hwatches.len(), "traces": self.traces.len(), "faults": self.fault_catch.is_some().then_some(self.fault_seq), "guest_agent": agent.connected.then_some(agent.agent)});
                 if self.vm.state() == RunState::Paused {
                     s["note"] = json!("paused: vm.resume runs the guest; its network, agent and screen are frozen until then");
                 }
@@ -1328,9 +1458,10 @@ impl Session {
                             .clone();
                     }
                 }
-                if self.tracepoints.iter().any(|t| t.context.is_some()) {
+                if self.tracepoints.iter().any(|t| t.context.is_some() && !t.fault) {
                     let active = self.processes(cpu)?;
-                    for process in self.tracepoints.iter_mut().filter_map(|t| t.context.as_mut()) {
+                    // debug.faults keeps a process that exited (the one that crashed): it records none.
+                    for process in self.tracepoints.iter_mut().filter(|t| !t.fault).filter_map(|t| t.context.as_mut()) {
                         *process = active
                             .iter()
                             .find(|p| p.eprocess == process.eprocess && p.pid == process.pid)
@@ -1683,28 +1814,7 @@ impl Session {
                 let mut stack =
                     vroom_kernel::unwind::walk(&space, &regs, &modules, &mut self.unwind);
                 for frame in &mut stack.frames {
-                    let module = modules
-                        .iter()
-                        .find(|m| frame.pc >= m.base && frame.pc - m.base < m.size as u64)
-                        .ok_or("stack frame module disappeared")?;
-                    let symbols = if self.kernel.as_ref().is_some_and(|k| k.base == module.base) {
-                        self.symbols.as_ref()
-                    } else {
-                        self.module_symbols.get(&(
-                            if module.base >> 63 != 0 {
-                                0
-                            } else {
-                                stack_process
-                            },
-                            module.base,
-                        ))
-                    };
-                    let found =
-                        symbols.and_then(|s| s.addresses.range(module.base..=frame.pc).next_back());
-                    frame.symbol = Some(match found {
-                        Some((&a, name)) => format!("{}!{}+{:#x}", module.name, name, frame.pc - a),
-                        None => format!("{}+{:#x}", module.name, frame.pc - module.base),
-                    });
+                    frame.symbol = Some(self.frame_name(&modules, stack_process, frame.pc).ok_or("stack frame module disappeared")?);
                 }
                 Ok(json!(stack))
             }
@@ -2071,7 +2181,7 @@ impl Session {
                         "{} breakpoints and {} tracepoints need {slots} of the 4 hardware breakpoint slots; clear some (debug.tracepoints [])",
                         addresses.len(),
                         self.tracepoints.iter().filter(|t| t.armed()).count()
-                    ));
+                    ) + if self.fault_catch.is_some() { " (debug.faults' hardware one counts)" } else { "" });
                 }
                 let mut contexts = BTreeMap::new();
                 for &address in &addresses {
@@ -2112,7 +2222,13 @@ impl Session {
                     if tracepoints[..i].iter().any(|u| u.address == t.address) {
                         return Err(format!("tracepoint {i}: {:#x} is traced already", t.address));
                     }
+                    if self.tracepoints.iter().any(|u| u.fault && u.address == t.address) {
+                        return Err(format!("tracepoint {i}: {:#x} is nt!KiDispatchException, which debug.faults traces: its records hold the exception (debug.faults enable: false frees it)", t.address));
+                    }
                 }
+                // debug.faults' tracepoint stays, after the caller's.
+                let mut tracepoints = tracepoints;
+                let faults = self.tracepoints.iter().position(|t| t.fault);
                 let slots = breakpoint_slots(&self.breakpoints, &tracepoints);
                 if slots > 4 {
                     return Err(format!(
@@ -2122,9 +2238,16 @@ impl Session {
                     ));
                 }
                 self.unplant()?;
+                if let Some(i) = faults {
+                    tracepoints.push(self.tracepoints.remove(i));
+                }
                 let old = std::mem::replace(&mut self.tracepoints, tracepoints);
                 if let Err(e) = self.plant(true).and_then(|()| self.configure()) {
                     let _ = self.unplant();
+                    let mut old = old;
+                    if let Some(i) = self.tracepoints.iter().position(|t| t.fault) {
+                        old.insert(faults.expect("kept"), self.tracepoints.remove(i));
+                    }
                     self.tracepoints = old;
                     let rollback = self.plant(true).and_then(|()| self.configure());
                     return Err(format!("{e}; rollback: {rollback:?}; VM remains paused"));
@@ -2136,7 +2259,7 @@ impl Session {
                         self.trace_dropped += 1;
                     }
                 }
-                Ok(json!({"tracepoints": self.tracepoints.iter().map(Tracepoint::json).collect::<Vec<_>>(),
+                Ok(json!({"tracepoints": self.tracepoints.iter().filter(|t| !t.fault).map(Tracepoint::json).collect::<Vec<_>>(),
                     "capacity": self.trace_capacity, "slots": slots}))
             }
             "hwatch" => {
@@ -2200,8 +2323,32 @@ impl Session {
                 };
                 Ok(json!({"records": records, "remaining": self.traces.len(), "recorded": self.trace_seq,
                     "dropped": self.trace_dropped, "capacity": self.trace_capacity,
-                    "tracepoints": self.tracepoints.iter().map(Tracepoint::json).collect::<Vec<_>>(),
+                    "tracepoints": self.tracepoints.iter().filter(|t| !t.fault).map(Tracepoint::json).collect::<Vec<_>>(),
                     "hwatch": self.hwatches.iter().map(Hwatch::json).collect::<Vec<_>>(), "memory_watch": self.memory_watch_counts()}))
+            }
+            "faults" if request.get("enable").is_some_and(|v| !v.is_null()) => {
+                let enable = request["enable"].as_bool().ok_or("enable: expected a boolean")?;
+                self.arm_faults(enable.then_some(request), cpu)
+            }
+            "faults" => {
+                let limit = request.get("limit").filter(|v| !v.is_null()).map(number).transpose()?;
+                let clear = match request.get("clear").filter(|v| !v.is_null()) {
+                    Some(v) => v.as_bool().ok_or("clear: expected a boolean")?,
+                    None => false,
+                };
+                if clear && limit == Some(0) {
+                    return Err("limit 0 returns no records, so clear would remove none: omit limit to drain them all".into());
+                }
+                let n = limit.map_or(self.faults.len(), |l| (l as usize).min(self.faults.len()));
+                let records: Vec<Value> = if clear {
+                    self.faults.drain(..n).map(|f| f.json()).collect()
+                } else {
+                    self.faults.iter().take(n).map(FaultRecord::json).collect()
+                };
+                let mut v = self.fault_status();
+                v["records"] = json!(records);
+                v["remaining"] = json!(self.faults.len());
+                Ok(v)
             }
             "step" => {
                 self.cancel_run_to()?;
@@ -2500,6 +2647,9 @@ impl Session {
     }
 
     fn record_hit(&mut self, index: usize, regs: &Registers) -> Result<Option<TraceHit>, String> {
+        if self.tracepoints[index].fault {
+            return Ok(Some(self.fault_hit(index, regs)));
+        }
         let t = &mut self.tracepoints[index];
         if !t.armed() {
             return Ok(Some(TraceHit { stop: false, moved: false }));
@@ -2557,6 +2707,238 @@ impl Session {
         Ok(Some(TraceHit { stop, moved: current.pc != regs.pc }))
     }
 
+    /// `module!function+0xoff` for a PC in `modules` (a user module's
+    /// function when its PDB is loaded for `process`, an EPROCESS), else
+    /// `module+0xoff`; None outside them.
+    fn frame_name(&self, modules: &[vroom_kernel::windows::Module], process: u64, pc: u64) -> Option<String> {
+        let module = modules.iter().find(|m| pc >= m.base && pc - m.base < m.size as u64)?;
+        let symbols = if self.kernel.as_ref().is_some_and(|k| k.base == module.base) {
+            self.symbols.as_ref()
+        } else {
+            self.module_symbols.get(&(if module.base >> 63 != 0 { 0 } else { process }, module.base))
+        };
+        let found = symbols.and_then(|s| s.addresses.range(module.base..=pc).next_back());
+        Some(match found {
+            Some((&a, name)) => format!("{}!{}+{:#x}", module.name, name, pc - a),
+            None => format!("{}+{:#x}", module.name, pc - module.base),
+        })
+    }
+
+    /// Arm debug.faults (`request`: its settings) or disarm it (None): a
+    /// tracepoint at nt!KiDispatchException, which every exception the
+    /// kernel dispatches passes at first chance (and again at second),
+    /// user mode's and kernel mode's, before a handler sees it. Loads the
+    /// kernel's symbols if they aren't.
+    fn arm_faults(&mut self, request: Option<&Value>, cpu: usize) -> Result<Value, String> {
+        let armed = match request {
+            None => None,
+            Some(request) => {
+                const KEYS: &str = "enable, kind, mode, codes, pid, stop";
+                let object = request.as_object().ok_or("expected an object")?;
+                if let Some(key) = object.keys().find(|k| !matches!(k.as_str(), "op" | "id" | "cpu") && !KEYS.split(", ").any(|known| known == k.as_str())) {
+                    return Err(format!("unknown key {key} ({KEYS})"));
+                }
+                let present = |k: &str| object.get(k).filter(|v| !v.is_null());
+                let user = match present("mode").map(|v| v.as_str()) {
+                    None | Some(Some("any")) => None,
+                    Some(Some("user")) => Some(true),
+                    Some(Some("kernel")) => Some(false),
+                    Some(_) => return Err("mode: user, kernel or any (default)".into()),
+                };
+                let codes = match present("codes") {
+                    None => Vec::new(),
+                    Some(list) => list
+                        .as_array()
+                        .ok_or("codes: expected an array of exception codes (0xc0000005 an access violation)")?
+                        .iter()
+                        .map(|c| number(c).and_then(|c| u32::try_from(c).map_err(|_| format!("codes: {c:#x} is not a 32-bit code"))))
+                        .collect::<Result<_, _>>()?,
+                };
+                let stop = match present("stop") {
+                    Some(v) => v.as_bool().ok_or("stop: expected a boolean")?,
+                    None => false,
+                };
+                let kind = match present("kind").map(|v| v.as_str()) {
+                    None | Some(Some("software")) => "software",
+                    Some(Some("hardware")) => "hardware",
+                    Some(_) => return Err("kind: software (default: no slot) or hardware (one of the 4 breakpoint slots)".into()),
+                };
+                if self.symbols.is_none() {
+                    if self.kernel.is_none() {
+                        self.command(&json!({"op": "kernel", "cpu": cpu})).map_err(|e| format!("finding the kernel: {e}"))?;
+                    }
+                    self.command(&json!({"op": "symbols", "cpu": cpu})).map_err(|e| format!("loading the kernel's symbols: {e}"))?;
+                }
+                let symbols = self.symbols.as_ref().expect("loaded above");
+                let address = symbols.resolve("KiDispatchException").map_err(|e| e.to_string())?;
+                symbols.field("_KTRAP_FRAME", "Pc").map_err(|e| e.to_string())?;
+                if self.tracepoints.iter().any(|t| !t.fault && t.address == address) {
+                    return Err(format!("debug.tracepoints traces nt!KiDispatchException ({address:#x}): remove that tracepoint first"));
+                }
+                let processes = if present("pid").is_some_and(Value::is_u64) { self.processes(cpu)? } else { Vec::new() };
+                let mut t = parse_tracepoint(0, &json!({"address": address, "kind": kind, "pid": present("pid")}), &[], None, &processes)?;
+                t.fault = true;
+                Some((t, FaultCatch { user, codes, stop, request: request.clone(), other_mode: 0, other_code: 0 }))
+            }
+        };
+        let mut wanted: Vec<&Tracepoint> = self.tracepoints.iter().filter(|t| !t.fault).collect();
+        if let Some((t, _)) = &armed {
+            wanted.push(t);
+        }
+        let hardware: Vec<u64> = wanted.iter().filter(|t| t.armed() && !t.software).map(|t| t.address).collect();
+        let mut slots = self.breakpoints.clone();
+        slots.extend(hardware);
+        slots.sort_unstable();
+        slots.dedup();
+        if slots.len() > 4 {
+            return Err("a hardware debug.faults needs one of the 4 breakpoint slots, which breakpoints and tracepoints hold: kind software takes none".into());
+        }
+        self.unplant()?;
+        let old = self.tracepoints.iter().position(|t| t.fault).map(|i| self.tracepoints.remove(i));
+        let old_catch = self.fault_catch.take();
+        if let Some((t, catch)) = armed {
+            self.tracepoints.push(t);
+            self.fault_catch = Some(catch);
+        }
+        if let Err(e) = self.plant(true).and_then(|()| self.configure()) {
+            let _ = self.unplant();
+            self.tracepoints.retain(|t| !t.fault);
+            self.tracepoints.extend(old);
+            self.fault_catch = old_catch;
+            let rollback = self.plant(true).and_then(|()| self.configure());
+            return Err(format!("{e}; rollback: {rollback:?}; VM remains paused"));
+        }
+        Ok(self.fault_status())
+    }
+
+    /// debug.faults' settings and tracepoint, and its ring's fill.
+    fn fault_status(&self) -> Value {
+        let catching = self.fault_catch.as_ref().map(|c| {
+            let t = self.tracepoints.iter().find(|t| t.fault).expect("armed with its catch");
+            let mut v = json!({"address": t.address, "kind": if t.software { "software" } else { "hardware" },
+                "mode": match c.user { None => "any", Some(true) => "user", Some(false) => "kernel" },
+                "codes": c.codes.iter().map(|c| format!("{c:#010x}")).collect::<Vec<_>>(), "stop": c.stop,
+                "pid": t.context.as_ref().map(|p| p.pid), "hits": t.hits,
+                "filtered": {"other_process": t.other_process, "mode": c.other_mode, "code": c.other_code}});
+            if t.software {
+                v["planted"] = json!(t.planted);
+                if let Some(why) = &t.pending {
+                    v["pending"] = json!(why);
+                }
+            }
+            v
+        });
+        let mut v = json!({"catching": catching, "recorded": self.fault_seq, "dropped": self.fault_dropped, "capacity": FAULT_CAPACITY,
+            "last": self.faults.back().map(FaultRecord::summary)});
+        if catching.is_none() {
+            v["note"] = json!("off: debug.faults {enable: true} (paused) records every exception the guest's kernel dispatches from then on; vm.restore keeps it on");
+        }
+        v
+    }
+
+    /// A stop at debug.faults' tracepoint: record the exception (unless the
+    /// process, mode or code filters it out).
+    fn fault_hit(&mut self, index: usize, regs: &Registers) -> TraceHit {
+        let quiet = TraceHit { stop: false, moved: false };
+        let t = &mut self.tracepoints[index];
+        if t.context.as_ref().is_some_and(|p| !same_space(p, regs)) {
+            t.other_process += 1;
+            return quiet;
+        }
+        let user = regs.x[3] & 0xff != 0;
+        let catch = self.fault_catch.as_mut().expect("armed with its tracepoint");
+        if catch.user.is_some_and(|u| u != user) {
+            catch.other_mode += 1;
+            return quiet;
+        }
+        if !catch.codes.is_empty() {
+            let mut walk = regs.clone();
+            walk.tcr &= !(1 << 7);
+            let mut code = [0u8; 4];
+            // An unreadable record is recorded, to say so.
+            let read = AddressSpace { memory: &self.vm, registers: &walk }.read(regs.x[0], &mut code);
+            if read.is_ok() && !catch.codes.contains(&exception_code(u32::from_le_bytes(code))) {
+                catch.other_code += 1;
+                return quiet;
+            }
+        }
+        let stop = catch.stop;
+        self.tracepoints[index].hits += 1;
+        let record = self.read_fault(regs, user);
+        if self.faults.len() >= FAULT_CAPACITY {
+            self.faults.pop_front();
+            self.fault_dropped += 1;
+        }
+        self.faults.push_back(record);
+        TraceHit { stop, moved: false }
+    }
+
+    /// KiDispatchException's arguments on this stopped CPU, read from the
+    /// guest now (not the page cache: the guest runs between faults).
+    fn read_fault(&mut self, regs: &Registers, user: bool) -> FaultRecord {
+        self.fault_seq += 1;
+        let stamp = Stamp { cntvct: self.vm.guest_clock(), time_ns: self.started.elapsed().as_nanos() as u64 };
+        let mut errors = Vec::new();
+        let mut walk = regs.clone();
+        walk.tcr &= !(1 << 7);
+        let space = AddressSpace { memory: &self.vm, registers: &walk };
+        // _EXCEPTION_RECORD: code, flags, record, address, parameter count, 15 parameters.
+        let mut raw = [0u8; 0x98];
+        let (code, address, information) = match space.read(regs.x[0], &mut raw) {
+            Ok(()) => {
+                let u64_at = |at: usize| u64::from_le_bytes(raw[at..at + 8].try_into().expect("8"));
+                let code = u32::from_le_bytes(raw[..4].try_into().expect("4"));
+                let count = u32::from_le_bytes(raw[0x18..0x1c].try_into().expect("4")).min(15) as usize;
+                (code, u64_at(0x10), (0..count).map(|i| u64_at(0x20 + 8 * i)).collect())
+            }
+            Err(e) => {
+                errors.push(format!("exception record at {:#x}: {e}", regs.x[0]));
+                (0, 0, Vec::new())
+            }
+        };
+        let code = exception_code(code);
+        let symbols = self.symbols.as_ref().expect("debug.faults loads them");
+        let trap = symbols.trap_registers(&space, regs.x[2], &walk).map_err(|e| errors.push(format!("trap frame at {:#x}: {e}", regs.x[2]))).ok();
+        let process = process::list(&space, symbols)
+            .map_err(|e| errors.push(format!("processes: {e}")))
+            .ok()
+            .and_then(|all| all.into_iter().find(|p| same_space(p, regs)));
+        let mut stack = Vec::new();
+        if let Some(trap) = &trap {
+            let mut modules = match self.module_cache.borrow().clone() {
+                Some(cached) => cached,
+                None => symbols
+                    .resolve("PsLoadedModuleList")
+                    .and_then(|head| vroom_kernel::windows::modules(&space, head, &symbols.module_layout()?))
+                    .map_err(|e| errors.push(format!("kernel modules: {e}")))
+                    .unwrap_or_default(),
+            };
+            if self.module_cache.borrow().is_none() && !modules.is_empty() {
+                *self.module_cache.borrow_mut() = Some(modules.clone());
+            }
+            if let Some(p) = &process {
+                match process::modules(&space, symbols, p) {
+                    Ok(user) => modules.extend(user),
+                    Err(e) => errors.push(format!("{}'s modules: {e}", p.name)),
+                }
+            }
+            let at = AddressSpace { memory: &self.vm, registers: trap };
+            let walked = vroom_kernel::unwind::walk(&at, trap, &modules, &mut self.unwind);
+            let eprocess = process.as_ref().map_or(0, |p| p.eprocess);
+            let mut pcs: Vec<u64> = walked.frames.iter().map(|f| f.pc).take(FAULT_FRAMES).collect();
+            if pcs.first() != Some(&trap.pc) {
+                // A PC in no module (a wild jump) unwinds nothing.
+                pcs.insert(0, trap.pc);
+            }
+            stack = pcs.iter().map(|&pc| self.frame_name(&modules, eprocess, pc).unwrap_or_else(|| format!("{pc:#x}"))).collect();
+            if let Some(why) = walked.stop.filter(|_| walked.frames.len() < FAULT_FRAMES) {
+                stack.push(format!("({why})"));
+            }
+        }
+        FaultRecord { seq: self.fault_seq, stamp, cpu: regs.cpu, user, first_chance: regs.x[4] & 0xff != 0, code, address, information,
+            process: process.map(|p| (p.pid, p.name)), registers: trap, stack, errors }
+    }
+
     /// The next record's sequence number and time, making room for it.
     fn next_record(&mut self) -> (u64, Stamp) {
         self.trace_seq += 1;
@@ -2570,7 +2952,7 @@ impl Session {
     /// Tracepoints and hwatches as armed, and the ring's fill: answers
     /// while the VM runs too.
     fn trace_status(&self) -> Value {
-        json!({"tracepoints": self.tracepoints.iter().map(Tracepoint::json).collect::<Vec<_>>(),
+        json!({"tracepoints": self.tracepoints.iter().filter(|t| !t.fault).map(Tracepoint::json).collect::<Vec<_>>(),
             "hwatch": self.hwatches.iter().map(Hwatch::json).collect::<Vec<_>>(),
             "records": self.traces.len(), "recorded": self.trace_seq, "dropped": self.trace_dropped, "capacity": self.trace_capacity,
             "memory_watch": self.memory_watch_counts(), "state": format!("{:?}", self.vm.state())})
@@ -2794,6 +3176,10 @@ fn boot(config_path: &std::path::Path, restore: Option<&std::path::Path>) -> Res
         hwatch_pending: BTreeMap::new(),
         watching: false,
         traces: Default::default(),
+        fault_catch: None,
+        faults: Default::default(),
+        fault_seq: 0,
+        fault_dropped: 0,
         trace_capacity: DEFAULT_TRACE_CAPACITY,
         trace_seq: 0,
         trace_dropped: 0,
@@ -2963,7 +3349,7 @@ fn run(args: Args) -> Result<(), String> {
                                 .reason
                                 .into();
                         } else if !user_hit && traced.as_ref().is_some_and(|t| t.stop) {
-                            reason = "Tracepoint".into();
+                            reason = if session.tracepoints.iter().any(|t| t.fault && t.address == stop.pc) { "Fault" } else { "Tracepoint" }.into();
                         } else if let Some(traced) = traced.filter(|_| !user_hit) {
                             // Recorded; a pause already asked for keeps the VM paused.
                             if was_running {
@@ -2993,8 +3379,11 @@ fn run(args: Args) -> Result<(), String> {
                     session.cancel_run_to()?;
                     session.continuing = false;
                     session.continue_cpus.clear();
-                    output(json!({"event":"stopped", "cpu":stop.cpu, "pc":stop.pc,
-                        "reason":reason, "syndrome":stop.syndrome}))?;
+                    let mut stopped = json!({"event":"stopped", "cpu":stop.cpu, "pc":stop.pc, "reason":reason, "syndrome":stop.syndrome});
+                    if reason == "Fault" {
+                        stopped["fault"] = json!(session.faults.back().map(FaultRecord::summary));
+                    }
+                    output(stopped)?;
                 }
                 VmEvent::Shutdown => {
                     session.vm.shutdown();
@@ -3082,9 +3471,9 @@ fn run(args: Args) -> Result<(), String> {
 }
 
 /// `restore`: this VM again, from one of its snapshots (or a snapshot
-/// folder), paused unless `resume`. Checked first: a snapshot that can't
-/// start leaves the running VM alone. Past that, a failure ends the lab:
-/// `slot` is empty after it.
+/// folder), paused unless `resume`, with debug.faults armed again if it
+/// was. Checked first: a snapshot that can't start leaves the running VM
+/// alone. Past that, a failure ends the lab: `slot` is empty after it.
 fn restore_in(slot: &mut Option<Session>, config_path: &std::path::Path, request: &Value) -> Result<Value, String> {
     let state_dir = slot.as_ref().map(|s| s.state_dir.clone()).ok_or("no VM")?;
     let given = request["name"].as_str().or(request["path"].as_str()).ok_or("missing name (or path)")?;
@@ -3094,16 +3483,31 @@ fn restore_in(slot: &mut Option<Session>, config_path: &std::path::Path, request
     };
     let dir = restore_dir(std::path::Path::new(given), &state_dir)?;
     vroom_vmm::check_snapshot(&dir).map_err(|e| e.to_string())?;
+    let faults = slot.as_ref().and_then(|s| s.fault_catch.as_ref()).map(|c| c.request.clone());
     // The old VM lets go of its state dir, disks and network ports first.
     drop(slot.take());
     let session = boot(config_path, Some(&dir)).map_err(|e| format!("{e} (the lab stops: its VM is gone)"))?;
     let session = slot.insert(session);
+    let mut reply = json!({"restored": dir, "state": "Paused", "note": "paused: vm.resume runs the guest (or restore with resume: true)"});
+    if let Some(request) = faults {
+        match session.command(&request) {
+            Ok(status) => reply["faults"] = status["catching"].clone(),
+            Err(e) => {
+                // Not resumed: the agent wanted faults caught from the start.
+                reply["faults_error"] = json!(format!("debug.faults is off: {e}"));
+                reply["note"] = json!("paused, without debug.faults (faults_error): arm it again, then vm.resume");
+                return Ok(reply);
+            }
+        }
+    }
     if !resume {
-        return Ok(json!({"restored": dir, "state": "Paused", "note": "paused: vm.resume runs the guest (or restore with resume: true)"}));
+        return Ok(reply);
     }
     // Restored, still paused: a failed resume says so and leaves it so.
     session.command(&json!({"op": "resume"})).map_err(|e| format!("restored {}, paused: vm.resume failed: {e}", dir.display()))?;
-    Ok(json!({"restored": dir, "state": "Running"}))
+    reply["state"] = json!("Running");
+    reply.as_object_mut().expect("object").remove("note");
+    Ok(reply)
 }
 
 fn main() {
@@ -3146,6 +3550,26 @@ mod tests {
         traced[0].hits = 1;
         traced[0].max_hits = Some(1);
         assert_eq!(breakpoint_slots(&[0xfffff80000002000, 0xfffff80000003000], &traced), 4, "a spent tracepoint frees its slot");
+    }
+
+    #[test]
+    fn fault_records_say_what_where_and_whose() {
+        let fault = |code: u32, information: Vec<u64>| FaultRecord { seq: 1, stamp: Stamp::default(), cpu: 0, user: true, first_chance: true,
+            code: exception_code(code), address: 0x7ff8_0000_1234, information, process: Some((1200, "app.exe".into())), registers: None,
+            stack: vec!["app.dll+0x1234".into()], errors: Vec::new() };
+        let read = fault(0x1000_0004, vec![0, 8]);
+        assert_eq!(read.code, 0xc000_0005, "the trap handlers' internal code, translated");
+        assert_eq!(read.summary(), "access violation: read of 0x8 at app.dll+0x1234 (0x7ff800001234), app.exe pid 1200, user mode, first chance");
+        let v = read.json();
+        assert_eq!((v["access"].as_str(), v["address"].as_u64(), v["code_hex"].as_str()), (Some("read"), Some(8), Some("0xc0000005")));
+        assert_eq!(fault(0xc000_0005, vec![1, 0x10]).access(), Some(("write", 0x10)));
+        assert_eq!(fault(0xc000_0005, vec![8, 0x41414141]).access(), Some(("execute", 0x41414141)));
+        let mut probe = fault(0xc000_001d, vec![0x2000_0040, 0xd538_4250]);
+        (probe.user, probe.first_chance, probe.process, probe.stack) = (false, false, None, Vec::new());
+        assert_eq!(probe.access(), None, "only access violations' parameters are an access");
+        assert_eq!(probe.summary(), "illegal instruction at 0x7ff800001234, kernel mode, second chance");
+        assert_eq!(fault(0xdead_beef, Vec::new()).summary(), "exception 0xdeadbeef at app.dll+0x1234 (0x7ff800001234), app.exe pid 1200, user mode, first chance");
+        assert!(v.get("registers").is_none() && v.get("errors").is_none());
     }
 
     #[test]

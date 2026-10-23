@@ -245,6 +245,16 @@ static COMMANDS: &[Command] = &[
         p("clear", "boolean", false, "remove the returned records from the buffer"),
         p("memory", "object", false, "{at: a capture's name (a memory capture's address, a register capture's value) | \"pointer\" | \"address\" (an hwatch's) | a register, offset, length: 1..4096}: each record also gets memory {address, hex} read now, through its own process's tables, to compare with what the hit captured; needs a paused VM"),
     ], "read", Target::Op("traces")),
+    c("debug.faults", "debug", "Guest exceptions, the faulting address included: with enable, a tracepoint at nt!KiDispatchException (kernel symbols loaded for it) records every exception the guest's kernel dispatches, user and kernel mode, before any handler (an __except, WER) sees it: code and name, pc, access (read|write|execute) and address for access violations, process, mode, first chance, the trap frame's registers and a stack of module!function+0xoff (user modules' functions when kernel.symbols loaded their PDB). summary is one line of it, last the newest's; a stop: true stop is reason Fault. Without enable: the records, also while the VM runs. vm.restore keeps it armed", &[
+        p("enable", "boolean", false, "true arms it (paused; again: new settings), false disarms it; omitted: report"),
+        p("mode", "string", false, "record only user (exceptions from user mode, e.g. a service's crash) | kernel | any (default)"),
+        p("codes", "array", false, "record only these exception codes, e.g. [\"0xc0000005\"] (access violations; default all: Windows' own handled ones included, such as user code's illegal-instruction probes of CurrentEL)"),
+        p("pid", "integer", false, "record only exceptions in this process"),
+        p("stop", "boolean", false, "stop the VM at each recorded one, at KiDispatchException's entry (default false: record and continue)"),
+        p("kind", "string", false, "software (default: a BRK, no slot) | hardware (one of the 4 breakpoint slots)"),
+        p("limit", "integer", false, "report: at most this many records, oldest first"),
+        p("clear", "boolean", false, "report: remove the returned records"),
+    ], "control", Target::Op("faults")),
     // Windows kernel.
     c("kernel.info", "kernel", "Find ntoskrnl: base, size, PDB", &[CPU], "read", Target::Op("kernel")),
     c("kernel.symbols", "kernel", "Load PDB symbols for the kernel or a module base (slow the first time)", &[CPU, p("base", "address", false, "module base; kernel if omitted"), CONTEXT], "read", Target::Op("symbols")),
