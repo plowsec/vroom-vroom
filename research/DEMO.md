@@ -172,6 +172,6 @@ That is the precondition, and it is the only one.
 |---|---|
 | `Demo needs a snapshot stopped at a registered Ex callback entry` | `PC` is not a callback entry: the snapshot was saved somewhere else. Make it again. |
 | `load kernel symbols first` | `kernel.symbols`, in this lab session. |
-| `pause the VM before inspection or control` | `vm.step` and `vm.resume` return at once and leave the VM running: `events.poll` for the stop before reading anything. |
+| `the VM is running: vm.pause before ...` | `vm.step` and `vm.resume` return at once and leave the VM running: `events.poll` for the stop before reading anything. `vm.resume` again when done, or the paused guest drops your probes. |
 | `backing file ... is outside the allowed directories` | The overlay's backing file is not beside it. Clone the base into the lab directory. |
 | a restore that refuses a changed disk | Something wrote a layer the snapshot recorded by size and mtime. The lab's layers are its own; the app writing the VM those layers came from is what breaks it. |

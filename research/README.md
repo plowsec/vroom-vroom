@@ -74,7 +74,8 @@ fuzz      check run* probe* coverage blocks diff crashes          * jobs.start o
 - `guest.exec {command, powershell?, timeout?, max_output?}`: the guest agent runs it (cmd.exe as SYSTEM); answers `{exit_code, timed_out, truncated, stdout, stderr}` when it ends. Older agent: `guest.update_tools` first.
 - `guest.upload {host_path, guest_path}`, `guest.download {guest_path, host_path?}`: host paths absolute or under exports/; answer `{size, sha256}`.
 - Each command lists params, `mutates` and `risk` (read, control, write, destructive): gate writes on these.
-- Addresses: integers or `"0x..."`. Inspection needs a paused VM.
+- Addresses: integers or `"0x..."`. Inspection (`kernel.*`, `memory.*`, `cpu.*`, `debug.*`) needs a paused VM: `vm.pause`, inspect, `vm.resume`. A guest left paused answers nothing, so network probes against it time out with no error.
+- Methods and commands share one namespace: `run commands.list` works, so does `{"method":"kernel.functions"}`. `-32601` means a wrong name (the error names the nearest ones), not a missing feature.
 - `events.poll` without `after` waits for the next event (stop, fault, shutdown). Events carry `seq`.
 - Arrays over `limit` (200) return `{items, total, handle, next_offset}`: page with `results.page`.
 - `fuzz.run`/`fuzz.probe`/`fuzz.trace` start `vroom-fuzz` (its own VM, signed; `$VROOM_FUZZ` or `target/release/vroom-fuzz`). Output and progress: `OUTPUT.agent.jsonl`, `OUTPUT.agent.log`. `fuzz.trace`'s OUTPUT is the trace file.

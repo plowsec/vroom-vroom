@@ -1032,7 +1032,7 @@ impl Session {
         if !matches!(op, "status" | "pause" | "shutdown" | "key" | "snapshot" | "snapshots" | "traces")
             && self.vm.state() != RunState::Paused
         {
-            return Err("pause the VM before inspection or control".into());
+            return Err(format!("the VM is running: vm.pause before {op}, and vm.resume when done (a paused guest's network, agent and screen are frozen)"));
         }
         match op {
             "status" => {
@@ -1050,7 +1050,7 @@ impl Session {
                 // A step over a BRK this pause cut short plants it again.
                 self.plant(false)?;
                 self.cancel_run_to()?;
-                Ok(json!("paused"))
+                Ok(json!({"state": "Paused", "note": "vm.resume when done: until then the guest's network, agent and screen are frozen, and probes against it time out"}))
             }
             "resume" => {
                 if self.vm.state() != RunState::Paused {

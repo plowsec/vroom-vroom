@@ -290,10 +290,55 @@ static COMMANDS: &[Command] = &[
 ];
 
 fn find(name: &str) -> Result<&'static Command, Error> {
-    COMMANDS
+    if METHODS.contains(&name) {
+        return Err(error(INVALID_PARAMS, format!("{name} is a protocol method, not a command: call it as the method itself")));
+    }
+    COMMANDS.iter().find(|c| c.name == name).ok_or_else(|| unknown("command", name))
+}
+
+/// An unknown name is almost always a misspelling or a method/command mixup,
+/// and agents read a bare "unknown" as a missing feature: say so, with the
+/// nearest real names.
+fn unknown(kind: &str, name: &str) -> Error {
+    let near = nearest(name);
+    let hint = if near.is_empty() { String::new() } else { format!("; did you mean {}?", near.join(", ")) };
+    error(
+        METHOD_NOT_FOUND,
+        format!("unknown {kind}: {name}{hint} (a wrong name, not a missing feature: commands.list lists every command, initialize every method)"),
+    )
+}
+
+/// Up to three method or command names close to `name`.
+fn nearest(name: &str) -> Vec<&'static str> {
+    let leaf = |n: &str| n.rsplit('.').next().unwrap_or(n).to_ascii_lowercase();
+    let want = name.to_ascii_lowercase();
+    let mut scored: Vec<(usize, &'static str)> = METHODS
         .iter()
-        .find(|c| c.name == name)
-        .ok_or_else(|| error(METHOD_NOT_FOUND, format!("unknown command: {name}; see commands.list")))
+        .copied()
+        .chain(COMMANDS.iter().map(|c| c.name))
+        .filter_map(|n| {
+            let d = edit_distance(&want, &n.to_ascii_lowercase());
+            let same_leaf = leaf(n) == leaf(name);
+            (d <= 3 || same_leaf).then_some((if same_leaf { 0 } else { d }, n))
+        })
+        .collect();
+    scored.sort();
+    scored.into_iter().take(3).map(|(_, n)| n).collect()
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut prev = row[0];
+        row[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let next = (prev + usize::from(ca != cb)).min(row[j] + 1).min(row[j + 1] + 1);
+            prev = row[j + 1];
+            row[j + 1] = next;
+        }
+    }
+    row[b.len()]
 }
 
 fn describe_command(c: &Command) -> Value {
@@ -689,7 +734,9 @@ impl Connection {
                     "fuzzer": self.shared.fuzz.as_ref().map(|p| p.display().to_string()),
                     "notes": [
                         "Addresses are integers or \"0x...\" strings; results give integers.",
-                        "Inspection needs a paused VM: vm.pause, or wait for a stop with events.poll after vm.resume.",
+                        "Inspection (kernel.*, memory.*, cpu.*, debug.*) needs a paused VM: vm.pause, or wait for a stop with events.poll after vm.resume.",
+                        "vm.resume when done inspecting: a paused guest answers nothing, so network probes against it time out without an error.",
+                        "Methods and commands share one namespace: commands.run {command: \"commands.list\"} and {\"method\": \"commands.list\"} both work. An unknown name is a wrong name, not a missing feature.",
                         "The lab starts paused (restore too): vm.resume runs the guest; its network, agent and screen are frozen until then.",
                         "guest.* needs a running VM and a guest agent (vm.status: guest_agent); guest.exec needs current guest tools: guest.update_tools installs them.",
                         "Commands with mutates=true change the guest, the VM or files; risk says how much.",
@@ -705,6 +752,10 @@ impl Connection {
             }
             "commands.run" => {
                 allow(&params, &["command", "args", "limit"])?;
+                // `vroom-rpc run commands.list`: a method named as a command is that method.
+                if let Some(name) = params.get("command").and_then(Value::as_str).filter(|n| METHODS.contains(n)) {
+                    return self.call(name, params.get("args").unwrap_or(&Value::Null));
+                }
                 let (command, args) = command_args(&params)?;
                 if command.job_only {
                     return Err(error(INVALID_PARAMS, format!("{} is long running: start it with jobs.start", command.name)));
@@ -743,7 +794,7 @@ impl Connection {
             }
             _ => {
                 let Some(command) = COMMANDS.iter().find(|c| c.name == method) else {
-                    return Err(error(METHOD_NOT_FOUND, format!("unknown method: {method}")));
+                    return Err(unknown("method", method));
                 };
                 if command.job_only {
                     return Err(error(INVALID_PARAMS, format!("{} is long running: start it with jobs.start", command.name)));
@@ -1084,6 +1135,23 @@ mod tests {
         let ok = call(&mut c, r#"{"jsonrpc":"2.0","id":3,"method":"debug.hwatch","params":{"capacity":262144,"watches":[{"address":"0x1e2a27fc7e0","length":1,"on":"free"}]}}"#);
         assert_eq!(ok["result"]["slots"], 1);
         lab.join().unwrap();
+    }
+
+    #[test]
+    fn methods_run_as_commands_and_wrong_names_say_so() {
+        let (mut c, _rx) = connection();
+        call(&mut c, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"actor":"a"}}"#);
+        // What `vroom-rpc run commands.list` sends.
+        let list = call(&mut c, r#"{"jsonrpc":"2.0","id":2,"method":"commands.run","params":{"command":"commands.list","args":{"category":"vm"}}}"#);
+        assert!(list["result"].as_array().unwrap().iter().any(|c| c["name"] == "vm.pause"));
+        let job = call(&mut c, r#"{"jsonrpc":"2.0","id":3,"method":"jobs.start","params":{"command":"describe","args":{}}}"#);
+        assert!(job["error"]["message"].as_str().unwrap().contains("protocol method"));
+        let typo = call(&mut c, r#"{"jsonrpc":"2.0","id":4,"method":"commands.run","params":{"command":"kernel.function","args":{}}}"#);
+        assert_eq!(typo["error"]["code"], METHOD_NOT_FOUND);
+        let message = typo["error"]["message"].as_str().unwrap();
+        assert!(message.contains("did you mean kernel.functions") && message.contains("not a missing feature"), "{message}");
+        let method = call(&mut c, r#"{"jsonrpc":"2.0","id":5,"method":"pause"}"#);
+        assert!(method["error"]["message"].as_str().unwrap().contains("vm.pause"));
     }
 
     #[test]
