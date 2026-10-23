@@ -63,7 +63,7 @@ vm        status pause resume step step_over step_out snapshot snapshots restore
 guest     exec upload download update_tools                       VM running
 cpu       registers write_register
 memory    regions read_virtual read_physical translate write_virtual write_physical dump
-debug     breakpoints watchpoints
+debug     breakpoints watchpoints tracepoints hwatch traces
 kernel    info symbols functions resolve processes process peb user_modules modules
           callbacks stack image export process_event cache
 fuzz      check run* probe* coverage blocks diff crashes          * jobs.start only
@@ -76,6 +76,7 @@ fuzz      check run* probe* coverage blocks diff crashes          * jobs.start o
 - Each command lists params, `mutates` and `risk` (read, control, write, destructive): gate writes on these.
 - Addresses: integers or `"0x..."`. Inspection (`kernel.*`, `memory.*`, `cpu.*`, `debug.*`) needs a paused VM: `vm.pause`, inspect, `vm.resume`. A guest left paused answers nothing, so network probes against it time out with no error.
 - Methods and commands share one namespace: `run commands.list` works, so does `{"method":"kernel.functions"}`. `-32601` means a wrong name (the error names the nearest ones), not a missing feature.
+- Tracepoints and hwatches record and continue. `pid` pins one to a process; `record_if {register, equals}` keeps only matching hits (`filtered` counts the rest, and hits in other processes). Records carry `cntvct` (guest CNTVCT_EL0) and `time_ns`. `debug.traces {memory: {at, offset, length}}` adds bytes read now at a capture's address. `debug.tracepoints {}` reports planted/pending without pausing.
 - `events.poll` without `after` waits for the next event (stop, fault, shutdown). Events carry `seq`.
 - Arrays over `limit` (200) return `{items, total, handle, next_offset}`: page with `results.page`.
 - `fuzz.run`/`fuzz.probe`/`fuzz.trace` start `vroom-fuzz` (its own VM, signed; `$VROOM_FUZZ` or `target/release/vroom-fuzz`). Output and progress: `OUTPUT.agent.jsonl`, `OUTPUT.agent.log`. `fuzz.trace`'s OUTPUT is the trace file.

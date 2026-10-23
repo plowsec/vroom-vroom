@@ -269,7 +269,8 @@ struct Hwatch {
     on: WatchOn,
     name: Option<String>,
     hits: u64,
-    /// A user-address watch's process (None: any).
+    /// The watch's process (None: any). A user address defaults to the
+    /// selected process; `pid` names one.
     context: Option<process::Process>,
 }
 
@@ -289,11 +290,12 @@ impl Hwatch {
 }
 
 /// One entry of debug.hwatch.
-fn parse_hwatch(i: usize, w: &Value, previous: &[Hwatch], selected: Option<&process::Process>) -> Result<Hwatch, String> {
+fn parse_hwatch(i: usize, w: &Value, previous: &[Hwatch], selected: Option<&process::Process>, processes: &[process::Process]) -> Result<Hwatch, String> {
     let fail = |e: String| format!("hwatch {i}: {e}");
     let object = w.as_object().ok_or_else(|| fail("expected an object".into()))?;
-    if let Some(key) = object.keys().find(|k| !matches!(k.as_str(), "address" | "length" | "on" | "name")) {
-        return Err(fail(format!("unknown key {key} (address, length, on, name)")));
+    const KEYS: &str = "address, length, on, name, pid";
+    if let Some(key) = object.keys().find(|k| !KEYS.split(", ").any(|known| known == k.as_str())) {
+        return Err(fail(format!("unknown key {key} ({KEYS})")));
     }
     let present = |k: &str| object.get(k).filter(|v| !v.is_null());
     let address = number(present("address").ok_or_else(|| fail("missing address".into()))?).map_err(fail)?;
@@ -307,18 +309,14 @@ fn parse_hwatch(i: usize, w: &Value, previous: &[Hwatch], selected: Option<&proc
     let on = present("on").ok_or_else(|| fail("missing on: write, read, access or free".into()))?;
     let on = WatchOn::parse(on.as_str().ok_or_else(|| fail("on: expected a string".into()))?).map_err(fail)?;
     let name = present("name").map(|v| v.as_str().map(str::to_owned).ok_or_else(|| fail("name: expected a string".into()))).transpose()?;
-    // A user address watches in the selected process; with none, in all.
-    let context = if address >> 63 == 0 {
-        previous.iter().find(|w| w.address == address).map_or(selected, |w| w.context.as_ref()).cloned()
-    } else {
-        None
-    };
+    let kept = previous.iter().find(|w| w.address == address).map(|w| w.context.as_ref());
+    let context = process_context(present("pid"), address, kept, selected, processes).map_err(fail)?;
     Ok(Hwatch { address, length, on, name, hits: 0, context })
 }
 
 /// A debug.hwatch list, checked as a whole.
-fn parse_hwatches(list: &[Value], previous: &[Hwatch], selected: Option<&process::Process>) -> Result<Vec<Hwatch>, String> {
-    let watches = list.iter().enumerate().map(|(i, w)| parse_hwatch(i, w, previous, selected)).collect::<Result<Vec<_>, _>>()?;
+fn parse_hwatches(list: &[Value], previous: &[Hwatch], selected: Option<&process::Process>, processes: &[process::Process]) -> Result<Vec<Hwatch>, String> {
+    let watches = list.iter().enumerate().map(|(i, w)| parse_hwatch(i, w, previous, selected, processes)).collect::<Result<Vec<_>, _>>()?;
     for (i, w) in watches.iter().enumerate() {
         if let Some(name) = &w.name {
             if watches[..i].iter().any(|u| u.name.as_ref() == Some(name)) {
@@ -363,6 +361,7 @@ struct HwatchPending {
 
 struct HwatchRecord {
     seq: u64,
+    stamp: Stamp,
     hwatch: usize,
     name: Option<String>,
     hit: u64,
@@ -397,6 +396,15 @@ impl HwatchRecord {
     }
 }
 
+/// When a record was made: the guest's virtual counter (CNTVCT_EL0, the
+/// clock its code reads) and host nanoseconds since the lab started. Both
+/// include the debugger's own time at each stop.
+#[derive(Clone, Copy, Default)]
+struct Stamp {
+    cntvct: u64,
+    time_ns: u64,
+}
+
 /// One entry of the ring buffer debug.traces drains.
 enum Record {
     Trace(TraceRecord),
@@ -405,9 +413,18 @@ enum Record {
 
 impl Record {
     fn json(&self) -> Value {
+        let (mut v, stamp) = match self {
+            Self::Trace(r) => (r.json(), r.stamp),
+            Self::Hwatch(r) => (r.json(), r.stamp),
+        };
+        v["cntvct"] = json!(stamp.cntvct);
+        v["time_ns"] = json!(stamp.time_ns);
+        v
+    }
+    fn regs(&self) -> &Registers {
         match self {
-            Self::Trace(r) => r.json(),
-            Self::Hwatch(r) => r.json(),
+            Self::Trace(r) => &r.regs,
+            Self::Hwatch(r) => &r.regs,
         }
     }
 }
@@ -434,8 +451,16 @@ struct Tracepoint {
     /// Applied in order on every hit, before the record is appended.
     actions: Vec<Action>,
     hits: u64,
-    /// A user-address tracepoint's process (None: any).
+    /// Record (and count, and stop) only hits where this register holds
+    /// this value; actions run on every hit.
+    record_if: Option<(ActionRegister, u64)>,
+    /// Hits not recorded: in another process, or record_if false.
+    other_process: u64,
+    unmatched: u64,
+    /// The tracepoint's process (None: any). A user address defaults to
+    /// the selected process; `pid` names one.
     context: Option<process::Process>,
+    source_record_if: Option<Value>,
 }
 
 impl Tracepoint {
@@ -447,7 +472,8 @@ impl Tracepoint {
             "register": self.register.as_ref().map(|r| &r.0), "length": self.length,
             "captures": self.captures.iter().map(|c| &c.source).collect::<Vec<_>>(), "max_hits": self.max_hits, "stop": self.stop,
             "actions": self.actions.iter().map(|a| &a.source).collect::<Vec<_>>(), "hits": self.hits, "armed": self.armed(),
-            "pid": self.context.as_ref().map(|p| p.pid)});
+            "pid": self.context.as_ref().map(|p| p.pid), "record_if": self.source_record_if,
+            "filtered": {"other_process": self.other_process, "record_if": self.unmatched}});
         if self.software {
             v["physical"] = json!(self.physical.filter(|_| self.planted));
             v["planted"] = json!(self.planted);
@@ -469,6 +495,7 @@ struct TraceHit {
 
 struct TraceRecord {
     seq: u64,
+    stamp: Stamp,
     tracepoint: usize,
     hit: u64,
     regs: Registers,
@@ -586,6 +613,18 @@ impl ActionRegister {
     }
 }
 
+/// A `{register, equals}` test (skip_if, record_if): holds when the
+/// register equals the value, at the register's width.
+fn condition(what: &str, c: &Value) -> Result<(ActionRegister, u64), String> {
+    let c = c.as_object().ok_or_else(|| format!("{what}: expected {{register, equals}}"))?;
+    if let Some(key) = c.keys().find(|k| !matches!(k.as_str(), "register" | "equals")) {
+        return Err(format!("{what}: unknown key {key} (register, equals)"));
+    }
+    let register = ActionRegister::parse(c.get("register").ok_or_else(|| format!("{what} needs a register"))?)?;
+    let equals = action_value(c.get("equals").ok_or_else(|| format!("{what} needs equals"))?).map_err(|e| format!("equals: {e}"))?;
+    Ok((register, register.width(equals)))
+}
+
 /// A number, hex string, or negative (wrapping) number or string.
 fn action_value(v: &Value) -> Result<u64, String> {
     if let Some(n) = v.as_i64().filter(|n| *n < 0) {
@@ -663,17 +702,7 @@ impl Action {
             (None, None, None) => return Err("needs one of set_register, add_register, write_memory".into()),
             _ => return Err("only one of set_register, add_register, write_memory per action".into()),
         };
-        let skip_if = present("skip_if")
-            .map(|c| {
-                let c = c.as_object().ok_or("skip_if: expected {register, equals}")?;
-                if let Some(key) = c.keys().find(|k| !matches!(k.as_str(), "register" | "equals")) {
-                    return Err(format!("skip_if: unknown key {key} (register, equals)"));
-                }
-                let register = ActionRegister::parse(c.get("register").ok_or("skip_if needs a register")?)?;
-                let equals = action_value(c.get("equals").ok_or("skip_if needs equals")?).map_err(|e| format!("equals: {e}"))?;
-                Ok::<_, String>((register, register.width(equals)))
-            })
-            .transpose()?;
+        let skip_if = present("skip_if").map(|c| condition("skip_if", c)).transpose()?;
         let stop = present("stop").map(|v| v.as_bool().ok_or("stop: expected a boolean")).transpose()?.unwrap_or(false);
         Ok(Action { operation, skip_if, stop, source: v.clone() })
     }
@@ -724,6 +753,10 @@ impl Capture {
         let name = present("name").and_then(Value::as_str).filter(|n| !n.is_empty()).ok_or("needs a name")?.to_owned();
         let length = present("length").map(number).transpose().map_err(|e| format!("length: {e}"))?;
         let offset = present("offset").map(action_value).transpose().map_err(|e| format!("offset: {e}"))?;
+        let named = present("register").or(present("name").filter(|_| length.is_none())).and_then(Value::as_str).map(str::to_ascii_lowercase);
+        if named.as_deref().is_some_and(|n| n.starts_with("cntvct")) {
+            return Err("every record carries cntvct (the guest's CNTVCT_EL0) and time_ns already".into());
+        }
         let register = match present("register") {
             Some(r) => ActionRegister::parse(r)?,
             None if length.is_some() || offset.is_some() => return Err("a memory capture needs the register holding the address".into()),
@@ -773,6 +806,65 @@ fn apply_effect(vm: &Vmm, regs: &mut Registers, effect: Effect) -> Result<(), St
     Ok(())
 }
 
+/// debug.traces `memory`: bytes read at drain time at an address each
+/// record holds, to compare with what the hit captured.
+struct DrainRead {
+    /// A capture's name (its address), "pointer" (the tracepoint's
+    /// register), "address" (an hwatch's), or a register as recorded.
+    at: String,
+    offset: u64,
+    length: u64,
+}
+
+impl DrainRead {
+    fn parse(v: &Value) -> Result<Self, String> {
+        let object = v.as_object().ok_or("memory: expected {at, offset?, length}")?;
+        if let Some(key) = object.keys().find(|k| !matches!(k.as_str(), "at" | "offset" | "length")) {
+            return Err(format!("memory: unknown key {key} (at, offset, length)"));
+        }
+        let at = object.get("at").and_then(Value::as_str).filter(|a| !a.is_empty())
+            .ok_or("memory needs at: a capture name, \"pointer\", \"address\" or a register")?.to_owned();
+        let offset = object.get("offset").filter(|v| !v.is_null()).map(action_value).transpose().map_err(|e| format!("memory offset: {e}"))?.unwrap_or(0);
+        let length = number(object.get("length").ok_or("memory needs a length")?).map_err(|e| format!("memory length: {e}"))?;
+        if length == 0 || length > MAX_TRACE_BYTES {
+            return Err(format!("memory length is 1..{MAX_TRACE_BYTES}"));
+        }
+        Ok(Self { at, offset, length })
+    }
+
+    /// The address to read for one record (`v`, its JSON).
+    fn address(&self, record: &Record, v: &Value) -> Result<u64, String> {
+        let at = self.at.as_str();
+        let base = if let Some(address) = v["capture_addresses"].get(at).and_then(Value::as_u64) {
+            address
+        } else if v["captures"].get(at).is_some() || v["capture_errors"].get(at).is_some() {
+            return Err(format!("capture {at} holds no address (a register capture, or a null pointer)"));
+        } else if matches!(at, "pointer" | "address") {
+            v[at].as_u64().ok_or_else(|| format!("this record has no {at}"))?
+        } else {
+            let register = ActionRegister::parse(&json!(at)).map_err(|e| format!("{at}: not a capture, pointer, address or register ({e})"))?;
+            register.get(record.regs())
+        };
+        Ok(base.wrapping_add(self.offset))
+    }
+
+    /// `{address, hex}` or `{address?, error}` for one record (`v`, its JSON).
+    fn read(&self, vm: &Vmm, record: &Record, v: &Value) -> Value {
+        let address = match self.address(record, v) {
+            Ok(address) => address,
+            Err(e) => return json!({"error": e}),
+        };
+        // Through the record's own tables: its process, as at the hit.
+        let mut walk = record.regs().clone();
+        walk.tcr &= !(1 << 7);
+        let mut bytes = vec![0; self.length as usize];
+        match (AddressSpace { memory: vm, registers: &walk }).read(address, &mut bytes) {
+            Ok(()) => json!({"address": address, "hex": hex_string(&bytes)}),
+            Err(e) => json!({"address": address, "error": e.to_string()}),
+        }
+    }
+}
+
 /// Hardware breakpoint slots these breakpoints and tracepoints take.
 fn breakpoint_slots(breakpoints: &[u64], tracepoints: &[Tracepoint]) -> usize {
     let mut addresses: Vec<u64> = breakpoints.to_vec();
@@ -786,12 +878,40 @@ fn same_space(process: &process::Process, regs: &Registers) -> bool {
     process.directory_table & 0x0000_ffff_ffff_f000 == regs.ttbr0 & 0x0000_ffff_ffff_f000
 }
 
+/// A tracepoint's or hwatch's process. `pid`: that process ("any": all).
+/// Otherwise a user address keeps the process it had (`kept`) or takes the
+/// selected one (with none, all); a kernel address, all.
+fn process_context(
+    pid: Option<&Value>,
+    address: u64,
+    kept: Option<Option<&process::Process>>,
+    selected: Option<&process::Process>,
+    processes: &[process::Process],
+) -> Result<Option<process::Process>, String> {
+    match pid {
+        Some(Value::String(any)) if any == "any" => Ok(None),
+        Some(pid) => {
+            let pid = pid.as_u64().ok_or("pid: a process id, or \"any\"")?;
+            let mut matching = processes.iter().filter(|p| p.pid == pid);
+            let process = matching.next().ok_or_else(|| format!("pid {pid}: no such process (kernel.processes lists them)"))?;
+            if matching.next().is_some() {
+                return Err(format!("pid {pid}: more than one process has it; select one with kernel.process and omit pid"));
+            }
+            Ok(Some(process.clone()))
+        }
+        None if address >> 63 == 0 => Ok(kept.unwrap_or(selected).cloned()),
+        None => Ok(None),
+    }
+}
+
 /// One entry of debug.tracepoints.
-fn parse_tracepoint(i: usize, t: &Value, previous: &[Tracepoint], selected: Option<&process::Process>) -> Result<Tracepoint, String> {
+/// `processes`: the guest's, when an entry names a pid.
+fn parse_tracepoint(i: usize, t: &Value, previous: &[Tracepoint], selected: Option<&process::Process>, processes: &[process::Process]) -> Result<Tracepoint, String> {
+    const KEYS: &str = "address, kind, register, length, captures, max_hits, stop, actions, record_if, pid";
     let fail = |e: String| format!("tracepoint {i}: {e}");
     let object = t.as_object().ok_or_else(|| fail("expected an object".into()))?;
-    if let Some(key) = object.keys().find(|k| !matches!(k.as_str(), "address" | "kind" | "register" | "length" | "captures" | "max_hits" | "stop" | "actions")) {
-        return Err(fail(format!("unknown key {key} (address, kind, register, length, captures, max_hits, stop, actions)")));
+    if let Some(key) = object.keys().find(|k| !KEYS.split(", ").any(|known| known == k.as_str())) {
+        return Err(fail(format!("unknown key {key} ({KEYS})")));
     }
     let present = |k: &str| object.get(k).filter(|v| !v.is_null());
     let address = number(present("address").ok_or_else(|| fail("missing address".into()))?).map_err(fail)?;
@@ -854,13 +974,11 @@ fn parse_tracepoint(i: usize, t: &Value, previous: &[Tracepoint], selected: Opti
                 .collect::<Result<_, _>>()?
         }
     };
-    // A user address traces in the selected process; with none, in all.
-    let context = if address >> 63 == 0 {
-        previous.iter().find(|t| t.address == address).map_or(selected, |t| t.context.as_ref()).cloned()
-    } else {
-        None
-    };
-    Ok(Tracepoint { address, software, physical: None, planted: false, pending: None, register, length, captures, max_hits, stop, actions, hits: 0, context })
+    let record_if = present("record_if").map(|c| condition("record_if", c)).transpose().map_err(fail)?;
+    let kept = previous.iter().find(|t| t.address == address).map(|t| t.context.as_ref());
+    let context = process_context(present("pid"), address, kept, selected, processes).map_err(fail)?;
+    Ok(Tracepoint { address, software, physical: None, planted: false, pending: None, register, length, captures, max_hits, stop, actions, hits: 0,
+        record_if, other_process: 0, unmatched: 0, context, source_record_if: present("record_if").cloned() })
 }
 
 struct Session {
@@ -878,6 +996,8 @@ struct Session {
     trace_capacity: usize,
     trace_seq: u64,
     trace_dropped: u64,
+    /// The lab's start: records' time_ns count from it.
+    started: std::time::Instant,
     watchpoints: Vec<Watchpoint>,
     watch_stopped: Option<usize>,
     step_cpu: Option<usize>,
@@ -1029,7 +1149,9 @@ impl Session {
     fn command(&mut self, request: &Value) -> Result<Value, String> {
         let cpu = request.get("cpu").map(number).transpose()?.unwrap_or(0) as usize;
         let op = request["op"].as_str().ok_or("missing op")?;
+        let query = op == "tracepoints" && request.get("tracepoints").is_none_or(Value::is_null);
         if !matches!(op, "status" | "pause" | "shutdown" | "key" | "snapshot" | "snapshots" | "traces")
+            && !query
             && self.vm.state() != RunState::Paused
         {
             return Err(format!("the VM is running: vm.pause before {op}, and vm.resume when done (a paused guest's network, agent and screen are frozen)"));
@@ -1740,10 +1862,12 @@ impl Session {
                 self.breakpoint_contexts = contexts;
                 Ok(json!(self.breakpoints))
             }
+            "tracepoints" if request.get("tracepoints").is_none_or(Value::is_null) => Ok(self.trace_status()),
             "tracepoints" => {
                 let list = request["tracepoints"]
                     .as_array()
                     .ok_or("expected tracepoints array")?;
+                let processes = if list.iter().any(|t| t.get("pid").is_some_and(Value::is_u64)) { self.processes(cpu)? } else { Vec::new() };
                 let capacity = request.get("capacity").filter(|v| !v.is_null()).map(number).transpose()?;
                 if capacity.is_some_and(|c| !(1..=MAX_TRACE_CAPACITY).contains(&c)) {
                     return Err(format!("capacity: 1..{MAX_TRACE_CAPACITY} records"));
@@ -1751,7 +1875,7 @@ impl Session {
                 let tracepoints = list
                     .iter()
                     .enumerate()
-                    .map(|(i, t)| parse_tracepoint(i, t, &self.tracepoints, self.process.as_ref()))
+                    .map(|(i, t)| parse_tracepoint(i, t, &self.tracepoints, self.process.as_ref(), &processes))
                     .collect::<Result<Vec<_>, _>>()?;
                 for (i, t) in tracepoints.iter().enumerate() {
                     if tracepoints[..i].iter().any(|u| u.address == t.address) {
@@ -1790,7 +1914,8 @@ impl Session {
                 if capacity.is_some_and(|c| !(1..=MAX_TRACE_CAPACITY).contains(&c)) {
                     return Err(format!("capacity: 1..{MAX_TRACE_CAPACITY} records"));
                 }
-                let watches = parse_hwatches(list, &self.hwatches, self.process.as_ref())?;
+                let processes = if list.iter().any(|w| w.get("pid").is_some_and(Value::is_u64)) { self.processes(cpu)? } else { Vec::new() };
+                let watches = parse_hwatches(list, &self.hwatches, self.process.as_ref(), &processes)?;
                 let slots = hwatch_slots(&watches).len();
                 if slots + self.watchpoints.len() > DATA_SLOTS {
                     return Err(format!(
@@ -1821,11 +1946,23 @@ impl Session {
                     Some(v) => v.as_bool().ok_or("clear: expected a boolean")?,
                     None => false,
                 };
+                let memory = request.get("memory").filter(|v| !v.is_null()).map(DrainRead::parse).transpose()?;
+                if memory.is_some() && self.vm.state() != RunState::Paused {
+                    return Err("memory reads guest memory: vm.pause, then debug.traces with memory (and vm.resume after)".into());
+                }
                 let n = limit.map_or(self.traces.len(), |l| (l as usize).min(self.traces.len()));
+                let json = |r: &Record| {
+                    let mut v = r.json();
+                    if let Some(m) = &memory {
+                        v["memory"] = m.read(&self.vm, r, &v);
+                    }
+                    v
+                };
                 let records: Vec<Value> = if clear {
-                    self.traces.drain(..n).map(|r| r.json()).collect()
+                    let drained: Vec<Record> = self.traces.drain(..n).collect();
+                    drained.iter().map(json).collect()
                 } else {
-                    self.traces.iter().take(n).map(Record::json).collect()
+                    self.traces.iter().take(n).map(json).collect()
                 };
                 Ok(json!({"records": records, "remaining": self.traces.len(), "recorded": self.trace_seq,
                     "dropped": self.trace_dropped, "capacity": self.trace_capacity,
@@ -2109,20 +2246,27 @@ impl Session {
     }
 
     fn record_hit(&mut self, index: usize, regs: &Registers) -> Result<Option<TraceHit>, String> {
-        let t = &self.tracepoints[index];
-        if !t.armed() || t.context.as_ref().is_some_and(|p| !same_space(p, regs)) {
+        let t = &mut self.tracepoints[index];
+        if !t.armed() {
             return Ok(Some(TraceHit { stop: false, moved: false }));
         }
+        if t.context.as_ref().is_some_and(|p| !same_space(p, regs)) {
+            t.other_process += 1;
+            return Ok(Some(TraceHit { stop: false, moved: false }));
+        }
+        let t = &self.tracepoints[index];
+        let recorded = t.record_if.is_none_or(|(register, equals)| register.get(regs) == equals);
         // A kernel stop may still read its caller's user pointers.
         let mut walk = regs.clone();
         walk.tcr &= !(1 << 7);
         let read = |address: u64, bytes: &mut [u8]| AddressSpace { memory: &self.vm, registers: &walk }.read(address, bytes).map_err(|e| e.to_string());
         let pointer = t.register.as_ref().map(|r| register_value(regs, r.1));
-        let data = pointer.filter(|_| t.length > 0).map(|pointer| {
+        // A hit record_if drops reads nothing.
+        let data = pointer.filter(|_| recorded && t.length > 0).map(|pointer| {
             let mut bytes = vec![0; t.length as usize];
             read(pointer, &mut bytes).map(|_| bytes)
         });
-        let captures = t.captures.iter().map(|c| (c.name.clone(), c.capture(regs, read))).collect();
+        let captures = if recorded { t.captures.iter().map(|c| (c.name.clone(), c.capture(regs, read))).collect() } else { Vec::new() };
         // The record keeps the registers as hit; actions see earlier ones' writes.
         let mut current = regs.clone();
         let (mut actions_applied, mut action_error, mut failed_stop) = (0, None, false);
@@ -2142,10 +2286,15 @@ impl Session {
             self.refresh_planted()?;
         }
         let t = &mut self.tracepoints[index];
+        // A failing stop action still stops, and its failure is recorded.
+        if !recorded && !failed_stop {
+            t.unmatched += 1;
+            return Ok(Some(TraceHit { stop: false, moved: current.pc != regs.pc }));
+        }
         t.hits += 1;
         let (hit, stop, exhausted) = (t.hits, t.stop || failed_stop, !t.armed());
-        let seq = self.next_record();
-        self.traces.push_back(Record::Trace(TraceRecord { seq, tracepoint: index, hit, regs: regs.clone(), pointer, data,
+        let (seq, stamp) = self.next_record();
+        self.traces.push_back(Record::Trace(TraceRecord { seq, stamp, tracepoint: index, hit, regs: regs.clone(), pointer, data,
             captures, actions_applied, action_error }));
         if exhausted {
             self.plant(false)?;
@@ -2154,14 +2303,23 @@ impl Session {
         Ok(Some(TraceHit { stop, moved: current.pc != regs.pc }))
     }
 
-    /// The next record's sequence number, making room for it.
-    fn next_record(&mut self) -> u64 {
+    /// The next record's sequence number and time, making room for it.
+    fn next_record(&mut self) -> (u64, Stamp) {
         self.trace_seq += 1;
         if self.traces.len() >= self.trace_capacity {
             self.traces.pop_front();
             self.trace_dropped += 1;
         }
-        self.trace_seq
+        (self.trace_seq, Stamp { cntvct: self.vm.guest_clock(), time_ns: self.started.elapsed().as_nanos() as u64 })
+    }
+
+    /// Tracepoints and hwatches as armed, and the ring's fill: answers
+    /// while the VM runs too.
+    fn trace_status(&self) -> Value {
+        json!({"tracepoints": self.tracepoints.iter().map(Tracepoint::json).collect::<Vec<_>>(),
+            "hwatch": self.hwatches.iter().map(Hwatch::json).collect::<Vec<_>>(),
+            "records": self.traces.len(), "recorded": self.trace_seq, "dropped": self.trace_dropped, "capacity": self.trace_capacity,
+            "state": format!("{:?}", self.vm.state())})
     }
 
     /// The 8 bytes at a watched address, through the stopped CPU's tables.
@@ -2216,8 +2374,8 @@ impl Session {
             let w = &mut self.hwatches[index];
             w.hits += 1;
             let (hit, name, address, length, on) = (w.hits, w.name.clone(), w.address, w.length, w.on);
-            let seq = self.next_record();
-            self.traces.push_back(Record::Hwatch(HwatchRecord { seq, hwatch: index, name, hit, regs: pending.regs.clone(),
+            let (seq, stamp) = self.next_record();
+            self.traces.push_back(Record::Hwatch(HwatchRecord { seq, stamp, hwatch: index, name, hit, regs: pending.regs.clone(),
                 fault_address: pending.fault_address, write: pending.write, address, length, on, before, after }));
         }
     }
@@ -2303,6 +2461,7 @@ fn boot(config_path: &std::path::Path, restore: Option<&std::path::Path>) -> Res
         trace_capacity: DEFAULT_TRACE_CAPACITY,
         trace_seq: 0,
         trace_dropped: 0,
+        started: std::time::Instant::now(),
         watchpoints: Vec::new(),
         watch_stopped: None,
         step_cpu: None,
@@ -2620,7 +2779,7 @@ mod tests {
 
     #[test]
     fn tracepoints_parse_and_share_breakpoint_slots() {
-        let t = parse_tracepoint(0, &json!({"address": "0xfffff80000001000", "register": "X1", "length": 16, "max_hits": 2}), &[], None).unwrap();
+        let t = parse_tracepoint(0, &json!({"address": "0xfffff80000001000", "register": "X1", "length": 16, "max_hits": 2}), &[], None, &[]).unwrap();
         assert_eq!((t.address, t.length, t.max_hits, t.stop), (0xfffff80000001000, 16, Some(2), false));
         assert_eq!(t.register.as_ref().unwrap().0, "x1");
         for bad in [
@@ -2630,9 +2789,9 @@ mod tests {
             json!({"address": "0xfffff80000001000", "max_hits": 0}),
             json!({"address": "0xfffff80000001000", "lenght": 8}),
         ] {
-            assert!(parse_tracepoint(0, &bad, &[], None).is_err(), "{bad}");
+            assert!(parse_tracepoint(0, &bad, &[], None, &[]).is_err(), "{bad}");
         }
-        let mut traced: Vec<Tracepoint> = (0..3).map(|i| parse_tracepoint(0, &json!({"address": 0xfffff80000001000u64 + i * 4}), &[], None).unwrap()).collect();
+        let mut traced: Vec<Tracepoint> = (0..3).map(|i| parse_tracepoint(0, &json!({"address": 0xfffff80000001000u64 + i * 4}), &[], None, &[]).unwrap()).collect();
         assert_eq!(breakpoint_slots(&[0xfffff80000001000, 0xfffff80000002000], &traced), 4);
         traced[0].hits = 1;
         traced[0].max_hits = Some(1);
@@ -2642,15 +2801,15 @@ mod tests {
     #[test]
     fn software_tracepoints_take_no_slot() {
         let many: Vec<Tracepoint> = (0..64)
-            .map(|i| parse_tracepoint(0, &json!({"address": 0xfffff80000001000u64 + i * 4, "kind": "software"}), &[], None).unwrap())
+            .map(|i| parse_tracepoint(0, &json!({"address": 0xfffff80000001000u64 + i * 4, "kind": "software"}), &[], None, &[]).unwrap())
             .collect();
         assert!(many.iter().all(|t| t.software && !t.planted && t.physical.is_none()));
         assert_eq!(breakpoint_slots(&[0xfffff80000001000], &many), 1);
         let json = many[0].json();
         assert_eq!((json["kind"].as_str(), json["planted"].as_bool()), (Some("software"), Some(false)));
-        assert_eq!(parse_tracepoint(0, &json!({"address": "0xfffff80000001000"}), &[], None).unwrap().json()["kind"], "hardware");
-        assert!(parse_tracepoint(0, &json!({"address": "0xfffff80000001000"}), &[], None).unwrap().json().get("planted").is_none());
-        assert!(parse_tracepoint(0, &json!({"address": "0xfffff80000001000", "kind": "soft"}), &[], None).err().unwrap().contains("kind"));
+        assert_eq!(parse_tracepoint(0, &json!({"address": "0xfffff80000001000"}), &[], None, &[]).unwrap().json()["kind"], "hardware");
+        assert!(parse_tracepoint(0, &json!({"address": "0xfffff80000001000"}), &[], None, &[]).unwrap().json().get("planted").is_none());
+        assert!(parse_tracepoint(0, &json!({"address": "0xfffff80000001000", "kind": "soft"}), &[], None, &[]).err().unwrap().contains("kind"));
         assert_eq!(u32::from_le_bytes(trace_brk()), 0xd42ece80, "brk #0x7674");
     }
 
@@ -2665,6 +2824,55 @@ mod tests {
         Action::parse(&v).unwrap_or_else(|e| panic!("{v}: {e}"))
     }
 
+    fn process(pid: u64, directory_table: u64) -> process::Process {
+        process::Process { eprocess: 0xffff_a000_0000_0000 + pid, pid, parent_pid: 4, name: "app.exe".into(), directory_table, peb: 0 }
+    }
+
+    #[test]
+    fn tracepoint_pid_and_record_if_parse() {
+        let processes = [process(1200, 0x4000), process(3400, 0x8000)];
+        let user = |v: Value| parse_tracepoint(0, &v, &[], Some(&processes[0]), &processes);
+        assert_eq!(user(json!({"address": "0x7ff800001000"})).unwrap().context.map(|p| p.pid), Some(1200), "selected by default");
+        assert_eq!(user(json!({"address": "0x7ff800001000", "pid": 3400})).unwrap().context.map(|p| p.pid), Some(3400));
+        assert!(user(json!({"address": "0x7ff800001000", "pid": "any"})).unwrap().context.is_none());
+        assert_eq!(user(json!({"address": "0xfffff80000001000", "pid": 3400})).unwrap().json()["pid"], 3400, "kernel code on its behalf");
+        assert!(user(json!({"address": "0x7ff800001000", "pid": 99})).err().unwrap().contains("no such process"));
+        assert!(user(json!({"address": "0x7ff800001000", "pid": "1200"})).err().unwrap().contains("pid:"));
+        let dup = [process(1200, 0x4000), process(1200, 0x8000)];
+        assert!(parse_tracepoint(0, &json!({"address": "0x7ff800001000", "pid": 1200}), &[], None, &dup).err().unwrap().contains("more than one"));
+        let t = user(json!({"address": "0xfffff80000001000", "record_if": {"register": "w0", "equals": "0x100000005"}})).unwrap();
+        assert_eq!(t.record_if.map(|(r, v)| (r.name(), v)), Some(("w0".into(), 5)));
+        assert_eq!(t.json()["record_if"], json!({"register": "w0", "equals": "0x100000005"}));
+        assert_eq!(t.json()["filtered"], json!({"other_process": 0, "record_if": 0}));
+        assert!(user(json!({"address": "0xfffff80000001000", "record_if": {"register": "x0", "equal": 1}})).err().unwrap().contains("record_if: unknown key equal"));
+        assert!(user(json!({"address": "0xfffff80000001000", "nope": 1})).err().unwrap().contains("record_if, pid"));
+        for capture in [json!({"name": "cntvct_el0"}), json!({"name": "t", "register": "CNTVCT_EL0"})] {
+            let e = user(json!({"address": "0xfffff80000001000", "captures": [capture]})).err().unwrap();
+            assert!(e.contains("every record carries cntvct"), "{e}");
+        }
+    }
+
+    #[test]
+    fn traces_memory_reads_at_a_record_address() {
+        let read = |v: Value| DrainRead::parse(&v);
+        assert!(read(json!({"at": "chunk"})).err().unwrap().contains("length"));
+        assert!(read(json!({"at": "chunk", "length": 0})).is_err());
+        assert!(read(json!({"at": "chunk", "length": 8, "size": 1})).err().unwrap().contains("unknown key size"));
+        let record = Record::Trace(TraceRecord { seq: 1, stamp: Stamp { cntvct: 77, time_ns: 5 }, tracepoint: 0, hit: 1, regs: regs(), pointer: Some(0x5000),
+            data: None, captures: vec![("chunk".into(), Captured::Memory { address: Some(0x9000), data: Ok(vec![1]) }), ("w0".into(), Captured::Register(5))],
+            actions_applied: 0, action_error: None });
+        let v = record.json();
+        assert_eq!((v["cntvct"].as_u64(), v["time_ns"].as_u64()), (Some(77), Some(5)));
+        let at = |at: &str, offset: i64| read(json!({"at": at, "offset": offset, "length": 8})).unwrap().address(&record, &v);
+        assert_eq!(at("chunk", 0x10), Ok(0x9010));
+        assert_eq!(at("chunk", -0x10), Ok(0x8ff0));
+        assert_eq!(at("pointer", 0), Ok(0x5000));
+        assert_eq!(at("x21", 8), Ok(0xfffff800_0000_2008), "a register as recorded");
+        assert!(at("w0", 0).err().unwrap().contains("holds no address"));
+        assert!(at("address", 0).err().unwrap().contains("no address"));
+        assert!(at("heap", 0).err().unwrap().contains("not a capture"));
+    }
+
     #[test]
     fn tracepoint_actions_parse() {
         use vroom_hv::debug::Register as R;
@@ -2675,7 +2883,7 @@ mod tests {
             {"set_register": "x21", "value": "0x10"},
             {"write_memory": {"register": "x0", "offset": 0, "hex": "01000000"}},
             {"skip_if": {"register": "x0", "equals": 0}, "add_register": "pc", "value": 4, "stop": true},
-        ]}), &[], None).unwrap();
+        ]}), &[], None, &[]).unwrap();
         let ops: Vec<_> = t.actions.iter().map(|a| &a.operation).collect();
         let x0 = ActionRegister { register: R::X(0), w: false };
         assert_eq!(ops[0], &Operation::Set(x0, 0));
@@ -2703,14 +2911,14 @@ mod tests {
             (json!({"skip_if": {"register": "x0"}, "add_register": "pc", "value": 4}), "needs equals"),
             (json!({"set_register": "x0", "value": 0, "stop": "yes"}), "stop: expected a boolean"),
         ] {
-            let e = parse_tracepoint(2, &json!({"address": "0xfffff80000001000", "actions": [{"set_register": "x1", "value": 1}, bad]}), &[], None)
+            let e = parse_tracepoint(2, &json!({"address": "0xfffff80000001000", "actions": [{"set_register": "x1", "value": 1}, bad]}), &[], None, &[])
                 .err()
                 .unwrap_or_else(|| panic!("{bad} parsed"));
             assert!(e.starts_with("tracepoint 2: action 1: ") && e.contains(message), "{bad}: {e}");
         }
-        assert!(parse_tracepoint(0, &json!({"address": "0xfffff80000001000", "actions": {}}), &[], None).err().unwrap().contains("expected an array"));
+        assert!(parse_tracepoint(0, &json!({"address": "0xfffff80000001000", "actions": {}}), &[], None, &[]).err().unwrap().contains("expected an array"));
         let many = vec![json!({"set_register": "x0", "value": 0}); MAX_TRACE_ACTIONS + 1];
-        assert!(parse_tracepoint(0, &json!({"address": "0xfffff80000001000", "actions": many}), &[], None).is_err());
+        assert!(parse_tracepoint(0, &json!({"address": "0xfffff80000001000", "actions": many}), &[], None, &[]).is_err());
     }
 
     #[test]
@@ -2759,7 +2967,7 @@ mod tests {
     fn tracepoint(v: Value) -> Result<Tracepoint, String> {
         let mut v = v;
         v["address"] = json!("0xfffff80000001000");
-        parse_tracepoint(0, &v, &[], None)
+        parse_tracepoint(0, &v, &[], None, &[])
     }
 
     #[test]
@@ -2851,7 +3059,7 @@ mod tests {
             }
             Ok(())
         };
-        let record = TraceRecord { seq: 1, tracepoint: 0, hit: 1, regs: r.clone(), pointer: None, data: None,
+        let record = TraceRecord { seq: 1, stamp: Stamp::default(), tracepoint: 0, hit: 1, regs: r.clone(), pointer: None, data: None,
             captures: t.captures.iter().map(|c| (c.name.clone(), c.capture(&r, read))).collect(), actions_applied: 0, action_error: None };
         let v = record.json();
         assert_eq!(v["captures"], json!({"w0": 5, "x0": 0xffff_ffff_0000_0005u64, "stack": "08090a0b", "ptr": "0001"}));
@@ -2862,7 +3070,7 @@ mod tests {
     }
 
     fn hwatches(v: Value) -> Result<Vec<Hwatch>, String> {
-        parse_hwatches(v.as_array().unwrap(), &[], None)
+        parse_hwatches(v.as_array().unwrap(), &[], None, &[])
     }
 
     #[test]
@@ -2935,7 +3143,7 @@ mod tests {
     fn hwatch_records_are_trace_records_with_kind() {
         let mut r = regs();
         r.x[30] = 0xfffff800_0000_3000;
-        let record = HwatchRecord { seq: 7, hwatch: 1, name: Some("heap16_free".into()), hit: 2, regs: r.clone(),
+        let record = HwatchRecord { seq: 7, stamp: Stamp::default(), hwatch: 1, name: Some("heap16_free".into()), hit: 2, regs: r.clone(),
             fault_address: Some(0x1e2a27fc7e0), write: true, address: 0x1e2a27fc7e0, length: 1, on: WatchOn::Free,
             before: Ok([0x10, 0, 0, 0, 0, 0, 0, 0]), after: Ok(FREE_POISON) };
         let v = Record::Hwatch(record).json();
@@ -2954,13 +3162,13 @@ mod tests {
         for key in ["pstate", "ttbr0"] {
             assert!(v.get(key).is_some(), "{key}");
         }
-        let unnamed = HwatchRecord { seq: 8, hwatch: 0, name: None, hit: 1, regs: r, fault_address: None, write: false,
+        let unnamed = HwatchRecord { seq: 8, stamp: Stamp::default(), hwatch: 0, name: None, hit: 1, regs: r, fault_address: None, write: false,
             address: 0x2000, length: 8, on: WatchOn::Access, before: Err("unmapped".into()), after: Err("unmapped".into()) };
         let v = unnamed.json();
         assert!(v.get("name").is_none());
         assert_eq!((v["access"].as_str(), v["read_error"].as_str(), v["before_error"].as_str()), (Some("read"), Some("unmapped"), Some("unmapped")));
         assert!(v.get("hex").is_none());
-        let trace = TraceRecord { seq: 1, tracepoint: 0, hit: 1, regs: regs(), pointer: None, data: None, captures: Vec::new(),
+        let trace = TraceRecord { seq: 1, stamp: Stamp::default(), tracepoint: 0, hit: 1, regs: regs(), pointer: None, data: None, captures: Vec::new(),
             actions_applied: 0, action_error: None };
         assert_eq!(Record::Trace(trace).json()["kind"], "tracepoint");
     }

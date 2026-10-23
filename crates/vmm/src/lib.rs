@@ -361,6 +361,11 @@ impl Vmm {
         self.state
     }
 
+    /// The guest's virtual counter now (CNTVCT on ARM).
+    pub fn guest_clock(&self) -> u64 {
+        self.vm.clock()
+    }
+
     #[cfg(feature = "research")]
     /// Capture the paused machine for high-rate fuzz iterations.
     pub fn research_arm(&mut self) -> Result<()> {
