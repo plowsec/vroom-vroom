@@ -164,6 +164,27 @@ def run(binary):
                 call('hwatch', watches=[])
                 refused('traces', 'omit limit', limit=0, clear=True)
                 print('software watch records show the watched bytes (16 here); limit 0 + clear refused')
+                # Partial reads and search: past the end of RAM is a hole.
+                end = base + (64 << 20)
+                r = call('read_virtual', address=end-0x1800, length=0x3000, skip_unmapped=True)
+                assert [(x['address'], len(x['hex'])//2) for x in r['runs']] == [(end-0x1800, 0x1800)], r['runs']
+                assert r['holes'] == [{'address': end, 'length': 0x1800}], r['holes']
+                refused('read_virtual', '', address=end-0x1800, length=0x3000)
+                d = call('dump', address=end-0x1800, length=0x3000, skip_unmapped=True)
+                assert d['unmapped'] == 0x1800 and Path(d['path']).stat().st_size == 0x3000, d
+                Path(d['path']).unlink()
+                hits = call('search', address=base, length=0x1000, hex='1f2003d5 c0035fd6')
+                assert hits['hits'] == [func] and hits['holes'] == [] and not hits['truncated'], hits
+                hits = call('search', address=base, length=0x1000, int=0xd503201f, width=4, align=4)
+                assert {func, copy} <= set(hits['hits']), hits
+                call('write_physical', address=base+0x2ffc, hex='0badc0de11223344')
+                hits = call('search', address=base+0x2000, length=0x2000, hex='0badc0de??223344')
+                assert hits['hits'] == [base+0x2ffc], 'a match across pages'
+                hits = call('search', address=end-0x1000, length=0x2000, int=0, width=1, limit=3)
+                assert hits['hits'] == [end-0x1000, end-0xfff, end-0xffe] and hits['truncated'] and hits['next'] == end-0xffd, hits
+                hits = call('search', address=end-0x1000, length=0x2000, text='\u0000never-here')
+                assert hits['hits'] == [] and hits['holes'] == [{'address': end, 'length': 0x1000}] and hits['scanned'] == 0x1000, hits
+                print('read_virtual/dump skip_unmapped list holes; search: hex with ??, int, across pages, limit/next, holes')
                 call('shutdown')
                 assert process.wait(timeout=10)==0
             finally:

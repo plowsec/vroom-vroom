@@ -200,6 +200,8 @@ const MAX_TRACE_ACTIONS: usize = 16;
 const MAX_TRACE_CAPTURES: usize = 16;
 /// Hardware data watchpoint slots, shared by debug.watchpoints and debug.hwatch.
 const DATA_SLOTS: usize = 2;
+/// memory.search reads at most this much virtual memory per call.
+const MAX_SEARCH_BYTES: u64 = 1 << 30;
 /// Software hwatches: at most this many, each at most this long.
 const MAX_SOFTWARE_WATCHES: usize = 4096;
 const MAX_SOFTWARE_WATCH_BYTES: u64 = 16 << 20;
@@ -617,6 +619,69 @@ impl TraceRecord {
         }
         v
     }
+}
+
+/// A memory.search pattern: bytes, None a wildcard (`??`).
+fn search_pattern(request: &Value) -> Result<Vec<Option<u8>>, String> {
+    let given: Vec<&str> = ["hex", "int", "text"].into_iter().filter(|k| request.get(*k).is_some_and(|v| !v.is_null())).collect();
+    let pattern: Vec<Option<u8>> = match given.as_slice() {
+        ["hex"] => {
+            let hex: String = request["hex"].as_str().ok_or("hex: expected a string")?.chars().filter(|c| !c.is_whitespace()).collect();
+            if hex.len() % 2 != 0 || !hex.is_ascii() {
+                return Err("hex: an even number of hex digits, ?? for any byte".into());
+            }
+            (0..hex.len())
+                .step_by(2)
+                .map(|i| match &hex[i..i + 2] {
+                    "??" => Ok(None),
+                    byte => u8::from_str_radix(byte, 16).map(Some).map_err(|_| format!("hex: {byte} is not a byte")),
+                })
+                .collect::<Result<_, _>>()?
+        }
+        ["int"] => {
+            let width = request.get("width").filter(|v| !v.is_null()).map(number).transpose()?.unwrap_or(8);
+            if !matches!(width, 1 | 2 | 4 | 8) {
+                return Err("width: 1, 2, 4 or 8 bytes".into());
+            }
+            let value = action_value(&request["int"]).map_err(|e| format!("int: {e}"))?;
+            if width < 8 && value >> (8 * width) != 0 && value >> (8 * width - 1) != u64::MAX >> (8 * width - 1) {
+                return Err(format!("int: {value:#x} does not fit {width} bytes"));
+            }
+            value.to_le_bytes()[..width as usize].iter().copied().map(Some).collect()
+        }
+        ["text"] => {
+            let text = request["text"].as_str().ok_or("text: expected a string")?;
+            if request.get("utf16").and_then(Value::as_bool).unwrap_or(false) {
+                text.encode_utf16().flat_map(u16::to_le_bytes).map(Some).collect()
+            } else {
+                text.bytes().map(Some).collect()
+            }
+        }
+        [] => return Err("search needs one of hex (?? for any byte), int (with width) or text (with utf16)".into()),
+        _ => return Err(format!("search takes one of hex, int, text, not {}", given.join(" and "))),
+    };
+    if pattern.is_empty() || pattern.len() > 4096 || pattern.iter().all(Option::is_none) {
+        return Err("pattern: 1..4096 bytes, not all ??".into());
+    }
+    Ok(pattern)
+}
+
+/// Offsets in `data` where `pattern` matches.
+fn find_pattern<'a>(data: &'a [u8], pattern: &'a [Option<u8>]) -> impl Iterator<Item = usize> + 'a {
+    let n = pattern.len();
+    (0..(data.len() + 1).saturating_sub(n)).filter(move |&i| pattern.iter().zip(&data[i..i + n]).all(|(p, b)| p.is_none_or(|p| p == *b)))
+}
+
+/// Unreadable (address, length) runs, merged.
+fn merge_hole(holes: &mut Vec<(u64, u64)>, address: u64, length: u64) {
+    match holes.last_mut() {
+        Some((start, n)) if *start + *n == address => *n += length,
+        _ => holes.push((address, length)),
+    }
+}
+
+fn holes_json(holes: &[(u64, u64)]) -> Value {
+    json!(holes.iter().map(|&(address, length)| json!({"address": address, "length": length})).collect::<Vec<_>>())
 }
 
 fn hex_string(bytes: &[u8]) -> String {
@@ -1807,6 +1872,31 @@ impl Session {
                     .create_new(true)
                     .open(&path)
                     .map_err(|e| e.to_string())?;
+                if request.get("skip_unmapped").and_then(Value::as_bool).unwrap_or(false) {
+                    // Holes are written as zeros and listed.
+                    let (mut holes, mut failed) = (Vec::new(), None);
+                    self.each_page(&regs, address, length, |va, bytes| {
+                        let n = (((va | 0xfff) + 1).min(address + length) - va) as usize;
+                        let written = match bytes {
+                            Some(bytes) => file.write_all(bytes),
+                            None => {
+                                merge_hole(&mut holes, va, n as u64);
+                                file.write_all(&[0; 4096][..n])
+                            }
+                        };
+                        failed = written.err();
+                        failed.is_none()
+                    });
+                    if let Some(e) = failed {
+                        drop(file);
+                        let _ = std::fs::remove_file(&path);
+                        return Err(e.to_string());
+                    }
+                    let unmapped: u64 = holes.iter().map(|h| h.1).sum();
+                    return Ok(json!({"path": path, "address": address, "length": length, "cpu": cpu,
+                        "pid": self.process.as_ref().map(|p| p.pid), "format": "raw virtual memory, holes zero-filled",
+                        "unmapped": unmapped, "holes": holes_json(&holes)}));
+                }
                 let result = (|| {
                     let mut bytes = vec![0; 65536];
                     let mut done = 0;
@@ -1828,6 +1918,53 @@ impl Session {
                     let _ = std::fs::remove_file(&path);
                 }
                 result
+            }
+            "search" => {
+                let address = number(&request["address"])?;
+                let length = number(request.get("length").ok_or("missing length")?)?;
+                if length == 0 || length > MAX_SEARCH_BYTES || address.checked_add(length).is_none() {
+                    return Err(format!("length: 1..{MAX_SEARCH_BYTES} bytes without address overflow"));
+                }
+                let pattern = search_pattern(request)?;
+                let align = request.get("align").filter(|v| !v.is_null()).map(number).transpose()?.unwrap_or(1);
+                if !align.is_power_of_two() || align > 4096 {
+                    return Err("align: a power of two up to 4096".into());
+                }
+                let limit = request.get("limit").filter(|v| !v.is_null()).map(number).transpose()?.unwrap_or(100);
+                if !(1..=10_000).contains(&limit) {
+                    return Err("limit: 1..10000 hits".into());
+                }
+                let regs = self.registers(cpu, request["context"].as_bool().unwrap_or(true))?;
+                let (mut hits, mut holes, mut scanned, mut next) = (Vec::new(), Vec::new(), 0u64, None);
+                // The end of the run before, so a match may cross pages.
+                let mut carry: (u64, Vec<u8>) = (address, Vec::new());
+                self.each_page(&regs, address, length, |va, bytes| {
+                    let Some(bytes) = bytes else {
+                        merge_hole(&mut holes, va, ((va | 0xfff) + 1).min(address + length) - va);
+                        carry = (va, Vec::new());
+                        return true;
+                    };
+                    scanned += bytes.len() as u64;
+                    let base = va - carry.1.len() as u64;
+                    let mut window = std::mem::take(&mut carry.1);
+                    window.extend_from_slice(bytes);
+                    for offset in find_pattern(&window, &pattern) {
+                        let hit = base + offset as u64;
+                        if hit % align != 0 {
+                            continue;
+                        }
+                        if hits.len() as u64 == limit {
+                            next = Some(hit);
+                            return false;
+                        }
+                        hits.push(hit);
+                    }
+                    let keep = window.len().min(pattern.len() - 1);
+                    carry = (va + bytes.len() as u64, window[window.len() - keep..].to_vec());
+                    true
+                });
+                Ok(json!({"hits": hits, "pattern_length": pattern.len(), "scanned": scanned, "holes": holes_json(&holes),
+                    "truncated": next.is_some(), "next": next}))
             }
             "translate" | "read_virtual" | "read_physical" => {
                 let address = number(&request["address"])?;
@@ -1855,6 +1992,24 @@ impl Session {
                     };
                     if op == "translate" {
                         return Ok(json!(space.translate(address).map_err(|e| e.to_string())?));
+                    }
+                    if request.get("skip_unmapped").and_then(Value::as_bool).unwrap_or(false) {
+                        address.checked_add(length).ok_or("address + length overflows")?;
+                        let mut runs: Vec<(u64, Vec<u8>)> = Vec::new();
+                        let mut holes = Vec::new();
+                        self.each_page(&regs, address, length, |va, bytes| {
+                            match bytes {
+                                Some(bytes) => match runs.last_mut() {
+                                    Some((start, run)) if *start + run.len() as u64 == va => run.extend_from_slice(bytes),
+                                    _ => runs.push((va, bytes.to_vec())),
+                                },
+                                None => merge_hole(&mut holes, va, ((va | 0xfff) + 1).min(address + length) - va),
+                            }
+                            true
+                        });
+                        return Ok(json!({"address": address, "length": length,
+                            "runs": runs.iter().map(|(a, b)| json!({"address": a, "hex": hex_string(b)})).collect::<Vec<_>>(),
+                            "holes": holes_json(&holes)}));
                     }
                     space.read(address, &mut data).map_err(|e| e.to_string())?;
                 }
@@ -2224,6 +2379,26 @@ impl Session {
             t.pending = planted.err();
         }
         Ok(())
+    }
+
+    /// Read `length` bytes of virtual memory a page at a time: `f` gets
+    /// each page's address and bytes, None where it does not translate or
+    /// is not RAM; false from `f` stops. Data is read past the page cache,
+    /// so large sweeps leave it to the page tables.
+    fn each_page(&self, regs: &Registers, address: u64, length: u64, mut f: impl FnMut(u64, Option<&[u8]>) -> bool) {
+        let space = AddressSpace { memory: &CachedMemory { memory: &self.vm, cache: &self.pages }, registers: regs };
+        let end = address + length;
+        let mut bytes = [0u8; 4096];
+        let mut va = address;
+        while va < end {
+            let next = ((va | 0xfff) + 1).min(end);
+            let chunk = &mut bytes[..(next - va) as usize];
+            let read = space.translate(va).ok().and_then(|t| self.vm.debug_read_physical(t.physical, chunk).ok());
+            if !f(va, read.map(|()| &*chunk)) {
+                return;
+            }
+            va = next;
+        }
     }
 
     /// CPU 0's registers to walk kernel addresses with, through the System
@@ -3026,6 +3201,30 @@ mod tests {
         assert_eq!(watch(0x1000, 0x1000, true).shown(Some(0x1800)), (0x1800, 64));
         assert_eq!(watch(0x1000, 0x1000, true).shown(Some(0x1fe0)), (0x1fe0, 32), "clipped at the watch's end");
         assert_eq!(watch(0x1004, 0x1000, true).shown(Some(0x1000)), (0x1004, 64), "an access before the start");
+    }
+
+    #[test]
+    fn memory_search_patterns() {
+        let pattern = |v: Value| search_pattern(&v);
+        assert_eq!(pattern(json!({"hex": "de ad ?? ef"})), Ok(vec![Some(0xde), Some(0xad), None, Some(0xef)]));
+        assert_eq!(pattern(json!({"int": "0x1122", "width": 2})), Ok(vec![Some(0x22), Some(0x11)]));
+        assert_eq!(pattern(json!({"int": -1, "width": 4})), Ok(vec![Some(0xff); 4]));
+        assert_eq!(pattern(json!({"int": 1})).unwrap().len(), 8);
+        assert_eq!(pattern(json!({"text": "Ab", "utf16": true})), Ok(vec![Some(b'A'), Some(0), Some(b'b'), Some(0)]));
+        assert!(pattern(json!({"int": "0x10000", "width": 2})).err().unwrap().contains("does not fit"));
+        assert!(pattern(json!({"hex": "????"})).is_err());
+        assert!(pattern(json!({"hex": "abc"})).is_err());
+        assert!(pattern(json!({"hex": "ab", "text": "x"})).err().unwrap().contains("one of"));
+        assert!(pattern(json!({})).err().unwrap().contains("needs one of"));
+        let data = [1, 2, 3, 1, 9, 3, 1, 2];
+        assert_eq!(find_pattern(&data, &[Some(1), None, Some(3)]).collect::<Vec<_>>(), vec![0, 3]);
+        assert_eq!(find_pattern(&data, &[Some(1), Some(2)]).collect::<Vec<_>>(), vec![0, 6], "a match at the end");
+        assert_eq!(find_pattern(&data[..1], &[Some(1), Some(2)]).count(), 0);
+        let mut holes = Vec::new();
+        merge_hole(&mut holes, 0x1000, 0x1000);
+        merge_hole(&mut holes, 0x2000, 0x800);
+        merge_hole(&mut holes, 0x4000, 0x1000);
+        assert_eq!(holes, vec![(0x1000, 0x1800), (0x4000, 0x1000)]);
     }
 
     #[test]
