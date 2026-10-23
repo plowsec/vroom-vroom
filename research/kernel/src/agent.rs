@@ -186,6 +186,7 @@ static COMMANDS: &[Command] = &[
     c("vm.restore", "vm", "Restart this VM from a snapshot (paused, breakpoints and caches cleared); refused if its disk layers changed since", &[
         p("name", "string", false, "a snapshot of this VM (snap-...)"),
         p("path", "path", false, "or a snapshot folder"),
+        p("resume", "boolean", false, "run it at once instead of returning paused"),
     ], "destructive", Target::Op("restore")),
     c("vm.screenshot", "vm", "Save the guest screen as PNG", &[p("path", "path", true, "PNG file to write")], "write", Target::Op("screen")),
     c("vm.key", "vm", "Press or release a key (USB HID usage code)", &[p("code", "integer", true, "HID usage code"), p("down", "boolean", true, "true = press, false = release")], "control", Target::Op("key")),
@@ -750,7 +751,7 @@ impl Connection {
                         "Inspection (kernel.*, memory.*, cpu.*, debug.*) needs a paused VM: vm.pause, or wait for a stop with events.poll after vm.resume.",
                         "vm.resume when done inspecting: a paused guest answers nothing, so network probes against it time out without an error.",
                         "Methods and commands share one namespace: commands.run {command: \"commands.list\"} and {\"method\": \"commands.list\"} both work. An unknown name is a wrong name, not a missing feature.",
-                        "The lab starts paused (restore too): vm.resume runs the guest; its network, agent and screen are frozen until then.",
+                        "The lab starts paused (restore too, unless resume: true): vm.resume runs the guest; its network, agent and screen are frozen until then.",
                         "guest.* needs a running VM and a guest agent (vm.status: guest_agent); guest.exec needs current guest tools: guest.update_tools installs them.",
                         "Commands with mutates=true change the guest, the VM or files; risk says how much.",
                         "A command is also a method: {\"method\": \"debug.traces\", \"params\": {...}} is commands.run with those args.",

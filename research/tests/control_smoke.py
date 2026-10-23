@@ -103,6 +103,17 @@ def run(binary):
                 else: raise AssertionError('temporary displaced a user breakpoint')
                 assert call('status')['temporary'] is None and call('status')['breakpoints']==own
                 print('pause/capacity: temporary cleanup; invalid writes leave RAM intact')
+                call('breakpoints',addresses=[]);reg('pc',base+0x10c)  # b .
+                call('snapshot',path=str(root/'snap'))
+                restored=call('restore',path=str(root/'snap'))
+                assert restored['state']=='Paused' and call('status')['state']=='Paused',restored
+                try: call('restore',path=str(root/'snap'),resume='yes')
+                except RuntimeError as error: assert 'resume' in str(error)
+                else: raise AssertionError('non-boolean resume accepted')
+                restored=call('restore',path=str(root/'snap'),resume=True)
+                assert restored['state']=='Running' and call('status')['state']=='Running',restored
+                call('pause');assert call('registers')['pc']==base+0x10c
+                print('restore: paused by default, running with resume')
                 call('shutdown')
                 assert process.wait(timeout=10)==0
             finally:

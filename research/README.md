@@ -87,7 +87,7 @@ fuzz      check run* probe* coverage blocks diff crashes          * jobs.start o
 - Socket paths: under 104 bytes. A path in a deep temp dir fails: use a relative one.
 - `--daemon`: own session, returns when the socket accepts (prints pid, log `PATH.log`). Use it from agents: their shells often kill what a command started, which leaves a dead socket (`Connection refused`).
 - `target/debug/vroom-lab` is unsigned (cargo tests relink it): run the `target/research/` builds.
-- Snapshots are one format everywhere (app, `vroom`, lab, fuzzer). `vm.snapshot` saves into the VM's own snapshots (the app lists them) or `path`; `vm.restore` restarts the lab's VM from one (`name` or `path`), paused; `--restore` does it at start. Refused when a disk layer under the snapshot changed since. One VM runs once: the lab and the app can't both run it.
+- Snapshots are one format everywhere (app, `vroom`, lab, fuzzer). `vm.snapshot` saves into the VM's own snapshots (the app lists them) or `path`; `vm.restore` restarts the lab's VM from one (`name` or `path`), paused (`resume: true`: running); `--restore` does it at start. Refused when a disk layer under the snapshot changed since. One VM runs once: the lab and the app can't both run it.
 
 Function-calling adapter (one tool):
 

@@ -3082,19 +3082,28 @@ fn run(args: Args) -> Result<(), String> {
 }
 
 /// `restore`: this VM again, from one of its snapshots (or a snapshot
-/// folder), paused. Checked first: a snapshot that can't start leaves the
-/// running VM alone. Past that, a failure ends the lab: `slot` is empty
-/// after it.
+/// folder), paused unless `resume`. Checked first: a snapshot that can't
+/// start leaves the running VM alone. Past that, a failure ends the lab:
+/// `slot` is empty after it.
 fn restore_in(slot: &mut Option<Session>, config_path: &std::path::Path, request: &Value) -> Result<Value, String> {
     let state_dir = slot.as_ref().map(|s| s.state_dir.clone()).ok_or("no VM")?;
     let given = request["name"].as_str().or(request["path"].as_str()).ok_or("missing name (or path)")?;
+    let resume = match request.get("resume").filter(|v| !v.is_null()) {
+        Some(v) => v.as_bool().ok_or("resume: expected a boolean")?,
+        None => false,
+    };
     let dir = restore_dir(std::path::Path::new(given), &state_dir)?;
     vroom_vmm::check_snapshot(&dir).map_err(|e| e.to_string())?;
     // The old VM lets go of its state dir, disks and network ports first.
     drop(slot.take());
     let session = boot(config_path, Some(&dir)).map_err(|e| format!("{e} (the lab stops: its VM is gone)"))?;
-    *slot = Some(session);
-    Ok(json!({"restored": dir, "state": "Paused", "note": "paused: vm.resume runs the guest"}))
+    let session = slot.insert(session);
+    if !resume {
+        return Ok(json!({"restored": dir, "state": "Paused", "note": "paused: vm.resume runs the guest (or restore with resume: true)"}));
+    }
+    // Restored, still paused: a failed resume says so and leaves it so.
+    session.command(&json!({"op": "resume"})).map_err(|e| format!("restored {}, paused: vm.resume failed: {e}", dir.display()))?;
+    Ok(json!({"restored": dir, "state": "Running"}))
 }
 
 fn main() {
