@@ -76,6 +76,7 @@ fuzz      check run* probe* coverage blocks diff crashes          * jobs.start o
 - Each command lists params, `mutates` and `risk` (read, control, write, destructive): gate writes on these.
 - Addresses: integers or `"0x..."`. Inspection (`kernel.*`, `memory.*`, `cpu.*`, `debug.*`) needs a paused VM: `vm.pause`, inspect, `vm.resume`. A guest left paused answers nothing, so network probes against it time out with no error.
 - Methods and commands share one namespace: `run commands.list` works, so does `{"method":"kernel.functions"}`. `-32601` means a wrong name (the error names the nearest ones), not a missing feature.
+- Memory read/write watches without slots: `debug.hwatch [{address, length, on, kind: "software", stop?}]`, any number, any address, up to 16 MiB each. The hypervisor protects their pages, so every access to a watched page exits; `memory_watch {stops, passes}` shows the cost. Hardware hwatches stay 2 slots of 8 bytes, cheaper on hot pages.
 - Tracepoints and hwatches record and continue. `pid` pins one to a process; `record_if {register, equals}` keeps only matching hits (`filtered` counts the rest, and hits in other processes). Records carry `cntvct` (guest CNTVCT_EL0) and `time_ns`. `debug.traces {memory: {at, offset, length}}` adds bytes read now at a capture's address. `debug.tracepoints {}` reports planted/pending without pausing.
 - `events.poll` without `after` waits for the next event (stop, fault, shutdown). Events carry `seq`.
 - Arrays over `limit` (200) return `{items, total, handle, next_offset}`: page with `results.page`.
