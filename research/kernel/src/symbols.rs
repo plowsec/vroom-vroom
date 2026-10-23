@@ -1,5 +1,6 @@
 //! Microsoft symbol cache, verified against the PE's CodeView GUID and age.
-use crate::windows::{ModuleLayout, PdbIdentity};
+use crate::arm64::Registers;
+use crate::windows::{ModuleLayout, PdbIdentity, VirtualMemory};
 use crate::{Error, Result};
 use pdb::FallibleIterator;
 use std::collections::BTreeMap;
@@ -253,6 +254,25 @@ impl Symbols {
             .copied()
             .ok_or_else(|| err(format!("field {ty}.{name} unavailable in this PDB")))
     }
+    /// The registers a kernel trap frame (`_KTRAP_FRAME` at `frame`) holds:
+    /// where the thread was when the exception came. `like` gives what the
+    /// frame doesn't (translation registers, x19-x28).
+    pub fn trap_registers(&self, memory: &impl VirtualMemory, frame: u64, like: &Registers) -> Result<Registers> {
+        // `frame` comes from the guest (x2 at KiDispatchException): any value.
+        let at = |offset: u64| frame.checked_add(offset).ok_or_else(|| err(format!("trap frame {frame:#x} wraps")));
+        let field = |name: &str| self.field("_KTRAP_FRAME", name).and_then(at);
+        let mut r = like.clone();
+        r.pc = memory.u64(field("Pc")?)?;
+        r.sp = memory.u64(field("Sp")?)?;
+        let x0 = field("X0")?;
+        for i in 0..19 {
+            r.x[i] = memory.u64(x0.checked_add(8 * i as u64).ok_or_else(|| err("trap frame wraps"))?)?;
+        }
+        r.x[29] = memory.u64(field("Fp")?)?;
+        r.x[30] = memory.u64(field("Lr")?)?;
+        Ok(r)
+    }
+
     pub fn module_layout(&self) -> Result<ModuleLayout> {
         let ty = if self.types.contains_key("_KLDR_DATA_TABLE_ENTRY") {
             "_KLDR_DATA_TABLE_ENTRY"

@@ -77,23 +77,10 @@ impl Symbolizer {
     }
 
     /// The registers a kernel trap frame (`_KTRAP_FRAME` at `frame`) holds:
-    /// where the thread was when the exception came. `like` gives what the
-    /// frame doesn't (translation registers, x19-x28).
+    /// see `Symbols::trap_registers`.
     pub fn trap_registers(&self, memory: &impl VirtualMemory, frame: u64, like: &Registers) -> Result<Registers> {
         let pdb = self.names.get(&self.kernel).and_then(|n| n.pdb.as_ref()).ok_or_else(|| Error::Invalid("no kernel PDB".into()))?;
-        // `frame` comes from the guest (x2 at KiDispatchException): any value.
-        let at = |offset: u64| frame.checked_add(offset).ok_or_else(|| Error::Invalid(format!("trap frame {frame:#x} wraps")));
-        let field = |name: &str| pdb.field("_KTRAP_FRAME", name).and_then(at);
-        let mut r = like.clone();
-        r.pc = memory.u64(field("Pc")?)?;
-        r.sp = memory.u64(field("Sp")?)?;
-        let x0 = field("X0")?;
-        for i in 0..19 {
-            r.x[i] = memory.u64(x0.checked_add(8 * i as u64).ok_or_else(|| Error::Invalid("trap frame wraps".into()))?)?;
-        }
-        r.x[29] = memory.u64(field("Fp")?)?;
-        r.x[30] = memory.u64(field("Lr")?)?;
-        Ok(r)
+        pdb.trap_registers(memory, frame, like)
     }
 
     /// Whether `address` is in a loaded module.
