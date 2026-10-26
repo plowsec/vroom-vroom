@@ -20,7 +20,13 @@ pub enum DiskCmd {
     Info { path: PathBuf },
     /// Rewrite a qcow2 image without the space freed inside it (the VM
     /// must be off).
-    Compact { path: PathBuf },
+    Compact {
+        path: PathBuf,
+        /// Another directory its backing files may live in (a state
+        /// layer's base image sits in the VM folder).
+        #[arg(long = "allow-dir")]
+        allow_dirs: Vec<PathBuf>,
+    },
 }
 
 pub(crate) fn parse_size(s: &str) -> Result<u64, String> {
@@ -59,9 +65,9 @@ pub fn run(cmd: DiskCmd) -> Result<(), String> {
             println!("created {} ({} bytes)", path.display(), size);
             Ok(())
         }
-        DiskCmd::Compact { path } => {
-            let (before, after) =
-                vroom_block::qcow2::compact(&path, &vroom_block::qcow2::OpenPolicy::default()).map_err(|e| format!("{}: {e}", path.display()))?;
+        DiskCmd::Compact { path, allow_dirs } => {
+            let policy = vroom_block::qcow2::OpenPolicy { allowed_dirs: allow_dirs, ..Default::default() };
+            let (before, after) = vroom_block::qcow2::compact(&path, &policy).map_err(|e| format!("{}: {e}", path.display()))?;
             println!("{}: {} -> {} bytes", path.display(), before, after);
             Ok(())
         }
