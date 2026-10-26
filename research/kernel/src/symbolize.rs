@@ -63,6 +63,22 @@ impl Symbolizer {
         &self.modules
     }
 
+    /// More modules (a process's DLLs), named and unwound like the
+    /// kernel's.
+    pub fn add_modules(&mut self, modules: impl IntoIterator<Item = Module>) {
+        for m in modules {
+            if !self.modules.iter().any(|k| k.base == m.base) {
+                self.modules.push(m);
+            }
+        }
+        self.seen.clear();
+    }
+
+    /// The kernel's PDB: structure layouts (processes, their modules).
+    pub fn kernel_symbols(&self) -> Option<&Symbols> {
+        self.names.get(&self.kernel)?.pdb.as_ref()
+    }
+
     /// A kernel symbol's address (`KiDispatchException`).
     pub fn resolve(&self, name: &str) -> Option<u64> {
         self.names.get(&self.kernel)?.pdb.as_ref()?.resolve(name).ok()

@@ -177,6 +177,12 @@ pub struct Harness {
     /// `entry_pc` is in.
     #[serde(default)]
     pub target: Option<String>,
+    /// A user-mode `target` (a DLL): the process it runs in. Its blocks
+    /// translate through that process's page tables, its range comes from
+    /// that process's modules, comparison logging follows that process's
+    /// threads, and that process's user-mode exceptions in it are findings.
+    #[serde(default)]
+    pub target_pid: Option<u64>,
     /// A client harness: the target's functions its calls enter by (the
     /// IRP dispatch), by name in the block list (a part of it will do), at
     /// most three. Comparison logging runs the guest at full speed to one
@@ -1059,6 +1065,8 @@ pub struct Engine {
     symbols: Option<vroom_kernel::symbolize::Symbolizer>,
     /// The target's image (`entry_pc`'s), found by the first compare log.
     target_image: Option<(u64, u64)>,
+    /// A user-mode target's process: its page table root (`target_pid`).
+    target_space: Option<u64>,
     /// `nt!KiDispatchException`, when the harness detects exceptions: every
     /// exception passes there first, the ones an `__except` swallows too.
     exception_hook: Option<u64>,
@@ -1201,6 +1209,7 @@ impl Engine {
             pending: BTreeMap::new(),
             symbols: None,
             target_image: None,
+            target_space: None,
             exception_hook: None,
             cmplog_blocks: Vec::new(),
         })
@@ -1226,9 +1235,12 @@ impl Engine {
             // Whose an exception is, from the first one on.
             self.target_range(&registers)?;
         }
+        // A user-mode target's code, through its own process only: at its
+        // VAs another process may have other memory.
+        let blocks_registers = self.target_registers(&registers)?.unwrap_or_else(|| registers.clone());
         let address_space = AddressSpace {
             memory: &self.vm,
-            registers: &registers,
+            registers: &blocks_registers,
         };
         for index in 0..self.harness.coverage.len() {
             let block = self.harness.coverage[index].clone();
@@ -1341,6 +1353,7 @@ impl Engine {
             watch_cursor,
             symbols,
             target_image,
+            target_space,
             ..
         } = self;
         drop(vm);
@@ -1349,6 +1362,7 @@ impl Engine {
         // The same snapshot: the same modules, PDBs already loaded.
         fresh.symbols = symbols;
         fresh.target_image = target_image;
+        fresh.target_space = target_space;
         fresh.instrument()?;
         fresh.watch_cursor = watch_cursor;
         Ok(fresh)
@@ -1412,6 +1426,7 @@ impl Engine {
         let state = self.vm.debug_registers(self.harness.cpu)?;
         let registers = Registers::from_state(&state)
             .map_err(|error| Error::Invalid(format!("ARM64 register state: {error}")))?;
+        let registers = self.target_registers(&registers)?.unwrap_or(registers);
         let mut mapped = Vec::new();
         {
             let address_space = AddressSpace {
@@ -1535,6 +1550,31 @@ impl Engine {
         Ok(())
     }
 
+    /// A user-mode target's process (`target_pid`): `registers` with its
+    /// page tables; its modules join the symbolizer's on the first call.
+    fn target_registers(&mut self, registers: &Registers) -> Result<Option<Registers>> {
+        let Some(pid) = self.harness.target_pid else {
+            return Ok(None);
+        };
+        if self.target_space.is_none() {
+            self.load_symbols(registers)?;
+            let symbols = self.symbols.as_ref().expect("loaded above");
+            let pdb = symbols.kernel_symbols().ok_or_else(|| Error::Invalid("target_pid: no kernel PDB".into()))?;
+            let space = AddressSpace { memory: &self.vm, registers };
+            let process = vroom_kernel::process::list(&space, pdb)
+                .map_err(|e| Error::Invalid(format!("target_pid: processes: {e}")))?
+                .into_iter()
+                .find(|p| p.pid == pid)
+                .ok_or_else(|| Error::Invalid(format!("target_pid {pid} isn't running")))?;
+            let theirs = with_space(registers, process.directory_table);
+            let modules = vroom_kernel::process::modules(&AddressSpace { memory: &self.vm, registers: &theirs }, pdb, &process)
+                .map_err(|e| Error::Invalid(format!("target_pid {pid}: modules: {e}")))?;
+            self.symbols.as_mut().expect("loaded above").add_modules(modules);
+            self.target_space = Some(process.directory_table);
+        }
+        Ok(self.target_space.map(|root| with_space(registers, root)))
+    }
+
     /// The target's code: the image `entry_pc` is in, or the module the
     /// harness names (`target`) when the entry is elsewhere (a user-mode
     /// client calling into a driver).
@@ -1545,10 +1585,11 @@ impl Engine {
         let range = match self.harness.target.clone() {
             Some(name) => {
                 self.load_symbols(registers)?;
+                self.target_registers(registers)?;
                 self.symbols
                     .as_ref()
                     .and_then(|s| s.module_range(&name))
-                    .ok_or_else(|| Error::Invalid(format!("target module {name} isn't loaded")))?
+                    .ok_or_else(|| Error::Invalid(format!("target module {name} isn't loaded (a DLL: target_pid)")))?
             }
             None => {
                 let entry = self.harness.entry_pc.unwrap_or(registers.pc);
@@ -1578,7 +1619,9 @@ impl Engine {
     }
 
     fn exception_finding(&mut self, registers: &Registers, input: &str) -> Result<Option<Finding>> {
-        if registers.x[3] & 0xff != 0 || registers.x[4] & 0xff == 0 {
+        // A user-mode target's process: its own (user-mode) exceptions.
+        let user_target = registers.x[3] & 0xff == 1 && self.target_space.is_some_and(|root| same_space(root, registers.ttbr0));
+        if (registers.x[3] & 0xff != 0 && !user_target) || registers.x[4] & 0xff == 0 {
             return Ok(None);
         }
         let record = registers.x[0];
@@ -1607,11 +1650,12 @@ impl Engine {
         let internal = code & 0xffff_ff00 == 0x1000_0000;
         let class = match code {
             // A kernel address, or the NULL page (a NULL dereference, user
-            // half or not).
-            0xc000_0005 if fault >> 63 == 1 || fault < 0x1_0000 => BugClass::AccessViolation,
-            // Stack overrun (fast fail), illegal and privileged instruction,
-            // data and instruction misalignment, stack overflow, divide.
-            0xc000_0409 | 0xc000_001d | 0xc000_0096 | 0x8000_0002 | 0xc000_00aa | 0xc000_00fd | 0xc000_0094 => {
+            // half or not); in a user-mode target, any address.
+            0xc000_0005 if user_target || fault >> 63 == 1 || fault < 0x1_0000 => BugClass::AccessViolation,
+            // Stack overrun (fast fail), heap corruption, illegal and
+            // privileged instruction, data and instruction misalignment,
+            // stack overflow, divide.
+            0xc000_0409 | 0xc000_0374 | 0xc000_001d | 0xc000_0096 | 0x8000_0002 | 0xc000_00aa | 0xc000_00fd | 0xc000_0094 => {
                 BugClass::ExceptionDispatch
             }
             // Other faults the trap handlers raise (an address size fault
@@ -2662,6 +2706,20 @@ fn resume_vm(vm: &mut vroom_vmm::Vmm, isolate: Option<usize>) -> Result<()> {
 /// stepped this CPU before the reset).
 pub(crate) fn isolated_pstate(pstate: u64) -> u64 {
     (pstate | 0xc0) & !(1 << 21)
+}
+
+/// `registers` walking another address space (a process's page table
+/// root), even from a context that has TTBR0 walks off (TCR.EPD0).
+fn with_space(registers: &Registers, root: u64) -> Registers {
+    let mut r = registers.clone();
+    r.ttbr0 = root;
+    r.tcr &= !(1 << 7);
+    r
+}
+
+/// The same address space: page table roots without their ASID and flags.
+fn same_space(a: u64, b: u64) -> bool {
+    a & 0x0000_ffff_ffff_f000 == b & 0x0000_ffff_ffff_f000
 }
 
 /// The first instruction of an AArch64 exception vector entry.

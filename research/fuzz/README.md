@@ -83,6 +83,7 @@ Kernel TUI: `coverage runs/a/coverage.json`, `coverage-diff runs/a/coverage.json
 | `input_register` / `input_pointer_va`, `input_length_register` / `input_length_va`, `output_length_va` | saved fields patched per input |
 | `entry_pc`, `stop_pc` | first block; return address that ends an input (testcase thread only). User-mode `entry_pc`: a client harness (needs `blocks`, no `isolate_cpu`, `target`, `stop_pc` in the client) |
 | `target` | module under test (`clfs.sys`); default the image of `entry_pc` |
+| `target_pid` | user-mode `target` (`app.dll`): its process. Blocks translate through its page tables, range from its modules, cmplog follows its threads, its user-mode exceptions in the target are findings (`client_harness.py --target-pid`) |
 | `entries` | client: ≤3 target functions its calls enter by (IRP dispatch), names from the block list (substring); cmplog steps from there. None: from the first new block the client's thread reaches |
 | `sequence` | input = calls `u32 code \| u16 length \| payload` for a client; mutations insert, drop, repeat, swap, splice calls |
 | `calls` / `calls_file` | a sequence's call descriptions (below): typed mutation, call-aware triage, `show`. File relative to the harness |
