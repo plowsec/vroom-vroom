@@ -5,6 +5,7 @@ the config's path: starting a lab that already runs attaches to it instead.
 Labs this module starts are daemons (`vroom-lab --daemon`); whoever started
 one decides whether it stops with the frontend.
 """
+import atexit
 import hashlib
 import os
 import plistlib
@@ -13,6 +14,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,14 +60,48 @@ def check_signed(binary: Path):
         raise RuntimeError(f'{binary} lacks the hypervisor entitlement: run research/build.sh')
 
 
-@dataclass
+#: Labs this process started and stops when it ends, however it ends.
+_owned: list['Lab'] = []
+_armed = False
+
+
+def _stop_owned():
+    for lab in list(_owned):
+        lab.stop()
+
+
+def _exit_on(signum, _frame):
+    raise SystemExit(128 + signum)
+
+
+@dataclass(eq=False)
 class Lab:
     socket: Path
     #: The daemon's pid when this process started it; None when it ran already.
     pid: int | None = None
 
+    def own(self):
+        """Stop this lab when the process ends, even if nothing detaches it.
+
+        A daemon outlives its parent on purpose; this ties it to the
+        frontend: normal exit, an uncaught exception, SIGTERM or SIGHUP.
+        """
+        global _armed
+        if self.pid is None or self in _owned:
+            return
+        if not _armed:
+            _armed = True
+            atexit.register(_stop_owned)
+            if threading.current_thread() is threading.main_thread():
+                for signum in (signal.SIGTERM, signal.SIGHUP):
+                    if signal.getsignal(signum) is signal.SIG_DFL:
+                        signal.signal(signum, _exit_on)
+        _owned.append(self)
+
     def stop(self, timeout=15.0):
         """SIGTERM: the lab stops its VM and removes the socket."""
+        if self in _owned:
+            _owned.remove(self)
         if self.pid is None:
             return
         pid, self.pid = self.pid, None

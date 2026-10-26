@@ -257,6 +257,8 @@ def open_vroom(spec: str, session=None) -> VroomTarget:
     path = Path(path).expanduser()
     if path.suffix == '.toml':
         lab = ensure(path, options.get('restore'), options.get('lab'))
+        if owned:
+            lab.own()
         owned = (lab.pid is not None and not options.get('keep')) or options.get('stop')
         socket_path = lab.socket
     else:
