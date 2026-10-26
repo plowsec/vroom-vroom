@@ -21,6 +21,8 @@ const PSTATE_SS: u64 = 1 << 21;
 /// How long a WFI sleep may last before we re-check for SGIs sent by other
 /// vCPUs. HVF delivers those in-kernel and gives us no wakeup signal.
 const WFI_POLL_SLICE: Duration = Duration::from_millis(1);
+/// The same with the idle skip on: an SGI to an idle vCPU waits this long.
+const IDLE_POLL_SLICE: Duration = Duration::from_micros(50);
 
 /// How long an access we can't emulate (an exclusive load or store, say)
 /// may keep faulting at one address before the VM stops. Memory the
@@ -68,6 +70,9 @@ pub struct HvfVcpu {
     pending_read: Option<DataAbort>,
     vtimer_masked: bool,
     vtimer_offset: Arc<AtomicU64>,
+    idle: Arc<super::idle::IdleSkip>,
+    /// The idle skip's epoch this vCPU's counter offset follows.
+    clock_epoch: u64,
     /// Guest runs at EL2 (nested virtualization).
     el2: bool,
     debug: DebugConfig,
@@ -109,6 +114,7 @@ impl HvfVcpu {
     pub(super) fn new(
         index: u32,
         vtimer_offset: Arc<AtomicU64>,
+        idle: Arc<super::idle::IdleSkip>,
         el2: bool,
         dirty: Arc<super::dirty::DirtyLog>,
         execute: Arc<super::execute::ExecutePatches>,
@@ -135,6 +141,8 @@ impl HvfVcpu {
             pending_read: None,
             vtimer_masked: false,
             vtimer_offset,
+            clock_epoch: idle.epoch(),
+            idle,
             el2,
             debug: DebugConfig::default(),
             guest_debug: Vec::new(),
@@ -280,9 +288,36 @@ impl HvfVcpu {
         Ok(self.gicr(ffi::GICR_ISPENDR0)? & self.gicr(ffi::GICR_ISENABLER0)? != 0)
     }
 
+    /// The guest timer's compare value, if armed.
+    fn vtimer_cval(&self) -> Result<Option<u64>> {
+        let ctl = self.get_sys(ffi::HV_SYS_REG_CNTV_CTL_EL0)?;
+        if ctl & 1 == 0 || ctl & 2 != 0 {
+            return Ok(None);
+        }
+        Ok(Some(self.get_sys(ffi::HV_SYS_REG_CNTV_CVAL_EL0)?))
+    }
+
+    /// Take the VM-wide counter offset the idle skip moved.
+    fn follow_clock(&mut self) -> Result<()> {
+        let epoch = self.idle.epoch();
+        if epoch != self.clock_epoch {
+            self.apply_vm_clock()?;
+            self.clock_epoch = epoch;
+        }
+        Ok(())
+    }
+
     /// Emulate WFI. Returns true if we were kicked.
     fn wait_for_interrupt(&mut self) -> Result<bool> {
+        let woke = self.wait_idle();
+        self.idle.leave(self.index);
+        self.follow_clock()?;
+        woke
+    }
+
+    fn wait_idle(&mut self) -> Result<bool> {
         loop {
+            self.follow_clock()?;
             if self.kicker.kicked.load(Ordering::Acquire) {
                 return Ok(true);
             }
@@ -293,9 +328,14 @@ impl HvfVcpu {
             if deadline == Some(0) {
                 return Ok(false);
             }
-            let slice = deadline
-                .map(|ns| Duration::from_nanos(ns).min(WFI_POLL_SLICE))
-                .unwrap_or(WFI_POLL_SLICE);
+            if !self.el2 {
+                self.idle.wait(self.index, self.vtimer_cval()?, &self.vtimer_offset);
+                if self.idle.epoch() != self.clock_epoch {
+                    continue;
+                }
+            }
+            let poll = if self.idle.on() { IDLE_POLL_SLICE } else { WFI_POLL_SLICE };
+            let slice = deadline.map(|ns| Duration::from_nanos(ns).min(poll)).unwrap_or(poll);
             let mut f = self.kicker.wake_flag.lock().unwrap_or_else(|e| e.into_inner());
             if !*f {
                 f = self.kicker.cv.wait_timeout(f, slice).unwrap_or_else(|e| e.into_inner()).0;
@@ -537,6 +577,17 @@ impl HvfVcpu {
                 if esr & 1 == 1 {
                     // WFE: just yield.
                     std::thread::yield_now();
+                    return Ok(None);
+                }
+                if self.wait_for_interrupt()? {
+                    self.kicker.take_kick();
+                    return Ok(Some(VcpuExit::Kicked));
+                }
+                Ok(None)
+            }
+            ExceptionClass::Hvc64 if esr & 0xffff == u64::from(crate::IDLE_HVC) => {
+                // A WFI the VMM rewrote (HVF waits out real ones itself).
+                if self.debug.single_step {
                     return Ok(None);
                 }
                 if self.wait_for_interrupt()? {

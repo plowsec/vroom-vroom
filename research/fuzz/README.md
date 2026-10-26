@@ -30,7 +30,7 @@ vroom-fuzz blocks clfs.sys --base 0xfffff804000d0000 --output blocks.json   # bl
 | `--budget N` | executions for minimizing (2000); `0` doesn't |
 | `--out FILE`, `--min FILE` | default `<input>.triage.json`, `<input>.min.bin` |
 
-Triage: the most frequent first finding over the runs is the one; minimizing keeps each change that still makes its signature. Sequences first: shortest call prefix, each call dropped (last first), then (described calls) arguments simpler by type: ints and inline values 0, flags fewer, bytes empty or halved, array elements 0, no bytes past the arguments; resource slots and lens stay. Then bytes: shortest prefix, zeroed spans (64, 8 bytes), dropped chunks, zeroed bytes. The IOCTL prefix stays. Candidates time out at 20× the input's run (≥250 ms). Report: `signature`, `reproduced`/`runs`, every signature seen, `finding`, lengths, executions, `program` (sequences: the minimized one, as `show` prints it). HEVD stack overflow: 2308 → 2096 bytes, 4 non-zero, ~11 s.
+Triage: the most frequent first finding over the runs is the one; minimizing keeps each change that still makes its signature. Sequences first: shortest call prefix, each call dropped (last first), then (described calls) arguments simpler by type: ints and inline values 0, flags fewer, bytes empty or halved, array elements 0, no bytes past the arguments; resource slots and lens stay. Then bytes: shortest prefix, zeroed spans (64, 8 bytes), dropped chunks, zeroed bytes. The IOCTL prefix stays. Candidates time out at 20× the input's run (≥250 ms). Report: `signature`, `reproduced`/`runs`, every signature seen, `finding`, lengths, executions, `program` (sequences: the minimized one, as `show` prints it), `ablations` (runs of the minimized input that still made it with each; 0: it needs that capability). HEVD stack overflow: 2308 → 2096 bytes, 4 non-zero, ~11 s.
 
 | `trace` flag | |
 |---|---|
@@ -92,6 +92,9 @@ Kernel TUI: `coverage runs/a/coverage.json`, `coverage-diff runs/a/coverage.json
 | `reopen_after` | `0` reset in place, `1` restore from disk every input |
 | `timeout_ms` | per input; a timeout restores from disk (a client's resets in place) |
 | `settle_ms` | client harnesses: keep running this long past `stop_pc` (async completions within the input) |
+| `skip_idle` | every vCPU in WFI: the guest clock jumps to the next timer (kernel `wfi`s become `hvc #0x7669`; HVF waits out real ones itself). A client's receive timeouts and sleeps cost their timer ticks, not wall time |
+| `ablations` | `[{name, va, bytes}]`: a client capability (a key, say) taken away by writing `bytes` (hex) at `va` (client's address space) before the input. `triage` reruns a finding with each |
+| `ablate` | ablation names every input gets: a campaign without them (pre-auth only) |
 | `coverage` / `coverage_file` | block manifest (`angr_blocks.py`); ≤4 successors per block |
 | `coverage_mode` | `edges` (default): HW breakpoints follow the path, edges + hit counts, one exit per block. `blocks`: one-shot BRK per uncovered block, known paths run exit-free, new blocks only (~1.8x faster; not for `probe`) |
 | `exception_sites` | ≤4 exception-dispatch PCs, reported when reached |
@@ -125,6 +128,8 @@ C:\HEVD-Lab\HevdFuzzClient.exe 0x222003 1
 ## Clients, sequences
 
 Stateful drivers (CLFS): the snapshot stands in a user-mode client parked in a loop; each input is a program of calls it makes (`sequence`), the whole guest running; the input ends at the client's `stop_pc`. Coverage is the target's blocks (`blocks` mode, any thread); exceptions are the target's, any thread. Cmplog: from each entry into the target (`entries`). Example: [CLFS.md](CLFS.md).
+
+Network services: the client sends to a peer in the NIC's `mirror` network (VM config, NAT: `mirror = "10.99.0.0/24"`); its datagrams come back through the NIC from there, so the service sees a remote peer and inputs take the remote path (NIC, IP reassembly, firewall, the service's policy for that address). With `skip_idle` the client's reply waits cost what the guest does in them: a UDP service's client, 1 worker: 9.3 → 36.7 inputs/s, median input 78 → 12 ms.
 
 ### Call descriptions
 

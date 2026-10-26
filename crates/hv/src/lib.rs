@@ -200,6 +200,9 @@ pub trait Vm: Send + Sync {
     /// Make the guest counter continue from `value` (snapshot restore).
     /// Takes effect on each vCPU at its next state restore.
     fn set_clock(&self, value: u64);
+    /// While every vCPU waits for an interrupt, move the guest counter to
+    /// the earliest armed timer rather than wait for it.
+    fn set_idle_skip(&self, _on: bool) {}
 
     /// Called once every vCPU exists (KVM initialises its vGIC here).
     fn finalize(&self) -> Result<()> {
@@ -217,6 +220,10 @@ pub trait Vm: Send + Sync {
         Err(Error::Unsupported("per-register interrupt controller access"))
     }
 }
+
+/// `HVC #IDLE_HVC` waits like WFI. HVF handles a guest's WFI itself, so
+/// a VMM that must see the guest idle (the idle skip) rewrites them to it.
+pub const IDLE_HVC: u16 = 0x7669;
 
 /// Why the vCPU stopped running guest code.
 #[derive(Debug, Clone, PartialEq, Eq)]

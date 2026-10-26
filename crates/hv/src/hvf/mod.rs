@@ -10,6 +10,7 @@
 mod dirty;
 mod execute;
 mod ffi;
+mod idle;
 mod vcpu;
 mod watch;
 
@@ -128,6 +129,7 @@ pub struct HvfVm {
     kickers: Mutex<Vec<Arc<HvfKicker>>>,
     /// Host ticks minus guest counter. Shared by all vCPUs.
     vtimer_offset: Arc<AtomicU64>,
+    idle: Arc<idle::IdleSkip>,
     spi_base: u32,
     spi_count: u32,
     msi: Option<crate::GicMsiConfig>,
@@ -243,6 +245,7 @@ impl HvfVm {
             // Guest counter starts at 0 when the VM is created.
             // SAFETY: no preconditions.
             vtimer_offset: Arc::new(AtomicU64::new(unsafe { ffi::mach_absolute_time() })),
+            idle: Arc::default(),
             spi_base: info.spi_base,
             spi_count: info.spi_count,
             msi,
@@ -423,8 +426,9 @@ impl Vm for HvfVm {
     }
 
     fn create_vcpu(&self, index: u32) -> Result<Box<dyn Vcpu>> {
-        let v = HvfVcpu::new(index, self.vtimer_offset.clone(), self.el2, self.dirty.clone(), self.execute.clone(), self.watches.clone())?;
+        let v = HvfVcpu::new(index, self.vtimer_offset.clone(), self.idle.clone(), self.el2, self.dirty.clone(), self.execute.clone(), self.watches.clone())?;
         self.kickers.lock().unwrap_or_else(|e| e.into_inner()).push(v.hvf_kicker());
+        self.idle.add(v.hvf_kicker());
         Ok(Box::new(v))
     }
 
@@ -462,6 +466,10 @@ impl Vm for HvfVm {
         // SAFETY: no preconditions.
         let now = unsafe { ffi::mach_absolute_time() };
         self.vtimer_offset.store(now.wrapping_sub(value), Ordering::SeqCst);
+    }
+
+    fn set_idle_skip(&self, on: bool) {
+        self.idle.set(on);
     }
 
     fn save_irqchip(&self) -> Result<IrqChipState> {

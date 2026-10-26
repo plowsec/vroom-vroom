@@ -367,6 +367,13 @@ impl Vmm {
     }
 
     #[cfg(feature = "research")]
+    /// While every vCPU waits for an interrupt, the guest's clock jumps to
+    /// its next timer.
+    pub fn research_skip_idle(&self, on: bool) {
+        self.vm.set_idle_skip(on);
+    }
+
+    #[cfg(feature = "research")]
     /// Capture the paused machine for high-rate fuzz iterations.
     pub fn research_arm(&mut self) -> Result<()> {
         if self.state != RunState::Paused {

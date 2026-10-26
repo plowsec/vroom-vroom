@@ -148,6 +148,11 @@ pub struct Harness {
     /// workers) runs within the input: its coverage and faults count.
     #[serde(default)]
     pub settle_ms: u64,
+    /// While every vCPU waits for an interrupt, the guest's clock jumps to
+    /// its next timer: a client's waits (receive timeouts, sleeps) cost
+    /// what handling the timer ticks costs, not wall time.
+    #[serde(default)]
+    pub skip_idle: bool,
     #[serde(default)]
     pub max_input: usize,
     /// `edges` (default): follow the path with hardware breakpoints on each
@@ -209,6 +214,14 @@ pub struct Harness {
     /// or freed objects whose address is known from a target harness.
     #[serde(default)]
     pub watchpoints: Vec<MemoryWatch>,
+    /// A client's capabilities, each taken away by writing `bytes` at `va`
+    /// (its address space) before an input: a key replaced by a wrong one,
+    /// say. `triage` runs a finding with each, to tell which it needs.
+    #[serde(default)]
+    pub ablations: Vec<Ablation>,
+    /// Ablations every input gets: a campaign without those capabilities.
+    #[serde(default)]
+    pub ablate: Vec<String>,
 }
 
 impl Harness {
@@ -232,6 +245,14 @@ pub const COVERAGE_BRK: u16 = 0x766d;
 
 fn brk_instruction(immediate: u16) -> [u8; 4] {
     (0xd420_0000u32 | u32::from(immediate) << 5).to_le_bytes()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Ablation {
+    pub name: String,
+    pub va: u64,
+    /// Hex.
+    pub bytes: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -397,6 +418,14 @@ impl Harness {
             return Err(Error::Invalid(
                 "exception_sites must be instruction aligned".into(),
             ));
+        }
+        for a in &h.ablations {
+            if hex::decode(&a.bytes).map_or(true, |b| b.is_empty()) {
+                return Err(Error::Invalid(format!("ablation {}: bytes must be non-empty hex", a.name)));
+            }
+        }
+        if let Some(name) = h.ablate.iter().find(|n| !h.ablations.iter().any(|a| &a.name == *n)) {
+            return Err(Error::Invalid(format!("ablate: no ablation named {name}")));
         }
         if h.settle_ms != 0 && (!h.client() || h.settle_ms >= h.timeout_ms) {
             return Err(Error::Invalid("settle_ms is for client harnesses, below timeout_ms".into()));
@@ -1073,6 +1102,8 @@ pub struct Engine {
     /// Blocks the last comparison log reached first (blocks mode): the
     /// input it logged covers them.
     pub cmplog_blocks: Vec<u64>,
+    /// Ablations (by name) the next inputs get on top of `ablate`.
+    pub ablated: Vec<String>,
 }
 
 /// One input, in place and ready to run (`Engine::load_case`).
@@ -1195,6 +1226,7 @@ impl Engine {
         )?;
         // Each reopen restores the snapshot onto a new disk overlay.
         vm.research_discard_disk_layers();
+        vm.research_skip_idle(harness.skip_idle);
         Ok(Self {
             vm,
             harness,
@@ -1212,6 +1244,7 @@ impl Engine {
             target_space: None,
             exception_hook: None,
             cmplog_blocks: Vec::new(),
+            ablated: Vec::new(),
         })
     }
 
@@ -1307,6 +1340,12 @@ impl Engine {
         if self.harness.coverage_mode == CoverageMode::Blocks {
             self.plant(entry_pc)?;
         }
+        if self.harness.skip_idle {
+            let rewritten = self.rewrite_idle(&registers)?;
+            if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
+                eprintln!("skip_idle: {rewritten} kernel WFIs rewritten");
+            }
+        }
         if let Some(bugcheck) = self.harness.bugcheck_pc {
             if self.load_symbols(&registers).is_ok() {
                 let symbols = self.symbols.as_ref().expect("loaded");
@@ -1354,10 +1393,12 @@ impl Engine {
             symbols,
             target_image,
             target_space,
+            ablated,
             ..
         } = self;
         drop(vm);
         let mut fresh = Self::open(harness)?;
+        fresh.ablated = ablated;
         fresh.coverage = coverage;
         // The same snapshot: the same modules, PDBs already loaded.
         fresh.symbols = symbols;
@@ -1403,6 +1444,49 @@ impl Engine {
             );
         }
         Ok(())
+    }
+
+    /// `skip_idle`: every resident `wfi` in the kernel's code sections
+    /// becomes `hvc #IDLE_HVC`, which the VMM waits out itself (and can
+    /// skip). Returns how many.
+    fn rewrite_idle(&mut self, registers: &Registers) -> Result<usize> {
+        const WFI: [u8; 4] = 0xd503_207fu32.to_le_bytes();
+        let hvc = (0xd400_0002u32 | u32::from(vroom_hv::IDLE_HVC) << 5).to_le_bytes();
+        let space = AddressSpace { memory: &self.vm, registers };
+        let kernel = vroom_kernel::windows::discover_kernel(&space, &[registers.vbar, registers.pc])
+            .map_err(|e| Error::Invalid(format!("skip_idle: kernel: {e}")))?;
+        let mut header = [0u8; 0x1000];
+        space
+            .read(kernel.base, &mut header)
+            .map_err(|e| Error::Invalid(format!("skip_idle: kernel headers: {e}")))?;
+        let u16_at = |o: usize| header.get(o..o + 2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]])) as usize;
+        let u32_at = |o: usize| header.get(o..o + 4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        let nt = u32_at(0x3c) as usize;
+        let table = nt + 24 + u16_at(nt + 20);
+        let mut sites = Vec::new();
+        for section in 0..u16_at(nt + 6) {
+            let at = table + section * 40;
+            // IMAGE_SCN_MEM_EXECUTE
+            if u32_at(at + 36) & 0x2000_0000 == 0 {
+                continue;
+            }
+            let (start, size) = (u64::from(u32_at(at + 12)), u64::from(u32_at(at + 8)));
+            for page in (kernel.base + start..kernel.base + start + size).step_by(0x1000) {
+                let Ok(translated) = space.translate(page & !0xfff) else { continue };
+                let mut code = [0u8; 0x1000];
+                self.vm.debug_read_physical(translated.physical, &mut code)?;
+                sites.extend(
+                    code.chunks_exact(4)
+                        .enumerate()
+                        .filter(|(_, word)| *word == WFI)
+                        .map(|(i, _)| translated.physical + 4 * i as u64),
+                );
+            }
+        }
+        for &gpa in &sites {
+            self.vm.research_patch(gpa, &hvc)?;
+        }
+        Ok(sites.len())
     }
 
     fn plant_at(&mut self, index: usize, gpa: u64, brk: [u8; 4]) -> Result<()> {
@@ -1800,6 +1884,7 @@ impl Engine {
         self.input_buffer[..payload.len()].copy_from_slice(payload);
         self.vm
             .debug_write_physical(&[(self.harness.input_gpa, &self.input_buffer)])?;
+        self.apply_ablations()?;
         let mut case_watchpoints = self.harness.watchpoints.clone();
         if !case_watchpoints.is_empty() {
             let state = self.vm.debug_registers(self.harness.cpu)?;
@@ -1957,6 +2042,43 @@ impl Engine {
             )?;
         }
         Ok(Case { arm_after_patch, reset_us, watchpoints: case_watchpoints })
+    }
+
+    /// The harness's `ablate` and `ablated`, written into the client.
+    fn apply_ablations(&mut self) -> Result<()> {
+        let names: Vec<&String> = self.harness.ablate.iter().chain(&self.ablated).collect();
+        if names.is_empty() {
+            return Ok(());
+        }
+        let state = self.vm.debug_registers(self.harness.cpu)?;
+        let registers = Registers::from_state(&state)
+            .map_err(|error| Error::Invalid(format!("ARM64 register state: {error}")))?;
+        let space = AddressSpace { memory: &self.vm, registers: &registers };
+        let mut writes = Vec::new();
+        for name in names {
+            let a = self
+                .harness
+                .ablations
+                .iter()
+                .find(|a| &a.name == name)
+                .ok_or_else(|| Error::Invalid(format!("no ablation named {name}")))?;
+            let bytes = hex::decode(&a.bytes).map_err(|e| Error::Invalid(format!("ablation {name}: {e}")))?;
+            // Page by page: the next page may be another frame.
+            let mut at = 0;
+            while at < bytes.len() {
+                let va = a.va + at as u64;
+                let take = (bytes.len() - at).min(0x1000 - (va & 0xfff) as usize);
+                let physical = space
+                    .translate(va)
+                    .map_err(|e| Error::Invalid(format!("ablation {name}: {e}")))?
+                    .physical;
+                writes.push((physical, bytes[at..at + take].to_vec()));
+                at += take;
+            }
+        }
+        let spans: Vec<(u64, &[u8])> = writes.iter().map(|(a, b)| (*a, b.as_slice())).collect();
+        self.vm.debug_write_physical(&spans)?;
+        Ok(())
     }
 
     pub fn run_input(&mut self, input: &[u8]) -> Result<RunResult> {
@@ -2922,6 +3044,25 @@ mod tests {
         assert!(lengths.len() > 3, "calls are inserted and dropped: {lengths:?}");
         // A cut-short last call keeps its bytes.
         assert_eq!(calls(&seed[..seed.len() - 2]).last().unwrap().1, b"hel");
+    }
+
+    #[test]
+    fn ablate_names_an_ablation() {
+        let path = std::env::temp_dir().join(format!("vroom-fuzz-ablate-{}.json", std::process::id()));
+        let load = |ablate: &[&str], bytes: &str| {
+            let h = serde_json::json!({
+                "name": "a", "config": "c", "snapshot": "s", "state_dir": "d",
+                "input_gpa": 0, "input_capacity": 4096,
+                "ablations": [{"name": "key", "va": 4096, "bytes": bytes}], "ablate": ablate,
+            });
+            fs::write(&path, h.to_string()).unwrap();
+            Harness::load(&path)
+        };
+        assert!(load(&["key"], "00ff").is_ok());
+        assert!(load(&["other"], "00ff").is_err());
+        assert!(load(&[], "").is_err());
+        assert!(load(&[], "0g").is_err());
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

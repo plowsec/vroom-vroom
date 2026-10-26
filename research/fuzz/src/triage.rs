@@ -35,6 +35,11 @@ pub struct Triage {
     /// The minimized program, a call a line (sequence harnesses).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub program: Vec<String>,
+    /// Each harness ablation: runs of the minimized input that still made
+    /// the finding with it (of `runs`). None: the finding needs what it
+    /// takes away.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub ablations: BTreeMap<String, usize>,
 }
 
 /// What minimizing asks of an input: does it still make the finding.
@@ -120,6 +125,7 @@ pub fn triage(engine: Engine, input: &[u8], options: &TriageOptions, mut progres
             minimized_length: input.len(),
             executions: 0,
             program: program(input),
+            ablations: BTreeMap::new(),
         };
         return Ok((report, input.to_vec()));
     };
@@ -139,6 +145,22 @@ pub fn triage(engine: Engine, input: &[u8], options: &TriageOptions, mut progres
         }
         best = minimize(&mut oracle, best, keep, options.budget, &mut progress)?;
     }
+    let mut ablations = BTreeMap::new();
+    let names: Vec<String> = runner.engine.as_ref().map_or(Vec::new(), |e| e.harness.ablations.iter().map(|a| a.name.clone()).collect());
+    for name in names {
+        runner.engine.as_mut().expect("engine is here").ablated = vec![name.clone()];
+        let mut made = 0;
+        for _ in 0..runs {
+            if runner.findings(&best)?.iter().any(|f| signature(f) == wanted) {
+                made += 1;
+            }
+        }
+        progress(&format!("without {name}: {made}/{runs}"));
+        ablations.insert(name, made);
+    }
+    if let Some(engine) = runner.engine.as_mut() {
+        engine.ablated.clear();
+    }
     let report = Triage {
         signature: wanted,
         reproduced,
@@ -149,6 +171,7 @@ pub fn triage(engine: Engine, input: &[u8], options: &TriageOptions, mut progres
         minimized_length: best.len(),
         executions: runner.executions,
         program: program(&best),
+        ablations,
     };
     Ok((report, best))
 }
