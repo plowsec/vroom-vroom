@@ -137,6 +137,7 @@ pub(crate) fn boot_backend(
         NetMode::Nat { port_forwards } => {
             let policy = NatPolicy { allow_host_loopback: n.allow_host_loopback, block_private: n.block_private };
             let mut cfg = nat_config(ident, idx, mac, policy, dns)?;
+            cfg.mirror = n.mirror_net()?;
             for p in port_forwards {
                 let ip: std::net::IpAddr =
                     p.host_addr.parse().map_err(|_| Error::Setup(format!("bad host_addr {}", p.host_addr)))?;
@@ -183,6 +184,7 @@ fn net_of(l: &NetLive, mac: [u8; 6]) -> vroom_config::Net {
         port_forwards: Vec::new(),
         allow_host_loopback: l.loopback,
         block_private: l.block_private,
+        mirror: None,
         mac: Some(vroom_config::format_mac(&mac)),
         connected: true,
     }

@@ -35,6 +35,11 @@ host's loopback (TCP/UDP). `block_private` also blocks LAN and CGNAT. The
 DNS alias forwards to the host's first IPv4 nameserver in
 `/etc/resolv.conf`.
 
+`mirror`: IPv4 frames from the guest to that network come straight back,
+MACs and addresses swapped (checksums unchanged), fragments one by one.
+A client in the guest reaches the guest's own services as from a remote
+peer, through the NIC's receive path.
+
 ## Changing adapters while the VM runs
 
 From the bar's network button or the settings page; both write the VM

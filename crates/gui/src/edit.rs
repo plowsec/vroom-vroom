@@ -199,6 +199,7 @@ fn empty_net() -> Net {
         port_forwards: Vec::new(),
         allow_host_loopback: false,
         block_private: false,
+        mirror: None,
         mac: None,
         connected: true,
     }

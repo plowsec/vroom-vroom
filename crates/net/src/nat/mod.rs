@@ -94,6 +94,9 @@ pub struct NatConfig {
     pub dns: Ipv4Addr,
     /// The gateway's MAC, as the guest's ARP table shows it.
     pub gateway_mac: Mac,
+    /// Network and prefix length: datagrams the guest sends there come
+    /// back to it, source and destination swapped.
+    pub mirror: Option<(Ipv4Addr, u8)>,
 }
 
 impl NatConfig {
@@ -107,6 +110,7 @@ impl NatConfig {
             gateway: GATEWAY,
             dns: DNS,
             gateway_mac: GATEWAY_MAC,
+            mirror: None,
         }
     }
 }
@@ -770,6 +774,29 @@ fn arp_reply(req: &Arp, ip: Ipv4Addr, mac: Mac) -> Vec<u8> {
 }
 
 impl Nat {
+    fn mirrored(&self, ip: Ipv4Addr) -> bool {
+        self.cfg.mirror.is_some_and(|(net, len)| {
+            let mask = u32::MAX.checked_shl(32 - u32::from(len)).unwrap_or(0);
+            u32::from(ip) & mask == u32::from(net) & mask
+        })
+    }
+
+    /// Back to the guest as from the address it went to: MACs and IPv4
+    /// addresses swapped (no checksum changes: the sums are the same).
+    /// Fragments too, each on its own.
+    fn mirror(&mut self, frame: &[u8]) {
+        let mut f = frame.to_vec();
+        f[0..6].copy_from_slice(&self.guest_mac);
+        f[6..12].copy_from_slice(&self.cfg.gateway_mac);
+        let (src, dst) = (ETH_HLEN + 12, ETH_HLEN + 16);
+        let from: [u8; 4] = f[src..src + 4].try_into().expect("parsed IPv4 header");
+        f.copy_within(dst..dst + 4, src);
+        f[dst..dst + 4].copy_from_slice(&from);
+        if self.to_guest.len() < MAX_TO_GUEST {
+            self.to_guest.push_back(f);
+        }
+    }
+
     /// Take one guest frame in; the stack runs later (`poll_stack`).
     fn take_frame(&mut self, frame: &[u8]) {
         let Some(eth) = parse_eth(frame) else { return };
@@ -780,6 +807,10 @@ impl Nat {
             ETHERTYPE_ARP => self.handle_arp(frame),
             ETHERTYPE_IPV4 => {
                 let Some(ip) = parse_ipv4(frame) else { return };
+                if ip.src == self.cfg.guest && self.mirrored(ip.dst) {
+                    self.mirror(frame);
+                    return;
+                }
                 if ip.fragmented {
                     if eth.src == self.guest_mac && ip.src == self.cfg.guest {
                         if let Some(complete) = self.fragments.push(frame) {
@@ -939,6 +970,25 @@ mod tests {
 
     fn nat() -> Nat {
         Nat::new(NatConfig::new([2, 0, 0, 0, 0, 9])).unwrap()
+    }
+
+    #[test]
+    fn mirror_reflects_into_the_guest() {
+        let mut cfg = NatConfig::new([2, 0, 0, 0, 0, 9]);
+        cfg.mirror = Some((Ipv4Addr::new(10, 99, 0, 0), 24));
+        let mut n = Nat::new(cfg).unwrap();
+        let peer = Ipv4Addr::new(10, 99, 0, 7);
+        let out = build_udp(GATEWAY_MAC, [2, 0, 0, 0, 0, 9], (GUEST, 51000), (peer, 7000), b"data");
+        n.send_frame(&out);
+        let back = n.recv_frame().expect("mirrored");
+        let ip = parse_ipv4(&back).expect("valid IPv4, checksum included");
+        assert_eq!((ip.src, ip.dst), (peer, GUEST));
+        let udp = parse_udp(ip.payload).unwrap();
+        assert_eq!((udp.src_port, udp.dst_port, udp.payload), (51000, 7000, &b"data"[..]));
+        assert_eq!(&back[0..12], &[[2, 0, 0, 0, 0, 9], GATEWAY_MAC].concat()[..]);
+        // Outside the mirror: NATed, not reflected.
+        n.send_frame(&build_udp(GATEWAY_MAC, [2, 0, 0, 0, 0, 9], (GUEST, 51000), (Ipv4Addr::new(10, 98, 0, 7), 7000), b"x"));
+        assert!(n.recv_frame().is_none());
     }
 
     #[test]

@@ -686,6 +686,11 @@ pub struct Net {
     /// NAT: block private (LAN) destinations; internet only.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub block_private: bool,
+    /// NAT: "10.99.0.0/24". What the guest sends there comes back to it
+    /// through its NIC, from there: the guest's own services, reached as
+    /// from a remote peer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mirror: Option<String>,
     /// "02:12:34:56:78:9a". Generated if absent (`identity.mac_prefix`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mac: Option<String>,
@@ -726,6 +731,16 @@ impl Net {
         }
     }
 
+    /// `mirror` as network and prefix length.
+    pub fn mirror_net(&self) -> Result<Option<(std::net::Ipv4Addr, u8)>> {
+        let Some(m) = &self.mirror else { return Ok(None) };
+        let bad = || Error::Invalid(format!("net.mirror {m:?}: an IPv4 network, \"10.99.0.0/24\""));
+        let (net, len) = m.split_once('/').ok_or_else(bad)?;
+        let net: std::net::Ipv4Addr = net.parse().map_err(|_| bad())?;
+        let len: u8 = len.parse().ok().filter(|l| (8..=32).contains(l)).ok_or_else(bad)?;
+        Ok(Some((net, len)))
+    }
+
     /// Typed view. Fails if fields don't match the mode.
     pub fn mode(&self) -> Result<NetMode> {
         let bad = |m: &str| Err(Error::Invalid(format!("net ({:?}): {m}", self.mode)));
@@ -737,10 +752,11 @@ impl Net {
                 if self.port_forwards.iter().any(|p| p.proto != "tcp") {
                     return bad("only tcp port forwards are supported for now");
                 }
+                self.mirror_net()?;
                 Ok(NetMode::Nat { port_forwards: self.port_forwards.clone() })
             }
-            NetKind::Bridged | NetKind::HostOnly if self.allow_host_loopback || self.block_private => {
-                bad("allow_host_loopback / block_private only apply to nat")
+            NetKind::Bridged | NetKind::HostOnly if self.allow_host_loopback || self.block_private || self.mirror.is_some() => {
+                bad("allow_host_loopback / block_private / mirror only apply to nat")
             }
             NetKind::Bridged => {
                 if self.network.is_some() || !self.port_forwards.is_empty() {
