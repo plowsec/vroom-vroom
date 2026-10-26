@@ -539,6 +539,9 @@ impl ClipboardProvider for RemoteClipboard {
         self.latest.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
     fn set_text(&mut self, text: &str) {
+        // The viewer suppresses echoes of guest copies. Update our copy
+        // too, or the next poll sends the previous host text back.
+        *self.latest.lock().unwrap_or_else(|e| e.into_inner()) = Some(text.to_string());
         self.tx.send(&ToViewer::ClipboardSet(text.to_string()));
     }
 }
@@ -1027,6 +1030,64 @@ fn handle(
 mod tests {
     use super::*;
     use std::io::Read;
+
+    #[test]
+    fn a_guest_copy_after_a_host_copy_is_not_overwritten() {
+        use crate::agent::{self, Screen};
+        use vroom_proto::{Decoder, Message};
+
+        fn guest_messages(guest: &mut UnixStream, decoder: &mut Decoder) -> Vec<Message> {
+            let mut messages = Vec::new();
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = guest.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                decoder.push(&buf[..n]);
+                while let Some(m) = decoder.next().unwrap() {
+                    messages.push(m);
+                }
+            }
+            messages
+        }
+
+        let (host, mut guest) = UnixStream::pair().unwrap();
+        let (viewer_host, mut viewer) = UnixStream::pair().unwrap();
+        let latest = Arc::new(Mutex::new(None));
+        let clipboard = RemoteClipboard { latest: latest.clone(), tx: ViewerTx::spawn(Some(viewer_host)).unwrap() };
+        let agent = agent::spawn(host, vroom_config::Clipboard::default(), Some(Box::new(clipboard)), Screen::default()).unwrap();
+        agent.send(AgentCmd::Focus(true));
+        guest.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        viewer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut decoder = Decoder::new(1 << 20);
+        let mut viewer_decoder = vroom_display::Decoder::default();
+        let (events, _) = std::sync::mpsc::channel();
+        let hello = guest_messages(&mut guest, &mut decoder);
+        assert!(matches!(hello.as_slice(), [Message::Hello { .. }]));
+
+        for text in ["guest first", "guest after host", "guest after host again"] {
+            guest.write_all(&Message::ClipboardText(text.into()).encode()).unwrap();
+            // The viewer accepts the guest copy without echoing it back.
+            let mut buf = [0u8; 4096];
+            let received = loop {
+                if let Some(m) = viewer_decoder.next_to_viewer().unwrap() {
+                    break m;
+                }
+                let n = viewer.read(&mut buf).unwrap();
+                assert_ne!(n, 0);
+                viewer_decoder.push(&buf[..n]);
+            };
+            assert_eq!(received, ToViewer::ClipboardSet(text.into()));
+            let messages = guest_messages(&mut guest, &mut decoder);
+            assert!(!messages.iter().any(|m| matches!(m, Message::ClipboardText(_))), "guest copy was overwritten: {messages:?}");
+
+            // The same host text can be copied again after a guest copy.
+            handle(ToVmm::Clipboard("host text".into()), None, &agent, &events, &latest);
+            let messages = guest_messages(&mut guest, &mut decoder);
+            assert!(messages.contains(&Message::ClipboardText("host text".into())), "{messages:?}");
+        }
+        agent.send(AgentCmd::Stop);
+    }
 
     fn px(sink: &FbSink) -> u32 {
         let (w, h) = *sink.mode.lock().unwrap();
