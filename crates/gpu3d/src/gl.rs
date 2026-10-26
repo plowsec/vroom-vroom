@@ -228,6 +228,9 @@ fn open(dir: &Path) -> Option<Egl> {
 }
 
 const GL_TEXTURE_2D: u32 = 0x0DE1;
+const GL_TEXTURE_WIDTH: u32 = 0x1000;
+const GL_PIXEL_PACK_BUFFER_BINDING: u32 = 0x88ED;
+const GL_TEXTURE_HEIGHT: u32 = 0x1001;
 const GL_UNSIGNED_BYTE: u32 = 0x1401;
 const GL_EXTENSIONS: u32 = 0x1F03;
 const GL_PACK_ALIGNMENT: u32 = 0x0D05;
@@ -253,6 +256,9 @@ struct Gl {
     bind_framebuffer: unsafe extern "C" fn(u32, u32),
     framebuffer_texture_2d: unsafe extern "C" fn(u32, u32, u32, u32, i32),
     check_framebuffer_status: unsafe extern "C" fn(u32) -> u32,
+    bind_texture: unsafe extern "C" fn(u32, u32),
+    get_integerv: unsafe extern "C" fn(u32, *mut i32),
+    get_tex_level_parameteriv: unsafe extern "C" fn(u32, i32, u32, *mut i32),
     gen_buffers: unsafe extern "C" fn(i32, *mut u32),
     bind_buffer: unsafe extern "C" fn(u32, u32),
     buffer_data: unsafe extern "C" fn(u32, isize, *const c_void, u32),
@@ -290,6 +296,9 @@ impl Gl {
             bind_framebuffer: gl!("glBindFramebuffer"),
             framebuffer_texture_2d: gl!("glFramebufferTexture2D"),
             check_framebuffer_status: gl!("glCheckFramebufferStatus"),
+            bind_texture: gl!("glBindTexture"),
+            get_integerv: gl!("glGetIntegerv"),
+            get_tex_level_parameteriv: gl!("glGetTexLevelParameteriv"),
             gen_buffers: gl!("glGenBuffers"),
             bind_buffer: gl!("glBindBuffer"),
             buffer_data: gl!("glBufferData"),
@@ -370,14 +379,56 @@ impl Reader {
                 (gl.gen_framebuffers)(1, &mut self.fbo);
                 (gl.gen_buffers)(1, &mut self.pbo);
             }
+            // Ask the texture how big it is, rather than trusting what
+            // virglrenderer last recorded for the resource: when the guest
+            // resizes its scanout the two disagree for a frame, and
+            // glReadPixels past the edge of the attachment is undefined.
+            // Apple's GL walks off the end of it instead of clamping, and
+            // the GPU process dies in glgConvertTo_32 taking this VM's 3D
+            // with it. A frame we can't read here is read the slow way.
+            (gl.bind_texture)(GL_TEXTURE_2D, tex);
+            let (mut tw, mut th) = (0i32, 0i32);
+            (gl.get_tex_level_parameteriv)(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &mut tw);
+            (gl.get_tex_level_parameteriv)(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &mut th);
+            (gl.bind_texture)(GL_TEXTURE_2D, 0);
+            if tw <= 0 || th <= 0 || x as i64 + w as i64 > tw as i64 || gl_y as i64 + h as i64 > th as i64 {
+                log::debug!(
+                    "gpu3d: scanout read {w}x{h}+{x}+{gl_y} is outside texture {tex} ({tw}x{th}); reading it the slow way"
+                );
+                return false;
+            }
             (gl.bind_framebuffer)(GL_READ_FRAMEBUFFER, self.fbo);
             (gl.framebuffer_texture_2d)(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
             let mut ok = (gl.check_framebuffer_status)(GL_READ_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
             if ok {
                 (gl.bind_buffer)(GL_PIXEL_PACK_BUFFER, self.pbo);
                 if self.pbo_size < size {
+                    while (gl.get_error)() != 0 {}
                     (gl.buffer_data)(GL_PIXEL_PACK_BUFFER, size as isize, std::ptr::null(), GL_STREAM_READ);
+                    // Believing a buffer grew when it didn't leaves every
+                    // later read writing past the end of it.
+                    if (gl.get_error)() != 0 {
+                        log::debug!("gpu3d: no pixel buffer for {size} bytes; reading the scanout the slow way");
+                        (gl.bind_buffer)(GL_PIXEL_PACK_BUFFER, 0);
+                        (gl.bind_framebuffer)(GL_READ_FRAMEBUFFER, 0);
+                        return false;
+                    }
                     self.pbo_size = size;
+                }
+                // glReadPixels writes to the bound pack buffer, and to host
+                // address 0 when there is none -- which is a segfault inside
+                // Apple's GL, not a GL error we could notice. A stale name
+                // (the reader's context went away and came back) binds
+                // nothing, so check the binding took before reading into it.
+                let mut bound = 0i32;
+                (gl.get_integerv)(GL_PIXEL_PACK_BUFFER_BINDING, &mut bound);
+                if bound == 0 {
+                    log::warn!("gpu3d: the scanout pixel buffer went away; reading the slow way");
+                    self.pbo = 0;
+                    self.fbo = 0;
+                    self.pbo_size = 0;
+                    (gl.bind_framebuffer)(GL_READ_FRAMEBUFFER, 0);
+                    return false;
                 }
                 (gl.pixel_storei)(GL_PACK_ALIGNMENT, 4);
                 // Offset 0 in the bound pack buffer.
