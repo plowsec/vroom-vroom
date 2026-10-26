@@ -17,6 +17,7 @@ pub mod calls;
 pub mod campaign;
 pub mod cmplog;
 pub mod hub;
+pub mod replay;
 pub mod sync;
 pub mod trace;
 pub mod triage;
@@ -1499,6 +1500,25 @@ impl Engine {
         self.vm.research_patch(gpa, &brk)?;
         self.planted.insert(index, original);
         Ok(())
+    }
+
+    /// `blocks` mode: block `index`'s breakpoint back, as if never hit
+    /// (`replay`: every input's whole coverage). False: its page isn't
+    /// mapped yet.
+    pub fn rearm(&mut self, index: usize) -> Result<bool> {
+        let Some(gpa) = self.harness.coverage[index].gpa else {
+            return Ok(false);
+        };
+        self.plant_at(index, gpa, brk_instruction(COVERAGE_BRK))?;
+        Ok(true)
+    }
+
+    /// The target's image: base and end.
+    pub fn target_module(&mut self) -> Result<(u64, u64)> {
+        let state = self.vm.debug_registers(self.harness.cpu)?;
+        let registers = Registers::from_state(&state)
+            .map_err(|error| Error::Invalid(format!("ARM64 register state: {error}")))?;
+        self.target_range(&registers)
     }
 
     /// `blocks` mode, after an input: plant the blocks on pages that input

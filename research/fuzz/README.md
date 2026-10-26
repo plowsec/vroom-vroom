@@ -19,6 +19,7 @@ vroom-fuzz cmplog harness.json input.bin                        # one input's co
 vroom-fuzz coverage runs/a/coverage.json runs/a/blocks.json     # per-function summary
 vroom-fuzz trace harness.json runs/a/crashes/<hash>-BugCheck.bin --blocks all-blocks.json   # replay, symbolized
 vroom-fuzz triage harness.json runs/a/crashes/<hash>-BugCheck.bin   # reproduce + minimize
+vroom-fuzz replay harness.json runs/a/inputs --output runs/a/drcov   # each input's whole coverage: drcov for Lighthouse
 vroom-fuzz show harness.json runs/a/inputs/<hash>.bin          # a sequence, a call a line
 vroom-fuzz mutate seed.bin --harness harness.json --count 5    # mutations as runs make them, no VM
 vroom-fuzz blocks clfs.sys --base 0xfffff804000d0000 --output blocks.json   # block list from the driver file
@@ -58,6 +59,8 @@ Output dir: `inputs/`, `crashes/<hash>-<class>.{bin,json}` (first input per sign
 
 Signature (dedupe): class + the 3 innermost functions of the faulting code (offsets dropped; frames above the kernel's exception entry and `KeBugCheck*` skipped); `<wild jump>` for a PC outside every image; else class + PC. Functions without a PDB: the block list's names, else `.pdata` starts as `sub_<address at 0x140000000>`.
 
+`replay` (blocks mode): the inputs (files, or directories oldest first) twice, the first pass to warm the VM up; each recorded run starts with every block's breakpoint armed. `<name>.drcov` per input, `all.drcov`, `replay.json` (blocks, new ones, calls, findings per input). Lighthouse: load the files (or the directory) on the target module; the composer unions, intersects, diffs them. Same input twice: same blocks ±0.5%.
+
 ## Exceptions
 
 Detector `exceptions` (or `access-violation`): a breakpoint on `nt!KiDispatchException` sees every exception at first chance, before an `__except` swallows it. Reported when the faulting PC or a frame of its stack (unwound from the trap frame) is in the target, or the PC is in no image:
@@ -92,7 +95,7 @@ Kernel TUI: `coverage runs/a/coverage.json`, `coverage-diff runs/a/coverage.json
 | `reopen_after` | `0` reset in place, `1` restore from disk every input |
 | `timeout_ms` | per input; a timeout restores from disk (a client's resets in place) |
 | `settle_ms` | client harnesses: keep running this long past `stop_pc` (async completions within the input) |
-| `skip_idle` | every vCPU in WFI: the guest clock jumps to the next timer (kernel `wfi`s become `hvc #0x7669`; HVF waits out real ones itself). A client's receive timeouts and sleeps cost their timer ticks, not wall time |
+| `skip_idle` | guest time is what the guest does: every vCPU in WFI and no virtio work in flight → the clock jumps to the next timer (kernel `wfi`s become `hvc #0x7669`; HVF waits out real ones itself); a debug stop parks every vCPU and the clock stands still until they run again. A client's receive timeouts cost their timer ticks, and breakpoints don't make its replies late |
 | `ablations` | `[{name, va, bytes}]`: a client capability (a key, say) taken away by writing `bytes` (hex) at `va` (client's address space) before the input. `triage` reruns a finding with each |
 | `ablate` | ablation names every input gets: a campaign without them (pre-auth only) |
 | `coverage` / `coverage_file` | block manifest (`angr_blocks.py`); ≤4 successors per block |
