@@ -5,7 +5,7 @@
 //! guest memory, so `pause()` returning means "no DMA in flight".
 
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -113,14 +113,39 @@ struct Inner<H> {
     handler: H,
 }
 
+/// Notifications and pokes no worker of this process has handled yet.
+static OUTSTANDING: AtomicUsize = AtomicUsize::new(0);
+
+/// A device has guest notifications or I/O completions it hasn't handled
+/// yet: the guest is waiting on the host, not on time (the idle skip).
+pub fn busy() -> bool {
+    OUTSTANDING.load(Ordering::Acquire) != 0
+}
+
 /// What other threads set to get the worker's attention.
 struct Signals {
+    /// This worker's share of `OUTSTANDING`.
+    outstanding: AtomicUsize,
     kicks: AtomicU64,
     poked: AtomicBool,
     stop: AtomicBool,
     /// [`Worker::release_thread`] asks; the worker counts the times it did.
     release: AtomicBool,
     released: (Mutex<u64>, std::sync::Condvar),
+}
+
+impl Signals {
+    fn pending(&self) {
+        self.outstanding.fetch_add(1, Ordering::AcqRel);
+        OUTSTANDING.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// `n` handled (or dropped with the worker).
+    fn handled(&self, n: usize) {
+        if n != 0 {
+            OUTSTANDING.fetch_sub(n, Ordering::AcqRel);
+        }
+    }
 }
 
 struct Shared<H> {
@@ -143,6 +168,7 @@ impl std::fmt::Debug for Poker {
 
 impl Poker {
     pub fn poke(&self) {
+        self.sig.pending();
         self.sig.poked.store(true, Ordering::Release);
         let _ = self.waker.wake();
     }
@@ -170,6 +196,7 @@ impl<H: QueueHandler> Worker<H> {
         let sig = Arc::new(Signals {
             // Process everything once at start: the driver may have queued
             // buffers before we came up (or before a snapshot).
+            outstanding: AtomicUsize::new(0),
             kicks: AtomicU64::new(if nq >= 64 { u64::MAX } else { (1u64 << nq) - 1 }),
             poked: AtomicBool::new(false),
             stop: AtomicBool::new(false),
@@ -188,6 +215,7 @@ impl<H: QueueHandler> Worker<H> {
 
     pub fn kick(&self, q: u16) {
         if q < 64 {
+            self.shared.sig.pending();
             self.shared.sig.kicks.fetch_or(1 << q, Ordering::AcqRel);
             let _ = self.waker.wake();
         }
@@ -287,6 +315,7 @@ fn run<H: QueueHandler>(mut poll: Poll, s: Arc<Shared<H>>) {
         if s.sig.stop.load(Ordering::Acquire) {
             let mut g = s.inner.lock().unwrap_or_else(|e| e.into_inner());
             g.handler.deregister(poll.registry());
+            s.sig.handled(s.sig.outstanding.swap(0, Ordering::AcqRel));
             return;
         }
         let mut g = s.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -301,6 +330,7 @@ fn run<H: QueueHandler>(mut poll: Poll, s: Arc<Shared<H>>) {
             was_paused = true;
             continue;
         }
+        let taken = s.sig.outstanding.swap(0, Ordering::AcqRel);
         if s.sig.poked.swap(false, Ordering::AcqRel) {
             inner.handler.backend_ready(&mut inner.ctx, POKE_TOKEN);
         }
@@ -324,6 +354,7 @@ fn run<H: QueueHandler>(mut poll: Poll, s: Arc<Shared<H>>) {
             inner.handler.tick(&mut inner.ctx);
         }
         inner.ctx.flush();
+        s.sig.handled(taken);
     }
 }
 

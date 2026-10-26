@@ -299,6 +299,7 @@ impl HvfVcpu {
 
     /// Take the VM-wide counter offset the idle skip moved.
     fn follow_clock(&mut self) -> Result<()> {
+        self.idle.take_rebase(&self.vtimer_offset);
         let epoch = self.idle.epoch();
         if epoch != self.clock_epoch {
             self.apply_vm_clock()?;
@@ -662,6 +663,7 @@ impl HvfVcpu {
             if self.kicker.take_kick() {
                 return Ok(VcpuExit::Kicked);
             }
+            self.follow_clock()?;
             self.sync_vtimer()?;
             // SAFETY: own vcpu, own thread.
             check("hv_vcpu_run", unsafe { ffi::hv_vcpu_run(self.id) })?;

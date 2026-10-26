@@ -996,6 +996,10 @@ pub(crate) fn build(
         events,
         peers: OnceLock::new(),
         device_exits: std::sync::atomic::AtomicU64::new(0),
+        halt_on_stop: Default::default(),
+        halting: Default::default(),
+        parked: Default::default(),
+        halted_at: Default::default(),
     });
     let mut vcpus = Vec::new();
     for i in 0..config.cpus {

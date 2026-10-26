@@ -139,6 +139,7 @@ impl Vmm {
             .vcpus
             .get(cpu)
             .ok_or_else(|| Error::Setup("invalid CPU index".into()))?;
+        self.shared.end_halt();
         v.peer.send(VcpuCmd::Resume)?;
         self.state = RunState::Running;
         Ok(())
@@ -155,6 +156,7 @@ impl Vmm {
         config.enabled = true;
         config.single_step = true;
         self.debug_configure(cpu, config)?;
+        self.shared.end_halt();
         self.vcpus[cpu].peer.send(VcpuCmd::Resume)?;
         self.state = RunState::Running;
         Ok(())

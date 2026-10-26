@@ -164,6 +164,10 @@ pub struct Vmm {
     hotplug: Option<Arc<hotplug::Hotplug>>,
     #[cfg(feature = "research")]
     research_baseline: Option<ResearchBaseline>,
+    /// `research_skip_idle`: the guest clock when the VM paused, put back
+    /// on resume (a fuzzer's stops take no guest time).
+    #[cfg(feature = "research")]
+    research_still_clock: Option<Option<u64>>,
 }
 
 /// Interrupt controller registers as (register, value).
@@ -315,6 +319,8 @@ impl Vmm {
             hotplug: m.hotplug,
             #[cfg(feature = "research")]
             research_baseline: None,
+            #[cfg(feature = "research")]
+            research_still_clock: None,
         };
         vmm.pristine_irqchip = match vmm.vm.save_irqchip() {
             Ok(s) => Some(s),
@@ -368,9 +374,11 @@ impl Vmm {
 
     #[cfg(feature = "research")]
     /// While every vCPU waits for an interrupt, the guest's clock jumps to
-    /// its next timer.
-    pub fn research_skip_idle(&self, on: bool) {
-        self.vm.set_idle_skip(on);
+    /// its next timer; while the VM is paused, it stands still.
+    pub fn research_skip_idle(&mut self, on: bool) {
+        self.vm.set_idle_skip(on.then(|| std::sync::Arc::new(vroom_virtio::worker::busy) as std::sync::Arc<dyn Fn() -> bool + Send + Sync>));
+        self.research_still_clock = on.then_some(None);
+        self.shared.halt_on_stop.store(on, std::sync::atomic::Ordering::SeqCst);
     }
 
     #[cfg(feature = "research")]
@@ -600,6 +608,9 @@ impl Vmm {
             self.vm.restore_irqchip(irqchip)?;
         }
         self.vm.set_clock(baseline.clock);
+        if let Some(still) = &mut self.research_still_clock {
+            *still = None;
+        }
         marks.push(("gic+clock", t0.elapsed()));
         if devices_idle {
             if verify {
@@ -732,6 +743,12 @@ impl Vmm {
         for d in &self.devices {
             d.lock().unwrap_or_else(|e| e.into_inner()).pause();
         }
+        #[cfg(feature = "research")]
+        if let Some(still) = &mut self.research_still_clock {
+            // A debug stop parked every CPU: the clock from then.
+            let halted = self.shared.halted_at.load(std::sync::atomic::Ordering::SeqCst);
+            *still = Some(if halted != 0 { halted - 1 } else { self.vm.clock() });
+        }
         self.state = RunState::Paused;
         Ok(())
     }
@@ -742,6 +759,11 @@ impl Vmm {
         }
         #[cfg(feature = "research")]
         self.research_devices_ran();
+        #[cfg(feature = "research")]
+        if let Some(clock) = self.research_still_clock.as_mut().and_then(Option::take) {
+            self.vm.set_clock(clock);
+        }
+        self.shared.end_halt();
         for d in &self.devices {
             d.lock().unwrap_or_else(|e| e.into_inner()).resume();
         }

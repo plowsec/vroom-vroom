@@ -198,11 +198,13 @@ pub trait Vm: Send + Sync {
     /// Guest-visible counter (CNTVCT on ARM). One clock for the whole VM.
     fn clock(&self) -> u64;
     /// Make the guest counter continue from `value` (snapshot restore).
-    /// Takes effect on each vCPU at its next state restore.
+    /// Takes effect on each vCPU at its next state restore, or (HVF) the
+    /// next time it enters the guest.
     fn set_clock(&self, value: u64);
-    /// While every vCPU waits for an interrupt, move the guest counter to
-    /// the earliest armed timer rather than wait for it.
-    fn set_idle_skip(&self, _on: bool) {}
+    /// While every vCPU waits for an interrupt and `busy` (devices with
+    /// work in flight) says no, move the guest counter to the earliest
+    /// armed timer rather than wait for it. None: off.
+    fn set_idle_skip(&self, _busy: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>) {}
 
     /// Called once every vCPU exists (KVM initialises its vGIC here).
     fn finalize(&self) -> Result<()> {

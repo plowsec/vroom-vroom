@@ -458,6 +458,9 @@ impl Vm for HvfVm {
     }
 
     fn clock(&self) -> u64 {
+        if let Some(value) = self.idle.pending() {
+            return value;
+        }
         // SAFETY: no preconditions.
         unsafe { ffi::mach_absolute_time() }.wrapping_sub(self.vtimer_offset.load(Ordering::SeqCst))
     }
@@ -466,10 +469,11 @@ impl Vm for HvfVm {
         // SAFETY: no preconditions.
         let now = unsafe { ffi::mach_absolute_time() };
         self.vtimer_offset.store(now.wrapping_sub(value), Ordering::SeqCst);
+        self.idle.rebase(value);
     }
 
-    fn set_idle_skip(&self, on: bool) {
-        self.idle.set(on);
+    fn set_idle_skip(&self, busy: Option<Arc<dyn Fn() -> bool + Send + Sync>>) {
+        self.idle.set(busy);
     }
 
     fn save_irqchip(&self) -> Result<IrqChipState> {
