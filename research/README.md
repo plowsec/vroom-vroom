@@ -22,19 +22,25 @@ called with: [DEMO.md](DEMO.md), which also covers making the snapshot
 
 `hevd/`: HackSys Extreme Vulnerable Driver ([hevd/README.md](hevd/README.md)). Target binaries, snapshots and coverage stay outside the repo.
 
-TUI: `coverage RUN/coverage.json`; `coverage-diff BASE/coverage.json CUR/coverage.json` (same block manifest): new blocks and hit changes per function.
+TUI: `:vroom.coverage path=RUN/coverage.json [baseline=BASE/coverage.json]` (same block manifest), `:pane vroom-coverage`: blocks and hit changes per function.
 
 ## run
 
 ```sh
-research/run.sh /path/to/lab.toml
+research/run.sh /path/to/lab.toml                              # boots paused; angr_tui on the kernel
 research/run.sh /path/to/lab.toml --restore /path/to/snapshot
-research/run.sh /path/to/lab.toml --atui /path/to/run-atui-macos.sh
+research/run.sh /path/to/lab.toml --keep                       # lab outlives angr_tui
+research/run.sh path/to/lab.sock                               # attach a running lab; it keeps running
 research/demo.sh CONFIG SNAPSHOT       # paused Ex callback: DEMO.md
 research/build.sh                        # build + sign
+uv run --project research/tui vroom-atui LAB.toml -- ATUI_OPTIONS
 ```
 
-Requires `uv`. UEFI: QEMU firmware; TPM: swtpm. Nested virtualization off.
+One lab per config: its socket is `~/.cache/vroom-atui/<hash>.sock`; a second
+`run.sh` attaches to it (`--restore`: restores it). From angr_tui:
+`:attach vroom LAB.toml[,restore=SNAPSHOT][,keep]` or `:attach vroom lab.sock[,stop]`.
+
+Requires `uv` and `../angr_tui` (path dependency). UEFI: QEMU firmware; TPM: swtpm. Nested virtualization off.
 Linux: `/dev/kvm` access. HVF snapshots cannot restore on KVM.
 Use a disposable overlay. Separate state directory. Starts paused.
 
@@ -44,7 +50,7 @@ JSON-RPC 2.0, one object per line, owner-only Unix socket. Same protocol as angr
 
 ```sh
 research/build.sh --release                                                # signed: target/research/release/vroom-lab
-research/run.sh LAB.toml --restore SNAPSHOT --agent-socket lab.sock     # beside the TUI
+research/run.sh LAB.toml --restore SNAPSHOT --keep                      # beside the TUI: ~/.cache/vroom-atui/*.sock
 target/research/release/vroom-lab LAB.toml --restore SNAPSHOT --agent-socket lab.sock --daemon   # headless
 kill PID                                                                   # stops the VM, removes the socket
 vroom-rpc --socket lab.sock describe
@@ -106,69 +112,46 @@ vroom("initialize", {"actor": "pentest-llm"})
 
 ## keys
 
+angr_tui with target `vroom` attached ([angr_tui](../../angr_tui) README for its own keys).
+
 | Key | Action |
 |---|---|
-| Enter | Module → functions; callback/function → assembly + C |
-| Enter on register/memory | Prepare edit in command bar |
-| F2 | Toggle execution breakpoint |
-| F3 | Analyze current address |
-| F4 | Kernel + symbols + modules |
-| F5 / F6 / F7 | Run / pause / step into |
-| F8 / Shift+F8 | Step over / out |
-| F9 | Side panels |
-| F10 | Expand Code view |
-| u / U | Address back / forward |
-| x / Ctrl+G | Xrefs / CFG |
-| : / ↑ / ↓ | Command / history |
-| Ctrl+Q | Power off + quit |
-
-Code: assembly left, angr C right. Requires `--atui`.
-Live/File button: paused memory or matching binary. Cached while paused.
-`PARTIAL`: missing pages. `reloc?`: unresolved absolute internal pointers.
+| F5 / F12 | Run / pause |
+| F7 / F8 | Step into / over |
+| F2 | Toggle execution breakpoint (4 slots) |
+| F6 | Code / run view |
+| Ctrl+T | Next target: vroom, angr emulator |
+| F3 / F4 | Modules / processes (Enter: select context) |
+| F10 / F11 | Stack / callback event |
+| Enter on a pane row | Go to its address |
 
 ## commands
 
 ```text
-functions ntoskrnl Ps           prefix filter; Enter opens function
-next / prev                    function pages (200 rows)
-symbols ntdll                   download/cache matching PDB
-x nt!KeBugCheckEx               resolve
-dis nt!KeBugCheckEx             assembly + C
-bp nt!KeBugCheckEx              execution breakpoint; 4 slots
-bc [ADDRESS]                   clear one/all execution breakpoints
-watch ADDRESS 8 w              data watchpoint; r/w/rw; 2 slots
-wc [ADDRESS]                   clear one/all watchpoints
-ps                             processes; Enter selects context
-process 1234                   select PID for memory/symbols
-process                        return to CPU memory context
-peb                            PEB, image path, command line
-modules                        kernel modules
-process 1234                   kernel + selected process modules
-functions ntdll NtCreate        user functions
-bp ntdll!NtCreateFile           process-scoped user breakpoint
-cpu 1                          select CPU registers/stepping
-reg x0 0x1234                  edit CPU register; fp/lr aliases
-reg pc 0xfffff80000001000       edit instruction pointer
-into / over                    step into / over
-out [VL_BYTES]                 step out; optional SVE length
-stack [VL_BYTES]               CPU stack + symbols; optional SVE length
-mem ADDRESS 256                virtual memory + ASCII
-mem-phys ADDRESS 256           physical RAM
-write ADDRESS 41424300          edit virtual memory; hex bytes
-write-phys ADDRESS 41424300     edit physical RAM; hex bytes
-image ntoskrnl                  fetch verified full binary
-image example.sys /path/file    use matching local binary
-dec-file nt!KeGetCurrentIrql    full binary → angr_tui
-dec ADDRESS                    live image → angr_tui; strict
-dec-partial ADDRESS            allow missing pages; labelled
-cfg [SYMBOL]                   function blocks + edges
-xrefs [SYMBOL]                 incoming CFG edges
-back / forward                 address history
-dump ADDRESS 4096              raw memory file in state/exports
-callbacks                      process callback registrations
-event                          Ex/Ex2 arguments at entry
-snapshot [/new/directory]     save the VM (default: its snapshots)
+:pane vroom-callbacks          callbacks; also -peb -faults -traces -snapshots -coverage
+:vroom.cpu cpu=1               registers, stepping, memory on this CPU
+:vroom.process pid=1234        user addresses + modules through this process
+:vroom.process                 back to the CPU's context
+:vroom.discover                kernel + verified PDB
+:vroom.vm.step_out             step out
+:vroom.kernel.resolve name=nt!KeBugCheckEx
+:vroom.kernel.functions prefix=Ps
+:vroom.memory.read_virtual address=0x... length=64
+:vroom.memory.write_virtual address=0x... hex=41424300
+:vroom.memory.dump address=0x... length=4096
+:vroom.debug.tracepoints {"tracepoints": [...]}
+:vroom.debug.faults enable=true
+:vroom.guest.download guest_path=C:\\x.txt
+:vroom.vm.snapshot             (snapshots pane: s save, r restore)
+:vroom.coverage path=RUN/coverage.json baseline=BASE/coverage.json
+:vroom.coverage_blocks function=module!function
+:wp ADDRESS 8 w                data watchpoint (2 slots)
+:bp ADDRESS if CONDITION       condition: angr_tui shell vocabulary (reg, u32, arg)
+:attach vroom LAB.toml / :detach vroom
 ```
+
+Every lab command is `:vroom.<command>` (palette, `:` line, angr_tui's agent socket).
+Modules open for analysis as RVA copies (`kernel.export`); runtime address = base + RVA.
 
 ## semantics
 
@@ -191,15 +174,14 @@ snapshot [/new/directory]     save the VM (default: its snapshots)
 
 32 MiB paused-state page cache. Invalidated before execution and after edits.
 Parsed PDBs cached. Function lookup: `O(log n + page)`.
-Unwind tables cached; binary search. Exports and decompilation reused while paused.
-Function filtering debounced; 200-row pages. Downloads/angr run outside TUI rendering.
+Unwind tables cached; binary search. Module exports reused per boot and process.
 
 ## layout
 
 ```text
 research/kernel/     backend, PE/PDB, process inspection, unwind
 research/hevd/       HEVD ARM64 target notes and coverage audit tools
-research/tui/        Textual, Capstone, optional angr_tui
+research/tui/        angr_tui plugin: target vroom, panes, launcher
 research/tests/      diskless integration checks
 experiments/         ignored local scripts/captures
 *.state/             ignored symbols, exports, VM state

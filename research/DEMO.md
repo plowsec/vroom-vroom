@@ -6,16 +6,11 @@ shows what the callback was called with: the process being created, who
 created it, and the stack that reached it. `experiments/demo-s1.sh` is
 that, with the S1 lab's paths filled in.
 
-The TUI's demo refuses anything else:
-
-```text
-Demo needs a snapshot stopped at a registered Ex callback entry
-```
-
-It means what it says. `start_demo` (`research/tui/vroom_tui/app.py`)
-discovers the kernel, lists the callbacks, reads `PC`, and looks for a
-callback whose `function` **equals** `PC`. No match, no demo. So the
-snapshot has to be made on purpose; this is how.
+angr_tui shows it in three panes: F11 the callback event (the
+arguments), `:pane vroom-callbacks` the registered callbacks with `>` on
+the one whose `function` **equals** `PC`, F10 the stack. No `>`, no demo:
+the event pane then decodes whatever the registers hold. So the snapshot
+has to be made on purpose; this is how.
 
 ## what you need
 
@@ -145,13 +140,12 @@ you see after restoring.
 
 ```sh
 research/demo.sh ~/dev/vroom-s1-lab/s1-clean.toml \
-  ~/dev/vroom-s1-lab/s1-callback-snapshot \
-  --atui /path/to/run-atui-macos.sh
+  ~/dev/vroom-s1-lab/s1-callback-snapshot
 ```
 
 The restore clears breakpoints, so the demo opens on a clean list.
 
-Headless, the same sequence the TUI runs, to check a snapshot without
+Headless, the same sequence the panes run, to check a snapshot without
 driving a terminal UI:
 
 ```sh
@@ -170,7 +164,7 @@ That is the precondition, and it is the only one.
 
 | | |
 |---|---|
-| `Demo needs a snapshot stopped at a registered Ex callback entry` | `PC` is not a callback entry: the snapshot was saved somewhere else. Make it again. |
+| no `>` in the callbacks pane | `PC` is not a callback entry: the snapshot was saved somewhere else. Make it again. |
 | `load kernel symbols first` | `kernel.symbols`, in this lab session. |
 | `the VM is running: vm.pause before ...` | `vm.step` and `vm.resume` return at once and leave the VM running: `events.poll` for the stop before reading anything. `vm.resume` again when done, or the paused guest drops your probes. |
 | `backing file ... is outside the allowed directories` | The overlay's backing file is not beside it. Clone the base into the lab directory. |

@@ -33,12 +33,12 @@ the restored page tables, so a harness survives a new snapshot.
 ## Blocks and IOCTLs (angr)
 
 ```sh
-uv sync --project research/tui --extra angr
-uv run --project research/tui --extra angr python research/fuzz/tools/angr_blocks.py \
+uv sync --project research/tui
+uv run --project research/tui python research/fuzz/tools/angr_blocks.py \
   /path/to/HEVD.sys 0x140001234 \
   --static-base 0x140000000 --runtime-base 0xfffff80612340000 \
   --module HEVD.sys --output research/hevd/blocks.json
-uv run --project research/tui --extra angr python research/fuzz/tools/angr_ioctls.py \
+uv run --project research/tui python research/fuzz/tools/angr_ioctls.py \
   /path/to/HEVD.sys 0x1400870a8 --device-type 0x22 \
   --function-start 0x800 --function-end 0x8ff
 ```
