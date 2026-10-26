@@ -49,6 +49,17 @@ uv run --project research/tui python research/fuzz/tools/angr_ioctls.py \
 - `angr_ioctls`: static literals only (`0x0022201f`, `0x0022203b`,
   `0x0022205b` here); `probe` finds what reaches new blocks.
 
+## Debug
+
+```sh
+research/run.sh LAB.toml --restore SNAPSHOT --binary /path/to/HEVD.sys   # the file over the loaded driver
+research/run.sh work.atui                                               # back at the last :checkpoint
+```
+
+Static addresses show as runtime ones while the lab maps the driver; F2
+there arms the runtime breakpoint. `:checkpoint NAME work.atui` before an
+IOCTL, `:resume` to replay from it.
+
 ## Run
 
 ```sh

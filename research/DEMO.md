@@ -144,6 +144,8 @@ research/demo.sh ~/dev/vroom-s1-lab/s1-clean.toml \
 ```
 
 The restore clears breakpoints, so the demo opens on a clean list.
+angr_tui opens on the module holding `PC`. F11 the event, `:pane
+vroom-callbacks` the `>` row, F10 the stack.
 
 Headless, the same sequence the panes run, to check a snapshot without
 driving a terminal UI:

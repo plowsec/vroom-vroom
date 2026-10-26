@@ -124,6 +124,37 @@ def test_module_images_are_rva_copies(lab):
     assert driver.image() == (path, 0)
 
 
+def test_module_lists_outlive_steps(lab, server):
+    def fetches():
+        return [name for name, _ in server.lab.calls].count('kernel.modules')
+
+    lab.modules()
+    lab.step()
+    assert wait_for(lambda: lab.stops and lab.stops[-1].reason == 'step')
+    lab.modules()
+    assert fetches() == 1
+    lab.resume()
+    lab.pause()
+    lab.modules()
+    assert fetches() == 2
+
+
+def test_a_module_is_the_same_module_at_another_base(tmp_path):
+    from atui.target.modules import identify_image
+
+    from fake_lab import pe_image
+    from vroom_atui.analysis import prepare_rva_image
+
+    identities = []
+    for n, base in enumerate((0xfffff80010000000, 0xfffff80023450000)):
+        exported = tmp_path / f'export-{n}.exe'
+        exported.write_bytes(pe_image(base))
+        path, _ = prepare_rva_image({'path': str(exported), 'missing_page_rvas': [],
+                                     'image': {'base': base, 'size': 0x3000, 'relocation_directory': [0x2000, 12]}})
+        identities.append(identify_image(path, 'driver.sys', 0x3000))
+    assert identities[0] == identities[1] and identities[0].digest
+
+
 def test_restore_clears_the_process_and_re_arms(lab, server):
     lab.select_process(PROCESS['pid'])
     lab.add_breakpoint(KERNEL + 0x40)

@@ -27,10 +27,12 @@ TUI: `:vroom.coverage path=RUN/coverage.json [baseline=BASE/coverage.json]` (sam
 ## run
 
 ```sh
-research/run.sh /path/to/lab.toml                              # boots paused; angr_tui on the kernel
+research/run.sh /path/to/lab.toml                              # boots paused; angr_tui on the module at pc
 research/run.sh /path/to/lab.toml --restore /path/to/snapshot
 research/run.sh /path/to/lab.toml --keep                       # lab outlives angr_tui
 research/run.sh path/to/lab.sock                               # attach a running lab; it keeps running
+research/run.sh path/to/lab.sock --binary driver.sys           # open a file instead, lab attached
+research/run.sh work.atui                                      # resume: re-attach, restore checkpoint, re-arm
 research/demo.sh CONFIG SNAPSHOT       # paused Ex callback: DEMO.md
 research/build.sh                        # build + sign
 uv run --project research/tui vroom-atui LAB.toml -- ATUI_OPTIONS
@@ -39,6 +41,13 @@ uv run --project research/tui vroom-atui LAB.toml -- ATUI_OPTIONS
 One lab per config: its socket is `~/.cache/vroom-atui/<hash>.sock`; a second
 `run.sh` attaches to it (`--restore`: restores it). From angr_tui:
 `:attach vroom LAB.toml[,restore=SNAPSHOT][,keep]` or `:attach vroom lab.sock[,stop]`.
+A lab angr_tui started stops with it, crash or signal included, unless `keep`.
+Without `--binary` the lab must be paused (it starts paused).
+
+Checkpoints: `:checkpoint NAME [work.atui]` = `vm.snapshot NAME` + project save (targets,
+breakpoints and watchpoints as module + offset, view). `:resume` / `run.sh work.atui`
+re-attaches, `vm.restore`s it, re-arms. `:resume here`: no restore; addresses follow
+the modules' current bases.
 
 Requires `uv` and `../angr_tui` (path dependency). UEFI: QEMU firmware; TPM: swtpm. Nested virtualization off.
 Linux: `/dev/kvm` access. HVF snapshots cannot restore on KVM.
@@ -148,6 +157,8 @@ angr_tui with target `vroom` attached ([angr_tui](../../angr_tui) README for its
 :wp ADDRESS 8 w                data watchpoint (2 slots)
 :bp ADDRESS if CONDITION       condition: angr_tui shell vocabulary (reg, u32, arg)
 :attach vroom LAB.toml / :detach vroom
+:checkpoint NAME [work.atui]   lab snapshot + project save
+:resume [here]                 re-attach at the checkpoint (here: as it is)
 ```
 
 Every lab command is `:vroom.<command>` (palette, `:` line, angr_tui's agent socket).

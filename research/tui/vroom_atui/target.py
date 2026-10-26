@@ -52,7 +52,6 @@ class VroomTarget(JsonRpcTarget):
         self.boot = 0
         self.coverage = None
         self._symbols = None
-        self._module_cache = None
         self._images = {}
         super().__init__(str(path), self._binding(), name=name, label=f'vroom {path}', actor='atui', timeout=300)
 
@@ -118,19 +117,19 @@ class VroomTarget(JsonRpcTarget):
             self._symbols = (self.boot, {**kernel, 'symbols': loaded.get('count')})
         return self._symbols[1]
 
-    def modules(self) -> tuple[ModuleInfo, ...]:
-        """Kernel modules, plus the selected process's DLLs."""
-        key = (self.generation, self.boot, (self.process or {}).get('pid'))
-        if self._module_cache is not None and self._module_cache[0] == key:
-            return self._module_cache[1]
+    def _fetch_modules(self) -> tuple[ModuleInfo, ...]:
+        """Kernel modules, plus the selected process's DLLs.
+
+        Kept across steps; a resume, a restore or a process switch (a
+        refresh) fetches them again. Name and size identify a module across
+        boots; its analysis image's header (base cleared) adds the digest.
+        """
         self.symbols()
         rows = list(self.inspect('kernel.modules', cpu=self.cpu))
         if self.process is not None:
             rows += self.inspect('kernel.user_modules', cpu=self.cpu, pid=self.process['pid'])
-        modules = tuple(ModuleInfo(row['name'], row['base'], row['size'],
-                                   image=partial(self.analysis_image, row['base'])) for row in rows)
-        self._module_cache = (key, modules)
-        return modules
+        return tuple(ModuleInfo(row['name'], row['base'], row['size'],
+                                image=partial(self.analysis_image, row['base'])) for row in rows)
 
     def analysis_image(self, base: int):
         """`(path, 0)`: the module exported from memory as an RVA copy."""
@@ -257,9 +256,9 @@ def open_vroom(spec: str, session=None) -> VroomTarget:
     path = Path(path).expanduser()
     if path.suffix == '.toml':
         lab = ensure(path, options.get('restore'), options.get('lab'))
+        owned = (lab.pid is not None and not options.get('keep')) or options.get('stop')
         if owned:
             lab.own()
-        owned = (lab.pid is not None and not options.get('keep')) or options.get('stop')
         socket_path = lab.socket
     else:
         if options.get('restore') or options.get('lab'):
