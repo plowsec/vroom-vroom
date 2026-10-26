@@ -1553,26 +1553,36 @@ impl Engine {
     /// A user-mode target's process (`target_pid`): `registers` with its
     /// page tables; its modules join the symbolizer's on the first call.
     fn target_registers(&mut self, registers: &Registers) -> Result<Option<Registers>> {
-        let Some(pid) = self.harness.target_pid else {
+        if self.harness.target_pid.is_none() {
             return Ok(None);
-        };
+        }
         if self.target_space.is_none() {
-            self.load_symbols(registers)?;
-            let symbols = self.symbols.as_ref().expect("loaded above");
-            let pdb = symbols.kernel_symbols().ok_or_else(|| Error::Invalid("target_pid: no kernel PDB".into()))?;
-            let space = AddressSpace { memory: &self.vm, registers };
-            let process = vroom_kernel::process::list(&space, pdb)
-                .map_err(|e| Error::Invalid(format!("target_pid: processes: {e}")))?
-                .into_iter()
-                .find(|p| p.pid == pid)
-                .ok_or_else(|| Error::Invalid(format!("target_pid {pid} isn't running")))?;
-            let theirs = with_space(registers, process.directory_table);
-            let modules = vroom_kernel::process::modules(&AddressSpace { memory: &self.vm, registers: &theirs }, pdb, &process)
-                .map_err(|e| Error::Invalid(format!("target_pid {pid}: modules: {e}")))?;
-            self.symbols.as_mut().expect("loaded above").add_modules(modules);
-            self.target_space = Some(process.directory_table);
+            self.target_modules(registers)?;
         }
         Ok(self.target_space.map(|root| with_space(registers, root)))
+    }
+
+    /// A user-mode target's process: its page table root, and its modules
+    /// into the symbolizer (again: a DLL it loaded since).
+    fn target_modules(&mut self, registers: &Registers) -> Result<()> {
+        let Some(pid) = self.harness.target_pid else {
+            return Ok(());
+        };
+        self.load_symbols(registers)?;
+        let symbols = self.symbols.as_ref().expect("loaded above");
+        let pdb = symbols.kernel_symbols().ok_or_else(|| Error::Invalid("target_pid: no kernel PDB".into()))?;
+        let space = AddressSpace { memory: &self.vm, registers };
+        let process = vroom_kernel::process::list(&space, pdb)
+            .map_err(|e| Error::Invalid(format!("target_pid: processes: {e}")))?
+            .into_iter()
+            .find(|p| p.pid == pid)
+            .ok_or_else(|| Error::Invalid(format!("target_pid {pid} isn't running")))?;
+        let theirs = with_space(registers, process.directory_table);
+        let modules = vroom_kernel::process::modules(&AddressSpace { memory: &self.vm, registers: &theirs }, pdb, &process)
+            .map_err(|e| Error::Invalid(format!("target_pid {pid}: modules: {e}")))?;
+        self.symbols.as_mut().expect("loaded above").add_modules(modules);
+        self.target_space = Some(process.directory_table);
+        Ok(())
     }
 
     /// The target's code: the image `entry_pc` is in, or the module the
@@ -1663,8 +1673,23 @@ impl Engine {
             _ if internal => BugClass::ExceptionDispatch,
             _ => return Ok(None),
         };
+        if user_target && code == 0xc000_001d {
+            // A DLL probing a system register EL0 can't read (CurrentEL):
+            // its own __except takes it.
+            let space = AddressSpace { memory: &self.vm, registers };
+            let mut word = [0u8; 4];
+            if vroom_kernel::windows::VirtualMemory::read(&space, address, &mut word).is_ok()
+                && is_system_register_read(u32::from_le_bytes(word))
+            {
+                return Ok(None);
+            }
+        }
         self.load_symbols(registers)?;
         let (lo, hi) = self.target_range(registers)?;
+        if user_target && !self.symbols.as_ref().expect("loaded above").in_module(address) {
+            // A DLL the target's process loaded since the snapshot.
+            self.target_modules(registers)?;
+        }
         let space = AddressSpace { memory: &self.vm, registers };
         let symbols = self.symbols.as_mut().expect("loaded above");
         let faulting = symbols.trap_registers(&space, registers.x[2], registers).ok();
@@ -2722,6 +2747,11 @@ fn same_space(a: u64, b: u64) -> bool {
     a & 0x0000_ffff_ffff_f000 == b & 0x0000_ffff_ffff_f000
 }
 
+/// `mrs`: a system register read, an illegal instruction at EL0 for most.
+fn is_system_register_read(instruction: u32) -> bool {
+    instruction & 0xfff0_0000 == 0xd530_0000
+}
+
 /// The first instruction of an AArch64 exception vector entry.
 fn is_exception_vector(pc: u64, vbar: u64) -> bool {
     pc.checked_sub(vbar)
@@ -2980,6 +3010,17 @@ mod tests {
         assert_eq!(brk_instruction(0xf000), 0xd43e_0000u32.to_le_bytes());
         let word = u32::from_le_bytes(brk_instruction(COVERAGE_BRK));
         assert_eq!((word >> 5) & 0xffff, u32::from(COVERAGE_BRK));
+    }
+
+    #[test]
+    fn a_current_el_probe_is_a_system_register_read() {
+        // mrs x16, CurrentEL; mrs x0, tpidr_el0
+        assert!(is_system_register_read(0xd538_4250));
+        assert!(is_system_register_read(0xd53b_d040));
+        // msr CurrentEL-like write, nop, brk
+        assert!(!is_system_register_read(0xd518_4250));
+        assert!(!is_system_register_read(0xd503_201f));
+        assert!(!is_system_register_read(0xd43e_0000));
     }
 
     #[test]
