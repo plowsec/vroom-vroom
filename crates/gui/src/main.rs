@@ -19,6 +19,7 @@ mod library;
 mod mac;
 mod msg;
 mod paths;
+mod relocate;
 mod rootd;
 mod shot;
 mod vm;

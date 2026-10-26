@@ -974,7 +974,7 @@ impl VmConfig {
     }
 
     /// Every host path the file names.
-    fn each_path(&mut self, mut fix: impl FnMut(&mut PathBuf)) {
+    pub fn each_path(&mut self, mut fix: impl FnMut(&mut PathBuf)) {
         match &mut self.boot {
             Boot::Kernel { kernel, initrd, .. } => {
                 fix(kernel);

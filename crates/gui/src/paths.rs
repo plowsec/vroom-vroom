@@ -45,6 +45,16 @@ pub fn log_file(key: &str) -> PathBuf {
     data_dir().join("logs").join(format!("{key}.log"))
 }
 
+/// A VM file moved: its pictures and log go with it to its new key.
+pub fn rekey(old: &str, new: &str) {
+    if old == new {
+        return;
+    }
+    let _ = std::fs::remove_dir_all(thumbs_dir(new));
+    let _ = std::fs::rename(thumbs_dir(old), thumbs_dir(new));
+    let _ = std::fs::rename(log_file(old), log_file(new));
+}
+
 /// Stable short id for a VM file: FNV-1a of its canonical path.
 pub fn key(config: &Path) -> String {
     let p = std::fs::canonicalize(config).unwrap_or_else(|_| config.to_path_buf());

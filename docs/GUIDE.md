@@ -55,7 +55,13 @@ their inputs change; `--no-build` packages what `target/` has.
 ![New VM](img/new-vm.png)
 
 - New VMs: `~/Library/Application Support/vroom/VMs/<name>/` (Linux:
-  `~/.local/share/vroom/VMs/`). "Add existing" leaves the file where it is.
+  `~/.local/share/vroom/VMs/`), or the folder picked with "Change…" in New
+  VM or "Choose folder…" in a VMware import (kept for the next ones).
+  "Open…" (`⌘O`) adds a VM file from anywhere and leaves it where it is.
+- `⋯` → Rename… / Move to… (off or suspended): the file, its `.state`
+  folder and its own folder follow; disk files keep their names, MACs stay
+  the same. Moving needs the VM in a folder of its own; to another disk it
+  copies, then deletes the original.
 - Settings save to the VM file at once, keeping comments. Hand edits show
   up within seconds.
 - Running or suspended: hardware is locked (hover the lock). Network, USB

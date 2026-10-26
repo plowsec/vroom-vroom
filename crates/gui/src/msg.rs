@@ -40,6 +40,8 @@ pub enum Msg {
     /// VMware import: percent done, then the result.
     ImportProgress(u32),
     Imported(Result<PathBuf, String>),
+    /// A VM moved to another disk (its key from before), where its file is now.
+    Moved { key: String, r: Result<PathBuf, String> },
 }
 
 #[derive(Debug, Clone, Copy)]

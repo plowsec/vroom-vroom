@@ -11,6 +11,9 @@ pub struct Library {
     /// "dark", "light", or absent: follow the system.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
+    /// Where new VMs go, if not the app's own VMs folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vm_dir: Option<PathBuf>,
     #[serde(skip)]
     file: PathBuf,
     /// Why the file couldn't be read. Saving then would drop the user's
@@ -50,6 +53,14 @@ impl Library {
         }
         self.vms.push(p);
         true
+    }
+
+    /// A VM file that moved: same place in the list.
+    pub fn replace(&mut self, old: &Path, new: &Path) {
+        match self.vms.iter().position(|v| v == old) {
+            Some(i) => self.vms[i] = new.to_path_buf(),
+            None => self.vms.push(new.to_path_buf()),
+        }
     }
 
     pub fn remove(&mut self, p: &Path) {

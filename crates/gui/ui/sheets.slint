@@ -423,17 +423,42 @@ export component NewVmSheet inherits Rectangle {
                 spacing: 10px;
                 Rectangle {
                     horizontal-stretch: 1;
-                    Text {
-                        width: 100%;
-                        text: root.dest;
-                        font-size: Theme.fs-xs;
-                        font-family: Theme.mono;
-                        color: Theme.text-3;
-                        vertical-alignment: center;
-                        overflow: elide;
+                    border-radius: Theme.r-md;
+                    background: lta.has-hover ? Theme.card-hover : transparent;
+                    lta := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { Bus.act("newvm.location"); }
                     }
                     Tip {
-                        text: "Where the VM's file and disk go";
+                        text: "Where the VM's file and disk go. Click to choose another folder: the next VMs go there too.";
+                    }
+                    HorizontalLayout {
+                        padding-left: 6px;
+                        padding-right: 6px;
+                        spacing: 8px;
+                        Icon {
+                            source: Icons.folder;
+                            width: 15px;
+                            height: 15px;
+                            y: (parent.height - self.height) / 2;
+                            tint: Theme.text-3;
+                        }
+                        Text {
+                            horizontal-stretch: 1;
+                            text: root.dest;
+                            font-size: Theme.fs-xs;
+                            font-family: Theme.mono;
+                            color: Theme.text-3;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                        Text {
+                            text: "Change…";
+                            font-size: Theme.fs-xs;
+                            font-weight: 600;
+                            color: lta.has-hover ? Theme.accent : Theme.text-2;
+                            vertical-alignment: center;
+                        }
                     }
                 }
                 Button {
@@ -552,6 +577,9 @@ export struct ConfirmInfo {
     ok: string,
     danger: bool,
     action: string,
+    // A third button (empty: none) and what it does; the dialog stays.
+    alt: string,
+    alt-action: string,
 }
 
 export component ConfirmDialog inherits Rectangle {
@@ -580,7 +608,12 @@ export component ConfirmDialog inherits Rectangle {
             }
             HorizontalLayout {
                 spacing: 10px;
-                alignment: end;
+                if root.info.alt != "": Button {
+                    text: root.info.alt;
+                    kind: "ghost";
+                    clicked => { Bus.act(root.info.alt-action); }
+                }
+                Rectangle { horizontal-stretch: 1; }
                 Button {
                     text: "Cancel";
                     kind: "ghost";
@@ -590,6 +623,63 @@ export component ConfirmDialog inherits Rectangle {
                     text: root.info.ok;
                     kind: root.info.danger ? "danger" : "primary";
                     clicked => { Bus.act("confirm.ok"); }
+                }
+            }
+        }
+    }
+}
+
+export component RenameDialog inherits Rectangle {
+    in-out property <string> name;
+    in property <string> error;
+    Scrim {
+        dismiss => { Bus.act("rename.cancel"); }
+    }
+    Panel {
+        width: min(440px, root.width - 60px);
+        height: rl.preferred-height;
+        rl := VerticalLayout {
+            padding: 24px;
+            spacing: 14px;
+            Text {
+                text: "Rename";
+                font-size: Theme.fs-xl;
+                font-weight: 700;
+                color: Theme.text;
+            }
+            Text {
+                text: "The VM file, its folder and its saved state take the new name. Its disks keep theirs, and the guest sees the same hardware.";
+                font-size: Theme.fs-md;
+                color: Theme.text-2;
+                wrap: word-wrap;
+            }
+            Field {
+                text: root.name;
+                mono: true;
+                // Return renames (the window's key handler).
+                edited(t) => { root.name = t; }
+                init => {
+                    self.focus-input();
+                    self.select-all();
+                }
+            }
+            if root.error != "": Banner {
+                kind: 3;
+                text: root.error;
+            }
+            HorizontalLayout {
+                spacing: 10px;
+                alignment: end;
+                Button {
+                    text: "Cancel";
+                    kind: "ghost";
+                    clicked => { Bus.act("rename.cancel"); }
+                }
+                Button {
+                    text: "Rename";
+                    kind: "primary";
+                    enabled: root.name != "";
+                    clicked => { Bus.act("rename.ok"); }
                 }
             }
         }

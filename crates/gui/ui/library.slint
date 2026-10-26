@@ -214,12 +214,24 @@ export component Sidebar inherits Rectangle {
             has-icon: true;
             clicked => { Bus.act("newvm"); }
         }
-        Button {
-            text: "Import from VMware";
-            tip: "Copies a VMware Fusion VM's disks into a new VM. VMware's copy is only read.";
-            kind: "ghost";
-            small: true;
-            clicked => { Bus.act("vmware"); }
+        HorizontalLayout {
+            spacing: 6px;
+            Button {
+                horizontal-stretch: 1;
+                text: "Open…";
+                tip: "Add a VM file that isn't in the list (⌘O)";
+                kind: "ghost";
+                small: true;
+                clicked => { Bus.act("import"); }
+            }
+            Button {
+                horizontal-stretch: 1;
+                text: "From VMware";
+                tip: "Copies a VMware Fusion VM's disks into a new VM. VMware's copy is only read.";
+                kind: "ghost";
+                small: true;
+                clicked => { Bus.act("vmware"); }
+            }
         }
         Text {
             text: root.host.free;
@@ -756,6 +768,8 @@ export component VmPage inherits Rectangle {
             { icon: Icons.file, text: "Open config file", action: "edit-file" },
             { icon: Icons.reveal, text: "Show in Finder", action: "reveal" },
             { icon: Icons.terminal, text: "Show log", action: "log" },
+            { icon: Icons.pencil, text: "Rename…", action: "rename" },
+            { icon: Icons.folder, text: "Move to…", action: "move" },
             { icon: Icons.broom, text: "Clean up snapshot layers", action: "prune" },
             { icon: Icons.history, text: "Discard saved state", action: "discard", danger: true },
             { icon: Icons.trash, text: "Remove from list", action: "remove", danger: true },
@@ -805,7 +819,7 @@ export component EmptyState inherits Rectangle {
             }
             Button {
                 text: "Open";
-                tip: "Add a VM file you already have";
+                tip: "Add a VM file you already have (⌘O)";
                 icon: Icons.file;
                 has-icon: true;
                 clicked => { Bus.act("import"); }

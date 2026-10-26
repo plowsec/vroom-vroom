@@ -19,6 +19,7 @@ use vroom_config::{Boot, DiskBus, DiskSync, GuestOs, Gpu, NetKind, OpenglHost, S
 use crate::edit;
 use crate::library::Library;
 use crate::msg::{self, Msg, PaletteKey};
+use crate::relocate;
 use crate::vm::{self, DiskState, Vm};
 use crate::*;
 
@@ -65,6 +66,10 @@ pub struct App {
     vmware: Option<vroom_import::Plan>,
     /// The progress toast of the import that's running.
     import_toast: Option<i32>,
+    /// The VM (key) the rename dialog is for.
+    renaming: Option<String>,
+    /// The VM (key) being copied to another disk, and its toast.
+    moving: Option<(String, i32)>,
     last_settings: Option<VmSettings>,
     /// Host USB devices as listed when "Add device" was pressed, and
     /// whether that list is open.
@@ -131,6 +136,10 @@ fn wire(ui: &AppWindow) {
                         return EventResult::PreventDefault;
                     }
                 }
+                if ui.get_rename_open() && matches!(code, KeyCode::Enter | KeyCode::NumpadEnter) {
+                    msg::send(Msg::Act("rename.ok".into()));
+                    return EventResult::Propagate;
+                }
                 match code {
                     KeyCode::KeyK if cmd => {
                         msg::send(Msg::Act("palette".into()));
@@ -140,9 +149,15 @@ fn wire(ui: &AppWindow) {
                         msg::send(Msg::Act("newvm".into()));
                         return EventResult::PreventDefault;
                     }
+                    KeyCode::KeyO if cmd => {
+                        msg::send(Msg::Act("import".into()));
+                        return EventResult::PreventDefault;
+                    }
                     KeyCode::Escape => {
                         if ui.get_newvm_open() {
                             msg::send(Msg::Act("newvm.cancel".into()));
+                        } else if ui.get_rename_open() {
+                            msg::send(Msg::Act("rename.cancel".into()));
                         } else if ui.get_confirm_open() {
                             msg::send(Msg::Act("confirm.cancel".into()));
                         }
@@ -199,6 +214,8 @@ impl App {
             installer: None,
             vmware: None,
             import_toast: None,
+            renaming: None,
+            moving: None,
             last_settings: None,
             usb_host: Vec::new(),
             usb_picking: false,
@@ -317,6 +334,20 @@ impl App {
                         self.toast("Imported. Check the notes in the guide before the first start (Windows needs the tools).", 1);
                     }
                     Err(e) => self.toast(format!("Import failed: {e}"), 3),
+                }
+            }
+            Msg::Moved { key, r } => {
+                if let Some((_, id)) = self.moving.take() {
+                    self.toasts.retain(|t| t.toast.id != id);
+                    self.push_toasts();
+                }
+                match (r, self.vms.iter().position(|v| v.key == key)) {
+                    (Ok(p), Some(i)) => {
+                        self.relocated(i, &p);
+                        self.toast(format!("Moved to {}", paths::tilde(p.parent().unwrap_or(&p))), 1);
+                    }
+                    (Ok(p), None) => self.add_vm(&p),
+                    (Err(e), _) => self.toast(e, 3),
                 }
             }
             Msg::NewVmProgress(t) => self.ui.set_newvm_progress(s(t)),
@@ -1247,6 +1278,11 @@ impl App {
                 }
             }
             "newvm.clear-installer" => self.set_installer(None),
+            "newvm.location" => {
+                if self.pick_location() {
+                    self.set_installer(self.installer.clone());
+                }
+            }
             "newvm.create" => self.newvm_create(),
             "vmware" => {
                 let mut d = rfd::FileDialog::new().set_title("Import from VMware").add_filter("VMware VM", &["vmwarevm", "vmx"]);
@@ -1261,6 +1297,11 @@ impl App {
                 }
             }
             "do.vmware" => self.vmware_run(),
+            "vmware.location" => {
+                if self.pick_location() {
+                    self.vmware_ask();
+                }
+            }
             // vroom-netd, the root helper (bridged, host-only, USB devices
             // macOS holds).
             "netd.setup" => self.netd(true),
@@ -1273,8 +1314,31 @@ impl App {
             ),
             "do.netd.remove" => self.netd(false),
             "import" => {
-                if let Some(p) = rfd::FileDialog::new().set_title("Add a VM file").add_filter("VM file", &["toml"]).pick_file() {
+                if let Some(p) = rfd::FileDialog::new().set_title("Open a VM").add_filter("VM file", &["toml"]).set_directory(self.vm_dir()).pick_file() {
                     self.import(&p);
+                }
+            }
+            "rename" => {
+                if let Some((key, name)) = self.cur().filter(|v| self.still(v)).map(|v| (v.key.clone(), v.name())) {
+                    self.renaming = Some(key);
+                    self.ui.set_rename_name(s(name));
+                    self.ui.set_rename_error(s(""));
+                    self.ui.set_rename_open(true);
+                }
+            }
+            "rename.cancel" => {
+                self.renaming = None;
+                self.ui.set_rename_open(false);
+            }
+            "rename.ok" => self.rename_vm(),
+            "move" => {
+                let Some(v) = self.cur().filter(|v| self.still(v)) else { return };
+                let mut d = rfd::FileDialog::new().set_title(format!("Move {} to", v.name()));
+                if let Some(p) = v.path.parent().and_then(Path::parent) {
+                    d = d.set_directory(p);
+                }
+                if let Some(to) = d.pick_folder() {
+                    self.move_vm(&to);
                 }
             }
             "theme" => {
@@ -1495,35 +1559,49 @@ impl App {
         match vroom_import::plan(p) {
             Err(e) => self.toast(e.to_string(), 3),
             Ok(plan) => {
-                let disks = plan.disks.iter().filter(|d| !d.cdrom).count();
-                let mut text = format!(
-                    "{} CPUs, {} GB, {} disk{} to copy into {}. VMware's copy is only read.",
-                    plan.cpus,
-                    plan.memory_mib.div_ceil(1024),
-                    disks,
-                    if disks == 1 { "" } else { "s" },
-                    paths::tilde(&paths::vms_dir())
-                );
-                for n in &plan.notes {
-                    text += "\n\n";
-                    text += n;
-                }
-                let title = format!("Import {}?", plan.name);
-                let (ok, danger) = if plan.suspended { ("Import anyway", true) } else { ("Import", false) };
                 self.vmware = Some(plan);
-                self.confirm = Some((String::new(), "do.vmware".into()));
-                self.ui.set_confirm(ConfirmInfo { title: s(title), text: s(text), ok: s(ok), danger, action: s("do.vmware") });
-                self.ui.set_confirm_open(true);
+                self.vmware_ask();
             }
         }
     }
 
+    /// The import's dialog, with where it goes (which can change there).
+    fn vmware_ask(&mut self) {
+        let Some(plan) = &self.vmware else { return };
+        let disks = plan.disks.iter().filter(|d| !d.cdrom).count();
+        let mut text = format!(
+            "{} CPUs, {} GB, {} disk{} to copy into {}. VMware's copy is only read.",
+            plan.cpus,
+            plan.memory_mib.div_ceil(1024),
+            disks,
+            if disks == 1 { "" } else { "s" },
+            paths::tilde(&self.vm_dir())
+        );
+        for n in &plan.notes {
+            text += "\n\n";
+            text += n;
+        }
+        let title = format!("Import {}?", plan.name);
+        let (ok, danger) = if plan.suspended { ("Import anyway", true) } else { ("Import", false) };
+        self.confirm = Some((String::new(), "do.vmware".into()));
+        self.ui.set_confirm(ConfirmInfo {
+            title: s(title),
+            text: s(text),
+            ok: s(ok),
+            danger,
+            action: s("do.vmware"),
+            alt: s("Choose folder…"),
+            alt_action: s("vmware.location"),
+        });
+        self.ui.set_confirm_open(true);
+    }
+
     fn vmware_run(&mut self) {
         let Some(plan) = self.vmware.take() else { return };
-        let opts = vroom_import::Options { name: Some(self.unique_name(&plan.name)), keep_hardware_ids: false, accept_suspended: true };
+        let dir = self.vm_dir();
+        let opts = vroom_import::Options { name: Some(self.unique_name(&dir, &plan.name)), keep_hardware_ids: false, accept_suspended: true };
         self.update(Msg::Toast { text: "Importing from VMware: 0%".into(), kind: 0, action: String::new() });
         self.import_toast = self.toasts.last().map(|t| t.toast.id);
-        let dir = paths::vms_dir();
         std::thread::spawn(move || {
             let _ = std::fs::create_dir_all(&dir);
             let mut last = 0u32;
@@ -1543,12 +1621,15 @@ impl App {
     fn ask(&mut self, title: &str, text: &str, ok: &str, danger: bool, action: &str) {
         let key = self.cur().map(|v| v.key.clone()).unwrap_or_default();
         self.confirm = Some((key, action.to_string()));
-        self.ui.set_confirm(ConfirmInfo { title: s(title), text: s(text), ok: s(ok), danger, action: s(action) });
+        self.ui.set_confirm(ConfirmInfo { title: s(title), text: s(text), ok: s(ok), danger, action: s(action), ..Default::default() });
         self.ui.set_confirm_open(true);
     }
 
     fn start_current(&mut self, extra: &[String]) {
         let Some(v) = self.cur() else { return };
+        if self.moving.as_ref().is_some_and(|(k, _)| *k == v.key) {
+            return self.toast("It's being moved: it can start once that's done.", 0);
+        }
         let st = self.state_of(v);
         if console::is_running(&v.key) {
             return console::show(&v.key);
@@ -1755,6 +1836,92 @@ impl App {
         removed || self.vms.len() != before
     }
 
+    /// Not running (suspended is fine) nor being moved: its files can
+    /// change places. Says why not.
+    fn still(&self, v: &Vm) -> bool {
+        let why = if self.moving.as_ref().is_some_and(|(k, _)| *k == v.key) {
+            "It's being moved already."
+        } else if console::is_running(&v.key) || !matches!(self.state_of(v), VmState::Off | VmState::Suspended) {
+            "Shut it down (or suspend it) first."
+        } else if vroom_state::StateLock::in_use(&v.state_dir()) {
+            "It's running from somewhere else. Shut it down there first."
+        } else {
+            return true;
+        };
+        msg::toast(why, 2);
+        false
+    }
+
+    fn rename_vm(&mut self) {
+        let Some(i) = self.renaming.as_ref().and_then(|k| self.vms.iter().position(|v| v.key == *k)) else {
+            return self.act("rename.cancel");
+        };
+        let name = self.ui.get_rename_name().trim().to_string();
+        if self.vms.iter().enumerate().any(|(j, v)| j != i && v.name() == name) {
+            return self.ui.set_rename_error(s("There's already a VM with that name."));
+        }
+        if !self.still(&self.vms[i]) {
+            return;
+        }
+        match relocate::rename(&self.vms[i].path, &name) {
+            Ok(p) => {
+                self.renaming = None;
+                self.ui.set_rename_open(false);
+                self.relocated(i, &p);
+            }
+            Err(e) => self.ui.set_rename_error(s(e)),
+        }
+    }
+
+    /// Move the current VM's folder into `to`: at once on the same disk,
+    /// else copied in the background.
+    fn move_vm(&mut self, to: &Path) {
+        let Some(i) = self.current else { return };
+        let m = match relocate::plan_move(&self.vms[i].path, to) {
+            Ok(m) => m,
+            Err(e) => return self.toast(e, 3),
+        };
+        if m.same_disk() {
+            match m.run() {
+                Ok(p) => {
+                    self.relocated(i, &p);
+                    self.toast(format!("Moved to {}", paths::tilde(p.parent().unwrap_or(&p))), 1);
+                }
+                Err(e) => self.toast(e, 3),
+            }
+            return;
+        }
+        let (key, name) = (self.vms[i].key.clone(), self.vms[i].name());
+        self.toast(format!("Moving {name} to {}…", paths::tilde(to)), 0);
+        let Some(t) = self.toasts.last_mut() else { return };
+        // Up until it's done, however long the copy takes.
+        t.until = Instant::now() + Duration::from_secs(24 * 3600);
+        self.moving = Some((key.clone(), t.toast.id));
+        std::thread::spawn(move || {
+            let r = m.run();
+            msg::post(move || Msg::Moved { key, r });
+        });
+    }
+
+    /// VM `i`'s file is at `p` now (renamed, moved): the list, its
+    /// pictures and log follow.
+    fn relocated(&mut self, i: usize, p: &Path) {
+        let p = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let (old, old_key) = (self.vms[i].path.clone(), self.vms[i].key.clone());
+        if p != old {
+            paths::rekey(&old_key, &paths::key(&p));
+            self.live_thumbs.remove(&old_key);
+            self.lib.replace(&old, &p);
+            if let Err(e) = self.lib.save() {
+                self.toast(format!("Couldn't save the list: {e}"), 3);
+            }
+        }
+        self.vms[i] = Vm::open(&p);
+        self.current = Some(i);
+        self.last_settings = None;
+        self.push_all();
+    }
+
     fn add_vm(&mut self, p: &Path) {
         let p = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
         if let Some(i) = self.vms.iter().position(|v| v.path == p) {
@@ -1803,8 +1970,29 @@ impl App {
 
     // ---- New VM ----
 
-    fn unique_name(&self, base: &str) -> String {
-        let taken = |n: &str| self.vms.iter().any(|v| v.name() == n) || paths::vms_dir().join(n).exists();
+    /// Where new VMs go: the folder picked last, if it's there (a disk
+    /// that isn't plugged in), else the app's own.
+    fn vm_dir(&self) -> PathBuf {
+        self.lib.vm_dir.clone().filter(|d| d.is_dir()).unwrap_or_else(paths::vms_dir)
+    }
+
+    /// Ask where new VMs go; remembered for the next ones. False if
+    /// cancelled.
+    fn pick_location(&mut self) -> bool {
+        let start = self.vm_dir();
+        let d = rfd::FileDialog::new().set_title("Where new VMs go").set_directory(if start.is_dir() { start } else { paths::data_dir() });
+        let Some(p) = d.pick_folder() else { return false };
+        let p = std::fs::canonicalize(&p).unwrap_or(p);
+        let default = std::fs::canonicalize(paths::vms_dir()).unwrap_or_else(|_| paths::vms_dir());
+        self.lib.vm_dir = (p != default).then_some(p);
+        if let Err(e) = self.lib.save() {
+            self.toast(format!("Couldn't save the list: {e}"), 3);
+        }
+        true
+    }
+
+    fn unique_name(&self, dir: &Path, base: &str) -> String {
+        let taken = |n: &str| self.vms.iter().any(|v| v.name() == n) || dir.join(n).exists();
         if !taken(base) {
             return base.to_string();
         }
@@ -1857,7 +2045,7 @@ impl App {
             GuestOs::Windows => "win11",
             o => os_id(o),
         };
-        let name = self.unique_name(base);
+        let name = self.unique_name(&self.vm_dir(), base);
         let t = Template::defaults(&name, os, "");
         let mut d = self.ui.get_draft();
         d.os_index = os_index(os);
@@ -1881,7 +2069,7 @@ impl App {
         d.ready = ready_kind(GuestOs::ALL.get(d.os_index.max(0) as usize).copied().unwrap_or(GuestOs::Linux), p.as_deref()).is_some();
         self.installer = p;
         self.ui.set_draft(d.clone());
-        self.ui.set_newvm_dest(s(format!("Goes in {}", paths::tilde(&paths::vms_dir().join(d.name.as_str())))));
+        self.ui.set_newvm_dest(s(paths::tilde(&self.vm_dir().join(d.name.as_str()))));
     }
 
     fn newvm_create(&mut self) {
@@ -1901,8 +2089,9 @@ impl App {
         let (cpus, mem, disk, gpu3d, start) = (d.cpus.max(1) as u32, d.memory_gib.max(1) as u64, d.disk_gib.max(1) as u64, d.gpu3d, d.start);
         self.ui.set_newvm_error(s(""));
         self.ui.set_newvm_creating(true);
+        let dir = self.vm_dir().join(&name);
         std::thread::spawn(move || {
-            let r = create_vm(&name, os, installer.as_deref(), cpus, mem, disk, gpu3d);
+            let r = create_vm(&dir, &name, os, installer.as_deref(), cpus, mem, disk, gpu3d);
             msg::post(move || Msg::Created(r, start));
         });
     }
@@ -1927,7 +2116,7 @@ impl App {
         let taken_ports: Vec<u16> = self.vms.iter().filter_map(|v| v.raw.as_ref()).flat_map(|c| c.nets.iter().flat_map(|n| n.port_forwards.iter().map(|f| f.host_port))).collect();
         let spec = Spec {
             name: name.to_string(),
-            dir: paths::vms_dir().join(name),
+            dir: self.vm_dir().join(name),
             cpus: d.cpus.max(1) as u32,
             memory_mib: d.memory_gib.max(1) as u64 * 1024,
             disk_gib: d.disk_gib.max(8) as u64,
@@ -1986,7 +2175,7 @@ impl App {
             }
         }
         all.push(e("New VM".into(), "⌘N", "plus", "newvm".into()));
-        all.push(e("Add a VM file".into(), "", "file", "import".into()));
+        all.push(e("Open a VM file".into(), "⌘O", "file", "import".into()));
         all.push(e("Import from VMware".into(), "", "upload", "vmware".into()));
         // vroom-netd, the root helper: bridged, host-only, USB devices macOS uses.
         match rootd::state() {
@@ -2007,6 +2196,8 @@ impl App {
                 ("Open config file", "file", "edit-file"),
                 ("Show in Finder", "reveal", "reveal"),
                 ("Show log", "terminal", "log"),
+                ("Rename", "pencil", "rename"),
+                ("Move to another folder", "folder", "move"),
                 ("Add a network adapter", "network", "net.add"),
                 ("Share a folder", "folder", "share.add"),
                 ("Attach an ISO", "disc", "disk.add-iso"),
@@ -2302,18 +2493,18 @@ fn reveal(p: &Path) {
     }
 }
 
-/// Write `<vms dir>/<name>/<name>.toml` and its disk.
-fn create_vm(name: &str, os: GuestOs, installer: Option<&Path>, cpus: u32, mem_gib: u64, disk_gib: u64, gpu3d: bool) -> Result<PathBuf, String> {
-    let dir = paths::vms_dir().join(name);
+/// Write `<dir>/<name>.toml` and its disk.
+#[allow(clippy::too_many_arguments)]
+fn create_vm(dir: &Path, name: &str, os: GuestOs, installer: Option<&Path>, cpus: u32, mem_gib: u64, disk_gib: u64, gpu3d: bool) -> Result<PathBuf, String> {
     if dir.exists() {
-        return Err(format!("{} already exists", paths::tilde(&dir)));
+        return Err(format!("{} already exists", paths::tilde(dir)));
     }
     if let Some(i) = installer {
         if !i.is_file() {
             return Err(format!("{}: no such file", paths::tilde(i)));
         }
     }
-    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let disk_file = format!("{name}.qcow2");
     let mut t = Template::defaults(name, os, &disk_file);
     t.installer = installer;
@@ -2324,7 +2515,7 @@ fn create_vm(name: &str, os: GuestOs, installer: Option<&Path>, cpus: u32, mem_g
     let text = t.render();
     VmConfig::from_toml(&text).map_err(|e| format!("template: {e}"))?;
     let undo = |e: String| {
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(dir);
         e
     };
     std::fs::write(&cfg, text).map_err(|e| undo(e.to_string()))?;
@@ -2388,6 +2579,34 @@ mod tests {
         act(&mut a, "confirm.ok");
         assert_eq!(names(&a), ["b"]);
         assert_eq!(a.ui.get_settings().name, "b");
+    }
+
+    #[test]
+    fn rename_keeps_its_place_in_the_list() {
+        let (t, mut a) = app(&["a", "b"]);
+        a.update(Msg::Select(0));
+        act(&mut a, "rename");
+        assert!(a.ui.get_rename_open());
+        a.ui.set_rename_name(s("b"));
+        act(&mut a, "rename.ok");
+        assert!(a.ui.get_rename_open() && !a.ui.get_rename_error().is_empty(), "b is taken");
+        a.ui.set_rename_name(s("web"));
+        act(&mut a, "rename.ok");
+        assert!(!a.ui.get_rename_open());
+        assert_eq!(names(&a), ["web", "b"]);
+        assert_eq!(a.current, Some(0));
+        assert!(a.vms[0].path.ends_with("web.toml") && !t.path().join("a.toml").exists());
+        assert_eq!(Library::load(&paths::library_file()).vms[0], a.vms[0].path);
+    }
+
+    #[test]
+    fn new_vms_go_where_they_were_put_last() {
+        let (t, mut a) = app(&[]);
+        assert_eq!(a.vm_dir(), paths::vms_dir());
+        a.lib.vm_dir = Some(t.path().join("unplugged"));
+        assert_eq!(a.vm_dir(), paths::vms_dir(), "a disk that isn't there");
+        a.lib.vm_dir = Some(t.path().to_path_buf());
+        assert_eq!(a.vm_dir(), t.path());
     }
 
     #[test]

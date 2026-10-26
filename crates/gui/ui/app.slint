@@ -5,7 +5,7 @@ import { Icons } from "icons.slint";
 import { Bus } from "bus.slint";
 import { VmItem, VmState, VmSettings, SnapRow, CardVis, HostInfo, Toast, PaletteItem, NewVm } from "types.slint";
 import { Sidebar, VmPage, EmptyState, States } from "library.slint";
-import { NewVmSheet, CommandPalette, ConfirmDialog, ConfirmInfo, Toasts } from "sheets.slint";
+import { NewVmSheet, CommandPalette, ConfirmDialog, ConfirmInfo, RenameDialog, Toasts } from "sheets.slint";
 import { Icon, Tips } from "controls.slint";
 import { ConsoleWindow, MonitorWindow } from "console.slint";
 import { CoherenceWindow, CoherenceBar, CohApp, CohChip } from "coherence.slint";
@@ -36,6 +36,10 @@ export component AppWindow inherits Window {
 
     in-out property <bool> confirm-open;
     in property <ConfirmInfo> confirm;
+
+    in-out property <bool> rename-open;
+    in-out property <string> rename-name;
+    in property <string> rename-error;
 
     in property <[Toast]> toasts;
     in property <bool> drop-hover;
@@ -129,5 +133,9 @@ export component AppWindow inherits Window {
     }
     if root.confirm-open: ConfirmDialog {
         info: root.confirm;
+    }
+    if root.rename-open: RenameDialog {
+        name <=> root.rename-name;
+        error: root.rename-error;
     }
 }
