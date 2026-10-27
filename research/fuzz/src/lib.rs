@@ -1666,12 +1666,26 @@ impl Engine {
                 Ok(registers) => {
                     let el = (registers.pstate >> 2) & 3;
                     let frames: Vec<String> = self.stack_of(&registers).into_iter().take(6).collect();
-                    format!("cpu{cpu} pc {:#x} EL{el} [{}]", registers.pc, frames.join(" < "))
+                    let process = self.process_of(&registers).unwrap_or_else(|| "?".into());
+                    format!("cpu{cpu} pc {:#x} EL{el} {process} [{}]", registers.pc, frames.join(" < "))
                 }
                 Err(e) => format!("cpu{cpu} ({e})"),
             });
         }
         parts.join("; ")
+    }
+
+    /// The process whose page tables `registers` use (name:pid), from the
+    /// kernel's process list.
+    fn process_of(&mut self, registers: &Registers) -> Option<String> {
+        self.load_symbols(registers).ok()?;
+        let pdb = self.symbols.as_ref()?.kernel_symbols()?;
+        let space = AddressSpace { memory: &self.vm, registers };
+        let processes = vroom_kernel::process::list(&space, pdb).ok()?;
+        processes
+            .iter()
+            .find(|p| same_space(p.directory_table, registers.ttbr0))
+            .map(|p| format!("{}:{}", p.name, p.pid))
     }
 
     fn stack_of(&mut self, registers: &Registers) -> Vec<String> {
