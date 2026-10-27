@@ -3,7 +3,10 @@ name = "vroom-atui"
 version = "0.1.0"
 description = "vroom-lab as an angr_tui target: live Windows ARM64 kernel debugging"
 requires-python = ">=3.12"
-dependencies = ["angr-tui", "bitstring<5"]
+dependencies = [
+    "angr-tui @ git+ssh://git@github.com/plowsec/angr_tui.git@3180dd5e034df66d1f20b2e58bb6724dff60a4e8",
+    "bitstring<5",
+]
 
 [project.entry-points."atui.plugins"]
 vroom = "vroom_atui:PLUGIN"
@@ -11,8 +14,8 @@ vroom = "vroom_atui:PLUGIN"
 [project.scripts]
 vroom-atui = "vroom_atui.launch:main"
 
-[tool.uv.sources]
-angr-tui = { path = "../../../angr_tui", editable = true }
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [build-system]
 requires = ["hatchling"]

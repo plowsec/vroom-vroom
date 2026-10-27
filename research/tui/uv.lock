@@ -60,7 +60,7 @@ wheels = [
 [[package]]
 name = "angr-tui"
 version = "0.1.0"
-source = { editable = "../../../angr_tui" }
+source = { git = "ssh://git@github.com/plowsec/angr_tui.git?rev=3180dd5e034df66d1f20b2e58bb6724dff60a4e8#3180dd5e034df66d1f20b2e58bb6724dff60a4e8" }
 dependencies = [
     { name = "angr", extra = ["unicorn"] },
     { name = "anthropic" },
@@ -69,24 +69,6 @@ dependencies = [
     { name = "pyelftools" },
     { name = "pyperclip" },
     { name = "textual" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "angr", extras = ["unicorn"], specifier = "==10.0.4.post1" },
-    { name = "anthropic", specifier = ">=0.117.0" },
-    { name = "capstone" },
-    { name = "psutil", specifier = ">=7.2.2" },
-    { name = "pyelftools" },
-    { name = "pyperclip", specifier = ">=1.11.0" },
-    { name = "textual", specifier = ">=0.80" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "pytest" },
-    { name = "pytest-asyncio", specifier = ">=1.4.0" },
-    { name = "textual-dev" },
 ]
 
 [[package]]
@@ -1382,7 +1364,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "angr-tui", editable = "../../../angr_tui" },
+    { name = "angr-tui", git = "ssh://git@github.com/plowsec/angr_tui.git?rev=3180dd5e034df66d1f20b2e58bb6724dff60a4e8" },
     { name = "bitstring", specifier = "<5" },
 ]
 

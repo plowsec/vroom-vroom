@@ -49,7 +49,7 @@ breakpoints and watchpoints as module + offset, view). `:resume` / `run.sh work.
 re-attaches, `vm.restore`s it, re-arms. `:resume here`: no restore; addresses follow
 the modules' current bases.
 
-Requires `uv` and `../angr_tui` (path dependency). UEFI: QEMU firmware; TPM: swtpm. Nested virtualization off.
+Requires `uv` and SSH access to `plowsec/angr_tui` (pinned commit). UEFI: QEMU firmware; TPM: swtpm. Nested virtualization off.
 Linux: `/dev/kvm` access. HVF snapshots cannot restore on KVM.
 Use a disposable overlay. Separate state directory. Starts paused.
 
@@ -121,7 +121,7 @@ vroom("initialize", {"actor": "pentest-llm"})
 
 ## keys
 
-angr_tui with target `vroom` attached ([angr_tui](../../angr_tui) README for its own keys).
+angr_tui with target `vroom` attached ([angr_tui](https://github.com/plowsec/angr_tui) README for its own keys).
 
 | Key | Action |
 |---|---|
