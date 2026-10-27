@@ -18,6 +18,8 @@ pub(super) struct IdleSkip {
     state: Mutex<Waiting>,
     rebasing: AtomicBool,
     rebase: Mutex<Option<u64>>,
+    /// Jumps made (diagnostics).
+    jumps: AtomicU64,
 }
 
 #[derive(Default)]
@@ -114,12 +116,29 @@ impl IdleSkip {
             return;
         }
         offset.store(off.wrapping_sub(earliest - now), Ordering::SeqCst);
+        self.jumps.fetch_add(1, Ordering::Relaxed);
         self.moved();
         for (i, k) in s.kickers.iter().enumerate() {
             if i != index as usize {
                 k.wake();
             }
         }
+    }
+
+    /// What it sees now; None while off.
+    pub(super) fn state(&self) -> Option<crate::IdleSkipState> {
+        if !self.on() {
+            return None;
+        }
+        let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Some(crate::IdleSkipState {
+            waiting: s.waiting.clone(),
+            cpus: s.kickers.len(),
+            busy: s.busy.as_ref().is_some_and(|busy| busy()),
+            moves: self.epoch(),
+            jumps: self.jumps.load(Ordering::Relaxed),
+            rebase_pending: self.rebasing.load(Ordering::Acquire),
+        })
     }
 
     pub(super) fn leave(&self, index: u32) {

@@ -505,6 +505,14 @@ impl Vm for HvfVm {
         self.idle.set(busy);
     }
 
+    fn clock_ns(&self, ticks: u64) -> u64 {
+        ffi::ticks_to_ns(ticks)
+    }
+
+    fn idle_skip_state(&self) -> Option<crate::IdleSkipState> {
+        self.idle.state()
+    }
+
     fn save_irqchip(&self) -> Result<IrqChipState> {
         // SAFETY: constructor; owned.
         let st = ffi::OsObject(unsafe { ffi::hv_gic_state_create() });

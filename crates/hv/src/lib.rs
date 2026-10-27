@@ -104,6 +104,23 @@ pub trait Hypervisor: Send + Sync {
 }
 
 /// A VM: address space + interrupt controller. Shared by all vCPU threads.
+/// What the idle skip sees (see [`Vm::set_idle_skip`]).
+#[derive(Debug, Clone, Default)]
+pub struct IdleSkipState {
+    /// vCPUs in WFI, with their timer's compare value if armed.
+    pub waiting: Vec<(u32, Option<u64>)>,
+    /// vCPUs in all.
+    pub cpus: usize,
+    /// Devices have work in flight (no jump).
+    pub busy: bool,
+    /// Times the VM-wide counter offset moved (jumps and rebases).
+    pub moves: u64,
+    /// Jumps alone.
+    pub jumps: u64,
+    /// A rebase waits for a vCPU to enter the guest.
+    pub rebase_pending: bool,
+}
+
 pub trait Vm: Send + Sync {
     /// Map all guest RAM. The VM keeps a clone so the backing outlives the mapping.
     fn map_memory(&self, mem: &GuestMemory) -> Result<()>;
@@ -205,10 +222,18 @@ pub trait Vm: Send + Sync {
     /// Takes effect on each vCPU at its next state restore, or (HVF) the
     /// next time it enters the guest.
     fn set_clock(&self, value: u64);
+    /// Nanoseconds in `ticks` of [`Vm::clock`].
+    fn clock_ns(&self, ticks: u64) -> u64 {
+        ticks
+    }
     /// While every vCPU waits for an interrupt and `busy` (devices with
     /// work in flight) says no, move the guest counter to the earliest
     /// armed timer rather than wait for it. None: off.
     fn set_idle_skip(&self, _busy: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>) {}
+    /// The idle skip right now (diagnostics); None while it is off.
+    fn idle_skip_state(&self) -> Option<IdleSkipState> {
+        None
+    }
 
     /// Called once every vCPU exists (KVM initialises its vGIC here).
     fn finalize(&self) -> Result<()> {

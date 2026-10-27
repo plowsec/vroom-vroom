@@ -1067,6 +1067,18 @@ impl CorpusStore {
         )?;
         Ok(path)
     }
+
+    /// Every timeout, not only a signature's first: `timeouts/<hash>.bin`
+    /// and its context (`.json`). Their signature is one for all, and
+    /// what tells them apart (where the VM was) is in the context.
+    pub fn save_timeout(&self, finding: &Finding, data: &[u8]) -> Result<PathBuf> {
+        let dir = self.root.join("timeouts");
+        fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{}.bin", Self::hash(data)));
+        fs::write(&path, data)?;
+        fs::write(path.with_extension("json"), serde_json::to_vec_pretty(finding)?)?;
+        Ok(path)
+    }
 }
 
 /// Optional VMM-backed runner. It is deliberately kept in this leaf crate so
@@ -1634,6 +1646,34 @@ impl Engine {
     /// The symbolized call stack of a stopped thread (the VM paused). A
     /// stack that can't be had is one line saying why: a finding stays a
     /// finding.
+    /// A timeout's context (the VM paused): host and guest time the input
+    /// ran, debug stops, the idle skip as it was, and where each CPU is
+    /// (PC, exception level, the innermost frames).
+    fn timeout_context(&mut self, host: Duration, guest_ns: u64, debug_stops: u64, idle: Option<String>) -> String {
+        let mut parts = vec![format!(
+            "host {} ms, guest {} ms, {debug_stops} debug stops",
+            host.as_millis(),
+            guest_ns / 1_000_000
+        )];
+        parts.extend(idle);
+        for cpu in 0..self.vm.cpu_count() {
+            let registers = self
+                .vm
+                .debug_registers(cpu)
+                .map_err(|e| e.to_string())
+                .and_then(|state| Registers::from_state(&state).map_err(|e| e.to_string()));
+            parts.push(match registers {
+                Ok(registers) => {
+                    let el = (registers.pstate >> 2) & 3;
+                    let frames: Vec<String> = self.stack_of(&registers).into_iter().take(6).collect();
+                    format!("cpu{cpu} pc {:#x} EL{el} [{}]", registers.pc, frames.join(" < "))
+                }
+                Err(e) => format!("cpu{cpu} ({e})"),
+            });
+        }
+        parts.join("; ")
+    }
+
     fn stack_of(&mut self, registers: &Registers) -> Vec<String> {
         if let Err(e) = self.load_symbols(registers) {
             return vec![format!("(no symbols: {e})")];
@@ -2177,6 +2217,9 @@ impl Engine {
         }
         resume_vm(&mut self.vm, isolate)?;
         let start = Instant::now();
+        // For a timeout's context: guest time against host time.
+        let clock_at_start = self.vm.guest_clock();
+        let mut debug_stops = 0u64;
         let token = CorpusStore::hash(input);
         let mut new_blocks = 0;
         let mut new_edges = 0;
@@ -2218,17 +2261,19 @@ impl Engine {
                 break;
             }
             if start.elapsed() > Duration::from_millis(self.harness.timeout_ms) {
+                // What the VM was doing: before the pause (the idle skip's
+                // view ends there), then each CPU paused.
+                let idle = self.vm.research_idle_report();
+                let guest_ns = self.vm.guest_clock_ns(self.vm.guest_clock().wrapping_sub(clock_at_start));
+                let host = start.elapsed();
                 self.vm.pause()?;
-                if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
-                    let state = self.vm.debug_registers(self.harness.cpu)?;
-                    let registers = Registers::from_state(&state).map_err(|error| {
-                        Error::Invalid(format!("ARM64 register state: {error}"))
-                    })?;
-                    let stack = self.stack_of(&registers);
-                    eprintln!("timeout at pc={:#x} {stack:?}", registers.pc);
-                }
+                let context = self.timeout_context(host, guest_ns, debug_stops, idle);
+                eprintln!("timeout {token}: {context}");
                 reopen = true;
                 finding = detect("execution timeout", None, &token, true);
+                if let Some(found) = &mut finding {
+                    found.detail = format!("execution timeout: {context}");
+                }
                 if let Some(found) = &finding {
                     findings.push(found.clone());
                 }
@@ -2247,6 +2292,7 @@ impl Engine {
             };
             match event {
                 vroom_vmm::VmEvent::Debug(stop) => {
+                    debug_stops += 1;
                     if std::env::var_os("VROOM_FUZZ_TRACE").is_some_and(|v| v == "2") {
                         eprintln!("debug stop cpu={} pc={:#x} {:?}", stop.cpu, stop.pc, stop.reason);
                     }

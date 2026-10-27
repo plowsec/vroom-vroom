@@ -372,6 +372,49 @@ impl Vmm {
         self.vm.clock()
     }
 
+    /// Nanoseconds in `ticks` of [`Vmm::guest_clock`].
+    pub fn guest_clock_ns(&self, ticks: u64) -> u64 {
+        self.vm.clock_ns(ticks)
+    }
+
+    /// How many vCPUs the VM has.
+    pub fn cpu_count(&self) -> usize {
+        self.vcpus.len()
+    }
+
+    #[cfg(feature = "research")]
+    /// The idle skip and the debug-stop halt as they are now, for a
+    /// fuzzer's diagnostics (a timeout): which vCPUs wait in WFI and for
+    /// which guest counter value, whether devices hold it back, how often
+    /// the clock moved, and a halt in progress. None while the skip is off.
+    pub fn research_idle_report(&self) -> Option<String> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let s = self.vm.idle_skip_state()?;
+        let now = self.vm.clock();
+        let waiting: Vec<String> = s
+            .waiting
+            .iter()
+            .map(|(cpu, cval)| match cval {
+                Some(c) => format!("cpu{cpu} timer {:+}", *c as i64 - now as i64),
+                None => format!("cpu{cpu} no timer"),
+            })
+            .collect();
+        Some(format!(
+            "idle skip: {}/{} in WFI [{}], devices busy {} ({} unhandled), {} jumps, {} clock moves{}; halt: halting {} parked {} halted_at {}",
+            s.waiting.len(),
+            s.cpus,
+            waiting.join(", "),
+            s.busy,
+            vroom_virtio::worker::outstanding(),
+            s.jumps,
+            s.moves,
+            if s.rebase_pending { ", rebase pending" } else { "" },
+            self.shared.halting.load(SeqCst),
+            self.shared.parked.load(SeqCst),
+            self.shared.halted_at.load(SeqCst),
+        ))
+    }
+
     #[cfg(feature = "research")]
     /// While every vCPU waits for an interrupt, the guest's clock jumps to
     /// its next timer; while the VM is paused, it stands still.
