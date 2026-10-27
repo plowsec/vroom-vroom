@@ -2803,11 +2803,13 @@ impl Engine {
                 _ => {}
             }
         }
+        let guest_us = self.vm.guest_clock_ns(self.vm.guest_clock().wrapping_sub(clock_at_start)) / 1000;
         self.coverage.finish_execution();
         if blocks_mode && !reopen {
             self.plant_pending()?;
         }
         Ok(RunResult {
+            guest_us,
             input_hash: token,
             new_blocks,
             new_edges,
@@ -3023,6 +3025,11 @@ pub struct RunResult {
     /// execution. Keeping it beside coverage makes target comparisons
     /// reproducible instead of relying on console timing.
     pub elapsed_us: u64,
+    /// Guest time the input ran (its clock from the resume to the end):
+    /// above `elapsed_us` when the idle skip jumped, below it when debug
+    /// stops held the clock.
+    #[serde(default)]
+    pub guest_us: u64,
     /// Times another thread reached `stop_pc` or an exception site during
     /// this input and was stepped past.
     #[serde(default)]
