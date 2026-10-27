@@ -199,6 +199,20 @@ enum Command {
         #[arg(long)]
         state_dir: Option<PathBuf>,
     },
+    /// At the snapshot: the loaded modules (the target process's too) and
+    /// the bytes and names at some addresses.
+    Peek {
+        harness: PathBuf,
+        /// Addresses (the target's address space).
+        #[arg(value_parser = parse_u64)]
+        addresses: Vec<u64>,
+        /// Bytes at each.
+        #[arg(long, default_value_t = 64)]
+        length: usize,
+        /// Use this VM state directory instead of the harness's.
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
     /// Run a saved finding's input again: does it come back, under which
     /// signature, and the least input that still makes it.
     Triage {
@@ -484,6 +498,14 @@ fn main() -> Result<()> {
                 "{}",
                 serde_json::json!({"inputs": report.len(), "output": output, "blocks": report.iter().map(|r| r.new).sum::<usize>()})
             );
+        }
+        Command::Peek { harness, addresses, length, state_dir } => {
+            let mut h = Harness::load(&harness)?;
+            if let Some(dir) = state_dir {
+                h.state_dir = dir;
+            }
+            let mut engine = Engine::open(h)?;
+            println!("{}", serde_json::to_string_pretty(&engine.peek(&addresses, length)?)?);
         }
         Command::Triage { harness, input, out, min, runs, budget, state_dir } => {
             let mut h = Harness::load(&harness)?;

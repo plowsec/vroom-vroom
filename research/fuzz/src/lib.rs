@@ -645,6 +645,9 @@ pub struct Finding {
     /// sites).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stack: Vec<String>,
+    /// The faulting code's registers (exceptions): `x0=0x…` … `pc=0x…`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub registers: Vec<String>,
 }
 
 /// Findings with the same signature are the same bug: the class and the
@@ -662,7 +665,7 @@ pub fn signature(finding: &Finding) -> String {
     let frames: Vec<&str> = stack[entry.map_or(0, |i| i + 1)..]
         .iter()
         .filter(|f| !f.starts_with("nt!KeBugCheck"))
-        .map(|f| if f.starts_with("<wild jump") { "<wild jump>" } else { f.split_once('+').map_or(*f, |(function, _)| function) })
+        .map(|f| if f.starts_with("<no image") { "<no image>" } else { f.split_once('+').map_or(*f, |(function, _)| function) })
         .take(3)
         .collect();
     if frames.is_empty() {
@@ -711,6 +714,7 @@ pub fn detect(text: &str, pc: Option<u64>, input: &str, timeout: bool) -> Option
         pc,
         input: input.to_string(),
         stack: Vec::new(),
+        registers: Vec::new(),
     })
 }
 
@@ -1533,6 +1537,49 @@ impl Engine {
         self.target_range(&registers)
     }
 
+    /// At the snapshot: the loaded modules (the kernel's, and the target
+    /// process's with `target_pid`), and for each address its name and
+    /// `length` bytes there (the target's address space; None if unmapped).
+    pub fn peek(&mut self, addresses: &[u64], length: usize) -> Result<serde_json::Value> {
+        let state = self.vm.debug_registers(self.harness.cpu)?;
+        let registers = Registers::from_state(&state)
+            .map_err(|error| Error::Invalid(format!("ARM64 register state: {error}")))?;
+        self.load_symbols(&registers)?;
+        let registers = self.target_registers(&registers)?.unwrap_or(registers);
+        let space = AddressSpace { memory: &self.vm, registers: &registers };
+        let symbols = self.symbols.as_mut().expect("loaded above");
+        let mut modules: Vec<_> = symbols.modules().to_vec();
+        modules.sort_by_key(|m| m.base);
+        let modules: Vec<_> = modules
+            .iter()
+            .map(|m| serde_json::json!({"base": format!("{:#x}", m.base), "end": format!("{:#x}", m.base + u64::from(m.size)), "name": m.name}))
+            .collect();
+        let at: Vec<_> = addresses
+            .iter()
+            .map(|&a| {
+                let mut bytes = vec![0u8; length];
+                let read = vroom_kernel::windows::VirtualMemory::read(&space, a, &mut bytes);
+                let hex = read.ok().map(|_| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>());
+                serde_json::json!({"address": format!("{a:#x}"), "name": symbols.name(&space, a), "in_module": symbols.in_module(a), "bytes": hex})
+            })
+            .collect();
+        // The target process: its EPROCESS and pointer-encoding cookie.
+        let process = match (self.harness.target_pid, symbols.kernel_symbols()) {
+            (Some(pid), Some(pdb)) => vroom_kernel::process::list(&space, pdb).ok().and_then(|l| l.into_iter().find(|p| p.pid == pid)).map(|p| {
+                let cookie = pdb
+                    .field("_EPROCESS", "Cookie")
+                    .ok()
+                    .and_then(|off| {
+                        let mut w = [0u8; 4];
+                        vroom_kernel::windows::VirtualMemory::read(&space, p.eprocess + off, &mut w).ok().map(|_| u32::from_le_bytes(w))
+                    });
+                serde_json::json!({"eprocess": format!("{:#x}", p.eprocess), "peb": format!("{:#x}", p.peb), "cookie": cookie.map(|c| format!("{c:#x}"))})
+            }),
+            _ => None,
+        };
+        Ok(serde_json::json!({"modules": modules, "addresses": at, "process": process}))
+    }
+
     /// `blocks` mode, after an input: plant the blocks on pages that input
     /// mapped. VM paused.
     fn plant_pending(&mut self) -> Result<()> {
@@ -1857,9 +1904,20 @@ impl Engine {
             Some(r) => symbols.pcs(&AddressSpace { memory: &self.vm, registers: r }, r),
             None => (vec![address], None),
         };
-        // The target's, or a jump out of all code (a smashed return
-        // address, a corrupt function pointer).
+        // The target's, or code in no image: a jump out of all code (a
+        // smashed return address, a corrupt function pointer), or code the
+        // system maps outside images (the CFG check stubs).
         let wild = !symbols.in_module(address);
+        // No unwind data there: a leaf, its caller's frames from the link
+        // register on (a smashed one names nothing).
+        let (pcs, stop) = match &faulting {
+            Some(r) if wild && symbols.in_module(r.x[30]) => {
+                let leaf = Registers { pc: r.x[30], ..r.clone() };
+                let (callers, stop) = symbols.pcs(&AddressSpace { memory: &self.vm, registers: &leaf }, &leaf);
+                (std::iter::once(address).chain(callers).collect(), stop)
+            }
+            _ => (pcs, stop),
+        };
         let theirs = !wild && !(lo..hi).contains(&address) && !pcs.iter().any(|pc| (lo..hi).contains(pc));
         if theirs {
             if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
@@ -1880,14 +1938,21 @@ impl Engine {
             (_, 1) if internal => format!("writing {fault:#x}"),
             _ => String::new(),
         };
-        // Nothing to unwind from a wild PC, and where it went depends on
-        // the input: one frame that says so.
-        let mut stack: Vec<String> = if wild {
-            vec![format!("<wild jump to {address:#x}>")]
-        } else {
-            frames.into_iter().map(|(_, n)| n).collect()
-        };
-        stack.extend(stop.filter(|_| !wild).map(|s| format!("({s})")));
+        // A PC in no image: where it went depends on the input, its
+        // callers don't.
+        let mut stack: Vec<String> = frames
+            .into_iter()
+            .map(|(pc, n)| if pc == address && wild { format!("<no image at {address:#x}>") } else { n })
+            .collect();
+        stack.extend(stop.map(|s| format!("({s})")));
+        let registers = faulting
+            .as_ref()
+            .map(|r| {
+                let mut out: Vec<String> = r.x.iter().enumerate().map(|(i, x)| format!("x{i}={x:#x}")).collect();
+                out.extend([format!("sp={:#x}", r.sp), format!("pc={:#x}", r.pc)]);
+                out
+            })
+            .unwrap_or_default();
         let at = stack.first().cloned().unwrap_or_else(|| format!("{address:#x}"));
         Ok(Some(Finding {
             class,
@@ -1895,6 +1960,7 @@ impl Engine {
             pc: Some(address),
             input: input.to_string(),
             stack,
+            registers,
         }))
     }
 
@@ -2353,6 +2419,7 @@ impl Engine {
                                 Some(stack) => stack,
                                 None => self.bugcheck_stack(&registers),
                             },
+                            registers: Vec::new(),
                         };
                         if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
                             eprintln!("{}", bugcheck.detail);
@@ -2563,6 +2630,7 @@ impl Engine {
                                     pc: Some(stop.pc),
                                     input: token.clone(),
                                     stack: stack.clone(),
+                                    registers: Vec::new(),
                                 });
                             }
                             if double {
@@ -2572,6 +2640,7 @@ impl Engine {
                                     pc: Some(stop.pc),
                                     input: token.clone(),
                                     stack,
+                                    registers: Vec::new(),
                                 });
                             }
                             if finding.is_none() {
@@ -2629,6 +2698,7 @@ impl Engine {
                             pc: Some(stop.pc),
                             input: token.clone(),
                             stack,
+                            registers: Vec::new(),
                         };
                         if finding.is_none() {
                             finding = Some(exception_finding.clone());
@@ -3188,6 +3258,7 @@ mod tests {
             pc: Some(1),
             input: String::new(),
             stack: stack.iter().map(|s| s.to_string()).collect(),
+            registers: Vec::new(),
         };
         let a = f(&["nt!KeBugCheckEx", "nt!MiSystemFault+0x8b0", "nt!KiKernelSp0ExceptionHandler+0x5c", "HEVD!sub_a+0x10", "HEVD!sub_b+0x4", "nt!IofCallDriver+0x78"]);
         assert_eq!(signature(&a), "BugCheck:HEVD!sub_a<HEVD!sub_b<nt!IofCallDriver");
@@ -3196,7 +3267,8 @@ mod tests {
         let c = f(&["clfs!X+0x8", "clfs!Y+0x4"]);
         assert_eq!(signature(&c), "BugCheck:clfs!X<clfs!Y");
         assert_eq!(signature(&f(&[])), "BugCheck:Some(1)");
-        assert_eq!(signature(&f(&["<wild jump to 0x4141414141414141>"])), "BugCheck:<wild jump>");
+        assert_eq!(signature(&f(&["<no image at 0x4141414141414141>"])), "BugCheck:<no image>");
+        assert_eq!(signature(&f(&["<no image at 0x7ff0000000d8>", "m!caller+0x10", "m!outer+0x4"])), "BugCheck:<no image><m!caller<m!outer");
     }
 
     #[test]

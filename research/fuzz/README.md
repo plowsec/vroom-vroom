@@ -21,6 +21,7 @@ vroom-fuzz trace harness.json runs/a/crashes/<hash>-BugCheck.bin --blocks all-bl
 vroom-fuzz triage harness.json runs/a/crashes/<hash>-BugCheck.bin   # reproduce + minimize
 vroom-fuzz replay harness.json runs/a/inputs --output runs/a/drcov   # each input's whole coverage: drcov for Lighthouse
 vroom-fuzz show harness.json runs/a/inputs/<hash>.bin          # a sequence, a call a line
+vroom-fuzz peek harness.json 0x7ff6a0001000 --length 64       # at the snapshot: modules (target_pid's too), bytes and names there
 vroom-fuzz mutate seed.bin --harness harness.json --count 5    # mutations as runs make them, no VM
 vroom-fuzz blocks clfs.sys --base 0xfffff804000d0000 --output blocks.json   # block list from the driver file
 ```
@@ -55,9 +56,9 @@ Trace file: `N  PC  module!function+0xoff` per instruction from the snapshot to 
 
 Comparison logging (Redqueen-style): each new corpus input runs once stepped through the target's image (≤200 ms); its comparisons (`cmp`, `cmn`, `ccmp`, `cbz`, `tbz`) become inputs that turn them the other way (operand found in the input → the other operand ±1; IOCTL and first payload words shifted by the operands' difference; a sequence: each call's code and first two payload words, only by comparisons whose register side holds the field's word, low half or byte) and dictionary words. Client: the guest runs at full speed to each entry into the target (`entries`, client's address space), 300 target instructions stepped from there, calls out at full speed (≤40k steps, ≤3 s); ≤128 inputs per log. CLFS: 4748 → 5738 blocks in 10 min. Without `--ioctl`, one mutation in four changes the code (dictionary, function ±1–4, method). Parents: novelty × speed (median-relative). HEVD: 29/29 IOCTLs from a zero code in ~0.1 s (blocks mode).
 
-Output dir: `inputs/`, `crashes/<hash>-<class>.{bin,json}` (first input per signature; `stack`: symbolized), `coverage.json`, `blocks.json`, `stats.json` (every 5 s).
+Output dir: `inputs/`, `crashes/<hash>-<class>.{bin,json}` (first input per signature; `stack`: symbolized; exceptions: `registers` of the faulting code), `coverage.json`, `blocks.json`, `stats.json` (every 5 s).
 
-Signature (dedupe): class + the 3 innermost functions of the faulting code (offsets dropped; frames above the kernel's exception entry and `KeBugCheck*` skipped); `<wild jump>` for a PC outside every image; else class + PC. Functions without a PDB: the block list's names, else `.pdata` starts as `sub_<address at 0x140000000>`.
+Signature (dedupe): class + the 3 innermost functions of the faulting code (offsets dropped; frames above the kernel's exception entry and `KeBugCheck*` skipped); `<no image>` for a PC outside every image (then its caller's frames, from the link register); else class + PC. Functions without a PDB: the block list's names, else `.pdata` starts as `sub_<address at 0x140000000>`.
 
 `replay` (blocks mode): the inputs (files, or directories oldest first) twice, the first pass to warm the VM up; each recorded run starts with every block's breakpoint armed. `<name>.drcov` per input, `all.drcov`, `replay.json` (blocks, new ones, calls, findings per input). Lighthouse: load the files (or the directory) on the target module; the composer unions, intersects, diffs them. Same input twice: same blocks ±0.5%.
 
