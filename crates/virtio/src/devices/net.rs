@@ -507,6 +507,16 @@ impl VirtioDevice for Net {
         };
         let bounce = {
             let mut l = lock(&self.link);
+            // Frames the backend still holds came after the saved state
+            // (a VM restored in place keeps its backend): the restored
+            // guest never sent what they answer.
+            let stale = l.backend.as_mut().map_or(0, |be| std::iter::from_fn(|| be.recv_frame()).count());
+            if stale > 0 {
+                log::debug!("net: {stale} frames from before the restore dropped");
+                if std::env::var_os("VROOM_RESET_PROFILE").is_some() {
+                    eprintln!("  net {}: {stale} frames from before the restore dropped", self.id);
+                }
+            }
             match snap {
                 Some(s) => {
                     if s.mac != l.mac {
@@ -656,6 +666,20 @@ mod tests {
         let mem = vroom_memory::GuestMemory::new(&[(vroom_memory::GuestAddress(0), 1 << 16)]).unwrap();
         let ctx = ActivateContext { mem, queues: vec![crate::Queue::new(256), crate::Queue::new(256)], irq, features: 0 };
         assert!(n.restore_active(ctx, b"{\"mac\":[1,2]}").is_err(), "checked");
+        n.reset();
+    }
+
+    #[test]
+    fn restore_drops_frames_from_before_it() {
+        let mut n = Net::with_link("eth0", [2, 0, 0, 0, 0, 1], Box::new(Pipe::default()), "nat", true);
+        let irq = active(&mut n);
+        let st = n.save_active().unwrap();
+        n.reset();
+        lock(&n.link).backend = Some(Box::new(Pipe { sent: Arc::default(), incoming: vec![vec![1; 60], vec![2; 60]] }));
+        let mem = vroom_memory::GuestMemory::new(&[(vroom_memory::GuestAddress(0), 1 << 16)]).unwrap();
+        let ctx = ActivateContext { mem, queues: st.queues, irq, features: F_STATUS };
+        n.restore_active(ctx, &st.data).unwrap();
+        assert!(lock(&n.link).backend.as_mut().unwrap().recv_frame().is_none());
         n.reset();
     }
 }
