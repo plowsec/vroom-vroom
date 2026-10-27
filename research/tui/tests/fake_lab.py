@@ -217,8 +217,14 @@ class Lab:
             if name == 'kernel.info':
                 return {'base': KERNEL, 'size': 0x3000, 'name': 'ntoskrnl.exe', 'pdb': None, 'export_count': 1}
             if name == 'kernel.symbols':
+                base = args.get('base', KERNEL)
+                if base == DRIVER:
+                    raise RuntimeError('no PDB for this module')
                 self.symbols = True
-                return {'count': 1234, 'base': KERNEL}
+                path = os.path.join(self.exports, f'symbols-{base:016x}.pdb')
+                with open(path, 'wb') as stream:
+                    stream.write(b'pdb')
+                return {'count': 1234, 'base': base, 'path': path}
             if not self.symbols and name in ('kernel.modules', 'kernel.callbacks', 'kernel.processes', 'kernel.process'):
                 raise RuntimeError('load matching kernel symbols first')
             if name == 'kernel.modules':

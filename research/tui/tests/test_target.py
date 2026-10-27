@@ -104,6 +104,7 @@ def test_memory_moves_in_lab_sized_pieces(lab, server):
 def test_modules_load_symbols_once_and_follow_the_process(lab, server):
     names = [module.name for module in lab.modules()]
     assert names == ['ntoskrnl.exe', 'driver.sys']
+    assert lab.modules()[0].named('nt') and not lab.modules()[1].named('nt')
     lab.modules()
     assert [name for name, _ in server.lab.calls].count('kernel.symbols') == 1
 
@@ -122,6 +123,15 @@ def test_module_images_are_rva_copies(lab):
     assert file_base == 0 and path.name.endswith('.rva.exe')
     assert path.read_bytes()[0xb0:0xb8] == bytes(8), 'image base 0'
     assert driver.image() == (path, 0)
+
+
+def test_a_module_s_pdb_sits_beside_its_image(lab):
+    kernel, driver = lab.modules()
+    path, _ = kernel.image()
+    pdb = path.with_suffix('.pdb')
+    assert pdb.is_symlink() and pdb.resolve().name == f'symbols-{KERNEL:016x}.pdb'
+    path, _ = driver.image()
+    assert not path.with_suffix('.pdb').exists(), 'no PDB, no names but the exports'
 
 
 def test_module_lists_outlive_steps(lab, server):

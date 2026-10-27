@@ -126,10 +126,11 @@ angr_tui with target `vroom` attached ([angr_tui](../../angr_tui) README for its
 | Key | Action |
 |---|---|
 | F5 / F12 | Run / pause |
-| F7 / F8 | Step into / over |
+| F7 / F8 / Shift+F8 | Step into / over / out |
 | F2 | Toggle execution breakpoint (4 slots) |
 | F6 | Code / run view |
 | Ctrl+T | Next target: vroom, angr emulator |
+| Ctrl+E | angr run from the VM's state at the cursor (`:reseed` after the VM moves) |
 | F3 / F4 | Modules / processes (Enter: select context) |
 | F10 / F11 | Stack / callback event |
 | Enter on a pane row | Go to its address |
@@ -137,6 +138,7 @@ angr_tui with target `vroom` attached ([angr_tui](../../angr_tui) README for its
 ## commands
 
 ```text
+:s NtClose                     a name in any open module; nt!NAME, fltmgr!NAME, MODULE!0xRVA
 :pane vroom-callbacks          callbacks; also -peb -faults -traces -snapshots -coverage
 :vroom.cpu cpu=1               registers, stepping, memory on this CPU
 :vroom.process pid=1234        user addresses + modules through this process
@@ -162,7 +164,8 @@ angr_tui with target `vroom` attached ([angr_tui](../../angr_tui) README for its
 ```
 
 Every lab command is `:vroom.<command>` (palette, `:` line, angr_tui's agent socket).
-Modules open for analysis as RVA copies (`kernel.export`); runtime address = base + RVA.
+Modules open for analysis as RVA copies (`kernel.export`), their PDB (`kernel.symbols`) beside
+them for names; runtime address = base + RVA.
 
 ## semantics
 

@@ -124,21 +124,33 @@ class VroomTarget(JsonRpcTarget):
         refresh) fetches them again. Name and size identify a module across
         boots; its analysis image's header (base cleared) adds the digest.
         """
-        self.symbols()
+        kernel = self.symbols()['base']
         rows = list(self.inspect('kernel.modules', cpu=self.cpu))
         if self.process is not None:
             rows += self.inspect('kernel.user_modules', cpu=self.cpu, pid=self.process['pid'])
         return tuple(ModuleInfo(row['name'], row['base'], row['size'],
-                                image=partial(self.analysis_image, row['base'])) for row in rows)
+                                image=partial(self.analysis_image, row['base']),
+                                aliases=('nt',) if row['base'] == kernel else ()) for row in rows)
 
     def analysis_image(self, base: int):
-        """`(path, 0)`: the module exported from memory as an RVA copy."""
+        """`(path, 0)`: the module exported from memory as an RVA copy, its PDB beside it."""
         key = (self.boot, (self.process or {}).get('pid'), base)
         if key not in self._images:
             exported = self.inspect('kernel.export', cpu=self.cpu, base=base, allow_missing=True)
             path, _ = prepare_rva_image(exported, allow_unrelocated=True)
+            self._link_pdb(path, base)
             self._images[key] = (path, 0)
         return self._images[key]
+
+    def _link_pdb(self, image, base: int):
+        """The module's PDB as IMAGE.pdb, where angr's loader looks for one."""
+        try:
+            pdb = self.inspect('kernel.symbols', cpu=self.cpu, base=base).get('path')
+        except CommandError:
+            return  # no PDB: the module has its exports' names
+        link = image.with_suffix('.pdb')
+        if pdb and not link.exists():
+            link.symlink_to(pdb)
 
     def select_cpu(self, cpu: int) -> dict:
         count = self.run_remote('vm.status').get('cpus', 1)
