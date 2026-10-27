@@ -120,6 +120,23 @@ impl Hypervisor for Hvf {
     }
 }
 
+/// Run with the MMU off from the helper page by `HvfVcpu::flush_tlb`:
+/// drop every stage-1 translation the VM's CPUs cached, then exit. At EL1
+/// from offset 0, at EL2 (nested) from `TLB_FLUSH_EL2`.
+const TLB_FLUSH: [u32; 9] = [
+    0xd508831f, // tlbi vmalle1is
+    0xd5033b9f, // dsb ish
+    0xd5033fdf, // isb
+    0xd40e8cc3, // smc #TLB_FLUSH_SMC (an HVC at EL2 stays in the guest)
+    0xd50c831f, // tlbi alle2is
+    0xd50c839f, // tlbi alle1is
+    0xd5033b9f, // dsb ish
+    0xd5033fdf, // isb
+    0xd40e8cc3, // smc #TLB_FLUSH_SMC (an HVC at EL2 stays in the guest)
+];
+pub(super) const TLB_FLUSH_EL2: u64 = 16;
+pub(super) const TLB_FLUSH_SMC: u64 = 0x7466;
+
 pub struct HvfVm {
     /// Stage-2 page size: the host's, or 4 KiB with `small_pages`.
     granule: u64,
@@ -134,6 +151,8 @@ pub struct HvfVm {
     spi_count: u32,
     msi: Option<crate::GicMsiConfig>,
     el2: bool,
+    /// Where `TLB_FLUSH` is mapped.
+    helper_page: u64,
     /// Guest writes to RAM, when a snapshot fuzzer logs them.
     dirty: Arc<dirty::DirtyLog>,
     execute: Arc<execute::ExecutePatches>,
@@ -230,6 +249,15 @@ impl HvfVm {
             }
             check("hv_gic_create", ffi::hv_gic_create(gcfg.0))?;
         }
+        let helper = Arc::new(MmapRegion::new(granule as usize).map_err(|e| Error::Invalid(format!("helper page: {e}")))?);
+        let code: Vec<u8> = TLB_FLUSH.iter().flat_map(|w| w.to_le_bytes()).collect();
+        helper.load(&code).map_err(|e| Error::Invalid(format!("helper page: {e}")))?;
+        // SAFETY: the region was just written by this thread; nothing runs it yet.
+        unsafe { ffi::sys_icache_invalidate(helper.as_ptr().cast(), code.len()) };
+        // SAFETY: a live host mapping kept in `roms` for the VM's lifetime.
+        check("hv_vm_map", unsafe {
+            ffi::hv_vm_map(helper.as_ptr().cast(), params.helper_page, granule as usize, ffi::HV_MEMORY_READ | ffi::HV_MEMORY_EXEC)
+        })?;
         std::mem::forget(vm_guard);
         log::info!(
             "hvf: vm created, ipa {ipa} bits, {} KiB pages, SPIs {}..{}",
@@ -240,7 +268,7 @@ impl HvfVm {
         Ok(HvfVm {
             granule,
             memory: Mutex::new(Vec::new()),
-            roms: Mutex::new(Vec::new()),
+            roms: Mutex::new(vec![helper]),
             kickers: Mutex::new(Vec::new()),
             // Guest counter starts at 0 when the VM is created.
             // SAFETY: no preconditions.
@@ -250,6 +278,7 @@ impl HvfVm {
             spi_count: info.spi_count,
             msi,
             el2: params.nested,
+            helper_page: params.helper_page,
             dirty: Arc::new(dirty::DirtyLog::new(granule)),
             execute: Arc::new(execute::ExecutePatches::new(granule)),
             watches: Arc::new(watch::MemoryWatches::new(granule)),
@@ -426,7 +455,7 @@ impl Vm for HvfVm {
     }
 
     fn create_vcpu(&self, index: u32) -> Result<Box<dyn Vcpu>> {
-        let v = HvfVcpu::new(index, self.vtimer_offset.clone(), self.idle.clone(), self.el2, self.dirty.clone(), self.execute.clone(), self.watches.clone())?;
+        let v = HvfVcpu::new(index, self.vtimer_offset.clone(), self.idle.clone(), self.el2, self.helper_page, self.dirty.clone(), self.execute.clone(), self.watches.clone())?;
         self.kickers.lock().unwrap_or_else(|e| e.into_inner()).push(v.hvf_kicker());
         self.idle.add(v.hvf_kicker());
         Ok(Box::new(v))

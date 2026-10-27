@@ -621,6 +621,7 @@ pub(crate) fn build(
         // Venus maps GPU buffers wherever the guest kernel puts them, in
         // its own page size: 4 KiB for stock kernels.
         small_pages: config.display.gpu == Gpu::Virtio3d,
+        helper_page: layout::HELPER_PAGE_BASE,
     })?;
 
     // With 3D, RAM is shared memory: the GPU process maps it too (the

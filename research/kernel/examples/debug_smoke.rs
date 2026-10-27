@@ -16,6 +16,7 @@ fn main() {
             },
             nested: false,
             small_pages: false,
+            helper_page: 0x0f00_0000,
         })
         .expect("vm");
     let base = 0x4000_0000;

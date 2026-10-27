@@ -88,6 +88,10 @@ pub struct VmParams {
     /// anywhere it likes in the shared window (Vulkan). Ignored where the
     /// host already maps 4 KiB.
     pub small_pages: bool,
+    /// Guest-physical address of one page the guest never uses (no RAM,
+    /// no device): the backend may map code of its own there (HVF: the
+    /// stage-1 TLB flush a register restore runs).
+    pub helper_page: u64,
 }
 
 /// Entry point to a hypervisor backend.

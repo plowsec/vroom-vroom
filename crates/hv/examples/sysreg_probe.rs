@@ -14,6 +14,7 @@ fn main() {
             irqchip: IrqChipConfig::GicV3 { dist_base: 0x0800_0000, redist_base: 0x080a_0000, msi: None },
             nested: false,
             small_pages: false,
+            helper_page: 0x0f00_0000,
         })
         .expect("vm");
     let ram = GuestAddress(0x4000_0000);
