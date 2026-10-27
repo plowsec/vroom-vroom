@@ -2181,6 +2181,9 @@ impl Engine {
         // Past stop_pc, running until then (settle_ms).
         let mut settle: Option<Instant> = None;
         let slow_trace = std::env::var_os("VROOM_FUZZ_TRACE").is_some_and(|v| v == "slow");
+        // VROOM_FUZZ_SLOW_MS=N: an input still running after N ms logs
+        // where the VM is (as a timeout does) once, and goes on.
+        let mut slow_sample = std::env::var("VROOM_FUZZ_SLOW_MS").ok().and_then(|v| v.parse::<u64>().ok());
         let mut iteration = Instant::now();
         let mut last_event = String::new();
         if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
@@ -2269,6 +2272,19 @@ impl Engine {
                     eprintln!("slow iteration {} ms after {last_event}", took.as_millis());
                 }
                 iteration = Instant::now();
+            }
+            if own_step.is_none()
+                && foreign_step.is_none()
+                && slow_sample.is_some_and(|ms| start.elapsed() > Duration::from_millis(ms))
+            {
+                slow_sample = None;
+                let idle = self.vm.research_idle_report();
+                let guest_ns = self.vm.guest_clock_ns(self.vm.guest_clock().wrapping_sub(clock_at_start));
+                let host = start.elapsed();
+                self.vm.pause()?;
+                let context = self.timeout_context(host, guest_ns, debug_stops, idle);
+                eprintln!("slow {token}: {context}");
+                resume_vm(&mut self.vm, isolate)?;
             }
             if settle.is_some_and(|deadline| Instant::now() >= deadline) {
                 self.vm.pause()?;

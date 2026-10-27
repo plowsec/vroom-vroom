@@ -108,6 +108,7 @@ Kernel TUI: `coverage runs/a/coverage.json`, `coverage-diff runs/a/coverage.json
 
 - `VROOM_COW_VERIFY=1`: after each reset, check RAM, untouched devices and GIC registers against the snapshot (~1 s each).
 - `VROOM_FUZZ_TRACE=1`: per-stop trace on stderr (a client's per-call results at `stop_pc`, a word per call); `=slow`: run loop iterations over 200 ms; `=2`: every debug stop.
+- `VROOM_FUZZ_SLOW_MS=N`: an input still running after N ms logs `slow <hash>: <context>` once (a timeout's context: host/guest ms, idle skip, each CPU's process, PC, frames) and goes on. Timeouts: `timeouts/<hash>.{bin,json}`, every one.
 - `VROOM_RESET_PROFILE=1`: each reset's phases (dirty log, copy back, icache, disks, GIC, devices, vCPUs) and devices restored over 0.2 ms.
 - `series.jsonl` (master, a row a minute): coverage, execs, corpus, findings; per worker exec and reset ms, restores, timeouts, comparison logs, live.
 - Resume: same `--output`. Workers run their corpus first (dropping inputs that time out), the master learns its coverage again; a failed worker restarts (20 times at most).
