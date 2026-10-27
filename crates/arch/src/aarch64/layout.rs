@@ -11,6 +11,7 @@
 //! 0x0902_0000  fw_cfg                            4K (reserved)
 //! 0x0903_0000  PL061 GPIO                        4K
 //! 0x0a00_0000  virtio-mmio slots                 32 x 512
+//! 0x0f00_0000  hypervisor helper page            ≤64K (not described to the guest)
 //! 0x1000_0000  PCIe 32-bit MMIO window           ~750M
 //! 0x3eff_0000  PCIe PIO window                   64K
 //! 0x3f00_0000  PCIe ECAM (16 buses)              16M
