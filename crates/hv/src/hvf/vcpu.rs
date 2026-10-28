@@ -366,8 +366,12 @@ impl HvfVcpu {
         const CNTV_CTL: u16 = ffi::HV_SYS_REG_CNTV_CTL_EL0;
         let (sctlr, pc_offset, mode) = if self.el2 { (0xe080, super::TLB_FLUSH_EL2, 0x3c9) } else { (0xc080, 0, 0x3c5) };
         let saved = (self.get(ffi::HV_REG_PC)?, self.get(ffi::HV_REG_CPSR)?, self.get_sys(sctlr)?, self.get_sys(CNTV_CTL)?);
-        // No timer exit while it runs; every exception masked (DAIF).
+        let mdscr = self.get_sys(MDSCR)?;
+        // No timer exit while it runs; every exception masked (DAIF). A
+        // step armed for the guest (MDSCR_EL1.SS) would stop it after one
+        // instruction: debug exceptions go to EL2 whatever DAIF says.
         self.set_sys(CNTV_CTL, 0)?;
+        self.set_sys(MDSCR, mdscr & !1)?;
         self.set_sys(sctlr, saved.2 & !1)?;
         self.set(ffi::HV_REG_CPSR, mode)?;
         self.set(ffi::HV_REG_PC, self.helper_page + pc_offset)?;
@@ -397,6 +401,7 @@ impl HvfVcpu {
         self.set(ffi::HV_REG_CPSR, saved.1)?;
         self.set_sys(sctlr, saved.2)?;
         self.set_sys(CNTV_CTL, saved.3)?;
+        self.set_sys(MDSCR, mdscr)?;
         ran
     }
 
