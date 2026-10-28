@@ -752,6 +752,36 @@ pub struct Stack {
     pub frames: Vec<Frame>,
     pub stop: Option<String>,
 }
+/// A return address without its pointer authentication code: sign
+/// extended from the VA width TCR gives (48 bits when it gives none).
+fn strip_pac(address: u64, tcr: u64) -> u64 {
+    let upper = address & (1 << 55) != 0;
+    let sz = if upper { (tcr >> 16) & 63 } else { tcr & 63 };
+    let sz = if (16..=39).contains(&sz) { sz } else { 16 };
+    let mask = (1u64 << (64 - sz)) - 1;
+    (address & mask) | if upper { !mask } else { 0 }
+}
+
+/// The caller's registers from the frame record x29 points at (previous
+/// x29, then the return address), when it is on this stack.
+fn frame_record(m: &impl VirtualMemory, regs: &Registers) -> Option<Registers> {
+    let fp = regs.x[29];
+    if fp & 15 != 0 || fp < regs.sp || fp - regs.sp > 16 * 1024 * 1024 {
+        return None;
+    }
+    let previous = m.u64(fp).ok()?;
+    let lr = strip_pac(m.u64(fp + 8).ok()?, regs.tcr);
+    if lr == 0 || lr & 3 != 0 {
+        return None;
+    }
+    let mut next = regs.clone();
+    next.x[29] = previous;
+    next.x[30] = lr;
+    next.pc = lr;
+    next.sp = fp + 16;
+    Some(next)
+}
+
 pub fn walk(
     m: &impl VirtualMemory,
     registers: &Registers,
@@ -775,8 +805,20 @@ pub fn walk(
             .iter()
             .find(|m| regs.pc >= m.base && regs.pc - m.base < m.size as u64);
         let Some(module) = module else {
-            stop = Some(format!("no loaded module at {:#x}", regs.pc));
-            break;
+            // Code in no module the walk knows (loaded since the list was
+            // read): its frame record names its caller.
+            match frame_record(m, &regs) {
+                Some(next) if next.sp > regs.sp => {
+                    frames.push(Frame { pc: regs.pc, sp: regs.sp, module: String::new(), symbol: None, method: "frame pointer".into() });
+                    regs = next;
+                    return_address = true;
+                    continue;
+                }
+                _ => {
+                    stop = Some(format!("no loaded module at {:#x}", regs.pc));
+                    break;
+                }
+            }
         };
         let mut frame = Frame {
             pc: regs.pc,
@@ -794,10 +836,27 @@ pub fn walk(
                 stack_switch = result.stack_switch;
             }
             Err(e) => {
-                frame.method = "stop".into();
+                // No unwind data to read (a page not resident): the frame
+                // record chain (x29) still names the callers.
+                let Some(next) = frame_record(m, &regs) else {
+                    frame.method = "stop".into();
+                    frames.push(frame);
+                    stop = Some(e.to_string());
+                    break;
+                };
+                frame.method = "frame pointer".into();
                 frames.push(frame);
-                stop = Some(e.to_string());
-                break;
+                // The faulting frame may have no record of its own yet (a
+                // leaf, a prologue): its caller is in the link register.
+                let lr = strip_pac(regs.x[30], regs.tcr);
+                if i == 0 && lr != next.pc {
+                    if let Some(module) = modules.iter().find(|m| lr >= m.base && lr - m.base < m.size as u64) {
+                        frames.push(Frame { pc: lr, sp: regs.sp, module: module.name.clone(), symbol: None, method: "link register".into() });
+                    }
+                }
+                regs = next;
+                return_address = true;
+                continue;
             }
         }
         frames.push(frame);
@@ -1023,6 +1082,39 @@ mod tests {
         assert_eq!(stack.frames.len(), 2);
         assert_eq!((stack.frames[1].pc, stack.frames[1].sp), (0x500, 0x800));
     }
+    #[test]
+    fn walk_without_unwind_data_follows_frame_records() {
+        // No PE image: every step fails, the frame records (x29) go on.
+        let mut m = Memory(vec![0; 0x3000]);
+        put(&mut m, 0x1100, 0x1200);
+        put(&mut m, 0x1108, 0x0033_0000_0000_0520);
+        put(&mut m, 0x1200, 0);
+        put(&mut m, 0x1208, 0x700);
+        let module = Module { name: "example.dll".into(), path: "example.dll".into(), base: 0, size: 0x3000 };
+        let mut r = regs();
+        r.pc = 0x410;
+        r.x[29] = 0x1100;
+        r.x[30] = 0x600;
+        let stack = walk(&m, &r, &[module], &mut Tables::default());
+        let pcs: Vec<u64> = stack.frames.iter().map(|f| f.pc).collect();
+        assert_eq!(pcs, [0x410, 0x600, 0x520, 0x700]);
+        assert!(stack.stop.is_some());
+    }
+
+    #[test]
+    fn walk_through_code_in_no_module_follows_its_frame_record() {
+        let mut m = Memory(vec![0; 0x3000]);
+        put(&mut m, 0x1100, 0);
+        put(&mut m, 0x1108, 0x700);
+        let module = Module { name: "example.dll".into(), path: "example.dll".into(), base: 0, size: 0x1000 };
+        let mut r = regs();
+        r.pc = 0x8_0000;
+        r.x[29] = 0x1100;
+        let stack = walk(&m, &r, &[module], &mut Tables::default());
+        let pcs: Vec<u64> = stack.frames.iter().map(|f| f.pc).collect();
+        assert_eq!(pcs, [0x8_0000, 0x700]);
+    }
+
     #[test]
     fn sve_allocations_use_known_or_saved_vector_length() {
         let mut m = Memory(vec![0; 0x2000]);
