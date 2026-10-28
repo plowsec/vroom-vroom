@@ -69,9 +69,12 @@ Detector `exceptions` (or `access-violation`): a breakpoint on `nt!KiDispatchExc
 | class | |
 |---|---|
 | `AccessViolation` | `0xc0000005` on a kernel address or the NULL page (`reading`/`writing`/`executing ADDR`) |
-| `ExceptionDispatch` | stack overrun `0xc0000409`, illegal/privileged instruction, misalignment, stack overflow, divide, the trap handlers' other `0x100000xx` codes (`0x10000011`: non-canonical address) |
+| `ExceptionDispatch` | stack overrun `0xc0000409` (and `__fastfail`: ARM64 `brk #0xf003`, a breakpoint with parameter `0xf003`), illegal/privileged instruction, misalignment, stack overflow (a user target: anywhere in its process), divide, the trap handlers' other `0x100000xx` codes (`0x10000011`: non-canonical address) |
+| `ProcessExit` | a user target's process ends itself with an error status (`nt!NtTerminateProcess` breakpoint): PageHeap verifier stops `0xc0000421` (block suffix overwritten, double free, bad free) dispatch no exception. Stack from the target's first frame, the exit path after |
 
 - User-address faults inside `__try` (probing user buffers) aren't findings.
+- Stacks: a frame whose unwind data isn't resident (or code in no listed module) continues on the x29 frame records; the faulting frame's caller from the link register.
+- PageHeap blind spots: reads inside a block's alignment slack; writes there are caught at its free, not where they happen.
 - Bugchecks stop at `KeBugCheck2` (every bugcheck goes through it; `bugcheck_pc` = `KeBugCheckEx` is moved there) with the exception's stack.
 - The same exception (code, PC, faulting address) 9 times in one input ends it: a fault in its own dispatch.
 Kernel TUI: `coverage runs/a/coverage.json`, `coverage-diff runs/a/coverage.json runs/b/coverage.json`.
@@ -82,7 +85,7 @@ Kernel TUI: `coverage runs/a/coverage.json`, `coverage-diff runs/a/coverage.json
 |---|---|
 | `config`, `snapshot`, `state_dir` | VM config, snapshot dir, VM state dir (one per instance) |
 | `cpu`, `isolate_cpu` | CPU of the target call; run it alone, IRQs masked, devices paused (~150x faster) |
-| `input_gpa`, `input_capacity`, `input_va`, `max_input` | input buffer |
+| `input_gpa`, `input_capacity`, `input_va`, `max_input` | input buffer; past 4096 bytes its further pages are found through `input_va` (the client's buffer, locked) |
 | `ioctl_prefix`, `ioctl_register` / `ioctl_va` | first 4 input bytes = IOCTL, and where it goes |
 | `input_register` / `input_pointer_va`, `input_length_register` / `input_length_va`, `output_length_va` | saved fields patched per input |
 | `entry_pc`, `stop_pc` | first block; return address that ends an input (testcase thread only). User-mode `entry_pc`: a client harness (needs `blocks`, no `isolate_cpu`, `target`, `stop_pc` in the client) |

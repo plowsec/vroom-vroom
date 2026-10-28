@@ -65,6 +65,13 @@ pub struct CoverageBlock {
     pub source: Option<String>,
 }
 
+/// The guest's page size for the input buffer (`input_capacity` past it:
+/// several pages).
+const INPUT_PAGE: usize = 4096;
+
+/// Exception-dispatch sites (hardware breakpoints, beside `stop_pc`).
+const MAX_EXCEPTION_SITES: usize = 4;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Harness {
     pub name: String,
@@ -79,6 +86,8 @@ pub struct Harness {
     pub cpu: usize,
     /// Optional guest virtual address of the input buffer. It must translate
     /// to `input_gpa`; the runner passes or stores it for each testcase.
+    /// Required past one page of `input_capacity`: the buffer's pages are
+    /// written where it maps them (physically apart).
     #[serde(default)]
     pub input_va: Option<u64>,
     /// Treat the first four testcase bytes as a little-endian IOCTL code.
@@ -339,6 +348,11 @@ impl Harness {
                 "name and input_capacity are required".into(),
             ));
         }
+        if h.input_capacity > INPUT_PAGE && h.input_va.is_none() {
+            return Err(Error::Invalid(format!(
+                "input_capacity past {INPUT_PAGE} bytes needs input_va (its pages are found through it)"
+            )));
+        }
         if h.max_input == 0 {
             h.max_input = h.input_capacity;
         }
@@ -440,7 +454,7 @@ impl Harness {
         }
         // DebugStop does not expose the fired WVR index yet, so one watched
         // range is the only unambiguous configuration supported by the runner.
-        if h.exception_sites.len() > 4 || h.watchpoints.len() > 1 {
+        if h.exception_sites.len() > MAX_EXCEPTION_SITES || h.watchpoints.len() > 1 {
             return Err(Error::Invalid(
                 "ARM64 supports four exception sites and one unambiguous watched range".into(),
             ));
@@ -631,6 +645,9 @@ pub enum BugClass {
     ExceptionDispatch,
     PoisonedAccess,
     DoubleFetch,
+    /// A user-mode target's process ends itself with an error status (a
+    /// verifier stop, a fail fast): no exception reaches a handler.
+    ProcessExit,
     Timeout,
     Unknown,
 }
@@ -1116,6 +1133,9 @@ pub struct Engine {
     /// `nt!KiDispatchException`, when the harness detects exceptions: every
     /// exception passes there first, the ones an `__except` swallows too.
     exception_hook: Option<u64>,
+    /// `nt!NtTerminateProcess`, for a user-mode target with `exceptions`:
+    /// its process ending itself with an error status is a finding.
+    exit_hook: Option<u64>,
     /// Blocks the last comparison log reached first (blocks mode): the
     /// input it logged covers them.
     pub cmplog_blocks: Vec<u64>,
@@ -1260,6 +1280,7 @@ impl Engine {
             target_image: None,
             target_space: None,
             exception_hook: None,
+            exit_hook: None,
             cmplog_blocks: Vec::new(),
             ablated: Vec::new(),
         })
@@ -1284,6 +1305,17 @@ impl Engine {
             self.exception_hook = Some(hook);
             // Whose an exception is, from the first one on.
             self.target_range(&registers)?;
+            // A verifier stop (PageHeap: a corrupt block, a double free, a
+            // bad free) or a fail fast ends the process without an exception
+            // reaching KiDispatchException first: watch it exit.
+            if self.harness.target_pid.is_some() && self.harness.exception_sites.len() < MAX_EXCEPTION_SITES {
+                if let Some(exit) = self.symbols.as_ref().and_then(|s| s.resolve("NtTerminateProcess")) {
+                    if !self.harness.exception_sites.contains(&exit) {
+                        self.harness.exception_sites.push(exit);
+                    }
+                    self.exit_hook = Some(exit);
+                }
+            }
         }
         // A user-mode target's code, through its own process only: at its
         // VAs another process may have other memory.
@@ -1863,6 +1895,10 @@ impl Engine {
             c => c,
         };
         let internal = code & 0xffff_ff00 == 0x1000_0000;
+        // __fastfail on ARM64 is `brk #0xf003`: a breakpoint exception whose
+        // second parameter is that immediate (the fail code in x0).
+        let fast_fail = code == 0x8000_0003 && fault == 0xf003;
+        let code = if fast_fail { 0xc000_0409 } else { code };
         let class = match code {
             // A kernel address, or the NULL page (a NULL dereference, user
             // half or not); in a user-mode target, any address.
@@ -1918,10 +1954,15 @@ impl Engine {
             }
             _ => (pcs, stop),
         };
-        let theirs = !wild && !(lo..hi).contains(&address) && !pcs.iter().any(|pc| (lo..hi).contains(pc));
+        // A stack overflow in the target's process: its frames are too many
+        // to walk to the target's.
+        let theirs = !wild
+            && !(user_target && code == 0xc000_00fd)
+            && !(lo..hi).contains(&address)
+            && !pcs.iter().any(|pc| (lo..hi).contains(pc));
         if theirs {
             if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
-                eprintln!("exception {code:#x} at {address:#x} (not the target's)");
+                eprintln!("exception {code:#x} at {address:#x} (not the target's: stack {pcs:#x?}, {stop:?})");
             }
             return Ok(None);
         }
@@ -1964,6 +2005,62 @@ impl Engine {
         }))
     }
 
+    /// The target's process ending itself (`NtTerminateProcess(-1, status)`)
+    /// with an error status: what the status says, the dying thread's stack.
+    fn exit_finding(&mut self, registers: &Registers, input: &str) -> Option<Finding> {
+        let own = self.target_space.is_some_and(|root| same_space(root, registers.ttbr0));
+        let status = registers.x[1] as u32;
+        if !own || registers.x[0] != u64::MAX || status >> 30 != 3 {
+            return None;
+        }
+        let what = match status {
+            0xc000_0421 => " (verifier stop: a corrupt heap block, a double or bad free)",
+            0xc000_0409 => " (fail fast)",
+            0xc000_0374 => " (heap corruption)",
+            0xc000_0005 => " (access violation, unhandled)",
+            0xc000_00fd => " (stack overflow)",
+            _ => "",
+        };
+        // What reports the failure (the verifier's stop, WER) loads DLLs
+        // after the snapshot.
+        let _ = self.target_modules(registers);
+        let stack = self.exit_stack(registers);
+        if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
+            eprintln!("process exit {status:#x}: {stack:?}");
+        }
+        Some(Finding {
+            class: BugClass::ProcessExit,
+            detail: format!("the target's process exits with {status:#x}{what}"),
+            pc: Some(registers.pc),
+            input: input.to_string(),
+            stack,
+            registers: Vec::new(),
+        })
+    }
+
+    /// A dying thread's stack from the target's first frame on (where the
+    /// bad free or the corrupt block came from: what tells two bugs apart),
+    /// the way it went to the exit after, in parentheses.
+    fn exit_stack(&mut self, registers: &Registers) -> Vec<String> {
+        if self.load_symbols(registers).is_err() {
+            return self.stack_of(registers);
+        }
+        let Ok((lo, hi)) = self.target_range(registers) else {
+            return self.stack_of(registers);
+        };
+        let space = AddressSpace { memory: &self.vm, registers };
+        let symbols = self.symbols.as_mut().expect("loaded above");
+        let (pcs, stop) = symbols.pcs(&space, registers);
+        let names: Vec<String> = pcs.iter().map(|&pc| symbols.name(&space, pc)).collect();
+        let first = pcs.iter().position(|pc| (lo..hi).contains(pc)).unwrap_or(0);
+        let mut stack = names[first..].to_vec();
+        stack.extend(stop.map(|s| format!("({s})")));
+        if first > 0 {
+            stack.push(format!("(exit path: {})", names[..first].join(" < ")));
+        }
+        stack
+    }
+
     /// The stack a bugcheck is about. KERNEL_SECURITY_CHECK_FAILURE (0x139,
     /// a fast fail) passes the trap frame of the failing code (third
     /// parameter): unwind from there. Else from `KeBugCheckEx`.
@@ -1977,6 +2074,30 @@ impl Engine {
             }
         }
         self.stack_of(registers)
+    }
+
+    /// The input buffer's pages, physical: `input_gpa`, then (past one
+    /// page) each further page of `input_va` as the snapshot's tables map
+    /// it.
+    fn input_pages(&self) -> Result<Vec<u64>> {
+        let mut pages = vec![self.harness.input_gpa];
+        if self.harness.input_capacity <= INPUT_PAGE {
+            return Ok(pages);
+        }
+        let va = self.harness.input_va.expect("validated: input_va past one page");
+        let state = self.vm.debug_registers(self.harness.cpu)?;
+        let registers = Registers::from_state(&state)
+            .map_err(|error| Error::Invalid(format!("ARM64 register state: {error}")))?;
+        let space = AddressSpace { memory: &self.vm, registers: &registers };
+        for page in 1..self.harness.input_capacity.div_ceil(INPUT_PAGE) {
+            let at = va + (page * INPUT_PAGE) as u64;
+            let physical = space
+                .translate(at)
+                .map_err(|error| Error::Invalid(format!("translate input page {at:#x}: {error}")))?
+                .physical;
+            pages.push(physical);
+        }
+        Ok(pages)
     }
 
     /// Put `input` in place for one execution, as every run does: reset
@@ -2022,8 +2143,13 @@ impl Engine {
         }
         self.input_buffer.fill(0);
         self.input_buffer[..payload.len()].copy_from_slice(payload);
-        self.vm
-            .debug_write_physical(&[(self.harness.input_gpa, &self.input_buffer)])?;
+        let pages = self.input_pages()?;
+        let writes: Vec<(u64, &[u8])> = pages
+            .iter()
+            .zip(self.input_buffer.chunks(INPUT_PAGE))
+            .map(|(&gpa, chunk)| (gpa, chunk))
+            .collect();
+        self.vm.debug_write_physical(&writes)?;
         self.apply_ablations()?;
         let mut case_watchpoints = self.harness.watchpoints.clone();
         if !case_watchpoints.is_empty() {
@@ -2686,6 +2812,24 @@ impl Engine {
                         self.vm.debug_step(stop.cpu as usize, step_debug_config(&[], always))?;
                         continue;
                     }
+                    if self.exit_hook == Some(stop.pc) {
+                        let state = self.vm.debug_registers(stop.cpu as usize)?;
+                        let registers = Registers::from_state(&state)
+                            .map_err(|error| Error::Invalid(format!("ARM64 exit registers: {error}")))?;
+                        if let Some(found) = self.exit_finding(&registers, &token) {
+                            // An exception reported already is the cause.
+                            if finding.is_none() {
+                                finding = Some(found.clone());
+                                findings.push(found);
+                            }
+                            // The process is going: nothing more of this
+                            // input will run.
+                            break;
+                        }
+                        foreign_step = Some(stop.cpu);
+                        self.vm.debug_step(stop.cpu as usize, step_debug_config(&[], always))?;
+                        continue;
+                    }
                     if self.harness.exception_sites.contains(&stop.pc) {
                         active_exception_sites.retain(|site| *site != stop.pc);
                         let stack = match self.vm.debug_registers(stop.cpu as usize).map(|s| Registers::from_state(&s)) {
@@ -3235,6 +3379,27 @@ mod tests {
         assert!(load(&["other"], "00ff").is_err());
         assert!(load(&[], "").is_err());
         assert!(load(&[], "0g").is_err());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_input_past_a_page_needs_its_va() {
+        let path = std::env::temp_dir().join(format!("vroom-fuzz-pages-{}.json", std::process::id()));
+        let load = |capacity: usize, va: bool| {
+            let mut h = serde_json::json!({
+                "name": "a", "config": "c", "snapshot": "s", "state_dir": "d",
+                "input_gpa": 0, "input_capacity": capacity,
+            });
+            if va {
+                h["input_va"] = serde_json::json!(0x10000);
+                h["input_pointer_va"] = serde_json::json!(0x20000);
+            }
+            fs::write(&path, h.to_string()).unwrap();
+            Harness::load(&path)
+        };
+        assert!(load(4096, false).is_ok());
+        assert!(load(16384, false).is_err());
+        assert!(load(16384, true).is_ok());
         let _ = fs::remove_file(&path);
     }
 
