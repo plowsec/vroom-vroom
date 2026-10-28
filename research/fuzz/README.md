@@ -134,6 +134,8 @@ C:\HEVD-Lab\HevdFuzzClient.exe 0x222003 1
 
 Stateful drivers (CLFS): the snapshot stands in a user-mode client parked in a loop; each input is a program of calls it makes (`sequence`), the whole guest running; the input ends at the client's `stop_pc`. Coverage is the target's blocks (`blocks` mode, any thread); exceptions are the target's, any thread. Cmplog: from each entry into the target (`entries`). Example: [CLFS.md](CLFS.md).
 
+User-mode libraries: the client calls the library in its own process; `target` the DLL, `target_pid` the client's pid (full PageHeap on the client's image: IFEO `GlobalFlag 0x02000000`, `PageHeapFlags 3`). A system DLL's code pages are shared by every process mapping it: their hits on its breakpoints cost each input (thousands of debug stops, timeouts). The client loads a renamed copy of it instead (`target` = the copy).
+
 Network services: the client sends to a peer in the NIC's `mirror` network (VM config, NAT: `mirror = "10.99.0.0/24"`); its datagrams come back through the NIC from there, so the service sees a remote peer and inputs take the remote path (NIC, IP reassembly, firewall, the service's policy for that address). With `skip_idle` the client's reply waits cost what the guest does in them: a UDP service's client, 1 worker: 9.3 → 36.7 inputs/s, median input 78 → 12 ms.
 
 ### Call descriptions
