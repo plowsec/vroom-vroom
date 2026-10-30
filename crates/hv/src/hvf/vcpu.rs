@@ -160,6 +160,15 @@ impl HvfVcpu {
             pfr0 |= 1 << 8;
         }
         v.set_sys(ffi::HV_SYS_REG_ID_AA64PFR0_EL1, pfr0)?;
+        // Hide SME from a guest at EL2: HVF advertises it (M4) but UNDEFs
+        // SMCR_EL2 there. Linux's EL2 stub takes that UNDEF as an unknown
+        // hypercall and returns to the same MSR, forever.
+        if el2 {
+            let pfr1 = v.get_sys(ffi::HV_SYS_REG_ID_AA64PFR1_EL1)?;
+            if (pfr1 >> 24) & 0xf != 0 {
+                v.set_sys(ffi::HV_SYS_REG_ID_AA64PFR1_EL1, pfr1 & !(0xf << 24))?;
+            }
+        }
         // Advertise PMUv3. HVF hides the PMU by default and then UNDEFs
         // PMU accesses; Windows requires a PMU (its boot manager reads
         // PMCR_EL0 unconditionally). Once advertised, HVF virtualizes it.
