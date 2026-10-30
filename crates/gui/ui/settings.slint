@@ -403,10 +403,9 @@ export component SettingsPanel inherits Rectangle {
                         enabled: !root.lk;
                         released(v) => { Bus.set("memory", round(v)); }
                     }
-                    Divider { text: "ADVANCED"; }
                     Row {
                         label: "Nested virtualization";
-                        tip: "Run VMs inside this VM. M3 or newer. No snapshots then.";
+                        tip: "Run VMs inside this VM. M3 or newer, macOS 15+. Not Hyper-V, so no WSL 2 or Docker Desktop in Windows: macOS gives guests EL2 without VHE, which Hyper-V needs. Shut the VM down fully before changing this; suspend keeps the old setting. No snapshots then.";
                         key: "nested";
                         Toggle {
                             y: (parent.height - self.height) / 2;
@@ -415,6 +414,7 @@ export component SettingsPanel inherits Rectangle {
                             toggled(v) => { Bus.set("nested", v ? "true" : "false"); }
                         }
                     }
+                    Divider { text: "ADVANCED"; }
                     Row {
                         label: "Guest system";
                         tip: "Only changes the icon and defaults.";

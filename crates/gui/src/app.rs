@@ -843,7 +843,7 @@ impl App {
         let any = words.is_empty();
         self.ui.set_vis(CardVis {
             searching: !any,
-            hw: any || hit(&format!("processor cpu cpus core memory ram nested virtualization guest system os {}", st.sum_hw.to_lowercase())),
+            hw: any || hit(&format!("processor cpu cpus core memory ram nested virtualization hypervisor hyper-v hyperv wsl wsl2 docker kvm guest system os {}", st.sum_hw.to_lowercase())),
             display: any || hit("display screen gpu 3d 2d graphics vulkan opengl angle apple driver resolution width height size monitor retina hidpi scale scaling sharp blurry video decode decoding h264 hevc videotoolbox"),
             storage: any || hit("storage disk disks iso cdrom installer drive nvme virtio bus sync write safety readonly read-only compact image qcow2 space"),
             net: any || hit("network net nat bridged host-only hostonly port forward forwarding ssh mac address interface internet lan localhost loopback adapter"),

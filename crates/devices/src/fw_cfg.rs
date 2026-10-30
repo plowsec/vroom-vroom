@@ -75,6 +75,12 @@ impl FwCfg {
         self.items.insert(key, Item { data, on_write: None });
     }
 
+    /// Skip EDK2's optional countdown before booting the OS.
+    pub fn skip_boot_menu(&mut self) -> Result<(), String> {
+        self.set(0x000e, 1u16.to_le_bytes().to_vec()); // FW_CFG_BOOT_MENU
+        self.add_file("etc/boot-menu-wait", 0u16.to_le_bytes().to_vec(), None)
+    }
+
     /// Add a named file. `on_write` makes it guest-writable.
     pub fn add_file(&mut self, name: &str, data: Vec<u8>, on_write: Option<WriteHook>) -> Result<(), String> {
         if name.len() >= 56 || self.files.iter().any(|(n, _)| n == name) {

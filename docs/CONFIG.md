@@ -14,7 +14,7 @@ the same files and picks up hand edits.
 | `cpus` | 2 | Virtual CPUs, 1-64. |
 | `memory_mib` | 2048 | RAM in MiB. |
 | `tpm` | false | TPM 2.0 (needs `swtpm`). Windows 11 wants it. |
-| `nested` | false | Let the guest run its own VMs. M3 or newer, macOS 15+. No snapshots then. |
+| `nested` | false | Let the guest run its own VMs. M3 or newer, macOS 15+. Changing it needs a full shutdown; resuming keeps the saved CPU configuration. Not Windows Hyper-V (so no WSL 2 or Docker Desktop): macOS gives guests EL2 without VHE, which Hyper-V needs; Windows boots without it. No snapshots then. |
 | `camera` | false | The Mac's camera as a USB webcam. Live only while the window is open and a guest app uses it. [GUIDE](GUIDE.md#camera). |
 | `virtio_transport` | `auto` | `auto` (MMIO for kernel boot, PCI for UEFI), `mmio`, `pci`. PCI adds four hot plug slots. |
 

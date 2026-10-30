@@ -103,6 +103,11 @@ impl Firmware {
         // fw_cfg: ACPI + ramfb.
         let ram = mem.total_size();
         let mut fw = FwCfg::new(layout::FW_CFG_BASE, mem.clone(), cpus as u16, ram);
+        // HVF doesn't deliver EDK2's virtual timer interrupt at EL2.
+        // Avoid waiting forever in the optional boot-menu countdown.
+        if cfg!(target_os = "macos") && psci_smc {
+            fw.skip_boot_menu().map_err(Error::Setup)?;
+        }
         let tables = acpi::build(&acpi::AcpiConfig {
             cpu_mpidrs: mpidrs.to_vec(),
             gic_dist_size: info.dist_size,

@@ -702,5 +702,8 @@ default).
   `tpm = true` (`brew install swtpm`) gives a real TPM 2.0.
 - Windows 3D: Direct3D 11 only.
 - NAT connections don't survive suspend.
+- Nested virtualization: no Hyper-V in Windows guests (WSL 2, Docker
+  Desktop, Windows Sandbox). Hypervisor.framework's EL2 has no VHE, and
+  Hyper-V on Arm runs only with it. Windows boots without Hyper-V.
 - USB: tested with fake devices; real USB sticks via vroom-netd untested
   with Full Disk Access.
