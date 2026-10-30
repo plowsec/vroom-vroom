@@ -33,8 +33,7 @@ pub fn run(a: ImportArgs) -> Result<(), String> {
     println!("{} -> {}", p.vmx.display(), a.dir.join(&name).display());
     println!("  {:?}, {} CPUs, {} MiB, TPM: {}", p.os, p.cpus, p.memory_mib, if p.tpm { "yes" } else { "no" });
     for d in &p.disks {
-        let what = if d.cdrom { "attach ISO" } else { "copy" };
-        println!("  {}: {what} {}", d.slot, d.source.display());
+        println!("  {}: copy {}", d.slot, d.source.display());
     }
     for n in &p.notes {
         println!("  note: {n}");

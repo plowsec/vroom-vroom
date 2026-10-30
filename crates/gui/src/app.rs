@@ -1568,7 +1568,7 @@ impl App {
     /// The import's dialog, with where it goes (which can change there).
     fn vmware_ask(&mut self) {
         let Some(plan) = &self.vmware else { return };
-        let disks = plan.disks.iter().filter(|d| !d.cdrom).count();
+        let disks = plan.disks.len();
         let mut text = format!(
             "{} CPUs, {} GB, {} disk{} to copy into {}. VMware's copy is only read.",
             plan.cpus,

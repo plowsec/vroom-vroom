@@ -131,7 +131,8 @@ App: "Import from VMware" in `⋯` or `⌘K`, or drop the `.vmwarevm`.
 - Disks → qcow2 (used parts only); snapshot chains and linked clones are
   flattened to the current state.
 - CPUs, memory, shared folders, sound, TPM setting carry over. Every NIC
-  becomes NAT. ISOs stay where they are, attached as CDs.
+  becomes NAT. ISOs are left out: VMware's boot entries don't come along,
+  so a CD would boot before the disk. Attach one after the first boot.
 - Before: shut down in VMware and quit it (a suspended VM imports with
   `--yes`, memory lost). No x86 VMs. Remove disk encryption first; TPM
   contents don't come along, so have the BitLocker recovery key.
