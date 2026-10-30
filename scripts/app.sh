@@ -2,7 +2,8 @@
 # Build vroom.app (macOS): the app you start from the Dock, Finder or
 # Spotlight, complete from a fresh clone: the VMM, GUI and root helper,
 # 3D on the Mac (ANGLE, DXMT, virglrenderer) and the guest tools. Long
-# builds run only when their inputs changed. Output: target/dist/vroom.app.
+# builds run only when their inputs changed. Output: target/dist.noindex/vroom.app
+# (.noindex: Spotlight lists only the installed copy, not every build).
 # Needs: Xcode with the Metal toolchain (xcodebuild -downloadComponent
 # MetalToolchain), rustup, cargo-xwin, and brew install meson ninja bison
 # pkg-config llvm llvm@15 molten-vk lld uv.
@@ -61,7 +62,7 @@ for b in vroom vroom-gui; do
 done
 
 ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-app=target/dist/vroom.app
+app=target/dist.noindex/vroom.app
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$r/vroom-gui" "$r/vroom" "$r/vroom-netd" "$app/Contents/MacOS/"

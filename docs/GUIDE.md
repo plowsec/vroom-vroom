@@ -31,8 +31,9 @@ aborting, and cargo-xwin cannot link the Windows agent. `brew upgrade lld`.
 
 ## The Mac app
 
-`scripts/app.sh` builds `target/dist/vroom.app`; `--install` copies it to
-`/Applications` (refused while VMs run from there). Everything is in it:
+`scripts/app.sh` builds `target/dist.noindex/vroom.app`; `--install` copies it to
+`/Applications` (refused while VMs run from there). Spotlight skips
+`.noindex` folders, so it offers only the installed app. Everything is in it:
 3D (ANGLE, DXMT, virglrenderer), the guest tools with the Windows 3D
 drivers, virtio-win drivers and WinFsp (pinned downloads,
 `scripts/fetch.sh`, in `target/downloads/`). Long builds rerun only when
