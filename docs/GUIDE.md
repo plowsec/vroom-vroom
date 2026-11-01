@@ -63,6 +63,13 @@ their inputs change; `--no-build` packages what `target/` has.
   folder and its own folder follow; disk files keep their names, MACs stay
   the same. Moving needs the VM in a folder of its own; to another disk it
   copies, then deletes the original.
+- `⋯` → Clone… (off or suspended, in a folder of its own): a copy next
+  to it, or in the folder picked with "Change…"; instant and sharing
+  space on APFS, a copy elsewhere. It gets new MACs, serials and hardware
+  UUID and starts from the disks as they are; snapshots and saved memory
+  stay with the original (a suspended VM's clone boots as if the power
+  had gone out). Inside the guest the hostname and machine ID are the
+  same, and so are port forwards: change those before running both.
 - Settings save to the VM file at once, keeping comments. Hand edits show
   up within seconds.
 - Running or suspended: hardware is locked (hover the lock). Network, USB

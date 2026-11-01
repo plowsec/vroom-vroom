@@ -42,6 +42,8 @@ pub enum Msg {
     Imported(Result<PathBuf, String>),
     /// A VM moved to another disk (its key from before), where its file is now.
     Moved { key: String, r: Result<PathBuf, String> },
+    /// A clone was made: its VM file.
+    Cloned(Result<PathBuf, String>),
 }
 
 #[derive(Debug, Clone, Copy)]

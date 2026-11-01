@@ -1,7 +1,8 @@
-//! Renaming a VM, and moving it to another folder. Its file, its state
-//! folder (`<name>.state`) and, when it has one of its own, its folder go
-//! along; the paths in the file follow. Only for a VM that isn't running:
-//! a suspended one is fine (its saves name files relative to its folder).
+//! Renaming a VM, moving it to another folder, and cloning it. Its file,
+//! its state folder (`<name>.state`) and, when it has one of its own, its
+//! folder go along; the paths in the file follow. Only for a VM that isn't
+//! running: a suspended one is fine (its saves name files relative to its
+//! folder; a clone leaves the save behind).
 
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
@@ -184,11 +185,7 @@ impl Move {
         let name = self.dest.file_name().ok_or("no folder name")?.to_string_lossy();
         let tmp = self.dest.with_file_name(format!(".{name}.moving"));
         let _ = std::fs::remove_dir_all(&tmp);
-        let out = std::process::Command::new("cp").arg("-Rp").arg(&self.from).arg(&tmp).output().map_err(|e| format!("cp: {e}"))?;
-        if !out.status.success() {
-            let _ = std::fs::remove_dir_all(&tmp);
-            return Err(format!("Couldn't copy it: {}", String::from_utf8_lossy(&out.stderr).trim()));
-        }
+        cp(&self.from, &tmp, false)?;
         if let Err(e) = mv(&tmp, &self.dest) {
             let _ = std::fs::remove_dir_all(&tmp);
             return Err(e);
@@ -216,6 +213,212 @@ impl Move {
         }
         crate::edit::save(file, &before, &after).map_err(|e| format!("Moved, but its file still names the old place: {e}"))
     }
+}
+
+/// Copy `from` to `to` (not there yet) with `cp`; `share` shares the
+/// blocks where the disk can (Linux reflinks). Leaves nothing at `to` if
+/// it fails.
+fn cp(from: &Path, to: &Path, share: bool) -> Result<(), String> {
+    let mut c = std::process::Command::new("cp");
+    c.arg("-Rp");
+    if share && cfg!(target_os = "linux") {
+        c.arg("--reflink=auto");
+    }
+    let out = c.arg(from).arg(to).output().map_err(|e| format!("cp: {e}"))?;
+    if !out.status.success() {
+        let _ = std::fs::remove_dir_all(to);
+        return Err(format!("Couldn't copy it: {}", String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    Ok(())
+}
+
+/// Folder `from` as an APFS clone at `to`: instant, and no space until
+/// either side changes. False where the disk can't (or not on a Mac).
+fn clonefile(from: &Path, to: &Path) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let c = |p: &Path| std::ffi::CString::new(p.as_os_str().as_bytes()).ok();
+        if let (Some(a), Some(b)) = (c(from), c(to)) {
+            // SAFETY: two NUL-terminated paths.
+            if unsafe { libc::clonefile(a.as_ptr(), b.as_ptr(), 0) } == 0 {
+                return true;
+            }
+        }
+        let _ = std::fs::remove_dir_all(to);
+    }
+    false
+}
+
+/// Copy folder `from` to `to` (not there yet), leaving out `skip` (paths
+/// in `from`, at any depth).
+fn copy_except(from: &Path, to: &Path, skip: &[PathBuf]) -> Result<(), String> {
+    std::fs::create_dir(to).map_err(|e| format!("{}: {e}", tilde(to)))?;
+    for e in std::fs::read_dir(from).map_err(|e| format!("{}: {e}", tilde(from)))?.flatten() {
+        let (p, q) = (e.path(), to.join(e.file_name()));
+        if skip.contains(&p) {
+            continue;
+        }
+        if e.file_type().is_ok_and(|t| t.is_dir()) && skip.iter().any(|s| s.starts_with(&p)) {
+            copy_except(&p, &q, skip)?;
+        } else {
+            cp(&p, &q, true)?;
+        }
+    }
+    Ok(())
+}
+
+/// Cloning a VM into a new folder.
+#[derive(Debug)]
+pub struct Clone {
+    file: PathBuf,
+    from: PathBuf,
+    old: String,
+    new: String,
+    pub dest: PathBuf,
+}
+
+/// Check a clone of the VM in `file`, named `new`, in folder `to`, before
+/// making it.
+pub fn plan_clone(file: &Path, new: &str, to: &Path) -> Result<Clone, String> {
+    if !vroom_config::valid_name(new) {
+        return Err("Use only letters, digits, '.', '_' and '-' in the name.".into());
+    }
+    let from = own_folder(file).ok_or("Its folder has other things in it, so only a VM in a folder of its own can be cloned.")?;
+    let file = from.join(file.file_name().ok_or("no file name")?);
+    let c = VmConfig::load(&file).map_err(|e| e.to_string())?;
+    // Both VMs would write to what's outside: one would break the other.
+    for d in c.disks.iter().filter(|d| !d.readonly) {
+        if !lexical(&d.path).starts_with(&from) {
+            return Err(format!("Its disk {} is outside its folder: both VMs would write to it.", tilde(&d.path)));
+        }
+    }
+    if let vroom_config::Boot::Uefi { vars, .. } = &c.boot {
+        if !lexical(vars).starts_with(&from) {
+            return Err(format!("Its UEFI variables ({}) are outside its folder: both VMs would write to them.", tilde(vars)));
+        }
+    }
+    let to = std::fs::canonicalize(to).map_err(|e| format!("{}: {e}", tilde(to)))?;
+    if to.starts_with(&from) {
+        return Err("That folder is inside the VM's own.".into());
+    }
+    let dest = to.join(new);
+    if dest.exists() {
+        return Err(format!("{} already exists.", tilde(&dest)));
+    }
+    Ok(Clone { file, from, old: c.name, new: new.to_string(), dest })
+}
+
+impl Clone {
+    /// Make it; returns its VM file. It is built next to where it goes
+    /// and renamed into place, so a clone that fails leaves nothing.
+    pub fn run(&self) -> Result<PathBuf, String> {
+        let tmp = self.dest.with_file_name(format!(".{}.cloning", self.new));
+        let _ = std::fs::remove_dir_all(&tmp);
+        if !clonefile(&self.from, &tmp) {
+            // Copied for real: not what make_new drops anyway (a saved
+            // memory image is as large as the VM's memory).
+            let st = self.from.join(format!("{}.state", self.old));
+            if let Err(e) = copy_except(&self.from, &tmp, &[st.join("snapshots"), st.join("suspend")]) {
+                let _ = std::fs::remove_dir_all(&tmp);
+                return Err(e);
+            }
+        }
+        let r = self.make_new(&tmp).and_then(|f| mv(&tmp, &self.dest).map(|()| self.dest.join(f)));
+        if r.is_err() {
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+        r
+    }
+
+    /// The copy in `tmp` becomes another machine: its own name, MACs,
+    /// serials and hardware UUID, booting from the disks as they are (no
+    /// snapshots). Returns its file's name.
+    fn make_new(&self, tmp: &Path) -> Result<PathBuf, String> {
+        let (old, new) = (&self.old, &self.new);
+        let state = tmp.join(format!("{new}.state"));
+        if tmp.join(format!("{old}.state")).exists() {
+            mv(&tmp.join(format!("{old}.state")), &state)?;
+            self.own_layers(&state)?;
+            fresh_state(&state)?;
+        }
+        let mut name = PathBuf::from(self.file.file_name().ok_or("no file name")?);
+        if self.file.file_stem().is_some_and(|s| s == old.as_str()) {
+            name = format!("{new}.toml").into();
+            mv(&tmp.join(self.file.file_name().ok_or("no file name")?), &tmp.join(&name))?;
+        }
+        let file = tmp.join(&name);
+        let before = VmConfig::load_raw(&file).map_err(|e| e.to_string())?;
+        let mut after = before.clone();
+        after.name = new.clone();
+        after.identity.randomize_serials(vroom_config::template::random8());
+        for (i, n) in after.nets.iter_mut().enumerate() {
+            if n.mac.is_some() {
+                n.mac = Some(vroom_config::format_mac(&before.identity.nic_mac(new, i)));
+            }
+        }
+        let (old_state, new_state) = (self.from.join(format!("{old}.state")), self.dest.join(format!("{new}.state")));
+        let (rel_old, rel_new) = (PathBuf::from(format!("{old}.state")), PathBuf::from(format!("{new}.state")));
+        let elsewhere = self.dest.parent() != self.from.parent();
+        after.each_path(|p| {
+            let q = if let Ok(r) = p.strip_prefix(&rel_old) {
+                rel_new.join(r)
+            } else if let Ok(r) = p.strip_prefix(&old_state) {
+                new_state.join(r)
+            } else if let Ok(r) = p.strip_prefix(&self.from) {
+                self.dest.join(r)
+            } else if p.is_relative() && elsewhere && !lexical(&self.from.join(&*p)).starts_with(&self.from) {
+                // An ISO next to the old folder, say.
+                lexical(&self.from.join(&*p))
+            } else {
+                return;
+            };
+            *p = q;
+        });
+        crate::edit::save(&file, &before, &after)?;
+        Ok(name)
+    }
+}
+
+impl Clone {
+    /// The disk pointers name layers in the clone: relative, as a VMM
+    /// writes them inside its folder. One naming the old folder by full
+    /// path would have the clone write to the original's disk.
+    fn own_layers(&self, state: &Path) -> Result<(), String> {
+        let Ok(dir) = std::fs::read_dir(state.join("disks")) else { return Ok(()) };
+        for p in dir.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "json")) {
+            let v: serde_json::Value = std::fs::read(&p).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+            let active = v.get("active").and_then(|a| a.as_str()).map(Path::new);
+            if active.is_some_and(|a| a.is_absolute() && lexical(a).starts_with(&self.from)) {
+                return Err(format!("{} names its disk by full path, so the clone would write to this VM's. Start and shut it down once, then clone it.", p.file_name().unwrap_or_default().to_string_lossy()));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A cloned state folder without the old VM's snapshots, its hardware
+/// UUID (the first start makes a new one) or what a running VMM leaves;
+/// the disk layers only those snapshots needed go.
+fn fresh_state(state: &Path) -> Result<(), String> {
+    let gone = |e: std::io::Error| format!("{}: {e}", tilde(state));
+    for d in ["snapshots", "suspend"] {
+        match std::fs::remove_dir_all(state.join(d)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(gone(e)),
+            _ => {}
+        }
+    }
+    for f in ["uuid", "lock", "control", "viewer"] {
+        match std::fs::remove_file(state.join(f)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(gone(e)),
+            _ => {}
+        }
+    }
+    if state.join("disks").is_dir() {
+        let vm = state.parent().map(Path::to_path_buf).into_iter().collect::<Vec<_>>();
+        vroom_state::prune(state, &vm).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// `a/b/../c` as `a/c`, without asking the disk.
@@ -320,5 +523,88 @@ mod tests {
         assert!(!t.path().join("VMs/dev").exists());
         assert_eq!(std::fs::read_to_string(to.join("dev/dev.state/efivars.fd")).unwrap(), "vars");
         assert!(!to.join(".dev.moving").exists());
+    }
+
+    #[test]
+    fn clone_is_another_machine() {
+        let t = tempfile::tempdir().unwrap();
+        let file = vm(t.path());
+        let dir = t.path().join("VMs/dev");
+        std::fs::write(&file, VM.replace("mode = \"nat\"\n", "mode = \"nat\"\nmac = \"02:00:00:00:00:01\"\n")).unwrap();
+        let st = dir.join("dev.state");
+        std::fs::create_dir_all(st.join("disks")).unwrap();
+        std::fs::create_dir_all(st.join("snapshots/s1")).unwrap();
+        std::fs::write(st.join("disks/disk0.json"), r#"{"active":"../../dev.qcow2"}"#).unwrap();
+        for f in ["uuid", "lock", "control", "viewer", "snapshots/s1/memory.bin"] {
+            std::fs::write(st.join(f), "x").unwrap();
+        }
+        assert!(plan_clone(&file, "dev", &t.path().join("VMs")).is_err(), "its own folder");
+        assert!(plan_clone(&file, "a b", &t.path().join("VMs")).is_err());
+        let new = plan_clone(&file, "web", &t.path().join("VMs")).unwrap().run().unwrap();
+        let root = std::fs::canonicalize(t.path()).unwrap();
+        assert_eq!(new, root.join("VMs/web/web.toml"));
+        assert!(!root.join("VMs/.web.cloning").exists());
+        let text = std::fs::read_to_string(&new).unwrap();
+        assert!(text.contains("name = \"web\" # mine"), "comments kept: {text}");
+        let c = VmConfig::load(&new).unwrap();
+        let vroom_config::Boot::Uefi { vars, .. } = &c.boot else { panic!() };
+        assert_eq!(vars, &root.join("VMs/web/web.state/efivars.fd"));
+        assert_eq!(std::fs::read_to_string(vars).unwrap(), "vars");
+        assert_eq!(c.disks[0].path, root.join("VMs/web/dev.qcow2"));
+        assert_eq!(std::fs::read_to_string(&c.disks[0].path).unwrap(), "disk");
+        assert_eq!(lexical(&c.disks[1].path), root.join("VMs/isos/x.iso"), "the ISO is shared");
+        assert_ne!(c.nets[0].mac.as_deref(), Some("02:00:00:00:00:01"));
+        assert!(c.identity.serial.is_some());
+        let st = root.join("VMs/web/web.state");
+        assert!(st.join("disks/disk0.json").is_file());
+        for gone in ["uuid", "lock", "control", "viewer", "snapshots"] {
+            assert!(!st.join(gone).exists(), "{gone}");
+        }
+        // The original is as it was.
+        assert!(dir.join("dev.state/uuid").is_file() && dir.join("dev.state/snapshots/s1").is_dir());
+        assert_eq!(VmConfig::load(&file).unwrap().nets[0].mac.as_deref(), Some("02:00:00:00:00:01"));
+        assert!(plan_clone(&file, "web", &t.path().join("VMs")).is_err(), "taken");
+    }
+
+    #[test]
+    fn clone_elsewhere_without_the_snapshots() {
+        let t = tempfile::tempdir().unwrap();
+        let file = vm(t.path());
+        let st = t.path().join("VMs/dev/dev.state");
+        std::fs::create_dir_all(st.join("snapshots/s1")).unwrap();
+        std::fs::write(st.join("snapshots/s1/memory.bin"), "big").unwrap();
+        let to = t.path().join("Elsewhere");
+        std::fs::create_dir_all(&to).unwrap();
+        assert!(plan_clone(&file, "web", &st).is_err(), "inside itself");
+        let c = plan_clone(&file, "web", &to).unwrap();
+        // What a disk APFS can't clone on gets.
+        copy_except(&c.from, &to.join("web"), &[c.from.join("dev.state/snapshots")]).unwrap();
+        assert!(to.join("web/dev.state/efivars.fd").is_file() && !to.join("web/dev.state/snapshots").exists());
+        std::fs::remove_dir_all(to.join("web")).unwrap();
+        let new = c.run().unwrap();
+        let root = std::fs::canonicalize(t.path()).unwrap();
+        assert_eq!(new, root.join("Elsewhere/web/web.toml"));
+        let c = VmConfig::load(&new).unwrap();
+        assert_eq!(c.disks[0].path, root.join("Elsewhere/web/dev.qcow2"));
+        // The ISO it reached by "../isos" is named where it is.
+        assert_eq!(c.disks[1].path, root.join("VMs/isos/x.iso"));
+    }
+
+    #[test]
+    fn clone_wont_share_what_it_writes() {
+        let t = tempfile::tempdir().unwrap();
+        let file = vm(t.path());
+        let shared = VM.replace("readonly = true\n", "");
+        std::fs::write(&file, &shared).unwrap();
+        let e = plan_clone(&file, "web", &t.path().join("VMs")).unwrap_err();
+        assert!(e.contains("x.iso") && e.contains("outside"), "{e}");
+        // A disk pointer naming the old folder by full path.
+        std::fs::write(&file, VM).unwrap();
+        let st = t.path().join("VMs/dev/dev.state/disks");
+        std::fs::create_dir_all(&st).unwrap();
+        let abs = std::fs::canonicalize(t.path()).unwrap().join("VMs/dev/dev.qcow2");
+        std::fs::write(st.join("disk0.json"), format!(r#"{{"active":"{}"}}"#, abs.display())).unwrap();
+        assert!(plan_clone(&file, "web", &t.path().join("VMs")).unwrap().run().unwrap_err().contains("full path"));
+        assert!(!t.path().join("VMs/web").exists() && !t.path().join("VMs/.web.cloning").exists());
     }
 }

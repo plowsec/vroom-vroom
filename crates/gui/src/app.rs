@@ -66,10 +66,14 @@ pub struct App {
     vmware: Option<vroom_import::Plan>,
     /// The progress toast of the import that's running.
     import_toast: Option<i32>,
-    /// The VM (key) the rename dialog is for.
-    renaming: Option<String>,
+    /// The VM (key) the name dialog is for, and whether it clones it.
+    renaming: Option<(String, bool)>,
     /// The VM (key) being copied to another disk, and its toast.
     moving: Option<(String, i32)>,
+    /// The VM (key) being cloned, and its toast.
+    cloning: Option<(String, i32)>,
+    /// The folder the clone dialog puts it in.
+    clone_dir: PathBuf,
     last_settings: Option<VmSettings>,
     /// Host USB devices as listed when "Add device" was pressed, and
     /// whether that list is open.
@@ -216,6 +220,8 @@ impl App {
             import_toast: None,
             renaming: None,
             moving: None,
+            cloning: None,
+            clone_dir: PathBuf::new(),
             last_settings: None,
             usb_host: Vec::new(),
             usb_picking: false,
@@ -348,6 +354,20 @@ impl App {
                     }
                     (Ok(p), None) => self.add_vm(&p),
                     (Err(e), _) => self.toast(e, 3),
+                }
+            }
+            Msg::Cloned(r) => {
+                if let Some((_, id)) = self.cloning.take() {
+                    self.toasts.retain(|t| t.toast.id != id);
+                    self.push_toasts();
+                }
+                match r {
+                    Ok(p) => {
+                        self.add_vm(&p);
+                        let name = self.cur().map(Vm::name).unwrap_or_default();
+                        self.toast(format!("Cloned as {name}, with its own MACs and serials"), 1);
+                    }
+                    Err(e) => self.toast(format!("Couldn't clone it: {e}"), 3),
                 }
             }
             Msg::NewVmProgress(t) => self.ui.set_newvm_progress(s(t)),
@@ -1320,16 +1340,47 @@ impl App {
             }
             "rename" => {
                 if let Some((key, name)) = self.cur().filter(|v| self.still(v)).map(|v| (v.key.clone(), v.name())) {
-                    self.renaming = Some(key);
+                    self.renaming = Some((key, false));
                     self.ui.set_rename_name(s(name));
                     self.ui.set_rename_error(s(""));
+                    self.ui.set_rename_clone(false);
+                    self.ui.set_rename_note(s(""));
                     self.ui.set_rename_open(true);
+                }
+            }
+            "clone" => {
+                let Some(v) = self.cur().filter(|v| self.still(v)) else { return };
+                // Its disks are closed and as the guest left them; the
+                // saved memory stays with it.
+                let note = if self.state_of(v) == VmState::Suspended {
+                    "It's suspended: the clone starts from the disks as they were then, as if the power had gone out, without what was in memory."
+                } else {
+                    ""
+                };
+                self.ui.set_rename_note(s(note));
+                let (key, dir) = (v.key.clone(), v.path.parent().and_then(Path::parent).map(Path::to_path_buf).unwrap_or_default());
+                let name = self.unique_name(&dir, &v.name());
+                self.renaming = Some((key, true));
+                self.ui.set_rename_name(s(name));
+                self.ui.set_rename_error(s(""));
+                self.ui.set_rename_dest(s(paths::tilde(&dir)));
+                self.clone_dir = dir;
+                self.ui.set_rename_clone(true);
+                self.ui.set_rename_open(true);
+            }
+            "clone.location" => {
+                let d = rfd::FileDialog::new().set_title("Put the clone in").set_directory(&self.clone_dir);
+                if let Some(p) = d.pick_folder() {
+                    self.clone_dir = std::fs::canonicalize(&p).unwrap_or(p);
+                    self.ui.set_rename_dest(s(paths::tilde(&self.clone_dir)));
+                    self.ui.set_rename_error(s(""));
                 }
             }
             "rename.cancel" => {
                 self.renaming = None;
                 self.ui.set_rename_open(false);
             }
+            "rename.ok" if self.renaming.as_ref().is_some_and(|(_, c)| *c) => self.clone_vm(),
             "rename.ok" => self.rename_vm(),
             "move" => {
                 let Some(v) = self.cur().filter(|v| self.still(v)) else { return };
@@ -1627,8 +1678,8 @@ impl App {
 
     fn start_current(&mut self, extra: &[String]) {
         let Some(v) = self.cur() else { return };
-        if self.moving.as_ref().is_some_and(|(k, _)| *k == v.key) {
-            return self.toast("It's being moved: it can start once that's done.", 0);
+        if let Some(w) = self.busy(v) {
+            return self.toast(format!("It's being {w}: it can start once that's done."), 0);
         }
         let st = self.state_of(v);
         if console::is_running(&v.key) {
@@ -1836,15 +1887,27 @@ impl App {
         removed || self.vms.len() != before
     }
 
-    /// Not running (suspended is fine) nor being moved: its files can
-    /// change places. Says why not.
+    /// "moved" or "cloned" while its files are being copied.
+    fn busy(&self, v: &Vm) -> Option<&'static str> {
+        let is = |job: &Option<(String, i32)>| job.as_ref().is_some_and(|(k, _)| *k == v.key);
+        if is(&self.moving) {
+            Some("moved")
+        } else if is(&self.cloning) {
+            Some("cloned")
+        } else {
+            None
+        }
+    }
+
+    /// Not running (suspended is fine) nor being moved or cloned: its
+    /// files can change places. Says why not.
     fn still(&self, v: &Vm) -> bool {
-        let why = if self.moving.as_ref().is_some_and(|(k, _)| *k == v.key) {
-            "It's being moved already."
+        let why = if let Some(w) = self.busy(v) {
+            format!("It's being {w} already.")
         } else if console::is_running(&v.key) || !matches!(self.state_of(v), VmState::Off | VmState::Suspended) {
-            "Shut it down (or suspend it) first."
+            "Shut it down (or suspend it) first.".into()
         } else if vroom_state::StateLock::in_use(&v.state_dir()) {
-            "It's running from somewhere else. Shut it down there first."
+            "It's running from somewhere else. Shut it down there first.".into()
         } else {
             return true;
         };
@@ -1852,14 +1915,47 @@ impl App {
         false
     }
 
-    fn rename_vm(&mut self) {
-        let Some(i) = self.renaming.as_ref().and_then(|k| self.vms.iter().position(|v| v.key == *k)) else {
-            return self.act("rename.cancel");
+    /// The VM the name dialog is for, and the name typed, unless a VM in
+    /// the list has it (said in the dialog). A rename may keep its own.
+    fn named(&mut self) -> Option<(usize, String)> {
+        let Some((i, clone)) = self.renaming.as_ref().and_then(|(k, c)| Some((self.vms.iter().position(|v| v.key == *k)?, *c))) else {
+            self.act("rename.cancel");
+            return None;
         };
         let name = self.ui.get_rename_name().trim().to_string();
-        if self.vms.iter().enumerate().any(|(j, v)| j != i && v.name() == name) {
-            return self.ui.set_rename_error(s("There's already a VM with that name."));
+        if self.vms.iter().enumerate().any(|(j, v)| (clone || j != i) && v.name() == name) {
+            self.ui.set_rename_error(s("There's already a VM with that name."));
+            return None;
         }
+        Some((i, name))
+    }
+
+    /// Clone the VM the dialog is for, in the folder picked there (next
+    /// to it unless changed), in the background: a copy where APFS can't
+    /// clone takes a while.
+    fn clone_vm(&mut self) {
+        let Some((i, name)) = self.named() else { return };
+        if !self.still(&self.vms[i]) {
+            return;
+        }
+        let c = match relocate::plan_clone(&self.vms[i].path, &name, &self.clone_dir) {
+            Ok(c) => c,
+            Err(e) => return self.ui.set_rename_error(s(e)),
+        };
+        self.renaming = None;
+        self.ui.set_rename_open(false);
+        self.toast(format!("Cloning {} as {name}…", self.vms[i].name()), 0);
+        let Some(t) = self.toasts.last_mut() else { return };
+        t.until = Instant::now() + Duration::from_secs(24 * 3600);
+        self.cloning = Some((self.vms[i].key.clone(), t.toast.id));
+        std::thread::spawn(move || {
+            let r = c.run();
+            msg::post(move || Msg::Cloned(r));
+        });
+    }
+
+    fn rename_vm(&mut self) {
+        let Some((i, name)) = self.named() else { return };
         if !self.still(&self.vms[i]) {
             return;
         }
@@ -2198,6 +2294,7 @@ impl App {
                 ("Show log", "terminal", "log"),
                 ("Rename", "pencil", "rename"),
                 ("Move to another folder", "folder", "move"),
+                ("Clone", "copy", "clone"),
                 ("Add a network adapter", "network", "net.add"),
                 ("Share a folder", "folder", "share.add"),
                 ("Attach an ISO", "disc", "disk.add-iso"),
@@ -2597,6 +2694,38 @@ mod tests {
         assert_eq!(a.current, Some(0));
         assert!(a.vms[0].path.ends_with("web.toml") && !t.path().join("a.toml").exists());
         assert_eq!(Library::load(&paths::library_file()).vms[0], a.vms[0].path);
+    }
+
+    #[test]
+    fn clone_asks_for_a_free_name() {
+        let (_t, mut a) = app(&["a", "a-2"]);
+        a.update(Msg::Select(0));
+        act(&mut a, "clone");
+        assert!(a.ui.get_rename_open() && a.ui.get_rename_clone());
+        assert_eq!(a.ui.get_rename_name(), "a-3");
+        a.ui.set_rename_name(s("a"));
+        act(&mut a, "rename.ok");
+        assert!(a.ui.get_rename_open() && !a.ui.get_rename_error().is_empty(), "its own name is taken");
+        // These share a folder: no clone.
+        a.ui.set_rename_name(s("b"));
+        act(&mut a, "rename.ok");
+        assert!(a.ui.get_rename_error().contains("folder of its own"));
+        assert!(a.cloning.is_none() && names(&a) == ["a", "a-2"]);
+    }
+
+    #[test]
+    fn clone_of_a_suspended_vm_says_what_it_leaves() {
+        let (t, mut a) = app(&["a"]);
+        std::fs::create_dir_all(t.path().join("a.state/suspend")).unwrap();
+        std::fs::write(t.path().join("a.state/suspend/manifest.json"), "{}").unwrap();
+        a.vms[0].refresh_state();
+        a.update(Msg::Select(0));
+        act(&mut a, "clone");
+        assert!(a.ui.get_rename_open(), "suspended is fine");
+        assert!(a.ui.get_rename_note().contains("memory"));
+        act(&mut a, "rename.cancel");
+        act(&mut a, "rename");
+        assert!(a.ui.get_rename_note().is_empty());
     }
 
     #[test]
