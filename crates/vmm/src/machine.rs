@@ -812,6 +812,8 @@ pub(crate) fn build(
     let viewer = ui.as_ref().map(|d| d.tx());
     let screen_ctl = agent::Screen { heads, max_pixels, gpu3d: config.display.gpu == Gpu::Virtio3d, viewer: viewer.clone() };
     let agent = agent::spawn(host_end, config.clipboard.clone(), clipboard, screen_ctl)?;
+    // A clone's first boot: its guest takes a name and machine ID of its own.
+    crate::reidentify::start(&env.state_dir, config.guest_os(), agent.clone());
     // `vroom guest exec` reaches the guest agent through it.
     match user_socket(&env.state_dir, "ctl", crate::control::CONTROL_FILE) {
         Ok(l) => crate::control::serve(l, agent.clone())?,

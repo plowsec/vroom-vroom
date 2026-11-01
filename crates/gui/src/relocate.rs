@@ -349,6 +349,11 @@ impl Clone {
         }
         let file = tmp.join(&name);
         let before = VmConfig::load_raw(&file).map_err(|e| e.to_string())?;
+        // The guest's own: the VMM has its agent take it at the first start.
+        if let Some(host) = guest_hostname(old, new, before.guest_os() == vroom_config::GuestOs::Windows) {
+            std::fs::create_dir_all(&state).map_err(|e| format!("{}: {e}", tilde(&state)))?;
+            std::fs::write(state.join(REIDENTIFY), host + "\n").map_err(|e| format!("{}: {e}", tilde(&state)))?;
+        }
         let mut after = before.clone();
         after.name = new.clone();
         after.identity.randomize_serials(vroom_config::template::random8());
@@ -395,6 +400,33 @@ impl Clone {
         }
         Ok(())
     }
+}
+
+/// In a clone's state folder until its guest has taken the hostname in it
+/// (and a new machine ID); the VMM's `reidentify` reads it.
+const REIDENTIFY: &str = "reidentify";
+
+/// The hostname a clone's guest takes: from its name, only the part that
+/// differs from the original's when they share a start up to a separator
+/// (`ubuntu-26.04-acme` cloned from `ubuntu-26.04-template`: `acme`). A
+/// DNS label: lowercase letters, digits and `-`; Windows: 15 at most.
+fn guest_hostname(old: &str, new: &str, windows: bool) -> Option<String> {
+    let same = old.bytes().zip(new.bytes()).take_while(|(a, b)| a.eq_ignore_ascii_case(b)).count();
+    let cut = new[..same].rfind(['-', '_', '.']).map_or(0, |i| i + 1);
+    let rest = &new[cut..];
+    let base = if rest.len() >= 2 && rest.bytes().any(|b| b.is_ascii_alphabetic()) { rest } else { new };
+    let mut h = String::new();
+    for c in base.chars().map(|c| c.to_ascii_lowercase()) {
+        if c.is_ascii_alphanumeric() {
+            h.push(c);
+        } else if !h.is_empty() && !h.ends_with('-') {
+            h.push('-');
+        }
+    }
+    h.truncate(if windows { 15 } else { 63 });
+    let h = h.trim_end_matches('-').to_string();
+    // Windows wants a letter in it.
+    (!h.is_empty() && h.bytes().any(|b| b.is_ascii_alphabetic())).then_some(h)
 }
 
 /// A cloned state folder without the old VM's snapshots, its hardware
@@ -557,6 +589,7 @@ mod tests {
         assert!(c.identity.serial.is_some());
         let st = root.join("VMs/web/web.state");
         assert!(st.join("disks/disk0.json").is_file());
+        assert_eq!(std::fs::read_to_string(st.join(REIDENTIFY)).unwrap(), "web\n", "the guest takes a name of its own");
         for gone in ["uuid", "lock", "control", "viewer", "snapshots"] {
             assert!(!st.join(gone).exists(), "{gone}");
         }
@@ -588,6 +621,19 @@ mod tests {
         assert_eq!(c.disks[0].path, root.join("Elsewhere/web/dev.qcow2"));
         // The ISO it reached by "../isos" is named where it is.
         assert_eq!(c.disks[1].path, root.join("VMs/isos/x.iso"));
+    }
+
+    #[test]
+    fn clone_hostnames() {
+        let h = |a, b| guest_hostname(a, b, false);
+        assert_eq!(h("Ubuntu-64-bit-Arm-26.04-alpha-lab", "Ubuntu-64-bit-Arm-26.04-beta-lab").as_deref(), Some("beta-lab"));
+        assert_eq!(h("ubuntu-template", "ubuntu-acme").as_deref(), Some("acme"));
+        assert_eq!(h("dev", "dev-2").as_deref(), Some("dev-2"));
+        assert_eq!(h("web-1", "web-2").as_deref(), Some("web-2"));
+        assert_eq!(h("template", "Acme_Lab.v2").as_deref(), Some("acme-lab-v2"));
+        assert_eq!(h("a", "1234"), None);
+        assert_eq!(guest_hostname("w", "Windows-11-64-bit-Arm-acme", true).as_deref(), Some("windows-11-64-b"));
+        assert_eq!(guest_hostname("w", "aaaaaaaaaaaaaa-b", true).as_deref(), Some("aaaaaaaaaaaaaa"));
     }
 
     #[test]

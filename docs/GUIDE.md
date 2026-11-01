@@ -68,8 +68,12 @@ their inputs change; `--no-build` packages what `target/` has.
   space on APFS, a copy elsewhere. It gets new MACs, serials and hardware
   UUID and starts from the disks as they are; snapshots and saved memory
   stay with the original (a suspended VM's clone boots as if the power
-  had gone out). Inside the guest the hostname and machine ID are the
-  same, and so are port forwards: change those before running both.
+  had gone out). At its first start the guest agent gives the guest a
+  hostname from the new name (the part that differs from the original's:
+  `ubuntu-26.04-acme` from `ubuntu-26.04-template` is `acme`), a new
+  machine ID and SSH host keys (Windows: computer name, machine GUID; not
+  the SID), then restarts it once. Port forwards stay the same: change
+  them before running both.
 - Settings save to the VM file at once, keeping comments. Hand edits show
   up within seconds.
 - Running or suspended: hardware is locked (hover the lock). Network, USB

@@ -654,7 +654,7 @@ export component RenameDialog inherits Rectangle {
             }
             Text {
                 text: root.clone
-                    ? "A copy of the VM in a folder of its own, starting from its disks as they are now. It gets its own MACs, serials and hardware UUID; snapshots stay with the original. On a Mac disk the copy takes no space until one of them changes."
+                    ? "A copy of the VM in a folder of its own, starting from its disks as they are now. It gets its own MACs, serials and hardware UUID; snapshots stay with the original. At its first start the guest tools give the guest its own hostname and machine ID, then restart it once. On a Mac disk the copy takes no space until one of them changes."
                     : "The VM file, its folder and its saved state take the new name. Its disks keep theirs, and the guest sees the same hardware.";
                 font-size: Theme.fs-md;
                 color: Theme.text-2;

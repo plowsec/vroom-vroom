@@ -28,6 +28,7 @@ mod net;
 pub use machine::gpu_in_process;
 pub mod psci;
 mod ramfb;
+mod reidentify;
 mod snapshot;
 mod tpm;
 mod usb;
