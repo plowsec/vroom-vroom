@@ -346,6 +346,8 @@ impl EcamPort {
                 (Some(blob), false) => d.restore(&blob.0)?,
                 (Some(blob), true) => d.reset(&blob.0)?,
                 (None, _) if is_port => {}
+                // A VM saved before it had a balloon: its guest never saw one.
+                (None, _) if id.starts_with("virtio-balloon@") => {}
                 (None, _) => return Err(vroom_snapshot::Error::Invalid(format!("missing {id}"))),
             }
         }

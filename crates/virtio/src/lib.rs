@@ -34,6 +34,7 @@ pub mod types {
     pub const BLOCK: u32 = 2;
     pub const CONSOLE: u32 = 3;
     pub const RNG: u32 = 4;
+    pub const BALLOON: u32 = 5;
     pub const GPU: u32 = 16;
     pub const INPUT: u32 = 18;
     pub const VSOCK: u32 = 19;

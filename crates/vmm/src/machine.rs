@@ -71,6 +71,9 @@ struct Board {
     msi: Arc<GicMsi>,
     /// Devices a resumed VM had in hot plug slots: (port, device).
     hot: Vec<(usize, Box<dyn VirtioDevice>)>,
+    /// On PCI, after the hot plug ports: devices newer than VMs saved
+    /// with them, which keep their slots.
+    after_ports: Vec<Box<dyn VirtioDevice>>,
 }
 
 impl Board {
@@ -92,6 +95,7 @@ impl Board {
             intx,
             msi,
             hot: Vec::new(),
+            after_ports: Vec::new(),
         }
     }
 
@@ -162,6 +166,13 @@ impl Board {
             }
             if !hot.is_empty() {
                 return Err(Error::Setup("the snapshot has a device in a hot plug slot this VM doesn't have".into()));
+            }
+            for dev in std::mem::take(&mut self.after_ports) {
+                // Nice to have: a VM with every slot taken does without.
+                let name = dev.name();
+                if let Err(e) = self.add_virtio(dev) {
+                    log::warn!("pci: no {name} ({e})");
+                }
             }
         }
         let root = PciRoot::with_ports(std::mem::take(&mut self.pci), host_ids, ports);
@@ -894,6 +905,24 @@ pub(crate) fn build(
     // Last, so the devices before keep their places in VMs made before.
     for fs in usb_files {
         board.add_virtio(Box::new(fs))?;
+    }
+    if config.balloon {
+        let ram: Vec<(u64, u64)> = mem.regions().map(|r| (r.start().raw(), r.len())).collect();
+        let (vm2, mem2) = (vm.clone(), mem.clone());
+        let release: vroom_virtio::devices::balloon::Release = Arc::new(move |gpa, len| match vm2.release_memory(&mem2, gpa, len) {
+            Ok(done) => done,
+            Err(e) => {
+                log::warn!("balloon: {e}");
+                false
+            }
+        });
+        let (dev, control) = vroom_virtio::devices::balloon::Balloon::new(ram, vroom_memory::page_size() as u64, release);
+        crate::balloon::start(control, ram_size);
+        if board.use_pci {
+            board.after_ports.push(Box::new(dev));
+        } else if let Err(e) = board.add_virtio(Box::new(dev)) {
+            log::warn!("no memory balloon ({e})");
+        }
     }
     let root = board.finish_pci(vendor_ids(&ident.pci_bridge_id)?, vendor_ids(&ident.pcie_port_id)?)?;
     let need_pci = root.is_some();

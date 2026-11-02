@@ -136,6 +136,9 @@ pub struct HvfVm {
     dirty: Arc<dirty::DirtyLog>,
     execute: Arc<execute::ExecutePatches>,
     watches: Arc<watch::MemoryWatches>,
+    /// Held while the balloon frees RAM, and while debugger views or
+    /// dirty logging start: neither sees the other half done.
+    release_lock: Mutex<()>,
 }
 
 impl std::fmt::Debug for HvfVm {
@@ -250,6 +253,7 @@ impl HvfVm {
             dirty: Arc::new(dirty::DirtyLog::new(granule)),
             execute: Arc::new(execute::ExecutePatches::new(granule)),
             watches: Arc::new(watch::MemoryWatches::new(granule)),
+            release_lock: Mutex::new(()),
         })
     }
 
@@ -353,6 +357,7 @@ impl Vm for HvfVm {
         // HVF keeps the pages it mapped: replacing them under it (discard
         // and COW resets remap) would leave the guest on the old contents.
         // Unmap first, map the new pages after.
+        let _views = self.release_lock.lock().unwrap_or_else(|e| e.into_inner());
         let flags = ffi::HV_MEMORY_READ | ffi::HV_MEMORY_WRITE | ffi::HV_MEMORY_EXEC;
         for r in mem.regions() {
             // SAFETY: unmapping a range we mapped; vCPUs are stopped.
@@ -367,7 +372,31 @@ impl Vm for HvfVm {
         replaced
     }
 
+    fn release_memory(&self, mem: &GuestMemory, gpa: u64, len: u64) -> Result<bool> {
+        // As `replace_memory`, for a range, with the vCPUs running: they
+        // don't touch pages the guest handed over (one that does faults
+        // in the gap, like on an MMIO hole). Debugger views and dirty
+        // logging keep their own mappings: not then.
+        let _views = self.release_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if self.dirty.is_on() || !self.execute.is_empty() || !self.watches.is_empty() {
+            return Ok(false);
+        }
+        let Some(ptr) = mem.host_ranges(vroom_memory::GuestAddress(gpa), len).and_then(|r| (r.len() == 1).then(|| r[0].0)) else {
+            return Err(Error::Invalid(format!("release {gpa:#x}+{len:#x}: not one RAM range")));
+        };
+        if mem.regions().any(|r| r.mmap().shared_fd().is_some()) {
+            return Ok(false);
+        }
+        // SAFETY: unmapping guest RAM we mapped; mapped again below.
+        check("hv_vm_unmap", unsafe { ffi::hv_vm_unmap(gpa, len as usize) })?;
+        let released = mem.release(vroom_memory::GuestAddress(gpa), len);
+        let flags = ffi::HV_MEMORY_READ | ffi::HV_MEMORY_WRITE | ffi::HV_MEMORY_EXEC;
+        self.map(ptr, gpa, len as usize, flags)?;
+        released.map_err(|e| Error::Invalid(format!("release: {e}")))
+    }
+
     fn start_dirty_log(&self, mem: &GuestMemory) -> Result<()> {
+        let _views = self.release_lock.lock().unwrap_or_else(|e| e.into_inner());
         if !self.execute.is_empty() {
             return Err(Error::Unsupported("logging writes to RAM with execute patches"));
         }
@@ -378,6 +407,7 @@ impl Vm for HvfVm {
     }
 
     fn set_execute_patch(&self, gpa: u64, word: Option<[u8; 4]>) -> Result<()> {
+        let _views = self.release_lock.lock().unwrap_or_else(|e| e.into_inner());
         if self.dirty.is_on() {
             return Err(Error::Unsupported("execute patches while logging writes to RAM"));
         }
@@ -389,6 +419,7 @@ impl Vm for HvfVm {
     }
 
     fn set_memory_watches(&self, watches: &[crate::debug::MemoryWatch]) -> Result<()> {
+        let _views = self.release_lock.lock().unwrap_or_else(|e| e.into_inner());
         if self.dirty.is_on() && !watches.is_empty() {
             return Err(Error::Unsupported("memory watches while logging writes to RAM"));
         }

@@ -131,6 +131,14 @@ pub trait Vm: Send + Sync {
         mem.discard_all().map_err(|e| Error::Invalid(format!("discard: {e}")))
     }
 
+    /// Free `len` bytes of guest RAM at `gpa` while the VM runs (pages the
+    /// guest handed over): the guest reads zeros there after. Multiples of
+    /// the host page size. False if not now (writes logged, execute
+    /// patches, watches, shared RAM): nothing changed then.
+    fn release_memory(&self, mem: &GuestMemory, gpa: u64, len: u64) -> Result<bool> {
+        mem.release(vroom_memory::GuestAddress(gpa), len).map_err(|e| Error::Invalid(format!("release: {e}")))
+    }
+
     /// Run `replace`, which swaps the host pages behind `mem` (remaps it),
     /// so the guest sees the new pages afterwards. vCPUs must be stopped.
     /// The default suits backends that follow host page table changes.

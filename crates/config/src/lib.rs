@@ -72,6 +72,10 @@ pub struct VmConfig {
     /// Host folders the guest can mount (virtio-fs).
     #[serde(default, rename = "share")]
     pub shares: Vec<Share>,
+    /// A memory balloon: the guest gives the Mac back the memory it frees,
+    /// and its caches when the Mac runs short.
+    #[serde(default = "yes", skip_serializing_if = "is_yes")]
+    pub balloon: bool,
     /// A TPM 2.0 (swtpm in its own process; state in the state dir).
     /// Windows 11 wants one; Linux uses it for measured boot.
     #[serde(default)]
