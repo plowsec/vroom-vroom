@@ -42,6 +42,8 @@ pub const HV_REG_FPSR: u32 = 33;
 pub const HV_REG_CPSR: u32 = 34;
 
 pub const HV_SYS_REG_MPIDR_EL1: u16 = 0xc005;
+pub const HV_SYS_REG_ID_AA64PFR0_EL1: u16 = 0xc020;
+pub const HV_SYS_REG_ID_AA64PFR1_EL1: u16 = 0xc021;
 pub const HV_SYS_REG_ID_AA64DFR0_EL1: u16 = 0xc028;
 pub const HV_SYS_REG_SP_EL1: u16 = 0xe208;
 pub const HV_SYS_REG_CNTV_CTL_EL0: u16 = 0xdf19;

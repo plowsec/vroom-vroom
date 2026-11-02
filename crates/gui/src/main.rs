@@ -74,7 +74,10 @@ pub fn fallback(m: msg::Msg) {
 fn main() {
     mac::log_to_file_if_detached();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
-    if let Err(e) = slint::BackendSelector::new().backend_name("winit".into()).select() {
+    // Metal, not OpenGL: AppKit redraws an OpenGL window on a software
+    // surface when the last display goes (lid closed), and that crashed.
+    let renderer = if cfg!(target_os = "macos") { "skia" } else { "femtovg" };
+    if let Err(e) = slint::BackendSelector::new().backend_name("winit".into()).renderer_name(renderer.into()).select() {
         eprintln!("vroom-gui: {e}");
         std::process::exit(1);
     }

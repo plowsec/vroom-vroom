@@ -85,6 +85,7 @@ fn lock_down(cfg: &VmConfig, state_dir: &Path, clipboard: bool, helpers: Vec<u32
         if n.mode == NetKind::Nat {
             p.network_outbound = true;
             p.loopback |= n.allow_host_loopback;
+            p.loopback_ports.extend(&n.host_ports);
             p.loopback_dns |= vroom_net::nat::host_dns().is_some_and(|a| a.ip().is_loopback());
             p.listen_ports.extend(n.port_forwards.iter().map(|f| f.host_port));
         }

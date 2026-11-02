@@ -163,6 +163,25 @@ impl HvfVcpu {
         };
         v.set_sys(ffi::HV_SYS_REG_MPIDR_EL1, mpidr)?;
         v.apply_vm_clock()?;
+        // HVF leaves GIC and EL2 hidden in PFR0 despite enabling them.
+        // Hyper-V checks this even when the firmware started at EL2.
+        let mut pfr0 = v.get_sys(ffi::HV_SYS_REG_ID_AA64PFR0_EL1)?;
+        if (pfr0 >> 24) & 0xf == 0 {
+            pfr0 |= 1 << 24;
+        }
+        if el2 && (pfr0 >> 8) & 0xf == 0 {
+            pfr0 |= 1 << 8;
+        }
+        v.set_sys(ffi::HV_SYS_REG_ID_AA64PFR0_EL1, pfr0)?;
+        // Hide SME from a guest at EL2: HVF advertises it (M4) but UNDEFs
+        // SMCR_EL2 there. Linux's EL2 stub takes that UNDEF as an unknown
+        // hypercall and returns to the same MSR, forever.
+        if el2 {
+            let pfr1 = v.get_sys(ffi::HV_SYS_REG_ID_AA64PFR1_EL1)?;
+            if (pfr1 >> 24) & 0xf != 0 {
+                v.set_sys(ffi::HV_SYS_REG_ID_AA64PFR1_EL1, pfr1 & !(0xf << 24))?;
+            }
+        }
         // Advertise PMUv3. HVF hides the PMU by default and then UNDEFs
         // PMU accesses; Windows requires a PMU (its boot manager reads
         // PMCR_EL0 unconditionally). Once advertised, HVF virtualizes it.
@@ -751,11 +770,12 @@ impl HvfVcpu {
     }
 }
 
-/// EL2 system registers (op0=3, op1=4/5): HCR, SCTLR, TCR, TTBR0/1, VBAR,
-/// ELR, SPSR, ESR, FAR, MAIR, CNTHCTL, CNTVOFF, CNTHP_CTL/CVAL, VTCR, VTTBR.
+/// EL2 system registers (op0=3, op1=4/5/6): HCR, SCTLR, TCR, TTBR0/1, VBAR,
+/// ELR, SPSR, ESR, FAR, MAIR, CNTHCTL, CNTVOFF, CNTHP_CTL/CVAL, VTCR, VTTBR,
+/// SP_EL1, VPIDR, VMPIDR, CPTR, MDCR, HSTR, TPIDR, HPFAR, SP_EL2.
 const EL2_REGS: &[u16] = &[
     0xe088, 0xe080, 0xe102, 0xe100, 0xe101, 0xe600, 0xe201, 0xe200, 0xe290, 0xe300, 0xe510, 0xe708, 0xe703, 0xe711,
-    0xe712, 0xe10a, 0xe108, 0xe208,
+    0xe712, 0xe10a, 0xe108, 0xe208, 0xe000, 0xe005, 0xe08a, 0xe089, 0xe08b, 0xe682, 0xe304, 0xf208,
 ];
 
 impl Drop for HvfVcpu {
@@ -953,6 +973,15 @@ impl Vcpu for HvfVcpu {
         }
         // The RAM this state goes with may have new page tables.
         self.flush_tlb()?;
+        // EL2 first: a reset must not keep the last boot's EL2 MMU and
+        // vectors, which point into RAM that is now zeroed.
+        for (id, bytes) in &s.raw {
+            let r = u16::try_from(*id).ok().filter(|r| self.el2 && EL2_REGS.contains(r));
+            let (Some(r), Ok(bytes)) = (r, <[u8; 8]>::try_from(bytes.as_slice())) else {
+                return Err(Error::Invalid(format!("unknown EL2 register {id:#x} in snapshot")));
+            };
+            self.set_sys(r, u64::from_le_bytes(bytes))?;
+        }
         for &(id, v) in &s.regs {
             if id & 0x1_0000 != 0 {
                 let r = (id & 0xffff) as u16;

@@ -69,6 +69,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 pub struct NatPolicy {
     /// Let the guest reach host 127.0.0.1 through the gateway address.
     pub allow_host_loopback: bool,
+    /// ... only on these ports (when not all of them).
+    pub host_ports: Vec<u16>,
     /// Block RFC1918 / CGNAT destinations (isolate from the LAN).
     pub block_private: bool,
 }
@@ -312,11 +314,8 @@ impl Nat {
             return None;
         }
         if dst == self.cfg.gateway {
-            return self
-                .cfg
-                .policy
-                .allow_host_loopback
-                .then(|| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)));
+            let p = &self.cfg.policy;
+            return (p.allow_host_loopback || p.host_ports.contains(&port)).then(|| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)));
         }
         let o = dst.octets();
         let in_subnet = o[..3] == self.cfg.gateway.octets()[..3];
@@ -1004,6 +1003,10 @@ mod tests {
         assert!(n.resolve(Ipv4Addr::new(192, 168, 1, 1), 80).is_some());
         n.cfg.policy.block_private = true;
         assert!(n.resolve(Ipv4Addr::new(192, 168, 1, 1), 80).is_none());
+        n.cfg.policy.host_ports = vec![8000];
+        assert_eq!(n.resolve(GATEWAY, 8000), Some("127.0.0.1:8000".parse().unwrap()));
+        assert!(n.resolve(GATEWAY, 22).is_none(), "only the ports listed");
+        assert!(n.resolve(Ipv4Addr::LOCALHOST, 8000).is_none());
         n.cfg.policy.allow_host_loopback = true;
         assert_eq!(n.resolve(GATEWAY, 22), Some("127.0.0.1:22".parse().unwrap()));
     }

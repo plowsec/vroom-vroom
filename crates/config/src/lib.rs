@@ -72,6 +72,10 @@ pub struct VmConfig {
     /// Host folders the guest can mount (virtio-fs).
     #[serde(default, rename = "share")]
     pub shares: Vec<Share>,
+    /// A memory balloon: the guest gives the Mac back the memory it frees,
+    /// and its caches when the Mac runs short.
+    #[serde(default = "yes", skip_serializing_if = "is_yes")]
+    pub balloon: bool,
     /// A TPM 2.0 (swtpm in its own process; state in the state dir).
     /// Windows 11 wants one; Linux uses it for measured boot.
     #[serde(default)]
@@ -683,6 +687,10 @@ pub struct Net {
     /// Off by default: localhost services often have no auth.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub allow_host_loopback: bool,
+    /// NAT: only these ports of host loopback, through the gateway IP (a
+    /// model server, say); `allow_host_loopback` opens them all.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_ports: Vec<u16>,
     /// NAT: block private (LAN) destinations; internet only.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub block_private: bool,
@@ -752,11 +760,16 @@ impl Net {
                 if self.port_forwards.iter().any(|p| p.proto != "tcp") {
                     return bad("only tcp port forwards are supported for now");
                 }
+                if self.host_ports.contains(&0) || self.host_ports.len() > HOST_PORTS_MAX {
+                    return bad(&format!("host_ports: 1 to {HOST_PORTS_MAX} ports, none of them 0"));
+                }
                 self.mirror_net()?;
                 Ok(NetMode::Nat { port_forwards: self.port_forwards.clone() })
             }
-            NetKind::Bridged | NetKind::HostOnly if self.allow_host_loopback || self.block_private || self.mirror.is_some() => {
-                bad("allow_host_loopback / block_private / mirror only apply to nat")
+            NetKind::Bridged | NetKind::HostOnly
+                if self.allow_host_loopback || self.block_private || !self.host_ports.is_empty() || self.mirror.is_some() =>
+            {
+                bad("allow_host_loopback / host_ports / block_private / mirror only apply to nat")
             }
             NetKind::Bridged => {
                 if self.network.is_some() || !self.port_forwards.is_empty() {
@@ -1030,6 +1043,9 @@ impl VmConfig {
         for n in &self.nets {
             if n.allow_host_loopback {
                 w.push("net.allow_host_loopback: the guest can reach services listening on this Mac's 127.0.0.1".into());
+            } else if !n.host_ports.is_empty() {
+                let ports: Vec<String> = n.host_ports.iter().map(u16::to_string).collect();
+                w.push(format!("net.host_ports: the guest can reach this Mac's 127.0.0.1 on port {}", ports.join(", ")));
             }
             for f in &n.port_forwards {
                 if f.host_addr != "127.0.0.1" && f.host_addr != "::1" {
@@ -1190,6 +1206,9 @@ pub fn config_dir(config: &Path) -> Result<PathBuf> {
     std::fs::canonicalize(base).map_err(|e| Error::Io(format!("{}: {e}", base.display())))
 }
 
+/// Most `host_ports` one adapter may list.
+pub const HOST_PORTS_MAX: usize = 16;
+
 /// VM, network and share names: 1-64 of `[A-Za-z0-9._-]`, no leading dot.
 pub fn valid_name(s: &str) -> bool {
     !s.is_empty()
@@ -1285,6 +1304,17 @@ mod tests {
         assert!(!t.contains("mode") && !t.contains("readonly"), "{t}");
         assert!(toml::to_string(&m).unwrap().contains("mode = \"files\""));
         assert_eq!(super::UsbMode::parse("disk"), Some(super::UsbMode::Disk));
+    }
+
+    #[test]
+    fn host_ports_are_nat_only_and_named() {
+        let vm = |net: &str| super::VmConfig::from_toml(&format!("name = \"w\"\n[boot]\ntype = \"kernel\"\nkernel = \"/k\"\n[[net]]\n{net}\n"));
+        let c = vm("mode = \"nat\"\nhost_ports = [8000]").unwrap();
+        assert_eq!(c.nets[0].host_ports, [8000]);
+        assert!(c.warnings().join("\n").contains("127.0.0.1 on port 8000"));
+        assert!(vm("mode = \"nat\"\nhost_ports = [0]").is_err());
+        assert!(vm("mode = \"host-only\"\nhost_ports = [8000]").is_err());
+        assert!(!toml::to_string(&vm("mode = \"nat\"").unwrap()).unwrap().contains("host_ports"));
     }
 
     #[test]

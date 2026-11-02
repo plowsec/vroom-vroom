@@ -629,9 +629,14 @@ export component ConfirmDialog inherits Rectangle {
     }
 }
 
+// Rename, or (clone) the name of a clone.
 export component RenameDialog inherits Rectangle {
     in-out property <string> name;
     in property <string> error;
+    in property <bool> clone;
+    // The clone's folder, and a warning about it.
+    in property <string> dest;
+    in property <string> note;
     Scrim {
         dismiss => { Bus.act("rename.cancel"); }
     }
@@ -642,13 +647,15 @@ export component RenameDialog inherits Rectangle {
             padding: 24px;
             spacing: 14px;
             Text {
-                text: "Rename";
+                text: root.clone ? "Clone" : "Rename";
                 font-size: Theme.fs-xl;
                 font-weight: 700;
                 color: Theme.text;
             }
             Text {
-                text: "The VM file, its folder and its saved state take the new name. Its disks keep theirs, and the guest sees the same hardware.";
+                text: root.clone
+                    ? "A copy of the VM in a folder of its own, starting from its disks as they are now. It gets its own MACs, serials and hardware UUID; snapshots stay with the original. At its first start the guest tools give the guest its own hostname and machine ID, then restart it once. On a Mac disk the copy takes no space until one of them changes."
+                    : "The VM file, its folder and its saved state take the new name. Its disks keep theirs, and the guest sees the same hardware.";
                 font-size: Theme.fs-md;
                 color: Theme.text-2;
                 wrap: word-wrap;
@@ -663,6 +670,50 @@ export component RenameDialog inherits Rectangle {
                     self.select-all();
                 }
             }
+            if root.clone: Rectangle {
+                height: 30px;
+                border-radius: Theme.r-md;
+                background: dta.has-hover ? Theme.card-hover : transparent;
+                dta := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { Bus.act("clone.location"); }
+                }
+                Tip {
+                    text: "The folder the clone's own folder goes in. Next to this VM's unless you choose another.";
+                }
+                HorizontalLayout {
+                    padding-left: 6px;
+                    padding-right: 6px;
+                    spacing: 8px;
+                    Icon {
+                        source: Icons.folder;
+                        width: 15px;
+                        height: 15px;
+                        y: (parent.height - self.height) / 2;
+                        tint: Theme.text-3;
+                    }
+                    Text {
+                        horizontal-stretch: 1;
+                        text: root.dest;
+                        font-size: Theme.fs-xs;
+                        font-family: Theme.mono;
+                        color: Theme.text-3;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    Text {
+                        text: "Change…";
+                        font-size: Theme.fs-xs;
+                        font-weight: 600;
+                        color: dta.has-hover ? Theme.accent : Theme.text-2;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+            if root.note != "": Banner {
+                kind: 2;
+                text: root.note;
+            }
             if root.error != "": Banner {
                 kind: 3;
                 text: root.error;
@@ -676,7 +727,7 @@ export component RenameDialog inherits Rectangle {
                     clicked => { Bus.act("rename.cancel"); }
                 }
                 Button {
-                    text: "Rename";
+                    text: root.clone ? "Clone" : "Rename";
                     kind: "primary";
                     enabled: root.name != "";
                     clicked => { Bus.act("rename.ok"); }

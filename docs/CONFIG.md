@@ -13,8 +13,9 @@ the same files and picks up hand edits.
 | `os` | guessed | `ubuntu`, `windows`, `debian`, `fedora`, `alpine`, `linux`, `other`. Only picks icons and defaults. |
 | `cpus` | 2 | Virtual CPUs, 1-64. |
 | `memory_mib` | 2048 | RAM in MiB. |
+| `balloon` | true | The guest gives the Mac back memory it frees (free page reporting), and its caches when the Mac runs short of memory (it inflates a balloon then). Linux: `virtio_balloon`, built into stock kernels; Windows: the virtio-win Balloon driver. |
 | `tpm` | false | TPM 2.0 (needs `swtpm`). Windows 11 wants it. |
-| `nested` | false | Let the guest run its own VMs. M3 or newer, macOS 15+. No snapshots then. |
+| `nested` | false | Let the guest run its own VMs. M3 or newer, macOS 15+. Changing it needs a full shutdown; resuming keeps the saved CPU configuration. Not Windows Hyper-V (so no WSL 2 or Docker Desktop): macOS gives guests EL2 without VHE, which Hyper-V needs; Windows boots without it. No snapshots then. |
 | `camera` | false | The Mac's camera as a USB webcam. Live only while the window is open and a guest app uses it. [GUIDE](GUIDE.md#camera). |
 | `virtio_transport` | `auto` | `auto` (MMIO for kernel boot, PCI for UEFI), `mmio`, `pci`. PCI adds four hot plug slots. |
 
@@ -63,6 +64,7 @@ port_forwards = [{ host_port = 2222, guest_port = 22 }]
 | `mode` | all | `nat`: guest gets out, nothing gets in except forwards. `bridged`: guest is on your LAN. `host-only`: private network between VMs and the host. |
 | `port_forwards` | nat | `{ host_port, guest_port, host_addr = "127.0.0.1", proto = "tcp" }`. Set `host_addr = "0.0.0.0"` to open it to other machines. |
 | `allow_host_loopback` | nat | Guest can reach services on the host's 127.0.0.1. Off: those often have no auth. |
+| `host_ports` | nat | Only these ports of the host's 127.0.0.1, at the gateway address (`10.0.2.2`): `host_ports = [8000]` for a local model server, nothing else. |
 | `block_private` | nat | Guest can only reach the internet, not your LAN. |
 | `mirror` | nat | `"10.99.0.0/24"`: what the guest sends there comes back to it through its NIC, from that address. Its own services as a remote peer reaches them (fuzzing). |
 | `interface` | bridged | Host interface, e.g. `en0`. |
@@ -75,7 +77,7 @@ Bridged and host-only need `vroom-netd`
 to set: `mode = "host-only"`, then `vroom net` for the guest's address.
 
 Live in the app: `connected`, `mode`, `interface`, `network`,
-`block_private`. Next start: port forwards, `allow_host_loopback`, `mirror`, `mac`.
+`block_private`. Next start: port forwards, `allow_host_loopback`, `host_ports`, `mirror`, `mac`.
 Adapters: [NETWORKING.md](NETWORKING.md#changing-adapters-while-the-vm-runs).
 
 ## `[display]`

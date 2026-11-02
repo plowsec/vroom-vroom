@@ -341,6 +341,23 @@ impl GuestMemory {
         fence(Ordering::SeqCst);
     }
 
+    /// Give `len` bytes at `addr` back to the host while the VM runs (the
+    /// balloon): they read zero after. Whole host pages, in one region.
+    /// False for shared RAM, which can't free part of itself.
+    pub fn release(&self, addr: GuestAddress, len: u64) -> Result<bool> {
+        let r = self.find(addr).ok_or(Error::InvalidRange(addr.0, len))?;
+        let off = (addr.0 - r.start.0) as usize;
+        if addr.0.checked_add(len).is_none_or(|e| e > r.end().0) {
+            return Err(Error::InvalidRange(addr.0, len));
+        }
+        if r.mmap.shared_fd().is_some() {
+            return Ok(false);
+        }
+        let _mapping = self.mapping_lock.write().unwrap_or_else(|error| error.into_inner());
+        r.mmap.discard(off, len as usize)?;
+        Ok(true)
+    }
+
     /// Zero all RAM and give pages back to the host (VM reset).
     pub fn discard_all(&self) -> Result<()> {
         let _mapping = self

@@ -178,6 +178,9 @@ pub fn profile(p: &Policy) -> Result<String> {
             if p.loopback_dns {
                 s += "(allow network-outbound (remote ip \"localhost:53\"))\n";
             }
+            for port in &p.loopback_ports {
+                s += &format!("(allow network-outbound (remote ip \"localhost:{port}\"))\n");
+            }
         }
     }
     for port in &p.listen_ports {
@@ -457,6 +460,29 @@ mod tests {
         assert!(t.len() > 16, "{t}");
         assert_ne!(t, issue_extension(d.path(), true).unwrap());
         assert!(issue_extension(&d.path().join("nothing"), false).is_err());
+    }
+
+    /// NAT `host_ports`: the listed loopback port connects, another one
+    /// doesn't, refused by the sandbox (not only by the NAT). In a child,
+    /// as a sandbox is for the whole process.
+    #[test]
+    fn only_the_listed_loopback_ports() {
+        const ME: &str = "macos::tests::only_the_listed_loopback_ports";
+        if std::env::var_os("VROOM_SB_PORTS_CHILD").is_none() {
+            let st = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", ME, "--nocapture", "--test-threads=1"])
+                .env("VROOM_SB_PORTS_CHILD", "1")
+                .status()
+                .unwrap();
+            assert!(st.success());
+            return;
+        }
+        let open = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let shut = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let (yes, no) = (open.local_addr().unwrap().port(), shut.local_addr().unwrap().port());
+        apply(&Policy { network_outbound: true, loopback_ports: vec![yes], ..Default::default() }).unwrap();
+        assert!(std::net::TcpStream::connect(("127.0.0.1", yes)).is_ok(), "the listed port");
+        assert!(std::net::TcpStream::connect(("127.0.0.1", no)).is_err(), "another port");
     }
 
     /// A USB disk's files handed over while the VMM is still setting up

@@ -40,6 +40,9 @@ export component AppWindow inherits Window {
     in-out property <bool> rename-open;
     in-out property <string> rename-name;
     in property <string> rename-error;
+    in property <bool> rename-clone;
+    in property <string> rename-dest;
+    in property <string> rename-note;
 
     in property <[Toast]> toasts;
     in property <bool> drop-hover;
@@ -137,5 +140,8 @@ export component AppWindow inherits Window {
     if root.rename-open: RenameDialog {
         name <=> root.rename-name;
         error: root.rename-error;
+        clone: root.rename-clone;
+        dest: root.rename-dest;
+        note: root.rename-note;
     }
 }

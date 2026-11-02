@@ -31,8 +31,9 @@ aborting, and cargo-xwin cannot link the Windows agent. `brew upgrade lld`.
 
 ## The Mac app
 
-`scripts/app.sh` builds `target/dist/vroom.app`; `--install` copies it to
-`/Applications` (refused while VMs run from there). Everything is in it:
+`scripts/app.sh` builds `target/dist.noindex/vroom.app`; `--install` copies it to
+`/Applications` (refused while VMs run from there). Spotlight skips
+`.noindex` folders, so it offers only the installed app. Everything is in it:
 3D (ANGLE, DXMT, virglrenderer), the guest tools with the Windows 3D
 drivers, virtio-win drivers and WinFsp (pinned downloads,
 `scripts/fetch.sh`, in `target/downloads/`). Long builds rerun only when
@@ -62,6 +63,17 @@ their inputs change; `--no-build` packages what `target/` has.
   folder and its own folder follow; disk files keep their names, MACs stay
   the same. Moving needs the VM in a folder of its own; to another disk it
   copies, then deletes the original.
+- `⋯` → Clone… (off or suspended, in a folder of its own): a copy next
+  to it, or in the folder picked with "Change…"; instant and sharing
+  space on APFS, a copy elsewhere. It gets new MACs, serials and hardware
+  UUID and starts from the disks as they are; snapshots and saved memory
+  stay with the original (a suspended VM's clone boots as if the power
+  had gone out). At its first start the guest agent gives the guest a
+  hostname from the new name (the part that differs from the original's:
+  `ubuntu-26.04-acme` from `ubuntu-26.04-template` is `acme`), a new
+  machine ID and SSH host keys (Windows: computer name, machine GUID; not
+  the SID), then restarts it once. Port forwards stay the same: change
+  them before running both.
 - Settings save to the VM file at once, keeping comments. Hand edits show
   up within seconds.
 - Running or suspended: hardware is locked (hover the lock). Network, USB
@@ -131,7 +143,8 @@ App: "Import from VMware" in `⋯` or `⌘K`, or drop the `.vmwarevm`.
 - Disks → qcow2 (used parts only); snapshot chains and linked clones are
   flattened to the current state.
 - CPUs, memory, shared folders, sound, TPM setting carry over. Every NIC
-  becomes NAT. ISOs stay where they are, attached as CDs.
+  becomes NAT. ISOs are left out: VMware's boot entries don't come along,
+  so a CD would boot before the disk. Attach one after the first boot.
 - Before: shut down in VMware and quit it (a suspended VM imports with
   `--yes`, memory lost). No x86 VMs. Remove disk encryption first; TPM
   contents don't come along, so have the BitLocker recovery key.
@@ -702,5 +715,8 @@ default).
   `tpm = true` (`brew install swtpm`) gives a real TPM 2.0.
 - Windows 3D: Direct3D 11 only.
 - NAT connections don't survive suspend.
+- Nested virtualization: no Hyper-V in Windows guests (WSL 2, Docker
+  Desktop, Windows Sandbox). Hypervisor.framework's EL2 has no VHE, and
+  Hyper-V on Arm runs only with it. Windows boots without Hyper-V.
 - USB: tested with fake devices; real USB sticks via vroom-netd untested
   with Full Disk Access.

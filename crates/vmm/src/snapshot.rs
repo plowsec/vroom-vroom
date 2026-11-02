@@ -289,6 +289,10 @@ pub(crate) fn restore(vmm: &mut Vmm, dir: &Path) -> Result<()> {
     for d in &vmm.devices {
         let mut d = d.lock().unwrap_or_else(|e| e.into_inner());
         let id = d.snapshot_id();
+        if id.starts_with("virtio-balloon@") && !snap.manifest.files.contains_key(&dev_blob(&id)) {
+            // Saved before the VM had a balloon: its guest never saw one.
+            continue;
+        }
         d.restore(&snap.get_blob(&dev_blob(&id))?)?;
     }
 
