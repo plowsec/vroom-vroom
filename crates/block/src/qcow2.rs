@@ -928,7 +928,12 @@ pub fn fold_backing(child: &Path, policy: &OpenPolicy) -> Result<PathBuf> {
                             let n = ccs.min(size - cg) as usize;
                             drop(pst);
                             p.read_at(&mut buf[..n], cg)?;
-                            c.write_at(&buf[..n], cg)?;
+                            // Zero markers (and zero-filled data) stay markers, not 64 KiB of zeroes.
+                            if buf[..n].iter().all(|&b| b == 0) {
+                                c.write_zeroes(cg, n as u64)?;
+                            } else {
+                                c.write_at(&buf[..n], cg)?;
+                            }
                             pst = p.state.lock().unwrap_or_else(|e| e.into_inner());
                         }
                         last_done = cg;
@@ -993,7 +998,11 @@ pub fn compact(path: &Path, policy: &OpenPolicy) -> Result<(u64, u64)> {
             } else if e != 0 {
                 // Our own data (plain or compressed), not the backing's.
                 src.read_chunk(&mut st, &mut buf[..n as usize], g)?;
-                dst.write_at(&buf[..n as usize], g)?;
+                if buf[..n as usize].iter().all(|&b| b == 0) {
+                    dst.write_zeroes(g, n)?;
+                } else {
+                    dst.write_at(&buf[..n as usize], g)?;
+                }
             }
             g += cs;
         }
@@ -1287,6 +1296,8 @@ mod tests {
         let t = Qcow2Image::open(&top, true).unwrap();
         assert_eq!(t.hdr.backing_file.as_deref(), Some("base.raw"));
         assert_eq!(t.hdr.backing_format.as_deref(), Some("raw"));
+        let e = t.l2_entry(&mut t.state.lock().unwrap(), 5 * C).unwrap();
+        assert_eq!(e & OFFSET_MASK, 0, "mid's zeroes folded up as a marker, not data");
 
         drop(t);
         // And once more down to no backing at all.
@@ -1422,6 +1433,7 @@ mod tests {
             }
             q.write_at(&vec![9u8; 4 * C as usize], 20 * C).unwrap();
             q.discard(30 * C, 2 * C).unwrap(); // zeros over the base's 7s
+            q.write_at(&vec![0u8; 2 * C as usize], 40 * C).unwrap(); // zero-filled data
         }
         let read_all = |p: &Path| {
             let q = Qcow2Image::open(p, true).unwrap();
@@ -1437,6 +1449,9 @@ mod tests {
         let (before, after) = compact(&p, &OpenPolicy::default()).unwrap();
         assert!(after <= before, "{after} > {before}");
         assert_eq!(read_all(&p), want);
+        let q = Qcow2Image::open(&p, true).unwrap();
+        assert_eq!(q.l2_entry(&mut q.state.lock().unwrap(), 40 * C).unwrap() & OFFSET_MASK, 0, "zero-filled data became a marker");
+        drop(q);
         if let Ok(out) = std::process::Command::new("qemu-img").args(["check"]).arg(&p).output() {
             assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
         }

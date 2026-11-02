@@ -46,7 +46,8 @@ def main():
     p.add_argument("--socket", required=True)
     p.add_argument("--pid", type=int, required=True, help="the client's process")
     p.add_argument("--report", required=True, help="the client's address line")
-    p.add_argument("--target", required=True, help="module under test, as the kernel lists it")
+    p.add_argument("--target", required=True, help="module under test, as the kernel lists it (a DLL: as its process does)")
+    p.add_argument("--target-pid", type=int, help="the process a user-mode target (a DLL) runs in")
     p.add_argument("--snapshot", required=True, help="snapshot name (the VM's snapshots)")
     p.add_argument("--blocks", required=True, help="block list, relative to the harness")
     p.add_argument("--output", required=True)
@@ -76,7 +77,12 @@ def main():
     cpu = stop["cpu"]
     lab.run("debug.breakpoints", {"addresses": []})
     gpa = lab.run("memory.translate", {"cpu": cpu, "address": report["input_va"]})["physical"]
-    modules = lab.run("kernel.modules", {"cpu": cpu})
+    if a.target_pid:
+        lab.run("kernel.process", {"cpu": cpu, "pid": a.target_pid})
+        modules = lab.run("kernel.user_modules", {"cpu": cpu, "pid": a.target_pid})
+        lab.run("kernel.process", {"cpu": cpu})
+    else:
+        modules = lab.run("kernel.modules", {"cpu": cpu})
     modules = modules if isinstance(modules, list) else modules.get("items", [])
     module = next((m for m in modules if m["name"].lower() == a.target.lower()), None)
     if module is None:
@@ -109,6 +115,8 @@ def main():
     }
     if a.entry:
         harness["entries"] = a.entry
+    if a.target_pid:
+        harness["target_pid"] = a.target_pid
     try:
         old = json.load(open(a.output))
         harness = {**old, **harness}

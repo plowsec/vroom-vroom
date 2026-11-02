@@ -200,6 +200,7 @@ fn empty_net() -> Net {
         allow_host_loopback: false,
         host_ports: Vec::new(),
         block_private: false,
+        mirror: None,
         mac: None,
         connected: true,
     }

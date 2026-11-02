@@ -86,6 +86,25 @@ pub struct VcpuShared {
     /// MMIO accesses vCPUs passed to devices (research resets skip the
     /// device restore when none happened and the devices stayed paused).
     pub device_exits: std::sync::atomic::AtomicU64,
+    /// A debug stop parks every vCPU at once (research: the guest clock
+    /// stands still from there). `halting`: a stop is parking them,
+    /// `parked`: how many are, `halted_at`: the guest clock once all are
+    /// (+1; 0: not yet).
+    pub halt_on_stop: std::sync::atomic::AtomicBool,
+    pub halting: std::sync::atomic::AtomicBool,
+    pub parked: std::sync::atomic::AtomicUsize,
+    pub halted_at: std::sync::atomic::AtomicU64,
+}
+
+impl VcpuShared {
+    /// The halt is over (the VM resumes, or one CPU runs alone): the clock
+    /// it recorded no longer holds.
+    pub fn end_halt(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.halting.store(false, SeqCst);
+        self.parked.store(0, SeqCst);
+        self.halted_at.store(0, SeqCst);
+    }
 }
 
 impl std::fmt::Debug for VcpuShared {
@@ -279,6 +298,20 @@ impl VcpuLoop {
         true
     }
 
+    /// Stopped (a debug stop, or another CPU's): wait for commands. The
+    /// last CPU to park during a halt records the guest clock.
+    fn park_for_halt(&mut self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.paused = true;
+        if !self.shared.halting.load(SeqCst) {
+            return;
+        }
+        let n = self.shared.parked.fetch_add(1, SeqCst) + 1;
+        if n == self.shared.peers.get().map_or(usize::MAX, Vec::len) {
+            self.shared.halted_at.store(self.shared.vm.clock() + 1, SeqCst);
+        }
+    }
+
     fn power_on(&mut self, regs: &BootRegs) -> Result<()> {
         // Fresh architectural state, then the entry point.
         self.vcpu.restore_state(&self.pristine)?;
@@ -300,10 +333,23 @@ impl VcpuLoop {
     fn step(&mut self) -> Result<()> {
         match self.vcpu.run()? {
             VcpuExit::Debug(stop) => {
-                self.paused = true;
+                use std::sync::atomic::Ordering::SeqCst;
+                if self.shared.halt_on_stop.load(SeqCst) && !self.shared.halting.swap(true, SeqCst) {
+                    let me = self.index();
+                    for (i, peer) in self.shared.peers.get().into_iter().flatten().enumerate() {
+                        if i != me {
+                            peer.kicker.kick();
+                        }
+                    }
+                }
+                self.park_for_halt();
                 let _ = self.shared.events.send(VmEvent::Debug(stop));
             }
-            VcpuExit::Kicked => {}
+            VcpuExit::Kicked => {
+                if self.shared.halting.load(std::sync::atomic::Ordering::SeqCst) {
+                    self.park_for_halt();
+                }
+            }
             VcpuExit::MmioRead { addr, len } => {
                 self.shared.device_exits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let mut buf = [0u8; 8];

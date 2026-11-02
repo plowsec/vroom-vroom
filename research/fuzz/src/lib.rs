@@ -17,6 +17,7 @@ pub mod calls;
 pub mod campaign;
 pub mod cmplog;
 pub mod hub;
+pub mod replay;
 pub mod sync;
 pub mod trace;
 pub mod triage;
@@ -148,6 +149,11 @@ pub struct Harness {
     /// workers) runs within the input: its coverage and faults count.
     #[serde(default)]
     pub settle_ms: u64,
+    /// While every vCPU waits for an interrupt, the guest's clock jumps to
+    /// its next timer: a client's waits (receive timeouts, sleeps) cost
+    /// what handling the timer ticks costs, not wall time.
+    #[serde(default)]
+    pub skip_idle: bool,
     #[serde(default)]
     pub max_input: usize,
     /// `edges` (default): follow the path with hardware breakpoints on each
@@ -177,6 +183,12 @@ pub struct Harness {
     /// `entry_pc` is in.
     #[serde(default)]
     pub target: Option<String>,
+    /// A user-mode `target` (a DLL): the process it runs in. Its blocks
+    /// translate through that process's page tables, its range comes from
+    /// that process's modules, comparison logging follows that process's
+    /// threads, and that process's user-mode exceptions in it are findings.
+    #[serde(default)]
+    pub target_pid: Option<u64>,
     /// A client harness: the target's functions its calls enter by (the
     /// IRP dispatch), by name in the block list (a part of it will do), at
     /// most three. Comparison logging runs the guest at full speed to one
@@ -203,6 +215,14 @@ pub struct Harness {
     /// or freed objects whose address is known from a target harness.
     #[serde(default)]
     pub watchpoints: Vec<MemoryWatch>,
+    /// A client's capabilities, each taken away by writing `bytes` at `va`
+    /// (its address space) before an input: a key replaced by a wrong one,
+    /// say. `triage` runs a finding with each, to tell which it needs.
+    #[serde(default)]
+    pub ablations: Vec<Ablation>,
+    /// Ablations every input gets: a campaign without those capabilities.
+    #[serde(default)]
+    pub ablate: Vec<String>,
 }
 
 impl Harness {
@@ -226,6 +246,14 @@ pub const COVERAGE_BRK: u16 = 0x766d;
 
 fn brk_instruction(immediate: u16) -> [u8; 4] {
     (0xd420_0000u32 | u32::from(immediate) << 5).to_le_bytes()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Ablation {
+    pub name: String,
+    pub va: u64,
+    /// Hex.
+    pub bytes: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -391,6 +419,14 @@ impl Harness {
             return Err(Error::Invalid(
                 "exception_sites must be instruction aligned".into(),
             ));
+        }
+        for a in &h.ablations {
+            if hex::decode(&a.bytes).map_or(true, |b| b.is_empty()) {
+                return Err(Error::Invalid(format!("ablation {}: bytes must be non-empty hex", a.name)));
+            }
+        }
+        if let Some(name) = h.ablate.iter().find(|n| !h.ablations.iter().any(|a| &a.name == *n)) {
+            return Err(Error::Invalid(format!("ablate: no ablation named {name}")));
         }
         if h.settle_ms != 0 && (!h.client() || h.settle_ms >= h.timeout_ms) {
             return Err(Error::Invalid("settle_ms is for client harnesses, below timeout_ms".into()));
@@ -1059,12 +1095,16 @@ pub struct Engine {
     symbols: Option<vroom_kernel::symbolize::Symbolizer>,
     /// The target's image (`entry_pc`'s), found by the first compare log.
     target_image: Option<(u64, u64)>,
+    /// A user-mode target's process: its page table root (`target_pid`).
+    target_space: Option<u64>,
     /// `nt!KiDispatchException`, when the harness detects exceptions: every
     /// exception passes there first, the ones an `__except` swallows too.
     exception_hook: Option<u64>,
     /// Blocks the last comparison log reached first (blocks mode): the
     /// input it logged covers them.
     pub cmplog_blocks: Vec<u64>,
+    /// Ablations (by name) the next inputs get on top of `ablate`.
+    pub ablated: Vec<String>,
 }
 
 /// One input, in place and ready to run (`Engine::load_case`).
@@ -1187,6 +1227,7 @@ impl Engine {
         )?;
         // Each reopen restores the snapshot onto a new disk overlay.
         vm.research_discard_disk_layers();
+        vm.research_skip_idle(harness.skip_idle);
         Ok(Self {
             vm,
             harness,
@@ -1201,8 +1242,10 @@ impl Engine {
             pending: BTreeMap::new(),
             symbols: None,
             target_image: None,
+            target_space: None,
             exception_hook: None,
             cmplog_blocks: Vec::new(),
+            ablated: Vec::new(),
         })
     }
 
@@ -1226,9 +1269,12 @@ impl Engine {
             // Whose an exception is, from the first one on.
             self.target_range(&registers)?;
         }
+        // A user-mode target's code, through its own process only: at its
+        // VAs another process may have other memory.
+        let blocks_registers = self.target_registers(&registers)?.unwrap_or_else(|| registers.clone());
         let address_space = AddressSpace {
             memory: &self.vm,
-            registers: &registers,
+            registers: &blocks_registers,
         };
         for index in 0..self.harness.coverage.len() {
             let block = self.harness.coverage[index].clone();
@@ -1295,6 +1341,12 @@ impl Engine {
         if self.harness.coverage_mode == CoverageMode::Blocks {
             self.plant(entry_pc)?;
         }
+        if self.harness.skip_idle {
+            let rewritten = self.rewrite_idle(&registers)?;
+            if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
+                eprintln!("skip_idle: {rewritten} kernel WFIs rewritten");
+            }
+        }
         if let Some(bugcheck) = self.harness.bugcheck_pc {
             if self.load_symbols(&registers).is_ok() {
                 let symbols = self.symbols.as_ref().expect("loaded");
@@ -1341,14 +1393,18 @@ impl Engine {
             watch_cursor,
             symbols,
             target_image,
+            target_space,
+            ablated,
             ..
         } = self;
         drop(vm);
         let mut fresh = Self::open(harness)?;
+        fresh.ablated = ablated;
         fresh.coverage = coverage;
         // The same snapshot: the same modules, PDBs already loaded.
         fresh.symbols = symbols;
         fresh.target_image = target_image;
+        fresh.target_space = target_space;
         fresh.instrument()?;
         fresh.watch_cursor = watch_cursor;
         Ok(fresh)
@@ -1391,6 +1447,49 @@ impl Engine {
         Ok(())
     }
 
+    /// `skip_idle`: every resident `wfi` in the kernel's code sections
+    /// becomes `hvc #IDLE_HVC`, which the VMM waits out itself (and can
+    /// skip). Returns how many.
+    fn rewrite_idle(&mut self, registers: &Registers) -> Result<usize> {
+        const WFI: [u8; 4] = 0xd503_207fu32.to_le_bytes();
+        let hvc = (0xd400_0002u32 | u32::from(vroom_hv::IDLE_HVC) << 5).to_le_bytes();
+        let space = AddressSpace { memory: &self.vm, registers };
+        let kernel = vroom_kernel::windows::discover_kernel(&space, &[registers.vbar, registers.pc])
+            .map_err(|e| Error::Invalid(format!("skip_idle: kernel: {e}")))?;
+        let mut header = [0u8; 0x1000];
+        space
+            .read(kernel.base, &mut header)
+            .map_err(|e| Error::Invalid(format!("skip_idle: kernel headers: {e}")))?;
+        let u16_at = |o: usize| header.get(o..o + 2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]])) as usize;
+        let u32_at = |o: usize| header.get(o..o + 4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        let nt = u32_at(0x3c) as usize;
+        let table = nt + 24 + u16_at(nt + 20);
+        let mut sites = Vec::new();
+        for section in 0..u16_at(nt + 6) {
+            let at = table + section * 40;
+            // IMAGE_SCN_MEM_EXECUTE
+            if u32_at(at + 36) & 0x2000_0000 == 0 {
+                continue;
+            }
+            let (start, size) = (u64::from(u32_at(at + 12)), u64::from(u32_at(at + 8)));
+            for page in (kernel.base + start..kernel.base + start + size).step_by(0x1000) {
+                let Ok(translated) = space.translate(page & !0xfff) else { continue };
+                let mut code = [0u8; 0x1000];
+                self.vm.debug_read_physical(translated.physical, &mut code)?;
+                sites.extend(
+                    code.chunks_exact(4)
+                        .enumerate()
+                        .filter(|(_, word)| *word == WFI)
+                        .map(|(i, _)| translated.physical + 4 * i as u64),
+                );
+            }
+        }
+        for &gpa in &sites {
+            self.vm.research_patch(gpa, &hvc)?;
+        }
+        Ok(sites.len())
+    }
+
     fn plant_at(&mut self, index: usize, gpa: u64, brk: [u8; 4]) -> Result<()> {
         let mut original = [0u8; 4];
         self.vm.debug_read_physical(gpa, &mut original)?;
@@ -1403,6 +1502,25 @@ impl Engine {
         Ok(())
     }
 
+    /// `blocks` mode: block `index`'s breakpoint back, as if never hit
+    /// (`replay`: every input's whole coverage). False: its page isn't
+    /// mapped yet.
+    pub fn rearm(&mut self, index: usize) -> Result<bool> {
+        let Some(gpa) = self.harness.coverage[index].gpa else {
+            return Ok(false);
+        };
+        self.plant_at(index, gpa, brk_instruction(COVERAGE_BRK))?;
+        Ok(true)
+    }
+
+    /// The target's image: base and end.
+    pub fn target_module(&mut self) -> Result<(u64, u64)> {
+        let state = self.vm.debug_registers(self.harness.cpu)?;
+        let registers = Registers::from_state(&state)
+            .map_err(|error| Error::Invalid(format!("ARM64 register state: {error}")))?;
+        self.target_range(&registers)
+    }
+
     /// `blocks` mode, after an input: plant the blocks on pages that input
     /// mapped. VM paused.
     fn plant_pending(&mut self) -> Result<()> {
@@ -1412,6 +1530,7 @@ impl Engine {
         let state = self.vm.debug_registers(self.harness.cpu)?;
         let registers = Registers::from_state(&state)
             .map_err(|error| Error::Invalid(format!("ARM64 register state: {error}")))?;
+        let registers = self.target_registers(&registers)?.unwrap_or(registers);
         let mut mapped = Vec::new();
         {
             let address_space = AddressSpace {
@@ -1535,6 +1654,41 @@ impl Engine {
         Ok(())
     }
 
+    /// A user-mode target's process (`target_pid`): `registers` with its
+    /// page tables; its modules join the symbolizer's on the first call.
+    fn target_registers(&mut self, registers: &Registers) -> Result<Option<Registers>> {
+        if self.harness.target_pid.is_none() {
+            return Ok(None);
+        }
+        if self.target_space.is_none() {
+            self.target_modules(registers)?;
+        }
+        Ok(self.target_space.map(|root| with_space(registers, root)))
+    }
+
+    /// A user-mode target's process: its page table root, and its modules
+    /// into the symbolizer (again: a DLL it loaded since).
+    fn target_modules(&mut self, registers: &Registers) -> Result<()> {
+        let Some(pid) = self.harness.target_pid else {
+            return Ok(());
+        };
+        self.load_symbols(registers)?;
+        let symbols = self.symbols.as_ref().expect("loaded above");
+        let pdb = symbols.kernel_symbols().ok_or_else(|| Error::Invalid("target_pid: no kernel PDB".into()))?;
+        let space = AddressSpace { memory: &self.vm, registers };
+        let process = vroom_kernel::process::list(&space, pdb)
+            .map_err(|e| Error::Invalid(format!("target_pid: processes: {e}")))?
+            .into_iter()
+            .find(|p| p.pid == pid)
+            .ok_or_else(|| Error::Invalid(format!("target_pid {pid} isn't running")))?;
+        let theirs = with_space(registers, process.directory_table);
+        let modules = vroom_kernel::process::modules(&AddressSpace { memory: &self.vm, registers: &theirs }, pdb, &process)
+            .map_err(|e| Error::Invalid(format!("target_pid {pid}: modules: {e}")))?;
+        self.symbols.as_mut().expect("loaded above").add_modules(modules);
+        self.target_space = Some(process.directory_table);
+        Ok(())
+    }
+
     /// The target's code: the image `entry_pc` is in, or the module the
     /// harness names (`target`) when the entry is elsewhere (a user-mode
     /// client calling into a driver).
@@ -1545,10 +1699,11 @@ impl Engine {
         let range = match self.harness.target.clone() {
             Some(name) => {
                 self.load_symbols(registers)?;
+                self.target_registers(registers)?;
                 self.symbols
                     .as_ref()
                     .and_then(|s| s.module_range(&name))
-                    .ok_or_else(|| Error::Invalid(format!("target module {name} isn't loaded")))?
+                    .ok_or_else(|| Error::Invalid(format!("target module {name} isn't loaded (a DLL: target_pid)")))?
             }
             None => {
                 let entry = self.harness.entry_pc.unwrap_or(registers.pc);
@@ -1578,7 +1733,9 @@ impl Engine {
     }
 
     fn exception_finding(&mut self, registers: &Registers, input: &str) -> Result<Option<Finding>> {
-        if registers.x[3] & 0xff != 0 || registers.x[4] & 0xff == 0 {
+        // A user-mode target's process: its own (user-mode) exceptions.
+        let user_target = registers.x[3] & 0xff == 1 && self.target_space.is_some_and(|root| same_space(root, registers.ttbr0));
+        if (registers.x[3] & 0xff != 0 && !user_target) || registers.x[4] & 0xff == 0 {
             return Ok(None);
         }
         let record = registers.x[0];
@@ -1607,11 +1764,12 @@ impl Engine {
         let internal = code & 0xffff_ff00 == 0x1000_0000;
         let class = match code {
             // A kernel address, or the NULL page (a NULL dereference, user
-            // half or not).
-            0xc000_0005 if fault >> 63 == 1 || fault < 0x1_0000 => BugClass::AccessViolation,
-            // Stack overrun (fast fail), illegal and privileged instruction,
-            // data and instruction misalignment, stack overflow, divide.
-            0xc000_0409 | 0xc000_001d | 0xc000_0096 | 0x8000_0002 | 0xc000_00aa | 0xc000_00fd | 0xc000_0094 => {
+            // half or not); in a user-mode target, any address.
+            0xc000_0005 if user_target || fault >> 63 == 1 || fault < 0x1_0000 => BugClass::AccessViolation,
+            // Stack overrun (fast fail), heap corruption, illegal and
+            // privileged instruction, data and instruction misalignment,
+            // stack overflow, divide.
+            0xc000_0409 | 0xc000_0374 | 0xc000_001d | 0xc000_0096 | 0x8000_0002 | 0xc000_00aa | 0xc000_00fd | 0xc000_0094 => {
                 BugClass::ExceptionDispatch
             }
             // Other faults the trap handlers raise (an address size fault
@@ -1619,8 +1777,23 @@ impl Engine {
             _ if internal => BugClass::ExceptionDispatch,
             _ => return Ok(None),
         };
+        if user_target && code == 0xc000_001d {
+            // A DLL probing a system register EL0 can't read (CurrentEL):
+            // its own __except takes it.
+            let space = AddressSpace { memory: &self.vm, registers };
+            let mut word = [0u8; 4];
+            if vroom_kernel::windows::VirtualMemory::read(&space, address, &mut word).is_ok()
+                && is_system_register_read(u32::from_le_bytes(word))
+            {
+                return Ok(None);
+            }
+        }
         self.load_symbols(registers)?;
         let (lo, hi) = self.target_range(registers)?;
+        if user_target && !self.symbols.as_ref().expect("loaded above").in_module(address) {
+            // A DLL the target's process loaded since the snapshot.
+            self.target_modules(registers)?;
+        }
         let space = AddressSpace { memory: &self.vm, registers };
         let symbols = self.symbols.as_mut().expect("loaded above");
         let faulting = symbols.trap_registers(&space, registers.x[2], registers).ok();
@@ -1731,6 +1904,7 @@ impl Engine {
         self.input_buffer[..payload.len()].copy_from_slice(payload);
         self.vm
             .debug_write_physical(&[(self.harness.input_gpa, &self.input_buffer)])?;
+        self.apply_ablations()?;
         let mut case_watchpoints = self.harness.watchpoints.clone();
         if !case_watchpoints.is_empty() {
             let state = self.vm.debug_registers(self.harness.cpu)?;
@@ -1888,6 +2062,43 @@ impl Engine {
             )?;
         }
         Ok(Case { arm_after_patch, reset_us, watchpoints: case_watchpoints })
+    }
+
+    /// The harness's `ablate` and `ablated`, written into the client.
+    fn apply_ablations(&mut self) -> Result<()> {
+        let names: Vec<&String> = self.harness.ablate.iter().chain(&self.ablated).collect();
+        if names.is_empty() {
+            return Ok(());
+        }
+        let state = self.vm.debug_registers(self.harness.cpu)?;
+        let registers = Registers::from_state(&state)
+            .map_err(|error| Error::Invalid(format!("ARM64 register state: {error}")))?;
+        let space = AddressSpace { memory: &self.vm, registers: &registers };
+        let mut writes = Vec::new();
+        for name in names {
+            let a = self
+                .harness
+                .ablations
+                .iter()
+                .find(|a| &a.name == name)
+                .ok_or_else(|| Error::Invalid(format!("no ablation named {name}")))?;
+            let bytes = hex::decode(&a.bytes).map_err(|e| Error::Invalid(format!("ablation {name}: {e}")))?;
+            // Page by page: the next page may be another frame.
+            let mut at = 0;
+            while at < bytes.len() {
+                let va = a.va + at as u64;
+                let take = (bytes.len() - at).min(0x1000 - (va & 0xfff) as usize);
+                let physical = space
+                    .translate(va)
+                    .map_err(|e| Error::Invalid(format!("ablation {name}: {e}")))?
+                    .physical;
+                writes.push((physical, bytes[at..at + take].to_vec()));
+                at += take;
+            }
+        }
+        let spans: Vec<(u64, &[u8])> = writes.iter().map(|(a, b)| (*a, b.as_slice())).collect();
+        self.vm.debug_write_physical(&spans)?;
+        Ok(())
     }
 
     pub fn run_input(&mut self, input: &[u8]) -> Result<RunResult> {
@@ -2664,6 +2875,25 @@ pub(crate) fn isolated_pstate(pstate: u64) -> u64 {
     (pstate | 0xc0) & !(1 << 21)
 }
 
+/// `registers` walking another address space (a process's page table
+/// root), even from a context that has TTBR0 walks off (TCR.EPD0).
+fn with_space(registers: &Registers, root: u64) -> Registers {
+    let mut r = registers.clone();
+    r.ttbr0 = root;
+    r.tcr &= !(1 << 7);
+    r
+}
+
+/// The same address space: page table roots without their ASID and flags.
+fn same_space(a: u64, b: u64) -> bool {
+    a & 0x0000_ffff_ffff_f000 == b & 0x0000_ffff_ffff_f000
+}
+
+/// `mrs`: a system register read, an illegal instruction at EL0 for most.
+fn is_system_register_read(instruction: u32) -> bool {
+    instruction & 0xfff0_0000 == 0xd530_0000
+}
+
 /// The first instruction of an AArch64 exception vector entry.
 fn is_exception_vector(pc: u64, vbar: u64) -> bool {
     pc.checked_sub(vbar)
@@ -2837,6 +3067,25 @@ mod tests {
     }
 
     #[test]
+    fn ablate_names_an_ablation() {
+        let path = std::env::temp_dir().join(format!("vroom-fuzz-ablate-{}.json", std::process::id()));
+        let load = |ablate: &[&str], bytes: &str| {
+            let h = serde_json::json!({
+                "name": "a", "config": "c", "snapshot": "s", "state_dir": "d",
+                "input_gpa": 0, "input_capacity": 4096,
+                "ablations": [{"name": "key", "va": 4096, "bytes": bytes}], "ablate": ablate,
+            });
+            fs::write(&path, h.to_string()).unwrap();
+            Harness::load(&path)
+        };
+        assert!(load(&["key"], "00ff").is_ok());
+        assert!(load(&["other"], "00ff").is_err());
+        assert!(load(&[], "").is_err());
+        assert!(load(&[], "0g").is_err());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
     fn a_sequence_compares_by_call_codes_and_first_words() {
         let h: Harness = serde_json::from_value(serde_json::json!({
             "name": "s", "config": "c", "snapshot": "s", "state_dir": "d",
@@ -2922,6 +3171,17 @@ mod tests {
         assert_eq!(brk_instruction(0xf000), 0xd43e_0000u32.to_le_bytes());
         let word = u32::from_le_bytes(brk_instruction(COVERAGE_BRK));
         assert_eq!((word >> 5) & 0xffff, u32::from(COVERAGE_BRK));
+    }
+
+    #[test]
+    fn a_current_el_probe_is_a_system_register_read() {
+        // mrs x16, CurrentEL; mrs x0, tpidr_el0
+        assert!(is_system_register_read(0xd538_4250));
+        assert!(is_system_register_read(0xd53b_d040));
+        // msr CurrentEL-like write, nop, brk
+        assert!(!is_system_register_read(0xd518_4250));
+        assert!(!is_system_register_read(0xd503_201f));
+        assert!(!is_system_register_read(0xd43e_0000));
     }
 
     #[test]

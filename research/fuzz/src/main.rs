@@ -185,6 +185,20 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Every input of a corpus again, each with all its blocks (not only
+    /// the ones new to the campaign): drcov files for Lighthouse, one per
+    /// input and `all.drcov`, and `replay.json`.
+    Replay {
+        harness: PathBuf,
+        /// Inputs: files, or directories (`inputs/` of a run), oldest first.
+        #[arg(required = true)]
+        inputs: Vec<PathBuf>,
+        #[arg(long)]
+        output: PathBuf,
+        /// Use this VM state directory instead of the harness's.
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
     /// Run a saved finding's input again: does it come back, under which
     /// signature, and the least input that still makes it.
     Triage {
@@ -438,6 +452,38 @@ fn main() -> Result<()> {
             let named = functions.iter().filter(|f| !f.starts_with("sub_")).count();
             std::fs::write(&output, serde_json::to_vec_pretty(&list)?)?;
             println!("{}", serde_json::json!({"output": output, "blocks": list.len(), "functions": functions.len(), "named": named}));
+        }
+        Command::Replay { harness, inputs, output, state_dir } => {
+            let mut h = Harness::load(&harness)?;
+            if let Some(dir) = state_dir {
+                h.state_dir = dir;
+            }
+            let mut files = Vec::new();
+            for path in inputs {
+                if path.is_dir() {
+                    for entry in std::fs::read_dir(&path)? {
+                        let entry = entry?;
+                        if entry.file_type()?.is_file() {
+                            files.push((entry.metadata()?.modified()?, entry.path()));
+                        }
+                    }
+                } else {
+                    files.push((std::fs::metadata(&path)?.modified()?, path));
+                }
+            }
+            files.sort();
+            let mut corpus = Vec::new();
+            for (_, path) in files {
+                let name = path.file_stem().map_or_else(|| "input".into(), |n| n.to_string_lossy().into_owned());
+                corpus.push((name, std::fs::read(&path)?));
+            }
+            let mut engine = Engine::open(h)?;
+            engine.instrument()?;
+            let report = vroom_fuzz::replay::replay(engine, &corpus, &output, |line| eprintln!("{line}"))?;
+            println!(
+                "{}",
+                serde_json::json!({"inputs": report.len(), "output": output, "blocks": report.iter().map(|r| r.new).sum::<usize>()})
+            );
         }
         Command::Triage { harness, input, out, min, runs, budget, state_dir } => {
             let mut h = Harness::load(&harness)?;

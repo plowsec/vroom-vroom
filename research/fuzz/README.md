@@ -19,6 +19,7 @@ vroom-fuzz cmplog harness.json input.bin                        # one input's co
 vroom-fuzz coverage runs/a/coverage.json runs/a/blocks.json     # per-function summary
 vroom-fuzz trace harness.json runs/a/crashes/<hash>-BugCheck.bin --blocks all-blocks.json   # replay, symbolized
 vroom-fuzz triage harness.json runs/a/crashes/<hash>-BugCheck.bin   # reproduce + minimize
+vroom-fuzz replay harness.json runs/a/inputs --output runs/a/drcov   # each input's whole coverage: drcov for Lighthouse
 vroom-fuzz show harness.json runs/a/inputs/<hash>.bin          # a sequence, a call a line
 vroom-fuzz mutate seed.bin --harness harness.json --count 5    # mutations as runs make them, no VM
 vroom-fuzz blocks clfs.sys --base 0xfffff804000d0000 --output blocks.json   # block list from the driver file
@@ -30,7 +31,7 @@ vroom-fuzz blocks clfs.sys --base 0xfffff804000d0000 --output blocks.json   # bl
 | `--budget N` | executions for minimizing (2000); `0` doesn't |
 | `--out FILE`, `--min FILE` | default `<input>.triage.json`, `<input>.min.bin` |
 
-Triage: the most frequent first finding over the runs is the one; minimizing keeps each change that still makes its signature. Sequences first: shortest call prefix, each call dropped (last first), then (described calls) arguments simpler by type: ints and inline values 0, flags fewer, bytes empty or halved, array elements 0, no bytes past the arguments; resource slots and lens stay. Then bytes: shortest prefix, zeroed spans (64, 8 bytes), dropped chunks, zeroed bytes. The IOCTL prefix stays. Candidates time out at 20× the input's run (≥250 ms). Report: `signature`, `reproduced`/`runs`, every signature seen, `finding`, lengths, executions, `program` (sequences: the minimized one, as `show` prints it). HEVD stack overflow: 2308 → 2096 bytes, 4 non-zero, ~11 s.
+Triage: the most frequent first finding over the runs is the one; minimizing keeps each change that still makes its signature. Sequences first: shortest call prefix, each call dropped (last first), then (described calls) arguments simpler by type: ints and inline values 0, flags fewer, bytes empty or halved, array elements 0, no bytes past the arguments; resource slots and lens stay. Then bytes: shortest prefix, zeroed spans (64, 8 bytes), dropped chunks, zeroed bytes. The IOCTL prefix stays. Candidates time out at 20× the input's run (≥250 ms). Report: `signature`, `reproduced`/`runs`, every signature seen, `finding`, lengths, executions, `program` (sequences: the minimized one, as `show` prints it), `ablations` (runs of the minimized input that still made it with each; 0: it needs that capability). HEVD stack overflow: 2308 → 2096 bytes, 4 non-zero, ~11 s.
 
 | `trace` flag | |
 |---|---|
@@ -58,6 +59,8 @@ Output dir: `inputs/`, `crashes/<hash>-<class>.{bin,json}` (first input per sign
 
 Signature (dedupe): class + the 3 innermost functions of the faulting code (offsets dropped; frames above the kernel's exception entry and `KeBugCheck*` skipped); `<wild jump>` for a PC outside every image; else class + PC. Functions without a PDB: the block list's names, else `.pdata` starts as `sub_<address at 0x140000000>`.
 
+`replay` (blocks mode): the inputs (files, or directories oldest first) twice, the first pass to warm the VM up; each recorded run starts with every block's breakpoint armed. `<name>.drcov` per input, `all.drcov`, `replay.json` (blocks, new ones, calls, findings per input). Lighthouse: load the files (or the directory) on the target module; the composer unions, intersects, diffs them. Same input twice: same blocks ±0.5%.
+
 ## Exceptions
 
 Detector `exceptions` (or `access-violation`): a breakpoint on `nt!KiDispatchException` sees every exception at first chance, before an `__except` swallows it. Reported when the faulting PC or a frame of its stack (unwound from the trap frame) is in the target, or the PC is in no image:
@@ -83,6 +86,7 @@ Kernel TUI: `coverage runs/a/coverage.json`, `coverage-diff runs/a/coverage.json
 | `input_register` / `input_pointer_va`, `input_length_register` / `input_length_va`, `output_length_va` | saved fields patched per input |
 | `entry_pc`, `stop_pc` | first block; return address that ends an input (testcase thread only). User-mode `entry_pc`: a client harness (needs `blocks`, no `isolate_cpu`, `target`, `stop_pc` in the client) |
 | `target` | module under test (`clfs.sys`); default the image of `entry_pc` |
+| `target_pid` | user-mode `target` (`app.dll`): its process. Blocks translate through its page tables, range from its modules, cmplog follows its threads, its user-mode exceptions in the target are findings (`client_harness.py --target-pid`) |
 | `entries` | client: ≤3 target functions its calls enter by (IRP dispatch), names from the block list (substring); cmplog steps from there. None: from the first new block the client's thread reaches |
 | `sequence` | input = calls `u32 code \| u16 length \| payload` for a client; mutations insert, drop, repeat, swap, splice calls |
 | `calls` / `calls_file` | a sequence's call descriptions (below): typed mutation, call-aware triage, `show`. File relative to the harness |
@@ -91,6 +95,9 @@ Kernel TUI: `coverage runs/a/coverage.json`, `coverage-diff runs/a/coverage.json
 | `reopen_after` | `0` reset in place, `1` restore from disk every input |
 | `timeout_ms` | per input; a timeout restores from disk (a client's resets in place) |
 | `settle_ms` | client harnesses: keep running this long past `stop_pc` (async completions within the input) |
+| `skip_idle` | guest time is what the guest does: every vCPU in WFI and no virtio work in flight → the clock jumps to the next timer (kernel `wfi`s become `hvc #0x7669`; HVF waits out real ones itself); a debug stop parks every vCPU and the clock stands still until they run again. A client's receive timeouts cost their timer ticks, and breakpoints don't make its replies late |
+| `ablations` | `[{name, va, bytes}]`: a client capability (a key, say) taken away by writing `bytes` (hex) at `va` (client's address space) before the input. `triage` reruns a finding with each |
+| `ablate` | ablation names every input gets: a campaign without them (pre-auth only) |
 | `coverage` / `coverage_file` | block manifest (`angr_blocks.py`); ≤4 successors per block |
 | `coverage_mode` | `edges` (default): HW breakpoints follow the path, edges + hit counts, one exit per block. `blocks`: one-shot BRK per uncovered block, known paths run exit-free, new blocks only (~1.8x faster; not for `probe`) |
 | `exception_sites` | ≤4 exception-dispatch PCs, reported when reached |
@@ -124,6 +131,8 @@ C:\HEVD-Lab\HevdFuzzClient.exe 0x222003 1
 ## Clients, sequences
 
 Stateful drivers (CLFS): the snapshot stands in a user-mode client parked in a loop; each input is a program of calls it makes (`sequence`), the whole guest running; the input ends at the client's `stop_pc`. Coverage is the target's blocks (`blocks` mode, any thread); exceptions are the target's, any thread. Cmplog: from each entry into the target (`entries`). Example: [CLFS.md](CLFS.md).
+
+Network services: the client sends to a peer in the NIC's `mirror` network (VM config, NAT: `mirror = "10.99.0.0/24"`); its datagrams come back through the NIC from there, so the service sees a remote peer and inputs take the remote path (NIC, IP reassembly, firewall, the service's policy for that address). With `skip_idle` the client's reply waits cost what the guest does in them: a UDP service's client, 1 worker: 9.3 → 36.7 inputs/s, median input 78 → 12 ms.
 
 ### Call descriptions
 

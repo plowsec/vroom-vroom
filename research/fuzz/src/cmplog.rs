@@ -9,7 +9,7 @@ use vroom_hv::debug::{DebugConfig, DebugReason};
 use vroom_kernel::arm64::{AddressSpace, Registers};
 use vroom_vmm::VmEvent;
 
-use crate::{configure_all, elr_el1, function_names, is_exception_vector, step_debug_config, Engine, Error, Result};
+use crate::{configure_all, elr_el1, function_names, is_exception_vector, same_space, step_debug_config, Engine, Error, Result};
 
 /// One comparison, as the CPU was about to run it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -245,7 +245,8 @@ impl Engine {
 
     /// A client: run the whole guest (the client's calls need the disks,
     /// other CPUs, the driver's workers) until the client's thread (its
-    /// address space, `ttbr0`) stops at one of `breakpoints`, with its
+    /// address space, `ttbr0`: the target's process for a DLL) stops at one
+    /// of `breakpoints` (the client's, `client`, at stop_pc), with its
     /// stack at `sp` if given, or, with `target`, at a new block there (a
     /// coverage BRK). New blocks on the way are recorded; other threads
     /// step past the breakpoints. The CPU it stopped on; None if the input
@@ -253,7 +254,7 @@ impl Engine {
     fn run_client(
         &mut self,
         breakpoints: &[u64],
-        ttbr0: u64,
+        (ttbr0, client): (u64, u64),
         sp: Option<u64>,
         target: Option<(u64, u64)>,
         deadline: Instant,
@@ -295,7 +296,7 @@ impl Engine {
             if self.harness.bugcheck_pc == Some(r.pc) {
                 return Ok(None);
             }
-            let ours = r.ttbr0 == ttbr0;
+            let ours = same_space(r.ttbr0, ttbr0);
             if stop.reason == DebugReason::SoftwareBreakpoint {
                 let Some(&index) = self.block_by_pc.get(&r.pc) else {
                     if trace {
@@ -314,7 +315,7 @@ impl Engine {
                 self.vm.resume()?;
                 continue;
             }
-            if ours && self.harness.stop_pc == Some(r.pc) {
+            if same_space(r.ttbr0, client) && self.harness.stop_pc == Some(r.pc) {
                 return Ok(None);
             }
             if ours && sp.map_or(true, |sp| r.sp == sp) && breakpoints.contains(&r.pc) {
@@ -372,15 +373,18 @@ impl Engine {
         let mut cmps = Vec::new();
         if self.harness.client() {
             let entries = self.client_entries()?;
+            // A DLL's calls run in its own process's threads.
+            let thread = self.target_registers(&first)?.map_or(first.ttbr0, |r| r.ttbr0);
+            let spaces = (thread, first.ttbr0);
             let mut steps = 0;
             while steps < max_steps {
-                match self.run_client(&entries, first.ttbr0, None, Some(target), deadline)? {
+                match self.run_client(&entries, spaces, None, Some(target), deadline)? {
                     Some(c) => cpu = c,
                     None => break,
                 }
                 let n = ENTRY_STEPS.min(max_steps - steps);
                 let at = self.registers_of(cpu)?.1.pc;
-                let (taken, how) = self.step_target(&mut cpu, target, n, deadline, Some(first.ttbr0), &mut cmps)?;
+                let (taken, how) = self.step_target(&mut cpu, target, n, deadline, Some(spaces), &mut cmps)?;
                 steps += taken;
                 if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
                     eprintln!("cmplog: entry at {at:#x}: {taken} steps, {how:?}, {} comparisons so far", cmps.len());
@@ -406,15 +410,16 @@ impl Engine {
     /// Step the target's code on `cpu` from where it stands, logging its
     /// comparisons, for at most `max_steps` instructions. Calls out of the
     /// target and exception handlers run at full speed: on `cpu` alone, or
-    /// for a client (`ttbr0`, its address space) the whole guest, after
-    /// which its thread may go on on another CPU. The steps taken.
+    /// for a client (`client`: the thread's address space, the client's)
+    /// the whole guest, after which the thread may go on on another CPU.
+    /// The steps taken.
     fn step_target(
         &mut self,
         cpu: &mut usize,
         (lo, hi): (u64, u64),
         max_steps: usize,
         deadline: Instant,
-        client: Option<u64>,
+        client: Option<(u64, u64)>,
         cmps: &mut Vec<Cmp>,
     ) -> Result<(usize, Stepped)> {
         let trace = std::env::var_os("VROOM_FUZZ_TRACE").is_some();
@@ -433,8 +438,8 @@ impl Engine {
                 // A branch out deeper than the entry (a tail call, an
                 // import thunk) comes back to the link register.
                 let lr = regs.x[30];
-                if let Some(ttbr0) = client.filter(|_| regs.sp < entry_sp && (lo..hi).contains(&lr)) {
-                    match self.run_client(&[lr], ttbr0, Some(regs.sp), None, deadline)? {
+                if let Some(spaces) = client.filter(|_| regs.sp < entry_sp && (lo..hi).contains(&lr)) {
+                    match self.run_client(&[lr], spaces, Some(regs.sp), None, deadline)? {
                         Some(c) => {
                             *cpu = c;
                             continue;
@@ -493,7 +498,7 @@ impl Engine {
             let back = match (back, client) {
                 (None, _) => None,
                 (Some(address), None) => self.run_until(*cpu, address)?.then_some(*cpu),
-                (Some(address), Some(ttbr0)) => self.run_client(&[address], ttbr0, Some(regs.sp), None, deadline)?,
+                (Some(address), Some(spaces)) => self.run_client(&[address], spaces, Some(regs.sp), None, deadline)?,
             };
             match back {
                 Some(c) => *cpu = c,

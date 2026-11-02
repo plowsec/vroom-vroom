@@ -66,6 +66,7 @@ port_forwards = [{ host_port = 2222, guest_port = 22 }]
 | `allow_host_loopback` | nat | Guest can reach services on the host's 127.0.0.1. Off: those often have no auth. |
 | `host_ports` | nat | Only these ports of the host's 127.0.0.1, at the gateway address (`10.0.2.2`): `host_ports = [8000]` for a local model server, nothing else. |
 | `block_private` | nat | Guest can only reach the internet, not your LAN. |
+| `mirror` | nat | `"10.99.0.0/24"`: what the guest sends there comes back to it through its NIC, from that address. Its own services as a remote peer reaches them (fuzzing). |
 | `interface` | bridged | Host interface, e.g. `en0`. |
 | `network` | host-only | Network name (`/etc/vroom/netd.toml`), default `lab`: 192.168.77.0/24, the Mac `.1`, DHCP for the guests. VMs on the same one see each other. |
 | `mac` | generated | `02:12:34:56:78:9a`. Generated ones start with `identity.mac_prefix`. |
@@ -76,7 +77,7 @@ Bridged and host-only need `vroom-netd`
 to set: `mode = "host-only"`, then `vroom net` for the guest's address.
 
 Live in the app: `connected`, `mode`, `interface`, `network`,
-`block_private`. Next start: port forwards, `allow_host_loopback`, `host_ports`, `mac`.
+`block_private`. Next start: port forwards, `allow_host_loopback`, `host_ports`, `mirror`, `mac`.
 Adapters: [NETWORKING.md](NETWORKING.md#changing-adapters-while-the-vm-runs).
 
 ## `[display]`
