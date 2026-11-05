@@ -391,6 +391,26 @@ export component NewVmSheet inherits Rectangle {
                         text: "Drawn by your Mac's GPU: Vulkan and OpenGL. Needs the 3D libraries (see the guide).";
                     }
                 }
+                Rectangle {
+                    width: sb.preferred-width;
+                    sb := HorizontalLayout {
+                        spacing: 10px;
+                        Toggle {
+                            y: (parent.height - self.height) / 2;
+                            checked: root.draft.secure-boot;
+                            toggled(v) => { root.draft.secure-boot = v; }
+                        }
+                        Text {
+                            text: "Secure Boot";
+                            font-size: Theme.fs-md;
+                            color: Theme.text;
+                            vertical-alignment: center;
+                        }
+                    }
+                    Tip {
+                        text: "Microsoft's keys: Windows and signed Linux boot.";
+                    }
+                }
                 HorizontalLayout {
                     spacing: 10px;
                     Toggle {

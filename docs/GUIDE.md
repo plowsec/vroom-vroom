@@ -214,6 +214,7 @@ optionally your SSH key (any `~/.ssh/*.pub`, with a port forward):
 - **Ubuntu 24.04**: leave the installer empty (downloads the cloud image,
   checked, cached in `~/Library/Caches/vroom`). Ready in a minute;
   "Desktop" adds about 10.
+- "Secure Boot" (`--secure-boot`): either OS; off by default.
 - **Windows 11 ARM64**: pick the ISO (from microsoft.com). About 20
   minutes, unattended. Afterwards remove the install disk from the VM file
   and delete `install.img`. ISOs with a 4 GB+ image need
@@ -284,7 +285,6 @@ The New VM sheet does all this ([Ready-made VMs](#ready-made-vms)). By hand:
    [boot]
    type = "uefi"
    vars = "win11.state/efivars.fd"
-   secure_boot = true
    [[disk]]
    path = "win11.qcow2"        # vroom disk create win11.qcow2 --size 64G
    format = "qcow2"

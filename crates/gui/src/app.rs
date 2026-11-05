@@ -2187,12 +2187,13 @@ impl App {
         if d.ready {
             return self.newvm_ready(&name, os, installer);
         }
-        let (cpus, mem, disk, gpu3d, start) = (d.cpus.max(1) as u32, d.memory_gib.max(1) as u64, d.disk_gib.max(1) as u64, d.gpu3d, d.start);
+        let (cpus, mem, disk, gpu3d, secure_boot, start) =
+            (d.cpus.max(1) as u32, d.memory_gib.max(1) as u64, d.disk_gib.max(1) as u64, d.gpu3d, d.secure_boot, d.start);
         self.ui.set_newvm_error(s(""));
         self.ui.set_newvm_creating(true);
         let dir = self.vm_dir().join(&name);
         std::thread::spawn(move || {
-            let r = create_vm(&dir, &name, os, installer.as_deref(), cpus, mem, disk, gpu3d);
+            let r = create_vm(&dir, &name, os, installer.as_deref(), cpus, mem, disk, gpu3d, secure_boot);
             msg::post(move || Msg::Created(r, start));
         });
     }
@@ -2222,6 +2223,7 @@ impl App {
             memory_mib: d.memory_gib.max(1) as u64 * 1024,
             disk_gib: d.disk_gib.max(8) as u64,
             gpu3d: d.gpu3d && os != GuestOs::Windows,
+            secure_boot: d.secure_boot,
             account: Account { user: d.user.trim().to_string(), password: d.password.to_string(), ssh_key },
             taken_ports,
         };
@@ -2597,7 +2599,17 @@ fn reveal(p: &Path) {
 
 /// Write `<dir>/<name>.toml` and its disk.
 #[allow(clippy::too_many_arguments)]
-fn create_vm(dir: &Path, name: &str, os: GuestOs, installer: Option<&Path>, cpus: u32, mem_gib: u64, disk_gib: u64, gpu3d: bool) -> Result<PathBuf, String> {
+fn create_vm(
+    dir: &Path,
+    name: &str,
+    os: GuestOs,
+    installer: Option<&Path>,
+    cpus: u32,
+    mem_gib: u64,
+    disk_gib: u64,
+    gpu3d: bool,
+    secure_boot: bool,
+) -> Result<PathBuf, String> {
     if dir.exists() {
         return Err(format!("{} already exists", paths::tilde(dir)));
     }
@@ -2613,6 +2625,7 @@ fn create_vm(dir: &Path, name: &str, os: GuestOs, installer: Option<&Path>, cpus
     t.cpus = cpus;
     t.memory_mib = mem_gib * 1024;
     t.gpu = if gpu3d && os != GuestOs::Windows { Gpu::Virtio3d } else { Gpu::Virtio2d };
+    t.secure_boot = secure_boot;
     let cfg = dir.join(format!("{name}.toml"));
     let text = t.render();
     VmConfig::from_toml(&text).map_err(|e| format!("template: {e}"))?;

@@ -5,7 +5,9 @@
 #   AAVMF_CODE.secboot.fd  ArmVirtQemu with SECURE_BOOT_ENABLE and TPM2
 #   AAVMF_VARS.ms.fd       NVRAM template: Secure Boot on, Debian's PK,
 #                          Microsoft's KEK, db (Windows PCA and UEFI CA
-#                          2011) and dbx
+#                          2011) and dbx, plus Microsoft's 2023 KEK and db
+#                          CAs (pinned too; scripts/enroll-keys.py): Windows
+#                          updated to the 2023 boot manager needs them
 #   copyright              EDK2's licenses (BSD-2-Clause-Patent and others)
 # Both images are cut to their used part (the rest is zeros); the VMM pads
 # them back to the 64 MiB flash.
@@ -26,5 +28,10 @@ take() {
 }
 take /AAVMF/AAVMF_CODE.secboot.fd 3145728
 take /AAVMF/AAVMF_VARS.ms.fd 786432
+python3 -I scripts/enroll-keys.py "$out/AAVMF_VARS.ms.fd" \
+  --db "$(scripts/fetch.sh ms-windows-ca-2023)" \
+  --db "$(scripts/fetch.sh ms-uefi-ca-2023)" \
+  --db "$(scripts/fetch.sh ms-option-rom-ca-2023)" \
+  --kek "$(scripts/fetch.sh ms-kek-ca-2023)" >&2
 ar p "$deb" data.tar.xz | tar -xOf - ./usr/share/doc/qemu-efi-aarch64/copyright >"$out/copyright"
 echo "$out"
