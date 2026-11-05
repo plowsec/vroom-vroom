@@ -39,6 +39,7 @@ vars = "dev.state/efivars.fd"    # NVRAM, created on first boot
 | Keys | PK: Debian's. KEK: Microsoft KEK CA 2011 and KEK 2K CA 2023. db: Windows Production PCA 2011, Windows UEFI CA 2023 (Windows' newer boot manager), Microsoft UEFI CA 2011 and 2023 (shim-booted Linux), Option ROM UEFI CA 2023 |
 | NVRAM | made from `AAVMF_VARS.ms.fd`. An NVRAM with no PK (made without Secure Boot) starts over at the next cold boot; the old one stays as `<vars>.bak`. Windows boots on through `\EFI\BOOT\BOOTAA64.EFI` |
 | Off again | keeps the keys; the Homebrew firmware just doesn't check them |
+| Windows | with Secure Boot and a TPM it turns on device encryption by itself and rewrites the whole disk. vroom's setup (unattended install, `vroom-setup.cmd`) sets `PreventDeviceEncryption`; a guest set up before needs `reg add HKLM\SYSTEM\CurrentControlSet\Control\BitLocker /v PreventDeviceEncryption /t REG_DWORD /d 1 /f` first |
 
 Direct kernel boot (fast, no firmware):
 

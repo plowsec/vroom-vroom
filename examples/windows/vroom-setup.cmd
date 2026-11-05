@@ -21,6 +21,9 @@ for %%d in (D E F G H I J K) do (
 )
 rem Our RTC runs in UTC (like every hypervisor's); Windows assumes local.
 reg add HKLM\SYSTEM\CurrentControlSet\Control\TimeZoneInformation /v RealTimeIsUniversal /t REG_DWORD /d 1 /f
+rem No automatic device encryption: with Secure Boot and a TPM, Windows
+rem would rewrite the whole disk (BitLocker you turn on yourself still works).
+reg add HKLM\SYSTEM\CurrentControlSet\Control\BitLocker /v PreventDeviceEncryption /t REG_DWORD /d 1 /f
 rem Agent, split in two:
 rem  - service "VroomAgent" (LocalSystem): owns the VirtIO port (only
 rem    admins / SYSTEM may open it), clock sync, clean shutdown;
