@@ -35,8 +35,8 @@ aborting, and cargo-xwin cannot link the Windows agent. `brew upgrade lld`.
 `/Applications` (refused while VMs run from there). Spotlight skips
 `.noindex` folders, so it offers only the installed app. Everything is in it:
 3D (ANGLE, DXMT, virglrenderer), the guest tools with the Windows 3D
-drivers, virtio-win drivers and WinFsp (pinned downloads,
-`scripts/fetch.sh`, in `target/downloads/`). Long builds rerun only when
+drivers, virtio-win drivers and WinFsp, Secure Boot firmware (pinned
+downloads, `scripts/fetch.sh`, in `target/downloads/`). Long builds rerun only when
 their inputs change; `--no-build` packages what `target/` has.
 
 - Open a VM file with vroom (Open With, or drop it on the Dock icon) to
@@ -284,6 +284,7 @@ The New VM sheet does all this ([Ready-made VMs](#ready-made-vms)). By hand:
    [boot]
    type = "uefi"
    vars = "win11.state/efivars.fd"
+   secure_boot = true
    [[disk]]
    path = "win11.qcow2"        # vroom disk create win11.qcow2 --size 64G
    format = "qcow2"
@@ -711,8 +712,9 @@ default).
 - x86_64 hosts build but can't run VMs.
 - Bridged tested on vmnet (Wi-Fi), host-only on vmnet (Windows guests);
   tap and netd's DHCP (Linux) untested on a real host.
-- Windows 11 installs with hardware checks bypassed (no Secure Boot);
-  `tpm = true` (`brew install swtpm`) gives a real TPM 2.0.
+- Windows 11 installs with hardware checks bypassed, in case the VM has
+  no TPM or Secure Boot. `tpm = true` (`brew install swtpm`) gives a real
+  TPM 2.0; `[boot] secure_boot = true` turns on Secure Boot.
 - Windows 3D: Direct3D 11 only.
 - NAT connections don't survive suspend.
 - Nested virtualization: no Hyper-V in Windows guests (WSL 2, Docker

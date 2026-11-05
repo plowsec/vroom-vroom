@@ -77,6 +77,7 @@ impl<'a> NewVm<'a> {
              [boot]\n\
              type = \"uefi\"\n\
              vars = \"{name}.state/efivars.fd\"\n\
+             secure_boot = {windows}\n\
              \n\
              {extra}[[disk]]\n\
              path = {disk}\n\
@@ -148,6 +149,7 @@ mod tests {
             n.installer = Some(iso);
             let c = VmConfig::from_toml(&n.render()).unwrap();
             assert_eq!(c.tpm, os == GuestOs::Windows);
+            assert!(matches!(c.boot, crate::Boot::Uefi { secure_boot, .. } if secure_boot == (os == GuestOs::Windows)));
             assert_eq!(c.guest_os(), os);
             assert_eq!(c.disks.len(), 2);
             assert_eq!(c.disks[1].path, iso);

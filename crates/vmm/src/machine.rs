@@ -968,8 +968,13 @@ pub(crate) fn build(
                 fdt_cfg: fdt_base(fdt_devices, cmdline.clone()),
             }
         }
-        Boot::Uefi { firmware, vars } => {
-            let fw = crate::firmware::Firmware { code: firmware.clone(), vars: vars.clone() };
+        Boot::Uefi { firmware, vars, secure_boot } => {
+            let fw = crate::firmware::Firmware {
+                code: firmware.clone(),
+                vars: vars.clone(),
+                secure_boot: *secure_boot,
+                resuming: env.resuming,
+            };
             fw.setup(
                 &vm,
                 &mem,

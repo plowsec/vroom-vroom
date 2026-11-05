@@ -19,6 +19,7 @@
 #   Contents/Frameworks/*.dylib  3D libraries, if built (see dist.sh)
 #   Contents/Resources/vroom.icns
 #   Contents/Resources/guest-tools  the guest agent, its installers, drivers
+#   Contents/Resources/firmware     Secure Boot EDK2 (scripts/make-firmware.sh)
 #
 # Signing is ad hoc: fine on the Mac that built it. To give it to others
 # you need a Developer ID, the hardened runtime and notarization; see
@@ -55,6 +56,7 @@ if [ $build = 1 ]; then
     stamp target/virglrenderer/.inputs $vrend
   fi
   scripts/make-guest-tools.sh
+  scripts/make-firmware.sh >/dev/null
 fi
 r=target/release
 for b in vroom vroom-gui; do
@@ -73,6 +75,10 @@ cp packaging/macos/vroom.icns "$app/Contents/Resources/"
 # guest's agent, puts in as a USB stick, and builds ready-made VMs with.
 [ -f target/guest-tools/vroom-tools.img ] || { echo "no guest tools: scripts/make-guest-tools.sh" >&2; exit 1; }
 cp -R target/guest-tools "$app/Contents/Resources/guest-tools"
+# Secure Boot: the VMM looks in Resources/firmware.
+[ -f target/firmware/AAVMF_CODE.secboot.fd ] || { echo "no Secure Boot firmware: scripts/make-firmware.sh" >&2; exit 1; }
+mkdir -p "$app/Contents/Resources/firmware"
+cp target/firmware/AAVMF_CODE.secboot.fd target/firmware/AAVMF_VARS.ms.fd "$app/Contents/Resources/firmware/"
 
 # 3D: virglrenderer and what it loads from its own directory (MoltenVK,
 # DXMT, ANGLE). The GPU process looks in Contents/Frameworks.
@@ -84,6 +90,7 @@ for f in target/virglrenderer/lib/libvirglrenderer.1.dylib "$(brew --prefix molt
   chmod u+w "$app/Contents/Frameworks/$(basename "$f")"
 done
 cp target/dxmt-build/src/COPYING.LIB "$app/Contents/Resources/licenses/dxmt-COPYING.LIB"
+cp target/firmware/copyright "$app/Contents/Resources/licenses/edk2-debian-copyright"
 
 # Inside out: libraries, the VMM (with the hypervisor entitlement), then
 # the bundle, which signs the app's own binary and seals the rest.

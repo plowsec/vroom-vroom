@@ -5,6 +5,8 @@
 #                                  vroom's devices (Red Hat, GPLv2/BSD)
 #   scripts/fetch.sh winfsp        WinFsp MSI: what virtiofs.exe mounts
 #                                  shared folders on (GPLv3 + FLOSS exception)
+#   scripts/fetch.sh aavmf         Debian's EDK2 for arm64 VMs: Secure Boot
+#                                  firmware, Microsoft keys (BSD-2-Clause-Patent)
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -18,8 +20,12 @@ case "${1:-}" in
     url=https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi
     sha=073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a
     ;;
+  aavmf)
+    url=https://deb.debian.org/debian/pool/main/e/edk2/qemu-efi-aarch64_2025.02-8+deb13u1_all.deb
+    sha=a00b2411a79c8aeafd95a7c868ac3cd1aab592f1af9fff965f02d81a625276ed
+    ;;
   *)
-    echo "usage: scripts/fetch.sh virtio-win|winfsp" >&2
+    echo "usage: scripts/fetch.sh virtio-win|winfsp|aavmf" >&2
     exit 2
     ;;
 esac

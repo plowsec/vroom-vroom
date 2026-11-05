@@ -28,7 +28,17 @@ UEFI (installers, Windows, most cases):
 type = "uefi"
 vars = "dev.state/efivars.fd"    # NVRAM, created on first boot
 # firmware = "/path/QEMU_EFI.fd"  # default: search Homebrew/distro paths
+# secure_boot = true              # Windows' default
 ```
+
+`secure_boot = true`:
+
+| | |
+|---|---|
+| Firmware | Debian's EDK2 (`AAVMF_CODE.secboot.fd`), in vroom.app's `Resources/firmware`; a build's in `target/firmware` (`scripts/make-firmware.sh`); Linux: `/usr/share/AAVMF` |
+| Keys | PK: Debian's. KEK: Microsoft KEK CA 2011. db: Windows Production PCA 2011, Microsoft UEFI CA 2011 (shim-booted Linux works) |
+| NVRAM | made from `AAVMF_VARS.ms.fd`. An NVRAM with no PK (made without Secure Boot) starts over at the next cold boot; the old one stays as `<vars>.bak`. Windows boots on through `\EFI\BOOT\BOOTAA64.EFI` |
+| Off again | keeps the keys; the Homebrew firmware just doesn't check them |
 
 Direct kernel boot (fast, no firmware):
 

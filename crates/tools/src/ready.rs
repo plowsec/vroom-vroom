@@ -195,7 +195,7 @@ fn windows(spec: &Spec, iso: &Path, tools: &Path, progress: &mut dyn FnMut(&str)
          # Windows ISO, the virtio drivers, the guest tools{}).\n\
          # Reference: docs/GUIDE.md, docs/CONFIG.md.\n\
          name = {}\nos = \"windows\"\ncpus = {}\nmemory_mib = {}\ntpm = true\n\
-         \n[boot]\ntype = \"uefi\"\nvars = {}\n\
+         \n[boot]\ntype = \"uefi\"\nvars = {}\nsecure_boot = true\n\
          \n# Windows setup only has an NVMe driver.\n\
          [[disk]]\npath = {}\nformat = \"qcow2\"\nbus = \"nvme\"\n\
          \n# The install stick. Setup stops rather than reinstall over a disk\n\

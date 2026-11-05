@@ -532,6 +532,11 @@ pub enum Boot {
         firmware: Option<PathBuf>,
         /// Per-VM NVRAM; created on first boot.
         vars: PathBuf,
+        /// UEFI Secure Boot, Microsoft's keys enrolled (Debian's EDK2,
+        /// bundled). Turned on for a VM whose NVRAM has no keys, that NVRAM
+        /// starts over (the old one is kept as `<vars>.bak`).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        secure_boot: bool,
     },
 }
 
@@ -1011,7 +1016,7 @@ impl VmConfig {
                     fix(i);
                 }
             }
-            Boot::Uefi { firmware, vars } => {
+            Boot::Uefi { firmware, vars, .. } => {
                 if let Some(f) = firmware {
                     fix(f);
                 }

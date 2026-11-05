@@ -62,6 +62,7 @@ pub struct Plan {
     pub shares: Vec<PlanShare>,
     pub audio: bool,
     pub tpm: bool,
+    pub secure_boot: bool,
     /// VMware's BIOS UUID, in the byte order vroom keeps it in.
     pub uuid: Option<[u8; 16]>,
     /// VMware's SMBIOS serial ("VMware-56 4d ...").
@@ -320,6 +321,7 @@ pub fn plan(path: &Path) -> Result<Plan> {
     if tpm || encrypted {
         notes.push("The TPM's contents can't come along (VMware encrypts them). If BitLocker is on in the guest, have the recovery key ready.".into());
     }
+    let secure_boot = v.flag("uefi.secureBoot.enabled", false);
     let audio = v.flag("sound.present", false);
 
     let raw_uuid = v.get("uuid.bios").and_then(parse_uuid_bios);
@@ -338,6 +340,7 @@ pub fn plan(path: &Path) -> Result<Plan> {
         shares,
         audio,
         tpm,
+        secure_boot,
         uuid: raw_uuid.map(smbios_to_rfc),
         vmware_serial,
         suspended,
@@ -353,7 +356,7 @@ fn is_delta_name(stem: &str) -> bool {
 /// The new VM's file, as text people can read.
 pub fn render(p: &Plan, name: &str, disk_files: &[String], opts: &Options, serials: [u8; 8]) -> String {
     let mut s = format!(
-        "# Imported from VMware: {}\nname = {}\nos = {}\ncpus = {}\nmemory_mib = {}\ntpm = {}\n\n[boot]\ntype = \"uefi\"\nvars = {}\n",
+        "# Imported from VMware: {}\nname = {}\nos = {}\ncpus = {}\nmemory_mib = {}\ntpm = {}\n\n[boot]\ntype = \"uefi\"\nvars = {}\n{}",
         p.vmx.display(),
         toml_str(name),
         toml_str(&format!("{:?}", p.os).to_ascii_lowercase()),
@@ -361,6 +364,7 @@ pub fn render(p: &Plan, name: &str, disk_files: &[String], opts: &Options, seria
         p.memory_mib,
         p.tpm,
         toml_str(&format!("{name}.state/efivars.fd")),
+        if p.secure_boot { "secure_boot = true\n" } else { "" },
     );
     for (d, f) in p.disks.iter().zip(disk_files) {
         let bus = if d.bus == DiskBus::Nvme { "nvme" } else { "virtio" };

@@ -413,6 +413,9 @@ written (or the drag ends with no drop) the app sends `DragOut` with
 `scripts/make-guest-tools.sh` builds them into `target/guest-tools/`
 (`linux/`, `windows/`, and `vroom-tools.img`, a FAT32 disk with both);
 `scripts/app.sh` copies that into the app. `vroom_tools::dir()` finds it.
+Secure Boot firmware goes the same way: `scripts/make-firmware.sh` puts
+it in `target/firmware/`, the app in `Resources/firmware/`, and
+`firmware.rs` looks next to the running program.
 
 Versions: `agent/build.rs` makes `0.1.0+348.e314084680` (crate version,
 commits on the branch, commit) and puts it in the binary after

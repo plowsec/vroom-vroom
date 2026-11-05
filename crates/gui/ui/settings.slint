@@ -1149,7 +1149,7 @@ export component SettingsPanel inherits Rectangle {
                     }
                     if !root.s.boot-kernel: Row {
                         label: "Firmware";
-                        tip: root.s.firmware == "" ? "Empty: found automatically (Homebrew qemu)." : "";
+                        tip: root.s.firmware != "" ? "" : root.s.secure-boot ? "Empty: the bundled one (Debian's EDK2)." : "Empty: found automatically (Homebrew qemu).";
                         key: "boot.firmware";
                         Field {
                             width: 180px;
@@ -1158,6 +1158,17 @@ export component SettingsPanel inherits Rectangle {
                             mono: true;
                             enabled: !root.lk;
                             committed(t) => { Bus.set("boot.firmware", t); }
+                        }
+                    }
+                    if !root.s.boot-kernel: Row {
+                        label: "Secure Boot";
+                        tip: "Microsoft's keys. Turning it on resets the NVRAM.";
+                        key: "boot.secure_boot";
+                        Toggle {
+                            y: (parent.height - self.height) / 2;
+                            checked: root.s.secure-boot;
+                            enabled: !root.lk;
+                            toggled(v) => { Bus.set("boot.secure_boot", v ? "true" : "false"); }
                         }
                     }
                     if !root.s.boot-kernel: Row {

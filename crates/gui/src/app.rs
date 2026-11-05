@@ -675,8 +675,9 @@ impl App {
         let warnings: Vec<SharedString> = r.warnings().into_iter().map(|w| s(capitalize(&w))).collect();
         let warn_short: Vec<SharedString> = r.warnings().iter().map(|w| s(warn_short(w))).collect();
 
+        let secure_boot = matches!(c.boot, Boot::Uefi { secure_boot: true, .. });
         let (boot_kernel, firmware, vars, kernel, initrd, cmdline) = match &c.boot {
-            Boot::Uefi { firmware, vars } => (
+            Boot::Uefi { firmware, vars, .. } => (
                 false,
                 firmware.as_ref().map(|f| f.display().to_string()).unwrap_or_default(),
                 vars.display().to_string(),
@@ -765,6 +766,7 @@ impl App {
                 _ => String::new(),
             }),
             boot_kernel,
+            secure_boot,
             firmware: s(firmware),
             vars: s(vars),
             kernel: s(kernel),
@@ -846,8 +848,11 @@ impl App {
                 if !c.identity.announce_vm { " · hides VM flags" } else if !same_names(&c.identity) { " · custom identity" } else { "" }
             )),
             sum_boot: s(match &c.boot {
-                Boot::Uefi { firmware: None, .. } => "UEFI".to_string(),
-                Boot::Uefi { .. } => "UEFI, custom firmware".to_string(),
+                Boot::Uefi { firmware, secure_boot, .. } => format!(
+                    "UEFI{}{}",
+                    if firmware.is_some() { ", custom firmware" } else { "" },
+                    if *secure_boot { " · Secure Boot" } else { "" }
+                ),
                 Boot::Kernel { kernel, .. } => {
                     format!("Linux kernel · {}", kernel.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
                 }
@@ -872,7 +877,7 @@ impl App {
             sound: any || hit("sound audio speakers music output microphone mic input camera webcam video call"),
             clip: any || hit("clipboard copy paste"),
             security: any || hit("security sandbox tpm transport mmio pci serial console identity fingerprint hardware maker vendor model product smbios acpi hide vm detection"),
-            boot: any || hit("boot uefi firmware kernel initrd cmdline command line nvram efi"),
+            boot: any || hit("boot uefi firmware secure boot secureboot kernel initrd cmdline command line nvram efi"),
             tools: any || hit("guest tools agent update install reinstall vroom-setup drivers"),
         });
     }

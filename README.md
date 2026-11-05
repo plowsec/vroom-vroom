@@ -54,7 +54,7 @@ video decoding and encoding get one each. [SECURITY.md](docs/SECURITY.md).
 - NAT with port forwards, several adapters; bridged, and host-only with DHCP (Mac ↔ VMs ↔ VMs), via a root helper (one password prompt)
 - Sound; microphone and camera, opt-in
 - Shared folders (Linux and Windows guests)
-- TPM 2.0 (Windows 11 needs it)
+- TPM 2.0 and Secure Boot (Windows 11 wants both)
 - Nested VMs (M3 or newer)
 - Import from VMware Fusion (ARM64 VMs)
 - USB passthrough, live from the VM window; USB disks also as shared files or a plain disk
@@ -63,7 +63,7 @@ video decoding and encoding get one each. [SECURITY.md](docs/SECURITY.md).
 - Hardware video decode (H.264, HEVC, VP9, AV1) and encode (H.264, HEVC) for Linux guests, opt-in; Firefox, Chrome, FFmpeg use them
 - Fast disk and network I/O, measured against QEMU ([numbers](docs/PERFORMANCE.md))
 
-Not yet: x86_64 hosts (it builds, can't run VMs yet) and Secure Boot.
+Not yet: x86_64 hosts (it builds, can't run VMs yet).
 
 ## Try it
 

@@ -1237,10 +1237,11 @@ running VM's images, even with `-U`.
 
 ## Known gaps
 
-- No UEFI Secure Boot: Homebrew's aarch64 EDK2 isn't built with it, and
-  without a protected (secure-world) variable store a guest kernel could
-  rewrite the keys anyway. Windows 11 is installed with that check
-  bypassed.
+- Secure Boot (`secure_boot = true`, Debian's EDK2) checks what boots,
+  but the variable store isn't protected (no secure world on ARM virt): a
+  guest kernel can rewrite the keys. It stops unsigned bootloaders, not a
+  guest that is already compromised. Windows 11 is installed with that
+  check bypassed, for VMs without it.
 - The Windows agent split is new; installs from before it run the
   all-in-one agent elevated (re-run `vroom-setup.cmd` to upgrade).
 - x86_64 isn't implemented, so none of this is tested there.

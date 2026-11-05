@@ -47,7 +47,8 @@ vroom $ver ($os $(uname -m))
 
 $run
 UEFI firmware comes from QEMU's package: brew install qemu (only its
-EDK2 files are used). vTPM (tpm = true) needs: brew install swtpm
+EDK2 files are used); Secure Boot's (Debian's EDK2) is in vroom.app.
+vTPM (tpm = true) needs: brew install swtpm
 $note
 TXT
 tar -C $out -czf "$out/$name.tar.gz" "$name"
