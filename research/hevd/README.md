@@ -1,9 +1,8 @@
 # HackSys Extreme Vulnerable Driver
 
-First Windows kernel target. Disposable VM only. HEVD source, driver,
-snapshots and guest state stay outside the repo. Pinned upstream:
-`b1cc756e55f69530f6468a6c3c310ed7b967bada`. Walkthrough:
-[../fuzz/DEMO.md](../fuzz/DEMO.md).
+- Disposable VM only. HEVD source, driver, snapshots, guest state stay outside the repo.
+- Pinned upstream: `b1cc756e55f69530f6468a6c3c310ed7b967bada`.
+- Walkthrough: [../fuzz/DEMO.md](../fuzz/DEMO.md).
 
 ## Build (Windows host, WDK)
 
@@ -11,13 +10,11 @@ snapshots and guest state stay outside the repo. Pinned upstream:
 Builder\Build_HEVD_Vulnerable_arm64.bat
 ```
 
-Install in the guest. [client.c](client.c) opens
-`\\.\HackSysExtremeVulnerableDriver` and calls `DeviceIoControl`.
+Install in the guest. [client.c](client.c): opens `\\.\HackSysExtremeVulnerableDriver`, calls `DeviceIoControl`.
 
 ## Snapshot
 
-Two places to stop; fill the addresses into
-[harness.example.json](harness.example.json).
+Stop at one of two places; addresses into [harness.example.json](harness.example.json).
 
 | | call site (before `DeviceIoControl`) | handler entry |
 |---|---|---|
@@ -27,8 +24,8 @@ Two places to stop; fill the addresses into
 | `stop_pc` | instruction after the call | saved return address |
 | always | `input_gpa`, `input_va` | `input_gpa`, `input_va`; clear call-site fields |
 
-Testcase: `u32 LE IOCTL | input bytes`. Block VAs are translated through
-the restored page tables, so a harness survives a new snapshot.
+- Testcase: `u32 LE IOCTL | input bytes`.
+- Block VAs translate through the restored page tables: a harness survives a new snapshot.
 
 ## Blocks and IOCTLs (angr)
 
@@ -43,11 +40,8 @@ uv run --project research/tui python research/fuzz/tools/angr_ioctls.py \
   --function-start 0x800 --function-end 0x8ff
 ```
 
-- `angr_blocks`: from the dispatch function, follows direct in-driver
-  calls. `static-base` = file image base, `runtime-base` = module base in
-  the guest. Paste rows into `coverage`. No source or symbols needed.
-- `angr_ioctls`: static literals only (`0x0022201f`, `0x0022203b`,
-  `0x0022205b` here); `probe` finds what reaches new blocks.
+- `angr_blocks`: from the dispatch function, follows direct in-driver calls. `static-base` = file image base, `runtime-base` = module base in the guest. Rows go into `coverage`. No source or symbols needed.
+- `angr_ioctls`: static literals only (`0x0022201f`, `0x0022203b`, `0x0022205b` here); `probe` finds what reaches new blocks.
 
 ## Debug
 
@@ -56,9 +50,8 @@ research/run.sh LAB.toml --restore SNAPSHOT --binary /path/to/HEVD.sys   # the f
 research/run.sh work.atui                                               # back at the last :checkpoint
 ```
 
-Static addresses show as runtime ones while the lab maps the driver; F2
-there arms the runtime breakpoint. `:checkpoint NAME work.atui` before an
-IOCTL, `:resume` to replay from it.
+- Static addresses show as runtime ones while the lab maps the driver; F2 there arms the runtime breakpoint.
+- `:checkpoint NAME work.atui` before an IOCTL; `:resume` replays from it.
 
 ## Run
 
@@ -68,12 +61,9 @@ cargo run -p vroom-fuzz -- run research/hevd/harness.example.json seed.bin --ite
 cargo run -p vroom-fuzz -- probe research/hevd/harness.example.json payload.bin --output runs/ioctl-probe
 ```
 
-- Coverage: only blocks in the map. Unresolved indirect branches: one HW
-  breakpoint rotates over function entries across inputs.
+- Coverage: only blocks in the map. Unresolved indirect branches: one HW breakpoint rotates over function entries across inputs.
 - Bugcheck or timeout: input saved, snapshot restored.
-- `reopen_after: 2` if in-place resets misbehave. `--no-boundary-seeds`
-  skips the size seeds.
-- `probe`: every IOCTL in range from the snapshot; `results.jsonl` plus
-  coverage for those that differ from the invalid-code baseline.
+- `reopen_after: 2` if in-place resets misbehave. `--no-boundary-seeds` skips the size seeds.
+- `probe`: every IOCTL in range from the snapshot; `results.jsonl` + coverage for those that differ from the invalid-code baseline.
 
 Harness fields: [../fuzz/README.md](../fuzz/README.md).

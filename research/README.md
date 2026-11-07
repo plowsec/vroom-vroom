@@ -14,9 +14,7 @@ cargo check -p vroom-vmm --features research    # + file-backed RAM baselines, p
 
 ## demo
 
-Paused on an EDR's process-notify callback, with the arguments it was
-called with: [DEMO.md](DEMO.md), which also covers making the snapshot
-(the demo refuses any other).
+Paused on an EDR's process-notify callback, with its arguments: [DEMO.md](DEMO.md) (also: making the snapshot; the demo refuses any other).
 
 ## targets
 
@@ -38,20 +36,14 @@ research/build.sh                        # build + sign
 uv run --project research/tui vroom-atui LAB.toml -- ATUI_OPTIONS
 ```
 
-One lab per config: its socket is `~/.cache/vroom-atui/<hash>.sock`; a second
-`run.sh` attaches to it (`--restore`: restores it). From angr_tui:
-`:attach vroom LAB.toml[,restore=SNAPSHOT][,keep]` or `:attach vroom lab.sock[,stop]`.
-A lab angr_tui started stops with it, crash or signal included, unless `keep`.
-Without `--binary` the lab must be paused (it starts paused).
-
-Checkpoints: `:checkpoint NAME [work.atui]` = `vm.snapshot NAME` + project save (targets,
-breakpoints and watchpoints as module + offset, view). `:resume` / `run.sh work.atui`
-re-attaches, `vm.restore`s it, re-arms. `:resume here`: no restore; addresses follow
-the modules' current bases.
-
-Requires `uv` and SSH access to `plowsec/angr_tui` (pinned commit). UEFI: QEMU firmware; TPM: swtpm. Nested virtualization off.
-Linux: `/dev/kvm` access. HVF snapshots cannot restore on KVM.
-Use a disposable overlay. Separate state directory. Starts paused.
+- One lab per config, socket `~/.cache/vroom-atui/<hash>.sock`; a second `run.sh` attaches (`--restore`: restores it).
+- From angr_tui: `:attach vroom LAB.toml[,restore=SNAPSHOT][,keep]` or `:attach vroom lab.sock[,stop]`.
+- A lab angr_tui started stops with it (crash, signal included) unless `keep`.
+- Without `--binary` the lab must be paused (it starts paused).
+- `:checkpoint NAME [work.atui]` = `vm.snapshot NAME` + project save (targets, breakpoints and watchpoints as module + offset, view). `:resume` / `run.sh work.atui`: re-attach, `vm.restore`, re-arm. `:resume here`: no restore; addresses follow the modules' current bases.
+- Needs `uv` and SSH access to `plowsec/angr_tui` (pinned commit). UEFI: QEMU firmware; TPM: swtpm. Nested virtualization off.
+- Linux: `/dev/kvm` access. HVF snapshots don't restore on KVM.
+- Disposable overlay, separate state dir. Starts paused.
 
 ## agents
 
@@ -98,7 +90,7 @@ fuzz      check run* probe* coverage blocks diff crashes          * jobs.start o
 - `events.poll` without `after` waits for the next event (stop, fault, shutdown). Events carry `seq`.
 - Arrays over `limit` (200) return `{items, total, handle, next_offset}`: page with `results.page`.
 - `fuzz.run`/`fuzz.probe`/`fuzz.trace` start `vroom-fuzz` (its own VM, signed; `$VROOM_FUZZ` or `target/release/vroom-fuzz`). Output and progress: `OUTPUT.agent.jsonl`, `OUTPUT.agent.log`. `fuzz.trace`'s OUTPUT is the trace file.
-- `fuzz.coverage|blocks|diff|crashes` read a run directory; no VM.
+- `fuzz.coverage|blocks|diff|crashes`: read a run directory, no VM.
 - Results and jobs belong to the actor that made them.
 - Socket paths: under 104 bytes. A path in a deep temp dir fails: use a relative one.
 - `--daemon`: own session, returns when the socket accepts (prints pid, log `PATH.log`). Use it from agents: their shells often kill what a command started, which leaves a dead socket (`Connection refused`).
@@ -163,9 +155,8 @@ angr_tui with target `vroom` attached ([angr_tui](https://github.com/plowsec/ang
 :resume [here]                 re-attach at the checkpoint (here: as it is)
 ```
 
-Every lab command is `:vroom.<command>` (palette, `:` line, angr_tui's agent socket).
-Modules open for analysis as RVA copies (`kernel.export`), their PDB (`kernel.symbols`) beside
-them for names; runtime address = base + RVA.
+- Every lab command is `:vroom.<command>` (palette, `:` line, angr_tui's agent socket).
+- Modules open for analysis as RVA copies (`kernel.export`), PDB (`kernel.symbols`) beside them for names. Runtime address = base + RVA.
 
 ## semantics
 
@@ -186,9 +177,9 @@ them for names; runtime address = base + RVA.
 
 ## speed
 
-32 MiB paused-state page cache. Invalidated before execution and after edits.
-Parsed PDBs cached. Function lookup: `O(log n + page)`.
-Unwind tables cached; binary search. Module exports reused per boot and process.
+- 32 MiB paused-state page cache; invalidated before execution and after edits.
+- Parsed PDBs cached. Function lookup `O(log n + page)`.
+- Unwind tables cached, binary search. Module exports reused per boot and process.
 
 ## layout
 

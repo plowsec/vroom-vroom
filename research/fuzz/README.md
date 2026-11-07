@@ -96,7 +96,7 @@ Kernel TUI: `coverage runs/a/coverage.json`, `coverage-diff runs/a/coverage.json
 | `calls` / `calls_file` | a sequence's call descriptions (below): typed mutation, call-aware triage, `show`. File relative to the harness |
 | `bugcheck_pc` | `KeBugCheckEx` VA: crash = finding + in-place reset (~1 ms, not ~11 s); 5th HW breakpoint |
 | `reset_is_bugcheck` | guest reset counts as a bugcheck |
-| `reopen_after` | `0` reset in place, `1` restore from disk every input |
+| `reopen_after` | `0` reset in place, `N` restore from disk every N inputs |
 | `timeout_ms` | per input; a timeout restores from disk (a client's resets in place) |
 | `settle_ms` | client harnesses: keep running this long past `stop_pc` (async completions within the input) |
 | `skip_idle` | guest time is what the guest does: every vCPU in WFI and no virtio work in flight → the clock jumps to the next timer (kernel `wfi`s become `hvc #0x7669`; HVF waits out real ones itself); a debug stop parks every vCPU and the clock stands still until they run again. A client's receive timeouts cost their timer ticks, and breakpoints don't make its replies late |
