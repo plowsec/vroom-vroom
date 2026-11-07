@@ -1,0 +1,16 @@
+[package]
+name = "vroom-linux-harness"
+description = "Bounded native x64 Linux boot/control acceptance harness, not the VMM CLI."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vroom-hv.workspace = true
+vroom-arch.workspace = true
+vroom-devices.workspace = true
+vroom-memory.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -5678,6 +5678,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "vroom-linux-harness"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "vroom-arch",
+ "vroom-devices",
+ "vroom-hv",
+ "vroom-memory",
+]
+
+[[package]]
 name = "vroom-memory"
 version = "0.1.0"
 dependencies = [
