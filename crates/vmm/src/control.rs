@@ -74,6 +74,21 @@ fn read_frame(s: &mut UnixStream) -> std::io::Result<(Vec<u8>, Message)> {
 fn one(mut s: UnixStream, agent: &Agent) -> std::io::Result<()> {
     s.set_read_timeout(Some(Duration::from_secs(5)))?;
     let (raw, m) = read_frame(&mut s)?;
+    // Reject after the request header, before reading bodies or creating a
+    // transfer pipe, socket clone, or forwarding thread. A disconnected
+    // service still follows the existing agent path below.
+    if let Some(why) = agent.unavailable_reason() {
+        let reply = match m {
+            Message::Exec { .. } => Message::ExecDone {
+                id: 0, end: ExecEnd::Failed, truncated: false,
+                stdout: Vec::new(), stderr: why.as_bytes().to_vec(),
+            },
+            Message::FilePut { .. } | Message::FileGet { .. } => file_done(Err(why.into())),
+            Message::UpdateBegin { .. } => Message::UpdateDone { id: 0, ok: false, why: why.into() },
+            _ => return Err(std::io::Error::other("not a request")),
+        };
+        return s.write_all(&reply.encode());
+    }
     let (shell, timeout_ms, max_out, command) = match m {
         Message::Exec { shell, timeout_ms, max_out, command, .. } => (shell, timeout_ms, max_out, command),
         Message::UpdateBegin { version, .. } => {
@@ -123,6 +138,33 @@ mod tests {
     use crate::agent::{spawn, Screen};
     use sha2::Digest;
     use vroom_proto::{features, Shell};
+
+    #[test]
+    fn unavailable_requests_fail_from_headers_without_transfer_bodies() {
+        let why = "guest agent is unavailable on this board";
+        let cases = [
+            (Message::Exec { id: 9, shell: Shell::Default, timeout_ms: 60000, max_out: 64, command: "unused".into() },
+             Message::ExecDone { id: 0, end: ExecEnd::Failed, truncated: false, stdout: Vec::new(), stderr: why.as_bytes().to_vec() }),
+            (Message::FilePut { id: 9, size: 1024, path: "unused".into() }, file_done(Err(why.into()))),
+            (Message::FileGet { id: 9, path: "unused".into() }, file_done(Err(why.into()))),
+            (Message::UpdateBegin { id: 9, version: "0.1.0".into(), files: vec![vroom_proto::UpdateFile {
+                path: "vroom-agent".into(), size: 1024, sha256: [0; 32],
+            }] }, Message::UpdateDone { id: 0, ok: false, why: why.into() }),
+        ];
+        for (request, expected) in cases {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let agent = Agent::unavailable(why);
+            let worker = std::thread::spawn(move || one(server, &agent));
+            client.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            client.write_all(&request.encode()).unwrap();
+            // No body and no write shutdown: unavailable must not wait for EOF.
+            let (_, reply) = read_frame(&mut client).unwrap();
+            assert_eq!(reply, expected);
+            // No transfer forwarder retains a clone of the request socket.
+            assert_eq!(client.read(&mut [0]).unwrap(), 0);
+            worker.join().unwrap().unwrap();
+        }
+    }
 
     #[test]
     fn a_request_reaches_the_agent_and_its_answer_comes_back() {

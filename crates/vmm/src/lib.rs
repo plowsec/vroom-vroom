@@ -34,6 +34,7 @@ pub use machine::gpu_in_process;
 pub mod psci;
 mod ramfb;
 mod reidentify;
+mod serial;
 mod snapshot;
 mod tpm;
 mod usb;
@@ -47,7 +48,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use vroom_config::VmConfig;
-use vroom_devices::pl011::Pl011;
 use vroom_hv::{BootRegs, Hypervisor, IrqChipState, Vm};
 #[cfg(feature = "research")]
 use vroom_hv::VcpuState;
@@ -80,6 +80,8 @@ pub enum Error {
     VcpuGone,
     #[error("{0} is unavailable for a cold-boot-only VM")]
     UnsupportedLifecycle(&'static str),
+    #[error("{0}")]
+    Unavailable(&'static str),
     #[error("timed out waiting for vCPUs")]
     Timeout,
     #[error("virtio: {0}")]
@@ -148,7 +150,7 @@ pub struct Vmm {
     vcpus: Vec<VcpuHandle>,
     events: Receiver<VmEvent>,
     devices: Vec<StatefulDevice>,
-    uart: Arc<Mutex<Pl011>>,
+    serial_input: serial::SerialInput,
     agent: agent::Agent,
     gpus: Vec<vroom_virtio::devices::gpu::GpuControl>,
     disks: disks::DiskSet,
@@ -318,7 +320,7 @@ impl Vmm {
             vcpus: m.vcpus,
             events: ev_rx,
             devices: m.devices,
-            uart: m.uart,
+            serial_input: m.serial_input,
             agent: m.agent,
             gpus: m.gpus,
             disks,
@@ -776,8 +778,9 @@ impl Vmm {
     }
 
     /// Keyboard input for the serial console.
-    pub fn serial_input(&self, bytes: &[u8]) {
-        self.uart.lock().unwrap_or_else(|e| e.into_inner()).queue_input(bytes);
+    /// Returns an error when this board has no host-to-guest serial input.
+    pub fn serial_input(&self, bytes: &[u8]) -> Result<()> {
+        self.serial_input.queue_input(bytes)
     }
 
     /// Wait for the next event from the guest.

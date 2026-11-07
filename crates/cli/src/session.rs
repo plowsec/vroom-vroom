@@ -431,7 +431,9 @@ pub fn run(o: RunOpts) -> Result<(), String> {
                 }
             }
             if !fwd.is_empty() {
-                s.vmm.serial_input(&fwd);
+                if let Err(e) = s.vmm.serial_input(&fwd) {
+                    eprintln!("vroom: {e}");
+                }
             }
         }
         if let Some(ev) = s.vmm.next_event(Duration::from_millis(20)) {

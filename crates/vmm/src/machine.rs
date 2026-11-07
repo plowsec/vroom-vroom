@@ -194,7 +194,7 @@ pub(crate) struct Machine {
     pub shared: Arc<VcpuShared>,
     pub vcpus: Vec<VcpuHandle>,
     pub devices: Vec<StatefulDevice>,
-    pub uart: Arc<Mutex<Pl011>>,
+    pub serial_input: crate::serial::SerialInput,
     pub agent: Agent,
     /// Each virtio-gpu's control handle (window size, Direct3D state).
     pub gpus: Vec<GpuControl>,
@@ -1047,7 +1047,7 @@ pub(crate) fn build(
     let _ = shared.peers.set(vcpus.iter().map(|v| v.peer.clone()).collect());
     vm.finalize()?;
 
-    Ok(Machine { vm, mem, shared, vcpus, devices: reg.stateful, uart, agent, gpus, viewer, display, screens, boot, nets, net_ports, hotplug })
+    Ok(Machine { vm, mem, shared, vcpus, devices: reg.stateful, serial_input: crate::serial::SerialInput::Pl011(uart), agent, gpus, viewer, display, screens, boot, nets, net_ports, hotplug })
 }
 
 #[cfg(test)]
