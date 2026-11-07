@@ -24,6 +24,11 @@ STATE = ROOT / ".aws-pilot"
 UTC = timezone.utc
 REGION = "eu-north-1"
 INSTANCE_TYPE = "m7i-flex.large"
+DEFAULT_HOST_PROFILE = "x64-nested-free"
+HOST_PROFILES = {
+    DEFAULT_HOST_PROFILE: {"instance_type": INSTANCE_TYPE, "architecture": "x86_64", "host_mode": "nested", "account_plan": "FREE"},
+    "arm64-metal-paid": {"instance_type": "c6g.metal", "architecture": "arm64", "host_mode": "metal", "account_plan": "PAID"},
+}
 SSM_POLICY = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 loader = importlib.util.spec_from_file_location("cost_pilot", ROOT / "scripts/aws-pilot.py")
 cost = importlib.util.module_from_spec(loader)
@@ -32,6 +37,17 @@ loader.loader.exec_module(cost)
 
 class PilotError(RuntimeError):
     pass
+
+
+def host_profile(name=DEFAULT_HOST_PROFILE):
+    if not isinstance(name, str) or name not in HOST_PROFILES:
+        raise PilotError("unlisted host profile; only the reviewed x64 nested and ARM64 metal profiles are allowed")
+    return HOST_PROFILES[name]
+
+
+def manifest_profile(manifest):
+    # Old manifests retain the exact original x64 policy for status/cleanup.
+    return host_profile(manifest.get("host_profile", DEFAULT_HOST_PROFILE))
 
 
 class Aws:
@@ -149,43 +165,55 @@ def host_instances(aws, run_id=None):
     return [instance for reservation in result["Reservations"] for instance in reservation["Instances"]]
 
 
-def preflight(aws, spec):
+def preflight(aws, spec, profile_name=DEFAULT_HOST_PROFILE):
+    profile = host_profile(profile_name)
     proposal = cost.prepare(spec)
-    if spec["region"] != REGION or spec["instance_type"] != INSTANCE_TYPE:
-        raise PilotError(f"first launcher is limited to {REGION} {INSTANCE_TYPE}")
-    if (spec["guest_os"], spec["architecture"], spec["host_mode"]) != ("linux", "x86_64", "nested"):
-        raise PilotError("first launcher is only a Linux x64 nested reference host")
+    if spec["region"] != REGION or spec["instance_type"] != profile["instance_type"]:
+        raise PilotError(f"host profile is limited to {REGION} {profile['instance_type']}")
+    if (spec["guest_os"], spec["architecture"], spec["host_mode"]) != ("linux", profile["architecture"], profile["host_mode"]):
+        raise PilotError("guest OS, architecture or host mode differs from the reviewed host profile")
     if spec["runtime_minutes"] > 30 or spec["root_gib"] > 40 or spec["public_ipv4_count"] != 1:
         raise PilotError("first run requires <=30 minutes, <=40GiB, exactly one ephemeral IPv4")
+    if profile["host_mode"] == "metal" and spec["root_gib"] != 40:
+        raise PilotError("ARM64 metal profile requires exactly 40GiB of root storage")
     account = identity(aws)
     plan = aws.call("freetier", "get-account-plan-state", region="us-east-1")
     credit = plan.get("accountPlanRemainingCredits", {})
-    if plan.get("accountId") != account or plan.get("accountPlanType") != "FREE" or plan.get("accountPlanStatus") != "ACTIVE":
-        raise PilotError("an active Free Plan on the same account is required; no automatic upgrade")
-    if credit.get("unit") != "USD" or cost.amount(credit.get("amount"), "remaining credits") < Decimal(
-            proposal["cost_usd"]["estimated_run_with_contingency"]):
-        raise PilotError("Free Plan credits do not cover the conservative run estimate")
-    if cost.timestamp(plan.get("accountPlanExpirationDate"), "plan expiration") < datetime.now(UTC) + timedelta(hours=2):
-        raise PilotError("Free Plan expires too soon for this bounded run")
+    if plan.get("accountId") != account or plan.get("accountPlanType") != profile["account_plan"] or plan.get("accountPlanStatus") != "ACTIVE":
+        raise PilotError(f"an active {profile['account_plan']} Plan on the same account is required; no automatic upgrade")
+    if profile["account_plan"] == "FREE":
+        if credit.get("unit") != "USD" or cost.amount(credit.get("amount"), "remaining credits") < Decimal(
+                proposal["cost_usd"]["estimated_run_with_contingency"]):
+            raise PilotError("Free Plan credits do not cover the conservative run estimate")
+        if cost.timestamp(plan.get("accountPlanExpirationDate"), "plan expiration") < datetime.now(UTC) + timedelta(hours=2):
+            raise PilotError("Free Plan expires too soon for this bounded run")
     if any(item["State"]["Name"] != "terminated" for item in host_instances(aws)):
         raise PilotError("an existing project instance must be reconciled before another launch")
-    types = aws.call("ec2", "describe-instance-types", {"InstanceTypes": [INSTANCE_TYPE]})["InstanceTypes"]
+    types = aws.call("ec2", "describe-instance-types", {"InstanceTypes": [profile["instance_type"]]})["InstanceTypes"]
     if len(types) != 1:
         raise PilotError("instance type could not be verified")
     info = types[0]
-    if info.get("FreeTierEligible") is not True:
-        raise PilotError("instance is not reported Free Tier eligible; no automatic plan upgrade")
-    if "nested-virtualization" not in info.get("ProcessorInfo", {}).get("SupportedFeatures", []):
-        raise PilotError("instance does not report nested virtualization support")
+    if profile["host_mode"] == "nested":
+        if info.get("FreeTierEligible") is not True:
+            raise PilotError("instance is not reported Free Tier eligible; no automatic plan upgrade")
+        if "nested-virtualization" not in info.get("ProcessorInfo", {}).get("SupportedFeatures", []):
+            raise PilotError("instance does not report nested virtualization support")
+    elif (info.get("InstanceType") != profile["instance_type"] or info.get("BareMetal") is not True
+          or info.get("ProcessorInfo", {}).get("SupportedArchitectures") != ["arm64"]
+          or type(info.get("VCpuInfo", {}).get("DefaultVCpus")) is not int
+          or info["VCpuInfo"]["DefaultVCpus"] != 64):
+        raise PilotError("ARM64 metal instance metadata must prove c6g.metal, arm64 and exactly 64 vCPUs")
     quota = aws.call("service-quotas", "get-service-quota",
                      {"ServiceCode": "ec2", "QuotaCode": "L-1216C47A"})["Quota"]["Value"]
+    if profile["host_mode"] == "metal":
+        quota = cost.amount(quota, "standard vCPU quota")
     if quota < info["VCpuInfo"]["DefaultVCpus"]:
         raise PilotError("regional On-Demand standard-instance vCPU quota is insufficient")
     ami_id = aws.call("ssm", "get-parameter", {"Name":
-        "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"})["Parameter"]["Value"]
+        "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-" + profile["architecture"]})["Parameter"]["Value"]
     images = aws.call("ec2", "describe-images", {"ImageIds": [ami_id], "Owners": ["amazon"]})["Images"]
-    if len(images) != 1 or images[0].get("Architecture") != "x86_64" or images[0].get("State") != "available":
-        raise PilotError("Amazon Linux x64 AMI ownership/architecture could not be verified")
+    if len(images) != 1 or images[0].get("Architecture") != profile["architecture"] or images[0].get("State") != "available":
+        raise PilotError("Amazon Linux AMI ownership/architecture could not be verified")
     image = images[0]
     if image.get("RootDeviceType") != "ebs" or image.get("ProductCodes"):
         raise PilotError("AMI must use EBS without paid marketplace products")
@@ -201,7 +229,7 @@ def preflight(aws, spec):
     routes = aws.call("ec2", "describe-route-tables", {"Filters": [
         {"Name": "vpc-id", "Values": [vpc_id]}]})["RouteTables"]
     offerings = aws.call("ec2", "describe-instance-type-offerings", {
-        "LocationType": "availability-zone", "Filters": [{"Name": "instance-type", "Values": [INSTANCE_TYPE]}]
+        "LocationType": "availability-zone", "Filters": [{"Name": "instance-type", "Values": [profile["instance_type"]]}]
     })["InstanceTypeOfferings"]
     zones = {item["Location"] for item in offerings}
     candidates = [item for item in subnets if item["AvailabilityZone"] in zones
@@ -241,6 +269,7 @@ def reaper_policy(account, region, run_id):
 
 
 def mutate(aws, manifest, path, service, operation, payload, **kwargs):
+    manifest_profile(manifest)
     manifest["last_intended_mutation"] = {"service": service, "operation": operation,
                                          "at": datetime.now(UTC).isoformat()}
     save(path, manifest)
@@ -390,18 +419,19 @@ def prepare_host(aws, manifest, path):
 
 
 def instance_request(manifest):
+    profile = manifest_profile(manifest)
     spec = manifest["specification"]
     run_id = manifest["run_id"]
     deadline = deadlines(manifest)[1].strftime("%Y-%m-%d %H:%M:%S UTC")
     bootstrap = "\n".join([
         "#!/bin/bash", "set -eu", "trap '/sbin/shutdown -h now' ERR",
         "systemd-run --unit=vroom-pilot-expiry --on-calendar=" + shlex.quote(deadline) + " /sbin/shutdown -h now",
-        "modprobe kvm_intel", "test -c /dev/kvm", "systemctl enable --now amazon-ssm-agent",
+        "modprobe kvm_intel" if profile["host_mode"] == "nested" else 'test "$(uname -m)" = aarch64',
+        "test -c /dev/kvm", "systemctl enable --now amazon-ssm-agent",
         "mkdir -p /var/lib/vroom-pilot", "printf '%s\\n' " + shlex.quote(run_id) + " > /var/lib/vroom-pilot/run-id", "",
     ])
-    return {"ImageId": manifest["preflight"]["image_id"], "InstanceType": INSTANCE_TYPE,
+    request = {"ImageId": manifest["preflight"]["image_id"], "InstanceType": profile["instance_type"],
         "MinCount": 1, "MaxCount": 1, "ClientToken": run_id,
-        "CpuOptions": {"NestedVirtualization": "enabled"},
         "IamInstanceProfile": {"Name": manifest["instance_profile"]},
         "InstanceInitiatedShutdownBehavior": "terminate", "DisableApiTermination": False,
         "MetadataOptions": {"HttpTokens": "required", "HttpPutResponseHopLimit": 1, "HttpEndpoint": "enabled"},
@@ -415,16 +445,22 @@ def instance_request(manifest):
         # but relying on that is unnecessary and obscures the actual payload.
         "UserData": bootstrap,
     }
+    if profile["host_mode"] == "nested":
+        request["CpuOptions"] = {"NestedVirtualization": "enabled"}
+    return request
 
 
 def bootstrap_check(manifest):
     """Read-only host proof, to prepend to every workload command. Never arms a timer."""
+    profile = manifest_profile(manifest)
     guard, fallback = deadlines(manifest)
     expected = int(fallback.timestamp())
     return "\n".join([
         "python3 -I - <<'VROOM_BOOTSTRAP_CHECK' || exit $?", "import json, os, pathlib, re, stat, subprocess, time",
         "run_id = " + repr(manifest["run_id"]), "expected = " + str(expected),
         "guard = " + str(int(guard.timestamp())),
+        *(["assert os.uname().sysname == 'Linux' and os.uname().machine == 'aarch64', 'ARM64 Linux host required'"]
+          if profile["host_mode"] == "metal" else []),
         "env = dict(os.environ, LC_ALL='C', TZ='UTC')",
         "def command(*args):",
         "    return subprocess.check_output(args, text=True, timeout=5, env=env).strip()",
@@ -489,12 +525,13 @@ def request_host(aws, manifest, path):
 
 
 def launch(aws, manifest, path):
+    manifest_profile(manifest)
     identity(aws, manifest["account"])
     retry_setup = (manifest["status"] == "cleaned" and not manifest.get("run_requested")
                    and manifest.get("setup_attempts", 1) < 2)
     if manifest["status"] != "prepared" and not retry_setup:
         raise PilotError("manifest is not new; use status/cleanup, never relaunch with a new token")
-    fresh = preflight(aws, manifest["specification"])
+    fresh = preflight(aws, manifest["specification"], manifest.get("host_profile", DEFAULT_HOST_PROFILE))
     if fresh["account"] != manifest["account"]:
         raise PilotError("preflight account changed")
     manifest["preflight"] = fresh
@@ -565,6 +602,7 @@ def owned_role(aws, name, run_id):
 
 
 def cleanup(aws, manifest, path):
+    manifest_profile(manifest)
     identity(aws, manifest["account"])
     run_id = manifest["run_id"]
     instances = host_instances(aws, run_id)
@@ -667,6 +705,8 @@ def cleanup_control_plane(aws, manifest):
 
 
 def smoke(aws, manifest, path):
+    if manifest_profile(manifest)["host_mode"] != "nested":
+        raise PilotError("this command is an x64 micro smoke; use the reviewed native ARM64 artifact workflow")
     identity(aws, manifest["account"])
     if manifest.get("status") != "running" or manifest.get("termination_permission_verified") is not True:
         raise PilotError("running status and proven expiry-role termination permission are required")
@@ -742,6 +782,8 @@ def main():
     prep = sub.add_parser("preflight", help="read AWS state and persist a disabled run manifest")
     prep.add_argument("specification", type=Path)
     prep.add_argument("--expected-account", required=True)
+    prep.add_argument("--host-profile", choices=tuple(HOST_PROFILES), default=DEFAULT_HOST_PROFILE,
+                      help="explicit reviewed host/account policy; never changes the account plan")
     prep.add_argument("--expiry-self-test-after-minutes", type=int,
                       help="earlier scheduled guard cutoff; original quoted runtime remains the host fallback")
     for name in ("launch", "status", "smoke", "cleanup", "expiry-status"):
@@ -758,13 +800,13 @@ def main():
             identity(aws, args.expected_account)
             spec = read(args.specification)
             minutes = self_test_minutes(spec, args.expiry_self_test_after_minutes)
-            details = preflight(aws, spec)
+            details = preflight(aws, spec, args.host_profile)
             path = STATE / (spec["run_id"] + ".json")
             if path.exists():
                 raise PilotError("run manifest already exists; use a new offline specification for a new run")
             manifest = {"schema_version": 1, "run_id": spec["run_id"], "profile": args.profile,
                         "region": REGION, "account": details["account"], "status": "prepared",
-                        "specification": spec, "preflight": details}
+                        "specification": spec, "preflight": details, "host_profile": args.host_profile}
             if minutes is not None:
                 manifest["expiry_self_test_after_minutes"] = minutes
             save(path, manifest)
@@ -773,6 +815,7 @@ def main():
                 raise PilotError("invalid run ID")
             path = STATE / (args.run_id + ".json")
             manifest = read(path)
+            manifest_profile(manifest)
             if manifest["run_id"] != args.run_id or manifest["region"] != REGION or manifest["profile"] != args.profile:
                 raise PilotError("manifest does not match selected run/profile/region")
             identity(aws, manifest["account"])
