@@ -1030,6 +1030,7 @@ pub(crate) fn build(
     let shared = Arc::new(VcpuShared {
         vm: vm.clone(),
         mmio: reg.bus.build(),
+        pio: None,
         cpus: Mutex::new(CpuTable::new(mpidrs)),
         events,
         peers: OnceLock::new(),

@@ -428,6 +428,7 @@ fn failed_worker_cold_start_cannot_retry_or_accept_state_commands() {
     let shared = Arc::new(VcpuShared {
         vm,
         mmio: vroom_devices::BusBuilder::new().build(),
+        pio: None,
         cpus: Mutex::new(psci::CpuTable::new(vec![0])),
         events,
         peers: Default::default(),

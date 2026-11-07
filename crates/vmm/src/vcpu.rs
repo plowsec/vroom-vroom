@@ -79,11 +79,13 @@ pub enum VmEvent {
 pub struct VcpuShared {
     pub vm: Arc<dyn Vm>,
     pub mmio: Bus,
+    /// Only an explicit PC board opts into absent-port behavior.
+    pub pio: Option<crate::pio::PcPioBus>,
     pub cpus: Mutex<CpuTable>,
     pub events: Sender<VmEvent>,
     /// Filled once all threads are up; used for CPU_ON.
     pub peers: OnceLock<Vec<Peer>>,
-    /// MMIO accesses vCPUs passed to devices (research resets skip the
+    /// Device I/O accesses vCPUs passed to devices (research resets skip the
     /// device restore when none happened and the devices stayed paused).
     pub device_exits: std::sync::atomic::AtomicU64,
     /// A debug stop parks every vCPU at once (research: the guest clock
@@ -408,8 +410,21 @@ impl VcpuLoop {
                 let _ = self.shared.events.send(VmEvent::Reset);
             }
             VcpuExit::Halted => self.running = false,
-            VcpuExit::PioIn { port, .. } | VcpuExit::PioOut { port, .. } => {
-                return Err(Error::Setup(format!("port I/O {port:#x} on a board without ports")));
+            VcpuExit::PioIn { port, len } => {
+                let bus = self.shared.pio.as_ref().ok_or_else(||
+                    Error::Setup(format!("port I/O {port:#x} on a board without ports")))?;
+                let mut bytes = [0u8; 4];
+                let bytes = bytes.get_mut(..len).ok_or_else(|| Error::Setup("PIO input exceeds a scalar value".into()))?;
+                bus.read(port, bytes)?;
+                self.shared.device_exits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.vcpu.complete_pio_in(bytes)?;
+            }
+            VcpuExit::PioOut { port, len, data } => {
+                let bus = self.shared.pio.as_ref().ok_or_else(||
+                    Error::Setup(format!("port I/O {port:#x} on a board without ports")))?;
+                let bytes = data.get(..len).ok_or_else(|| Error::Setup("PIO output exceeds a scalar value".into()))?;
+                bus.write(port, bytes)?;
+                self.shared.device_exits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
         Ok(())
@@ -453,3 +468,7 @@ impl VcpuLoop {
     }
 }
 
+
+#[cfg(test)]
+#[path = "pio_worker_tests.rs"]
+mod pio_worker_tests;

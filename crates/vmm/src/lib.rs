@@ -29,6 +29,7 @@ mod lifecycle;
 mod lifecycle_tests;
 mod machine;
 mod net;
+mod pio;
 pub use machine::gpu_in_process;
 pub mod psci;
 mod ramfb;
