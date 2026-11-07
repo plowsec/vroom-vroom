@@ -215,6 +215,8 @@ The host was terminated immediately after recording results. Complete cleanup fi
 
 ## Local x64 QEMU firmware/TPM acceptance
 
+Reusable source and local build instructions are in [tests/firmware-reference](../tests/firmware-reference/README.md); private campaign reports and generated artifacts are intentionally not committed.
+
 The separately reviewed local QEMU reference campaign passed on 2026-11-07:
 three cold starts (enrollment, Linux seal, Linux unseal), using the reviewed
 spawn/join lifecycle and three guest-shutdown records. External process

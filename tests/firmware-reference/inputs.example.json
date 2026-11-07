@@ -1,0 +1,18 @@
+{
+  "paths": {
+    "qemu": "/path/to/qemu-system-x86_64",
+    "swtpm": "/path/to/swtpm",
+    "openssl": "/path/to/openssl",
+    "osslsigncode": "/path/to/osslsigncode",
+    "clang": "/path/to/clang",
+    "lld_link": "/path/to/lld-link",
+    "llvm_library": "/path/to/libLLVM.dylib",
+    "mformat": "/path/to/mformat",
+    "mcopy": "/path/to/mcopy",
+    "mmd": "/path/to/mmd",
+    "firmware_code": "/path/to/edk2-x86_64-secure-code.fd",
+    "firmware_vars": "/path/to/edk2-i386-vars.fd",
+    "kernel": "/path/to/verified-x64-efi-stub-kernel"
+  },
+  "kernel_sha256": "REPLACE_WITH_VERIFIED_64_CHARACTER_LOWERCASE_SHA256"
+}

@@ -1,0 +1,19 @@
+[package]
+name = "vroom-tpm-reference-init"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[workspace]
+
+[dependencies]
+libc = "=0.2.190"
+sha2 = "=0.10.9"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+strip = true
+overflow-checks = true
