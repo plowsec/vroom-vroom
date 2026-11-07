@@ -17,6 +17,7 @@ struct Counts {
     drops: AtomicUsize,
     zeroes: AtomicUsize,
     fail_boot: AtomicBool,
+    panic_boot_cpu: AtomicBool,
     timeline: Mutex<Vec<String>>,
 }
 
@@ -63,6 +64,9 @@ impl Vcpu for FakeCpu {
         self.kernel_psci
     }
     fn run(&mut self) -> vroom_hv::Result<VcpuExit> {
+        if self.index == 0 && self.counts.panic_boot_cpu.load(SeqCst) {
+            panic!("injected worker panic");
+        }
         self.counts
             .timeline
             .lock()
@@ -379,7 +383,7 @@ fn default_policy_retains_pristine_state_and_reset() {
 }
 
 #[test]
-fn x64_board_remains_unavailable() {
+fn unsupported_x64_backend_is_rejected_before_state_creation() {
     let temp = tempfile::tempdir().unwrap();
     let (config, opts, hv, counts) = fixture(temp.path(), 1, StartMode::BootPaused);
     let hv = Arc::new(FakeHv {
@@ -389,7 +393,8 @@ fn x64_board_remains_unavailable() {
     assert!(Vmm::start(config, hv, opts)
         .unwrap_err()
         .to_string()
-        .contains("only the aarch64 board"));
+        .contains("requires the x86_64 KVM backend"));
+    assert!(!temp.path().join("state").exists());
     assert_eq!(counts.runs.load(SeqCst), 0);
 }
 
@@ -432,6 +437,7 @@ fn failed_worker_cold_start_cannot_retry_or_accept_state_commands() {
         cpus: Mutex::new(psci::CpuTable::new(vec![0])),
         events,
         peers: Default::default(),
+        run_calls: Default::default(),
         device_exits: Default::default(),
         halt_on_stop: Default::default(),
         halting: Default::default(),
@@ -525,4 +531,22 @@ fn resettable_runtime_cpu_on_remains_distinct_from_once_only_initialization() {
         assert_eq!(counts.restores.load(SeqCst), expected);
     }
     assert_eq!(counts.runs.load(SeqCst), 0);
+}
+
+
+#[test]
+fn checked_shutdown_reports_panic_and_still_joins_every_worker() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, opts, hv, counts) = fixture(temp.path(), 2, StartMode::BootPaused);
+    let mut vm = Vmm::start(config, hv, opts).unwrap();
+    counts.panic_boot_cpu.store(true, SeqCst);
+    vm.resume().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while counts.drops.load(SeqCst) == 0 {
+        assert!(Instant::now() < deadline, "injected panic did not occur");
+        std::thread::yield_now();
+    }
+    assert!(vm.shutdown_checked().unwrap_err().to_string().contains("worker panicked"));
+    assert_eq!(vm.state(), RunState::Stopped);
+    assert_eq!(counts.drops.load(SeqCst), 2, "the other worker must also be joined");
 }

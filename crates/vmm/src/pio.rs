@@ -5,6 +5,10 @@
 //! KVM rejects string/multiple-element I/O before producing VcpuExit: that
 //! interface carries one scalar value, not an element count.
 use std::ops::Range;
+use std::sync::{Arc, Mutex};
+
+/// First asynchronous/device callback error, fatal to the PC worker.
+pub(crate) type PioError = Arc<Mutex<Option<String>>>;
 
 use vroom_devices::SharedDevice;
 
@@ -28,7 +32,6 @@ impl std::fmt::Debug for PioRegion {
 impl PioRegion {
     /// Map a device and the scalar widths it actually implements. A UART
     /// with byte registers should explicitly use `&[1]`.
-    #[allow(dead_code)] // The PC board remains gated; exercised by the tests.
     pub(crate) fn new(base: u16, len: u32, widths: &[usize], device: SharedDevice) -> Result<Self> {
         let start = u32::from(base);
         let end = start
@@ -58,12 +61,12 @@ impl PioRegion {
 #[derive(Debug)]
 pub(crate) struct PcPioBus {
     regions: Vec<PioRegion>,
+    error: Option<PioError>,
 }
 
 impl PcPioBus {
     /// Freeze a non-overlapping map. Constructing this bus opts into the
     /// absent-PC-device behavior; an empty map is distinct from no PIO bus.
-    #[allow(dead_code)] // The PC board remains gated; exercised by the tests.
     pub(crate) fn new(mut regions: Vec<PioRegion>) -> Result<Self> {
         regions.sort_by_key(|region| region.ports.start);
         if regions
@@ -72,7 +75,20 @@ impl PcPioBus {
         {
             return Err(Error::Setup("overlapping PIO regions".into()));
         }
-        Ok(Self { regions })
+        Ok(Self { regions, error: None })
+    }
+
+    pub(crate) fn with_error_latch(mut self, error: PioError) -> Self {
+        self.error = Some(error);
+        self
+    }
+
+    pub(crate) fn check_error(&self) -> Result<()> {
+        if let Some(error) = &self.error {
+            let error = error.lock().map_err(|_| Error::Setup("PIO error lock poisoned".into()))?;
+            if let Some(why) = &*error { return Err(Error::Setup(why.clone())); }
+        }
+        Ok(())
     }
 
     fn device(&self, port: u16, len: usize) -> Result<Option<&PioRegion>> {
@@ -105,6 +121,7 @@ impl PcPioBus {
     }
 
     pub(crate) fn read(&self, port: u16, data: &mut [u8]) -> Result<()> {
+        self.check_error()?;
         match self.device(port, data.len())? {
             Some(region) => {
                 let mut device = region
@@ -115,10 +132,11 @@ impl PcPioBus {
             }
             None => data.fill(0xff),
         }
-        Ok(())
+        self.check_error()
     }
 
     pub(crate) fn write(&self, port: u16, data: &[u8]) -> Result<()> {
+        self.check_error()?;
         if let Some(region) = self.device(port, data.len())? {
             let mut device = region
                 .device
@@ -126,7 +144,7 @@ impl PcPioBus {
                 .map_err(|_| Error::Setup("PIO device lock poisoned".into()))?;
             device.write(u64::from(port) - u64::from(region.ports.start), data);
         }
-        Ok(())
+        self.check_error()
     }
 }
 

@@ -1,9 +1,9 @@
 # Lifecycle policies
 
-`Vmm::start` keeps the existing `Resettable` policy. The internal
-`start_with_lifecycle` seam also accepts `ColdBootOnly` for a future board;
-no public configuration selects that policy yet, and the x64 board gate
-remains closed.
+`Vmm::start` keeps the existing `Resettable` policy on ARM. The strict x64
+reference board selects `ColdBootOnly` and validates its configuration and
+owned image bytes before state/device/helper creation. See `X64_LINUX.md` for
+that deliberately narrow profile and its separate native acceptance example.
 
 Cold-boot workers do not capture or restore pristine CPU state. The VMM also
 skips pristine device and interrupt-controller snapshots. Initial register
@@ -30,4 +30,12 @@ this change was prepared.
 The fake-hypervisor tests exercise initialization errors, duplicate starts,
 paused boot, default reset and runtime ARM power-on, and rejection without
 CPU, device, memory, or snapshot-file side effects. These tests do not claim
-a new guest OS boot, native x64 VMM support, or hardware validation.
+a new guest OS boot or hardware validation. Native acceptance is reported
+separately from these fake-backend tests.
+
+`shutdown_checked()` adds panic reporting to host stop: every worker is stopped
+and joined and display teardown is completed before a join error is returned.
+`shutdown()` retains its unit-returning compatibility behavior. Neither method
+claims a guest OS poweroff, and a supervising timeout must bound a stuck backend.
+`vcpu_run_calls()` exposes attempted backend run calls (not instructions); zero
+combined with acknowledged BootPaused state proves no attempted entry.

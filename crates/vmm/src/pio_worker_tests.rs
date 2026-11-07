@@ -173,6 +173,7 @@ fn run(
         cpus: Mutex::new(CpuTable::new(vec![0])),
         events,
         peers: Default::default(),
+        run_calls: Default::default(),
         device_exits: Default::default(),
         halt_on_stop: Default::default(),
         halting: Default::default(),

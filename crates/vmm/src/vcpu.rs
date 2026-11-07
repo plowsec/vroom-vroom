@@ -88,6 +88,8 @@ pub struct VcpuShared {
     /// Device I/O accesses vCPUs passed to devices (research resets skip the
     /// device restore when none happened and the devices stayed paused).
     pub device_exits: std::sync::atomic::AtomicU64,
+    /// Attempted backend run calls, not executed instructions.
+    pub run_calls: std::sync::atomic::AtomicU64,
     /// A debug stop parks every vCPU at once (research: the guest clock
     /// stands still from there). `halting`: a stop is parking them,
     /// `parked`: how many are, `halted_at`: the guest clock once all are
@@ -143,9 +145,14 @@ pub struct VcpuHandle {
 
 impl VcpuHandle {
     pub fn join(&mut self) {
+        let _ = self.join_checked();
+    }
+
+    pub fn join_checked(&mut self) -> Result<()> {
         if let Some(t) = self.thread.take() {
-            let _ = t.join();
+            t.join().map_err(|_| Error::Setup("vCPU worker panicked".into()))?;
         }
+        Ok(())
     }
 }
 
@@ -366,6 +373,15 @@ impl VcpuLoop {
     }
 
     fn step(&mut self) -> Result<()> {
+        if let Some(pio) = &self.shared.pio { pio.check_error()?; }
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut count = self.shared.run_calls.load(SeqCst);
+        while count != u64::MAX {
+            match self.shared.run_calls.compare_exchange_weak(count, count + 1, SeqCst, SeqCst) {
+                Ok(_) => break,
+                Err(now) => count = now,
+            }
+        }
         match self.vcpu.run()? {
             VcpuExit::Debug(stop) => {
                 use std::sync::atomic::Ordering::SeqCst;
@@ -390,6 +406,7 @@ impl VcpuLoop {
                 let mut buf = [0u8; 8];
                 let len = len.min(8);
                 if !self.shared.mmio.read(addr, &mut buf[..len]) {
+                    if self.shared.pio.is_some() { return Err(Error::Setup(format!("unmapped PC MMIO read at {addr:#x}"))); }
                     log::debug!("vcpu{}: read from unmapped {addr:#x}", self.index());
                 }
                 self.vcpu.complete_mmio_read(&buf[..len])?;
@@ -397,6 +414,7 @@ impl VcpuLoop {
             VcpuExit::MmioWrite { addr, len, data } => {
                 self.shared.device_exits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if !self.shared.mmio.write(addr, &data[..len.min(8)]) {
+                    if self.shared.pio.is_some() { return Err(Error::Setup(format!("unmapped PC MMIO write at {addr:#x}"))); }
                     log::debug!("vcpu{}: write to unmapped {addr:#x}", self.index());
                 }
             }

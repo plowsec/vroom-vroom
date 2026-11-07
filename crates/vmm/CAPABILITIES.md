@@ -18,6 +18,7 @@ failure frame before reading a transfer body, cloning a socket, or creating a
 transfer pipe or forwarding thread. The regular listener/request handler may
 still run. There is no claim that a guest operation succeeded.
 
-These interfaces prepare for another board. The x64 VMM builder remains gated;
-this change adds no UART receive worker, guest agent transport, new board,
-snapshot support, or hardware-runtime acceptance.
+The strict x64 direct-Linux reference board selects both unavailable states.
+Its serial output is separate from input. It adds no receive worker or guest
+agent transport. See `X64_LINUX.md` for its bounded boot/control acceptance and
+limitations; capability tests alone establish no hardware-runtime acceptance.

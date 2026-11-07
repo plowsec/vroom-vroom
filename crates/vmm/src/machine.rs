@@ -274,12 +274,18 @@ pub(crate) enum BootImage {
     Kernel { kernel: Vec<u8>, initrd: Option<Vec<u8>>, ram: (u64, u64), fdt_cfg: board::FdtConfig },
     /// UEFI in flash; the FDT goes at the start of RAM for it to find.
     Firmware { fdt_cfg: board::FdtConfig },
+    /// Validated, owned direct x64 Linux inputs. Cold boot only.
+    X86Kernel(vroom_arch::x86_64::PreparedBoot),
 }
 
 impl BootImage {
     /// Put boot blobs into RAM. Returns boot CPU regs.
     pub fn load(&self, mem: &GuestMemory) -> Result<BootRegs> {
         match self {
+            BootImage::X86Kernel(boot) => {
+                let info = boot.load(mem)?;
+                Ok(BootRegs::X86_64 { rip: info.rip, rsi: info.rsi, cr3: info.cr3, gdt: info.gdt })
+            }
             BootImage::Kernel { kernel, initrd, ram, fdt_cfg } => {
                 let kernel = vroom_arch::decompress_if_needed(kernel.clone())?;
                 let k = board::load_kernel(mem, ram.0, &kernel)?;
@@ -603,7 +609,7 @@ pub(crate) fn build(
     lifecycle: crate::lifecycle::LifecyclePolicy,
 ) -> Result<Machine> {
     if hv.arch() != vroom_hv::Arch::Aarch64 {
-        return Err(Error::Setup("only the aarch64 board exists so far".into()));
+        return Err(Error::Setup("the ARM board builder requires aarch64".into()));
     }
     // Names and numbers the guest can read about its hardware.
     let ident = &config.identity;
@@ -1034,6 +1040,7 @@ pub(crate) fn build(
         cpus: Mutex::new(CpuTable::new(mpidrs)),
         events,
         peers: OnceLock::new(),
+        run_calls: Default::default(),
         device_exits: std::sync::atomic::AtomicU64::new(0),
         halt_on_stop: Default::default(),
         halting: Default::default(),

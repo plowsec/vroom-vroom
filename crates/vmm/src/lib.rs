@@ -28,6 +28,9 @@ mod lifecycle;
 #[cfg(test)]
 mod lifecycle_tests;
 mod machine;
+mod machine_x86;
+#[cfg(test)]
+mod machine_x86_tests;
 mod net;
 mod pio;
 pub use machine::gpu_in_process;
@@ -248,13 +251,27 @@ fn restore_hardware(now: VmConfig, saved: &VmConfig) -> VmConfig {
 impl Vmm {
     /// Build the machine and start it.
     pub fn start(config: VmConfig, hv: Arc<dyn Hypervisor>, opts: VmmOptions) -> Result<Vmm> {
-        Self::start_with_lifecycle(config, hv, opts, LifecyclePolicy::default())
+        let lifecycle = match hv.arch() {
+            vroom_hv::Arch::X86_64 => LifecyclePolicy::ColdBootOnly,
+            vroom_hv::Arch::Aarch64 => LifecyclePolicy::default(),
+        };
+        Self::start_with_lifecycle(config, hv, opts, lifecycle)
     }
 
-    // Board integration selects the policy here; public/default behavior is unchanged.
+    // Tests can also exercise cold-only lifecycle on the existing ARM board.
     fn start_with_lifecycle(config: VmConfig, hv: Arc<dyn Hypervisor>, opts: VmmOptions, lifecycle: LifecyclePolicy) -> Result<Vmm> {
         lifecycle.check_start(&opts.start)?;
         config.validate()?;
+        // Validate and own x64 boot inputs before any viewer, state lock,
+        // disk layer, identity file, device, or helper is created.
+        let x86_boot = if hv.arch() == vroom_hv::Arch::X86_64 {
+            if lifecycle != LifecyclePolicy::ColdBootOnly {
+                return Err(Error::Setup("x64 requires the cold-boot-only lifecycle".into()));
+            }
+            Some(machine_x86::prepare(&config, hv.as_ref(), &opts)?)
+        } else {
+            None
+        };
         let saved = match &opts.start {
             StartMode::Restore(dir) | StartMode::RestorePaused(dir) => Some(snapshot::saved_config(dir)?),
             StartMode::Boot | StartMode::BootPaused => None,
@@ -275,12 +292,12 @@ impl Vmm {
         };
         let disks = disks::DiskSet::open(&config, &opts.state_dir, &layers)?;
         let uuid = machine_uuid(&opts.state_dir)?;
-        let net_ctrl = saved.as_ref().is_none_or(|s| s.1);
+        let net_ctrl = x86_boot.is_none() && saved.as_ref().is_none_or(|s| s.1);
         // USB disks' files go to removable shares a VM started on a Mac
         // has; a resumed one has those it was saved with.
         let usb_file_slots = match &opts.start {
             StartMode::Restore(dir) | StartMode::RestorePaused(dir) => snapshot::saved_usb_file_slots(dir),
-            StartMode::Boot | StartMode::BootPaused if cfg!(target_os = "macos") => usb::FILE_SLOTS,
+            StartMode::Boot | StartMode::BootPaused if cfg!(target_os = "macos") && x86_boot.is_none() => usb::FILE_SLOTS,
             StartMode::Boot | StartMode::BootPaused => 0,
         };
         let saved = saved.map(|s| s.0);
@@ -291,7 +308,7 @@ impl Vmm {
         // Windows' 3D GPU has memory in BAR 0; saves from before have not.
         let gpu3d_vram = match &opts.start {
             StartMode::Restore(dir) | StartMode::RestorePaused(dir) => snapshot::saved_gpu3d_vram(dir),
-            StartMode::Boot | StartMode::BootPaused => true,
+            StartMode::Boot | StartMode::BootPaused => x86_boot.is_none(),
         };
         let env = machine::BuildEnv {
             uuid,
@@ -304,7 +321,11 @@ impl Vmm {
             hot_nets,
             gpu3d_vram,
         };
-        let m = machine::build(&config, hv.as_ref(), opts.serial_out, opts.clipboard, ui, &disks, ev_tx, &env, lifecycle)?;
+        let m = if let Some(boot) = x86_boot {
+            machine_x86::build(&config, hv.as_ref(), opts.serial_out, ev_tx, boot)?
+        } else {
+            machine::build(&config, hv.as_ref(), opts.serial_out, opts.clipboard, ui, &disks, ev_tx, &env, lifecycle)?
+        };
         // A save records the hardware the guest has: a resumed VM keeps
         // the network adapters it was saved with until it restarts.
         let mut config = config;
@@ -398,6 +419,14 @@ impl Vmm {
     /// Nanoseconds in `ticks` of [`Vmm::guest_clock`].
     pub fn guest_clock_ns(&self, ticks: u64) -> u64 {
         self.vm.clock_ns(ticks)
+    }
+
+    /// Total attempts by the workers to call `Vcpu::run`, saturating at u64::MAX.
+    /// This is not an instruction count: a call can return without guest entry.
+    /// Zero together with an acknowledged BootPaused/paused state proves that
+    /// no worker has attempted entry. Read while paused for a stable value.
+    pub fn vcpu_run_calls(&self) -> u64 {
+        self.shared.run_calls.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// How many vCPUs the VM has.
@@ -976,6 +1005,14 @@ impl Vmm {
 
     /// Tear everything down. vCPUs are destroyed on their own threads.
     pub fn shutdown(&mut self) {
+        let _ = self.shutdown_checked();
+    }
+
+    /// Stop and join every worker, reporting a caught join panic after teardown.
+    /// With panic=abort, a worker panic instead terminates the whole process.
+    /// A successful host stop does not mean the guest OS powered itself off.
+    /// Like `shutdown`, a stuck backend requires a supervising process timeout.
+    pub fn shutdown_checked(&mut self) -> Result<()> {
         self.agent.send(agent::AgentCmd::Stop);
         self.disks.flush_all();
         if let Some(v) = &self.viewer {
@@ -984,13 +1021,17 @@ impl Vmm {
         for v in &self.vcpus {
             let _ = v.peer.send(VcpuCmd::Stop);
         }
+        let mut first_error = None;
         for v in &mut self.vcpus {
-            v.join();
+            if let Err(error) = v.join_checked() {
+                if first_error.is_none() { first_error = Some(error); }
+            }
         }
         if let Some(d) = &self.display {
             d.stop();
         }
         self.state = RunState::Stopped;
+        first_error.map_or(Ok(()), Err)
     }
 }
 
