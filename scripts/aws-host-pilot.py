@@ -27,6 +27,7 @@ INSTANCE_TYPE = "m7i-flex.large"
 DEFAULT_HOST_PROFILE = "x64-nested-free"
 HOST_PROFILES = {
     DEFAULT_HOST_PROFILE: {"instance_type": INSTANCE_TYPE, "architecture": "x86_64", "host_mode": "nested", "account_plan": "FREE"},
+    "x64-nested-paid": {"instance_type": INSTANCE_TYPE, "architecture": "x86_64", "host_mode": "nested", "account_plan": "PAID"},
     "arm64-metal-paid": {"instance_type": "c6g.metal", "architecture": "arm64", "host_mode": "metal", "account_plan": "PAID"},
 }
 SSM_POLICY = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
@@ -194,6 +195,12 @@ def preflight(aws, spec, profile_name=DEFAULT_HOST_PROFILE):
         raise PilotError("instance type could not be verified")
     info = types[0]
     if profile["host_mode"] == "nested":
+        if profile_name == "x64-nested-paid" and (
+                info.get("InstanceType") != profile["instance_type"] or info.get("BareMetal") is not False
+                or info.get("ProcessorInfo", {}).get("SupportedArchitectures") != ["x86_64"]
+                or type(info.get("VCpuInfo", {}).get("DefaultVCpus")) is not int
+                or info["VCpuInfo"]["DefaultVCpus"] != 2):
+            raise PilotError("Paid x64 metadata must prove m7i-flex.large, x86_64 and exactly two virtual vCPUs")
         if info.get("FreeTierEligible") is not True:
             raise PilotError("instance is not reported Free Tier eligible; no automatic plan upgrade")
         if "nested-virtualization" not in info.get("ProcessorInfo", {}).get("SupportedFeatures", []):
@@ -205,7 +212,7 @@ def preflight(aws, spec, profile_name=DEFAULT_HOST_PROFILE):
         raise PilotError("ARM64 metal instance metadata must prove c6g.metal, arm64 and exactly 64 vCPUs")
     quota = aws.call("service-quotas", "get-service-quota",
                      {"ServiceCode": "ec2", "QuotaCode": "L-1216C47A"})["Quota"]["Value"]
-    if profile["host_mode"] == "metal":
+    if profile["host_mode"] == "metal" or profile_name == "x64-nested-paid":
         quota = cost.amount(quota, "standard vCPU quota")
     if quota < info["VCpuInfo"]["DefaultVCpus"]:
         raise PilotError("regional On-Demand standard-instance vCPU quota is insufficient")
