@@ -609,9 +609,9 @@ Found and fixed: qcow2 crash on short v3 headers; qcow2 multi-GB allocations fro
 
 ## Known gaps
 
-- Secure Boot (`secure_boot = true`, Debian's EDK2): checks what boots, but the variable store isn't protected (no secure world on ARM virt): a guest kernel can rewrite the keys. Stops unsigned bootloaders, not an already-compromised guest. Windows 11 installs with that check bypassed, for VMs without it.
+- Secure Boot (`secure_boot = true`, Debian's EDK2): ARM firmware checks boot signatures, but its variable store is not protected from guest-kernel writes. An enabled flag or successful installation does not establish authenticated-variable enforcement. Installer checks bypassed by an existing setup path do not satisfy Secure Boot/TPM acceptance.
 - Windows agent split is new; older installs run the all-in-one agent elevated (re-run `vroom-setup.cmd`).
-- x86_64 not implemented: none of this tested there.
+- x86_64: the restricted one-vCPU, 512 MiB [direct-Linux VMM profile](../crates/vmm/X64_LINUX.md) passed boot and lifecycle acceptance on AWS nested KVM. Firmware/security features, Windows, general CLI/RPC, snapshots and migration remain outside that acceptance. The profile rejects firmware and TPM configuration.
 - Fuzzing doesn't cover Venus, virgl, Neptune (3D) command streams: virglrenderer C (and DXMT C++ for Neptune), in the GPU process.
 
 ## What the guest can tell

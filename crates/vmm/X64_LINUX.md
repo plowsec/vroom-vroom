@@ -1,9 +1,10 @@
 # Direct x64 Linux reference board
 
-This is a narrow, cold-boot-only VMM integration. Local tests and cross-compilation
-are separate from running a real Linux guest; this patch has no native runtime
-acceptance yet. The earlier `vroom-linux-harness` runtime exercised its own
-controller, not this `Vmm::start` integration.
+This is a narrow, cold-boot-only VMM integration. Its native `Vmm::start` Linux
+acceptance passed on an AWS x64 nested-KVM host on 2026-11-07. This is separate
+from the earlier `vroom-linux-harness` controller test. The supported profile is
+restricted as described below; general CLI/RPC and firmware/security support
+are not established.
 
 The accepted profile is x86_64 KVM, one vCPU, 512 MiB RAM starting at zero,
 COM1 byte-wide PIO at 0x3f8 with IRQ4, and KVM's in-kernel PIC/PIT/APIC. Input is
@@ -86,3 +87,23 @@ sandbox implementation or policy defaults. The supervising process must remove
 its own temporary state after child termination: the existing sandbox syscall
 allowlist does not permit the child to unlink/rmdir it. No guest disks or network
 interfaces are created.
+
+
+## Observed native validation
+
+The seventh AWS pilot ran the reviewed static x64 musl example on one
+`m7i-flex.large`. All 175 native tests (including 66 VMM and three example
+tests) and 17 helper tests passed. The canonical Amazon Linux 6.18.56 kernel
+matched its recorded RPM SHA256 before execution. Actual acceptance verified
+BootPaused with zero worker run attempts, sandbox application before resume,
+five sequential PID1 heartbeats, acknowledged pause with unchanged serial/run
+counts, resume to ten heartbeats, and checked stop/join. Exactly one guest ran;
+the external supervisor removed its owned state directory afterward.
+
+The 23.481-second wrapper exited zero with complete captured output and an
+independent result audit. Landlock enforcement, guest poweroff, snapshots,
+serial RX/IRQ delivery, guest RPC and security features remained explicitly
+false. The disposable AWS instance, root volume and temporary controls were
+removed and independently audited absent. Private evidence is
+`.aws-pilot/vroom-pilot-282f5876653f.report.json`; this successful run does not
+relax any profile restriction above.

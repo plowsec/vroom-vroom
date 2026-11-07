@@ -50,7 +50,7 @@ Linux and Windows VMs on Apple Silicon Macs and arm64 Linux. Rust. The VMM sandb
 - NAT with port forwards, several adapters; bridged and host-only with DHCP (Mac ↔ VMs ↔ VMs) via a root helper (one password prompt)
 - sound; microphone and camera opt-in
 - shared folders (Linux, Windows)
-- TPM 2.0, Secure Boot (Windows 11 wants both)
+- TPM 2.0; ARM Secure Boot signature checks (variable-store protection remains a [known gap](docs/SECURITY.md#known-gaps))
 - nested VMs (M3+)
 - import from VMware Fusion (ARM64)
 - USB passthrough, live from the VM window; USB disks also as shared files or a plain disk

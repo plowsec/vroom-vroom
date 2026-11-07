@@ -31,7 +31,11 @@ vars = "dev.state/efivars.fd"    # NVRAM, created on first boot
 # secure_boot = true              # New VM: "Secure Boot"; vroom new --secure-boot
 ```
 
-`secure_boot = true`:
+`secure_boot = true` enables signature checks in the ARM firmware below. Its
+variable store remains writable by the guest kernel; an enabled Secure Boot
+flag does not establish protected authenticated variables. See the
+[security limitation](SECURITY.md#known-gaps). The restricted
+[x64 Linux profile](../crates/vmm/X64_LINUX.md) does not support firmware or TPM.
 
 | | |
 |---|---|
@@ -39,7 +43,14 @@ vars = "dev.state/efivars.fd"    # NVRAM, created on first boot
 | Keys | PK: Debian's. KEK: Microsoft KEK CA 2011 and KEK 2K CA 2023. db: Windows Production PCA 2011, Windows UEFI CA 2023 (Windows' newer boot manager), Microsoft UEFI CA 2011 and 2023 (shim-booted Linux), Option ROM UEFI CA 2023 |
 | NVRAM | made from `AAVMF_VARS.ms.fd`. NVRAM with no PK (made without Secure Boot): recreated at next cold boot, old one kept as `<vars>.bak`. Windows boots on via `\EFI\BOOT\BOOTAA64.EFI` |
 | Off again | keys kept; Homebrew firmware doesn't check them |
-| Windows | Secure Boot + TPM: Windows turns on device encryption itself, rewrites the whole disk. vroom's setup (unattended install, `vroom-setup.cmd`) sets `PreventDeviceEncryption`. Guests set up earlier: `reg add HKLM\SYSTEM\CurrentControlSet\Control\BitLocker /v PreventDeviceEncryption /t REG_DWORD /d 1 /f` first |
+| Windows | vroom's setup (unattended install, `vroom-setup.cmd`) sets `PreventDeviceEncryption` to suppress automatic device encryption. This default is not evidence that BitLocker protection is enabled. |
+
+BitLocker acceptance requires a fully encrypted OS volume, protection on, a
+TPM protector and successful cold-boot unlock, together with protected firmware
+variables. Account for the setup suppression above when preparing that test;
+the [read-only guest check](../scripts/guest-readiness.ps1) cannot establish
+variable-store protection or cold-boot unlock by itself. The AWS pilot has not
+yet run Windows or validated BitLocker.
 
 Direct kernel boot (fast, no firmware):
 
