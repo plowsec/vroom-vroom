@@ -1,32 +1,23 @@
 # Performance
 
-How fast vroom is, compared with QEMU (HVF) on the same Mac and the same
-guest, and how to measure it again.
+vroom vs QEMU (HVF), same Mac, same guest. How to rerun: [Measuring](#measuring).
 
 ## Setup
 
-- Apple M3 Max (16 cores, 64 GB), macOS 15. QEMU 11.1 from Homebrew
-  (`-accel hvf -cpu host`, virtio-pci devices, `-netdev user`, default
-  cache mode).
-- Guest: Ubuntu 24.04 cloud image, 4 vCPUs, 4 GiB, kernel boot unless
-  noted. Root disk qcow2; fio runs on a separate 2 GiB data disk
-  (filled first, so qcow2 numbers are for allocated clusters).
-- vroom: default settings (`sync = "fsync"`), `virtio_transport = "pci"`
-  to match QEMU. "before" is commit d4bff82, "after" is this branch.
-- The Mac was shared with other work while measuring (other VMs,
-  builds). Runs of vroom before, vroom after and QEMU were interleaved;
-  numbers are medians of 3 to 6 runs (2 for the qcow2 and NVMe disk
-  tables) and still move by 10-20 % between runs. Small differences mean
-  nothing.
-- Disk data sits in the host's page cache (both VMMs use it), so these
-  numbers show what the VMM adds, not what the SSD can do.
+| | |
+|---|---|
+| host | Apple M3 Max (16 cores, 64 GB), macOS 15 |
+| QEMU | 11.1, Homebrew; `-accel hvf -cpu host`, virtio-pci, `-netdev user`, default cache mode |
+| guest | Ubuntu 24.04 cloud image, 4 vCPUs, 4 GiB, kernel boot unless noted. Root disk qcow2; fio on a separate 2 GiB data disk, filled first (qcow2 numbers = allocated clusters) |
+| vroom | defaults (`sync = "fsync"`), `virtio_transport = "pci"` to match QEMU. "before" = d4bff82, "after" = this branch |
+
+- Mac shared with other work (VMs, builds). vroom before/after and QEMU runs interleaved.
+- Medians of 3–6 runs (2 for the qcow2 and NVMe disk tables); still ±10–20% run to run. Small differences mean nothing.
+- Disk data in the host page cache (both VMMs): numbers show VMM overhead, not SSD speed.
 
 ## Results
 
-Medians. "4k random read qd1" also shows the time per request; for
-vroom's NVMe, and now virtio-blk too, a lone request is done before the
-guest's submit call returns, so fio's own latency figure would say
-0.3-0.7 µs, which is not what the guest waits.
+Medians. "µs per 4k read at qd1" is the real per-request time. fio's own latency for vroom NVMe and virtio-blk at qd1 reads 0.3–0.7 µs: a lone request completes before the guest's submit call returns, so fio times nothing.
 
 **Boot, idle, exits (4 vCPUs, 4 GiB)**
 
@@ -109,67 +100,7 @@ guest's submit call returns, so fio's own latency figure would say
 | 1-byte TCP round trip, port forward (µs) | 63 | 61 | 73 |
 | ping to the gateway (ms) | - | 0.229 | 0.309 |
 
-## What changed
-
-- **Disk requests run in parallel.** virtio-blk handed one request at a
-  time to the disk image from a single thread. Now several requests in
-  flight go to I/O threads: four per disk, more (up to 32) while requests
-  wait for one. NVMe ran every command on the
-  vCPU that rang the doorbell; now big transfers, flushes and commands
-  queued behind others go to I/O threads too. Pausing (snapshots,
-  suspend), resets and queue deletion wait for them, so a paused VM still
-  has no I/O in flight.
-- **A lone small request runs on the vCPU.** While the guest sends one
-  request at a time (queue depth 1), virtio-blk now handles it on the
-  vCPU that kicked the queue, as NVMe already did: no thread wakeups,
-  which cost tens of microseconds each on macOS. It switches to the I/O
-  threads as soon as the guest keeps several in flight, and checks now
-  and then whether it went back to one at a time.
-- **A virtio-blk queue per vCPU**, so each completion interrupts the vCPU
-  that asked instead of waking another one first.
-- **No bounce buffers.** Disk data moves between the image file and guest
-  RAM with `preadv`/`pwritev` on the guest pages (bounds-checked, no Rust
-  references into guest memory). qcow2 looks clusters up under its lock
-  and does the data I/O outside it, one call per run of adjacent
-  clusters; freeing clusters waits for that I/O, so a cluster can't be
-  reused (say, as an L2 table) under a request still using it. A newly
-  allocated cluster is written once (old contents and new data together)
-  instead of twice.
-- **Fewer interrupts.** NVMe sends one interrupt per doorbell, not one
-  per command.
-- **PCI MMIO without a global lock.** All PCI BAR accesses went through
-  one lock, so a vCPU ringing the network card waited for another doing
-  a disk flush. Each device keeps its own lock.
-- **NAT batches.** Frames the guest queues go through the TCP/IP stack
-  together: one host write per connection per batch instead of one per
-  1500-byte frame. The first 16 TCP connections get 512 KiB buffers
-  instead of 64 KiB: the buffer is the TCP window, and with the guest
-  tens of microseconds away the window was the limit (64 KiB caps a
-  stream near 6 Gbit/s). A guest opening the maximum of 512 connections
-  still can't make the NAT allocate more than about 80 MiB. The NAT no
-  longer re-checks checksums of frames from the guest (they came through
-  RAM; a guest can send any bytes with a right checksum anyway).
-- **Pings to the gateway answer** (they were dropped: a smoltcp feature
-  was off).
-- **VM window.** Damage rectangles from the VMM, and a window that
-  converts only what changed into a reused buffer, landed separately
-  (the hidpi work); on a 5120x2880 screen that turns an 8 ms conversion
-  per frame into a fraction of a millisecond for a changed text line.
-- **Memory.** A kernel-booted VM kept the unpacked kernel (about 50 MB
-  for Ubuntu's) for resets; it keeps the file as read and unpacks it
-  again on reset. The VMM's own heap after a kernel boot went from about
-  85 MB to 45 MB (most of what is left is the kernel file and initrd).
-  RSS in the table is mostly guest pages the guest touched, so it moves
-  with what the guest did.
-- **ramfb** (the firmware framebuffer, always there with UEFI) was
-  copied out of guest RAM into a fresh 4 MB buffer 30 times a second and
-  compared with the last copy. Now two buffers are reused, only the rows
-  that changed go to the window, it looks 4 times a second once the
-  screen is still, and once a second with no window at all. UEFI guests
-  idle at 0.8 % of a core instead of 2.9 %.
-
-**Disk from the SSD (virtio raw, 60 GB of random data, host cache can't
-hold it, `scripts/bench-cold.sh`)**
+**Disk from the SSD** (virtio raw, 60 GB random data, too big for host cache, `scripts/bench-cold.sh`). What a cold-cache workload sees; the tables above mostly measure VMM cost.
 
 | | vroom | QEMU |
 |---|---|---|
@@ -179,20 +110,27 @@ hold it, `scripts/bench-cold.sh`)**
 |   mean / p99 latency (µs) | 234 / 448 | 265 / 485 |
 | 64k random read qd1 (IOPS) | 5.2k | 4.7k |
 
-These are the numbers a real workload with a cold cache sees; the tables
-above mostly measure the VMM's own cost. fio's latency for vroom at queue
-depth 1 in the tables above (well under a microsecond) is not real: the
-request finishes before fio's submit call returns, so fio times nothing.
-The per-request time in the "µs per 4k read" rows is the real one.
+## What changed
+
+| Change | Detail |
+|---|---|
+| parallel disk requests | virtio-blk: in-flight requests go to I/O threads, 4 per disk, up to 32 while requests wait. NVMe: big transfers, flushes, commands queued behind others go to I/O threads (was: all on the doorbell vCPU). Pause (snapshot, suspend), reset, queue deletion wait for them: paused VM has no I/O in flight |
+| lone small request on the vCPU | virtio-blk at qd1 runs on the kicking vCPU, like NVMe: no thread wakeups (tens of µs each on macOS). Switches to I/O threads when several are in flight; rechecks now and then |
+| virtio-blk queue per vCPU | completion interrupts the asking vCPU directly |
+| no bounce buffers | `preadv`/`pwritev` straight on guest pages (bounds-checked, no Rust references into guest memory). qcow2: cluster lookup under its lock, data I/O outside it, one call per run of adjacent clusters. Freeing clusters waits for that I/O (no reuse, e.g. as L2 table, under a live request). New cluster written once (old contents + new data) instead of twice |
+| fewer interrupts | NVMe: one interrupt per doorbell, not per command |
+| PCI MMIO without a global lock | was: all BAR accesses under one lock (a NIC kick waited for a disk flush). Now a lock per device |
+| NAT batches | guest-queued frames go through the TCP/IP stack together: one host write per connection per batch, not per 1500-byte frame |
+| NAT buffers | first 16 TCP connections: 512 KiB buffers, not 64 KiB. Buffer = TCP window; 64 KiB caps a stream near 6 Gbit/s at tens of µs RTT. Max 512 connections still ≤ ~80 MiB of NAT memory |
+| NAT checksums | guest frames no longer re-checked (came through RAM; a guest can send any bytes with a valid checksum anyway) |
+| gateway pings | answered (were dropped: a smoltcp feature was off) |
+| VM window | damage rectangles from the VMM; window converts only what changed into a reused buffer (hidpi work). 5120x2880: 8 ms per frame → fraction of a ms for a changed text line |
+| memory | kernel-booted VM keeps the kernel file as read, unpacks again on reset (was: unpacked kernel kept, ~50 MB for Ubuntu). VMM heap after kernel boot ~85 → 45 MB (rest: mostly kernel file, initrd). RSS in the table is mostly guest-touched pages |
+| ramfb (UEFI framebuffer) | was: copied from guest RAM into a fresh 4 MB buffer 30×/s and compared. Now 2 reused buffers, only changed rows sent, 4×/s once still, 1×/s with no window. UEFI idle 2.9% → 0.8% of a core |
 
 ## 3D display
 
-Ubuntu 24.04, Xorg in the app's window, M3 Max. "before" is master
-344e5e8 (each GL frame read back and copied four times on the CPU on its
-way to the window, Vulkan window frames copied into GL with the CPU),
-"after" the IOSurface paths (ARCHITECTURE.md, "The screen straight from
-the GPU"). CPU: cores used by the app / the VM process (vCPUs included)
-/ the GPU process.
+Ubuntu 24.04, Xorg in the app window, M3 Max. "before" = master 344e5e8 (each GL frame read back and copied 4× on the CPU; Vulkan window frames copied into GL by the CPU). "after" = IOSurface paths ([ARCHITECTURE.md](ARCHITECTURE.md#the-screen-straight-from-the-gpu)). CPU = cores used by app / VM process (vCPUs included) / GPU process.
 
 | | before | after |
 |---|---|---|
@@ -205,23 +143,17 @@ the GPU"). CPU: cores used by the app / the VM process (vCPUs included)
 | `vkcube` 2560x1560, screen 2560x1600 | 188 fps | 781 fps |
 | GNOME on Wayland, glmark2 1200x700 | 996 | 1973 |
 
-glmark2 is six scenes (build, texture, shading, terrain, refract,
-desktop; four on Wayland), 5 s each. Light scenes gain most (1900 to
-2800 fps): their frames no longer wait for the copies, and GL fences are
-looked at every 250 µs instead of every millisecond. Without the second
-change they stopped near 1200 fps, below before, because the copies had
-been waking the device thread early. The GPU-heavy terrain scene gains
-10 to 15 %.
+- glmark2: 6 scenes (build, texture, shading, terrain, refract, desktop; 4 on Wayland), 5 s each.
+- Light scenes gain most (1900 to 2800 fps): no waiting for copies, and GL fences polled every 250 µs instead of 1 ms. Without the fence change they stopped near 1200 fps, below before (the copies had been waking the device thread early).
+- GPU-heavy terrain: +10–15%.
 
 ## Guest features
 
-Measurements behind [GUIDE.md](GUIDE.md); M3 Max unless said.
+Behind [GUIDE.md](GUIDE.md). M3 Max unless said.
 
 ### OpenGL (Linux guests)
 
-Speed, Ubuntu 22.04 live desktop (X11), 1280×800, 4 vCPUs, M3 Max,
-glmark2 2021.02 at its default 800×600 window, `opengl_host = "apple"`
-against llvmpipe in the same guest:
+Ubuntu 22.04 live desktop (X11), 1280×800, 4 vCPUs; glmark2 2021.02, default 800×600 window; `opengl_host = "apple"` vs llvmpipe in the same guest:
 
 | | llvmpipe (CPU) | `apple` |
 |---|---|---|
@@ -230,29 +162,27 @@ against llvmpipe in the same guest:
 | refract | 40 fps | 981 to 1071 fps |
 | desktop (blur) | 159 fps | 892 to 1006 fps |
 
-Anything with real work is many times faster, and the guest's CPUs stay
-free.
+Real work: many times faster, guest CPUs stay free.
 
 ### Zink
 
-Zink is a little slower than virgl for ordinary drawing: in a GNOME
-Wayland session, glmark2 scores about 1000 on Zink and 1170 on virgl, and
-its terrain scene, the heaviest for the GPU, runs at about 210 fps against
-420. Keep virgl for the desktop and use Zink for apps that need more than
-4.1. A compute shader test (1M invocations, 4096
-`sin` each) takes 9.4 ms on Zink, 3.1 s on llvmpipe.
+| GNOME Wayland | Zink | virgl |
+|---|---|---|
+| glmark2 | ~1000 | ~1170 |
+| terrain (heaviest GPU scene) | ~210 fps | ~420 fps |
+
+- virgl for the desktop; Zink for apps needing >4.1.
+- Compute shader test (1M invocations, 4096 `sin` each): 9.4 ms on Zink, 3.1 s on llvmpipe.
 
 ### Vulkan apps through snapshots
 
-Vulkan apps keep running through snapshots and suspend too, windows
-included (vkcube in Xorg, OpenGL apps on Zink). Each Vulkan app's
-renderer keeps the commands that made its objects (and the latest
-recording of each command buffer, the latest descriptor writes); a
-snapshot stops the app's renderer between two commands, waits for the
-GPU, and copies out its memory and images. On resume a fresh renderer
-replays the commands, puts the contents back and carries on where the
-app's command ring stood. The app notices nothing. Measured, Ubuntu 24.04,
-4 GiB guest:
+Vulkan apps survive snapshots and suspend, windows included (vkcube in Xorg, OpenGL apps on Zink).
+
+- Each app's renderer keeps the commands that made its objects, the latest recording of each command buffer, the latest descriptor writes.
+- Snapshot: stop the renderer between two commands, wait for the GPU, copy out memory and images.
+- Resume: fresh renderer replays the commands, restores contents, continues from the app's command ring. App notices nothing.
+
+Ubuntu 24.04, 4 GiB guest:
 
 | Running | Kept per app | Saving it | Building it again |
 |---|---|---|---|
@@ -262,44 +192,38 @@ app's command ring stood. The app notices nothing. Measured, Ubuntu 24.04,
 | glxgears on Zink | 380 commands, 28.9 MiB | | 0.44 s |
 | the compute loop with 1 GiB of buffers | 44 commands, 1033 MiB | 0.33 s | 0.8 s |
 
-About 9 MiB of each app's share is the guest driver's own command and
-reply memory. With vkcube, glxgears, the compute loop and the drawing
-test all open, suspend took 5.2 s and resume 5.6 s, and all four went on
-(the two tests check their results: no wrong values, the same pictures as
-before). With 1 GiB of Vulkan memory the snapshot took 9 s and 2 GB on
-disk (the GPU's part is stored as base64 for now, a third larger).
+- ~9 MiB of each app's share: the guest driver's own command and reply memory.
+- All four open (vkcube, glxgears, compute loop, drawing test): suspend 5.2 s, resume 5.6 s; all continued. Both tests self-check: no wrong values, same pictures.
+- 1 GiB of Vulkan memory: snapshot 9 s, 2 GB on disk (GPU part stored as base64 for now, a third larger).
 
 ### Direct3D 11 suspend (Windows guests)
 
-Measured (M3 Max, 8 GB guest, Edge and a Direct3D app open, 20
-suspends and resumes): before, 77 crash reports (about 4 per suspend:
-Explorer, the Start menu, the text input host, DWM, the app), one
-suspend refused, one resume that hung; after (42 suspends), no crash
-in the Direct3D driver, no refusal, no hang. Suspend about 13 s,
-resume about 10 s. In 2 to 4 resumes of 12, Windows shows nothing on
-its 3D display for about a minute, then comes back by itself; vroom
-turns the display device off and on meanwhile, which sometimes helps.
-If it stays black, suspend and resume again. With an OpenGL (Zink)
-and a Vulkan app open as well (8 suspends): no crash in the Direct3D
-driver; the Vulkan app stops at each save (lost device), the OpenGL
-one keeps running, except once when it crashed in our OpenGL driver.
+M3 Max, 8 GB guest, Edge + a Direct3D app open:
+
+| | suspends | crash reports | refused | hung resume |
+|---|---|---|---|---|
+| before | 20 | 77 (~4 per suspend: Explorer, Start menu, text input host, DWM, the app) | 1 | 1 |
+| after | 42 | 0 in the Direct3D driver | 0 | 0 |
+
+- Suspend ~13 s, resume ~10 s.
+- 2–4 resumes of 12: Windows shows nothing on its 3D display for ~1 min, then recovers. vroom toggles the display device meanwhile (sometimes helps). Stays black: suspend and resume again.
+- Plus a Zink OpenGL app and a Vulkan app (8 suspends): no Direct3D driver crash; Vulkan app stops at each save (lost device); OpenGL app keeps running, except one crash in our OpenGL driver.
 
 ### OpenGL and Vulkan in Windows guests
 
-Frames come back from the Mac and are drawn into the window with GDI
-(the desktop compositor runs on Direct3D and can't see Vulkan's
-images). Measured at 640x480 (M3 Max): a Vulkan spinning cube about
-1000 frames per second; a spinning triangle in OpenGL 385 on Zink, 350
-on virgl, without vsync (OpenGL apps wait for vsync by default: 60). A
-compute shader over 1M values takes 5 to 10 ms in Vulkan, 16 ms in
-OpenGL. Big windows are slower.
+Frames come back from the Mac, drawn into the window with GDI (the compositor runs on Direct3D, can't see Vulkan images). 640x480, M3 Max:
+
+| | |
+|---|---|
+| Vulkan spinning cube | ~1000 fps |
+| OpenGL spinning triangle, no vsync | 385 (Zink), 350 (virgl). Default vsync: 60 |
+| compute shader over 1M values | 5–10 ms Vulkan, 16 ms OpenGL |
+
+Big windows are slower.
 
 ### Video decoding
 
-### What it saves
-
-On an M3 Max, guest with 4 vCPUs, decoding to nowhere (hardware:
-GStreamer or our V4L2 client; software: FFmpeg on all 4 vCPUs):
+Guest 4 vCPUs, decoding to nowhere. Hardware: GStreamer or our V4L2 client. Software: FFmpeg on all 4 vCPUs.
 
 | Stream | Hardware: time, guest CPU | Software: time, guest CPU |
 |---|---|---|
@@ -308,18 +232,19 @@ GStreamer or our V4L2 client; software: FFmpeg on all 4 vCPUs):
 | VP9 1080p, 10 Mbit/s, 600 pictures | 2.0 s, 0.25 s | 3.9 s, 6.6 s |
 | AV1 1080p, 4 Mbit/s, 900 pictures | 1.0 s, 0.2 s | 1.9 s, 3.2 s |
 
-That is 140 to 900 pictures a second, far more than playing needs.
+140 to 900 pictures/s.
 
-Firefox playing 1080p files, its decoding process: H.264 at 12 Mbit/s
-from 0.24 CPUs to 0.02, VP9 at 10 Mbit/s from 0.35 to 0.02, HEVC at
-8 Mbit/s from 0.52 to 0.02. The
-picture is the same (bit for bit, checked with FFmpeg's VA-API decoding
-against FFmpeg's own decoders: H.264 with B-frames, slices, scaling
-matrices, weighted prediction; HEVC 8 and 10-bit with B-frame pyramids,
-slices, open GOPs; VP9 8 and 10-bit with hidden frames).
+Firefox, 1080p files, its decoding process, CPUs:
 
-Chrome 155, 1080p at 30 frames a second, in CPUs (1.0 is one guest CPU
-busy), before and after Chrome could use the GPU:
+| | software | hardware |
+|---|---|---|
+| H.264 12 Mbit/s | 0.24 | 0.02 |
+| VP9 10 Mbit/s | 0.35 | 0.02 |
+| HEVC 8 Mbit/s | 0.52 | 0.02 |
+
+Bit-identical pictures (FFmpeg VA-API decode vs FFmpeg's own decoders): H.264 with B-frames, slices, scaling matrices, weighted prediction; HEVC 8/10-bit with B-frame pyramids, slices, open GOPs; VP9 8/10-bit with hidden frames.
+
+Chrome 155, 1080p30, CPUs (1.0 = one guest CPU busy), before/after Chrome could use the GPU:
 
 | | Before: GPU process, page, whole guest | Now: GPU process, page, whole guest |
 |---|---|---|
@@ -328,20 +253,11 @@ busy), before and after Chrome could use the GPU:
 | Video call with itself, 720p VP8 (camera) | 0.04, 0.17, 0.43 | 0.04, 0.19, 0.48 |
 | The same in VP9 | | 0.09, 0.14, 0.49 |
 
-The decoding moves out of the page's process; the GPU process does the
-copies into GPU memory. A call costs about the same: sending was in
-software either way (for H.264 it no longer is, see
-[Video encoding](#video-encoding)).
+- Decoding leaves the page's process; the GPU process does the copies into GPU memory.
+- A call costs about the same: sending was software either way (H.264 no longer: [Video encoding](#video-encoding)).
+- Driver no longer spins waiting for a picture (since 2026-10-18; it polled free bitstream buffers too, nearly always there). Chrome, 1080p30 H.264 12 Mbit/s, Wayland: GPU process 0.13 → 0.06, whole guest 0.35 → 0.28 (same clip, two runs each). Get it: rerun `install-vaapi.sh`.
 
-Since October 18, 2026 the driver no longer spins while it waits for a
-picture (it asked `poll()` about free bitstream buffers too, which are
-nearly always there): Chrome playing a 1080p30 H.264 clip at 12 Mbit/s
-under Wayland, GPU process 0.13 to 0.06, whole guest 0.35 to 0.28 (same
-clip, old and new driver, two runs each). Run `install-vaapi.sh` again
-to get it.
-
-The same videos in GNOME on Xorg (mean of two runs), before and after
-the X11 support (October 17, 2026):
+GNOME on Xorg, mean of two runs, before/after X11 support (2026-10-17):
 
 | | Before: GPU process, page, whole guest | Now: GPU process, page, whole guest |
 |---|---|---|
@@ -349,14 +265,11 @@ the X11 support (October 17, 2026):
 | VP9, 22 Mbit/s | 0.04, 0.49, 0.64 | 0.15, 0.02, 0.34 |
 | HEVC, 8 Mbit/s | doesn't play | 0.10, 0.02, 0.28 |
 
-No pictures dropped either way. The GPU process's share includes the
-conversion to BGRA (about 0.03 of a CPU at 1080p30).
+No dropped pictures either way. GPU process share includes BGRA conversion (~0.03 CPU at 1080p30).
 
 ### Video encoding
 
-FFmpeg 6.1 encoding 300 frames of NV12 at 4 Mbit/s (time, then guest
-CPU: user and system), on an M3 Max with 4 vCPUs; PSNR of the result
-against its source:
+FFmpeg 6.1, 300 NV12 frames at 4 Mbit/s, 4 vCPUs. Time, guest CPU (user + system); PSNR vs source:
 
 | | 1280x720 | 1920x1080 |
 |---|---|---|
@@ -366,17 +279,12 @@ against its source:
 | `hevc_vaapi` | 0.93 s, 1.00 s; 46.1 dB | 1.35 s, 1.50 s (1920x1088) |
 | `libx264 -preset veryfast` (software) | 0.77 s, 2.10 s; 46.2 dB | 1.23 s, 3.64 s; 41.0 dB |
 
-That is 200 to 650 frames a second. Through V4L2 the guest's CPU barely
-works; through VA-API, FFmpeg's upload and the driver's copies cost
-about 3 ms of guest CPU a frame. FFmpeg's V4L2 encoders put a key frame
-every 12 frames by default (`-g` changes that), hence their lower PSNR.
-All of these decode back cleanly. GStreamer's `v4l2h264enc` (720p,
-decodes back cleanly) and `v4l2h265enc` (1080p, 300 frames) work too.
+- 200 to 650 frames/s.
+- V4L2: guest CPU barely works. VA-API: FFmpeg's upload + driver copies ~3 ms guest CPU per frame.
+- FFmpeg's V4L2 encoders: key frame every 12 frames by default (`-g` changes it): hence lower PSNR.
+- All decode back cleanly. GStreamer `v4l2h264enc` (720p) and `v4l2h265enc` (1080p, 300 frames) work too.
 
-Chrome 155 in a call with itself (H.264, 720p camera, at most 2.5
-Mbit/s, received through the hardware decoder), in CPUs (1.0 is one
-guest CPU busy): GPU process, page, whole guest; mean of three 30-second
-runs each:
+Chrome 155, call with itself (H.264, 720p camera, ≤2.5 Mbit/s, received via hardware decoder). CPUs: GPU process, page, whole guest; mean of three 30 s runs:
 
 | | OpenH264 (software) | VideoToolbox |
 |---|---|---|
@@ -385,33 +293,16 @@ runs each:
 | Xorg: the VM's camera | 0.06, 0.09, 0.41 | 0.08, 0.06, 0.41 |
 | Xorg: the noisy clip | 0.07, 0.15, 0.44 | 0.10, 0.09, 0.42 |
 
-The encoding leaves the page's process (0.03 to 0.07 of a CPU less); the
-GPU process takes 0.02 to 0.03 more: it converts each camera frame to
-NV12 for the driver, which hands it to the device. For the guest as a
-whole it comes out about even at these sizes. With the noisy clip,
-OpenH264 sent 960x540 at that bitrate in every run; VideoToolbox kept
-1280x720 in two runs of six. Each frame takes longer: 5 to 7.5 ms from Chrome's
-side (`totalEncodeTime` over `framesEncoded`), against 2 to 3.5 ms for
-OpenH264; about 5 ms of it is VideoToolbox's low-latency encoder itself.
+- Encoding leaves the page process (−0.03 to −0.07 CPU); GPU process +0.02 to +0.03 (converts each camera frame to NV12 for the driver). Whole guest: about even at these sizes.
+- Noisy clip: OpenH264 sent 960x540 in every run; VideoToolbox kept 1280x720 in 2 runs of 6.
+- Per frame (Chrome `totalEncodeTime` / `framesEncoded`): 5–7.5 ms VideoToolbox vs 2–3.5 ms OpenH264; ~5 ms of it is VideoToolbox's low-latency encoder.
 
 ## Trade-offs
 
-- 4 KiB random I/O at queue depth 32 on virtio-blk is about 10 % below
-  where it was (the guest now sends each request to its own vCPU's queue
-  and kicks more often), still about twice QEMU's. NVMe at that depth is
-  unchanged.
-- A fixed four I/O threads looked best with the data in the host cache,
-  but from the SSD it allowed only four reads at once: 4 KiB random reads
-  at queue depth 32 ran at 43k IOPS, against QEMU's 121k. The pool now
-  grows to the number of requests in flight (up to 32): 136k from the
-  SSD. From the cache, 4 KiB at queue depth 32 drops from 251k to 205k
-  IOPS (QEMU: 120k) and 1 MiB reads go from 25 to 35 GB/s.
-- The virtio-blk device now has one queue per vCPU (up to 16), so a
-  suspend image made by an older vroom of a VM with virtio disks no
-  longer resumes ("queue layout mismatch"): start it with `--fresh`.
-- Vulkan and Direct3D contexts each run in a process of their own (see
-  SECURITY.md). Measured against one shared process, M3 Max, a busy
-  host, so a few runs each:
+- virtio-blk 4 KiB random qd32: ~10% below before (guest sends each request to its own vCPU's queue, kicks more often); still ~2× QEMU. NVMe at qd32 unchanged.
+- I/O thread pool: fixed 4 looked best from host cache, but from SSD allowed only 4 reads at once: 4 KiB random qd32 = 43k IOPS vs QEMU 121k. Pool now grows to requests in flight (≤32): 136k from SSD. From cache: 4 KiB qd32 251k → 205k IOPS (QEMU 120k); 1 MiB reads 25 → 35 GB/s.
+- virtio-blk has one queue per vCPU (≤16): suspend images of VMs with virtio disks from older vroom don't resume ("queue layout mismatch"). Start with `--fresh`.
+- Vulkan and Direct3D contexts: a process each ([SECURITY.md](SECURITY.md)). vs one shared process, M3 Max, busy host, a few runs each:
 
   | | one process | a process per context |
   |---|---|---|
@@ -421,55 +312,31 @@ OpenH264; about 5 ms of it is VideoToolbox's low-latency encoder itself.
   | Edge window (Windows 11), first / later | 1.49 / 0.35-0.40 s | 1.42-1.78 / 0.29-0.44 s |
   | Notepad window | 52-82 ms | 57-87 ms |
 
-  GL doesn't change (it stays in the GPU process; glmark2 moves 10 % from
-  run to run here). Drawing doesn't either. What costs is a new context:
-  about 50 ms to start the process, load MoltenVK or DXMT and make a
-  Metal device. Memory: a Windows desktop with Edge open runs 15 to 20
-  contexts, 200 to 400 MB more in all.
+  - GL unchanged (stays in the GPU process; glmark2 ±10% run to run here). Drawing unchanged.
+  - Cost: a new context, ~50 ms (start process, load MoltenVK or DXMT, make a Metal device).
+  - Memory: Windows desktop with Edge = 15–20 contexts, +200–400 MB total.
 
 ## Looked at, left alone
 
-- **Idle CPU.** An idle guest costs about half a percent of one host
-  core, like QEMU. (QEMU's UEFI runs here had no display device at all;
-  vroom always has ramfb with UEFI.) On macOS 15, HVF handles the guest's WFI itself (our WFI
-  emulation, with its 1 ms re-check for IPIs, is never reached), so
-  spinning before sleeping (KVM's halt polling) gained nothing and was
-  dropped. Spinning in the device workers before they sleep made things
-  slower on a busy Mac (the spinning thread competes with the vCPUs), so
-  that was dropped too.
-- **MMIO exits** cost about the same as QEMU's (~1.6 µs per guest
-  register read, syscall included).
-- **Boot** is dominated by the guest (systemd, cloud-init): both VMMs
-  reach the login prompt within a few hundred milliseconds of each other.
+- **Idle CPU**: ~0.5% of a host core, like QEMU. (QEMU's UEFI runs had no display device; vroom always has ramfb with UEFI.) macOS 15 HVF handles guest WFI itself (our WFI emulation, 1 ms IPI recheck, is never reached): halt polling gained nothing, dropped. Spinning in device workers before sleep: slower on a busy Mac (competes with vCPUs), dropped.
+- **MMIO exits**: ~QEMU's (~1.6 µs per guest register read, syscall included).
+- **Boot**: dominated by the guest (systemd, cloud-init); both VMMs within a few hundred ms.
 
 ## Still slow, and what it would take
 
-- **4 KiB random I/O at queue depth 32 on NVMe** stays near 100k IOPS:
-  every command costs an MMIO exit for the doorbell and an interrupt on
-  the submitting vCPU. NVMe's doorbell buffer (shadow doorbells, which
-  QEMU implements) would let the guest skip most doorbell exits.
-- **Network** has no offloads: the guest sends and receives 1500-byte
-  frames and computes every checksum. TSO and checksum offload on
-  virtio-net (NAT only: it terminates TCP, so big segments are fine for
-  it) would cut the guest's per-packet work; on the receive side smoltcp
-  computes a checksum per frame the guest could skip.
-- **VM window, 2D**: without 3D (and whenever something covers the 3D
-  screen) Slint uploads the whole image to the GPU each frame. Partial
-  texture updates need a lower-level path than `slint::Image`.
-- **NAT latency** (a 1-byte TCP round trip through a port forward takes
-  about 60 µs) is thread wakeups: host socket to the device worker to the
-  vCPU and back. Polling instead of sleeping would cut it, at a CPU cost
-  that hurt more than it helped on a busy Mac.
-- **UDP** throughput wasn't pushed past the 3 Gbit/s the test offers.
+| | Why | Fix |
+|---|---|---|
+| NVMe 4 KiB random qd32 ~100k IOPS | MMIO exit per doorbell + interrupt on the submitting vCPU per command | NVMe doorbell buffer (shadow doorbells, QEMU has it) |
+| network | no offloads: 1500-byte frames, guest computes every checksum; smoltcp checksums each received frame | TSO + checksum offload on virtio-net (NAT only: it terminates TCP, big segments fine) |
+| VM window, 2D | without 3D (or when something covers the 3D screen) Slint uploads the whole image per frame | partial texture updates: needs a lower-level path than `slint::Image` |
+| NAT latency (~60 µs 1-byte TCP RTT via port forward) | thread wakeups: host socket → device worker → vCPU and back | polling; cost more CPU than it saved on a busy Mac |
+| UDP | not pushed past the test's 3 Gbit/s | |
 
 ## Measuring
 
-`scripts/bench.py` boots a guest under vroom or QEMU, runs the tests over
-ssh and prints one JSON line per run (also appended to
-`WORKDIR/results.jsonl`); `scripts/bench.py --table results.jsonl` prints
-the medians per tag as above.
+`scripts/bench.py`: boots a guest under vroom or QEMU, runs tests over ssh, prints a JSON line per run (appended to `WORKDIR/results.jsonl`). `--table results.jsonl`: medians per tag. Test details: the script's header.
 
-One-time setup of a work directory (about 3 GB):
+Work dir, once (~3 GB):
 
 ```bash
 W=~/vroom-bench; mkdir -p $W/seed; cd $W
@@ -483,12 +350,7 @@ hdiutil makehybrid -iso -joliet -default-volume-name cidata -o seed.iso seed
 brew install iperf3
 ```
 
-Boot it once with vroom so cloud-init installs the packages, then in the
-guest replace cloud-init's network config with one that runs DHCP on any
-`e*` interface (cloud-init's matches the first NIC's MAC, and QEMU's
-differs).
-
-Then, for example:
+Boot once with vroom (cloud-init installs packages). Then in the guest replace cloud-init's network config with DHCP on any `e*` interface (cloud-init's matches the first NIC's MAC; QEMU's differs).
 
 ```bash
 scripts/build.sh --release
@@ -499,7 +361,5 @@ scripts/bench.py $W --boot uefi --tests boot,idle
 scripts/bench.py --table $W/results.jsonl
 ```
 
-What each test does is in the script's header. The data disk is made
-fresh for every run and deleted after it. Network tests need
-`allow_host_loopback` (the script sets it): guest-to-host traffic goes to
-`10.0.2.2`, which both NATs map to the host's loopback.
+- Data disk: fresh per run, deleted after.
+- Network tests need `allow_host_loopback` (script sets it): guest→host traffic goes to `10.0.2.2`, which both NATs map to host loopback.
