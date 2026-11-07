@@ -6,6 +6,7 @@ pub mod acpi;
 pub mod aarch64;
 mod image;
 pub mod smbios;
+pub mod x86_64;
 
 pub use image::{decompress_if_needed, MAX_KERNEL_SIZE};
 
