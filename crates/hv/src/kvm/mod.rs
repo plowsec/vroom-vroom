@@ -277,6 +277,37 @@ pub(crate) fn set_thread_run(p: *mut kvm_run) {
     KVM_RUN.with(|c| c.set(p));
 }
 
+/// A different live vCPU may currently own this thread's signal binding.
+pub(crate) fn clear_thread_run(p: *mut kvm_run) {
+    KVM_RUN.with(|c| {
+        if c.get() == p {
+            c.set(std::ptr::null_mut());
+        }
+    });
+}
+
+#[cfg(test)]
+mod signal_binding_tests {
+    use super::*;
+
+    #[test]
+    fn clearing_one_vcpu_keeps_another_active_binding() {
+        let mut first = kvm_run::default();
+        let mut second = kvm_run::default();
+        let first = &mut first as *mut _;
+        let second = &mut second as *mut _;
+        set_thread_run(first);
+        set_thread_run(second);
+        clear_thread_run(first);
+        assert_eq!(KVM_RUN.with(|c| c.get()), second);
+        set_thread_run(first); // the next RUN rebinds its own mapping
+        clear_thread_run(second);
+        assert_eq!(KVM_RUN.with(|c| c.get()), first);
+        clear_thread_run(first);
+        assert!(KVM_RUN.with(|c| c.get()).is_null());
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct KvmKicker {
     /// Kernel thread id of the vCPU thread (we signal it with tgkill on
