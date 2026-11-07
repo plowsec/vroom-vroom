@@ -8,6 +8,7 @@
 //! above this crate so it is shared and testable without hardware.
 
 pub mod aarch64;
+mod x86_64;
 mod error;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub mod hvf;
@@ -299,7 +300,11 @@ pub trait VcpuKicker: Send + Sync {
 pub enum BootRegs {
     /// PC, and X0..X3 (Linux arm64 boot protocol: X0 = FDT).
     Aarch64 { pc: u64, x: [u64; 4] },
-    /// 64-bit Linux boot protocol: RIP, RSI = boot_params, page tables.
+    /// 64-bit Linux boot protocol: RIP, RSI = boot_params, identity-mapped
+    /// page tables at CR3. `gdt` names four entries: null, unused, 64-bit
+    /// kernel code (selector 0x10), flat kernel data (selector 0x18).
+    /// The caller supplies that GDT and maps the entry, parameters and GDT.
+    /// Interrupts start disabled; this does not describe a saved CPU state.
     X86_64 { rip: u64, rsi: u64, cr3: u64, gdt: u64 },
 }
 

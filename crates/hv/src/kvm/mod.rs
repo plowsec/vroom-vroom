@@ -7,9 +7,6 @@
 //! handler sets `immediate_exit` so a kick racing with KVM_RUN entry is
 //! never lost.
 
-// The x86 board is a stub for now: the shared vCPU plumbing goes unused.
-#![cfg_attr(target_arch = "x86_64", allow(dead_code))]
-
 #[cfg(target_arch = "aarch64")]
 mod aarch64;
 #[cfg(target_arch = "aarch64")]
@@ -112,6 +109,8 @@ impl std::fmt::Debug for KvmVm {
 
 impl KvmVm {
     fn add_slot(&self, gpa: u64, host: *mut u8, size: u64, flags: u32) -> Result<u32> {
+        #[cfg(target_arch = "x86_64")]
+        x86_64::check_memory_range(gpa, size)?;
         let mut s = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         let slot = s.free.pop().unwrap_or(s.next);
         let region = kvm_userspace_memory_region { slot, flags, guest_phys_addr: gpa, memory_size: size, userspace_addr: host as u64 };
