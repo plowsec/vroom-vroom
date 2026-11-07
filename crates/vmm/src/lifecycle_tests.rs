@@ -420,6 +420,76 @@ impl Snapshottable for ProbeDevice {
     }
 }
 
+struct FailingTpmCapture(Arc<AtomicBool>);
+impl vroom_devices::tpm::TpmBackend for FailingTpmCapture {
+    fn execute(&mut self, command: &[u8]) -> Vec<u8> { command.to_vec() }
+    fn reset(&mut self) {}
+    fn save(&mut self) -> vroom_snapshot::Result<Vec<u8>> {
+        if self.0.load(SeqCst) {
+            Err(vroom_snapshot::Error::Invalid("injected TPM capture failure".into()))
+        } else {
+            Ok(b"test complete TPM state".to_vec())
+        }
+    }
+}
+
+fn add_failing_tpm(vm: &mut Vmm) -> Arc<AtomicBool> {
+    let fail = Arc::new(AtomicBool::new(true));
+    vm.devices.push(Arc::new(Mutex::new(vroom_devices::tpm::Tpm::new(
+        0x0c00_0000, Box::new(FailingTpmCapture(fail.clone())),
+    ))));
+    fail
+}
+
+#[test]
+fn failed_tpm_snapshot_does_not_commit_and_preserves_running_or_paused_state() {
+    for mode in [StartMode::Boot, StartMode::BootPaused] {
+        let temp = tempfile::tempdir().unwrap();
+        let (config, opts, hv, counts) = fixture(temp.path(), 1, mode);
+        let mut vm = Vmm::start(config, hv, opts).unwrap();
+        let state = vm.state();
+        let fail = add_failing_tpm(&mut vm);
+        let rejected = temp.path().join("rejected");
+        let before = counts.runs.load(SeqCst);
+        let error = vm.snapshot(&rejected, "TPM capture failure").unwrap_err();
+        assert!(error.to_string().contains("injected TPM capture failure"));
+        assert!(vroom_snapshot::SnapshotDir::open(&rejected).is_err());
+        assert_eq!(vm.state(), state);
+        assert_eq!(counts.drops.load(SeqCst), 0);
+        if state == RunState::Running {
+            wait_for_runs(&counts, before);
+        } else {
+            assert_eq!(counts.runs.load(SeqCst), 0);
+        }
+        // A fresh target can be saved after the transient backend fault clears.
+        fail.store(false, SeqCst);
+        let complete = temp.path().join("complete");
+        vm.snapshot(&complete, "retry").unwrap();
+        assert!(vroom_snapshot::SnapshotDir::open(&complete).is_ok());
+        assert_eq!(vm.state(), state);
+        vm.shutdown_checked().unwrap();
+    }
+}
+
+#[test]
+fn failed_tpm_suspend_keeps_workers_paused_and_can_resume() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, opts, hv, counts) = fixture(temp.path(), 1, StartMode::Boot);
+    let mut vm = Vmm::start(config, hv, opts).unwrap();
+    add_failing_tpm(&mut vm);
+    let target = temp.path().join("rejected-suspend");
+    assert!(vm.suspend(&target).unwrap_err().to_string().contains("injected TPM capture failure"));
+    assert!(vroom_snapshot::SnapshotDir::open(&target).is_err());
+    assert_eq!(vm.state(), RunState::Paused);
+    assert_eq!(counts.drops.load(SeqCst), 0);
+    let before = counts.runs.load(SeqCst);
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(counts.runs.load(SeqCst), before);
+    vm.resume().unwrap();
+    wait_for_runs(&counts, before);
+    vm.shutdown_checked().unwrap();
+}
+
 #[test]
 fn failed_worker_cold_start_cannot_retry_or_accept_state_commands() {
     let counts = Arc::new(Counts::default());

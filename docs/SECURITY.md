@@ -383,7 +383,7 @@ Frame sockets: macOS gives Unix datagram sockets 4 KiB (2 frames). Both ends ask
 
 - `tpm = true`: TPM 2.0. libtpms runs in a separate `swtpm` process, not the VMM. macOS: own Seatbelt profile (its install, system libraries, its state dir; no network).
 - VMM only frames commands for it, size-limited.
-- State: `<state>/tpm` (0700). Snapshots include it: reverting a VM reverts its TPM.
+- State: `<state>/tpm` (0700). Capture requires successful volatile export and complete permanent/volatile state; export/read errors abort the snapshot. Incomplete state archives are rejected before stopping the current TPM or replacing its files. See the [TPM state contract](../crates/vmm/TPM_STATE.md) for recovery behavior and compatibility limits. Valid-input restore replacement remains nontransactional; this is not a whole-VM atomicity or cross-version portability guarantee.
 
 ## What 3D costs
 
