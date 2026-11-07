@@ -130,7 +130,7 @@ Medians. "µs per 4k read at qd1" is the real per-request time. fio's own latenc
 
 ## 3D display
 
-Ubuntu 24.04, Xorg in the app window, M3 Max. "before" = master 344e5e8 (each GL frame read back and copied 4× on the CPU; Vulkan window frames copied into GL by the CPU). "after" = IOSurface paths ([ARCHITECTURE.md](ARCHITECTURE.md#the-screen-straight-from-the-gpu)). CPU = cores used by app / VM process (vCPUs included) / GPU process.
+Ubuntu 24.04, Xorg in the app window, M3 Max. "before" = master 344e5e8 (each GL frame read back and copied 4× on the CPU; Vulkan window frames copied into GL by the CPU). "after" = IOSurface paths ([ARCHITECTURE.md](ARCHITECTURE.md#the-screen-straight-from-the-gpu-macos)). CPU = cores used by app / VM process (vCPUs included) / GPU process.
 
 | | before | after |
 |---|---|---|
