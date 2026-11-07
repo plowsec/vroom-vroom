@@ -15,16 +15,16 @@ use vroom_hv::{BootRegs, Vcpu, VcpuExit, VcpuKicker, VcpuState, Vm};
 
 use crate::psci::{self, CpuTable, PsciOutcome};
 use crate::{Error, Result};
+use crate::lifecycle::LifecyclePolicy;
 
 /// Commands for a vCPU thread. Replies go back on the embedded channel.
 pub enum VcpuCmd {
     WriteRegister(vroom_hv::debug::Register, u64, Sender<Result<()>>),
     Debug(vroom_hv::debug::DebugConfig, Sender<Result<()>>),
-    /// Start executing (boot CPU, or PSCI CPU_ON target).
+    /// Once-only initial boot, acknowledged before any CPU is resumed.
+    Initialize(Option<BootRegs>, Sender<Result<()>>),
+    /// Runtime PSCI CPU_ON, using pristine state on resettable boards.
     PowerOn(BootRegs),
-    /// Enter the run loop without touching registers (secondaries when
-    /// the kernel does PSCI: it keeps them parked until CPU_ON).
-    Start,
     Pause(Sender<()>),
     Resume,
     Save(Sender<Result<VcpuState>>),
@@ -44,7 +44,7 @@ impl std::fmt::Debug for VcpuCmd {
             VcpuCmd::WriteRegister(..) => "WriteRegister",
             VcpuCmd::Debug(..) => "Debug",
             VcpuCmd::PowerOn(_) => "PowerOn",
-            VcpuCmd::Start => "Start",
+            VcpuCmd::Initialize(..) => "Initialize",
             VcpuCmd::Pause(_) => "Pause",
             VcpuCmd::Resume => "Resume",
             VcpuCmd::Save(_) => "Save",
@@ -137,8 +137,6 @@ impl Peer {
 pub struct VcpuHandle {
     pub peer: Peer,
     thread: Option<JoinHandle<()>>,
-    /// The kernel handles PSCI: secondaries just need a Start.
-    pub in_kernel_psci: bool,
 }
 
 impl VcpuHandle {
@@ -150,7 +148,7 @@ impl VcpuHandle {
 }
 
 /// Spawn vCPU `index`. Returns once the vCPU exists (or failed to).
-pub fn spawn(index: u32, shared: Arc<VcpuShared>) -> Result<VcpuHandle> {
+pub fn spawn(index: u32, shared: Arc<VcpuShared>, lifecycle: LifecyclePolicy) -> Result<VcpuHandle> {
     let (tx, rx) = mpsc::channel();
     let (ready_tx, ready_rx) = mpsc::channel();
     let thread = std::thread::Builder::new()
@@ -163,31 +161,33 @@ pub fn spawn(index: u32, shared: Arc<VcpuShared>) -> Result<VcpuHandle> {
                     return;
                 }
             };
-            let pristine = {
-                let mut v = vcpu;
-                match v.save_state() {
-                    Ok(s) => {
-                        let _ = ready_tx.send(Ok((v.kicker(), v.in_kernel_psci())));
-                        (v, s)
-                    }
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(Error::Hv(e)));
+            let mut vcpu = vcpu;
+            let pristine = if lifecycle == LifecyclePolicy::Resettable {
+                match vcpu.save_state() {
+                    Ok(state) => Some(state),
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(Error::Hv(error)));
                         return;
                     }
                 }
+            } else {
+                None
             };
-            // Everyone waits for PowerOn / Start: with KVM the irqchip must
-            // be initialised before any vCPU enters KVM_RUN.
-            VcpuLoop { vcpu: pristine.0, pristine: pristine.1, shared, rx, running: false, paused: false, stopped_by: None }.run();
+            let _ = ready_tx.send(Ok(vcpu.kicker()));
+            // Wait for acknowledged Initialize; KVM's irqchip is finalized first.
+            VcpuLoop { vcpu, pristine, lifecycle, initialized: false, shared, rx,
+                running: false, paused: false, stopped_by: None }.run();
         })
         .map_err(|e| Error::Setup(format!("spawn vcpu thread: {e}")))?;
-    let (kicker, in_kernel_psci) = ready_rx.recv().map_err(|_| Error::VcpuGone)??;
-    Ok(VcpuHandle { peer: Peer { tx, kicker }, thread: Some(thread), in_kernel_psci })
+    let kicker = ready_rx.recv().map_err(|_| Error::VcpuGone)??;
+    Ok(VcpuHandle { peer: Peer { tx, kicker }, thread: Some(thread) })
 }
 
 struct VcpuLoop {
     vcpu: Box<dyn Vcpu>,
-    pristine: VcpuState,
+    pristine: Option<VcpuState>,
+    lifecycle: LifecyclePolicy,
+    initialized: bool,
     shared: Arc<VcpuShared>,
     rx: Receiver<VcpuCmd>,
     running: bool,
@@ -259,17 +259,24 @@ impl VcpuLoop {
                 };
                 let _ = reply.send(r);
             }
+            VcpuCmd::Initialize(regs, reply) => {
+                let result = self.initialize(regs.as_ref());
+                let _ = reply.send(result);
+            }
             VcpuCmd::PowerOn(regs) => match self.power_on(&regs) {
                 Ok(()) => self.running = true,
                 Err(e) => log::error!("vcpu{}: power on: {e}", self.index()),
             },
-            VcpuCmd::Start => self.running = true,
             VcpuCmd::Pause(ack) => {
                 self.paused = true;
                 let _ = ack.send(());
             }
             VcpuCmd::Resume => self.paused = false,
             VcpuCmd::Save(reply) => {
+                if let Err(error) = self.lifecycle.require_state("snapshot") {
+                    let _ = reply.send(Err(error));
+                    return true;
+                }
                 if let Some(why) = &self.stopped_by {
                     let _ = reply.send(Err(Error::CantSave(format!("CPU {} stopped: {why}", self.index()))));
                     return true;
@@ -282,6 +289,10 @@ impl VcpuLoop {
                 let _ = reply.send(r.map_err(Error::Hv));
             }
             VcpuCmd::Restore(state, on, reply) => {
+                if let Err(error) = self.lifecycle.require_state("restore") {
+                    let _ = reply.send(Err(error));
+                    return true;
+                }
                 let r = self.vcpu.restore_state(&state).map_err(Error::Hv);
                 if r.is_ok() {
                     // In-kernel PSCI: off CPUs wait inside KVM_RUN.
@@ -312,16 +323,38 @@ impl VcpuLoop {
         }
     }
 
+    fn initialize(&mut self, regs: Option<&BootRegs>) -> Result<()> {
+        if self.initialized {
+            return Err(Error::Setup("vCPU initialization was already attempted".into()));
+        }
+        // A failed register write can leave partial state. Never retry a cold start.
+        self.initialized = true;
+        self.paused = true;
+        if let Some(regs) = regs {
+            if self.lifecycle == LifecyclePolicy::Resettable {
+                self.power_on(regs)?;
+            } else {
+                self.vcpu.set_boot_regs(regs)?;
+            }
+        }
+        self.running = regs.is_some() || self.vcpu.in_kernel_psci();
+        Ok(())
+    }
+
     fn power_on(&mut self, regs: &BootRegs) -> Result<()> {
+        self.lifecycle.require_state("CPU power-on reset")?;
         // Fresh architectural state, then the entry point.
-        self.vcpu.restore_state(&self.pristine)?;
+        let pristine = self.pristine.as_ref().ok_or_else(|| Error::Setup("missing pristine CPU state".into()))?;
+        self.vcpu.restore_state(pristine)?;
         self.vcpu.set_boot_regs(regs)?;
         Ok(())
     }
 
     fn reset(&mut self, regs: Option<&BootRegs>) -> Result<()> {
+        self.lifecycle.require_state("reset")?;
+        let pristine = self.pristine.as_ref().ok_or_else(|| Error::Setup("missing pristine CPU state".into()))?;
+        self.vcpu.restore_state(pristine)?;
         self.stopped_by = None;
-        self.vcpu.restore_state(&self.pristine)?;
         self.running = self.vcpu.in_kernel_psci() && self.index() != 0;
         if let Some(r) = regs {
             self.vcpu.set_boot_regs(r)?;

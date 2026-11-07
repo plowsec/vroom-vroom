@@ -24,6 +24,9 @@ mod display;
 mod firmware;
 mod hotplug;
 mod irq;
+mod lifecycle;
+#[cfg(test)]
+mod lifecycle_tests;
 mod machine;
 mod net;
 pub use machine::gpu_in_process;
@@ -52,6 +55,7 @@ use vroom_snapshot::Snapshottable;
 
 pub use vcpu::VmEvent;
 use vcpu::{VcpuCmd, VcpuHandle, VcpuShared};
+use lifecycle::LifecyclePolicy;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -73,6 +77,8 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("a vCPU thread is gone")]
     VcpuGone,
+    #[error("{0} is unavailable for a cold-boot-only VM")]
+    UnsupportedLifecycle(&'static str),
     #[error("timed out waiting for vCPUs")]
     Timeout,
     #[error("virtio: {0}")]
@@ -133,6 +139,7 @@ pub struct Vmm {
     /// One VMM per state dir: two would write the same disk layers.
     _lock: state::StateLock,
     config: VmConfig,
+    lifecycle: LifecyclePolicy,
     hv: Arc<dyn Hypervisor>,
     vm: Arc<dyn Vm>,
     mem: GuestMemory,
@@ -238,6 +245,12 @@ fn restore_hardware(now: VmConfig, saved: &VmConfig) -> VmConfig {
 impl Vmm {
     /// Build the machine and start it.
     pub fn start(config: VmConfig, hv: Arc<dyn Hypervisor>, opts: VmmOptions) -> Result<Vmm> {
+        Self::start_with_lifecycle(config, hv, opts, LifecyclePolicy::default())
+    }
+
+    // Board integration selects the policy here; public/default behavior is unchanged.
+    fn start_with_lifecycle(config: VmConfig, hv: Arc<dyn Hypervisor>, opts: VmmOptions, lifecycle: LifecyclePolicy) -> Result<Vmm> {
+        lifecycle.check_start(&opts.start)?;
         config.validate()?;
         let saved = match &opts.start {
             StartMode::Restore(dir) | StartMode::RestorePaused(dir) => Some(snapshot::saved_config(dir)?),
@@ -288,7 +301,7 @@ impl Vmm {
             hot_nets,
             gpu3d_vram,
         };
-        let m = machine::build(&config, hv.as_ref(), opts.serial_out, opts.clipboard, ui, &disks, ev_tx, &env)?;
+        let m = machine::build(&config, hv.as_ref(), opts.serial_out, opts.clipboard, ui, &disks, ev_tx, &env, lifecycle)?;
         // A save records the hardware the guest has: a resumed VM keeps
         // the network adapters it was saved with until it restarts.
         let mut config = config;
@@ -296,6 +309,7 @@ impl Vmm {
         let mut vmm = Vmm {
             _lock: lock,
             config,
+            lifecycle,
             hv,
             vm: m.vm,
             mem: m.mem,
@@ -324,17 +338,19 @@ impl Vmm {
             #[cfg(feature = "research")]
             research_still_clock: None,
         };
-        vmm.pristine_irqchip = match vmm.vm.save_irqchip() {
-            Ok(s) => Some(s),
-            Err(vroom_hv::Error::Unsupported(why)) => {
-                log::info!("irqchip state not saveable ({why}); reset won't restore it");
-                None
+        if lifecycle == LifecyclePolicy::Resettable {
+            vmm.pristine_irqchip = match vmm.vm.save_irqchip() {
+                Ok(s) => Some(s),
+                Err(vroom_hv::Error::Unsupported(why)) => {
+                    log::info!("irqchip state not saveable ({why}); reset won't restore it");
+                    None
+                }
+                Err(e) => return Err(e.into()),
+            };
+            for d in &vmm.devices {
+                let s = d.lock().unwrap_or_else(|e| e.into_inner()).save()?;
+                vmm.pristine_devices.push(s);
             }
-            Err(e) => return Err(e.into()),
-        };
-        for d in &vmm.devices {
-            let s = d.lock().unwrap_or_else(|e| e.into_inner()).save()?;
-            vmm.pristine_devices.push(s);
         }
         let start_paused = matches!(opts.start, StartMode::BootPaused | StartMode::RestorePaused(_));
         // Restore marks each CPU runnable. Park every CPU before loading any
@@ -344,11 +360,13 @@ impl Vmm {
         match opts.start {
             StartMode::Boot | StartMode::BootPaused => {
                 let regs = vmm.boot.load(&vmm.mem)?;
-                vmm.vcpus[0].peer.send(VcpuCmd::PowerOn(regs))?;
-                // In-kernel PSCI: secondaries wait inside KVM_RUN for CPU_ON.
-                // Only now: irqchip state access needs them out of KVM_RUN.
-                for v in vmm.vcpus.iter().skip(1).filter(|v| v.in_kernel_psci) {
-                    v.peer.send(VcpuCmd::Start)?;
+                // Acknowledge register initialization while every CPU is parked.
+                // Secondary CPUs enter KVM only after the later resume.
+                for (index, v) in vmm.vcpus.iter().enumerate() {
+                    let (tx, rx) = mpsc::channel();
+                    let initial = (index == 0).then(|| regs.clone());
+                    v.peer.send(VcpuCmd::Initialize(initial, tx))?;
+                    rx.recv_timeout(PAUSE_TIMEOUT).map_err(|_| Error::Timeout)??;
                 }
             }
             StartMode::Restore(dir) | StartMode::RestorePaused(dir) => {
@@ -821,6 +839,7 @@ impl Vmm {
 
     /// Hard reset: like pressing the reset button.
     pub fn reset(&mut self) -> Result<()> {
+        self.lifecycle.require_state("reset")?;
         let was_running = self.state == RunState::Running;
         self.pause()?;
         for (d, s) in self.devices.iter().zip(&self.pristine_devices) {
@@ -846,6 +865,7 @@ impl Vmm {
 
     /// Save a full snapshot. The VM keeps running afterwards.
     pub fn snapshot(&mut self, dir: &Path, description: &str) -> Result<()> {
+        self.lifecycle.require_state("snapshot")?;
         let was_running = self.state == RunState::Running;
         let parked = self.park_direct3d()?;
         self.pause()?;
@@ -928,13 +948,16 @@ impl Vmm {
 
     /// Snapshot then stop: the VM can be resumed later with
     /// [`StartMode::Restore`]. This is "suspend to disk".
-    pub fn suspend(mut self, dir: &Path) -> Result<()> {
+    /// Borrows the VM so rejecting an unsupported suspend leaves it running.
+    pub fn suspend(&mut self, dir: &Path) -> Result<()> {
         self.suspend_in_place(dir)
     }
 
     /// Like [`suspend`], for callers that keep the handle. On error the
-    /// VM is left paused, not stopped, so nothing is lost.
+    /// VM is left paused, not stopped, if saving fails. An unsupported policy
+    /// is rejected before changing the VM state.
     pub fn suspend_in_place(&mut self, dir: &Path) -> Result<()> {
+        self.lifecycle.require_state("suspend")?;
         let parked = self.park_direct3d()?;
         self.pause()?;
         if let Err(e) = snapshot::save(self, dir, "suspend", snapshot::Kind::Suspend) {

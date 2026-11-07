@@ -600,6 +600,7 @@ pub(crate) fn build(
     disks: &DiskSet,
     events: Sender<VmEvent>,
     env: &BuildEnv,
+    lifecycle: crate::lifecycle::LifecyclePolicy,
 ) -> Result<Machine> {
     if hv.arch() != vroom_hv::Arch::Aarch64 {
         return Err(Error::Setup("only the aarch64 board exists so far".into()));
@@ -1040,7 +1041,7 @@ pub(crate) fn build(
     });
     let mut vcpus = Vec::new();
     for i in 0..config.cpus {
-        vcpus.push(vcpu::spawn(i, shared.clone())?);
+        vcpus.push(vcpu::spawn(i, shared.clone(), lifecycle)?);
     }
     let _ = shared.peers.set(vcpus.iter().map(|v| v.peer.clone()).collect());
     vm.finalize()?;

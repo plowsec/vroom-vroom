@@ -121,6 +121,7 @@ pub(crate) fn saved_config(dir: &Path) -> Result<(vroom_config::VmConfig, bool)>
 }
 
 pub(crate) fn save(vmm: &mut Vmm, dir: &Path, description: &str, kind: Kind) -> Result<()> {
+    vmm.lifecycle.require_state(match kind { Kind::Snapshot => "snapshot", Kind::Suspend => "suspend" })?;
     let vm = crate::disks::vm_dir(vmm.disks.state_dir());
     let mut snap = SnapshotDir::create(dir)?;
     match kind {
@@ -222,6 +223,7 @@ pub(crate) fn save(vmm: &mut Vmm, dir: &Path, description: &str, kind: Kind) -> 
 }
 
 pub(crate) fn restore(vmm: &mut Vmm, dir: &Path) -> Result<()> {
+    vmm.lifecycle.require_state("restore")?;
     let snap = SnapshotDir::open(dir)?;
     let m = &snap.manifest;
     if m.backend != vmm.hv.name() {
