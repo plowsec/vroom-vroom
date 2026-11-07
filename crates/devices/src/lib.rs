@@ -17,6 +17,7 @@ pub mod tpm;
 pub mod pl011;
 pub mod pl031;
 pub mod usb;
+pub mod uart16550;
 
 pub use bus::{Bus, BusBuilder, BusDevice, BusRange, ConcurrentBusDevice, SharedDevice};
 pub use irq::{IrqLine, NoIrq};
