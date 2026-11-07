@@ -140,6 +140,72 @@ port_forwards = [{ host_port = 2222, guest_port = 22 }]
 gpu = "virtio2d"
 ```
 
+## Agents
+
+Use these. Don't rebuild them: no SSH, scp, serial-console scraping, or your own socket client.
+
+| Need | Use |
+|---|---|
+| run a command in a running VM | `vroom guest exec` |
+| copy a file in / out | `vroom guest push` / `pull` |
+| guest tools too old or missing | `vroom guest update-tools` |
+| a VM with the OS and tools installed | `vroom new --ready` |
+| a guest's address (host-only) | `vroom net` |
+| debugger: memory, registers, breakpoints, kernel symbols, snapshots | `vroom-lab` + `vroom-rpc` |
+
+Installed app: `vroom` is `/Applications/vroom.app/Contents/MacOS/vroom`. Built from source: `target/release/vroom`.
+
+### Guest tools: `vroom guest`
+
+Talks to the guest agent through the VMM. No guest network, no SSH needed.
+
+```bash
+vroom guest exec dev -- ipconfig /all                  # dev = app VM name or path to dev.toml
+vroom guest exec dev -p -t 300 -- Get-Service          # -p PowerShell (Linux: pwsh), -t timeout s (60)
+vroom guest exec dev -- systemd-run --wait --pipe --collect sh -c 'apt-get install -y jq'
+vroom guest push dev ./tool.exe 'C:\tools\tool.exe'
+vroom guest pull dev /var/log/syslog ./                # to a dir: same name
+vroom guest update-tools dev
+vroom guest-tools info                                 # tools this vroom ships, versions
+```
+
+- VM must be running (`dev isn't running`), agent connected (`no guest agent is running`; window status shows it).
+- `exec` runs as Windows `cmd.exe` SYSTEM / Linux `sh` root. Prints stdout/stderr, exits with the command's code (low 8 bits). `124` = timed out. Output capped at 1 MiB each (`--max-out`).
+- Linux `exec` runs in the agent's sandbox: read-only system, Unix sockets only. `apt`, Docker, services: wrap in `systemd-run --wait --pipe --collect`.
+- `push`/`pull`: size and SHA-256 checked; target replaced only once the whole file arrived.
+- `the guest agent is too old ...`: `update-tools` first.
+- More: [GUIDE.md](docs/GUIDE.md#guest-tools).
+
+### Debugger: `vroom-rpc`
+
+`vroom-lab` runs a VM under the kernel debugger (Windows ARM64, research build). `vroom-rpc` makes one JSON-RPC call to its socket and prints the JSON result.
+
+```bash
+research/build.sh --release                               # target/research/release/vroom-lab (signed)
+cargo build --release -p vroom-kernel --bin vroom-rpc      # target/release/vroom-rpc
+vroom-lab LAB.toml [--restore SNAP] --agent-socket lab.sock --daemon   # prints pid; kill PID stops it
+R() { vroom-rpc --socket lab.sock "$@"; }
+R describe
+R commands.list '{"category":"kernel"}'                   # every command: params, mutates, risk
+R run vm.resume                                           # lab starts paused
+R run guest.exec '{"command":"whoami"}'                   # also guest.upload / download / update_tools
+R run vm.pause
+R run kernel.symbols                                      # once per lab session
+R run memory.read_virtual '{"cpu":1,"address":"0xfffff80275ff70a8","length":16}'
+R run debug.breakpoints '{"addresses":["0x..."]}'
+R events.poll '{"wait_ms":10000}'                          # next stop, fault, shutdown
+R traces follow                                           # tracepoint/hwatch records, JSON lines
+R run vm.snapshot '{"name":"hit"}'
+```
+
+- Always `--daemon`: agent shells kill what they start; a dead lab = `Connection refused`.
+- Socket path under 104 bytes: use a relative one.
+- `kernel.*`, `memory.*`, `cpu.*`, `debug.*` need a paused VM. A paused guest answers nothing on the network.
+- `-32601` = wrong name (error lists the nearest), not a missing feature.
+- Gate writes on each command's `risk` (read, control, write, destructive).
+- Lab and app can't run the same VM at once.
+- All methods, commands, a Python adapter: [research/README.md](research/README.md#agents).
+
 ## Docs
 
 | | |
