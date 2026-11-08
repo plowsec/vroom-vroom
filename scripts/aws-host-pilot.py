@@ -230,6 +230,8 @@ def preflight(aws, spec, profile_name=DEFAULT_HOST_PROFILE):
     vpcs = aws.call("ec2", "describe-vpcs", {"Filters": [{"Name": "is-default", "Values": ["true"]}]})["Vpcs"]
     if len(vpcs) != 1:
         raise PilotError("one existing default VPC is required; no VPC will be created automatically")
+    if vpcs[0].get("InstanceTenancy") != "default":
+        raise PilotError("selected VPC must explicitly use default tenancy; dedicated charges are not quoted")
     vpc_id = vpcs[0]["VpcId"]
     subnets = aws.call("ec2", "describe-subnets", {"Filters": [
         {"Name": "vpc-id", "Values": [vpc_id]}, {"Name": "state", "Values": ["available"]}]})["Subnets"]
@@ -246,7 +248,7 @@ def preflight(aws, spec, profile_name=DEFAULT_HOST_PROFILE):
     subnet = sorted(candidates, key=lambda item: item["AvailabilityZone"])[0]
     return {"account": account, "proposal": proposal, "instance_info": info,
             "image_id": ami_id, "root_device": image["RootDeviceName"],
-            "vpc_id": vpc_id, "subnet_id": subnet["SubnetId"], "availability_zone": subnet["AvailabilityZone"]}
+            "vpc_id": vpc_id, "vpc_tenancy": "default", "subnet_id": subnet["SubnetId"], "availability_zone": subnet["AvailabilityZone"]}
 
 
 def public_subnet(subnet_id, route_tables):
@@ -439,6 +441,7 @@ def instance_request(manifest):
     ])
     request = {"ImageId": manifest["preflight"]["image_id"], "InstanceType": profile["instance_type"],
         "MinCount": 1, "MaxCount": 1, "ClientToken": run_id,
+        "Placement": {"Tenancy": "default"},
         "IamInstanceProfile": {"Name": manifest["instance_profile"]},
         "InstanceInitiatedShutdownBehavior": "terminate", "DisableApiTermination": False,
         "MetadataOptions": {"HttpTokens": "required", "HttpPutResponseHopLimit": 1, "HttpEndpoint": "enabled"},

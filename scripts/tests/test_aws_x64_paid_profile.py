@@ -100,6 +100,24 @@ class PaidX64Tests(unittest.TestCase):
                          {'VolumeType': 'gp3', 'VolumeSize': 40, 'Encrypted': True, 'DeleteOnTermination': True})
         self.assertEqual(request['InstanceInitiatedShutdownBehavior'], 'terminate')
         self.assertEqual(request['MetadataOptions']['HttpTokens'], 'required')
+        self.assertEqual(request['Placement'], {'Tenancy': 'default'})
+
+    def test_dedicated_unknown_and_missing_vpc_tenancy_fail_closed(self):
+        for tenancy in ('dedicated', 'host', 'unknown', None, True):
+            cloud = aws(); cloud.vpc['InstanceTenancy'] = tenancy
+            with self.subTest(tenancy=tenancy), self.assertRaisesRegex(host.PilotError, 'default tenancy'):
+                host.preflight(cloud, fixtures.specification(False), PAID)
+            self.assertFalse(any(operation == 'describe-subnets' for _, operation, _ in cloud.calls))
+        cloud = aws(); del cloud.vpc['InstanceTenancy']
+        with self.assertRaisesRegex(host.PilotError, 'default tenancy'):
+            host.preflight(cloud, fixtures.specification(False), PAID)
+
+    def test_default_tenancy_evidence_binds_the_selected_vpc(self):
+        cloud = aws()
+        result = host.preflight(cloud, fixtures.specification(False), PAID)
+        self.assertEqual((result['vpc_id'], result['vpc_tenancy']), ('vpc-test', 'default'))
+        subnet_calls = [payload for _, operation, payload in cloud.calls if operation == 'describe-subnets']
+        self.assertEqual(subnet_calls[0]['Filters'][0], {'Name': 'vpc-id', 'Values': [result['vpc_id']]})
 
     def test_existing_reservations_still_block_overspend(self):
         value = prepared()

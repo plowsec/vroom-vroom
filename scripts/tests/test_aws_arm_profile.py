@@ -45,6 +45,7 @@ class PreflightAws:
                      'ProcessorInfo': {'SupportedArchitectures': ['arm64' if arm else 'x86_64'],
                                        'SupportedFeatures': [] if arm else ['nested-virtualization']}}
         self.quota = 64 if arm else 2
+        self.vpc = {'VpcId': 'vpc-test', 'InstanceTenancy': 'default'}
         self.image = {'ImageId': 'ami-test', 'Architecture': 'arm64' if arm else 'x86_64', 'State': 'available',
                       'RootDeviceType': 'ebs', 'RootDeviceName': '/dev/xvda', 'ProductCodes': [],
                       'BlockDeviceMappings': [{'DeviceName': '/dev/xvda', 'Ebs': {'VolumeSize': 30}}]}
@@ -57,7 +58,7 @@ class PreflightAws:
             'get-account-plan-state': self.plan, 'describe-instances': {'Reservations': []},
             'describe-instance-types': {'InstanceTypes': [self.info]}, 'get-service-quota': {'Quota': {'Value': self.quota}},
             'get-parameter': {'Parameter': {'Value': 'ami-test'}}, 'describe-images': {'Images': [self.image]},
-            'describe-vpcs': {'Vpcs': [{'VpcId': 'vpc-test'}]},
+            'describe-vpcs': {'Vpcs': [self.vpc]},
             'describe-subnets': {'Subnets': [{'SubnetId': 'subnet-test', 'AvailabilityZone': 'eu-north-1a', 'AvailableIpAddressCount': 1}]},
             'describe-route-tables': {'RouteTables': [{'Associations': [{'Main': True}], 'Routes': [
                 {'DestinationCidrBlock': '0.0.0.0/0', 'State': 'active', 'GatewayId': 'igw-test'}]}]},
