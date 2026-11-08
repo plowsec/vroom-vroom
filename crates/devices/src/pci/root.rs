@@ -9,7 +9,7 @@ use vroom_snapshot::{decode, encode, Snapshottable};
 
 use super::{ConfigSpace, PciId, RootPort, SharedPciDevice, VendorIds};
 use crate::{BusDevice, ConcurrentBusDevice, IrqLine};
-use super::mch::{MchConfig, PciConfigError};
+use super::mch::{MchConfig, MchError, PciConfigError};
 
 /// Four shared level-triggered lines; a line is high while any device
 /// on it asserts.
@@ -260,6 +260,65 @@ impl PciRoot {
             None => d.bar_read(m.bar, addr - m.start, data),
         }
         true
+    }
+
+    /// The opt-in cold MCH route. Do not reuse the legacy cached first-hit map:
+    /// validate every currently enabled memory BAR, under retained endpoint
+    /// guards, before dispatching one callback. Config writes are not rolled
+    /// back: arbitrary config callbacks may already have had side effects.
+    /// Callbacks must not reenter endpoint/root locks while these guards live.
+    pub(super) fn checked_bar_mmio(&self, addr: u64, data: &mut [u8], write: Option<&[u8]>,
+                                   windows: &[crate::BusRange], excluded: &[crate::BusRange]) -> Result<bool, MchError> {
+        let len = write.map_or(data.len(), |bytes| bytes.len());
+        let finish = addr.checked_add(len as u64).filter(|_| len != 0).ok_or(MchError::Boundary)?;
+        let mut endpoints: Vec<_> = self.devices.iter().collect();
+        endpoints.sort_by_key(|(slot, _)| *slot);
+        let mut guards = Vec::with_capacity(endpoints.len());
+        for (_, device) in &endpoints {
+            guards.push(device.try_lock().map_err(|error| match error {
+                std::sync::TryLockError::WouldBlock => MchError::BarBusy,
+                std::sync::TryLockError::Poisoned(_) => MchError::BarPoisoned,
+            })?);
+        }
+        // (base, exclusive end, endpoint guard index, BAR index)
+        let mut map: Vec<(u64, u64, usize, usize)> = Vec::new();
+        for (index, device) in guards.iter().enumerate() {
+            let config = device.config();
+            if !config.mem_enabled() { continue; }
+            let mut high_half = false;
+            for bar in 0..6 {
+                let spec = config.bar_spec(bar);
+                if high_half {
+                    if spec.is_some() { return Err(MchError::BarMap); }
+                    high_half = false;
+                    continue;
+                }
+                let Some(spec) = spec else { continue };
+                if !spec.size.is_power_of_two() || spec.size < 4096 || (spec.is64 && bar == 5) {
+                    return Err(MchError::BarMap);
+                }
+                high_half = spec.is64;
+                let Some(base) = config.bar_addr(bar) else { continue }; // Zero is unassigned.
+                let limit = base.checked_add(spec.size).ok_or(MchError::BarMap)?;
+                if base % spec.size != 0 || (!spec.is64 && limit > 1 << 32)
+                    || !windows.iter().any(|r| r.base <= base && r.base.checked_add(r.len).is_some_and(|end| limit <= end))
+                    || excluded.iter().any(|r| r.base < limit && r.base.checked_add(r.len).is_none_or(|end| base < end))
+                    || map.iter().any(|(start, end, _, _)| base < *end && *start < limit) {
+                    return Err(MchError::BarMap);
+                }
+                map.push((base, limit, index, bar));
+            }
+        }
+        let hit = map.iter().find(|(base, end, _, _)| addr < *end && *base < finish);
+        let Some(&(base, end, index, bar)) = hit else { return Ok(false) };
+        if addr < base || finish > end { return Err(MchError::Boundary); }
+        match write {
+            Some(bytes) => guards[index].bar_write(bar, addr - base, bytes),
+            None => guards[index].bar_read(bar, addr - base, data),
+        }
+        // All guards remain owned until after the callback, including guards
+        // for other endpoints whose BARs were part of the overlap proof.
+        Ok(true)
     }
 
     /// How many hot plug ports there are.

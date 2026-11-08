@@ -1,8 +1,8 @@
 //! Cold-only Q35 MCH configuration and checked ECAM routing.
 //!
 //! PCIEXBAR changes real absolute-GPA decoding inside one reserved aperture.
-//! This is not a Q35 board: BAR-window MMIO, PAM/SMRAM/TSEG, reset and snapshots
-//! are deliberately not implemented here. In particular, no register claims a
+//! This is not a Q35 board: PAM/SMRAM/TSEG, reset and snapshots are deliberately
+//! not implemented here. In particular, no register claims a
 //! memory-protection effect that has not happened in the hypervisor.
 //!
 //! The exclusive router owns every route to its private MCH state. A future
@@ -49,6 +49,16 @@ pub enum MchError {
     Layout,
     #[error("duplicate or invalid PCI endpoint slot")]
     Slot,
+    #[error("invalid or overlapping BAR windows or reserved-range inventory")]
+    BarLayout,
+    #[error("the same PCI endpoint occurs in more than one slot")]
+    EndpointAlias,
+    #[error("a PCI endpoint is busy; no BAR callback was invoked")]
+    BarBusy,
+    #[error("a PCI endpoint mutex is poisoned")]
+    BarPoisoned,
+    #[error("the complete enabled memory-BAR map is invalid")]
+    BarMap,
     #[error("unsupported MMIO access width")]
     Width,
     #[error("unaligned MMIO access")]
@@ -143,7 +153,9 @@ impl MchConfig {
 ///
 /// No root or generic ECAM handle escapes: CF8 and ECAM share one MCH state and
 /// `&mut self` serializes decoding with register changes. The entire aperture
-/// stays reserved when disabled/shrunk. BAR MMIO is a separate future route.
+/// stays reserved when disabled/shrunk. BAR MMIO is opt-in with explicit windows
+/// and an immutable private-range inventory. Invalid BAR config stays readable
+/// and repairable: validation precedes BAR callbacks, not config callbacks.
 /// The caller must also exclude the aperture from hidden HV RAM/ROM mappings;
 /// this device layer can verify only supplied GuestMemory and the fixed bus.
 #[derive(Debug)]
@@ -152,11 +164,29 @@ pub struct MchPci {
     cf8: PciCf8,
     fixed: Bus,
     aperture: BusRange,
+    bar_windows: Vec<BusRange>,
+    bar_exclusions: Vec<BusRange>,
 }
 
 impl MchPci {
     pub fn new(devices: Vec<(u8, SharedPciDevice)>, fixed_mmio: Bus, ram: &GuestMemory,
                ecam_aperture: BusRange) -> Result<Self, MchError> {
+        Self::with_bar_windows(devices, fixed_mmio, ram, ecam_aperture, Vec::new(), Vec::new())
+    }
+
+    /// Enable checked BAR MMIO in at most two disjoint, page-aligned windows.
+    /// `reserved_ranges` must be the board's COMPLETE private/ROM/MMIO inventory,
+    /// bound to its actual HV mappings (including both SMRAM ranges and KVM's
+    /// private pages). GuestMemory cannot reveal those hidden mappings. We can
+    /// check the supplied inventory, but cannot prove that it is complete.
+    ///
+    /// Every BAR transaction try-locks all distinct endpoints in slot order and
+    /// keeps the guards through validation and dispatch. Busy/poison fails before
+    /// callbacks. Endpoint and IRQ callbacks must not synchronously reenter any
+    /// PCI endpoint/root lock. No hotplug ports or snapshot path are exposed.
+    pub fn with_bar_windows(mut devices: Vec<(u8, SharedPciDevice)>, fixed_mmio: Bus,
+                            ram: &GuestMemory, ecam_aperture: BusRange,
+                            bar_windows: Vec<BusRange>, reserved_ranges: Vec<BusRange>) -> Result<Self, MchError> {
         let finish = end(ecam_aperture).ok_or(MchError::Layout)?;
         if ecam_aperture.len != APERTURE_SIZE || ecam_aperture.base % APERTURE_SIZE != 0
             || finish > ADDRESS_LIMIT
@@ -169,9 +199,34 @@ impl MchPci {
             if !(1..=31).contains(slot) || slots & (1u32 << slot) != 0 { return Err(MchError::Slot); }
             slots |= 1u32 << slot;
         }
+        if bar_windows.len() > 2 || reserved_ranges.len() > 64
+            || (!bar_windows.is_empty() && reserved_ranges.is_empty())
+            || reserved_ranges.iter().any(|r| end(*r).is_none_or(|limit| limit > ADDRESS_LIMIT)) {
+            return Err(MchError::BarLayout);
+        }
+        let mut bar_exclusions = reserved_ranges;
+        bar_exclusions.push(ecam_aperture);
+        bar_exclusions.extend(fixed_mmio.ranges());
+        bar_exclusions.extend(ram.regions().map(|r| BusRange { base: r.start().0, len: r.len() }));
+        for (i, window) in bar_windows.iter().enumerate() {
+            let limit = end(*window).ok_or(MchError::BarLayout)?;
+            if window.base % 4096 != 0 || window.len % 4096 != 0 || limit > ADDRESS_LIMIT
+                || bar_exclusions.iter().any(|r| overlaps(*r, window.base, limit))
+                || bar_windows[..i].iter().any(|r| overlaps(*r, window.base, limit)) {
+                return Err(MchError::BarLayout);
+            }
+        }
+        if !bar_windows.is_empty() {
+            for (i, (_, device)) in devices.iter().enumerate() {
+                if devices[..i].iter().any(|(_, other)| Arc::ptr_eq(device, other)) {
+                    return Err(MchError::EndpointAlias);
+                }
+            }
+            devices.sort_by_key(|(slot, _)| *slot);
+        }
         let root = PciRoot::with_mch(devices, MchConfig::new(ecam_aperture));
         let cf8 = PciCf8::new(root.clone());
-        Ok(Self { root, cf8, fixed: fixed_mmio, aperture: ecam_aperture })
+        Ok(Self { root, cf8, fixed: fixed_mmio, aperture: ecam_aperture, bar_windows, bar_exclusions })
     }
 
     pub fn pio_read(&mut self, port: u16, data: &mut [u8]) -> Result<(), MchError> {
@@ -205,6 +260,10 @@ impl MchPci {
             self.root.config_access(address - window.base, data, write)?;
             return Ok(true);
         }
+        if let Some(window) = self.bar_windows.iter().find(|r| overlaps(**r, address, finish)) {
+            if !contains(*window, address, finish) { return Err(MchError::Boundary); }
+            return self.root.checked_bar_mmio(address, data, write, &self.bar_windows, &self.bar_exclusions);
+        }
         let hit = self.fixed.ranges().find(|range| overlaps(*range, address, finish));
         let Some(range) = hit else { return Ok(false) };
         if !contains(range, address, finish) { return Err(MchError::Boundary); }
@@ -229,7 +288,8 @@ mod tests {
     const SLOT1: u64 = 1 << 15;
 
     #[derive(Default, Debug)]
-    struct Counts { reads: usize, writes: usize, saves: usize, restores: usize, fixed: usize }
+    struct Counts { reads: usize, writes: usize, saves: usize, restores: usize, fixed: usize,
+                    bar_reads: usize, bar_writes: usize, last_bar: Option<(usize, u64)> }
     struct Endpoint { config: ConfigSpace, counts: Arc<Mutex<Counts>> }
     impl PciDevice for Endpoint {
         fn config(&self) -> &ConfigSpace { &self.config }
@@ -242,8 +302,15 @@ mod tests {
             self.counts.lock().unwrap().writes += 1;
             self.config.write(off, data);
         }
-        fn bar_read(&mut self, _: usize, _: u64, _: &mut [u8]) { panic!("BAR MMIO is not wired") }
-        fn bar_write(&mut self, _: usize, _: u64, _: &[u8]) { panic!("BAR MMIO is not wired") }
+        fn bar_read(&mut self, bar: usize, off: u64, data: &mut [u8]) {
+            let mut counts = self.counts.lock().unwrap();
+            counts.bar_reads += 1; counts.last_bar = Some((bar, off));
+            crate::put_le(data, 0x1122_3344 + off);
+        }
+        fn bar_write(&mut self, bar: usize, off: u64, _: &[u8]) {
+            let mut counts = self.counts.lock().unwrap();
+            counts.bar_writes += 1; counts.last_bar = Some((bar, off));
+        }
         fn id(&self) -> String { "mch-test-endpoint".into() }
         fn save(&mut self) -> vroom_snapshot::Result<Vec<u8>> {
             self.counts.lock().unwrap().saves += 1;
@@ -491,5 +558,259 @@ mod tests {
         assert_eq!(data, [0xa5; 4]);
         router.mmio_read(BASE + SLOT1 + 0x10, &mut data).unwrap();
         assert_eq!(u32::from_le_bytes(data), 0x4000);
+    }
+    const BAR_LOW: BusRange = BusRange { base: 0x4000_0000, len: 0x1000_0000 };
+    const BAR_HIGH: BusRange = BusRange { base: 0x8_0000_0000, len: 0x1_0000_0000 };
+
+    fn private_ranges() -> Vec<BusRange> {
+        vec![BusRange { base: 0x30000, len: 0x20000 },
+             BusRange { base: 0x1f80_0000, len: 0x80_0000 },
+             BusRange { base: 0xffbf_c000, len: 0x4000 },
+             BusRange { base: 0xffc0_0000, len: 0x40_0000 },
+             BusRange { base: 0xfec0_0000, len: 0x1000 },
+             BusRange { base: 0xfee0_0000, len: 0x1000 }]
+    }
+    fn bar_router(devices: Vec<(u8, SharedPciDevice)>) -> MchPci {
+        MchPci::with_bar_windows(devices, Bus::default(), &GuestMemory::default(), APERTURE,
+            vec![BAR_LOW, BAR_HIGH], private_ranges()).unwrap()
+    }
+    fn assign(router: &mut MchPci, slot: u8, base: u64, is64: bool) {
+        config_write(router, slot, 4, &0u16.to_le_bytes()).unwrap();
+        config_write(router, slot, 0x10, &(base as u32).to_le_bytes()).unwrap();
+        if is64 { config_write(router, slot, 0x14, &((base >> 32) as u32).to_le_bytes()).unwrap(); }
+        config_write(router, slot, 4, &2u16.to_le_bytes()).unwrap();
+    }
+
+    #[test]
+    fn checked_bar_route_reaches_actual_callback_and_tracks_ecam_rebase() {
+        let (device, counts) = endpoint();
+        let mut router = bar_router(vec![(1, device)]); enable(&mut router);
+        assign(&mut router, 1, BAR_LOW.base, false);
+        let mut data = [0; 4];
+        assert_eq!(router.mmio_read(BAR_LOW.base + 4, &mut data), Ok(true));
+        assert_eq!(u32::from_le_bytes(data), 0x1122_3348);
+        assert_eq!(counts.lock().unwrap().last_bar, Some((0, 4)));
+        router.mmio_write(BAR_LOW.base + 8, &[1, 2, 3, 4]).unwrap();
+        assert_eq!(counts.lock().unwrap().last_bar, Some((0, 8)));
+        router.mmio_write(BASE + SLOT1 + 0x10, &((BAR_LOW.base + 0x2000) as u32).to_le_bytes()).unwrap();
+        data.fill(0xa5);
+        assert_eq!(router.mmio_read(BAR_LOW.base, &mut data), Ok(false));
+        assert_eq!(data, [0xa5; 4]);
+        assert_eq!(router.mmio_read(BAR_LOW.base + 0x2000, &mut data), Ok(true));
+        assert_eq!(counts.lock().unwrap().last_bar, Some((0, 0)));
+    }
+
+    #[test]
+    fn bar64_probes_unassigned_and_mem_disabled_do_not_decode() {
+        let (device, counts) = endpoint();
+        device.lock().unwrap().config_mut().add_bar(0, BarSpec { size: 0x4000, is64: true, prefetch: false });
+        let mut router = bar_router(vec![(1, device)]);
+        let mut data = [0xa5; 4];
+        config_write(&mut router, 1, 4, &2u16.to_le_bytes()).unwrap();
+        assert_eq!(router.mmio_read(BAR_HIGH.base, &mut data), Ok(false)); // Unassigned.
+        config_write(&mut router, 1, 4, &0u16.to_le_bytes()).unwrap();
+        config_write(&mut router, 1, 0x10, &u32::MAX.to_le_bytes()).unwrap();
+        config_write(&mut router, 1, 0x14, &u32::MAX.to_le_bytes()).unwrap();
+        select(&mut router, 1, 0x10); router.pio_read(0xcfc, &mut data).unwrap();
+        assert_eq!(u32::from_le_bytes(data), 0xffff_c004);
+        data.fill(0xa5);
+        assert_eq!(router.mmio_read(BAR_HIGH.base, &mut data), Ok(false));
+        assert_eq!(data, [0xa5; 4]);
+        assign(&mut router, 1, BAR_HIGH.base, true);
+        assert_eq!(router.mmio_read(BAR_HIGH.base, &mut data), Ok(true));
+        assert_eq!(counts.lock().unwrap().bar_reads, 1);
+    }
+
+    #[test]
+    fn entire_enabled_map_is_checked_and_bad_config_is_repairable() {
+        let (first, first_counts) = endpoint(); let (second, second_counts) = endpoint();
+        let mut router = bar_router(vec![(2, second), (1, first)]); enable(&mut router);
+        assign(&mut router, 1, BAR_LOW.base, false);
+        assign(&mut router, 2, BAR_LOW.base + 0x2000, false);
+        let before = second_counts.lock().unwrap().writes;
+        // This callback is accepted and its side effect is NOT rolled back.
+        config_write(&mut router, 2, 0x10, &(BASE as u32).to_le_bytes()).unwrap();
+        assert_eq!(second_counts.lock().unwrap().writes, before + 1);
+        let mut data = [0xa5; 4];
+        assert_eq!(router.mmio_read(BAR_LOW.base, &mut data), Err(MchError::BarMap));
+        assert_eq!(router.mmio_write(BAR_LOW.base, &[0; 4]), Err(MchError::BarMap));
+        assert_eq!(data, [0xa5; 4]);
+        assert_eq!(first_counts.lock().unwrap().bar_reads, 0);
+        assert_eq!(first_counts.lock().unwrap().bar_writes, 0);
+        select(&mut router, 2, 0x10); router.pio_read(0xcfc, &mut data).unwrap();
+        assert_eq!(u32::from_le_bytes(data), BASE as u32);
+        // ECAM still works and repairs the map; no old decode was retained.
+        router.mmio_write(BASE + (2 << 15) + 0x10, &((BAR_LOW.base + 0x2000) as u32).to_le_bytes()).unwrap();
+        assert_eq!(router.mmio_read(BAR_LOW.base, &mut data), Ok(true));
+        assert_eq!(router.mmio_read(BAR_LOW.base + 0x2000, &mut data), Ok(true));
+    }
+
+    #[test]
+    fn overlapping_bars_have_no_order_dependent_winner_but_adjacency_works() {
+        for reverse in [false, true] {
+            let (first, first_counts) = endpoint(); let (second, second_counts) = endpoint();
+            let mut devices = vec![(1, first), (2, second)]; if reverse { devices.reverse(); }
+            let mut router = bar_router(devices);
+            assign(&mut router, 1, BAR_LOW.base, false); assign(&mut router, 2, BAR_LOW.base, false);
+            let mut data = [0xa5; 4];
+            assert_eq!(router.mmio_read(BAR_LOW.base, &mut data), Err(MchError::BarMap));
+            assert_eq!(data, [0xa5; 4]);
+            assert_eq!(first_counts.lock().unwrap().bar_reads + second_counts.lock().unwrap().bar_reads, 0);
+            config_write(&mut router, 2, 0x10, &((BAR_LOW.base + 0x1000) as u32).to_le_bytes()).unwrap();
+            assert_eq!(router.mmio_read(BAR_LOW.base, &mut data), Ok(true));
+            assert_eq!(router.mmio_read(BAR_LOW.base + 0x1000, &mut data), Ok(true));
+            // Internal checked route validates full BAR spans too; outer aligned
+            // scalar accesses normally make this particular crossing impossible.
+            assert_eq!(router.root.checked_bar_mmio(BAR_LOW.base + 0xffc, &mut [0xa5; 8], None,
+                &router.bar_windows, &router.bar_exclusions), Err(MchError::Boundary));
+        }
+    }
+
+    #[test]
+    fn multiple_bars_keep_their_index_and_intra_endpoint_overlap_is_rejected() {
+        let (device, counts) = endpoint();
+        device.lock().unwrap().config_mut().add_bar(2, BarSpec { size: 4096, is64: false, prefetch: false });
+        let mut router = bar_router(vec![(1, device)]);
+        assign(&mut router, 1, BAR_LOW.base, false);
+        config_write(&mut router, 1, 0x18, &((BAR_LOW.base + 0x1000) as u32).to_le_bytes()).unwrap();
+        assert_eq!(router.mmio_write(BAR_LOW.base + 0x1008, &[0; 4]), Ok(true));
+        assert_eq!(counts.lock().unwrap().last_bar, Some((2, 8)));
+        config_write(&mut router, 1, 0x18, &(BAR_LOW.base as u32).to_le_bytes()).unwrap();
+        let mut data = [0xa5; 4];
+        assert_eq!(router.mmio_read(BAR_LOW.base, &mut data), Err(MchError::BarMap));
+        assert_eq!(data, [0xa5; 4]);
+        assert_eq!(counts.lock().unwrap().bar_reads, 0);
+    }
+
+    #[test]
+    fn bar_layout_rejects_missing_private_inventory_and_every_collision_class() {
+        let create = |windows, reserved| MchPci::with_bar_windows(vec![], Bus::default(),
+            &GuestMemory::default(), APERTURE, windows, reserved);
+        assert!(matches!(create(vec![BAR_LOW], vec![]), Err(MchError::BarLayout)));
+        assert!(matches!(create(vec![BAR_LOW; 3], private_ranges()), Err(MchError::BarLayout)));
+        assert!(matches!(create(vec![BAR_LOW], vec![BusRange { base: 0, len: 1 }; 65]), Err(MchError::BarLayout)));
+        for window in [APERTURE, BusRange { base: BAR_LOW.base + 1, len: 4096 },
+                       BusRange { base: BAR_LOW.base, len: 0 }, BusRange { base: ADDRESS_LIMIT, len: 4096 },
+                       BusRange { base: u64::MAX - 4095, len: 4096 }] {
+            assert!(matches!(create(vec![window], private_ranges()), Err(MchError::BarLayout)));
+        }
+        assert!(matches!(create(vec![BAR_LOW, BAR_LOW], private_ranges()), Err(MchError::BarLayout)));
+        assert!(create(vec![BusRange { base: BAR_LOW.base, len: 4096 },
+                           BusRange { base: BAR_LOW.base + 4096, len: 4096 }], private_ranges()).is_ok());
+        for reserved in private_ranges() {
+            assert!(matches!(create(vec![reserved], private_ranges()), Err(MchError::BarLayout)));
+        }
+        for bad in [BusRange { base: 0, len: 0 }, BusRange { base: u64::MAX, len: 2 },
+                    BusRange { base: ADDRESS_LIMIT, len: 1 }] {
+            assert!(matches!(create(vec![BAR_LOW], vec![bad]), Err(MchError::BarLayout)));
+        }
+        let ram = GuestMemory::new(&[(GuestAddress(BAR_LOW.base), page_size() as u64)]).unwrap();
+        assert!(matches!(MchPci::with_bar_windows(vec![], Bus::default(), &ram, APERTURE,
+            vec![BAR_LOW], private_ranges()), Err(MchError::BarLayout)));
+        let mut fixed = BusBuilder::new();
+        fixed.insert(BAR_LOW.base, 4, Arc::new(Mutex::new(Fixed(Arc::default())))).unwrap();
+        assert!(matches!(MchPci::with_bar_windows(vec![], fixed.build(), &GuestMemory::default(), APERTURE,
+            vec![BAR_LOW], private_ranges()), Err(MchError::BarLayout)));
+    }
+
+    #[test]
+    fn invalid_enabled_bar_metadata_fails_before_callbacks() {
+        let (device, counts) = endpoint(); let mut router = bar_router(vec![(1, device.clone())]);
+        assign(&mut router, 1, BAR_LOW.base, false);
+        let pristine = device.lock().unwrap().config().clone();
+        let mut malformed = Vec::new();
+        for (size, is64) in [(0u64, false), (6144, false), (0x2_0000_0000, false)] {
+            let mut value = serde_json::to_value(&pristine).unwrap();
+            value["bars"][0]["size"] = size.into(); value["bars"][0]["is64"] = is64.into();
+            malformed.push(serde_json::from_value::<ConfigSpace>(value).unwrap());
+        }
+        let mut unaligned = pristine.clone(); unaligned.raw_mut()[0x10..0x14].copy_from_slice(&0x4000_0010u32.to_le_bytes());
+        malformed.push(unaligned);
+        let mut overflow = pristine.clone(); overflow.add_bar(0, BarSpec { size: 4096, is64: true, prefetch: false });
+        overflow.write(0x10, &u32::MAX.to_le_bytes()); overflow.write(0x14, &u32::MAX.to_le_bytes()); malformed.push(overflow);
+        let mut pair = pristine.clone(); pair.add_bar(0, BarSpec { size: 4096, is64: true, prefetch: false });
+        pair.add_bar(1, BarSpec { size: 4096, is64: false, prefetch: false }); malformed.push(pair);
+        for config in malformed {
+            *device.lock().unwrap().config_mut() = config;
+            let mut data = [0xa5; 4];
+            assert_eq!(router.mmio_read(BAR_LOW.base, &mut data), Err(MchError::BarMap));
+            assert_eq!(data, [0xa5; 4]);
+        }
+        assert_eq!(counts.lock().unwrap().bar_reads, 0);
+        *device.lock().unwrap().config_mut() = pristine;
+        assert_eq!(router.mmio_read(BAR_LOW.base, &mut [0; 4]), Ok(true));
+    }
+
+    #[test]
+    fn endpoint_alias_busy_and_poison_are_fail_closed() {
+        let (device, counts) = endpoint();
+        assert!(matches!(MchPci::with_bar_windows(vec![(1, device.clone()), (2, device.clone())], Bus::default(),
+            &GuestMemory::default(), APERTURE, vec![BAR_LOW], private_ranges()), Err(MchError::EndpointAlias)));
+        let mut router = bar_router(vec![(1, device.clone())]); assign(&mut router, 1, BAR_LOW.base, false);
+        let guard = device.lock().unwrap(); let mut data = [0xa5; 4];
+        assert_eq!(router.mmio_read(BAR_LOW.base, &mut data), Err(MchError::BarBusy));
+        assert_eq!(data, [0xa5; 4]); drop(guard);
+        let poison = device.clone();
+        assert!(std::thread::spawn(move || { let _guard = poison.lock().unwrap(); panic!("intentional poison fixture"); }).join().is_err());
+        assert_eq!(router.mmio_read(BAR_LOW.base, &mut data), Err(MchError::BarPoisoned));
+        assert_eq!(data, [0xa5; 4]); assert_eq!(counts.lock().unwrap().bar_reads, 0);
+    }
+
+    #[test]
+    fn all_endpoint_guards_survive_until_the_selected_callback_finishes() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        struct Blocking {
+            config: ConfigSpace, entered: mpsc::Sender<()>, release: mpsc::Receiver<()>,
+        }
+        impl PciDevice for Blocking {
+            fn config(&self) -> &ConfigSpace { &self.config }
+            fn config_mut(&mut self) -> &mut ConfigSpace { &mut self.config }
+            fn bar_read(&mut self, _: usize, _: u64, data: &mut [u8]) {
+                self.entered.send(()).unwrap(); self.release.recv_timeout(Duration::from_secs(2)).unwrap(); data.fill(0x55);
+            }
+            fn bar_write(&mut self, _: usize, _: u64, _: &[u8]) { panic!("no write") }
+            fn id(&self) -> String { "blocking".into() }
+            fn save(&mut self) -> vroom_snapshot::Result<Vec<u8>> { panic!("cold only") }
+            fn restore(&mut self, _: &[u8]) -> vroom_snapshot::Result<()> { panic!("cold only") }
+        }
+        let (other, _) = endpoint(); let config = other.lock().unwrap().config().clone();
+        let (entered_tx, entered_rx) = mpsc::channel(); let (release_tx, release_rx) = mpsc::channel();
+        let first: SharedPciDevice = Arc::new(Mutex::new(Blocking { config, entered: entered_tx, release: release_rx }));
+        let mut router = bar_router(vec![(1, first), (2, other.clone())]);
+        assign(&mut router, 1, BAR_LOW.base, false); assign(&mut router, 2, BAR_LOW.base + 0x2000, false);
+        let reader = std::thread::spawn(move || {
+            let mut data = [0; 4]; assert_eq!(router.mmio_read(BAR_LOW.base, &mut data), Ok(true));
+            assert_eq!(data, [0x55; 4]); router
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(other.try_lock(), Err(std::sync::TryLockError::WouldBlock)));
+        let (started_tx, started_rx) = mpsc::channel(); let (changed_tx, changed_rx) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            other.lock().unwrap().config_mut().write(0x10, &(BASE as u32).to_le_bytes());
+            changed_tx.send(()).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(changed_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        release_tx.send(()).unwrap();
+        let mut router = reader.join().unwrap(); writer.join().unwrap();
+        changed_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(router.mmio_read(BAR_LOW.base, &mut [0; 4]), Err(MchError::BarMap));
+    }
+
+    #[test]
+    fn real_nvme_cap_and_version_are_reachable_without_disks_or_queues() {
+        struct NoMsi;
+        impl crate::pci::MsiSender for NoMsi { fn send(&self, _: u64, _: u32) { panic!("no interrupt expected") } }
+        let irq = crate::pci::IntxRouter::new((0..4).map(|_| Arc::new(crate::NoIrq) as Arc<dyn crate::IrqLine>).collect());
+        let nvme = crate::nvme::Nvme::new(1, vec![], GuestMemory::default(), irq.pin(1, 1), Arc::new(NoMsi)).into_shared();
+        let mut router = bar_router(vec![(1, nvme)]); assign(&mut router, 1, BAR_HIGH.base, true);
+        let mut cap = [0; 8]; let mut version = [0; 4];
+        assert_eq!(router.mmio_read(BAR_HIGH.base, &mut cap), Ok(true));
+        assert_ne!(u64::from_le_bytes(cap) & (1 << 37), 0);
+        assert_eq!(router.mmio_read(BAR_HIGH.base + 8, &mut version), Ok(true));
+        assert_eq!(u32::from_le_bytes(version), 0x0001_0400);
+        // No CC enable/doorbell write, namespace, disk, worker, guest or VM.
     }
 }
