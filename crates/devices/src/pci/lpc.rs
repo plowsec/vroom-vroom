@@ -1,7 +1,8 @@
 //! Checked ICH9 LPC PM decode and free-running ACPI timer, cold boot only.
 //!
-//! APM SMI requests use an explicit stopped-CPU callback; SCI and power
-//! management remain unsupported. In particular, ACPI_EN
+//! APM SMI requests use an explicit stopped-CPU callback; normal S5 uses a
+//! typed terminal result. SCI and other power management remain unsupported.
+//! In particular, ACPI_EN
 //! enables the PM port window, not an SCI or an ACPI guest mode transition.
 //! The selected OVMF enables this window before PCI_COMMAND.IOSE, so IOSE must
 //! not gate the timer. No host clock, scheduler or infallible device callback
@@ -27,6 +28,8 @@ const SMI_LOCK: u16 = 1 << 4;
 const SMI_EN_OFFSET: u64 = 0x30;
 const GBL_SMI_EN: u32 = 1;
 const APMC_EN: u32 = 1 << 5;
+const PM1_CNT_OFFSET: u64 = 4;
+const SLP_EN: u16 = 1 << 13;
 
 /// Describe THIS completed RUN's exit, not a cached mode or authorization
 /// token. The injection backend must independently check the actual CPU.
@@ -37,6 +40,13 @@ pub enum LpcIoContext { Normal, Smm }
 /// handler and subsequent RSM/normal continuation to be observed separately.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LpcSmiRequest { pub command: u8, pub data: u8 }
+
+/// The owner must consume AcpiS5 by stopping the actual exiting CPU without
+/// another RUN. A bool cannot represent that effect. The device itself does
+/// not own the CPU; its terminal latch only closes subsequent router access.
+#[must_use = "AcpiS5 requires the VM owner to stop before another RUN"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LpcPioWriteOutcome { Unmapped, Handled, AcpiS5 }
 
 pub(super) type Inject<'a> = &'a mut dyn FnMut(LpcSmiRequest) -> Result<(), LpcError>;
 
@@ -68,6 +78,12 @@ pub enum LpcError {
     SmiBackend,
     #[error("LPC router is poisoned after an ambiguous SMI request")]
     SmiPoisoned,
+    #[error("S5 requires a typed terminal consumer for the actual exit")]
+    PowerConsumerRequired,
+    #[error("only normal-context S5 is supported")]
+    PowerContext,
+    #[error("LPC is terminal after an accepted ACPI S5 request")]
+    PoweredOff,
 }
 
 fn end(r: BusRange) -> Option<u64> {
@@ -133,6 +149,7 @@ pub(super) struct Ich9Lpc {
     apm_command: u8,
     apm_data: u8,
     poisoned: bool,
+    powered_off: bool,
 }
 
 impl Ich9Lpc {
@@ -144,11 +161,12 @@ impl Ich9Lpc {
         config.set_wmask(4, &[1, 0]);
         config.raw_mut()[PMBASE..PMBASE + 4].copy_from_slice(&1u32.to_le_bytes());
         Self { config, layout, last_ns: 0, smi_en: 0, smi_locked: false,
-            apm_command: 0, apm_data: 0, poisoned: false }
+            apm_command: 0, apm_data: 0, poisoned: false, powered_off: false }
     }
 
     pub(super) fn check(&self) -> Result<(), LpcError> {
-        if self.poisoned { Err(LpcError::SmiPoisoned) } else { Ok(()) }
+        if self.poisoned { Err(LpcError::SmiPoisoned) }
+        else if self.powered_off { Err(LpcError::PoweredOff) } else { Ok(()) }
     }
 
     fn base(&self) -> u32 {
@@ -222,11 +240,57 @@ impl Ich9Lpc {
         self.pio_with_smi(port, data, write, elapsed_ns, None, None)
     }
 
+    fn pm1_span(&self, port: u16, len: usize) -> Result<bool, LpcError> {
+        let (start, finish) = Self::port_span(port, len)?;
+        let Some(base) = self.decode(self.base(), self.config.raw()[ACPI_CNTL])? else { return Ok(false) };
+        if finish <= base || start >= base + PM_LEN { return Ok(false); }
+        if start < base || finish > base + PM_LEN { return Err(LpcError::Boundary); }
+        if start < base + PM1_CNT_OFFSET + 2 && finish > base + PM1_CNT_OFFSET {
+            if start != base + PM1_CNT_OFFSET || len != 2 { return Err(LpcError::Boundary); }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn pm1_value(bytes: &[u8]) -> Result<u16, LpcError> {
+        let value = u16::from_le_bytes(bytes.try_into().map_err(|_| LpcError::Width)?);
+        // First-EFI subset: SCI is disabled, SLP_TYP0 is the only sleep type,
+        // no BM_RLD/GBL_RLS or event-service bits are fabricated as storage.
+        if value & !SLP_EN != 0 { return Err(LpcError::ReservedBits); }
+        Ok(value)
+    }
+
+    pub(super) fn pio_write_with_power(&mut self, port: u16, data: &[u8], elapsed_ns: u64,
+        context: LpcIoContext) -> Result<LpcPioWriteOutcome, LpcError> {
+        self.check()?;
+        if self.pm1_span(port, data.len())? {
+            let value = Self::pm1_value(data)?;
+            if value == 0 { return Ok(LpcPioWriteOutcome::Handled); }
+            if context != LpcIoContext::Normal { return Err(LpcError::PowerContext); }
+            // Terminal before the outcome escapes. No callback, invisible
+            // hardware stop or rollback is claimed; the real owner must stop.
+            self.powered_off = true;
+            return Ok(LpcPioWriteOutcome::AcpiS5);
+        }
+        // This API cannot inject an APM SMI: B2 still needs its own callback.
+        self.pio(port, &mut [], Some(data), elapsed_ns)
+            .map(|handled| if handled { LpcPioWriteOutcome::Handled } else { LpcPioWriteOutcome::Unmapped })
+    }
+
     pub(super) fn pio_with_smi(&mut self, port: u16, data: &mut [u8], write: Option<&[u8]>, elapsed_ns: u64,
         context: Option<LpcIoContext>, inject: Option<Inject<'_>>) -> Result<bool, LpcError> {
         self.check()?;
         let len = write.map_or(data.len(), |bytes| bytes.len());
         let (start, finish) = Self::port_span(port, len)?;
+        if self.pm1_span(port, len)? {
+            match write {
+                Some(bytes) => {
+                    if Self::pm1_value(bytes)? != 0 { return Err(LpcError::PowerConsumerRequired); }
+                }
+                None => data.fill(0), // SLP_EN is a command, never retained storage.
+            }
+            return Ok(true);
+        }
         // Fixed APM ports exist independently of PMBASE and ACPI_EN. Reject
         // an overlapping wide access before invoking any backend or mutation.
         if start < 0xb4 && finish > 0xb2 {
@@ -382,7 +446,7 @@ mod tests {
         let mut lpc = Ich9Lpc::new(layout()); enable(&mut lpc);
         for (port, len, error) in [(0x5ff, 2, LpcError::Boundary), (0x67f, 2, LpcError::Boundary),
             (0x607, 2, LpcError::Boundary), (0x609, 4, LpcError::Boundary),
-            (0x604, 2, LpcError::UnsupportedRegister), (0x634, 4, LpcError::UnsupportedRegister),
+            (0x600, 2, LpcError::UnsupportedRegister), (0x634, 4, LpcError::UnsupportedRegister),
             (0xffff, 2, LpcError::Boundary), (0x608, 3, LpcError::Width)] {
             let mut b = vec![0x55; len];
             assert_eq!(lpc.pio(port, &mut b, None, u64::MAX), Err(error));
@@ -514,5 +578,73 @@ mod tests {
             assert_eq!(data, [0xa5; 4]);
             assert_eq!(command(&mut lpc, 0x43, LpcIoContext::Normal, &mut |_| panic!("retry")), Err(LpcError::SmiPoisoned));
         }
+    }
+
+    #[test]
+    fn pm1_clear_and_readback_do_not_arm_or_fake_sci_before_terminal_s5() {
+        for clear_first in [false, true] {
+            let mut lpc = Ich9Lpc::new(layout()); enable(&mut lpc);
+            let mut value = [0xa5; 2];
+            assert!(lpc.pio(0x604, &mut value, None, 0).unwrap()); assert_eq!(value, [0, 0]);
+            if clear_first {
+                assert_eq!(lpc.pio_write_with_power(0x604, &[0, 0], 0, LpcIoContext::Normal), Ok(LpcPioWriteOutcome::Handled));
+                assert!(lpc.pio(0x604, &mut value, None, 0).unwrap()); assert_eq!(value, [0, 0]);
+                assert!(!lpc.powered_off);
+            }
+            assert_eq!(lpc.pio_write_with_power(0x604, &SLP_EN.to_le_bytes(), 0, LpcIoContext::Normal), Ok(LpcPioWriteOutcome::AcpiS5));
+            assert!(lpc.powered_off); assert!(!lpc.poisoned, "normal poweroff is not an ambiguous SMI failure");
+            value.fill(0xa5);
+            assert_eq!(lpc.pio(0x604, &mut value, None, 0), Err(LpcError::PoweredOff));
+            assert_eq!(lpc.config_access(PMBASE, &mut value, None), Err(LpcError::PoweredOff));
+            assert_eq!(value, [0xa5; 2]);
+            assert_eq!(lpc.pio_write_with_power(0x604, &SLP_EN.to_le_bytes(), 0, LpcIoContext::Normal), Err(LpcError::PoweredOff));
+        }
+    }
+
+    #[test]
+    fn missing_terminal_consumer_and_smm_context_refuse_before_mutation() {
+        let mut lpc = Ich9Lpc::new(layout()); enable(&mut lpc);
+        assert_eq!(lpc.pio(0x604, &mut [], Some(&SLP_EN.to_le_bytes()), 0), Err(LpcError::PowerConsumerRequired));
+        assert_eq!(lpc.pio_with_smi(0x604, &mut [], Some(&SLP_EN.to_le_bytes()), 0,
+            Some(LpcIoContext::Normal), Some(&mut |_| panic!("power write injected SMI"))), Err(LpcError::PowerConsumerRequired));
+        assert_eq!(lpc.pio_write_with_power(0x604, &SLP_EN.to_le_bytes(), 0, LpcIoContext::Smm), Err(LpcError::PowerContext));
+        assert_eq!(lpc.pio_write_with_power(0xb2, &[0x42], 0, LpcIoContext::Normal), Err(LpcError::SmiBackendRequired));
+        assert!(!lpc.powered_off); assert!(!lpc.poisoned);
+        assert_eq!(lpc.pio_write_with_power(0x604, &[0; 2], 0, LpcIoContext::Smm), Ok(LpcPioWriteOutcome::Handled));
+        assert_eq!(lpc.pio_write_with_power(0x604, &SLP_EN.to_le_bytes(), 0, LpcIoContext::Normal), Ok(LpcPioWriteOutcome::AcpiS5));
+    }
+
+    #[test]
+    fn pm1_unsupported_controls_and_full_spans_have_no_side_effects() {
+        let mut lpc = Ich9Lpc::new(layout()); enable(&mut lpc);
+        for bit in (0..16).filter(|b| *b != 13) {
+            for value in [1u16 << bit, (1u16 << bit) | SLP_EN] {
+                assert_eq!(lpc.pio_write_with_power(0x604, &value.to_le_bytes(), 0, LpcIoContext::Normal), Err(LpcError::ReservedBits));
+                assert!(!lpc.powered_off);
+            }
+        }
+        for (port, len) in [(0x603, 2), (0x604, 1), (0x604, 4), (0x605, 1), (0x605, 2)] {
+            let mut value = vec![0xa5; len];
+            assert_eq!(lpc.pio(port, &mut value, None, 0), Err(LpcError::Boundary)); assert!(value.iter().all(|b| *b == 0xa5));
+            assert_eq!(lpc.pio_write_with_power(port, &vec![0; len], 0, LpcIoContext::Normal), Err(LpcError::Boundary));
+        }
+        assert!(!lpc.powered_off); assert_eq!(lpc.last_ns, 0);
+        for port in [0x600, 0x602, 0x606, 0x620] {
+            assert_eq!(lpc.pio_write_with_power(port, &[0; 2], 0, LpcIoContext::Normal), Err(LpcError::UnsupportedRegister));
+        }
+    }
+
+    #[test]
+    fn power_decode_follows_actual_pm_window_and_never_old_ports() {
+        let mut lpc = Ich9Lpc::new(layout());
+        assert_eq!(lpc.pio_write_with_power(0x604, &SLP_EN.to_le_bytes(), 0, LpcIoContext::Normal), Ok(LpcPioWriteOutcome::Unmapped));
+        enable(&mut lpc); write(&mut lpc, PMBASE, &0x800u32.to_le_bytes()).unwrap();
+        assert_eq!(lpc.pio_write_with_power(0x604, &SLP_EN.to_le_bytes(), 0, LpcIoContext::Normal), Ok(LpcPioWriteOutcome::Unmapped));
+        let mut value = [0xa5; 2]; assert!(!lpc.pio(0x604, &mut value, None, 0).unwrap()); assert_eq!(value, [0xa5; 2]);
+        assert!(lpc.pio(0x804, &mut value, None, 0).unwrap()); assert_eq!(value, [0; 2]);
+        write(&mut lpc, ACPI_CNTL, &[0]).unwrap();
+        assert_eq!(lpc.pio_write_with_power(0x804, &SLP_EN.to_le_bytes(), 0, LpcIoContext::Normal), Ok(LpcPioWriteOutcome::Unmapped));
+        write(&mut lpc, ACPI_CNTL, &[ACPI_EN]).unwrap();
+        assert_eq!(lpc.pio_write_with_power(0x804, &SLP_EN.to_le_bytes(), 0, LpcIoContext::Normal), Ok(LpcPioWriteOutcome::AcpiS5));
     }
 }

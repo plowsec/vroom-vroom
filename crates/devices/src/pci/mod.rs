@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 
 pub use config::{BarSpec, ConfigSpace, PciId, VendorIds, CFG_SIZE};
 pub use cf8::{PciCf8, PciCf8Error};
-pub use lpc::{LpcError, LpcIoContext, LpcPioLayout, LpcSmiRequest};
+pub use lpc::{LpcError, LpcIoContext, LpcPioLayout, LpcPioWriteOutcome, LpcSmiRequest};
 pub use mch::{MchError, MchPci, PciConfigError};
 pub use msi::Msi;
 pub use msix::{Msix, MsiSender};

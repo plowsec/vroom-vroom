@@ -226,7 +226,8 @@ impl MchPci {
 
     /// Add the checked LPC PM timer at slot 31.0 to the fixed-Q35 SMRAM model.
     /// All `with_q35_smram` backend/inventory obligations still apply. The LPC
-    /// owns no generic endpoint handle and supports no SMI, SCI, S5 or RTC yet.
+    /// owns no generic endpoint handle. APM SMI needs its stopped-CPU callback;
+    /// normal S5 needs its typed terminal consumer. SCI and RTC are separate.
     /// This is a cold-only device composition, not an OVMF/Windows VMM profile.
     pub fn with_q35_lpc(devices: Vec<(u8, SharedPciDevice)>, fixed_mmio: Bus,
                        ram: &GuestMemory, ecam_aperture: BusRange,
@@ -336,6 +337,17 @@ impl MchPci {
         context: super::LpcIoContext, inject: &mut dyn FnMut(super::LpcSmiRequest) -> Result<(), LpcError>) -> Result<bool, MchError> {
         self.root.mch_check()?;
         Ok(self.root.lpc_pio_write_with_smi(port, data, elapsed_ns, context, inject)?)
+    }
+
+    /// Consume AcpiS5 as terminal on the actual exiting CPU: no more RUN or
+    /// read completion, then drop the owned VM/CPU state. Context describes
+    /// THIS exit, not cached mode. The router latches terminal before returning
+    /// the outcome; it does not secretly stop an independently owned CPU.
+    /// Existing bool APIs reject power effects instead of discarding them.
+    pub fn lpc_pio_write_with_power(&mut self, port: u16, data: &[u8], elapsed_ns: u64,
+        context: super::LpcIoContext) -> Result<super::LpcPioWriteOutcome, MchError> {
+        self.root.mch_check()?;
+        Ok(self.root.lpc_pio_write_with_power(port, data, elapsed_ns, context)?)
     }
 
     /// The nonstored callback must apply the requested state on the sole vCPU
@@ -773,6 +785,7 @@ mod tests {
         assert_eq!(router.lpc_pio_write(0x608, &[0; 4], 0), Err(poisoned));
         assert_eq!(router.lpc_pio_read(0x700, &mut data, 0), Err(poisoned));
         assert_eq!(router.mmio_read(slot, &mut data), Err(poisoned));
+        assert_eq!(router.lpc_pio_write_with_power(0x604, &[0, 0x20], 0, super::super::LpcIoContext::Normal), Err(poisoned));
         assert_eq!(data, [0xa5; 4]);
     }
 
@@ -816,6 +829,7 @@ mod tests {
                 assert_eq!(router.lpc_pio_write_with_smi(port, &[0], 0, LpcIoContext::Normal,
                     &mut |_| panic!("SMI retry")), Err(error));
             }
+            assert_eq!(router.lpc_pio_write_with_power(0x604, &[0, 0x20], 0, LpcIoContext::Normal), Err(error));
             assert_eq!(data, [0xa5; 4]);
             assert_eq!(*counts.lock().unwrap(), before);
         }
@@ -843,6 +857,38 @@ mod tests {
         assert_eq!(router.lpc_pio_write_with_smi(0xb2, &[0x43], 0, LpcIoContext::Smm,
             &mut |_| panic!("nested SMI")), Err(MchError::Lpc(LpcError::SmiContext)));
         router.lpc_pio_read(0xb2, &mut read[..1], 0).unwrap(); assert_eq!(read[0], 0x42);
+    }
+
+    #[test]
+    fn consumed_s5_is_typed_once_and_all_routes_are_terminal() {
+        use super::super::{LpcIoContext, LpcPioWriteOutcome};
+        let (device, counts) = endpoint();
+        let mut fixed = BusBuilder::new();
+        fixed.insert(0x1000, 8, Arc::new(Mutex::new(Fixed(counts.clone())))).unwrap();
+        let mut router = MchPci::with_q35_lpc(vec![(1, device)], fixed.build(), &GuestMemory::default(),
+            APERTURE, vec![BAR_LOW], private_ranges(), lpc_layout()).unwrap(); enable(&mut router);
+        let slot = BASE + (31 << 15);
+        router.mmio_write(slot + 0x40, &0x600u32.to_le_bytes()).unwrap(); router.mmio_write(slot + 0x44, &[0x80]).unwrap();
+        assert_eq!(router.lpc_pio_write(0x604, &[0, 0x20], 0), Err(MchError::Lpc(LpcError::PowerConsumerRequired)));
+        assert_eq!(router.lpc_pio_write_with_power(0x604, &[0; 2], 0, LpcIoContext::Normal), Ok(LpcPioWriteOutcome::Handled));
+        let mut read = [0xa5; 4]; assert!(router.lpc_pio_read(0x604, &mut read[..2], 0).unwrap()); assert_eq!(&read[..2], &[0; 2]);
+        assert_eq!(router.lpc_pio_write_with_power(0x604, &[0, 0x20], 0, LpcIoContext::Normal), Ok(LpcPioWriteOutcome::AcpiS5));
+        let before = counts.lock().unwrap().clone(); read.fill(0xa5);
+        let terminal = MchError::Config(PciConfigError::Lpc(LpcError::PoweredOff));
+        for port in [0xcf8, 0xcfc] {
+            assert_eq!(router.pio_read(port, &mut read), Err(terminal)); assert_eq!(router.pio_write(port, &[0; 4]), Err(terminal));
+            assert_eq!(router.pio_write_with_smram(port, &[0; 4], &mut |_| panic!("mapping after S5")), Err(terminal));
+        }
+        for addr in [BASE, slot, BASE + SLOT1, 0x1000, BAR_LOW.base, 0x3000] {
+            assert_eq!(router.mmio_read(addr, &mut read), Err(terminal)); assert_eq!(router.mmio_write(addr, &[0; 4]), Err(terminal));
+            assert_eq!(router.mmio_write_with_smram(addr, &[0; 4], &mut |_| panic!("mapping after S5")), Err(terminal));
+        }
+        for port in [0x604, 0x608, 0xb2, 0xb3, 0x700] {
+            assert_eq!(router.lpc_pio_read(port, &mut read[..1], 0), Err(terminal)); assert_eq!(router.lpc_pio_write(port, &[0], 0), Err(terminal));
+            assert_eq!(router.lpc_pio_write_with_smi(port, &[0], 0, LpcIoContext::Normal, &mut |_| panic!("SMI after S5")), Err(terminal));
+            assert_eq!(router.lpc_pio_write_with_power(port, &[0, 0x20], 0, LpcIoContext::Normal), Err(terminal));
+        }
+        assert_eq!(*counts.lock().unwrap(), before); assert_eq!(read, [0xa5; 4]);
     }
 
     #[test]

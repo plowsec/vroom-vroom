@@ -176,6 +176,15 @@ impl PciRoot {
         }
     }
 
+    pub(super) fn lpc_pio_write_with_power(&self, port: u16, data: &[u8], elapsed_ns: u64,
+        context: super::LpcIoContext) -> Result<super::LpcPioWriteOutcome, super::LpcError> {
+        Ich9Lpc::port_span(port, data.len())?;
+        match &self.lpc {
+            Some(lpc) => lock(lpc).pio_write_with_power(port, data, elapsed_ns, context),
+            None => Ok(super::LpcPioWriteOutcome::Unmapped),
+        }
+    }
+
     fn device(&self, slot: u8) -> Option<&SharedPciDevice> {
         self.devices.iter().find(|(s, _)| *s == slot).map(|(_, d)| d)
     }
