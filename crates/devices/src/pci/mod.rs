@@ -1,5 +1,6 @@
-//! PCI(e): config space, MSI-X, INTx routing and the ECAM root complex.
+//! PCI(e): config space, MSI-X, INTx, ECAM and checked legacy CF8/CFC access.
 
+mod cf8;
 mod config;
 pub mod msi;
 pub mod msix;
@@ -9,6 +10,7 @@ mod root;
 use std::sync::{Arc, Mutex};
 
 pub use config::{BarSpec, ConfigSpace, PciId, VendorIds, CFG_SIZE};
+pub use cf8::{PciCf8, PciCf8Error};
 pub use msi::Msi;
 pub use msix::{Msix, MsiSender};
 pub use port::RootPort;

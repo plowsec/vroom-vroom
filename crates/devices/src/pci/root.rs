@@ -1,4 +1,4 @@
-//! Root complex: ECAM config access, BAR windows, INTx routing, and the
+//! Root complex: shared PCI config access, BAR windows, INTx routing, and the
 //! hot plug root ports' buses.
 
 use std::collections::BTreeMap;
@@ -166,22 +166,31 @@ impl PciRoot {
         })
     }
 
-    fn ecam(&self, off: u64, data: &mut [u8], write: Option<&[u8]>) {
+    /// Shared ECAM-encoded config cycle. Validate the whole span before any
+    /// callback, read-buffer mutation or BAR/hotplug side effect. False means
+    /// malformed; a valid cycle to an absent function still succeeds.
+    /// Keep ECAM's existing byte/unaligned/bulk access behavior within one
+    /// 4 KiB function. The legacy adapter imposes its narrower scalar rules.
+    pub(super) fn config_access(&self, off: u64, data: &mut [u8], write: Option<&[u8]>) -> bool {
+        let reg = (off & 0xfff) as usize;
+        let len = write.map_or(data.len(), |w| w.len());
+        if off >= 1 << 28 || len == 0 || reg.checked_add(len).is_none_or(|end| end > super::CFG_SIZE) {
+            return false;
+        }
         let bus = off >> 20;
         let slot = ((off >> 15) & 31) as u8;
         let func = (off >> 12) & 7;
-        let reg = (off & 0xfff) as usize;
         if bus == 0 && slot == 0 && func == 0 {
             let mut h = lock(&self.host);
             match write {
                 Some(w) => h.write(reg, w),
                 None => h.read(reg, data),
             }
-            return;
+            return true;
         }
         let Some(d) = self.target(bus, slot, func) else {
             data.fill(0xff);
-            return;
+            return true;
         };
         let mut d = lock(&d);
         match write {
@@ -195,6 +204,7 @@ impl PciRoot {
             self.remap();
             drop(gone);
         }
+        true
     }
 
     /// Devices the ports let go of: the caller drops them once it holds
@@ -296,11 +306,10 @@ pub struct EcamPort(Arc<PciRoot>);
 
 impl BusDevice for EcamPort {
     fn read(&mut self, offset: u64, data: &mut [u8]) {
-        self.0.ecam(offset, data, None);
+        if !self.0.config_access(offset, data, None) { data.fill(0xff); }
     }
     fn write(&mut self, offset: u64, data: &[u8]) {
-        let mut scratch = [0u8; 8];
-        self.0.ecam(offset, &mut scratch[..data.len().min(8)], Some(data));
+        self.0.config_access(offset, &mut [], Some(data));
     }
 }
 
