@@ -103,6 +103,29 @@ class TransferTests(unittest.TestCase):
 
 
 class BundleTests(unittest.TestCase):
+    def test_smm_source_profile_has_exact_example_and_no_media_helpers(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            names = ['crates/hv/build.rs', 'crates/linux-harness/examples/smm_flash.rs']
+            for crate in bundle.LINUX_CRATES:
+                names += ['crates/' + crate + '/Cargo.toml', 'crates/' + crate + '/src/lib.rs']
+            for name in names:
+                path = root / name; path.parent.mkdir(parents=True, exist_ok=True); path.write_text('fixture')
+            sources = {path.as_posix() for path in bundle.selected_sources(root, 'smm_flash')}
+            self.assertEqual(sources, set(names))
+            self.assertFalse(set(bundle.LINUX_SCRIPTS) & sources)
+            self.assertEqual(bundle.workload_target('smm_flash'), 'x86_64-unknown-linux-gnu')
+            (root / 'crates/linux-harness/examples/smm_flash.rs').unlink()
+            with self.assertRaisesRegex(bundle.BundleError, 'source missing'):
+                bundle.selected_sources(root, 'smm_flash')
+        script = bundle.build_script('smm_flash')
+        self.assertIn('exec timeout -k 5s 360s sh', script)
+        self.assertIn('20s target/x86_64-unknown-linux-gnu/debug/examples/smm_flash', script)
+        self.assertIn('CARGO_NET_OFFLINE=true', script)
+        self.assertNotIn('qemu', script)
+        self.assertNotIn('heartbeat', script)
+        self.assertNotIn('select-packaged-kernel', script)
+
     def test_combined_arm_profile_includes_both_workloads_and_hard_outer_bound(self):
         sources = {path.as_posix() for path in bundle.selected_sources(bundle.ROOT, 'linux_harness_arm64')}
         self.assertIn('crates/hv/examples/smoke.rs', sources)

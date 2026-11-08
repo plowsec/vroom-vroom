@@ -46,7 +46,7 @@ def toml_value(value):
 
 
 def workload_crates(example):
-    if example in ("linux_harness", "linux_harness_arm64"):
+    if example in ("linux_harness", "linux_harness_arm64", "smm_flash"):
         return LINUX_CRATES
     if example in ("smoke", "smoke_x86_64"):
         return CRATES
@@ -90,7 +90,9 @@ def selected_sources(root, example):
     excluded_backend = {"crates/hv/src/kvm/x86_64.rs"} if workload_target(example).startswith("aarch64") else {
         "crates/hv/src/kvm/aarch64.rs", "crates/hv/src/kvm/gic.rs"}
     selected = [Path("crates/hv/build.rs")]
-    if example in ("linux_harness", "linux_harness_arm64"):
+    if example == "smm_flash":
+        selected.append(Path("crates/linux-harness/examples/smm_flash.rs"))
+    elif example in ("linux_harness", "linux_harness_arm64"):
         selected.extend(Path(name) for name in LINUX_SCRIPTS)
         if example == "linux_harness_arm64":
             selected.extend(Path(name) for name in ARM_SCRIPTS)
@@ -160,7 +162,7 @@ def stage_sources(root, stage, example, allow_fetch=False):
     (stage / ".cargo/config.toml").write_text('[source.crates-io]\nreplace-with = "vendored-sources"\n\n[source.vendored-sources]\ndirectory = "vendor"\n')
     (stage / "build-and-run.sh").write_text(build_script(example))
     os.chmod(stage / "build-and-run.sh", 0o755)
-    manifest = {"schema_version": 1, "purpose": "native Linux harness only" if example in ("linux_harness", "linux_harness_arm64") else "native hypervisor smoke only", "example": example,
+    manifest = {"schema_version": 1, "purpose": "native SMM isolation microharness only" if example == "smm_flash" else "native Linux harness only" if example in ("linux_harness", "linux_harness_arm64") else "native hypervisor smoke only", "example": example,
         "target": workload_target(example), "first_party_files": [str(path) for path in sorted(sources)],
         "registry_package_count": sum(item.get("source") is not None for item in reduced["package"]),
         "source_files": {str(path): digest((stage / path).read_bytes()) for path in sorted(sources)},
@@ -171,6 +173,21 @@ def stage_sources(root, stage, example, allow_fetch=False):
 
 
 def build_script(example):
+    if example == "smm_flash":
+        # Reproduction from the source bundle only. AWS plans use a separately
+        # reviewed prebuilt package and never fall back to building on a host.
+        return """#!/bin/sh
+set -eu
+[ "$(uname -s)" = Linux ] && [ "$(uname -m)" = x86_64 ] || exit 2
+cd "$(dirname "$0")"
+exec timeout -k 5s 360s sh <<'VROOM_SMM_BOUND'
+set -eu
+export CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_HOME="$PWD/.cargo-home"
+mkdir -p "$CARGO_HOME"
+timeout -k 5s 300s sh -c 'cargo test --frozen -p vroom-hv -p vroom-devices -p vroom-linux-harness --lib --target x86_64-unknown-linux-gnu && cargo build --frozen -p vroom-linux-harness --example smm_flash --target x86_64-unknown-linux-gnu'
+timeout -k 2s 20s target/x86_64-unknown-linux-gnu/debug/examples/smm_flash
+VROOM_SMM_BOUND
+"""
     if example == "linux_harness_arm64":
         return '''#!/bin/sh
 set -eu
@@ -303,7 +320,7 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
     stage = sub.add_parser("stage")
     stage.add_argument("output", type=Path)
-    stage.add_argument("--example", choices=("smoke", "smoke_x86_64", "linux_harness", "linux_harness_arm64"), default="smoke_x86_64")
+    stage.add_argument("--example", choices=("smoke", "smoke_x86_64", "linux_harness", "linux_harness_arm64", "smm_flash"), default="smoke_x86_64")
     stage.add_argument("--allow-fetch", action="store_true")
     freeze = sub.add_parser("pack")
     freeze.add_argument("stage", type=Path)
