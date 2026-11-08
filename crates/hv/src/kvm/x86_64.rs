@@ -1,5 +1,5 @@
-//! Initial x86 KVM backend: one CPU, Linux64 entry, scalar PIO/MMIO.
-//! This is not an x86 board: the VMM still rejects x86 configurations.
+//! x86 KVM backend: one CPU, Linux64 or fresh reset-vector entry, scalar I/O.
+//! The reset-vector mechanism supplies no firmware board or SMM integration.
 //! CPU/irqchip snapshots and guest hypervisors are deliberately unsupported.
 
 use std::sync::Arc;
@@ -11,7 +11,8 @@ use kvm_ioctls::{Cap, Kvm, VcpuExit as KExit, VcpuFd, VmFd};
 
 use super::{clear_thread_run, kerr, set_thread_run, Chip, KvmKicker};
 pub(super) use crate::x86_64::check_memory_range;
-use crate::x86_64::{cpuid_registers, mmio_len, scalar_pio, validate_boot, IDENTITY_MAP, TSS_BASE};
+use crate::x86_64::{cpuid_registers, initialize_reset_vector, mmio_len, scalar_pio, validate_boot,
+    ResetEntryGuard, ResetSegment, ResetVectorCpu, ResetVectorState, IDENTITY_MAP, TSS_BASE};
 use crate::{BootRegs, Error, IrqChipConfig, IrqChipInfo, Result, Vcpu, VcpuExit, VcpuKicker, VcpuState, VmParams};
 
 pub(super) fn irqchip_info() -> IrqChipInfo {
@@ -75,6 +76,38 @@ fn segment(selector: u16, code: bool) -> kvm_segment {
     }
 }
 
+fn reset_segment(s: kvm_segment) -> ResetSegment {
+    ResetSegment { base: s.base, limit: s.limit, selector: s.selector, kind: s.type_,
+        attributes: [s.present, s.dpl, s.db, s.s, s.l, s.g, s.avl, s.unusable] }
+}
+
+impl ResetVectorCpu for VcpuFd {
+    fn read_reset_state(&mut self) -> Result<ResetVectorState> {
+        let r = self.get_regs().map_err(kerr("KVM_GET_REGS for firmware entry"))?;
+        let s = self.get_sregs().map_err(kerr("KVM_GET_SREGS for firmware entry"))?;
+        let mp = self.get_mp_state().map_err(kerr("KVM_GET_MP_STATE for firmware entry"))?;
+        Ok(ResetVectorState {
+            gprs: [r.rax, r.rbx, r.rcx, r.rdx, r.rsi, r.rdi, r.rsp, r.rbp,
+                r.r8, r.r9, r.r10, r.r11, r.r12, r.r13, r.r14, r.r15, r.rip, r.rflags],
+            controls: [s.cr0, s.cr2, s.cr3, s.cr4, s.cr8, s.efer],
+            segments: [s.cs, s.ds, s.es, s.fs, s.gs, s.ss, s.tr, s.ldt].map(reset_segment),
+            tables: [(s.gdt.base, s.gdt.limit), (s.idt.base, s.idt.limit)],
+            interrupt_bitmap: s.interrupt_bitmap,
+            runnable: mp.mp_state == KVM_MP_STATE_RUNNABLE,
+        })
+    }
+
+    fn set_reset_gprs(&mut self, signature: u32) -> Result<()> {
+        self.set_regs(&kvm_regs { rdx: u64::from(signature), rip: 0xfff0, rflags: 2, ..Default::default() })
+            .map_err(kerr("KVM_SET_REGS for firmware entry"))
+    }
+
+    fn set_runnable(&mut self) -> Result<()> {
+        self.set_mp_state(kvm_mp_state { mp_state: KVM_MP_STATE_RUNNABLE })
+            .map_err(kerr("KVM_SET_MP_STATE for firmware entry"))
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum PendingRead {
     Mmio(usize),
@@ -86,6 +119,8 @@ pub struct KvmVcpu {
     kicker: Arc<KvmKicker>,
     run_size: usize,
     pending: Option<PendingRead>,
+    reset_entry: ResetEntryGuard,
+    cpuid_signature: u32,
 }
 
 impl std::fmt::Debug for KvmVcpu {
@@ -102,11 +137,14 @@ impl KvmVcpu {
         let kvm = Kvm::new().map_err(kerr("open KVM capabilities"))?;
         let mut cpuid = kvm.get_supported_cpuid(KVM_MAX_CPUID_ENTRIES).map_err(kerr("KVM_GET_SUPPORTED_CPUID"))?;
         configure_cpuid(&mut cpuid)?;
+        let cpuid_signature = cpuid.as_slice().iter().find(|e| e.function == 1)
+            .map(|e| e.eax).ok_or(Error::Unsupported("KVM CPU lacks its version signature"))?;
         let mut fd = vm.create_vcpu(0).map_err(kerr("KVM_CREATE_VCPU"))?;
         fd.set_cpuid2(&cpuid).map_err(kerr("KVM_SET_CPUID2"))?;
         let run_size = kvm.get_vcpu_mmap_size().map_err(kerr("KVM_GET_VCPU_MMAP_SIZE"))?;
         set_thread_run(fd.get_kvm_run() as *mut _);
-        Ok(Self { fd, kicker: KvmKicker::current(), run_size, pending: None })
+        Ok(Self { fd, kicker: KvmKicker::current(), run_size, pending: None,
+            reset_entry: ResetEntryGuard::Fresh, cpuid_signature })
     }
 
     /// Called only immediately after an IoIn/IoOut exit.
@@ -134,6 +172,8 @@ impl Vcpu for KvmVcpu {
     fn index(&self) -> u32 { 0 }
 
     fn run(&mut self) -> Result<VcpuExit> {
+        // Even an unsuccessful or kicked attempt ends fresh-reset eligibility.
+        self.reset_entry.other_attempt()?;
         if self.pending.is_some() {
             return Err(Error::Invalid("complete the pending guest read before running".into()));
         }
@@ -222,6 +262,12 @@ impl Vcpu for KvmVcpu {
     fn kicker(&self) -> Arc<dyn VcpuKicker> { self.kicker.clone() }
 
     fn set_boot_regs(&mut self, regs: &BootRegs) -> Result<()> {
+        if matches!(regs, BootRegs::X86ResetVector) {
+            // Any previous RUN/boot attempt has already consumed eligibility.
+            // The helper keeps failures latched, including readback failures.
+            return initialize_reset_vector(&mut self.reset_entry, &mut self.fd, self.cpuid_signature);
+        }
+        self.reset_entry.other_attempt()?;
         if self.pending.is_some() {
             return Err(Error::Invalid("complete the pending guest read before changing boot state".into()));
         }

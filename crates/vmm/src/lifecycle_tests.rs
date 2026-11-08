@@ -18,6 +18,7 @@ struct Counts {
     zeroes: AtomicUsize,
     fail_boot: AtomicBool,
     panic_boot_cpu: AtomicBool,
+    boot_regs: Mutex<Vec<BootRegs>>,
     timeline: Mutex<Vec<String>>,
 }
 
@@ -82,8 +83,9 @@ impl Vcpu for FakeCpu {
         *signalled = false;
         Ok(VcpuExit::Kicked)
     }
-    fn set_boot_regs(&mut self, _: &BootRegs) -> vroom_hv::Result<()> {
+    fn set_boot_regs(&mut self, regs: &BootRegs) -> vroom_hv::Result<()> {
         self.counts.boots.fetch_add(1, SeqCst);
+        self.counts.boot_regs.lock().unwrap().push(regs.clone());
         if self.counts.fail_boot.load(SeqCst) {
             return Err(vroom_hv::Error::Invalid("injected boot failure".into()));
         }
@@ -488,6 +490,54 @@ fn failed_tpm_suspend_keeps_workers_paused_and_can_resume() {
     vm.resume().unwrap();
     wait_for_runs(&counts, before);
     vm.shutdown_checked().unwrap();
+}
+
+#[test]
+fn reset_vector_initialization_is_acknowledged_parked_and_failure_never_runs() {
+    for fail in [false, true] {
+        let counts = Arc::new(Counts::default());
+        counts.fail_boot.store(fail, SeqCst);
+        let (events, _events_rx) = mpsc::channel();
+        let shared = Arc::new(VcpuShared {
+            vm: Arc::new(FakeVm { counts: counts.clone(), memory: Mutex::new(None), kernel_psci: false }),
+            mmio: vroom_devices::BusBuilder::new().build(), pio: None,
+            cpus: Mutex::new(psci::CpuTable::new(vec![0])), events, peers: Default::default(),
+            run_calls: Default::default(), device_exits: Default::default(),
+            halt_on_stop: Default::default(), halting: Default::default(),
+            parked: Default::default(), halted_at: Default::default(),
+        });
+        let mut worker = vcpu::spawn(0, shared.clone(), LifecyclePolicy::ColdBootOnly).unwrap();
+        let (tx, rx) = mpsc::channel();
+        worker.peer.send(VcpuCmd::Initialize(Some(BootRegs::X86ResetVector), tx)).unwrap();
+        assert_eq!(rx.recv_timeout(PAUSE_TIMEOUT).unwrap().is_err(), fail);
+        assert_eq!(*counts.boot_regs.lock().unwrap(), [BootRegs::X86ResetVector]);
+        // Give an incorrectly running worker a chance to enter the counting
+        // fake backend before the command barrier. No guest instructions run.
+        std::thread::sleep(Duration::from_millis(20));
+        let (tx, rx) = mpsc::channel();
+        worker.peer.send(VcpuCmd::Pause(tx)).unwrap();
+        rx.recv_timeout(PAUSE_TIMEOUT).unwrap();
+        assert_eq!(shared.run_calls.load(SeqCst), 0);
+        assert_eq!(counts.runs.load(SeqCst), 0);
+        let (tx, rx) = mpsc::channel();
+        worker.peer.send(VcpuCmd::Initialize(Some(BootRegs::X86ResetVector), tx)).unwrap();
+        assert!(rx.recv_timeout(PAUSE_TIMEOUT).unwrap().is_err());
+        worker.peer.send(VcpuCmd::Resume).unwrap();
+        if !fail { wait_for_runs(&counts, 0); }
+        else { std::thread::sleep(Duration::from_millis(20)); }
+        let (tx, rx) = mpsc::channel();
+        worker.peer.send(VcpuCmd::Pause(tx)).unwrap();
+        rx.recv_timeout(PAUSE_TIMEOUT).unwrap();
+        if fail {
+            assert_eq!(shared.run_calls.load(SeqCst), 0);
+            assert_eq!(counts.runs.load(SeqCst), 0);
+        }
+        assert_eq!(counts.boots.load(SeqCst), 1);
+        no_state_calls(&counts);
+        worker.peer.send(VcpuCmd::Stop).unwrap();
+        worker.join_checked().unwrap();
+        assert_eq!(counts.drops.load(SeqCst), 1);
+    }
 }
 
 #[test]

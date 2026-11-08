@@ -306,6 +306,11 @@ pub enum BootRegs {
     /// The caller supplies that GDT and maps the entry, parameters and GDT.
     /// Interrupts start disabled; this does not describe a saved CPU state.
     X86_64 { rip: u64, rsi: u64, cr3: u64, gdt: u64 },
+    /// Enter the x86 firmware reset vector on a fresh, never-run vCPU only.
+    /// The backend verifies its power-on state; this is not a runtime reset.
+    /// The caller must supply the ROM mapping and board. No SMM, firmware
+    /// security or Windows support is implied by this entry mechanism.
+    X86ResetVector,
 }
 
 /// A virtual CPU. Not `Send`: lives and dies on its own thread.
