@@ -67,7 +67,10 @@ class Aws:
             args += ["--cli-input-json", json.dumps(payload)]
         if outfile:
             args.append(str(outfile))
-        env = dict(os.environ, AWS_PAGER="", AWS_MAX_ATTEMPTS="3", AWS_IGNORE_CONFIGURED_ENDPOINT_URLS="true")
+        # Only request_host may retry RunInstances, after a definite IAM-profile
+        # rejection. CLI transport retries would hide ambiguous launch attempts.
+        attempts = "1" if (service, operation) == ("ec2", "run-instances") else "3"
+        env = dict(os.environ, AWS_PAGER="", AWS_MAX_ATTEMPTS=attempts, AWS_IGNORE_CONFIGURED_ENDPOINT_URLS="true")
         for name in env:
             if name.startswith("AWS_ENDPOINT_URL"):
                 raise PilotError("custom AWS endpoints are not permitted for this pilot")

@@ -166,6 +166,21 @@ class ReaperTests(unittest.TestCase):
 
 
 class LaunchGuardTests(unittest.TestCase):
+    def test_cli_cannot_retry_ambiguous_runinstances_transport(self):
+        import subprocess
+        result = subprocess.CompletedProcess([], 0, '{}', '')
+        with patch.dict(host.os.environ, {"AWS_MAX_ATTEMPTS": "99"}), \
+                patch.object(host.subprocess, "run", return_value=result) as invoked:
+            cloud = host.Aws("test", "eu-north-1")
+            cloud.call("ec2", "run-instances", {"ClientToken": RUN})
+            self.assertEqual(invoked.call_args.kwargs["env"]["AWS_MAX_ATTEMPTS"], "1")
+            cloud.call("ec2", "describe-instances")
+            self.assertEqual(invoked.call_args.kwargs["env"]["AWS_MAX_ATTEMPTS"], "3")
+        with patch.object(host.subprocess, "run", side_effect=subprocess.TimeoutExpired("aws", 90)) as invoked:
+            with self.assertRaisesRegex(host.PilotError, "did not complete"):
+                host.Aws("test", "eu-north-1").call("ec2", "run-instances", {"ClientToken": RUN})
+            invoked.assert_called_once()
+
     def test_profile_propagation_retry_preserves_exact_request_and_deadline(self):
         value = manifest()
         deadline = value["deadline"]
