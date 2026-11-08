@@ -9,6 +9,7 @@ use vroom_snapshot::{decode, encode, Snapshottable};
 
 use super::{ConfigSpace, PciId, RootPort, SharedPciDevice, VendorIds};
 use crate::{BusDevice, ConcurrentBusDevice, IrqLine};
+use super::mch::{MchConfig, PciConfigError};
 
 /// Four shared level-triggered lines; a line is high while any device
 /// on it asserts.
@@ -69,13 +70,27 @@ struct Mapping {
 }
 
 pub struct PciRoot {
-    host: Mutex<ConfigSpace>,
+    host: Mutex<HostBridge>,
     devices: Vec<(u8, SharedPciDevice)>,
     /// Hot plug root ports (also in `devices`, in their slots).
     ports: Vec<(u8, Arc<Mutex<RootPort>>)>,
     map: RwLock<Vec<Mapping>>,
     /// The VM is paused: a device plugged now starts paused.
     paused: AtomicBool,
+}
+
+enum HostBridge {
+    Legacy(ConfigSpace),
+    Mch(MchConfig),
+}
+
+impl HostBridge {
+    fn legacy(&self) -> vroom_snapshot::Result<&ConfigSpace> {
+        match self {
+            Self::Legacy(config) => Ok(config),
+            Self::Mch(_) => Err(vroom_snapshot::Error::Invalid("MCH PCI is cold-boot only".into())),
+        }
+    }
 }
 
 impl std::fmt::Debug for PciRoot {
@@ -115,7 +130,21 @@ impl PciRoot {
         for (slot, p) in &ports {
             devices.push((*slot, p.clone() as SharedPciDevice));
         }
-        Arc::new(PciRoot { host: Mutex::new(host), devices, ports, map: RwLock::new(Vec::new()), paused: AtomicBool::new(false) })
+        Arc::new(PciRoot { host: Mutex::new(HostBridge::Legacy(host)), devices, ports, map: RwLock::new(Vec::new()), paused: AtomicBool::new(false) })
+    }
+
+    // Only the checked MCH router receives this root: no generic ECAM port or
+    // independently writable host-bridge handle escapes its exclusive owner.
+    pub(super) fn with_mch(devices: Vec<(u8, SharedPciDevice)>, host: MchConfig) -> Arc<Self> {
+        Arc::new(Self { host: Mutex::new(HostBridge::Mch(host)), devices, ports: Vec::new(),
+            map: RwLock::new(Vec::new()), paused: AtomicBool::new(false) })
+    }
+
+    pub(super) fn mch_window(&self) -> Option<crate::BusRange> {
+        match &*lock(&self.host) {
+            HostBridge::Mch(host) => host.window(),
+            HostBridge::Legacy(_) => None,
+        }
     }
 
     fn device(&self, slot: u8) -> Option<&SharedPciDevice> {
@@ -167,30 +196,33 @@ impl PciRoot {
     }
 
     /// Shared ECAM-encoded config cycle. Validate the whole span before any
-    /// callback, read-buffer mutation or BAR/hotplug side effect. False means
-    /// malformed; a valid cycle to an absent function still succeeds.
+    /// callback, read-buffer mutation or BAR/hotplug side effect. A valid cycle
+    /// to an absent function still succeeds. Chipset failures remain fallible.
     /// Keep ECAM's existing byte/unaligned/bulk access behavior within one
     /// 4 KiB function. The legacy adapter imposes its narrower scalar rules.
-    pub(super) fn config_access(&self, off: u64, data: &mut [u8], write: Option<&[u8]>) -> bool {
+    pub(super) fn config_access(&self, off: u64, data: &mut [u8], write: Option<&[u8]>) -> Result<(), PciConfigError> {
         let reg = (off & 0xfff) as usize;
         let len = write.map_or(data.len(), |w| w.len());
         if off >= 1 << 28 || len == 0 || reg.checked_add(len).is_none_or(|end| end > super::CFG_SIZE) {
-            return false;
+            return Err(PciConfigError::Span);
         }
         let bus = off >> 20;
         let slot = ((off >> 15) & 31) as u8;
         let func = (off >> 12) & 7;
         if bus == 0 && slot == 0 && func == 0 {
             let mut h = lock(&self.host);
-            match write {
-                Some(w) => h.write(reg, w),
-                None => h.read(reg, data),
+            match &mut *h {
+                HostBridge::Legacy(config) => match write {
+                    Some(w) => config.write(reg, w),
+                    None => config.read(reg, data),
+                },
+                HostBridge::Mch(host) => return host.access(reg, data, write),
             }
-            return true;
+            return Ok(());
         }
         let Some(d) = self.target(bus, slot, func) else {
             data.fill(0xff);
-            return true;
+            return Ok(());
         };
         let mut d = lock(&d);
         match write {
@@ -204,7 +236,7 @@ impl PciRoot {
             self.remap();
             drop(gone);
         }
-        true
+        Ok(())
     }
 
     /// Devices the ports let go of: the caller drops them once it holds
@@ -306,10 +338,10 @@ pub struct EcamPort(Arc<PciRoot>);
 
 impl BusDevice for EcamPort {
     fn read(&mut self, offset: u64, data: &mut [u8]) {
-        if !self.0.config_access(offset, data, None) { data.fill(0xff); }
+        if self.0.config_access(offset, data, None).is_err() { data.fill(0xff); }
     }
     fn write(&mut self, offset: u64, data: &[u8]) {
-        self.0.config_access(offset, &mut [], Some(data));
+        let _ = self.0.config_access(offset, &mut [], Some(data));
     }
 }
 
@@ -338,14 +370,17 @@ impl EcamPort {
     /// missing from it (a snapshot from before they existed) starts
     /// empty, as at power-on.
     fn load(&mut self, data: &[u8], reset: bool) -> vroom_snapshot::Result<()> {
+        // Reject cold-only roots before even decoding bytes or touching a
+        // device. The legacy serialized tuple deliberately remains unchanged.
+        lock(&self.0.host).legacy()?;
         let (host, mut devs): (ConfigSpace, Blobs) = decode(data)?;
         {
             let mut h = lock(&self.0.host);
             let mut host = host;
-            if !host.rebuild_masks(&h) {
+            if !host.rebuild_masks(h.legacy()?) {
                 return Err(vroom_snapshot::Error::Invalid("host bridge layout".into()));
             }
-            *h = host;
+            *h = HostBridge::Legacy(host);
         }
         for (slot, d) in &self.0.devices {
             let mut d = lock(d);
@@ -387,7 +422,7 @@ impl Snapshottable for EcamPort {
     }
 
     fn save(&mut self) -> vroom_snapshot::Result<Vec<u8>> {
-        let host = lock(&self.0.host).clone();
+        let host = lock(&self.0.host).legacy()?.clone();
         let mut devs = BTreeMap::new();
         for (_, d) in &self.0.devices {
             let mut d = lock(d);
@@ -504,7 +539,7 @@ mod tests {
         let r = IntxRouter::new((0..4).map(|_| Arc::new(crate::NoIrq) as Arc<dyn IrqLine>).collect());
         let port = Arc::new(Mutex::new(RootPort::new(5, 0, VendorIds { vendor: 0x1b36, device: 0x000c, subsys_vendor: 0, subsys: 0 }, r.pin(5, 1), Arc::new(NoMsi))));
         let root = PciRoot::with_ports(vec![], VendorIds { vendor: 0x1b36, device: 8, subsys_vendor: 0, subsys: 0 }, vec![(5, port)]);
-        let old = encode(&(lock(&root.host).clone(), Blobs::new())).unwrap(); // from before ports
+        let old = encode(&(lock(&root.host).legacy().unwrap().clone(), Blobs::new())).unwrap(); // from before ports
         let mut ecam = root.ecam_port();
         let win = root.window_port(0x1000_0000);
         let p = 5u64 << 15;

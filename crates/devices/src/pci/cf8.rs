@@ -24,7 +24,7 @@
 //! https://github.com/qemu/qemu/blob/v11.1.2/include/hw/southbridge/ich9.h
 
 use std::sync::Arc;
-use super::PciRoot;
+use super::{PciConfigError, PciRoot};
 
 const ADDRESS: u16 = 0xcf8;
 const DATA: u16 = 0xcfc;
@@ -45,6 +45,17 @@ pub enum PciCf8Error {
     ReservedSelector,
     #[error("PCI configuration access crosses its function")]
     ConfigSpan,
+    #[error("PCI host configuration: {0}")]
+    Host(PciConfigError),
+}
+
+impl From<PciConfigError> for PciCf8Error {
+    fn from(error: PciConfigError) -> Self {
+        match error {
+            PciConfigError::Span => Self::ConfigSpan,
+            other => Self::Host(other),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -85,8 +96,8 @@ impl PciCf8 {
             data.copy_from_slice(&self.address.to_le_bytes());
         } else if self.address & ENABLE == 0 {
             data.fill(0xff);
-        } else if !self.root.config_access(self.config_offset(port), data, None) {
-            return Err(PciCf8Error::ConfigSpan);
+        } else {
+            self.root.config_access(self.config_offset(port), data, None)?;
         }
         Ok(())
     }
@@ -99,9 +110,8 @@ impl PciCf8 {
             let value = u32::from_le_bytes(data.try_into().map_err(|_| PciCf8Error::Width)?);
             if value & RESERVED != 0 { return Err(PciCf8Error::ReservedSelector); }
             self.address = value;
-        } else if self.address & ENABLE != 0
-            && !self.root.config_access(self.config_offset(port), &mut [], Some(data)) {
-            return Err(PciCf8Error::ConfigSpan);
+        } else if self.address & ENABLE != 0 {
+            self.root.config_access(self.config_offset(port), &mut [], Some(data))?;
         }
         Ok(())
     }
@@ -306,10 +316,10 @@ mod tests {
         for (off, len) in [(1 << 15, 0), ((1 << 15) | 0xfff, 2),
             ((1 << 15) | 0xff8, 9), (1 << 28, 4), (u64::MAX, 4), (0xfff, 2)] {
             let mut data = vec![0xa5; len];
-            assert!(!root.config_access(off, &mut data, None));
+            assert_eq!(root.config_access(off, &mut data, None), Err(PciConfigError::Span));
             assert_eq!(data, vec![0xa5; len], "failed dispatch must not modify the read buffer");
             // Empty scratch must not hide the actual write's length.
-            assert!(!root.config_access(off, &mut [], Some(&data)));
+            assert_eq!(root.config_access(off, &mut [], Some(&data)), Err(PciConfigError::Span));
             ecam.write(off, &data);
             ecam.read(off, &mut data);
             assert_eq!(data, vec![0xff; len], "infallible ECAM maps malformed reads to all ones");
