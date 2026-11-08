@@ -3,7 +3,10 @@
 
 use crate::{Error, Result};
 
-pub(crate) const IDENTITY_MAP: u64 = 0xfffb_c000;
+// Keep KVM's four private pages below the top 4 MiB used by OVMF flash.
+// The default identity-map address (0xfffb_c000) overlaps that firmware.
+// This only reserves address space; it does not enable a firmware board.
+pub(crate) const IDENTITY_MAP: u64 = 0xffbf_c000;
 pub(crate) const TSS_BASE: u64 = IDENTITY_MAP + 0x1000;
 // KVM's private identity-map page and three TSS pages, then the irqchip MMIO.
 const RESERVED: [(u64, u64); 3] = [(IDENTITY_MAP, 0x4000), (0xfec0_0000, 0x1000), (0xfee0_0000, 0x1000)];
@@ -89,6 +92,41 @@ mod tests {
         }
         assert!(check_memory_range(u64::MAX - 0xfff, 0x1000).is_err());
         assert!(check_memory_range(1, 0x1000).is_err());
+    }
+
+    #[test]
+    fn selected_ovmf_code_and_vars_fit_above_kvm_private_pages() {
+        // QEMU 11.1.2's edk2-x86_64-secure-code.fd and edk2-i386-vars.fd.
+        // Pure layout fixture: no firmware files are read or executed.
+        let top = 1u64 << 32;
+        let code_size = 0x37c000;
+        let vars_size = 0x84000;
+        let code_base = top - code_size;
+        let vars_base = code_base - vars_size;
+        assert_eq!(code_size + vars_size, 4 << 20);
+        assert_eq!(code_base, 0xffc8_4000);
+        assert_eq!(vars_base, 0xffc0_0000);
+        assert_eq!(IDENTITY_MAP + 0x4000, vars_base);
+        assert_eq!(TSS_BASE + 3 * 0x1000, vars_base);
+        assert!(check_memory_range(code_base, code_size).is_ok());
+        assert!(check_memory_range(vars_base, vars_size).is_ok());
+        // The former private-page addresses are now available for CODE.
+        assert!(check_memory_range(0xfffb_c000, 0x4000).is_ok());
+    }
+
+    #[test]
+    fn ram_cannot_overlap_the_relocated_identity_or_tss_pages() {
+        assert!(check_memory_range(0, 512 << 20).is_ok());
+        assert!(check_memory_range(IDENTITY_MAP - 0x1000, 0x1000).is_ok());
+        assert!(check_memory_range(IDENTITY_MAP - 0x1000, 0x2000).is_err());
+        for page in 0..4 {
+            assert!(check_memory_range(IDENTITY_MAP + page * 0x1000, 0x1000).is_err());
+        }
+        assert!(check_memory_range(IDENTITY_MAP, 0x4000).is_err());
+        assert!(check_memory_range(TSS_BASE + 0x2000, 0x2000).is_err());
+        assert!(check_memory_range(IDENTITY_MAP + 0x4000, 0x1000).is_ok());
+        assert_eq!(IDENTITY_MAP & 0xfff, 0);
+        assert!(TSS_BASE + 0x3000 < 1 << 32);
     }
 
     #[test]
