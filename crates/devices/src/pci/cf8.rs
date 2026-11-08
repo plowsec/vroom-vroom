@@ -105,13 +105,18 @@ impl PciCf8 {
     /// Write an absolute CF8/CFC port. On Err, the address latch and all device
     /// state are unchanged. Writes through a disabled selector do nothing.
     pub fn write(&mut self, port: u16, data: &[u8]) -> Result<(), PciCf8Error> {
+        self.write_with_smram(port, data, None)
+    }
+
+    pub(super) fn write_with_smram(&mut self, port: u16, data: &[u8],
+        apply: Option<super::smram::Apply<'_>>) -> Result<(), PciCf8Error> {
         Self::check(port, data.len())?;
         if port == ADDRESS {
             let value = u32::from_le_bytes(data.try_into().map_err(|_| PciCf8Error::Width)?);
             if value & RESERVED != 0 { return Err(PciCf8Error::ReservedSelector); }
             self.address = value;
         } else if self.address & ENABLE != 0 {
-            self.root.config_access(self.config_offset(port), &mut [], Some(data))?;
+            self.root.config_access_with_smram(self.config_offset(port), &mut [], Some(data), apply)?;
         }
         Ok(())
     }

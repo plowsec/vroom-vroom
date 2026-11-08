@@ -140,6 +140,13 @@ impl PciRoot {
             map: RwLock::new(Vec::new()), paused: AtomicBool::new(false) })
     }
 
+    pub(super) fn mch_check(&self) -> Result<(), PciConfigError> {
+        match &*lock(&self.host) {
+            HostBridge::Mch(host) => host.check(),
+            HostBridge::Legacy(_) => Ok(()),
+        }
+    }
+
     pub(super) fn mch_window(&self) -> Option<crate::BusRange> {
         match &*lock(&self.host) {
             HostBridge::Mch(host) => host.window(),
@@ -201,6 +208,11 @@ impl PciRoot {
     /// Keep ECAM's existing byte/unaligned/bulk access behavior within one
     /// 4 KiB function. The legacy adapter imposes its narrower scalar rules.
     pub(super) fn config_access(&self, off: u64, data: &mut [u8], write: Option<&[u8]>) -> Result<(), PciConfigError> {
+        self.config_access_with_smram(off, data, write, None)
+    }
+
+    pub(super) fn config_access_with_smram(&self, off: u64, data: &mut [u8], write: Option<&[u8]>,
+        apply: Option<super::smram::Apply<'_>>) -> Result<(), PciConfigError> {
         let reg = (off & 0xfff) as usize;
         let len = write.map_or(data.len(), |w| w.len());
         if off >= 1 << 28 || len == 0 || reg.checked_add(len).is_none_or(|end| end > super::CFG_SIZE) {
@@ -216,7 +228,7 @@ impl PciRoot {
                     Some(w) => config.write(reg, w),
                     None => config.read(reg, data),
                 },
-                HostBridge::Mch(host) => return host.access(reg, data, write),
+                HostBridge::Mch(host) => return host.access(reg, data, write, apply),
             }
             return Ok(());
         }

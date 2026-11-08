@@ -7,6 +7,7 @@ pub mod msi;
 pub mod msix;
 pub mod port;
 mod root;
+mod smram;
 
 use std::sync::{Arc, Mutex};
 
@@ -17,6 +18,7 @@ pub use msi::Msi;
 pub use msix::{Msix, MsiSender};
 pub use port::RootPort;
 pub use root::{Intx, IntxRouter, PciRoot};
+pub use smram::{MchSmramState, MchTsegState};
 
 use crate::IrqLine;
 

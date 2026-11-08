@@ -1,13 +1,13 @@
 //! Cold-only Q35 MCH configuration and checked ECAM routing.
 //!
 //! PCIEXBAR changes real absolute-GPA decoding inside one reserved aperture.
-//! This is not a Q35 board: PAM/SMRAM/TSEG, reset and snapshots are deliberately
-//! not implemented here. In particular, no register claims a
-//! memory-protection effect that has not happened in the hypervisor.
+//! This is not a complete Q35 board: PAM, legacy SMRAM, reset and snapshots
+//! remain unsupported. Fixed SMRAM controls are opt-in and require a successful
+//! synchronous backend transition before register readback is committed.
 //!
-//! The exclusive router owns every route to its private MCH state. A future
-//! SMRAM write must prepare state, apply a fallible mapping transition on the
-//! exiting vCPU, then commit readback; it must not use infallible BusDevice.
+//! The exclusive router owns every route to its private MCH state. Each
+//! SMRAM write prepares state, applies a fallible mapping transition on the
+//! exiting vCPU, then commits readback; it must not use infallible BusDevice.
 //!
 //! Register definitions and the pinned firmware's disable/high/enable sequence:
 //! https://github.com/qemu/qemu/blob/v11.1.2/include/hw/pci-host/q35.h
@@ -16,7 +16,8 @@
 use std::sync::Arc;
 use vroom_memory::GuestMemory;
 use crate::{Bus, BusRange};
-use super::{ConfigSpace, PciCf8, PciCf8Error, PciId, PciRoot, SharedPciDevice};
+use super::smram::{Apply, SmramConfig};
+use super::{MchSmramState, ConfigSpace, PciCf8, PciCf8Error, PciId, PciRoot, SharedPciDevice};
 
 const PCIEXBAR: usize = 0x60;
 const APERTURE_SIZE: u64 = 256 << 20;
@@ -41,6 +42,14 @@ pub enum PciConfigError {
     BaseAlignment,
     #[error("enabled PCIEXBAR window is outside its reserved aperture")]
     Aperture,
+    #[error("unsupported fixed-Q35 SMRAM configuration")]
+    SmramProfile,
+    #[error("SMRAM write requires the exiting vCPU mapping callback")]
+    SmramBackendRequired,
+    #[error("SMRAM mapping callback failed or returned a different state")]
+    SmramBackend,
+    #[error("MCH router is poisoned after a failed SMRAM transition")]
+    SmramPoisoned,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -88,6 +97,7 @@ fn overlaps(range: BusRange, start: u64, finish: u64) -> bool {
 pub(super) struct MchConfig {
     config: ConfigSpace,
     aperture: BusRange,
+    smram: Option<SmramConfig>,
 }
 
 impl MchConfig {
@@ -95,7 +105,7 @@ impl MchConfig {
         let mut config = ConfigSpace::new(PciId { vendor: 0x8086, device: 0x29c0,
             class: 0x06_00_00, revision: 0, subsys_vendor: 0, subsys: 0 }, 0);
         config.raw_mut()[PCIEXBAR..PCIEXBAR + 8].copy_from_slice(&0xb000_0000u64.to_le_bytes());
-        Self { config, aperture }
+        Self { config, aperture, smram: None }
     }
 
     fn value(&self) -> u64 {
@@ -123,7 +133,12 @@ impl MchConfig {
         self.decode(self.value()).expect("validated private PCIEXBAR")
     }
 
-    pub(super) fn access(&mut self, off: usize, data: &mut [u8], write: Option<&[u8]>) -> Result<(), PciConfigError> {
+    pub(super) fn check(&self) -> Result<(), PciConfigError> {
+        self.smram.as_ref().map_or(Ok(()), SmramConfig::check)
+    }
+
+    pub(super) fn access(&mut self, off: usize, data: &mut [u8], write: Option<&[u8]>, apply: Option<Apply<'_>>) -> Result<(), PciConfigError> {
+        self.check()?;
         let len = write.map_or(data.len(), |bytes| bytes.len());
         if !matches!(len, 1 | 2 | 4 | 8) { return Err(PciConfigError::Width); }
         if off % len != 0 { return Err(PciConfigError::Alignment); }
@@ -135,7 +150,9 @@ impl MchConfig {
             }
             return Ok(());
         }
-        if off < PCIEXBAR || finish > PCIEXBAR + 8 { return Err(PciConfigError::UnsupportedRegister); }
+        if off < PCIEXBAR || finish > PCIEXBAR + 8 {
+            return self.smram.as_mut().ok_or(PciConfigError::UnsupportedRegister)?.access(off, data, write, apply);
+        }
         match write {
             Some(bytes) => {
                 let mut candidate = self.value().to_le_bytes();
@@ -184,9 +201,35 @@ impl MchPci {
     /// keeps the guards through validation and dispatch. Busy/poison fails before
     /// callbacks. Endpoint and IRQ callbacks must not synchronously reenter any
     /// PCI endpoint/root lock. No hotplug ports or snapshot path are exposed.
-    pub fn with_bar_windows(mut devices: Vec<(u8, SharedPciDevice)>, fixed_mmio: Bus,
+    pub fn with_bar_windows(devices: Vec<(u8, SharedPciDevice)>, fixed_mmio: Bus,
                             ram: &GuestMemory, ecam_aperture: BusRange,
                             bar_windows: Vec<BusRange>, reserved_ranges: Vec<BusRange>) -> Result<Self, MchError> {
+        Self::build(devices, fixed_mmio, ram, ecam_aperture, bar_windows, reserved_ranges, false)
+    }
+
+    /// Bind fixed 128 KiB default-SMBASE and 8 MiB TSEG controls. The caller
+    /// MUST first configure that exact backend profile. Inventory checks do not
+    /// prove hidden HV ownership or that a full 512 MiB board has been populated.
+    /// Private ranges stay excluded from GuestMemory/DMA even while CPU-open.
+    pub fn with_q35_smram(devices: Vec<(u8, SharedPciDevice)>, fixed_mmio: Bus,
+                         ram: &GuestMemory, ecam_aperture: BusRange,
+                         bar_windows: Vec<BusRange>, reserved_ranges: Vec<BusRange>) -> Result<Self, MchError> {
+        for private in [BusRange { base: 0x30000, len: 0x20000 }, BusRange { base: 0x1f800000, len: 0x800000 }] {
+            let limit = private.base + private.len;
+            if !reserved_ranges.iter().any(|r| contains(*r, private.base, limit))
+                || overlaps(ecam_aperture, private.base, limit)
+                || bar_windows.iter().any(|r| overlaps(*r, private.base, limit))
+                || fixed_mmio.ranges().any(|r| overlaps(r, private.base, limit))
+                || ram.regions().any(|r| overlaps(BusRange { base: r.start().0, len: r.len() }, private.base, limit)) {
+                return Err(MchError::Layout);
+            }
+        }
+        Self::build(devices, fixed_mmio, ram, ecam_aperture, bar_windows, reserved_ranges, true)
+    }
+
+    fn build(mut devices: Vec<(u8, SharedPciDevice)>, fixed_mmio: Bus,
+             ram: &GuestMemory, ecam_aperture: BusRange,
+             bar_windows: Vec<BusRange>, reserved_ranges: Vec<BusRange>, smram: bool) -> Result<Self, MchError> {
         let finish = end(ecam_aperture).ok_or(MchError::Layout)?;
         if ecam_aperture.len != APERTURE_SIZE || ecam_aperture.base % APERTURE_SIZE != 0
             || finish > ADDRESS_LIMIT
@@ -224,30 +267,51 @@ impl MchPci {
             }
             devices.sort_by_key(|(slot, _)| *slot);
         }
-        let root = PciRoot::with_mch(devices, MchConfig::new(ecam_aperture));
+        let mut host = MchConfig::new(ecam_aperture);
+        if smram { host.smram = Some(SmramConfig::new()); }
+        let root = PciRoot::with_mch(devices, host);
         let cf8 = PciCf8::new(root.clone());
         Ok(Self { root, cf8, fixed: fixed_mmio, aperture: ecam_aperture, bar_windows, bar_exclusions })
     }
 
     pub fn pio_read(&mut self, port: u16, data: &mut [u8]) -> Result<(), MchError> {
+        self.root.mch_check()?;
         Ok(self.cf8.read(port, data)?)
     }
 
     pub fn pio_write(&mut self, port: u16, data: &[u8]) -> Result<(), MchError> {
+        self.root.mch_check()?;
         Ok(self.cf8.write(port, data)?)
+    }
+
+    /// The nonstored callback must apply the requested state on the sole vCPU
+    /// stopped on THIS write exit, and return the actual result. It must not
+    /// reenter any PCI/router/endpoint lock. Err, mismatch or panic permanently
+    /// poisons every route; the caller must then stop the VM.
+    pub fn pio_write_with_smram(&mut self, port: u16, data: &[u8],
+        apply: &mut dyn FnMut(MchSmramState) -> Result<MchSmramState, PciConfigError>) -> Result<(), MchError> {
+        self.root.mch_check()?;
+        Ok(self.cf8.write_with_smram(port, data, Some(apply))?)
+    }
+
+    /// Same callback contract as `pio_write_with_smram`, through active ECAM.
+    pub fn mmio_write_with_smram(&mut self, address: u64, data: &[u8],
+        apply: &mut dyn FnMut(MchSmramState) -> Result<MchSmramState, PciConfigError>) -> Result<bool, MchError> {
+        self.mmio(address, &mut [], Some(data), Some(apply))
     }
 
     /// Absolute-GPA access. False is unmapped; errors and unmapped reads leave
     /// the buffer unchanged. Every full span is checked before any callback.
     pub fn mmio_read(&mut self, address: u64, data: &mut [u8]) -> Result<bool, MchError> {
-        self.mmio(address, data, None)
+        self.mmio(address, data, None, None)
     }
 
     pub fn mmio_write(&mut self, address: u64, data: &[u8]) -> Result<bool, MchError> {
-        self.mmio(address, &mut [], Some(data))
+        self.mmio(address, &mut [], Some(data), None)
     }
 
-    fn mmio(&mut self, address: u64, data: &mut [u8], write: Option<&[u8]>) -> Result<bool, MchError> {
+    fn mmio(&mut self, address: u64, data: &mut [u8], write: Option<&[u8]>, apply: Option<Apply<'_>>) -> Result<bool, MchError> {
+        self.root.mch_check()?;
         let len = write.map_or(data.len(), |bytes| bytes.len());
         if !matches!(len, 1 | 2 | 4 | 8) { return Err(MchError::Width); }
         if address % len as u64 != 0 { return Err(MchError::Alignment); }
@@ -257,7 +321,7 @@ impl MchPci {
             let Some(window) = self.root.mch_window() else { return Ok(false) };
             if !overlaps(window, address, finish) { return Ok(false); }
             if !contains(window, address, finish) { return Err(MchError::Boundary); }
-            self.root.config_access(address - window.base, data, write)?;
+            self.root.config_access_with_smram(address - window.base, data, write, apply)?;
             return Ok(true);
         }
         if let Some(window) = self.bar_windows.iter().find(|r| overlaps(**r, address, finish)) {
@@ -569,6 +633,129 @@ mod tests {
              BusRange { base: 0xffc0_0000, len: 0x40_0000 },
              BusRange { base: 0xfec0_0000, len: 0x1000 },
              BusRange { base: 0xfee0_0000, len: 0x1000 }]
+    }
+    fn smram_router() -> (MchPci, Arc<Mutex<Counts>>) {
+        let (device, counts) = endpoint();
+        let mut fixed = BusBuilder::new();
+        fixed.insert(0x1000, 8, Arc::new(Mutex::new(Fixed(counts.clone())))).unwrap();
+        let router = MchPci::with_q35_smram(vec![(1, device)], fixed.build(), &GuestMemory::default(),
+            APERTURE, vec![BAR_LOW], private_ranges()).unwrap();
+        (router, counts)
+    }
+
+    #[test]
+    fn smram_cf8_and_ecam_share_applied_state_and_lock_masks() {
+        use super::super::MchTsegState::*;
+        let (mut router, _) = smram_router(); enable(&mut router);
+        let mut states = Vec::new();
+        let mut apply = |s| { states.push(s); Ok(s) };
+        for (reg, bytes, expected) in [(0x50, vec![255, 255], vec![8, 0]),
+            (0x9c, vec![255], vec![1]), (0x52, vec![2, 0], vec![2, 0]),
+            (0xb0, vec![0, 0x20], vec![0, 0x20]),
+            (0xa4, vec![0, 0, 0, 0x20], vec![0, 0, 0, 0x20]),
+            (0xa8, vec![0, 0, 0, 0x20], vec![0, 0, 0, 0x20]),
+            (0xac, vec![0, 0, 0x80, 0x1f], vec![0, 0, 0x80, 0x1f]),
+            (0x9e, vec![0x3d], vec![0x3d]), (0x9d, vec![0xa], vec![0xa])] {
+            select(&mut router, 0, reg);
+            router.pio_write_with_smram(0xcfc + u16::from(reg & 3), &bytes, &mut apply).unwrap();
+            let mut actual = vec![0xa5; bytes.len()];
+            router.mmio_read(BASE + u64::from(reg), &mut actual).unwrap();
+            assert_eq!(actual, expected);
+        }
+        for (reg, value, expected) in [(0x9e, 0x3c, 0x3c), (0x9e, 0x3d, 0x3d),
+            (0x9d, 0x1a, 0x1a), (0x9c, 255, 2), (0x9c, 0, 2),
+            (0x9d, 0x40, 0x1a), (0x9e, 0, 0x3d), (0x9d, 0x20, 0x3a)] {
+            router.mmio_write_with_smram(BASE + u64::from(reg), &[value], &mut apply).unwrap();
+            select(&mut router, 0, reg);
+            let mut actual = [0xa5]; router.pio_read(0xcfc + u16::from(reg & 3), &mut actual).unwrap();
+            assert_eq!(actual, [expected]);
+        }
+        assert_eq!(states.len(), 17, "exactly one application per accepted write");
+        assert_eq!(states.iter().map(|s| s.tseg).collect::<Vec<_>>(),
+            [vec![Open; 8], vec![Closed, Open, Closed], vec![Locked; 6]].concat());
+        assert!(states[..12].iter().all(|s| !s.default_smbase_locked));
+        assert!(states[12..].iter().all(|s| s.default_smbase_locked));
+    }
+
+    #[test]
+    fn smram_callback_is_required_only_for_valid_new_bank_writes() {
+        let (mut router, _) = smram_router(); enable(&mut router);
+        assert_eq!(router.mmio_write(BASE + 0x50, &[255, 255]),
+            Err(MchError::Config(PciConfigError::SmramBackendRequired)));
+        let mut old = [0; 2]; router.mmio_read(BASE + 0x50, &mut old).unwrap(); assert_eq!(old, [255, 255]);
+        let mut never = |_| panic!("unrelated/invalid write called mapping backend");
+        router.mmio_write_with_smram(BASE + SLOT1 + 0x80, &[4], &mut never).unwrap();
+        router.mmio_write_with_smram(BASE + 0x60, &(BASE | 1).to_le_bytes(), &mut never).unwrap();
+        router.mmio_write_with_smram(0x1000, &[4], &mut never).unwrap();
+        router.pio_write_with_smram(0xcf8, &0x80000050u32.to_le_bytes(), &mut never).unwrap();
+        for (reg, bytes) in [(0x50, vec![8, 0]), (0x52, vec![0, 0]), (0x9d, vec![0x40]),
+            (0x9e, vec![0xbc]), (0x9c, vec![4]), (0xac, vec![0, 0, 0, 0x20]),
+            (0x50, vec![255; 4]), (0x9c, vec![255; 2]), (0x90, vec![0]), (0xb0, vec![0; 4])] {
+            assert!(router.mmio_write_with_smram(BASE + reg, &bytes, &mut never).is_err());
+            let mut data = [0; 2]; router.mmio_read(BASE + 0x50, &mut data).unwrap();
+            assert_eq!(data, old);
+        }
+        // Recoverable invalid/missing-backend accesses must not poison.
+        router.mmio_write_with_smram(BASE + 0x50, &[255, 255], &mut Ok).unwrap();
+        router.mmio_read(BASE + 0x50, &mut old).unwrap(); assert_eq!(old, [8, 0]);
+    }
+
+    #[test]
+    fn failed_mismatched_or_panicking_apply_poisons_every_router_route() {
+        for fault in 0..3 {
+            let (mut router, counts) = smram_router(); enable(&mut router);
+            assign(&mut router, 1, BAR_LOW.base, false);
+            *counts.lock().unwrap() = Counts::default();
+            let mut calls = 0;
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                router.mmio_write_with_smram(BASE + 0x50, &[255, 255], &mut |mut s| {
+                    calls += 1;
+                    match fault {
+                        0 => Err(PciConfigError::SmramBackend),
+                        1 => { s.default_smbase_locked = true; Ok(s) }
+                        _ => panic!("injected apply panic"),
+                    }
+                })
+            }));
+            if fault == 2 { assert!(outcome.is_err()); }
+            else { assert_eq!(outcome.unwrap(), Err(MchError::Config(PciConfigError::SmramBackend))); }
+            assert_eq!(calls, 1);
+            for address in [BASE, BASE + 0x50, BASE + SLOT1, BAR_LOW.base, 0x1000, 0x2000, u64::MAX] {
+                let mut data = [0xa5; 4];
+                assert_eq!(router.mmio_read(address, &mut data), Err(MchError::Config(PciConfigError::SmramPoisoned)));
+                assert_eq!(data, [0xa5; 4]);
+                assert_eq!(router.mmio_write(address, &[0; 4]), Err(MchError::Config(PciConfigError::SmramPoisoned)));
+                assert!(router.mmio_write_with_smram(address, &[0; 4], &mut |_| panic!("reapplied poison")).is_err());
+            }
+            for port in [0xcf8, 0xcfc, 0xcfd, 0] {
+                let mut data = [0xa5; 4];
+                assert_eq!(router.pio_read(port, &mut data), Err(MchError::Config(PciConfigError::SmramPoisoned)));
+                assert_eq!(data, [0xa5; 4]);
+                assert!(router.pio_write(port, &[0; 4]).is_err());
+                assert!(router.pio_write_with_smram(port, &[0; 4], &mut |_| panic!("reapplied poison")).is_err());
+            }
+            let counts = counts.lock().unwrap();
+            assert_eq!((counts.reads, counts.writes, counts.fixed, counts.bar_reads, counts.bar_writes), (0, 0, 0, 0, 0));
+        }
+    }
+
+    #[test]
+    fn smram_constructor_requires_both_private_ranges_excluded_from_every_route() {
+        let empty = GuestMemory::default();
+        for inventory in [vec![], private_ranges()[1..].to_vec(), vec![private_ranges()[0]],
+            vec![BusRange { base: 0x30000, len: 0x10000 }, private_ranges()[1]]] {
+            assert!(MchPci::with_q35_smram(vec![], Bus::default(), &empty, APERTURE, vec![], inventory).is_err());
+        }
+        for private in &private_ranges()[..2] {
+            let ram = GuestMemory::new(&[(GuestAddress(private.base), page_size() as u64)]).unwrap();
+            assert!(MchPci::with_q35_smram(vec![], Bus::default(), &ram, APERTURE, vec![], private_ranges()).is_err());
+            let mut fixed = BusBuilder::new();
+            fixed.insert(private.base, 4, Arc::new(Mutex::new(Fixed(Arc::default())))).unwrap();
+            assert!(MchPci::with_q35_smram(vec![], fixed.build(), &empty, APERTURE, vec![], private_ranges()).is_err());
+            assert!(MchPci::with_q35_smram(vec![], Bus::default(), &empty, APERTURE, vec![*private], private_ranges()).is_err());
+            let ecam = BusRange { base: private.base & !(APERTURE_SIZE - 1), len: APERTURE_SIZE };
+            assert!(MchPci::with_q35_smram(vec![], Bus::default(), &empty, ecam, vec![], private_ranges()).is_err());
+        }
     }
     fn bar_router(devices: Vec<(u8, SharedPciDevice)>) -> MchPci {
         MchPci::with_bar_windows(devices, Bus::default(), &GuestMemory::default(), APERTURE,
