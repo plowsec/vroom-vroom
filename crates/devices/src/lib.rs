@@ -12,6 +12,7 @@ pub mod fw_cfg;
 pub mod hda;
 pub mod nvme;
 pub mod pci;
+pub mod pc_flash;
 pub mod pflash;
 pub mod tpm;
 pub mod pl011;
