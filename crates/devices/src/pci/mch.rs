@@ -326,6 +326,18 @@ impl MchPci {
         Ok(self.root.lpc_pio(port, &mut [], Some(data), elapsed_ns)?)
     }
 
+    /// Bind THIS exit's context to an actual stopped-CPU SMI request. The
+    /// callback must not RUN, retry, complete another exit or reenter any
+    /// router/endpoint lock. It must independently validate the actual CPU.
+    /// Ok means request accepted, not delivered: observe the handler and RSM
+    /// separately. Err/panic permanently poisons every route before readback
+    /// commits; the owner must stop the VM. No callback is stored.
+    pub fn lpc_pio_write_with_smi(&mut self, port: u16, data: &[u8], elapsed_ns: u64,
+        context: super::LpcIoContext, inject: &mut dyn FnMut(super::LpcSmiRequest) -> Result<(), LpcError>) -> Result<bool, MchError> {
+        self.root.mch_check()?;
+        Ok(self.root.lpc_pio_write_with_smi(port, data, elapsed_ns, context, inject)?)
+    }
+
     /// The nonstored callback must apply the requested state on the sole vCPU
     /// stopped on THIS write exit, and return the actual result. It must not
     /// reenter any PCI/router/endpoint lock. Err, mismatch or panic permanently
@@ -393,7 +405,7 @@ mod tests {
     const APERTURE: BusRange = BusRange { base: BASE, len: APERTURE_SIZE };
     const SLOT1: u64 = 1 << 15;
 
-    #[derive(Default, Debug)]
+    #[derive(Default, Debug, Clone, PartialEq, Eq)]
     struct Counts { reads: usize, writes: usize, saves: usize, restores: usize, fixed: usize,
                     bar_reads: usize, bar_writes: usize, last_bar: Option<(usize, u64)> }
     struct Endpoint { config: ConfigSpace, counts: Arc<Mutex<Counts>> }
@@ -762,6 +774,75 @@ mod tests {
         assert_eq!(router.lpc_pio_read(0x700, &mut data, 0), Err(poisoned));
         assert_eq!(router.mmio_read(slot, &mut data), Err(poisoned));
         assert_eq!(data, [0xa5; 4]);
+    }
+
+    #[test]
+    fn lpc_smi_error_or_panic_poison_every_cold_router_route() {
+        use super::super::LpcIoContext;
+        for panic in [false, true] {
+            let (device, counts) = endpoint();
+            let mut fixed = BusBuilder::new();
+            fixed.insert(0x1000, 8, Arc::new(Mutex::new(Fixed(counts.clone())))).unwrap();
+            let mut router = MchPci::with_q35_lpc(vec![(1, device)], fixed.build(), &GuestMemory::default(),
+                APERTURE, vec![BAR_LOW], private_ranges(), lpc_layout()).unwrap();
+            enable(&mut router);
+            let slot = BASE + (31 << 15);
+            router.mmio_write(slot + 0x40, &0x600u32.to_le_bytes()).unwrap();
+            router.mmio_write(slot + 0x44, &[0x80]).unwrap();
+            router.lpc_pio_write(0x630, &0x21u32.to_le_bytes(), 0).unwrap();
+            let mut calls = 0;
+            let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| router.lpc_pio_write_with_smi(
+                0xb2, &[0x42], 0, LpcIoContext::Normal, &mut |_| {
+                    calls += 1; if panic { panic!("backend panic") } Err(LpcError::SmiBackend)
+                })));
+            if panic { assert!(failure.is_err()); } else { assert_eq!(failure.unwrap(), Err(MchError::Lpc(LpcError::SmiBackend))); }
+            assert_eq!(calls, 1);
+            let before = counts.lock().unwrap().clone();
+            let error = MchError::Config(PciConfigError::Lpc(LpcError::SmiPoisoned));
+            let mut data = [0xa5; 4];
+            for port in [0xcf8, 0xcfc] {
+                assert_eq!(router.pio_read(port, &mut data), Err(error));
+                assert_eq!(router.pio_write(port, &[0; 4]), Err(error));
+                assert_eq!(router.pio_write_with_smram(port, &[0; 4], &mut |_| panic!("SMRAM effect")), Err(error));
+            }
+            for address in [BASE, slot, BASE + SLOT1, 0x1000, BAR_LOW.base, 0x3000] {
+                assert_eq!(router.mmio_read(address, &mut data), Err(error));
+                assert_eq!(router.mmio_write(address, &[0; 4]), Err(error));
+                assert_eq!(router.mmio_write_with_smram(address, &[0; 4], &mut |_| panic!("SMRAM effect")), Err(error));
+            }
+            for port in [0x608, 0xb2, 0xb3, 0x700] {
+                assert_eq!(router.lpc_pio_read(port, &mut data[..1], 0), Err(error));
+                assert_eq!(router.lpc_pio_write(port, &[0], 0), Err(error));
+                assert_eq!(router.lpc_pio_write_with_smi(port, &[0], 0, LpcIoContext::Normal,
+                    &mut |_| panic!("SMI retry")), Err(error));
+            }
+            assert_eq!(data, [0xa5; 4]);
+            assert_eq!(*counts.lock().unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn lpc_lock_shares_cf8_ecam_state_and_smi_callback_receives_committed_data() {
+        use super::super::{LpcIoContext, LpcSmiRequest};
+        let mut router = lpc_router(); enable(&mut router);
+        let slot = BASE + (31 << 15);
+        router.mmio_write(slot + 0x40, &0x600u32.to_le_bytes()).unwrap();
+        router.mmio_write(slot + 0x44, &[0x80]).unwrap();
+        router.lpc_pio_write(0x630, &0x21u32.to_le_bytes(), 0).unwrap();
+        select(&mut router, 31, 0xa0); router.pio_write(0xcfc, &0x10u16.to_le_bytes()).unwrap();
+        let mut read = [0; 4]; router.mmio_read(slot + 0xa0, &mut read[..2]).unwrap(); assert_eq!(read[..2], [0x10, 0]);
+        router.mmio_write(slot + 0xa0, &[0; 2]).unwrap(); router.pio_read(0xcfc, &mut read[..2]).unwrap(); assert_eq!(read[..2], [0x10, 0]);
+        router.lpc_pio_write(0x630, &0x20u32.to_le_bytes(), 0).unwrap();
+        router.lpc_pio_read(0x630, &mut read, 0).unwrap(); assert_eq!(read, [0x21, 0, 0, 0]);
+        router.lpc_pio_write(0xb3, &[0xa5], 0).unwrap();
+        let mut requests = vec![];
+        router.lpc_pio_write_with_smi(0xb2, &[0x42], 0, LpcIoContext::Normal,
+            &mut |r| { requests.push(r); Ok(()) }).unwrap();
+        assert_eq!(requests, [LpcSmiRequest { command: 0x42, data: 0xa5 }]);
+        router.lpc_pio_read(0xb2, &mut read[..1], 0).unwrap(); assert_eq!(read[0], 0x42);
+        assert_eq!(router.lpc_pio_write_with_smi(0xb2, &[0x43], 0, LpcIoContext::Smm,
+            &mut |_| panic!("nested SMI")), Err(MchError::Lpc(LpcError::SmiContext)));
+        router.lpc_pio_read(0xb2, &mut read[..1], 0).unwrap(); assert_eq!(read[0], 0x42);
     }
 
     #[test]

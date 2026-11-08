@@ -147,7 +147,9 @@ impl PciRoot {
         match &*lock(&self.host) {
             HostBridge::Mch(host) => host.check(),
             HostBridge::Legacy(_) => Ok(()),
-        }
+        }?;
+        if let Some(lpc) = &self.lpc { lock(lpc).check()?; }
+        Ok(())
     }
 
     pub(super) fn mch_window(&self) -> Option<crate::BusRange> {
@@ -161,6 +163,15 @@ impl PciRoot {
         Ich9Lpc::port_span(port, write.map_or(data.len(), |b| b.len()))?;
         match &self.lpc {
             Some(lpc) => lock(lpc).pio(port, data, write, elapsed_ns),
+            None => Ok(false),
+        }
+    }
+
+    pub(super) fn lpc_pio_write_with_smi(&self, port: u16, data: &[u8], elapsed_ns: u64,
+        context: super::LpcIoContext, inject: super::lpc::Inject<'_>) -> Result<bool, super::LpcError> {
+        Ich9Lpc::port_span(port, data.len())?;
+        match &self.lpc {
+            Some(lpc) => lock(lpc).pio_with_smi(port, &mut [], Some(data), elapsed_ns, Some(context), Some(inject)),
             None => Ok(false),
         }
     }
