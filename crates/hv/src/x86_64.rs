@@ -7,16 +7,16 @@ use crate::{Error, Result, VcpuExit, X86IoExit};
 /// either development host; the backend asserts the binding values match.
 const RUN_SMM: u16 = 1;
 
-pub(crate) fn classify_io(smm_enabled: bool, flags: u16, io: X86IoExit) -> Result<VcpuExit> {
+pub(crate) fn classify_io(private: Option<&[(u64, u64)]>, flags: u16, io: X86IoExit) -> Result<VcpuExit> {
     let smm = flags & RUN_SMM != 0;
-    if smm && !smm_enabled {
+    if smm && private.is_none() {
         return Err(Error::GuestFault("SMM I/O without isolated SMM configuration".into()));
     }
     match &io {
         X86IoExit::MmioRead { addr, len } | X86IoExit::MmioWrite { addr, len, .. } => {
             mmio_len(*len)?;
             let end = addr.checked_add(*len as u64).ok_or_else(|| Error::GuestFault("MMIO overflow".into()))?;
-            if smm_enabled && !smm && *addr < crate::smm::BASE + crate::smm::SIZE as u64 && crate::smm::BASE < end {
+            if !smm && private.is_some_and(|ranges| ranges.iter().any(|&(base, size)| *addr < base + size && base < end)) {
                 return Err(Error::GuestFault("normal-context access to private SMRAM".into()));
             }
         }
@@ -31,6 +31,29 @@ pub(crate) fn classify_io(smm_enabled: bool, flags: u16, io: X86IoExit) -> Resul
         X86IoExit::PioIn { port, len } => VcpuExit::PioIn { port, len },
         X86IoExit::PioOut { port, len, data } => VcpuExit::PioOut { port, len, data },
     })
+}
+
+/// A stopped write exit is a one-shot mapping opportunity, not guest-provided
+/// authorization. The chipset still validates its complete candidate state.
+#[derive(Default)]
+pub(crate) struct SmramWriteGrant(bool);
+
+impl SmramWriteGrant {
+    pub fn clear(&mut self) { self.0 = false; }
+
+    pub fn observe(&mut self, exit: &VcpuExit) {
+        self.0 = matches!(exit, VcpuExit::PioOut { .. } | VcpuExit::MmioWrite { .. }
+            | VcpuExit::X86SmmIo(X86IoExit::PioOut { .. } | X86IoExit::MmioWrite { .. }));
+    }
+
+    /// Consume before even checking readiness, including a rejected attempt.
+    pub fn consume(&mut self, initialized: bool, pending: bool) -> Result<()> {
+        let granted = std::mem::replace(&mut self.0, false);
+        if !granted || !initialized || pending {
+            return Err(Error::Invalid("SMRAM transition requires the current stopped write exit with no pending read".into()));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -493,12 +516,12 @@ mod tests {
             X86IoExit::PioOut { port: 0x700, len: 4, data: [9; 4] },
         ];
         for io in exits {
-            assert_eq!(classify_io(true, 1, io.clone()).unwrap(), VcpuExit::X86SmmIo(io.clone()));
-            assert_eq!(classify_io(true, 3, io.clone()).unwrap(), VcpuExit::X86SmmIo(io.clone()), "BUS_LOCK does not erase SMM");
-            assert!(classify_io(false, 1, io.clone()).is_err());
-            let normal = classify_io(false, 0, io.clone()).unwrap();
-            assert_eq!(classify_io(true, 0, io.clone()).unwrap(), normal, "RSM must not inherit prior SMM context");
-            assert_eq!(classify_io(true, 2, io).unwrap(), normal, "BUS_LOCK alone is normal");
+            assert_eq!(classify_io(Some(crate::smm::STATIC_RANGES), 1, io.clone()).unwrap(), VcpuExit::X86SmmIo(io.clone()));
+            assert_eq!(classify_io(Some(crate::smm::STATIC_RANGES), 3, io.clone()).unwrap(), VcpuExit::X86SmmIo(io.clone()), "BUS_LOCK does not erase SMM");
+            assert!(classify_io(None, 1, io.clone()).is_err());
+            let normal = classify_io(None, 0, io.clone()).unwrap();
+            assert_eq!(classify_io(Some(crate::smm::STATIC_RANGES), 0, io.clone()).unwrap(), normal, "RSM must not inherit prior SMM context");
+            assert_eq!(classify_io(Some(crate::smm::STATIC_RANGES), 2, io).unwrap(), normal, "BUS_LOCK alone is normal");
         }
     }
 
@@ -506,16 +529,16 @@ mod tests {
     fn normal_smram_reads_writes_and_cross_boundary_accesses_fail_before_dispatch() {
         for addr in [crate::smm::BASE - 1, crate::smm::BASE, crate::smm::BASE + crate::smm::SIZE as u64 - 1] {
             for io in [X86IoExit::MmioRead { addr, len: 2 }, X86IoExit::MmioWrite { addr, len: 2, data: [7; 8] }] {
-                assert!(classify_io(true, 0, io.clone()).is_err());
-                assert!(matches!(classify_io(true, 1, io.clone()).unwrap(), VcpuExit::X86SmmIo(_)));
-                assert!(classify_io(false, 0, io).is_ok(), "ordinary Linux behavior unchanged");
+                assert!(classify_io(Some(crate::smm::STATIC_RANGES), 0, io.clone()).is_err());
+                assert!(matches!(classify_io(Some(crate::smm::STATIC_RANGES), 1, io.clone()).unwrap(), VcpuExit::X86SmmIo(_)));
+                assert!(classify_io(None, 0, io).is_ok(), "ordinary Linux behavior unchanged");
             }
         }
-        assert!(classify_io(true, 0, X86IoExit::MmioRead { addr: u64::MAX, len: 2 }).is_err());
+        assert!(classify_io(Some(crate::smm::STATIC_RANGES), 0, X86IoExit::MmioRead { addr: u64::MAX, len: 2 }).is_err());
         for len in [0, 9, usize::MAX] {
-            assert!(classify_io(true, 1, X86IoExit::MmioRead { addr: 0x100000, len }).is_err());
+            assert!(classify_io(Some(crate::smm::STATIC_RANGES), 1, X86IoExit::MmioRead { addr: 0x100000, len }).is_err());
         }
-        assert!(classify_io(true, 1, X86IoExit::PioIn { port: 0x700, len: 3 }).is_err());
+        assert!(classify_io(Some(crate::smm::STATIC_RANGES), 1, X86IoExit::PioIn { port: 0x700, len: 3 }).is_err());
     }
 
     #[test]
@@ -543,5 +566,44 @@ mod tests {
         assert!(check_smm_boot(false, &linux).is_ok());
         assert!(check_smm_boot(true, &crate::BootRegs::Aarch64 { pc: 0, x: [0; 4] }).is_err());
         assert!(check_smm_boot(true, &crate::BootRegs::X86ResetVector).is_ok());
+    }
+
+    #[test]
+    fn mapping_grant_is_one_shot_and_is_consumed_even_by_rejected_attempts() {
+        let output = VcpuExit::PioOut { port: 0xcfc, len: 1, data: [0; 4] };
+        let mut grant = SmramWriteGrant::default();
+        assert!(grant.consume(true, false).is_err());
+        for (initialized, pending) in [(false, false), (true, true), (false, true)] {
+            grant.observe(&output);
+            assert!(grant.consume(initialized, pending).is_err());
+            assert!(grant.consume(true, false).is_err(), "rejected attempt must consume grant");
+        }
+        for output in [output, VcpuExit::MmioWrite { addr: 0xe000009e, len: 1, data: [0; 8] },
+            VcpuExit::X86SmmIo(X86IoExit::PioOut { port: 0xcfc, len: 1, data: [0; 4] })] {
+            grant.observe(&output); grant.consume(true, false).unwrap();
+            assert!(grant.consume(true, false).is_err(), "even a no-op or later ioctl failure cannot retry");
+            grant.observe(&output); grant.clear(); // every RUN/SMI/boot/completion attempt
+            assert!(grant.consume(true, false).is_err());
+        }
+        for exit in [VcpuExit::Kicked, VcpuExit::Halted, VcpuExit::PioIn { port: 0xcfc, len: 1 },
+            VcpuExit::MmioRead { addr: 0xe000009e, len: 1 },
+            VcpuExit::X86SmmIo(X86IoExit::MmioRead { addr: 0xe000009e, len: 1 })] {
+            grant.observe(&exit); assert!(grant.consume(true, false).is_err());
+        }
+    }
+
+    #[test]
+    fn q35_private_guard_includes_upper_default_window_and_both_tseg_edges() {
+        let ranges = [(crate::smm::BASE, crate::smm::Q35_DEFAULT_SIZE as u64),
+            (crate::smm::TSEG_BASE, crate::smm::TSEG_SIZE as u64)];
+        for (base, size) in ranges {
+            for addr in [base - 1, base, base + size / 2, base + size - 1] {
+                for io in [X86IoExit::MmioRead { addr, len: 2 }, X86IoExit::MmioWrite { addr, len: 2, data: [0; 8] }] {
+                    assert!(classify_io(Some(&ranges), 0, io.clone()).is_err());
+                    assert!(classify_io(None, 0, io).is_ok());
+                }
+            }
+            assert!(classify_io(Some(&ranges), 0, X86IoExit::MmioRead { addr: base + size, len: 1 }).is_ok());
+        }
     }
 }

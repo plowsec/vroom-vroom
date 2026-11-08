@@ -136,6 +136,15 @@ pub trait Vm: Send + Sync {
         Err(Error::Unsupported("restricted x86 SMM memory"))
     }
 
+    /// Fixed one-CPU Q35 SMRAM prerequisite: nominal low RAM ends at 512 MiB,
+    /// with private default-SMBASE 0x30000..0x50000 and 8 MiB TSEG immediately
+    /// below that low-RAM end. Both are initially CPU-visible in AS0 and AS1;
+    /// neither ever belongs to device-facing GuestMemory. Configure once on a
+    /// fresh unmapped VM. No chipset/firmware profile or runtime reset implied.
+    fn configure_x86_q35_smram(&self) -> Result<X86SmmCapabilities> {
+        Err(Error::Unsupported("fixed Q35 SMRAM memory"))
+    }
+
     /// Map all guest RAM. The VM keeps a clone so the backing outlives the mapping.
     fn map_memory(&self, mem: &GuestMemory) -> Result<()>;
 
@@ -323,6 +332,19 @@ pub struct X86SmmCapabilities {
     pub system_address_spaces: u32,
 }
 
+/// CPU visibility of the fixed Q35 TSEG; Locked cannot be downgraded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum X86TsegState { Open, Closed, Locked }
+
+/// Applied backend state, separate from chipset register emulation. The MCH
+/// may publish matching readbacks only after its mapping operation succeeds.
+/// Neither lock can be cleared without recreating the complete VM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct X86SmramState {
+    pub tseg: X86TsegState,
+    pub default_smbase_locked: bool,
+}
+
 /// Handle another thread uses to bounce a vCPU out of guest mode.
 pub trait VcpuKicker: Send + Sync {
     fn kick(&self);
@@ -350,6 +372,13 @@ pub enum BootRegs {
 
 /// A virtual CPU. Not `Send`: lives and dies on its own thread.
 pub trait Vcpu {
+    /// Apply fixed-Q35 CPU visibility on the owning thread at the current
+    /// successful PIO-out/MMIO-write exit. Consumes that grant even on error
+    /// or an idempotent request. Pending reads and every other exit reject it.
+    /// Partial mapping failure poisons execution/completion; never retry RUN.
+    fn apply_x86_smram(&mut self, _target: X86SmramState) -> Result<X86SmramState> {
+        Err(Error::Unsupported("fixed Q35 SMRAM transition"))
+    }
     /// Inject SMI on the owning thread into an initialized, explicitly SMM-
     /// configured x86 vCPU. Pending I/O reads must be completed first.
     fn inject_smi(&mut self) -> Result<()> {

@@ -66,7 +66,7 @@ impl Hypervisor for Kvm {
         #[cfg(target_arch = "x86_64")]
         let (fd, chip) = x86_64::create_vm(&self.kvm, params)?;
         Ok(Arc::new(KvmVm {
-            fd,
+            fd: Arc::new(fd),
             chip,
             slots: Arc::new(Mutex::new(Slots::default())),
             vcpus: params.vcpus,
@@ -98,7 +98,7 @@ pub(crate) enum Chip {
 }
 
 pub struct KvmVm {
-    fd: VmFd,
+    fd: Arc<VmFd>,
     chip: Chip,
     // SMM vCPUs retain this Arc: a VcpuFd keeps the kernel VM alive even
     // after KvmVm drops. The fd fields must drop before these backing owners.
@@ -114,6 +114,20 @@ impl std::fmt::Debug for KvmVm {
 }
 
 impl KvmVm {
+    #[cfg(target_arch = "x86_64")]
+    fn smm_capabilities(&self) -> Result<(crate::X86SmmCapabilities, usize)> {
+        use kvm_ioctls::Cap;
+        let kvm = KvmSys::new().map_err(kerr("open SMM capabilities"))?;
+        if !kvm.check_extension(Cap::CheckExtensionVm) || !self.fd.check_extension(Cap::X86Smm) {
+            return Err(Error::Unsupported("VM-level KVM_CAP_X86_SMM"));
+        }
+        // VmFd's pinned API exposes bool only, so query the numeric count
+        // with the existing raw system extension wrapper (not a new ioctl).
+        let count = kvm.check_extension_raw(kvm_bindings::KVM_CAP_MULTI_ADDRESS_SPACE.into());
+        if count < 2 { return Err(Error::Unsupported("KVM_CAP_MULTI_ADDRESS_SPACE must be at least 2")); }
+        Ok((crate::X86SmmCapabilities { vm_smm: true, system_address_spaces: count as u32 }, kvm.get_nr_memslots()))
+    }
+
     fn add_slot(&self, s: &mut Slots, gpa: u64, host: *mut u8, size: u64, flags: u32) -> Result<u32> {
         #[cfg(target_arch = "x86_64")]
         x86_64::check_memory_range(gpa, size)?;
@@ -149,21 +163,23 @@ impl Slots {
 impl Vm for KvmVm {
     #[cfg(target_arch = "x86_64")]
     fn configure_x86_smm(&self, initial: &[u8]) -> Result<crate::X86SmmCapabilities> {
-        use kvm_ioctls::Cap;
         let mut s = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         s.smm_setup.begin(self.finalized.load(Ordering::SeqCst))?;
-        let kvm = KvmSys::new().map_err(kerr("open SMM capabilities"))?;
-        if !kvm.check_extension(Cap::CheckExtensionVm) || !self.fd.check_extension(Cap::X86Smm) {
-            return Err(Error::Unsupported("VM-level KVM_CAP_X86_SMM"));
-        }
-        // The pinned VmFd API exposes only boolean extension checks, and its
-        // Cap enum omits MULTI_ADDRESS_SPACE. Use the existing raw system API
-        // for the count, not a bool or a hand-written ioctl.
-        let count = kvm.check_extension_raw(kvm_bindings::KVM_CAP_MULTI_ADDRESS_SPACE.into());
-        if count < 2 { return Err(Error::Unsupported("KVM_CAP_MULTI_ADDRESS_SPACE must be at least 2")); }
-        s.smm = Some(crate::smm::Memory::new(initial, kvm.get_nr_memslots())?);
+        let (capabilities, slots) = self.smm_capabilities()?;
+        s.smm = Some(crate::smm::Memory::new(initial, slots)?);
         s.smm_memory()?.install_private(|mapping| install_smm_slot(&self.fd, mapping))?;
-        Ok(crate::X86SmmCapabilities { vm_smm: true, system_address_spaces: count as u32 })
+        Ok(capabilities)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn configure_x86_q35_smram(&self) -> Result<crate::X86SmmCapabilities> {
+        let mut s = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        s.smm_setup.begin(self.finalized.load(Ordering::SeqCst))?;
+        if self.vcpus != 1 { return Err(Error::Unsupported("fixed Q35 SMRAM requires exactly one vCPU")); }
+        let (capabilities, slots) = self.smm_capabilities()?;
+        s.smm = Some(crate::smm::Memory::new_q35(slots)?);
+        s.smm_memory()?.install_private(|mapping| install_smm_slot(&self.fd, mapping))?;
+        Ok(capabilities)
     }
 
     fn map_memory(&self, mem: &GuestMemory) -> Result<()> {
@@ -238,6 +254,10 @@ impl Vm for KvmVm {
     }
 
     fn finalize(&self) -> Result<()> {
+        // Serialize the fresh-SMM check with finalize as well as map/create.
+        // ARM's GIC finalization path is unchanged.
+        #[cfg(target_arch = "x86_64")]
+        let _topology = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         if self.finalized.swap(true, Ordering::SeqCst) {
             return Ok(());
         }

@@ -1,5 +1,5 @@
 //! x86 KVM backend: one CPU, Linux64 or fresh reset-vector entry, scalar I/O.
-//! Optional restricted AS1 SMRAM is for the SMI/RSM/flash harness, not a board.
+//! Optional static or fixed-Q35 SMRAM is for native prerequisites, not a board.
 //! CPU/irqchip snapshots and guest hypervisors are deliberately unsupported.
 
 use std::sync::{Arc, Mutex};
@@ -12,7 +12,7 @@ use kvm_ioctls::{Cap, Kvm, VcpuExit as KExit, VcpuFd, VmFd};
 use super::{clear_thread_run, kerr, set_thread_run, Chip, KvmKicker};
 pub(super) use crate::x86_64::check_memory_range;
 use crate::x86_64::{cpuid_registers, initialize_reset_vector, mmio_len, scalar_pio, validate_boot,
-    check_completion, check_smi_ready, check_smm_boot, classify_io, PendingRead,
+    check_completion, check_smi_ready, check_smm_boot, classify_io, PendingRead, SmramWriteGrant,
     ResetEntryGuard, ResetSegment, ResetVectorCpu, ResetVectorState, IDENTITY_MAP, TSS_BASE};
 use crate::{BootRegs, Error, IrqChipConfig, IrqChipInfo, Result, Vcpu, VcpuExit, VcpuKicker, VcpuState, VmParams, X86IoExit};
 
@@ -114,6 +114,9 @@ impl ResetVectorCpu for VcpuFd {
 pub struct KvmVcpu {
     // Close the CPU fd before dropping its last memory backing owners.
     fd: VcpuFd,
+    // Q35 transitions use VM ioctls from the stopped CPU's owning thread.
+    // This VM fd must also close BEFORE the last backing-owner Arc drops.
+    smm_vm: Option<Arc<VmFd>>,
     smm_owners: Option<Arc<Mutex<super::Slots>>>,
     kicker: Arc<KvmKicker>,
     run_size: usize,
@@ -123,6 +126,7 @@ pub struct KvmVcpu {
     initialized: bool,
     last_run_smm: bool,
     smm_faulted: bool,
+    smram_write: SmramWriteGrant,
 }
 
 impl std::fmt::Debug for KvmVcpu {
@@ -132,7 +136,7 @@ impl std::fmt::Debug for KvmVcpu {
 }
 
 impl KvmVcpu {
-    pub(super) fn new(vm: &VmFd, index: u32, n: u32, smm_owners: Option<Arc<Mutex<super::Slots>>>) -> Result<Self> {
+    pub(super) fn new(vm: &Arc<VmFd>, index: u32, n: u32, smm_owners: Option<Arc<Mutex<super::Slots>>>) -> Result<Self> {
         if index != 0 || n != 1 {
             return Err(Error::Unsupported("initial x86 KVM backend supports only vCPU 0"));
         }
@@ -145,9 +149,10 @@ impl KvmVcpu {
         fd.set_cpuid2(&cpuid).map_err(kerr("KVM_SET_CPUID2"))?;
         let run_size = kvm.get_vcpu_mmap_size().map_err(kerr("KVM_GET_VCPU_MMAP_SIZE"))?;
         set_thread_run(fd.get_kvm_run() as *mut _);
-        Ok(Self { fd, smm_owners, kicker: KvmKicker::current(), run_size, pending: None,
+        let smm_vm = smm_owners.as_ref().map(|_| vm.clone());
+        Ok(Self { fd, smm_vm, smm_owners, kicker: KvmKicker::current(), run_size, pending: None,
             reset_entry: ResetEntryGuard::Fresh, cpuid_signature, initialized: false,
-            last_run_smm: false, smm_faulted: false })
+            last_run_smm: false, smm_faulted: false, smram_write: SmramWriteGrant::default() })
     }
 
     /// Called only immediately after an IoIn/IoOut exit.
@@ -163,13 +168,21 @@ impl KvmVcpu {
     }
 
     fn io_exit(&mut self, flags: u16, io: X86IoExit) -> Result<VcpuExit> {
-        let result = classify_io(self.smm_owners.is_some(), flags, io);
+        let private = if let Some(owners) = &self.smm_owners {
+            let mut slots = owners.lock().unwrap_or_else(|e| e.into_inner());
+            Some(slots.smm_memory()?.private_ranges())
+        } else { None };
+        let result = classify_io(private, flags, io);
+        if let Ok(exit) = &result { self.smram_write.observe(exit); }
         if result.is_err() { self.smm_faulted = true; }
         result
     }
 
     fn check_smm_fault(&self) -> Result<()> {
         if self.smm_faulted { return Err(Error::Invalid("failed SMM operation; recreate the vCPU".into())); }
+        if let Some(owners) = &self.smm_owners {
+            owners.lock().unwrap_or_else(|e| e.into_inner()).smm_memory()?.check_cpu()?;
+        }
         Ok(())
     }
 }
@@ -183,9 +196,19 @@ impl Drop for KvmVcpu {
 }
 
 impl Vcpu for KvmVcpu {
+    fn apply_x86_smram(&mut self, target: crate::X86SmramState) -> Result<crate::X86SmramState> {
+        self.smram_write.consume(self.initialized, self.pending.is_some())?;
+        self.check_smm_fault()?;
+        let vm = self.smm_vm.as_ref().ok_or(Error::Unsupported("SMRAM transition without isolated configuration"))?;
+        let owners = self.smm_owners.as_ref().ok_or(Error::Unsupported("SMRAM transition without isolated configuration"))?;
+        owners.lock().unwrap_or_else(|e| e.into_inner()).smm_memory()?
+            .apply_q35(target, |mapping| super::install_smm_slot(vm, mapping))
+    }
+
     fn index(&self) -> u32 { 0 }
 
     fn run(&mut self) -> Result<VcpuExit> {
+        self.smram_write.clear();
         // Even an unsuccessful or kicked attempt ends fresh-reset eligibility.
         self.reset_entry.other_attempt()?;
         self.check_smm_fault()?;
@@ -256,6 +279,7 @@ impl Vcpu for KvmVcpu {
     }
 
     fn complete_mmio_read(&mut self, data: &[u8]) -> Result<()> {
+        self.smram_write.clear();
         self.check_smm_fault()?;
         match check_completion(self.pending, true, data.len())? {
             PendingRead::Mmio(len) => {
@@ -269,6 +293,7 @@ impl Vcpu for KvmVcpu {
     }
 
     fn complete_pio_in(&mut self, data: &[u8]) -> Result<()> {
+        self.smram_write.clear();
         self.check_smm_fault()?;
         match check_completion(self.pending, false, data.len())? {
             PendingRead::Pio { len, offset } => {
@@ -291,6 +316,7 @@ impl Vcpu for KvmVcpu {
     fn kicker(&self) -> Arc<dyn VcpuKicker> { self.kicker.clone() }
 
     fn inject_smi(&mut self) -> Result<()> {
+        self.smram_write.clear();
         self.check_smm_fault()?;
         check_smi_ready(self.smm_owners.is_some(), self.initialized, self.pending.is_some(), self.last_run_smm)?;
         // A failed injection never permits an ambiguous retry or RUN.
@@ -301,6 +327,7 @@ impl Vcpu for KvmVcpu {
     }
 
     fn set_boot_regs(&mut self, regs: &BootRegs) -> Result<()> {
+        self.smram_write.clear();
         self.check_smm_fault()?;
         if self.last_run_smm { return Err(Error::Invalid("cannot replace boot registers while in SMM".into())); }
         if let Err(error) = check_smm_boot(self.smm_owners.is_some(), regs) {
