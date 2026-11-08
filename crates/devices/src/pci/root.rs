@@ -167,6 +167,13 @@ impl PciRoot {
         }
     }
 
+    pub(super) fn lpc_rcrb_decode(&self, start: u64, finish: u64) -> Result<bool, super::LpcError> {
+        match &self.lpc {
+            Some(lpc) => lock(lpc).rcrb_decode(start, finish),
+            None => Ok(false),
+        }
+    }
+
     pub(super) fn lpc_pio_write_with_smi(&self, port: u16, data: &[u8], elapsed_ns: u64,
         context: super::LpcIoContext, inject: super::lpc::Inject<'_>) -> Result<bool, super::LpcError> {
         Ich9Lpc::port_span(port, data.len())?;

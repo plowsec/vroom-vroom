@@ -60,6 +60,8 @@ pub enum PciConfigError {
 pub enum MchError {
     #[error("invalid or overlapping reserved ECAM aperture")]
     Layout,
+    #[error("missing, ambiguous or overlapping fixed RCRB reservation")]
+    RcrbLayout,
     #[error("duplicate or invalid PCI endpoint slot")]
     Slot,
     #[error("invalid or overlapping BAR windows or reserved-range inventory")]
@@ -238,6 +240,37 @@ impl MchPci {
             true, Some(Ich9Lpc::new(lpc_pio_layout)))
     }
 
+    /// Add the selected fixed RCBA decoder at FED1C000..FED20000. The exact
+    /// range must occur once in the complete reserved inventory, separate from
+    /// all RAM, fixed devices, ECAM and BAR windows. That inventory must match
+    /// real HV mappings; this layer cannot discover omitted hidden backing.
+    ///
+    /// RCBA controls actual MMIO dispatch. Every enabled RCRB register access
+    /// explicitly errors; IRQ/OIC/GCS/lock semantics are not implemented. This
+    /// opt-in accepts the selected firmware's setup, not a complete chipset.
+    pub fn with_q35_lpc_rcrb(devices: Vec<(u8, SharedPciDevice)>, fixed_mmio: Bus,
+                            ram: &GuestMemory, ecam_aperture: BusRange,
+                            bar_windows: Vec<BusRange>, reserved_ranges: Vec<BusRange>,
+                            lpc_pio_layout: LpcPioLayout) -> Result<Self, MchError> {
+        let range = super::lpc::RCRB;
+        let limit = range.base + range.len;
+        let mut count = 0;
+        for r in &reserved_ranges {
+            let finish = end(*r).ok_or(MchError::RcrbLayout)?;
+            if r.base == range.base && finish == limit { count += 1; }
+            else if overlaps(*r, range.base, limit) { return Err(MchError::RcrbLayout); }
+        }
+        if count != 1 || overlaps(ecam_aperture, range.base, limit)
+            || bar_windows.iter().any(|r| overlaps(*r, range.base, limit))
+            || fixed_mmio.ranges().any(|r| overlaps(r, range.base, limit))
+            || ram.regions().any(|r| overlaps(BusRange { base: r.start().0, len: r.len() }, range.base, limit)) {
+            return Err(MchError::RcrbLayout);
+        }
+        Self::q35_layout(&fixed_mmio, ram, ecam_aperture, &bar_windows, &reserved_ranges)?;
+        Self::build(devices, fixed_mmio, ram, ecam_aperture, bar_windows, reserved_ranges,
+            true, Some(Ich9Lpc::with_rcrb(lpc_pio_layout)))
+    }
+
     fn q35_layout(fixed_mmio: &Bus, ram: &GuestMemory, ecam_aperture: BusRange,
                   bar_windows: &[BusRange], reserved_ranges: &[BusRange]) -> Result<(), MchError> {
         for private in [BusRange { base: 0x30000, len: 0x20000 }, BusRange { base: 0x1f800000, len: 0x800000 }] {
@@ -382,6 +415,9 @@ impl MchPci {
         if !matches!(len, 1 | 2 | 4 | 8) { return Err(MchError::Width); }
         if address % len as u64 != 0 { return Err(MchError::Alignment); }
         let finish = address.checked_add(len as u64).ok_or(MchError::Boundary)?;
+        // Consume the reserved window even while disabled: never fall through
+        // to fixed/BAR callbacks. The private LPC owns both F0 and this decode.
+        if self.root.lpc_rcrb_decode(address, finish)? { return Ok(false); }
         if overlaps(self.aperture, address, finish) {
             if !contains(self.aperture, address, finish) { return Err(MchError::Boundary); }
             let Some(window) = self.root.mch_window() else { return Ok(false) };
@@ -1247,5 +1283,34 @@ mod tests {
         assert_eq!(router.mmio_read(BAR_HIGH.base + 8, &mut version), Ok(true));
         assert_eq!(u32::from_le_bytes(version), 0x0001_0400);
         // No CC enable/doorbell write, namespace, disk, worker, guest or VM.
+    }
+
+    #[test]
+    fn rcrb_dispatch_cannot_invoke_endpoint_or_fixed_callbacks() {
+        let (device, counts) = endpoint();
+        let mut fixed = BusBuilder::new();
+        let rcrb = super::super::lpc::RCRB;
+        fixed.insert(rcrb.base + rcrb.len, 8, Arc::new(Mutex::new(Fixed(counts.clone())))).unwrap();
+        let mut reserved = private_ranges(); reserved.push(rcrb);
+        let mut router = MchPci::with_q35_lpc_rcrb(vec![(1, device)], fixed.build(), &GuestMemory::default(),
+            APERTURE, vec![BAR_LOW], reserved, lpc_layout()).unwrap();
+        // An invalid endpoint BAR at RCRB must never acquire precedence over
+        // the reserved decoder, or cause a device callback during RCBA setup.
+        config_write(&mut router, 1, 0x10, &(rcrb.base as u32).to_le_bytes()).unwrap();
+        config_write(&mut router, 1, 4, &2u16.to_le_bytes()).unwrap();
+        let before = counts.lock().unwrap().clone();
+        let mut data = [0xa5; 4];
+        for value in [0, rcrb.base as u32 | 1, rcrb.base as u32] {
+            config_write(&mut router, 31, 0xf0, &value.to_le_bytes()).unwrap();
+            let expected = if value & 1 != 0 { Err(MchError::Lpc(LpcError::RcrbRegister)) } else { Ok(false) };
+            assert_eq!(router.mmio_read(rcrb.base, &mut data), expected);
+            assert_eq!(router.mmio_write(rcrb.base, &[0; 4]), expected);
+            assert_eq!(router.mmio_write_with_smram(rcrb.base, &[0; 4], &mut |_| panic!("mapping callback")), expected);
+            assert_eq!(data, [0xa5; 4]); assert_eq!(*counts.lock().unwrap(), before);
+        }
+        assert_eq!(router.mmio_read(BAR_LOW.base, &mut data), Err(MchError::BarMap));
+        assert_eq!(*counts.lock().unwrap(), before);
+        assert_eq!(router.mmio_read(rcrb.base + rcrb.len, &mut data), Ok(true));
+        assert_eq!(counts.lock().unwrap().fixed, before.fixed + 1);
     }
 }

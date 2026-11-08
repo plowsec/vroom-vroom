@@ -30,6 +30,8 @@ const GBL_SMI_EN: u32 = 1;
 const APMC_EN: u32 = 1 << 5;
 const PM1_CNT_OFFSET: u64 = 4;
 const SLP_EN: u16 = 1 << 13;
+const RCBA: usize = 0xf0;
+pub(super) const RCRB: BusRange = BusRange { base: 0xfed1_c000, len: 0x4000 };
 
 /// Describe THIS completed RUN's exit, not a cached mode or authorization
 /// token. The injection backend must independently check the actual CPU.
@@ -84,6 +86,8 @@ pub enum LpcError {
     PowerContext,
     #[error("LPC is terminal after an accepted ACPI S5 request")]
     PoweredOff,
+    #[error("RCRB register behavior is not implemented")]
+    RcrbRegister,
 }
 
 fn end(r: BusRange) -> Option<u64> {
@@ -150,6 +154,7 @@ pub(super) struct Ich9Lpc {
     apm_data: u8,
     poisoned: bool,
     powered_off: bool,
+    rcba: Option<u32>,
 }
 
 impl Ich9Lpc {
@@ -161,7 +166,26 @@ impl Ich9Lpc {
         config.set_wmask(4, &[1, 0]);
         config.raw_mut()[PMBASE..PMBASE + 4].copy_from_slice(&1u32.to_le_bytes());
         Self { config, layout, last_ns: 0, smi_en: 0, smi_locked: false,
-            apm_command: 0, apm_data: 0, poisoned: false, powered_off: false }
+            apm_command: 0, apm_data: 0, poisoned: false, powered_off: false, rcba: None }
+    }
+
+    pub(super) fn with_rcrb(layout: LpcPioLayout) -> Self {
+        let mut lpc = Self::new(layout);
+        lpc.rcba = Some(0);
+        lpc
+    }
+
+    /// The router has checked width/alignment/overflow. True consumes this
+    /// disabled reservation; enabled accesses explicitly fail. No backing or
+    /// fabricated IRQ/OIC/GCS register bytes exist behind the decoder.
+    pub(super) fn rcrb_decode(&self, start: u64, finish: u64) -> Result<bool, LpcError> {
+        self.check()?;
+        let Some(rcba) = self.rcba else { return Ok(false) };
+        let limit = RCRB.base + RCRB.len;
+        if finish <= RCRB.base || start >= limit { return Ok(false); }
+        if start < RCRB.base || finish > limit { return Err(LpcError::Boundary); }
+        if rcba & 1 != 0 { return Err(LpcError::RcrbRegister); }
+        Ok(true)
     }
 
     pub(super) fn check(&self) -> Result<(), LpcError> {
@@ -189,6 +213,22 @@ impl Ich9Lpc {
         if !matches!(len, 1 | 2 | 4) { return Err(LpcError::Width); }
         if off % len != 0 { return Err(LpcError::Alignment); }
         let finish = off.checked_add(len).ok_or(LpcError::Boundary)?;
+        if off == RCBA && len == 4 {
+            let value = self.rcba.as_mut().ok_or(LpcError::UnsupportedRegister)?;
+            match write {
+                Some(bytes) => {
+                    let candidate = u32::from_le_bytes(bytes.try_into().unwrap());
+                    // Selected OVMF uses this fixed base. No arbitrary chipset
+                    // relocation, partial writes or reserved-bit storage.
+                    if candidate != 0 && candidate != RCRB.base as u32 && candidate != (RCRB.base as u32 | 1) {
+                        return Err(LpcError::ReservedBits);
+                    }
+                    *value = candidate;
+                }
+                None => data.copy_from_slice(&value.to_le_bytes()),
+            }
+            return Ok(());
+        }
         if off == GEN_PMCON_1 && len == 2 {
             match write {
                 Some(bytes) => {
@@ -646,5 +686,30 @@ mod tests {
         assert_eq!(lpc.pio_write_with_power(0x804, &SLP_EN.to_le_bytes(), 0, LpcIoContext::Normal), Ok(LpcPioWriteOutcome::Unmapped));
         write(&mut lpc, ACPI_CNTL, &[ACPI_EN]).unwrap();
         assert_eq!(lpc.pio_write_with_power(0x804, &SLP_EN.to_le_bytes(), 0, LpcIoContext::Normal), Ok(LpcPioWriteOutcome::AcpiS5));
+    }
+
+    #[test]
+    fn rcrb_span_and_config_failures_preserve_the_private_decoder() {
+        let mut lpc = Ich9Lpc::with_rcrb(layout());
+        let limit = RCRB.base + RCRB.len;
+        for value in [0, RCRB.base as u32, RCRB.base as u32 | 1] {
+            write(&mut lpc, RCBA, &value.to_le_bytes()).unwrap();
+            let before = lpc.config.raw().to_vec();
+            for (start, finish) in [(RCRB.base - 1, RCRB.base + 1), (limit - 1, limit + 1)] {
+                assert_eq!(lpc.rcrb_decode(start, finish), Err(LpcError::Boundary));
+            }
+            for (off, bytes) in [(RCBA, vec![0]), (RCBA + 2, vec![0; 2]), (RCBA - 1, vec![0; 2]),
+                (RCBA, 1u32.to_le_bytes().to_vec())] {
+                assert!(write(&mut lpc, off, &bytes).is_err());
+                assert_eq!(lpc.rcba, Some(value)); assert_eq!(lpc.config.raw(), before);
+            }
+            assert_eq!(lpc.rcrb_decode(RCRB.base - 4, RCRB.base), Ok(false));
+            assert_eq!(lpc.rcrb_decode(limit, limit + 4), Ok(false));
+            assert_eq!(lpc.rcrb_decode(RCRB.base, limit),
+                if value & 1 != 0 { Err(LpcError::RcrbRegister) } else { Ok(true) });
+        }
+        let mut ordinary = Ich9Lpc::new(layout());
+        assert_eq!(write(&mut ordinary, RCBA, &(RCRB.base as u32 | 1).to_le_bytes()), Err(LpcError::UnsupportedRegister));
+        assert_eq!(ordinary.rcrb_decode(RCRB.base, limit), Ok(false));
     }
 }
