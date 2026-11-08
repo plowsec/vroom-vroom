@@ -221,9 +221,9 @@ impl BusDevice for FwCfg {
 /// the stream. Modern fw_cfg ignores data-port writes.
 ///
 /// This adapter does not register a board device or enable a firmware profile.
-/// EDK2's `IoReadFifo8` probing may use string PIO; the current scalar-only
-/// hypervisor interface still rejects multiple-element I/O. No VM snapshot
-/// support is implied by this transport.
+/// Current EDK2 `BaseIoLibIntrinsic` FIFO reads loop over scalar accesses.
+/// Other clients' string/multiple-element I/O remains unsupported by the
+/// hypervisor interface. No VM snapshot support is implied by this transport.
 #[derive(Debug)]
 pub struct FwCfgIo {
     inner: FwCfg,
