@@ -18,8 +18,34 @@ struct Counts {
     zeroes: AtomicUsize,
     fail_boot: AtomicBool,
     panic_boot_cpu: AtomicBool,
+    fail_create: AtomicBool,
+    panic_create: AtomicBool,
+    fail_save: AtomicBool,
+    panic_cpu_drop: AtomicBool,
+    vm_drops: AtomicUsize,
+    startup_drop_gate: Mutex<Option<StartupDropGate>>,
+    drop_wait_timed_out: AtomicBool,
     boot_regs: Mutex<Vec<BootRegs>>,
     timeline: Mutex<Vec<String>>,
+}
+
+#[derive(Debug)]
+struct StartupDropGate {
+    entered: mpsc::Sender<()>,
+    release: mpsc::Receiver<()>,
+}
+
+impl Counts {
+    fn wait_at_startup_drop(&self) {
+        let gate = self.startup_drop_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            let _ = gate.entered.send(());
+            if gate.release.recv_timeout(Duration::from_secs(2)).is_err() {
+                // Do not panic from a destructor while another panic unwinds.
+                self.drop_wait_timed_out.store(true, SeqCst);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -43,7 +69,11 @@ struct FakeCpu {
 }
 impl Drop for FakeCpu {
     fn drop(&mut self) {
+        self.counts.wait_at_startup_drop();
         self.counts.drops.fetch_add(1, SeqCst);
+        if self.counts.panic_cpu_drop.load(SeqCst) {
+            panic!("injected startup CPU drop panic");
+        }
     }
 }
 impl Vcpu for FakeCpu {
@@ -98,6 +128,9 @@ impl Vcpu for FakeCpu {
     }
     fn save_state(&mut self) -> vroom_hv::Result<VcpuState> {
         self.counts.saves.fetch_add(1, SeqCst);
+        if self.counts.fail_save.load(SeqCst) {
+            return Err(vroom_hv::Error::Invalid("injected pristine save failure".into()));
+        }
         Ok(VcpuState {
             index: self.index,
             ..Default::default()
@@ -124,6 +157,12 @@ struct FakeVm {
     memory: Mutex<Option<GuestMemory>>,
     kernel_psci: bool,
 }
+impl Drop for FakeVm {
+    fn drop(&mut self) {
+        self.counts.wait_at_startup_drop();
+        self.counts.vm_drops.fetch_add(1, SeqCst);
+    }
+}
 impl Vm for FakeVm {
     fn map_memory(&self, memory: &GuestMemory) -> vroom_hv::Result<()> {
         *self.memory.lock().unwrap() = Some(memory.clone());
@@ -133,6 +172,12 @@ impl Vm for FakeVm {
         Ok(())
     }
     fn create_vcpu(&self, index: u32) -> vroom_hv::Result<Box<dyn Vcpu>> {
+        if self.counts.panic_create.load(SeqCst) {
+            panic!("injected startup creation panic");
+        }
+        if self.counts.fail_create.load(SeqCst) {
+            return Err(vroom_hv::Error::Invalid("injected CPU creation failure".into()));
+        }
         Ok(Box::new(FakeCpu {
             index,
             counts: self.counts.clone(),
@@ -669,4 +714,122 @@ fn checked_shutdown_reports_panic_and_still_joins_every_worker() {
     assert!(vm.shutdown_checked().unwrap_err().to_string().contains("worker panicked"));
     assert_eq!(vm.state(), RunState::Stopped);
     assert_eq!(counts.drops.load(SeqCst), 2, "the other worker must also be joined");
+}
+
+fn startup_shared(counts: &Arc<Counts>) -> Arc<VcpuShared> {
+    let (events, _) = mpsc::channel();
+    Arc::new(VcpuShared {
+        vm: Arc::new(FakeVm { counts: counts.clone(), memory: Mutex::new(None), kernel_psci: false }),
+        mmio: vroom_devices::BusBuilder::new().build(), pio: None,
+        cpus: Mutex::new(psci::CpuTable::new(vec![0])), events, peers: Default::default(),
+        run_calls: Default::default(), device_exits: Default::default(),
+        halt_on_stop: Default::default(), halting: Default::default(),
+        parked: Default::default(), halted_at: Default::default(),
+    })
+}
+
+fn startup_drop_gate(counts: &Counts) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+    let (entered, receive) = mpsc::channel(); let (release, wait) = mpsc::channel();
+    *counts.startup_drop_gate.lock().unwrap() = Some(StartupDropGate { entered, release: wait });
+    (receive, release)
+}
+
+// Counts are sampled immediately when startup returns, never after a later
+// wait that could hide a detached worker eventually destroying its resources.
+type StartupReturn = (Error, usize, usize, usize);
+fn startup_return(error: Error, counts: &Counts) -> StartupReturn {
+    (error, counts.drops.load(SeqCst), counts.vm_drops.load(SeqCst), counts.runs.load(SeqCst))
+}
+
+fn joined_startup_error(counts: &Counts, entered: mpsc::Receiver<()>, release: mpsc::Sender<()>,
+    returned: mpsc::Receiver<StartupReturn>, caller: std::thread::JoinHandle<()>, cpus: usize) -> Error {
+    let dropping = entered.recv_timeout(Duration::from_secs(2));
+    let early = returned.recv_timeout(Duration::from_millis(40));
+    let returned_before_cleanup = early.is_ok();
+    // Always release and join before asserting, even if the regression returns
+    // early. The 40ms wait is a test checkpoint, not a runtime timeout policy.
+    let _ = release.send(());
+    let result = early.or_else(|_| returned.recv_timeout(Duration::from_secs(2)));
+    caller.join().unwrap();
+    assert!(dropping.is_ok(), "worker did not reach the controlled destructor");
+    assert!(!returned_before_cleanup, "startup detached the worker during destruction");
+    let (error, cpu_drops, vm_drops, runs) = result.unwrap();
+    assert_eq!((cpu_drops, vm_drops, runs), (cpus, 1, 0));
+    assert_eq!(counts.boots.load(SeqCst), 0);
+    assert!(!counts.drop_wait_timed_out.load(SeqCst));
+    error
+}
+
+#[test]
+fn startup_errors_and_panics_join_owned_resources_before_return_without_run() {
+    for failure in 0..4 {
+        let counts = Arc::new(Counts::default());
+        counts.fail_create.store(failure == 0, SeqCst);
+        counts.panic_create.store(failure == 1, SeqCst);
+        counts.fail_save.store(failure >= 2, SeqCst);
+        counts.panic_cpu_drop.store(failure == 3, SeqCst);
+        let shared = startup_shared(&counts); let weak = Arc::downgrade(&shared);
+        let (entered, release) = startup_drop_gate(&counts);
+        let (returned_tx, returned) = mpsc::channel(); let c = counts.clone();
+        let caller = std::thread::spawn(move || {
+            let error = vcpu::spawn(0, shared, LifecyclePolicy::Resettable).unwrap_err();
+            let _ = returned_tx.send(startup_return(error, &c));
+        });
+        let error = joined_startup_error(&counts, entered, release, returned, caller, usize::from(failure >= 2));
+        assert!(weak.upgrade().is_none(), "shared VM owner survived failed startup");
+        match failure {
+            0 => assert!(matches!(error, Error::Hv(vroom_hv::Error::Invalid(ref s)) if s == "injected CPU creation failure")),
+            2 => assert!(matches!(error, Error::Hv(vroom_hv::Error::Invalid(ref s)) if s == "injected pristine save failure")),
+            _ => assert!(matches!(error, Error::Setup(ref s) if s == "vCPU worker panicked")),
+        }
+        assert_eq!(counts.saves.load(SeqCst), usize::from(failure >= 2));
+    }
+}
+
+#[test]
+fn startup_disconnected_readiness_closes_commands_and_joins_before_error() {
+    let counts = Arc::new(Counts::default()); let shared = startup_shared(&counts);
+    let weak = Arc::downgrade(&shared); let (entered, release) = startup_drop_gate(&counts);
+    let (tx, rx) = mpsc::channel(); let (ready_tx, ready_rx) = mpsc::channel();
+    // A clean disconnected readiness channel is not normally produced by the
+    // backend. Inject it at the same private completion helper used by spawn.
+    let worker = std::thread::spawn(move || {
+        let cpu = shared.vm.create_vcpu(0).unwrap();
+        drop(ready_tx);
+        assert!(matches!(rx.recv_timeout(Duration::from_secs(2)), Err(mpsc::RecvTimeoutError::Disconnected)),
+            "startup must close commands before joining");
+        drop(cpu); drop(shared);
+    });
+    let (returned_tx, returned) = mpsc::channel(); let c = counts.clone();
+    let caller = std::thread::spawn(move || {
+        let error = vcpu::finish_startup_for_test(tx, ready_rx, worker).unwrap_err();
+        let _ = returned_tx.send(startup_return(error, &c));
+    });
+    assert!(matches!(joined_startup_error(&counts, entered, release, returned, caller, 1), Error::VcpuGone));
+    assert!(weak.upgrade().is_none());
+    assert_eq!(counts.saves.load(SeqCst), 0);
+}
+
+#[test]
+fn startup_abandoned_ready_receiver_never_enters_the_command_loop() {
+    for lifecycle in [LifecyclePolicy::ColdBootOnly, LifecyclePolicy::Resettable] {
+        let counts = Arc::new(Counts::default()); let shared = startup_shared(&counts);
+        let weak = Arc::downgrade(&shared);
+        let (tx, rx) = mpsc::channel(); let (ready_tx, ready_rx) = mpsc::channel();
+        let (reply_tx, reply_rx) = mpsc::channel();
+        tx.send(VcpuCmd::Initialize(Some(BootRegs::X86ResetVector), reply_tx)).unwrap();
+        tx.send(VcpuCmd::Resume).unwrap(); tx.send(VcpuCmd::Stop).unwrap();
+        drop(ready_rx);
+        let worker = std::thread::spawn(move || vcpu::start_worker_for_test(0, shared, lifecycle, rx, ready_tx));
+        worker.join().unwrap();
+        // Ignoring the send failure would consume Initialize before Stop,
+        // even though this queued Stop prevents an accidentally endless loop.
+        assert!(matches!(reply_rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)));
+        assert_eq!(counts.boots.load(SeqCst), 0);
+        assert_eq!(counts.runs.load(SeqCst), 0);
+        assert_eq!(counts.drops.load(SeqCst), 1);
+        assert_eq!(counts.vm_drops.load(SeqCst), 1);
+        assert_eq!(counts.saves.load(SeqCst), usize::from(lifecycle == LifecyclePolicy::Resettable));
+        assert!(weak.upgrade().is_none());
+    }
 }

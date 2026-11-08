@@ -162,34 +162,63 @@ pub fn spawn(index: u32, shared: Arc<VcpuShared>, lifecycle: LifecyclePolicy) ->
     let (ready_tx, ready_rx) = mpsc::channel();
     let thread = std::thread::Builder::new()
         .name(format!("vcpu{index}"))
-        .spawn(move || {
-            let vcpu = match shared.vm.create_vcpu(index) {
-                Ok(v) => v,
-                Err(e) => {
-                    let _ = ready_tx.send(Err(Error::Hv(e)));
-                    return;
-                }
-            };
-            let mut vcpu = vcpu;
-            let pristine = if lifecycle == LifecyclePolicy::Resettable {
-                match vcpu.save_state() {
-                    Ok(state) => Some(state),
-                    Err(error) => {
-                        let _ = ready_tx.send(Err(Error::Hv(error)));
-                        return;
-                    }
-                }
-            } else {
-                None
-            };
-            let _ = ready_tx.send(Ok(vcpu.kicker()));
-            // Wait for acknowledged Initialize; KVM's irqchip is finalized first.
-            VcpuLoop { vcpu, pristine, lifecycle, initialized: false, shared, rx,
-                running: false, paused: false, stopped_by: None }.run();
-        })
+        .spawn(move || start_worker(index, shared, lifecycle, rx, ready_tx))
         .map_err(|e| Error::Setup(format!("spawn vcpu thread: {e}")))?;
-    let kicker = ready_rx.recv().map_err(|_| Error::VcpuGone)??;
-    Ok(VcpuHandle { peer: Peer { tx, kicker }, thread: Some(thread) })
+    finish_startup(tx, ready_rx, thread)
+}
+
+fn start_worker(index: u32, shared: Arc<VcpuShared>, lifecycle: LifecyclePolicy,
+    rx: Receiver<VcpuCmd>, ready_tx: Sender<Result<Arc<dyn VcpuKicker>>>) {
+    let mut vcpu = match shared.vm.create_vcpu(index) {
+        Ok(v) => v,
+        Err(error) => {
+            let _ = ready_tx.send(Err(Error::Hv(error)));
+            return;
+        }
+    };
+    let pristine = if lifecycle == LifecyclePolicy::Resettable {
+        match vcpu.save_state() {
+            Ok(state) => Some(state),
+            Err(error) => {
+                let _ = ready_tx.send(Err(Error::Hv(error)));
+                return;
+            }
+        }
+    } else { None };
+    // An abandoned startup must not enter the command loop, even if commands
+    // were already queued. Locals drop the CPU before its shared VM owners.
+    if ready_tx.send(Ok(vcpu.kicker())).is_err() { return; }
+    // Wait for acknowledged Initialize; KVM's irqchip is finalized first.
+    VcpuLoop { vcpu, pristine, lifecycle, initialized: false, shared, rx,
+        running: false, paused: false, stopped_by: None }.run();
+}
+
+fn finish_startup(tx: Sender<VcpuCmd>, ready_rx: Receiver<Result<Arc<dyn VcpuKicker>>>,
+    thread: JoinHandle<()>) -> Result<VcpuHandle> {
+    match ready_rx.recv().map_err(|_| Error::VcpuGone).and_then(|ready| ready) {
+        Ok(kicker) => Ok(VcpuHandle { peer: Peer { tx, kicker }, thread: Some(thread) }),
+        Err(error) => {
+            // Closing commands also releases a parked worker if readiness was
+            // lost. Never detach a failed startup while it owns VM resources.
+            drop(tx);
+            thread.join().map_err(|_| Error::Setup("vCPU worker panicked".into()))?;
+            Err(error)
+        }
+    }
+}
+
+// Only the lifecycle tests can arrange channel abandonment/disconnection.
+// Production uses the same two helpers through spawn, without policy hooks.
+#[cfg(test)]
+pub(super) fn start_worker_for_test(index: u32, shared: Arc<VcpuShared>, lifecycle: LifecyclePolicy,
+    rx: Receiver<VcpuCmd>, ready_tx: Sender<Result<Arc<dyn VcpuKicker>>>) {
+    start_worker(index, shared, lifecycle, rx, ready_tx)
+}
+
+#[cfg(test)]
+pub(super) fn finish_startup_for_test(tx: Sender<VcpuCmd>, ready_rx: Receiver<Result<Arc<dyn VcpuKicker>>>,
+    thread: JoinHandle<()>) -> Result<VcpuHandle> {
+    finish_startup(tx, ready_rx, thread)
 }
 
 struct VcpuLoop {
