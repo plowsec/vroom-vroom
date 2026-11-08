@@ -22,6 +22,7 @@ pub(crate) fn note_helper(pid: u32) {
 pub use vroom_state as state;
 mod display;
 mod firmware;
+mod firmware_x86;
 mod hotplug;
 mod irq;
 mod lifecycle;

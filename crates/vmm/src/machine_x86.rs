@@ -32,6 +32,12 @@ fn unsupported(why: &str) -> Error {
 
 /// This entire phase runs before VMM state/device/helper side effects.
 pub(crate) fn prepare(config: &VmConfig, hv: &dyn Hypervisor, opts: &VmmOptions) -> Result<PreparedBoot> {
+    if matches!(config.boot, Boot::Uefi { .. }) {
+        // Own and validate inputs, but do not enable a firmware board. In
+        // particular, never pass these paths to the ARM VARS/disk setup.
+        let _prepared = crate::firmware_x86::prepare(config, hv, opts)?;
+        return Err(Error::Unavailable(crate::firmware_x86::EXECUTION_DISABLED));
+    }
     if hv.arch() != Arch::X86_64 || hv.name() != "kvm" {
         return Err(unsupported("requires the x86_64 KVM backend"));
     }
