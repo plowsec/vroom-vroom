@@ -10,6 +10,7 @@ use vroom_snapshot::{decode, encode, Snapshottable};
 use super::{ConfigSpace, PciId, RootPort, SharedPciDevice, VendorIds};
 use crate::{BusDevice, ConcurrentBusDevice, IrqLine};
 use super::mch::{MchConfig, MchError, PciConfigError};
+use super::lpc::Ich9Lpc;
 
 /// Four shared level-triggered lines; a line is high while any device
 /// on it asserts.
@@ -71,6 +72,8 @@ struct Mapping {
 
 pub struct PciRoot {
     host: Mutex<HostBridge>,
+    /// Only the cold MCH router can own this checked slot 31 function.
+    lpc: Option<Mutex<Ich9Lpc>>,
     devices: Vec<(u8, SharedPciDevice)>,
     /// Hot plug root ports (also in `devices`, in their slots).
     ports: Vec<(u8, Arc<Mutex<RootPort>>)>,
@@ -130,13 +133,13 @@ impl PciRoot {
         for (slot, p) in &ports {
             devices.push((*slot, p.clone() as SharedPciDevice));
         }
-        Arc::new(PciRoot { host: Mutex::new(HostBridge::Legacy(host)), devices, ports, map: RwLock::new(Vec::new()), paused: AtomicBool::new(false) })
+        Arc::new(PciRoot { host: Mutex::new(HostBridge::Legacy(host)), lpc: None, devices, ports, map: RwLock::new(Vec::new()), paused: AtomicBool::new(false) })
     }
 
     // Only the checked MCH router receives this root: no generic ECAM port or
     // independently writable host-bridge handle escapes its exclusive owner.
-    pub(super) fn with_mch(devices: Vec<(u8, SharedPciDevice)>, host: MchConfig) -> Arc<Self> {
-        Arc::new(Self { host: Mutex::new(HostBridge::Mch(host)), devices, ports: Vec::new(),
+    pub(super) fn with_mch(devices: Vec<(u8, SharedPciDevice)>, host: MchConfig, lpc: Option<Ich9Lpc>) -> Arc<Self> {
+        Arc::new(Self { host: Mutex::new(HostBridge::Mch(host)), lpc: lpc.map(Mutex::new), devices, ports: Vec::new(),
             map: RwLock::new(Vec::new()), paused: AtomicBool::new(false) })
     }
 
@@ -151,6 +154,14 @@ impl PciRoot {
         match &*lock(&self.host) {
             HostBridge::Mch(host) => host.window(),
             HostBridge::Legacy(_) => None,
+        }
+    }
+
+    pub(super) fn lpc_pio(&self, port: u16, data: &mut [u8], write: Option<&[u8]>, elapsed_ns: u64) -> Result<bool, super::LpcError> {
+        Ich9Lpc::port_span(port, write.map_or(data.len(), |b| b.len()))?;
+        match &self.lpc {
+            Some(lpc) => lock(lpc).pio(port, data, write, elapsed_ns),
+            None => Ok(false),
         }
     }
 
@@ -231,6 +242,11 @@ impl PciRoot {
                 HostBridge::Mch(host) => return host.access(reg, data, write, apply),
             }
             return Ok(());
+        }
+        if bus == 0 && slot == 31 && func == 0 {
+            if let Some(lpc) = &self.lpc {
+                return lock(lpc).config_access(reg, data, write).map_err(PciConfigError::Lpc);
+            }
         }
         let Some(d) = self.target(bus, slot, func) else {
             data.fill(0xff);

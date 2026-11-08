@@ -17,6 +17,8 @@ use std::sync::Arc;
 use vroom_memory::GuestMemory;
 use crate::{Bus, BusRange};
 use super::smram::{Apply, SmramConfig};
+use super::lpc::Ich9Lpc;
+use super::{LpcError, LpcPioLayout};
 use super::{MchSmramState, ConfigSpace, PciCf8, PciCf8Error, PciId, PciRoot, SharedPciDevice};
 
 const PCIEXBAR: usize = 0x60;
@@ -50,6 +52,8 @@ pub enum PciConfigError {
     SmramBackend,
     #[error("MCH router is poisoned after a failed SMRAM transition")]
     SmramPoisoned,
+    #[error("LPC configuration access: {0}")]
+    Lpc(#[from] LpcError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -78,6 +82,8 @@ pub enum MchError {
     Port(#[from] PciCf8Error),
     #[error("PCI configuration access: {0}")]
     Config(#[from] PciConfigError),
+    #[error("LPC port access: {0}")]
+    Lpc(#[from] LpcError),
 }
 
 fn end(range: BusRange) -> Option<u64> {
@@ -204,7 +210,7 @@ impl MchPci {
     pub fn with_bar_windows(devices: Vec<(u8, SharedPciDevice)>, fixed_mmio: Bus,
                             ram: &GuestMemory, ecam_aperture: BusRange,
                             bar_windows: Vec<BusRange>, reserved_ranges: Vec<BusRange>) -> Result<Self, MchError> {
-        Self::build(devices, fixed_mmio, ram, ecam_aperture, bar_windows, reserved_ranges, false)
+        Self::build(devices, fixed_mmio, ram, ecam_aperture, bar_windows, reserved_ranges, false, None)
     }
 
     /// Bind fixed 128 KiB default-SMBASE and 8 MiB TSEG controls. The caller
@@ -214,6 +220,25 @@ impl MchPci {
     pub fn with_q35_smram(devices: Vec<(u8, SharedPciDevice)>, fixed_mmio: Bus,
                          ram: &GuestMemory, ecam_aperture: BusRange,
                          bar_windows: Vec<BusRange>, reserved_ranges: Vec<BusRange>) -> Result<Self, MchError> {
+        Self::q35_layout(&fixed_mmio, ram, ecam_aperture, &bar_windows, &reserved_ranges)?;
+        Self::build(devices, fixed_mmio, ram, ecam_aperture, bar_windows, reserved_ranges, true, None)
+    }
+
+    /// Add the checked LPC PM timer at slot 31.0 to the fixed-Q35 SMRAM model.
+    /// All `with_q35_smram` backend/inventory obligations still apply. The LPC
+    /// owns no generic endpoint handle and supports no SMI, SCI, S5 or RTC yet.
+    /// This is a cold-only device composition, not an OVMF/Windows VMM profile.
+    pub fn with_q35_lpc(devices: Vec<(u8, SharedPciDevice)>, fixed_mmio: Bus,
+                       ram: &GuestMemory, ecam_aperture: BusRange,
+                       bar_windows: Vec<BusRange>, reserved_ranges: Vec<BusRange>,
+                       lpc_pio_layout: LpcPioLayout) -> Result<Self, MchError> {
+        Self::q35_layout(&fixed_mmio, ram, ecam_aperture, &bar_windows, &reserved_ranges)?;
+        Self::build(devices, fixed_mmio, ram, ecam_aperture, bar_windows, reserved_ranges,
+            true, Some(Ich9Lpc::new(lpc_pio_layout)))
+    }
+
+    fn q35_layout(fixed_mmio: &Bus, ram: &GuestMemory, ecam_aperture: BusRange,
+                  bar_windows: &[BusRange], reserved_ranges: &[BusRange]) -> Result<(), MchError> {
         for private in [BusRange { base: 0x30000, len: 0x20000 }, BusRange { base: 0x1f800000, len: 0x800000 }] {
             let limit = private.base + private.len;
             if !reserved_ranges.iter().any(|r| contains(*r, private.base, limit))
@@ -224,12 +249,12 @@ impl MchPci {
                 return Err(MchError::Layout);
             }
         }
-        Self::build(devices, fixed_mmio, ram, ecam_aperture, bar_windows, reserved_ranges, true)
+        Ok(())
     }
 
     fn build(mut devices: Vec<(u8, SharedPciDevice)>, fixed_mmio: Bus,
              ram: &GuestMemory, ecam_aperture: BusRange,
-             bar_windows: Vec<BusRange>, reserved_ranges: Vec<BusRange>, smram: bool) -> Result<Self, MchError> {
+             bar_windows: Vec<BusRange>, reserved_ranges: Vec<BusRange>, smram: bool, lpc: Option<Ich9Lpc>) -> Result<Self, MchError> {
         let finish = end(ecam_aperture).ok_or(MchError::Layout)?;
         if ecam_aperture.len != APERTURE_SIZE || ecam_aperture.base % APERTURE_SIZE != 0
             || finish > ADDRESS_LIMIT
@@ -239,7 +264,9 @@ impl MchPci {
         }
         let mut slots = 0u32;
         for (slot, _) in &devices {
-            if !(1..=31).contains(slot) || slots & (1u32 << slot) != 0 { return Err(MchError::Slot); }
+            if !(1..=31).contains(slot) || slots & (1u32 << slot) != 0 || (lpc.is_some() && *slot == 31) {
+                return Err(MchError::Slot);
+            }
             slots |= 1u32 << slot;
         }
         if bar_windows.len() > 2 || reserved_ranges.len() > 64
@@ -269,7 +296,7 @@ impl MchPci {
         }
         let mut host = MchConfig::new(ecam_aperture);
         if smram { host.smram = Some(SmramConfig::new()); }
-        let root = PciRoot::with_mch(devices, host);
+        let root = PciRoot::with_mch(devices, host, lpc);
         let cf8 = PciCf8::new(root.clone());
         Ok(Self { root, cf8, fixed: fixed_mmio, aperture: ecam_aperture, bar_windows, bar_exclusions })
     }
@@ -282,6 +309,21 @@ impl MchPci {
     pub fn pio_write(&mut self, port: u16, data: &[u8]) -> Result<(), MchError> {
         self.root.mch_check()?;
         Ok(self.cf8.write(port, data)?)
+    }
+
+    /// Absolute LPC port access. The owner supplies nanoseconds since one
+    /// monotonic cold epoch, not `Vm::clock` (currently zero on KVM). False
+    /// means no decode. Invalid/unmapped reads leave the buffer unchanged.
+    /// Disable/rebase does not restart the timer. Pause, reset and migration
+    /// are not supported; the future board must bind its clock consistently.
+    pub fn lpc_pio_read(&mut self, port: u16, data: &mut [u8], elapsed_ns: u64) -> Result<bool, MchError> {
+        self.root.mch_check()?;
+        Ok(self.root.lpc_pio(port, data, None, elapsed_ns)?)
+    }
+
+    pub fn lpc_pio_write(&mut self, port: u16, data: &[u8], elapsed_ns: u64) -> Result<bool, MchError> {
+        self.root.mch_check()?;
+        Ok(self.root.lpc_pio(port, &mut [], Some(data), elapsed_ns)?)
     }
 
     /// The nonstored callback must apply the requested state on the sole vCPU
@@ -641,6 +683,85 @@ mod tests {
         let router = MchPci::with_q35_smram(vec![(1, device)], fixed.build(), &GuestMemory::default(),
             APERTURE, vec![BAR_LOW], private_ranges()).unwrap();
         (router, counts)
+    }
+
+    fn lpc_layout() -> LpcPioLayout {
+        LpcPioLayout::new(vec![BusRange { base: 0x600, len: 0x80 }, BusRange { base: 0x800, len: 0x80 }],
+            vec![BusRange { base: 0x700, len: 0x20 }]).unwrap()
+    }
+    fn lpc_router() -> MchPci {
+        MchPci::with_q35_lpc(vec![], Bus::default(), &GuestMemory::default(), APERTURE,
+            vec![], private_ranges(), lpc_layout()).unwrap()
+    }
+
+    #[test]
+    fn lpc_cf8_and_ecam_share_checked_config_and_actual_port_decoding() {
+        let mut router = lpc_router(); enable(&mut router);
+        let slot = BASE + (31 << 15);
+        let mut data = [0; 4];
+        select(&mut router, 31, 0);
+        router.pio_read(0xcfc, &mut data).unwrap(); assert_eq!(u32::from_le_bytes(data), 0x2918_8086);
+        router.mmio_read(slot + 8, &mut data).unwrap(); assert_eq!(u32::from_le_bytes(data), 0x0601_0002);
+        router.mmio_read(slot + 4, &mut data).unwrap(); assert_eq!(data, [0; 4]);
+        select(&mut router, 31, 0x40); router.pio_write(0xcfc, &0x600u32.to_le_bytes()).unwrap();
+        router.mmio_read(slot + 0x40, &mut data).unwrap(); assert_eq!(u32::from_le_bytes(data), 0x601);
+        router.mmio_write(slot + 0x44, &[0x80]).unwrap();
+        assert!(router.lpc_pio_read(0x608, &mut data, 1_000_000_000).unwrap());
+        assert_eq!(u32::from_le_bytes(data), 3_579_545);
+        let mut callbacks = 0;
+        router.mmio_write_with_smram(slot + 0x41, &[8], &mut |s| { callbacks += 1; Ok(s) }).unwrap();
+        assert_eq!(callbacks, 0, "LPC config never invokes the SMRAM mapping backend");
+        select(&mut router, 31, 0x40); router.pio_read(0xcfc, &mut data).unwrap();
+        assert_eq!(u32::from_le_bytes(data), 0x801);
+        let before = data;
+        assert!(!router.lpc_pio_read(0x608, &mut data, 2_000_000_000).unwrap()); assert_eq!(data, before);
+        assert!(router.lpc_pio_read(0x808, &mut data, 2_000_000_000).unwrap());
+        assert_eq!(u32::from_le_bytes(data), 7_159_090);
+        assert_eq!(router.mmio_write(slot + 0x44, &[0x81]),
+            Err(MchError::Config(PciConfigError::Lpc(LpcError::ReservedBits))));
+        select(&mut router, 31, 0x44); router.pio_read(0xcfc, &mut data[..1]).unwrap(); assert_eq!(data[0], 0x80);
+        assert_eq!(router.pio_write(0xcfc, &[0; 2]),
+            Err(MchError::Port(PciCf8Error::Host(PciConfigError::Lpc(LpcError::UnsupportedRegister)))));
+        router.mmio_read(slot + 0x10, &mut data).unwrap(); assert_eq!(data, [0; 4], "LPC has no BARs");
+        data.fill(0xa5);
+        assert_eq!(router.mmio_read(slot + 0xf0, &mut data),
+            Err(MchError::Config(PciConfigError::Lpc(LpcError::UnsupportedRegister))));
+        assert_eq!(data, [0xa5; 4], "RCBA must not be fabricated");
+    }
+
+    #[test]
+    fn lpc_constructor_is_opt_in_and_cannot_shadow_an_endpoint_or_private_memory() {
+        let (device, counts) = endpoint();
+        assert!(matches!(MchPci::with_q35_lpc(vec![(31, device.clone())], Bus::default(), &GuestMemory::default(),
+            APERTURE, vec![], private_ranges(), lpc_layout()), Err(MchError::Slot)));
+        assert_eq!(counts.lock().unwrap().reads, 0);
+        let mut old = MchPci::new(vec![(31, device)], Bus::default(), &GuestMemory::default(), APERTURE).unwrap();
+        select(&mut old, 31, 0); let mut data = [0; 4]; old.pio_read(0xcfc, &mut data).unwrap();
+        assert_eq!(u32::from_le_bytes(data), 0x5678_1234);
+        assert!(!old.lpc_pio_read(0x608, &mut data, 0).unwrap());
+        assert!(MchPci::with_q35_lpc(vec![], Bus::default(), &GuestMemory::default(), APERTURE,
+            vec![], vec![], lpc_layout()).is_err());
+        let ram = GuestMemory::new(&[(GuestAddress(0x30000), page_size() as u64)]).unwrap();
+        assert!(MchPci::with_q35_lpc(vec![], Bus::default(), &ram, APERTURE,
+            vec![], private_ranges(), lpc_layout()).is_err());
+        let router = lpc_router();
+        assert!(router.root.ecam_port().save().is_err());
+    }
+
+    #[test]
+    fn smram_failure_also_poison_gates_lpc_config_and_timer_routes() {
+        let mut router = lpc_router(); enable(&mut router);
+        let slot = BASE + (31 << 15);
+        router.mmio_write(slot + 0x40, &0x600u32.to_le_bytes()).unwrap();
+        router.mmio_write(slot + 0x44, &[0x80]).unwrap();
+        assert!(router.mmio_write_with_smram(BASE + 0x50, &[255; 2], &mut |_| Err(PciConfigError::SmramBackend)).is_err());
+        let poisoned = MchError::Config(PciConfigError::SmramPoisoned);
+        let mut data = [0xa5; 4];
+        assert_eq!(router.lpc_pio_read(0x608, &mut data, 0), Err(poisoned));
+        assert_eq!(router.lpc_pio_write(0x608, &[0; 4], 0), Err(poisoned));
+        assert_eq!(router.lpc_pio_read(0x700, &mut data, 0), Err(poisoned));
+        assert_eq!(router.mmio_read(slot, &mut data), Err(poisoned));
+        assert_eq!(data, [0xa5; 4]);
     }
 
     #[test]

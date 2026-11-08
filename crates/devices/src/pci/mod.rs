@@ -2,6 +2,7 @@
 
 mod cf8;
 mod config;
+mod lpc;
 mod mch;
 pub mod msi;
 pub mod msix;
@@ -13,6 +14,7 @@ use std::sync::{Arc, Mutex};
 
 pub use config::{BarSpec, ConfigSpace, PciId, VendorIds, CFG_SIZE};
 pub use cf8::{PciCf8, PciCf8Error};
+pub use lpc::{LpcError, LpcPioLayout};
 pub use mch::{MchError, MchPci, PciConfigError};
 pub use msi::Msi;
 pub use msix::{Msix, MsiSender};
