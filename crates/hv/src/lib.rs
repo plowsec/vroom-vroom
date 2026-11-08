@@ -9,6 +9,9 @@
 
 pub mod aarch64;
 mod x86_64;
+// Private, binding-independent SMM mapping transaction; also tested on macOS.
+#[path = "kvm/smm.rs"]
+mod smm;
 mod error;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub mod hvf;
@@ -123,6 +126,16 @@ pub struct IdleSkipState {
 }
 
 pub trait Vm: Send + Sync {
+    /// Restricted x86 SMM fixture: own a private 64 KiB image at the default
+    /// SMBASE (0x30000), mapped in KVM address space 1 only. Call before any
+    /// memory mapping or vCPU creation attempt. Common RAM/ROM mapped later
+    /// is mirrored into both address spaces; topology freezes at vCPU creation.
+    /// No host-buffer maps, SMRAM relocation, chipset or firmware board.
+    /// The backend copies `initial`; no device-facing GuestMemory owns SMRAM.
+    fn configure_x86_smm(&self, _initial: &[u8]) -> Result<X86SmmCapabilities> {
+        Err(Error::Unsupported("restricted x86 SMM memory"))
+    }
+
     /// Map all guest RAM. The VM keeps a clone so the backing outlives the mapping.
     fn map_memory(&self, mem: &GuestMemory) -> Result<()>;
 
@@ -276,6 +289,10 @@ pub enum VcpuExit {
     /// x86 port I/O.
     PioIn { port: u16, len: usize },
     PioOut { port: u16, len: usize, data: [u8; 4] },
+    /// An x86 I/O exit with KVM_RUN_X86_SMM set in that same successful RUN.
+    /// Must never enter ordinary device/GuestMemory routing. Only an explicit
+    /// SMM-aware board may handle it; existing VMM profiles reject this exit.
+    X86SmmIo(X86IoExit),
     /// SMCCC call (PSCI etc) the backend did not handle in-kernel.
     /// Call [`Vcpu::complete_hypercall`] with the result.
     Hypercall { func: u64, args: [u64; 3] },
@@ -286,6 +303,24 @@ pub enum VcpuExit {
     Kicked,
     /// Halted with no wakeup source; the VMM decides.
     Halted,
+}
+
+/// Bounded x86 I/O, with the same scalar widths/completion rules as VcpuExit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum X86IoExit {
+    MmioRead { addr: u64, len: usize },
+    MmioWrite { addr: u64, len: usize, data: [u8; 8] },
+    PioIn { port: u16, len: usize },
+    PioOut { port: u16, len: usize, data: [u8; 4] },
+}
+
+/// Successful restricted SMM configuration, not a protected-firmware claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct X86SmmCapabilities {
+    /// VM-level KVM_CAP_X86_SMM query succeeded.
+    pub vm_smm: bool,
+    /// Numeric system-level KVM_CAP_MULTI_ADDRESS_SPACE result (at least 2).
+    pub system_address_spaces: u32,
 }
 
 /// Handle another thread uses to bounce a vCPU out of guest mode.
@@ -315,6 +350,11 @@ pub enum BootRegs {
 
 /// A virtual CPU. Not `Send`: lives and dies on its own thread.
 pub trait Vcpu {
+    /// Inject SMI on the owning thread into an initialized, explicitly SMM-
+    /// configured x86 vCPU. Pending I/O reads must be completed first.
+    fn inject_smi(&mut self) -> Result<()> {
+        Err(Error::Unsupported("x86 SMI injection"))
+    }
     fn debug_write_register(&mut self, _register: debug::Register, _value: u64) -> Result<()> {
         Err(Error::Unsupported("register editing on this backend"))
     }

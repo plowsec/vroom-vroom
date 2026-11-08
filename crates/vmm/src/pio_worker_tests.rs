@@ -347,3 +347,25 @@ fn completion_error_parks_worker_without_rerun_or_fabricated_success() {
     assert!(script.completions.lock().unwrap().is_empty());
     assert_eq!(device.lock().unwrap().reads, 1);
 }
+
+#[test]
+fn smm_io_never_reaches_generic_devices_or_read_completion() {
+    use vroom_hv::X86IoExit;
+    for io in [
+        X86IoExit::PioIn { port: 0x500, len: 1 },
+        X86IoExit::PioOut { port: 0x500, len: 1, data: [1; 4] },
+        X86IoExit::MmioRead { addr: 0x100000, len: 1 },
+        X86IoExit::MmioWrite { addr: 0x100000, len: 1, data: [1; 8] },
+    ] {
+        let device = Arc::new(Mutex::new(Device::default()));
+        let (event, script, count) = run(
+            vec![VcpuExit::X86SmmIo(io), VcpuExit::SystemOff], Some(bus(device.clone())), false);
+        assert!(matches!(event, VmEvent::Crashed(ref e) if e.contains("SMM I/O is unavailable")));
+        assert_eq!(script.runs.load(SeqCst), 1);
+        assert_eq!(script.completion_attempts.load(SeqCst), 0);
+        assert!(script.completions.lock().unwrap().is_empty());
+        assert_eq!(device.lock().unwrap().reads, 0);
+        assert!(device.lock().unwrap().writes.is_empty());
+        assert_eq!(count, 0);
+    }
+}

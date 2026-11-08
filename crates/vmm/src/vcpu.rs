@@ -383,6 +383,12 @@ impl VcpuLoop {
             }
         }
         match self.vcpu.run()? {
+            VcpuExit::X86SmmIo(_) => {
+                // Existing boards have no isolated SMM-aware device routing.
+                // Never erase the context by forwarding to the ordinary bus,
+                // GuestMemory/device DMA, or a fabricated read completion.
+                return Err(Error::Setup("SMM I/O is unavailable on this VMM board".into()));
+            }
             VcpuExit::Debug(stop) => {
                 use std::sync::atomic::Ordering::SeqCst;
                 if self.shared.halt_on_stop.load(SeqCst) && !self.shared.halting.swap(true, SeqCst) {

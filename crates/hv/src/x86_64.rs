@@ -1,7 +1,66 @@
 //! Pure contracts for the first x86 KVM backend, testable on any host.
 #![cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
 
-use crate::{Error, Result};
+use crate::{Error, Result, VcpuExit, X86IoExit};
+
+/// Values from the x86 KVM UAPI. Kept pure so the protocol can be tested on
+/// either development host; the backend asserts the binding values match.
+const RUN_SMM: u16 = 1;
+
+pub(crate) fn classify_io(smm_enabled: bool, flags: u16, io: X86IoExit) -> Result<VcpuExit> {
+    let smm = flags & RUN_SMM != 0;
+    if smm && !smm_enabled {
+        return Err(Error::GuestFault("SMM I/O without isolated SMM configuration".into()));
+    }
+    match &io {
+        X86IoExit::MmioRead { addr, len } | X86IoExit::MmioWrite { addr, len, .. } => {
+            mmio_len(*len)?;
+            let end = addr.checked_add(*len as u64).ok_or_else(|| Error::GuestFault("MMIO overflow".into()))?;
+            if smm_enabled && !smm && *addr < crate::smm::BASE + crate::smm::SIZE as u64 && crate::smm::BASE < end {
+                return Err(Error::GuestFault("normal-context access to private SMRAM".into()));
+            }
+        }
+        X86IoExit::PioIn { len, .. } | X86IoExit::PioOut { len, .. } => {
+            if !matches!(len, 1 | 2 | 4) { return Err(Error::GuestFault("invalid scalar PIO width".into())); }
+        }
+    }
+    if smm { return Ok(VcpuExit::X86SmmIo(io)); }
+    Ok(match io {
+        X86IoExit::MmioRead { addr, len } => VcpuExit::MmioRead { addr, len },
+        X86IoExit::MmioWrite { addr, len, data } => VcpuExit::MmioWrite { addr, len, data },
+        X86IoExit::PioIn { port, len } => VcpuExit::PioIn { port, len },
+        X86IoExit::PioOut { port, len, data } => VcpuExit::PioOut { port, len, data },
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingRead {
+    Mmio(usize),
+    Pio { len: usize, offset: usize },
+}
+
+pub(crate) fn check_completion(pending: Option<PendingRead>, mmio: bool, len: usize) -> Result<PendingRead> {
+    match pending {
+        Some(value @ PendingRead::Mmio(want)) if mmio && len == want => Ok(value),
+        Some(value @ PendingRead::Pio { len: want, .. }) if !mmio && len == want => Ok(value),
+        _ => Err(Error::Invalid("no matching guest read or wrong completion length".into())),
+    }
+}
+
+pub(crate) fn check_smi_ready(enabled: bool, initialized: bool, pending: bool, in_smm: bool) -> Result<()> {
+    if !enabled { return Err(Error::Unsupported("SMI requires isolated SMM configuration")); }
+    if !initialized || pending || in_smm {
+        return Err(Error::Invalid("SMI requires an initialized normal-mode CPU with no pending read".into()));
+    }
+    Ok(())
+}
+
+pub(crate) fn check_smm_boot(enabled: bool, regs: &crate::BootRegs) -> Result<()> {
+    if enabled && !matches!(regs, crate::BootRegs::X86ResetVector) {
+        return Err(Error::Unsupported("restricted SMM requires fresh reset-vector entry"));
+    }
+    Ok(())
+}
 
 // Keep KVM's four private pages below the top 4 MiB used by OVMF flash.
 // The default identity-map address (0xfffb_c000) overlaps that firmware.
@@ -423,5 +482,66 @@ mod tests {
         assert_eq!(cpuid_registers(0x1f, 1, [u32::MAX; 4]), [0, 1, 0x201, 0]);
         assert_eq!(cpuid_registers(0x1f, 2, [u32::MAX; 4]), [0, 0, 2, 0]);
         assert_eq!(cpuid_registers(7, 0, input), input, "other supported leaves stay unchanged");
+    }
+
+    #[test]
+    fn only_that_runs_smm_flag_produces_smm_io_and_normal_after_rsm_is_normal() {
+        let exits = [
+            X86IoExit::MmioRead { addr: 0x100000, len: 1 },
+            X86IoExit::MmioWrite { addr: 0x100000, len: 8, data: [9; 8] },
+            X86IoExit::PioIn { port: 0x700, len: 2 },
+            X86IoExit::PioOut { port: 0x700, len: 4, data: [9; 4] },
+        ];
+        for io in exits {
+            assert_eq!(classify_io(true, 1, io.clone()).unwrap(), VcpuExit::X86SmmIo(io.clone()));
+            assert_eq!(classify_io(true, 3, io.clone()).unwrap(), VcpuExit::X86SmmIo(io.clone()), "BUS_LOCK does not erase SMM");
+            assert!(classify_io(false, 1, io.clone()).is_err());
+            let normal = classify_io(false, 0, io.clone()).unwrap();
+            assert_eq!(classify_io(true, 0, io.clone()).unwrap(), normal, "RSM must not inherit prior SMM context");
+            assert_eq!(classify_io(true, 2, io).unwrap(), normal, "BUS_LOCK alone is normal");
+        }
+    }
+
+    #[test]
+    fn normal_smram_reads_writes_and_cross_boundary_accesses_fail_before_dispatch() {
+        for addr in [crate::smm::BASE - 1, crate::smm::BASE, crate::smm::BASE + crate::smm::SIZE as u64 - 1] {
+            for io in [X86IoExit::MmioRead { addr, len: 2 }, X86IoExit::MmioWrite { addr, len: 2, data: [7; 8] }] {
+                assert!(classify_io(true, 0, io.clone()).is_err());
+                assert!(matches!(classify_io(true, 1, io.clone()).unwrap(), VcpuExit::X86SmmIo(_)));
+                assert!(classify_io(false, 0, io).is_ok(), "ordinary Linux behavior unchanged");
+            }
+        }
+        assert!(classify_io(true, 0, X86IoExit::MmioRead { addr: u64::MAX, len: 2 }).is_err());
+        for len in [0, 9, usize::MAX] {
+            assert!(classify_io(true, 1, X86IoExit::MmioRead { addr: 0x100000, len }).is_err());
+        }
+        assert!(classify_io(true, 1, X86IoExit::PioIn { port: 0x700, len: 3 }).is_err());
+    }
+
+    #[test]
+    fn read_completion_requires_exact_kind_and_size_and_smi_cannot_interrupt_it() {
+        for pending in [PendingRead::Mmio(8), PendingRead::Pio { len: 4, offset: 4096 }] {
+            let (mmio, len) = match pending { PendingRead::Mmio(len) => (true, len), PendingRead::Pio { len, .. } => (false, len) };
+            for size in [0, len - 1, len + 1, usize::MAX] {
+                assert!(check_completion(Some(pending), mmio, size).is_err());
+            }
+            assert!(check_completion(Some(pending), !mmio, len).is_err());
+            assert_eq!(check_completion(Some(pending), mmio, len).unwrap(), pending);
+            assert!(check_completion(None, mmio, len).is_err());
+            assert!(check_smi_ready(true, true, true, false).is_err());
+        }
+        assert!(check_smi_ready(false, true, false, false).is_err());
+        assert!(check_smi_ready(true, false, false, false).is_err());
+        assert!(check_smi_ready(true, true, false, true).is_err());
+        assert!(check_smi_ready(true, true, false, false).is_ok());
+    }
+
+    #[test]
+    fn smm_only_allows_once_only_reset_entry_not_repeatable_linux_boot_mutations() {
+        let linux = crate::BootRegs::X86_64 { rip: 0x10000, rsi: 0, cr3: 0x1000, gdt: 0x5000 };
+        assert!(check_smm_boot(true, &linux).is_err());
+        assert!(check_smm_boot(false, &linux).is_ok());
+        assert!(check_smm_boot(true, &crate::BootRegs::Aarch64 { pc: 0, x: [0; 4] }).is_err());
+        assert!(check_smm_boot(true, &crate::BootRegs::X86ResetVector).is_ok());
     }
 }

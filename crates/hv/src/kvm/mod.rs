@@ -68,7 +68,7 @@ impl Hypervisor for Kvm {
         Ok(Arc::new(KvmVm {
             fd,
             chip,
-            slots: Mutex::new(Slots::default()),
+            slots: Arc::new(Mutex::new(Slots::default())),
             vcpus: params.vcpus,
             finalized: AtomicBool::new(false),
         }))
@@ -83,6 +83,10 @@ struct Slots {
     /// Host buffer mappings (GPU): gpa -> slot, and slots to reuse.
     host: std::collections::HashMap<u64, u32>,
     free: Vec<u32>,
+    #[cfg(target_arch = "x86_64")]
+    smm_setup: crate::smm::Setup,
+    #[cfg(target_arch = "x86_64")]
+    smm: Option<crate::smm::Memory>,
 }
 
 /// Arch-specific irqchip handle (vGIC device fd on ARM).
@@ -96,7 +100,9 @@ pub(crate) enum Chip {
 pub struct KvmVm {
     fd: VmFd,
     chip: Chip,
-    slots: Mutex<Slots>,
+    // SMM vCPUs retain this Arc: a VcpuFd keeps the kernel VM alive even
+    // after KvmVm drops. The fd fields must drop before these backing owners.
+    slots: Arc<Mutex<Slots>>,
     vcpus: u32,
     finalized: AtomicBool,
 }
@@ -108,10 +114,9 @@ impl std::fmt::Debug for KvmVm {
 }
 
 impl KvmVm {
-    fn add_slot(&self, gpa: u64, host: *mut u8, size: u64, flags: u32) -> Result<u32> {
+    fn add_slot(&self, s: &mut Slots, gpa: u64, host: *mut u8, size: u64, flags: u32) -> Result<u32> {
         #[cfg(target_arch = "x86_64")]
         x86_64::check_memory_range(gpa, size)?;
-        let mut s = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         let slot = s.free.pop().unwrap_or(s.next);
         let region = kvm_userspace_memory_region { slot, flags, guest_phys_addr: gpa, memory_size: size, userspace_addr: host as u64 };
         // SAFETY: host..host+size is a live mapping: RAM/ROMs are kept in
@@ -124,29 +129,86 @@ impl KvmVm {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+fn install_smm_slot(fd: &VmFd, mapping: crate::smm::Mapping) -> Result<()> {
+    let region = kvm_userspace_memory_region { slot: mapping.slot,
+        flags: if mapping.readonly { KVM_MEM_READONLY } else { 0 },
+        guest_phys_addr: mapping.gpa, memory_size: mapping.size, userspace_addr: mapping.host };
+    // SAFETY: the SMM transaction retains the full backing owner BEFORE this
+    // call, including failed/partial transactions; all live vCPUs retain it.
+    unsafe { fd.set_user_memory_region(region) }.map_err(kerr("KVM_SET_USER_MEMORY_REGION for SMM"))
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Slots {
+    fn smm_memory(&mut self) -> Result<&mut crate::smm::Memory> {
+        self.smm.as_mut().ok_or_else(|| Error::Invalid("failed SMM configuration; recreate the VM".into()))
+    }
+}
+
 impl Vm for KvmVm {
-    fn map_memory(&self, mem: &GuestMemory) -> Result<()> {
-        for r in mem.regions() {
-            self.add_slot(r.start().raw(), r.host_ptr(), r.len(), 0)?;
+    #[cfg(target_arch = "x86_64")]
+    fn configure_x86_smm(&self, initial: &[u8]) -> Result<crate::X86SmmCapabilities> {
+        use kvm_ioctls::Cap;
+        let mut s = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        s.smm_setup.begin(self.finalized.load(Ordering::SeqCst))?;
+        let kvm = KvmSys::new().map_err(kerr("open SMM capabilities"))?;
+        if !kvm.check_extension(Cap::CheckExtensionVm) || !self.fd.check_extension(Cap::X86Smm) {
+            return Err(Error::Unsupported("VM-level KVM_CAP_X86_SMM"));
         }
-        self.slots.lock().unwrap_or_else(|e| e.into_inner()).memory.push(mem.clone());
+        // The pinned VmFd API exposes only boolean extension checks, and its
+        // Cap enum omits MULTI_ADDRESS_SPACE. Use the existing raw system API
+        // for the count, not a bool or a hand-written ioctl.
+        let count = kvm.check_extension_raw(kvm_bindings::KVM_CAP_MULTI_ADDRESS_SPACE.into());
+        if count < 2 { return Err(Error::Unsupported("KVM_CAP_MULTI_ADDRESS_SPACE must be at least 2")); }
+        s.smm = Some(crate::smm::Memory::new(initial, kvm.get_nr_memslots())?);
+        s.smm_memory()?.install_private(|mapping| install_smm_slot(&self.fd, mapping))?;
+        Ok(crate::X86SmmCapabilities { vm_smm: true, system_address_spaces: count as u32 })
+    }
+
+    fn map_memory(&self, mem: &GuestMemory) -> Result<()> {
+        let mut s = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(target_arch = "x86_64")]
+        { s.smm_setup.mapping_attempted = true; }
+        #[cfg(target_arch = "x86_64")]
+        if s.smm_setup.requested {
+            return s.smm_memory()?.map_memory(mem, |mapping| install_smm_slot(&self.fd, mapping));
+        }
+        for r in mem.regions() {
+            self.add_slot(&mut s, r.start().raw(), r.host_ptr(), r.len(), 0)?;
+        }
+        s.memory.push(mem.clone());
         Ok(())
     }
 
     fn map_readonly(&self, gpa: u64, region: Arc<MmapRegion>) -> Result<()> {
-        self.add_slot(gpa, region.as_ptr(), region.size() as u64, KVM_MEM_READONLY)?;
-        self.slots.lock().unwrap_or_else(|e| e.into_inner()).roms.push(region);
+        let mut s = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(target_arch = "x86_64")]
+        { s.smm_setup.mapping_attempted = true; }
+        #[cfg(target_arch = "x86_64")]
+        if s.smm_setup.requested {
+            return s.smm_memory()?.map_readonly(gpa, region, |mapping| install_smm_slot(&self.fd, mapping));
+        }
+        self.add_slot(&mut s, gpa, region.as_ptr(), region.size() as u64, KVM_MEM_READONLY)?;
+        s.roms.push(region);
         Ok(())
     }
 
     unsafe fn map_host(&self, gpa: u64, ptr: *mut u8, size: u64) -> Result<()> {
-        let slot = self.add_slot(gpa, ptr, size, 0)?;
-        self.slots.lock().unwrap_or_else(|e| e.into_inner()).host.insert(gpa, slot);
+        let mut s = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(target_arch = "x86_64")]
+        { s.smm_setup.mapping_attempted = true; }
+        #[cfg(target_arch = "x86_64")]
+        if s.smm_setup.requested { return Err(Error::Unsupported("host-buffer maps in restricted SMM mode")); }
+        let slot = self.add_slot(&mut s, gpa, ptr, size, 0)?;
+        s.host.insert(gpa, slot);
         Ok(())
     }
 
     fn unmap_host(&self, gpa: u64, _size: u64) -> Result<()> {
         let mut s = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(target_arch = "x86_64")]
+        if s.smm_setup.requested { return Err(Error::Unsupported("host-buffer maps in restricted SMM mode")); }
         let slot = s.host.remove(&gpa).ok_or_else(|| Error::Invalid(format!("no host mapping at {gpa:#x}")))?;
         let region = kvm_userspace_memory_region { slot, flags: 0, guest_phys_addr: gpa, memory_size: 0, userspace_addr: 0 };
         // SAFETY: size 0 deletes the slot.
@@ -163,7 +225,15 @@ impl Vm for KvmVm {
         }
         #[cfg(target_arch = "x86_64")]
         {
-            Ok(Box::new(x86_64::KvmVcpu::new(&self.fd, index, self.vcpus)?))
+            // Configuration, all mapping ioctls and this attempt share one
+            // lock. Seal before validation/CREATE_VCPU, even if either fails.
+            let mut s = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+            s.smm_setup.vcpu_attempted = true;
+            let owners = if s.smm_setup.requested {
+                s.smm_memory()?.seal()?;
+                Some(self.slots.clone())
+            } else { None };
+            Ok(Box::new(x86_64::KvmVcpu::new(&self.fd, index, self.vcpus, owners)?))
         }
     }
 
