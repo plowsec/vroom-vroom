@@ -102,23 +102,43 @@ pub fn single_display() {
 /// the host's by as much as that monitor is wide, and disappears into it
 /// past the right edge. Keep ours, as on Windows.
 ///
-/// The session can start before the compositor answers, so keep trying
-/// for a while, on a thread of its own.
+/// Mutter puts it back each time the monitors change (a resize does), so
+/// this keeps watching, on a thread of its own. The session can start
+/// before the compositor answers: until it does, keep trying.
 #[cfg(target_os = "linux")]
 pub fn single_display() {
     if !crate::scale::wayland() {
         return;
     }
-    std::thread::spawn(|| {
-        for _ in 0..30 {
-            match crate::scale::only_ours() {
-                Ok(true) => return log::info!("monitors: ours is the desktop now"),
-                Ok(false) => return,
-                Err(e) => log::debug!("monitors: {e}"),
+    let keep = || match crate::scale::only_ours() {
+        Ok(true) => {
+            log::info!("monitors: ours is the desktop now");
+            true
+        }
+        Ok(false) => true,
+        Err(e) => {
+            log::debug!("monitors: {e}");
+            false
+        }
+    };
+    std::thread::spawn(move || {
+        let mut tries = 0;
+        while !keep() {
+            tries += 1;
+            if tries == 30 {
+                log::info!("monitors: the compositor never said what it had");
+                break;
             }
             std::thread::sleep(std::time::Duration::from_secs(2));
         }
-        log::info!("monitors: left as they are; the compositor never said what it had");
+        loop {
+            if let Err(e) = crate::scale::on_monitors_changed(|| {
+                keep();
+            }) {
+                log::debug!("monitors: {e}");
+            }
+            std::thread::sleep(std::time::Duration::from_secs(10));
+        }
     });
 }
 
