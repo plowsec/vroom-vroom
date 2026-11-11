@@ -260,6 +260,9 @@ pub(crate) struct BuildEnv {
     /// Removable shares for USB disks' files (`usb::FILE_SLOTS` on a
     /// Mac; a resumed VM: as many as it was saved with).
     pub usb_file_slots: usize,
+    /// A resumed VM's folders that its saved hardware hasn't: they go on
+    /// removable shares, as when they were shared while it ran.
+    pub later_shares: Vec<vroom_config::Share>,
     /// A resumed VM's network adapters in hot plug slots: adapter index
     /// to port.
     pub hot_nets: std::collections::BTreeMap<usize, usize>,
@@ -872,6 +875,14 @@ pub(crate) fn build(
             slots.push((tag, slot));
         }
         u.set_files(slots, agent.clone());
+        for s in &env.later_shares {
+            let r = std::fs::File::open(&s.path)
+                .map_err(|e| format!("{}: {e}", s.path.display()))
+                .and_then(|f| u.attach_folder(f.into(), s.readonly, &s.tag, ""));
+            if let Err(e) = r {
+                log::warn!("shares: {e}");
+            }
+        }
         crate::usb::test_seam(u);
     }
     let net_ports = crate::net::NetPorts::new(nics, viewer.clone(), reach, ident.clone(), env.net_ctrl);

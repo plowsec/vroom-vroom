@@ -553,7 +553,7 @@ impl App {
             VmState::Suspended => (
                 true,
                 "Suspended: hardware is locked",
-                "Suspended. Network and USB changes apply when it resumes. Other hardware changes after a fresh boot: resume and shut down, or discard the saved state (⋯ menu).",
+                "Suspended. Network, USB and added shared folders apply when it resumes. Other hardware changes after a fresh boot: resume and shut down, or discard the saved state (⋯ menu).",
                 "The VM was saved with this hardware: it changes after a fresh boot.",
             ),
             _ if !console::is_running(&v.key) && console::viewer_socket(&v.state_dir()).is_some() => (
@@ -980,8 +980,8 @@ impl App {
         let (key, state) = (v.key.clone(), self.state_of(v));
         let Some(sh) = v.raw.as_ref().and_then(|c| c.shares.iter().rev().find(|s| s.path == path).cloned()) else { return };
         match state {
-            VmState::Off => {}
-            VmState::Suspended => self.toast("Applies after a restart", 0),
+            // Suspended: it resumes with the folder (see vmm `later_shares`).
+            VmState::Off | VmState::Suspended => {}
             _ => {
                 if let Err(e) = console::share_folder(&key, path, &sh.tag, sh.readonly) {
                     self.toast(format!("Applies after a restart: {e}"), 0);

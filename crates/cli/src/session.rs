@@ -53,7 +53,7 @@ fn timestamp() -> u64 {
 }
 
 /// Sandbox the process now that everything is open.
-fn lock_down(cfg: &VmConfig, state_dir: &Path, clipboard: bool, helpers: Vec<u32>) -> Result<(), String> {
+fn lock_down(cfg: &VmConfig, later_shares: &[vroom_config::Share], state_dir: &Path, clipboard: bool, helpers: Vec<u32>) -> Result<(), String> {
     let mut p = vroom_sandbox::Policy {
         write_dirs: vec![state_dir.to_path_buf()],
         clipboard,
@@ -72,7 +72,7 @@ fn lock_down(cfg: &VmConfig, state_dir: &Path, clipboard: bool, helpers: Vec<u32
             p.rw_files.push(d.path.clone());
         }
     }
-    for s in &cfg.shares {
+    for s in cfg.shares.iter().chain(later_shares) {
         // Rules name real paths: the share root may be a symlink.
         let real = std::fs::canonicalize(&s.path).unwrap_or_else(|_| s.path.clone());
         if s.readonly {
@@ -383,7 +383,7 @@ pub fn run(o: RunOpts) -> Result<(), String> {
     }
 
     if o.sandbox && vmm.config().security.sandbox {
-        lock_down(vmm.config(), &o.state_dir, has_clip, vmm.helper_pids())?;
+        lock_down(vmm.config(), vmm.later_shares(), &o.state_dir, has_clip, vmm.helper_pids())?;
     } else {
         eprintln!("vroom: WARNING: running without sandbox");
     }

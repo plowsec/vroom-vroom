@@ -172,6 +172,9 @@ pub struct Vmm {
     net_ctrl: bool,
     /// Removable shares for USB disks' files (what a save records).
     usb_file_slots: usize,
+    /// A resumed VM's folders that are in its file but not in the hardware
+    /// it was saved with: served on removable shares.
+    later_shares: Vec<vroom_config::Share>,
     /// Windows' 3D GPU has memory in BAR 0 (see `machine::GPU3D_VRAM`).
     gpu3d_vram: bool,
     /// The network adapters now (a save records them).
@@ -249,6 +252,12 @@ fn restore_hardware(now: VmConfig, saved: &VmConfig) -> VmConfig {
     }
 }
 
+/// Folders in the VM file now that the saved hardware hasn't: shared while
+/// it ran (on a removable share), or added while it was suspended.
+fn later_shares(now: &VmConfig, saved: &VmConfig) -> Vec<vroom_config::Share> {
+    now.shares.iter().filter(|s| !saved.shares.iter().any(|o| o.tag == s.tag)).cloned().collect()
+}
+
 impl Vmm {
     /// Build the machine and start it.
     pub fn start(config: VmConfig, hv: Arc<dyn Hypervisor>, opts: VmmOptions) -> Result<Vmm> {
@@ -277,6 +286,7 @@ impl Vmm {
             StartMode::Restore(dir) | StartMode::RestorePaused(dir) => Some(snapshot::saved_config(dir)?),
             StartMode::Boot | StartMode::BootPaused => None,
         };
+        let later_shares = saved.as_ref().map(|(s, _)| later_shares(&config, s)).unwrap_or_default();
         let config = match &saved {
             Some((s, _)) => restore_hardware(config, s),
             None => config,
@@ -318,6 +328,7 @@ impl Vmm {
             saved,
             net_ctrl,
             usb_file_slots,
+            later_shares: later_shares.clone(),
             sandbox: opts.sandbox && config.security.sandbox,
             hot_nets,
             gpu3d_vram,
@@ -355,6 +366,7 @@ impl Vmm {
             state: RunState::Paused,
             net_ctrl,
             usb_file_slots,
+            later_shares,
             gpu3d_vram,
             net_ports: m.net_ports,
             hotplug: m.hotplug,
@@ -406,6 +418,12 @@ impl Vmm {
 
     pub fn config(&self) -> &VmConfig {
         &self.config
+    }
+
+    /// Folders served on removable shares since the start (see
+    /// `later_shares`): the sandbox must let them be read too.
+    pub fn later_shares(&self) -> &[vroom_config::Share] {
+        &self.later_shares
     }
 
     pub fn state(&self) -> RunState {
@@ -1086,4 +1104,25 @@ fn machine_uuid(state_dir: &Path) -> Result<[u8; 16]> {
     let hex: String = u.iter().map(|b| format!("{b:02x}")).collect();
     std::fs::write(&path, format!("{}-{}-{}-{}-{}\n", &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..]))?;
     Ok(u)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn folders_the_saved_hardware_hasnt() {
+        let cfg = |tags: &[&str]| {
+            let mut c = VmConfig::from_toml("name='t'\ncpus=1\nmemory_mib=64\n[boot]\ntype='kernel'\nkernel='k'\n").unwrap();
+            c.shares = tags.iter().map(|t| vroom_config::Share { path: format!("/tmp/{t}").into(), tag: t.to_string(), readonly: true }).collect();
+            c
+        };
+        let saved = cfg(&["boot"]);
+        let tags = |v: Vec<vroom_config::Share>| v.into_iter().map(|s| s.tag).collect::<Vec<_>>();
+        assert_eq!(tags(later_shares(&cfg(&["boot", "live"]), &saved)), ["live"], "shared while it ran");
+        assert!(later_shares(&cfg(&["boot"]), &saved).is_empty(), "nothing new");
+        assert!(later_shares(&cfg(&[]), &saved).is_empty(), "removed: the saved device stays until a restart");
+        // The resumed VM keeps the saved device; the new folder is extra.
+        assert_eq!(tags(restore_hardware(cfg(&["boot", "live"]), &saved).shares), ["boot"]);
+    }
 }

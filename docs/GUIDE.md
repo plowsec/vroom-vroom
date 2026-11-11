@@ -395,6 +395,8 @@ readonly = false     # default true
 
 Linux: `sudo mount -t virtiofs host /mnt` (fstab: `host /mnt virtiofs defaults 0 0`). Guest can't create symlinks, hard links, device nodes; existing symlinks not followed on the host.
 
+Added while the VM runs or is suspended: there at once, and after each resume (Linux: `/media/vroom/<tag>`, mounted by the agent). A plain `[[share]]` from the next boot.
+
 ### Windows guests
 
 - Drive letters from Z: down.
