@@ -449,7 +449,9 @@ impl Service {
                         }
                     }
                 }
-                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                // Interrupted: the sandbox's per-thread signal (Linux lock-down)
+                // lands in this timed read; SA_RESTART doesn't restart those.
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted) => {}
                 Err(_) => return,
             }
             loop {

@@ -562,6 +562,7 @@ pub fn helper_main(sock: UnixDatagram, opts: HelperOpts) -> io::Result<()> {
                 }
                 continue;
             }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         };
         let Some(m) = read_msg(&mut &buf[..n])? else { break };
