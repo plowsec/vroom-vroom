@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 use vroom_block::qcow2::{fold_backing, OpenPolicy};
 use vroom_snapshot::SnapshotDir;
 
+pub mod hostile;
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// Another vroom process (a running VM) holds the state dir.
@@ -207,31 +209,13 @@ fn roots(state: &Path) -> Result<(BTreeSet<PathBuf>, BTreeSet<PathBuf>)> {
 /// Disk pointers are a line of JSON. Refuses links, FIFOs and big files:
 /// a VMM writes these.
 fn read_small(p: &Path) -> Result<Vec<u8>> {
-    use std::io::Read;
-    const MAX: u64 = 1 << 20;
-    let mut o = std::fs::OpenOptions::new();
-    o.read(true);
-    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut o, libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    let f = o.open(p)?;
-    if !f.metadata()?.is_file() {
-        return Err(Error::Setup(format!("{}: not a file", p.display())));
-    }
-    let mut v = Vec::new();
-    f.take(MAX + 1).read_to_end(&mut v)?;
-    if v.len() as u64 > MAX {
-        return Err(Error::Setup(format!("{}: too large", p.display())));
-    }
-    Ok(v)
+    hostile::read_small(p, 1 << 20).map_err(|e| Error::Setup(e.to_string()))
 }
 
 /// A directory in the state dir, not a link to one somewhere else (we
 /// delete files in there).
 fn real_dir(p: &Path) -> Result<()> {
-    if std::fs::symlink_metadata(p)?.is_dir() {
-        Ok(())
-    } else {
-        Err(Error::Setup(format!("{} is not a directory", p.display())))
-    }
+    hostile::real_dir(p).map_err(|e| Error::Setup(e.to_string()))
 }
 
 fn canon(p: &Path) -> PathBuf {
