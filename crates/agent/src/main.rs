@@ -12,6 +12,9 @@
 // start them.
 #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 mod apps;
+// Opening folders without following planted links (files, drops).
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+mod at;
 #[cfg(windows)]
 mod apps_win;
 // Desktop entries: Linux only; the parsing is tested everywhere unix.

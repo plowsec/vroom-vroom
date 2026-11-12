@@ -15,13 +15,21 @@
 //! The host is trusted more than the guest, still: paths come checked by
 //! vroom-proto (relative, no `..`), must start with a name from
 //! `DragEnter`, and a file gets no more bytes than it announced.
+//!
+//! Run elevated (by hand as root, old all-in-one Windows installs) we
+//! write where a guest user may: folders are opened without following
+//! links they planted, files made new, never written through, all
+//! relative to the staging folder's handle (at.rs).
 
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use vroom_proto::Message;
+
+use crate::at::Dir;
 
 /// A drag of our own in the guest's desktop, started under the pointer.
 pub trait LiveDrag {
@@ -32,6 +40,8 @@ pub trait LiveDrag {
 struct Incoming {
     id: u32,
     dir: PathBuf,
+    /// `dir`, opened.
+    stage: Dir,
     items: Vec<(String, bool)>,
     live: Option<Box<dyn LiveDrag>>,
     /// The file being written and the bytes it still expects.
@@ -48,6 +58,8 @@ pub struct Drops {
     base: PathBuf,
     cur: Option<Incoming>,
     start: StartFn,
+    /// Follow links our own user made on the way (at.rs); root's always.
+    own_links: bool,
 }
 
 /// Staging folders older than this go when a new drag starts (an app
@@ -61,6 +73,7 @@ impl Drops {
             base: staging_base(),
             cur: None,
             start: live_drag,
+            own_links: true,
         }
     }
 
@@ -70,6 +83,7 @@ impl Drops {
             base,
             cur: None,
             start,
+            own_links: true,
         }
     }
 
@@ -136,28 +150,27 @@ impl Drops {
 
     fn enter(&mut self, id: u32, items: &[(String, bool)]) -> io::Result<bool> {
         let _ = std::fs::create_dir_all(&self.base);
-        sweep(&self.base);
         let stamp = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
-        let dir = self.base.join(format!("{stamp}-{id}"));
-        std::fs::create_dir_all(&dir)?;
+        let name = format!("{stamp}-{id}");
+        let dir = self.base.join(&name);
+        // A link there (or on the way) someone else planted: refused.
+        let base = Dir::open(&self.base, self.own_links)?;
+        sweep(&self.base);
+        let stage = base.mkdir(OsStr::new(&name))?;
         // The names exist from the start: a drag needs real files to
         // point at. Their contents come with the drop.
         for (name, is_dir) in items {
-            let p = dir.join(name);
-            if *is_dir {
-                std::fs::create_dir_all(&p)?;
-            } else {
-                File::create(&p)?;
-            }
+            within(&stage, name, |d, n| if *is_dir { d.dir(n).map(drop) } else { d.create(n, 0o666).map(drop) })?;
         }
         let live = (self.start)(&dir, items);
         let is_live = live.is_some();
         self.cur = Some(Incoming {
             id,
             dir,
+            stage,
             items: items.to_vec(),
             live,
             file: None,
@@ -203,7 +216,7 @@ impl Drops {
             // folder when the host lets go of the button.
             return (true, String::new());
         }
-        match land(&d.dir, &d.items) {
+        match land(&d.dir, &d.stage, &d.items) {
             Ok(place) => {
                 let _ = std::fs::remove_dir_all(&d.dir);
                 notify(&d.items, &place);
@@ -234,16 +247,10 @@ impl Incoming {
         {
             return Err(io::Error::other("not part of this drop"));
         }
-        let p = self
-            .dir
-            .join(path.replace('/', std::path::MAIN_SEPARATOR_STR));
         if dir {
-            std::fs::create_dir_all(&p)
+            within(&self.stage, path, |d, n| d.dir(n).map(drop))
         } else {
-            if let Some(parent) = p.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let f = File::create(&p)?;
+            let f = within(&self.stage, path, |d, n| d.create(n, 0o666))?;
             self.files += 1;
             self.file = Some((f, size));
             Ok(())
@@ -261,6 +268,22 @@ impl Incoming {
         *left -= data.len() as u64;
         Ok(())
     }
+}
+
+/// `f` on the last name of `rel` ("a/b/c") and the folder it is in,
+/// folders on the way made as needed, all under `stage`.
+fn within<T>(stage: &Dir, rel: &str, f: impl FnOnce(&Dir, &OsStr) -> io::Result<T>) -> io::Result<T> {
+    let parts: Vec<&str> = rel.split('/').collect();
+    if parts.iter().any(|p| p.is_empty() || *p == "." || *p == ".." || (cfg!(windows) && p.contains('\\'))) {
+        return Err(io::Error::other("not a plain relative path"));
+    }
+    let Some((last, folders)) = parts.split_last() else { return Err(io::Error::other("no name")) };
+    let mut cur: Option<Dir> = None;
+    for p in folders {
+        let next = cur.as_ref().unwrap_or(stage).dir(OsStr::new(p))?;
+        cur = Some(next);
+    }
+    f(cur.as_ref().unwrap_or(stage), OsStr::new(last))
 }
 
 /// Where staging folders go.
@@ -332,14 +355,15 @@ fn landing() -> PathBuf {
 
 /// Move the drop's items into the landing folder, renaming on clashes
 /// ("photo (2).jpg"). Returns the folder.
-fn land(staging: &Path, items: &[(String, bool)]) -> io::Result<PathBuf> {
+fn land(staging: &Path, stage: &Dir, items: &[(String, bool)]) -> io::Result<PathBuf> {
     let to = landing();
+    let to_dir = Dir::open(&to, true)?;
     for (name, _) in items {
         let target = free_name(&to, name);
-        let from = staging.join(name);
-        if std::fs::rename(&from, &target).is_err() {
+        let moved = target.file_name().is_some_and(|t| stage.move_to(OsStr::new(name), &to_dir, t).is_ok());
+        if !moved {
             // Another file system: copy.
-            copy_tree(&from, &target)?;
+            copy_tree(&staging.join(name), &target)?;
         }
     }
     Ok(to)
@@ -360,8 +384,13 @@ fn free_name(dir: &Path, name: &str) -> PathBuf {
         .unwrap_or(p)
 }
 
+/// Never through a link (one planted in the staging folder).
 fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
-    if from.is_dir() {
+    let m = std::fs::symlink_metadata(from)?;
+    if m.file_type().is_symlink() {
+        return Err(io::Error::other(format!("{}: a link, not followed", from.display())));
+    }
+    if m.is_dir() {
         std::fs::create_dir_all(to)?;
         for e in std::fs::read_dir(from)? {
             let e = e?;
@@ -593,6 +622,47 @@ mod tests {
             .unwrap();
         assert_eq!(std::fs::read_dir(&base).unwrap().count(), 0);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_privileged_drop_never_writes_through_a_planted_link() {
+        use std::os::unix::fs::symlink;
+        let t = tempfile::tempdir().unwrap();
+        let victim = t.path().join("victim");
+        std::fs::create_dir(&victim).unwrap();
+        std::fs::write(victim.join("f"), b"keep").unwrap();
+        let send = |d: &mut Drops, m: Message| {
+            let mut out = Vec::new();
+            d.handle(&m, &mut out).unwrap();
+            answers(&out)
+        };
+        // As root: a user's links are not followed.
+        let privileged = |base: &Path| Drops { own_links: false, ..Drops::with(base.to_path_buf(), |_, _| Some(Box::new(FakeLive))) };
+        // The staging folder a link: refused.
+        let base = t.path().join("base");
+        symlink(&victim, &base).unwrap();
+        let mut d = privileged(&base);
+        let r = send(&mut d, Message::DragEnter { id: 1, items: vec![("a".into(), false)] });
+        assert!(matches!(&r[..], [Message::DropDone { id: 1, ok: false, place }] if place.contains("a link")), "{r:?}");
+        // Names in it swapped for links: replaced, or refused.
+        let base = t.path().join("real");
+        let mut d = privileged(&base);
+        send(&mut d, Message::DragEnter { id: 2, items: vec![("a.txt".into(), false), ("dir".into(), true)] });
+        let staged = std::fs::read_dir(&base).unwrap().next().unwrap().unwrap().path();
+        std::fs::remove_file(staged.join("a.txt")).unwrap();
+        symlink(victim.join("f"), staged.join("a.txt")).unwrap();
+        std::fs::remove_dir(staged.join("dir")).unwrap();
+        symlink(&victim, staged.join("dir")).unwrap();
+        send(&mut d, Message::DropEntry { id: 2, path: "a.txt".into(), dir: false, size: 3 });
+        send(&mut d, Message::DropData { id: 2, data: b"new".to_vec() });
+        assert_eq!(std::fs::read(staged.join("a.txt")).unwrap(), b"new");
+        assert!(!std::fs::symlink_metadata(staged.join("a.txt")).unwrap().file_type().is_symlink());
+        send(&mut d, Message::DropEntry { id: 2, path: "dir/x".into(), dir: false, size: 0 });
+        let r = send(&mut d, Message::DropEnd { id: 2 });
+        assert!(matches!(&r[..], [Message::DropDone { id: 2, ok: false, .. }]), "{r:?}");
+        assert_eq!(std::fs::read(victim.join("f")).unwrap(), b"keep");
+        assert_eq!(std::fs::read_dir(&victim).unwrap().count(), 1, "nothing written through");
     }
 
     #[test]
