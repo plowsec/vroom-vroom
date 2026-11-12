@@ -1,44 +1,108 @@
 //! Linux: Landlock (filesystem) + seccomp-bpf (syscalls) + no_new_privs.
+//! Fails closed: no enforced Landlock, no sandbox (an error, not a warning).
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
-use landlock::{Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, ABI};
+use landlock::{
+    Access, AccessFs, BitFlags, CompatLevel, Compatible, PathBeneath, PathFd, RestrictSelfAttr, Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr,
+    RulesetStatus, ABI,
+};
 use seccompiler::{BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter, SeccompRule, TargetArch};
 
+use crate::rules;
 use crate::{Error, Policy, Result};
 
 fn err<E: std::fmt::Display>(e: E) -> Error {
     Error::Apply(e.to_string())
 }
 
+const ABI_RULES: ABI = ABI::V2;
+
+/// The running kernel's Landlock ABI (< 0: none).
+fn kernel_abi() -> i64 {
+    const LANDLOCK_CREATE_RULESET_VERSION: libc::c_uint = 1;
+    // SAFETY: the VERSION query reads no memory (NULL attr, size 0).
+    unsafe { libc::syscall(libc::SYS_landlock_create_ruleset, std::ptr::null::<u8>(), 0usize, LANDLOCK_CREATE_RULESET_VERSION) }
+}
+
+/// Threads of this process now (0: unknown).
+fn threads() -> usize {
+    std::fs::read_dir("/proc/self/task").map(|d| d.count()).unwrap_or(0)
+}
+
+fn no_new_privs() -> Result<()> {
+    // SAFETY: prctl with constant arguments.
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        return Err(Error::Apply("no_new_privs failed".into()));
+    }
+    Ok(())
+}
+
+/// A ruleset handling every ABI 2 right, refusing to be weakened.
+fn ruleset() -> Result<RulesetCreated> {
+    Ruleset::default()
+        .set_compatibility(CompatLevel::HardRequirement)
+        .handle_access(AccessFs::from_all(ABI_RULES))
+        .map_err(err)?
+        .create()
+        .map_err(err)
+}
+
+/// Allow `access` beneath `path`; on a file only the file rights of it
+/// (a dir right on a file is an error under HardRequirement).
+fn allow(rs: RulesetCreated, path: &Path, access: BitFlags<AccessFs>) -> Result<RulesetCreated> {
+    let fd = PathFd::new(path).map_err(|e| Error::Apply(format!("{}: {e}", path.display())))?;
+    let access = if std::fs::metadata(path).is_ok_and(|m| m.is_dir()) { access } else { access & AccessFs::from_file(ABI_RULES) };
+    rs.add_rule(PathBeneath::new(fd, access)).map_err(err)
+}
+
+/// Same, skipping paths this host doesn't have.
+fn allow_if(rs: RulesetCreated, path: &str, access: BitFlags<AccessFs>) -> Result<RulesetCreated> {
+    if Path::new(path).exists() {
+        allow(rs, Path::new(path), access)
+    } else {
+        Ok(rs)
+    }
+}
+
+/// Enforce `rs` on the whole process, or fail. Other threads already
+/// running need TSYNC (ABI 8): Landlock otherwise confines only the
+/// calling thread, and its siblings share its memory.
+fn enforce(rs: RulesetCreated) -> Result<()> {
+    let n = threads();
+    rules::landlock_check(kernel_abi(), n).map_err(Error::Apply)?;
+    let rs = if n == 1 { rs } else { rs.all_threads(true).map_err(err)? };
+    let st = rs.restrict_self().map_err(err)?;
+    if st.ruleset != RulesetStatus::FullyEnforced || (n != 1 && !st.all_threads) {
+        return Err(Error::Apply(format!("landlock not enforced: {:?}, all threads {}", st.ruleset, st.all_threads)));
+    }
+    log::info!("landlock: enforced ({n} threads)");
+    Ok(())
+}
+
 fn landlock(p: &Policy) -> Result<()> {
-    let abi = ABI::V2;
-    let mut rs = Ruleset::default().handle_access(AccessFs::from_all(abi)).map_err(err)?.create().map_err(err)?;
-    let file_rw = AccessFs::from_file(abi);
-    let file_ro = AccessFs::ReadFile;
+    let mut rs = ruleset()?;
+    let file_rw = AccessFs::from_file(ABI_RULES);
     for f in &p.rw_files {
-        rs = rs.add_rule(PathBeneath::new(PathFd::new(f).map_err(err)?, file_rw)).map_err(err)?;
+        rs = allow(rs, f, file_rw)?;
     }
     for f in &p.ro_files {
-        rs = rs.add_rule(PathBeneath::new(PathFd::new(f).map_err(err)?, file_ro)).map_err(err)?;
+        rs = allow(rs, f, AccessFs::ReadFile.into())?;
     }
     if p.gpu {
         // Vulkan loader + driver files (read), the render node (read-write).
         let read_dir = AccessFs::ReadFile | AccessFs::ReadDir;
         for d in ["/usr/share/vulkan", "/etc/vulkan", "/usr/lib", "/sys/dev/char", "/sys/devices"] {
-            if let Ok(fd) = PathFd::new(d) {
-                rs = rs.add_rule(PathBeneath::new(fd, read_dir)).map_err(err)?;
-            }
+            rs = allow_if(rs, d, read_dir)?;
         }
-        if let Ok(fd) = PathFd::new("/dev/dri") {
-            rs = rs.add_rule(PathBeneath::new(fd, file_rw | AccessFs::ReadDir)).map_err(err)?;
-        }
+        rs = allow_if(rs, "/dev/dri", file_rw | AccessFs::ReadDir)?;
     }
     for d in &p.write_dirs {
-        rs = rs.add_rule(PathBeneath::new(PathFd::new(d).map_err(err)?, AccessFs::from_all(abi))).map_err(err)?;
+        rs = allow(rs, d, AccessFs::from_all(ABI_RULES))?;
     }
     for d in &p.share_ro {
-        rs = rs.add_rule(PathBeneath::new(PathFd::new(d).map_err(err)?, AccessFs::ReadFile | AccessFs::ReadDir)).map_err(err)?;
+        rs = allow(rs, d, AccessFs::ReadFile | AccessFs::ReadDir)?;
     }
     // What virtio-fs does: no device nodes, sockets, FIFOs or symlinks.
     let share = AccessFs::ReadFile
@@ -50,11 +114,9 @@ fn landlock(p: &Policy) -> Result<()> {
         | AccessFs::MakeReg
         | AccessFs::Refer;
     for d in &p.share_rw {
-        rs = rs.add_rule(PathBeneath::new(PathFd::new(d).map_err(err)?, share)).map_err(err)?;
+        rs = allow(rs, d, share)?;
     }
-    let st = rs.restrict_self().map_err(err)?;
-    log::info!("landlock: {:?}", st.ruleset);
-    Ok(())
+    enforce(rs)
 }
 
 /// Syscalls the VMM needs after setup. Everything else kills the process.
@@ -126,41 +188,22 @@ fn seccomp(p: &Policy) -> Result<()> {
 /// The USB helper: libusb needs the usbfs nodes (read-write) and sysfs
 /// and udev's database (read) to find devices; nothing else on disk.
 pub fn apply_usb_helper() -> Result<()> {
-    // SAFETY: prctl with constant arguments.
-    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
-        return Err(Error::Apply("no_new_privs failed".into()));
-    }
-    let abi = ABI::V2;
-    let mut rs = Ruleset::default().handle_access(AccessFs::from_all(abi)).map_err(err)?.create().map_err(err)?;
+    no_new_privs()?;
+    let mut rs = ruleset()?;
     let read = AccessFs::ReadFile | AccessFs::ReadDir;
     for d in ["/sys/bus/usb", "/sys/devices", "/sys/class", "/run/udev"] {
-        if let Ok(fd) = PathFd::new(d) {
-            rs = rs.add_rule(PathBeneath::new(fd, read)).map_err(err)?;
-        }
+        rs = allow_if(rs, d, read)?;
     }
     for f in ["/dev/null", "/dev/urandom"] {
-        if let Ok(fd) = PathFd::new(f) {
-            rs = rs.add_rule(PathBeneath::new(fd, AccessFs::ReadFile)).map_err(err)?;
-        }
+        rs = allow_if(rs, f, AccessFs::ReadFile.into())?;
     }
-    if let Ok(fd) = PathFd::new("/dev/bus/usb") {
-        rs = rs.add_rule(PathBeneath::new(fd, read | AccessFs::WriteFile)).map_err(err)?;
-    }
-    match rs.restrict_self() {
-        Ok(st) => log::info!("usb helper landlock: {:?}", st.ruleset),
-        Err(e) => log::warn!("landlock unavailable: {e}"),
-    }
-    Ok(())
+    rs = allow_if(rs, "/dev/bus/usb", read | AccessFs::WriteFile)?;
+    // libusb_init started its event thread already: TSYNC (ABI 8).
+    enforce(rs)
 }
 
 pub fn apply(p: &Policy) -> Result<()> {
-    // SAFETY: prctl with constant arguments.
-    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
-        return Err(Error::Apply("no_new_privs failed".into()));
-    }
-    if let Err(e) = landlock(p) {
-        // Old kernels: no Landlock. Seccomp still applies.
-        log::warn!("landlock unavailable: {e}");
-    }
+    no_new_privs()?;
+    landlock(p)?;
     seccomp(p)
 }
