@@ -101,6 +101,12 @@ impl SnapshotDir {
 
     /// Open an existing, complete snapshot.
     pub fn open(root: &Path) -> Result<Self> {
+        // The sandboxed VMM writes these dirs: a link to a folder elsewhere
+        // isn't one of them.
+        let md = fs::symlink_metadata(root).map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", root.display())))?;
+        if !md.is_dir() {
+            return Err(Error::Invalid(format!("{} is not a directory", root.display())));
+        }
         // No links, and a FIFO planted there must not block the reader.
         let f = fs::OpenOptions::new()
             .read(true)
@@ -143,7 +149,7 @@ impl SnapshotDir {
             .files
             .get(name)
             .ok_or_else(|| Error::Invalid(format!("missing blob {name}")))?;
-        let f = File::open(self.root.join(name))?;
+        let f = open_blob(&self.root.join(name))?;
         if f.metadata()?.len() > MAX_BLOB {
             return Err(Error::Invalid(format!("blob {name} too large")));
         }
@@ -183,7 +189,7 @@ impl SnapshotDir {
             .files
             .get(name)
             .ok_or_else(|| Error::Invalid(format!("missing blob {name}")))?;
-        let file = File::open(self.root.join(name))?;
+        let file = open_blob(&self.root.join(name))?;
         // This process checked this very file already (a fuzzer restoring
         // its snapshot after each timeout: 25 s to hash 7 GB of RAM).
         let seen = identity(&file, want);
@@ -218,6 +224,16 @@ impl SnapshotDir {
         fs::rename(&tmp, self.root.join(MANIFEST))?;
         Ok(())
     }
+}
+
+/// A blob: a regular file there, not a link, not a FIFO (which would hang
+/// the reader) or a device (endless).
+fn open_blob(p: &Path) -> Result<File> {
+    let f = fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(p)?;
+    if !f.metadata()?.is_file() {
+        return Err(Error::Invalid(format!("{} is not a file", p.display())));
+    }
+    Ok(f)
 }
 
 /// A file as it is now (device, inode, size, modification and change
@@ -295,6 +311,24 @@ mod tests {
         fs::write(td.path().join("elsewhere.json"), "{}").unwrap();
         std::os::unix::fs::symlink(td.path().join("elsewhere.json"), link.join(MANIFEST)).unwrap();
         assert!(SnapshotDir::open(&link).is_err());
+        // The snapshot dir a link to one elsewhere.
+        let real = td.path().join("real");
+        let mut s = SnapshotDir::create(&real).unwrap();
+        s.put_blob("a", b"1").unwrap();
+        s.commit().unwrap();
+        std::os::unix::fs::symlink(&real, td.path().join("dirlink")).unwrap();
+        assert!(SnapshotDir::open(&td.path().join("dirlink")).is_err());
+        // Blobs: a link to a file with the same bytes, a FIFO.
+        let s = SnapshotDir::open(&real).unwrap();
+        fs::write(td.path().join("same"), b"1").unwrap();
+        fs::remove_file(real.join("a")).unwrap();
+        std::os::unix::fs::symlink(td.path().join("same"), real.join("a")).unwrap();
+        assert!(s.get_blob("a").is_err(), "read through a link");
+        assert!(s.verified_reader("a").is_err());
+        fs::remove_file(real.join("a")).unwrap();
+        assert!(std::process::Command::new("mkfifo").arg(real.join("a")).status().unwrap().success());
+        assert!(s.get_blob("a").is_err());
+        assert!(s.verified_reader("a").is_err());
     }
 
     #[test]
