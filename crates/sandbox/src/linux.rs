@@ -559,6 +559,12 @@ fn seccomp(p: &Policy) -> Result<()> {
     install(rules, SeccompAction::KillProcess, SeccompAction::Allow)
 }
 
+// Not in libc for musl.
+#[cfg(target_arch = "aarch64")]
+const KEXEC_FILE_LOAD: i64 = 294;
+#[cfg(target_arch = "x86_64")]
+const KEXEC_FILE_LOAD: i64 = 320;
+
 /// Syscalls the USB helper never needs; it may run as root (vroom-netd),
 /// where each is a way out of Landlock or into the kernel. A deny-list
 /// (EPERM): libusb's own needs aren't fully known, and a kill there takes
@@ -568,7 +574,7 @@ fn usb_refused(pid: u32) -> Result<BTreeMap<i64, Vec<SeccompRule>>> {
     let mut m = refused()?;
     let never: &[i64] = &[
         SYS_execve, SYS_execveat, SYS_ptrace, SYS_process_vm_readv, SYS_process_vm_writev,
-        SYS_init_module, SYS_finit_module, SYS_delete_module, SYS_kexec_load, SYS_kexec_file_load,
+        SYS_init_module, SYS_finit_module, SYS_delete_module, SYS_kexec_load, KEXEC_FILE_LOAD,
         SYS_reboot, SYS_mount, SYS_umount2, SYS_pivot_root, SYS_chroot, SYS_swapon, SYS_swapoff,
         SYS_fsopen, SYS_fsmount, SYS_fsconfig, SYS_fspick, SYS_move_mount, SYS_open_tree, SYS_mount_setattr,
         SYS_bpf, SYS_perf_event_open, SYS_unshare, SYS_setns, SYS_acct, SYS_quotactl,
