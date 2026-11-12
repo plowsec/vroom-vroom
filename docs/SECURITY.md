@@ -52,6 +52,7 @@ Known gaps (Linux):
 
 - `sendmsg` can carry an address (inside the struct, seccomp can't read it): an existing Unix datagram fd may still reach a pathname socket.
 - No `chmod`/`fchmodat` (Landlock doesn't cover them): modes change only through an open fd (`fchmod`: layer freeze, snapshot dirs).
+- `readlinkat` allowed (snapshot and suspend check each layer's real path). Landlock doesn't cover it: the VMM can read where any link points, not the target.
 - `ioctl`, `prctl`: deny-lists, not allow-lists (in-process Vulkan drivers).
 
 `--no-sandbox`: debugging only, prints a warning.

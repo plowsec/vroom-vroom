@@ -446,6 +446,9 @@ fn allowed(p: &Policy) -> Vec<i64> {
         // fchmod only, no chmod by path: disks.rs freeze_file (layers read-only),
         // snapshot dirs 0700. Landlock doesn't cover chmod.
         SYS_mkdirat, SYS_renameat, SYS_renameat2, SYS_fchmod, SYS_fsync, SYS_fdatasync, SYS_ftruncate, SYS_fallocate, SYS_flock,
+        // canonicalize: every layer opened for a snapshot or suspend has
+        // its real path checked (qcow2.rs). Without it both die here.
+        SYS_readlinkat,
         // clone: threads only (see rules::clone_denied). clone3: ENOSYS
         // from its own filter, glibc then falls back to clone; allowed
         // here so the ENOSYS wins over a kill.
