@@ -258,7 +258,8 @@ impl Spawn for Exec {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            // Landlock and no_new_privs once libusb is loaded.
+            // no_new_privs, Landlock and seccomp once libusb is loaded
+            // (vroom_sandbox::apply_usb_helper); it exits if they fail.
             c = Command::new(&self.exe);
         }
         c.arg("usb-host").arg("--id").arg(format!("{:04x}:{:04x}", dev.0, dev.1));

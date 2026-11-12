@@ -139,9 +139,9 @@ pub fn usb_profile_root(exe: &std::path::Path, lib: &std::path::Path) -> Result<
 }
 
 /// Lock down the USB passthrough helper (Linux), once libusb is loaded:
-/// no new privileges, and Landlock leaves it the USB device nodes and
-/// sysfs (read-only) only. Its seccomp filter is still to come. An error
-/// if Landlock can't be enforced on every thread.
+/// no new privileges, Landlock leaves it the USB device nodes and sysfs
+/// (read-only) only, seccomp refuses what root could escape with. An
+/// error if Landlock can't be enforced on every thread.
 #[cfg(target_os = "linux")]
 pub fn apply_usb_helper() -> Result<()> {
     linux::apply_usb_helper()

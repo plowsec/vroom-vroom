@@ -248,6 +248,48 @@ fn seccomp(p: &Policy) -> Result<()> {
     install(rules, SeccompAction::KillProcess, SeccompAction::Allow)
 }
 
+/// Syscalls the USB helper never needs; it may run as root (vroom-netd),
+/// where each is a way out of Landlock or into the kernel. A deny-list
+/// (EPERM): libusb's own needs aren't fully known, and a kill there takes
+/// the device away from the guest.
+fn usb_refused(pid: u32) -> Result<BTreeMap<i64, Vec<SeccompRule>>> {
+    use libc::*;
+    let mut m = refused()?;
+    let never: &[i64] = &[
+        SYS_execve, SYS_execveat, SYS_ptrace, SYS_process_vm_readv, SYS_process_vm_writev,
+        SYS_init_module, SYS_finit_module, SYS_delete_module, SYS_kexec_load, SYS_kexec_file_load,
+        SYS_reboot, SYS_mount, SYS_umount2, SYS_pivot_root, SYS_chroot, SYS_swapon, SYS_swapoff,
+        SYS_fsopen, SYS_fsmount, SYS_fsconfig, SYS_fspick, SYS_move_mount, SYS_open_tree, SYS_mount_setattr,
+        SYS_bpf, SYS_perf_event_open, SYS_unshare, SYS_setns, SYS_acct, SYS_quotactl,
+        SYS_settimeofday, SYS_clock_settime, SYS_adjtimex, SYS_clock_adjtime,
+        SYS_sethostname, SYS_setdomainname, SYS_syslog, SYS_vhangup,
+        SYS_open_by_handle_at, SYS_name_to_handle_at, SYS_fanotify_init, SYS_userfaultfd,
+        SYS_add_key, SYS_request_key, SYS_keyctl,
+        SYS_setuid, SYS_setgid, SYS_setreuid, SYS_setregid, SYS_setresuid, SYS_setresgid,
+        SYS_setgroups, SYS_setfsuid, SYS_setfsgid, SYS_capset, SYS_personality,
+        SYS_kcmp, SYS_pidfd_getfd, SYS_pidfd_send_signal, SYS_process_madvise, SYS_migrate_pages, SYS_move_pages,
+        SYS_setpriority, SYS_sched_setscheduler, SYS_sched_setparam, SYS_sched_setattr, SYS_sched_setaffinity, SYS_ioprio_set,
+        SYS_mknodat, SYS_tkill,
+        // io_uring runs opens, sockets... past seccomp.
+        SYS_io_uring_setup, SYS_io_uring_enter, SYS_io_uring_register,
+        // New sockets: libusb's netlink/udev monitor is open before us.
+        SYS_socket,
+    ];
+    for &n in never {
+        m.insert(n, vec![]);
+    }
+    #[cfg(target_arch = "x86_64")]
+    for n in [SYS_iopl, SYS_ioperm, SYS_modify_ldt, SYS_mknod, SYS_uselib] {
+        m.insert(n, vec![]);
+    }
+    // Signals: our own threads only (abort, pthread_kill).
+    for n in [SYS_kill, SYS_tgkill, SYS_rt_sigqueueinfo, SYS_rt_tgsigqueueinfo] {
+        m.insert(n, seccomp_rules(&rules::signal_denied(pid))?);
+    }
+    m.insert(SYS_prlimit64, seccomp_rules(&rules::prlimit_denied())?);
+    Ok(m)
+}
+
 /// The USB helper: libusb needs the usbfs nodes (read-write) and sysfs
 /// and udev's database (read) to find devices; nothing else on disk.
 pub fn apply_usb_helper() -> Result<()> {
@@ -262,7 +304,16 @@ pub fn apply_usb_helper() -> Result<()> {
     }
     rs = allow_if(rs, "/dev/bus/usb", read | AccessFs::WriteFile)?;
     // libusb_init started its event thread already: TSYNC (ABI 8).
-    enforce(rs)
+    enforce(rs)?;
+    // SAFETY: getpid has no preconditions.
+    let pid = unsafe { libc::getpid() } as u32;
+    #[cfg(target_arch = "x86_64")]
+    {
+        let prog: BpfProgram = rules::x32_guard().into_iter().map(|(code, jt, jf, k)| seccompiler::sock_filter { code, jt, jf, k }).collect();
+        seccompiler::apply_filter_all_threads(&prog).map_err(err)?;
+    }
+    no_clone3()?;
+    install(usb_refused(pid)?, SeccompAction::Allow, SeccompAction::Errno(libc::EPERM as u32))
 }
 
 pub fn apply(p: &Policy) -> Result<()> {

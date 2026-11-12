@@ -208,6 +208,17 @@ pub fn prctl_denied() -> Vec<Rule> {
     )
 }
 
+/// kill/tgkill/rt_*sigqueueinfo to anyone but `pid` (arg 0, pid_t).
+pub fn signal_denied(pid: u32) -> Vec<Rule> {
+    vec![vec![Cond::dword(0, Op::Ne(pid as u64))]]
+}
+
+/// prlimit64 on another process, or setting a limit (glibc's getrlimit is
+/// prlimit64(0, r, NULL, old)).
+pub fn prlimit_denied() -> Vec<Rule> {
+    vec![vec![Cond::dword(0, Op::Ne(0))], vec![Cond { arg: 2, wide: true, op: Op::Ne(0) }]]
+}
+
 /// Landlock ABI 2 (Linux 5.19): the rules use `Refer` (renames in shares).
 pub const LANDLOCK_ABI_MIN: i64 = 2;
 /// ABI 8 (Linux 7.0): LANDLOCK_RESTRICT_SELF_TSYNC. Without it only the
@@ -236,6 +247,30 @@ pub fn landlock_check(kernel: i64, threads: usize) -> Result<(), String> {
         _ => format!("ABI 8 (Linux 7.0) to confine all {} threads", if threads == 0 { "?".to_string() } else { threads.to_string() }),
     };
     Err(format!("landlock: {have}; need {why}. --no-sandbox runs the VM unconfined"))
+}
+
+/// x86_64 only: kill x32-ABI syscalls (nr | 0x4000_0000) and foreign
+/// arches. A default-allow filter keyed on x86_64 numbers misses them.
+/// Instructions as (code, jt, jf, k).
+pub const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
+pub const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+pub const AUDIT_ARCH_X86_64: u32 = 62 | 0x8000_0000 | 0x4000_0000;
+pub const X32_SYSCALL_BIT: u32 = 0x4000_0000;
+
+pub fn x32_guard() -> Vec<(u16, u8, u8, u32)> {
+    const LD_W_ABS: u16 = 0x20;
+    const JEQ_K: u16 = 0x15;
+    const JGE_K: u16 = 0x35;
+    const RET_K: u16 = 0x06;
+    vec![
+        (LD_W_ABS, 0, 0, 4), // seccomp_data.arch
+        (JEQ_K, 1, 0, AUDIT_ARCH_X86_64),
+        (RET_K, 0, 0, SECCOMP_RET_KILL_PROCESS),
+        (LD_W_ABS, 0, 0, 0), // seccomp_data.nr
+        (JGE_K, 0, 1, X32_SYSCALL_BIT),
+        (RET_K, 0, 0, SECCOMP_RET_KILL_PROCESS),
+        (RET_K, 0, 0, SECCOMP_RET_ALLOW),
+    ]
 }
 
 #[cfg(test)]
@@ -322,6 +357,16 @@ mod tests {
     }
 
     #[test]
+    fn signals_and_limits() {
+        assert!(!matches(&signal_denied(42), &a(0, 42)));
+        assert!(matches(&signal_denied(42), &a(0, 1)));
+        assert!(matches(&signal_denied(42), &a(0, u32::MAX as u64)), "kill(-1)");
+        assert!(!matches(&prlimit_denied(), &[0, 7, 0, 0x1000, 0, 0]), "getrlimit");
+        assert!(matches(&prlimit_denied(), &[1, 7, 0, 0x1000, 0, 0]));
+        assert!(matches(&prlimit_denied(), &[0, 7, 0x1000, 0, 0, 0]));
+    }
+
+    #[test]
     fn landlock_abi() {
         assert!(landlock_check(2, 1).is_ok());
         assert!(landlock_check(1, 1).is_err());
@@ -332,4 +377,27 @@ mod tests {
         assert!(landlock_check(7, 0).is_err(), "unknown thread count");
     }
 
+    /// A tiny BPF interpreter for the guard's few opcodes.
+    fn run(prog: &[(u16, u8, u8, u32)], nr: u32, arch: u32) -> u32 {
+        let (mut pc, mut acc) = (0usize, 0u32);
+        loop {
+            let (code, jt, jf, k) = prog[pc];
+            pc += 1;
+            match code {
+                0x20 => acc = if k == 0 { nr } else { arch },
+                0x15 => pc += if acc == k { jt } else { jf } as usize,
+                0x35 => pc += if acc >= k { jt } else { jf } as usize,
+                0x06 => return k,
+                _ => panic!("opcode {code:#x}"),
+            }
+        }
+    }
+
+    #[test]
+    fn x32_and_foreign_arches_die() {
+        let g = x32_guard();
+        assert_eq!(run(&g, 59, AUDIT_ARCH_X86_64), SECCOMP_RET_ALLOW);
+        assert_eq!(run(&g, X32_SYSCALL_BIT | 59, AUDIT_ARCH_X86_64), SECCOMP_RET_KILL_PROCESS);
+        assert_eq!(run(&g, 11, 3 | 0x4000_0000), SECCOMP_RET_KILL_PROCESS, "i386");
+    }
 }
