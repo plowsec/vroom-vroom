@@ -358,14 +358,32 @@ fn usb_profile_with(exe: &Path, libs: &str) -> Result<String> {
     ))
 }
 
+/// What swtpm may read of its own install, never wider than it:
+/// `<brew>/Cellar/<formula>/<version>/bin/x`: the formula (all versions);
+/// `<p>/bin/x`: that bin and `<p>`'s lib and share (MacPorts' /opt/local);
+/// else its own directory; nothing when that is `/`.
+fn helper_read_dirs(exe: &Path) -> Vec<std::path::PathBuf> {
+    let a: Vec<&Path> = exe.ancestors().collect();
+    let name = |i: usize| a.get(i).and_then(|p| p.file_name()).and_then(|n| n.to_str());
+    if name(1) == Some("bin") && name(4) == Some("Cellar") {
+        return vec![a[3].to_path_buf()];
+    }
+    // Never `/` (or a relative path's empty one): that is everything.
+    let Some(&dir) = a.get(1).filter(|d| d.is_absolute() && d.parent().is_some()) else { return Vec::new() };
+    match a.get(2) {
+        Some(&p) if name(1) == Some("bin") && p.parent().is_some() => vec![dir.to_path_buf(), p.join("lib"), p.join("share")],
+        _ => vec![dir.to_path_buf()],
+    }
+}
+
 pub fn helper_profile(exe: &Path, rw_dir: &Path) -> Result<String> {
     let exe_real = exe.canonicalize().unwrap_or_else(|_| exe.to_path_buf());
-    let prefix = exe_real.ancestors().nth(3).unwrap_or(Path::new("/opt/homebrew"));
+    let own = helper_read_dirs(&exe_real).iter().map(|d| q(d).map(|d| format!("(subpath {d})"))).collect::<Result<Vec<_>>>()?.join(" ");
     Ok(format!(
         r#"(version 1)
 (deny default)
 (allow process-exec (literal {exe}))
-(allow file-read* (subpath {prefix}) (subpath "/opt/homebrew") (subpath "/usr/lib") (subpath "/System")
+(allow file-read* {own} (subpath "/opt/homebrew") (subpath "/usr/lib") (subpath "/System")
   (subpath "/Library/Apple") (literal "/dev/urandom") (literal "/dev/random") (literal "/dev/null")
   (literal "/private/etc/localtime") (subpath "/private/var/db/timezone"))
 (allow file-write* (literal "/dev/null"))
@@ -377,7 +395,6 @@ pub fn helper_profile(exe: &Path, rw_dir: &Path) -> Result<String> {
 (allow mach-task-name (target self))
 "#,
         exe = q(&exe_real)?,
-        prefix = q(prefix)?,
         dir = q(rw_dir)?,
     ))
 }
@@ -437,6 +454,20 @@ pub fn apply(p: &Policy) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn swtpm_reads_only_its_own_install() {
+        let d = |v: &[&str]| v.iter().map(std::path::PathBuf::from).collect::<Vec<_>>();
+        assert_eq!(helper_read_dirs(Path::new("/opt/homebrew/Cellar/swtpm/0.10.0/bin/swtpm")), d(&["/opt/homebrew/Cellar/swtpm"]));
+        assert_eq!(helper_read_dirs(Path::new("/usr/local/Cellar/swtpm/0.10.0/bin/swtpm")), d(&["/usr/local/Cellar/swtpm"]));
+        assert_eq!(helper_read_dirs(Path::new("/opt/local/bin/swtpm")), d(&["/opt/local/bin", "/opt/local/lib", "/opt/local/share"]));
+        assert_eq!(helper_read_dirs(Path::new("/usr/bin/x")), d(&["/usr/bin", "/usr/lib", "/usr/share"]));
+        assert_eq!(helper_read_dirs(Path::new("/bin/x")), d(&["/bin"]));
+        assert!(helper_read_dirs(Path::new("/x")).is_empty());
+        assert!(helper_read_dirs(Path::new("swtpm")).is_empty());
+        let prof = helper_profile(Path::new("/opt/local/bin/swtpm"), Path::new("/tmp")).unwrap();
+        assert!(!prof.contains("(subpath \"/\")"), "{prof}");
+    }
 
     #[test]
     fn profile_quotes_and_rejects() {
