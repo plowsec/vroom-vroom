@@ -201,11 +201,42 @@ const GUEST_CLIP_MIN_INTERVAL: Duration = Duration::from_millis(200);
 pub struct Agent {
     tx: Sender<AgentCmd>,
     status: Arc<Mutex<AgentStatus>>,
+    // Distinct from a service that exists but is waiting for a guest hello.
+    unavailable: Option<&'static str>,
 }
 
 impl Agent {
+    /// Reply-bearing requests fail immediately when this board has no agent.
+    /// Fire-and-forget commands remain best effort.
     pub fn send(&self, cmd: AgentCmd) {
+        if let Some(why) = self.unavailable {
+            match cmd {
+                AgentCmd::Exec { reply, .. } => { let _ = reply.send(Err(why.into())); }
+                AgentCmd::FilePut { reply, .. } | AgentCmd::FileGet { reply, .. } => {
+                    let _ = reply.send(Err(why.into()));
+                }
+                AgentCmd::Update { reply: Some(reply), .. } => { let _ = reply.send(Err(why.into())); }
+                _ => {}
+            }
+            return;
+        }
         let _ = self.tx.send(cmd);
+    }
+
+    /// A board without an agent transport: no socket or service thread.
+    #[allow(dead_code)] // Used when a board without virtio-serial is enabled.
+    pub(crate) fn unavailable(why: &'static str) -> Self {
+        let (tx, rx) = mpsc::channel();
+        drop(rx);
+        Self { tx, status: Arc::new(Mutex::new(AgentStatus::default())), unavailable: Some(why) }
+    }
+
+    pub(crate) fn unavailable_reason(&self) -> Option<&'static str> {
+        self.unavailable
+    }
+
+    fn require_available(&self) -> Result<(), String> {
+        self.unavailable.map_or(Ok(()), |why| Err(why.into()))
     }
 
     pub fn status(&self) -> AgentStatus {
@@ -221,6 +252,7 @@ impl Agent {
     /// Run a command in the guest and wait for it (at most its timeout
     /// and a little).
     pub fn exec(&self, req: ExecReq) -> Result<ExecOut, String> {
+        self.require_available()?;
         let (tx, rx) = mpsc::channel();
         self.send(AgentCmd::Exec { req, reply: tx });
         rx.recv().map_err(|_| "the VM stopped".to_string())?
@@ -231,6 +263,7 @@ impl Agent {
     /// Put `size` bytes from `from` at the guest's `path`; returns once
     /// the guest wrote them and its SHA-256 matches.
     pub fn put(&self, path: String, size: u64, from: Box<dyn Read + Send>) -> Result<FileOut, String> {
+        self.require_available()?;
         let (tx, rx) = mpsc::channel();
         self.send(AgentCmd::FilePut { path, size, from: FileFrom(from), reply: tx });
         rx.recv().map_err(|_| "the VM stopped".to_string())?
@@ -239,12 +272,14 @@ impl Agent {
     /// Write the guest's file at `path` into `to`; returns once all came
     /// and its SHA-256 matches.
     pub fn get(&self, path: String, to: Box<dyn Write + Send>) -> Result<FileOut, String> {
+        self.require_available()?;
         let (tx, rx) = mpsc::channel();
         self.send(AgentCmd::FileGet { path, to: FileTo(to), reply: tx });
         rx.recv().map_err(|_| "the VM stopped".to_string())?
     }
 
     pub fn update(&self, from: std::os::fd::OwnedFd) -> Result<(), String> {
+        self.require_available()?;
         let (tx, rx) = mpsc::channel();
         self.send(AgentCmd::Update { from, reply: Some(tx) });
         rx.recv_timeout(Duration::from_secs(600)).map_err(|_| "the guest agent didn't answer".to_string())?
@@ -379,7 +414,7 @@ pub fn spawn(stream: UnixStream, policy: ClipPolicy, clip: Option<Box<dyn Clipbo
         sent: mpsc::channel(),
     };
     std::thread::Builder::new().name("agent".into()).spawn(move || svc.run())?;
-    Ok(Agent { tx, status })
+    Ok(Agent { tx, status, unavailable: None })
 }
 
 impl Service {
@@ -1612,5 +1647,101 @@ mod tests {
             assert!(r.is_err(), "{bad:?}");
             assert!(got.len() < bad.len() || matches!(bad.last(), Some(Message::UpdateData { .. })), "{bad:?} {got:?}");
         }
+    }
+}
+
+
+#[cfg(test)]
+mod unavailable_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const WHY: &str = "guest agent is unavailable on this board";
+
+    struct Untouched(Arc<AtomicUsize>);
+    impl Read for Untouched {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            panic!("unavailable agent read a transfer body")
+        }
+    }
+    impl Write for Untouched {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            panic!("unavailable agent wrote a transfer body")
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            panic!("unavailable agent flushed a transfer")
+        }
+    }
+
+    fn promptly<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || { let _ = tx.send(f()); });
+        let result = rx.recv_timeout(Duration::from_secs(1)).expect("unavailable operation must not wait for a guest");
+        thread.join().unwrap();
+        result
+    }
+
+    fn request() -> ExecReq {
+        ExecReq { shell: Shell::Default, command: "unused".into(), timeout: Duration::from_secs(60), max_out: 16 }
+    }
+
+    #[test]
+    fn unavailable_calls_fail_without_transfer_io_or_waiting_for_payloads() {
+        let agent = Agent::unavailable(WHY);
+        assert_eq!(agent.status(), AgentStatus::default());
+        assert_eq!(agent.features(), 0);
+        let touched = Arc::new(AtomicUsize::new(0));
+        let ops = touched.clone();
+        promptly(move || {
+            assert_eq!(agent.exec(request()), Err(WHY.into()));
+            assert_eq!(agent.put("unused".into(), 1, Box::new(Untouched(ops.clone()))), Err(WHY.into()));
+            assert_eq!(agent.get("unused".into(), Box::new(Untouched(ops))), Err(WHY.into()));
+            // Keep the writer open with no body. An attempted update read
+            // would block instead of returning the capability rejection.
+            let (from, mut writer) = UnixStream::pair().unwrap();
+            writer.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+            assert_eq!(agent.update(from.into()), Err(WHY.into()));
+            assert_eq!(writer.read(&mut [0]).unwrap(), 0);
+        });
+        assert_eq!(touched.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn unavailable_direct_commands_receive_explicit_failures() {
+        let agent = Agent::unavailable(WHY);
+        let touched = Arc::new(AtomicUsize::new(0));
+        let ops = touched.clone();
+        promptly(move || {
+            let (tx, rx) = mpsc::channel();
+            agent.send(AgentCmd::Exec { req: request(), reply: tx });
+            assert_eq!(rx.recv().unwrap(), Err(WHY.into()));
+            let (tx, rx) = mpsc::channel();
+            agent.send(AgentCmd::FilePut { path: "unused".into(), size: 1, from: FileFrom(Box::new(Untouched(ops.clone()))), reply: tx });
+            assert_eq!(rx.recv().unwrap(), Err(WHY.into()));
+            let (tx, rx) = mpsc::channel();
+            agent.send(AgentCmd::FileGet { path: "unused".into(), to: FileTo(Box::new(Untouched(ops))), reply: tx });
+            assert_eq!(rx.recv().unwrap(), Err(WHY.into()));
+            let (from, _writer) = UnixStream::pair().unwrap();
+            let (tx, rx) = mpsc::channel();
+            agent.send(AgentCmd::Update { from: from.into(), reply: Some(tx) });
+            assert_eq!(rx.recv().unwrap(), Err(WHY.into()));
+            agent.send(AgentCmd::SyncTime);
+            agent.send(AgentCmd::Stop);
+        });
+        assert_eq!(touched.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_service_waiting_for_hello_is_not_an_unavailable_transport() {
+        let (host, _guest) = UnixStream::pair().unwrap();
+        let agent = spawn(host, Default::default(), None, Screen::default()).unwrap();
+        assert!(!agent.status().connected);
+        assert_eq!(agent.features(), 0);
+        assert_eq!(agent.unavailable_reason(), None);
+        assert_eq!(agent.require_available(), Ok(()));
+        agent.send(AgentCmd::Stop);
     }
 }

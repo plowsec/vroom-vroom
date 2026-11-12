@@ -21,6 +21,7 @@ vroom-fuzz trace harness.json runs/a/crashes/<hash>-BugCheck.bin --blocks all-bl
 vroom-fuzz triage harness.json runs/a/crashes/<hash>-BugCheck.bin   # reproduce + minimize
 vroom-fuzz replay harness.json runs/a/inputs --output runs/a/drcov   # each input's whole coverage: drcov for Lighthouse
 vroom-fuzz show harness.json runs/a/inputs/<hash>.bin          # a sequence, a call a line
+vroom-fuzz peek harness.json 0x7ff6a0001000 --length 64       # at the snapshot: modules (target_pid's too), bytes and names there
 vroom-fuzz mutate seed.bin --harness harness.json --count 5    # mutations as runs make them, no VM
 vroom-fuzz blocks clfs.sys --base 0xfffff804000d0000 --output blocks.json   # block list from the driver file
 ```
@@ -55,9 +56,9 @@ Trace file: `N  PC  module!function+0xoff` per instruction from the snapshot to 
 
 Comparison logging (Redqueen-style): each new corpus input runs once stepped through the target's image (≤200 ms); its comparisons (`cmp`, `cmn`, `ccmp`, `cbz`, `tbz`) become inputs that turn them the other way (operand found in the input → the other operand ±1; IOCTL and first payload words shifted by the operands' difference; a sequence: each call's code and first two payload words, only by comparisons whose register side holds the field's word, low half or byte) and dictionary words. Client: the guest runs at full speed to each entry into the target (`entries`, client's address space), 300 target instructions stepped from there, calls out at full speed (≤40k steps, ≤3 s); ≤128 inputs per log. CLFS: 4748 → 5738 blocks in 10 min. Without `--ioctl`, one mutation in four changes the code (dictionary, function ±1–4, method). Parents: novelty × speed (median-relative). HEVD: 29/29 IOCTLs from a zero code in ~0.1 s (blocks mode).
 
-Output dir: `inputs/`, `crashes/<hash>-<class>.{bin,json}` (first input per signature; `stack`: symbolized), `coverage.json`, `blocks.json`, `stats.json` (every 5 s).
+Output dir: `inputs/`, `crashes/<hash>-<class>.{bin,json}` (first input per signature; `stack`: symbolized; exceptions: `registers` of the faulting code), `coverage.json`, `blocks.json`, `stats.json` (every 5 s).
 
-Signature (dedupe): class + the 3 innermost functions of the faulting code (offsets dropped; frames above the kernel's exception entry and `KeBugCheck*` skipped); `<wild jump>` for a PC outside every image; else class + PC. Functions without a PDB: the block list's names, else `.pdata` starts as `sub_<address at 0x140000000>`.
+Signature (dedupe): class + the 3 innermost functions of the faulting code (offsets dropped; frames above the kernel's exception entry and `KeBugCheck*` skipped); `<no image>` for a PC outside every image (then its caller's frames, from the link register); else class + PC. Functions without a PDB: the block list's names, else `.pdata` starts as `sub_<address at 0x140000000>`.
 
 `replay` (blocks mode): the inputs (files, or directories oldest first) twice, the first pass to warm the VM up; each recorded run starts with every block's breakpoint armed. `<name>.drcov` per input, `all.drcov`, `replay.json` (blocks, new ones, calls, findings per input). Lighthouse: load the files (or the directory) on the target module; the composer unions, intersects, diffs them. Same input twice: same blocks ±0.5%.
 
@@ -68,9 +69,12 @@ Detector `exceptions` (or `access-violation`): a breakpoint on `nt!KiDispatchExc
 | class | |
 |---|---|
 | `AccessViolation` | `0xc0000005` on a kernel address or the NULL page (`reading`/`writing`/`executing ADDR`) |
-| `ExceptionDispatch` | stack overrun `0xc0000409`, illegal/privileged instruction, misalignment, stack overflow, divide, the trap handlers' other `0x100000xx` codes (`0x10000011`: non-canonical address) |
+| `ExceptionDispatch` | stack overrun `0xc0000409` (and `__fastfail`: ARM64 `brk #0xf003`, a breakpoint with parameter `0xf003`), illegal/privileged instruction, misalignment, stack overflow (a user target: anywhere in its process), divide, the trap handlers' other `0x100000xx` codes (`0x10000011`: non-canonical address) |
+| `ProcessExit` | a user target's process ends itself with an error status (`nt!NtTerminateProcess` breakpoint): PageHeap verifier stops `0xc0000421` (block suffix overwritten, double free, bad free) dispatch no exception. Stack from the target's first frame, the exit path after |
 
 - User-address faults inside `__try` (probing user buffers) aren't findings.
+- Stacks: a frame whose unwind data isn't resident (or code in no listed module) continues on the x29 frame records; the faulting frame's caller from the link register.
+- PageHeap blind spots: reads inside a block's alignment slack; writes there are caught at its free, not where they happen.
 - Bugchecks stop at `KeBugCheck2` (every bugcheck goes through it; `bugcheck_pc` = `KeBugCheckEx` is moved there) with the exception's stack.
 - The same exception (code, PC, faulting address) 9 times in one input ends it: a fault in its own dispatch.
 Kernel TUI: `coverage runs/a/coverage.json`, `coverage-diff runs/a/coverage.json runs/b/coverage.json`.
@@ -81,7 +85,7 @@ Kernel TUI: `coverage runs/a/coverage.json`, `coverage-diff runs/a/coverage.json
 |---|---|
 | `config`, `snapshot`, `state_dir` | VM config, snapshot dir, VM state dir (one per instance) |
 | `cpu`, `isolate_cpu` | CPU of the target call; run it alone, IRQs masked, devices paused (~150x faster) |
-| `input_gpa`, `input_capacity`, `input_va`, `max_input` | input buffer |
+| `input_gpa`, `input_capacity`, `input_va`, `max_input` | input buffer; past 4096 bytes its further pages are found through `input_va` (the client's buffer, locked) |
 | `ioctl_prefix`, `ioctl_register` / `ioctl_va` | first 4 input bytes = IOCTL, and where it goes |
 | `input_register` / `input_pointer_va`, `input_length_register` / `input_length_va`, `output_length_va` | saved fields patched per input |
 | `entry_pc`, `stop_pc` | first block; return address that ends an input (testcase thread only). User-mode `entry_pc`: a client harness (needs `blocks`, no `isolate_cpu`, `target`, `stop_pc` in the client) |
@@ -92,7 +96,7 @@ Kernel TUI: `coverage runs/a/coverage.json`, `coverage-diff runs/a/coverage.json
 | `calls` / `calls_file` | a sequence's call descriptions (below): typed mutation, call-aware triage, `show`. File relative to the harness |
 | `bugcheck_pc` | `KeBugCheckEx` VA: crash = finding + in-place reset (~1 ms, not ~11 s); 5th HW breakpoint |
 | `reset_is_bugcheck` | guest reset counts as a bugcheck |
-| `reopen_after` | `0` reset in place, `1` restore from disk every input |
+| `reopen_after` | `0` reset in place, `N` restore from disk every N inputs |
 | `timeout_ms` | per input; a timeout restores from disk (a client's resets in place) |
 | `settle_ms` | client harnesses: keep running this long past `stop_pc` (async completions within the input) |
 | `skip_idle` | guest time is what the guest does: every vCPU in WFI and no virtio work in flight → the clock jumps to the next timer (kernel `wfi`s become `hvc #0x7669`; HVF waits out real ones itself); a debug stop parks every vCPU and the clock stands still until they run again. A client's receive timeouts cost their timer ticks, and breakpoints don't make its replies late |
@@ -108,6 +112,7 @@ Kernel TUI: `coverage runs/a/coverage.json`, `coverage-diff runs/a/coverage.json
 
 - `VROOM_COW_VERIFY=1`: after each reset, check RAM, untouched devices and GIC registers against the snapshot (~1 s each).
 - `VROOM_FUZZ_TRACE=1`: per-stop trace on stderr (a client's per-call results at `stop_pc`, a word per call); `=slow`: run loop iterations over 200 ms; `=2`: every debug stop.
+- `VROOM_FUZZ_SLOW_MS=N`: an input still running after N ms logs `slow <hash>: <context>` once (a timeout's context: host/guest ms, idle skip, each CPU's process, PC, frames) and goes on. Timeouts: `timeouts/<hash>.{bin,json}`, every one.
 - `VROOM_RESET_PROFILE=1`: each reset's phases (dirty log, copy back, icache, disks, GIC, devices, vCPUs) and devices restored over 0.2 ms.
 - `series.jsonl` (master, a row a minute): coverage, execs, corpus, findings; per worker exec and reset ms, restores, timeouts, comparison logs, live.
 - Resume: same `--output`. Workers run their corpus first (dropping inputs that time out), the master learns its coverage again; a failed worker restarts (20 times at most).
@@ -131,6 +136,8 @@ C:\HEVD-Lab\HevdFuzzClient.exe 0x222003 1
 ## Clients, sequences
 
 Stateful drivers (CLFS): the snapshot stands in a user-mode client parked in a loop; each input is a program of calls it makes (`sequence`), the whole guest running; the input ends at the client's `stop_pc`. Coverage is the target's blocks (`blocks` mode, any thread); exceptions are the target's, any thread. Cmplog: from each entry into the target (`entries`). Example: [CLFS.md](CLFS.md).
+
+User-mode libraries: the client calls the library in its own process; `target` the DLL, `target_pid` the client's pid (full PageHeap on the client's image: IFEO `GlobalFlag 0x02000000`, `PageHeapFlags 3`). A system DLL's code pages are shared by every process mapping it: their hits on its breakpoints cost each input (thousands of debug stops, timeouts). The client loads a renamed copy of it instead (`target` = the copy).
 
 Network services: the client sends to a peer in the NIC's `mirror` network (VM config, NAT: `mirror = "10.99.0.0/24"`); its datagrams come back through the NIC from there, so the service sees a remote peer and inputs take the remote path (NIC, IP reassembly, firewall, the service's policy for that address). With `skip_idle` the client's reply waits cost what the guest does in them: a UDP service's client, 1 worker: 9.3 → 36.7 inputs/s, median input 78 → 12 ms.
 

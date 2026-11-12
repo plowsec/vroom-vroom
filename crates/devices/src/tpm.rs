@@ -52,8 +52,10 @@ pub trait TpmBackend: Send {
     /// Platform reset (power cycle the TPM).
     fn reset(&mut self);
     /// Make the TPM state durable and return it (snapshots, suspend).
-    fn save(&mut self) -> Vec<u8> {
-        Vec::new()
+    /// Persistent backends must report export/read failures, never partial success.
+    /// The default is deliberately stateless and pairs with the default `load`.
+    fn save(&mut self) -> vroom_snapshot::Result<Vec<u8>> {
+        Ok(Vec::new())
     }
     /// Go back to a saved state. False if it can't.
     fn load(&mut self, _state: &[u8]) -> bool {
@@ -244,7 +246,7 @@ impl Snapshottable for Tpm {
     }
 
     fn save(&mut self) -> vroom_snapshot::Result<Vec<u8>> {
-        let backend = self.backend.save();
+        let backend = self.backend.save()?;
         encode(&Snap { state: self.state, active: self.active, buf: self.buf.clone(), pos: self.pos, backend })
     }
 
@@ -253,7 +255,9 @@ impl Snapshottable for Tpm {
         if s.buf.len() > MAX_BUFFER || s.pos > s.buf.len() {
             return Err(vroom_snapshot::Error::Invalid("tpm snapshot".into()));
         }
-        if !s.backend.is_empty() && !self.backend.load(&s.backend) {
+        // Even an empty blob must be checked: a persistent backend may require
+        // state, whereas the default stateless backend deliberately accepts it.
+        if !self.backend.load(&s.backend) {
             return Err(vroom_snapshot::Error::Invalid("tpm state could not be restored".into()));
         }
         self.state = s.state;
@@ -335,5 +339,61 @@ mod tests {
         t.read(DATA_FIFO, &mut rc[4..8]);
         t.read(DATA_FIFO, &mut rc[8..10]);
         assert_eq!(&rc[6..10], &0x101u32.to_be_bytes());
+    }
+
+    #[test]
+    fn stateless_backend_roundtrip_keeps_partial_fifo_command() {
+        let mut t = Tpm::new(0, Box::new(Echo));
+        t.write(ACCESS, &[ACCESS_REQUEST_USE]);
+        t.write(STS, &STS_COMMAND_READY.to_le_bytes());
+        let cmd = [0x80, 0x01, 0, 0, 0, 12, 0, 0, 1, 0x44, 0, 0];
+        t.write(DATA_FIFO, &cmd[..4]);
+        let saved = t.save().unwrap();
+        let mut restored = Tpm::new(0, Box::new(Echo));
+        restored.restore(&saved).unwrap();
+        for b in &cmd[4..] { restored.write(DATA_FIFO, &[*b]); }
+        restored.write(STS, &STS_GO.to_le_bytes());
+        let mut reply = [0; 12];
+        for b in &mut reply { restored.read(DATA_FIFO, std::slice::from_mut(b)); }
+        assert_eq!(reply, cmd);
+    }
+
+    struct RequiredState;
+    impl TpmBackend for RequiredState {
+        fn execute(&mut self, cmd: &[u8]) -> Vec<u8> { cmd.to_vec() }
+        fn reset(&mut self) {}
+        fn save(&mut self) -> vroom_snapshot::Result<Vec<u8>> {
+            Err(vroom_snapshot::Error::Invalid("injected TPM export failure".into()))
+        }
+        fn load(&mut self, state: &[u8]) -> bool { state == b"complete state" }
+    }
+
+    #[test]
+    fn failed_capture_propagates_without_changing_fifo_or_backend_usability() {
+        let mut t = Tpm::new(0, Box::new(RequiredState));
+        t.write(ACCESS, &[ACCESS_REQUEST_USE]);
+        t.write(STS, &STS_COMMAND_READY.to_le_bytes());
+        let cmd = [0x80, 1, 0, 0, 0, 10, 0, 0, 1, 0x44];
+        t.write(DATA_FIFO, &cmd[..4]);
+        assert!(t.save().unwrap_err().to_string().contains("injected TPM export failure"));
+        assert_eq!(t.buf, cmd[..4]);
+        assert_eq!(t.state, State::Receiving);
+        for b in &cmd[4..] { t.write(DATA_FIFO, &[*b]); }
+        t.write(STS, &STS_GO.to_le_bytes());
+        assert_eq!(t.state, State::Completion);
+        assert_eq!(t.buf, cmd);
+    }
+
+    #[test]
+    fn empty_backend_restore_is_validated_before_tis_state_changes() {
+        let empty = Tpm::new(0, Box::new(Echo)).save().unwrap();
+        let mut t = Tpm::new(0, Box::new(RequiredState));
+        t.write(ACCESS, &[ACCESS_REQUEST_USE]);
+        t.write(STS, &STS_COMMAND_READY.to_le_bytes());
+        t.write(DATA_FIFO, &[0x80, 1]);
+        assert!(t.restore(&empty).is_err());
+        assert!(t.active);
+        assert_eq!(t.buf, [0x80, 1]);
+        assert_eq!(t.state, State::Receiving);
     }
 }

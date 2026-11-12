@@ -65,6 +65,13 @@ pub struct CoverageBlock {
     pub source: Option<String>,
 }
 
+/// The guest's page size for the input buffer (`input_capacity` past it:
+/// several pages).
+const INPUT_PAGE: usize = 4096;
+
+/// Exception-dispatch sites (hardware breakpoints, beside `stop_pc`).
+const MAX_EXCEPTION_SITES: usize = 4;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Harness {
     pub name: String,
@@ -79,6 +86,8 @@ pub struct Harness {
     pub cpu: usize,
     /// Optional guest virtual address of the input buffer. It must translate
     /// to `input_gpa`; the runner passes or stores it for each testcase.
+    /// Required past one page of `input_capacity`: the buffer's pages are
+    /// written where it maps them (physically apart).
     #[serde(default)]
     pub input_va: Option<u64>,
     /// Treat the first four testcase bytes as a little-endian IOCTL code.
@@ -339,6 +348,11 @@ impl Harness {
                 "name and input_capacity are required".into(),
             ));
         }
+        if h.input_capacity > INPUT_PAGE && h.input_va.is_none() {
+            return Err(Error::Invalid(format!(
+                "input_capacity past {INPUT_PAGE} bytes needs input_va (its pages are found through it)"
+            )));
+        }
         if h.max_input == 0 {
             h.max_input = h.input_capacity;
         }
@@ -440,7 +454,7 @@ impl Harness {
         }
         // DebugStop does not expose the fired WVR index yet, so one watched
         // range is the only unambiguous configuration supported by the runner.
-        if h.exception_sites.len() > 4 || h.watchpoints.len() > 1 {
+        if h.exception_sites.len() > MAX_EXCEPTION_SITES || h.watchpoints.len() > 1 {
             return Err(Error::Invalid(
                 "ARM64 supports four exception sites and one unambiguous watched range".into(),
             ));
@@ -631,6 +645,9 @@ pub enum BugClass {
     ExceptionDispatch,
     PoisonedAccess,
     DoubleFetch,
+    /// A user-mode target's process ends itself with an error status (a
+    /// verifier stop, a fail fast): no exception reaches a handler.
+    ProcessExit,
     Timeout,
     Unknown,
 }
@@ -645,6 +662,9 @@ pub struct Finding {
     /// sites).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stack: Vec<String>,
+    /// The faulting code's registers (exceptions): `x0=0x…` … `pc=0x…`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub registers: Vec<String>,
 }
 
 /// Findings with the same signature are the same bug: the class and the
@@ -662,7 +682,7 @@ pub fn signature(finding: &Finding) -> String {
     let frames: Vec<&str> = stack[entry.map_or(0, |i| i + 1)..]
         .iter()
         .filter(|f| !f.starts_with("nt!KeBugCheck"))
-        .map(|f| if f.starts_with("<wild jump") { "<wild jump>" } else { f.split_once('+').map_or(*f, |(function, _)| function) })
+        .map(|f| if f.starts_with("<no image") { "<no image>" } else { f.split_once('+').map_or(*f, |(function, _)| function) })
         .take(3)
         .collect();
     if frames.is_empty() {
@@ -711,6 +731,7 @@ pub fn detect(text: &str, pc: Option<u64>, input: &str, timeout: bool) -> Option
         pc,
         input: input.to_string(),
         stack: Vec::new(),
+        registers: Vec::new(),
     })
 }
 
@@ -1067,6 +1088,18 @@ impl CorpusStore {
         )?;
         Ok(path)
     }
+
+    /// Every timeout, not only a signature's first: `timeouts/<hash>.bin`
+    /// and its context (`.json`). Their signature is one for all, and
+    /// what tells them apart (where the VM was) is in the context.
+    pub fn save_timeout(&self, finding: &Finding, data: &[u8]) -> Result<PathBuf> {
+        let dir = self.root.join("timeouts");
+        fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{}.bin", Self::hash(data)));
+        fs::write(&path, data)?;
+        fs::write(path.with_extension("json"), serde_json::to_vec_pretty(finding)?)?;
+        Ok(path)
+    }
 }
 
 /// Optional VMM-backed runner. It is deliberately kept in this leaf crate so
@@ -1100,6 +1133,9 @@ pub struct Engine {
     /// `nt!KiDispatchException`, when the harness detects exceptions: every
     /// exception passes there first, the ones an `__except` swallows too.
     exception_hook: Option<u64>,
+    /// `nt!NtTerminateProcess`, for a user-mode target with `exceptions`:
+    /// its process ending itself with an error status is a finding.
+    exit_hook: Option<u64>,
     /// Blocks the last comparison log reached first (blocks mode): the
     /// input it logged covers them.
     pub cmplog_blocks: Vec<u64>,
@@ -1244,6 +1280,7 @@ impl Engine {
             target_image: None,
             target_space: None,
             exception_hook: None,
+            exit_hook: None,
             cmplog_blocks: Vec::new(),
             ablated: Vec::new(),
         })
@@ -1268,6 +1305,17 @@ impl Engine {
             self.exception_hook = Some(hook);
             // Whose an exception is, from the first one on.
             self.target_range(&registers)?;
+            // A verifier stop (PageHeap: a corrupt block, a double free, a
+            // bad free) or a fail fast ends the process without an exception
+            // reaching KiDispatchException first: watch it exit.
+            if self.harness.target_pid.is_some() && self.harness.exception_sites.len() < MAX_EXCEPTION_SITES {
+                if let Some(exit) = self.symbols.as_ref().and_then(|s| s.resolve("NtTerminateProcess")) {
+                    if !self.harness.exception_sites.contains(&exit) {
+                        self.harness.exception_sites.push(exit);
+                    }
+                    self.exit_hook = Some(exit);
+                }
+            }
         }
         // A user-mode target's code, through its own process only: at its
         // VAs another process may have other memory.
@@ -1521,6 +1569,49 @@ impl Engine {
         self.target_range(&registers)
     }
 
+    /// At the snapshot: the loaded modules (the kernel's, and the target
+    /// process's with `target_pid`), and for each address its name and
+    /// `length` bytes there (the target's address space; None if unmapped).
+    pub fn peek(&mut self, addresses: &[u64], length: usize) -> Result<serde_json::Value> {
+        let state = self.vm.debug_registers(self.harness.cpu)?;
+        let registers = Registers::from_state(&state)
+            .map_err(|error| Error::Invalid(format!("ARM64 register state: {error}")))?;
+        self.load_symbols(&registers)?;
+        let registers = self.target_registers(&registers)?.unwrap_or(registers);
+        let space = AddressSpace { memory: &self.vm, registers: &registers };
+        let symbols = self.symbols.as_mut().expect("loaded above");
+        let mut modules: Vec<_> = symbols.modules().to_vec();
+        modules.sort_by_key(|m| m.base);
+        let modules: Vec<_> = modules
+            .iter()
+            .map(|m| serde_json::json!({"base": format!("{:#x}", m.base), "end": format!("{:#x}", m.base + u64::from(m.size)), "name": m.name}))
+            .collect();
+        let at: Vec<_> = addresses
+            .iter()
+            .map(|&a| {
+                let mut bytes = vec![0u8; length];
+                let read = vroom_kernel::windows::VirtualMemory::read(&space, a, &mut bytes);
+                let hex = read.ok().map(|_| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>());
+                serde_json::json!({"address": format!("{a:#x}"), "name": symbols.name(&space, a), "in_module": symbols.in_module(a), "bytes": hex})
+            })
+            .collect();
+        // The target process: its EPROCESS and pointer-encoding cookie.
+        let process = match (self.harness.target_pid, symbols.kernel_symbols()) {
+            (Some(pid), Some(pdb)) => vroom_kernel::process::list(&space, pdb).ok().and_then(|l| l.into_iter().find(|p| p.pid == pid)).map(|p| {
+                let cookie = pdb
+                    .field("_EPROCESS", "Cookie")
+                    .ok()
+                    .and_then(|off| {
+                        let mut w = [0u8; 4];
+                        vroom_kernel::windows::VirtualMemory::read(&space, p.eprocess + off, &mut w).ok().map(|_| u32::from_le_bytes(w))
+                    });
+                serde_json::json!({"eprocess": format!("{:#x}", p.eprocess), "peb": format!("{:#x}", p.peb), "cookie": cookie.map(|c| format!("{c:#x}"))})
+            }),
+            _ => None,
+        };
+        Ok(serde_json::json!({"modules": modules, "addresses": at, "process": process}))
+    }
+
     /// `blocks` mode, after an input: plant the blocks on pages that input
     /// mapped. VM paused.
     fn plant_pending(&mut self) -> Result<()> {
@@ -1634,6 +1725,48 @@ impl Engine {
     /// The symbolized call stack of a stopped thread (the VM paused). A
     /// stack that can't be had is one line saying why: a finding stays a
     /// finding.
+    /// A timeout's context (the VM paused): host and guest time the input
+    /// ran, debug stops, the idle skip as it was, and where each CPU is
+    /// (PC, exception level, the innermost frames).
+    fn timeout_context(&mut self, host: Duration, guest_ns: u64, debug_stops: u64, idle: Option<String>) -> String {
+        let mut parts = vec![format!(
+            "host {} ms, guest {} ms, {debug_stops} debug stops",
+            host.as_millis(),
+            guest_ns / 1_000_000
+        )];
+        parts.extend(idle);
+        for cpu in 0..self.vm.cpu_count() {
+            let registers = self
+                .vm
+                .debug_registers(cpu)
+                .map_err(|e| e.to_string())
+                .and_then(|state| Registers::from_state(&state).map_err(|e| e.to_string()));
+            parts.push(match registers {
+                Ok(registers) => {
+                    let el = (registers.pstate >> 2) & 3;
+                    let frames: Vec<String> = self.stack_of(&registers).into_iter().take(6).collect();
+                    let process = self.process_of(&registers).unwrap_or_else(|| "?".into());
+                    format!("cpu{cpu} pc {:#x} EL{el} {process} [{}]", registers.pc, frames.join(" < "))
+                }
+                Err(e) => format!("cpu{cpu} ({e})"),
+            });
+        }
+        parts.join("; ")
+    }
+
+    /// The process whose page tables `registers` use (name:pid), from the
+    /// kernel's process list.
+    fn process_of(&mut self, registers: &Registers) -> Option<String> {
+        self.load_symbols(registers).ok()?;
+        let pdb = self.symbols.as_ref()?.kernel_symbols()?;
+        let space = AddressSpace { memory: &self.vm, registers };
+        let processes = vroom_kernel::process::list(&space, pdb).ok()?;
+        processes
+            .iter()
+            .find(|p| same_space(p.directory_table, registers.ttbr0))
+            .map(|p| format!("{}:{}", p.name, p.pid))
+    }
+
     fn stack_of(&mut self, registers: &Registers) -> Vec<String> {
         if let Err(e) = self.load_symbols(registers) {
             return vec![format!("(no symbols: {e})")];
@@ -1762,6 +1895,10 @@ impl Engine {
             c => c,
         };
         let internal = code & 0xffff_ff00 == 0x1000_0000;
+        // __fastfail on ARM64 is `brk #0xf003`: a breakpoint exception whose
+        // second parameter is that immediate (the fail code in x0).
+        let fast_fail = code == 0x8000_0003 && fault == 0xf003;
+        let code = if fast_fail { 0xc000_0409 } else { code };
         let class = match code {
             // A kernel address, or the NULL page (a NULL dereference, user
             // half or not); in a user-mode target, any address.
@@ -1803,13 +1940,29 @@ impl Engine {
             Some(r) => symbols.pcs(&AddressSpace { memory: &self.vm, registers: r }, r),
             None => (vec![address], None),
         };
-        // The target's, or a jump out of all code (a smashed return
-        // address, a corrupt function pointer).
+        // The target's, or code in no image: a jump out of all code (a
+        // smashed return address, a corrupt function pointer), or code the
+        // system maps outside images (the CFG check stubs).
         let wild = !symbols.in_module(address);
-        let theirs = !wild && !(lo..hi).contains(&address) && !pcs.iter().any(|pc| (lo..hi).contains(pc));
+        // No unwind data there: a leaf, its caller's frames from the link
+        // register on (a smashed one names nothing).
+        let (pcs, stop) = match &faulting {
+            Some(r) if wild && symbols.in_module(r.x[30]) => {
+                let leaf = Registers { pc: r.x[30], ..r.clone() };
+                let (callers, stop) = symbols.pcs(&AddressSpace { memory: &self.vm, registers: &leaf }, &leaf);
+                (std::iter::once(address).chain(callers).collect(), stop)
+            }
+            _ => (pcs, stop),
+        };
+        // A stack overflow in the target's process: its frames are too many
+        // to walk to the target's.
+        let theirs = !wild
+            && !(user_target && code == 0xc000_00fd)
+            && !(lo..hi).contains(&address)
+            && !pcs.iter().any(|pc| (lo..hi).contains(pc));
         if theirs {
             if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
-                eprintln!("exception {code:#x} at {address:#x} (not the target's)");
+                eprintln!("exception {code:#x} at {address:#x} (not the target's: stack {pcs:#x?}, {stop:?})");
             }
             return Ok(None);
         }
@@ -1826,14 +1979,21 @@ impl Engine {
             (_, 1) if internal => format!("writing {fault:#x}"),
             _ => String::new(),
         };
-        // Nothing to unwind from a wild PC, and where it went depends on
-        // the input: one frame that says so.
-        let mut stack: Vec<String> = if wild {
-            vec![format!("<wild jump to {address:#x}>")]
-        } else {
-            frames.into_iter().map(|(_, n)| n).collect()
-        };
-        stack.extend(stop.filter(|_| !wild).map(|s| format!("({s})")));
+        // A PC in no image: where it went depends on the input, its
+        // callers don't.
+        let mut stack: Vec<String> = frames
+            .into_iter()
+            .map(|(pc, n)| if pc == address && wild { format!("<no image at {address:#x}>") } else { n })
+            .collect();
+        stack.extend(stop.map(|s| format!("({s})")));
+        let registers = faulting
+            .as_ref()
+            .map(|r| {
+                let mut out: Vec<String> = r.x.iter().enumerate().map(|(i, x)| format!("x{i}={x:#x}")).collect();
+                out.extend([format!("sp={:#x}", r.sp), format!("pc={:#x}", r.pc)]);
+                out
+            })
+            .unwrap_or_default();
         let at = stack.first().cloned().unwrap_or_else(|| format!("{address:#x}"));
         Ok(Some(Finding {
             class,
@@ -1841,7 +2001,64 @@ impl Engine {
             pc: Some(address),
             input: input.to_string(),
             stack,
+            registers,
         }))
+    }
+
+    /// The target's process ending itself (`NtTerminateProcess(-1, status)`)
+    /// with an error status: what the status says, the dying thread's stack.
+    fn exit_finding(&mut self, registers: &Registers, input: &str) -> Option<Finding> {
+        let own = self.target_space.is_some_and(|root| same_space(root, registers.ttbr0));
+        let status = registers.x[1] as u32;
+        if !own || registers.x[0] != u64::MAX || status >> 30 != 3 {
+            return None;
+        }
+        let what = match status {
+            0xc000_0421 => " (verifier stop: a corrupt heap block, a double or bad free)",
+            0xc000_0409 => " (fail fast)",
+            0xc000_0374 => " (heap corruption)",
+            0xc000_0005 => " (access violation, unhandled)",
+            0xc000_00fd => " (stack overflow)",
+            _ => "",
+        };
+        // What reports the failure (the verifier's stop, WER) loads DLLs
+        // after the snapshot.
+        let _ = self.target_modules(registers);
+        let stack = self.exit_stack(registers);
+        if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
+            eprintln!("process exit {status:#x}: {stack:?}");
+        }
+        Some(Finding {
+            class: BugClass::ProcessExit,
+            detail: format!("the target's process exits with {status:#x}{what}"),
+            pc: Some(registers.pc),
+            input: input.to_string(),
+            stack,
+            registers: Vec::new(),
+        })
+    }
+
+    /// A dying thread's stack from the target's first frame on (where the
+    /// bad free or the corrupt block came from: what tells two bugs apart),
+    /// the way it went to the exit after, in parentheses.
+    fn exit_stack(&mut self, registers: &Registers) -> Vec<String> {
+        if self.load_symbols(registers).is_err() {
+            return self.stack_of(registers);
+        }
+        let Ok((lo, hi)) = self.target_range(registers) else {
+            return self.stack_of(registers);
+        };
+        let space = AddressSpace { memory: &self.vm, registers };
+        let symbols = self.symbols.as_mut().expect("loaded above");
+        let (pcs, stop) = symbols.pcs(&space, registers);
+        let names: Vec<String> = pcs.iter().map(|&pc| symbols.name(&space, pc)).collect();
+        let first = pcs.iter().position(|pc| (lo..hi).contains(pc)).unwrap_or(0);
+        let mut stack = names[first..].to_vec();
+        stack.extend(stop.map(|s| format!("({s})")));
+        if first > 0 {
+            stack.push(format!("(exit path: {})", names[..first].join(" < ")));
+        }
+        stack
     }
 
     /// The stack a bugcheck is about. KERNEL_SECURITY_CHECK_FAILURE (0x139,
@@ -1857,6 +2074,30 @@ impl Engine {
             }
         }
         self.stack_of(registers)
+    }
+
+    /// The input buffer's pages, physical: `input_gpa`, then (past one
+    /// page) each further page of `input_va` as the snapshot's tables map
+    /// it.
+    fn input_pages(&self) -> Result<Vec<u64>> {
+        let mut pages = vec![self.harness.input_gpa];
+        if self.harness.input_capacity <= INPUT_PAGE {
+            return Ok(pages);
+        }
+        let va = self.harness.input_va.expect("validated: input_va past one page");
+        let state = self.vm.debug_registers(self.harness.cpu)?;
+        let registers = Registers::from_state(&state)
+            .map_err(|error| Error::Invalid(format!("ARM64 register state: {error}")))?;
+        let space = AddressSpace { memory: &self.vm, registers: &registers };
+        for page in 1..self.harness.input_capacity.div_ceil(INPUT_PAGE) {
+            let at = va + (page * INPUT_PAGE) as u64;
+            let physical = space
+                .translate(at)
+                .map_err(|error| Error::Invalid(format!("translate input page {at:#x}: {error}")))?
+                .physical;
+            pages.push(physical);
+        }
+        Ok(pages)
     }
 
     /// Put `input` in place for one execution, as every run does: reset
@@ -1902,8 +2143,13 @@ impl Engine {
         }
         self.input_buffer.fill(0);
         self.input_buffer[..payload.len()].copy_from_slice(payload);
-        self.vm
-            .debug_write_physical(&[(self.harness.input_gpa, &self.input_buffer)])?;
+        let pages = self.input_pages()?;
+        let writes: Vec<(u64, &[u8])> = pages
+            .iter()
+            .zip(self.input_buffer.chunks(INPUT_PAGE))
+            .map(|(&gpa, chunk)| (gpa, chunk))
+            .collect();
+        self.vm.debug_write_physical(&writes)?;
         self.apply_ablations()?;
         let mut case_watchpoints = self.harness.watchpoints.clone();
         if !case_watchpoints.is_empty() {
@@ -2127,6 +2373,9 @@ impl Engine {
         // Past stop_pc, running until then (settle_ms).
         let mut settle: Option<Instant> = None;
         let slow_trace = std::env::var_os("VROOM_FUZZ_TRACE").is_some_and(|v| v == "slow");
+        // VROOM_FUZZ_SLOW_MS=N: an input still running after N ms logs
+        // where the VM is (as a timeout does) once, and goes on.
+        let mut slow_sample = std::env::var("VROOM_FUZZ_SLOW_MS").ok().and_then(|v| v.parse::<u64>().ok());
         let mut iteration = Instant::now();
         let mut last_event = String::new();
         if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
@@ -2177,6 +2426,9 @@ impl Engine {
         }
         resume_vm(&mut self.vm, isolate)?;
         let start = Instant::now();
+        // For a timeout's context: guest time against host time.
+        let clock_at_start = self.vm.guest_clock();
+        let mut debug_stops = 0u64;
         let token = CorpusStore::hash(input);
         let mut new_blocks = 0;
         let mut new_edges = 0;
@@ -2213,22 +2465,37 @@ impl Engine {
                 }
                 iteration = Instant::now();
             }
+            if own_step.is_none()
+                && foreign_step.is_none()
+                && slow_sample.is_some_and(|ms| start.elapsed() > Duration::from_millis(ms))
+            {
+                slow_sample = None;
+                let idle = self.vm.research_idle_report();
+                let guest_ns = self.vm.guest_clock_ns(self.vm.guest_clock().wrapping_sub(clock_at_start));
+                let host = start.elapsed();
+                self.vm.pause()?;
+                let context = self.timeout_context(host, guest_ns, debug_stops, idle);
+                eprintln!("slow {token}: {context}");
+                resume_vm(&mut self.vm, isolate)?;
+            }
             if settle.is_some_and(|deadline| Instant::now() >= deadline) {
                 self.vm.pause()?;
                 break;
             }
             if start.elapsed() > Duration::from_millis(self.harness.timeout_ms) {
+                // What the VM was doing: before the pause (the idle skip's
+                // view ends there), then each CPU paused.
+                let idle = self.vm.research_idle_report();
+                let guest_ns = self.vm.guest_clock_ns(self.vm.guest_clock().wrapping_sub(clock_at_start));
+                let host = start.elapsed();
                 self.vm.pause()?;
-                if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
-                    let state = self.vm.debug_registers(self.harness.cpu)?;
-                    let registers = Registers::from_state(&state).map_err(|error| {
-                        Error::Invalid(format!("ARM64 register state: {error}"))
-                    })?;
-                    let stack = self.stack_of(&registers);
-                    eprintln!("timeout at pc={:#x} {stack:?}", registers.pc);
-                }
+                let context = self.timeout_context(host, guest_ns, debug_stops, idle);
+                eprintln!("timeout {token}: {context}");
                 reopen = true;
                 finding = detect("execution timeout", None, &token, true);
+                if let Some(found) = &mut finding {
+                    found.detail = format!("execution timeout: {context}");
+                }
                 if let Some(found) = &finding {
                     findings.push(found.clone());
                 }
@@ -2247,6 +2514,7 @@ impl Engine {
             };
             match event {
                 vroom_vmm::VmEvent::Debug(stop) => {
+                    debug_stops += 1;
                     if std::env::var_os("VROOM_FUZZ_TRACE").is_some_and(|v| v == "2") {
                         eprintln!("debug stop cpu={} pc={:#x} {:?}", stop.cpu, stop.pc, stop.reason);
                     }
@@ -2277,6 +2545,7 @@ impl Engine {
                                 Some(stack) => stack,
                                 None => self.bugcheck_stack(&registers),
                             },
+                            registers: Vec::new(),
                         };
                         if std::env::var_os("VROOM_FUZZ_TRACE").is_some() {
                             eprintln!("{}", bugcheck.detail);
@@ -2487,6 +2756,7 @@ impl Engine {
                                     pc: Some(stop.pc),
                                     input: token.clone(),
                                     stack: stack.clone(),
+                                    registers: Vec::new(),
                                 });
                             }
                             if double {
@@ -2496,6 +2766,7 @@ impl Engine {
                                     pc: Some(stop.pc),
                                     input: token.clone(),
                                     stack,
+                                    registers: Vec::new(),
                                 });
                             }
                             if finding.is_none() {
@@ -2541,6 +2812,24 @@ impl Engine {
                         self.vm.debug_step(stop.cpu as usize, step_debug_config(&[], always))?;
                         continue;
                     }
+                    if self.exit_hook == Some(stop.pc) {
+                        let state = self.vm.debug_registers(stop.cpu as usize)?;
+                        let registers = Registers::from_state(&state)
+                            .map_err(|error| Error::Invalid(format!("ARM64 exit registers: {error}")))?;
+                        if let Some(found) = self.exit_finding(&registers, &token) {
+                            // An exception reported already is the cause.
+                            if finding.is_none() {
+                                finding = Some(found.clone());
+                                findings.push(found);
+                            }
+                            // The process is going: nothing more of this
+                            // input will run.
+                            break;
+                        }
+                        foreign_step = Some(stop.cpu);
+                        self.vm.debug_step(stop.cpu as usize, step_debug_config(&[], always))?;
+                        continue;
+                    }
                     if self.harness.exception_sites.contains(&stop.pc) {
                         active_exception_sites.retain(|site| *site != stop.pc);
                         let stack = match self.vm.debug_registers(stop.cpu as usize).map(|s| Registers::from_state(&s)) {
@@ -2553,6 +2842,7 @@ impl Engine {
                             pc: Some(stop.pc),
                             input: token.clone(),
                             stack,
+                            registers: Vec::new(),
                         };
                         if finding.is_none() {
                             finding = Some(exception_finding.clone());
@@ -2757,11 +3047,13 @@ impl Engine {
                 _ => {}
             }
         }
+        let guest_us = self.vm.guest_clock_ns(self.vm.guest_clock().wrapping_sub(clock_at_start)) / 1000;
         self.coverage.finish_execution();
         if blocks_mode && !reopen {
             self.plant_pending()?;
         }
         Ok(RunResult {
+            guest_us,
             input_hash: token,
             new_blocks,
             new_edges,
@@ -2977,6 +3269,11 @@ pub struct RunResult {
     /// execution. Keeping it beside coverage makes target comparisons
     /// reproducible instead of relying on console timing.
     pub elapsed_us: u64,
+    /// Guest time the input ran (its clock from the resume to the end):
+    /// above `elapsed_us` when the idle skip jumped, below it when debug
+    /// stops held the clock.
+    #[serde(default)]
+    pub guest_us: u64,
     /// Times another thread reached `stop_pc` or an exception site during
     /// this input and was stepped past.
     #[serde(default)]
@@ -3086,6 +3383,27 @@ mod tests {
     }
 
     #[test]
+    fn an_input_past_a_page_needs_its_va() {
+        let path = std::env::temp_dir().join(format!("vroom-fuzz-pages-{}.json", std::process::id()));
+        let load = |capacity: usize, va: bool| {
+            let mut h = serde_json::json!({
+                "name": "a", "config": "c", "snapshot": "s", "state_dir": "d",
+                "input_gpa": 0, "input_capacity": capacity,
+            });
+            if va {
+                h["input_va"] = serde_json::json!(0x10000);
+                h["input_pointer_va"] = serde_json::json!(0x20000);
+            }
+            fs::write(&path, h.to_string()).unwrap();
+            Harness::load(&path)
+        };
+        assert!(load(4096, false).is_ok());
+        assert!(load(16384, false).is_err());
+        assert!(load(16384, true).is_ok());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
     fn a_sequence_compares_by_call_codes_and_first_words() {
         let h: Harness = serde_json::from_value(serde_json::json!({
             "name": "s", "config": "c", "snapshot": "s", "state_dir": "d",
@@ -3105,6 +3423,7 @@ mod tests {
             pc: Some(1),
             input: String::new(),
             stack: stack.iter().map(|s| s.to_string()).collect(),
+            registers: Vec::new(),
         };
         let a = f(&["nt!KeBugCheckEx", "nt!MiSystemFault+0x8b0", "nt!KiKernelSp0ExceptionHandler+0x5c", "HEVD!sub_a+0x10", "HEVD!sub_b+0x4", "nt!IofCallDriver+0x78"]);
         assert_eq!(signature(&a), "BugCheck:HEVD!sub_a<HEVD!sub_b<nt!IofCallDriver");
@@ -3113,7 +3432,8 @@ mod tests {
         let c = f(&["clfs!X+0x8", "clfs!Y+0x4"]);
         assert_eq!(signature(&c), "BugCheck:clfs!X<clfs!Y");
         assert_eq!(signature(&f(&[])), "BugCheck:Some(1)");
-        assert_eq!(signature(&f(&["<wild jump to 0x4141414141414141>"])), "BugCheck:<wild jump>");
+        assert_eq!(signature(&f(&["<no image at 0x4141414141414141>"])), "BugCheck:<no image>");
+        assert_eq!(signature(&f(&["<no image at 0x7ff0000000d8>", "m!caller+0x10", "m!outer+0x4"])), "BugCheck:<no image><m!caller<m!outer");
     }
 
     #[test]

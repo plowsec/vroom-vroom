@@ -5,6 +5,20 @@
 //! Pages written by every input in a row ("hot", typically the target's
 //! stack and the kernel's per-call scratch) stay writable instead and are
 //! always copied back.
+//!
+//! HVF's permission changes cost in proportion to the writable islands in
+//! the VM (`examples/dirty_fault`): ~3 ns an island to make a page
+//! writable, ~6 ns to protect one (16k islands: ~100 µs a page; all RAM
+//! protected over them in one call, 0.5 s). A big scattered hot set (a
+//! guest zeroing free pages keeps ~50k pages busy, each written now and
+//! then) is cheaper copied back blindly than protected: any policy that
+//! protects those pages sooner pays bursts of faults and protections
+//! growing with the square of the pages written. Measured side by side on
+//! a 2-vCPU Windows guest (one fuzz worker each, same corpus): sampled
+//! comparison with per-page aging, caps of 2k-32k pages, and cooling a few
+//! pages a take instead of all at once each ran 5-40% fewer inputs than
+//! this. Cooling all at once costs ~1.5 s every COOL_EVERY takes but sheds
+//! the idle majority (1-4% of a big set change in an input).
 
 use super::ffi;
 use crate::Result;

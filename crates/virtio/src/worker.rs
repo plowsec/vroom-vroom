@@ -122,6 +122,12 @@ pub fn busy() -> bool {
     OUTSTANDING.load(Ordering::Acquire) != 0
 }
 
+/// How many notifications and pokes no worker has handled yet (see
+/// [`busy`]); diagnostics.
+pub fn outstanding() -> usize {
+    OUTSTANDING.load(Ordering::Acquire)
+}
+
 /// What other threads set to get the worker's attention.
 struct Signals {
     /// This worker's share of `OUTSTANDING`.

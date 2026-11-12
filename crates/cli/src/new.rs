@@ -61,6 +61,9 @@ pub struct NewArgs {
     /// 3D graphics (Linux guests).
     #[arg(long)]
     pub gpu3d: bool,
+    /// UEFI Secure Boot, Microsoft's keys.
+    #[arg(long)]
+    pub secure_boot: bool,
 }
 
 impl Os {
@@ -99,6 +102,7 @@ pub fn run(a: NewArgs, load: impl Fn(&Path) -> Result<vroom_config::VmConfig, St
     n.installer = a.iso.as_deref();
     n.cpus = a.cpus.unwrap_or(n.cpus);
     n.memory_mib = a.memory_mib.unwrap_or(n.memory_mib);
+    n.secure_boot = a.secure_boot;
     let text = n.render();
     std::fs::write(&cfg_path, &text).map_err(|e| format!("{}: {e}", cfg_path.display()))?;
     // Check it the way `run` will read it, before creating the disk.
@@ -130,6 +134,7 @@ fn ready(a: NewArgs) -> Result<(), String> {
         memory_mib: a.memory_mib.unwrap_or(defaults.memory_mib),
         disk_gib: (crate::disk::parse_size(&disk)? >> 30).max(8),
         gpu3d: a.gpu3d,
+        secure_boot: a.secure_boot,
         account: Account { user, password, ssh_key },
         taken_ports: Vec::new(),
     };

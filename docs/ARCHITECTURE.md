@@ -31,1045 +31,528 @@ vroom-gui ── starts vroom usb-host for a device connected from the VM
 vroom-netd   root daemon (launchd): vmnet ports, root USB helpers
 ```
 
-The GUI never touches the guest: it shows a framebuffer the VMM shares
-with it and forwards input. Closing it makes the VMM suspend the VM.
-
-`vroom-netd` is the only privileged piece. It owns vmnet (macOS) or
-tap+bridge (Linux) and hands each VMM an `AF_UNIX` datagram socket carrying
-Ethernet frames, after policy checks (allow-listed interfaces, per-user
-limits, source-MAC anti-spoofing). The VMM never holds an interface.
-It also starts the USB helper as root (`vroom-netd usb-host`, sandboxed)
-for a device a macOS driver holds, when the app asks for it by id, and
-hands the app its socket. The app installs and removes it with macOS's
-password prompt (`gui/src/rootd.rs`). Its protocol (`net/src/netd.rs`) is
-one JSON line in: a network request (the VMM), a USB request or a status
-question (the app).
+- GUI never touches the guest: shows the framebuffer the VMM shares, forwards input. Closing it: VMM suspends the VM.
+- `vroom-netd`: the only privileged piece.
+  - Owns vmnet (macOS) or tap+bridge (Linux). Hands each VMM an `AF_UNIX` datagram socket of Ethernet frames after policy checks (allow-listed interfaces, per-user limits, source-MAC anti-spoofing). VMM never holds an interface.
+  - Starts the USB helper as root (`vroom-netd usb-host`, sandboxed) for a device a macOS driver holds, when the app asks by id; hands the app its socket.
+  - Installed/removed by the app with macOS's password prompt (`gui/src/rootd.rs`).
+  - Protocol (`net/src/netd.rs`): one JSON line in: network request (VMM), USB request or status question (app).
 
 ## USB devices while the VM runs
 
-The xHCI has 8 USB 2 + USB 3 port pairs for host devices whatever the
-VM file lists (`PASS_PORTS`); the VM file's devices take the first ones.
-The VM window's USB menu lists the Mac's devices (`usb/src/list.rs`,
-IOKit registry). Connecting one: the app starts `vroom usb-host` for it
-in its sandbox (or gets a root one from vroom-netd), and sends
-`ToVmm::UsbAttach` with the helper's socket attached. The VMM
-(`vmm/src/usb.rs`) puts it on a free pair (`Xhci::pass_plug`) and wires
-it like the helpers it starts itself; the guest sees the port's connect
-change once the helper says the device is there. `ToVmm::UsbDetach`
-shuts the socket: the guest sees the device go (`pass_unplug`), the
-helper ends. Each plug bumps a generation, so a helper that is going
-away can't speak for the next device on the same pair. The VMM tells
-the window what it has plugged in (`ToViewer::Usb`), and the window
-tells the next one, if the app restarts. A saved VM keeps the number of
-pairs it was saved with (the guest read it at driver start); older saves
-had one pair per device in the VM file.
+- xHCI: 8 USB 2 + USB 3 port pairs for host devices regardless of the VM file (`PASS_PORTS`); the file's devices take the first.
+- USB menu lists Mac devices (`usb/src/list.rs`, IOKit registry).
+- Connect: app starts `vroom usb-host` in its sandbox (or gets a root one from vroom-netd), sends `ToVmm::UsbAttach` with the helper's socket. VMM (`vmm/src/usb.rs`) puts it on a free pair (`Xhci::pass_plug`), wires it like its own helpers. Guest sees the connect change once the helper reports the device.
+- `ToVmm::UsbDetach`: socket shut, guest sees the device go (`pass_unplug`), helper ends.
+- Each plug bumps a generation: a helper going away can't speak for the next device on the pair.
+- VMM tells the window what's plugged (`ToViewer::Usb`); the window passes it to the next one if the app restarts.
+- Saved VM keeps the pair count it was saved with (guest read it at driver start). Older saves: one pair per VM-file device.
 
 ## USB disks
 
-A USB disk can also go to the guest without its USB device (macOS
-15.3 and later refuse USB storage without Full Disk Access). The app
-does the host side (`gui/src/usbdisk.rs`, the menu in
-`gui/src/console/usbmenu.rs`); the disk is found below the USB device
-in the IOKit registry (`usb::list::disks`, `mounts`).
+USB disk to the guest without its USB device (macOS 15.3+ refuses USB storage without Full Disk Access). Host side in the app: `gui/src/usbdisk.rs`, menu `gui/src/console/usbmenu.rs`. Disk found below the USB device in IOKit (`usb::list::disks`, `mounts`).
 
-- Files: the app opens the volume's directory and issues a sandbox
-  extension for it (`sandbox::issue_extension`), and sends both with
-  `ToVmm::UsbFiles`. The VMM consumes the token (one consumed before
-  `sandbox_init` doesn't carry into the sandbox it makes, and the VMM
-  handles the viewer while it sets up: `vroom_sandbox` keeps such a
-  token and consumes it right after the sandbox is applied) and puts a
-  `vroom_fs::Share` made from the fd on a free removable share
-  (`virtio::devices::fs::FsSlot`): a virtio-fs device whose tree can be
-  swapped while the guest has it mounted. The worker takes the new tree
-  at once (a poke), dropping every node and open file of the old one.
-  They are there from the start (PCI hot plug, below, could take them
-  later): a VM started on a Mac has two (`vroom-usb0`, `vroom-usb1`),
-  added after every other device so
-  older VMs keep their device places; a save records how many it has
-  (`usb.file_shares`) and a resume builds those. The VMM tells the agent
-  (`Message::UsbShare`), which mounts it (Linux: `/media/vroom/NAME`
-  through `systemd-run`; Windows: starts the share's virtiofs.exe
-  service, made demand-start for these tags) and unmounts it when it
-  goes. The viewer list shows it at `FILES_PORT0` + slot.
-- Disk: the app unmounts the disk, opens `/dev/rdiskN` (itself, or
-  through `authopen`) and sends the fd with `ToVmm::UsbDisk`. The VMM
-  wraps it (`usb::rawdisk::FdStore`) and runs the helper's code in a
-  thread of its own (`helper::serve` with `msd::StoreOpener`): the
-  Bulk-Only/SCSI stick (`usb::msd`), on a free port pair like any
-  helper. `UsbDetach` waits for that thread to flush and close the disk
-  before the viewer hears of it; the app then waits for macOS to read
-  the disk again and mount it (`usbdisk::remount`, also when the VM
-  ends). macOS takes a disk's partitions away while a program has the
-  raw disk open for writing, and reads them again when the last one
-  closes it; `mountDisk` succeeds on a disk with no partitions, so the
-  app checks a volume did mount, asks again for 30 seconds, and reads
-  a disk it owns (a disk image) once more by opening it for writing
-  and closing it. A stick that still shows no partitions gets a
-  message: unplug it and plug it in again.
+Files:
 
-`[[usb]] mode = "files" | "disk"` entries are the app's to connect once
-the VM has its USB controller; `vroom run` skips them. Without the app,
-`VROOM_USB_TEST_DISK` / `VROOM_USB_TEST_FILES` do the same for tests.
+- App opens the volume dir, issues a sandbox extension (`sandbox::issue_extension`), sends both with `ToVmm::UsbFiles`.
+- Token: one consumed before `sandbox_init` doesn't carry into the new sandbox, and the VMM handles the viewer during setup: `vroom_sandbox` keeps it and consumes it right after the sandbox is applied.
+- A `vroom_fs::Share` from the fd goes on a free removable share (`virtio::devices::fs::FsSlot`): a virtio-fs device whose tree can be swapped while mounted. Worker takes the new tree at once (a poke), dropping every node and open file of the old.
+- Slots exist from start (PCI hot plug could add them later): a Mac-started VM has two (`vroom-usb0`, `vroom-usb1`), added after every other device so older VMs keep device places. Save records the count (`usb.file_shares`); resume builds those.
+- VMM tells the agent (`Message::UsbShare`): mounts it (Linux `/media/vroom/NAME` via `systemd-run`; Windows starts the share's virtiofs.exe service, demand-start for these tags), unmounts on removal.
+- Viewer list: at `FILES_PORT0` + slot.
+
+Disk:
+
+- App unmounts, opens `/dev/rdiskN` (itself or via `authopen`), sends the fd with `ToVmm::UsbDisk`.
+- VMM wraps it (`usb::rawdisk::FdStore`), runs the helper code in its own thread (`helper::serve` with `msd::StoreOpener`): Bulk-Only/SCSI stick (`usb::msd`) on a free pair.
+- `UsbDetach` waits for that thread to flush and close before telling the viewer. App then waits for macOS to reread and mount (`usbdisk::remount`, also at VM end).
+- macOS removes a disk's partitions while a program holds the raw disk open for writing, rereads on last close. `mountDisk` succeeds on a disk with no partitions: app checks a volume mounted, retries 30 s, and for a disk it owns (disk image) opens it for writing and closes once more. Still no partitions: message to replug.
+
+`[[usb]] mode = "files" | "disk"`: the app connects them once the VM has its USB controller; `vroom run` skips them. Tests without the app: `VROOM_USB_TEST_DISK` / `VROOM_USB_TEST_FILES`.
 
 ## Network adapters while the VM runs
 
-Each virtio-net device keeps its backend, its MAC and its cable in a
-`Link` shared with a `NetControl` the VMM holds (`virtio/src/devices/net.rs`).
-The worker takes the link's lock for each batch of frames. Pulling the
-cable clears the status bit and raises a config interrupt; while it is
-out, frames are dropped both ways. A new backend is registered on the
-worker's poller (a clone of its `mio::Registry`) after the old one is
-taken off, and the link bounces: down, then up after two seconds on the
-worker's tick, so the guest asks DHCP again. A paused VM hears about it
-when it resumes. `MacXlate` (`net/src/mac.rs`) wraps a backend whose
-port passes another MAC than the guest's.
+Device (`virtio/src/devices/net.rs`):
 
-`vmm/src/net.rs` owns the adapters (`NetPorts`): what each is now, the
-NAT an adapter started with while it is on another network (it holds
-the port forwards' listening sockets), and what the sandbox leaves
-(NAT only if an adapter had it at start; DNS read before the sandbox).
-The viewer asks (`ToVmm::NetConnect`, `ToVmm::NetSet`, with a netd
-socket for bridged and host-only) and is told the result
-(`ToViewer::Net`, replayed to a window that attaches later). On the app
-side, `gui/src/console/netmenu.rs` keeps the VM file in step: it maps
-the file's adapters to the running ones (an adapter added while running
-has none, a removed one is unplugged), asks netd for ports off the UI
-thread, and gives the settings page what waits for the next start.
+- Each virtio-net keeps backend, MAC, cable in a `Link` shared with the VMM's `NetControl`. Worker locks the link per batch of frames.
+- Cable out: status bit cleared, config interrupt; frames dropped both ways.
+- New backend: old one taken off the worker's poller, new one registered (clone of its `mio::Registry`); link bounces (down, up 2 s later on the worker tick) so the guest re-DHCPs. Paused VM hears it on resume.
+- `MacXlate` (`net/src/mac.rs`) wraps a backend whose port passes another MAC.
 
-A resumed VM is built with the adapters of the config it was saved
-with, set up as the VM file says now (`net::plan`): the device layout
-must match the snapshot. A device's snapshot keeps its MAC, its link
-state and which network it was on: if the backend now passes another
-MAC, it translates; if the network changed, the link bounces after the
-resume. The adapters built are what the next save records.
+VMM (`vmm/src/net.rs`, `NetPorts`):
+
+- Tracks each adapter's current backend, the start-time NAT kept while on another network (holds the port forwards' listening sockets), and what the sandbox allows (NAT only if an adapter had it at start; DNS read before the sandbox).
+- Viewer asks `ToVmm::NetConnect`, `ToVmm::NetSet` (with a netd socket for bridged/host-only); told `ToViewer::Net` (replayed to a later window).
+
+App (`gui/src/console/netmenu.rs`): keeps the VM file in step, maps file adapters to running ones (added-while-running has none; removed one is unplugged), asks netd for ports off the UI thread, gives the settings page what waits for next start.
+
+Resume (`net::plan`): built with the saved config's adapters (layout must match the snapshot), set up as the file says now. Device snapshot keeps MAC, link state, network: other MAC now → translate; network changed → link bounces after resume. Adapters built = what the next save records.
 
 ## Layers
 
 | Crate | Role |
 |---|---|
-| `hv` | `Hypervisor` / `Vm` / `Vcpu` traits. HVF backend (in-kernel GICv3, vtimer, EL2 for nested), KVM arm64 backend (vGICv3 with save/restore, in-kernel PSCI). Exits are decoded into `VcpuExit` (MMIO, hypercall, PSCI events). |
+| `hv` | `Hypervisor` / `Vm` / `Vcpu` traits. HVF backend (in-kernel GICv3, vtimer, EL2 for nested), KVM arm64 backend (vGICv3 with save/restore, in-kernel PSCI). Exits decoded into `VcpuExit` (MMIO, hypercall, PSCI events). |
 | `memory` | Guest RAM as guarded mmaps; every access bounds-checked (`GuestMemory`). |
-| `arch` | Board layout (QEMU-virt compatible), FDT, ACPI tables (own AML encoder), SMBIOS, kernel image loader (Image, gzip, EFI zboot). |
-| `devices` | Bus, PL011, PL031, fw_cfg (+DMA), CFI flash (NVRAM), PCI host (ECAM, MSI, MSI-X, INTx), PCI Express root ports with native hot plug, NVMe, xHCI + USB HID (8 USB 2 + USB 3 port pairs for passthrough devices, plugged in and out while the VM runs; asynchronous transfers; isochronous TDs go out in batches, a few batches ahead), Intel HD Audio (controller + codec, streams moved by a timer thread). Parses hostile input only; `forbid(unsafe_code)`. |
-| `video` | Hardware video decoding, shared by the VMM and `vroom video-helper`: their protocol (grants, epochs, resume state), H.264/HEVC NAL unit, access unit and parameter set parsing, picture order counts, VP9 frame headers and AV1 OBUs. Parses hostile input only; `forbid(unsafe_code)`. |
-| `usb` | USB passthrough: the VMM/helper protocol, the helper's request checks, libusb (loaded with `dlopen`, helper only; the root helper only from its own copy), host device listing (IOKit registry / sysfs), taking a device from the host's drivers and giving it back, a USB stick (Bulk-Only, SCSI) on a RAM disk for tests or on a Mac disk's fd ("Use as a disk"), a pretend serial port and sound card for tests. |
-| `virtio` | Split-queue handling (hardened), MMIO and modern PCI transports, devices (blk, net, console, rng, gpu, input, fs, sound, media), a pausable worker per device. `forbid(unsafe_code)`. |
-| `fs` | Host side of shared folders: component-wise `openat(O_NOFOLLOW)` walks from a root fd, Linux errno mapping. The virtio-fs FUSE server lives in `virtio`; it serves Linux and virtio-win's virtiofs.exe (Windows), telling them apart by their INIT flags. |
-| `audio` | Sound helper: datagram protocol, ring buffer, CoreAudio (macOS) / ALSA (Linux, `dlopen`) playback and recording, WAV test files. |
-| `gpu3d` | virglrenderer loaded with `dlopen`, behind the `Renderer3d` trait the virtio crate defines. The one place with GPU FFI. `remote`: the same trait over a socket to the GPU process, and that process's loop. |
-| `block` | raw and qcow2 (COW, compressed reads, backing chains with an allow-list, discard/zero clusters with hole punching, folding a layer into its child), sync modes, swappable layers, flock-based image locks. VMDK reader (read-only) for importing VMware disks. |
-| `net` | Userspace NAT (smoltcp for the guest side, host sockets outward), DHCP/DNS, ICMP echo, fragments; netd wire protocol. |
-| `snapshot` | `Snapshottable` trait, snapshot directories with per-blob SHA-256 and an atomic manifest. |
-| `state` | A VM's state dir: one-VMM lock, snapshot list/delete, pruning disk layers nothing needs. Shared by the CLI and the app. |
-| `vmm` | Builds the board from the config, runs vCPUs, PSCI, the agent channel, display arbitration (ramfb vs virtio-gpu), snapshots and suspend, disk layering. |
+| `arch` | Board layout (QEMU-virt compatible), FDT, ACPI tables (own AML encoder), SMBIOS, kernel loader (Image, gzip, EFI zboot). |
+| `devices` | Bus, PL011, PL031, fw_cfg (+DMA), CFI flash (NVRAM), PCI host (ECAM, MSI, MSI-X, INTx), PCIe root ports with native hot plug, NVMe, xHCI + USB HID (8 USB 2 + USB 3 pairs for passthrough, hot plugged; async transfers; isochronous TDs in batches, a few ahead), Intel HD Audio (controller + codec, streams moved by a timer thread). Hostile input only; `forbid(unsafe_code)`. |
+| `video` | Hardware video, shared by VMM and `vroom video-helper`: their protocol (grants, epochs, resume state), H.264/HEVC NAL unit, access unit, parameter set parsing, picture order counts, VP9 frame headers, AV1 OBUs. Hostile input only; `forbid(unsafe_code)`. |
+| `usb` | Passthrough: VMM/helper protocol, helper request checks, libusb (`dlopen`, helper only; root helper only from its own copy), host device listing (IOKit / sysfs), taking a device from host drivers and back, USB stick (Bulk-Only, SCSI) on a RAM disk (tests) or a Mac disk fd ("Use as a disk"), fake serial port and sound card (tests). |
+| `virtio` | Split queues (hardened), MMIO and modern PCI transports, devices (blk, net, console, rng, gpu, input, fs, sound, media), a pausable worker per device. `forbid(unsafe_code)`. |
+| `fs` | Shared folders host side: component-wise `openat(O_NOFOLLOW)` walks from a root fd, Linux errno mapping. FUSE server lives in `virtio`; serves Linux and virtio-win's virtiofs.exe, told apart by INIT flags. |
+| `audio` | Sound helper: datagram protocol, ring buffer, CoreAudio (macOS) / ALSA (Linux, `dlopen`) play and record, WAV test files. |
+| `gpu3d` | virglrenderer via `dlopen`, behind the `Renderer3d` trait (defined in `virtio`). The only GPU FFI. `remote`: same trait over a socket to the GPU process, and that process's loop. |
+| `block` | raw, qcow2 (COW, compressed reads, backing chains with allow-list, discard/zero clusters with hole punching, folding a layer into its child), sync modes, swappable layers, flock image locks. VMDK reader (read-only) for VMware import. |
+| `net` | Userspace NAT (smoltcp guest side, host sockets out), DHCP/DNS, ICMP echo, fragments; netd wire protocol. |
+| `snapshot` | `Snapshottable` trait; snapshot dirs with per-blob SHA-256, atomic manifest. |
+| `state` | VM state dir: one-VMM lock, snapshot list/delete, pruning unneeded disk layers. Shared by CLI and app. |
+| `vmm` | Builds the board from config, runs vCPUs, PSCI, agent channel, display arbitration (ramfb vs virtio-gpu), snapshots, suspend, disk layering. |
 | `sandbox` | Seatbelt profile (macOS), seccomp + Landlock (Linux). |
-| `gui` | The app (Slint): VM list, settings that edit the VM file in place (toml_edit, comments kept), New VM, `⌘K` palette, VM windows. All state changes go through one message queue on the UI thread. VM windows only see pixels and send input. Labels stay short; what a control does is in its tooltip: one `Tip` (`ui/controls.slint`) on Slint's `Tooltip` (hover delay, by the pointer, never takes a click), shown under its control on keyboard focus too. |
-| `agent` / `proto` | Guest agent (Linux, Windows) and its framed protocol over a virtio-serial port. |
-| `tools` | Host side of the guest tools: finding them (`Contents/Resources/guest-tools`, `target/guest-tools`), the agent's version in its binary, updates as agent frames, ready-made VMs (cloud-init seeds, Windows install sticks). |
+| `gui` | Slint app: VM list, settings editing the VM file in place (toml_edit, comments kept), New VM, `⌘K` palette, VM windows. All state changes through one UI-thread message queue. VM windows see pixels, send input. Short labels; detail in a tooltip: one `Tip` (`ui/controls.slint`) on Slint's `Tooltip` (hover delay, by the pointer, never takes a click), also shown under its control on keyboard focus. |
+| `agent` / `proto` | Guest agent (Linux, Windows); framed protocol over a virtio-serial port. |
+| `tools` | Guest tools host side: locating them (`Contents/Resources/guest-tools`, `target/guest-tools`), agent version from its binary, updates as agent frames, ready-made VMs (cloud-init seeds, Windows install sticks). |
 
 ## Board (aarch64)
 
-QEMU-virt compatible memory map so stock EDK2 (`edk2-aarch64-code.fd`) works:
-flash at 0, GICv3 at 0x0800_0000 (+ a GICv2m MSI frame, emulated when the
-backend lacks one), UART 0x0900_0000, RTC, fw_cfg, virtio-mmio slots at
-0x0a00_0000, PCI ECAM/windows, RAM at 0x4000_0000. Virtio shared memory
-windows (GPU host-visible memory) sit at 0x70_0000_0000.
+QEMU-virt compatible map, so stock EDK2 (`edk2-aarch64-code.fd`) works:
 
-UEFI boots get ACPI (MADT, GTDT, SPCR, MCFG, DSDT with PCI and virtio
-devices) and SMBIOS through fw_cfg. Direct kernel boots get an FDT.
+| Address | |
+|---|---|
+| 0 | flash |
+| 0x0800_0000 | GICv3 (+ GICv2m MSI frame, emulated if the backend lacks one) |
+| 0x0900_0000 | UART; then RTC, fw_cfg |
+| 0x0a00_0000 | virtio-mmio slots; then PCI ECAM/windows |
+| 0x4000_0000 | RAM |
+| 0x70_0000_0000 | virtio shared memory windows (GPU host-visible memory) |
+
+- UEFI: ACPI (MADT, GTDT, SPCR, MCFG, DSDT with PCI and virtio devices) and SMBIOS via fw_cfg.
+- Direct kernel boot: FDT.
 
 ### PCI hot plug
 
-A VM on PCI (UEFI boot, or `virtio_transport = "pci"`) gets four PCI
-Express root ports after its other devices, so those keep their slots
-(`devices::pci::port`, Red Hat's QEMU root port IDs, 1b36:000c). Each is
-a bridge with one empty slot that supports native hot plug: attention
-button, power controller, indicators, presence detect, Data Link Layer
-Link Active reporting, and an MSI (or INTx) for slot events. Guests
-drive it with their own drivers: Linux's pciehp (ACPI grants it
-through `_OSC`; device trees always do) and Windows' pci.sys. No ACPI
-hot plug is needed: the DSDT stays as it was.
+PCI VMs (UEFI, or `virtio_transport = "pci"`): 4 PCIe root ports after all other devices, so those keep their slots (`devices::pci::port`, Red Hat QEMU root port IDs 1b36:000c).
 
-- Resources: EDK2's PciHotPlugInitDxe (in the stock build) reserves a
-  2 MiB window behind each port for what comes later; Linux reassigns
-  windows itself and pads hot plug bridges the same way. Windows keeps
-  the firmware's.
-- ECAM: a config cycle for a bus other than 0 goes to the port whose
-  secondary bus it is, and reaches device 0 behind it while the slot
-  has power. BARs of devices in slots are mapped as on the root bus.
-- In: `PciRoot::plug` puts a device in a free slot and raises Presence
-  Detect Changed and Attention Button Pressed, as QEMU does. The guest
-  powers the slot on, the link comes up, and it scans the bus.
-- Out: `PciRoot::unplug` presses the attention button. The guest lets
-  go of the device and powers the slot off; that write takes the device
-  out (dropped once no lock is held). The VMM gives it 15 seconds
-  (`hotplug::Hotplug`), then pulls it out (a surprise removal, which
-  both guests handle).
-- Command Completed is raised for each write to Slot Control, except
-  the 32-bit writes Windows uses to clear status bits, which carry Slot
-  Control unchanged: answering those as commands set Command Completed
-  again at once, and Windows kept clearing it.
-- A guest reset keeps a device in its slot (as a card in a real slot),
-  reset to the state it had when it went in; one on its way out goes.
-- Snapshots: a port's blob carries its device's. A save records which
-  network adapter is in which slot (`net.hotplug` in the manifest); a
-  resume builds those devices into those slots before restoring, and a
-  slot set that doesn't match refuses. A device still on its way out
-  is pulled out before the save. Snapshots from before the ports leave
-  them empty.
-- Only virtio-net uses it (`ToVmm::NetAdd`, `ToVmm::NetRemove`). The
-  ports take any virtio device (`Hotplug::add` takes a `VirtioDevice`):
-  a disk, a USB disk's files share, would work the same way, with a save
-  recording them as it records adapters.
+- Each port: bridge, one empty slot, native hot plug: attention button, power controller, indicators, presence detect, Data Link Layer Link Active reporting, MSI (or INTx) for slot events.
+- Guest drivers: Linux pciehp (ACPI grants it via `_OSC`; device trees always do), Windows pci.sys. No ACPI hot plug; DSDT unchanged.
+- Resources: EDK2's PciHotPlugInitDxe (stock build) reserves a 2 MiB window per port; Linux reassigns and pads hot plug bridges likewise; Windows keeps firmware's.
+- ECAM: config cycle for bus ≠ 0 goes to the port whose secondary bus it is, reaching device 0 behind it while the slot has power. Slot device BARs mapped as on the root bus.
+- In: `PciRoot::plug` puts a device in a free slot, raises Presence Detect Changed + Attention Button Pressed (as QEMU). Guest powers the slot, link up, scans.
+- Out: `PciRoot::unplug` presses the attention button; guest releases and powers the slot off; that write removes the device (dropped once no lock is held). 15 s timeout (`hotplug::Hotplug`), then surprise removal (both guests cope).
+- Command Completed raised per Slot Control write, except Windows' 32-bit status-clearing writes carrying Slot Control unchanged (answering those set Command Completed again at once; Windows kept clearing it).
+- Guest reset: device stays in its slot (like a real card), reset to its plug-in state; one on its way out goes.
+- Snapshots: port blob carries its device's. Save records adapter → slot (`net.hotplug` in the manifest); resume builds those devices in those slots before restoring; mismatched slot set refuses. Device on its way out: pulled before the save. Pre-port snapshots: ports empty.
+- Used by virtio-net only (`ToVmm::NetAdd`, `ToVmm::NetRemove`). Ports take any virtio device (`Hotplug::add` takes a `VirtioDevice`): disks or a USB files share would work the same, with saves recording them like adapters.
 
 ## vCPU loop
 
-Each vCPU thread owns its hypervisor handle and reacts to commands
-(power-on, pause, save/restore state, reset, stop). MMIO exits go to the
-device bus; PSCI is handled in the VMM (HVF) or the kernel (KVM). WFI is
-emulated with short sleeps bounded by the guest timer deadline.
-
-Pausing is synchronous: every vCPU acknowledges, device workers park and
-disk I/O threads finish their requests before anything reads guest
-memory. That's what makes snapshots consistent.
-
-Disks (virtio-blk, NVMe): a lone small request runs on the vCPU that
-submitted it; when the guest keeps several in flight they go to a few
-I/O threads per disk, and data moves between the image and guest RAM
-without a bounce buffer. See [PERFORMANCE.md](PERFORMANCE.md).
+- Each vCPU thread owns its hypervisor handle; commands: power-on, pause, save/restore state, reset, stop.
+- MMIO exits → device bus. PSCI: in the VMM (HVF) or kernel (KVM). WFI: emulated with short sleeps bounded by the guest timer deadline.
+- Pause is synchronous: every vCPU acknowledges, device workers park, disk I/O threads finish requests, before anything reads guest memory. That makes snapshots consistent.
+- Disks (virtio-blk, NVMe): lone small request runs on the submitting vCPU; several in flight → a few I/O threads per disk; no bounce buffer. [PERFORMANCE.md](PERFORMANCE.md).
 
 ## Snapshots and suspend
 
-A snapshot is a directory: manifest (hashes), per-vCPU state, irqchip
-state, one blob per device, sparse RAM (64 KiB chunks plus a bitmap). Disks
-are frozen at the same moment: the current top layer becomes read-only and
-a new qcow2 overlay starts on it. Reverting starts a fresh overlay on the
-frozen layer. Suspend is a snapshot that ends the process; resuming checks
-the disks didn't change in between. On restore, devices come back before
-the vCPUs: a vCPU runs as soon as its state is back.
+Snapshot = directory: manifest (hashes), per-vCPU state, irqchip state, a blob per device, sparse RAM (64 KiB chunks + bitmap).
 
-Host GPU objects can't be saved as they are. For GL (virgl) contexts the
-GPU device follows each submitted command stream (`virgl_state.rs`): live
-objects, and the latest of each setter, dropping a setter once a later one
-writes everything it wrote (vrend's own rules: sampler views clear the
-slots after them, sampler states don't). A snapshot reads every texture
-level and buffer back through virglrenderer; restore makes the resources
-again, writes the contents, makes the contexts and replays their state,
-then returns the fenced commands the GPU had finished. Blobs of GL
-contexts aren't tracked: snapshots refuse while one is in use. The GL
-side also keeps the type a compositor gives a Vulkan window's blob
-(`PIPE_RESOURCE_SET_TYPE`) and replays it before anything uses that blob.
+- Disks frozen at the same moment: top layer → read-only, new qcow2 overlay on it. Revert: fresh overlay on the frozen layer.
+- Suspend = snapshot that ends the process; resume checks the disks didn't change meanwhile.
+- Restore: devices before vCPUs (a vCPU runs as soon as its state is back).
+- Nested-virtualization EL2 state: best effort.
+- Disk layers: a tree under `<state>/disks`. `vroom snapshot delete/prune` (VM stopped) removes unreferenced layers, folds a layer needed by one child only into it (copy up clusters the child lacks, repoint its header): short chains.
+- Locks: state dir locked by its VMM; images exclusive (writer) or shared (read-only layer); snapshot downgrades the frozen layer to shared.
+- Shared folders: FUSE node table kept as paths, so it's in the snapshot; open files reopened by path on restore.
+- Sound hands back in-flight buffers before saving.
 
-Vulkan (Venus) contexts are saved by their render worker
-(`third_party/virglrenderer/0010-venus-snapshots.patch`, `vkr_snap.c`).
-The worker runs every command, from the virtqueue, a ring or a command
-stream, through one function that notes what the command looked up (the
-decoder's object lookups), made and destroyed (the context's object
-table). It keeps, as the guest encoded them, the commands that made or
-destroyed objects, bound memory, wrote descriptors or recorded command
-buffers. Venus ids are the guest's own, so replaying the kept commands in
-a fresh context gives the same objects under the same ids. What goes:
+GL (virgl) contexts (`virgl_state.rs`): host GPU objects can't be saved as is.
 
-- a command buffer's recording, when it begins again or is reset (also
-  through its pool);
-- a descriptor write that a later one writes over completely, unless a
-  recording still holds it (it bound that set while the old value was
-  there: the replay must record it the same way); a copy of descriptors
-  stops this for everything older;
-- now and then, everything nothing alive needs. An object is needed if it
-  is alive or a needed command uses it; a command is needed if it makes a
-  needed object, destroys one (the replay must too), or, making nothing,
-  uses only needed objects. So a pipeline keeps the shader module it was
-  made from, even after the app destroyed it.
+- GPU device follows each submitted command stream: live objects, latest of each setter; a setter dropped once a later one overwrites all it wrote (vrend's rules: sampler views clear later slots, sampler states don't).
+- Snapshot reads every texture level and buffer back through virglrenderer.
+- Restore: remake resources, write contents, make contexts, replay state, return the fenced commands the GPU had finished.
+- GL context blobs not tracked: snapshots refuse while one is in use.
+- Keeps the type a compositor gives a Vulkan window's blob (`PIPE_RESOURCE_SET_TYPE`), replays it before anything uses that blob.
 
-Past 4M commands or 1 GiB kept after that clean-up, the context isn't
-followed any more and comes back lost.
+Vulkan (Venus) contexts: saved by their render worker (`third_party/virglrenderer/0010-venus-snapshots.patch`, `vkr_snap.c`).
 
-A snapshot (`RENDER_CONTEXT_OP_SAVE` from the GPU process's proxy, in turn
-from `Renderer3d::venus_save`) first stops every thread of the context at a
-command boundary: dispatching threads hold a gate per command, and a ring
-stores its head inside it, so the saved head is exactly what ran. A
-command blocked in a wait (`vkWaitVirtqueueSeqnoMESA`, `vkWaitForFences`)
-lets go of the gate while it waits; it runs again from the start after a
-restore. Then each queue gets an empty submission with a fence, and the
-worker waits for those. It writes, into one shared memory object: the
-shared memory the context made (rings, reply streams), the kept commands,
-the contents of each device memory object (host-visible memory from its
-shared memory; device-local memory a buffer was bound to, through a
-staging buffer), the contents of each image (every level, layer and
-aspect, copied to a staging buffer with `VK_IMAGE_LAYOUT_GENERAL`:
-MoltenVK keeps no layouts, Metal has none; images get transfer usage
-added when they are made, where the format allows it), fence and event
-states, timeline semaphore values and which binary semaphores are left
-signaled (followed from submissions), each ring's place and creation
-parameters, and the reply stream positions. If the threads don't stop in
-5 s, the GPU doesn't finish in 10 s, or the context had already failed,
-only the rings are written: the context comes back lost.
+- Every command (virtqueue, ring or command stream) goes through one function noting what it looked up (decoder lookups), made and destroyed (context object table).
+- Kept, as the guest encoded them: commands that made/destroyed objects, bound memory, wrote descriptors, recorded command buffers. Venus ids are the guest's: replay in a fresh context gives the same objects under the same ids.
+- Dropped:
+  - a command buffer's recording when it begins again or is reset (also via its pool)
+  - a descriptor write fully overwritten later, unless a recording still holds it (bound while the old value was there: replay must record it the same way); a descriptor copy stops this for everything older
+  - periodically, everything nothing alive needs. Object needed = alive or used by a needed command. Command needed = makes a needed object, destroys one (replay must too), or makes nothing and uses only needed objects. So a pipeline keeps its shader module even after the app destroyed it.
+- Past 4M commands or 1 GiB kept after clean-up: context no longer followed, comes back lost.
 
-The VMM stores that next to the GL state, with the context's blobs (how
-each was made, where the guest had it mapped). Restore: make the context,
-make its shared-memory blobs (blob id 0) again with their ids,
-`RENDER_CONTEXT_OP_RESTORE` (the worker copies the shared memory back,
-replays the commands with replies off, fills memory and images, sets the
-states, makes the rings at their old head, alive), then the memory blobs
-(blob id = the memory object's id, so they export the new memory),
-`RENDER_CONTEXT_OP_RESUME` (start the rings), map every blob where the
-guest had it, and only then the GL contexts. A context the worker can't
-build again gets plain shared memory for its memory blobs, so the guest's
-pages stay backed, and its rings marked fatal: Mesa's Venus driver stops
-that app ("ring fatal error"), the rest of the guest goes on.
+Venus save (`RENDER_CONTEXT_OP_SAVE` from the GPU process proxy, from `Renderer3d::venus_save`):
 
-Nested-virtualization EL2 state is best effort.
+1. Stop every context thread at a command boundary: dispatching threads hold a gate per command; a ring stores its head inside it, so the saved head is exactly what ran. A command blocked in a wait (`vkWaitVirtqueueSeqnoMESA`, `vkWaitForFences`) releases the gate while waiting; reruns from the start after restore.
+2. Empty submission with a fence on each queue; wait for them.
+3. Write into one shared memory object: the context's shared memory (rings, reply streams), kept commands, each device memory object's contents (host-visible from its shm; device-local bound to a buffer via a staging buffer), each image's contents (every level, layer, aspect, copied to staging with `VK_IMAGE_LAYOUT_GENERAL`: MoltenVK keeps no layouts, Metal has none; images get transfer usage added at creation where the format allows), fence and event states, timeline semaphore values, which binary semaphores remain signaled (followed from submissions), each ring's place and creation parameters, reply stream positions.
+4. Threads not stopped in 5 s, GPU not done in 10 s, or context already failed: only rings written; context comes back lost.
 
-Layers form a tree under `<state>/disks`. `vroom snapshot delete/prune`
-(VM stopped) removes layers nothing references and folds a layer that only
-one child still needs into that child (copying up the clusters the child
-lacks, then re-pointing its header), so chains stay short. A state dir is
-locked by its VMM; every image is locked exclusive (writer) or shared
-(read-only layer), and a snapshot downgrades the frozen layer to shared.
+Venus restore (VMM stores the save beside the GL state, with the context's blobs: how made, where mapped):
 
-Shared folders keep their FUSE node table as paths, so a snapshot carries
-it and open files are reopened by path on restore. Sound hands back
-in-flight buffers before saving.
+1. Make the context; remake its shared-memory blobs (blob id 0) with their ids.
+2. `RENDER_CONTEXT_OP_RESTORE`: worker copies shm back, replays commands (replies off), fills memory and images, sets states, makes rings at their old head, alive.
+3. Memory blobs (blob id = memory object id, so they export the new memory).
+4. `RENDER_CONTEXT_OP_RESUME`: start rings.
+5. Map every blob where the guest had it; then GL contexts.
+6. Context the worker can't rebuild: plain shm for its memory blobs (guest pages stay backed), rings marked fatal. Mesa Venus stops that app ("ring fatal error"); rest of the guest continues.
 
 ## Several monitors
 
-`[display] monitors` (1 to 4). The shared framebuffer has a slot per
-monitor; each monitor's sink (`FbSink`) writes its slot and tells the
-viewer (`Mode`/`Damage` for the first, `HeadMode`/`HeadDamage` with the
-monitor's number for the others). ramfb only shares the first.
+`[display] monitors` (1–4).
 
-virtio-gpu has a scanout per sink. A resource can show on several
-scanouts at different places (X11 makes one framebuffer for all
-monitors): a flush goes to each scanout that shows it, clipped to its
-part; a GL flush reads the union of those parts back once and hands
-each scanout its piece. GET_DISPLAY_INFO reports each scanout, and a
-window that closes unplugs its monitor (a display event).
-
-Linux gets one GPU with N scanouts. Windows' drivers drive one scanout
-each, so a Windows guest gets one GPU per monitor, added after the other
-devices (their PCI slots don't move) and numbered in the PCI subsystem
-id (0x1100 + n), which the agent reads to tell them apart. Only the
-first has 3D: two 3D GPUs would need to share frames (Windows draws a
-monitor on one GPU and shows it on another), which the Direct3D driver
-can't do across renderers. The others are 2D; Windows' 2D driver clears
-"its framebuffer" in BAR 0 with stores the hypervisor can't decode, so
-those GPUs have plain memory there and their registers in BAR 2. The 3D
-one has some too (see "Direct3D state can't be saved" below).
-
-The viewer sends each window's size (`HeadResize`, 0x0 when it closes)
-and pointer (`HeadPointer`). The agent service turns the sizes into one
-layout, monitors side by side, top edges lined up (`SetLayout`, applied
-with xrandr, Mutter's DisplayConfig, or ChangeDisplaySettingsEx); the
-display thread maps a monitor's pointer onto that desktop for the
-tablet. Windows maps the tablet to its main monitor only: there the
-tablet, elsewhere the agent moves the pointer (`Mouse`, SendInput).
+- Shared framebuffer: a slot per monitor. Each monitor's sink (`FbSink`) writes its slot and tells the viewer (`Mode`/`Damage` for the first, `HeadMode`/`HeadDamage` + monitor number for others). ramfb shares only the first.
+- virtio-gpu: a scanout per sink. A resource can show on several scanouts at different places (X11: one framebuffer for all monitors): a flush goes to each scanout showing it, clipped to its part; a GL flush reads the union back once and hands each scanout its piece.
+- GET_DISPLAY_INFO reports each scanout; a window closing unplugs its monitor (display event).
+- Linux: one GPU, N scanouts.
+- Windows: drivers drive one scanout each → one GPU per monitor, added after other devices (PCI slots don't move), numbered in the PCI subsystem id (0x1100 + n), which the agent reads.
+  - Only the first has 3D: two 3D GPUs would need to share frames (Windows draws a monitor on one GPU, shows it on another); the D3D driver can't across renderers.
+  - Others 2D. Windows' 2D driver clears "its framebuffer" in BAR 0 with stores the hypervisor can't decode: those GPUs have plain memory in BAR 0, registers in BAR 2. The 3D one too ([Direct3D state can't be saved](#direct3d-state-cant-be-saved)).
+- Viewer sends each window's size (`HeadResize`, 0x0 on close) and pointer (`HeadPointer`).
+- Agent service makes one layout: monitors side by side, top edges aligned (`SetLayout`, applied with xrandr, Mutter's DisplayConfig, or ChangeDisplaySettingsEx). Display thread maps a monitor's pointer onto that desktop for the tablet.
+- Windows maps the tablet to its main monitor only: tablet there; elsewhere the agent moves the pointer (`Mouse`, SendInput).
 
 ## Drag and drop
 
-Finder drags reach the app's window as winit events (no position: the
-app polls the mouse while files hover and moves the guest's pointer with
-it). The app sends the names (`ToVmm::DragEnter`); the VMM's agent
-service passes them on (`Message::DragEnter`), and the guest agent's
-session side (`agent/src/drop.rs`) makes a staging folder with them. On
-Windows (`dnd_win.rs`) it then shows a window under the pointer, brought
-in front of the active app and composed before it answers (Windows routes
-no click to a window before that), and answers `DragReady { live }`. The
-app presses the guest's left button: the window gets it and starts a
-shell drag (`SHDoDragDrop`) of the staged names, which Windows tracks as
-the pointer moves. On X11 desktops (`dnd_x11.rs`) the window is an
-InputOnly one and the agent is the source of an XDND drag (it owns
-`XdndSelection` and hands out the staged files as `text/uri-list`).
-Wayland has no way for an outside program to drag: the files go to the
-Desktop. On the drop the app opens a socket pair, sends one end
-to the VMM with `ToVmm::Drop` (SCM_RIGHTS), and writes the files into the
-other as agent frames; the VMM forwards them, checked, from a thread of
-its own. When the guest says `DropDone`, the app lets go of the button
-and the app under the pointer takes the files. Leaving the window sends
-`DragCancel`, Escape and the button up.
+Mac → guest:
 
-The other way (guest to Mac, `gui/src/dragout.rs`): when the mouse
-leaves the guest screen with the guest's button held since a press on
-it, the app asks once (`ToVmm::DragOut`, agent `DragOutQuery`). The
-agent (`agent/src/dragout.rs`) puts a small window under the guest's
-pointer, now at the screen edge, and makes it a drop target: an OLE
-`IDropTarget` on Windows, an `XdndAware` window on X11. It nudges the
-pointer so the drag going on finds it; if that drag carries files
-(CF_HDROP, or `text/uri-list` with file URIs), it learns their paths and
-answers their names (`DragOutItems`, `ToViewer::DragOutItems`). The app
-then starts an AppKit drag of file promises (`dragout_mac.rs`) from the
-VM window while the Mac's button is still down, and gives up the guest's
-drag (Escape, button up: the guest drops nothing). When something takes
-the drop, AppKit asks each promise where to write; for each item the app
-sends a pipe to the VMM (`ToVmm::DragOutGet`, SCM_RIGHTS), the VMM asks
-the guest (`DragOutGet` with a stream number of its own) and passes the
-guest's DropEntry, DropData and DropEnd frames on, checked, with the
-drag's id. The app writes the item where the promise says. When all are
-written (or the drag ends with no drop) the app sends `DragOut` with
-`end`, and the agent forgets the paths.
+1. Finder drag reaches the window as winit events (no position: app polls the mouse while files hover, moves the guest pointer).
+2. App sends names (`ToVmm::DragEnter`) → VMM agent service (`Message::DragEnter`) → agent session side (`agent/src/drop.rs`) makes a staging folder.
+3. Windows (`dnd_win.rs`): shows a window under the pointer, brought in front of the active app and composed before answering (Windows routes no click to a window before that), answers `DragReady { live }`. App presses the guest's left button: the window starts a shell drag (`SHDoDragDrop`) of the staged names, tracked by Windows as the pointer moves.
+4. X11 (`dnd_x11.rs`): InputOnly window; agent is the XDND source (owns `XdndSelection`, offers staged files as `text/uri-list`).
+5. Wayland: outside programs can't drag; files go to the Desktop.
+6. Drop: app opens a socket pair, sends one end to the VMM (`ToVmm::Drop`, SCM_RIGHTS), writes the files into the other as agent frames; VMM forwards them, checked, from its own thread.
+7. Guest says `DropDone`: app releases the button; the app under the pointer takes the files.
+8. Leaving the window: `DragCancel`, Escape, button up.
+
+Guest → Mac (`gui/src/dragout.rs`):
+
+1. Mouse leaves the guest screen with the guest button held since a press on it: app asks once (`ToVmm::DragOut`, agent `DragOutQuery`).
+2. Agent (`agent/src/dragout.rs`) puts a small window under the guest pointer (now at the screen edge) as a drop target: OLE `IDropTarget` (Windows), `XdndAware` window (X11). Nudges the pointer so the ongoing drag finds it.
+3. Drag carries files (CF_HDROP, or `text/uri-list` with file URIs): agent learns paths, answers names (`DragOutItems`, `ToViewer::DragOutItems`).
+4. App starts an AppKit drag of file promises (`dragout_mac.rs`) from the VM window while the Mac button is down; abandons the guest drag (Escape, button up: guest drops nothing).
+5. Drop taken: AppKit asks each promise where to write; per item the app sends a pipe (`ToVmm::DragOutGet`, SCM_RIGHTS); VMM asks the guest (`DragOutGet` + its own stream number), passes DropEntry, DropData, DropEnd frames on, checked, with the drag id. App writes where the promise says.
+6. All written (or no drop): app sends `DragOut` with `end`; agent forgets the paths.
 
 ## Guest tools
 
-`scripts/make-guest-tools.sh` builds them into `target/guest-tools/`
-(`linux/`, `windows/`, and `vroom-tools.img`, a FAT32 disk with both);
-`scripts/app.sh` copies that into the app. `vroom_tools::dir()` finds it.
+Build:
 
-Versions: `agent/build.rs` makes `0.1.0+348.e314084680` (crate version,
-commits on the branch, commit) and puts it in the binary after
-`\0VROOM_AGENT_VERSION=`. The agent's hello says it, with its system:
-`vroom-agent 0.1.0+348.e314084680 linux`. Older means a lower crate
-version, then fewer commits (`vroom_proto::version`). The app reads the
-tools' version from the agent binary it carries.
+- `scripts/make-guest-tools.sh` → `target/guest-tools/` (`linux/`, `windows/`, `vroom-tools.img` = FAT32 disk with both). `scripts/app.sh` copies it into the app. `vroom_tools::dir()` finds it.
+- Secure Boot firmware likewise: `scripts/make-firmware.sh` → `target/firmware/`; app `Resources/firmware/`; `firmware.rs` looks next to the running program.
 
-The VM window (`gui/src/console/tools.rs`) learns the guest's agent from
-the VMM's "guest agent connected (...)" status line and its features.
-Its tools button shows when the guest's agent is older, or when none
-came in 90 s of running:
+Versions:
 
-- An agent with `features::UPDATE` gets the tools over the agent
-  channel. The app writes them into a pipe as agent frames
-  (`vroom_tools::bundle`: `UpdateBegin` with each file's path, size and
-  SHA-256, then `UpdateData`, 256 KiB at most each) and sends the pipe
-  with `ToVmm::AgentUpdate`. The VMM's `forward_update` passes exactly
-  what was announced to the guest. The agent's service
-  (`agent/src/update.rs`) stages and checks the files, then installs them
-  (Linux: `vroom-agent-update.path` sees `ready` and runs the bundle's
-  `install-agent.sh --update`; Windows: `winupdate.rs`), and answers
-  `UpdateDone`. The service restarts; the session helpers notice their
-  file changed when the service goes, and start the new one (exec on
-  Linux, a new process on Windows). The new agent's hello ends it.
-- Otherwise the app plugs `vroom-tools.img` in as a read-only USB stick
-  (`ToVmm::UsbDisk` with the file's fd, as for a Mac disk) and says what
-  to run; on Linux the command also goes on the Mac's clipboard. When
-  an up-to-date agent says hello, the app takes the stick out.
+- `agent/build.rs` makes `0.1.0+348.e314084680` (crate version + commits on the branch + commit), embedded after `\0VROOM_AGENT_VERSION=`.
+- Agent hello: `vroom-agent 0.1.0+348.e314084680 linux`.
+- Older = lower crate version, then fewer commits (`vroom_proto::version`).
+- App reads the tools' version from the agent binary it carries.
 
-Ready-made VMs (`vroom_tools::ready`, used by `vroom new --ready` and the
-New VM sheet) put the same tools in at install time: Ubuntu's on the
-cloud-init seed (`seed.rs`), installed by its `runcmd`; Windows' on the
-install stick (`winstick.rs`), with the drivers added in the specialize
-pass and `vroom-setup.cmd` at the first logon.
+Update (`gui/src/console/tools.rs`): window learns the guest agent from the VMM status line "guest agent connected (...)" and its features. Tools button shows when the agent is older or none came within 90 s.
+
+- Agent with `features::UPDATE`: over the agent channel.
+  - App writes agent frames into a pipe (`vroom_tools::bundle`: `UpdateBegin` with each file's path, size, SHA-256; then `UpdateData`, ≤256 KiB each), sends it with `ToVmm::AgentUpdate`. VMM `forward_update` passes exactly what was announced.
+  - Agent service (`agent/src/update.rs`) stages and checks files, installs (Linux: `vroom-agent-update.path` sees `ready`, runs the bundle's `install-agent.sh --update`; Windows: `winupdate.rs`), answers `UpdateDone`.
+  - Service restarts; session helpers see their file changed when the service goes, start the new one (exec on Linux, new process on Windows). New agent's hello ends it.
+- Otherwise: `vroom-tools.img` plugged as read-only USB stick (`ToVmm::UsbDisk` with the file's fd, as for a Mac disk); app says what to run (Linux: command also on the Mac clipboard). Up-to-date agent hello: stick removed.
+
+Ready-made VMs (`vroom_tools::ready`; `vroom new --ready`, New VM sheet): tools at install time. Ubuntu: on the cloud-init seed (`seed.rs`), installed by `runcmd`. Windows: on the install stick (`winstick.rs`), drivers added in the specialize pass, `vroom-setup.cmd` at first logon.
 
 ## Coherence
 
-The app asks the guest for a screen the size of the Mac screen's free
-area (`ToVmm::Resize`, the usual path) and sends `ToVmm::Coherence(true)`;
-the VMM's agent service passes `Message::Coherence` on, the guest's
-service hands it to the session helper (`agent/src/coherence.rs`, with
-`coh_win.rs` for Windows and `coh_x11.rs` for X11).
+Start: app asks for a screen the size of the Mac screen's free area (`ToVmm::Resize`), sends `ToVmm::Coherence(true)` → VMM agent service `Message::Coherence` → guest service → session helper (`agent/src/coherence.rs`; `coh_win.rs`, `coh_x11.rs`).
 
-The helper looks at the windows when its desktop says they changed, at
-most every 10 ms, and every 500 ms anyway in case an event got lost:
+Window tracking: on desktop change events, ≤ every 10 ms; every 500 ms anyway (lost events).
 
-- Windows: `SetWinEventHook` (out of context, on a thread of its own with
-  a message loop) for foreground, menus, move and size, minimize, and
-  top-level windows created, destroyed, shown, hidden, moved, renamed,
-  cloaked. The callback only sets a flag and wakes the session loop.
-  The helper hides the taskbar, makes the whole screen the work area,
-  and walks the windows front to back (`GetTopWindow`/`GW_HWNDNEXT`:
-  `EnumWindows` leaves out Store apps and the Start menu), with
-  per-monitor DPI awareness so it reads real pixels.
-- X11: a second connection selects structure and property events on the
-  root and on every managed window. The list is `_NET_CLIENT_LIST`, put
-  in the order of the root's children (the window manager's frames), plus
-  override-redirect windows above the lowest frame (menus, tooltips).
-  What can be seen of a window is the client area, plus
-  `_NET_FRAME_EXTENTS`, less `_GTK_FRAME_EXTENTS` (GTK's shadows).
-  Windows of other workspaces, the desktop and docks are left out.
-  Actions are the client messages a taskbar sends (`_NET_ACTIVE_WINDOW`,
-  `WM_CHANGE_STATE`, `_NET_CLOSE_WINDOW`, `_NET_MOVERESIZE_WINDOW` with
-  static gravity). Ubuntu's dock is set to hide (`gsettings`, put back
-  after; what it was is noted in `$XDG_RUNTIME_DIR` for a helper that
-  died). GNOME's top bar can only be hidden from inside GNOME Shell (no
-  setting does it): the guest tools install a small extension
-  (`examples/linux/gnome-shell`, `vroom-coherence@vroom`; one file for
-  GNOME 42 to 44, one for 45 and later) that takes the top bar out of
-  the struts and hides it while enabled. The helper runs
-  `gnome-extensions enable` when Coherence goes on and `disable` when it
-  goes off (and at start). GNOME Shell only finds a new extension when
-  it starts, so it works from the login after the install. On Wayland
-  the helper answers `CoherenceNo` with the reason.
+- Windows:
+  - `SetWinEventHook` (out of context, own thread + message loop): foreground, menus, move/size, minimize; top-level windows created, destroyed, shown, hidden, moved, renamed, cloaked. Callback sets a flag, wakes the session loop.
+  - Hides the taskbar, whole screen = work area.
+  - Walks windows front to back with `GetTopWindow`/`GW_HWNDNEXT` (`EnumWindows` misses Store apps and Start menu); per-monitor DPI aware (real pixels).
+- X11:
+  - Second connection selects structure and property events on root and every managed window.
+  - List: `_NET_CLIENT_LIST` in the order of root's children (WM frames), plus override-redirect windows above the lowest frame (menus, tooltips).
+  - Visible area: client area + `_NET_FRAME_EXTENTS` − `_GTK_FRAME_EXTENTS` (GTK shadows). Other workspaces, desktop, docks left out.
+  - Actions: taskbar client messages (`_NET_ACTIVE_WINDOW`, `WM_CHANGE_STATE`, `_NET_CLOSE_WINDOW`, `_NET_MOVERESIZE_WINDOW` with static gravity).
+  - Ubuntu dock set to hide (`gsettings`, restored after; old value noted in `$XDG_RUNTIME_DIR` for a helper that died).
+  - GNOME top bar: only hideable from inside GNOME Shell. Tools install an extension (`examples/linux/gnome-shell`, `vroom-coherence@vroom`; one file for GNOME 42–44, one for 45+) removing the top bar from struts and hiding it while enabled. Helper runs `gnome-extensions enable` on Coherence on, `disable` on off (and at start). GNOME Shell finds new extensions only at start: works from the login after install.
+  - Wayland: helper answers `CoherenceNo` with the reason.
 
-When the list changes the helper sends `Message::Windows`: id (window
-handle or X window), what can be seen of it, flags (in front, minimized,
-app window, maximized), title. App windows' icons go as `WindowIcon`
-(32x32 RGBA) when new and when they change (looked at every 2 s):
-Windows draws the window's icon (`WM_GETICON`, the class icon, or its
-program's) twice, on black and on white, which gives the alpha of any
-kind of icon; X11 takes the size nearest 32 of `_NET_WM_ICON`. Back come
-`WindowDo` requests: activate, minimize, close (`SC_CLOSE` /
-`_NET_CLOSE_WINDOW`), move (to the visible bounds, borders added back).
-Only windows of the last list are touched, in the VMM and the agent.
-A Store app's window (in `ApplicationFrameHost`, or a packaged program)
-has no icon of its own and its program none either: the helper finds
-its package (`GetPackageFullName` on the process,
-`GetPackagePathByFullName`), the app's entry in `AppxManifest.xml` (by
-its program), its `Square44x44Logo`, and of that logo's files the
-unplated one at the size nearest 32 (`appx.rs`), a PNG decoded in the
-guest.
+Messages:
 
-`StartApp` (`apps.rs`) reads the menu again, on a thread, and starts
-the app the name fits best: its name (whole, then its start, then a
-word's start) before its other names; of equal ones, apps that run in
-a terminal last, then a shorter name first. Windows (`apps_win.rs`): the `.lnk` files of both Start menu folders (named as
-the shell shows them, localized through `desktop.ini`), then the apps
-of `shell:AppsFolder` no shortcut has the name of (Store apps by
-AppUserModelID; enumerated through `IShellItem` and
-`IEnumShellItems`); opened with `ShellExecute` (the `.lnk`, or
-`shell:AppsFolder\<id>`). Windows may open the new app behind the
-window in front, so the helper waits up to 10 s for its first window
-and brings it forward. No app by that name: if the name is plain, the
-old way (the Windows key, the name typed as characters, Enter). Linux
-(`apps_xdg.rs`): the desktop entries of the XDG data dirs (the user's,
-`XDG_DATA_DIRS`, Flatpak and Snap), in precedence order by desktop file
-id, without NoDisplay, Hidden, OnlyShowIn/NotShowIn and missing TryExec
-ones; names in the session's language (`LC_ALL`, `LC_MESSAGES`,
-`LANG`), other names from GenericName, Keywords and the file name.
-Started with `gio launch <file>` (GLib 2.68 and later), or when that
-fails with the Exec line split into words (quoting rules of the spec,
-field codes out: no files) run directly, in its own process group,
-from the home folder.
+- `Message::Windows` on change: id (window handle or X window), visible area, flags (in front, minimized, app window, maximized), title.
+- `WindowIcon` (32x32 RGBA) for app windows when new or changed (checked every 2 s). Windows: draws the icon (`WM_GETICON`, class icon, or its program's) twice, on black and white → alpha for any icon kind. X11: `_NET_WM_ICON` size nearest 32.
+- Store app windows (`ApplicationFrameHost`, or a packaged program) have no icon and their program none: helper finds the package (`GetPackageFullName`, `GetPackagePathByFullName`), the app's `AppxManifest.xml` entry (by program), its `Square44x44Logo`, the unplated file nearest 32 (`appx.rs`), PNG decoded in the guest.
+- `WindowDo` back: activate, minimize, close (`SC_CLOSE` / `_NET_CLOSE_WINDOW`), move (to visible bounds, borders added back). Only windows of the last list are touched, in VMM and agent.
 
-While Coherence is on the helper also sends the apps it can start
-(`Apps`: name and 32x32 icon, at most 512, sorted), read on a thread of
-its own when Coherence goes on and again every minute, sent when it
-changed. Icons: Windows asks the shell (`SHGetFileInfo`) for shortcuts
-and the package logo (as above) for Store apps; Linux looks the entry's
-icon up in the icon themes (the user's GTK theme, Yaru, Adwaita,
-hicolor..., PNG files only, the size nearest 32) or takes the file it
-names. About 3 s on Windows (the shell draws every icon), 70 ms on
-Ubuntu.
+`StartApp` (`apps.rs`): rereads the menu on a thread, starts the best name match: name (whole, then prefix, then word prefix) before other names; ties: terminal apps last, then shorter name.
 
-The VMM forwards the list to the app coalesced (`ToViewer::Windows`, like
-damage: a busy guest costs one queued list), icons the same way per
-window (at most 128 waiting). The app (`gui/src/console/coherence.rs`)
-keeps one frameless Slint window per guest window on screen
-(`ui/coherence.slint`): our strip on top, then the guest window's part
-of the shared framebuffer, copied where damage touches it. Guest pixels
-and Mac points convert through `Map` (the free area and the guest's
-mode, which may be smaller than asked: Windows' driver caps it). Pointer
-events map back through the picture's own size. Moves either way: the
-guest's list places the Mac windows; a Mac window moved or resized by
-the user sends `WindowDo::Move` (kept on the guest's screen) and is left
-alone by guest reports for half a second. The guest's order is applied
-with `orderFront:` while vroom is the active app; new windows open
-behind other apps' windows when it isn't. The guest's window in front
-gets the keyboard on the Mac while one of ours has it. The bar
-(`CoherenceBar`) lists app windows with their icons, sends the Windows
-key for Start, and has the app field (its keys stay in the bar while it
-has focus). As one types there the bar shows the three apps of the
-guest's list the text fits best (`suggest`) in place of the window
-buttons; Enter sends the one picked, or the text if none fits. Once a second the app looks at which screen the bar is on
-and at that screen's free area; if either changed (the bar dragged to
-another screen, the Dock moved, a screen unplugged), the guest's screen
-moves there: new area, a resize, the bar at the bottom. Leaving sends
-`Coherence(false)` and the VM window's size; a viewer that goes away
-(the app crashed) turns Coherence off in the VMM, and the agent puts the
-taskbar back when its session ends or it starts again. A session helper
-replaced by another (started twice) is told to leave Coherence first.
+- Windows (`apps_win.rs`): `.lnk` files of both Start menu folders (shell names, localized via `desktop.ini`), then `shell:AppsFolder` apps no shortcut names (Store apps by AppUserModelID; via `IShellItem`, `IEnumShellItems`). Opened with `ShellExecute` (the `.lnk` or `shell:AppsFolder\<id>`). Windows may open it behind the front window: helper waits ≤10 s for its first window, brings it forward. No match and a plain name: old way (Windows key, typed name, Enter).
+- Linux (`apps_xdg.rs`): desktop entries of XDG data dirs (user's, `XDG_DATA_DIRS`, Flatpak, Snap), precedence by desktop file id; skips NoDisplay, Hidden, OnlyShowIn/NotShowIn, missing TryExec. Names in session language (`LC_ALL`, `LC_MESSAGES`, `LANG`); other names from GenericName, Keywords, file name. Started with `gio launch <file>` (GLib 2.68+); on failure the Exec line split per spec quoting, field codes removed (no files), run directly in its own process group from home.
+
+`Apps` while on: name + 32x32 icon, ≤512, sorted; read on its own thread at start and every minute, sent when changed. Icons: Windows `SHGetFileInfo` for shortcuts, package logo for Store apps; Linux icon themes (user's GTK theme, Yaru, Adwaita, hicolor…, PNG only, nearest 32) or the named file. ~3 s on Windows (shell draws every icon), 70 ms on Ubuntu.
+
+VMM → app: list coalesced (`ToViewer::Windows`, like damage: busy guest = one queued list); icons coalesced per window (≤128 waiting).
+
+App (`gui/src/console/coherence.rs`, `ui/coherence.slint`):
+
+- One frameless Slint window per on-screen guest window: our strip on top, then the guest window's part of the shared framebuffer, copied where damage touches.
+- Guest pixels ↔ Mac points via `Map` (free area + guest mode, which may be smaller than asked: Windows' driver caps it). Pointer events map back through the picture's own size.
+- Moves: guest list places Mac windows; a user-moved/resized Mac window sends `WindowDo::Move` (kept on the guest screen), ignores guest reports for 0.5 s.
+- Order applied with `orderFront:` while vroom is active; otherwise new windows open behind other apps'.
+- Guest's front window gets the keyboard while one of ours has it on the Mac.
+- Bar (`CoherenceBar`): app windows with icons, Windows key for Start, app field (keys stay in the bar while focused). Typing shows the 3 best guest-list matches (`suggest`) in place of window buttons; Enter sends the pick, or the text if none fits.
+- Every second: bar's screen and its free area checked; changed (bar dragged, Dock moved, screen unplugged) → guest screen moves there: new area, resize, bar at bottom.
+- Leave: `Coherence(false)` + VM window size. Viewer gone (app crash): VMM turns Coherence off; agent restores the taskbar when its session ends or it restarts. A session helper replaced by another (started twice) is told to leave Coherence first.
 
 ## Video decoding
 
-`video_decode = true` (app: Settings, Display, Hardware video decoding) adds a virtio-media device (`virtio/src/devices/media`):
-V4L2 carried over virtio, the guest's kernel forwarding each ioctl of
-its `/dev/videoN` on the command queue. The device plays a V4L2 stateful
-decoder: H.264, HEVC, VP9 or AV1 buffers in (OUTPUT queue; the codecs
-the helper said this Mac decodes), NV12 or P010 pictures out (CAPTURE
-queue), with the source-change event, the LAST buffer and decoder
-STOP/START the V4L2 decoder interface describes. Buffers are allocated in
-one shared memory window (region 0, 1 GiB, mapped into the guest where
-the guest puts it; `vmm/src/video.rs`), and the guest maps them with
-virtio-media's MMAP command.
+`video_decode = true` (app: Settings, Display, Hardware video decoding): a virtio-media device (`virtio/src/devices/media`).
 
-The decoding happens in `vroom video-helper` (`cli/src/video.rs`,
-`cli/src/vt.rs`). At start the VMM hands it the window's shared memory
-object (it maps it) and the helper answers with the codecs VideoToolbox
-decodes here. The VMM copies each bitstream buffer out of the window and
-sends it; the helper takes it apart (`video/src/nal.rs` for H.264 and
-HEVC: access units and parameter sets; `video/src/vpx.rs` for VP9 frame
-headers and AV1 OBUs), makes a VideoToolbox decompression session for
-the stream's format (a new one when the size, depth or a key frame's
-format changes, announced to the VMM before its first picture), decodes,
-and puts the pictures back in display order: VideoToolbox hands H.264 and
-HEVC pictures out in decoding order, so the helper works out each
-picture's order count from its slice header, as the standards define it,
-and holds as many as the stream's SPS says it may reorder
-(`video/src/poc.rs`).
+- V4L2 over virtio: guest kernel forwards each `/dev/videoN` ioctl on the command queue.
+- Device = V4L2 stateful decoder: H.264, HEVC, VP9 or AV1 in (OUTPUT; codecs the helper says this Mac decodes), NV12 or P010 out (CAPTURE); source-change event, LAST buffer, decoder STOP/START per the V4L2 decoder interface.
+- Buffers in one shared memory window (region 0, 1 GiB, mapped where the guest puts it; `vmm/src/video.rs`); guest maps them with virtio-media's MMAP command.
 
-Pictures don't cross the socket. The VMM grants the helper each guest
-picture buffer it may fill (offset, length, NV12 or P010) under an
-epoch it bumps when those buffers change (size change, seek, stream
-off); the helper writes the picture from VideoToolbox's buffer straight
-into the granted guest buffer (converting 10 to 8 bits if the guest
-wanted NV12) and says which one. The VMM checks that it is the oldest
-grant of the current epoch and of the stream's size, and returns the
-buffer to the guest with the timestamp of the bitstream buffer it came
-from. Bitstream buffers go back to the guest as soon as they are copied
-out.
+Helper `vroom video-helper` (`cli/src/video.rs`, `cli/src/vt.rs`):
 
-With V4L2's display delay set to 0 (`V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY`,
-enabled), a session runs in decoding order: no reordering, each picture
-out as soon as VideoToolbox has it, and a picture that failed comes back
-as a buffer with the error flag. That is for our VA-API driver.
+- At start VMM hands it the window's shm object (it maps it); helper answers with the codecs VideoToolbox decodes here.
+- VMM copies each bitstream buffer out of the window and sends it. Helper parses (`video/src/nal.rs`: H.264/HEVC access units, parameter sets; `video/src/vpx.rs`: VP9 frame headers, AV1 OBUs), makes a VideoToolbox session per stream format (new one on size, depth or key-frame format change, announced to the VMM before its first picture), decodes.
+- Display order: VideoToolbox outputs H.264/HEVC in decode order; helper computes each picture's order count from its slice header (per the standards), holds as many as the SPS allows reordering (`video/src/poc.rs`).
 
-A pause (snapshot) first answers every command the guest waits on (its
-driver gives up after 5 seconds). The device saves each decoder's V4L2
-side (formats, buffers and where they are in the window, queues) and the
-helper's resume state (it sends the stream's parameter sets, VP9 key
-frame header or AV1 sequence header whenever they change). On restore,
-the new helper opens the stream from that state and the decoder goes on
-from the next key frame; bitstream buffers that hadn't reached the helper
-go back to the guest (the window's contents aren't saved).
+Pictures don't cross the socket:
+
+- VMM grants each guest picture buffer the helper may fill (offset, length, NV12/P010) under an epoch, bumped when buffers change (size change, seek, stream off).
+- Helper writes from VideoToolbox's buffer straight into the granted guest buffer (10 → 8 bit if the guest wanted NV12), says which.
+- VMM checks it's the oldest grant of the current epoch and stream size, returns it with the timestamp of its bitstream buffer.
+- Bitstream buffers go back to the guest as soon as copied out.
+
+Display delay 0 (`V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY`, enabled): decode order, no reordering, each picture out as soon as VideoToolbox has it; a failed picture returns with the error flag. For our VA-API driver.
+
+Snapshot:
+
+- Pause first answers every command the guest waits on (its driver gives up after 5 s).
+- Saved: each decoder's V4L2 side (formats, buffers and their place in the window, queues) + helper resume state (helper sends parameter sets, VP9 key frame header or AV1 sequence header on change).
+- Restore: new helper opens the stream from that state, decoder resumes at the next key frame. Bitstream buffers that hadn't reached the helper go back to the guest (window contents not saved).
 
 ### The guest's VA-API driver
 
-Browsers decode through VA-API, which hands the driver pictures already
-parsed. `scripts/guest/vaapi/vroom_drv_video.c` (a libva driver, in C,
-built in the guest) turns them back into a bitstream for the V4L2
-decoder, one buffer per picture, in decoding order:
+Browsers decode via VA-API, which hands the driver parsed pictures. `scripts/guest/vaapi/vroom_drv_video.c` (libva driver, C, built in the guest) turns them back into a bitstream for the V4L2 decoder, one buffer per picture, decode order:
 
-- H.264: SPS and PPS written from VA-API's picture parameters and scaling
-  lists, sent when they change; the PPS reference counts slices leave to
-  it are read from the slice headers. The SPS says no reordering, so
-  VideoToolbox outputs each picture at once.
-- HEVC: VPS, SPS and PPS likewise. VA-API doesn't pass the SPS's
-  reference picture sets that slice headers point to, so each slice
-  header is rewritten to carry its picture's set (from VA-API's
-  reference list); the rest of the header and the slice data are copied.
-- VP9: the frame as it came (VA-API passes all of it).
+| Codec | |
+|---|---|
+| H.264 | SPS, PPS written from VA-API picture parameters and scaling lists, sent on change. PPS reference counts left to slices read from slice headers. SPS says no reordering: VideoToolbox outputs each picture at once |
+| HEVC | VPS, SPS, PPS likewise. VA-API omits the SPS reference picture sets slice headers point to: each slice header rewritten to carry its picture's set (from VA-API's reference list); rest of header and slice data copied |
+| VP9 | frame as is (VA-API passes all of it) |
 
-Each VA surface has its own copy of its picture, filled when its
-decoded picture comes back (matched by the timestamp the driver gave the
-bitstream buffer). For players that want dma-bufs (Firefox), a surface
-also gets two GBM buffers on the virtio-gpu render node (luma, chroma),
-filled through their guest pages and one transfer each when exported.
-Chrome exports each surface once, when it makes it, before anything is
-decoded into it, and keeps showing that dma-buf; a GPU decoder writes
-into it in place. So a surface exported while still empty is marked, and
-from then on `vaEndPicture` waits for its picture and fills its buffers
-before returning (Chrome shows a picture once that returns). Firefox
-exports after decoding and keeps the old behaviour. When the stream's
-format is set again (an HEVC seek), Chrome destroys its surfaces, keeps
-the dma-bufs and makes new surfaces from them (`DRM_PRIME` memory, which
-names only the first plane's buffer). A destroyed live surface's two
-buffers are kept for 5 seconds (32 at most), and such a surface gets
-them back by its luma buffer's handle; other dma-bufs are refused.
+Surfaces and dma-bufs:
 
-Chrome under X11 shows video through X pixmaps (DRI3), which take only
-BGRA buffers, so it asks for video processing (`VAProfileNone`,
-`VAEntrypointVideoProc`): NV12 or P010 into BGRA. It makes the BGRA
-surfaces with `vaCreateSurfaces` and exports them, then imports both the
-decoded surfaces and the BGRA ones back as dma-bufs. Such an import
-becomes a surface that stands for the one that exported the buffer,
-found again by its GEM handle at each use (Chrome may have remade it
-from the same buffers meanwhile). `vaEndPicture` on a processing
-context converts the picture on the CPU (NEON, 16 pixels by 2 rows,
-nearest-pixel scaling) straight into the BGRA buffer's guest pages and
-sends one transfer: Chrome doesn't sync before showing it. A decoded
-surface that only feeds processing no longer fills its own GBM buffers.
-The colour matrix comes from VP9 key frames; H.264 and HEVC don't pass
-theirs through VA-API, so the driver guesses it from the size and bit
-depth. Transfers to the host give no stride: the kernel refuses one for
-these (non-blob) resources, and the host reads the rows packed, as GBM
-lays them out.
+- Each VA surface has its own picture copy, filled when its decoded picture returns (matched by the timestamp the driver gave the bitstream buffer).
+- dma-buf players (Firefox): a surface also gets two GBM buffers on the virtio-gpu render node (luma, chroma), filled via their guest pages and one transfer each on export.
+- Chrome exports each surface once, at creation, before decode, and keeps showing that dma-buf (a GPU decoder writes in place). So a surface exported while empty is marked; from then on `vaEndPicture` waits for its picture and fills its buffers before returning (Chrome shows it once that returns). Firefox exports after decoding: old behaviour.
+- Stream format set again (HEVC seek): Chrome destroys surfaces, keeps the dma-bufs, makes new surfaces from them (`DRM_PRIME` memory, naming only the first plane's buffer). A destroyed live surface's two buffers are kept 5 s (≤32); such a surface gets them back by its luma buffer handle. Other dma-bufs refused.
+
+Chrome on X11 (DRI3 pixmaps take only BGRA):
+
+- Asks for video processing (`VAProfileNone`, `VAEntrypointVideoProc`): NV12/P010 → BGRA.
+- Makes BGRA surfaces with `vaCreateSurfaces`, exports them, then imports decoded and BGRA surfaces back as dma-bufs. An import becomes a surface standing for the exporter, found again by GEM handle on each use (Chrome may have remade it from the same buffers).
+- `vaEndPicture` on a processing context converts on the CPU (NEON, 16 pixels × 2 rows, nearest-pixel scaling) straight into the BGRA buffer's guest pages, one transfer: Chrome doesn't sync before showing.
+- A decoded surface feeding only processing no longer fills its own GBM buffers.
+- Colour matrix: from VP9 key frames; H.264/HEVC don't pass theirs through VA-API: guessed from size and bit depth.
+- Transfers to the host carry no stride (kernel refuses one for these non-blob resources); host reads rows packed, as GBM lays them out.
 
 ## Video encoding
 
-`video_encode = true` (app: Settings, Display, Hardware video encoding)
-adds a second virtio-media device, the encoder
-(`virtio/src/devices/media/enc.rs`): the same transport, command and
-event queues, and a buffer window of its own (1 GiB, only what buffers
-touch is real memory), in front of a V4L2 stateful encoder. Raw frames
-on the OUTPUT queue (NV12, or P010 for HEVC Main 10, laid out at the
-guest's own size: rows of the frame's width, chroma right after the last
-row), H.264 or HEVC on the CAPTURE queue, the formats the helper said it
-encodes. Frame intervals come from `S_PARM`, the rest from controls
-(`G/S/TRY_EXT_CTRLS`, `QUERY_EXT_CTRL` and the old single-control
-ioctls): bitrate, peak bitrate, rate control (VBR, CBR, constant
-quality), GOP size and H.264 I-frame period, force key frame, profile,
-level, entropy coding. B-frames are 0 only; parameter sets come joined
-with each key frame. `ENCODER_CMD` STOP drains: every frame queued comes
-back coded, then an empty buffer with the LAST flag and the EOS event.
+`video_encode = true` (app: Settings, Display, Hardware video encoding): a second virtio-media device, the encoder (`virtio/src/devices/media/enc.rs`). Same transport, command and event queues; own buffer window (1 GiB, only touched pages are real memory); V4L2 stateful encoder.
 
-The work happens in a second helper, `vroom video-helper --encode`
-(`cli/src/venc.rs`, `cli/src/vtenc.rs`), with the encoder's window. When
-the queues start, the device sends the helper the session's settings
-(`EncConfig`: codec, raw format and layout, picture size, frame rate,
-rate control, bitrate, key frame interval, profile, flags); changed
-rates go to the running session, anything else starts a new
-VideoToolbox session with a key frame. Each raw frame the guest queues
-becomes an `Encode` message naming where it is in the window; the helper
-copies it into one of the compression session's pixel buffers (IOSurface)
-and the guest gets its buffer back. Frames don't cross the socket either
-way: coded frames go into CAPTURE buffers the device granted, as
-pictures do for the decoder (same grants and epochs). VideoToolbox hands
-out length-prefixed NAL units with the parameter sets apart; the helper
-writes Annex B with the parameter sets in front of each key frame
-(`video/src/nal.rs`). No frame reordering: coded frames come out in the
-order their frames went in, and the device gives each the time of its
-frame, the KEYFRAME or PFRAME flag, and its size.
+- OUTPUT: raw NV12, or P010 for HEVC Main 10, at the guest's own size (rows of frame width, chroma right after the last row). CAPTURE: H.264 or HEVC, formats the helper said it encodes.
+- Frame intervals from `S_PARM`; the rest from controls (`G/S/TRY_EXT_CTRLS`, `QUERY_EXT_CTRL`, old single-control ioctls): bitrate, peak bitrate, rate control (VBR, CBR, constant quality), GOP size and H.264 I-frame period, force key frame, profile, level, entropy coding.
+- B-frames: 0 only. Parameter sets joined with each key frame.
+- `ENCODER_CMD` STOP drains: every queued frame comes back coded, then an empty buffer with LAST and the EOS event.
 
-Constant bitrate asks for VideoToolbox's low-latency mode (real time,
-the rate control FaceTime uses; one frame in, one out, about 5 ms for
-720p on an M3 Max), as calls want; the other modes run the ordinary
-encoder, which pipelines frames for throughput. A key frame on request
-is a frame option; the GOP size is VideoToolbox's key frame interval
-(0: only the first frame and those asked for).
+Helper `vroom video-helper --encode` (`cli/src/venc.rs`, `cli/src/vtenc.rs`), with the encoder's window:
 
-A pause (snapshot) keeps each encoder's V4L2 side: formats, controls,
-buffers and queues. Raw frames still queued, at the helper, or coded but
-not handed back are lost (the window isn't saved): after a restore the
-raw buffers go back to the guest and, for each lost frame, a coded buffer
-comes back empty with the error flag and that frame's time, so a player
-waiting on it moves on. The new helper gets the session's settings and
-the stream goes on with a key frame.
+- Queues start: device sends `EncConfig` (codec, raw format and layout, size, frame rate, rate control, bitrate, key frame interval, profile, flags). Changed rates → running session; anything else → new VideoToolbox session with a key frame.
+- Each queued raw frame → `Encode` message naming its place in the window; helper copies it into a compression session pixel buffer (IOSurface); guest gets its buffer back.
+- No frames over the socket: coded frames into CAPTURE buffers the device granted (same grants and epochs as decode).
+- VideoToolbox gives length-prefixed NAL units, parameter sets apart; helper writes Annex B with parameter sets before each key frame (`video/src/nal.rs`).
+- No reordering: coded frames in input order; device gives each its frame's time, KEYFRAME or PFRAME flag, size.
+- CBR → VideoToolbox low-latency mode (real time, FaceTime's rate control; one frame in, one out; ~5 ms for 720p on M3 Max), as calls want. Other modes: ordinary encoder, pipelined for throughput.
+- Key frame on request = frame option. GOP size = VideoToolbox key frame interval (0: only the first frame and requested ones).
+
+Snapshot:
+
+- Kept: each encoder's V4L2 side (formats, controls, buffers, queues).
+- Lost (window not saved): raw frames still queued, at the helper, or coded but not returned. After restore: raw buffers back to the guest; per lost frame, an empty coded buffer with the error flag and that frame's time (a waiting player moves on).
+- New helper gets the session settings; stream resumes with a key frame.
 
 ### The VA-API driver's encoder
 
-`vroom_drv_video.c` offers `VAEntrypointEncSlice` for H.264
-(Constrained Baseline, Main, High) and HEVC (Main, Main 10) when the VM
-has the encoder. VA-API encoders are made for hardware that codes slices
-the player describes, with headers the player writes (packed headers).
-Ours codes whole frames and writes its own headers, so the driver says
-it takes no packed headers (Chrome and FFmpeg then leave the headers to
-the driver), one reference frame and no B-frames, and maps what the
-player sends onto the encoder:
+`vroom_drv_video.c` offers `VAEntrypointEncSlice` for H.264 (Constrained Baseline, Main, High) and HEVC (Main, Main 10) when the VM has the encoder.
 
-- the sequence parameters: the picture size (H.264's frame cropping
-  included), bitrate and frame rate (VUI timing);
-- the misc parameters: rate control (target and peak bitrate) and frame
-  rate;
-- the picture parameters: the coded buffer to fill, and IDR, which
-  becomes a forced key frame;
-- the config's rate control mode: CBR, VBR, or CQP as a constant
-  quality from the key frames' QP.
+- VA-API encoders assume hardware coding player-described slices with player-written headers (packed headers). Ours codes whole frames with its own headers: driver reports no packed headers (Chrome, FFmpeg then leave headers to the driver), 1 reference frame, no B-frames.
+- Mapping:
 
-At `vaEndPicture` the input surface (our copy of its picture: Chrome
-fills it through `vaDeriveImage`, FFmpeg through `vaDeriveImage` or
-`vaPutImage`) is copied into a V4L2 raw buffer and queued; the coded
-frame lands in the VA coded buffer when it comes back.
-`vaSyncSurface` on the input surface, `vaSyncBuffer` and `vaMapBuffer`
-on the coded buffer wait for it. Rate changes become control changes
-only when they change. Reference surfaces and the player's slice headers
-are ignored.
+  | VA-API | encoder |
+  |---|---|
+  | sequence parameters | picture size (incl. H.264 frame cropping), bitrate, frame rate (VUI timing) |
+  | misc parameters | rate control (target, peak bitrate), frame rate |
+  | picture parameters | coded buffer to fill; IDR → forced key frame |
+  | config rate control mode | CBR, VBR, or CQP as constant quality from the key frames' QP |
+
+- `vaEndPicture`: input surface (our copy; Chrome fills it via `vaDeriveImage`, FFmpeg via `vaDeriveImage` or `vaPutImage`) copied into a V4L2 raw buffer, queued; coded frame lands in the VA coded buffer on return.
+- `vaSyncSurface` (input), `vaSyncBuffer`, `vaMapBuffer` (coded buffer) wait for it.
+- Rate changes → control changes only when different. Reference surfaces and player slice headers ignored.
 
 ## 3D
 
-`gpu = "virtio3d"` adds three protocols to virtio-gpu. Venus: guest Vulkan
-(Mesa's venus driver) serializes commands, virglrenderer replays them on
-MoltenVK. virgl: guest OpenGL (Mesa's virgl driver) sends Gallium
-commands, virglrenderer's vrend replays them on macOS's OpenGL 4.1 (CGL),
-or with `opengl_host = "angle"` on OpenGL ES from ANGLE's Metal backend.
-Neptune: Windows' viogpu3d driver sends Direct3D 11 calls, virglrenderer
-(UTM's fork) replays them on DXMT, Direct3D on Metal. All capsets are
-offered; Mesa picks per API. Windows takes Neptune for Direct3D, Venus
-for Vulkan and for OpenGL through Zink, and virgl for OpenGL when there
-is no Vulkan. Our drivers for Windows come from one Mesa build
-(`third_party/mesa/`, `scripts/build-windows-gl.sh`):
+`gpu = "virtio3d"` adds three protocols to virtio-gpu:
 
-- `vroom_vk_*.dll`: Venus as a Vulkan driver of its own (D3DKMT, no
-  Direct3D runtime). viogpu3d runs in WDDM 2 mode (GpuMmu): render
-  packets carry no allocation lists, and a mappable blob's window in the
-  host-visible region is placed by the kernel driver, which maps it into
-  the process from its RES_INFO escape (D3DKMTLock would give staging
-  pages the host never sees). Maps and unmaps go by resource id. Command
-  streams go in D3DKMT render packets; fences are CPU events the kernel
-  driver signals when a packet is done.
-- `vroom_gl_*.dll`: Mesa's OpenGL with Zink on that Vulkan first, else
-  virgl with a winsys of ours: a virgl context through viogpu3d's escapes,
-  command streams in render packets, resources that are the driver's 3D
-  allocations (their guest pages go to the host when they have a GPU
-  address and are resident).
+| Protocol | Guest | Host |
+|---|---|---|
+| Venus | Vulkan (Mesa venus driver) serializes commands | virglrenderer replays on MoltenVK |
+| virgl | OpenGL (Mesa virgl driver) sends Gallium commands | vrend replays on macOS OpenGL 4.1 (CGL), or with `opengl_host = "angle"` on OpenGL ES from ANGLE's Metal backend |
+| Neptune | Windows viogpu3d driver sends Direct3D 11 calls | virglrenderer (UTM's fork) replays on DXMT (Direct3D on Metal) |
 
-Windows' compositor runs on Neptune and can't see Venus's or vrend's
-images, so frames come back to the guest and are drawn with GDI
-(Vulkan: Mesa's CPU swapchain; virgl: a read-back). When the 3D display
-device goes off (vroom does that before a save), the kernel driver drops
-the contexts and unmaps the windows. Our Venus driver then puts plain
-memory where a window was (an exception handler) and marks itself lost:
-waits end, submissions and presents fail with VK_ERROR_DEVICE_LOST, and
-Zink's OpenGL keeps running without drawing. Venus and Neptune go
-through virglrenderer's proxy to its render server: ours
-(`gpu3d/src/server.rs`, `vroom gpu-server`) starts one `vroom gpu-worker`
-per guest context, which runs that context with virglrenderer's own
-worker code (patch 0009 exports it) and sends buffers back as shared
-memory it creates. GL contexts stay in the renderer: vrend shares one GL
-context group between them. Host-visible buffers are mapped into the
-guest's shared memory window with the hypervisor.
+- All capsets offered; Mesa picks per API.
+- Windows: Neptune for Direct3D, Venus for Vulkan and for OpenGL via Zink, virgl for OpenGL without Vulkan.
 
-The renderer runs in the GPU process (`gpu3d/src/remote.rs`,
-`vroom gpu-helper`; see SECURITY.md): the VMM's virtio-gpu device talks
-to a `Remote`, the same `Renderer3d` trait the in-process `Virgl`
-implements, over a Unix socket. One call at a time, each answered, in
-the worker's order, so the device code can't tell the difference. A
-second socket carries a byte when fences may be done (the worker's
-backend fd). With 3D, guest RAM is shared memory (`MmapRegion::new_shared`)
-the GPU process maps too; guest buffers go over as (region, offset,
-length), checked against its mapping. A reset gives the guest new RAM
-objects (zeroed); `GuestMemory::generation` changes and the next call
-that names guest memory first sends the new ones. Buffers the guest maps
-(Venus, Neptune) come back as shared memory fds the VMM maps itself;
-frames read back land in a shared frame buffer the VMM made (sending
-them over the socket cost a third of glmark2's score; now within a few
-percent of in-process). `VROOM_GPU_IN_PROCESS=1` keeps it all in the VMM.
+Windows drivers, one Mesa build (`third_party/mesa/`, `scripts/build-windows-gl.sh`):
 
-GL details (`gpu3d/src/gl.rs`): we create the CGL or EGL contexts
-virglrenderer asks for (one share group, no surfaces) and keep the right
-one bound on whichever thread calls in (setup thread, then the GPU
-worker, which changes on device reset). GL fences have no completion thread (ANGLE
-serializes a share group's contexts, so a thread blocked on a fence
-would stall submits): the worker polls them every 250 microseconds while
-any is pending (at 1 ms, a frame whose display no longer waits for the
-GPU waited for its fence instead: glmark2's light scenes stopped near
-1,200 frames a second). The render server's contexts (Vulkan, Direct3D) always get a
-fence thread in the GPU process, woken by their worker process
-(`0013-proxy-fence-thread-always.patch`): polled once a millisecond like
-GL, each Zink frame waited half a millisecond more on average, and
-glmark2 on Zink scored 547 instead of 963. A GL scanout is copied back on flush: from a context of our
-own, into a pixel buffer on the GPU, and shown when the copy lands while
-the worker goes on. On macOS, when the app started the VMM, it shows GL
-scanouts from IOSurfaces instead (next section). Windows' Direct3D frames are blobs in the render
-server's shared memory that the guest never maps: a flush reads them
-through a read-only mapping of that memory, made on first use.
-Windows only lists the modes a monitor offered when it was plugged in,
-and viogpu3d reports a plug only when the scanout's enabled flag changes:
-once a Neptune context exists, a resize reports scanout 0 disabled, then
-enabled at the new size (checked and retried until Windows shows it), and
-the guest agent is asked for the mode after that.
+- `vroom_vk_*.dll`: Venus as its own Vulkan driver (D3DKMT, no Direct3D runtime).
+  - viogpu3d in WDDM 2 mode (GpuMmu): render packets carry no allocation lists.
+  - A mappable blob's window in the host-visible region is placed by the kernel driver, mapped into the process from its RES_INFO escape (D3DKMTLock would give staging pages the host never sees). Maps/unmaps by resource id.
+  - Command streams in D3DKMT render packets; fences = CPU events the kernel driver signals when a packet is done.
+- `vroom_gl_*.dll`: Mesa OpenGL, Zink on that Vulkan first, else virgl with our winsys: a virgl context via viogpu3d escapes, command streams in render packets, resources = the driver's 3D allocations (guest pages go to the host once they have a GPU address and are resident).
 
-The guest creates IMMUTABLE buffers and textures without data and fills
-them right after with an update. Direct3D forbids writing those, and DXMT
-orders nothing on them, so a copy or draw could read one before its
-contents landed: in Explorer the glyph atlas lost its white texel (copied
-from a 1x1 IMMUTABLE texture), and text and boxes drawn with it went
-missing. Our virglrenderer patch creates such resources DEFAULT
-(`third_party/virglrenderer/`).
+Windows display:
 
-The viewer can come and go. The VMM a window starts also listens on a
-socket in the user's temp dir (`$TMPDIR/vroom/<hash of the state dir>.sock`,
-0600 in a 0700 dir; the state dir's `viewer` file names it; socket paths
-are too short for state dirs). A window that goes without asking for a
-suspend (the app crashed) leaves the VM running; the next app connects,
-gets the framebuffer and what it missed (mode, pointer, state, agent),
-then everything as usual. One viewer at a time. No viewer for 5 minutes:
-the VMM suspends. The state lock holds the VMM's pid, so the app can stop
-one that hangs (only a process whose executable is `vroom`).
+- Compositor runs on Neptune, can't see Venus or vrend images: frames come back to the guest, drawn with GDI (Vulkan: Mesa CPU swapchain; virgl: read-back).
+- 3D display device off (vroom does it before a save): kernel driver drops contexts, unmaps windows. Our Venus driver puts plain memory where a window was (exception handler), marks itself lost: waits end, submissions and presents fail `VK_ERROR_DEVICE_LOST`; Zink OpenGL keeps running without drawing.
 
-Direct3D state can't be saved ("parking"). A suspend or snapshot of a
-Windows guest using it first asks the guest agent to turn the 3D display
-device off (SetupAPI, like Device Manager); the VMM waits until the guest
-has no Direct3D context left and the agent confirms, lets Windows settle
-on its basic display for 3 s, saves, and asks for the device back on
-(after a snapshot, and whenever an agent connects, so a resumed or killed
-VM gets it back). Pieces that make this work:
+Render server:
 
-- The kernel driver stops before Windows has destroyed every process's
-  Direct3D device, and it destroys the rest when it can no longer tell
-  the host. Contexts still there 3 s after the agent said "off" are the
-  stopped driver's: the GPU worker drops them (the driver resets the GPU
-  when it starts again anyway). virglrenderer patch 0017 sets the
-  "fatal" bit in each ring's status when a Neptune context goes, so a
-  process still waiting on one gives up at once.
-- The driver unmaps its shared memory (the UMD's rings) from every
-  process while their UMD threads still use it: each process with a
-  Direct3D device crashed at its next draw. `vroom_d3d.dll`
-  (`scripts/guest/d3d/`), which the agent registers in place of the
-  driver's UMD and which loads it, adds an exception handler: an access
-  from the UMD's code to memory that is gone (free, or sometimes left
-  reserved) gets zeroed memory there, with "fatal" where a ring's status
-  would be. The UMD fails the call and Windows reports the device
-  removed, as after any GPU loss. A fault it can't handle leaves a line
-  in the process's `%TEMP%\vroom_d3d.log`.
-- When the driver stops it hands Windows' basic display driver a
-  1024x768 framebuffer at BAR 0, which was the virtio registers: the
-  basic display wrote its pixels there (registers garbled, and once an
-  access the hypervisor can't decode stopped a CPU; the save then held a
-  dead CPU and the resumed guest hung). Windows' 3D GPU now has 8 MiB of
-  plain memory in BAR 0 (as Windows' extra GPUs have), the host window in
-  BAR 2 and the registers in BAR 4. Saves from before keep the old layout
-  (snapshot meta `gpu.bar0_vram`).
-- A CPU that stopped on a fault is not saved: the save fails instead.
+- Venus and Neptune go through virglrenderer's proxy to its render server. Ours (`gpu3d/src/server.rs`, `vroom gpu-server`) starts one `vroom gpu-worker` per guest context, running it with virglrenderer's own worker code (patch 0009 exports it), sending buffers back as shm it creates.
+- GL contexts stay in the renderer: vrend shares one GL context group between them.
+- Host-visible buffers mapped into the guest's shared memory window with the hypervisor.
 
-A stopped driver also leaves blobs behind; host blobs no context uses
-are left out of the save. Where no buffer is mapped, the host-visible
-window is backed by reserved anonymous memory, so a guest touching a
-buffer it already gave back reads memory instead of stopping the VM.
+GPU process (`gpu3d/src/remote.rs`, `vroom gpu-helper`; [SECURITY.md](SECURITY.md#the-gpu-process)):
 
-Why not save Direct3D instead (studied October 2026): Neptune forwards
-the COM calls of Direct3D 11 and 12 and DXGI (about 800 methods, 107 of
-them create objects, 195 object types; 142 methods on the D3D11 device
-context alone) over rings that several guest threads share. Venus
-snapshots (patch 0010, 3000 lines) replay a context's creation calls and
-copy its memory back; for Neptune the same needs: a record of every
-creation call with its data (resources made with initial data,
-shaders, states, views, swapchains, fences, shared handles between
-processes: Windows' compositor opens every app's surfaces), the
-immediate context's bound state (no Vulkan-style explicit state: read
-back with the Get* calls), texture contents copied out through staging
-resources (multisampled and depth textures can't be, they would need a
-resolve or a shader), deferred contexts and their command lists, queries
-and fences with values in flight, and D3D12 on top. All of it in
-virglrenderer's C against DXMT's behaviour, with the guest UMD's ids kept.
-Several months of work with a long tail, so parking stays.
+- VMM virtio-gpu talks to a `Remote`: same `Renderer3d` trait as in-process `Virgl`, over a Unix socket. One call at a time, each answered, in worker order: device code can't tell the difference.
+- Second socket: a byte when fences may be done (worker's backend fd).
+- With 3D, guest RAM is shared memory (`MmapRegion::new_shared`) the GPU process maps too; guest buffers sent as (region, offset, length), checked against its mapping.
+- Reset: new zeroed RAM objects; `GuestMemory::generation` changes; next call naming guest memory sends the new ones first.
+- Guest-mapped buffers (Venus, Neptune) come back as shm fds the VMM maps.
+- Read-back frames land in a shared frame buffer the VMM made (over the socket cost a third of glmark2's score; now within a few % of in-process).
+- `VROOM_GPU_IN_PROCESS=1`: all in the VMM.
 
-With GL on, 2D resources (dumb buffers) live in virglrenderer too, as in
-QEMU: Xorg's glamor draws into them with GL, and a context that touches
-a resource virglrenderer doesn't know is marked broken for good (every
-window turns black). Without GL they stay plain CPU buffers.
+GL (`gpu3d/src/gl.rs`):
 
-macOS constraints: HVF maps at the host's 16 KiB by default; a 4 KiB-page
-guest kernel places GPU buffers at 4 KiB steps, which can't be mapped that
-way. With 3D, the VM asks for 4 KiB stage-2 pages
-(`_hv_vm_config_set_ipa_granule`, private on macOS 15, public from 26),
-and GPU mappings round to that. MoltenVK lacks
-`VK_KHR_external_memory_fd`, which Mesa requires; our virglrenderer patch
-advertises it and shares mappings by pointer instead
-(`third_party/virglrenderer/`). Two more patches there make vrend work on
-macOS's OpenGL 4.1: multisample textures without `glTexStorage*Multisample`
-(GL 4.3), and shaders written at the host's GLSL version (4.10) instead of
-an older one plus `#extension` lines macOS's compiler rejects. A third
-(0011) clears textures without `glClearTexSubImage` (GL 4.4): it uploads
-the guest's texel over the box, 4 MiB of rows at a time, through vrend's
-normal upload path. Without it, the guest's Mesa 25.2 clears through a
-surface the host never saw (handle 0), vrend puts the whole context in
-error, and Xwayland under GNOME on Wayland drew nothing (its glamor clears
-pixmaps this way). UTM's fork told the guest the Mac had no multisampling
-(one sample, so Mesa fakes it), from before multisample textures worked
-on GL 4.1; 0014 keeps the real count (4) on macOS's OpenGL. One sample
-left the guest's OpenGL ES 3.0 below its spec, and ANGLE, so Chrome's
-GPU process, refused to make an ES 3.0 context on it. With
-`opengl_host = "angle"` it is still one: ANGLE's ES 3.0 has no
-multisample textures. vrend pauses transform feedback after each draw
-and ends it only when the guest drops its buffers; macOS's GL crashed
-in `glEndTransformFeedback` when the program it began with wasn't
-bound any more (any GL app using transform feedback, at its end: the
-GPU process died). 0015 binds that program again for the end, or leaves
-the object to the context's end if the program is gone. virglrenderer
-logs through our logger (`virgl:` lines).
+- We create the CGL or EGL contexts virglrenderer asks for (one share group, no surfaces), keep the right one bound on whichever thread calls (setup thread, then GPU worker, which changes on device reset).
+- GL fences: no completion thread (ANGLE serializes a share group's contexts; a thread blocked on a fence would stall submits). Worker polls every 250 µs while any is pending. At 1 ms, frames no longer waiting for the GPU waited for fences instead: glmark2 light scenes capped near 1,200 fps.
+- Render server contexts (Vulkan, Direct3D): always a fence thread in the GPU process, woken by their worker (`0013-proxy-fence-thread-always.patch`). Polled at 1 ms like GL: each Zink frame waited 0.5 ms more on average; glmark2 on Zink 547 vs 963.
+- GL scanout copied back on flush: from our own context into a GPU pixel buffer, shown when the copy lands while the worker continues. macOS, VMM started by the app: GL scanouts from IOSurfaces instead ([below](#the-screen-straight-from-the-gpu-macos)).
+- Windows Direct3D frames: blobs in render server shm the guest never maps; a flush reads them via a read-only mapping made on first use.
+- Windows lists only the modes a monitor offered at plug-in, and viogpu3d reports a plug only when a scanout's enabled flag changes. So once a Neptune context exists, a resize reports scanout 0 disabled, then enabled at the new size (checked and retried until Windows shows it); then the agent is asked for the mode.
+- IMMUTABLE buffers/textures: guest creates them without data and fills them right after with an update. D3D forbids writing those, DXMT orders nothing on them: a copy or draw could read one first (Explorer's glyph atlas lost its white texel, copied from a 1x1 IMMUTABLE texture; text and boxes went missing). Our virglrenderer patch creates them DEFAULT (`third_party/virglrenderer/`).
 
-What MoltenVK lacks, the Venus decoder makes up (patches 0007, 0008 and
-0012):
+Viewer reattach:
 
-- `nullDescriptor`: the guest may leave a descriptor or vertex buffer
-  null. Each device gets, on first need, a 64 KiB buffer for reads, one
-  for writes, 1x1 images for sampling and storage, and views of them, all
-  cleared to zero once on the device's first queue; null handles in
-  descriptor writes, push descriptors and vertex buffer binds point there.
-- `VK_EXT_depth_clip_enable`: depth clip off becomes depth clamp.
-- Sync fd import into semaphores: `vkImportSemaphoreResourceMESA` (the
-  guest waited for the fd, mark the semaphore signaled) becomes an empty
-  submission that signals it, `vkWaitSemaphoreResourceMESA` one that waits
-  on it. The guest's Venus needs this for `VK_KHR_swapchain` and
-  `synchronization2`.
-- Images and buffers the guest may export as dma-bufs only see host
-  visible memory types: their memory is shm imported as host memory, which
-  device local memory can't be. A guest that picks device local anyway
-  gets host visible memory under it (it never maps it).
-- Host image copy isn't offered for depth and stencil formats
-  (0012): MoltenVK offers it, but keeps depth images in private Metal
-  storage, so such an image gets no memory type at all. Zink asks for it
-  on every texture it may copy into from the CPU, and every depth
-  texture failed.
-- For Zink only (its instance says "mesa zink"): transform feedback, and
-  packed 10-bit vertex formats and RGB32 texel buffers mapped to the
-  nearest Metal has. These are what lift Zink to OpenGL 4.4.
+- The VMM a window starts also listens on `$TMPDIR/vroom/<hash of the state dir>.sock` (0600, dir 0700; state dir's `viewer` file names it; socket paths too short for state dirs).
+- Window gone without suspend request (app crash): VM keeps running. Next app connects, gets the framebuffer and what it missed (mode, pointer, state, agent), then as usual.
+- One viewer at a time. No viewer 5 min: VMM suspends.
+- State lock holds the VMM pid: app can stop a hung one (only a process whose executable is `vroom`).
 
-Transform feedback, which MoltenVK lacks, is done by the vertex shader
-itself (0016, `vkr_xfb.c`). A vertex shader module with the `Xfb`
-execution mode gets a second host module: before each return it stores
-its captured outputs (their `XfbBuffer`, `XfbStride` and `Offset`
-decorations) through buffer device addresses read from 48 bytes of push
-constants at offset 256. Every pipeline layout gets room for them (the
-vertex range grows to 304 bytes; a layout already using that range gets
-none, and its pipelines don't capture). Zink devices get
-`bufferDeviceAddress`, `shaderInt64` and vertex stores turned on,
-transform feedback buffers the device address usage, and every memory
-allocation the device address flag. Each command buffer keeps the bound
-buffers (address, size), what was written to each, the bound pipeline's
-topology and the transform feedback state; before every draw with such
-a pipeline the host pushes where its vertices go, or zeros (nothing to
-write). Vertex n of instance i goes to slot i * count + n, which is the
-order transform feedback writes in for non-indexed point, line and
-triangle lists only; other draws capture nothing. The host caps the slots
-at what fits in every buffer, in whole primitives, so a shader never
-writes past a buffer's bound range. Counter buffers (pause and resume
-across render passes, `glDrawTransformFeedback`) and the query pools for
-transform feedback and pipeline statistics (`GL_PRIMITIVES_GENERATED`;
-MoltenVK has neither) are kept by the host as commands are recorded:
-values are right when command buffers run in the order they were
-recorded, which is what Zink does. Before this, a Zink app asking for
-`GL_PRIMITIVES_GENERATED` got a query pool the host refused and its
-context failed. Apps without transform feedback run as before, within
-noise (glmark2 on Zink, three runs each: terrain 270 then 260 fps,
-refract 596 then 637).
+### Direct3D state can't be saved
 
-A Vulkan window reaches the screen through the guest's compositor, which
-imports the frame's dma-buf with OpenGL (virgl, `PIPE_RESOURCE_SET_TYPE`).
-On macOS's OpenGL (no EGL, no memory objects) vrend makes a texture of its
-own and maps the Venus blob's shm read only (layout checked against its
-size); the first time each command stream samples, blits or copies from
-it, the frame goes into the texture. For BGRA frames of 0.6 megapixels
-and up that is done on the GPU (`0030-vrend-venus-frames-through-an-iosurface.patch`,
-`vrend_shm_surface.m`): Metal takes the shm as a buffer
-(`newBufferWithBytesNoCopy`) and blits the frame into an IOSurface; GL
-sees that IOSurface as a rectangle texture (CGL takes IOSurfaces as
-rectangle textures, and as BGRA, only) and copies it into vrend's
-texture. Smaller or other frames are copied with `glTexSubImage2D` as
-before: Metal's round trip costs the GL thread 0.2 to 0.3 ms whatever
-the size, the CPU copy 0.45 ms at 1280x800 and 1.8 ms at 2560x1600
-(Apple's driver retiles on the CPU). `VROOM_SHM_COPY=1` copies always.
-Why not one IOSurface for both sides, with no copy at all: under Xorg the
-guest's Vulkan driver presents through a buffer (its "prime blit": it
-copies its image into a linear exported buffer), and the buffer's layout
-isn't known when its memory is made, so it can't be an IOSurface; and GL
-can't sample an IOSurface as the 2D texture the guest's shaders expect,
-so a copy on the GPU stays whatever the Vulkan side does. Done this way
-nothing new crosses between processes. ANGLE takes UTM's path instead (a
-Metal texture on the same memory, no copy). When a guest context goes
-away, commands still waiting on its fences go back to the guest:
-virglrenderer drops those fences.
+"Parking". Suspend or snapshot of a Windows guest using Direct3D:
+
+1. Guest agent turns the 3D display device off (SetupAPI, like Device Manager).
+2. VMM waits until the guest has no D3D context left and the agent confirms.
+3. Windows settles on its basic display for 3 s.
+4. Save.
+5. Device back on: after a snapshot, and whenever an agent connects (resumed or killed VM gets it back).
+
+What makes it work:
+
+- Kernel driver stops before Windows has destroyed every process's D3D device, and destroys the rest when it can no longer tell the host. Contexts still present 3 s after the agent said "off" belong to the stopped driver: GPU worker drops them (driver resets the GPU on restart anyway). virglrenderer patch 0017 sets "fatal" in each ring's status when a Neptune context goes: a process waiting on one gives up at once.
+- Driver unmaps its shared memory (the UMD's rings) from every process while their UMD threads still use it: each D3D process crashed at its next draw. `vroom_d3d.dll` (`scripts/guest/d3d/`), registered by the agent in place of the driver's UMD and loading it, adds an exception handler: UMD-code access to vanished memory (freed, or sometimes left reserved) gets zeroed memory, "fatal" where a ring status would be. UMD fails the call, Windows reports device removed (as after any GPU loss). Unhandled fault: a line in the process's `%TEMP%\vroom_d3d.log`.
+- Stopped driver hands Windows' basic display a 1024x768 framebuffer at BAR 0, which was the virtio registers: basic display wrote pixels there (garbled registers; once an undecodable access stopped a CPU, the save held a dead CPU, resumed guest hung). Now Windows' 3D GPU: 8 MiB plain memory in BAR 0 (like the extra GPUs), host window in BAR 2, registers in BAR 4. Older saves keep the old layout (snapshot meta `gpu.bar0_vram`).
+- A CPU stopped on a fault isn't saved: save fails.
+- Stopped driver leaves blobs: host blobs no context uses are left out of the save.
+- Host-visible window with no buffer mapped: backed by reserved anonymous memory, so a guest touching a returned buffer reads memory instead of stopping the VM.
+
+Why not save Direct3D (studied Oct 2026):
+
+- Neptune forwards D3D11, D3D12, DXGI COM calls (~800 methods, 107 create objects, 195 object types; 142 on the D3D11 device context alone) over rings several guest threads share.
+- Venus snapshots (patch 0010, 3000 lines) replay creation calls and copy memory back. Neptune would need: every creation call with data (resources with initial data, shaders, states, views, swapchains, fences, cross-process shared handles: the compositor opens every app's surfaces), immediate context bound state (no explicit state: read back with Get*), texture contents via staging (multisampled and depth can't: need a resolve or shader), deferred contexts and command lists, queries and fences with in-flight values, D3D12 on top. All in virglrenderer C against DXMT behaviour, guest UMD ids kept.
+- Months of work, long tail: parking stays.
+
+### macOS GL and Vulkan gaps
+
+- GL on: 2D resources (dumb buffers) live in virglrenderer too, as in QEMU: Xorg glamor draws into them with GL; a context touching a resource virglrenderer doesn't know is broken for good (every window black). GL off: plain CPU buffers.
+- HVF maps at the host's 16 KiB by default; 4 KiB-page guests place GPU buffers at 4 KiB steps. With 3D the VM asks for 4 KiB stage-2 pages (`_hv_vm_config_set_ipa_granule`, private on macOS 15, public from 26); GPU mappings round to that.
+- MoltenVK lacks `VK_KHR_external_memory_fd` (Mesa requires it): our virglrenderer patch advertises it and shares mappings by pointer (`third_party/virglrenderer/`).
+- virglrenderer logs through our logger (`virgl:` lines).
+
+vrend on macOS OpenGL 4.1, patches:
+
+| Patch | Fixes |
+|---|---|
+| (two) | multisample textures without `glTexStorage*Multisample` (GL 4.3); shaders at host GLSL 4.10, not older + `#extension` lines macOS rejects |
+| 0011 | texture clears without `glClearTexSubImage` (GL 4.4): uploads the guest's texel over the box, 4 MiB of rows at a time, via vrend's normal upload. Without it guest Mesa 25.2 clears through a surface the host never saw (handle 0), vrend errors the whole context; Xwayland under GNOME Wayland drew nothing (glamor clears pixmaps this way) |
+| 0014 | real sample count (4) on macOS GL. UTM's fork reported 1 (Mesa fakes MSAA), from before multisample textures worked on GL 4.1; 1 sample left guest ES 3.0 below spec, and ANGLE (so Chrome's GPU process) refused ES 3.0. `opengl_host = "angle"`: still 1 (ANGLE ES 3.0 has no multisample textures) |
+| 0015 | vrend pauses transform feedback after each draw, ends it only when the guest drops its buffers; macOS GL crashed in `glEndTransformFeedback` if the program it began with was unbound (any GL app using transform feedback, at its end: GPU process died). Binds that program again for the end, or leaves the object to the context's end if the program is gone |
+
+Venus decoder makes up for MoltenVK (patches 0007, 0008, 0012):
+
+- `nullDescriptor`: guest may leave descriptors or vertex buffers null. Per device, on first need: 64 KiB read buffer, write buffer, 1x1 images for sampling and storage, their views; zeroed once on the device's first queue. Null handles in descriptor writes, push descriptors, vertex buffer binds point there.
+- `VK_EXT_depth_clip_enable`: depth clip off → depth clamp.
+- Sync fd import into semaphores: `vkImportSemaphoreResourceMESA` (guest waited for the fd; mark signaled) → empty submission signaling it; `vkWaitSemaphoreResourceMESA` → one waiting on it. Guest Venus needs this for `VK_KHR_swapchain` and `synchronization2`.
+- Images/buffers the guest may export as dma-bufs see only host-visible memory types (their memory is shm imported as host memory; device-local can't be). Guest picking device-local anyway gets host-visible under it (never maps it).
+- 0012: no host image copy for depth/stencil formats. MoltenVK offers it but keeps depth images in private Metal storage → no memory type at all. Zink asks for it on every texture it may CPU-copy into: every depth texture failed.
+- Zink only (instance says "mesa zink"): transform feedback; packed 10-bit vertex formats and RGB32 texel buffers mapped to Metal's nearest. These lift Zink to GL 4.4.
+
+Transform feedback in the vertex shader (0016, `vkr_xfb.c`):
+
+- Vertex shader module with `Xfb` execution mode gets a second host module: before each return it stores captured outputs (`XfbBuffer`, `XfbStride`, `Offset` decorations) via buffer device addresses from 48 bytes of push constants at offset 256.
+- Every pipeline layout gets room (vertex range → 304 bytes; a layout already using that range gets none, its pipelines don't capture).
+- Zink devices: `bufferDeviceAddress`, `shaderInt64`, vertex stores on; xfb buffers get device address usage; every allocation the device address flag.
+- Each command buffer tracks bound buffers (address, size), what was written to each, bound pipeline topology, xfb state. Before each draw with such a pipeline: push where vertices go, or zeros (nothing to write).
+- Vertex n of instance i → slot i * count + n: matches xfb order for non-indexed point, line, triangle lists only; other draws capture nothing.
+- Slots capped to what fits in every buffer, whole primitives: never writes past a bound range.
+- Counter buffers (pause/resume across render passes, `glDrawTransformFeedback`) and query pools for xfb and pipeline statistics (`GL_PRIMITIVES_GENERATED`; MoltenVK has neither): kept by the host at record time; correct when command buffers run in record order (Zink does).
+- Before: a Zink app asking for `GL_PRIMITIVES_GENERATED` got a refused query pool, its context failed.
+- Apps without xfb: unchanged within noise (glmark2 on Zink, 3 runs each: terrain 270 → 260 fps, refract 596 → 637).
+
+Vulkan window to screen:
+
+- Guest compositor imports the frame's dma-buf with GL (virgl, `PIPE_RESOURCE_SET_TYPE`).
+- macOS GL (no EGL, no memory objects): vrend makes its own texture, maps the Venus blob's shm read-only (layout checked against size); first time each command stream samples, blits or copies from it, the frame goes into the texture.
+- BGRA frames ≥0.6 MP: on the GPU (`0030-vrend-venus-frames-through-an-iosurface.patch`, `vrend_shm_surface.m`): Metal takes the shm as a buffer (`newBufferWithBytesNoCopy`), blits into an IOSurface; GL sees it as a rectangle texture (CGL takes IOSurfaces only as rectangle textures, BGRA only), copies into vrend's texture.
+- Smaller/other frames: `glTexSubImage2D`. Metal round trip costs the GL thread 0.2–0.3 ms at any size; CPU copy 0.45 ms at 1280x800, 1.8 ms at 2560x1600 (Apple's driver retiles on the CPU).
+- `VROOM_SHM_COPY=1`: always CPU copy.
+- No single shared IOSurface (zero copy) because: under Xorg the guest Vulkan driver presents via a "prime blit" into a linear exported buffer whose layout isn't known when its memory is made (can't be an IOSurface); and GL can't sample an IOSurface as the 2D texture guest shaders expect. A GPU copy stays either way; this way nothing new crosses processes.
+- ANGLE: UTM's path (Metal texture on the same memory, no copy).
+- Guest context gone: commands still waiting on its fences go back to the guest (virglrenderer drops those fences).
 
 ### The screen straight from the GPU (macOS)
 
-Each GL frame used to be copied four times on the CPU on its way to the
-app: the GPU process mapped its readback into the VMM's frame buffer,
-the VMM copied it into its shadow and into the shared frame buffer, the
-app converted it to RGBA, and its UI toolkit uploaded it to a texture
-again. At 2560x1600 that was about a core in the app and half a core in
-the VMM, and halved the frame rate of anything drawing full screen.
+Before: each GL frame copied 4× on the CPU (GPU process readback mapped into the VMM frame buffer; VMM copy into its shadow and the shared frame buffer; app RGBA conversion; UI toolkit texture upload). At 2560x1600: ~1 core in the app, ½ in the VMM, half the frame rate full screen.
 
-Now, when the app starts the VMM (not when it reattaches to one):
+Now, when the app starts the VMM (not on reattach):
 
-- The app makes a mach receive port and starts `vroom run` with a send
-  right to it as its registered port (`mach_ports_register` around the
-  spawn, `vroom_ipc::mach`): no bootstrap name, nothing another process
-  can look up. The VMM takes it before it starts anything, and starts
-  the GPU process the same way with a port of its own. A child must be
-  started with posix_spawn for this (a process forked then exec'd gets a
-  right to some other port), so the GPU process now gets its fence
-  socket and guest RAM over its call socket (its stdin) instead of
-  inheriting them.
-- The app sends `ToVmm::Surfaces(true)` (message 110). For the first
-  monitor's GL scanout, a flush then asks the GPU process to blit the
-  scanout into one of three IOSurfaces of the monitor's size
-  (`gl.rs`, `Present`; on the GPU, with alpha set opaque), made when the
-  size changes and sent to the VMM as mach ports with
-  `[head, generation, slot, width, height]`. The VMM checks the sender
-  is its GPU process and the numbers are in range, and passes each port
-  on to the app without looking inside (its sandbox has no IOSurface).
-  When the blit is done the VMM sends `ToViewer::Surface` (message 110:
-  generation, slot, changed rect). At most 240 frames a second go into
-  surfaces; frames in between are skipped (the last one always goes) and
-  the guest doesn't wait for them.
-- The app checks each surface's sender (the VMM's pid, from the kernel),
-  size and format, and shows the latest one in a CALayer over the
-  screen's place in the window (`console/surfaces.rs`). Whenever
-  something of the app's is drawn over the screen (menus, messages, the
-  pause veil, the fullscreen bar, a drop), it hides the layer and asks
-  for pixels again (`Surfaces(false)`), first putting the last surface
-  into its own picture so nothing old flashes; the VMM then reads the
-  next frame back whole. Thumbnails and `VROOM_SHOT` pictures read the
-  surface on the CPU. Coherence, other monitors and reattached apps use
-  pixels. `VROOM_NO_SURFACES=1` in the app's environment turns it off.
-
-Windows' Direct3D scanouts are blobs read by the VMM, not GL scanouts:
-they still go as pixels.
+- Mach ports:
+  - App makes a receive port, starts `vroom run` with a send right as its registered port (`mach_ports_register` around the spawn, `vroom_ipc::mach`): no bootstrap name, nothing others can look up.
+  - VMM takes it before starting anything; starts the GPU process the same way with its own port.
+  - Needs posix_spawn (fork+exec gives a right to another port): the GPU process now gets its fence socket and guest RAM over its call socket (stdin) instead of inheriting them.
+- Frames:
+  - App sends `ToVmm::Surfaces(true)` (message 110).
+  - First monitor's GL scanout: a flush asks the GPU process to blit it into one of 3 monitor-sized IOSurfaces (`gl.rs`, `Present`; on the GPU, alpha forced opaque), made on size change, sent to the VMM as mach ports with `[head, generation, slot, width, height]`.
+  - VMM checks the sender is its GPU process and numbers in range; passes each port to the app unopened (its sandbox has no IOSurface).
+  - Blit done: VMM sends `ToViewer::Surface` (message 110: generation, slot, changed rect).
+  - ≤240 frames/s into surfaces; in-between frames skipped (the last always goes); guest never waits.
+- App (`console/surfaces.rs`):
+  - Checks each surface's sender (VMM pid, from the kernel), size, format; shows the latest in a CALayer over the screen's place in the window.
+  - Anything of the app's drawn over the screen (menus, messages, pause veil, fullscreen bar, a drop): hides the layer, asks for pixels (`Surfaces(false)`), first copying the last surface into its own picture (no stale flash); VMM then reads the next frame back whole.
+  - Thumbnails, `VROOM_SHOT`: read the surface on the CPU.
+  - Pixels instead: Coherence, other monitors, reattached apps. `VROOM_NO_SURFACES=1` (app env): off.
+- Windows Direct3D scanouts: blobs read by the VMM, not GL scanouts: still pixels.

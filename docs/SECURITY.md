@@ -2,398 +2,183 @@
 
 ## Threat model
 
-The guest is hostile: a compromised OS, or malware running in it. Goals, in
-order:
+Guest = hostile (compromised OS or malware in it). Goals, in order:
 
-1. A guest can't get code execution on the host.
-2. If it does (a VMM bug), it lands in a process that can do almost nothing.
-3. A guest can't read host data it wasn't given (files, clipboard, network).
+1. Guest can't get code execution on the host.
+2. If it does (VMM bug), it lands in a process that can do almost nothing.
+3. Guest can't read host data it wasn't given (files, clipboard, network).
 
-Out of scope: a malicious host, side channels the CPU itself leaks
-(Spectre-class issues are the hypervisor's and the OS's job), denial of
-service by a guest against its own VM.
+Out of scope: malicious host; CPU side channels (Spectre-class: hypervisor's and OS's job); guest DoS against its own VM.
 
 ## Layer 1: small, careful device code
 
-- One process per VM, written in Rust. `devices`, `virtio`, `arch`, `net`,
-  `config`, `snapshot`, `proto` and `video` are `forbid(unsafe_code)`;
-  unsafe code is confined to `hv`, `memory`, `sandbox`, `gpu3d`, `ipc`,
-  `usb` (libusb, loaded by the USB helper only, and IOKit device listing)
-  and a few FFI shims (VideoToolbox in the video helper among them), with
-  `// SAFETY:` notes.
-- Guest memory goes through bounds-checked `GuestMemory`; there are no raw
-  pointers into guest RAM in device code.
-- Every guest-controlled value is validated: virtqueue rings (loops, sizes,
-  indirect tables), NVMe PRP lists, xHCI rings and contexts, GPU resources
-  (sizes, counts, rects, backing entries), qcow2 headers and L1/L2 tables,
-  network packets, agent messages (size caps, UTF-8).
-- Hard limits on everything a guest can make us allocate: GPU resource
-  memory, pending fences, queue sizes, NAT connections and their buffers
-  (about 80 MiB at most), fragment memory, disk requests in flight.
-- Config parsing is strict: unknown keys are errors. `vroom check` (and
-  every start) also names risky but valid choices: sandbox off, writable or
-  home-wide shares, port forwards reachable from the LAN, host loopback
-  open to the guest, bridged networking.
-- Logging is capped (50 lines a second, errors excepted): a guest that
-  keeps tripping warnings can't flood the terminal or fill a log disk.
-- qcow2 backing files: only from the image's own directory or allow-listed
-  ones, no protocol prefixes, chain depth capped.
-- Imported VMware disks (VMDK, read-only): headers, grain tables and
-  descriptors are range-checked and capped like qcow2's; extent files must
-  be plain names next to their descriptor (no symlinks out); parents must
-  be `.vmdk` files, CIDs must match, chains are capped and loops refused.
+- One Rust process per VM.
+- `forbid(unsafe_code)`: `devices`, `virtio`, `arch`, `net`, `config`, `snapshot`, `proto`, `video`.
+- Unsafe only in `hv`, `memory`, `sandbox`, `gpu3d`, `ipc`, `usb` (libusb, loaded by the USB helper only; IOKit listing) and a few FFI shims (VideoToolbox in the video helper among them), each with `// SAFETY:` notes.
+- Guest memory only via bounds-checked `GuestMemory`; no raw pointers into guest RAM in device code.
+- Every guest value validated: virtqueue rings (loops, sizes, indirect tables), NVMe PRP lists, xHCI rings and contexts, GPU resources (sizes, counts, rects, backing entries), qcow2 headers and L1/L2 tables, network packets, agent messages (size caps, UTF-8).
+- Hard caps on guest-driven allocation: GPU resource memory, pending fences, queue sizes, NAT connections and buffers (~80 MiB max), fragment memory, disk requests in flight.
+- Strict config: unknown keys are errors. `vroom check` (and every start) flags risky valid choices: sandbox off, writable or home-wide shares, LAN-reachable port forwards, host loopback open, bridged networking.
+- Logging capped at 50 lines/s (errors excepted): a guest can't flood the terminal or fill a log disk.
+- qcow2 backing files: only the image's own dir or allow-listed ones; no protocol prefixes; chain depth capped.
+- VMDK import (read-only): headers, grain tables, descriptors range-checked and capped like qcow2; extent files plain names next to their descriptor (no symlinks out); parents must be `.vmdk`, CIDs must match, chains capped, loops refused.
 
 ## Layer 2: sandbox
 
-After the VM is built and before the guest runs, the VMM drops its
-privileges:
+VMM drops privileges after building the VM, before the guest runs.
 
-**macOS (Seatbelt, `sandbox_init`)**: deny by default. Allowed: the VM's own
-disk images and state directory, outbound sockets only if NAT is used,
-accept only on the configured port-forward sockets, the pasteboard only if
-clipboard sync is on. No exec, no new listeners, no reading the user's
-files (tested: `/etc/passwd`, `~/.ssh`, `exec` and `bind` all fail).
+| | |
+|---|---|
+| macOS (Seatbelt, `sandbox_init`) | deny by default. Allowed: VM's disk images and state dir; outbound sockets only if NAT is used; accept only on configured port-forward sockets; pasteboard only if clipboard sync is on. No exec, no new listeners, no user files (tested: `/etc/passwd`, `~/.ssh`, `exec`, `bind` all fail) |
+| Linux (Landlock + seccomp) | Landlock: same files and dirs. seccomp: only syscalls the VMM uses (no `bind`, `execve`, `ptrace`...); signals only to own threads (`tgkill` with our pid); new sockets IPv4/IPv6 only (no Unix, netlink, packet). Anything else kills the process |
 
-**Linux (Landlock + seccomp)**: Landlock limits the filesystem to the same
-files and directories; seccomp allows only the syscalls the VMM uses (no
-`bind`, `execve`, `ptrace`...). Signals go only to our own threads
-(`tgkill` with our pid); new sockets only for IPv4/IPv6 (no Unix,
-netlink or packet sockets). Anything else kills the process.
+Network reach of the VMM itself:
 
-Network reach of the VMM process itself: on macOS the profile allows IP
-only (no Unix sockets, so no ssh-agent or docker.sock) and denies the host's
-loopback unless `allow_host_loopback` (port 53 stays open if the host's
-resolver is local). On Linux, seccomp can't see addresses: loopback is
-refused by the NAT code only.
+- macOS: IP only (no Unix sockets: no ssh-agent, no docker.sock); host loopback denied unless `allow_host_loopback` (port 53 stays open if the host resolver is local).
+- Linux: seccomp can't see addresses; loopback refused by the NAT code only.
 
-`--no-sandbox` exists for debugging and prints a warning.
+`--no-sandbox`: debugging only, prints a warning.
 
-Check it on your machine: `VROOM_SANDBOX_SELFTEST=1 vroom run vm.toml`
-makes the VMM, once locked down, try to read `/etc/passwd` and
-`~/.ssh`, exec a program, open a listener, reach host loopback
-(`VROOM_SELFTEST_LOOPBACK_PORT=<a port you listen on>`), connect to
-`$SSH_AUTH_SOCK` and reach the internet, and print what happened. On
-Linux the Unix-socket probe ends the process (seccomp kills it): that is
-the expected result.
+Self-test:
+
+```bash
+VROOM_SANDBOX_SELFTEST=1 vroom run vm.toml
+VROOM_SELFTEST_LOOPBACK_PORT=<a port you listen on>   # for the loopback probe
+```
+
+Once locked down, the VMM tries: read `/etc/passwd` and `~/.ssh`, exec, open a listener, reach host loopback, connect to `$SSH_AUTH_SOCK`, reach the internet; prints results. Linux: the Unix-socket probe ends the process (seccomp kill) = expected.
 
 ## Clipboard
 
-Text only, size capped, and sync happens only while the VM window has focus.
-A background guest can't read what you copy on the host, and can't push to
-your clipboard behind your back. Headless runs need explicit push/pull.
-
-The GUI (`vroom-gui`) is not sandboxed, so it treats the VMM like the
-guest-exposed process it is: it applies the clipboard policy from the VM's
-config itself (never sends the host clipboard if `host_to_guest` is off,
-never sets it if `guest_to_host` is off, focus and size limits too),
-caps and cleans status text, checks every mode and rectangle against the
-shared framebuffer, and on Linux only maps a framebuffer memfd that is
-sealed against shrinking (a VMM shrinking it would crash the GUI).
-
-The app (same binary, no arguments) also reads VM state dirs, which the
-sandboxed VMM can write: it only parses snapshot manifests (JSON, size
-checked) and checks for the lock and the suspend marker there. Pictures
-it shows come from its own data dir, taken from the shared framebuffer,
-never from image files a VMM could have planted. Snapshot names from VMM
-status messages must be valid names before they become file names.
+- Text only, size capped, sync only while the VM window has focus. Background guest can't read host copies or push to your clipboard. Headless: explicit push/pull.
+- `vroom-gui` is not sandboxed, so it treats the VMM as guest-exposed:
+  - applies the VM config's clipboard policy itself (never sends host clipboard if `host_to_guest` off; never sets it if `guest_to_host` off; focus and size limits)
+  - caps and cleans status text
+  - checks every mode and rect against the shared framebuffer
+  - Linux: maps only a framebuffer memfd sealed against shrinking (a shrinking VMM would crash the GUI)
+- The app (same binary, no args) reads VM state dirs the sandboxed VMM can write: parses only snapshot manifests (JSON, size checked), checks lock and suspend marker.
+- Pictures it shows: its own data dir, taken from the shared framebuffer; never image files a VMM could plant.
+- Snapshot names from VMM status messages must be valid names before becoming file names.
 
 ## Drag and drop
 
-Files dragged onto a VM window are read by the app, which the user
-dragged them to, never by the VMM: its sandbox opens no file of the
-user's. The app writes them into a pipe it hands the VMM; the VMM checks
-each frame (this drop's id, file entries and data only, size-capped) and
-passes it to the guest agent. While files only hover, the guest gets
-their names and nothing else, so a guest can't read what the user merely
-dragged across its window.
+Mac → guest:
 
-In the guest the agent checks every path again (relative, no `..`, no
-names Windows reads another way, under a name the drag announced) and
-writes no more bytes than each file announced. Files land in a staging
-folder of the logged-in user (their temp folder on Windows, their cache
-folder on Linux), then go where the drop lands. The drag window the agent
-puts under the pointer (Windows, X11) only starts a drag of those files.
+- Files read by the app (the drag target), never the VMM (its sandbox opens no user file).
+- App writes them into a pipe handed to the VMM; VMM checks each frame (this drop's id, file entries and data only, size-capped), passes it to the agent.
+- While hovering: guest gets names only. Dragging across a window leaks no content.
+- Agent rechecks every path (relative, no `..`, no names Windows reads another way, under an announced name), writes no more bytes than announced.
+- Files land in the logged-in user's staging folder (Windows: temp; Linux: cache), then where the drop lands.
+- Agent's drag window (Windows, X11) only starts a drag of those files.
 
-Files dragged out of the guest go the other way, and there the guest is
-the one to distrust. It can only answer a question: the app asks once
-per press of the mouse button, when the mouse leaves the guest screen
-with the button held, and the VMM takes one answer per question; a list
-of names alone starts a drag on the Mac but copies nothing. Data only
-flows when something on the Mac takes the drop and asks for an item, and
-only that item. The guest picks the names and the sizes, so both are
-checked twice, in the VMM and in the app (vroom-proto's `TreeCheck`):
-names `drop_name_ok` takes (no `/`, `..`, control characters), the item
-asked for first, every entry inside a folder announced before it, no
-more bytes than a file announced, at most 200,000 entries; frames of an
-item the app gave up on carry an old stream number and are dropped. A
-guest that breaks a rule loses the drag. The app, not the VMM, writes
-the files, where the Mac drop says: it only creates new files and
-folders (`O_EXCL`, `O_NOFOLLOW`, `mkdir`), never writes through a link
-or over something there (a taken name gets a number), removes what it
-wrote if the copy fails, and stops when the disk would have less than
-2 GB free. In the guest the agent reads only the paths the desktop's
-drag handed its drop target, and leaves out links inside folders.
+Guest → Mac (guest is the one to distrust):
+
+- Guest only answers a question: asked once per mouse-button press, when the mouse leaves the guest screen with the button held; VMM takes one answer per question.
+- A name list alone starts a Mac drag but copies nothing. Data flows only when something on the Mac takes the drop and asks for an item, and only that item.
+- Names and sizes checked twice, VMM and app (vroom-proto `TreeCheck`): `drop_name_ok` names (no `/`, `..`, control characters); asked-for item first; every folder entry announced before it; no more bytes than announced; ≤200,000 entries. Frames of an abandoned item carry an old stream number: dropped. A rule break loses the drag.
+- App (not VMM) writes the files where the Mac drop says: new files/folders only (`O_EXCL`, `O_NOFOLLOW`, `mkdir`), never through a link or over existing (taken name gets a number), removes partial output on failure, stops at <2 GB free.
+- Agent reads only paths the desktop handed its drop target; skips links inside folders.
 
 ## Coherence
 
-In Coherence the guest decides what windows appear on the Mac desktop,
-where, and with what title. That is the guest's word, so:
+The guest decides which windows appear on the Mac, where, with what title. Treated as the guest's word:
 
-- The list is checked three times (agent protocol in the VMM, viewer
-  protocol in the app, then the app itself): at most 64 windows, ids
-  unique, titles of at most 256 bytes of UTF-8, sizes within 65536
-  pixels. The app clips every window to the guest's screen and shows at
-  most 24. Titles lose control and direction-changing characters and are
-  cut to 80 characters. A guest that floods lists costs one queued list
-  in the VMM and one in the app.
-- App icons are the guest's pictures: raw RGBA, at most 64x64, exactly
-  that many bytes, checked by the VMM's and the app's decoders and once
-  more before they become an image. No image format is decoded on the
-  Mac. Only icons of windows in the last list are passed on; a guest
-  that floods them costs one waiting icon per window (at most 128) in the
-  VMM and in the app. Icons show in our bar next to the title, never in
-  the strip, the Dock or the menu bar.
-- Every Coherence window carries a strip the app draws above the guest's
-  picture, with the VM's name and the window's title; the guest can't draw
-  over it, and has no way to open a window without it. Its macOS window
-  title starts with the VM's name too (Mission Control, the Window menu).
-- The guest's screen is placed inside the Mac screen's free area: guest
-  windows can't cover the menu bar, the Dock or the Coherence bar, and
-  they sit at the normal window level (never above other apps' windows by
-  level).
-- New guest windows open behind other apps' windows while vroom isn't the
-  app in front, and the guest's window order is only applied while it is:
-  a guest can't pop windows over what the user is working on. It still
-  can while the user works in one of its windows.
-- Clicking a Mac window activates its guest window; menus and other
-  windows without a title are never activated. The guest is asked to
-  act only on windows of its last list (the VMM and the agent both
-  check), and only to bring them to the front, minimize, close them
-  politely (`SC_CLOSE`, the app may refuse) or move them.
-- The clipboard rules don't change: sync only while one of the VM's
-  windows (or the bar) has the keyboard.
-- The bar's app field sends a name to the guest (one line of plain
-  text, at most 256 bytes, checked by the viewer protocol, the VMM and
-  the agent). Nothing on the Mac is started. Keys typed in the field
-  stay out of the guest until Enter.
-- In the guest, that name only picks one of the apps installed there:
-  Windows: a Start menu shortcut (`.lnk` in ProgramData's or the user's
-  Start menu folder) or an app of `shell:AppsFolder` (Store apps, by
-  their AppUserModelID); Linux: a desktop entry of the menu (the XDG
-  data dirs; entries the menu hides, NoDisplay, Hidden, OnlyShowIn
-  another desktop, are left out). The name is only compared with the
-  apps' names. It never becomes a command line, an argument, a path or
-  a file to open. That is the boundary: the host can start what the
-  user could start from the guest's menu, and nothing else, with no
-  files and no options. Linux runs the entry with `gio launch` or its
-  own Exec line split into words (field codes out), never through a
-  shell, as the session's user; an agent running as root refuses.
-  Windows opens the shortcut, or `shell:AppsFolder\<id>`, with
-  `ShellExecute` from the user's session helper. Only when no app has
-  the name, and the name is plain (letters, digits, spaces and a few
-  marks: no path, no command line), does Windows fall back to typing it
-  into Start's search, as the user would; that may pick something else
-  (a web search). The host has the guest's keyboard anyway.
-- The list of apps the guest sends for the field to suggest (`Apps`) is
-  the guest's word too: at most 512, each name a line the field could
-  send and given once, icons raw RGBA of at most 32x32 with exactly that
-  many bytes, checked by the VMM's and the app's decoders and once more
-  before they become an image. Passed on only in Coherence, and only
-  shown as suggestions: a guest that lies about its apps can make the
-  field suggest a name, and that name goes back to the guest's own
-  matching above. The guest reads its icons and logos itself (PNG files
-  of at most 4 MB and 1024x1024; Store app manifests without DTDs); no
-  image format is decoded on the Mac.
-- "Coherence can't work here" from the guest (Wayland) is one line of
-  plain text, cleaned again before the app shows it.
-- The guest's screen follows the bar to another Mac screen, never on the
-  guest's say: only where the user put the bar. Windows the user drags
-  off the guest's screen stay on it in the guest.
-- In the guest, window events (Windows hooks, X11 events) only wake the
-  helper, at most every 10 ms: a guest app that moves windows all the
-  time costs the helper's CPU and a list per look, coalesced as above.
-- X11: the helper acts on windows as a taskbar does (client messages to
-  the window manager) and only on windows of its last list. It may hide
-  Ubuntu's dock (a user setting, put back after) and GNOME's top bar
-  (it enables the guest tools' own GNOME Shell extension, which does
-  nothing else, and disables it after).
+- Window list checked 3× (agent protocol in VMM, viewer protocol in app, app itself): ≤64 windows, unique ids, titles ≤256 bytes UTF-8, sizes ≤65536 px. App clips every window to the guest screen, shows ≤24. Titles lose control and direction-changing characters, cut to 80 chars. Flooding costs one queued list in VMM, one in app.
+- App icons: raw RGBA, ≤64x64, exact byte count, checked by VMM and app decoders and again before becoming an image. No image format decoded on the Mac. Only icons of last-list windows passed on; flood = one waiting icon per window (≤128) in VMM and app. Shown in our bar next to the title; never in the strip, Dock, menu bar.
+- Every Coherence window has a strip drawn by the app above the guest picture: VM name + window title. Guest can't draw over it, can't open a window without it. macOS window title starts with the VM name (Mission Control, Window menu).
+- Guest screen placed inside the Mac screen's free area: can't cover menu bar, Dock, Coherence bar; normal window level (never above other apps by level).
+- New guest windows open behind other apps' windows while vroom isn't frontmost; guest window order applied only while it is: no popping over the user's work (still possible while the user works in one of its windows).
+- Clicking a Mac window activates its guest window; menus and untitled windows never activated. Guest asked to act only on last-list windows (VMM and agent check), only: front, minimize, polite close (`SC_CLOSE`, app may refuse), move.
+- Clipboard unchanged: sync only while a VM window (or the bar) has the keyboard.
+- Bar app field sends a name: one line of plain text ≤256 bytes, checked by viewer protocol, VMM, agent. Nothing on the Mac is started. Typed keys stay out of the guest until Enter.
+- In the guest, the name only picks an installed app:
+  - Windows: Start menu `.lnk` (ProgramData's or the user's) or a `shell:AppsFolder` app (Store, by AppUserModelID). Opened with `ShellExecute` (shortcut or `shell:AppsFolder\<id>`) from the user's session helper.
+  - Linux: menu desktop entry (XDG data dirs; hidden ones, NoDisplay, Hidden, OnlyShowIn another desktop, excluded). Run with `gio launch` or its Exec line split into words (field codes out), never via a shell, as the session user. Agent running as root refuses.
+  - The name is only compared with app names; never a command line, argument, path or file. Boundary: host starts what the user could start from the guest menu, nothing else, no files, no options.
+  - Windows fallback, only if no app matches and the name is plain (letters, digits, spaces, a few marks: no path, no command line): typed into Start search as the user would; may pick something else (web search). Host has the guest keyboard anyway.
+- `Apps` list (suggestions) is the guest's word too: ≤512, each name a sendable line, given once; icons raw RGBA ≤32x32, exact bytes, checked by VMM and app decoders and again. Passed only in Coherence, shown only as suggestions: a lying guest can make the field suggest a name, which goes back to the guest's own matching. Guest reads its icons/logos itself (PNG ≤4 MB, ≤1024x1024; Store manifests without DTDs); no image format decoded on the Mac.
+- "Coherence can't work here" (Wayland): one plain line, cleaned again before display.
+- Guest screen follows the bar to another Mac screen only where the user put the bar, never on the guest's say. Windows the user drags off the guest screen stay on it in the guest.
+- Guest window events (Windows hooks, X11 events) only wake the helper, ≤ every 10 ms: a window-moving app costs helper CPU and a list per look, coalesced.
+- X11: helper acts like a taskbar (client messages to the WM), only on last-list windows. May hide Ubuntu's dock (user setting, restored) and GNOME's top bar (enables the tools' own Shell extension, which does nothing else; disables after).
 
-What's left: a guest app can still draw anything below the strip,
-including something that looks like a Mac dialog. The strip says whose
-window it is; read it before typing a password into a window.
+Left: a guest app can draw anything below the strip, including a fake Mac dialog. The strip says whose window it is: read it before typing a password.
 
+## Network
 
-
-NAT is a userspace proxy: the guest never gets raw access to the host
-network stack. Host loopback is unreachable unless `allow_host_loopback`;
-`block_private` keeps the guest off your LAN. Bridged and host-only go
-through `vroom-netd`, which enforces allow-listed interfaces and source
-MAC anti-spoofing (see [the root helper](#the-root-helper-vroom-netd)).
+- NAT: userspace proxy; guest never gets raw access to the host network stack.
+- Host loopback unreachable unless `allow_host_loopback`. `block_private`: guest off your LAN.
+- Bridged, host-only: via `vroom-netd`: allow-listed interfaces, source-MAC anti-spoofing ([the root helper](#the-root-helper-vroom-netd)).
 
 ### Network changes while the VM runs
 
-An adapter's cable and network can change while the VM runs (see
-[NETWORKING.md](NETWORKING.md#changing-adapters-while-the-vm-runs)). The
-sandbox stays as it was set at start; nothing here widens it.
+Cable and network change live ([NETWORKING.md](NETWORKING.md#changing-adapters-while-the-vm-runs)). The sandbox stays as set at start; nothing here widens it.
 
-- **Who asks**: the VM window (`ToVmm::NetConnect`, `ToVmm::NetSet`,
-  `ToVmm::NetAdd`, `ToVmm::NetRemove`, viewer messages 40, 41, 95 and
-  96). The guest has no way to send them. The VMM checks each like guest
-  input: adapter index, mode, names (the VM file's rules), forwards
-  (count, addresses), MAC (unicast, not one an adapter has), and that a
-  bridged or host-only change comes with its socket.
-- **Adding and removing adapters** (a VM on PCI) builds the same
-  virtio-net device with the same backends as at start, in a PCI
-  Express hot plug slot (below), at most 8 adapters. Removing works only
-  on an adapter added that way; one the VM started with only has its
-  cable pulled.
-- **Bridged and host-only**: the sandboxed VMM can't open Unix sockets,
-  so it can't reach vroom-netd after start, and that stays so. The app
-  asks netd for the port, as the user (netd's checks and per-user
-  limits apply as for any request), and hands the VMM the frame socket
-  over the window's connection (SCM_RIGHTS), as for USB helpers. What
-  the VMM gets is what it gets at start: one datagram socket of Ethernet
-  frames for one adapter, behind netd's interface allow-list and
-  source-MAC check. Opening sockets itself would have needed Unix
-  sockets in its sandbox (ssh-agent, docker.sock); a socket handed over
-  reaches only netd's port. The MAC in the app's request is the one the
-  VMM reports for the adapter, made locally administered: netd refuses
-  other MACs whoever asks, and on macOS vmnet picks its own anyway.
-- **NAT**: the VMM's own, and only if its sandbox already allows
-  connections out (a NAT adapter at start). A VM that started with only
-  bridged or host-only adapters has no network in its sandbox and gets
-  none later: NAT waits for its next start. `allow_host_loopback` turned
-  on later works only if an adapter had it at start (the sandbox refuses
-  the host's loopback otherwise; the NAT code doesn't even try).
-- **Port forwards** need listening sockets, which the sandbox never
-  allows: new ones wait for the next start. A NAT the adapter started
-  with is kept, forwards and all, while the adapter is on another
-  network: its listening sockets stay open, so a connection to a
-  forwarded port then waits until the adapter is back on NAT.
-- **MAC translation**: when a vmnet port passes another MAC than the
-  guest's (the adapter started on NAT), the VMM rewrites one to the
-  other in frames: Ethernet, ARP, the DHCP client address, IPv6 neighbor
-  discovery options (`vroom-net/src/mac.rs`). Every offset is checked;
-  frames it can't parse pass unchanged. netd still drops frames whose
-  source isn't the port's MAC, so a guest can't use it to send as
-  another machine.
-- A cable pulled out drops frames both ways in the VMM: nothing reaches
-  the guest or leaves it on that adapter.
+- **Who asks**: the VM window only (`ToVmm::NetConnect`, `ToVmm::NetSet`, `ToVmm::NetAdd`, `ToVmm::NetRemove`; viewer messages 40, 41, 95, 96). Guest can't send them. VMM checks each like guest input: adapter index, mode, names (VM file rules), forwards (count, addresses), MAC (unicast, not another adapter's), bridged/host-only change comes with its socket.
+- **Add/remove adapters** (PCI VM): same virtio-net device, same backends as at start, in a PCIe hot plug slot (below), ≤8 adapters. Remove only works on hot-added ones; a start-time adapter just has its cable pulled.
+- **Bridged, host-only**: sandboxed VMM can't open Unix sockets, can't reach vroom-netd after start; stays so.
+  - App asks netd for the port as the user (netd checks and per-user limits apply), hands the VMM the frame socket over the window connection (SCM_RIGHTS), as for USB helpers.
+  - VMM gets what it gets at start: one datagram socket of Ethernet frames for one adapter, behind netd's interface allow-list and source-MAC check.
+  - Opening sockets itself would need Unix sockets in its sandbox (ssh-agent, docker.sock); a handed-over socket reaches only netd's port.
+  - MAC in the request: the one the VMM reports for the adapter, made locally administered. netd refuses other MACs from anyone; macOS vmnet picks its own anyway.
+- **NAT**: the VMM's own, only if its sandbox already allows outbound connections (a NAT adapter at start). VM started with only bridged/host-only: no network in its sandbox, none later; NAT waits for next start. `allow_host_loopback` turned on later works only if an adapter had it at start (sandbox refuses loopback otherwise; NAT code doesn't try).
+- **Port forwards** need listening sockets, never allowed by the sandbox: new ones wait for next start. Start-time NAT kept (forwards included) while the adapter is on another network: listeners stay open, a forwarded connection waits until the adapter is back on NAT.
+- **MAC translation**: vmnet port passing another MAC than the guest's (adapter started on NAT): VMM rewrites in frames: Ethernet, ARP, DHCP client address, IPv6 ND options (`vroom-net/src/mac.rs`). Every offset checked; unparseable frames pass unchanged. netd still drops frames whose source isn't the port's MAC: no sending as another machine.
+- Cable out: VMM drops frames both ways on that adapter.
 
 ### PCI hot plug slots
 
-A VM on PCI has four PCI Express root ports (ARCHITECTURE.md, "PCI hot
-plug"). What the guest reaches through them:
+PCI VMs: 4 PCIe root ports ([ARCHITECTURE.md](ARCHITECTURE.md#pci-hot-plug)). Guest reach:
 
-- Each port's config space: a bridge header (bus numbers, memory
-  windows: plain registers, masked as on real hardware), the PCI Express
-  capability (Slot Control and Status, Link Status) and an MSI. All in
-  `devices` (`forbid(unsafe_code)`), fixed size, every write masked.
-- Config cycles for other buses: routed to the port whose secondary bus
-  the guest set, device 0 only, and only while the slot has power; any
-  other bus, device or function reads all ones. A guest that gives two
-  ports the same bus reaches the first one's device.
-- The memory windows are not enforced: a device behind a port answers
-  at the BAR address the guest gave it, as devices on the root bus do.
-  A guest can only point its own devices at its own address space.
-- The slot's state machine: the guest can't plug anything in (only the
-  host does, from the VM window), and can't keep a device it was asked
-  to give back (pulled out after 15 seconds). Powering a slot off
-  without being asked only takes its link down. Devices taken out are
-  dropped after every lock is released.
-- Slot events raise one MSI per rising edge, or a level INTx: a guest
-  can't make a port send more interrupts than it writes commands.
-- A snapshot restores a device into a slot only if the VM was built
-  with that device there (the manifest's `net.hotplug`, checked: slot
-  numbers in range, each used once).
+- Each port's config space: bridge header (bus numbers, memory windows: plain registers, masked as on real hardware), PCIe capability (Slot Control/Status, Link Status), MSI. In `devices` (`forbid(unsafe_code)`), fixed size, every write masked.
+- Config cycles for other buses: routed to the port whose secondary bus the guest set, device 0 only, only while the slot has power; anything else reads all ones. Two ports given the same bus: the first one's device.
+- Memory windows not enforced: a device behind a port answers at the BAR the guest gave it (as on the root bus). Guest can only point its own devices at its own address space.
+- Slot state machine: guest can't plug anything in (host only, from the VM window); can't keep a device it was asked to return (pulled after 15 s). Powering a slot off unasked only drops its link. Removed devices dropped after every lock is released.
+- Slot events: one MSI per rising edge, or a level INTx: no more interrupts than commands written.
+- Snapshot restores a device into a slot only if the VM was built with it there (manifest `net.hotplug`, checked: slot numbers in range, each once).
 
 ## Shared folders
 
-Off unless configured, read-only unless `readonly = false`. The host side
-(`vroom-fs`) walks every guest path one component at a time with
-`openat(O_NOFOLLOW)` from an fd on the share root: a symlink anywhere ends
-the walk, so neither a guest-planted link nor one swapped in on the host
-mid-walk leads outside. Names with `/`, NUL, `.` or `..` are refused; only
-regular files and directories are opened (no FIFOs, devices, sockets);
-the guest can't create links or device nodes. Node, handle and directory
-listing counts are capped, and so are path lengths (4096 bytes) and the
-memory all node paths take together. The sandbox only grants the share's
-own subtree (read-only shares: read access only; writable ones: no set-id
-bits, owner changes, ACLs, file flags or extended attributes). The FUSE
-server is fuzzed, as both clients and on both kinds of share.
-
-Windows guests (virtio-win's virtiofs.exe) get the same server. Names
-that mean something special to Windows (`name:stream`, `CON`, trailing
-dots) are plain names on a Mac or Linux host: they stay inside the share.
-So does a Mac's `file/..namedfork/rsrc`, since a file is never walked
-through. The only extra name accepted is `.` for "this directory", which
-the Windows client uses for the root; `..` is still refused. The guest
-side needs WinFsp: setup installs one pinned version and checks its
-SHA-256 first.
+- Off unless configured; read-only unless `readonly = false`.
+- Host side (`vroom-fs`): every guest path walked one component at a time with `openat(O_NOFOLLOW)` from the share root fd. A symlink anywhere ends the walk: neither guest-planted nor host-swapped-mid-walk links lead outside.
+- Refused names: `/`, NUL, `.`, `..`. Only regular files and directories opened (no FIFOs, devices, sockets). Guest can't create links or device nodes.
+- Capped: node, handle, directory listing counts; path length 4096 bytes; total memory of all node paths.
+- Sandbox grants only the share's subtree. Read-only shares: read only. Writable: no set-id bits, owner changes, ACLs, file flags, extended attributes.
+- FUSE server fuzzed, as both clients, on both kinds of share.
+- Windows guests (virtio-win virtiofs.exe), same server:
+  - Windows-special names (`name:stream`, `CON`, trailing dots) are plain names on Mac/Linux hosts: stay inside the share. Same for Mac `file/..namedfork/rsrc` (a file is never walked through).
+  - Only extra name accepted: `.` = this directory (client uses it for the root). `..` still refused.
+  - Guest needs WinFsp: setup installs one pinned version, checks SHA-256 first.
 
 ## Sound
 
-Off unless `[audio] output` or `input` is on. PCM goes over a datagram
-socket to a helper process (`vroom audio-out`) that plays it, so
-CoreAudio and the plug-ins it loads never run in the VMM. The helper
-runs under its own Seatbelt profile: system libraries, the CoreAudio
-services and the audio user client only; no user files, no network, no
-exec. The VMM never blocks on it (it drops audio instead).
-
-Both sound cards parse guest input with the same care as the rest:
-virtio-snd chains as virtqueues; HD Audio registers of any width and
-offset, CORB/RIRB rings (pointers masked to the ring size, one pass per
-doorbell), buffer descriptor lists (index masked, empty or unreachable
-entries stop the stream with an error), DMA amounts capped per tick.
-Both are fuzzed.
+- Off unless `[audio] output` or `input`.
+- PCM over a datagram socket to `vroom audio-out`, which plays it: CoreAudio and its plug-ins never run in the VMM.
+- Helper Seatbelt profile: system libraries, CoreAudio services, audio user client only. No user files, network, exec.
+- VMM never blocks on it (drops audio instead).
+- Guest input parsing: virtio-snd chains as virtqueues; HD Audio registers of any width/offset, CORB/RIRB rings (pointers masked to ring size, one pass per doorbell), buffer descriptor lists (index masked; empty or unreachable entries stop the stream with an error), DMA amounts capped per tick. Both fuzzed.
 
 ### Microphone
 
-There is a microphone path now, off by default. How it works:
+Off by default.
 
-- `[audio] input = false` (the default): the guest's sound card has no
-  input at all (no capture stream, no mic pin). The helper is started
-  without `--input`, so it refuses to record whatever the VMM asks, and
-  its Seatbelt profile has no `device-microphone`. Both are fixed before
-  the guest runs; a guest that took over the VMM can't change them.
-- `input = true`: the helper may record and its profile allows the
-  microphone. The VMM itself still has no microphone access: only the
-  helper talks to CoreAudio (or ALSA). The VMM asks for audio only
-  while a VM window is open (a viewer is connected; headless runs never),
-  the VM runs (pausing stops it) and the guest records. The window shows
-  "Microphone in use" whenever the VMM says it asked.
-- What that gate does not cover: with `input = true`, the gate and the
-  indicator are enforced by the VMM process. A guest that broke out into
-  the VMM could ask the helper for the microphone at any time while the
-  VM runs, and not tell the window. macOS's own indicator (the orange
-  dot in the menu bar) can't be faked by it. That's why it's opt-in.
-- macOS asks for the microphone permission on behalf of the app that
-  started vroom (Terminal, iTerm, VS Code...): a yes covers everything
-  started from that app, not just vroom. See [GUIDE.md](GUIDE.md#microphone).
-- What the helper sends back is parsed by the VMM like guest input
-  (sizes, whole frames, a generation number so audio from an earlier
-  request is dropped), and at most a quarter second is buffered.
+- `[audio] input = false` (default): sound card has no input (no capture stream, no mic pin); helper started without `--input`, refuses to record; its profile lacks `device-microphone`. All fixed before the guest runs; a guest owning the VMM can't change them.
+- `input = true`: helper may record, profile allows the mic. VMM itself has no mic access; only the helper talks to CoreAudio (or ALSA).
+- VMM asks for audio only while: a VM window is open (viewer connected; never headless), the VM runs (pause stops it), the guest records. Window shows "Microphone in use" whenever the VMM asked.
+- Gap: with `input = true`, gate and indicator are enforced by the VMM. A guest that broke into the VMM could ask the helper for the mic any time the VM runs, without telling the window. macOS's orange menu-bar dot can't be faked. Hence opt-in.
+- macOS grants mic permission to the app that started vroom (Terminal, iTerm, VS Code...): a yes covers everything started from it. [GUIDE.md](GUIDE.md#microphone).
+- Helper replies parsed like guest input (sizes, whole frames, generation number drops audio from earlier requests); ≤¼ s buffered.
 
 ### Camera
 
-Off unless `camera = true`; then there is a USB camera in the guest and a
-helper process (`vroom camera-helper`) with a Seatbelt profile of its
-own: the camera, the system's camera services and frame buffers
-(IOSurface), reading the system's libraries; no files of the user's, no
-writes, no network, no exec. The VMM never touches the camera. It asks
-the helper for frames only while a window is open and the guest reads
-them (two seconds after the guest stops, the camera goes off), and the
-window shows "Camera in use" whenever it asked. The same limit as the
-microphone applies: a guest that broke out into the VMM could ask for the
-camera while the VM runs without telling the window; macOS's green
-camera light can't be faked by it. Frames from the helper are checked
-like guest input (size, a whole frame) before they reach the guest.
+- Off unless `camera = true`: USB camera in the guest + `vroom camera-helper` with its own Seatbelt profile: camera, system camera services, frame buffers (IOSurface), system library reads. No user files, writes, network, exec.
+- VMM never touches the camera. Asks for frames only while a window is open and the guest reads them (camera off 2 s after the guest stops); window shows "Camera in use" whenever it asked.
+- Same gap as the mic: a VMM-escaped guest could ask for frames while the VM runs without telling the window; macOS's green camera light can't be faked.
+- Helper frames checked like guest input (size, whole frame).
 
 ## Video decoding
 
-Off unless `[display] video_decode = true`. A guest's video stream is
-about the most hostile input there is: decoders are big, old C code. So
-the decoding never happens in the VMM:
+Off unless `[display] video_decode = true`. A video stream is about the most hostile input there is (big, old C decoders): decoding never happens in the VMM.
 
 ```text
 guest V4L2 decoder --virtio-media--> VMM device (Rust)  --socket--> vroom video-helper --XPC--> Apple's decoder service
@@ -403,89 +188,43 @@ guest V4L2 decoder --virtio-media--> VMM device (Rust)  --socket--> vroom video-
                                                                      the granted buffers
 ```
 
-The VMM's device (`virtio/src/devices/media`, no unsafe code) speaks
-V4L2 to the guest and nothing else: every ioctl is size-checked, queue
-types, buffer indices, memory types and control values are checked, at
-most 8 decoders, 16 bitstream buffers (8 MiB each at most) and 24 picture
-buffers each (4096x2304 at most). The buffers live in one shared memory
-window of 1 GiB the guest maps; the guest can only map our buffers'
-offsets in it. A bitstream is copied out of the window before it goes
-anywhere (the guest can't change it under the helper), and no more than
-16 MiB or 32 buffers per decoder wait at the helper. Pending events are
-capped.
+VMM device (`virtio/src/devices/media`, no unsafe):
 
-The helper (`vroom video-helper`, one per VM, started before the VMM's
-sandbox goes up) runs under its own Seatbelt profile: system libraries
-(read), VideoToolbox's decoder service (an XPC service, the only
-service it may look up) and frame buffers (IOSurface). No files, no
-network, no exec, no GPU, no writes. Besides its socket it holds the
-buffer window: the VMM passes it the window's shared memory object at
-start, and it writes each picture straight into a guest buffer there.
-That is all the guest memory it gets: the window holds only decoder
-buffers, never guest RAM.
+- Speaks V4L2 only. Every ioctl size-checked; queue types, buffer indices, memory types, control values checked.
+- Limits: ≤8 decoders; per decoder 16 bitstream buffers (≤8 MiB each), 24 picture buffers (≤4096x2304).
+- Buffers in one 1 GiB shared window the guest maps; guest can map only our buffers' offsets.
+- Bitstream copied out of the window before going anywhere (no change under the helper). ≤16 MiB or 32 buffers per decoder waiting at the helper. Pending events capped.
 
-Before VideoToolbox sees anything the helper takes the stream apart
-itself (`crates/video`, fuzzed): H.264 / HEVC NAL units (4096 per buffer
-at most), parameter sets (4 KiB each, ids within what the standards
-allow), access units (256 per buffer), slice headers for the display
-order; VP9 superframe indexes and frame headers up to the frame size;
-AV1 OBU headers and sequence headers (1 KiB at most). VideoToolbox gets
-parameter sets and length-prefixed access units, VP9 frames whose header
-we read, AV1 temporal units without delimiters or padding, and a
-sequence header we parsed.
+Helper (`vroom video-helper`, one per VM, started before the VMM sandbox):
 
-Each side treats the other as hostile. The helper takes from the VMM
-only messages of known kinds within their size (8 MiB of bitstream, a
-grant for at most one 4K P010 picture), for 8 sessions, 64 queued buffers
-and 64 grants each. It writes a picture only into a grant that lies in
-the window and is big enough for it. The VMM takes from the helper only
-pictures in the oldest buffer it granted (the helper must name it), under
-the current epoch (one that changes whenever the guest's buffers do), of
-exactly the size the stream's format makes; a format must be a valid
-size and depth; more than 256 unread messages, or a write that blocks for
-2 seconds, and the helper counts as gone. Then the guest's decoders fail
-with `EIO` and the rest of the VM runs on. The VMM never reads a
-picture.
+- Own Seatbelt profile: system libraries (read), VideoToolbox decoder XPC service (the only lookup allowed), IOSurface. No files, network, exec, GPU, writes.
+- Holds its socket + the buffer window (shm object passed at start); writes pictures straight into guest buffers there. Window holds only decoder buffers, never guest RAM.
+- Parses the stream before VideoToolbox (`crates/video`, fuzzed): H.264/HEVC NAL units (≤4096 per buffer), parameter sets (≤4 KiB each, ids within standard ranges), access units (≤256 per buffer), slice headers for display order; VP9 superframe indexes and frame headers up to frame size; AV1 OBU and sequence headers (≤1 KiB).
+- VideoToolbox gets: parameter sets + length-prefixed access units; VP9 frames whose header we read; AV1 temporal units without delimiters/padding + a sequence header we parsed.
 
-A helper taken over by a stream can write anywhere in the window: into
-that VM's other decoders' buffers, which the guest sees anyway. It can't
-reach the VMM's memory, guest RAM or the guest's other devices.
+Each side treats the other as hostile:
 
-Snapshots keep each decoder's V4L2 side and up to 16 KiB of resume state
-from the helper (the stream's parameter sets, VP9 key frame header or AV1
-sequence header). The VMM doesn't read that state; after a restore it
-hands it to the new helper, which parses it like any stream. A snapshot
-is a file: on restore every saved field is checked again (sizes, buffer
-offsets inside the window and not overlapping, queues naming real
-buffers), and a decoder whose state doesn't hold together fails.
+- Helper accepts from the VMM only known message kinds within size (8 MiB bitstream; grant ≤ one 4K P010 picture), 8 sessions, 64 queued buffers and 64 grants each. Writes only into a grant inside the window and big enough.
+- VMM accepts from the helper only pictures in the oldest granted buffer (helper must name it), current epoch (changes when guest buffers do), exact size for the stream format; formats must be valid size/depth. >256 unread messages or a write blocked 2 s: helper counted gone; guest decoders fail `EIO`, rest of VM runs. VMM never reads a picture.
+- Stream-compromised helper: can write anywhere in the window (that VM's other decoders' buffers, which the guest sees anyway). Can't reach VMM memory, guest RAM, other devices.
 
-What a bug reachable from a stream gets:
+Snapshots:
 
-- in the helper: VideoToolbox's client side, its decoder service and
-  IOSurfaces; the streams and buffers of that VM's other decoders.
-  Nothing else of the user's.
-- in Apple's decoder service (`com.apple.coremedia.videodecoder`), which
-  the hardware decoder's kernel driver sits behind: the same reach a video
-  file opened in Safari or QuickTime has. That code is Apple's and shared
-  with every app on the Mac; this is the real cost of turning it on.
+- Keep each decoder's V4L2 side + ≤16 KiB helper resume state (parameter sets, VP9 key frame header, AV1 sequence header). VMM doesn't read it; after restore hands it to the new helper, which parses it like any stream.
+- Snapshot = a file: on restore every field rechecked (sizes; buffer offsets inside the window, non-overlapping; queues naming real buffers). Inconsistent decoder state fails.
 
-Memory a guest can make us use: the window (up to 1 GiB, only what its
-buffers touch), and in the helper per decoder up to 16 MiB of bitstream
-and 24 pictures held as VideoToolbox's buffers (8 waiting for a guest
-buffer, up to 16 held for display order): about 350 MB for a 4K decoder.
+Reach of a stream-triggered bug:
 
-The guest side runs Google's virtio-media driver, out of tree.
-`scripts/guest/install-virtio-media.sh` downloads one pinned commit and
-checks its SHA-256 before building it. Our VA-API driver
-(`scripts/guest/vaapi`) runs inside the guest's players and only talks to
-that V4L2 decoder (and the guest's GPU for dma-bufs): nothing new on the
-host side.
+- helper: VideoToolbox client side, its decoder service, IOSurfaces; that VM's other decoders' streams and buffers. Nothing else of the user's.
+- Apple's decoder service (`com.apple.coremedia.videodecoder`, in front of the hardware decoder's kernel driver): same reach as a video opened in Safari or QuickTime. Apple's code, shared by every app: the real cost of enabling this.
+
+Memory a guest can cause: window (≤1 GiB, only touched); helper per decoder ≤16 MiB bitstream + 24 pictures as VideoToolbox buffers (8 waiting for a guest buffer, ≤16 held for display order): ~350 MB for a 4K decoder.
+
+Guest side: Google's virtio-media driver, out of tree. `scripts/guest/install-virtio-media.sh` downloads one pinned commit, checks SHA-256 before building. Our VA-API driver (`scripts/guest/vaapi`) runs in guest players, talks only to that V4L2 decoder (and the guest GPU for dma-bufs): nothing new host side.
 
 ## Video encoding
 
-Off unless `[display] video_encode = true`. A guest's raw frames are only
-pixels: nothing in them is parsed. What the guest controls is the
-encoder's settings and where its buffers are, and both are checked:
+Off unless `[display] video_encode = true`. Raw frames are just pixels: nothing parsed. Guest controls encoder settings and buffer placement; both checked.
 
 ```text
 guest V4L2 encoder --virtio-media--> VMM device (Rust)   --socket--> vroom video-helper --encode --XPC--> Apple's encoder service
@@ -494,473 +233,241 @@ guest V4L2 encoder --virtio-media--> VMM device (Rust)   --socket--> vroom video
                                      grants coded buffers             coded frames into grants
 ```
 
-The device is a second virtio-media device with a buffer window of its
-own (the decoder's is untouched), in the same code: every ioctl
-size-checked, at most 8 encoders, 16 raw buffers and 16 coded buffers
-each (8 MiB each at most), at most 4 raw frames at the helper per
-encoder, 64 controls per request. Formats it doesn't make are refused,
-picture sizes are even and within 16 to 4096 (4096x2304 at most), frame
-rates within one frame in 1000 s and 240 a second, bitrates within 1
-kbit/s and 400 Mbit/s; profiles, levels and menus take only the values
-listed; settings that would change the stream need the queues stopped.
-The settings go to the helper as one fixed-size message that both sides
-check the same way (`EncConfig::valid`).
+Device: second virtio-media device, own buffer window (decoder's untouched), same code.
 
-The encoder helper (`vroom video-helper --encode`) is a process of its
-own, separate from the decoder's, with its own Seatbelt profile: the
-decoder's minus Apple's decoder service, plus its encoder service
-(`com.apple.coremedia.videoencoder`) and the user's trust agent
-(`com.apple.trustd.agent`, Security's certificate service, which every
-app may reach; VideoToolbox finds no hardware encoder without it). No
-files, no network, no exec, no GPU, no writes. It reads a raw frame only
-where the VMM said (inside the window, as big as the session's layout)
-and writes a coded frame only into a grant that lies in the window and
-that it fits. It takes from the VMM only messages of known kinds within
-their size, a config that holds together, 8 sessions with 64 frames and
-64 grants each. Coded frames come from VideoToolbox; the helper still
-takes them apart as if they were hostile (length-prefixed NAL units to
-Annex B, every length checked, `video/src/nal.rs`, fuzzed).
+- Every ioctl size-checked. ≤8 encoders; per encoder 16 raw + 16 coded buffers (≤8 MiB each), ≤4 raw frames at the helper; ≤64 controls per request.
+- Refused: formats it doesn't make. Sizes even, 16–4096 (≤4096x2304). Frame rates 1 per 1000 s to 240/s. Bitrates 1 kbit/s–400 Mbit/s. Profiles, levels, menus: listed values only. Stream-changing settings need queues stopped.
+- Settings go to the helper as one fixed-size message both sides check identically (`EncConfig::valid`).
 
-The VMM takes from the encoder helper only coded frames in the oldest
-buffer it granted, under the current epoch, no bigger than that buffer;
-a frame's buffer goes back to the guest only once the helper says it
-read it. The VMM never reads a frame or a coded frame. A guest may
-change a frame while the helper copies it: that spoils that frame's
-pixels, nothing else.
+Encoder helper (`vroom video-helper --encode`), separate process:
 
-A snapshot keeps each encoder's settings, controls and buffers, checked
-again on restore like the decoder's (a state that doesn't hold together
-fails that encoder in the guest).
+- Profile: the decoder's, minus Apple's decoder service, plus its encoder service (`com.apple.coremedia.videoencoder`) and the user's trust agent (`com.apple.trustd.agent`, Security's certificate service, reachable by every app; VideoToolbox finds no hardware encoder without it). No files, network, exec, GPU, writes.
+- Reads a raw frame only where the VMM said (inside the window, session layout size); writes a coded frame only into a grant inside the window that fits.
+- Accepts only known messages within size, a consistent config, 8 sessions × 64 frames × 64 grants.
+- Coded frames come from VideoToolbox but are parsed as hostile (length-prefixed NAL → Annex B, every length checked, `video/src/nal.rs`, fuzzed).
 
-What a bug reachable from the guest gets: in the helper, VideoToolbox's
-client side and that VM's encoder buffers; in Apple's encoder service
-(which the hardware encoder's driver sits behind), the same reach an app
-encoding video (a FaceTime call, a screen recording) has. Memory: the
-window (up to 1 GiB, what buffers touch), and in the helper per encoder
-up to 8 coded frames held (8 MiB each at most) and VideoToolbox's pixel
-buffer pool.
+VMM:
 
-The guest side is the same virtio-media driver; our VA-API driver gets
-an encoder half that talks to that V4L2 encoder only.
+- Takes from the helper only coded frames in the oldest granted buffer, current epoch, ≤ that buffer's size.
+- Returns a raw buffer to the guest only once the helper says it read it.
+- Never reads a frame or coded frame. Guest changing a frame during the copy spoils that frame's pixels, nothing else.
+
+Snapshot keeps each encoder's settings, controls, buffers; rechecked on restore like the decoder's (inconsistent state fails that encoder in the guest).
+
+Bug reach: helper: VideoToolbox client side, that VM's encoder buffers. Apple's encoder service (in front of the hardware encoder driver): same reach as any app encoding video (FaceTime call, screen recording). Memory: window (≤1 GiB, touched only); helper per encoder ≤8 coded frames held (≤8 MiB each) + VideoToolbox's pixel buffer pool.
+
+Guest side: same virtio-media driver; our VA-API driver's encoder half talks to that V4L2 encoder only.
 
 ## USB devices
 
-Off unless the VM file lists `[[usb]]` devices or you connect one from
-the VM window. The VM process never touches the host's USB stack: each
-device gets a helper process (`vroom usb-host`) that opens that one
-device with libusb. The VMM starts the VM file's helpers before it
-locks itself down; for a device connected while the VM runs, the app
-starts the helper (or vroom-netd does, below) and passes its socket to
-the VMM over the viewer connection. The VMM can't start anything itself
-and gains nothing new: one more socket to a helper that is as limited
-as the others. The two talk with a small protocol: submit a transfer,
-cancel one, reset the device; back come attached/detached and transfer
-results.
+Off unless `[[usb]]` is listed or a device is connected from the VM window.
 
-The helper treats the VMM as hostile, like the VMM treats the guest:
+- VMM never touches the host USB stack: each device gets `vroom usb-host`, opening that one device with libusb.
+- VM-file helpers: started by the VMM before lockdown. Devices connected while running: helper started by the app (or vroom-netd, below), socket passed over the viewer connection. VMM can start nothing; gains only one more socket to an equally limited helper.
+- Protocol: submit, cancel, reset; back: attached/detached, transfer results.
 
-- It only opens the device its command line names (vendor and product,
-  and serial number if given), chosen by the VMM's config before the
-  sandbox; the protocol has no way to name another device, list devices
-  or change the address.
-- Every request is checked: sizes (1 MiB per transfer), at most 64
-  transfers in flight, endpoints only those of the configuration and
-  alternate settings the guest selected, with the type the descriptors
-  give. Isochronous transfers: at most 128 packets, none larger than
-  what the endpoint moves per interval (its descriptors say).
-  Configuration, interface and halt changes go through libusb's own
-  calls; SET_ADDRESS is refused. Hubs are never opened.
-- Malformed messages end the connection.
+Helper treats the VMM as hostile:
 
-The VMM checks the helper the same way: answers must match a transfer it
-sent (size, direction, for isochronous the packet count and each
-packet's size), and never write past the guest's buffers. The VMM keeps
-at most 8 transfers in flight per endpoint and 32 per device. A dead
-or misbehaving helper looks like an unplugged device. The vCPUs never
-wait on a helper.
+- Opens only the device on its command line (vendor, product, serial if given), chosen by VMM config before the sandbox. Protocol can't name another device, list devices, or change the address.
+- Requests checked: ≤1 MiB per transfer, ≤64 in flight; endpoints only of the guest-selected configuration and alternate settings, with the descriptor-given type. Isochronous: ≤128 packets, none larger than the endpoint's per-interval max.
+- Configuration, interface, halt changes via libusb's own calls; SET_ADDRESS refused; hubs never opened.
+- Malformed message ends the connection.
 
-The helper's own sandbox (macOS, Seatbelt): system libraries and libusb,
-the IOKit registry, and the USB device and interface user clients only;
-no files, no network, no exec, no other drivers. Seatbelt can't tell USB
-devices apart, so a compromised helper could open other USB devices macOS
-lets a normal user open (none that a macOS driver holds: not keyboards,
-mice or disks). On Linux the helper sets no_new_privs and Landlock
-(`/dev/bus/usb` and sysfs only); it has no seccomp filter yet, and can
-open whatever USB device nodes your user may open (udev rules decide).
+VMM checks the helper:
 
-The guest gets full control of a device it is given (it can send it any
-request, including firmware updates). Give it only devices you'd plug
-into that machine.
+- Answers must match a sent transfer (size, direction; isochronous: packet count and each size), never write past guest buffers.
+- ≤8 transfers in flight per endpoint, 32 per device.
+- Dead or misbehaving helper = unplugged device. vCPUs never wait on a helper.
 
-The test devices (`VROOM_USB_FAKE`: serial port, sound card, USB stick)
-run inside the helper in place of libusb, behind the same checks. The
-stick parses the guest's SCSI commands there: fixed-size blocks, every
-offset checked against its RAM disk.
+Helper sandbox:
+
+- macOS (Seatbelt): system libraries and libusb, IOKit registry, USB device and interface user clients only. No files, network, exec, other drivers. Seatbelt can't tell USB devices apart: a compromised helper could open other USB devices a normal user may open (none held by a macOS driver: not keyboards, mice, disks).
+- Linux: no_new_privs + Landlock (`/dev/bus/usb`, sysfs only). No seccomp filter yet; can open any USB device node your user may (udev rules decide).
+
+Guest gets full control of a given device (any request, firmware updates included): pass only devices you'd plug into that machine.
+
+Test devices (`VROOM_USB_FAKE`: serial port, sound card, USB stick) run inside the helper in place of libusb, behind the same checks. The stick parses guest SCSI there: fixed-size blocks, every offset checked against its RAM disk.
 
 ### USB disks: their files, or the disk
 
-macOS 15.3 and later refuse USB storage to any program without Full Disk
-Access, root included. So the app offers two ways that don't pass the
-USB device, and need no root helper (GUIDE, "USB disks"):
+macOS 15.3+ refuses USB storage to programs without Full Disk Access, root included. Two ways that don't pass the USB device and need no root helper (GUIDE, "USB disks"):
 
-"Share its files". The app (unsandboxed, the user's) opens the volume's
-directory (`/Volumes/NAME`) and issues a sandbox extension for that one
-path: a token the kernel signs, of a class of ours
-(`org.vroom.usb-files.read`, or `.read-write`). It passes the directory
-fd and the token to the VMM over the viewer socket. The VMM's profile
-allows file access under an extension of those classes and nowhere else
-new: without a token from the app it reaches nothing more. (A token
-that comes while the VMM is still setting up, as for a VM file's disk,
-is kept and consumed once the sandbox is on: one consumed before it
-would be lost with the new sandbox.) Seatbelt
-checks paths, so a directory fd alone wouldn't be enough; the token is
-what lets the VMM in, and only below that directory. The files are
-served by the same code as shared folders (component walks with
-`openat(O_NOFOLLOW)`, no symlink followed, no `..`), read-only when the
-user asked or when macOS has the volume read-only. On disconnect the
-VMM drops the share (its fds close at once) and releases the token. A
-VMM taken over by the guest could keep the token instead: it then keeps
-read access to that volume, as long as the VMM lives. The token names
-the path; whether the kernel also binds it to that volume (a new one
-mounted later under the same name) we haven't checked. The extension
-calls are not public API (Safari and WebKit use them): a macOS update
-could change them, and the share would then fail, not open up.
+"Share its files":
 
-The guest sees these on two virtio-fs devices every VM started on a Mac
-has (`vroom-usb0`, `vroom-usb1`), empty until something is shared. The
-agent mounts them when the VMM says so (a tag of that form and a volume
-name checked like a file name: no `/`, `..`, leading dot or dash); on
-Linux through `systemd-run` (the agent's own service has no mount
-privilege), with the arguments passed as they are, no shell.
+- App (unsandboxed, the user's) opens `/Volumes/NAME`, issues a sandbox extension for that one path: a kernel-signed token of our class (`org.vroom.usb-files.read` or `.read-write`). Passes dir fd + token over the viewer socket.
+- VMM profile allows file access under extensions of those classes, nowhere else new: no token from the app, no reach.
+- Token arriving during VMM setup (as for a VM file's disk): kept, consumed once the sandbox is on (one consumed before would be lost with the new sandbox).
+- Seatbelt checks paths: a dir fd alone isn't enough; the token lets the VMM in, only below that dir.
+- Served by the shared-folder code (component walks with `openat(O_NOFOLLOW)`, no symlinks, no `..`); read-only if asked or if macOS has the volume read-only.
+- Disconnect: VMM drops the share (fds close at once), releases the token.
+- Gaps: a guest-owned VMM could keep the token: read access to that volume while the VMM lives. Token names the path; whether the kernel also binds it to the volume (a later mount under the same name): not checked. Extension calls are private API (Safari, WebKit use them): a macOS update could change them; the share would fail, not open up.
+- Guest side: two virtio-fs devices on every Mac-started VM (`vroom-usb0`, `vroom-usb1`), empty until shared. Agent mounts on VMM request (tag of that form; volume name checked like a file name: no `/`, `..`, leading dot or dash). Linux via `systemd-run` (agent service has no mount privilege), arguments passed as is, no shell.
 
-"Use as a disk". The app finds the disk in the IOKit registry below the
-chosen USB device (vendor, product, serial), and takes it only if macOS
-calls it removable or ejectable, its storage device doesn't say it is
-internal, and nothing of it is mounted where macOS lives. It unmounts it
-(`diskutil unmountDisk`, which refuses while files are open), checks
-the same disk is still there, and opens `/dev/rdiskN`: directly when the
-user owns the node (disk images), else with `/usr/libexec/authopen`,
-macOS's tool for this, which asks for an admin password and passes the
-fd back over a socket. The fd must be a character device with that
-disk's device number. The VMM gets the fd over the viewer socket. It
-checks it is a character device (or, for tests, a plain file) and reads
-its size with the disk ioctls; its profile allows ioctls on
-`/dev/rdisk*` only, and only on fds it was given (it can open no disk).
-It serves the disk as a plain USB stick: the test stick's Bulk-Only and
-SCSI code, now in a thread of the VMM with the fd as its store, behind
-the same request checks as a helper (endpoints, sizes, transfers in
-flight). Every block number and length is checked against the disk's
-size before the read or write; reads and writes are whole blocks (the
-fuzzer's `usb_proto` target drives it as a hostile VMM would). On
-disconnect the VMM flushes (the disk's cache too) and closes the fd
-before it tells the app, which then has macOS mount the disk again. A
-disk image whose partitions don't come back is read once more by the
-app: it opens `/dev/rdiskN` for writing and closes it (macOS reads the
-partition table again then). It writes nothing, does it only while
-nothing of that disk is mounted, and opens no disk node it can't open
-as the user (a USB stick's is root's).
+"Use as a disk":
 
-What the guest gets: all of that disk, to read and overwrite (format it,
-plant a boot sector). That is what was asked for. It can't reach other
-disks: the VMM holds the one fd. vroom-netd has no part in it: no root
-process opens disks.
+- App finds the disk in IOKit below the chosen USB device (vendor, product, serial); takes it only if macOS calls it removable or ejectable, its storage device doesn't say internal, and nothing of it is mounted where macOS lives.
+- Unmounts (`diskutil unmountDisk`, refuses while files are open), checks the same disk is still there, opens `/dev/rdiskN`: directly if the user owns the node (disk images), else via `/usr/libexec/authopen` (admin password, fd passed back over a socket). Fd must be a character device with that disk's device number.
+- VMM gets the fd over the viewer socket; checks it's a character device (tests: plain file); reads size with disk ioctls. Profile allows ioctls on `/dev/rdisk*` only, only on given fds (it can open no disk).
+- Served as a plain USB stick: test stick's Bulk-Only/SCSI code in a VMM thread with the fd as store, behind the helper's request checks (endpoints, sizes, in-flight). Every block number and length checked against disk size; whole-block I/O only (fuzzer target `usb_proto` drives it as a hostile VMM would).
+- Disconnect: VMM flushes (disk cache too), closes the fd, then tells the app, which has macOS remount.
+- Disk image whose partitions don't return: app opens `/dev/rdiskN` for writing and closes it (macOS rereads the partition table). Writes nothing; only while nothing of that disk is mounted; opens no node it can't open as the user (a USB stick's is root's).
+- Guest gets all of that disk, read and overwrite (format, plant a boot sector): what was asked. No other disks: VMM holds one fd. vroom-netd not involved: no root process opens disks.
 
-macOS's privacy checks: reading a removable volume, and probably opening
-a removable disk, is a "Removable Volumes" permission macOS asks the
-user for once, on behalf of vroom (the app's `Info.plist` says why). If
-the user said no, the app says where to allow it.
+macOS privacy: reading a removable volume (and probably opening a removable disk) = "Removable Volumes" permission, asked once for vroom (`Info.plist` says why). Denied: the app says where to allow it.
 
-The VM's xHCI always has 8 USB 2 + USB 3 port pairs for these devices
-(fixed, so the guest and saved VMs see the same controller); the
-viewer protocol caps names and the list, and the VMM checks every
-device id it is handed. A VMM taken over by a guest can't plug in a
-device: it gets only the sockets the app gives it.
+xHCI always has 8 USB 2 + USB 3 pairs for these (fixed: guest and saved VMs see the same controller). Viewer protocol caps names and list; VMM checks every device id handed in. A guest-owned VMM can't plug a device: it gets only sockets the app gives it.
 
 ## The root helper (vroom-netd)
 
-Bridged and host-only networking, and taking a USB device from a macOS
-driver, need root. vroom has one process for that, `vroom-netd`, a
-launchd daemon. The app sets it up when asked (macOS's own password
-prompt, `osascript ... with administrator privileges`): a root-owned
-copy of the binary and of libusb in `/usr/local/libexec/vroom`, its
-config in `/etc/vroom/netd.toml`, its launchd file. The setup refuses to
-go under a `/usr/local` or `/usr/local/libexec` someone other than root
-can change. The app itself never runs as root.
+Root needed for bridged/host-only networking and for taking USB devices from macOS drivers. One process: `vroom-netd`, a launchd daemon.
 
-What it does, and only that:
+Setup (app, on request; macOS password prompt via `osascript ... with administrator privileges`):
 
-- Network: on request, a vmnet (macOS) or tap (Linux) port for one VM
-  adapter, handed back as a datagram socket of Ethernet frames. Only
-  interfaces `bridge_interfaces` allows, only host-only networks it
-  lists; locally administered unicast MACs only, every frame's source
-  MAC checked; 32 ports per user.
-- USB: on request, the USB helper (`vroom-netd usb-host`, the same code
-  as `vroom usb-host`) started as root for one device, handed back as a
-  stream socket.
+- Root-owned copies of the binary and libusb in `/usr/local/libexec/vroom`; config `/etc/vroom/netd.toml`; launchd file.
+- Refuses to install under a `/usr/local` or `/usr/local/libexec` anyone but root can change.
+- The app itself never runs as root.
 
-Who can ask: its socket (`/var/run/vroom/netd.sock`) is root-owned,
-mode 0660, group `group` (`staff`: the Mac's users). Each connection's
-user comes from the kernel (`getpeereid`, `SO_PEERCRED` on Linux), not
-from what it says. USB requests are for members of `[usb] group` only
-(`admin` by default: users who could do the same with sudo), and off
-unless `[usb] enabled`.
+Does only:
 
-What a request can say: one JSON line, strictly parsed (unknown fields
-refused, bounded length, 5 seconds to send it). For USB: a VM name for
-the log, a `vendor:product` id and maybe a serial number (printable
-ASCII). No paths, no bus locations, no arguments, no environment. The
-device must be plugged in and not a hub, and not already served to a
-VM. At most 10 USB requests a minute per user, 8 USB helpers per user,
-16 in all, 64 connections at once.
+| | |
+|---|---|
+| network | vmnet (macOS) or tap (Linux) port for one VM adapter, returned as a datagram socket of Ethernet frames. Only `bridge_interfaces` interfaces, only listed host-only networks; locally administered unicast MACs only, every frame's source MAC checked; 32 ports per user |
+| USB | USB helper (`vroom-netd usb-host`, same code as `vroom usb-host`) started as root for one device, returned as a stream socket |
 
-How the root USB helper is run: `/usr/bin/sandbox-exec` with its own
-Seatbelt profile, as the user's helper but libusb only from the
-root-owned copy (`/opt/homebrew` is the user's: nothing a user can
-write is loaded into a root process), with an empty environment. The
-daemon checks before each start that its binary and that libusb, and
-every directory above them, belong to root and no one else can write
-them. So the helper can do what the user's helper does (the USB device
-user clients, the IOKit registry; no files, no network, no exec), plus
-what root adds there: open and take any USB device. That is what was
-asked for: the user named the device, and the helper serves only that
-one. On Linux the root helper sets no_new_privs and Landlock like the
-user's.
+Who can ask:
 
-What the root USB helper does to the device: as soon as it opens one a
-macOS driver holds (or one an earlier helper left taken), it takes the
-whole device (libusb's "capture": macOS re-enumerates it and keeps its
-drivers off; a mounted disk is unmounted). It keeps it through the
-guest's resets, so macOS never mounts the disk in between, and gives
-it back when it ends (one more re-enumeration, macOS's drivers come
-back). A device the guest can't use at all is given back at once.
+- Socket `/var/run/vroom/netd.sock`: root-owned, 0660, group `group` (`staff`: the Mac's users).
+- Caller identity from the kernel (`getpeereid`; Linux `SO_PEERCRED`), not from the request.
+- USB: members of `[usb] group` only (default `admin`: users who could sudo the same), off unless `[usb] enabled`.
 
-macOS 15 opens USB storage only to a program with Full Disk Access,
-root or not. To pass a USB disk as the device the user gives vroom-netd
-that permission (GUIDE); sharing its files or using it as a disk (above)
-needs neither the permission nor vroom-netd. That covers the daemon and the helpers it starts: macOS then
-lets them read the user's protected files too (Mail, Messages, other
-apps' data), which root alone can't. Neither does: the daemon reads
-only its config, and the helpers' Seatbelt profile allows no files at
-all. It is a real widening still: code execution in vroom-netd would
-get it. Without the permission everything else works; only USB disks
-fail, and they go back to macOS.
+Requests:
 
-What a compromised VMM can do with it: nothing new. The VMM asks for
-the VM file's USB devices when it starts, before it locks itself down
-(the user wrote that file); afterwards its sandbox has no way to reach
-the daemon's socket. Devices connected while the VM runs come from the
-app. The network side was already its business. A compromised user
-account in `admin` could take USB devices (keyboards included) without
-the password; it could also wait for the next sudo. The daemon logs every request with the user to
-`/var/log/vroom-netd.log`.
+- One JSON line, strict (unknown fields refused), bounded length, 5 s to send.
+- USB: VM name (for the log), `vendor:product`, optional serial (printable ASCII). No paths, bus locations, arguments, environment.
+- Device must be plugged in, not a hub, not already served to a VM.
+- Limits: 10 USB requests/min per user; 8 USB helpers per user, 16 total; 64 connections at once.
 
-Passing sockets: macOS can deliver a socket already disconnected when
-the sender closes its own copy while the socket is still in flight
-(about 1 in 10 times here). The daemon keeps its copy until the
-client hangs up; the app keeps its copy of a helper's socket for a few
-seconds after handing it to the VMM.
+Root USB helper:
 
-Frame sockets: macOS gives a Unix datagram socket 4 KiB of buffer, two
-frames. Both ends now ask for 2 MiB, and when the VMM's side is full
-anyway the daemon drops the frame, as a full NIC queue would. Before,
-it gave the whole port up after the first failed send, so a bridged
-adapter could die a few seconds into a boot (the guest's driver isn't
-reading yet) or during a burst. Only a VMM that is gone ends a port.
-That part needs the daemon set up again to take effect; the VMM's
-bigger buffer helps with an older daemon too.
+- Run via `/usr/bin/sandbox-exec` with its own Seatbelt profile: like the user's helper, but libusb only from the root-owned copy (`/opt/homebrew` is the user's: nothing user-writable loads into a root process); empty environment.
+- Before each start the daemon checks its binary, that libusb, and every parent directory are root-owned and not writable by others.
+- Can do what the user's helper does (USB device user clients, IOKit registry; no files, network, exec) plus what root adds: open and take any USB device. As asked: the user named the device; the helper serves only it.
+- Linux: no_new_privs + Landlock like the user's.
+- On a device a macOS driver holds (or one left taken by an earlier helper): takes the whole device (libusb "capture": macOS re-enumerates, keeps its drivers off; mounted disk unmounted). Keeps it through guest resets (macOS never mounts the disk in between). Gives it back at the end (one more re-enumeration, drivers return). A device the guest can't use at all: given back at once.
+
+Full Disk Access (needed to pass a USB disk as the device on macOS 15; sharing files / using as a disk needs neither FDA nor vroom-netd):
+
+- Covers the daemon and the helpers it starts: macOS then lets them read the user's protected files (Mail, Messages, other apps' data), which root alone can't.
+- Neither does: daemon reads only its config; helper profile allows no files.
+- Still a real widening: code execution in vroom-netd would get it.
+- Without it everything else works; only USB disks fail (returned to macOS).
+
+Compromised VMM gains nothing:
+
+- VMM asks for VM-file USB devices at start, before lockdown (user wrote the file); afterwards its sandbox can't reach the daemon socket.
+- Devices connected while running come from the app. Network was already its business.
+- A compromised `admin` user account could take USB devices (keyboards included) without the password; it could also wait for the next sudo.
+- Every request logged with the user to `/var/log/vroom-netd.log`.
+
+Socket passing: macOS may deliver a socket already disconnected if the sender closes its copy while in flight (~1 in 10 here). Daemon keeps its copy until the client hangs up; app keeps its copy of a helper socket a few seconds after handing it to the VMM.
+
+Frame sockets: macOS gives Unix datagram sockets 4 KiB (2 frames). Both ends ask for 2 MiB; VMM side full anyway: daemon drops the frame (like a full NIC queue). Before: whole port given up after the first failed send (bridged adapter could die seconds into a boot, guest driver not reading yet, or in a burst). Only a gone VMM ends a port. Needs the daemon set up again; the VMM's bigger buffer helps with an older daemon too.
 
 ## Snapshots
 
-Snapshots contain guest RAM (keys, passwords). They're written 0600 in 0700
-directories, every blob is SHA-256 checked on load, and restore parses them
-with the same validation as live input.
+- Contain guest RAM (keys, passwords).
+- Written 0600 in 0700 dirs.
+- Every blob SHA-256 checked on load; restore parses with the same validation as live input.
 
 ## vTPM
 
-`tpm = true` attaches a TPM 2.0. The TPM itself (libtpms) runs in a
-separate `swtpm` process, not in the VMM: on macOS under its own Seatbelt
-profile (its install, system libraries, its state directory, nothing
-else; no network). The VMM only frames commands for it, with size limits.
-State is in `<state>/tpm` (0700); snapshots include it, so reverting a VM
-reverts its TPM too.
+- `tpm = true`: TPM 2.0. libtpms runs in a separate `swtpm` process, not the VMM. macOS: own Seatbelt profile (its install, system libraries, its state dir; no network).
+- VMM only frames commands for it, size-limited.
+- State: `<state>/tpm` (0700). Capture requires successful volatile export and complete permanent/volatile state; export/read errors abort the snapshot. Incomplete state archives are rejected before stopping the current TPM or replacing its files. See the [TPM state contract](../crates/vmm/TPM_STATE.md) for recovery behavior and compatibility limits. Valid-input restore replacement remains nontransactional; this is not a whole-VM atomicity or cross-version portability guarantee.
 
 ## What 3D costs
 
-With `gpu = "virtio3d"`, guest command streams are parsed by C code and
-reach the Apple GPU driver: Venus (Vulkan) commands by virglrenderer's
-Venus decoder, virgl (OpenGL) commands by its GL decoder (vrend), which
-has the longer history of bugs, and on Windows, Direct3D 11 calls
-(Neptune, UTM's protocol) by virglrenderer's Neptune decoder and DXMT,
-which turns the guest's Direct3D shaders into Metal ones with its own
-LLVM-based converter. That is a large amount of young C and C++ code in
-reach of the guest. So none of it runs in the VMM. Windows guests reach
-vrend too: the 3D driver makes virgl contexts for its own copies, and
-our OpenGL driver for Windows apps uses them like Linux's Mesa does.
-Our Vulkan driver for Windows (and OpenGL through Zink on it) makes
-Venus contexts the same way Linux's Mesa does. Nothing new on the host:
-any guest code could already ask for either.
+`gpu = "virtio3d"`: guest command streams parsed by C/C++ code that reaches the Apple GPU driver:
+
+| Stream | Parsed by |
+|---|---|
+| Venus (Vulkan) | virglrenderer's Venus decoder |
+| virgl (OpenGL) | vrend, virglrenderer's GL decoder: the longer bug history |
+| Neptune (Windows Direct3D 11, UTM's protocol) | virglrenderer's Neptune decoder + DXMT (guest D3D shaders → Metal via its own LLVM-based converter) |
+
+- Lots of young C/C++ in guest reach: none of it runs in the VMM.
+- Windows guests reach vrend too (3D driver makes virgl contexts for its own copies; our Windows OpenGL driver uses them like Linux Mesa). Our Windows Vulkan driver (and Zink on it) makes Venus contexts like Linux Mesa. Nothing new on the host: any guest code could already ask for either.
 
 ### The GPU process
 
-As browsers do, the renderer has a process of its own: `vroom gpu-helper`,
-started by the VMM, one per VM, with OpenGL in it; Vulkan and Direct3D
-contexts get a process each below it (next section). virglrenderer,
-MoltenVK, DXMT and the GL driver are loaded there and only there; the
-VMM never loads them and its
-sandbox has no GPU rules at all (no AGX user clients, no Metal compiler
-service, no shared memory but its own guest RAM).
+- `vroom gpu-helper`, started by the VMM, one per VM, holds OpenGL; Vulkan and Direct3D contexts get a process each below it ([below](#a-process-per-vulkan-and-direct3d-context)).
+- virglrenderer, MoltenVK, DXMT, the GL driver load there only. VMM never loads them; its sandbox has no GPU rules (no AGX user clients, no Metal compiler service, no shm but its own guest RAM).
 
-What a bug in the 3D code can reach from the GPU process:
+Bug reach from the GPU process:
 
-- the GPU (the AGX and IOSurface user clients, the Metal compiler
-  service, framework reads: what Metal needs, nothing else);
-- that VM's guest RAM, which it maps (shared memory the VMM hands over
-  as fds; the guest has it all anyway) and the buffers it made itself;
-- the two sockets to the VMM, and the one to the render server.
+- the GPU: AGX and IOSurface user clients, Metal compiler service, framework reads (what Metal needs, nothing else)
+- that VM's guest RAM (shm fds from the VMM; the guest has it all anyway) and buffers it made
+- its two sockets to the VMM, and one to the render server
 
-What it can't: disks, the network, shared folders, the clipboard, the
-hypervisor (it has no vCPUs and no VM; a VM belongs to the process that
-made it), the viewer, other VMs, any file of the user's, other processes
-(no exec, no signals, no other process's shared memory). The sandbox goes
-up after the libraries are loaded and before the first guest command.
+Can't reach: disks, network, shared folders, clipboard, the hypervisor (no vCPUs, no VM; a VM belongs to the process that made it), the viewer, other VMs, user files, other processes (no exec, no signals, no other process's shm). Sandbox goes up after libraries load, before the first guest command.
 
-What the VMM trusts from it: nothing it can't check. Replies are framed
-with size limits; buffers it hands over are mapped at the size the guest
-asked for, never more; frames come back through a shared buffer the VMM
-made, copied out at the size the VMM asked for, or (macOS, a window the
-app started) as IOSurfaces the VMM passes to the app unopened (below).
-The GPU process gets its fence socket and guest RAM over its call
-socket at start, not by inheritance. If the GPU process dies,
-the VMM sees the socket close: 3D stops for that VM (the guest gets GPU
-errors, nothing else breaks) until the VM is started again.
-`VROOM_GPU_IN_PROCESS=1` puts the renderer back in the VMM, with the GPU
-rules in its sandbox (for debugging; macOS only has the GPU process).
+VMM trusts nothing it can't check:
 
-Where vrend's GL calls go depends on `opengl_host`:
+- Replies framed with size limits.
+- Handed-over buffers mapped at the guest-requested size, never more.
+- Frames back via a VMM-made shared buffer, copied out at the size the VMM asked; or (macOS, app-started window) as IOSurfaces passed to the app unopened ([below](#the-screen-as-iosurfaces-macos)).
+- GPU process gets fence socket and guest RAM over its call socket at start, not by inheritance.
+- GPU process dies: VMM sees the socket close; 3D stops for that VM (guest gets GPU errors, nothing else breaks) until restart.
+- `VROOM_GPU_IN_PROCESS=1`: renderer back in the VMM with GPU rules in its sandbox (debugging; macOS only has the GPU process).
 
-- `"apple"` (the default): macOS's own OpenGL 4.1. vrend's checks are the
-  only ones before Apple's driver, and macOS's GL has no robust buffer
-  access, so a shader reading out of bounds reads whatever GPU memory of
-  the GPU process follows (its own guest's data) or crashes it. In
-  exchange the guest gets OpenGL 4.1, which most Linux apps need.
-- `"angle"`: ANGLE on Metal, which checks every call the way a browser
-  checks WebGL before anything reaches Metal, so a vrend mistake meets a
-  second check. Its contexts ask for robust buffer access (out-of-bounds
-  reads give zeros). The guest gets OpenGL 2.1 only.
+vrend's GL target (`opengl_host`):
 
-`opengl = false` leaves vrend and both GL drivers out entirely.
+| | |
+|---|---|
+| `"apple"` (default) | macOS OpenGL 4.1. vrend's checks are the only ones before Apple's driver; no robust buffer access: an out-of-bounds shader read returns whatever GPU memory of the GPU process follows (its own guest's data) or crashes it. Gives GL 4.1, which most Linux apps need |
+| `"angle"` | ANGLE on Metal: checks every call like browser WebGL before Metal; a vrend mistake meets a second check. Contexts request robust buffer access (OOB reads = zeros). Guest gets GL 2.1 only |
 
-The GPU process loads virglrenderer by full path from its own directory
-(next to `vroom`, or `Contents/Frameworks` when it is
-`vroom.app/Contents/MacOS/vroom`, symlinks resolved), and only if it isn't
-there from Homebrew's prefix, then dyld's search path.
+`opengl = false`: vrend and both GL drivers left out entirely.
 
-Our Venus patches add a little code in reach of the guest, all in the GPU
-process: filling null descriptors (they now never reach MoltenVK, which
-would follow a null pointer), empty submissions for sync fd imports, and
-for Zink a few format and feature substitutions. Without the semaphore
-emulation, a guest could already crash the GPU process by calling
-`vkWaitSemaphoreResourceMESA`, which MoltenVK has no function for. To show
-a Vulkan window on macOS's OpenGL, vrend maps the frame's shared memory
-read only and copies rows out of it; the row size, offset and height the
-guest gives are checked against the memory's size first. For big BGRA
-frames (patch 0030) the copy is done by Metal in the GPU process: the
-same read-only mapping, whole pages, becomes a Metal buffer (Metal only
-reads it), and a blit with that checked offset, stride and size goes into
-an IOSurface the GPU process makes and keeps to itself (not global,
-never sent anywhere), which GL then copies into the texture. The GPU
-process already had Metal (its sandbox rules don't change); the guest
-reaches no new code on the CPU side, only one more GPU copy whose bounds
-were checked as before. Nothing new is
-loaded and the sandbox rules don't change. Each Vulkan or Direct3D
-context also has a thread in the GPU process that its worker wakes
-through a pipe when fences finish; it reads the same shared fence
-counters the millisecond poll read before, so a worker gains nothing new
-by writing to that pipe.
+Library loading: virglrenderer by full path from the GPU process's own dir (next to `vroom`, or `Contents/Frameworks` for `vroom.app/Contents/MacOS/vroom`, symlinks resolved); only if absent: Homebrew prefix, then dyld search path.
 
-On the GL side, texture clears (`VIRGL_CCMD_CLEAR_TEXTURE`) now reach the
-host on macOS's OpenGL and ANGLE too, which lack the GL call: vrend checks
-the box against the texture's level first, then uploads the texel through
-its normal upload path from a scratch buffer of at most 4 MiB (one band of
-rows), so a huge box costs time, not memory.
+Our Venus patches (all in the GPU process):
 
-On macOS's OpenGL the guest is now told the GPU's real sample count (4)
-instead of 1 (patch 0014), so ordinary apps (Chrome, antialiased WebGL,
-games) make multisampled textures and resolve them with blits. A guest
-could ask for those before too: vrend checked and created them the same
-way. Now they are common, not rare. Snapshots don't keep their contents.
+- Null descriptors filled (never reach MoltenVK, which would follow a null pointer); empty submissions for sync fd imports; for Zink, some format/feature substitutions.
+- Without semaphore emulation, a guest could already crash the GPU process via `vkWaitSemaphoreResourceMESA` (no MoltenVK function for it).
+- Vulkan window on macOS GL: vrend maps the frame's shm read-only, copies rows; guest row size, offset, height checked against the shm size first.
+- Big BGRA frames (patch 0030): Metal does the copy. Same read-only mapping (whole pages) becomes a Metal buffer (read only); blit with the checked offset, stride, size into an IOSurface the GPU process makes and keeps (not global, never sent); GL copies it into the texture. Metal was already there, sandbox rules unchanged, no new CPU-side code reached, only one more GPU copy with the same bound checks. Nothing new loaded.
+- Fence thread per Vulkan/Direct3D context in the GPU process, woken via a pipe by its worker; reads the same shared fence counters the 1 ms poll read before: writing to the pipe gains a worker nothing.
 
-Any guest GL app using transform feedback could crash the GPU process
-when it ended (macOS's `glEndTransformFeedback` with the wrong program
-bound; patch 0015). The guest lost 3D until the VM restarted, nothing
-more: the crash stays in the GPU process.
+GL side:
 
-Transform feedback for Zink (patch 0016) adds, in the Venus worker:
+- Texture clears (`VIRGL_CCMD_CLEAR_TEXTURE`) now reach the host on macOS GL and ANGLE (no GL call for it): box checked against the texture level, texel uploaded via normal upload from a ≤4 MiB scratch buffer (one band of rows): a huge box costs time, not memory.
+- macOS GL: guest told the real sample count (4), not 1 (patch 0014). Apps (Chrome, antialiased WebGL, games) now make multisampled textures and resolve with blits. Possible before too (vrend checked and created them the same way); now common. Snapshots don't keep their contents.
+- Transform feedback could crash the GPU process at app end (macOS `glEndTransformFeedback` with the wrong program bound; patch 0015). Guest lost 3D until VM restart, nothing more: crash stays in the GPU process.
 
-- A SPIR-V rewriter (`vkr_xfb.c`) reading the guest's vertex shaders.
-  Every read is checked against the module's size and id bound; anything
-  it doesn't expect (structs captured, 64-bit outputs, strides over 2048,
-  offsets past the stride, SPIR-V before 1.5) leaves the module as it was.
-  300,000 mutated Zink shaders ran through it under AddressSanitizer and
-  UBSan without a finding. Its output goes to MoltenVK's compiler, which
-  read the guest's own SPIR-V before anyway.
-- Shader stores through device addresses. The addresses and how many
-  vertices may be written come only from the host, pushed right before
-  each draw: the host's copy of the bound range (checked against the
-  buffer's size, buffers made for transform feedback and bound to memory
-  only) and the room left in it. The guest's own push constants into our
-  48 bytes are cut off. The rewritten shader checks each vertex's slot
-  against that count, so it writes inside the bound ranges. Zink devices
-  now have `bufferDeviceAddress` on, as a Vulkan app on Venus could
-  already ask for: a guest shader can write anywhere in its worker's GPU
-  memory, which only holds that app's own objects.
-- Command buffers keep a little state; layouts and query pools are found
-  again by id, so a guest destroying them mid-recording gets nothing
-  written rather than a dangling pointer.
+Zink transform feedback (patch 0016), in the Venus worker:
+
+- SPIR-V rewriter (`vkr_xfb.c`) reads guest vertex shaders. Every read checked against module size and id bound. Unexpected input (captured structs, 64-bit outputs, strides >2048, offsets past the stride, SPIR-V <1.5): module left as is. 300,000 mutated Zink shaders under AddressSanitizer + UBSan: no finding. Output goes to MoltenVK's compiler, which read the guest's SPIR-V anyway.
+- Shader stores via device addresses. Addresses and vertex count come only from the host, pushed before each draw: host copy of the bound range (checked against buffer size; only xfb buffers bound to memory) and remaining room. Guest push constants into our 48 bytes cut off. Rewritten shader checks each vertex slot against the count: writes stay in bound ranges.
+- Zink devices now have `bufferDeviceAddress` on (any Venus Vulkan app could already ask): a guest shader can write anywhere in its worker's GPU memory, which holds only that app's objects.
+- Command buffers keep a little state; layouts and query pools found again by id: guest destroying them mid-recording gets nothing written, not a dangling pointer.
 
 ### The screen as IOSurfaces (macOS)
 
-When the app starts a VMM, the guest's GL screen can go to the app as
-IOSurfaces instead of pixels (ARCHITECTURE.md, "The screen straight from
-the GPU"). What that adds:
+App-started VMM: guest GL screen can reach the app as IOSurfaces instead of pixels ([ARCHITECTURE.md](ARCHITECTURE.md#the-screen-straight-from-the-gpu-macos)). Adds:
 
-- Mach ports between our own processes. An IOSurface can only cross as a
-  mach port or by its global id; global ids stay unused (no surface is
-  made global, nothing looks one up by id), and Unix sockets can't carry
-  ports. So the app gives the VMM, and the VMM the GPU process, a send
-  right to a port of its own at spawn (a registered port,
-  `mach_ports_register`, taken by the child before it starts anything
-  and cleared so its own children don't get it). No name goes into the
-  bootstrap namespace and no sandbox gets a `mach-lookup` rule.
-- What crosses: one message per surface (three per monitor, made when
-  the size changes), holding the surface's port and five numbers, and a
-  small socket message per frame. The VMM takes messages on its port
-  only from its GPU process (the kernel gives the sender's pid), checks
-  the numbers (monitor, slot, generation, size) and passes the port on
-  as is: it never maps or looks up a surface, and its sandbox has no
-  IOSurface access. The app takes messages only from the VMM it started,
-  and checks each surface: the size announced, one plane, BGRA, rows
-  inside its memory. The guest can't name a surface, only change the
-  pixels the GPU process puts in it, which it could before.
-- A compromised GPU process could send the VMM other ports or junk:
-  anything malformed is thrown away (its rights given back), and the
-  VMM only forwards ports in well-formed messages from that pid, to the
-  app, which then refuses what isn't a surface of the announced size. A
-  compromised VMM can send the app any surface of the right size: it
-  decides what the screen shows anyway. Surfaces the app keeps are those
-  of the latest size only (three).
-- The app reads a surface with the CPU only for thumbnails and
-  pictures, locked read only and inside its size. The window server
-  shows the rest.
-
-A process that sends on someone else's port can only be one we started
-during the short window the app or VMM registers its port (another
-helper spawned at that moment); its messages fail the pid check.
+- Mach ports between our processes. An IOSurface crosses only as a mach port or global id; global ids unused (no surface made global, none looked up by id); Unix sockets can't carry ports. App gives the VMM, VMM gives the GPU process, a send right to its own port at spawn (registered port, `mach_ports_register`, taken by the child before starting anything and cleared so its children don't get it). Nothing in the bootstrap namespace; no sandbox gets a `mach-lookup` rule.
+- Crossing: one message per surface (3 per monitor, made on size change) with its port + 5 numbers; one small socket message per frame.
+- VMM accepts port messages only from its GPU process (kernel gives sender pid), checks numbers (monitor, slot, generation, size), forwards the port as is. Never maps or looks up a surface; its sandbox has no IOSurface access.
+- App accepts only from the VMM it started; checks each surface: announced size, one plane, BGRA, rows within its memory. Guest can't name a surface, only change pixels the GPU process puts in it (as before).
+- Compromised GPU process sending other ports or junk: malformed thrown away (rights returned); VMM forwards only well-formed messages from that pid; app refuses anything not a surface of the announced size.
+- Compromised VMM can send the app any right-size surface: it decides what the screen shows anyway. App keeps surfaces of the latest size only (3).
+- App reads a surface on the CPU only for thumbnails and pictures, locked read-only, within size. Window server shows the rest.
+- A process sending on someone else's port can only be one we started during the brief port-registration window (another helper spawned then); its messages fail the pid check.
 
 ### A process per Vulkan and Direct3D context
 
-Each Vulkan (Venus) and Direct3D (Neptune) context of the guest, roughly
-one per app using the GPU, runs in a process of its own:
+Each guest Vulkan (Venus) and Direct3D (Neptune) context (roughly one per GPU-using app) gets its own process:
 
 ```text
  GPU process (sandboxed)          render server (no sandbox)
@@ -971,339 +478,172 @@ one per app using the GPU, runs in a process of its own:
  the GPU, its own shared memory; Direct3D ones DXMT's shader cache
 ```
 
-A worker loads virglrenderer and the one driver it needs (MoltenVK or
-DXMT) from vroom's own directory (`Contents/Frameworks` in vroom.app),
-never a search path, then sandboxes
-itself (the GPU rules above, shared memory under its own process id
-only, and for Direct3D the VM's shader cache) before it reads anything
-from the guest. Its environment is cleared but for logging and the
-drivers' debug switches, never a variable that names a library. A guest
-app that breaks its driver lands in a process with only its own GPU
-objects: it can't read another app's textures or buffers, nor the GL
-state in the GPU process, nor guest RAM (workers never map it: Vulkan
-and Direct3D buffers are shared memory the worker makes and hands to the
-GPU process). Workers talk to the GPU process only, over their socket.
+Worker:
 
-The render server has no sandbox, because on macOS a process can't
-narrow the sandbox it inherits: whatever starts sandboxed workers must
-have none. It is kept small: it reads four fixed-size requests from the
-GPU process (start, reset, create and destroy a context), refuses
-backends the GPU process didn't ask for and more than 256 workers,
-starts only `vroom gpu-worker` with arguments it builds itself (the
-guest's name for the context is cut to 31 letters, digits and `._-`),
-and never loads virglrenderer or any GPU code. A GPU process taken over
-can ask it for more workers, each sandboxed like the others: nothing it
-didn't have. The server exits when the GPU process does, and kills its
-workers.
+- Loads virglrenderer and its one driver (MoltenVK or DXMT) from vroom's own dir (`Contents/Frameworks` in vroom.app), never a search path.
+- Sandboxes itself before reading any guest input: GPU rules above, shm under its own pid only, Direct3D: the VM's shader cache.
+- Environment cleared except logging and driver debug switches; never a library-naming variable.
+- A guest app breaking its driver lands with only its own GPU objects: no other app's textures/buffers, no GL state in the GPU process, no guest RAM (workers never map it: Vulkan/D3D buffers are shm the worker makes and hands to the GPU process).
+- Talks only to the GPU process, over its socket.
 
-A worker that crashes (or is killed) takes its context with it, nothing
-else: the server logs it, the GPU process retires that context's fences
-so the guest doesn't wait forever, and the other contexts go on. In a
-Linux guest the Vulkan app sees its device lost and stops. In Windows,
-an app's Direct3D device stops drawing; if the context was the desktop
-compositor's, the screen stops updating until Windows restarts its
-graphics (Win+Ctrl+Shift+B; tested: the desktop comes back). Holding the
-fences back instead doesn't help: Windows' GPU watchdog doesn't fire
-with this driver, the desktop just hangs.
+Render server:
 
-Windows' Direct3D contexts are not saved: the VMM has the guest agent
-turn the 3D display off first (ARCHITECTURE.md, "Direct3D state can't be
-saved"). Contexts the stopped driver left are destroyed by the VMM, as a
-device reset would; that is a host decision on the agent's word that the
-device is off, and a guest that lies about it only loses its own
-contexts. Patch 0017 writes the "fatal" bit into the ring status the
-guest already shares with the host. `vroom_d3d.dll`, the wrapper around
-the guest's Direct3D driver, runs inside the guest only and adds no path
-to the host.
+- No sandbox: on macOS a process can't narrow an inherited sandbox, so whatever starts sandboxed workers must have none.
+- Kept small: reads 4 fixed-size requests from the GPU process (start, reset, create, destroy context); refuses unrequested backends and >256 workers; starts only `vroom gpu-worker` with arguments it builds (guest's context name cut to 31 of letters, digits, `._-`); never loads virglrenderer or GPU code.
+- Compromised GPU process can ask for more workers, each sandboxed alike: nothing new.
+- Exits with the GPU process, kills its workers.
 
-Snapshots of Vulkan contexts (patch 0010) add three requests on each
-worker's socket and three calls between the VMM and the GPU process. The
-worker writes its context's state into a shared memory object of its own
-(under one of the names its sandbox already allows) and hands it to the
-GPU process, which hands it to the VMM. The VMM checks its size (at most
-64 GiB, no more than the object holds) and stores it without reading it.
-On restore the VMM puts that data in shared memory, and it goes down the
-same way to a new worker, which maps it read only. The data comes from
-the snapshot file, which anything that can write the VM's state
-directory controls, so the worker checks it like guest input: each
-record's length against what is left; contents against the size of the
-resource, memory or image region they go to (regions are worked out again
-from the image, never taken from the file); rings with the same layout
-checks as `vkCreateRingMESA`; reply streams with the same checks as
-`vkSetReplyCommandStreamMESA`. The kept commands are the guest's own
-bytes, replayed through the same Venus decoder and handlers as when the
-guest sent them (with the reply flag cleared). Workers still never map
-guest RAM. The VMM checks what it keeps itself like the guest's own
-requests: blob sizes and kinds, guest RAM ranges, and each mapping with
-the same checks as `RESOURCE_MAP_BLOB`. Following commands adds code on
-every command a guest sends, with a bound: past 4M commands or 1 GiB
-kept, a context isn't followed any more.
+Worker crash (or kill): takes its context only. Server logs it; GPU process retires that context's fences (guest doesn't wait forever); other contexts continue.
 
-OpenGL (virgl) contexts stay together in the GPU process: vrend shares
-one GL context group across them (shared objects, one GL thread), so
-splitting them would mean a GL driver per guest app and copying every
-shared texture. A GL bug reaches every GL app of that VM, and guest RAM.
+- Linux guest: Vulkan app sees device lost, stops.
+- Windows: app's D3D device stops drawing. Desktop compositor's context: screen frozen until Windows restarts graphics (Win+Ctrl+Shift+B; tested, desktop returns). Holding fences back doesn't help: Windows' GPU watchdog doesn't fire with this driver, desktop just hangs.
 
-Costs: a new Vulkan or Direct3D context takes about 50 ms more (start
-the process, load the driver, make a Metal device). A Windows desktop
-with Edge open has 15 to 20 contexts, 10 to 60 MB each: 200 to 400 MB
-more than with one process.
+Windows D3D contexts aren't saved: VMM has the agent turn the 3D display off first ([ARCHITECTURE.md](ARCHITECTURE.md#direct3d-state-cant-be-saved)).
 
-libepoxy is built to load ANGLE only from virglrenderer's own directory,
-and Apple's OpenGL only by its system path, when the GPU process made a
-CGL context current first; never a search path. DXMT (LGPL, a separate
-dylib) is loaded from the same directory before the sandbox goes up, and
-virglrenderer is patched to look for it only there, and to never start a
-render server of its own. Shared memory: the sandbox lets the GPU
-process and each worker create, map and unlink shared memory only under
-names carrying its own process id and virglrenderer's prefixes, and
-open no other (not even read: another app's or another worker's shared
-memory is out of reach; `VROOM_SANDBOX_SELFTEST=1` checks it). Metal's
-shader cache, which the user's other apps share, is read only, so a
-process taken over can't plant GPU code for them. DXMT's cache (Metal
-versions of guest shaders) is per VM, in its state dir: one guest can't
-plant shaders for another.
+- VMM destroys contexts the stopped driver left (like a device reset): a host decision on the agent's word that the device is off; a lying guest loses only its own contexts.
+- Patch 0017 writes "fatal" into the ring status the guest already shares.
+- `vroom_d3d.dll` (wrapper around the guest D3D driver): guest only, no new host path.
 
-With 3D, the GPU's host-visible window (8 GiB of guest address space) is
-backed by reserved memory where no buffer is mapped, as a real card's
-memory would be. Pages the guest writes there become real host memory: a
-guest can grow the VMM by up to 8 GiB that way, on top of its RAM.
-Swapping what backs a page (a buffer unmapped, filler mapped) leaves it
-unbacked for a few microseconds. A guest access there that we can't
-emulate (an exclusive load, which Windows' Vulkan driver uses on its
-ring) is run again until it gets through, for at most 100 ms at one
-address; after that the VM stops as before. It costs the guest only its
-own vCPU's time.
+Vulkan context snapshots (patch 0010):
 
-Snapshots with GL in them hold the guest's GPU contents (textures read
-back, so whatever was on screen) next to its RAM, in the state dir. On
-restore, the GL state goes back through virglrenderer's checks like any
-command the guest sends, and resource sizes, backing ranges and counts get
-the same limits as guest commands: a tampered snapshot can do what the
-guest could, no more.
+- 3 new requests on each worker socket, 3 calls VMM ↔ GPU process.
+- Worker writes state into its own shm object (under a name its sandbox already allows), hands it to the GPU process → VMM. VMM checks size (≤64 GiB, ≤ what the object holds), stores it unread.
+- Restore: VMM puts the data in shm, sent down to a new worker, which maps it read-only.
+- Data comes from the snapshot file (controlled by anything that can write the state dir): worker checks it like guest input: each record length vs what's left; contents vs the size of the target resource, memory or image region (regions recomputed from the image, never from the file); rings with `vkCreateRingMESA`'s layout checks; reply streams with `vkSetReplyCommandStreamMESA`'s checks.
+- Kept commands are the guest's own bytes, replayed through the same Venus decoder and handlers (reply flag cleared). Workers still never map guest RAM.
+- VMM checks what it keeps like guest requests: blob sizes and kinds, guest RAM ranges, each mapping with `RESOURCE_MAP_BLOB`'s checks.
+- Command following adds code on every guest command, bounded: past 4M commands or 1 GiB kept, the context isn't followed.
 
-Use 3D only for guests that need it: the GPU process confines the 3D
-code, but a guest that breaks out of it still holds the host GPU, and
-GPU drivers are kernel code.
+OpenGL (virgl) contexts stay together in the GPU process: vrend shares one GL context group (shared objects, one GL thread); splitting = a GL driver per app + copying every shared texture. A GL bug reaches every GL app of that VM, and guest RAM.
+
+Cost: new Vulkan/D3D context +~50 ms (process start, driver load, Metal device). Windows desktop with Edge: 15–20 contexts, 10–60 MB each: +200–400 MB vs one process.
+
+Loading and shared memory:
+
+- libepoxy loads ANGLE only from virglrenderer's dir; Apple's OpenGL only by its system path, after the GPU process made a CGL context current; never a search path.
+- DXMT (LGPL, separate dylib) loaded from the same dir before the sandbox; virglrenderer patched to look only there and never start its own render server.
+- Shm: GPU process and each worker may create, map, unlink shm only under names with their own pid and virglrenderer's prefixes; open no other (not even read: another app's or worker's shm unreachable; `VROOM_SANDBOX_SELFTEST=1` checks it).
+- Metal shader cache (shared with the user's other apps): read-only, so a compromised process can't plant GPU code for them.
+- DXMT cache (Metal versions of guest shaders): per VM, in its state dir: no cross-guest planting.
+
+Host-visible window (8 GiB of guest address space):
+
+- Backed by reserved memory where no buffer is mapped (like real card memory). Pages the guest writes become real host memory: guest can grow the VMM by ≤8 GiB beyond its RAM.
+- Swapping a page's backing (buffer unmapped, filler mapped) leaves it unbacked for a few µs. A guest access there we can't emulate (exclusive load, used by Windows' Vulkan driver on its ring) is retried until it succeeds, ≤100 ms per address; then the VM stops as before. Costs only that guest's vCPU time.
+
+GL snapshots hold guest GPU contents (textures read back: whatever was on screen) next to RAM, in the state dir. Restore: GL state goes back through virglrenderer's checks like any guest command; resource sizes, backing ranges, counts get guest-command limits. A tampered snapshot can do what the guest could, no more.
+
+Use 3D only for guests that need it: the GPU process confines the 3D code, but an escape from it still holds the host GPU, and GPU drivers are kernel code.
 
 ## The viewer socket
 
-A VM started from the app accepts a new window on a Unix socket, so it
-survives the app crashing. The socket is in the user's own temp dir
-(`$TMPDIR/vroom/`, 0700), itself 0600, bound before the sandbox goes up.
-Whoever connects gets the guest's screen and sends it keys and commands:
-any process running as the user can, which matches what the user's
-processes can already do to the VM's files. One viewer at a time; the
-guest has no way to reach it. To stop a VM that hangs, the app reads the
-pid the VMM wrote into its state lock and signals it only if that process
-is a `vroom` executable (the VMM can write that file).
+- App-started VMs accept a new window on a Unix socket (survive app crashes).
+- Socket in the user's temp dir (`$TMPDIR/vroom/`, 0700), itself 0600, bound before the sandbox.
+- Whoever connects gets the guest screen and sends keys and commands: any process of the user can, matching what user processes can already do to the VM's files.
+- One viewer at a time; guest can't reach it.
+- Hung VM: app reads the pid from the VMM's state lock, signals it only if that process is a `vroom` executable (the VMM can write that file).
 
 ## Several monitors
 
-What changes with `[display] monitors`:
+With `[display] monitors`:
 
-- The shared framebuffer gets a slot per monitor (8K each, 4 at most);
-  every write and read is checked against its slot, so nothing written
-  for one monitor reaches another. The app maps what the file holds,
-  never more than 4 slots.
-- The viewer messages for the other monitors (mode, damage, window
-  size, pointer) name a monitor; numbers outside 1..3 are refused, sizes
-  come both or neither.
-- virtio-gpu takes up to 4 scanouts; every scanout id is checked, every
-  rect is clipped to its scanout's view, and a snapshot's scanouts are
-  checked like commands.
-- The guest agent gets the layout (sizes and places, bounded) and, on
-  Windows, the pointer on monitors the USB tablet doesn't reach. Both go
-  host to guest only; the agent's session helper injects that pointer
-  with SendInput, so it can't reach elevated windows or the secure
-  desktop (UAC), as with any app of the user.
-- Windows' extra GPUs carry 32 MiB of plain memory in BAR 0 (reserved,
-  only what the guest writes is ever memory): its 2D driver clears it
-  as a framebuffer. Windows' 3D GPU carries 8 MiB, for the basic display
-  driver while the 3D one is off. The device never reads it. The memory
-  follows the BAR only inside the PCI windows: a BAR halfway through
-  being sized (all ones in its low half) can sit on RAM, and the memory
-  once went there and RAM was unmapped when it moved on.
-- On Windows the agent's service picks a display driver per GPU from the
-  driver store (the 2D one on GPUs without 3D, the 3D one on the first
-  when the host has 3D), as Device Manager does. It only chooses between
-  drivers that are already installed.
+- Shared framebuffer: a slot per monitor (8K each, ≤4); every read/write checked against its slot: nothing crosses monitors. App maps what the file holds, never >4 slots.
+- Viewer messages for other monitors (mode, damage, window size, pointer) name a monitor; outside 1..3 refused; sizes both or neither.
+- virtio-gpu: ≤4 scanouts; every scanout id checked; every rect clipped to its scanout's view; snapshot scanouts checked like commands.
+- Agent gets the layout (sizes, places, bounded) and, on Windows, the pointer on monitors the USB tablet doesn't reach. Host → guest only. Session helper injects the pointer with SendInput: can't reach elevated windows or the secure desktop (UAC), like any user app.
+- Windows' extra GPUs: 32 MiB plain memory in BAR 0 (reserved; only guest-written pages become memory), cleared by the 2D driver as a framebuffer. Windows' 3D GPU: 8 MiB, for the basic display driver while 3D is off. Device never reads it. Memory follows the BAR only inside the PCI windows: a BAR mid-sizing (all ones in its low half) can sit on RAM; once the memory went there and RAM was unmapped when it moved on.
+- Windows: agent service picks a display driver per GPU from the driver store (2D on GPUs without 3D; 3D on the first when the host has 3D), like Device Manager; chooses only among installed drivers.
 
 ## Guest agent (Windows and Linux)
 
-The VirtIO serial port only admits Administrators and SYSTEM, so the agent
-is split. A LocalSystem service owns the port and does clock sync and
-clean shutdown. An unprivileged helper in the console session does
-clipboard, resolution and UI scale, and talks to the service over a named pipe:
-SYSTEM/Administrators/interactive users only, remote clients refused,
-only clients from the active console session served. The helper only
-talks to a pipe server in session 0, so a user process squatting the pipe
-name gets nothing. The service accepts nothing from the helper but
-clipboard text (size-capped), answers about dropped files, and window
-and app lists while the host's window is in Coherence (checked like the
-rest).
+Windows (VirtIO serial port admits only Administrators and SYSTEM), so split:
 
-The Linux agent has the same split: a hardened systemd service
-(`CAP_SYS_TIME` only, read-only file system, Unix sockets only) and a
-session helper started with the desktop. They meet on
-`/run/vroom-agent.sock`; the service serves only the user logind reports
-active on seat0, and the helper only talks to a root-owned peer.
+- LocalSystem service: owns the port; clock sync, clean shutdown.
+- Unprivileged console-session helper: clipboard, resolution, UI scale. Talks to the service over a named pipe: SYSTEM/Administrators/interactive users only; remote clients refused; only the active console session served.
+- Helper only talks to a pipe server in session 0: a user process squatting the pipe name gets nothing.
+- Service accepts from the helper only: clipboard text (size-capped), dropped-file answers, window and app lists while the host window is in Coherence (checked like the rest).
+
+Linux, same split:
+
+- Hardened systemd service: `CAP_SYS_TIME` only, read-only file system, Unix sockets only.
+- Session helper started with the desktop.
+- Meet on `/run/vroom-agent.sock`; service serves only the user logind reports active on seat0; helper only talks to a root-owned peer.
 
 ### Guest tools updates
 
-Here the host sends code into the guest, which the guest runs as root
-(SYSTEM). That is the point: the guest asked for the host's tools when
-it installed the agent, and the host controls the guest entirely anyway.
-What has to hold is that nobody but the host can do it, and that the VMM
-never runs anything the guest sends.
+Host sends code the guest runs as root/SYSTEM. Intended: the guest asked for host tools by installing the agent, and the host controls the guest anyway. Must hold: only the host can do it; the VMM never runs anything the guest sends.
 
-- Only the privileged side takes an update, and only from the host
-  port, which only root (Administrators and SYSTEM on Windows) can open.
-  The session helper's link never carries one: the service drops
-  `UpdateBegin` and `UpdateData` from a helper and never relays them to
-  one (tested: `updates_come_only_from_the_host`). The agent run by hand
-  (not as the service) refuses them unless it is root.
-- The update starts with a manifest: each file's path, size and SHA-256.
-  Paths are checked like dropped files' (relative, no `..`, no drive
-  letters, nothing Windows reads another way), at most 512 files and
-  256 MB in all, no file twice. The agent writes the files into a new
-  folder only root can write (Linux: `/var/lib/vroom-agent/update`, mode
-  0700, owned by root, never through a link; Windows: under
-  `Program Files\Vroom`, which users can't write), checks each against
-  its size and hash as it comes, and drops everything at the first
-  mismatch. Only a complete, checked set is installed. The hashes catch
-  damage and a half-sent update; they are not a signature, and need not
-  be one: only the host can write the port. Signing would protect
-  against nothing the host couldn't do another way.
-- Linux: the hardened service can't replace files in `/usr` or restart
-  itself, and stays that way. It writes a `ready` file; a systemd path
-  unit starts `vroom-agent-update.service`, which runs the update's
-  `install-agent.sh --update` as root. Windows: the service starts the
-  update's `vroom-agent.exe --apply-update`, which stops the service,
-  adds drivers whose version changed (`pnputil`; the display driver
-  only goes into the driver store), swaps the files (a file in use is
-  renamed out of the way, and put back if anything fails) and starts
-  the service again.
-- The VMM passes an update from the app to the guest only as announced:
-  one `UpdateBegin`, then exactly its bytes in `UpdateData` frames of the
-  same update, nothing else (`forward_update`). It never reads the
-  update's contents and never runs anything. The guest's only answer is
-  `UpdateDone` (one short line, shown as text).
-- The app takes the tools from its own bundle (`Contents/Resources/guest-tools`)
-  or `VROOM_GUEST_TOOLS`. The agent's version is read from the agent
-  binary there; the guest's version comes from its hello and is only
-  compared and shown, cleaned like every status line.
-- The tools stick for guests without an agent is the app's own image,
-  plugged in read-only; installing from it is the user's step in the
-  guest.
+- Only the privileged side takes an update, only from the host port (root; Windows: Administrators, SYSTEM). The session helper link never carries one: service drops `UpdateBegin`/`UpdateData` from a helper, never relays them (test: `updates_come_only_from_the_host`). Agent run by hand (not as service) refuses unless root.
+- Manifest first: each file's path, size, SHA-256. Paths checked like dropped files (relative, no `..`, no drive letters, nothing Windows reads another way); ≤512 files, ≤256 MB total, no duplicates.
+- Files written into a new root-only folder (Linux: `/var/lib/vroom-agent/update`, 0700, root-owned, never through a link; Windows: under `Program Files\Vroom`, not user-writable); each checked against size and hash as it arrives; first mismatch drops everything. Only a complete checked set is installed.
+- Hashes catch damage and half-sent updates; not a signature, and needn't be: only the host can write the port. Signing protects against nothing the host couldn't do another way.
+- Linux: hardened service can't replace `/usr` files or restart itself, and stays so. Writes a `ready` file; a systemd path unit starts `vroom-agent-update.service`, running the update's `install-agent.sh --update` as root.
+- Windows: service starts the update's `vroom-agent.exe --apply-update`: stops the service, adds drivers whose version changed (`pnputil`; display driver only into the driver store), swaps files (in-use files renamed aside, restored on any failure), restarts the service.
+- VMM passes an update from the app only as announced: one `UpdateBegin`, then exactly its bytes in `UpdateData` frames of that update, nothing else (`forward_update`). Never reads contents, never runs anything. Guest's only answer: `UpdateDone` (one short line, shown as text).
+- App takes tools from its bundle (`Contents/Resources/guest-tools`) or `VROOM_GUEST_TOOLS`. Agent version read from the agent binary there; guest's version from its hello, only compared and shown, cleaned like every status line.
+- Tools stick (guests without an agent): the app's own image, plugged read-only; installing from it is the user's step in the guest.
 
 ## Fuzzing
 
-`fuzz/` has cargo-fuzz targets for what a guest (or a downloaded image)
-controls: agent protocol, the viewer protocol (both directions), network frames (the NAT's parsers and the MAC translation), virtqueue chains over arbitrary
-guest memory, virtio-gpu 2D commands, virtio-fs (FUSE) requests, virtio-snd control
-and PCM transfers (playback and capture), the HD Audio controller (registers,
-CORB/RIRB, buffer descriptor lists, stream DMA, MSI), the virtio-pci transport and PCI
-config space, xHCI, NVMe, TPM TIS, fw_cfg (DMA included) and flash, each
-driven by arbitrary register writes plus guest RAM; and qcow2 images,
-both parsing and a differential target (random writes, discards, zero
-writes, reopens and compactions checked byte for byte against a model),
-and VMDK (sparse headers, grain tables, compressed grains, descriptors),
-the USB passthrough protocol both ways with the helper's checks, and USB
-descriptors (the xHCI target also has a passthrough device whose answers
-come from the input), and the video helper's stream parsing (NAL units,
-parameter sets, display order, VP9 superframes and frame headers, AV1
-OBUs and sequence headers), the encoder's output turned into Annex B,
-and its protocol both ways, encoder messages included (`video`, 21M runs
-clean, and 4.5M more with the encoder's parts), and the virtio-media
-device itself, decoder and encoder: ioctls from guest memory, then what
-a hostile helper sends, then a snapshot of the result restored (`media`,
-4.7M runs clean; it also has junk-command tests). Run with
-`cargo +nightly fuzz run -O <target>`. First runs found two qcow2 bugs
-(a crash on short v3 headers, multi-GB allocations from crafted table
-sizes); both fixed. The USB target found a short configuration descriptor
-read out of bounds (a panic, not memory corruption); fixed.
+`fuzz/`: cargo-fuzz targets for what a guest (or downloaded image) controls. Run: `cargo +nightly fuzz run -O <target>`.
+
+| Area | Targets |
+|---|---|
+| protocols | agent; viewer (both directions); USB passthrough both ways with the helper's checks; video helper protocol both ways, encoder messages included |
+| network | NAT parsers, MAC translation |
+| virtio | virtqueue chains over arbitrary guest memory; virtio-gpu 2D commands; virtio-fs (FUSE) requests; virtio-snd control and PCM (playback, capture); virtio-pci transport and PCI config space |
+| devices | HD Audio (registers, CORB/RIRB, BDLs, stream DMA, MSI), xHCI (also a passthrough device answering from the input), NVMe, TPM TIS, fw_cfg (DMA included), flash: arbitrary register writes + guest RAM |
+| images | qcow2 parsing; qcow2 differential (random writes, discards, zero writes, reopens, compactions checked byte for byte against a model); VMDK (sparse headers, grain tables, compressed grains, descriptors) |
+| USB | descriptors |
+| video (`video`) | stream parsing (NAL units, parameter sets, display order, VP9 superframes and frame headers, AV1 OBUs and sequence headers), encoder output to Annex B. 21M runs clean, +4.5M with the encoder parts |
+| media (`media`) | virtio-media device, decoder and encoder: ioctls from guest memory, then hostile helper replies, then a snapshot of the result restored. 4.7M runs clean; also junk-command tests |
+
+Found and fixed: qcow2 crash on short v3 headers; qcow2 multi-GB allocations from crafted table sizes; USB short configuration descriptor read out of bounds (panic, not memory corruption).
 
 ## Host resources
 
-A guest can fill its disk layers, and so the host disk. The VMM pauses the
-VM when less than 2 GiB is left where its state lives, rather than letting
-guest writes fail half-way. A state dir is locked by the VMM using it,
-and every disk image is locked too: exclusive while a VM writes it, shared
-while it is a read-only layer. A second VM can't write an image another
-uses, or build on a base image another is still writing (that silently
-corrupts the overlay). On macOS these locks also keep `qemu-img` out of a
-running VM's images, even with `-U`.
+- A guest can fill its disk layers, hence the host disk: VMM pauses the VM at <2 GiB free where its state lives, rather than failing guest writes half-way.
+- State dir locked by its VMM. Every disk image locked: exclusive while a VM writes it, shared as a read-only layer.
+- A second VM can't write an image in use, or build on a base another still writes (silently corrupts the overlay).
+- macOS: these locks also keep `qemu-img` out of a running VM's images, even with `-U`.
 
 ## Known gaps
 
-- No UEFI Secure Boot: Homebrew's aarch64 EDK2 isn't built with it, and
-  without a protected (secure-world) variable store a guest kernel could
-  rewrite the keys anyway. Windows 11 is installed with that check
-  bypassed.
-- The Windows agent split is new; installs from before it run the
-  all-in-one agent elevated (re-run `vroom-setup.cmd` to upgrade).
-- x86_64 isn't implemented, so none of this is tested there.
-- Fuzzing doesn't cover Venus, virgl or Neptune (3D) command streams:
-  that is virglrenderer's C code (and DXMT's C++ for Neptune), which runs
-  in the GPU process.
+- Secure Boot (`secure_boot = true`, Debian's EDK2): ARM firmware checks boot signatures, but its variable store is not protected from guest-kernel writes. An enabled flag or successful installation does not establish authenticated-variable enforcement. Installer checks bypassed by an existing setup path do not satisfy Secure Boot/TPM acceptance.
+- Windows agent split is new; older installs run the all-in-one agent elevated (re-run `vroom-setup.cmd`).
+- x86_64: the restricted one-vCPU, 512 MiB [direct-Linux VMM profile](../crates/vmm/X64_LINUX.md) passed boot and lifecycle acceptance on AWS nested KVM. Firmware/security features, Windows, general CLI/RPC, snapshots and migration remain outside that acceptance. The profile rejects firmware and TPM configuration.
+- Fuzzing doesn't cover Venus, virgl, Neptune (3D) command streams: virglrenderer C (and DXMT C++ for Neptune), in the GPU process.
 
 ## What the guest can tell
 
-These come from the VM's `[identity]` (see [CONFIG.md](CONFIG.md#identity)):
+From `[identity]` ([CONFIG.md](CONFIG.md#identity)):
 
-- SMBIOS: vendor, product, family, SKU (the VM's name unless set),
-  version, date, serials, chassis type, CPU name, the "VM" BIOS flag.
-- ACPI table header IDs and the FADT hypervisor vendor.
-- The device tree model (direct kernel boot).
-- Disks: NVMe model, serial, firmware revision; virtio disk serials.
-- PCI IDs of the host bridge, NVMe, USB and HD Audio controllers, and
-  the HD Audio codec's IDs. The defaults are QEMU's (vendor 0x1B36; HD
-  Audio: QEMU's Intel ICH6 `intel-hda` and `hda-duplex` codec).
-- USB keyboard/tablet vendor ID and names, virtio input names and vendor.
-- Generated MACs (prefix), and the NAT network: guest, gateway and DNS
-  addresses and the gateway's MAC. The defaults (10.0.2.15, .2, .3) are
-  the classic QEMU/VirtualBox layout.
-- The agent's port name.
+- SMBIOS: vendor, product, family, SKU (VM name unless set), version, date, serials, chassis type, CPU name, "VM" BIOS flag
+- ACPI table header IDs, FADT hypervisor vendor
+- device tree model (direct kernel boot)
+- disks: NVMe model, serial, firmware revision; virtio disk serials
+- PCI IDs of host bridge, NVMe, USB, HD Audio controllers; HD Audio codec IDs. Defaults are QEMU's (vendor 0x1B36; HD Audio: QEMU's Intel ICH6 `intel-hda` and `hda-duplex` codec)
+- USB keyboard/tablet vendor ID and names; virtio input names and vendor
+- generated MAC prefix; NAT guest, gateway, DNS addresses, gateway MAC. Defaults (10.0.2.15, .2, .3) = classic QEMU/VirtualBox layout
+- agent port name
 
 `announce_vm = false` drops the SMBIOS and ACPI "this is a VM" markers.
 
-Still visible, whatever the config says:
+Visible whatever the config:
 
-- virtio devices: PCI vendor 0x1AF4, subsystem 0x1AF4:1100, revision 1.
-  Linux and the Windows drivers match on these (virtio-win INFs list
-  `SUBSYS_11001AF4&REV_01`).
-- With `video_decode`: a virtio-media device (id 48) named "Video
-  decoder", whose formats (the codecs this Mac decodes), sizes and levels
-  are VideoToolbox's. Our VA-API driver names itself "vroom".
-- With `video_encode`: another one named "Video encoder", with the codecs
-  this Mac encodes; the streams it makes are VideoToolbox's.
-- fw_cfg: the "QEMU" signature, its DMA signature and file names
-  (`etc/acpi/tables`, `etc/smbios/...`, `etc/ramfb`). EDK2 looks for them.
-- The board: QEMU virt memory map, PL011/PL031 PrimeCell IDs, CFI flash
-  (Intel 0x89/0x18), GICv3, ACPI device names (`COM0`, `PCI0`, `VR00`...)
-  and _HIDs. Stock EDK2 and the OS drivers expect this layout.
-- PSCI 1.0 / SMCCC 1.1 answers. They name no vendor. On KVM hosts the
-  kernel's PSCI also answers the KVM vendor-hypervisor UID call.
-- The firmware itself: EDK2 reports its own vendor in UEFI tables.
-- The display size follows the window, so it says something about your
-  screen; with `[display] hidpi` the guest also learns its pixel density
-  (the scale its agent is asked for).
-- The display: ramfb, then virtio-gpu with no EDID. With 3D, Vulkan shows
-  the host GPU (MoltenVK on Apple). Windows guests with 3D see a "Red Hat
-  VirtIO GPU 3D controller" whose Direct3D runs on Metal underneath. OpenGL's renderer name follows
-  `gl_renderer`, but its limits (GL 4.1 with `apple`, GL 2.1 and ES 3.0
-  with `angle`, texture sizes, formats) still give the host driver away.
-- CPU ID registers come from the host CPU (an Apple core on a Mac), and
-  timing differs from bare metal.
-- The vTPM is swtpm: its manufacturer is IBM, and the TIS DID/VID register
-  says the same (1014:0001) so the two agree.
-- NAT's TCP/IP stack (smoltcp) and the absolute-pointer tablet behave like
-  no physical router or mouse.
-- The guest agent, if installed (its protocol says "vroom").
-- Shared folders, if any: virtio-fs itself, the host disk's size and free
-  space, and on Windows the `VroomShare_<tag>` services.
+- virtio devices: PCI vendor 0x1AF4, subsystem 0x1AF4:1100, revision 1 (Linux and Windows drivers match on these; virtio-win INFs list `SUBSYS_11001AF4&REV_01`)
+- `video_decode`: virtio-media device (id 48) "Video decoder", formats (codecs this Mac decodes), sizes, levels = VideoToolbox's. Our VA-API driver names itself "vroom"
+- `video_encode`: another, "Video encoder", codecs this Mac encodes; streams are VideoToolbox's
+- fw_cfg: "QEMU" signature, DMA signature, file names (`etc/acpi/tables`, `etc/smbios/...`, `etc/ramfb`); EDK2 looks for them
+- board: QEMU virt memory map, PL011/PL031 PrimeCell IDs, CFI flash (Intel 0x89/0x18), GICv3, ACPI device names (`COM0`, `PCI0`, `VR00`...) and _HIDs; stock EDK2 and OS drivers expect this
+- PSCI 1.0 / SMCCC 1.1 answers (no vendor named). KVM hosts: kernel PSCI also answers the KVM vendor-hypervisor UID call
+- firmware: EDK2 reports its own vendor in UEFI tables
+- display size follows the window (says something about your screen); `[display] hidpi` also reveals pixel density (the scale the agent is asked for)
+- display: ramfb, then virtio-gpu without EDID. 3D: Vulkan shows the host GPU (MoltenVK on Apple). Windows 3D: "Red Hat VirtIO GPU 3D controller", Direct3D on Metal underneath. GL renderer name follows `gl_renderer`, but limits (GL 4.1 with `apple`; GL 2.1, ES 3.0 with `angle`; texture sizes, formats) still give the host driver away
+- CPU ID registers from the host CPU (an Apple core on a Mac); timing differs from bare metal
+- vTPM is swtpm: manufacturer IBM; TIS DID/VID register agrees (1014:0001)
+- NAT's TCP/IP stack (smoltcp) and the absolute-pointer tablet behave like no physical router or mouse
+- guest agent if installed (its protocol says "vroom")
+- shared folders: virtio-fs itself, host disk size and free space; Windows: `VroomShare_<tag>` services
 
-So this makes casual checks fail. It doesn't make a VM look like real
-hardware to software that tries hard.
-
+Defeats casual checks, not software that tries hard.

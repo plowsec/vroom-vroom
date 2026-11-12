@@ -120,6 +120,23 @@ impl Hypervisor for Hvf {
     }
 }
 
+/// Run with the MMU off from the helper page by `HvfVcpu::flush_tlb`:
+/// drop every stage-1 translation the VM's CPUs cached, then exit. At EL1
+/// from offset 0, at EL2 (nested) from `TLB_FLUSH_EL2`.
+const TLB_FLUSH: [u32; 9] = [
+    0xd508831f, // tlbi vmalle1is
+    0xd5033b9f, // dsb ish
+    0xd5033fdf, // isb
+    0xd40e8cc3, // smc #TLB_FLUSH_SMC (an HVC at EL2 stays in the guest)
+    0xd50c831f, // tlbi alle2is
+    0xd50c839f, // tlbi alle1is
+    0xd5033b9f, // dsb ish
+    0xd5033fdf, // isb
+    0xd40e8cc3, // smc #TLB_FLUSH_SMC (an HVC at EL2 stays in the guest)
+];
+pub(super) const TLB_FLUSH_EL2: u64 = 16;
+pub(super) const TLB_FLUSH_SMC: u64 = 0x7466;
+
 pub struct HvfVm {
     /// Stage-2 page size: the host's, or 4 KiB with `small_pages`.
     granule: u64,
@@ -134,10 +151,15 @@ pub struct HvfVm {
     spi_count: u32,
     msi: Option<crate::GicMsiConfig>,
     el2: bool,
+    /// Where `TLB_FLUSH` is mapped.
+    helper_page: u64,
     /// Guest writes to RAM, when a snapshot fuzzer logs them.
     dirty: Arc<dirty::DirtyLog>,
     execute: Arc<execute::ExecutePatches>,
     watches: Arc<watch::MemoryWatches>,
+    /// Held while the balloon frees RAM, and while debugger views or
+    /// dirty logging start: neither sees the other half done.
+    release_lock: Mutex<()>,
 }
 
 impl std::fmt::Debug for HvfVm {
@@ -230,6 +252,17 @@ impl HvfVm {
             }
             check("hv_gic_create", ffi::hv_gic_create(gcfg.0))?;
         }
+        // Host memory comes in host pages; the guest sees one granule of it
+        // (4 KiB with small_pages on a 16 KiB-page host).
+        let helper = Arc::new(MmapRegion::new(host_page as usize).map_err(|e| Error::Invalid(format!("helper page: {e}")))?);
+        let code: Vec<u8> = TLB_FLUSH.iter().flat_map(|w| w.to_le_bytes()).collect();
+        helper.load(&code).map_err(|e| Error::Invalid(format!("helper page: {e}")))?;
+        // SAFETY: the region was just written by this thread; nothing runs it yet.
+        unsafe { ffi::sys_icache_invalidate(helper.as_ptr().cast(), code.len()) };
+        // SAFETY: a live host mapping kept in `roms` for the VM's lifetime.
+        check("hv_vm_map", unsafe {
+            ffi::hv_vm_map(helper.as_ptr().cast(), params.helper_page, granule as usize, ffi::HV_MEMORY_READ | ffi::HV_MEMORY_EXEC)
+        })?;
         std::mem::forget(vm_guard);
         log::info!(
             "hvf: vm created, ipa {ipa} bits, {} KiB pages, SPIs {}..{}",
@@ -240,7 +273,7 @@ impl HvfVm {
         Ok(HvfVm {
             granule,
             memory: Mutex::new(Vec::new()),
-            roms: Mutex::new(Vec::new()),
+            roms: Mutex::new(vec![helper]),
             kickers: Mutex::new(Vec::new()),
             // Guest counter starts at 0 when the VM is created.
             // SAFETY: no preconditions.
@@ -250,9 +283,11 @@ impl HvfVm {
             spi_count: info.spi_count,
             msi,
             el2: params.nested,
+            helper_page: params.helper_page,
             dirty: Arc::new(dirty::DirtyLog::new(granule)),
             execute: Arc::new(execute::ExecutePatches::new(granule)),
             watches: Arc::new(watch::MemoryWatches::new(granule)),
+            release_lock: Mutex::new(()),
         })
     }
 
@@ -356,6 +391,7 @@ impl Vm for HvfVm {
         // HVF keeps the pages it mapped: replacing them under it (discard
         // and COW resets remap) would leave the guest on the old contents.
         // Unmap first, map the new pages after.
+        let _views = self.release_lock.lock().unwrap_or_else(|e| e.into_inner());
         let flags = ffi::HV_MEMORY_READ | ffi::HV_MEMORY_WRITE | ffi::HV_MEMORY_EXEC;
         for r in mem.regions() {
             // SAFETY: unmapping a range we mapped; vCPUs are stopped.
@@ -370,7 +406,31 @@ impl Vm for HvfVm {
         replaced
     }
 
+    fn release_memory(&self, mem: &GuestMemory, gpa: u64, len: u64) -> Result<bool> {
+        // As `replace_memory`, for a range, with the vCPUs running: they
+        // don't touch pages the guest handed over (one that does faults
+        // in the gap, like on an MMIO hole). Debugger views and dirty
+        // logging keep their own mappings: not then.
+        let _views = self.release_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if self.dirty.is_on() || !self.execute.is_empty() || !self.watches.is_empty() {
+            return Ok(false);
+        }
+        let Some(ptr) = mem.host_ranges(vroom_memory::GuestAddress(gpa), len).and_then(|r| (r.len() == 1).then(|| r[0].0)) else {
+            return Err(Error::Invalid(format!("release {gpa:#x}+{len:#x}: not one RAM range")));
+        };
+        if mem.regions().any(|r| r.mmap().shared_fd().is_some()) {
+            return Ok(false);
+        }
+        // SAFETY: unmapping guest RAM we mapped; mapped again below.
+        check("hv_vm_unmap", unsafe { ffi::hv_vm_unmap(gpa, len as usize) })?;
+        let released = mem.release(vroom_memory::GuestAddress(gpa), len);
+        let flags = ffi::HV_MEMORY_READ | ffi::HV_MEMORY_WRITE | ffi::HV_MEMORY_EXEC;
+        self.map(ptr, gpa, len as usize, flags)?;
+        released.map_err(|e| Error::Invalid(format!("release: {e}")))
+    }
+
     fn start_dirty_log(&self, mem: &GuestMemory) -> Result<()> {
+        let _views = self.release_lock.lock().unwrap_or_else(|e| e.into_inner());
         if !self.execute.is_empty() {
             return Err(Error::Unsupported("logging writes to RAM with execute patches"));
         }
@@ -381,6 +441,7 @@ impl Vm for HvfVm {
     }
 
     fn set_execute_patch(&self, gpa: u64, word: Option<[u8; 4]>) -> Result<()> {
+        let _views = self.release_lock.lock().unwrap_or_else(|e| e.into_inner());
         if self.dirty.is_on() {
             return Err(Error::Unsupported("execute patches while logging writes to RAM"));
         }
@@ -392,6 +453,7 @@ impl Vm for HvfVm {
     }
 
     fn set_memory_watches(&self, watches: &[crate::debug::MemoryWatch]) -> Result<()> {
+        let _views = self.release_lock.lock().unwrap_or_else(|e| e.into_inner());
         if self.dirty.is_on() && !watches.is_empty() {
             return Err(Error::Unsupported("memory watches while logging writes to RAM"));
         }
@@ -426,7 +488,7 @@ impl Vm for HvfVm {
     }
 
     fn create_vcpu(&self, index: u32) -> Result<Box<dyn Vcpu>> {
-        let v = HvfVcpu::new(index, self.vtimer_offset.clone(), self.idle.clone(), self.el2, self.dirty.clone(), self.execute.clone(), self.watches.clone())?;
+        let v = HvfVcpu::new(index, self.vtimer_offset.clone(), self.idle.clone(), self.el2, self.helper_page, self.dirty.clone(), self.execute.clone(), self.watches.clone())?;
         self.kickers.lock().unwrap_or_else(|e| e.into_inner()).push(v.hvf_kicker());
         self.idle.add(v.hvf_kicker());
         Ok(Box::new(v))
@@ -474,6 +536,14 @@ impl Vm for HvfVm {
 
     fn set_idle_skip(&self, busy: Option<Arc<dyn Fn() -> bool + Send + Sync>>) {
         self.idle.set(busy);
+    }
+
+    fn clock_ns(&self, ticks: u64) -> u64 {
+        ffi::ticks_to_ns(ticks)
+    }
+
+    fn idle_skip_state(&self) -> Option<crate::IdleSkipState> {
+        self.idle.state()
     }
 
     fn save_irqchip(&self) -> Result<IrqChipState> {

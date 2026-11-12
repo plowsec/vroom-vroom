@@ -86,13 +86,17 @@ pub fn set(c: &mut VmConfig, key: &str, v: &str, default_iface: Option<&str>) ->
                     c.boot = Boot::Kernel { kernel: PathBuf::new(), initrd: None, cmdline: "console=ttyAMA0 root=/dev/vda1".into() }
                 }
                 (Boot::Kernel { .. }, false) => {
-                    c.boot = Boot::Uefi { firmware: None, vars: PathBuf::from(format!("{}.state/efivars.fd", c.name)) }
+                    c.boot = Boot::Uefi { firmware: None, vars: PathBuf::from(format!("{}.state/efivars.fd", c.name)), secure_boot: false }
                 }
                 _ => {}
             }
         }
         ["boot", "firmware"] => match &mut c.boot {
             Boot::Uefi { firmware, .. } => *firmware = opt_path(v),
+            _ => return Err("not a UEFI VM".into()),
+        },
+        ["boot", "secure_boot"] => match &mut c.boot {
+            Boot::Uefi { secure_boot, .. } => *secure_boot = bool_of(v)?,
             _ => return Err("not a UEFI VM".into()),
         },
         ["boot", f @ ("kernel" | "initrd" | "cmdline")] => match &mut c.boot {
@@ -198,6 +202,7 @@ fn empty_net() -> Net {
         network: None,
         port_forwards: Vec::new(),
         allow_host_loopback: false,
+        host_ports: Vec::new(),
         block_private: false,
         mirror: None,
         mac: None,
@@ -724,6 +729,7 @@ gpu = "virtio2d"
         ("identity.announce", "false"),
         ("serial", "1"),
         ("boot.firmware", "/fw.fd"),
+        ("boot.secure_boot", "true"),
         ("boot.kind", "1"),
         ("boot.kernel", "/k"),
         ("boot.initrd", "/i"),

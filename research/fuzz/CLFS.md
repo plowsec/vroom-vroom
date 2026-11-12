@@ -1,6 +1,9 @@
 # CLFS demo
 
-Sequence fuzzing of `clfs.sys` (Windows 11 ARM64, build 26300): each input is a program of CLFS calls run by a client in the guest, so a log, its containers, marshalling areas, records and cursors carry from call to call. Coverage: every block of `clfs.sys`; exceptions at first chance, `__except` or not.
+Sequence fuzzing of `clfs.sys` (Windows 11 ARM64, build 26300).
+
+- Input: a program of CLFS calls run by a guest client; log, containers, marshalling areas, records, cursors carry between calls.
+- Coverage: every block of `clfs.sys`. Exceptions at first chance, `__except` or not.
 
 ```bash
 cd /Users/vladimir/ctf/vroom-vroom
@@ -11,7 +14,8 @@ R="target/debug/vroom-rpc --socket $VM/lab.sock"
 
 ## 1. VM
 
-Clone of S1 at its `checkpoint-ssh-ready` snapshot (agent with `guest.exec`): base disk, its frozen layer, EFI vars, TPM state and the snapshot as APFS clones (`cp -c -p`: snapshots check layer mtimes), names changed to `clfs-windows-arm64`, NAT, shares `$VM/shared`, `$VM/shared-rw`. Snapshots: `checkpoint` (the guest idle, agent up), `clfs-park` (the client parked); both in the state dir (`vroom snapshot list`), where pruning sees them.
+- Clone of S1 at its `checkpoint-ssh-ready` snapshot (agent with `guest.exec`): base disk, frozen layer, EFI vars, TPM state, snapshot as APFS clones (`cp -c -p`: snapshots check layer mtimes); renamed `clfs-windows-arm64`; NAT; shares `$VM/shared`, `$VM/shared-rw`.
+- Snapshots in the state dir (`vroom snapshot list`, pruning sees them): `checkpoint` (guest idle, agent up), `clfs-park` (client parked).
 
 ```bash
 T=/tmp/vroom-lab-build    # any target dir: not target/ while another lab runs from it
@@ -33,9 +37,8 @@ $R run guest.upload "{\"host_path\":\"$VM/shared/clfs-client.exe\",\"guest_path\
 $R run guest.exec '{"command":"rd /s /q C:\\clfs & start \"\" /b C:\\clfs-client.exe wait & ping -n 3 127.0.0.1 >nul & type C:\\clfs\\client.txt & tasklist /fi \"imagename eq clfs-client.exe\""}'
 ```
 
-Ops 0–25 (34 calls with their variants), typed: [clients/clfs/calls.json](clients/clfs/calls.json), from `src/main.rs`'s payload reads. A client change that moves a payload changes it too.
-
-Call: `u32 op | u16 length | payload`. An LSN: a slot byte, or bit 7 set and 8 bytes. Slots are taken modulo their count; missing ones are null handles.
+- Ops 0–25 (34 calls with variants), typed: [clients/clfs/calls.json](clients/clfs/calls.json), from `src/main.rs`'s payload reads. A client change that moves a payload must update it.
+- Call: `u32 op | u16 length | payload`. LSN: a slot byte, or bit 7 set + 8 bytes. Slots modulo their count; missing ones = null handles.
 
 ## 3. Snapshot in the client, harness
 
@@ -45,9 +48,10 @@ python3 research/fuzz/tools/client_harness.py --socket $VM/lab.sock --pid PID \
   --blocks clfs-blocks.json --output $VM/clfs-harness.json --sequence --entry LogIoDispatch@CClfsDriver
 ```
 
-Breaks at `entry_pc` (`park`) in the client's process, snapshots there (`$VM/clfs-windows-arm64.state/snapshots/clfs-park`), and writes the harness: `cpu` of the stop, `input_gpa`, the client's addresses, `bugcheck_pc`, `target`, `entries` (cmplog), blocks mode, no isolation, detectors `exceptions`, `bugcheck`, `timeout`; `config`, `state_dir` and `calls_file` kept from an existing harness. Call descriptions: `cp research/fuzz/clients/clfs/calls.json $VM/clfs-calls.json`, `"calls_file": "clfs-calls.json"`; `$F show $VM/clfs-harness.json FILE` prints a program.
-
-A rebuilt client moves its addresses: steps 2–3 again, after `vroom snapshot delete $VM/clfs-windows-arm64.toml clfs-park` (a CLI from 956acff on).
+- Breaks at `entry_pc` (`park`) in the client's process, snapshots there (`$VM/clfs-windows-arm64.state/snapshots/clfs-park`).
+- Harness written: stop's `cpu`, `input_gpa`, client addresses, `bugcheck_pc`, `target`, `entries` (cmplog), blocks mode, no isolation, detectors `exceptions`, `bugcheck`, `timeout`. `config`, `state_dir`, `calls_file` kept from an existing harness.
+- Call descriptions: `cp research/fuzz/clients/clfs/calls.json $VM/clfs-calls.json`, `"calls_file": "clfs-calls.json"`. `$F show $VM/clfs-harness.json FILE` prints a program.
+- Rebuilt client = moved addresses: `vroom snapshot delete $VM/clfs-windows-arm64.toml clfs-park` (CLI from 956acff on), then steps 2–3 again.
 
 ## 4. Blocks
 
@@ -57,7 +61,7 @@ $F blocks $VM/clfs.sys --base 0xfffff804000d0000 --module CLFS.SYS --symbols $VM
 # 18003 blocks, 1305 functions (992 named from the PDB), ~2 s
 ```
 
-The base is `kernel.modules`' (the harness tool prints it).
+Base: from `kernel.modules` (the harness tool prints it).
 
 ## 5. Fuzz
 
@@ -79,11 +83,15 @@ $F triage $VM/clfs-harness.json $VM/runs/a/crashes/HASH-CLASS.bin --state-dir $V
 | op 14 fixed, `--no-cmplog` | 19.6k (33/s) | 4748 |
 | op 14 fixed, cmplog (130 logs, ~1.6 s each) | 20.6k (34/s) | 5738 |
 
-Cmplog's extra blocks: the management IOCTLs (`ClfsMgmtDispatchIo`, managed-log policies, container growth), archival and restart requests. Earlier: `append-read.bin` 36k (60/s), 4529. No findings.
+- Cmplog's extra blocks: management IOCTLs (`ClfsMgmtDispatchIo`, managed-log policies, container growth), archival and restart requests.
+- Earlier: `append-read.bin` 36k (60/s), 4529. No findings.
 
-First night (3 workers, ~8 h, resumed sessions; seeds also `rich2.bin`: ops 15-25, `rich3.bin`: an overlapped log): 6763 blocks (~1000 more are the kernel-mode marshalling API, unreachable from user mode), 40-60 programs/s. One finding: `CClfsManagedLogClientUser::QueryRegistration` reads `0x28` (a NULL client) on management IOCTLs `0x80077018` then `0x8007b020` on a fresh log, swallowed by CLFS's own `__except`, caught at first chance; 98-byte reproducer in `runs/night/triage/`.
+First night: 3 workers, ~8 h, resumed sessions; seeds also `rich2.bin` (ops 15-25), `rich3.bin` (overlapped log).
 
-Typed mutation (`calls_file`), 30 min, 2 workers, `--no-cmplog`, a fresh output seeded with the night's 593 inputs (6797 blocks); harness with and without `calls_file`, then later builds. Calls ok and errors: the workers' `VROOM_FUZZ_TRACE` `stop_pc` lines past each one's first 300 (the corpus), errors of all calls:
+- 6763 blocks (~1000 more are the kernel-mode marshalling API, unreachable from user mode), 40-60 programs/s.
+- One finding: `CClfsManagedLogClientUser::QueryRegistration` reads `0x28` (NULL client) on management IOCTLs `0x80077018` then `0x8007b020` on a fresh log. Swallowed by CLFS's own `__except`, caught at first chance. 98-byte reproducer in `runs/night/triage/`.
+
+Typed mutation (`calls_file`): 30 min, 2 workers, `--no-cmplog`, fresh output seeded with the night's 593 inputs (6797 blocks); harness with and without `calls_file`, then later builds. Calls ok / errors: workers' `VROOM_FUZZ_TRACE` `stop_pc` lines past each one's first 300 (the corpus); errors over all calls.
 
 | | execs | blocks at 5 / 10 / 20 / 30 min | new vs the night | corpus | calls ok (ops 0–25) | error 87 / 6 |
 |---|---|---|---|---|---|---|
@@ -96,4 +104,7 @@ Typed mutation (`calls_file`), 30 min, 2 workers, `--no-cmplog`, a fresh output 
 
 Typed's new blocks: `AdjustReservation`, `ReserveAdjustment`, `ReadNotification`, `ReadMgmtNotificationDone`, `ClfsMgmtUserModeRegister`, `GetIoStatistics`.
 
-Runtime results change neither calls ok nor coverage within 30 min (typed variants: 6854–6868, the noise between runs). The corpus programs' 87s (their `stop_pc` lines matched to inputs by op sequence, 80k calls): 89% are calls on an area that is dead (its `CreateLogMarshallingArea` failed) or never made, 64% with no area live at all (retargeting alone can't fix those: repair inserts producers). Offline, on the same programs: handle uses naming no live slot are 31% of parents', 24.5% of children's (one producer), 19% (≤4). Live, 87s only go 20.0% → 19.2%. Calls ok falls during every run (~55% at 10 min, ~53% at 30).
+- Runtime results change neither calls ok nor coverage within 30 min (typed variants 6854–6868 = run-to-run noise).
+- Corpus programs' 87s (`stop_pc` lines matched to inputs by op sequence, 80k calls): 89% on an area that is dead (its `CreateLogMarshallingArea` failed) or never made; 64% with no area live at all (retargeting can't fix those: repair inserts producers).
+- Offline, same programs: handle uses naming no live slot: 31% of parents', 24.5% of children's (one producer), 19% (≤4). Live, 87s only 20.0% → 19.2%.
+- Calls ok falls during every run (~55% at 10 min, ~53% at 30).

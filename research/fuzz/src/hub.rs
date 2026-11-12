@@ -546,6 +546,7 @@ mod tests {
                 pc: Some(4),
                 input: String::new(),
                 stack: Vec::new(),
+                registers: Vec::new(),
             },
             data: vec![1],
         };

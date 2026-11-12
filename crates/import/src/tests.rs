@@ -61,9 +61,10 @@ fn windows_11_from_fusion() {
     assert_eq!(p.os, GuestOs::Windows);
     assert_eq!((p.cpus, p.memory_mib, p.nets), (4, 12096, 1));
     assert!(p.tpm && !p.suspended && !p.audio);
-    assert_eq!(p.disks.len(), 2);
-    assert_eq!((p.disks[0].bus, p.disks[0].cdrom), (DiskBus::Nvme, false));
-    assert!(p.disks[1].cdrom && p.disks[1].source == iso);
+    // The ISO stays out: with fresh firmware settings it would boot first.
+    assert_eq!(p.disks.len(), 1);
+    assert_eq!(p.disks[0].bus, DiskBus::Nvme);
+    assert!(p.notes.iter().any(|n| n.contains("win.iso") && n.contains("left out")));
     assert!(p.notes.iter().any(|n| n.contains("TPM")));
     assert!(p.notes.iter().any(|n| n.contains("snapshots")), "-000003 is a snapshot delta");
     // uuid.bios is raw SMBIOS bytes; vroom keeps the usual order.
@@ -72,8 +73,8 @@ fn windows_11_from_fusion() {
     // The VM file it writes is valid, and names its disks.
     let text = render(&p, &p.name, &["w.qcow2".into()], &Options::default(), [1, 2, 3, 4, 5, 6, 7, 8]);
     let c = VmConfig::from_toml(&text).unwrap();
-    assert_eq!(c.disks.len(), 2);
-    assert!(c.tpm && c.disks[1].cdrom);
+    assert_eq!(c.disks.len(), 1);
+    assert!(c.tpm && !c.disks[0].cdrom);
     assert_eq!(c.identity.serial.as_deref(), Some("010203040506"));
     let keep = render(&p, &p.name, &["w.qcow2".into()], &Options { keep_hardware_ids: true, ..Default::default() }, [0; 8]);
     let c = VmConfig::from_toml(&keep).unwrap();

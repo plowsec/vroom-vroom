@@ -110,6 +110,13 @@ pub fn only_ours() -> io::Result<bool> {
     mutter::only_ours()
 }
 
+/// Call `f` now, then each time Mutter's monitors change (a resize, a
+/// monitor plugged in), until its session bus goes away.
+#[cfg(target_os = "linux")]
+pub fn on_monitors_changed(f: impl FnMut()) -> io::Result<()> {
+    mutter::on_change(f)
+}
+
 /// The desktop's backend, if we know how to scale it.
 pub fn system() -> Option<Box<dyn Backend>> {
     #[cfg(windows)]
@@ -372,6 +379,27 @@ mod mutter {
         call.extend(args.iter().map(String::as_str));
         busctl(&call)?;
         Ok(true)
+    }
+
+    /// `busctl monitor` prints a line per MonitorsChanged signal.
+    pub fn on_change(mut f: impl FnMut()) -> io::Result<()> {
+        use std::io::BufRead;
+        let match_rule = format!("type=signal,interface={},member=MonitorsChanged", DEST[2]);
+        let mut child = Command::new("busctl")
+            .args(["--user", "--json=short", "monitor", "--match", &match_rule])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        let out = child.stdout.take().ok_or_else(|| io::Error::other("busctl: no output"))?;
+        f();
+        for line in io::BufReader::new(out).lines() {
+            if line?.contains("\"MonitorsChanged\"") {
+                f();
+            }
+        }
+        let _ = child.wait();
+        Err(io::Error::other("busctl monitor ended"))
     }
 
     impl super::Backend for Mutter {

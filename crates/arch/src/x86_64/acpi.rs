@@ -1,4 +1,4 @@
-use super::layout::*;
+use super::pc_layout::*;
 use crate::acpi::aml::{self, res};
 use crate::acpi::{assemble_pc, AcpiBlobs, AcpiIds, Table};
 

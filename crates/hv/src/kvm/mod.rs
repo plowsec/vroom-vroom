@@ -13,6 +13,8 @@ mod aarch64;
 mod gic;
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
+#[cfg(target_arch = "x86_64")]
+mod x86_64_smm;
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -66,9 +68,9 @@ impl Hypervisor for Kvm {
         #[cfg(target_arch = "x86_64")]
         let (fd, chip) = x86_64::create_vm(&self.kvm, params)?;
         Ok(Arc::new(KvmVm {
-            fd,
+            fd: Arc::new(fd),
             chip,
-            slots: Mutex::new(Slots::default()),
+            slots: Arc::new(Mutex::new(Slots::default())),
             vcpus: params.vcpus,
             finalized: AtomicBool::new(false),
         }))
@@ -83,6 +85,10 @@ struct Slots {
     /// Host buffer mappings (GPU): gpa -> slot, and slots to reuse.
     host: std::collections::HashMap<u64, u32>,
     free: Vec<u32>,
+    #[cfg(target_arch = "x86_64")]
+    smm_setup: crate::smm::Setup,
+    #[cfg(target_arch = "x86_64")]
+    smm: Option<crate::smm::Memory>,
 }
 
 /// Arch-specific irqchip handle (vGIC device fd on ARM).
@@ -94,9 +100,11 @@ pub(crate) enum Chip {
 }
 
 pub struct KvmVm {
-    fd: VmFd,
+    fd: Arc<VmFd>,
     chip: Chip,
-    slots: Mutex<Slots>,
+    // SMM vCPUs retain this Arc: a VcpuFd keeps the kernel VM alive even
+    // after KvmVm drops. The fd fields must drop before these backing owners.
+    slots: Arc<Mutex<Slots>>,
     vcpus: u32,
     finalized: AtomicBool,
 }
@@ -108,8 +116,23 @@ impl std::fmt::Debug for KvmVm {
 }
 
 impl KvmVm {
-    fn add_slot(&self, gpa: u64, host: *mut u8, size: u64, flags: u32) -> Result<u32> {
-        let mut s = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(target_arch = "x86_64")]
+    fn smm_capabilities(&self) -> Result<(crate::X86SmmCapabilities, usize)> {
+        use kvm_ioctls::Cap;
+        let kvm = KvmSys::new().map_err(kerr("open SMM capabilities"))?;
+        if !kvm.check_extension(Cap::CheckExtensionVm) || !self.fd.check_extension(Cap::X86Smm) {
+            return Err(Error::Unsupported("VM-level KVM_CAP_X86_SMM"));
+        }
+        // VmFd's pinned API exposes bool only, so query the numeric count
+        // with the existing raw system extension wrapper (not a new ioctl).
+        let count = kvm.check_extension_raw(kvm_bindings::KVM_CAP_MULTI_ADDRESS_SPACE.into());
+        if count < 2 { return Err(Error::Unsupported("KVM_CAP_MULTI_ADDRESS_SPACE must be at least 2")); }
+        Ok((crate::X86SmmCapabilities { vm_smm: true, system_address_spaces: count as u32 }, kvm.get_nr_memslots()))
+    }
+
+    fn add_slot(&self, s: &mut Slots, gpa: u64, host: *mut u8, size: u64, flags: u32) -> Result<u32> {
+        #[cfg(target_arch = "x86_64")]
+        x86_64::check_memory_range(gpa, size)?;
         let slot = s.free.pop().unwrap_or(s.next);
         let region = kvm_userspace_memory_region { slot, flags, guest_phys_addr: gpa, memory_size: size, userspace_addr: host as u64 };
         // SAFETY: host..host+size is a live mapping: RAM/ROMs are kept in
@@ -122,29 +145,88 @@ impl KvmVm {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+fn install_smm_slot(fd: &VmFd, mapping: crate::smm::Mapping) -> Result<()> {
+    let region = kvm_userspace_memory_region { slot: mapping.slot,
+        flags: if mapping.readonly { KVM_MEM_READONLY } else { 0 },
+        guest_phys_addr: mapping.gpa, memory_size: mapping.size, userspace_addr: mapping.host };
+    // SAFETY: the SMM transaction retains the full backing owner BEFORE this
+    // call, including failed/partial transactions; all live vCPUs retain it.
+    unsafe { fd.set_user_memory_region(region) }.map_err(kerr("KVM_SET_USER_MEMORY_REGION for SMM"))
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Slots {
+    fn smm_memory(&mut self) -> Result<&mut crate::smm::Memory> {
+        self.smm.as_mut().ok_or_else(|| Error::Invalid("failed SMM configuration; recreate the VM".into()))
+    }
+}
+
 impl Vm for KvmVm {
+    #[cfg(target_arch = "x86_64")]
+    fn configure_x86_smm(&self, initial: &[u8]) -> Result<crate::X86SmmCapabilities> {
+        let mut s = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        s.smm_setup.begin(self.finalized.load(Ordering::SeqCst))?;
+        let (capabilities, slots) = self.smm_capabilities()?;
+        s.smm = Some(crate::smm::Memory::new(initial, slots)?);
+        s.smm_memory()?.install_private(|mapping| install_smm_slot(&self.fd, mapping))?;
+        Ok(capabilities)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn configure_x86_q35_smram(&self) -> Result<crate::X86SmmCapabilities> {
+        let mut s = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        s.smm_setup.begin(self.finalized.load(Ordering::SeqCst))?;
+        if self.vcpus != 1 { return Err(Error::Unsupported("fixed Q35 SMRAM requires exactly one vCPU")); }
+        let (capabilities, slots) = self.smm_capabilities()?;
+        s.smm = Some(crate::smm::Memory::new_q35(slots)?);
+        s.smm_memory()?.install_private(|mapping| install_smm_slot(&self.fd, mapping))?;
+        Ok(capabilities)
+    }
+
     fn map_memory(&self, mem: &GuestMemory) -> Result<()> {
-        for r in mem.regions() {
-            self.add_slot(r.start().raw(), r.host_ptr(), r.len(), 0)?;
+        let mut s = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(target_arch = "x86_64")]
+        { s.smm_setup.mapping_attempted = true; }
+        #[cfg(target_arch = "x86_64")]
+        if s.smm_setup.requested {
+            return s.smm_memory()?.map_memory(mem, |mapping| install_smm_slot(&self.fd, mapping));
         }
-        self.slots.lock().unwrap_or_else(|e| e.into_inner()).memory.push(mem.clone());
+        for r in mem.regions() {
+            self.add_slot(&mut s, r.start().raw(), r.host_ptr(), r.len(), 0)?;
+        }
+        s.memory.push(mem.clone());
         Ok(())
     }
 
     fn map_readonly(&self, gpa: u64, region: Arc<MmapRegion>) -> Result<()> {
-        self.add_slot(gpa, region.as_ptr(), region.size() as u64, KVM_MEM_READONLY)?;
-        self.slots.lock().unwrap_or_else(|e| e.into_inner()).roms.push(region);
+        let mut s = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(target_arch = "x86_64")]
+        { s.smm_setup.mapping_attempted = true; }
+        #[cfg(target_arch = "x86_64")]
+        if s.smm_setup.requested {
+            return s.smm_memory()?.map_readonly(gpa, region, |mapping| install_smm_slot(&self.fd, mapping));
+        }
+        self.add_slot(&mut s, gpa, region.as_ptr(), region.size() as u64, KVM_MEM_READONLY)?;
+        s.roms.push(region);
         Ok(())
     }
 
     unsafe fn map_host(&self, gpa: u64, ptr: *mut u8, size: u64) -> Result<()> {
-        let slot = self.add_slot(gpa, ptr, size, 0)?;
-        self.slots.lock().unwrap_or_else(|e| e.into_inner()).host.insert(gpa, slot);
+        let mut s = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(target_arch = "x86_64")]
+        { s.smm_setup.mapping_attempted = true; }
+        #[cfg(target_arch = "x86_64")]
+        if s.smm_setup.requested { return Err(Error::Unsupported("host-buffer maps in restricted SMM mode")); }
+        let slot = self.add_slot(&mut s, gpa, ptr, size, 0)?;
+        s.host.insert(gpa, slot);
         Ok(())
     }
 
     fn unmap_host(&self, gpa: u64, _size: u64) -> Result<()> {
         let mut s = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(target_arch = "x86_64")]
+        if s.smm_setup.requested { return Err(Error::Unsupported("host-buffer maps in restricted SMM mode")); }
         let slot = s.host.remove(&gpa).ok_or_else(|| Error::Invalid(format!("no host mapping at {gpa:#x}")))?;
         let region = kvm_userspace_memory_region { slot, flags: 0, guest_phys_addr: gpa, memory_size: 0, userspace_addr: 0 };
         // SAFETY: size 0 deletes the slot.
@@ -161,11 +243,27 @@ impl Vm for KvmVm {
         }
         #[cfg(target_arch = "x86_64")]
         {
-            Ok(Box::new(x86_64::KvmVcpu::new(&self.fd, index, self.vcpus)?))
+            // Configuration, all mapping ioctls and this attempt share one
+            // lock. Seal before validation/CREATE_VCPU, even if either fails.
+            let mut s = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+            s.smm_setup.vcpu_attempted = true;
+            let owners = if s.smm_setup.requested {
+                s.smm_memory()?.seal()?;
+                Some(self.slots.clone())
+            } else { None };
+            if owners.is_some() {
+                Ok(Box::new(x86_64_smm::KvmVcpu::new(&self.fd, index, self.vcpus, owners)?))
+            } else {
+                Ok(Box::new(x86_64::KvmVcpu::new(&self.fd, index, self.vcpus)?))
+            }
         }
     }
 
     fn finalize(&self) -> Result<()> {
+        // Serialize the fresh-SMM check with finalize as well as map/create.
+        // ARM's GIC finalization path is unchanged.
+        #[cfg(target_arch = "x86_64")]
+        let _topology = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         if self.finalized.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
@@ -216,7 +314,12 @@ impl Vm for KvmVm {
                 Ok(crate::IrqChipState { backend: "kvm-vgicv3".into(), blob: gic::save(dev, self.vcpus, aarch64::NR_IRQS)? })
             }
             #[cfg(target_arch = "x86_64")]
-            Chip::Ioapic => Ok(crate::IrqChipState { backend: "kvm-x86_64-v1".into(), blob: x86_64::save_chip(&self.fd)? }),
+            Chip::Ioapic => {
+                if self.slots.lock().unwrap_or_else(|e| e.into_inner()).smm_setup.requested {
+                    return Err(Error::Unsupported("restricted SMM irqchip snapshots"));
+                }
+                Ok(crate::IrqChipState { backend: "kvm-x86_64-v1".into(), blob: x86_64::save_chip(&self.fd)? })
+            }
         }
     }
 
@@ -231,6 +334,9 @@ impl Vm for KvmVm {
             }
             #[cfg(target_arch = "x86_64")]
             Chip::Ioapic => {
+                if self.slots.lock().unwrap_or_else(|e| e.into_inner()).smm_setup.requested {
+                    return Err(Error::Unsupported("restricted SMM irqchip restore"));
+                }
                 if s.backend != "kvm-x86_64-v1" { return Err(Error::Invalid("wrong x86 irqchip backend".into())); }
                 x86_64::restore_chip(&self.fd, &s.blob)
             }
@@ -273,6 +379,37 @@ fn install_kick_handler() {
 /// Register this thread's kvm_run for the kick handler.
 pub(crate) fn set_thread_run(p: *mut kvm_run) {
     KVM_RUN.with(|c| c.set(p));
+}
+
+/// A different live vCPU may currently own this thread's signal binding.
+pub(crate) fn clear_thread_run(p: *mut kvm_run) {
+    KVM_RUN.with(|c| {
+        if c.get() == p {
+            c.set(std::ptr::null_mut());
+        }
+    });
+}
+
+#[cfg(test)]
+mod signal_binding_tests {
+    use super::*;
+
+    #[test]
+    fn clearing_one_vcpu_keeps_another_active_binding() {
+        let mut first = kvm_run::default();
+        let mut second = kvm_run::default();
+        let first = &mut first as *mut _;
+        let second = &mut second as *mut _;
+        set_thread_run(first);
+        set_thread_run(second);
+        clear_thread_run(first);
+        assert_eq!(KVM_RUN.with(|c| c.get()), second);
+        set_thread_run(first); // the next RUN rebinds its own mapping
+        clear_thread_run(second);
+        assert_eq!(KVM_RUN.with(|c| c.get()), first);
+        clear_thread_run(first);
+        assert!(KVM_RUN.with(|c| c.get()).is_null());
+    }
 }
 
 #[derive(Debug)]

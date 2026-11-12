@@ -380,6 +380,9 @@ impl Campaign {
         for finding in result.findings.iter().filter(|f| new_signatures.contains(&signature(f))) {
             self.store.save_finding(finding, &input)?;
         }
+        for finding in result.findings.iter().filter(|f| f.class == BugClass::Timeout) {
+            self.store.save_timeout(finding, &input)?;
+        }
         self.stats.execs += 1;
         if !result.findings.is_empty() {
             self.stats.crashes += 1;

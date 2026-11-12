@@ -11,6 +11,7 @@
 //! 0x0902_0000  fw_cfg                            4K (reserved)
 //! 0x0903_0000  PL061 GPIO                        4K
 //! 0x0a00_0000  virtio-mmio slots                 32 x 512
+//! 0x0f00_0000  hypervisor helper page            ≤64K (not described to the guest)
 //! 0x1000_0000  PCIe 32-bit MMIO window           ~750M
 //! 0x3eff_0000  PCIe PIO window                   64K
 //! 0x3f00_0000  PCIe ECAM (16 buses)              16M
@@ -40,6 +41,10 @@ pub const TPM_SIZE: u64 = 0x5000;
 pub const VIRTIO_MMIO_BASE: u64 = 0x0a00_0000;
 pub const VIRTIO_MMIO_SIZE: u64 = 0x200;
 pub const VIRTIO_MMIO_SLOTS: u32 = 32;
+
+/// One page (up to 64 KiB) the guest is never told about: hypervisor
+/// helper code (`VmParams::helper_page`).
+pub const HELPER_PAGE_BASE: u64 = 0x0f00_0000;
 
 pub const PCI_MMIO_BASE: u64 = 0x1000_0000;
 pub const PCI_MMIO_SIZE: u64 = 0x2eff_0000;
@@ -89,6 +94,7 @@ mod tests {
         assert!(last + VIRTIO_MMIO_SIZE <= PCI_MMIO_BASE);
         assert!(irq < MSI_INTID_BASE - 32);
         const { assert!(PCI_ECAM_BASE + PCI_ECAM_SIZE <= RAM_BASE) };
+        const { assert!(TPM_BASE + TPM_SIZE <= HELPER_PAGE_BASE && HELPER_PAGE_BASE + 0x1_0000 <= PCI_MMIO_BASE) };
         const { assert!(PCI_PIO_BASE + PCI_PIO_SIZE <= PCI_ECAM_BASE) };
         const { assert!(PCI_MMIO_BASE + PCI_MMIO_SIZE <= PCI_PIO_BASE) };
     }

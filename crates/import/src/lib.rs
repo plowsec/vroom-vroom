@@ -38,8 +38,6 @@ pub struct PlanDisk {
     /// The VMware device, e.g. "nvme0:0".
     pub slot: String,
     pub source: PathBuf,
-    /// An ISO: attached where it is, not copied.
-    pub cdrom: bool,
     pub bus: DiskBus,
 }
 
@@ -64,6 +62,7 @@ pub struct Plan {
     pub shares: Vec<PlanShare>,
     pub audio: bool,
     pub tpm: bool,
+    pub secure_boot: bool,
     /// VMware's BIOS UUID, in the byte order vroom keeps it in.
     pub uuid: Option<[u8; 16]>,
     /// VMware's SMBIOS serial ("VMware-56 4d ...").
@@ -217,7 +216,7 @@ pub fn plan(path: &Path) -> Result<Plan> {
         name = "imported".into();
     }
 
-    // Disks and CDs, boot disk first.
+    // Disks, boot disk first.
     let mut slots: Vec<String> = v
         .keys_with("")
         .filter_map(|k| k.strip_suffix(".present"))
@@ -235,8 +234,13 @@ pub fn plan(path: &Path) -> Result<Plan> {
         let source = if Path::new(file).is_absolute() { PathBuf::from(file) } else { dir.join(file) };
         let cd = kind.starts_with("cdrom") || kind.starts_with("atapi");
         if cd {
+            // The firmware's boot entries stay in VMware's .nvram, and a
+            // CD (virtio) comes before an NVMe disk, so it would boot first.
             if kind == "cdrom-image" && source.is_file() {
-                disks.push(PlanDisk { slot, source, cdrom: true, bus: DiskBus::Virtio });
+                notes.push(format!(
+                    "{slot}: the ISO {} is left out (it would start instead of the disk). Attach it in Storage settings once the VM has booted.",
+                    source.display()
+                ));
             } else if kind == "cdrom-image" {
                 notes.push(format!("{slot}: the ISO {} isn't there any more; left out.", source.display()));
             }
@@ -248,22 +252,22 @@ pub fn plan(path: &Path) -> Result<Plan> {
         }
         let from_nvme = slot.starts_with("nvme");
         let bus = if windows || from_nvme { DiskBus::Nvme } else { DiskBus::Virtio };
-        if windows && !from_nvme && !disks.iter().any(|d: &PlanDisk| !d.cdrom) {
+        if windows && !from_nvme && disks.is_empty() {
             notes.push(format!(
                 "Windows was installed on a {} disk and will see an NVMe one. It may fail to boot (INACCESSIBLE_BOOT_DEVICE).",
                 slot.trim_end_matches(|c: char| c.is_ascii_digit() || c == ':')
             ));
         }
-        disks.push(PlanDisk { slot, source, cdrom: false, bus });
+        disks.push(PlanDisk { slot, source, bus });
     }
-    if !disks.iter().any(|d| !d.cdrom) {
+    if disks.is_empty() {
         return Err(Error::Refused(if encrypted && v.get("displayName").is_none() {
             "This VM is encrypted by VMware. Remove the encryption in VMware first (VM settings, Encryption).".into()
         } else {
             "This VM has no disk to import.".into()
         }));
     }
-    if disks.iter().any(|d| !d.cdrom && d.source.file_stem().is_some_and(|s| is_delta_name(&s.to_string_lossy()))) {
+    if disks.iter().any(|d| d.source.file_stem().is_some_and(|s| is_delta_name(&s.to_string_lossy()))) {
         notes.push("The VM has VMware snapshots. Its current state is imported; the snapshots stay in VMware.".into());
     }
 
@@ -317,6 +321,7 @@ pub fn plan(path: &Path) -> Result<Plan> {
     if tpm || encrypted {
         notes.push("The TPM's contents can't come along (VMware encrypts them). If BitLocker is on in the guest, have the recovery key ready.".into());
     }
+    let secure_boot = v.flag("uefi.secureBoot.enabled", false);
     let audio = v.flag("sound.present", false);
 
     let raw_uuid = v.get("uuid.bios").and_then(parse_uuid_bios);
@@ -335,6 +340,7 @@ pub fn plan(path: &Path) -> Result<Plan> {
         shares,
         audio,
         tpm,
+        secure_boot,
         uuid: raw_uuid.map(smbios_to_rfc),
         vmware_serial,
         suspended,
@@ -350,7 +356,7 @@ fn is_delta_name(stem: &str) -> bool {
 /// The new VM's file, as text people can read.
 pub fn render(p: &Plan, name: &str, disk_files: &[String], opts: &Options, serials: [u8; 8]) -> String {
     let mut s = format!(
-        "# Imported from VMware: {}\nname = {}\nos = {}\ncpus = {}\nmemory_mib = {}\ntpm = {}\n\n[boot]\ntype = \"uefi\"\nvars = {}\n",
+        "# Imported from VMware: {}\nname = {}\nos = {}\ncpus = {}\nmemory_mib = {}\ntpm = {}\n\n[boot]\ntype = \"uefi\"\nvars = {}\n{}",
         p.vmx.display(),
         toml_str(name),
         toml_str(&format!("{:?}", p.os).to_ascii_lowercase()),
@@ -358,15 +364,11 @@ pub fn render(p: &Plan, name: &str, disk_files: &[String], opts: &Options, seria
         p.memory_mib,
         p.tpm,
         toml_str(&format!("{name}.state/efivars.fd")),
+        if p.secure_boot { "secure_boot = true\n" } else { "" },
     );
-    let mut files = disk_files.iter();
-    for d in &p.disks {
-        if d.cdrom {
-            s += &format!("\n# From VMware {}.\n[[disk]]\npath = {}\nreadonly = true\ncdrom = true\n", d.slot, toml_str(&d.source.display().to_string()));
-        } else if let Some(f) = files.next() {
-            let bus = if d.bus == DiskBus::Nvme { "nvme" } else { "virtio" };
-            s += &format!("\n# From VMware {} ({}).\n[[disk]]\npath = {}\nformat = \"qcow2\"\nbus = \"{bus}\"\n", d.slot, file_name(&d.source), toml_str(f));
-        }
+    for (d, f) in p.disks.iter().zip(disk_files) {
+        let bus = if d.bus == DiskBus::Nvme { "nvme" } else { "virtio" };
+        s += &format!("\n# From VMware {} ({}).\n[[disk]]\npath = {}\nformat = \"qcow2\"\nbus = \"{bus}\"\n", d.slot, file_name(&d.source), toml_str(f));
     }
     for _ in 0..p.nets {
         s += "\n[[net]]\nmode = \"nat\"\n";
@@ -440,12 +442,11 @@ pub fn run(p: &Plan, parent: &Path, opts: &Options, mut progress: impl FnMut(Pro
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).map_err(|e| io(&tmp, e))?;
     let r = (|| -> Result<()> {
-        let sources: Vec<&PlanDisk> = p.disks.iter().filter(|d| !d.cdrom).collect();
         let mut files = Vec::new();
-        for (i, d) in sources.iter().enumerate() {
+        for (i, d) in p.disks.iter().enumerate() {
             let img = VmdkImage::open(&d.source).map_err(|e| Error::Disk(format!("{}: {e}", d.source.display())))?;
             let f = if i == 0 { format!("{name}.qcow2") } else { format!("{name}-disk{}.qcow2", i + 1) };
-            copy_disk(&img, &tmp.join(&f), |done, total| progress(Progress { disk: i, disks: sources.len(), done, total }))?;
+            copy_disk(&img, &tmp.join(&f), |done, total| progress(Progress { disk: i, disks: p.disks.len(), done, total }))?;
             files.push(f);
         }
         let text = render(p, &name, &files, opts, vroom_config::template::random8());

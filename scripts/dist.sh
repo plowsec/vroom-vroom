@@ -1,5 +1,5 @@
 #!/bin/sh
-# Release bundle: target/dist/vroom-<version>-<os>-<arch>.tar.gz with the
+# Release bundle: target/dist.noindex/vroom-<version>-<os>-<arch>.tar.gz with the
 # signed VMM and GUI (on macOS: vroom.app, built complete by scripts/app.sh,
 # 3D and guest tools included), the guest tools, and the docs.
 set -e
@@ -12,12 +12,13 @@ fi
 ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 os=$(uname -s | tr '[:upper:]' '[:lower:]')
 name=vroom-$ver-$os-$(uname -m)
-d=target/dist/$name
+out=target/dist.noindex
+d=$out/$name
 rm -rf "$d"
 mkdir -p "$d"
 note=""
 if [ "$(uname)" = Darwin ]; then
-  ditto target/dist/vroom.app "$d/vroom.app"
+  ditto $out/vroom.app "$d/vroom.app"
   mkdir -p "$d/licenses"
   cp target/dxmt-build/src/COPYING.LIB "$d/licenses/dxmt-COPYING.LIB"
   ditto target/guest-tools "$d/guest"
@@ -46,8 +47,9 @@ vroom $ver ($os $(uname -m))
 
 $run
 UEFI firmware comes from QEMU's package: brew install qemu (only its
-EDK2 files are used). vTPM (tpm = true) needs: brew install swtpm
+EDK2 files are used); Secure Boot's (Debian's EDK2) is in vroom.app.
+vTPM (tpm = true) needs: brew install swtpm
 $note
 TXT
-tar -C target/dist -czf "target/dist/$name.tar.gz" "$name"
-echo "target/dist/$name.tar.gz"
+tar -C $out -czf "$out/$name.tar.gz" "$name"
+echo "$out/$name.tar.gz"

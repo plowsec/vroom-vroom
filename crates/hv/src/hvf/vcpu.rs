@@ -75,6 +75,8 @@ pub struct HvfVcpu {
     clock_epoch: u64,
     /// Guest runs at EL2 (nested virtualization).
     el2: bool,
+    /// Where the VM mapped its TLB flush code.
+    helper_page: u64,
     debug: DebugConfig,
     /// Guest debug state while the host owns the hardware registers.
     guest_debug: Vec<(u16, u64)>,
@@ -111,11 +113,13 @@ struct NativeStep {
 }
 
 impl HvfVcpu {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         index: u32,
         vtimer_offset: Arc<AtomicU64>,
         idle: Arc<super::idle::IdleSkip>,
         el2: bool,
+        helper_page: u64,
         dirty: Arc<super::dirty::DirtyLog>,
         execute: Arc<super::execute::ExecutePatches>,
         watches: Arc<super::watch::MemoryWatches>,
@@ -144,6 +148,7 @@ impl HvfVcpu {
             clock_epoch: idle.epoch(),
             idle,
             el2,
+            helper_page,
             debug: DebugConfig::default(),
             guest_debug: Vec::new(),
             breakpoint_slots: 0,
@@ -158,6 +163,25 @@ impl HvfVcpu {
         };
         v.set_sys(ffi::HV_SYS_REG_MPIDR_EL1, mpidr)?;
         v.apply_vm_clock()?;
+        // HVF leaves GIC and EL2 hidden in PFR0 despite enabling them.
+        // Hyper-V checks this even when the firmware started at EL2.
+        let mut pfr0 = v.get_sys(ffi::HV_SYS_REG_ID_AA64PFR0_EL1)?;
+        if (pfr0 >> 24) & 0xf == 0 {
+            pfr0 |= 1 << 24;
+        }
+        if el2 && (pfr0 >> 8) & 0xf == 0 {
+            pfr0 |= 1 << 8;
+        }
+        v.set_sys(ffi::HV_SYS_REG_ID_AA64PFR0_EL1, pfr0)?;
+        // Hide SME from a guest at EL2: HVF advertises it (M4) but UNDEFs
+        // SMCR_EL2 there. Linux's EL2 stub takes that UNDEF as an unknown
+        // hypercall and returns to the same MSR, forever.
+        if el2 {
+            let pfr1 = v.get_sys(ffi::HV_SYS_REG_ID_AA64PFR1_EL1)?;
+            if (pfr1 >> 24) & 0xf != 0 {
+                v.set_sys(ffi::HV_SYS_REG_ID_AA64PFR1_EL1, pfr1 & !(0xf << 24))?;
+            }
+        }
         // Advertise PMUv3. HVF hides the PMU by default and then UNDEFs
         // PMU accesses; Windows requires a PMU (its boot manager reads
         // PMCR_EL0 unconditionally). Once advertised, HVF virtualizes it.
@@ -350,6 +374,54 @@ impl HvfVcpu {
                 return Ok(false);
             }
         }
+    }
+
+    /// Drop every stage-1 translation any CPU of the VM cached. Guest RAM
+    /// replaced under the guest (a snapshot restore in place) leaves the
+    /// TLBs on the old page tables, and HVF flushes them for none of its
+    /// calls (stage-2 changes, remaps, register writes). Runs the helper
+    /// page's broadcast TLBI with the MMU off and puts back what it changed.
+    fn flush_tlb(&mut self) -> Result<()> {
+        const CNTV_CTL: u16 = ffi::HV_SYS_REG_CNTV_CTL_EL0;
+        let (sctlr, pc_offset, mode) = if self.el2 { (0xe080, super::TLB_FLUSH_EL2, 0x3c9) } else { (0xc080, 0, 0x3c5) };
+        let saved = (self.get(ffi::HV_REG_PC)?, self.get(ffi::HV_REG_CPSR)?, self.get_sys(sctlr)?, self.get_sys(CNTV_CTL)?);
+        let mdscr = self.get_sys(MDSCR)?;
+        // No timer exit while it runs; every exception masked (DAIF). A
+        // step armed for the guest (MDSCR_EL1.SS) would stop it after one
+        // instruction: debug exceptions go to EL2 whatever DAIF says.
+        self.set_sys(CNTV_CTL, 0)?;
+        self.set_sys(MDSCR, mdscr & !1)?;
+        self.set_sys(sctlr, saved.2 & !1)?;
+        self.set(ffi::HV_REG_CPSR, mode)?;
+        self.set(ffi::HV_REG_PC, self.helper_page + pc_offset)?;
+        let ran = loop {
+            // SAFETY: own vcpu, own thread.
+            check("hv_vcpu_run", unsafe { ffi::hv_vcpu_run(self.id) })?;
+            // SAFETY: HVF fills `exit` before hv_vcpu_run returns.
+            let exit = unsafe { *self.exit };
+            match exit.reason {
+                ffi::HV_EXIT_REASON_CANCELED => continue,
+                ffi::HV_EXIT_REASON_EXCEPTION
+                    if aarch64::exception_class(exit.exception.syndrome) == ExceptionClass::Smc64
+                        && exit.exception.syndrome & 0xffff == super::TLB_FLUSH_SMC =>
+                {
+                    break Ok(());
+                }
+                r => {
+                    break Err(Error::GuestFault(format!(
+                        "TLB flush: exit {r} esr {:#x} pc {:#x}",
+                        exit.exception.syndrome,
+                        self.get(ffi::HV_REG_PC)?
+                    )))
+                }
+            }
+        };
+        self.set(ffi::HV_REG_PC, saved.0)?;
+        self.set(ffi::HV_REG_CPSR, saved.1)?;
+        self.set_sys(sctlr, saved.2)?;
+        self.set_sys(CNTV_CTL, saved.3)?;
+        self.set_sys(MDSCR, mdscr)?;
+        ran
     }
 
     /// A fault on a page with execute patches: see `execute`.
@@ -698,11 +770,12 @@ impl HvfVcpu {
     }
 }
 
-/// EL2 system registers (op0=3, op1=4/5): HCR, SCTLR, TCR, TTBR0/1, VBAR,
-/// ELR, SPSR, ESR, FAR, MAIR, CNTHCTL, CNTVOFF, CNTHP_CTL/CVAL, VTCR, VTTBR.
+/// EL2 system registers (op0=3, op1=4/5/6): HCR, SCTLR, TCR, TTBR0/1, VBAR,
+/// ELR, SPSR, ESR, FAR, MAIR, CNTHCTL, CNTVOFF, CNTHP_CTL/CVAL, VTCR, VTTBR,
+/// SP_EL1, VPIDR, VMPIDR, CPTR, MDCR, HSTR, TPIDR, HPFAR, SP_EL2.
 const EL2_REGS: &[u16] = &[
     0xe088, 0xe080, 0xe102, 0xe100, 0xe101, 0xe600, 0xe201, 0xe200, 0xe290, 0xe300, 0xe510, 0xe708, 0xe703, 0xe711,
-    0xe712, 0xe10a, 0xe108, 0xe208,
+    0xe712, 0xe10a, 0xe108, 0xe208, 0xe000, 0xe005, 0xe08a, 0xe089, 0xe08b, 0xe682, 0xe304, 0xf208,
 ];
 
 impl Drop for HvfVcpu {
@@ -898,6 +971,17 @@ impl Vcpu for HvfVcpu {
     fn restore_state(&mut self, s: &VcpuState) -> Result<()> {
         if s.backend != BACKEND {
             return Err(Error::Invalid(format!("vcpu state from backend {}", s.backend)));
+        }
+        // The RAM this state goes with may have new page tables.
+        self.flush_tlb()?;
+        // EL2 first: a reset must not keep the last boot's EL2 MMU and
+        // vectors, which point into RAM that is now zeroed.
+        for (id, bytes) in &s.raw {
+            let r = u16::try_from(*id).ok().filter(|r| self.el2 && EL2_REGS.contains(r));
+            let (Some(r), Ok(bytes)) = (r, <[u8; 8]>::try_from(bytes.as_slice())) else {
+                return Err(Error::Invalid(format!("unknown EL2 register {id:#x} in snapshot")));
+            };
+            self.set_sys(r, u64::from_le_bytes(bytes))?;
         }
         for &(id, v) in &s.regs {
             if id & 0x1_0000 != 0 {

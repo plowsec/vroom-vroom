@@ -1,18 +1,26 @@
-//! PCI(e): config space, MSI-X, INTx routing and the ECAM root complex.
+//! PCI(e): config space, MSI-X, INTx, ECAM and checked legacy CF8/CFC access.
 
+mod cf8;
 mod config;
+mod lpc;
+mod mch;
 pub mod msi;
 pub mod msix;
 pub mod port;
 mod root;
+mod smram;
 
 use std::sync::{Arc, Mutex};
 
 pub use config::{BarSpec, ConfigSpace, PciId, VendorIds, CFG_SIZE};
+pub use cf8::{PciCf8, PciCf8Error};
+pub use lpc::{LpcError, LpcIoContext, LpcPioLayout, LpcPioWriteOutcome, LpcSmiRequest};
+pub use mch::{MchError, MchPci, PciConfigError};
 pub use msi::Msi;
 pub use msix::{Msix, MsiSender};
 pub use port::RootPort;
 pub use root::{Intx, IntxRouter, PciRoot};
+pub use smram::{MchSmramState, MchTsegState};
 
 use crate::IrqLine;
 

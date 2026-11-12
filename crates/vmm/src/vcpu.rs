@@ -15,16 +15,16 @@ use vroom_hv::{BootRegs, Vcpu, VcpuExit, VcpuKicker, VcpuState, Vm};
 
 use crate::psci::{self, CpuTable, PsciOutcome};
 use crate::{Error, Result};
+use crate::lifecycle::LifecyclePolicy;
 
 /// Commands for a vCPU thread. Replies go back on the embedded channel.
 pub enum VcpuCmd {
     WriteRegister(vroom_hv::debug::Register, u64, Sender<Result<()>>),
     Debug(vroom_hv::debug::DebugConfig, Sender<Result<()>>),
-    /// Start executing (boot CPU, or PSCI CPU_ON target).
+    /// Once-only initial boot, acknowledged before any CPU is resumed.
+    Initialize(Option<BootRegs>, Sender<Result<()>>),
+    /// Runtime PSCI CPU_ON, using pristine state on resettable boards.
     PowerOn(BootRegs),
-    /// Enter the run loop without touching registers (secondaries when
-    /// the kernel does PSCI: it keeps them parked until CPU_ON).
-    Start,
     Pause(Sender<()>),
     Resume,
     Save(Sender<Result<VcpuState>>),
@@ -44,7 +44,7 @@ impl std::fmt::Debug for VcpuCmd {
             VcpuCmd::WriteRegister(..) => "WriteRegister",
             VcpuCmd::Debug(..) => "Debug",
             VcpuCmd::PowerOn(_) => "PowerOn",
-            VcpuCmd::Start => "Start",
+            VcpuCmd::Initialize(..) => "Initialize",
             VcpuCmd::Pause(_) => "Pause",
             VcpuCmd::Resume => "Resume",
             VcpuCmd::Save(_) => "Save",
@@ -79,15 +79,20 @@ pub enum VmEvent {
 pub struct VcpuShared {
     pub vm: Arc<dyn Vm>,
     pub mmio: Bus,
-    pub pio: Bus,
+    /// Full PC board ports, including repeated string I/O.
+    pub pc_pio: Option<Bus>,
     pub unmapped_mmio: u8,
+    /// Only an explicit PC board opts into absent-port behavior.
+    pub pio: Option<crate::pio::PcPioBus>,
     pub cpus: Mutex<CpuTable>,
     pub events: Sender<VmEvent>,
     /// Filled once all threads are up; used for CPU_ON.
     pub peers: OnceLock<Vec<Peer>>,
-    /// MMIO accesses vCPUs passed to devices (research resets skip the
+    /// Device I/O accesses vCPUs passed to devices (research resets skip the
     /// device restore when none happened and the devices stayed paused).
     pub device_exits: std::sync::atomic::AtomicU64,
+    /// Attempted backend run calls, not executed instructions.
+    pub run_calls: std::sync::atomic::AtomicU64,
     /// A debug stop parks every vCPU at once (research: the guest clock
     /// stands still from there). `halting`: a stop is parking them,
     /// `parked`: how many are, `halted_at`: the guest clock once all are
@@ -139,57 +144,91 @@ impl Peer {
 pub struct VcpuHandle {
     pub peer: Peer,
     thread: Option<JoinHandle<()>>,
-    /// The kernel handles PSCI: secondaries just need a Start.
-    pub in_kernel_psci: bool,
 }
 
 impl VcpuHandle {
     pub fn join(&mut self) {
+        let _ = self.join_checked();
+    }
+
+    pub fn join_checked(&mut self) -> Result<()> {
         if let Some(t) = self.thread.take() {
-            let _ = t.join();
+            t.join().map_err(|_| Error::Setup("vCPU worker panicked".into()))?;
         }
+        Ok(())
     }
 }
 
 /// Spawn vCPU `index`. Returns once the vCPU exists (or failed to).
-pub fn spawn(index: u32, shared: Arc<VcpuShared>) -> Result<VcpuHandle> {
+pub fn spawn(index: u32, shared: Arc<VcpuShared>, lifecycle: LifecyclePolicy) -> Result<VcpuHandle> {
     let (tx, rx) = mpsc::channel();
     let (ready_tx, ready_rx) = mpsc::channel();
     let thread = std::thread::Builder::new()
         .name(format!("vcpu{index}"))
-        .spawn(move || {
-            let vcpu = match shared.vm.create_vcpu(index) {
-                Ok(v) => v,
-                Err(e) => {
-                    let _ = ready_tx.send(Err(Error::Hv(e)));
-                    return;
-                }
-            };
-            let pristine = {
-                let mut v = vcpu;
-                match v.save_state() {
-                    Ok(s) => {
-                        let _ = ready_tx.send(Ok((v.kicker(), v.in_kernel_psci())));
-                        (v, s)
-                    }
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(Error::Hv(e)));
-                        return;
-                    }
-                }
-            };
-            // Everyone waits for PowerOn / Start: with KVM the irqchip must
-            // be initialised before any vCPU enters KVM_RUN.
-            VcpuLoop { vcpu: pristine.0, pristine: pristine.1, shared, rx, running: false, paused: false, stopped_by: None }.run();
-        })
+        .spawn(move || start_worker(index, shared, lifecycle, rx, ready_tx))
         .map_err(|e| Error::Setup(format!("spawn vcpu thread: {e}")))?;
-    let (kicker, in_kernel_psci) = ready_rx.recv().map_err(|_| Error::VcpuGone)??;
-    Ok(VcpuHandle { peer: Peer { tx, kicker }, thread: Some(thread), in_kernel_psci })
+    finish_startup(tx, ready_rx, thread)
+}
+
+fn start_worker(index: u32, shared: Arc<VcpuShared>, lifecycle: LifecyclePolicy,
+    rx: Receiver<VcpuCmd>, ready_tx: Sender<Result<Arc<dyn VcpuKicker>>>) {
+    let mut vcpu = match shared.vm.create_vcpu(index) {
+        Ok(v) => v,
+        Err(error) => {
+            let _ = ready_tx.send(Err(Error::Hv(error)));
+            return;
+        }
+    };
+    let pristine = if lifecycle == LifecyclePolicy::Resettable {
+        match vcpu.save_state() {
+            Ok(state) => Some(state),
+            Err(error) => {
+                let _ = ready_tx.send(Err(Error::Hv(error)));
+                return;
+            }
+        }
+    } else { None };
+    // An abandoned startup must not enter the command loop, even if commands
+    // were already queued. Locals drop the CPU before its shared VM owners.
+    if ready_tx.send(Ok(vcpu.kicker())).is_err() { return; }
+    // Wait for acknowledged Initialize; KVM's irqchip is finalized first.
+    VcpuLoop { vcpu, pristine, lifecycle, initialized: false, shared, rx,
+        running: false, paused: false, stopped_by: None }.run();
+}
+
+fn finish_startup(tx: Sender<VcpuCmd>, ready_rx: Receiver<Result<Arc<dyn VcpuKicker>>>,
+    thread: JoinHandle<()>) -> Result<VcpuHandle> {
+    match ready_rx.recv().map_err(|_| Error::VcpuGone).and_then(|ready| ready) {
+        Ok(kicker) => Ok(VcpuHandle { peer: Peer { tx, kicker }, thread: Some(thread) }),
+        Err(error) => {
+            // Closing commands also releases a parked worker if readiness was
+            // lost. Never detach a failed startup while it owns VM resources.
+            drop(tx);
+            thread.join().map_err(|_| Error::Setup("vCPU worker panicked".into()))?;
+            Err(error)
+        }
+    }
+}
+
+// Only the lifecycle tests can arrange channel abandonment/disconnection.
+// Production uses the same two helpers through spawn, without policy hooks.
+#[cfg(test)]
+pub(super) fn start_worker_for_test(index: u32, shared: Arc<VcpuShared>, lifecycle: LifecyclePolicy,
+    rx: Receiver<VcpuCmd>, ready_tx: Sender<Result<Arc<dyn VcpuKicker>>>) {
+    start_worker(index, shared, lifecycle, rx, ready_tx)
+}
+
+#[cfg(test)]
+pub(super) fn finish_startup_for_test(tx: Sender<VcpuCmd>, ready_rx: Receiver<Result<Arc<dyn VcpuKicker>>>,
+    thread: JoinHandle<()>) -> Result<VcpuHandle> {
+    finish_startup(tx, ready_rx, thread)
 }
 
 struct VcpuLoop {
     vcpu: Box<dyn Vcpu>,
-    pristine: VcpuState,
+    pristine: Option<VcpuState>,
+    lifecycle: LifecyclePolicy,
+    initialized: bool,
     shared: Arc<VcpuShared>,
     rx: Receiver<VcpuCmd>,
     running: bool,
@@ -261,17 +300,24 @@ impl VcpuLoop {
                 };
                 let _ = reply.send(r);
             }
+            VcpuCmd::Initialize(regs, reply) => {
+                let result = self.initialize(regs.as_ref());
+                let _ = reply.send(result);
+            }
             VcpuCmd::PowerOn(regs) => match self.power_on(&regs) {
                 Ok(()) => self.running = true,
                 Err(e) => log::error!("vcpu{}: power on: {e}", self.index()),
             },
-            VcpuCmd::Start => self.running = true,
             VcpuCmd::Pause(ack) => {
                 self.paused = true;
                 let _ = ack.send(());
             }
             VcpuCmd::Resume => self.paused = false,
             VcpuCmd::Save(reply) => {
+                if let Err(error) = self.lifecycle.require_state("snapshot") {
+                    let _ = reply.send(Err(error));
+                    return true;
+                }
                 if let Some(why) = &self.stopped_by {
                     let _ = reply.send(Err(Error::CantSave(format!("CPU {} stopped: {why}", self.index()))));
                     return true;
@@ -284,6 +330,10 @@ impl VcpuLoop {
                 let _ = reply.send(r.map_err(Error::Hv));
             }
             VcpuCmd::Restore(state, on, reply) => {
+                if let Err(error) = self.lifecycle.require_state("restore") {
+                    let _ = reply.send(Err(error));
+                    return true;
+                }
                 let r = self.vcpu.restore_state(&state).map_err(Error::Hv);
                 if r.is_ok() {
                     // In-kernel PSCI: off CPUs wait inside KVM_RUN.
@@ -314,16 +364,38 @@ impl VcpuLoop {
         }
     }
 
+    fn initialize(&mut self, regs: Option<&BootRegs>) -> Result<()> {
+        if self.initialized {
+            return Err(Error::Setup("vCPU initialization was already attempted".into()));
+        }
+        // A failed register write can leave partial state. Never retry a cold start.
+        self.initialized = true;
+        self.paused = true;
+        if let Some(regs) = regs {
+            if self.lifecycle == LifecyclePolicy::Resettable {
+                self.power_on(regs)?;
+            } else {
+                self.vcpu.set_boot_regs(regs)?;
+            }
+        }
+        self.running = regs.is_some() || self.vcpu.in_kernel_psci();
+        Ok(())
+    }
+
     fn power_on(&mut self, regs: &BootRegs) -> Result<()> {
+        self.lifecycle.require_state("CPU power-on reset")?;
         // Fresh architectural state, then the entry point.
-        self.vcpu.restore_state(&self.pristine)?;
+        let pristine = self.pristine.as_ref().ok_or_else(|| Error::Setup("missing pristine CPU state".into()))?;
+        self.vcpu.restore_state(pristine)?;
         self.vcpu.set_boot_regs(regs)?;
         Ok(())
     }
 
     fn reset(&mut self, regs: Option<&BootRegs>) -> Result<()> {
+        self.lifecycle.require_state("reset")?;
+        let pristine = self.pristine.as_ref().ok_or_else(|| Error::Setup("missing pristine CPU state".into()))?;
+        self.vcpu.restore_state(pristine)?;
         self.stopped_by = None;
-        self.vcpu.restore_state(&self.pristine)?;
         self.running = self.vcpu.in_kernel_psci() && self.index() != 0;
         if let Some(r) = regs {
             self.vcpu.set_boot_regs(r)?;
@@ -333,7 +405,22 @@ impl VcpuLoop {
     }
 
     fn step(&mut self) -> Result<()> {
+        if let Some(pio) = &self.shared.pio { pio.check_error()?; }
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut count = self.shared.run_calls.load(SeqCst);
+        while count != u64::MAX {
+            match self.shared.run_calls.compare_exchange_weak(count, count + 1, SeqCst, SeqCst) {
+                Ok(_) => break,
+                Err(now) => count = now,
+            }
+        }
         match self.vcpu.run()? {
+            VcpuExit::X86SmmIo(_) => {
+                // Existing boards have no isolated SMM-aware device routing.
+                // Never erase the context by forwarding to the ordinary bus,
+                // GuestMemory/device DMA, or a fabricated read completion.
+                return Err(Error::Setup("SMM I/O is unavailable on this VMM board".into()));
+            }
             VcpuExit::Debug(stop) => {
                 use std::sync::atomic::Ordering::SeqCst;
                 if self.shared.halt_on_stop.load(SeqCst) && !self.shared.halting.swap(true, SeqCst) {
@@ -357,6 +444,7 @@ impl VcpuLoop {
                 let mut buf = [self.shared.unmapped_mmio; 8];
                 let len = len.min(8);
                 if !self.shared.mmio.read(addr, &mut buf[..len]) {
+                    if self.shared.pio.is_some() { return Err(Error::Setup(format!("unmapped PC MMIO read at {addr:#x}"))); }
                     log::debug!("vcpu{}: read from unmapped {addr:#x}", self.index());
                 }
                 log::trace!(target: "vroom_mmio", "read {addr:#x}: {:x?}", &buf[..len]);
@@ -366,6 +454,7 @@ impl VcpuLoop {
                 log::trace!(target: "vroom_mmio", "write {addr:#x}: {:x?}", &data[..len.min(8)]);
                 self.shared.device_exits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if !self.shared.mmio.write(addr, &data[..len.min(8)]) {
+                    if self.shared.pio.is_some() { return Err(Error::Setup(format!("unmapped PC MMIO write at {addr:#x}"))); }
                     log::debug!("vcpu{}: write to unmapped {addr:#x}", self.index());
                 }
             }
@@ -380,7 +469,10 @@ impl VcpuLoop {
             }
             VcpuExit::Halted => self.running = false,
             VcpuExit::PioIn { port, len } => self.port_in(port, len, 1)?,
-            VcpuExit::PioOut { port, len, data } => self.port_out(port, len, &data[..len.min(4)])?,
+            VcpuExit::PioOut { port, len, data } => {
+                let bytes = data.get(..len).ok_or_else(|| Error::Setup("PIO output exceeds a scalar value".into()))?;
+                self.port_out(port, len, bytes)?;
+            }
             VcpuExit::PioInBatch { port, size, count } => self.port_in(port, size, count)?,
             VcpuExit::PioOutBatch { port, size, data } => self.port_out(port, size, &data)?,
         }
@@ -391,7 +483,12 @@ impl VcpuLoop {
         let len = size.checked_mul(count).filter(|&n| n <= 65536 && n > 0);
         if ![1,2,4].contains(&size) || len.is_none() { return Err(Error::Setup("invalid KVM port input length".into())); }
         let mut data = vec![0xff; len.unwrap_or(0)];
-        for chunk in data.chunks_mut(size) { self.shared.pio.read(port as u64, chunk); }
+        if let Some(bus) = &self.shared.pc_pio {
+            for chunk in data.chunks_mut(size) { bus.read(port as u64, chunk); }
+        } else {
+            if count != 1 { return Err(Error::Setup("string I/O on scalar-only board".into())); }
+            self.shared.pio.as_ref().ok_or_else(|| Error::Setup("port I/O on a board without ports".into()))?.read(port, &mut data)?;
+        }
         log::trace!("pio in {port:#x}: {data:x?}");
         self.shared.device_exits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.vcpu.complete_pio_in(&data)?; Ok(())
@@ -399,11 +496,17 @@ impl VcpuLoop {
 
     fn port_out(&mut self, port: u16, size: usize, data: &[u8]) -> Result<()> {
         if ![1,2,4].contains(&size) || !data.len().is_multiple_of(size) { return Err(Error::Setup("invalid KVM port output length".into())); }
+        if self.shared.pc_pio.is_none() {
+            if data.len() != size { return Err(Error::Setup("string I/O on scalar-only board".into())); }
+            self.shared.pio.as_ref().ok_or_else(|| Error::Setup("port I/O on a board without ports".into()))?.write(port, data)?;
+            self.shared.device_exits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(());
+        }
         for chunk in data.chunks(size) {
             log::trace!("pio out {port:#x}: {chunk:x?}");
             if port == 0xcf9 && chunk[0] & 4 != 0 { let _ = self.shared.events.send(VmEvent::Reset); }
             else if port == 0x402 { log::debug!("OVMF: {}", String::from_utf8_lossy(chunk)); }
-            else { self.shared.pio.write(port as u64, chunk); }
+            else if let Some(bus) = &self.shared.pc_pio { bus.write(port as u64, chunk); }
         }
         self.shared.device_exits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
@@ -446,3 +549,8 @@ impl VcpuLoop {
         Ok(())
     }
 }
+
+
+#[cfg(test)]
+#[path = "pio_worker_tests.rs"]
+mod pio_worker_tests;

@@ -3,7 +3,7 @@ import struct
 
 import pytest
 
-from vroom_tui.analysis import prepare_rva_image
+from vroom_atui.analysis import prepare_rva_image
 
 
 def fixture(tmp_path):

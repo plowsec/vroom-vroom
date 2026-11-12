@@ -50,6 +50,7 @@
 /research/snapshots/
 /HEVD-LAB-CHEATSHEET.md
 /.vm-ssh/
+/.aws-pilot/
 
 # Local credentials.
 .env

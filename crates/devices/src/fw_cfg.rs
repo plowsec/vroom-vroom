@@ -1,8 +1,10 @@
-//! QEMU fw_cfg (MMIO flavour), the channel EDK2 uses to get ACPI tables,
+//! QEMU fw_cfg, the channel EDK2 uses to get ACPI tables,
 //! the ramfb config and boot settings.
 //!
-//! Layout at `base`: data @0x0 (byte stream), selector @0x8 (BE u16),
+//! MMIO layout at `base`: data @0x0 (byte stream), selector @0x8 (BE u16),
 //! DMA address @0x10 (BE u64; writing the low half starts the transfer).
+//! [`FwCfgIo`] supplies the PC port-I/O transport over the same item/DMA core.
+//! Protocol: <https://www.qemu.org/docs/master/specs/fw_cfg.html>.
 
 use std::collections::BTreeMap;
 
@@ -84,6 +86,12 @@ impl FwCfg {
         f
     }
 
+    /// Skip EDK2's optional countdown before booting the OS.
+    pub fn skip_boot_menu(&mut self) -> Result<(), String> {
+        self.set(0x000e, 1u16.to_le_bytes().to_vec()); // FW_CFG_BOOT_MENU
+        self.add_file("etc/boot-menu-wait", 0u16.to_le_bytes().to_vec(), None)
+    }
+
     /// Add a named file. `on_write` makes it guest-writable.
     pub fn add_file(&mut self, name: &str, data: Vec<u8>, on_write: Option<WriteHook>) -> Result<(), String> {
         if name.len() >= 56 || self.files.iter().any(|(n, _)| n == name) {
@@ -152,10 +160,6 @@ impl FwCfg {
             self.read_bytes(&mut v);
             return self.mem.write(buf, &v).is_ok();
         }
-        if control & DMA_SKIP != 0 {
-            self.st.offset = self.st.offset.saturating_add(len as usize);
-            return true;
-        }
         if control & DMA_WRITE != 0 {
             let mut v = vec![0u8; len as usize];
             if self.mem.read(buf, &mut v).is_err() {
@@ -172,6 +176,10 @@ impl FwCfg {
             self.st.offset += v.len();
             hook(&item.data);
             return true;
+        }
+        // The protocol gives READ priority over WRITE, then SKIP.
+        if control & DMA_SKIP != 0 {
+            self.st.offset = self.st.offset.saturating_add(len as usize);
         }
         true
     }
@@ -229,6 +237,67 @@ impl BusDevice for FwCfg {
                 self.st.dma_hi = 0;
                 self.dma(addr);
             }
+            _ => {}
+        }
+    }
+}
+
+/// PC scalar port-I/O transport. Map [`Self::PORT_SIZE`] bytes at
+/// [`Self::PORT_BASE`], with scalar widths 1, 2 and 4 enabled on the bus.
+///
+/// The overlapping selector/data registers are at offsets 0 (LE u16 write)
+/// and 1 (byte read). DMA address halves at offsets 4 and 8 are BE u32;
+/// writing the low half starts the transfer and clears the address latch.
+/// Unsupported accesses read all ones or ignore writes, without advancing
+/// the stream. Modern fw_cfg ignores data-port writes.
+///
+/// This adapter does not register a board device or enable a firmware profile.
+/// Current EDK2 `BaseIoLibIntrinsic` FIFO reads loop over scalar accesses.
+/// Other clients' string/multiple-element I/O remains unsupported by the
+/// hypervisor interface. No VM snapshot support is implied by this transport.
+#[derive(Debug)]
+pub struct FwCfgIo {
+    inner: FwCfg,
+}
+
+impl FwCfgIo {
+    pub const PORT_BASE: u16 = 0x510;
+    pub const PORT_SIZE: u32 = 12;
+
+    pub fn new(mem: GuestMemory, cpus: u16, ram: u64) -> Self {
+        Self { inner: FwCfg::new(u64::from(Self::PORT_BASE), mem, cpus, ram) }
+    }
+
+    /// Add a named file to the shared firmware directory.
+    pub fn add_file(&mut self, name: &str, data: Vec<u8>, on_write: Option<WriteHook>) -> Result<(), String> {
+        self.inner.add_file(name, data, on_write)
+    }
+
+    pub fn skip_boot_menu(&mut self) -> Result<(), String> {
+        self.inner.skip_boot_menu()
+    }
+}
+
+impl BusDevice for FwCfgIo {
+    fn read(&mut self, offset: u64, data: &mut [u8]) {
+        match (offset, data.len()) {
+            (1, 1) => self.inner.read_bytes(data),
+            // DMA signature bytes are string-preserving, including partial
+            // reads. Check the entire span before indexing or touching state.
+            (4..=11, 1 | 2 | 4) if data.len() <= 12 - offset as usize => {
+                let start = offset as usize - 4;
+                data.copy_from_slice(&b"QEMU CFG"[start..start + data.len()]);
+            }
+            _ => data.fill(0xff),
+        }
+    }
+
+    fn write(&mut self, offset: u64, data: &[u8]) {
+        match (offset, data.len()) {
+            (0, 2) => self.inner.select(u16::from_le_bytes([data[0], data[1]])),
+            // Reuse the MMIO core's BE high/low latch and DMA completion.
+            (4, 4) => self.inner.write(0x10, data),
+            (8, 4) => self.inner.write(0x14, data),
             _ => {}
         }
     }
@@ -329,5 +398,178 @@ mod tests {
         assert_eq!(dma(&mut f, DMA_SELECT | DMA_WRITE | ((ramfb + 1) << 16), 4, 0x3000), DMA_ERROR);
         // Huge read: refused, no allocation.
         assert_eq!(dma(&mut f, DMA_SELECT | DMA_READ | (ramfb << 16), u32::MAX, 0x3000), DMA_ERROR);
+    }
+
+    fn io_dev() -> FwCfgIo {
+        let mem = GuestMemory::new(&[
+            (GuestAddress(0), 1 << 20),
+            (GuestAddress(1 << 32), 1 << 16),
+        ]).unwrap();
+        FwCfgIo::new(mem, 0x1234, 0x0102_0304_0506_0708)
+    }
+
+    fn io_bytes(f: &mut FwCfgIo, count: usize) -> Vec<u8> {
+        (0..count).map(|_| {
+            let mut byte = [0];
+            f.read(1, &mut byte);
+            byte[0]
+        }).collect()
+    }
+
+    fn io_descriptor(f: &FwCfgIo, addr: u64, control: u32, len: u32, buf: u64) {
+        let mut h = control.to_be_bytes().to_vec();
+        h.extend_from_slice(&len.to_be_bytes());
+        h.extend_from_slice(&buf.to_be_bytes());
+        f.inner.mem.write(GuestAddress(addr), &h).unwrap();
+    }
+
+    fn io_dma(f: &mut FwCfgIo, control: u32, len: u32, buf: u64) -> u32 {
+        io_descriptor(f, 0x1000, control, len, buf);
+        f.write(8, &0x1000u32.to_be_bytes());
+        u32::from_be_bytes(f.inner.mem.read_obj::<[u8; 4]>(GuestAddress(0x1000)).unwrap())
+    }
+
+    #[test]
+    fn io_selector_is_little_endian_and_data_is_a_byte_stream() {
+        let mut f = io_dev();
+        assert_eq!(io_bytes(&mut f, 6), b"QEMU\0\0");
+        f.write(0, &SIGNATURE.to_le_bytes());
+        assert_eq!(io_bytes(&mut f, 2), b"QE");
+        f.write(0, &SIGNATURE.to_le_bytes());
+        assert_eq!(io_bytes(&mut f, 4), b"QEMU");
+        f.write(0, &ID.to_le_bytes());
+        assert_eq!(io_bytes(&mut f, 4), FEATURES.to_le_bytes());
+        f.write(0, &NB_CPUS.to_le_bytes());
+        assert_eq!(io_bytes(&mut f, 2), 0x1234u16.to_le_bytes());
+        f.write(0, &RAM_SIZE.to_le_bytes());
+        assert_eq!(io_bytes(&mut f, 8), 0x0102_0304_0506_0708u64.to_le_bytes());
+        // MMIO's selector encoding must not accidentally work for PC PIO.
+        f.write(0, &NB_CPUS.to_be_bytes());
+        assert_eq!(io_bytes(&mut f, 2), [0, 0]);
+    }
+
+    #[test]
+    fn io_directory_preserves_shared_file_and_boot_configuration() {
+        let mut f = io_dev();
+        f.add_file("etc/test", vec![7, 8, 9], None).unwrap();
+        assert!(f.add_file("etc/test", vec![], None).is_err());
+        f.skip_boot_menu().unwrap();
+        f.write(0, &FILE_DIR.to_le_bytes());
+        let dir = io_bytes(&mut f, 4 + 2 * 64);
+        assert_eq!(&dir[..4], &2u32.to_be_bytes());
+        // The sorted directory retains BE size/key, irrespective of transport.
+        assert_eq!(&dir[4..8], &2u32.to_be_bytes());
+        assert_eq!(&dir[8..10], &(FILE_FIRST + 1).to_be_bytes());
+        assert_eq!(&dir[12..31], b"etc/boot-menu-wait\0");
+        assert_eq!(&dir[68..72], &3u32.to_be_bytes());
+        assert_eq!(&dir[72..74], &FILE_FIRST.to_be_bytes());
+        assert_eq!(&dir[76..85], b"etc/test\0");
+        f.write(0, &FILE_FIRST.to_le_bytes());
+        assert_eq!(io_bytes(&mut f, 3), [7, 8, 9]);
+        f.write(0, &0x000eu16.to_le_bytes());
+        assert_eq!(io_bytes(&mut f, 2), [1, 0]);
+    }
+
+    #[test]
+    fn io_dma_signature_is_string_preserving_for_scalar_reads() {
+        let mut f = io_dev();
+        for width in [1, 2, 4] {
+            for start in 0..=8 - width {
+                let mut bytes = vec![0; width];
+                f.read(4 + start as u64, &mut bytes);
+                assert_eq!(bytes, &b"QEMU CFG"[start..start + width]);
+            }
+        }
+        // Signature probing must not consume the selected data stream.
+        assert_eq!(io_bytes(&mut f, 4), b"QEMU");
+    }
+
+    #[test]
+    fn io_invalid_accesses_have_no_device_side_effects() {
+        let mut f = io_dev();
+        let initial = f.inner.save().unwrap();
+        for (offset, width) in [
+            (0, 0), (0, 1), (0, 4), (1, 1), (1, 2), (1, 4),
+            (2, 2), (3, 4), (4, 2), (4, 8), (5, 4), (8, 2),
+            (8, 8), (9, 4), (12, 4), (u64::MAX, 4),
+        ] {
+            f.write(offset, &vec![0xa5; width]);
+            assert_eq!(f.inner.save().unwrap(), initial, "write {offset:#x}/{width}");
+        }
+        for (offset, width) in [
+            (0, 0), (0, 1), (0, 2), (1, 2), (1, 4), (2, 1),
+            (3, 4), (4, 8), (8, 8), (10, 4), (11, 2), (12, 1), (u64::MAX, 1),
+        ] {
+            let mut bytes = vec![0xa5; width];
+            f.read(offset, &mut bytes);
+            assert_eq!(bytes, vec![0xff; width], "read {offset:#x}/{width}");
+            assert_eq!(f.inner.save().unwrap(), initial);
+        }
+        assert_eq!(io_bytes(&mut f, 4), b"QEMU");
+    }
+
+    #[test]
+    fn io_dma_high_then_low_triggers_and_clears_the_address_latch() {
+        let mut f = io_dev();
+        f.add_file("etc/test", b"abcdef".to_vec(), None).unwrap();
+        let high_descriptor = (1 << 32) + 0x1000;
+        let control = (u32::from(FILE_FIRST) << 16) | DMA_SELECT | DMA_READ;
+        io_descriptor(&f, high_descriptor, control, 3, 0x3000);
+        f.write(4, &1u32.to_be_bytes());
+        // High-half and invalid-width low-half writes do not transfer.
+        f.write(8, &0x1000u16.to_be_bytes());
+        assert_eq!(f.inner.mem.read_obj::<[u8; 4]>(GuestAddress(high_descriptor)).unwrap(), control.to_be_bytes());
+        assert_eq!(f.inner.mem.read_obj::<[u8; 3]>(GuestAddress(0x3000)).unwrap(), [0; 3]);
+        f.write(8, &0x1000u32.to_be_bytes());
+        assert_eq!(f.inner.mem.read_obj::<[u8; 4]>(GuestAddress(high_descriptor)).unwrap(), [0; 4]);
+        assert_eq!(f.inner.mem.read_obj::<[u8; 3]>(GuestAddress(0x3000)).unwrap(), *b"abc");
+        // PIO and DMA consume the same stream offset.
+        assert_eq!(io_bytes(&mut f, 1), b"d");
+        assert_eq!(io_dma(&mut f, DMA_READ, 2, 0x3000), 0);
+        assert_eq!(f.inner.mem.read_obj::<[u8; 2]>(GuestAddress(0x3000)).unwrap(), *b"ef");
+        assert_eq!(f.inner.st.dma_hi, 0);
+    }
+
+    #[test]
+    fn io_dma_writes_hooks_and_reports_bounded_errors() {
+        let mut f = io_dev();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let s2 = seen.clone();
+        f.add_file("etc/writable", vec![0; 4], Some(Box::new(move |d| *s2.lock().unwrap() = d.to_vec()))).unwrap();
+        f.add_file("etc/read-only", vec![9; 4], None).unwrap();
+        f.inner.mem.write(GuestAddress(0x3000), b"test").unwrap();
+        let select = (u32::from(FILE_FIRST) << 16) | DMA_SELECT;
+        assert_eq!(io_dma(&mut f, select | DMA_WRITE | DMA_SKIP, 4, 0x3000), 0);
+        assert_eq!(*seen.lock().unwrap(), b"test");
+        assert_eq!(io_dma(&mut f, select | DMA_WRITE, 5, 0x3000), DMA_ERROR);
+        assert_eq!(io_dma(&mut f, select | DMA_WRITE, 4, u64::MAX), DMA_ERROR);
+        assert_eq!(io_dma(&mut f, select | DMA_READ, MAX_DMA + 1, 0x3000), DMA_ERROR);
+        assert_eq!(io_dma(&mut f, select | DMA_READ, 4, u64::MAX), DMA_ERROR);
+        assert_eq!(io_dma(&mut f, (select + (1 << 16)) | DMA_WRITE, 4, 0x3000), DMA_ERROR);
+        assert_eq!(*seen.lock().unwrap(), b"test");
+        // An incomplete descriptor is not interpreted or partially executed.
+        f.inner.mem.write(GuestAddress((1 << 20) - 8), &[0xa5; 8]).unwrap();
+        f.write(8, &((1u32 << 20) - 8).to_be_bytes());
+        assert_eq!(f.inner.mem.read_obj::<[u8; 8]>(GuestAddress((1 << 20) - 8)).unwrap(), [0xa5; 8]);
+        assert_eq!(io_dma(&mut f, select | DMA_READ, 4, 0x3000), 0);
+        assert_eq!(f.inner.mem.read_obj::<[u8; 4]>(GuestAddress(0x3000)).unwrap(), *b"test");
+    }
+
+    #[test]
+    fn dma_operation_priority_is_read_then_write_then_skip() {
+        let mut f = dev();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let s2 = seen.clone();
+        f.add_file("etc/test", b"abcd".to_vec(), Some(Box::new(move |d| *s2.lock().unwrap() = d.to_vec()))).unwrap();
+        let select = (u32::from(FILE_FIRST) << 16) | DMA_SELECT;
+        assert_eq!(dma(&mut f, select | DMA_READ | DMA_WRITE | DMA_SKIP, 4, 0x3000), 0);
+        assert_eq!(f.mem.read_obj::<[u8; 4]>(GuestAddress(0x3000)).unwrap(), *b"abcd");
+        assert!(seen.lock().unwrap().is_empty());
+        f.mem.write(GuestAddress(0x3000), b"wxyz").unwrap();
+        assert_eq!(dma(&mut f, select | DMA_WRITE | DMA_SKIP, 4, 0x3000), 0);
+        assert_eq!(*seen.lock().unwrap(), b"wxyz");
+        assert_eq!(dma(&mut f, select | DMA_SKIP, 2, u64::MAX), 0);
+        assert_eq!(dma(&mut f, DMA_READ, 2, 0x3000), 0);
+        assert_eq!(f.mem.read_obj::<[u8; 2]>(GuestAddress(0x3000)).unwrap(), *b"yz");
     }
 }

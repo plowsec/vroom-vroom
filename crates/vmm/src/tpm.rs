@@ -12,6 +12,7 @@
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -30,6 +31,7 @@ const INIT_FLAG_DELETE_VOLATILE: u32 = 1;
 /// Key generation on a busy host can take a while.
 const TIMEOUT: Duration = Duration::from_secs(60);
 const STATE_FILES: [&str; 2] = ["tpm2-00.permall", "tpm2-00.volatilestate"];
+const MAX_STATE_FILE: usize = 1 << 20;
 
 pub struct Swtpm {
     ctrl: UnixStream,
@@ -57,6 +59,73 @@ fn err(what: &str) -> impl Fn(std::io::Error) -> Error + '_ {
 
 #[derive(Serialize, Deserialize)]
 struct StateFiles(Vec<(String, Vec<u8>)>);
+
+impl StateFiles {
+    fn validate(&self) -> vroom_snapshot::Result<()> {
+        // This backend always runs TPM 2. A successful init has permanent
+        // state; STORE_VOLATILE must then produce volatile state. TPM 1.2's
+        // optional savestate blob is not part of this backend's contract.
+        if self.0.len() != STATE_FILES.len()
+            || STATE_FILES.iter().any(|required| self.0.iter().filter(|(n, _)| n == required).count() != 1)
+        {
+            return Err(vroom_snapshot::Error::Invalid("vtpm: missing, duplicate or unexpected state file".into()));
+        }
+        for (name, bytes) in &self.0 {
+            if bytes.is_empty() || bytes.len() > MAX_STATE_FILE {
+                return Err(vroom_snapshot::Error::Invalid(format!("vtpm: {name}: empty or oversized state")));
+            }
+        }
+        Ok(())
+    }
+
+    fn decode(blob: &[u8]) -> vroom_snapshot::Result<Self> {
+        // Do not include serde's error text: malformed input may contain state
+        // bytes in a position where a field/type diagnostic would print them.
+        let state: Self = serde_json::from_slice(blob)
+            .map_err(|_| vroom_snapshot::Error::Invalid("vtpm: malformed state archive".into()))?;
+        state.validate()?;
+        Ok(state)
+    }
+}
+
+fn read_state_file(dir: &Path, name: &str) -> std::io::Result<Vec<u8>> {
+    // Bound the read and reject links/special files without potentially blocking
+    // on a FIFO. The TPM is serialized behind the device lock during capture.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(dir.join(name))?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_STATE_FILE as u64 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "expected bounded nonempty regular state file"));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_STATE_FILE as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != metadata.len() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "state file length changed while reading"));
+    }
+    Ok(bytes)
+}
+
+/// Export first, then capture both required files. No STOP, INIT or state-file
+/// replacement occurs here: an error leaves the live backend available to the
+/// caller's existing snapshot/suspend recovery path.
+fn capture_state(
+    export: impl FnOnce() -> Result<()>,
+    mut read: impl FnMut(&str) -> std::io::Result<Vec<u8>>,
+) -> vroom_snapshot::Result<Vec<u8>> {
+    export().map_err(|e| vroom_snapshot::Error::Invalid(format!("vtpm state export: {e}")))?;
+    let mut files = Vec::with_capacity(STATE_FILES.len());
+    for name in STATE_FILES {
+        let bytes = read(name).map_err(|e| vroom_snapshot::Error::Io(std::io::Error::new(
+            e.kind(), format!("vtpm: read required {name}: {}", e.kind()),
+        )))?;
+        files.push((name.to_string(), bytes));
+    }
+    let state = StateFiles(files);
+    state.validate()?;
+    vroom_snapshot::encode(&state)
+}
 
 impl Swtpm {
     /// Start swtpm on `dir`. `fresh`: cold boot (drop volatile state) vs
@@ -201,22 +270,18 @@ impl TpmBackend for Swtpm {
         self.stop_and_init(0);
     }
 
-    fn save(&mut self) -> Vec<u8> {
-        if let Err(e) = self.ctrl_cmd(CMD_STORE_VOLATILE, &[], "store volatile") {
-            log::warn!("{e}");
-        }
-        let files: Vec<(String, Vec<u8>)> = STATE_FILES
-            .iter()
-            .filter_map(|n| std::fs::read(self.dir.join(n)).ok().map(|b| (n.to_string(), b)))
-            .collect();
-        serde_json::to_vec(&StateFiles(files)).unwrap_or_default()
+    fn save(&mut self) -> vroom_snapshot::Result<Vec<u8>> {
+        let dir = self.dir.clone();
+        capture_state(
+            || self.ctrl_cmd(CMD_STORE_VOLATILE, &[], "store volatile"),
+            |name| read_state_file(&dir, name),
+        )
     }
 
     fn load(&mut self, blob: &[u8]) -> bool {
-        let Ok(StateFiles(files)) = serde_json::from_slice::<StateFiles>(blob) else { return false };
-        if files.iter().any(|(n, b)| !STATE_FILES.contains(&n.as_str()) || b.len() > 1 << 20) {
-            return false;
-        }
+        // Reject incomplete older captures before stopping the current TPM or
+        // replacing any of its files. Complete existing archives are unchanged.
+        let Ok(StateFiles(files)) = StateFiles::decode(blob) else { return false };
         if let Err(e) = self.ctrl_cmd(CMD_STOP, &[], "stop") {
             log::warn!("{e}");
             return false;
@@ -247,5 +312,179 @@ impl Drop for Swtpm {
             std::thread::sleep(Duration::from_millis(20));
         }
         log::warn!("vtpm: swtpm {} did not exit", self.child.id());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::io::ErrorKind;
+
+    fn write_state(dir: &Path) {
+        std::fs::write(dir.join(STATE_FILES[0]), b"test permanent state").unwrap();
+        std::fs::write(dir.join(STATE_FILES[1]), b"test volatile state").unwrap();
+    }
+
+    #[test]
+    fn successful_export_creates_required_volatile_state_and_captures_both_files() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join(STATE_FILES[0]), b"test permanent state").unwrap();
+        // Volatile state may be absent after INIT, but not after its successful
+        // export. No TPM 1.2 savestate file is needed or read.
+        let exported = Cell::new(false);
+        let blob = capture_state(
+            || {
+                std::fs::write(temp.path().join(STATE_FILES[1]), b"test volatile state")?;
+                exported.set(true);
+                Ok(())
+            },
+            |name| {
+                assert!(exported.get());
+                read_state_file(temp.path(), name)
+            },
+        ).unwrap();
+        let state = StateFiles::decode(&blob).unwrap();
+        assert_eq!(state.0, vec![
+            (STATE_FILES[0].into(), b"test permanent state".to_vec()),
+            (STATE_FILES[1].into(), b"test volatile state".to_vec()),
+        ]);
+        assert_eq!(std::fs::read(temp.path().join(STATE_FILES[0])).unwrap(), b"test permanent state");
+    }
+
+    #[test]
+    fn failed_export_does_not_read_or_return_stale_files() {
+        let reads = Cell::new(0);
+        let result = capture_state(
+            || Err(Error::Setup("store volatile: injected failure".into())),
+            |_| { reads.set(reads.get() + 1); Ok(b"stale state".to_vec()) },
+        );
+        assert!(result.unwrap_err().to_string().contains("store volatile: injected failure"));
+        assert_eq!(reads.get(), 0);
+    }
+
+    #[test]
+    fn unreadable_required_state_is_not_a_partial_success_or_secret_diagnostic() {
+        for failed in STATE_FILES {
+            let error = capture_state(|| Ok(()), |name| {
+                if name == failed {
+                    Err(std::io::Error::new(ErrorKind::PermissionDenied, "secret state bytes must not appear"))
+                } else {
+                    Ok(vec![1, 2, 3])
+                }
+            }).unwrap_err();
+            let text = error.to_string();
+            assert!(text.contains(failed));
+            assert!(!text.contains("secret state bytes"));
+            assert!(matches!(error, vroom_snapshot::Error::Io(e) if e.kind() == ErrorKind::PermissionDenied));
+        }
+    }
+
+    #[test]
+    fn disappearing_state_aborts_capture_and_a_later_capture_can_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        write_state(temp.path());
+        let result = capture_state(|| Ok(()), |name| {
+            let bytes = read_state_file(temp.path(), name)?;
+            if name == STATE_FILES[0] {
+                std::fs::remove_file(temp.path().join(STATE_FILES[1]))?;
+            }
+            Ok(bytes)
+        });
+        assert!(matches!(result, Err(vroom_snapshot::Error::Io(e)) if e.kind() == ErrorKind::NotFound));
+        assert_eq!(std::fs::read(temp.path().join(STATE_FILES[0])).unwrap(), b"test permanent state");
+        let retried = capture_state(
+            || { std::fs::write(temp.path().join(STATE_FILES[1]), b"new volatile state")?; Ok(()) },
+            |name| read_state_file(temp.path(), name),
+        ).unwrap();
+        assert_eq!(StateFiles::decode(&retried).unwrap().0[1].1, b"new volatile state");
+    }
+
+    #[test]
+    fn missing_required_state_after_successful_export_is_an_error() {
+        let temp = tempfile::tempdir().unwrap();
+        for missing in STATE_FILES {
+            write_state(temp.path());
+            std::fs::remove_file(temp.path().join(missing)).unwrap();
+            let error = capture_state(|| Ok(()), |name| read_state_file(temp.path(), name)).unwrap_err();
+            assert!(error.to_string().contains(missing));
+        }
+    }
+
+    #[test]
+    fn capture_rejects_empty_and_oversized_required_state() {
+        for size in [0, MAX_STATE_FILE + 1] {
+            let result = capture_state(|| Ok(()), |_| Ok(vec![0; size]));
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn state_reader_rejects_empty_large_nonregular_and_symlink_files() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(STATE_FILES[0]);
+        let f = std::fs::File::create(&path).unwrap();
+        assert!(read_state_file(temp.path(), STATE_FILES[0]).is_err());
+        f.set_len(MAX_STATE_FILE as u64 + 1).unwrap();
+        assert!(read_state_file(temp.path(), STATE_FILES[0]).is_err());
+        drop(f);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(read_state_file(temp.path(), STATE_FILES[0]).is_err());
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(temp.path().join("other"), b"test state").unwrap();
+        symlink("other", &path).unwrap();
+        assert!(read_state_file(temp.path(), STATE_FILES[0]).is_err());
+    }
+
+    #[test]
+    fn restore_preflight_requires_exact_nonempty_state_without_echoing_input() {
+        let valid = || vec![(STATE_FILES[0].to_string(), vec![1]), (STATE_FILES[1].to_string(), vec![2])];
+        assert!(StateFiles::decode(&serde_json::to_vec(&StateFiles(valid())).unwrap()).is_ok());
+        let mut reversed = valid();
+        reversed.reverse();
+        assert!(StateFiles::decode(&serde_json::to_vec(&StateFiles(reversed)).unwrap()).is_ok());
+        for files in [
+            vec![], vec![valid()[0].clone()],
+            vec![valid()[0].clone(), valid()[0].clone()],
+            vec![("secret unknown name".into(), vec![1]), valid()[1].clone()],
+            vec![(STATE_FILES[0].into(), vec![]), valid()[1].clone()],
+            vec![(STATE_FILES[0].into(), vec![0; MAX_STATE_FILE + 1]), valid()[1].clone()],
+        ] {
+            let error = StateFiles::decode(&serde_json::to_vec(&StateFiles(files)).unwrap()).err().unwrap();
+            assert!(!error.to_string().contains("secret unknown name"));
+        }
+        for blob in [b"".as_slice(), b"[\"secret malformed state\"]".as_slice()] {
+            assert_eq!(StateFiles::decode(blob).err().unwrap().to_string(), "snapshot is invalid: vtpm: malformed state archive");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an explicit disposable helper directory and external 30-second supervisor"]
+    fn disposable_swtpm_captures_manufactured_state_before_guest_commands() {
+        let root = std::env::var_os("VROOM_TPM_TEST_ROOT").expect("set private disposable VROOM_TPM_TEST_ROOT");
+        let temp = tempfile::tempdir_in(&root).unwrap();
+        let mut tpm = Swtpm::start(temp.path(), true).unwrap();
+        std::fs::write(Path::new(&root).join("helper.pid"), tpm.child.id().to_string()).unwrap();
+        // No TPM guest command has been sent: permanent state must already
+        // exist after successful INIT/manufacture.
+        assert!(std::fs::metadata(temp.path().join(STATE_FILES[0])).unwrap().len() > 0);
+        let first = tpm.save().unwrap();
+        assert!(StateFiles::decode(&first).is_ok());
+        let permanent = std::fs::read(temp.path().join(STATE_FILES[0])).unwrap();
+        // Invalid restore input must not STOP the live TPM or replace its NV.
+        for invalid in [b"".as_slice(), b"[]".as_slice()] {
+            assert!(!tpm.load(invalid));
+            assert!(std::fs::read(temp.path().join(STATE_FILES[0])).unwrap() == permanent);
+            assert!(StateFiles::decode(&tpm.save().unwrap()).is_ok());
+        }
+        // Wait, not merely kill: prove the disposable helper was reaped before
+        // its directory is deleted. Drop handles the same cleanup on failures.
+        tpm.ctrl.shutdown(std::net::Shutdown::Both).unwrap();
+        let _ = tpm.child.kill();
+        tpm.child.wait().unwrap();
+        drop(tpm);
+        temp.close().unwrap();
     }
 }

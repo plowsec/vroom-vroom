@@ -115,6 +115,12 @@ impl std::fmt::Debug for Bus {
 }
 
 impl Bus {
+    /// Immutable occupied ranges, in address order. A checked board router can
+    /// reserve an aperture without changing this bus's dispatch semantics.
+    pub fn ranges(&self) -> impl Iterator<Item = BusRange> + '_ {
+        self.entries.iter().map(|(range, _)| *range)
+    }
+
     fn index(&self, addr: u64) -> Option<usize> {
         let i = self.entries.partition_point(|(r, _)| r.base <= addr);
         (i != 0 && addr < self.entries[i - 1].0.end()).then(|| i - 1)

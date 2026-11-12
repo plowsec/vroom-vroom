@@ -13,6 +13,7 @@ fn reset_vector_ports_and_snapshot() {
             irqchip: IrqChipConfig::Ioapic,
             nested: false,
             small_pages: false,
+            helper_page: 0,
         })
         .unwrap();
     let ram = GuestMemory::new(&[(GuestAddress(0), 2 << 20)]).unwrap();
@@ -33,27 +34,26 @@ fn reset_vector_ports_and_snapshot() {
     cpu.set_boot_regs(&BootRegs::X86Reset).unwrap();
     assert_eq!(
         cpu.run().unwrap(),
-        VcpuExit::PioOutBatch {
+        VcpuExit::PioOut {
             port: 0x3f8,
-            size: 1,
-            data: vec![b'X']
+            len: 1,
+            data: [b'X', 0, 0, 0]
         }
     );
     assert_eq!(
         cpu.run().unwrap(),
-        VcpuExit::PioInBatch {
+        VcpuExit::PioIn {
             port: 0x3f8,
-            size: 1,
-            count: 1
+            len: 1
         }
     );
     cpu.complete_pio_in(&[0x42]).unwrap();
     assert_eq!(
         cpu.run().unwrap(),
-        VcpuExit::PioOutBatch {
+        VcpuExit::PioOut {
             port: 0x1234,
-            size: 1,
-            data: vec![0x42]
+            len: 1,
+            data: [0x42, 0, 0, 0]
         }
     );
     let chip = vm.save_irqchip().unwrap();
@@ -61,10 +61,10 @@ fn reset_vector_ports_and_snapshot() {
     cpu.restore_state(&pristine).unwrap();
     assert_eq!(
         cpu.run().unwrap(),
-        VcpuExit::PioOutBatch {
+        VcpuExit::PioOut {
             port: 0x3f8,
-            size: 1,
-            data: vec![b'X']
+            len: 1,
+            data: [b'X', 0, 0, 0]
         }
     );
 }
@@ -80,6 +80,7 @@ fn hardware_breakpoint_step_register_edit_and_watchpoint() {
             irqchip: IrqChipConfig::Ioapic,
             nested: false,
             small_pages: false,
+            helper_page: 0,
         })
         .unwrap();
     let ram = GuestMemory::new(&[(GuestAddress(0), 2 << 20)]).unwrap();
@@ -179,6 +180,6 @@ fn hardware_breakpoint_step_register_edit_and_watchpoint() {
     cpu.configure_debug(&DebugConfig::default()).unwrap();
     assert!(matches!(
         cpu.run().unwrap(),
-        VcpuExit::PioOutBatch { port: 0x1234, .. }
+        VcpuExit::PioOut { port: 0x1234, .. }
     ));
 }

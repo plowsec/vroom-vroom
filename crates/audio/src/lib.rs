@@ -37,6 +37,11 @@ pub const MIC_NO_DATA: u8 = 1;
 pub const MIC_SILENT: u8 = 2;
 /// How long after `InStart` the helper checks what the device gave.
 const MIC_CHECK: Duration = Duration::from_secs(2);
+/// A recording that gave nothing this long is started again: its device
+/// may be gone (a headset, the lid closed), and starting again takes the
+/// default one now. Then twice as long each time, up to `MIC_STALL_MAX`.
+const MIC_STALL: Duration = Duration::from_secs(5);
+const MIC_STALL_MAX: Duration = Duration::from_secs(60);
 /// Largest payload accepted.
 pub const MAX_MSG: usize = 1 << 20;
 /// PCM bytes per datagram: macOS caps Unix datagrams at 2048 bytes.
@@ -228,6 +233,11 @@ pub struct CaptureStats {
 }
 
 impl CaptureStats {
+    /// Buffers delivered so far.
+    pub fn chunks(&self) -> u64 {
+        self.chunks.load(Ordering::Relaxed)
+    }
+
     /// None if all is well, else a `MIC_*` code.
     pub fn problem(&self) -> Option<u8> {
         if self.chunks.load(Ordering::Relaxed) == 0 {
@@ -439,6 +449,43 @@ pub struct HelperOpts {
     pub input: bool,
 }
 
+/// A running recording, watched for its device going quiet for good.
+struct Stall {
+    gen: u32,
+    rate: u32,
+    channels: u8,
+    stats: Arc<CaptureStats>,
+    seen: u64,
+    since: Instant,
+    wait: Duration,
+}
+
+impl Stall {
+    fn new(gen: u32, rate: u32, channels: u8, stats: Arc<CaptureStats>, now: Instant) -> Self {
+        Stall { gen, rate, channels, stats, seen: 0, since: now, wait: MIC_STALL }
+    }
+
+    /// Whether to start it again now.
+    fn due(&mut self, now: Instant) -> bool {
+        let n = self.stats.chunks();
+        if n != self.seen {
+            (self.seen, self.since, self.wait) = (n, now, MIC_STALL);
+            return false;
+        }
+        if now.duration_since(self.since) < self.wait {
+            return false;
+        }
+        self.since = now;
+        self.wait = (self.wait * 2).min(MIC_STALL_MAX);
+        true
+    }
+
+    /// Recording again, into `stats`.
+    fn restarted(&mut self, stats: Arc<CaptureStats>) {
+        (self.stats, self.seen) = (stats, 0);
+    }
+}
+
 /// The real microphone of this host.
 fn host_input() -> Option<Box<dyn Input>> {
     #[cfg(target_os = "macos")]
@@ -484,6 +531,7 @@ pub fn helper_main(sock: UnixDatagram, opts: HelperOpts) -> io::Result<()> {
     let parent = parent_pid();
     // After a recording starts: when to look at what the device gave.
     let mut check: Option<(Instant, Arc<CaptureStats>)> = None;
+    let mut stall: Option<Stall> = None;
     loop {
         if let Some((at, stats)) = &check {
             if at.elapsed() >= MIC_CHECK {
@@ -492,6 +540,17 @@ pub fn helper_main(sock: UnixDatagram, opts: HelperOpts) -> io::Result<()> {
                     send_nowait(&sock, &Msg::MicNote(code).encode());
                 }
                 check = None;
+            }
+        }
+        if let (Some(s), Some(i)) = (stall.as_mut(), input.as_mut()) {
+            if s.due(Instant::now()) {
+                log::warn!("audio: the microphone stopped giving audio: starting it again");
+                i.stop();
+                let out = CaptureOut::new(sock.clone(), s.gen);
+                s.restarted(out.stats());
+                if let Err(e) = i.start(s.rate, s.channels, out) {
+                    log::warn!("audio: microphone: {e}");
+                }
             }
         }
         let n = match sock.recv(&mut buf) {
@@ -523,6 +582,7 @@ pub fn helper_main(sock: UnixDatagram, opts: HelperOpts) -> io::Result<()> {
                     i.stop();
                     let out = CaptureOut::new(sock.clone(), gen);
                     check = Some((Instant::now(), out.stats()));
+                    stall = Some(Stall::new(gen, rate, channels, out.stats(), Instant::now()));
                     if let Err(e) = i.start(rate, channels, out) {
                         log::warn!("audio: microphone: {e}");
                     }
@@ -531,6 +591,7 @@ pub fn helper_main(sock: UnixDatagram, opts: HelperOpts) -> io::Result<()> {
             },
             Msg::InStop => {
                 check = None;
+                stall = None;
                 if let Some(i) = input.as_mut() {
                     i.stop();
                 }
@@ -559,6 +620,32 @@ mod alsa;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_microphone_gone_quiet_starts_again() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let stats = Arc::new(CaptureStats::default());
+        let mut s = Stall::new(1, 48000, 1, stats.clone(), t0);
+        assert!(!s.due(at(4)), "not yet");
+        stats.chunks.fetch_add(1, Ordering::Relaxed);
+        assert!(!s.due(at(4)), "audio came");
+        assert!(!s.due(at(8)), "the wait starts over with each buffer");
+        assert!(s.due(at(9)), "5 s without any");
+        // Started again: nothing either, so twice as long each time.
+        s.restarted(Arc::new(CaptureStats::default()));
+        assert!(!s.due(at(18)));
+        assert!(s.due(at(19)));
+        s.restarted(Arc::new(CaptureStats::default()));
+        assert!(!s.due(at(38)));
+        assert!(s.due(at(39)));
+        // Audio again: back to the short wait.
+        let fresh = Arc::new(CaptureStats::default());
+        s.restarted(fresh.clone());
+        fresh.chunks.fetch_add(1, Ordering::Relaxed);
+        assert!(!s.due(at(40)));
+        assert!(s.due(at(45)));
+    }
 
     #[test]
     fn messages_round_trip_and_bad_ones_fail() {

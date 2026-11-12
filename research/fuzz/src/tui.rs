@@ -529,6 +529,7 @@ mod tests {
             pc: Some(0x1234),
             input: String::new(),
             stack: Vec::new(),
+            registers: Vec::new(),
         };
         hub.submit(
             InstanceStats {

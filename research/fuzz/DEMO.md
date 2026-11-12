@@ -14,12 +14,8 @@ F=target/release/vroom-fuzz
 mkdir -p $OUT
 ```
 
-A snapshot records its disk layers relative to the VM's folder, and the
-folder is taken to be the state directory's parent. So `--state-dir` goes
-directly in `$VM` (`$VM/demo-a.state`), never one level down in `$OUT`:
-under `$OUT` the layers are looked for in `$OUT` and the restore fails with
-`snapshot layer ...: No such file or directory`. The harnesses here already
-point at `$VM/fuzz.state` and `$VM/fuzz-coverage-run2.state`.
+- `--state-dir` directly in `$VM` (`$VM/demo-a.state`), never in `$OUT`: a snapshot records disk layers relative to the VM folder, taken as the state dir's parent. Under `$OUT`: `snapshot layer ...: No such file or directory`.
+- The harnesses here already point at `$VM/fuzz.state` and `$VM/fuzz-coverage-run2.state`.
 
 ## 1. Build + sign
 
@@ -30,7 +26,7 @@ scripts/build.sh                                   # vroom CLI (+ app, netd): ta
 uv sync --project research/tui --extra angr        # kernel TUI, angr_tui (atui)
 ```
 
-`research/run.sh` runs `research/build.sh` itself; it refuses while a lab runs from `target/`.
+`research/run.sh` runs `research/build.sh` itself; refuses while a lab runs from `target/`.
 
 ## 2. Snapshot (prep, already done: `hevd-dispatch-buffer`)
 
@@ -178,7 +174,7 @@ for f in $OUT/discover/inputs/*; do od -An -tx4 -N4 "$f"; done | sort -u   # 0x2
 
 - 29/29 IOCTLs in ~0.1 s; 527/600 blocks, ~900 exec/s.
 - 7 bugs in 20 s from 5-byte inputs, most caught by HEVD's own `__try` (`crashes/`, one input per signature): NULL dereference (`0x22202b`), type confusion (`0x222023`, jump to 0), uninitialized stack (`0x22202f`, bugcheck 0x50) and heap (`0x222033`, wild jump) variables, NULL write-what-where (`0x22200b`), `0x222047`, `0x222073`. Then `$F triage $OUT/blocks-safe.json $OUT/discover/crashes/HASH-CLASS.bin`.
-- Comparison logging: each new corpus input runs once stepped through HEVD's code. Its comparisons (`cmp w3, w8`: the code against a literal; `cmp w8, #3` after `sub w8, w3, #0x222000`) become inputs that turn them the other way, and dictionary words. `--no-cmplog`: 0/29 from this seed.
+- Comparison logging: each new corpus input runs once stepped through HEVD's code; its comparisons (`cmp w3, w8`: code vs a literal; `cmp w8, #3` after `sub w8, w3, #0x222000`) become inputs that flip them, and dictionary words. `--no-cmplog`: 0/29 from this seed.
 - `$F cmplog $OUT/blocks-safe.json $OUT/zero.bin`: one input's comparisons.
 - Edges mode reaches them too, but exits on every loop iteration of a handler (one takes ~2 s): blocks mode.
 
@@ -235,14 +231,14 @@ $F run $CK/hevd-harness-all-30s.json $(ls $OUT/crash/crashes/*-BugCheck.bin | he
   --no-boundary-seeds --iterations 1 --state-dir $VM/demo-c.state --output $OUT/replay
 ```
 
-7. Correctness: RAM, untouched devices and GIC registers checked against the snapshot after every reset (~1 s per input). Silent = pass; a mismatch stops the run and lists the pages.
+7. Correctness: RAM, untouched devices, GIC registers checked against the snapshot after every reset (~1 s per input). Silent = pass; mismatch stops the run, lists the pages.
 
 ```bash
 VROOM_COW_VERIFY=1 $F run $CK/hevd-harness-all-30s.json $CK/one-byte-payload.bin --ioctl 0x222003 \
   --iterations 20 --state-dir $VM/demo-c.state --output $OUT/verify
 ```
 
-8. Workers (one VM each, ~9 GB). Fuzz VMs drop host port forwards and keep their own EFI vars, so they run beside each other and beside the lab.
+8. Workers (one VM each, ~9 GB). Fuzz VMs drop host port forwards, keep their own EFI vars: they run beside each other and the lab.
 
 ```bash
 jq '. + {coverage_mode: "blocks"}' $CK/hevd-harness-all-safe.json > $OUT/fleet.json
@@ -335,7 +331,7 @@ uv run --project research/tui --extra angr atui $VM/HEVD.sys -s 0x140088a60
 
 ## 5. Agents (optional)
 
-Same lab, piloted over JSON-RPC (angr_tui's protocol). Full list: `research/README.md` → agents.
+Same lab over JSON-RPC (angr_tui's protocol). Full list: `research/README.md` → agents.
 
 ```bash
 research/run.sh $VM/hevd-windows-arm64.toml --restore $CK/hevd-dispatch-buffer --agent-socket lab.sock

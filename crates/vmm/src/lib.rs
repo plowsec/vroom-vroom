@@ -6,6 +6,7 @@
 
 pub mod agent;
 mod audio;
+mod balloon;
 mod camera;
 pub mod control;
 mod debug;
@@ -21,13 +22,23 @@ pub(crate) fn note_helper(pid: u32) {
 pub use vroom_state as state;
 mod display;
 mod firmware;
+mod firmware_x86;
 mod hotplug;
 mod irq;
+mod lifecycle;
+#[cfg(test)]
+mod lifecycle_tests;
 mod machine;
+mod machine_x86;
+#[cfg(test)]
+mod machine_x86_tests;
 mod net;
+mod pio;
 pub use machine::gpu_in_process;
 pub mod psci;
 mod ramfb;
+mod reidentify;
+mod serial;
 mod snapshot;
 mod tpm;
 mod usb;
@@ -49,6 +60,7 @@ use vroom_snapshot::Snapshottable;
 
 pub use vcpu::VmEvent;
 use vcpu::{VcpuCmd, VcpuHandle, VcpuShared};
+use lifecycle::LifecyclePolicy;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -70,6 +82,10 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("a vCPU thread is gone")]
     VcpuGone,
+    #[error("{0} is unavailable for a cold-boot-only VM")]
+    UnsupportedLifecycle(&'static str),
+    #[error("{0}")]
+    Unavailable(&'static str),
     #[error("timed out waiting for vCPUs")]
     Timeout,
     #[error("virtio: {0}")]
@@ -130,6 +146,7 @@ pub struct Vmm {
     /// One VMM per state dir: two would write the same disk layers.
     _lock: state::StateLock,
     config: VmConfig,
+    lifecycle: LifecyclePolicy,
     hv: Arc<dyn Hypervisor>,
     vm: Arc<dyn Vm>,
     mem: GuestMemory,
@@ -137,7 +154,7 @@ pub struct Vmm {
     vcpus: Vec<VcpuHandle>,
     events: Receiver<VmEvent>,
     devices: Vec<StatefulDevice>,
-    uart: machine::Serial,
+    serial_input: serial::SerialInput,
     agent: agent::Agent,
     gpus: Vec<vroom_virtio::devices::gpu::GpuControl>,
     disks: disks::DiskSet,
@@ -155,6 +172,9 @@ pub struct Vmm {
     net_ctrl: bool,
     /// Removable shares for USB disks' files (what a save records).
     usb_file_slots: usize,
+    /// A resumed VM's folders that are in its file but not in the hardware
+    /// it was saved with: served on removable shares.
+    later_shares: Vec<vroom_config::Share>,
     /// Windows' 3D GPU has memory in BAR 0 (see `machine::GPU3D_VRAM`).
     gpu3d_vram: bool,
     /// The network adapters now (a save records them).
@@ -232,14 +252,45 @@ fn restore_hardware(now: VmConfig, saved: &VmConfig) -> VmConfig {
     }
 }
 
+/// Folders in the VM file now that the saved hardware hasn't: shared while
+/// it ran (on a removable share), or added while it was suspended.
+fn later_shares(now: &VmConfig, saved: &VmConfig) -> Vec<vroom_config::Share> {
+    now.shares.iter().filter(|s| !saved.shares.iter().any(|o| o.tag == s.tag)).cloned().collect()
+}
+
 impl Vmm {
     /// Build the machine and start it.
     pub fn start(config: VmConfig, hv: Arc<dyn Hypervisor>, opts: VmmOptions) -> Result<Vmm> {
+        let lifecycle = match hv.arch() {
+            vroom_hv::Arch::X86_64 if machine_x86::is_reference(&config) => LifecyclePolicy::ColdBootOnly,
+            vroom_hv::Arch::X86_64 => LifecyclePolicy::Resettable,
+            vroom_hv::Arch::Aarch64 => LifecyclePolicy::default(),
+        };
+        Self::start_with_lifecycle(config, hv, opts, lifecycle)
+    }
+
+    // Tests can also exercise cold-only lifecycle on the existing ARM board.
+    fn start_with_lifecycle(config: VmConfig, hv: Arc<dyn Hypervisor>, opts: VmmOptions, lifecycle: LifecyclePolicy) -> Result<Vmm> {
+        lifecycle.check_start(&opts.start)?;
         config.validate()?;
+        if hv.arch() == vroom_hv::Arch::X86_64 && matches!(config.boot, vroom_config::Boot::Uefi { secure_boot: true, .. }) {
+            return Err(Error::Unavailable("Secure Boot is unavailable on the experimental PC board"));
+        }
+        // Validate and own x64 boot inputs before any viewer, state lock,
+        // disk layer, identity file, device, or helper is created.
+        let x86_boot = if hv.arch() == vroom_hv::Arch::X86_64 && machine_x86::is_reference(&config) {
+            if lifecycle != LifecyclePolicy::ColdBootOnly {
+                return Err(Error::Setup("x64 requires the cold-boot-only lifecycle".into()));
+            }
+            Some(machine_x86::prepare(&config, hv.as_ref(), &opts)?)
+        } else {
+            None
+        };
         let saved = match &opts.start {
             StartMode::Restore(dir) | StartMode::RestorePaused(dir) => Some(snapshot::saved_config(dir)?),
             StartMode::Boot | StartMode::BootPaused => None,
         };
+        let later_shares = saved.as_ref().map(|(s, _)| later_shares(&config, s)).unwrap_or_default();
         let config = match &saved {
             Some((s, _)) => restore_hardware(config, s),
             None => config,
@@ -256,12 +307,12 @@ impl Vmm {
         };
         let disks = disks::DiskSet::open(&config, &opts.state_dir, &layers)?;
         let uuid = machine_uuid(&opts.state_dir)?;
-        let net_ctrl = saved.as_ref().is_none_or(|s| s.1);
+        let net_ctrl = x86_boot.is_none() && saved.as_ref().is_none_or(|s| s.1);
         // USB disks' files go to removable shares a VM started on a Mac
         // has; a resumed one has those it was saved with.
         let usb_file_slots = match &opts.start {
             StartMode::Restore(dir) | StartMode::RestorePaused(dir) => snapshot::saved_usb_file_slots(dir),
-            StartMode::Boot | StartMode::BootPaused if cfg!(target_os = "macos") => usb::FILE_SLOTS,
+            StartMode::Boot | StartMode::BootPaused if cfg!(target_os = "macos") && x86_boot.is_none() => usb::FILE_SLOTS,
             StartMode::Boot | StartMode::BootPaused => 0,
         };
         let saved = saved.map(|s| s.0);
@@ -272,7 +323,7 @@ impl Vmm {
         // Windows' 3D GPU has memory in BAR 0; saves from before have not.
         let gpu3d_vram = match &opts.start {
             StartMode::Restore(dir) | StartMode::RestorePaused(dir) => snapshot::saved_gpu3d_vram(dir),
-            StartMode::Boot | StartMode::BootPaused => true,
+            StartMode::Boot | StartMode::BootPaused => x86_boot.is_none(),
         };
         let env = machine::BuildEnv {
             uuid,
@@ -281,11 +332,16 @@ impl Vmm {
             saved,
             net_ctrl,
             usb_file_slots,
+            later_shares: later_shares.clone(),
             sandbox: opts.sandbox && config.security.sandbox,
             hot_nets,
             gpu3d_vram,
         };
-        let m = machine::build(&config, hv.as_ref(), opts.serial_out, opts.clipboard, ui, &disks, ev_tx, &env)?;
+        let m = if let Some(boot) = x86_boot {
+            machine_x86::build(&config, hv.as_ref(), opts.serial_out, ev_tx, boot)?
+        } else {
+            machine::build(&config, hv.as_ref(), opts.serial_out, opts.clipboard, ui, &disks, ev_tx, &env, lifecycle)?
+        };
         // A save records the hardware the guest has: a resumed VM keeps
         // the network adapters it was saved with until it restarts.
         let mut config = config;
@@ -293,6 +349,7 @@ impl Vmm {
         let mut vmm = Vmm {
             _lock: lock,
             config,
+            lifecycle,
             hv,
             vm: m.vm,
             mem: m.mem,
@@ -300,7 +357,7 @@ impl Vmm {
             vcpus: m.vcpus,
             events: ev_rx,
             devices: m.devices,
-            uart: m.uart,
+            serial_input: m.serial_input,
             agent: m.agent,
             gpus: m.gpus,
             disks,
@@ -313,6 +370,7 @@ impl Vmm {
             state: RunState::Paused,
             net_ctrl,
             usb_file_slots,
+            later_shares,
             gpu3d_vram,
             net_ports: m.net_ports,
             hotplug: m.hotplug,
@@ -321,17 +379,19 @@ impl Vmm {
             #[cfg(feature = "research")]
             research_still_clock: None,
         };
-        vmm.pristine_irqchip = match vmm.vm.save_irqchip() {
-            Ok(s) => Some(s),
-            Err(vroom_hv::Error::Unsupported(why)) => {
-                log::info!("irqchip state not saveable ({why}); reset won't restore it");
-                None
+        if lifecycle == LifecyclePolicy::Resettable {
+            vmm.pristine_irqchip = match vmm.vm.save_irqchip() {
+                Ok(s) => Some(s),
+                Err(vroom_hv::Error::Unsupported(why)) => {
+                    log::info!("irqchip state not saveable ({why}); reset won't restore it");
+                    None
+                }
+                Err(e) => return Err(e.into()),
+            };
+            for d in &vmm.devices {
+                let s = d.lock().unwrap_or_else(|e| e.into_inner()).save()?;
+                vmm.pristine_devices.push(s);
             }
-            Err(e) => return Err(e.into()),
-        };
-        for d in &vmm.devices {
-            let s = d.lock().unwrap_or_else(|e| e.into_inner()).save()?;
-            vmm.pristine_devices.push(s);
         }
         let start_paused = matches!(opts.start, StartMode::BootPaused | StartMode::RestorePaused(_));
         // Restore marks each CPU runnable. Park every CPU before loading any
@@ -341,11 +401,13 @@ impl Vmm {
         match opts.start {
             StartMode::Boot | StartMode::BootPaused => {
                 let regs = vmm.boot.load(&vmm.mem)?;
-                vmm.vcpus[0].peer.send(VcpuCmd::PowerOn(regs))?;
-                // In-kernel PSCI: secondaries wait inside KVM_RUN for CPU_ON.
-                // Only now: irqchip state access needs them out of KVM_RUN.
-                for v in vmm.vcpus.iter().skip(1).filter(|v| v.in_kernel_psci) {
-                    v.peer.send(VcpuCmd::Start)?;
+                // Acknowledge register initialization while every CPU is parked.
+                // Secondary CPUs enter KVM only after the later resume.
+                for (index, v) in vmm.vcpus.iter().enumerate() {
+                    let (tx, rx) = mpsc::channel();
+                    let initial = (index == 0).then(|| regs.clone());
+                    v.peer.send(VcpuCmd::Initialize(initial, tx))?;
+                    rx.recv_timeout(PAUSE_TIMEOUT).map_err(|_| Error::Timeout)??;
                 }
             }
             StartMode::Restore(dir) | StartMode::RestorePaused(dir) => {
@@ -362,6 +424,12 @@ impl Vmm {
         &self.config
     }
 
+    /// Folders served on removable shares since the start (see
+    /// `later_shares`): the sandbox must let them be read too.
+    pub fn later_shares(&self) -> &[vroom_config::Share] {
+        &self.later_shares
+    }
+
     pub fn state(&self) -> RunState {
         self.state
     }
@@ -369,6 +437,57 @@ impl Vmm {
     /// The guest's virtual counter now (CNTVCT on ARM).
     pub fn guest_clock(&self) -> u64 {
         self.vm.clock()
+    }
+
+    /// Nanoseconds in `ticks` of [`Vmm::guest_clock`].
+    pub fn guest_clock_ns(&self, ticks: u64) -> u64 {
+        self.vm.clock_ns(ticks)
+    }
+
+    /// Total attempts by the workers to call `Vcpu::run`, saturating at u64::MAX.
+    /// This is not an instruction count: a call can return without guest entry.
+    /// Zero together with an acknowledged BootPaused/paused state proves that
+    /// no worker has attempted entry. Read while paused for a stable value.
+    pub fn vcpu_run_calls(&self) -> u64 {
+        self.shared.run_calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many vCPUs the VM has.
+    pub fn cpu_count(&self) -> usize {
+        self.vcpus.len()
+    }
+
+    #[cfg(feature = "research")]
+    /// The idle skip and the debug-stop halt as they are now, for a
+    /// fuzzer's diagnostics (a timeout): which vCPUs wait in WFI and for
+    /// which guest counter value, whether devices hold it back, how often
+    /// the clock moved, and a halt in progress. None while the skip is off.
+    pub fn research_idle_report(&self) -> Option<String> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let s = self.vm.idle_skip_state()?;
+        let now = self.vm.clock();
+        let waiting: Vec<String> = s
+            .waiting
+            .iter()
+            .map(|(cpu, cval)| match cval {
+                Some(c) => format!("cpu{cpu} timer {:+}", *c as i64 - now as i64),
+                None => format!("cpu{cpu} no timer"),
+            })
+            .collect();
+        Some(format!(
+            "idle skip: {}/{} in WFI [{}], devices busy {} ({} unhandled), {} jumps, {} clock moves{}; halt: halting {} parked {} halted_at {}",
+            s.waiting.len(),
+            s.cpus,
+            waiting.join(", "),
+            s.busy,
+            vroom_virtio::worker::outstanding(),
+            s.jumps,
+            s.moves,
+            if s.rebase_pending { ", rebase pending" } else { "" },
+            self.shared.halting.load(SeqCst),
+            self.shared.parked.load(SeqCst),
+            self.shared.halted_at.load(SeqCst),
+        ))
     }
 
     #[cfg(feature = "research")]
@@ -711,8 +830,9 @@ impl Vmm {
     }
 
     /// Keyboard input for the serial console.
-    pub fn serial_input(&self, bytes: &[u8]) {
-        self.uart.queue_input(bytes);
+    /// Returns an error when this board has no host-to-guest serial input.
+    pub fn serial_input(&self, bytes: &[u8]) -> Result<()> {
+        self.serial_input.queue_input(bytes)
     }
 
     /// Wait for the next event from the guest.
@@ -775,6 +895,7 @@ impl Vmm {
 
     /// Hard reset: like pressing the reset button.
     pub fn reset(&mut self) -> Result<()> {
+        self.lifecycle.require_state("reset")?;
         let was_running = self.state == RunState::Running;
         self.pause()?;
         for (d, s) in self.devices.iter().zip(&self.pristine_devices) {
@@ -800,6 +921,7 @@ impl Vmm {
 
     /// Save a full snapshot. The VM keeps running afterwards.
     pub fn snapshot(&mut self, dir: &Path, description: &str) -> Result<()> {
+        self.lifecycle.require_state("snapshot")?;
         let was_running = self.state == RunState::Running;
         let parked = self.park_direct3d()?;
         self.pause()?;
@@ -882,13 +1004,16 @@ impl Vmm {
 
     /// Snapshot then stop: the VM can be resumed later with
     /// [`StartMode::Restore`]. This is "suspend to disk".
-    pub fn suspend(mut self, dir: &Path) -> Result<()> {
+    /// Borrows the VM so rejecting an unsupported suspend leaves it running.
+    pub fn suspend(&mut self, dir: &Path) -> Result<()> {
         self.suspend_in_place(dir)
     }
 
     /// Like [`suspend`], for callers that keep the handle. On error the
-    /// VM is left paused, not stopped, so nothing is lost.
+    /// VM is left paused, not stopped, if saving fails. An unsupported policy
+    /// is rejected before changing the VM state.
     pub fn suspend_in_place(&mut self, dir: &Path) -> Result<()> {
+        self.lifecycle.require_state("suspend")?;
         let parked = self.park_direct3d()?;
         self.pause()?;
         if let Err(e) = snapshot::save(self, dir, "suspend", snapshot::Kind::Suspend) {
@@ -903,6 +1028,14 @@ impl Vmm {
 
     /// Tear everything down. vCPUs are destroyed on their own threads.
     pub fn shutdown(&mut self) {
+        let _ = self.shutdown_checked();
+    }
+
+    /// Stop and join every worker, reporting a caught join panic after teardown.
+    /// With panic=abort, a worker panic instead terminates the whole process.
+    /// A successful host stop does not mean the guest OS powered itself off.
+    /// Like `shutdown`, a stuck backend requires a supervising process timeout.
+    pub fn shutdown_checked(&mut self) -> Result<()> {
         self.agent.send(agent::AgentCmd::Stop);
         self.disks.flush_all();
         if let Some(v) = &self.viewer {
@@ -911,13 +1044,17 @@ impl Vmm {
         for v in &self.vcpus {
             let _ = v.peer.send(VcpuCmd::Stop);
         }
+        let mut first_error = None;
         for v in &mut self.vcpus {
-            v.join();
+            if let Err(error) = v.join_checked() {
+                if first_error.is_none() { first_error = Some(error); }
+            }
         }
         if let Some(d) = &self.display {
             d.stop();
         }
         self.state = RunState::Stopped;
+        first_error.map_or(Ok(()), Err)
     }
 }
 
@@ -971,4 +1108,25 @@ fn machine_uuid(state_dir: &Path) -> Result<[u8; 16]> {
     let hex: String = u.iter().map(|b| format!("{b:02x}")).collect();
     std::fs::write(&path, format!("{}-{}-{}-{}-{}\n", &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..]))?;
     Ok(u)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn folders_the_saved_hardware_hasnt() {
+        let cfg = |tags: &[&str]| {
+            let mut c = VmConfig::from_toml("name='t'\ncpus=1\nmemory_mib=64\n[boot]\ntype='kernel'\nkernel='k'\n").unwrap();
+            c.shares = tags.iter().map(|t| vroom_config::Share { path: format!("/tmp/{t}").into(), tag: t.to_string(), readonly: true }).collect();
+            c
+        };
+        let saved = cfg(&["boot"]);
+        let tags = |v: Vec<vroom_config::Share>| v.into_iter().map(|s| s.tag).collect::<Vec<_>>();
+        assert_eq!(tags(later_shares(&cfg(&["boot", "live"]), &saved)), ["live"], "shared while it ran");
+        assert!(later_shares(&cfg(&["boot"]), &saved).is_empty(), "nothing new");
+        assert!(later_shares(&cfg(&[]), &saved).is_empty(), "removed: the saved device stays until a restart");
+        // The resumed VM keeps the saved device; the new folder is extra.
+        assert_eq!(tags(restore_hardware(cfg(&["boot", "live"]), &saved).shares), ["boot"]);
+    }
 }

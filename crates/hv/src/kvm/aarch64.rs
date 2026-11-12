@@ -10,7 +10,7 @@ use kvm_bindings::{
 };
 use kvm_ioctls::{Cap, DeviceFd, Kvm, VcpuExit as KExit, VcpuFd, VmFd};
 
-use super::{kerr, set_thread_run, Chip, KvmKicker};
+use super::{clear_thread_run, kerr, set_thread_run, Chip, KvmKicker};
 use crate::aarch64::PSTATE_EL1H_DAIF;
 use crate::{BootRegs, Error, IrqChipConfig, IrqChipInfo, Result, Vcpu, VcpuExit, VcpuKicker, VcpuState, VmParams};
 
@@ -53,6 +53,9 @@ fn set_attr(what: &'static str, dev: &DeviceFd, group: u32, attr: u64, addr: u64
 }
 
 pub(super) fn create_vm(kvm: &Kvm, params: &VmParams) -> Result<(VmFd, Chip)> {
+    if !kvm.check_extension(Cap::ImmediateExit) {
+        return Err(Error::Unsupported("ARM KVM requires KVM_CAP_IMMEDIATE_EXIT for bounded control"));
+    }
     let IrqChipConfig::GicV3 { dist_base, redist_base, .. } = params.irqchip else {
         return Err(Error::Unsupported("aarch64 KVM needs a GICv3 layout"));
     };
@@ -95,7 +98,7 @@ impl std::fmt::Debug for KvmVcpu {
 
 impl KvmVcpu {
     pub(super) fn new(vm: &VmFd, index: u32) -> Result<Self> {
-        let mut fd = vm.create_vcpu(index as u64).map_err(kerr("KVM_CREATE_VCPU"))?;
+        let fd = vm.create_vcpu(index as u64).map_err(kerr("KVM_CREATE_VCPU"))?;
         let mut kvi = kvm_vcpu_init::default();
         vm.get_preferred_target(&mut kvi).map_err(kerr("KVM_ARM_PREFERRED_TARGET"))?;
         kvi.features[0] |= 1 << KVM_ARM_VCPU_PSCI_0_2;
@@ -104,7 +107,6 @@ impl KvmVcpu {
             kvi.features[0] |= 1 << KVM_ARM_VCPU_POWER_OFF;
         }
         fd.vcpu_init(&kvi).map_err(kerr("KVM_ARM_VCPU_INIT"))?;
-        set_thread_run(fd.get_kvm_run() as *mut _);
         let kvm = Kvm::new().map_err(kerr("open KVM capabilities"))?;
         let mut v = KvmVcpu { fd, index, mpidr: 0, kicker: KvmKicker::current(), pending_read: None,
             debug_slots: kvm.check_extension_int(Cap::DebugHwBps).max(0) as usize,
@@ -123,6 +125,13 @@ impl KvmVcpu {
 
     fn set(&self, id: u64, v: u64) -> Result<()> {
         self.fd.set_one_reg(id, &v.to_le_bytes()).map(|_| ()).map_err(kerr("KVM_SET_ONE_REG"))
+    }
+}
+
+impl Drop for KvmVcpu {
+    fn drop(&mut self) {
+        // A retained kicker may signal until this worker thread exits.
+        clear_thread_run(self.fd.get_kvm_run() as *mut _);
     }
 }
 
@@ -154,7 +163,10 @@ impl Vcpu for KvmVcpu {
     }
 
     fn run(&mut self) -> Result<VcpuExit> {
+        set_thread_run(self.fd.get_kvm_run() as *mut _);
         loop {
+            // A signal after the atomic test must retain immediate_exit=1.
+            self.fd.set_kvm_immediate_exit(0);
             if self.kicker.take() {
                 return Ok(VcpuExit::Kicked);
             }
@@ -187,7 +199,6 @@ impl Vcpu for KvmVcpu {
                 Ok(KExit::Hlt) | Ok(KExit::Intr) => continue,
                 Ok(other) => return Err(Error::GuestFault(format!("unexpected KVM exit {other:?}"))),
                 Err(e) if e.errno() == libc::EINTR || e.errno() == libc::EAGAIN => {
-                    self.fd.set_kvm_immediate_exit(0);
                     continue;
                 }
                 Err(e) => return Err(Error::Backend { call: "KVM_RUN", code: e.errno() as i64 }),

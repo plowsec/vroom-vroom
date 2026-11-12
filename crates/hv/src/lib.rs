@@ -8,6 +8,10 @@
 //! above this crate so it is shared and testable without hardware.
 
 pub mod aarch64;
+mod x86_64;
+// Private, binding-independent SMM mapping transaction; also tested on macOS.
+#[path = "kvm/smm.rs"]
+mod smm;
 mod error;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub mod hvf;
@@ -88,6 +92,10 @@ pub struct VmParams {
     /// anywhere it likes in the shared window (Vulkan). Ignored where the
     /// host already maps 4 KiB.
     pub small_pages: bool,
+    /// Guest-physical address of one page the guest never uses (no RAM,
+    /// no device): the backend may map code of its own there (HVF: the
+    /// stage-1 TLB flush a register restore runs).
+    pub helper_page: u64,
 }
 
 /// Entry point to a hypervisor backend.
@@ -100,7 +108,43 @@ pub trait Hypervisor: Send + Sync {
 }
 
 /// A VM: address space + interrupt controller. Shared by all vCPU threads.
+/// What the idle skip sees (see [`Vm::set_idle_skip`]).
+#[derive(Debug, Clone, Default)]
+pub struct IdleSkipState {
+    /// vCPUs in WFI, with their timer's compare value if armed.
+    pub waiting: Vec<(u32, Option<u64>)>,
+    /// vCPUs in all.
+    pub cpus: usize,
+    /// Devices have work in flight (no jump).
+    pub busy: bool,
+    /// Times the VM-wide counter offset moved (jumps and rebases).
+    pub moves: u64,
+    /// Jumps alone.
+    pub jumps: u64,
+    /// A rebase waits for a vCPU to enter the guest.
+    pub rebase_pending: bool,
+}
+
 pub trait Vm: Send + Sync {
+    /// Restricted x86 SMM fixture: own a private 64 KiB image at the default
+    /// SMBASE (0x30000), mapped in KVM address space 1 only. Call before any
+    /// memory mapping or vCPU creation attempt. Common RAM/ROM mapped later
+    /// is mirrored into both address spaces; topology freezes at vCPU creation.
+    /// No host-buffer maps, SMRAM relocation, chipset or firmware board.
+    /// The backend copies `initial`; no device-facing GuestMemory owns SMRAM.
+    fn configure_x86_smm(&self, _initial: &[u8]) -> Result<X86SmmCapabilities> {
+        Err(Error::Unsupported("restricted x86 SMM memory"))
+    }
+
+    /// Fixed one-CPU Q35 SMRAM prerequisite: nominal low RAM ends at 512 MiB,
+    /// with private default-SMBASE 0x30000..0x50000 and 8 MiB TSEG immediately
+    /// below that low-RAM end. Both are initially CPU-visible in AS0 and AS1;
+    /// neither ever belongs to device-facing GuestMemory. Configure once on a
+    /// fresh unmapped VM. No chipset/firmware profile or runtime reset implied.
+    fn configure_x86_q35_smram(&self) -> Result<X86SmmCapabilities> {
+        Err(Error::Unsupported("fixed Q35 SMRAM memory"))
+    }
+
     /// Map all guest RAM. The VM keeps a clone so the backing outlives the mapping.
     fn map_memory(&self, mem: &GuestMemory) -> Result<()>;
 
@@ -129,6 +173,14 @@ pub trait Vm: Send + Sync {
     /// page table changes (KVM, via MMU notifiers).
     fn zero_memory(&self, mem: &GuestMemory) -> Result<()> {
         mem.discard_all().map_err(|e| Error::Invalid(format!("discard: {e}")))
+    }
+
+    /// Free `len` bytes of guest RAM at `gpa` while the VM runs (pages the
+    /// guest handed over): the guest reads zeros there after. Multiples of
+    /// the host page size. False if not now (writes logged, execute
+    /// patches, watches, shared RAM): nothing changed then.
+    fn release_memory(&self, mem: &GuestMemory, gpa: u64, len: u64) -> Result<bool> {
+        mem.release(vroom_memory::GuestAddress(gpa), len).map_err(|e| Error::Invalid(format!("release: {e}")))
     }
 
     /// Run `replace`, which swaps the host pages behind `mem` (remaps it),
@@ -201,10 +253,18 @@ pub trait Vm: Send + Sync {
     /// Takes effect on each vCPU at its next state restore, or (HVF) the
     /// next time it enters the guest.
     fn set_clock(&self, value: u64);
+    /// Nanoseconds in `ticks` of [`Vm::clock`].
+    fn clock_ns(&self, ticks: u64) -> u64 {
+        ticks
+    }
     /// While every vCPU waits for an interrupt and `busy` (devices with
     /// work in flight) says no, move the guest counter to the earliest
     /// armed timer rather than wait for it. None: off.
     fn set_idle_skip(&self, _busy: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>) {}
+    /// The idle skip right now (diagnostics); None while it is off.
+    fn idle_skip_state(&self) -> Option<IdleSkipState> {
+        None
+    }
 
     /// Called once every vCPU exists (KVM initialises its vGIC here).
     fn finalize(&self) -> Result<()> {
@@ -241,6 +301,10 @@ pub enum VcpuExit {
     /// Repeated string I/O: every element accesses the same port.
     PioInBatch { port: u16, size: usize, count: usize },
     PioOutBatch { port: u16, size: usize, data: Vec<u8> },
+    /// An x86 I/O exit with KVM_RUN_X86_SMM set in that same successful RUN.
+    /// Must never enter ordinary device/GuestMemory routing. Only an explicit
+    /// SMM-aware board may handle it; existing VMM profiles reject this exit.
+    X86SmmIo(X86IoExit),
     /// SMCCC call (PSCI etc) the backend did not handle in-kernel.
     /// Call [`Vcpu::complete_hypercall`] with the result.
     Hypercall { func: u64, args: [u64; 3] },
@@ -251,6 +315,37 @@ pub enum VcpuExit {
     Kicked,
     /// Halted with no wakeup source; the VMM decides.
     Halted,
+}
+
+/// Bounded x86 I/O, with the same scalar widths/completion rules as VcpuExit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum X86IoExit {
+    MmioRead { addr: u64, len: usize },
+    MmioWrite { addr: u64, len: usize, data: [u8; 8] },
+    PioIn { port: u16, len: usize },
+    PioOut { port: u16, len: usize, data: [u8; 4] },
+}
+
+/// Successful restricted SMM configuration, not a protected-firmware claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct X86SmmCapabilities {
+    /// VM-level KVM_CAP_X86_SMM query succeeded.
+    pub vm_smm: bool,
+    /// Numeric system-level KVM_CAP_MULTI_ADDRESS_SPACE result (at least 2).
+    pub system_address_spaces: u32,
+}
+
+/// CPU visibility of the fixed Q35 TSEG; Locked cannot be downgraded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum X86TsegState { Open, Closed, Locked }
+
+/// Applied backend state, separate from chipset register emulation. The MCH
+/// may publish matching readbacks only after its mapping operation succeeds.
+/// Neither lock can be cleared without recreating the complete VM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct X86SmramState {
+    pub tseg: X86TsegState,
+    pub default_smbase_locked: bool,
 }
 
 /// Handle another thread uses to bounce a vCPU out of guest mode.
@@ -265,14 +360,35 @@ pub trait VcpuKicker: Send + Sync {
 pub enum BootRegs {
     /// PC, and X0..X3 (Linux arm64 boot protocol: X0 = FDT).
     Aarch64 { pc: u64, x: [u64; 4] },
-    /// 64-bit Linux boot protocol: RIP, RSI = boot_params, page tables.
+    /// 64-bit Linux boot protocol: RIP, RSI = boot_params, identity-mapped
+    /// page tables at CR3. `gdt` names four entries: null, unused, 64-bit
+    /// kernel code (selector 0x10), flat kernel data (selector 0x18).
+    /// The caller supplies that GDT and maps the entry, parameters and GDT.
+    /// Interrupts start disabled; this does not describe a saved CPU state.
     X86_64 { rip: u64, rsi: u64, cr3: u64, gdt: u64 },
     /// Firmware entry in the architectural x86 reset state.
     X86Reset,
+    /// Enter the x86 firmware reset vector on a fresh, never-run vCPU only.
+    /// The backend verifies its power-on state; this is not a runtime reset.
+    /// The caller must supply the ROM mapping and board. No SMM, firmware
+    /// security or Windows support is implied by this entry mechanism.
+    X86ResetVector,
 }
 
 /// A virtual CPU. Not `Send`: lives and dies on its own thread.
 pub trait Vcpu {
+    /// Apply fixed-Q35 CPU visibility on the owning thread at the current
+    /// successful PIO-out/MMIO-write exit. Consumes that grant even on error
+    /// or an idempotent request. Pending reads and every other exit reject it.
+    /// Partial mapping failure poisons execution/completion; never retry RUN.
+    fn apply_x86_smram(&mut self, _target: X86SmramState) -> Result<X86SmramState> {
+        Err(Error::Unsupported("fixed Q35 SMRAM transition"))
+    }
+    /// Inject SMI on the owning thread into an initialized, explicitly SMM-
+    /// configured x86 vCPU. Pending I/O reads must be completed first.
+    fn inject_smi(&mut self) -> Result<()> {
+        Err(Error::Unsupported("x86 SMI injection"))
+    }
     fn debug_write_register(&mut self, _register: debug::Register, _value: u64) -> Result<()> {
         Err(Error::Unsupported("register editing on this backend"))
     }

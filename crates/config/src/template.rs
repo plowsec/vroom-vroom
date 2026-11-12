@@ -17,6 +17,7 @@ pub struct NewVm<'a> {
     pub cpus: u32,
     pub memory_mib: u64,
     pub gpu: Gpu,
+    pub secure_boot: bool,
     /// Seed for this VM's serials (system and disks), so VMs differ.
     pub serials: [u8; 8],
 }
@@ -44,6 +45,7 @@ impl<'a> NewVm<'a> {
             cpus: host.clamp(1, 4),
             memory_mib: if windows { 8192 } else { 4096 },
             gpu: Gpu::Virtio2d,
+            secure_boot: false,
             serials: random8(),
         }
     }
@@ -77,6 +79,7 @@ impl<'a> NewVm<'a> {
              [boot]\n\
              type = \"uefi\"\n\
              vars = \"{name}.state/efivars.fd\"\n\
+             {sb}\
              \n\
              {extra}[[disk]]\n\
              path = {disk}\n\
@@ -86,6 +89,7 @@ impl<'a> NewVm<'a> {
             cpus = self.cpus,
             mem = self.memory_mib,
             disk = toml_str(self.disk_file),
+            sb = if self.secure_boot { "secure_boot = true\n" } else { "" },
         );
         if let Some(iso) = self.installer {
             let p = toml_str(&iso.display().to_string());
@@ -148,6 +152,10 @@ mod tests {
             n.installer = Some(iso);
             let c = VmConfig::from_toml(&n.render()).unwrap();
             assert_eq!(c.tpm, os == GuestOs::Windows);
+            assert!(matches!(c.boot, crate::Boot::Uefi { secure_boot: false, .. }));
+            n.secure_boot = true;
+            let c = VmConfig::from_toml(&n.render()).unwrap();
+            assert!(matches!(c.boot, crate::Boot::Uefi { secure_boot: true, .. }));
             assert_eq!(c.guest_os(), os);
             assert_eq!(c.disks.len(), 2);
             assert_eq!(c.disks[1].path, iso);

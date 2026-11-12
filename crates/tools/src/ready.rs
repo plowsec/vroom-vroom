@@ -42,6 +42,7 @@ pub struct Spec {
     pub memory_mib: u64,
     pub disk_gib: u64,
     pub gpu3d: bool,
+    pub secure_boot: bool,
     pub account: Account,
     /// Host ports other VMs forward already: SSH gets another.
     pub taken_ports: Vec<u16>,
@@ -162,7 +163,7 @@ fn ubuntu(spec: &Spec, image: &Path, desktop: bool, tools: &Path, progress: &mut
          # its own, set up at first boot by cloud-init (seed.iso: the user and\n\
          # the guest tools{}). Reference: docs/GUIDE.md, docs/CONFIG.md.\n\
          name = {}\nos = \"ubuntu\"\ncpus = {}\nmemory_mib = {}\n\
-         \n[boot]\ntype = \"uefi\"\nvars = {}\n\
+         \n[boot]\ntype = \"uefi\"\nvars = {}\n{}\
          \n# base.img (the cloud image) is never written: changes go here.\n\
          [[disk]]\npath = \"disk.qcow2\"\nformat = \"qcow2\"\n\
          \n# Read at first boot only; can go after that.\n\
@@ -172,11 +173,20 @@ fn ubuntu(spec: &Spec, image: &Path, desktop: bool, tools: &Path, progress: &mut
         spec.cpus,
         spec.memory_mib,
         toml_str(&format!("{}.state/efivars.fd", spec.name)),
+        secure_boot(spec),
     );
     t += &identity();
     t += &net(ssh);
     t += &format!("\n[display]\ngpu = \"{gpu}\"\nwidth = 1280\nheight = 800\nhidpi = true\n");
     write_config(dir, &spec.name, &t)
+}
+
+fn secure_boot(spec: &Spec) -> &'static str {
+    if spec.secure_boot {
+        "secure_boot = true\n"
+    } else {
+        ""
+    }
 }
 
 fn windows(spec: &Spec, iso: &Path, tools: &Path, progress: &mut dyn FnMut(&str)) -> Result<PathBuf, String> {
@@ -195,7 +205,7 @@ fn windows(spec: &Spec, iso: &Path, tools: &Path, progress: &mut dyn FnMut(&str)
          # Windows ISO, the virtio drivers, the guest tools{}).\n\
          # Reference: docs/GUIDE.md, docs/CONFIG.md.\n\
          name = {}\nos = \"windows\"\ncpus = {}\nmemory_mib = {}\ntpm = true\n\
-         \n[boot]\ntype = \"uefi\"\nvars = {}\n\
+         \n[boot]\ntype = \"uefi\"\nvars = {}\n{}\
          \n# Windows setup only has an NVMe driver.\n\
          [[disk]]\npath = {}\nformat = \"qcow2\"\nbus = \"nvme\"\n\
          \n# The install stick. Setup stops rather than reinstall over a disk\n\
@@ -206,6 +216,7 @@ fn windows(spec: &Spec, iso: &Path, tools: &Path, progress: &mut dyn FnMut(&str)
         spec.cpus,
         spec.memory_mib,
         toml_str(&format!("{}.state/efivars.fd", spec.name)),
+        secure_boot(spec),
         toml_str(&disk),
     );
     t += &identity();
@@ -286,6 +297,7 @@ mod tests {
             memory_mib: 2048,
             disk_gib: 20,
             gpu3d: false,
+            secure_boot: false,
             account: Account { user: "me".into(), password: "pw".into(), ssh_key: None },
             taken_ports: vec![],
         }

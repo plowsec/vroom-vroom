@@ -135,6 +135,7 @@ export struct VmSettings {
     serial: int,     // 0 terminal, 1 file, 2 none
     serial-path: string,
     boot-kernel: bool,
+    secure-boot: bool,
     firmware: string,
     vars: string,
     kernel: string,
@@ -225,6 +226,7 @@ export struct NewVm {
     memory-gib: int,
     disk-gib: int,
     gpu3d: bool,
+    secure-boot: bool,
     start: bool,
     // Ready-made (Ubuntu from its cloud image, Windows from its ISO): the
     // account, SSH with a key of ~/.ssh, Ubuntu's desktop.

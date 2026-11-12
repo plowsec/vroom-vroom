@@ -12,6 +12,8 @@ pub mod fw_cfg;
 pub mod hda;
 pub mod nvme;
 pub mod pci;
+pub mod pc_flash;
+pub mod pc_rtc;
 pub mod pflash;
 pub mod tpm;
 pub mod pl011;
@@ -19,6 +21,7 @@ pub mod pl031;
 pub mod serial16550;
 pub mod pc;
 pub mod usb;
+pub mod uart16550;
 
 pub use bus::{Bus, BusBuilder, BusDevice, BusRange, ConcurrentBusDevice, SharedDevice};
 pub use irq::{IrqLine, NoIrq};

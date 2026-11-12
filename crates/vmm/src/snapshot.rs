@@ -121,6 +121,7 @@ pub(crate) fn saved_config(dir: &Path) -> Result<(vroom_config::VmConfig, bool)>
 }
 
 pub(crate) fn save(vmm: &mut Vmm, dir: &Path, description: &str, kind: Kind) -> Result<()> {
+    vmm.lifecycle.require_state(match kind { Kind::Snapshot => "snapshot", Kind::Suspend => "suspend" })?;
     let vm = crate::disks::vm_dir(vmm.disks.state_dir());
     let mut snap = SnapshotDir::create(dir)?;
     match kind {
@@ -226,6 +227,7 @@ pub(crate) fn save(vmm: &mut Vmm, dir: &Path, description: &str, kind: Kind) -> 
 }
 
 pub(crate) fn restore(vmm: &mut Vmm, dir: &Path) -> Result<()> {
+    vmm.lifecycle.require_state("restore")?;
     let snap = SnapshotDir::open(dir)?;
     let m = &snap.manifest;
     if m.backend != vmm.hv.name() {
@@ -293,6 +295,10 @@ pub(crate) fn restore(vmm: &mut Vmm, dir: &Path) -> Result<()> {
     for d in &vmm.devices {
         let mut d = d.lock().unwrap_or_else(|e| e.into_inner());
         let id = d.snapshot_id();
+        if id.starts_with("virtio-balloon@") && !snap.manifest.files.contains_key(&dev_blob(&id)) {
+            // Saved before the VM had a balloon: its guest never saw one.
+            continue;
+        }
         d.restore(&snap.get_blob(&dev_blob(&id))?)?;
     }
 

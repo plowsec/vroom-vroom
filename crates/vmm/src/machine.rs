@@ -6,7 +6,7 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use vroom_arch::aarch64::{self as board, layout};
-use vroom_arch::x86_64::{self as pc, layout as pc_layout};
+use vroom_arch::x86_64::{self as pc, pc_layout};
 use vroom_config::{Boot, DiskBus, Gpu, GuestOs, SoundDevice, VmConfig};
 use vroom_devices::audio::{AudioSink, AudioSource, NullSink, Silence};
 use vroom_devices::hda::{codec::CodecIds, Hda, HdaIds};
@@ -74,6 +74,9 @@ struct Board {
     msi: Arc<GicMsi>,
     /// Devices a resumed VM had in hot plug slots: (port, device).
     hot: Vec<(usize, Box<dyn VirtioDevice>)>,
+    /// On PCI, after the hot plug ports: devices newer than VMs saved
+    /// with them, which keep their slots.
+    after_ports: Vec<Box<dyn VirtioDevice>>,
 }
 
 impl Board {
@@ -97,6 +100,7 @@ impl Board {
             intx,
             msi,
             hot: Vec::new(),
+            after_ports: Vec::new(),
         }
     }
 
@@ -168,6 +172,13 @@ impl Board {
             if !hot.is_empty() {
                 return Err(Error::Setup("the snapshot has a device in a hot plug slot this VM doesn't have".into()));
             }
+            for dev in std::mem::take(&mut self.after_ports) {
+                // Nice to have: a VM with every slot taken does without.
+                let name = dev.name();
+                if let Err(e) = self.add_virtio(dev) {
+                    log::warn!("pci: no {name} ({e})");
+                }
+            }
         }
         let host_ids = if self.x86 { VendorIds { vendor: 0x8086, device: 0x1237, subsys_vendor: 0, subsys: 0 } } else { host_ids };
         let root = PciRoot::with_ports(std::mem::take(&mut self.pci), host_ids, ports);
@@ -193,7 +204,7 @@ pub(crate) struct Machine {
     pub shared: Arc<VcpuShared>,
     pub vcpus: Vec<VcpuHandle>,
     pub devices: Vec<StatefulDevice>,
-    pub uart: Serial,
+    pub serial_input: crate::serial::SerialInput,
     pub agent: Agent,
     /// Each virtio-gpu's control handle (window size, Direct3D state).
     pub gpus: Vec<GpuControl>,
@@ -246,16 +257,6 @@ impl DeviceRegistry {
     }
 }
 
-pub(crate) enum Serial { Arm(Arc<Mutex<Pl011>>), Pc(Arc<Mutex<vroom_devices::serial16550::Serial16550>>) }
-impl Serial {
-    pub fn queue_input(&self, bytes: &[u8]) {
-        match self {
-            Self::Arm(u) => u.lock().unwrap_or_else(|e| e.into_inner()).queue_input(bytes),
-            Self::Pc(u) => u.lock().unwrap_or_else(|e| e.into_inner()).queue_input(bytes),
-        }
-    }
-}
-
 struct PcPortRange { base: u64, dev: Arc<Mutex<vroom_devices::pc::PcPorts>> }
 impl BusDevice for PcPortRange {
     fn read(&mut self, off: u64, data: &mut [u8]) { self.dev.lock().unwrap_or_else(|e| e.into_inner()).read(self.base + off, data); }
@@ -280,6 +281,9 @@ pub(crate) struct BuildEnv {
     /// Removable shares for USB disks' files (`usb::FILE_SLOTS` on a
     /// Mac; a resumed VM: as many as it was saved with).
     pub usb_file_slots: usize,
+    /// A resumed VM's folders that its saved hardware hasn't: they go on
+    /// removable shares, as when they were shared while it ran.
+    pub later_shares: Vec<vroom_config::Share>,
     /// A resumed VM's network adapters in hot plug slots: adapter index
     /// to port.
     pub hot_nets: std::collections::BTreeMap<usize, usize>,
@@ -290,12 +294,14 @@ pub(crate) struct BuildEnv {
 /// What gets loaded into RAM at (re)boot. Kept so reset can reload it.
 pub(crate) enum BootImage {
     X86Firmware,
-    X86Kernel { kernel: Vec<u8>, initrd: Option<Vec<u8>>, ram_size: u64, cmdline: String, acpi: vroom_arch::acpi::AcpiBlobs },
+    PcKernel { kernel: Vec<u8>, initrd: Option<Vec<u8>>, ram_size: u64, cmdline: String, acpi: vroom_arch::acpi::AcpiBlobs },
     /// Direct Linux boot. The kernel stays as read from its file (often
     /// compressed, a third of its size) and is unpacked at each load.
     Kernel { kernel: Vec<u8>, initrd: Option<Vec<u8>>, ram: (u64, u64), fdt_cfg: board::FdtConfig },
     /// UEFI in flash; the FDT goes at the start of RAM for it to find.
     Firmware { fdt_cfg: board::FdtConfig },
+    /// Validated, owned direct x64 Linux inputs. Cold boot only.
+    X86Kernel(vroom_arch::x86_64::PreparedBoot),
 }
 
 impl BootImage {
@@ -303,10 +309,14 @@ impl BootImage {
     pub fn load(&self, mem: &GuestMemory) -> Result<BootRegs> {
         match self {
             BootImage::X86Firmware => Ok(BootRegs::X86Reset),
-            BootImage::X86Kernel { kernel, initrd, ram_size, cmdline, acpi } => {
-                let rip = pc::loader::load(mem, *ram_size, kernel, initrd.as_deref(), cmdline)?;
+            BootImage::PcKernel { kernel, initrd, ram_size, cmdline, acpi } => {
+                let rip = pc::pc_loader::load(mem, *ram_size, kernel, initrd.as_deref(), cmdline)?;
                 pc::acpi::install(mem, acpi)?;
-                Ok(BootRegs::X86_64 { rip, rsi: pc::loader::BOOT_PARAMS, cr3: pc::loader::PML4, gdt: pc::loader::GDT })
+                Ok(BootRegs::X86_64 { rip, rsi: pc::pc_loader::BOOT_PARAMS, cr3: pc::pc_loader::PML4, gdt: pc::pc_loader::GDT })
+            }
+            BootImage::X86Kernel(boot) => {
+                let info = boot.load(mem)?;
+                Ok(BootRegs::X86_64 { rip: info.rip, rsi: info.rsi, cr3: info.cr3, gdt: info.gdt })
             }
             BootImage::Kernel { kernel, initrd, ram, fdt_cfg } => {
                 let kernel = vroom_arch::decompress_if_needed(kernel.clone())?;
@@ -628,6 +638,7 @@ pub(crate) fn build(
     disks: &DiskSet,
     events: Sender<VmEvent>,
     env: &BuildEnv,
+    lifecycle: crate::lifecycle::LifecyclePolicy,
 ) -> Result<Machine> {
     let x86 = hv.arch() == vroom_hv::Arch::X86_64;
     if x86 && matches!(config.virtio_transport, vroom_config::Transport::Mmio) {
@@ -661,6 +672,7 @@ pub(crate) fn build(
         // Venus maps GPU buffers wherever the guest kernel puts them, in
         // its own page size: 4 KiB for stock kernels.
         small_pages: config.display.gpu == Gpu::Virtio3d,
+        helper_page: layout::HELPER_PAGE_BASE,
     })?;
 
     // With 3D, RAM is shared memory: the GPU process maps it too (the
@@ -682,7 +694,7 @@ pub(crate) fn build(
             board.reg.pio.insert(base, len, Arc::new(Mutex::new(PcPortRange { base, dev: ports.clone() }))).map_err(Error::Setup)?;
         }
         board.reg.stateful.push(ports);
-        Serial::Pc(u)
+        crate::serial::SerialInput::Pc(u)
     } else {
     let uart = Arc::new(Mutex::new(Pl011::new(
         layout::UART_BASE,
@@ -692,7 +704,7 @@ pub(crate) fn build(
     board.reg.add(layout::UART_BASE, layout::MMIO_DEV_SIZE, uart.clone())?;
     let rtc = Arc::new(Mutex::new(Pl031::new(layout::RTC_BASE, SpiLine::new(vm.clone(), layout::RTC_SPI))));
     board.reg.add(layout::RTC_BASE, layout::MMIO_DEV_SIZE, rtc)?;
-    Serial::Arm(uart)
+    crate::serial::SerialInput::Pl011(uart)
     };
 
     if !info.msi_frame_in_kernel {
@@ -868,6 +880,8 @@ pub(crate) fn build(
     let viewer = ui.as_ref().map(|d| d.tx());
     let screen_ctl = agent::Screen { heads, max_pixels, gpu3d: config.display.gpu == Gpu::Virtio3d, viewer: viewer.clone() };
     let agent = agent::spawn(host_end, config.clipboard.clone(), clipboard, screen_ctl)?;
+    // A clone's first boot: its guest takes a name and machine ID of its own.
+    crate::reidentify::start(&env.state_dir, config.guest_os(), agent.clone());
     // `vroom guest exec` reaches the guest agent through it.
     match user_socket(&env.state_dir, "ctl", crate::control::CONTROL_FILE) {
         Ok(l) => crate::control::serve(l, agent.clone())?,
@@ -907,6 +921,14 @@ pub(crate) fn build(
             slots.push((tag, slot));
         }
         u.set_files(slots, agent.clone());
+        for s in &env.later_shares {
+            let r = std::fs::File::open(&s.path)
+                .map_err(|e| format!("{}: {e}", s.path.display()))
+                .and_then(|f| u.attach_folder(f.into(), s.readonly, &s.tag, ""));
+            if let Err(e) = r {
+                log::warn!("shares: {e}");
+            }
+        }
         crate::usb::test_seam(u);
     }
     let net_ports = crate::net::NetPorts::new(nics, viewer.clone(), reach, ident.clone(), env.net_ctrl);
@@ -949,6 +971,24 @@ pub(crate) fn build(
     for fs in usb_files {
         board.add_virtio(Box::new(fs))?;
     }
+    if config.balloon {
+        let ram: Vec<(u64, u64)> = mem.regions().map(|r| (r.start().raw(), r.len())).collect();
+        let (vm2, mem2) = (vm.clone(), mem.clone());
+        let release: vroom_virtio::devices::balloon::Release = Arc::new(move |gpa, len| match vm2.release_memory(&mem2, gpa, len) {
+            Ok(done) => done,
+            Err(e) => {
+                log::warn!("balloon: {e}");
+                false
+            }
+        });
+        let (dev, control) = vroom_virtio::devices::balloon::Balloon::new(ram, vroom_memory::page_size() as u64, release);
+        crate::balloon::start(control, ram_size);
+        if board.use_pci {
+            board.after_ports.push(Box::new(dev));
+        } else if let Err(e) = board.add_virtio(Box::new(dev)) {
+            log::warn!("no memory balloon ({e})");
+        }
+    }
     let root = board.finish_pci(vendor_ids(&ident.pci_bridge_id)?, vendor_ids(&ident.pcie_port_id)?)?;
     let need_pci = root.is_some();
     let hotplug = root
@@ -980,15 +1020,15 @@ pub(crate) fn build(
         model: ident.dt_model.clone(),
     };
     let boot = match &config.boot {
-        Boot::Kernel { kernel, initrd, cmdline } if x86 => BootImage::X86Kernel {
+        Boot::Kernel { kernel, initrd, cmdline } if x86 => BootImage::PcKernel {
             kernel: read_file(kernel, "kernel", 1 << 30)?,
             initrd: initrd.as_ref().map(|p| read_file(p, "initrd", ram_size / 2)).transpose()?, ram_size, cmdline: cmdline.clone(),
             acpi: pc::acpi::build(config.cpus, config.tpm, &vroom_arch::acpi::AcpiIds::new(
                 &ident.acpi_oem_id, &ident.acpi_table_id, &ident.acpi_creator_id,
                 Some(ident.hypervisor_id.as_str()).filter(|h| ident.announce_vm && !h.is_empty())), ram_size),
         },
-        Boot::Uefi { firmware, vars } if x86 => {
-            crate::firmware::Firmware { code: firmware.clone(), vars: vars.clone() }.setup_x86(
+        Boot::Uefi { firmware, vars, secure_boot } if x86 => {
+            crate::firmware::Firmware { code: firmware.clone(), vars: vars.clone(), secure_boot: *secure_boot, resuming: env.resuming }.setup_x86(
                 &vm, &mem, &mut reg, config.cpus, ram_size, config.tpm,
                 screen.as_ref().map(Arc::downgrade),
                 &vroom_arch::smbios::SmbiosConfig {
@@ -1015,8 +1055,13 @@ pub(crate) fn build(
                 fdt_cfg: fdt_base(fdt_devices, cmdline.clone()),
             }
         }
-        Boot::Uefi { firmware, vars } => {
-            let fw = crate::firmware::Firmware { code: firmware.clone(), vars: vars.clone() };
+        Boot::Uefi { firmware, vars, secure_boot } => {
+            let fw = crate::firmware::Firmware {
+                code: firmware.clone(),
+                vars: vars.clone(),
+                secure_boot: *secure_boot,
+                resuming: env.resuming,
+            };
             fw.setup(
                 &vm,
                 &mem,
@@ -1071,11 +1116,13 @@ pub(crate) fn build(
     let shared = Arc::new(VcpuShared {
         vm: vm.clone(),
         mmio: reg.bus.build(),
-        pio: reg.pio.build(),
+        pc_pio: x86.then(|| reg.pio.build()),
         unmapped_mmio: if x86 { 0xff } else { 0 },
+        pio: None,
         cpus: Mutex::new(CpuTable::new(mpidrs)),
         events,
         peers: OnceLock::new(),
+        run_calls: Default::default(),
         device_exits: std::sync::atomic::AtomicU64::new(0),
         halt_on_stop: Default::default(),
         halting: Default::default(),
@@ -1084,12 +1131,12 @@ pub(crate) fn build(
     });
     let mut vcpus = Vec::new();
     for i in 0..config.cpus {
-        vcpus.push(vcpu::spawn(i, shared.clone())?);
+        vcpus.push(vcpu::spawn(i, shared.clone(), lifecycle)?);
     }
     let _ = shared.peers.set(vcpus.iter().map(|v| v.peer.clone()).collect());
     vm.finalize()?;
 
-    Ok(Machine { vm, mem, shared, vcpus, devices: reg.stateful, uart, agent, gpus, viewer, display, screens, boot, nets, net_ports, hotplug })
+    Ok(Machine { vm, mem, shared, vcpus, devices: reg.stateful, serial_input: uart, agent, gpus, viewer, display, screens, boot, nets, net_ports, hotplug })
 }
 
 #[cfg(test)]

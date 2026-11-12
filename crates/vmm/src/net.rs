@@ -135,7 +135,7 @@ pub(crate) fn boot_backend(
     };
     match n.mode()? {
         NetMode::Nat { port_forwards } => {
-            let policy = NatPolicy { allow_host_loopback: n.allow_host_loopback, block_private: n.block_private };
+            let policy = NatPolicy { allow_host_loopback: n.allow_host_loopback, host_ports: n.host_ports.clone(), block_private: n.block_private };
             let mut cfg = nat_config(ident, idx, mac, policy, dns)?;
             cfg.mirror = n.mirror_net()?;
             for p in port_forwards {
@@ -183,6 +183,7 @@ fn net_of(l: &NetLive, mac: [u8; 6]) -> vroom_config::Net {
         network,
         port_forwards: Vec::new(),
         allow_host_loopback: l.loopback,
+        host_ports: Vec::new(),
         block_private: l.block_private,
         mirror: None,
         mac: Some(vroom_config::format_mac(&mac)),
@@ -284,7 +285,7 @@ impl NetPorts {
                 if !self.reach.nat {
                     return Err("NAT needs the VM restarted: it started without a NAT adapter, so its sandbox allows no connections out".into());
                 }
-                let policy = NatPolicy { allow_host_loopback: want.loopback && self.reach.loopback, block_private: want.block_private };
+                let policy = NatPolicy { allow_host_loopback: want.loopback && self.reach.loopback, host_ports: Vec::new(), block_private: want.block_private };
                 let cfg = nat_config(&self.ident, i, mac, policy.clone(), self.reach.dns).map_err(|e| e.to_string())?;
                 let nat = Nat::new(cfg).map_err(|e| format!("NAT: {e}"))?;
                 let live = NetLive { forwards: Vec::new(), loopback: policy.allow_host_loopback, ..want };
@@ -357,7 +358,9 @@ impl NetPorts {
         let label = label(&want);
         match want.kind {
             NetKind::Nat => {
-                let policy = NatPolicy { allow_host_loopback: want.loopback && self.reach.loopback, block_private: want.block_private };
+                // Its host ports as the VM file had them: the sandbox allows those.
+                let host_ports = n.net.host_ports.clone();
+                let policy = NatPolicy { allow_host_loopback: want.loopback && self.reach.loopback, host_ports, block_private: want.block_private };
                 if n.live.kind == NetKind::Nat {
                     // The same NAT: new rules from the next connection on.
                     // Its port forwards stay as they are.
