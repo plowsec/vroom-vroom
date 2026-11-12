@@ -4,6 +4,7 @@
 
 pub mod acpi;
 pub mod aarch64;
+pub mod x86_64;
 mod image;
 pub mod smbios;
 

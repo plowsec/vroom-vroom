@@ -109,7 +109,7 @@ pub fn build(c: &SmbiosConfig) -> Smbios {
     t4.extend_from_slice(&[0, 0, 0]); // serial, asset, part (no strings)
     t4.extend_from_slice(&[cores, cores, cores]);
     t4.extend_from_slice(&0x04u16.to_le_bytes()); // characteristics: 64-bit
-    t4.extend_from_slice(&0x0101u16.to_le_bytes()); // family 2: ARMv8
+    t4.extend_from_slice(&(if cfg!(target_arch = "aarch64") { 0x0101u16 } else { 0x02u16 }).to_le_bytes()); // ARMv8, or unspecified x86 model
     b.add(4, &t4, &["CPU0", vendor, &c.cpu_name]);
 
     // Type 16, physical memory array (handle referenced by 17 and 19).
