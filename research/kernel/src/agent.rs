@@ -794,6 +794,7 @@ impl Connection {
                         if c.name == "cpu.write_register" { description["summary"] = json!("Write an AMD64 register: rax..r15, rip, rsp, rflags, cr0/cr2/cr3/cr4, efer"); }
                         if c.name == "debug.breakpoints" { description["summary"] = json!("Replace AMD64 hardware execution breakpoints; four shared execution/data slots, no instruction alignment restriction"); }
                          if c.name == "debug.watchpoints" { description["summary"] = json!("Replace AMD64 data watchpoints: aligned 1/2/4/8 bytes, w or rw, sharing four slots with execution breakpoints"); }
+                         if c.name == "memory.search" { description["summary"] = json!("Search virtual memory with wildcard hex, integer or text patterns; skips/reports holes and supports cross-page matches. A deterministic work budget may require a smaller range or larger alignment"); }
                     }
                     description
                 }).collect()))
@@ -1164,6 +1165,36 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":4,"method":"commands.run","params":{"command":"cpu.registers"}}"#,
             r#"{"jsonrpc":"2.0","id":5,"method":"jobs.start","params":{"command":"cpu.registers"}}"#,
         ] { assert!(call(&mut c,request).get("error").is_some()); }
+    }
+
+    #[test]
+    fn x64_extended_debugger_commands_are_discovered_and_forwarded() {
+        let (mut c, rx) = connection();
+        Arc::get_mut(&mut c.shared).unwrap().ops = Some(crate::x64_lab::OPS);
+        call(&mut c, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"actor":"test"}}"#);
+        let cases = vec![
+            ("memory.dump", "dump", json!({"address":"0x1000","length":64})),
+            ("memory.search", "search", json!({"address":"0x1000","length":64,"text":"MZ"})),
+        ];
+        let list = call(&mut c, r#"{"jsonrpc":"2.0","id":2,"method":"commands.list"}"#);
+        let names: Vec<_> = list["result"].as_array().unwrap().iter().map(|v| v["name"].as_str().unwrap()).collect();
+        for (name, _, _) in &cases {
+            assert!(names.contains(name), "missing x64 command {name}");
+        }
+        let expected: Vec<_> = cases.iter().map(|(_, op, _)| *op).collect();
+        let lab = std::thread::spawn(move || {
+            for op in expected {
+                let f = rx.recv_timeout(Duration::from_secs(5)).expect("command was not forwarded");
+                assert_eq!(f.request["op"], op);
+                f.reply.send(Ok(json!(true))).unwrap();
+            }
+        });
+        for (i, (name, _, params)) in cases.into_iter().enumerate() {
+            let request = json!({"jsonrpc":"2.0","id":i + 3,"method":name,"params":params});
+            let response = call(&mut c, &request.to_string());
+            assert_eq!(response["result"], true, "{name}: {response}");
+        }
+        lab.join().unwrap();
     }
 
     #[test]

@@ -61,6 +61,11 @@ target/debug/vroom-lab /absolute/path/windows11.toml \
   paused by default, on the same KVM host/backend.
 - General/control registers, physical and virtual memory reads/writes,
   memory regions, and four-level x64 page translation (4 KiB/2 MiB/1 GiB).
+- `memory.dump` writes up to 64 MiB under `exports`; optional holes are listed
+  and zero-filled. `memory.search` supports wildcard hex, signed integers,
+  UTF-8/UTF-16LE, cross-page matches, alignment and resumable hit limits. Ranges
+  are capped at 1 GiB and a deterministic work budget; expensive searches fail
+  explicitly and must be split or given a larger alignment.
 - Four shared hardware execution/data breakpoint slots. Data watches require
   aligned 1/2/4/8-byte ranges, write or read+write; read-only is unsupported.
 - Kernel discovery from live CPU contexts, exact-build Microsoft PDBs,

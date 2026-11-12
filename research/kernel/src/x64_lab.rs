@@ -13,6 +13,9 @@ use vroom_kernel::x86_64::{canonical, AddressSpace, Registers};
 use vroom_kernel::{process, symbols::Symbols};
 use vroom_vmm::{RunState, StartMode, VmEvent, Vmm, VmmOptions};
 
+#[path = "x64_memory.rs"]
+mod memory_util;
+
 pub(super) const OPS: &[&str] = &[
     "status",
     "pause",
@@ -33,6 +36,8 @@ pub(super) const OPS: &[&str] = &[
     "translate",
     "write_physical",
     "write_virtual",
+    "dump",
+    "search",
     "breakpoints",
     "watchpoints",
     "kernel",
@@ -552,6 +557,8 @@ impl Session {
         }
         match op {
             "registers" => Ok(json!(self.registers(cpu, false)?)),
+            "dump" => self.memory_dump(cpu, q),
+            "search" => self.memory_search(cpu, q),
             "write_register" => {
                 let name = q["register"].as_str().ok_or("missing register")?;
                 let register =
