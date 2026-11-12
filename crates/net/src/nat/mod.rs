@@ -5,7 +5,7 @@
 //! over normal host sockets; UDP flows map to connected host UDP sockets.
 //!
 //! Policy (secure by default): the guest can reach the internet but NOT
-//! the host's loopback services, link-local, multicast or our own subnet.
+//! the host's loopback services or own addresses, link-local, multicast or our own subnet.
 //! Every table is capped so a hostile guest can't exhaust host memory.
 
 mod fragment;
@@ -64,6 +64,18 @@ const TCP_BUF_BIG: usize = 512 << 10;
 const MAX_BIG_BUFS: usize = 16;
 const UDP_IDLE: Duration = Duration::from_secs(60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Whether `dst` is one of this host's own addresses, asked now (they change while a VM runs).
+/// Connecting a UDP socket sends nothing; the kernel picks `dst` itself as source when it is local.
+/// No route: not ours.
+fn host_owns(dst: Ipv4Addr) -> io::Result<bool> {
+    let s = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+    match s.connect((dst, 9)) {
+        Ok(()) => Ok(s.local_addr()?.ip() == std::net::IpAddr::V4(dst)),
+        Err(e) if matches!(e.kind(), io::ErrorKind::NetworkUnreachable | io::ErrorKind::HostUnreachable) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NatPolicy {
@@ -331,6 +343,11 @@ impl Nat {
             return None;
         }
         if self.cfg.policy.block_private && (dst.is_private() || cgnat) {
+            return None;
+        }
+        // The host's own LAN/VPN/bridge addresses reach its `*`-bound services: host loopback rules.
+        // Unknown means no.
+        if !self.cfg.policy.allow_host_loopback && host_owns(dst).unwrap_or(true) {
             return None;
         }
         Some(SocketAddr::V4(SocketAddrV4::new(dst, port)))
@@ -1009,6 +1026,33 @@ mod tests {
         assert!(n.resolve(Ipv4Addr::LOCALHOST, 8000).is_none());
         n.cfg.policy.allow_host_loopback = true;
         assert_eq!(n.resolve(GATEWAY, 22), Some("127.0.0.1:22".parse().unwrap()));
+    }
+
+    /// This host's address towards 192.0.2.1 (TEST-NET-1), if it has a non-loopback one.
+    fn own_address() -> Option<Ipv4Addr> {
+        let s = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+        s.connect((Ipv4Addr::new(192, 0, 2, 1), 9)).ok()?;
+        match s.local_addr().ok()?.ip() {
+            std::net::IpAddr::V4(a) if !a.is_loopback() && !a.is_unspecified() => Some(a),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn own_addresses_are_host_loopback() {
+        let Some(me) = own_address() else {
+            eprintln!("skipped: host has only loopback");
+            return;
+        };
+        let mut n = nat();
+        assert!(host_owns(me).unwrap());
+        assert!(!host_owns(Ipv4Addr::new(1, 1, 1, 1)).unwrap_or(true));
+        assert!(n.resolve(me, 22).is_none(), "{me} is this host");
+        assert!(n.resolve(Ipv4Addr::new(1, 1, 1, 1), 443).is_some());
+        n.cfg.policy.host_ports = vec![22];
+        assert!(n.resolve(me, 22).is_none(), "host_ports: gateway alias only");
+        n.cfg.policy.allow_host_loopback = true;
+        assert_eq!(n.resolve(me, 22), Some(SocketAddr::V4(SocketAddrV4::new(me, 22))));
     }
 
     #[test]

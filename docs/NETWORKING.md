@@ -24,8 +24,9 @@ Supported:
 
 Policy:
 
-- Blocked: loopback, link-local, multicast, the virtual subnets.
-- `allow_host_loopback`: gateway = alias for host loopback (TCP/UDP).
+- Blocked: loopback, link-local, multicast, the virtual subnets, the host's own addresses (LAN, VPN, bridge; checked per new flow, TCP/UDP/ping).
+- `allow_host_loopback`: gateway = alias for host loopback (TCP/UDP); host's own addresses open too.
+- `host_ports`: gateway alias only.
 - `block_private`: also LAN and CGNAT.
 - DNS alias forwards to the host's first IPv4 nameserver in `/etc/resolv.conf`.
 

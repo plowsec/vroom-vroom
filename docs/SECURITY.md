@@ -107,7 +107,7 @@ Left: a guest app can draw anything below the strip, including a fake Mac dialog
 ## Network
 
 - NAT: userspace proxy; guest never gets raw access to the host network stack.
-- Host loopback unreachable unless `allow_host_loopback`. `block_private`: guest off your LAN.
+- Host loopback unreachable unless `allow_host_loopback`. Same for the host's own addresses (LAN, VPN, `bridgeN`): reach `*`-bound services. Checked per new flow (UDP connect probe, nothing sent; unknown = refused). `block_private`: guest off your LAN.
 - Bridged, host-only: via `vroom-netd`: allow-listed interfaces, source-MAC anti-spoofing ([the root helper](#the-root-helper-vroom-netd)).
 
 ### Network changes while the VM runs
