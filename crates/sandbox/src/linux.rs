@@ -464,9 +464,9 @@ fn allowed(p: &Policy) -> Vec<i64> {
         // gets an argument rule in `seccomp` (IP families only).
         v.extend_from_slice(&[SYS_connect]);
     }
-    if !p.listen_ports.is_empty() {
-        v.extend_from_slice(&[SYS_accept4, SYS_accept]);
-    }
+    // Always: the control socket (made before lock-down) accepts too.
+    // No bind or listen here, so only sockets from before can accept.
+    v.extend_from_slice(&[SYS_accept4, SYS_accept]);
     v
 }
 
