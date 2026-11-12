@@ -263,6 +263,9 @@ pub(crate) struct BuildEnv {
     /// A resumed VM's folders that its saved hardware hasn't: they go on
     /// removable shares, as when they were shared while it ran.
     pub later_shares: Vec<vroom_config::Share>,
+    /// A resumed VM's saved shares its file no longer has, by their place
+    /// among the saved ones: the devices stay (the guest has them), empty.
+    pub gone_shares: Vec<(usize, vroom_config::Share)>,
     /// A resumed VM's network adapters in hot plug slots: adapter index
     /// to port.
     pub hot_nets: std::collections::BTreeMap<usize, usize>,
@@ -338,6 +341,43 @@ fn user_socket(state_dir: &std::path::Path, ext: &str, file: &str) -> std::io::R
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
     crate::state::hostile::write_atomic(&state_dir.join(file), p.as_os_str().as_bytes(), 0o600)?;
     Ok(l)
+}
+
+/// An adapter the VM file no longer has (a resumed VM keeps it, cable
+/// out): the save named it, so nothing of its reaches the host: no
+/// backend, and host-only as far as the sandbox is concerned.
+fn unplugged(p: crate::net::Planned) -> crate::net::Planned {
+    if !p.removed {
+        return p;
+    }
+    let net = vroom_config::Net {
+        mode: vroom_config::NetKind::HostOnly,
+        interface: None,
+        network: None,
+        port_forwards: Vec::new(),
+        allow_host_loopback: false,
+        host_ports: Vec::new(),
+        block_private: false,
+        mirror: None,
+        mac: p.net.mac,
+        connected: false,
+    };
+    crate::net::Planned { net, ..p }
+}
+
+/// The backend of an unplugged adapter: frames go nowhere.
+#[derive(Debug)]
+struct Unplugged;
+
+impl vroom_net::NetBackend for Unplugged {
+    fn send_frame(&mut self, _frame: &[u8]) {}
+    fn recv_frame(&mut self) -> Option<Vec<u8>> {
+        None
+    }
+    fn register(&mut self, _reg: &mio::Registry) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn ready(&mut self, _token: usize) {}
 }
 
 /// Host-visible window size for GPU buffers (address space, not memory).
@@ -665,8 +705,16 @@ pub(crate) fn build(
         Some(dev) => Some(sound_card(&mut board, config, dev, ui.as_ref())?),
         None => None,
     };
-    for s in &config.shares {
-        board.add_virtio(Box::new(Fs::new(&s.tag, s.path.clone(), s.readonly).map_err(|e| Error::Setup(e.to_string()))?))?;
+    let mut shares = config.shares.iter();
+    for i in 0..config.shares.len() + env.gone_shares.len() {
+        let fs = match env.gone_shares.iter().find(|(at, _)| *at == i) {
+            Some((_, s)) => Fs::removable(&s.tag).map(|(fs, _)| fs),
+            None => match shares.next() {
+                Some(s) => Fs::new(&s.tag, s.path.clone(), s.readonly),
+                None => break,
+            },
+        };
+        board.add_virtio(Box::new(fs.map_err(|e| Error::Setup(e.to_string()))?))?;
     }
     let mut nvme_ns = Vec::new();
     for (d, vd) in config.disks.iter().zip(&disks.disks) {
@@ -837,12 +885,16 @@ pub(crate) fn build(
     }
     // Network adapters (right after the console: the device order is the
     // guest's layout). The viewer can change them while the VM runs.
-    let planned = crate::net::plan(config, env.saved.as_ref())?;
+    let planned: Vec<_> = crate::net::plan(config, env.saved.as_ref())?.into_iter().map(unplugged).collect();
     let reach = crate::net::Reach::of(planned.iter().map(|p| &p.net), env.sandbox);
     let mut nics = Vec::new();
     let mut nets = Vec::new();
     for (i, p) in planned.into_iter().enumerate() {
-        let (backend, mac) = crate::net::boot_backend(&config.name, ident, i, &p.net, p.mac, reach.dns)?;
+        let (backend, mac) = if p.removed {
+            (Box::new(Unplugged) as Box<dyn vroom_net::NetBackend>, p.mac)
+        } else {
+            crate::net::boot_backend(&config.name, ident, i, &p.net, p.mac, reach.dns)?
+        };
         let live = crate::net::live_of(&p.net)?;
         let mut dev = Net::with_link(&format!("eth{i}"), mac, backend, &crate::net::label(&live), p.net.connected && !p.removed);
         if !env.net_ctrl {
@@ -1081,6 +1133,24 @@ mod tests {
         let ids = vendor_ids("144d:a808:144d:a801").unwrap();
         assert_eq!((ids.device, ids.subsys), (0xa808, 0xa801));
         assert!(vendor_ids("144d").is_err());
+    }
+
+    #[test]
+    fn a_removed_adapter_reaches_nothing() {
+        let mut saved = VmConfig::from_toml("name='t'\n[boot]\ntype='kernel'\nkernel='/k'\n[[net]]\nmode='nat'\n[[net]]\nmode='nat'\nallow_host_loopback=true\n[[net.port_forwards]]\nhost_port=2222\nguest_port=22\n").unwrap();
+        saved.nets.push(vroom_config::Net { mode: vroom_config::NetKind::Bridged, interface: Some("en0".into()), ..saved.nets[0].clone() });
+        let mut now = saved.clone();
+        now.nets.truncate(1);
+        let p: Vec<_> = crate::net::plan(&now, Some(&saved)).unwrap().into_iter().map(unplugged).collect();
+        assert_eq!(p[0].net, now.nets[0], "the file's adapter as it is");
+        for r in &p[1..] {
+            assert!(r.removed && !r.net.connected);
+            assert_eq!(r.net.mode, vroom_config::NetKind::HostOnly);
+            assert!(r.net.port_forwards.is_empty() && !r.net.allow_host_loopback && r.net.interface.is_none());
+            crate::net::live_of(&r.net).unwrap();
+        }
+        let reach = crate::net::Reach::of(p.iter().map(|p| &p.net), true);
+        assert!(!reach.loopback, "loopback from a removed adapter");
     }
 
     #[test]

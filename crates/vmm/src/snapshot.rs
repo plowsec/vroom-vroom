@@ -155,6 +155,10 @@ pub(crate) fn save(vmm: &mut Vmm, dir: &Path, description: &str, kind: Kind) -> 
     m.arch = "aarch64".into();
     m.backend = vmm.hv.name().into();
     let mut config = vmm.config.clone();
+    // The devices of shares its file dropped are still there: in their place.
+    for (i, s) in &vmm.gone_shares {
+        config.shares.insert((*i).min(config.shares.len()), s.clone());
+    }
     config.relative_paths(dir, &vm);
     m.config = serde_json::to_value(&config).map_err(|e| Error::Setup(e.to_string()))?;
     if !hot.is_empty() {

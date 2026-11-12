@@ -27,6 +27,7 @@ vroom-ipc.workspace = true
 vroom-sandbox.workspace = true
 vroom-block.workspace = true
 vroom-net.workspace = true
+mio.workspace = true
 vroom-audio.workspace = true
 vroom-proto.workspace = true
 sha2 = "0.10"

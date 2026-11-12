@@ -175,6 +175,9 @@ pub struct Vmm {
     /// A resumed VM's folders that are in its file but not in the hardware
     /// it was saved with: served on removable shares.
     later_shares: Vec<vroom_config::Share>,
+    /// A resumed VM's saved shares its file no longer has (served empty;
+    /// a save records them again).
+    gone_shares: GoneShares,
     /// Windows' 3D GPU has memory in BAR 0 (see `machine::GPU3D_VRAM`).
     gpu3d_vram: bool,
     /// The network adapters now (a save records them).
@@ -235,21 +238,104 @@ const PARK_SETTLE: Duration = Duration::from_secs(3);
 /// go before the save drops them (see `GpuControl::set_driver_stopped`).
 const PARK_LEFTOVERS: Duration = Duration::from_secs(3);
 
+/// Saved shares the VM file no longer has, by their place among the saved
+/// ones: served empty.
+type GoneShares = Vec<(usize, vroom_config::Share)>;
+
 /// A snapshot comes back with the hardware it was taken with: its devices
-/// and their state are in it. From the VM file now only what the host does
-/// around them: network attachments (planned against the saved adapters),
-/// clipboard, serial, sandbox and the window's size.
-fn restore_hardware(now: VmConfig, saved: &VmConfig) -> VmConfig {
-    VmConfig {
+/// and their state are in it. But the sandboxed VMM writes saves, so the
+/// save only gives the guest-visible shape; whatever reaches the host comes
+/// from the VM file now, and no opt-in may go beyond it:
+/// - from the file: boot files, disk images, network attachments (planned
+///   against the saved adapters), shares' folders, USB devices, clipboard,
+///   serial, sandbox, identity, the window's size;
+/// - from the save, if the file allows them too: 3D, OpenGL, video
+///   decoding and encoding, nested, TPM, sound, microphone, camera;
+/// - from the save: CPUs, memory, transport, balloon, monitors, sound card.
+///
+/// What the save has and the file can't honour is refused (boot fresh),
+/// except a share the file dropped (served empty) and a USB device it
+/// dropped (left out).
+fn restore_hardware(now: VmConfig, saved: &VmConfig) -> Result<(VmConfig, GoneShares)> {
+    use vroom_config::{Boot, Gpu, OpenglHost};
+    let refuse = |what: String| Error::Setup(format!("can't resume: {what}; the VM file doesn't allow what the saved VM has (start it fresh: --fresh)"));
+    let opt_in = |what: &str, saved: bool, now: bool| if saved && !now { Err(refuse(format!("{what} is off in the VM file"))) } else { Ok(saved) };
+    match (&saved.boot, &now.boot) {
+        (Boot::Kernel { .. }, Boot::Kernel { .. }) => {}
+        (Boot::Uefi { secure_boot: a, .. }, Boot::Uefi { secure_boot: b, .. }) if a == b => {}
+        _ => return Err(refuse("its boot (kernel or UEFI, Secure Boot) changed".into())),
+    }
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    if saved.disks.len() != now.disks.len() {
+        return Err(refuse(format!("it has {} disks, the VM file {}", saved.disks.len(), now.disks.len())));
+    }
+    for (i, (a, b)) in saved.disks.iter().zip(&now.disks).enumerate() {
+        if real(&a.path) != real(&b.path) || (a.readonly, a.format, a.cdrom, a.bus) != (b.readonly, b.format, b.cdrom, b.bus) {
+            return Err(refuse(format!("disk {} is {} in the save, {} in the VM file (or set up differently)", i + 1, a.path.display(), b.path.display())));
+        }
+    }
+    if saved.identity != now.identity {
+        return Err(refuse("its [identity] changed".into()));
+    }
+    let three_d = saved.display.gpu == Gpu::Virtio3d;
+    if three_d && now.display.gpu != Gpu::Virtio3d {
+        return Err(refuse("3D graphics is off in the VM file".into()));
+    }
+    let opengl = if three_d { opt_in("OpenGL", saved.display.opengl, now.display.opengl)? } else { saved.display.opengl };
+    if three_d && opengl && saved.display.opengl_host == OpenglHost::Apple && now.display.opengl_host != OpenglHost::Apple {
+        return Err(refuse("OpenGL through Apple's driver is off in the VM file".into()));
+    }
+    let display = vroom_config::Display {
+        gpu: saved.display.gpu,
+        width: now.display.width,
+        height: now.display.height,
+        hidpi: now.display.hidpi,
+        opengl,
+        opengl_host: saved.display.opengl_host,
+        video_decode: opt_in("video decoding", saved.display.video_decode, now.display.video_decode)?,
+        video_encode: opt_in("video encoding", saved.display.video_encode, now.display.video_encode)?,
+        monitors: saved.display.monitors,
+    };
+    let audio = vroom_config::Audio {
+        output: opt_in("sound", saved.audio.output, now.audio.output)?,
+        input: opt_in("the microphone", saved.audio.input, now.audio.input)?,
+        device: saved.audio.device,
+    };
+    let (mut shares, mut gone) = (Vec::new(), Vec::new());
+    for (i, s) in saved.shares.iter().enumerate() {
+        match now.shares.iter().find(|n| n.tag == s.tag) {
+            Some(n) => shares.push(n.clone()),
+            None => gone.push((i, s.clone())),
+        }
+    }
+    let usb = saved
+        .usb
+        .iter()
+        .filter_map(|u| now.usb.iter().find(|n| (&n.id, &n.serial, n.mode) == (&u.id, &u.serial, u.mode)).cloned())
+        .collect();
+    let config = VmConfig {
         name: now.name,
+        cpus: saved.cpus,
+        memory_mib: saved.memory_mib,
+        boot: now.boot,
+        disks: now.disks,
         nets: now.nets,
+        display,
         clipboard: now.clipboard,
         serial: now.serial,
         security: now.security,
+        virtio_transport: saved.virtio_transport,
+        nested: opt_in("nested virtualization", saved.nested, now.nested)?,
+        audio,
+        camera: opt_in("the camera", saved.camera, now.camera)?,
+        shares,
+        balloon: saved.balloon,
+        tpm: opt_in("the TPM", saved.tpm, now.tpm)?,
         os: now.os,
-        display: vroom_config::Display { width: now.display.width, height: now.display.height, hidpi: now.display.hidpi, ..saved.display.clone() },
-        ..saved.clone()
-    }
+        usb,
+        identity: now.identity,
+    };
+    Ok((config, gone))
 }
 
 /// Folders in the VM file now that the saved hardware hasn't: shared while
@@ -287,9 +373,9 @@ impl Vmm {
             StartMode::Boot | StartMode::BootPaused => None,
         };
         let later_shares = saved.as_ref().map(|(s, _)| later_shares(&config, s)).unwrap_or_default();
-        let config = match &saved {
-            Some((s, _)) => restore_hardware(config, s),
-            None => config,
+        let (config, gone_shares) = match &saved {
+            Some((s, _)) => restore_hardware(config, s)?,
+            None => (config, Vec::new()),
         };
         let (ev_tx, ev_rx) = mpsc::channel();
         let ui = match opts.ui {
@@ -329,6 +415,7 @@ impl Vmm {
             net_ctrl,
             usb_file_slots,
             later_shares: later_shares.clone(),
+            gone_shares: gone_shares.clone(),
             sandbox: opts.sandbox && config.security.sandbox,
             hot_nets,
             gpu3d_vram,
@@ -367,6 +454,7 @@ impl Vmm {
             net_ctrl,
             usb_file_slots,
             later_shares,
+            gone_shares,
             gpu3d_vram,
             net_ports: m.net_ports,
             hotplug: m.hotplug,
@@ -1127,6 +1215,70 @@ mod tests {
     }
 
     #[test]
+    fn a_save_gets_no_more_host_access_than_the_file() {
+        let base = || {
+            let mut c = VmConfig::from_toml("name='t'\ncpus=1\nmemory_mib=64\n[boot]\ntype='kernel'\nkernel='/k'\n[[disk]]\npath='/vm/disk.qcow2'\nformat='qcow2'\n").unwrap();
+            c.shares = vec![vroom_config::Share { path: "/home/me/work".into(), tag: "work".into(), readonly: true }];
+            c
+        };
+        let now = base();
+        // Unchanged: the file's own.
+        let (c, gone) = restore_hardware(now.clone(), &base()).unwrap();
+        assert_eq!(c, now);
+        assert!(gone.is_empty());
+        // A forged save: another folder (writable) under the same tag, an
+        // extra share, a kernel elsewhere, a USB device: the file's, or nothing.
+        let mut forged = base();
+        forged.shares[0] = vroom_config::Share { path: "/".into(), tag: "work".into(), readonly: false };
+        forged.shares.push(vroom_config::Share { path: "/home/me/.ssh".into(), tag: "x".into(), readonly: false });
+        forged.boot = vroom_config::Boot::Kernel { kernel: "/etc/passwd".into(), initrd: None, cmdline: String::new() };
+        forged.usb.push(vroom_config::Usb { id: "05ac:1234".into(), serial: None, name: None, mode: Default::default(), readonly: false });
+        let (c, gone) = restore_hardware(now.clone(), &forged).unwrap();
+        assert_eq!(c.shares, now.shares);
+        assert_eq!(c.boot, now.boot);
+        assert!(c.usb.is_empty());
+        assert_eq!(gone.iter().map(|(i, s)| (*i, s.tag.as_str())).collect::<Vec<_>>(), [(1, "x")], "served empty, not from the save");
+        // Another disk image, or more disks: refused.
+        let mut forged = base();
+        forged.disks[0].path = "/home/me/.ssh/id_ed25519".into();
+        let e = restore_hardware(now.clone(), &forged).unwrap_err().to_string();
+        assert!(e.contains("disk 1") && e.contains("--fresh"), "{e}");
+        let mut forged = base();
+        forged.disks.push(forged.disks[0].clone());
+        assert!(restore_hardware(now.clone(), &forged).is_err());
+        // Opt-ins the file doesn't have.
+        let opt_ins: [fn(&mut VmConfig); 9] = [
+            |c| c.audio.input = true,
+            |c| c.audio.output = true,
+            |c| c.camera = true,
+            |c| c.tpm = true,
+            |c| c.nested = true,
+            |c| c.display.video_decode = true,
+            |c| c.display.video_encode = true,
+            |c| c.display.gpu = vroom_config::Gpu::Virtio3d,
+            |c| c.identity.gl_renderer = Some("x".into()),
+        ];
+        for f in opt_ins {
+            let mut forged = base();
+            f(&mut forged);
+            assert!(restore_hardware(now.clone(), &forged).is_err(), "{forged:?}");
+            // With the file allowing it, it comes back.
+            let mut allowed = base();
+            f(&mut allowed);
+            assert!(restore_hardware(allowed, &forged).is_ok());
+        }
+        // 3D with OpenGL in the save, the file Vulkan only.
+        let mut forged = base();
+        forged.display.gpu = vroom_config::Gpu::Virtio3d;
+        let mut file = forged.clone();
+        file.display.opengl = false;
+        assert!(restore_hardware(file.clone(), &forged).is_err());
+        // The other way round: the save's (less).
+        let (c, _) = restore_hardware(forged.clone(), &file).unwrap();
+        assert!(!c.display.opengl);
+    }
+
+    #[test]
     fn folders_the_saved_hardware_hasnt() {
         let cfg = |tags: &[&str]| {
             let mut c = VmConfig::from_toml("name='t'\ncpus=1\nmemory_mib=64\n[boot]\ntype='kernel'\nkernel='k'\n").unwrap();
@@ -1139,6 +1291,6 @@ mod tests {
         assert!(later_shares(&cfg(&["boot"]), &saved).is_empty(), "nothing new");
         assert!(later_shares(&cfg(&[]), &saved).is_empty(), "removed: the saved device stays until a restart");
         // The resumed VM keeps the saved device; the new folder is extra.
-        assert_eq!(tags(restore_hardware(cfg(&["boot", "live"]), &saved).shares), ["boot"]);
+        assert_eq!(tags(restore_hardware(cfg(&["boot", "live"]), &saved).unwrap().0.shares), ["boot"]);
     }
 }
