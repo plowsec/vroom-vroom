@@ -135,11 +135,12 @@ pub fn open_files(mount: &Path, readonly: bool) -> Result<Files, String> {
 
 #[allow(unsafe_code)]
 fn mounted_readonly(dir: &File) -> bool {
-    // SAFETY: a zeroed statfs is plain data fstatfs fills in.
-    let mut s: libc::statfs = unsafe { std::mem::zeroed() };
+    // Use the POSIX interface: statfs/MNT_RDONLY are BSD-specific.
+    // SAFETY: a zeroed statvfs is plain data fstatvfs fills in.
+    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
     // SAFETY: valid fd and out pointer.
-    let r = unsafe { libc::fstatfs(dir.as_raw_fd(), &mut s) };
-    r == 0 && (s.f_flags as u64) & (libc::MNT_RDONLY as u64) != 0
+    let r = unsafe { libc::fstatvfs(dir.as_raw_fd(), &mut s) };
+    r == 0 && (s.f_flag as u64) & (libc::ST_RDONLY as u64) != 0
 }
 
 /// Have macOS let go of the disk's volumes. A volume in use refuses.
@@ -341,6 +342,12 @@ fn authopen_error(code: Option<i32>, err: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_writable_filesystem_is_not_marked_readonly() {
+        let file = tempfile::tempfile().unwrap();
+        assert!(!mounted_readonly(&file));
+    }
 
     #[test]
     fn the_fd_comes_over_the_pipe() {
