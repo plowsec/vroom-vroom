@@ -45,6 +45,9 @@ impl FrameSocket {
         while self.rx.len() < MAX_QUEUED {
             match self.sock.recv(&mut buf) {
                 Ok(n) if n >= 14 => self.rx.push_back(buf[..n].to_vec()),
+                // netd went away (Linux: a SOCK_SEQPACKET pair says so
+                // with 0, for good: looping on it would never end).
+                Ok(0) => break,
                 Ok(_) => {}
                 Err(_) => break,
             }

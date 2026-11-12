@@ -236,6 +236,25 @@ fn buffer_full(e: &std::io::Error) -> bool {
     e.kind() == std::io::ErrorKind::WouldBlock || e.raw_os_error() == Some(libc::ENOBUFS)
 }
 
+/// The socket pair frames cross on. Linux: SOCK_SEQPACKET, since a
+/// datagram pair there never tells one end that the other closed (`pump`
+/// would keep a stopped VM's port until traffic came). Same calls on both.
+fn frame_pair() -> std::io::Result<(UnixDatagram, UnixDatagram)> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let mut fds = [0; 2];
+        // SAFETY: a valid array for the two fds.
+        if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0, fds.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: two fresh fds nobody else owns.
+        Ok(unsafe { (UnixDatagram::from(OwnedFd::from_raw_fd(fds[0])), UnixDatagram::from(OwnedFd::from_raw_fd(fds[1]))) })
+    }
+    #[cfg(not(target_os = "linux"))]
+    UnixDatagram::pair()
+}
+
 /// Shuttle frames until the VMM goes away. With `dhcp`, the guest's DHCP
 /// requests are answered here and go no further.
 fn pump(guest: UnixDatagram, port: Arc<dyn Port>, dhcp: Option<Dhcp<'_>>) {
@@ -408,7 +427,7 @@ fn net(st: &State, mut s: UnixStream, uid: u32, req: Request, slot: Slot) {
             return refuse(&mut s, &e);
         }
     };
-    let (vmm_end, our_end) = match UnixDatagram::pair() {
+    let (vmm_end, our_end) = match frame_pair() {
         Ok(p) => p,
         Err(e) => {
             release(st);
@@ -732,7 +751,7 @@ name = "lab"
         let st = state(false);
         let mac = [2, 0, 0, 0, 0, 7];
         let port = Arc::new(Sink(mac, Mutex::new(Vec::new())));
-        let (vmm, ours) = UnixDatagram::pair().unwrap();
+        let (vmm, ours) = frame_pair().unwrap();
         vmm.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         std::thread::scope(|s| {
             let p = port.clone() as Arc<dyn Port>;
