@@ -34,8 +34,9 @@ use serde::Deserialize;
 use vroom_net::netd::{read_line, Attach, HostOnlyNet, Hello, PortInfo, Request, Response, Status, UsbRequest, VERSION};
 
 const MAX_PORTS_PER_USER: usize = 32;
-/// Connections handled at once (each holds a thread): a local user can't
-/// starve the daemon by opening sockets and saying nothing.
+/// Requests handled at once (each holds a thread): a local user can't
+/// starve the daemon by opening sockets and saying nothing. Open ports
+/// don't count (MAX_PORTS_PER_USER caps those).
 const MAX_CONNS: usize = 64;
 const MAX_FRAME: usize = 65536;
 
@@ -112,13 +113,28 @@ struct State {
     ports: Mutex<HashMap<u64, (u32, PortInfo)>>,
     next_port: AtomicU64,
     usb: usb::Usb,
+    /// `open_port`; tests put a fake in.
+    open: OpenPort,
+}
+
+type OpenPort = for<'a> fn(&'a State, &Request) -> Result<(Arc<dyn Port>, Option<Dhcp<'a>>), String>;
+
+/// One of the MAX_CONNS request slots, given back when dropped.
+struct Slot(Option<Arc<std::sync::atomic::AtomicUsize>>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        if let Some(n) = self.0.take() {
+            n.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
 }
 
 impl State {
     fn new(cfg: Config, usb: usb::Usb) -> Result<State, String> {
         let subnets = hostonly::check(&cfg.host_only)?;
         let pools = subnets.iter().map(|s| Mutex::new(dhcp::Pool::new(*s))).collect();
-        Ok(State { cfg, subnets, pools, per_user: Mutex::new(HashMap::new()), ports: Mutex::new(HashMap::new()), next_port: AtomicU64::new(0), usb })
+        Ok(State { cfg, subnets, pools, per_user: Mutex::new(HashMap::new()), ports: Mutex::new(HashMap::new()), next_port: AtomicU64::new(0), usb, open: open_port })
     }
 
     /// The leased address and host name of `mac` on host-only `network`,
@@ -176,7 +192,7 @@ fn open_port<'a>(st: &'a State, req: &Request) -> Result<(Arc<dyn Port>, Option<
     match &req.attach {
         Attach::Bridged { interface } => {
             if !iface_allowed(&st.cfg.bridge_interfaces, interface) {
-                return Err(format!("bridging onto {interface} is not allowed (netd.toml bridge_interfaces)"));
+                return Err(format!("bridging onto {interface:?} is not allowed (netd.toml bridge_interfaces)"));
             }
             #[cfg(target_os = "macos")]
             {
@@ -192,7 +208,7 @@ fn open_port<'a>(st: &'a State, req: &Request) -> Result<(Arc<dyn Port>, Option<
         Attach::HostOnly { network } => {
             let Some(i) = st.cfg.host_only.iter().position(|n| &n.name == network) else {
                 let have: Vec<&str> = st.cfg.host_only.iter().map(|n| n.name.as_str()).collect();
-                return Err(format!("no host-only network {network} in netd.toml (it has: {})", if have.is_empty() { "none".into() } else { have.join(", ") }));
+                return Err(format!("no host-only network {network:?} in netd.toml (it has: {})", if have.is_empty() { "none".into() } else { have.join(", ") }));
             };
             #[cfg(target_os = "macos")]
             {
@@ -285,7 +301,7 @@ fn pump(guest: UnixDatagram, port: Arc<dyn Port>, dhcp: Option<Dhcp<'_>>) {
     let _ = down.join();
 }
 
-fn handle(st: Arc<State>, mut s: UnixStream) {
+fn handle(st: Arc<State>, mut s: UnixStream, slot: Slot) {
     let uid = peer_uid(&s).unwrap_or(u32::MAX);
     let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
     let line = match s.try_clone().map(BufReader::new).and_then(|mut r| read_line(&mut r)) {
@@ -293,11 +309,15 @@ fn handle(st: Arc<State>, mut s: UnixStream) {
         Err(_) => return,
     };
     match serde_json::from_str::<Hello>(&line) {
-        Ok(Hello::Net(req)) => net(&st, s, uid, req),
+        Ok(Hello::Net(req)) => net(&st, s, uid, req, slot),
         Ok(Hello::Usb(req)) => usb_request(&st, s, uid, &req),
         Ok(Hello::Status(r)) if r.version == VERSION && r.status => status(&st, s, uid),
         Ok(Hello::Status(_)) => refuse(&mut s, "invalid request"),
-        Err(e) => refuse(&mut s, &format!("bad request: {e}")),
+        // serde's text quotes the input: the kind and place only, in root's log.
+        Err(e) => {
+            log::warn!("uid {uid}: bad request ({:?} at {}:{}, {} bytes)", e.classify(), e.line(), e.column(), line.len());
+            reply(&mut s, &Response { ok: false, error: "bad request".into(), mac: [0; 6], mtu: 0 });
+        }
     }
 }
 
@@ -333,11 +353,11 @@ fn usb_request(st: &Arc<State>, mut s: UnixStream, uid: u32, req: &UsbRequest) {
     let g = match st.usb.grant(uid, req) {
         Ok(g) => g,
         Err(e) => {
-            log::warn!("uid {uid}: usb {} for {}: {e}", req.usb.id, req.vm);
+            log::warn!("uid {uid}: usb {:?} for {:?}: {e}", req.usb.id, req.vm);
             return refuse(&mut s, &e);
         }
     };
-    log::info!("uid {uid}: usb {} for {}", req.usb.id, req.vm);
+    log::info!("uid {uid}: usb {:?} for {:?}", req.usb.id, req.vm);
     let usb::Grant { sock, mut helper, dev, uid } = g;
     reply(&mut s, &Response { ok: true, error: String::new(), mac: [0; 6], mtu: 0 });
     if let Err(e) = vroom_ipc::send_fd(&s, sock.as_raw_fd()) {
@@ -358,7 +378,7 @@ fn usb_request(st: &Arc<State>, mut s: UnixStream, uid: u32, req: &UsbRequest) {
     });
 }
 
-fn net(st: &State, mut s: UnixStream, uid: u32, req: Request) {
+fn net(st: &State, mut s: UnixStream, uid: u32, req: Request, slot: Slot) {
     if req.version != VERSION || !valid_name(&req.vm) || req.nic >= 16 {
         return refuse(&mut s, "invalid request");
     }
@@ -381,7 +401,7 @@ fn net(st: &State, mut s: UnixStream, uid: u32, req: Request) {
             *n = n.saturating_sub(1);
         }
     };
-    let (port, dhcp) = match open_port(st, &req) {
+    let (port, dhcp) = match (st.open)(st, &req) {
         Ok(p) => p,
         Err(e) => {
             release(st);
@@ -411,6 +431,8 @@ fn net(st: &State, mut s: UnixStream, uid: u32, req: Request) {
     let pid = st.next_port.fetch_add(1, Ordering::Relaxed);
     let info = PortInfo { vm: req.vm.clone(), nic: req.nic, attach: req.attach.clone(), mac: port.mac(), ip: None, host_name: String::new() };
     st.ports.lock().unwrap_or_else(|e| e.into_inner()).insert(pid, (uid, info));
+    // The request is done: the port's life doesn't hold a request slot.
+    drop(slot);
     pump(our_end, port, dhcp);
     st.ports.lock().unwrap_or_else(|e| e.into_inner()).remove(&pid);
     log::info!("uid {uid}: {} nic{} detached", req.vm, req.nic);
@@ -497,11 +519,8 @@ fn serve(listener: UnixListener, st: Arc<State>) {
                     continue;
                 }
                 live.fetch_add(1, Ordering::AcqRel);
-                let (st, live) = (st.clone(), live.clone());
-                std::thread::spawn(move || {
-                    handle(st, s);
-                    live.fetch_sub(1, Ordering::AcqRel);
-                });
+                let (st, slot) = (st.clone(), Slot(Some(live.clone())));
+                std::thread::spawn(move || handle(st, s, slot));
             }
             Err(e) => log::warn!("accept: {e}"),
         }
@@ -568,7 +587,7 @@ name = "lab"
     fn connect(st: &Arc<State>) -> UnixStream {
         let (client, server) = UnixStream::pair().unwrap();
         let st = st.clone();
-        std::thread::spawn(move || handle(st, server));
+        std::thread::spawn(move || handle(st, server, Slot(None)));
         client
     }
 
@@ -660,6 +679,52 @@ name = "lab"
             std::thread::sleep(t.min(Duration::from_millis(20)));
             Ok(0)
         }
+    }
+
+    fn fake_port<'a>(_: &'a State, req: &Request) -> Result<(Arc<dyn Port>, Option<Dhcp<'a>>), String> {
+        Ok((Arc::new(Sink(req.mac, Mutex::new(Vec::new()))), None))
+    }
+
+    /// One line from netd, byte by byte (an fd may follow it).
+    fn line_from(s: &mut UnixStream) -> String {
+        let mut v = Vec::new();
+        let mut b = [0u8; 1];
+        while std::io::Read::read(s, &mut b).unwrap() == 1 && b[0] != b'\n' {
+            v.push(b[0]);
+        }
+        String::from_utf8(v).unwrap()
+    }
+
+    #[test]
+    fn an_open_port_gives_its_request_slot_back() {
+        let mut st = state(false);
+        Arc::get_mut(&mut st).unwrap().open = fake_port;
+        let live = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let (st2, slot) = (st.clone(), Slot(Some(live.clone())));
+        let t = std::thread::spawn(move || handle(st2, server, slot));
+        let req = Request { version: VERSION, vm: "dev".into(), nic: 0, attach: Attach::HostOnly { network: "lab".into() }, mac: [2, 0, 0, 0, 0, 7] };
+        client.write_all(format!("{}\n", serde_json::to_string(&req).unwrap()).as_bytes()).unwrap();
+        assert!(line_from(&mut client).contains("\"ok\":true"));
+        let frames = UnixDatagram::from(vroom_ipc::recv_fd(&client).unwrap());
+        drop(client);
+        let t0 = Instant::now();
+        while st.ports.lock().unwrap().is_empty() && t0.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(st.ports.lock().unwrap().len(), 1, "the port is open");
+        assert_eq!(live.load(Ordering::Acquire), 0, "and holds no request slot");
+        drop(frames);
+        t.join().unwrap();
+    }
+
+    #[test]
+    fn bad_requests_are_not_echoed() {
+        let st = state(false);
+        let mut c = connect(&st);
+        c.write_all(b"{\"evil\nline\": 1}\n").unwrap();
+        let r: Response = serde_json::from_str(&line_from(&mut c)).unwrap();
+        assert_eq!((r.ok, r.error.as_str()), (false, "bad request"));
     }
 
     #[test]
