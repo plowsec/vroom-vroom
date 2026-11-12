@@ -238,6 +238,9 @@ pub enum VcpuExit {
     /// x86 port I/O.
     PioIn { port: u16, len: usize },
     PioOut { port: u16, len: usize, data: [u8; 4] },
+    /// Repeated string I/O: every element accesses the same port.
+    PioInBatch { port: u16, size: usize, count: usize },
+    PioOutBatch { port: u16, size: usize, data: Vec<u8> },
     /// SMCCC call (PSCI etc) the backend did not handle in-kernel.
     /// Call [`Vcpu::complete_hypercall`] with the result.
     Hypercall { func: u64, args: [u64; 3] },
@@ -264,6 +267,8 @@ pub enum BootRegs {
     Aarch64 { pc: u64, x: [u64; 4] },
     /// 64-bit Linux boot protocol: RIP, RSI = boot_params, page tables.
     X86_64 { rip: u64, rsi: u64, cr3: u64, gdt: u64 },
+    /// Firmware entry in the architectural x86 reset state.
+    X86Reset,
 }
 
 /// A virtual CPU. Not `Send`: lives and dies on its own thread.

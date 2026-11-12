@@ -79,6 +79,8 @@ pub enum VmEvent {
 pub struct VcpuShared {
     pub vm: Arc<dyn Vm>,
     pub mmio: Bus,
+    pub pio: Bus,
+    pub unmapped_mmio: u8,
     pub cpus: Mutex<CpuTable>,
     pub events: Sender<VmEvent>,
     /// Filled once all threads are up; used for CPU_ON.
@@ -352,14 +354,16 @@ impl VcpuLoop {
             }
             VcpuExit::MmioRead { addr, len } => {
                 self.shared.device_exits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let mut buf = [0u8; 8];
+                let mut buf = [self.shared.unmapped_mmio; 8];
                 let len = len.min(8);
                 if !self.shared.mmio.read(addr, &mut buf[..len]) {
                     log::debug!("vcpu{}: read from unmapped {addr:#x}", self.index());
                 }
+                log::trace!(target: "vroom_mmio", "read {addr:#x}: {:x?}", &buf[..len]);
                 self.vcpu.complete_mmio_read(&buf[..len])?;
             }
             VcpuExit::MmioWrite { addr, len, data } => {
+                log::trace!(target: "vroom_mmio", "write {addr:#x}: {:x?}", &data[..len.min(8)]);
                 self.shared.device_exits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if !self.shared.mmio.write(addr, &data[..len.min(8)]) {
                     log::debug!("vcpu{}: write to unmapped {addr:#x}", self.index());
@@ -375,10 +379,33 @@ impl VcpuLoop {
                 let _ = self.shared.events.send(VmEvent::Reset);
             }
             VcpuExit::Halted => self.running = false,
-            VcpuExit::PioIn { port, .. } | VcpuExit::PioOut { port, .. } => {
-                return Err(Error::Setup(format!("port I/O {port:#x} on a board without ports")));
-            }
+            VcpuExit::PioIn { port, len } => self.port_in(port, len, 1)?,
+            VcpuExit::PioOut { port, len, data } => self.port_out(port, len, &data[..len.min(4)])?,
+            VcpuExit::PioInBatch { port, size, count } => self.port_in(port, size, count)?,
+            VcpuExit::PioOutBatch { port, size, data } => self.port_out(port, size, &data)?,
         }
+        Ok(())
+    }
+
+    fn port_in(&mut self, port: u16, size: usize, count: usize) -> Result<()> {
+        let len = size.checked_mul(count).filter(|&n| n <= 65536 && n > 0);
+        if ![1,2,4].contains(&size) || len.is_none() { return Err(Error::Setup("invalid KVM port input length".into())); }
+        let mut data = vec![0xff; len.unwrap_or(0)];
+        for chunk in data.chunks_mut(size) { self.shared.pio.read(port as u64, chunk); }
+        log::trace!("pio in {port:#x}: {data:x?}");
+        self.shared.device_exits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.vcpu.complete_pio_in(&data)?; Ok(())
+    }
+
+    fn port_out(&mut self, port: u16, size: usize, data: &[u8]) -> Result<()> {
+        if ![1,2,4].contains(&size) || !data.len().is_multiple_of(size) { return Err(Error::Setup("invalid KVM port output length".into())); }
+        for chunk in data.chunks(size) {
+            log::trace!("pio out {port:#x}: {chunk:x?}");
+            if port == 0xcf9 && chunk[0] & 4 != 0 { let _ = self.shared.events.send(VmEvent::Reset); }
+            else if port == 0x402 { log::debug!("OVMF: {}", String::from_utf8_lossy(chunk)); }
+            else { self.shared.pio.write(port as u64, chunk); }
+        }
+        self.shared.device_exits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -419,4 +446,3 @@ impl VcpuLoop {
         Ok(())
     }
 }
-

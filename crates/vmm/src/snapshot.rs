@@ -151,7 +151,11 @@ pub(crate) fn save(vmm: &mut Vmm, dir: &Path, description: &str, kind: Kind) -> 
     vmm.config.nets = nets;
     let m = &mut snap.manifest;
     m.description = description.to_string();
-    m.arch = "aarch64".into();
+    m.arch = match vmm.hv.arch() {
+        vroom_hv::Arch::Aarch64 => "aarch64",
+        vroom_hv::Arch::X86_64 => "x86_64",
+    }
+    .into();
     m.backend = vmm.hv.name().into();
     let mut config = vmm.config.clone();
     config.relative_paths(dir, &vm);

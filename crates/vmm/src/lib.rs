@@ -41,7 +41,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use vroom_config::VmConfig;
-use vroom_devices::pl011::Pl011;
 use vroom_hv::{BootRegs, Hypervisor, IrqChipState, Vm};
 #[cfg(feature = "research")]
 use vroom_hv::VcpuState;
@@ -138,7 +137,7 @@ pub struct Vmm {
     vcpus: Vec<VcpuHandle>,
     events: Receiver<VmEvent>,
     devices: Vec<StatefulDevice>,
-    uart: Arc<Mutex<Pl011>>,
+    uart: machine::Serial,
     agent: agent::Agent,
     gpus: Vec<vroom_virtio::devices::gpu::GpuControl>,
     disks: disks::DiskSet,
@@ -713,7 +712,7 @@ impl Vmm {
 
     /// Keyboard input for the serial console.
     pub fn serial_input(&self, bytes: &[u8]) {
-        self.uart.lock().unwrap_or_else(|e| e.into_inner()).queue_input(bytes);
+        self.uart.queue_input(bytes);
     }
 
     /// Wait for the next event from the guest.

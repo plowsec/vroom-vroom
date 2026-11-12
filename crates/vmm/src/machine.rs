@@ -6,6 +6,7 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use vroom_arch::aarch64::{self as board, layout};
+use vroom_arch::x86_64::{self as pc, layout as pc_layout};
 use vroom_config::{Boot, DiskBus, Gpu, GuestOs, SoundDevice, VmConfig};
 use vroom_devices::audio::{AudioSink, AudioSource, NullSink, Silence};
 use vroom_devices::hda::{codec::CodecIds, Hda, HdaIds};
@@ -57,6 +58,8 @@ impl VirtioSlots {
 /// Device attachment: owns the bus registry, virtio-mmio and PCI slot
 /// allocation, and interrupt wiring, so callers just say "add this".
 struct Board {
+    x86: bool,
+    pci64: (u64, u64),
     vm: Arc<dyn Vm>,
     mem: GuestMemory,
     reg: DeviceRegistry,
@@ -74,21 +77,23 @@ struct Board {
 }
 
 impl Board {
-    fn new(vm: Arc<dyn Vm>, mem: GuestMemory, use_pci: bool) -> Self {
+    fn new(vm: Arc<dyn Vm>, mem: GuestMemory, use_pci: bool, x86: bool, ram_size: u64) -> Self {
         let intx = IntxRouter::new(
-            (0..4).map(|i| SpiLine::new(vm.clone(), layout::PCI_INTX_SPI + i) as Arc<dyn IrqLine>).collect(),
+            (0..4).map(|i| SpiLine::new(vm.clone(), if x86 { pc_layout::PCI_IRQ_BASE + i } else { layout::PCI_INTX_SPI + i }) as Arc<dyn IrqLine>).collect(),
         );
         let msi = GicMsi::new(vm.clone());
         Board {
+            x86,
+            pci64: if x86 { pc_layout::pci_mmio64(ram_size) } else { (layout::PCI_MMIO64_BASE, layout::PCI_MMIO64_SIZE) },
             vm,
             mem,
-            reg: DeviceRegistry { bus: BusBuilder::new(), stateful: Vec::new() },
+            reg: DeviceRegistry { bus: BusBuilder::new(), pio: BusBuilder::new(), stateful: Vec::new() },
             fdt: Vec::new(),
             mmio_slots: VirtioSlots::default(),
             shm_next: layout::SHM_BASE,
             use_pci,
             pci: Vec::new(),
-            next_pci_slot: 1,
+            next_pci_slot: if x86 { 2 } else { 1 },
             intx,
             msi,
             hot: Vec::new(),
@@ -164,10 +169,15 @@ impl Board {
                 return Err(Error::Setup("the snapshot has a device in a hot plug slot this VM doesn't have".into()));
             }
         }
+        let host_ids = if self.x86 { VendorIds { vendor: 0x8086, device: 0x1237, subsys_vendor: 0, subsys: 0 } } else { host_ids };
         let root = PciRoot::with_ports(std::mem::take(&mut self.pci), host_ids, ports);
-        self.reg.add(layout::PCI_ECAM_BASE, layout::PCI_ECAM_SIZE, Arc::new(Mutex::new(root.ecam_port())))?;
-        self.reg.add_concurrent(layout::PCI_MMIO_BASE, layout::PCI_MMIO_SIZE, Arc::new(root.window_port(layout::PCI_MMIO_BASE)))?;
-        self.reg.add_concurrent(layout::PCI_MMIO64_BASE, layout::PCI_MMIO64_SIZE, Arc::new(root.window_port(layout::PCI_MMIO64_BASE)))?;
+        let (ecam, size, mmio, mmio_size) = if self.x86 {
+            (pc_layout::PCI_ECAM_BASE, pc_layout::PCI_ECAM_SIZE, pc_layout::PCI_MMIO_BASE, pc_layout::PCI_MMIO_SIZE)
+        } else { (layout::PCI_ECAM_BASE, layout::PCI_ECAM_SIZE, layout::PCI_MMIO_BASE, layout::PCI_MMIO_SIZE) };
+        self.reg.add(ecam, size, Arc::new(Mutex::new(root.ecam_port())))?;
+        self.reg.add_concurrent(mmio, mmio_size, Arc::new(root.window_port(mmio)))?;
+        self.reg.add_concurrent(self.pci64.0, self.pci64.1, Arc::new(root.window_port(self.pci64.0)))?;
+        if self.x86 { self.reg.add_pio(0xcf8, 8, Arc::new(Mutex::new(root.config_port())))?; }
         self.fdt.push(board::FdtDevice::PciEcam {
             ecam_base: layout::PCI_ECAM_BASE,
             ecam_size: layout::PCI_ECAM_SIZE,
@@ -183,7 +193,7 @@ pub(crate) struct Machine {
     pub shared: Arc<VcpuShared>,
     pub vcpus: Vec<VcpuHandle>,
     pub devices: Vec<StatefulDevice>,
-    pub uart: Arc<Mutex<Pl011>>,
+    pub uart: Serial,
     pub agent: Agent,
     /// Each virtio-gpu's control handle (window size, Direct3D state).
     pub gpus: Vec<GpuControl>,
@@ -206,10 +216,15 @@ pub(crate) struct Machine {
 /// so nothing can be on the bus but missing from snapshots.
 pub(crate) struct DeviceRegistry {
     bus: BusBuilder,
+    pio: BusBuilder,
     stateful: Vec<StatefulDevice>,
 }
 
 impl DeviceRegistry {
+    pub fn add_pio<T: BusDevice + Snapshottable + Send + 'static>(&mut self, base: u64, len: u64, dev: Arc<Mutex<T>>) -> Result<()> {
+        self.pio.insert(base, len, dev.clone()).map_err(Error::Setup)?;
+        self.stateful.push(dev); Ok(())
+    }
     pub fn add<T>(&mut self, base: u64, len: u64, dev: Arc<Mutex<T>>) -> Result<()>
     where
         T: BusDevice + Snapshottable + Send + 'static,
@@ -229,6 +244,22 @@ impl DeviceRegistry {
     pub fn add_concurrent(&mut self, base: u64, len: u64, dev: Arc<dyn ConcurrentBusDevice>) -> Result<()> {
         self.bus.insert_concurrent(base, len, dev).map_err(Error::Setup)
     }
+}
+
+pub(crate) enum Serial { Arm(Arc<Mutex<Pl011>>), Pc(Arc<Mutex<vroom_devices::serial16550::Serial16550>>) }
+impl Serial {
+    pub fn queue_input(&self, bytes: &[u8]) {
+        match self {
+            Self::Arm(u) => u.lock().unwrap_or_else(|e| e.into_inner()).queue_input(bytes),
+            Self::Pc(u) => u.lock().unwrap_or_else(|e| e.into_inner()).queue_input(bytes),
+        }
+    }
+}
+
+struct PcPortRange { base: u64, dev: Arc<Mutex<vroom_devices::pc::PcPorts>> }
+impl BusDevice for PcPortRange {
+    fn read(&mut self, off: u64, data: &mut [u8]) { self.dev.lock().unwrap_or_else(|e| e.into_inner()).read(self.base + off, data); }
+    fn write(&mut self, off: u64, data: &[u8]) { self.dev.lock().unwrap_or_else(|e| e.into_inner()).write(self.base + off, data); }
 }
 
 /// Host-side facts the board needs.
@@ -258,6 +289,8 @@ pub(crate) struct BuildEnv {
 
 /// What gets loaded into RAM at (re)boot. Kept so reset can reload it.
 pub(crate) enum BootImage {
+    X86Firmware,
+    X86Kernel { kernel: Vec<u8>, initrd: Option<Vec<u8>>, ram_size: u64, cmdline: String, acpi: vroom_arch::acpi::AcpiBlobs },
     /// Direct Linux boot. The kernel stays as read from its file (often
     /// compressed, a third of its size) and is unpacked at each load.
     Kernel { kernel: Vec<u8>, initrd: Option<Vec<u8>>, ram: (u64, u64), fdt_cfg: board::FdtConfig },
@@ -269,6 +302,12 @@ impl BootImage {
     /// Put boot blobs into RAM. Returns boot CPU regs.
     pub fn load(&self, mem: &GuestMemory) -> Result<BootRegs> {
         match self {
+            BootImage::X86Firmware => Ok(BootRegs::X86Reset),
+            BootImage::X86Kernel { kernel, initrd, ram_size, cmdline, acpi } => {
+                let rip = pc::loader::load(mem, *ram_size, kernel, initrd.as_deref(), cmdline)?;
+                pc::acpi::install(mem, acpi)?;
+                Ok(BootRegs::X86_64 { rip, rsi: pc::loader::BOOT_PARAMS, cr3: pc::loader::PML4, gdt: pc::loader::GDT })
+            }
             BootImage::Kernel { kernel, initrd, ram, fdt_cfg } => {
                 let kernel = vroom_arch::decompress_if_needed(kernel.clone())?;
                 let k = board::load_kernel(mem, ram.0, &kernel)?;
@@ -590,13 +629,14 @@ pub(crate) fn build(
     events: Sender<VmEvent>,
     env: &BuildEnv,
 ) -> Result<Machine> {
-    if hv.arch() != vroom_hv::Arch::Aarch64 {
-        return Err(Error::Setup("only the aarch64 board exists so far".into()));
+    let x86 = hv.arch() == vroom_hv::Arch::X86_64;
+    if x86 && matches!(config.virtio_transport, vroom_config::Transport::Mmio) {
+        return Err(Error::Setup("x86 requires virtio PCI transport".into()));
     }
     // Names and numbers the guest can read about its hardware.
     let ident = &config.identity;
     let info: IrqChipInfo = hv.irqchip_info()?;
-    let max = layout::max_vcpus(info.redist_size_per_cpu);
+    let max = if x86 { pc_layout::MAX_CPUS } else { layout::max_vcpus(info.redist_size_per_cpu) };
     if config.cpus > max {
         return Err(Error::Setup(format!("at most {max} vCPUs on this board")));
     }
@@ -612,11 +652,11 @@ pub(crate) fn build(
     };
     let vm = hv.create_vm(&VmParams {
         vcpus: config.cpus,
-        irqchip: IrqChipConfig::GicV3 {
+        irqchip: if x86 { IrqChipConfig::Ioapic } else { IrqChipConfig::GicV3 {
             dist_base: layout::GIC_DIST_BASE,
             redist_base: layout::GIC_REDIST_BASE,
             msi: Some(msi),
-        },
+        } },
         nested: config.nested,
         // Venus maps GPU buffers wherever the guest kernel puts them, in
         // its own page size: 4 KiB for stock kernels.
@@ -625,11 +665,25 @@ pub(crate) fn build(
 
     // With 3D, RAM is shared memory: the GPU process maps it too (the
     // buffers the guest hands the GPU live there).
-    let ram = [(GuestAddress(layout::RAM_BASE), ram_size)];
+    let ram: Vec<_> = if x86 { pc_layout::ram_regions(ram_size)?.into_iter().map(|(a, s)| (GuestAddress(a), s)).collect() }
+        else { vec![(GuestAddress(layout::RAM_BASE), ram_size)] };
     let mem = if config.display.gpu == Gpu::Virtio3d { GuestMemory::new_shared(&ram)? } else { GuestMemory::new(&ram)? };
     vm.map_memory(&mem)?;
 
-    let mut board = Board::new(vm.clone(), mem.clone(), config.use_pci());
+    let mut board = Board::new(vm.clone(), mem.clone(), x86 || config.use_pci(), x86, ram_size);
+    let uart = if x86 {
+        let u = Arc::new(Mutex::new(vroom_devices::serial16550::Serial16550::new(serial_out, SpiLine::new(vm.clone(), pc_layout::UART_IRQ))));
+        board.reg.add_pio(pc_layout::UART_PORT, 8, u.clone())?;
+        let tx = events.clone();
+        let ports = Arc::new(Mutex::new(vroom_devices::pc::PcPorts::new(ram_size, Box::new(move |event| {
+            let _ = tx.send(match event { vroom_devices::pc::Event::Reset => VmEvent::Reset, vroom_devices::pc::Event::Shutdown => VmEvent::Shutdown });
+        }))));
+        for (base, len) in [(0x60, 1), (0x64, 1), (0x70, 2), (0x80, 1), (0x92, 1), (pc_layout::PM_BASE as u64, 64)] {
+            board.reg.pio.insert(base, len, Arc::new(Mutex::new(PcPortRange { base, dev: ports.clone() }))).map_err(Error::Setup)?;
+        }
+        board.reg.stateful.push(ports);
+        Serial::Pc(u)
+    } else {
     let uart = Arc::new(Mutex::new(Pl011::new(
         layout::UART_BASE,
         serial_out,
@@ -638,6 +692,8 @@ pub(crate) fn build(
     board.reg.add(layout::UART_BASE, layout::MMIO_DEV_SIZE, uart.clone())?;
     let rtc = Arc::new(Mutex::new(Pl031::new(layout::RTC_BASE, SpiLine::new(vm.clone(), layout::RTC_SPI))));
     board.reg.add(layout::RTC_BASE, layout::MMIO_DEV_SIZE, rtc)?;
+    Serial::Arm(uart)
+    };
 
     if !info.msi_frame_in_kernel {
         // Backend has no MSI frame (KVM): emulate the GICv2m doorbell.
@@ -902,14 +958,15 @@ pub(crate) fn build(
         net_ports.set_hotplug(h.clone());
     }
     let Board { mut reg, fdt: mut fdt_devices, .. } = board;
+    let tpm_base = if x86 { pc_layout::TPM_BASE } else { layout::TPM_BASE };
     if config.tpm {
         let backend = crate::tpm::Swtpm::start(&env.state_dir.join("tpm"), !env.resuming)?;
-        let dev = vroom_devices::tpm::Tpm::new(layout::TPM_BASE, Box::new(backend));
-        reg.add(layout::TPM_BASE, layout::TPM_SIZE, Arc::new(Mutex::new(dev)))?;
-        fdt_devices.push(board::FdtDevice::Tpm { base: layout::TPM_BASE, size: layout::TPM_SIZE });
+        let dev = vroom_devices::tpm::Tpm::new(tpm_base, Box::new(backend));
+        reg.add(tpm_base, layout::TPM_SIZE, Arc::new(Mutex::new(dev)))?;
+        fdt_devices.push(board::FdtDevice::Tpm { base: tpm_base, size: layout::TPM_SIZE });
     }
 
-    let mpidrs: Vec<u64> = (0..config.cpus).map(mpidr_for).collect();
+    let mpidrs: Vec<u64> = (0..config.cpus).map(|i| if x86 { i as u64 } else { mpidr_for(i) }).collect();
     let fdt_base = |devices: Vec<board::FdtDevice>, cmdline: String| board::FdtConfig {
         cpu_mpidrs: mpidrs.clone(),
         ram: vec![(layout::RAM_BASE, ram_size)],
@@ -923,6 +980,28 @@ pub(crate) fn build(
         model: ident.dt_model.clone(),
     };
     let boot = match &config.boot {
+        Boot::Kernel { kernel, initrd, cmdline } if x86 => BootImage::X86Kernel {
+            kernel: read_file(kernel, "kernel", 1 << 30)?,
+            initrd: initrd.as_ref().map(|p| read_file(p, "initrd", ram_size / 2)).transpose()?, ram_size, cmdline: cmdline.clone(),
+            acpi: pc::acpi::build(config.cpus, config.tpm, &vroom_arch::acpi::AcpiIds::new(
+                &ident.acpi_oem_id, &ident.acpi_table_id, &ident.acpi_creator_id,
+                Some(ident.hypervisor_id.as_str()).filter(|h| ident.announce_vm && !h.is_empty())), ram_size),
+        },
+        Boot::Uefi { firmware, vars } if x86 => {
+            crate::firmware::Firmware { code: firmware.clone(), vars: vars.clone() }.setup_x86(
+                &vm, &mem, &mut reg, config.cpus, ram_size, config.tpm,
+                screen.as_ref().map(Arc::downgrade),
+                &vroom_arch::smbios::SmbiosConfig {
+                    sku: ident.sku_or(&config.name).to_string(), vendor: ident.vendor.clone(), product: ident.product.clone(),
+                    family: ident.family.clone(), version: ident.version.clone(), bios_date: ident.bios_date.clone(),
+                    serial: ident.serial.clone(), chassis_type: ident.chassis_type, cpu_name: ident.cpu_name.clone(),
+                    announce_vm: ident.announce_vm, uuid: env.uuid, cpus: config.cpus, memory_bytes: ram_size, ram_base: 0,
+                },
+                &vroom_arch::acpi::AcpiIds::new(&ident.acpi_oem_id, &ident.acpi_table_id, &ident.acpi_creator_id,
+                    Some(ident.hypervisor_id.as_str()).filter(|h| ident.announce_vm && !h.is_empty())),
+            )?;
+            BootImage::X86Firmware
+        }
         Boot::Kernel { kernel, initrd, cmdline } => {
             let kernel = read_file(kernel, "kernel", 1 << 30)?;
             let initrd = match initrd {
@@ -992,6 +1071,8 @@ pub(crate) fn build(
     let shared = Arc::new(VcpuShared {
         vm: vm.clone(),
         mmio: reg.bus.build(),
+        pio: reg.pio.build(),
+        unmapped_mmio: if x86 { 0xff } else { 0 },
         cpus: Mutex::new(CpuTable::new(mpidrs)),
         events,
         peers: OnceLock::new(),

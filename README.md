@@ -1,6 +1,9 @@
 # vroom-vroom
 
 Run Linux and Windows VMs on your Mac (Apple Silicon) or on arm64 Linux.
+
+An experimental x86-64 Linux/KVM board is also available; see
+[x86-64 setup and validation](docs/X86_64.md) for requirements and current limits.
 Written in Rust. The VM process locks itself down before the guest starts,
 and every virtual device treats the guest as hostile.
 
@@ -63,7 +66,10 @@ video decoding and encoding get one each. [SECURITY.md](docs/SECURITY.md).
 - Hardware video decode (H.264, HEVC, VP9, AV1) and encode (H.264, HEVC) for Linux guests, opt-in; Firefox, Chrome, FFmpeg use them
 - Fast disk and network I/O, measured against QEMU ([numbers](docs/PERFORMANCE.md))
 
-Not yet: x86_64 hosts (it builds, can't run VMs yet) and Secure Boot.
+Linux x86-64/KVM is experimental: Windows 11 x64 installation, desktop,
+USB input and installer-free cold boot have been tested with 2D graphics.
+See [x86-64 limits](docs/X86_64.md); the full Mac feature list above does
+not yet apply to that board. Secure Boot is not yet supported.
 
 ## Try it
 

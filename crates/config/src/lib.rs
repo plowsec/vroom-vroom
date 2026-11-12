@@ -499,7 +499,7 @@ impl VmConfig {
         match self.virtio_transport {
             Transport::Pci => true,
             Transport::Mmio => false,
-            Transport::Auto => matches!(self.boot, Boot::Uefi { .. }),
+            Transport::Auto => cfg!(target_arch = "x86_64") || matches!(self.boot, Boot::Uefi { .. }),
         }
     }
 }
