@@ -278,9 +278,6 @@ pub const SECUREBITS_LOCKED_DOWN: u64 = SECBIT_NOROOT
     | SECBIT_NO_CAP_AMBIENT_RAISE
     | SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED;
 
-pub const CAP_SETPCAP: u32 = 8;
-pub const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
-
 /// x86_64 only: kill x32-ABI syscalls (nr | 0x4000_0000) and foreign
 /// arches. A default-allow filter keyed on x86_64 numbers misses them.
 /// Instructions as (code, jt, jf, k).

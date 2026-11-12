@@ -129,6 +129,9 @@ static N_ACKED: AtomicUsize = AtomicUsize::new(0);
 /// First failure's errno; -1: more threads than ACK_SLOTS.
 static FAILED: AtomicI32 = AtomicI32::new(0);
 
+const CAP_SETPCAP: u32 = 8;
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
 #[repr(C)]
 struct CapHeader {
     version: u32,
@@ -150,7 +153,7 @@ fn errno() -> i32 {
 
 /// This thread's capability sets (pid 0: the caller).
 fn capget() -> std::result::Result<[CapData; 2], i32> {
-    let mut h = CapHeader { version: rules::LINUX_CAPABILITY_VERSION_3, pid: 0 };
+    let mut h = CapHeader { version: LINUX_CAPABILITY_VERSION_3, pid: 0 };
     let mut d = [CapData::default(); 2];
     // SAFETY: a v3 header and the two data structs v3 writes.
     if unsafe { libc::syscall(libc::SYS_capget, &mut h as *mut CapHeader, d.as_mut_ptr()) } != 0 {
@@ -184,14 +187,14 @@ fn lock_this_thread(l: ThreadLock) -> i32 {
                 }
             }
             // SAFETY: integer arguments only. 1: still in the bounding set.
-            if unsafe { libc::prctl(libc::PR_CAPBSET_READ, rules::CAP_SETPCAP as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong) } != 0 {
+            if unsafe { libc::prctl(libc::PR_CAPBSET_READ, CAP_SETPCAP as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong) } != 0 {
                 return libc::EPERM;
             }
         }
         if !prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_CLEAR_ALL as libc::c_ulong) {
             return errno();
         }
-        let mut h = CapHeader { version: rules::LINUX_CAPABILITY_VERSION_3, pid: 0 };
+        let mut h = CapHeader { version: LINUX_CAPABILITY_VERSION_3, pid: 0 };
         let none = [CapData::default(); 2];
         // SAFETY: a v3 header and the two data structs v3 reads.
         if unsafe { libc::syscall(libc::SYS_capset, &mut h as *mut CapHeader, none.as_ptr()) } != 0 {
@@ -605,7 +608,7 @@ fn usb_refused(pid: u32) -> Result<BTreeMap<i64, Vec<SeccompRule>>> {
 pub fn apply_usb_helper() -> Result<()> {
     no_new_privs()?;
     let setpcap = capget().map_err(|e| Error::Apply(format!("capget: {}", std::io::Error::from_raw_os_error(e))))?[0].effective
-        & (1 << rules::CAP_SETPCAP)
+        & (1 << CAP_SETPCAP)
         != 0;
     let mut rs = ruleset()?;
     let read = AccessFs::ReadFile | AccessFs::ReadDir;
