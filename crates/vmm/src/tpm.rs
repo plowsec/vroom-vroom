@@ -149,8 +149,9 @@ fn clean_dir(dir: &Path) -> std::io::Result<()> {
 
 impl Swtpm {
     /// Start swtpm on `dir`. `fresh`: cold boot (drop volatile state) vs
-    /// resuming a suspended VM.
-    pub fn start(dir: &Path, fresh: bool) -> Result<Swtpm> {
+    /// resuming a suspended VM. `sandbox`: the VM's setting (Linux: off,
+    /// swtpm runs unconfined, so a kernel without Landlock still works).
+    pub fn start(dir: &Path, fresh: bool, sandbox: bool) -> Result<Swtpm> {
         let exe = find_swtpm().ok_or_else(|| Error::Setup("tpm = true needs swtpm (brew install swtpm)".into()))?;
         clean_dir(dir)?;
         // swtpm < 0.8 has no "terminate" (exit when the control channel
@@ -172,7 +173,7 @@ impl Swtpm {
             "--log".into(),
             format!("file={},level=1,truncate", dir.join("swtpm.log").display()),
         ];
-        let mut cmd = Self::command(&exe, dir, &args)?;
+        let mut cmd = Self::command(&exe, dir, &args, sandbox)?;
         let fd: RawFd = ctrl_child.as_raw_fd();
         // SAFETY: between fork and exec we only call dup2/fcntl, which are
         // async-signal-safe. fd 3 becomes the control socket: dup2 clears
@@ -216,10 +217,11 @@ impl Swtpm {
 
     /// macOS: run under its own Seatbelt profile. Linux: no_new_privs,
     /// Landlock (its state dir read-write, system libraries read-only),
-    /// and swtpm's own seccomp.
-    fn command(exe: &Path, dir: &Path, args: &[String]) -> Result<Command> {
+    /// and swtpm's own seccomp; with the sandbox off, only the latter.
+    fn command(exe: &Path, dir: &Path, args: &[String], sandbox: bool) -> Result<Command> {
         #[cfg(target_os = "macos")]
         {
+            let _ = sandbox;
             let prof = vroom_sandbox::helper_profile(exe, dir).map_err(|e| Error::Setup(format!("vtpm sandbox: {e}")))?;
             let mut c = Command::new("/usr/bin/sandbox-exec");
             c.arg("-p").arg(prof).arg(exe).args(args);
@@ -227,11 +229,15 @@ impl Swtpm {
         }
         #[cfg(target_os = "linux")]
         {
-            // Built here: we are multi-threaded, the child may only make
-            // async-signal-safe calls.
-            let sb = vroom_sandbox::ExecSandbox::new(exe, dir).map_err(|e| Error::Setup(format!("vtpm sandbox: {e}")))?;
             let mut c = Command::new(exe);
             c.args(args).args(["--seccomp", "action=kill"]);
+            if !sandbox {
+                log::warn!("vtpm: sandbox off: swtpm runs without Landlock, with your user's access");
+                return Ok(c);
+            }
+            // Built here: we are multi-threaded, the child may only make
+            // async-signal-safe calls.
+            let sb = vroom_sandbox::ExecSandbox::new(exe, dir).map_err(|e| Error::Setup(format!("vtpm sandbox: {e} (or start with the sandbox off)")))?;
             // SAFETY: `enter` is two raw syscalls (prctl, landlock_restrict_self).
             unsafe {
                 c.pre_exec(move || sb.enter());
@@ -240,7 +246,7 @@ impl Swtpm {
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
-            let _ = dir;
+            let _ = (dir, sandbox);
             let mut c = Command::new(exe);
             c.args(args).args(["--seccomp", "action=kill"]);
             Ok(c)
@@ -355,6 +361,15 @@ impl Drop for Swtpm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// With the sandbox off, nothing of the sandbox is set up for swtpm
+    /// (a kernel without Landlock, a state dir it can't confine).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn swtpm_unconfined_with_the_sandbox_off() {
+        let nowhere = Path::new("/nonexistent/vroom-tpm");
+        assert!(Swtpm::command(Path::new("/nonexistent/swtpm"), nowhere, &[], false).is_ok());
+    }
     use std::cell::Cell;
     use std::io::ErrorKind;
 
@@ -523,7 +538,7 @@ mod tests {
     fn disposable_swtpm_captures_manufactured_state_before_guest_commands() {
         let root = std::env::var_os("VROOM_TPM_TEST_ROOT").expect("set private disposable VROOM_TPM_TEST_ROOT");
         let temp = tempfile::tempdir_in(&root).unwrap();
-        let mut tpm = Swtpm::start(temp.path(), true).unwrap();
+        let mut tpm = Swtpm::start(temp.path(), true, true).unwrap();
         std::fs::write(Path::new(&root).join("helper.pid"), tpm.child.id().to_string()).unwrap();
         // No TPM guest command has been sent: permanent state must already
         // exist after successful INIT/manufacture.

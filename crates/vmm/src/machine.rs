@@ -1019,7 +1019,7 @@ pub(crate) fn build(
     }
     let Board { mut reg, fdt: mut fdt_devices, .. } = board;
     if config.tpm {
-        let backend = crate::tpm::Swtpm::start(&env.state_dir.join("tpm"), !env.resuming)?;
+        let backend = crate::tpm::Swtpm::start(&env.state_dir.join("tpm"), !env.resuming, env.sandbox)?;
         let dev = vroom_devices::tpm::Tpm::new(layout::TPM_BASE, Box::new(backend));
         reg.add(layout::TPM_BASE, layout::TPM_SIZE, Arc::new(Mutex::new(dev)))?;
         fdt_devices.push(board::FdtDevice::Tpm { base: layout::TPM_BASE, size: layout::TPM_SIZE });
