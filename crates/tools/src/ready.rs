@@ -191,7 +191,7 @@ fn windows(spec: &Spec, iso: &Path, tools: &Path, progress: &mut dyn FnMut(&str)
     vroom_block::qcow2::Qcow2Image::create(&dir.join(&disk), spec.disk_gib << 30, None).map_err(|e| format!("disk: {e}"))?;
     let ssh = spec.account.ssh_key.as_ref().map(|_| ssh_port(&spec.taken_ports));
     let mut t = format!(
-        "# Windows 11 ARM64, installed unattended by vroom from install.img (the\n\
+        "# Windows 11, installed unattended by vroom from install.img (the\n\
          # Windows ISO, the virtio drivers, the guest tools{}).\n\
          # Reference: docs/GUIDE.md, docs/CONFIG.md.\n\
          name = {}\nos = \"windows\"\ncpus = {}\nmemory_mib = {}\ntpm = true\n\

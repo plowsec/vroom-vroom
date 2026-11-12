@@ -14,7 +14,7 @@ pub enum Os {
     Linux,
     /// Ubuntu (with --ready: 24.04 from its cloud image).
     Ubuntu,
-    /// Windows 11 ARM64 (UEFI, NVMe, TPM 2.0).
+    /// Windows 11 for the host architecture (UEFI, NVMe, TPM 2.0).
     Windows,
 }
 
@@ -29,7 +29,7 @@ pub struct NewArgs {
     pub disk: String,
     /// Installer: an ISO (Linux) or an install stick image (Windows, see
     /// docs/GUIDE.md). With --ready and --os windows: the Windows 11
-    /// ARM64 ISO.
+    /// ISO matching the host architecture (ARM64 or x64).
     #[arg(long)]
     pub iso: Option<PathBuf>,
     #[arg(long)]
@@ -135,7 +135,7 @@ fn ready(a: NewArgs) -> Result<(), String> {
     };
     let mut say = |s: &str| println!("{s}");
     let kind = match a.os {
-        Os::Windows => Kind::Windows { iso: a.iso.ok_or("--os windows --ready needs --iso: the Windows 11 ARM64 ISO")? },
+        Os::Windows => Kind::Windows { iso: a.iso.ok_or("--os windows --ready needs --iso: a Windows 11 ISO matching the host architecture")? },
         Os::Ubuntu => {
             let image = match a.image {
                 Some(p) => p,

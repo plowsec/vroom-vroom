@@ -1,5 +1,5 @@
 @echo off
-rem vroom guest tools for Windows ARM64: virtio drivers, agent, shared
+rem vroom guest tools for Windows: virtio drivers, agent, shared
 rem folders. Looks for the virtio-win media on any drive letter. Run as
 rem admin (first logon runs it elevated). Safe to run again to upgrade.
 rem No labels or goto: cmd can miss labels in files with Unix line ends.
@@ -11,12 +11,17 @@ if errorlevel 1 (
   exit /b
 )
 set VIOFS=
+set VROOM_ARCH=amd64
+set WINFSP_DLL=winfsp-x64.dll
+if /i "%PROCESSOR_ARCHITECTURE%"=="ARM64" set VROOM_ARCH=ARM64
+if /i "%PROCESSOR_ARCHITEW6432%"=="ARM64" set VROOM_ARCH=ARM64
+if /i "%VROOM_ARCH%"=="ARM64" set WINFSP_DLL=winfsp-a64.dll
 for %%d in (D E F G H I J K) do (
-  if exist %%d:\viogpudo\w11\ARM64 (
+  if exist %%d:\viogpudo\w11\%VROOM_ARCH% (
     for %%x in (viogpudo NetKVM vioserial vioinput viorng viostor vioscsi viofs Balloon) do (
-      if exist %%d:\%%x\w11\ARM64 pnputil /add-driver %%d:\%%x\w11\ARM64\*.inf /install
+      if exist %%d:\%%x\w11\%VROOM_ARCH% pnputil /add-driver %%d:\%%x\w11\%VROOM_ARCH%\*.inf /install
     )
-    if exist %%d:\viofs\w11\ARM64\virtiofs.exe set VIOFS=%%d:\viofs\w11\ARM64\virtiofs.exe
+    if exist %%d:\viofs\w11\%VROOM_ARCH%\virtiofs.exe set VIOFS=%%d:\viofs\w11\%VROOM_ARCH%\virtiofs.exe
   )
 )
 rem Our RTC runs in UTC (like every hypervisor's); Windows assumes local.
@@ -69,7 +74,7 @@ set WINFSP_MSI=winfsp-2.1.25156.msi
 set WINFSP_SHA256=073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a
 set WINFSP_TMP=%TEMP%\%WINFSP_MSI%
 set NEED=
-if defined SHARES if not exist "%ProgramFiles(x86)%\WinFsp\bin\winfsp-a64.dll" set NEED=1
+if defined SHARES if not exist "%ProgramFiles(x86)%\WinFsp\bin\%WINFSP_DLL%" set NEED=1
 if defined NEED del "%WINFSP_TMP%" 2>nul
 if defined NEED if exist "%~dp0%WINFSP_MSI%" copy /y "%~dp0%WINFSP_MSI%" "%WINFSP_TMP%" >nul
 if defined NEED (

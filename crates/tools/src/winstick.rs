@@ -1,4 +1,4 @@
-//! Windows 11 ARM64 install sticks for ready-made VMs (what
+//! Windows 11 install sticks for ready-made VMs (what
 //! scripts/make-windows-stick.sh does by hand): a raw FAT32 disk with an
 //! MBR, holding the ISO's files, the virtio drivers and guest tools from
 //! the guest tools' `windows` folder, and an answer file for this VM
@@ -39,6 +39,10 @@ pub fn user_ok(u: &str) -> bool {
 
 /// The answer file for this VM. `index`: the image in install.wim (Pro).
 pub fn unattend(acct: &Account, computer: &str, index: u32) -> String {
+    unattend_arch(acct, computer, index, cfg!(target_arch = "x86_64"))
+}
+
+fn unattend_arch(acct: &Account, computer: &str, index: u32, x64: bool) -> String {
     let ssh = if acct.ssh_key.is_some() {
         "        <SynchronousCommand wcm:action=\"add\">\n          <Order>2</Order>\n          \
          <CommandLine>cmd /c for %d in (D E F G H I J K) do if exist %d:\\vroom-ssh.ps1 powershell -NoProfile -ExecutionPolicy Bypass -File %d:\\vroom-ssh.ps1</CommandLine>\n          \
@@ -46,7 +50,8 @@ pub fn unattend(acct: &Account, computer: &str, index: u32) -> String {
     } else {
         ""
     };
-    TEMPLATE
+    TEMPLATE.replace("processorArchitecture=\"arm64\"", if x64 { "processorArchitecture=\"amd64\"" } else { "processorArchitecture=\"arm64\"" })
+        .replace("\\ARM64", if x64 { "\\amd64" } else { "\\ARM64" })
         .replace("@USER@", &xml(&acct.user))
         .replace("@PASSWORD@", &xml(&acct.password))
         .replace("@COMPUTER@", &xml(computer))
@@ -250,8 +255,9 @@ pub fn build(iso: &Path, tools: &Path, acct: &Account, computer: &str, out: &Pat
     if !isom.join("sources/boot.wim").is_file() {
         return Err("not a Windows install ISO (no sources/boot.wim)".into());
     }
-    if !isom.join("efi/boot/bootaa64.efi").is_file() {
-        return Err("not an ARM64 Windows ISO (no efi/boot/bootaa64.efi)".into());
+    let efi = if cfg!(target_arch = "x86_64") { "efi/boot/bootx64.efi" } else { "efi/boot/bootaa64.efi" };
+    if !isom.join(efi).is_file() {
+        return Err(format!("Windows ISO has the wrong architecture (missing {efi})"));
     }
     let wim = isom.join("sources/install.wim");
     let esd = isom.join("sources/install.esd");
@@ -300,6 +306,18 @@ pub fn build(iso: &Path, tools: &Path, acct: &Account, computer: &str, out: &Pat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn answer_architecture_and_driver_paths_match() {
+        let acct = Account { user: "arm64".into(), password: "ARM64".into(), ssh_key: None };
+        let x64 = unattend_arch(&acct, "X64", 1, true);
+        assert!(x64.contains("processorArchitecture=\"amd64\""));
+        assert!(x64.contains("\\w11\\amd64"));
+        assert!(x64.contains("<Name>arm64</Name>"));
+        let arm = unattend_arch(&acct, "ARM", 1, false);
+        assert!(arm.contains("processorArchitecture=\"arm64\""));
+        assert!(arm.contains("\\w11\\ARM64"));
+    }
 
     #[test]
     fn answers_are_escaped_and_complete() {
