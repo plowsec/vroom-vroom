@@ -257,13 +257,14 @@ mod win {
 
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows_sys::Wdk::Storage::FileSystem::{
-        NtCreateFile, FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
+        FileRenameInformation, NtCreateFile, NtSetInformationFile, FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
+        FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT,
     };
     use windows_sys::Win32::Foundation::{RtlNtStatusToDosError, HANDLE, UNICODE_STRING};
     use windows_sys::Win32::Storage::FileSystem::{
-        FileAttributeTagInfo, FileDispositionInfo, FileRenameInfo, GetFileInformationByHandleEx, SetFileInformationByHandle, DELETE,
+        FileAttributeTagInfo, FileDispositionInfo, GetFileInformationByHandleEx, SetFileInformationByHandle, DELETE,
         FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_DISPOSITION_INFO,
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_DELETE,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
         FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, SYNCHRONIZE,
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
@@ -280,6 +281,10 @@ mod win {
     /// Entry `name` of folder `root`, never through a reparse point.
     fn nt_open(root: HANDLE, name: &OsStr, access: u32, share: u32, disposition: u32, options: u32) -> io::Result<OwnedHandle> {
         let mut w: Vec<u16> = name.encode_wide().collect();
+        // "file:stream" would open a hidden stream of another file.
+        if w.contains(&(b':' as u16)) {
+            return Err(io::Error::other(format!("{}: a name with a colon", name.to_string_lossy())));
+        }
         let len = u16::try_from(w.len() * 2).map_err(|_| io::Error::other("name too long"))?;
         let us = UNICODE_STRING { Length: len, MaximumLength: len, Buffer: w.as_mut_ptr() };
         let oa = OBJECT_ATTRIBUTES {
@@ -346,14 +351,17 @@ mod win {
     }
 
     /// Rename what `h` (opened with DELETE) is to `name` in folder `root`.
+    /// The NT call: SetFileInformationByHandle reads the name as a Win32
+    /// path (a bare one lands in the service's current folder, System32;
+    /// with a root handle it answers "The parameter is incorrect").
     fn rename_handle(h: HANDLE, root: HANDLE, name: &OsStr, replace: bool) -> io::Result<()> {
         let w: Vec<u16> = name.encode_wide().collect();
-        let off = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
-        let size = off + (w.len() + 1) * 2;
+        let off = std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName);
+        let size = off + w.len() * 2;
         let bytes = u32::try_from(w.len() * 2).map_err(|_| io::Error::other("name too long"))?;
-        // u64s: aligned for FILE_RENAME_INFO; zeroed, so NUL-terminated.
-        let mut buf = vec![0u64; size.div_ceil(8)];
-        let p = buf.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        // u64s: aligned for FILE_RENAME_INFORMATION, and never smaller.
+        let mut buf = vec![0u64; size.max(std::mem::size_of::<FILE_RENAME_INFORMATION>()).div_ceil(8)];
+        let p = buf.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
         // SAFETY: buf is aligned and big enough for the struct and the name.
         unsafe {
             (*p).Anonymous.ReplaceIfExists = u8::from(replace);
@@ -361,9 +369,13 @@ mod win {
             (*p).FileNameLength = bytes;
             std::ptr::copy_nonoverlapping(w.as_ptr(), p.cast::<u8>().add(off).cast::<u16>(), w.len());
         }
+        // SAFETY: zeroed IO_STATUS_BLOCK is valid plain data.
+        let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
         // SAFETY: valid handle; buffer of the size given.
-        if unsafe { SetFileInformationByHandle(h, FileRenameInfo, p.cast(), size as u32) } == 0 {
-            let e = io::Error::last_os_error();
+        let st = unsafe { NtSetInformationFile(h, &mut iosb, p.cast(), (buf.len() * 8) as u32, FileRenameInformation) };
+        if st < 0 {
+            // SAFETY: plain call.
+            let e = io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(st) } as i32);
             return Err(io::Error::new(e.kind(), format!("{}: {e}", name.to_string_lossy())));
         }
         Ok(())

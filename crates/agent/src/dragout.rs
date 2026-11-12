@@ -328,7 +328,8 @@ mod tests {
         ONCE.call_once(|| {
             std::fs::create_dir_all(d.join("Photos/sub")).unwrap();
             std::fs::write(d.join("Photos/a.jpg"), vec![1u8; DROP_CHUNK + 7]).unwrap();
-            std::fs::write(d.join("Photos/sub/b?.txt"), b"hi").unwrap();
+            // "?": cleaned to "_" for the host. Windows has no such names.
+            std::fs::write(d.join(if cfg!(windows) { "Photos/sub/b_.txt" } else { "Photos/sub/b?.txt" }), b"hi").unwrap();
             std::fs::write(d.join("note.txt"), b"hello").unwrap();
             #[cfg(unix)]
             std::os::unix::fs::symlink("/etc", d.join("Photos/link")).unwrap();
