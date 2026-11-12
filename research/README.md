@@ -59,6 +59,11 @@ target/debug/vroom-lab /absolute/path/windows11.toml \
   snapshot/restore, single-step, screenshot, keyboard and shutdown.
 - Snapshots save RAM, CPU, device and disk state; restore replaces the live VM,
   paused by default, on the same KVM host/backend.
+- `vm.step_over` decodes native AMD64 near calls; other instructions single-step.
+  `vm.step_out` recovers a return target from Windows unwind metadata. Return
+  steps run all CPUs/devices and match CPU, stack pointer and CR3; `vm.pause`
+  cancels them. There is no automatic timeout, and thread migration can leave a
+  return step pending. Firmware/WOW64 contexts and SVE `vector_length` are refused.
 - General/control registers, physical and virtual memory reads/writes,
   memory regions, and four-level x64 page translation (4 KiB/2 MiB/1 GiB).
 - `memory.dump` writes up to 64 MiB under `exports`; optional holes are listed

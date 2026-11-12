@@ -795,9 +795,11 @@ impl Connection {
                         if c.name == "debug.breakpoints" { description["summary"] = json!("Replace AMD64 hardware execution breakpoints; four shared execution/data slots, no instruction alignment restriction"); }
                          if c.name == "debug.watchpoints" { description["summary"] = json!("Replace AMD64 data watchpoints: aligned 1/2/4/8 bytes, w or rw, sharing four slots with execution breakpoints"); }
                          if c.name == "memory.search" { description["summary"] = json!("Search virtual memory with wildcard hex, integer or text patterns; skips/reports holes and supports cross-page matches. A deterministic work budget may require a smaller range or larger alignment"); }
-                         if c.name == "kernel.stack" {
+                         if matches!(c.name, "vm.step_over" | "vm.step_out" | "kernel.stack") {
                              description["params"].as_array_mut().unwrap().retain(|p| p["name"] != "vector_length");
                          }
+                         if c.name == "vm.step_over" { description["summary"] = json!("AMD64 near CALL: run to its return; otherwise single-step. All CPUs/devices run for return steps; CPU/RSP/CR3 must match. vm.pause cancels; no automatic timeout"); }
+                         if c.name == "vm.step_out" { description["summary"] = json!("Run to the caller using bounded native Windows AMD64 unwind metadata; unsupported frames fail closed. All CPUs/devices run; vm.pause cancels; no automatic timeout"); }
                          if c.name == "kernel.image" {
                              description["summary"] = json!("Fetch/validate an exact-build AMD64 static image and write flat PE analysis artifacts under exports (path optionally selects a host source file)");
                              description["risk"] = json!("write");
@@ -1182,7 +1184,7 @@ mod tests {
         call(&mut c, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"actor":"test"}}"#);
         let list = call(&mut c, r#"{"jsonrpc":"2.0","id":2,"method":"commands.list"}"#);
         let commands = list["result"].as_array().unwrap();
-        for name in ["kernel.stack"] {
+        for name in ["vm.step_over", "vm.step_out", "kernel.stack"] {
             let command = commands.iter().find(|c| c["name"] == name).unwrap();
             assert!(!command["params"].as_array().unwrap().iter().any(|p| p["name"] == "vector_length"));
         }
@@ -1194,6 +1196,8 @@ mod tests {
         Arc::get_mut(&mut c.shared).unwrap().ops = Some(crate::x64_lab::OPS);
         call(&mut c, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"actor":"test"}}"#);
         let cases = vec![
+            ("vm.step_over", "step_over", json!({"cpu":0})),
+            ("vm.step_out", "step_out", json!({"cpu":0})),
             ("memory.dump", "dump", json!({"address":"0x1000","length":64})),
             ("memory.search", "search", json!({"address":"0x1000","length":64,"text":"MZ"})),
             ("kernel.callbacks", "callbacks", json!({})),

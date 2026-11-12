@@ -53,7 +53,7 @@ def main():
             call("kernel.stack", error=True)
         call("vm.pause")
         commands = {c["name"] for c in call("commands.list")}
-        required = {"memory.dump", "memory.search",
+        required = {"vm.step_over", "vm.step_out", "memory.dump", "memory.search",
                     "kernel.stack", "kernel.callbacks", "kernel.image",
                     "kernel.export", "kernel.process_event", "kernel.cache"}
         assert required <= commands, sorted(required - commands)

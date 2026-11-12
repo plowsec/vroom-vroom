@@ -40,6 +40,7 @@ assert 'cpu.registers' in names and 'kernel.processes' in names
 assert 'vm.restart' in names
 assert {'vm.snapshot', 'vm.snapshots', 'vm.restore'} <= names
 assert {'memory.dump', 'memory.search'} <= names
+assert {'vm.step_over', 'vm.step_out'} <= names
 assert {'kernel.stack', 'kernel.callbacks', 'kernel.image', 'kernel.export',
         'kernel.process_event', 'kernel.cache'} <= names
 assert 'guest.upload' in names and 'guest.download' in names

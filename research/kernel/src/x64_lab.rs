@@ -19,6 +19,9 @@ pub(super) mod analysis;
 #[path = "x64_memory.rs"]
 mod memory_util;
 
+#[path = "x64_step.rs"]
+mod stepping;
+
 pub(super) const OPS: &[&str] = &[
     "status",
     "pause",
@@ -28,6 +31,8 @@ pub(super) const OPS: &[&str] = &[
     "restore",
     "resume",
     "step",
+    "step_over",
+    "step_out",
     "shutdown",
     "screen",
     "key",
@@ -171,33 +176,13 @@ struct Session {
     breakpoints: Vec<u64>,
     watches: Vec<Watchpoint>,
     stopped: BTreeMap<usize, DebugReason>,
+    run_to: Option<stepping::RunTo>,
     kernel: Option<Image>,
     kernel_regs: Option<Registers>,
     symbols: BTreeMap<u64, Symbols>,
     selected: Option<process::Process>,
 }
 impl Session {
-    // Drain exits produced before an acknowledged pause before changing state.
-    fn pending_step_events(&mut self) -> Result<bool, String> {
-        let mut pending = false;
-        while let Some(event) = self.vm.next_event(Duration::ZERO) {
-            pending = true;
-            match event {
-                VmEvent::Debug(stop) => {
-                    self.debug(&self.breakpoints, &self.watches)?;
-                    self.stopped.insert(stop.cpu as usize, stop.reason);
-                    super::output(json!({"event":"stopped","cpu":stop.cpu,"pc":stop.pc,"reason":format!("{:?}",stop.reason),"syndrome":stop.syndrome}))?;
-                }
-                VmEvent::Shutdown | VmEvent::Reset => {
-                    self.vm.shutdown();
-                    return Err("VM stopped while preparing debugger operation".into());
-                }
-                VmEvent::Crashed(error) => return Err(format!("guest: {error}")),
-                other => super::output(json!({"event":"vm","message":format!("{other:?}")}))?,
-            }
-        }
-        Ok(pending)
-    }
     fn registers(&self, cpu: usize, context: bool) -> Result<Registers, String> {
         let mut r = Registers::from_state(&self.vm.debug_registers(cpu).map_err(string)?)
             .map_err(string)?;
@@ -209,6 +194,12 @@ impl Session {
         Ok(r)
     }
     fn debug(&self, points: &[u64], watches: &[Watchpoint]) -> Result<(), String> {
+        let mut points = points.to_vec();
+        if let Some(run) = &self.run_to {
+            if !points.contains(&run.address) {
+                points.push(run.address);
+            }
+        }
         let config = DebugConfig {
             enabled: !points.is_empty() || !watches.is_empty(),
             breakpoints: points.to_vec(),
@@ -337,6 +328,7 @@ impl Session {
             breakpoints: vec![],
             watches: vec![],
             stopped: BTreeMap::new(),
+            run_to: None,
             kernel: None,
             kernel_regs: None,
             symbols: BTreeMap::new(),
@@ -438,6 +430,22 @@ impl Session {
         let cpu = q.get("cpu").map(number).transpose()?.unwrap_or(0) as usize;
         if cpu >= self.vm.config().cpus as usize {
             return Err("invalid CPU index".into());
+        }
+        if self.run_to.is_some()
+            && matches!(
+                op,
+                "pause"
+                    | "resume"
+                    | "step"
+                    | "step_over"
+                    | "step_out"
+                    | "restart"
+                    | "snapshot"
+                    | "shutdown"
+            )
+        {
+            self.vm.pause().map_err(string)?;
+            self.cancel_step()?;
         }
         match op {
             "status" => {
@@ -569,6 +577,7 @@ impl Session {
                 self.analysis_command(op, cpu, q)
             }
             "registers" => Ok(json!(self.registers(cpu, false)?)),
+            "step_over" | "step_out" => self.step_return(cpu, op == "step_over", q),
             "dump" => self.memory_dump(cpu, q),
             "search" => self.memory_search(cpu, q),
             "write_register" => {
@@ -816,6 +825,7 @@ pub(super) fn run(args: Args) -> Result<(), String> {
         breakpoints: vec![],
         watches: vec![],
         stopped: BTreeMap::new(),
+        run_to: None,
         kernel: None,
         kernel_regs: None,
         symbols: BTreeMap::new(),
@@ -861,6 +871,15 @@ pub(super) fn run(args: Args) -> Result<(), String> {
             match event {
                 VmEvent::Debug(stop) => {
                     session.vm.pause().map_err(string)?;
+                    if session.run_to.is_some() {
+                        let Some(reason) = session.step_stopped(&stop)? else {
+                            continue;
+                        };
+                        super::output(
+                            json!({"event":"stopped","cpu":stop.cpu,"pc":stop.pc,"reason":reason,"syndrome":stop.syndrome}),
+                        )?;
+                        continue;
+                    }
                     // Disarm single-step after its first exit; reapply persistent slots.
                     session.debug(&session.breakpoints, &session.watches)?;
                     session.stopped.insert(stop.cpu as usize, stop.reason);
