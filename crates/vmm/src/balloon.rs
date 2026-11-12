@@ -71,7 +71,10 @@ pub(crate) fn host_memory() -> Option<HostMemory> {
     let kib = |key: &str| -> Option<u64> {
         s.lines().find(|l| l.starts_with(key))?.split_whitespace().nth(1)?.parse::<u64>().ok().map(|k| k << 10)
     };
-    Some(HostMemory { total: kib("MemTotal:")?, free: kib("MemFree:")?, supply: kib("MemAvailable:")?, wired: 0, compressor: 0 })
+    // MemFree is small on a healthy Linux (the page cache has the rest):
+    // what is available counts as free too.
+    let supply = kib("MemAvailable:")?;
+    Some(HostMemory { total: kib("MemTotal:")?, free: supply, supply, wired: 0, compressor: 0 })
 }
 
 /// Free memory under which the Mac is short while it compresses: twice
@@ -83,8 +86,20 @@ pub(crate) fn free_floor(host: &HostMemory) -> u64 {
 /// The supply floors, by the Mac's RAM: under `low` the Mac is short;
 /// over `high` it has room again.
 pub(crate) fn floors(total: u64) -> (u64, u64) {
+    floors_for(total, cfg!(target_os = "linux"))
+}
+
+/// `small`: the host may have little RAM (Linux): never more than a
+/// quarter of it, and three eighths. The Mac's 6 and 10 GiB would call
+/// an 8 GiB host short for ever and squeeze every guest.
+fn floors_for(total: u64, small: bool) -> (u64, u64) {
     let low = (6 * GIB).max(total / 8);
-    (low, low + (4 * GIB).max(total / 16))
+    let high = low + (4 * GIB).max(total / 16);
+    if small {
+        (low.min(total / 4), high.min(total / 8 * 3))
+    } else {
+        (low, high)
+    }
 }
 
 /// The Mac now: its memory, and whether it compresses (128 MiB in the
@@ -244,6 +259,9 @@ mod tests {
         // guest keeps 1.5 GiB.
         assert_eq!(free_floor(&mac(0, 0, false).mem), 4 * GIB);
         assert_eq!(floors(MAC), (8 * GIB, 12 * GIB));
+        assert_eq!(floors_for(MAC, true), (8 * GIB, 12 * GIB));
+        assert_eq!(floors_for(8 * GIB, true), (2 * GIB, 3 * GIB));
+        assert_eq!(floors_for(8 * GIB, false), (6 * GIB, 10 * GIB));
         assert_eq!(decide(mac(3 * GIB, 5 * GIB, false), guest(9 * GIB, 0)), Some(15 * GIB / 2));
         // Few free pages, plenty of file cache: short only while it compresses.
         assert_eq!(decide(mac(GIB / 8, 10 * GIB, false), guest(9 * GIB, 0)), None);
