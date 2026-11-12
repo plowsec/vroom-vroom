@@ -36,7 +36,7 @@ VMM drops privileges after building the VM, before the guest runs.
 
 Network reach of the VMM itself:
 
-- macOS: IP only (no Unix sockets: no ssh-agent, no docker.sock); host loopback denied unless `allow_host_loopback` (port 53 stays open if the host resolver is local).
+- macOS: TCP and UDP only (no Unix sockets: no ssh-agent, no docker.sock); host loopback denied unless `allow_host_loopback` (port 53 stays open if the host resolver is local). Loopback = 127.0.0.1, ::1 and the Mac's own addresses. Tested: `cargo test -p vroom-sandbox` (a bare `(remote ip)` allow left loopback open on macOS 27).
 - Linux: seccomp can't see addresses; loopback refused by the NAT code only.
 
 Linux kernel needed (else `--no-sandbox`):
