@@ -55,7 +55,8 @@ def main():
         commands = {c["name"] for c in call("commands.list")}
         required = {"vm.step_over", "vm.step_out", "memory.dump", "memory.search",
                     "kernel.stack", "kernel.callbacks", "kernel.image",
-                    "kernel.export", "kernel.process_event", "kernel.cache"}
+                    "kernel.export", "kernel.process_event", "kernel.cache",
+                    "debug.tracepoints", "debug.hwatch", "debug.traces", "debug.faults"}
         assert required <= commands, sorted(required - commands)
         kernel = call("kernel.info")
         base = kernel["base"]

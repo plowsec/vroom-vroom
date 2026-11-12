@@ -794,12 +794,36 @@ impl Connection {
                         if c.name == "cpu.write_register" { description["summary"] = json!("Write an AMD64 register: rax..r15, rip, rsp, rflags, cr0/cr2/cr3/cr4, efer"); }
                         if c.name == "debug.breakpoints" { description["summary"] = json!("Replace AMD64 hardware execution breakpoints; four shared execution/data slots, no instruction alignment restriction"); }
                          if c.name == "debug.watchpoints" { description["summary"] = json!("Replace AMD64 data watchpoints: aligned 1/2/4/8 bytes, w or rw, sharing four slots with execution breakpoints"); }
-                         if c.name == "memory.search" { description["summary"] = json!("Search virtual memory with wildcard hex, integer or text patterns; skips/reports holes and supports cross-page matches. A deterministic work budget may require a smaller range or larger alignment"); }
                          if matches!(c.name, "vm.step_over" | "vm.step_out" | "kernel.stack") {
                              description["params"].as_array_mut().unwrap().retain(|p| p["name"] != "vector_length");
                          }
                          if c.name == "vm.step_over" { description["summary"] = json!("AMD64 near CALL: run to its return; otherwise single-step. All CPUs/devices run for return steps; CPU/RSP/CR3 must match. vm.pause cancels; no automatic timeout"); }
                          if c.name == "vm.step_out" { description["summary"] = json!("Run to the caller using bounded native Windows AMD64 unwind metadata; unsupported frames fail closed. All CPUs/devices run; vm.pause cancels; no automatic timeout"); }
+                         if c.name == "debug.tracepoints" {
+                             description["summary"] = json!("AMD64 hardware execution tracepoints with register/memory captures and automatic continuation; four shared execution/data slots. Software traps and actions are unsupported");
+                             for p in description["params"].as_array_mut().unwrap() {
+                                 if p["name"] == "tracepoints" { p["help"] = json!("[{address, kind: hardware (default), pid: integer | any, register: rax..r15 | rip | rsp | rflags | cr3, length: 0..4096, captures: [{name, register, offset, length}], record_if: {register, equals}, max_hits, stop}]; [] clears, omitted reports"); }
+                                 if p["name"] == "capacity" { p["help"] = json!("records kept, oldest dropped first; 1..16384, default 4096"); }
+                             }
+                         }
+                         if c.name == "debug.hwatch" {
+                             description["summary"] = json!("AMD64 hardware data watches: aligned 1/2/4/8 bytes, shared four-slot budget; capture post-instruction registers/bytes and continue or stop. Software/read-only watches are unsupported");
+                             for p in description["params"].as_array_mut().unwrap() {
+                                 if p["name"] == "watches" { p["help"] = json!("[{address, length: 1|2|4|8 (aligned), on: write|access|free, kind: hardware, name, pid, stop}]; free requires an 8-byte poison match; access cannot distinguish reads from writes; [] clears"); }
+                                 if p["name"] == "capacity" { p["help"] = json!("shared record buffer capacity: 1..16384, default 4096"); }
+                             }
+                         }
+                         if c.name == "debug.traces" {
+                             description["summary"] = json!("AMD64 bounded tracepoint/hwatch records, oldest first; host elapsed nanoseconds and raw DR6. No guest CNTVCT or memory rereads; capture bytes at hit time instead");
+                             description["params"].as_array_mut().unwrap().retain(|p| p["name"] != "memory");
+                         }
+                         if c.name == "debug.faults" {
+                             description["summary"] = json!("AMD64 exceptions observed at nt!KiDispatchException using one hardware execution slot and symbol-derived exception/trap frames. No fault stack unwind; restore clears this configuration; pid filters do not match KPTI user-CR3 aliases");
+                             for p in description["params"].as_array_mut().unwrap() {
+                                 if p["name"] == "kind" { p["help"] = json!("hardware only (default); shares the four execution/data slots"); }
+                             }
+                         }
+                         if c.name == "memory.search" { description["summary"] = json!("Search virtual memory with wildcard hex, integer or text patterns; skips/reports holes and supports cross-page matches. A deterministic work budget may require a smaller range or larger alignment"); }
                          if c.name == "kernel.image" {
                              description["summary"] = json!("Fetch/validate an exact-build AMD64 static image and write flat PE analysis artifacts under exports (path optionally selects a host source file)");
                              description["risk"] = json!("write");
@@ -1163,72 +1187,6 @@ mod tests {
     }
 
     #[test]
-    fn architecture_allowlist_covers_aliases_and_jobs() {
-        let (mut c, _rx) = connection();
-        Arc::get_mut(&mut c.shared).unwrap().ops = Some(&["status"]);
-        call(&mut c, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"actor":"test"}}"#);
-        let list=call(&mut c,r#"{"jsonrpc":"2.0","id":2,"method":"commands.list"}"#);
-        assert_eq!(list["result"].as_array().unwrap().len(),1);
-        assert_eq!(list["result"][0]["name"],"vm.status");
-        for request in [
-            r#"{"jsonrpc":"2.0","id":3,"method":"cpu.registers"}"#,
-            r#"{"jsonrpc":"2.0","id":4,"method":"commands.run","params":{"command":"cpu.registers"}}"#,
-            r#"{"jsonrpc":"2.0","id":5,"method":"jobs.start","params":{"command":"cpu.registers"}}"#,
-        ] { assert!(call(&mut c,request).get("error").is_some()); }
-    }
-
-    #[test]
-    fn x64_discovery_does_not_advertise_arm_only_trace_options() {
-        let (mut c, _rx) = connection();
-        Arc::get_mut(&mut c.shared).unwrap().ops = Some(crate::x64_lab::OPS);
-        call(&mut c, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"actor":"test"}}"#);
-        let list = call(&mut c, r#"{"jsonrpc":"2.0","id":2,"method":"commands.list"}"#);
-        let commands = list["result"].as_array().unwrap();
-        for name in ["vm.step_over", "vm.step_out", "kernel.stack"] {
-            let command = commands.iter().find(|c| c["name"] == name).unwrap();
-            assert!(!command["params"].as_array().unwrap().iter().any(|p| p["name"] == "vector_length"));
-        }
-    }
-
-    #[test]
-    fn x64_extended_debugger_commands_are_discovered_and_forwarded() {
-        let (mut c, rx) = connection();
-        Arc::get_mut(&mut c.shared).unwrap().ops = Some(crate::x64_lab::OPS);
-        call(&mut c, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"actor":"test"}}"#);
-        let cases = vec![
-            ("vm.step_over", "step_over", json!({"cpu":0})),
-            ("vm.step_out", "step_out", json!({"cpu":0})),
-            ("memory.dump", "dump", json!({"address":"0x1000","length":64})),
-            ("memory.search", "search", json!({"address":"0x1000","length":64,"text":"MZ"})),
-            ("kernel.callbacks", "callbacks", json!({})),
-            ("kernel.stack", "stack", json!({"cpu":0})),
-            ("kernel.image", "image", json!({"base":"0x1000"})),
-            ("kernel.export", "export", json!({"base":"0x1000"})),
-            ("kernel.process_event", "process_event", json!({})),
-            ("kernel.cache", "cache", json!({})),
-        ];
-        let list = call(&mut c, r#"{"jsonrpc":"2.0","id":2,"method":"commands.list"}"#);
-        let names: Vec<_> = list["result"].as_array().unwrap().iter().map(|v| v["name"].as_str().unwrap()).collect();
-        for (name, _, _) in &cases {
-            assert!(names.contains(name), "missing x64 command {name}");
-        }
-        let expected: Vec<_> = cases.iter().map(|(_, op, _)| *op).collect();
-        let lab = std::thread::spawn(move || {
-            for op in expected {
-                let f = rx.recv_timeout(Duration::from_secs(5)).expect("command was not forwarded");
-                assert_eq!(f.request["op"], op);
-                f.reply.send(Ok(json!(true))).unwrap();
-            }
-        });
-        for (i, (name, _, params)) in cases.into_iter().enumerate() {
-            let request = json!({"jsonrpc":"2.0","id":i + 3,"method":name,"params":params});
-            let response = call(&mut c, &request.to_string());
-            assert_eq!(response["result"], true, "{name}: {response}");
-        }
-        lab.join().unwrap();
-    }
-
-    #[test]
     fn x64_discovers_guest_file_commands() {
         let (mut c, _rx) = connection();
         Arc::get_mut(&mut c.shared).unwrap().ops = Some(crate::x64_lab::OPS);
@@ -1260,6 +1218,82 @@ mod tests {
         for name in ["vm.snapshot", "vm.snapshots", "vm.restore", "vm.restart"] {
             assert!(names.contains(&name), "missing {name}");
         }
+    }
+
+    #[test]
+    fn x64_extended_debugger_commands_are_discovered_and_forwarded() {
+        let (mut c, rx) = connection();
+        Arc::get_mut(&mut c.shared).unwrap().ops = Some(crate::x64_lab::OPS);
+        call(&mut c, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"actor":"test"}}"#);
+        let cases = vec![
+            ("vm.step_over", "step_over", json!({"cpu":0})),
+            ("vm.step_out", "step_out", json!({"cpu":0})),
+            ("memory.dump", "dump", json!({"address":"0x1000","length":64})),
+            ("memory.search", "search", json!({"address":"0x1000","length":64,"text":"MZ"})),
+            ("debug.tracepoints", "tracepoints", json!({"tracepoints":[]})),
+            ("debug.hwatch", "hwatch", json!({"watches":[]})),
+            ("debug.traces", "traces", json!({"limit":1})),
+            ("debug.faults", "faults", json!({"enable":false})),
+            ("kernel.callbacks", "callbacks", json!({})),
+            ("kernel.stack", "stack", json!({"cpu":0})),
+            ("kernel.image", "image", json!({"base":"0x1000"})),
+            ("kernel.export", "export", json!({"base":"0x1000"})),
+            ("kernel.process_event", "process_event", json!({})),
+            ("kernel.cache", "cache", json!({})),
+        ];
+        let list = call(&mut c, r#"{"jsonrpc":"2.0","id":2,"method":"commands.list"}"#);
+        let names: Vec<_> = list["result"].as_array().unwrap().iter().map(|v| v["name"].as_str().unwrap()).collect();
+        for (name, _, _) in &cases {
+            assert!(names.contains(name), "missing x64 command {name}");
+        }
+        let expected: Vec<_> = cases.iter().map(|(_, op, _)| *op).collect();
+        let lab = std::thread::spawn(move || {
+            for op in expected {
+                let f = rx.recv_timeout(Duration::from_secs(5)).expect("command was not forwarded");
+                assert_eq!(f.request["op"], op);
+                f.reply.send(Ok(json!(true))).unwrap();
+            }
+        });
+        for (i, (name, _, params)) in cases.into_iter().enumerate() {
+            let request = json!({"jsonrpc":"2.0","id":i + 3,"method":name,"params":params});
+            let response = call(&mut c, &request.to_string());
+            assert_eq!(response["result"], true, "{name}: {response}");
+        }
+        lab.join().unwrap();
+    }
+
+    #[test]
+    fn x64_discovery_does_not_advertise_arm_only_trace_options() {
+        let (mut c, _rx) = connection();
+        Arc::get_mut(&mut c.shared).unwrap().ops = Some(crate::x64_lab::OPS);
+        call(&mut c, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"actor":"test"}}"#);
+        let list = call(&mut c, r#"{"jsonrpc":"2.0","id":2,"method":"commands.list"}"#);
+        let commands = list["result"].as_array().unwrap();
+        for name in ["vm.step_over", "vm.step_out", "kernel.stack"] {
+            let command = commands.iter().find(|c| c["name"] == name).unwrap();
+            assert!(!command["params"].as_array().unwrap().iter().any(|p| p["name"] == "vector_length"));
+        }
+        let traces = commands.iter().find(|c| c["name"] == "debug.traces").unwrap();
+        assert!(!traces["params"].as_array().unwrap().iter().any(|p| p["name"] == "memory"));
+        for name in ["debug.tracepoints", "debug.hwatch"] {
+            let command = commands.iter().find(|c| c["name"] == name).unwrap();
+            assert!(command["summary"].as_str().unwrap().contains("unsupported"));
+        }
+    }
+
+    #[test]
+    fn architecture_allowlist_covers_aliases_and_jobs() {
+        let (mut c, _rx) = connection();
+        Arc::get_mut(&mut c.shared).unwrap().ops = Some(&["status"]);
+        call(&mut c, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"actor":"test"}}"#);
+        let list=call(&mut c,r#"{"jsonrpc":"2.0","id":2,"method":"commands.list"}"#);
+        assert_eq!(list["result"].as_array().unwrap().len(),1);
+        assert_eq!(list["result"][0]["name"],"vm.status");
+        for request in [
+            r#"{"jsonrpc":"2.0","id":3,"method":"cpu.registers"}"#,
+            r#"{"jsonrpc":"2.0","id":4,"method":"commands.run","params":{"command":"cpu.registers"}}"#,
+            r#"{"jsonrpc":"2.0","id":5,"method":"jobs.start","params":{"command":"cpu.registers"}}"#,
+        ] { assert!(call(&mut c,request).get("error").is_some()); }
     }
 
     #[test]

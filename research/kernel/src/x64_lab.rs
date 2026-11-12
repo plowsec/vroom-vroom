@@ -19,6 +19,9 @@ pub(super) mod analysis;
 #[path = "x64_memory.rs"]
 mod memory_util;
 
+#[path = "x64_trace.rs"]
+mod tracing;
+
 #[path = "x64_step.rs"]
 mod stepping;
 
@@ -48,6 +51,10 @@ pub(super) const OPS: &[&str] = &[
     "search",
     "breakpoints",
     "watchpoints",
+    "tracepoints",
+    "hwatch",
+    "traces",
+    "faults",
     "kernel",
     "symbols",
     "functions",
@@ -181,6 +188,7 @@ struct Session {
     kernel_regs: Option<Registers>,
     symbols: BTreeMap<u64, Symbols>,
     selected: Option<process::Process>,
+    tracing: tracing::State,
 }
 impl Session {
     fn registers(&self, cpu: usize, context: bool) -> Result<Registers, String> {
@@ -200,17 +208,19 @@ impl Session {
                 points.push(run.address);
             }
         }
+        let (points, watches) = self.trace_slots(&points, watches)?;
         let config = DebugConfig {
             enabled: !points.is_empty() || !watches.is_empty(),
             breakpoints: points.to_vec(),
             watchpoints: watches.to_vec(),
             ..Default::default()
         };
+        let old = self.tracing.installed.borrow().clone();
         for cpu in 0..self.vm.config().cpus as usize {
             if let Err(e) = self.vm.debug_configure(cpu, config.clone()) {
                 let mut errors = Vec::new();
                 for done in 0..cpu {
-                    let (breakpoints, watchpoints) = (self.breakpoints.clone(), self.watches.clone());
+                    let (breakpoints, watchpoints) = old.get(&done).cloned().unwrap_or_default();
                     if let Err(e) = self.vm.debug_configure(
                         done,
                         DebugConfig {
@@ -227,6 +237,12 @@ impl Session {
                     "{e}; configuration rollback errors: {errors:?}; VM remains paused"
                 ));
             }
+        }
+        for cpu in 0..self.vm.config().cpus as usize {
+            self.tracing
+                .installed
+                .borrow_mut()
+                .insert(cpu, (points.clone(), watches.clone()));
         }
         Ok(())
     }
@@ -256,6 +272,8 @@ impl Session {
         if running {
             self.vm.pause().map_err(string)?;
         }
+        self.trace_pause_requested();
+        self.trace_preserve_pending();
         if self.pending_step_events()? {
             return Err("pending VM stops were reported; inspect them and retry snapshot (VM remains paused)".into());
         }
@@ -272,6 +290,7 @@ impl Session {
         let rearmed = self.debug(&self.breakpoints, &self.watches);
         rearmed?;
         if running {
+            self.trace_resume_requested()?;
             self.vm.resume().map_err(string)?;
         }
         saved?;
@@ -333,6 +352,7 @@ impl Session {
             kernel_regs: None,
             symbols: BTreeMap::new(),
             selected: None,
+            tracing: tracing::State::default(),
         };
         session.vm.pause().map_err(string)?;
         let mut reply = json!({"restored": dir, "state": "Paused",
@@ -445,9 +465,13 @@ impl Session {
             )
         {
             self.vm.pause().map_err(string)?;
+            self.trace_pause_requested();
             self.cancel_step()?;
         }
         match op {
+            "tracepoints" | "hwatch" | "traces" | "faults" => {
+                return self.trace_command(q, cpu);
+            }
             "status" => {
                 let agent = self.vm.agent().status();
                 return Ok(
@@ -458,6 +482,8 @@ impl Session {
             }
             "pause" => {
                 self.vm.pause().map_err(string)?;
+                self.trace_preserve_pending();
+                self.trace_pause_requested();
                 return Ok(json!({"state":"Paused"}));
             }
             "restart" => {
@@ -471,6 +497,8 @@ impl Session {
                 // Pause first: Vmm::reset resumes by itself when it finds the VM
                 // running, which would execute boot code before we clear state.
                 self.vm.pause().map_err(string)?;
+                self.trace_pause_requested();
+                self.trace_preserve_pending();
                 self.pending_step_events()?;
                 self.vm.reset().map_err(string)?;
                 self.breakpoints.clear();
@@ -480,6 +508,7 @@ impl Session {
                 self.kernel_regs = None;
                 self.symbols.clear();
                 self.selected = None;
+                self.tracing = tracing::State::default();
                 self.debug(&self.breakpoints, &self.watches)?;
                 if !paused {
                     self.vm.resume().map_err(string)?;
@@ -490,6 +519,7 @@ impl Session {
             "snapshots" => return self.snapshots(),
             "resume" => {
                 self.vm.pause().map_err(string)?;
+                self.trace_resume_requested()?;
                 self.debug(&self.breakpoints, &self.watches)?;
                 for (&cpu, &reason) in &self.stopped {
                     if reason == DebugReason::Breakpoint {
@@ -509,6 +539,8 @@ impl Session {
             }
             "step" => {
                 self.vm.pause().map_err(string)?;
+                self.trace_pause_requested();
+                self.trace_preserve_pending();
                 if self.pending_step_events()? {
                     return Err(
                         "pending VM stops were reported; inspect them and retry stepping".into(),
@@ -566,6 +598,8 @@ impl Session {
             op,
             "breakpoints" | "watchpoints" | "write_register" | "write_virtual" | "write_physical"
         ) {
+            self.trace_pause_requested();
+            self.trace_preserve_pending();
             if self.pending_step_events()? {
                 return Err(
                     "pending VM stops were reported; inspect them and retry the mutation".into(),
@@ -830,6 +864,7 @@ pub(super) fn run(args: Args) -> Result<(), String> {
         kernel_regs: None,
         symbols: BTreeMap::new(),
         selected: None,
+        tracing: tracing::State::default(),
     };
     session.vm.pause().map_err(string)?;
     let (tx, rx) = mpsc::channel();
@@ -865,12 +900,15 @@ pub(super) fn run(args: Args) -> Result<(), String> {
     {
         // Busy automatic tracepoints must not starve pause/shutdown RPCs.
         for _ in 0..64 {
-            let Some(event) = session.vm.next_event(Duration::ZERO) else {
+            let Some(event) = session.trace_next_event() else {
                 break;
             };
             match event {
                 VmEvent::Debug(stop) => {
                     session.vm.pause().map_err(string)?;
+                    if session.trace_debug_stop(&stop)? {
+                        continue;
+                    }
                     if session.run_to.is_some() {
                         let Some(reason) = session.step_stopped(&stop)? else {
                             continue;

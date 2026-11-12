@@ -126,6 +126,7 @@ impl Session {
     pub(super) fn cancel_step(&mut self) -> Result<(), String> {
         // Preserve the old DR-slot layout before removing the private target.
         // An acknowledged pause can still have debug exits queued for delivery.
+        self.trace_preserve_pending();
         self.run_to = None;
         self.debug(&self.breakpoints, &self.watches)
     }
@@ -137,6 +138,7 @@ impl Session {
             }
         }
         self.debug(&points, &self.watches)?;
+        let (points, _) = self.trace_slots(&points, &self.watches)?;
         for cpu in 0..self.vm.config().cpus as usize {
             let r = self.registers(cpu, false)?;
             if points.contains(&r.regs.rip)
@@ -152,6 +154,7 @@ impl Session {
             }
         }
         self.stopped.clear();
+        self.trace_resume_requested()?;
         self.vm.resume().map_err(string)
     }
     pub(super) fn step_return(
@@ -233,10 +236,13 @@ impl Session {
     }
     pub(super) fn pending_step_events(&mut self) -> Result<bool, String> {
         let mut pending = false;
-        while let Some(event) = self.vm.next_event(Duration::ZERO) {
+        while let Some(event) = self.trace_next_event() {
             pending = true;
             match event {
                 VmEvent::Debug(stop) => {
+                    // run_to suppresses trace auto-continue while recording the
+                    // queued stop and retiring its original DR-slot layout.
+                    self.trace_debug_stop(&stop)?;
                     self.stopped.insert(stop.cpu as usize, stop.reason);
                     super::super::output(
                         json!({"event":"stopped","cpu":stop.cpu,"pc":stop.pc,"reason":format!("{:?}",stop.reason),"syndrome":stop.syndrome}),
@@ -270,7 +276,9 @@ impl Session {
                 let r = self.registers(stop.cpu as usize, false)?;
                 if run.matches(&r) {
                     reason = run.reason.into();
-                } else if !self.breakpoints.contains(&stop.pc) {
+                } else if !self.breakpoints.contains(&stop.pc)
+                    && !self.trace_execution_owned(stop.pc)
+                {
                     if self.pending_step_events()? {
                         self.cancel_step()?;
                         return Ok(Some(reason));

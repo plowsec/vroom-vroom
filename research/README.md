@@ -73,6 +73,17 @@ target/debug/vroom-lab /absolute/path/windows11.toml \
   explicitly and must be split or given a larger alignment.
 - Four shared hardware execution/data breakpoint slots. Data watches require
   aligned 1/2/4/8-byte ranges, write or read+write; read-only is unsupported.
+- `debug.tracepoints`, `debug.hwatch` and `debug.traces`: hardware-only tracing,
+  register/memory captures, filtering and bounded record buffers. All traps,
+  including temporary step targets and fault capture, share those four slots.
+  Data-watch records are post-instruction and cannot distinguish a read from a
+  write in access mode. Software/EPT traps, tracepoint actions and trace memory
+  rereads are explicitly refused. PID filtering compares kernel CR3 and does
+  not recognize KPTI user-CR3 aliases.
+- `debug.faults` observes exceptions at `nt!KiDispatchException` with the AMD64
+  calling convention and PDB-derived trap/exception frames. It is not a general
+  bugcheck catcher and does not synthesize an unwound fault stack. Restore clears
+  x64 tracing/fault configuration; re-arm it after `vm.restore`.
 - Kernel discovery from live CPU contexts, exact-build Microsoft PDBs,
   symbol lookup, process selection, PEBs, and loaded kernel/user modules.
 - `kernel.callbacks` lists process-notify callbacks using matching PDB layouts
@@ -104,16 +115,29 @@ target/debug/vroom-lab /absolute/path/windows11.toml \
   assembles chunks on the RPC client and verifies size and SHA-256. It refuses
   existing output files; failures may leave a partial output for diagnosis.
 
-Capabilities are architecture-specific; unsupported commands are omitted from
-discovery and refused through direct calls, command aliases and jobs.
-Five-level paging and paged-out memory are rejected rather than guessed.
-Use lossless uint64 handling for addresses and response values.
+AMD64 does **not** yet expose software tracepoints/watches, trace actions,
+fault-stack synthesis, fuzzing, `guest.update_tools`, or host-side download paths.
+The hardware tracing and unwind limitations above still differ from ARM64. Snapshots are
+backend-specific: an AMD64 snapshot restores on the same KVM host, not on
+ARM64/HVF. `guest.upload` uses the same absolute-or-exports host-path rules
+as ARM64. Unsupported commands are omitted from discovery and refused through
+direct calls, command aliases, and jobs. Five-level paging and paged-out
+memory are rejected rather than interpreted as valid data. Use hex strings for
+addresses in clients whose JSON numbers cannot represent 64-bit integers exactly.
+Parse response uint64 values losslessly too (for example Python/Rust, or a
+BigInt-aware JSON parser in JavaScript).
 
 Inspection requires an all-CPU pause. Resume afterwards: while paused, Windows,
 its network and Falcon cannot make progress. `vm.shutdown` ends the VM immediately;
 prefer Windows' normal shutdown when preserving a running installation.
 
-Opt-in live feature checks: `python3 research/tests/x64_features_live.py SOCKET`.
+Opt-in host-side regression checks (require an idle debugger session and a booted
+Windows guest; the feature checks restore its original running/paused state):
+
+```sh
+python3 research/tests/x64_features_live.py /run/user/1000/vroom-agent.sock
+python3 research/tests/x64_run_control_live.py /run/user/1000/vroom-agent.sock
+```
 
 #### Exposing only this socket to a Coop VM
 
@@ -184,7 +208,6 @@ VMM sandbox; expose it only to agents you authorize to control this guest, or
 place a separately enforced allowlist proxy in front of it. The x64 allowlist
 excludes host-side download paths and fuzzer subprocesses. `guest.upload`
 follows ARM64 semantics and can read any host file the lab user can read.
-
 
 ### RPC reference (architecture-dependent capabilities)
 
