@@ -646,3 +646,67 @@ pub fn apply(p: &Policy) -> Result<()> {
     landlock(p)?;
     seccomp(p)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{ErrorKind, Read};
+    use std::sync::mpsc;
+
+    /// Threads from before lock-down are confined too (Landlock is per
+    /// thread; kernels without thread sync get it by signal). A timed
+    /// socket read in one of them sees that signal as Interrupted:
+    /// read loops must take it like a timeout. In a child: a sandbox is
+    /// for the whole process.
+    #[test]
+    fn threads_from_before_are_confined() {
+        const ME: &str = "linux::tests::threads_from_before_are_confined";
+        if std::env::var_os("VROOM_SB_THREADS_CHILD").is_none() {
+            let st = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", ME, "--nocapture", "--test-threads=1"])
+                .env("VROOM_SB_THREADS_CHILD", "1")
+                .status()
+                .unwrap();
+            assert!(st.success(), "{st:?}");
+            return;
+        }
+        if kernel_abi() < 0 {
+            eprintln!("skipped: no Landlock in this kernel");
+            std::process::exit(0);
+        }
+        let secret = "/etc/passwd";
+        assert!(std::fs::File::open(secret).is_ok());
+        let (done, results) = mpsc::channel();
+        let mut go = Vec::new();
+        for i in 0..4 {
+            let (tx, rx) = mpsc::channel::<()>();
+            let done = done.clone();
+            go.push(tx);
+            std::thread::spawn(move || {
+                rx.recv().unwrap();
+                done.send((i, std::fs::File::open(secret).map(|_| ()).map_err(|e| e.kind()))).unwrap();
+            });
+        }
+        let (mut a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        a.set_read_timeout(Some(std::time::Duration::from_secs(3))).unwrap();
+        let reader = std::thread::spawn(move || a.read(&mut [0u8; 1]).map_err(|e| e.kind()));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        if let Err(e) = apply(&Policy::default()) {
+            eprintln!("apply: {e}");
+            std::process::exit(1);
+        }
+        let mut bad = std::fs::File::open(secret).is_ok();
+        for tx in &go {
+            tx.send(()).unwrap();
+        }
+        for _ in 0..go.len() {
+            let (i, r) = results.recv().unwrap();
+            eprintln!("thread {i}: {r:?}");
+            bad |= r != Err(ErrorKind::PermissionDenied);
+        }
+        let r = reader.join().unwrap();
+        eprintln!("timed read during lock-down: {r:?}");
+        bad |= !matches!(r, Err(ErrorKind::Interrupted | ErrorKind::WouldBlock | ErrorKind::TimedOut));
+        std::process::exit(i32::from(bad));
+    }
+}
