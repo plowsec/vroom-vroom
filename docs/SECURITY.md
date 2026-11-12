@@ -21,7 +21,8 @@ Out of scope: malicious host; CPU side channels (Spectre-class: hypervisor's and
 - Strict config: unknown keys are errors. `vroom check` (and every start) flags risky valid choices: sandbox off, writable or home-wide shares, LAN-reachable port forwards, host loopback open, bridged networking.
 - Logging capped at 50 lines/s (errors excepted): a guest can't flood the terminal or fill a log disk.
 - Guest serial and `vroom guest exec` output on a terminal: OSC 52 (clipboard), DCS, SOS, PM, APC, ENQ dropped; CSI, other OSC pass (`cli/src/term.rs`).
-- qcow2 backing files: only the image's own dir or allow-listed ones; no protocol prefixes; chain depth capped.
+- qcow2 backing files: only the image's own dir or allow-listed ones (exact dirs, not below); no protocol prefixes; chain depth capped; format from the backing-format extension, never sniffed (missing: refused, `qemu-img rebase -u -F`).
+- Writable VM disk chains (VMM, prune, app compact): backing = a plain file in `<state>/disks` (qcow2) or exactly the configured image; a writable image with a backing file of its own is refused (the VMM could have rewritten its header).
 - VMDK import (read-only): headers, grain tables, descriptors range-checked and capped like qcow2; extent files plain names next to their descriptor (no symlinks out); parents must be `.vmdk`, CIDs must match, chains capped, loops refused.
 
 ## Layer 2: sandbox
@@ -52,6 +53,14 @@ Known gaps (Linux):
 - `ioctl`, `prctl`: deny-lists, not allow-lists (in-process Vulkan drivers).
 
 `--no-sandbox`: debugging only, prints a warning.
+
+State dir (`<vm>.state`) = hostile input for everything outside the sandbox (next VMM start, app, CLI). `vroom_state::hostile`:
+
+- Reads: `O_NOFOLLOW|O_NONBLOCK`, regular file, one link, size cap (`uuid`, disk pointers, `reidentify`, `viewer`, `control`, snapshot blobs).
+- Writes: new temp file (`O_EXCL|O_NOFOLLOW`) + rename (`uuid`, pointers, `viewer`, `control`). NVRAM opened `O_NOFOLLOW`, regular file.
+- Dirs (`disks`, `tpm`, `shaders`, snapshot dirs): real dirs (`symlink_metadata`), not links. `tpm/`: non-plain swtpm files removed before swtpm starts.
+- Pointer layer names: only `disk<i>-<secs>-<nanos>.qcow2` (plain file) or the base image's name.
+- Sockets: `$XDG_RUNTIME_DIR/vroom` (Linux, if set) or `$TMPDIR/vroom`; must be ours, 0700. App/CLI connect only to the path derived from the state dir, never one a file names.
 
 Self-test:
 
@@ -394,6 +403,18 @@ Frame sockets: macOS gives Unix datagram sockets 4 KiB (2 frames). Both ends ask
 - Contain guest RAM (keys, passwords).
 - Written 0600 in 0700 dirs.
 - Every blob SHA-256 checked on load; restore parses with the same validation as live input.
+- Hashes are in the manifest the VMM writes: a save is the guest's word. Resume/restore (`restore_hardware`):
+
+  | From | What |
+  |---|---|
+  | VM file | boot files, disk images, net attachments, share folders + writability, USB devices, identity, clipboard, serial, sandbox |
+  | save, only if the file has it too | 3D, OpenGL (Apple driver), video decode/encode, nested, TPM, sound, mic, camera |
+  | save | CPUs, memory, transport, balloon, monitors, sound card |
+
+  - Mismatch (disk path/setup, disk count, boot kind, Secure Boot, identity, opt-in off in the file): refused, `--fresh` boots.
+  - Share tag the file dropped: device stays, empty. USB device the file dropped: left out.
+  - Adapter the file dropped: kept unplugged, no backend, host-only for the sandbox.
+- Frozen layer named by a snapshot: a plain file in `<state>/disks` (qcow2) or exactly the disk's image (format from the VM file; never sniffed).
 
 ## vTPM
 
