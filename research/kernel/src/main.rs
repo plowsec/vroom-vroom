@@ -1376,6 +1376,37 @@ impl Session {
         self.export_cache.clear();
         self.module_symbols.clear();
     }
+    /// A hard reset starts a new boot: drop every address, cache and probe
+    /// that belonged to the old one. Watches are disarmed in the hypervisor too.
+    fn forget_debug_state(&mut self) -> Result<(), String> {
+        self.vm.debug_memory_watches(&[]).map_err(|e| e.to_string())?;
+        self.breakpoints.clear();
+        self.breakpoint_contexts.clear();
+        self.tracepoints.clear();
+        self.trace_walk = None;
+        self.hwatches.clear();
+        self.hwatch_pending.clear();
+        self.watching = false;
+        self.traces.clear();
+        self.fault_catch = None;
+        self.faults.clear();
+        self.fault_seq = 0;
+        self.fault_dropped = 0;
+        self.trace_seq = 0;
+        self.trace_dropped = 0;
+        self.watchpoints.clear();
+        self.watch_stopped = None;
+        self.step_cpu = None;
+        self.run_to = None;
+        self.kernel = None;
+        self.symbols = None;
+        self.process = None;
+        self.local_images.clear();
+        self.continue_cpus.clear();
+        self.continuing = false;
+        self.invalidate();
+        Ok(())
+    }
     fn execution_breakpoints(&self) -> Vec<u64> {
         let mut addresses = self.breakpoints.clone();
         for t in self.tracepoints.iter().filter(|t| t.armed() && !t.software) {
@@ -1423,7 +1454,7 @@ impl Session {
         let op = request["op"].as_str().ok_or("missing op")?;
         let query = (op == "tracepoints" && request.get("tracepoints").is_none_or(Value::is_null))
             || (op == "faults" && request.get("enable").is_none_or(Value::is_null));
-        if !matches!(op, "status" | "pause" | "shutdown" | "key" | "snapshot" | "snapshots" | "traces")
+        if !matches!(op, "status" | "pause" | "restart" | "shutdown" | "key" | "snapshot" | "snapshots" | "traces")
             && !query
             && self.vm.state() != RunState::Paused
         {
@@ -1446,6 +1477,25 @@ impl Session {
                 self.plant(false)?;
                 self.cancel_run_to()?;
                 Ok(json!({"state": "Paused", "note": "vm.resume when done: until then the guest's network, agent and screen are frozen, and probes against it time out"}))
+            }
+            "restart" => {
+                if self.vm.state() == RunState::Stopped {
+                    return Err("the VM is stopped; start a new lab".into());
+                }
+                let paused = match request.get("paused").filter(|v| !v.is_null()) {
+                    Some(v) => v.as_bool().ok_or("paused: expected a boolean")?,
+                    None => false,
+                };
+                // Pause first: reset() otherwise resumes a running VM before the
+                // boot-specific debugger state below is cleared.
+                self.vm.pause().map_err(|e| e.to_string())?;
+                self.vm.reset().map_err(|e| e.to_string())?;
+                self.forget_debug_state()?;
+                if !paused {
+                    self.vm.resume().map_err(|e| e.to_string())?;
+                    return Ok(json!({"state": "Running"}));
+                }
+                Ok(json!({"state": "Paused"}))
             }
             "resume" => {
                 if self.vm.state() != RunState::Paused {

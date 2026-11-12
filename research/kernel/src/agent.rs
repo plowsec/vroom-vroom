@@ -173,6 +173,9 @@ static COMMANDS: &[Command] = &[
     // VM control.
     c("vm.status", "vm", "Run state, CPU count, breakpoints", &[], "read", Target::Op("status")),
     c("vm.pause", "vm", "Stop every CPU", &[], "control", Target::Op("pause")),
+    c("vm.restart", "vm", "Hard-reset the VM from the reset vector; breakpoints, watches, tracepoints and caches are cleared. With paused, stop before the first guest instruction so breakpoints can be armed first", &[
+        p("paused", "boolean", false, "leave the reset VM paused instead of resuming it; default false"),
+    ], "destructive", Target::Op("restart")),
     c("vm.resume", "vm", "Run until a breakpoint, watchpoint or pause; poll events.poll for the stop", &[CPU], "control", Target::Op("resume")),
     c("vm.step", "vm", "Execute one instruction on a CPU", &[CPU], "control", Target::Op("step")),
     c("vm.step_over", "vm", "Step over a call (runs to the next instruction)", &[CPU, VL], "control", Target::Op("step_over")),
@@ -1154,6 +1157,15 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":4,"method":"commands.run","params":{"command":"cpu.registers"}}"#,
             r#"{"jsonrpc":"2.0","id":5,"method":"jobs.start","params":{"command":"cpu.registers"}}"#,
         ] { assert!(call(&mut c,request).get("error").is_some()); }
+    }
+
+    #[test]
+    fn x64_discovers_restart() {
+        let (mut c, _rx) = connection();
+        Arc::get_mut(&mut c.shared).unwrap().ops = Some(crate::x64_lab::OPS);
+        call(&mut c, r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"actor":"test"}}"#);
+        let list = call(&mut c, r#"{"jsonrpc":"2.0","id":1,"method":"commands.list"}"#);
+        assert!(list["result"].as_array().unwrap().iter().any(|c| c["name"] == "vm.restart"));
     }
 
     #[test]

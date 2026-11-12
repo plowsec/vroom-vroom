@@ -37,6 +37,7 @@ def call(method, params=None, error=False):
 call('initialize', {'actor': 'x64-rpc-smoke'})
 names = {c['name'] for c in call('commands.list')}
 assert 'cpu.registers' in names and 'kernel.processes' in names
+assert 'vm.restart' in names
 assert 'fuzz.check' not in names
 call('fuzz.check', {'harness': 'unsupported.json'}, error=True)
 call('commands.run', {'command': 'fuzz.check', 'args': {'harness': 'unsupported.json'}}, error=True)

@@ -56,6 +56,7 @@ target/debug/vroom-lab /absolute/path/windows11.toml \
 `commands.list` is architecture-specific. AMD64 currently implements:
 
 - VM status, all-CPU pause/resume, single-step, screenshot, keyboard and shutdown.
+- Hard restart, optionally paused before the first guest instruction.
 - General/control registers, physical and virtual memory reads/writes,
   memory regions, and four-level x64 page translation (4 KiB/2 MiB/1 GiB).
 - Four shared hardware execution/data breakpoint slots. Data watches require
@@ -108,6 +109,7 @@ fuzz      check run* probe* coverage blocks diff crashes          * jobs.start o
 
 - Commands run on the lab's thread, in order with the TUI's. The TUI sees the agent's stops too.
 - The lab starts paused: `vm.resume` runs the guest (network, agent, screen). `vm.status` shows `guest_agent`.
+- `vm.restart {paused?}` hard-resets the live VM from the reset vector (devices and RAM reset); breakpoints, watches, tracepoints and caches from the previous boot are cleared. With `paused: true`, it stops before the first guest instruction: arm breakpoints, then `vm.resume`. For an early-boot target, use `vm.restart {paused: true}` -> `debug.breakpoints` -> `vm.resume`, and repeat per boot. Disks and the VM config are kept; use a snapshot restore or a new lab for fresh disks/config.
 - `guest.exec {command, powershell?, timeout?, max_output?}`: the guest agent runs it (cmd.exe as SYSTEM); answers `{exit_code, timed_out, truncated, stdout, stderr}` when it ends. Older agent: `guest.update_tools` first.
 - `guest.upload {host_path, guest_path}`, `guest.download {guest_path, host_path?}`: host paths absolute or under exports/; answer `{size, sha256}`.
 - `memory.read_virtual`/`memory.dump` `skip_unmapped: true` read what translates and list the holes. `memory.search {address, length, hex (?? wildcards) | int+width | text+utf16, align?, limit?}` finds a pattern in up to 1 GiB, skipping holes; `next` resumes a truncated search.

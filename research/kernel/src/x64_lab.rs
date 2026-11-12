@@ -16,6 +16,7 @@ use vroom_vmm::{RunState, StartMode, VmEvent, Vmm, VmmOptions};
 pub(super) const OPS: &[&str] = &[
     "status",
     "pause",
+    "restart",
     "resume",
     "step",
     "shutdown",
@@ -316,6 +317,32 @@ impl Session {
             "pause" => {
                 self.vm.pause().map_err(string)?;
                 return Ok(json!({"state":"Paused"}));
+            }
+            "restart" => {
+                if self.vm.state() == RunState::Stopped {
+                    return Err("the VM is stopped; start a new lab".into());
+                }
+                let paused = match q.get("paused").filter(|v| !v.is_null()) {
+                    Some(v) => v.as_bool().ok_or("paused: expected a boolean")?,
+                    None => false,
+                };
+                // Pause first: Vmm::reset resumes by itself when it finds the VM
+                // running, which would execute boot code before we clear state.
+                self.vm.pause().map_err(string)?;
+                self.pending_step_events()?;
+                self.vm.reset().map_err(string)?;
+                self.breakpoints.clear();
+                self.watches.clear();
+                self.stopped.clear();
+                self.kernel = None;
+                self.kernel_regs = None;
+                self.symbols.clear();
+                self.selected = None;
+                self.debug(&self.breakpoints, &self.watches)?;
+                if !paused {
+                    self.vm.resume().map_err(string)?;
+                }
+                return Ok(json!({"state":if paused {"Paused"} else {"Running"}}));
             }
             "resume" => {
                 self.vm.pause().map_err(string)?;
