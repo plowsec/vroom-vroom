@@ -17,6 +17,8 @@ pub const MAX_NICS: usize = 8;
 /// The host-only network an adapter is on when its `network` is unset
 /// (vroom-netd offers it unless told otherwise).
 pub const DEFAULT_HOST_ONLY: &str = "lab";
+/// The host, in warnings.
+const HOST: &str = if cfg!(target_os = "macos") { "this Mac" } else { "this host" };
 pub const MAX_USB: usize = 8;
 pub const MIN_MEMORY_MIB: u64 = 64;
 pub const MAX_MEMORY_MIB: u64 = 512 * 1024;
@@ -1055,10 +1057,10 @@ impl VmConfig {
         }
         for n in &self.nets {
             if n.allow_host_loopback {
-                w.push("net.allow_host_loopback: the guest can reach services listening on this Mac's 127.0.0.1".into());
+                w.push(format!("net.allow_host_loopback: the guest can reach services listening on {HOST}'s 127.0.0.1"));
             } else if !n.host_ports.is_empty() {
                 let ports: Vec<String> = n.host_ports.iter().map(u16::to_string).collect();
-                w.push(format!("net.host_ports: the guest can reach this Mac's 127.0.0.1 on port {}", ports.join(", ")));
+                w.push(format!("net.host_ports: the guest can reach {HOST}'s 127.0.0.1 on port {}", ports.join(", ")));
             }
             for f in &n.port_forwards {
                 if f.host_addr != "127.0.0.1" && f.host_addr != "::1" {

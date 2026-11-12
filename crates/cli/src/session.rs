@@ -91,6 +91,11 @@ fn lock_down(cfg: &VmConfig, later_shares: &[vroom_config::Share], state_dir: &P
         }
     }
     p.helper_pids = helpers;
+    // The balloon reads the host's free memory from it (Landlock said no:
+    // the "host runs short" inflate never happened on Linux).
+    if cfg!(target_os = "linux") && cfg.balloon {
+        p.ro_files.push("/proc/meminfo".into());
+    }
     vroom_sandbox::apply(&p).map_err(|e| e.to_string())?;
     log::info!("sandbox applied");
     if std::env::var_os("VROOM_SANDBOX_SELFTEST").is_some() {
@@ -425,17 +430,23 @@ pub fn run(o: RunOpts) -> Result<(), String> {
     // Built with every CPU parked; the guest runs only once we're locked
     // down (a resumed guest would go on right where it was).
     let vmm = Vmm::start_confined(o.config, hv, opts, |vmm| {
-        if resumed_suspend {
-            // A suspend image is single use: the disks move on from here.
-            // Before lock-down: seccomp has no unlinkat.
+        // A suspend image is single use: the disks move on from here.
+        // Linux: before lock-down, seccomp has no unlinkat (a failed
+        // lock-down then loses the image). macOS: after, so a failed
+        // lock-down leaves it for the next try.
+        let early = cfg!(target_os = "linux");
+        if resumed_suspend && early {
             let _ = std::fs::remove_dir_all(&suspend);
         }
         if o.sandbox && vmm.config().security.sandbox {
-            lock_down(vmm.config(), vmm.later_shares(), &o.state_dir, has_clip, vmm.helper_pids()).map_err(StartError)
+            lock_down(vmm.config(), vmm.later_shares(), &o.state_dir, has_clip, vmm.helper_pids()).map_err(StartError)?;
         } else {
             eprintln!("vroom: WARNING: running without sandbox");
-            Ok(())
         }
+        if resumed_suspend && !early {
+            let _ = std::fs::remove_dir_all(&suspend);
+        }
+        Ok(())
     })
     .map_err(|StartError(e)| e)?;
     let mut s = Session { vmm, state_dir: o.state_dir, agent_sessions: 0, viewer_lost: None,

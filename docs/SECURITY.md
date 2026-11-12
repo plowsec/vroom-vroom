@@ -53,6 +53,9 @@ Known gaps (Linux):
 - `sendmsg` can carry an address (inside the struct, seccomp can't read it): an existing Unix datagram fd may still reach a pathname socket.
 - No `chmod`/`fchmodat` (Landlock doesn't cover them): modes change only through an open fd (`fchmod`: layer freeze, snapshot dirs).
 - `readlinkat` allowed (snapshot and suspend check each layer's real path). Landlock doesn't cover it: the VMM can read where any link points, not the target.
+- `accept` always allowed: only sockets from before lock-down can accept (no `bind`, no `listen`).
+- `/proc/meminfo` readable when `balloon` is on (host free memory).
+- A suspend image is deleted before lock-down (no `unlinkat` after): a failed lock-down loses it. macOS deletes after.
 - `ioctl`, `prctl`: deny-lists, not allow-lists (in-process Vulkan drivers).
 
 `--no-sandbox`: debugging only, prints a warning.
