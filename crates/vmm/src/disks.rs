@@ -82,13 +82,25 @@ fn fmt_of(f: DiskFormat) -> Option<Format> {
 /// A layer something is built on (a snapshot's, an overlay's base) can't
 /// change any more: take its write permission, so nothing writes to it by
 /// mistake (a VM run from a copy of the config, with another state dir).
-fn freeze_file(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    if let Ok(m) = std::fs::metadata(path) {
-        let mode = m.permissions().mode();
-        if mode & 0o222 != 0 {
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & !0o222));
-        }
+/// Through an fd (`fchmod`: nothing changes modes by path after
+/// lock-down). A layer of ours (in `layers`, the state's `disks/`): never
+/// through a link. The VM file's image (anywhere else) may be a link of
+/// the user's.
+fn freeze_file(path: &Path, layers: &Path) {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let r = if !path.starts_with(layers) {
+        std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(path).and_then(|f| {
+            let m = f.metadata()?;
+            if !m.is_file() || m.permissions().mode() & 0o222 == 0 {
+                return Ok(());
+            }
+            f.set_permissions(std::fs::Permissions::from_mode(m.permissions().mode() & !0o222))
+        })
+    } else {
+        crate::state::hostile::set_mode(path, |m| m & !0o222)
+    };
+    if let Err(e) = r {
+        log::warn!("disk {}: can't make it read-only: {e}", path.display());
     }
 }
 
@@ -186,10 +198,10 @@ impl DiskSet {
             let on_base = active == std::path::absolute(&d.path)?;
             if !on_base {
                 // Under an overlay the base never changes again.
-                freeze_file(&d.path);
+                freeze_file(&d.path, &dir);
             }
             if let Some(layer) = restore.get(&i) {
-                freeze_file(layer);
+                freeze_file(layer, &dir);
             }
             let fmt = if on_base { fmt_of(d.format) } else { Some(fmt) };
             let img = vroom_block::open_with(&active, fmt, false, &policy)
@@ -303,7 +315,7 @@ impl DiskSet {
                 .with_sync(d.sync);
             d.image.swap(Arc::new(top)).map_err(|e| Error::Setup(e.to_string()))?;
             write_pointer(&self.dir.join(format!("disk{}.json", d.index)), &top_path)?;
-            freeze_file(&frozen);
+            freeze_file(&frozen, &self.dir);
             d.below.insert(0, frozen.clone());
             d.active = Some(top_path);
             d.active_fmt = Format::Qcow2;
@@ -455,6 +467,31 @@ mod tests {
         let mut c = cfg(disk);
         c.disks[0].format = DiskFormat::Raw;
         c
+    }
+
+    #[test]
+    fn freezing_never_follows_a_link_in_the_layers_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = tempfile::tempdir().unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let layers = td.path().join("vm.state/disks");
+        std::fs::create_dir_all(&layers).unwrap();
+        let victim = td.path().join("victim");
+        std::fs::write(&victim, b"x").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let l = layers.join("disk0-1-000000001.qcow2");
+        std::os::unix::fs::symlink(&victim, &l).unwrap();
+        freeze_file(&l, &layers);
+        assert_eq!(mode(&victim), 0o644);
+        // Our own layer, and the VM file's image through the user's link.
+        let own = layers.join("disk0-1-000000002.qcow2");
+        std::fs::write(&own, b"x").unwrap();
+        freeze_file(&own, &layers);
+        assert_eq!(mode(&own) & 0o222, 0);
+        let base = td.path().join("disk.img");
+        std::os::unix::fs::symlink(&victim, &base).unwrap();
+        freeze_file(&base, &layers);
+        assert_eq!(mode(&victim), 0o444);
     }
 
     #[test]

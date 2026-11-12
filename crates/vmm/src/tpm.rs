@@ -135,9 +135,8 @@ const SWTPM_FILES: [&str; 4] = [STATE_FILES[0], STATE_FILES[1], "swtpm.log", ".l
 /// sandboxed VMM left to a folder elsewhere), mode 0700, and nothing but
 /// plain files where swtpm opens its files.
 fn clean_dir(dir: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
     crate::state::hostile::ensure_dir(dir, 0o700)?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    crate::state::hostile::set_dir_mode(dir, 0o700)?;
     for n in SWTPM_FILES {
         let p = dir.join(n);
         if std::fs::symlink_metadata(&p).is_ok() && !crate::state::hostile::plain_file(&p) {

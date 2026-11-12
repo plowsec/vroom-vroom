@@ -261,8 +261,10 @@ fn verified() -> &'static std::sync::Mutex<std::collections::HashSet<Identity>> 
 #[cfg(unix)]
 fn set_private(p: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    // Snapshots contain guest RAM (keys, passwords). Owner only.
-    fs::set_permissions(p, fs::Permissions::from_mode(0o700))?;
+    // Snapshots contain guest RAM (keys, passwords). Owner only. Through
+    // the directory itself (`fchmod`), not a link, nothing by path.
+    let d = fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY).open(p)?;
+    d.set_permissions(fs::Permissions::from_mode(0o700))?;
     Ok(())
 }
 
@@ -274,6 +276,22 @@ fn set_private(_p: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn private_means_the_dir_itself() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = tempfile::tempdir().unwrap();
+        let elsewhere = td.path().join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        fs::set_permissions(&elsewhere, fs::Permissions::from_mode(0o755)).unwrap();
+        let link = td.path().join("snap");
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+        assert!(set_private(&link).is_err());
+        assert_eq!(fs::metadata(&elsewhere).unwrap().permissions().mode() & 0o777, 0o755);
+        set_private(&elsewhere).unwrap();
+        assert_eq!(fs::metadata(&elsewhere).unwrap().permissions().mode() & 0o777, 0o700);
+    }
 
     #[test]
     fn roundtrip_and_tamper_detection() {

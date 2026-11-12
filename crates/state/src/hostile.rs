@@ -69,6 +69,23 @@ pub fn write_atomic(p: &Path, data: &[u8], mode: u32) -> io::Result<()> {
     r
 }
 
+/// Change a plain file's mode (`mode` gets the current one) through an fd
+/// of its own: no link followed, nothing by path after lock-down
+/// (`fchmod`, not `chmod`).
+pub fn set_mode(p: &Path, mode: impl FnOnce(u32) -> u32) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let f = open_nofollow(p, false)?;
+    let m = mode(f.metadata()?.permissions().mode() & 0o7777);
+    f.set_permissions(std::fs::Permissions::from_mode(m))
+}
+
+/// The same for a directory itself (not a link to one).
+pub fn set_dir_mode(p: &Path, mode: u32) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY).open(p)?;
+    f.set_permissions(std::fs::Permissions::from_mode(mode))
+}
+
 /// `p` is a directory itself, not a link to one somewhere else.
 pub fn real_dir(p: &Path) -> io::Result<()> {
     if std::fs::symlink_metadata(p)?.is_dir() {
@@ -169,6 +186,35 @@ mod tests {
         // Too big.
         std::fs::write(t.path().join("big"), [0u8; 100]).unwrap();
         assert!(read_small(&t.path().join("big"), 64).is_err());
+    }
+
+    #[test]
+    fn modes_change_only_on_our_own_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let victim = t.path().join("victim");
+        std::fs::write(&victim, b"x").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let l = t.path().join("layer.qcow2");
+        std::os::unix::fs::symlink(&victim, &l).unwrap();
+        assert!(set_mode(&l, |_| 0o600).is_err());
+        let h = t.path().join("hard.qcow2");
+        std::fs::hard_link(&victim, &h).unwrap();
+        assert!(set_mode(&h, |_| 0o600).is_err());
+        assert_eq!(mode(&victim), 0o444, "changed through a link");
+        let own = t.path().join("own.qcow2");
+        std::fs::write(&own, b"x").unwrap();
+        set_mode(&own, |m| m & !0o222).unwrap();
+        assert_eq!(mode(&own) & 0o222, 0);
+        // Directories.
+        let elsewhere = t.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let d = t.path().join("snap");
+        std::os::unix::fs::symlink(&elsewhere, &d).unwrap();
+        assert!(set_dir_mode(&d, 0o700).is_err());
+        set_dir_mode(&elsewhere, 0o700).unwrap();
+        assert_eq!(mode(&elsewhere), 0o700);
     }
 
     #[test]
