@@ -110,6 +110,77 @@ prefer Windows' normal shutdown when preserving a running installation.
 
 Opt-in live feature checks: `python3 research/tests/x64_features_live.py SOCKET`.
 
+#### Exposing only this socket to a Coop VM
+
+For this installed Windows lab, after rebooting the Linux host, run as the normal
+host user (not with sudo):
+
+```sh
+python3 scripts/start-windows-lab.py
+```
+
+This starts the existing `images/windows11-x64.KNZ4j8/windows11.toml` with
+`vroom-lab --daemon`, resumes a newly started VM, waits up to 240 seconds for
+guest tools and an actual Windows command response, verifies `guest.download`
+discovery, applies `scripts/set-windows-isolation.ps1` (routing-only isolation;
+undo with `-Remove` and renew DHCP), and checks/re-establishes the private SSH
+forward to `coop-crowdstrike`. It checks actual RPC responses, not just socket
+existence.
+Both host and Coop checks execute a fresh random challenge inside Windows and
+require its exact echo, successful exit, and no timeout/truncation. Merely
+reporting the agent as connected is insufficient. Local guest-command checks
+retry during the boot timeout; a failed Coop guest-command check exits nonzero
+without replacing a functioning tunnel or resetting Windows.
+An existing running lab is reused; an existing paused debugger session is left
+alone unless `--resume-existing` is specified. No disks are created or reset.
+`--no-coop` checks only the host lab; `--no-isolate` leaves the guest's default
+routes alone; `--config`, `--lab`, `--socket`, `--ssh-host`, `--coop-socket`,
+and `--timeout` override defaults. Requires Python
+3, a built lab binary, host KVM access, and noninteractive SSH access to the
+already-running Coop VM. Rebuild if needed with
+`cargo build -p vroom-kernel --bins`.
+
+Success prints `READY`; failure exits nonzero with a diagnostic. It does not
+install a boot service or continuously monitor/restart the VM. A stale Coop
+socket is removed only if owned by the remote user and connection-refused;
+a live but broken listener is reported, never replaced automatically.
+
+On the host, with the corresponding `coop-<name>` SSH alias configured:
+
+```sh
+ssh -NT -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+  -R /home/ubuntu/vroom-agent.sock:/run/user/1000/vroom-agent.sock \
+  coop-crowdstrike
+```
+
+Keep this tunnel alive. Inside Coop:
+
+```sh
+vroom-rpc --socket /home/ubuntu/vroom-agent.sock describe
+vroom-rpc --socket /home/ubuntu/vroom-agent.sock commands.list
+vroom-rpc --socket /home/ubuntu/vroom-agent.sock run vm.resume
+vroom-rpc --socket /home/ubuntu/vroom-agent.sock run vm.pause
+vroom-rpc --socket /home/ubuntu/vroom-agent.sock run kernel.info
+vroom-rpc --socket /home/ubuntu/vroom-agent.sock run kernel.symbols
+vroom-rpc --socket /home/ubuntu/vroom-agent.sock run kernel.processes
+vroom-rpc --socket /home/ubuntu/vroom-agent.sock run kernel.modules
+```
+
+Coop needs neither `/dev/kvm` nor a copy of the Windows disk. A listening SSH
+socket alone does not prove the backend is alive: `describe` must succeed.
+Connection reset commonly means the host lab/socket has stopped. The host socket
+is mode 0600 and verifies the peer UID (`SO_PEERCRED` on Linux); SSH must run as
+the lab's host user. The endpoint is custom newline-delimited JSON-RPC, **not MCP**.
+
+Treat socket access as debugger authority, not read-only access. Risk metadata
+is descriptive, not an authorization policy. The lab runs without the production
+VMM sandbox; expose it only to agents you authorize to control this guest, or
+place a separately enforced allowlist proxy in front of it. The x64 allowlist
+excludes host-side download paths and fuzzer subprocesses. `guest.upload`
+follows ARM64 semantics and can read any host file the lab user can read.
+
+
 ### RPC reference (architecture-dependent capabilities)
 
 The catalog below includes ARM64-only operations. On every connection,
