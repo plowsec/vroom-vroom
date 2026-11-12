@@ -248,8 +248,12 @@ fn recv_fd(s: &UnixStream) -> std::io::Result<OwnedFd> {
 }
 
 /// Map `fd` (shared memory) `size` bytes, read-write or read-only.
+/// The other process states `size`: an object shorter than that would be SIGBUS on first touch.
 #[allow(unsafe_code)]
 fn map_fd(fd: RawFd, size: u64, write: bool) -> Option<*mut u8> {
+    if size == 0 || usize::try_from(size).is_err() || !matches!(fd_size(fd), Some(n) if n >= size) {
+        return None;
+    }
     let prot = libc::PROT_READ | if write { libc::PROT_WRITE } else { 0 };
     // SAFETY: a fresh shared mapping of an object we were handed.
     let p = unsafe { libc::mmap(std::ptr::null_mut(), size as usize, prot, libc::MAP_SHARED, fd, 0) };
@@ -1468,6 +1472,18 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
     use vroom_memory::{GuestAddress, MmapRegion};
+
+    #[test]
+    fn map_fd_refuses_objects_shorter_than_stated() {
+        let p = std::env::temp_dir().join(format!("vroom-mapfd-{}", std::process::id()));
+        let f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&p).unwrap();
+        let _ = std::fs::remove_file(&p);
+        f.set_len(4096).unwrap();
+        assert!(map_fd(f.as_raw_fd(), 8192, false).is_none(), "short: SIGBUS on touch");
+        assert!(map_fd(f.as_raw_fd(), 0, false).is_none());
+        let m = map_fd(f.as_raw_fd(), 4096, true).expect("whole object");
+        unmap(m, 4096);
+    }
 
     /// Records what reaches it, as the GPU process's renderer would see it.
     struct Fake {
