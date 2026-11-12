@@ -292,6 +292,7 @@ pub fn add_disk(c: &mut VmConfig, path: &Path, kind: NewDisk) {
     let nvme = c.guest_os() == GuestOs::Windows;
     c.disks.push(match kind {
         NewDisk::Iso => Disk {
+            backing_dirs: Vec::new(),
             path: path.to_path_buf(),
             readonly: true,
             format: DiskFormat::Raw,
@@ -300,6 +301,7 @@ pub fn add_disk(c: &mut VmConfig, path: &Path, kind: NewDisk) {
             sync: DiskSync::Fsync,
         },
         NewDisk::Image => Disk {
+            backing_dirs: Vec::new(),
             path: path.to_path_buf(),
             readonly: false,
             format: DiskFormat::Auto,

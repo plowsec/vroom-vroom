@@ -49,7 +49,9 @@ fn report(r: &PruneReport) {
 
 /// Directories the configured disks live in: layer chains end there.
 fn base_dirs(cfg: &VmConfig) -> Vec<PathBuf> {
-    cfg.disks.iter().filter_map(|d| d.path.parent().map(Path::to_path_buf)).collect()
+    cfg.disks.iter().flat_map(|d| {
+        d.path.parent().map(Path::to_path_buf).into_iter().chain(d.backing_dirs.iter().cloned())
+    }).collect()
 }
 
 pub fn run(cmd: SnapCmd, load: impl Fn(&Path) -> Result<VmConfig, String>, state_of: impl Fn(&Path, &VmConfig) -> PathBuf) -> Result<(), String> {
