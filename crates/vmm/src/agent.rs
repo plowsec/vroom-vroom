@@ -514,7 +514,7 @@ impl Service {
     fn on_message(&mut self, m: Message) {
         match m {
             Message::Hello { features, agent } => {
-                let agent: String = agent.chars().filter(|c| c.is_ascii_graphic() || *c == ' ').take(64).collect();
+                let agent: String = guest_text(&agent, 64).chars().filter(|c| c.is_ascii_graphic() || *c == ' ').collect();
                 log::info!("guest agent connected: {agent}");
                 let mut s = self.status.lock().unwrap_or_else(|e| e.into_inner());
                 let sessions = s.sessions.wrapping_add(1);
@@ -563,6 +563,7 @@ impl Service {
             // only suggests them.
             Message::Apps(list) if self.coherence => self.to_viewer(ToViewer::Apps(list)),
             Message::CoherenceNo(why) if self.coherence => {
+                let why = guest_text(&why, 200);
                 log::info!("guest: no coherence here: {why}");
                 self.to_viewer(ToViewer::CoherenceNo(why));
             }
@@ -588,7 +589,7 @@ impl Service {
             }
             Message::DragReady { id, live } => self.to_viewer(ToViewer::DragReady { id, live }),
             Message::DropDone { id, ok, place } => {
-                let place: String = place.chars().filter(|c| !c.is_control()).take(200).collect();
+                let place = guest_text(&place, 200);
                 log::info!("guest: drop {id} {}{place}", if ok { "done " } else { "failed: " });
                 self.to_viewer(ToViewer::DropDone { id, ok, place });
             }
@@ -602,6 +603,7 @@ impl Service {
             }
             m @ (Message::DropEntry { .. } | Message::DropData { .. } | Message::DropEnd { .. } | Message::DragOutFail { .. }) => self.drag_out_frame(m),
             Message::UpdateDone { id, ok, why } => {
+                let why = guest_text(&why, 200);
                 if let Some(r) = self.update_reply.take() {
                     let _ = r.send(if ok { Ok(()) } else { Err(why.clone()) });
                 }
@@ -616,7 +618,7 @@ impl Service {
             }
             Message::FileData { id, data } => self.file_data(id, &data),
             Message::FileDone { id, ok, size, sha256, why } => {
-                let done = if ok { Ok(FileOut { size, sha256 }) } else { Err(why) };
+                let done = if ok { Ok(FileOut { size, sha256 }) } else { Err(guest_text(&why, 200)) };
                 self.file_done(id, done);
             }
             Message::ExecDone { id, end, truncated, stdout, stderr } => {
@@ -1049,7 +1051,7 @@ impl Service {
             }
             Err(_) if matches!(m, Message::DragOutFail { .. }) => {
                 let Message::DragOutFail { why, .. } = m else { return };
-                let why: String = why.chars().filter(|c| !c.is_control()).take(200).collect();
+                let why = guest_text(&why, 200);
                 log::info!("guest: drag {id} out: {why}");
                 (Message::DragOutFail { stream: id, why }, true, false)
             }
@@ -1138,6 +1140,13 @@ fn forward_drop(id: u32, from: std::os::fd::OwnedFd, out: &Mutex<UnixStream>) {
 /// update it never installs (the next one starts over).
 /// Send `size` bytes from `from` to the guest as file `id`'s data; their
 /// SHA-256.
+/// A guest's words for the host (status lines, errors a command prints):
+/// one line, no control, invisible or text-direction characters, at most
+/// `max` characters.
+fn guest_text(s: &str, max: usize) -> String {
+    s.chars().filter(|c| !c.is_control() && !vroom_proto::hidden_char(*c)).take(max).collect()
+}
+
 fn forward_file(id: u32, size: u64, mut from: FileFrom, out: &Mutex<UnixStream>) -> Result<[u8; 32], String> {
     use sha2::Digest;
     let mut h = sha2::Sha256::new();
@@ -1452,6 +1461,34 @@ mod tests {
                 assert_eq!(*buf.0.lock().unwrap(), data);
             }
         }
+        // The guest's reason, printed by `vroom guest pull`: clean.
+        let a2 = a.clone();
+        let t = std::thread::spawn(move || a2.get("/x".into(), Box::new(Vec::new())));
+        let id = match read_msgs(&mut guest, &mut d).as_slice() {
+            [Message::FileGet { id, .. }] => *id,
+            m => panic!("{m:?}"),
+        };
+        let why = format!("denied\u{202e}txt.exe\u{200b}{}", "x".repeat(300));
+        guest.write_all(&Message::FileDone { id, ok: false, size: 0, sha256: [0; 32], why }.encode()).unwrap();
+        let e = t.join().unwrap().unwrap_err();
+        assert!(e.starts_with("deniedtxt.exe") && e.chars().count() == 200, "{e:?}");
+        a.send(AgentCmd::Stop);
+    }
+
+    #[test]
+    fn the_agents_name_is_clean() {
+        let (host, mut guest) = UnixStream::pair().unwrap();
+        let a = spawn(host, ClipPolicy::default(), None, Screen::default()).unwrap();
+        let mut d = Decoder::new(1 << 20);
+        read_msgs(&mut guest, &mut d);
+        let agent = format!("vroom\u{1b}]52;c;eA==\u{7}\u{202e}\u{2066}-agent {}", "y".repeat(100));
+        guest.write_all(&Message::Hello { features: 0, agent }.encode()).unwrap();
+        while !a.status().connected {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let s = a.status().agent;
+        assert!(s.starts_with("vroom]52;c;eA==-agent y") && s.len() <= 64, "{s:?}");
+        assert!(s.chars().all(|c| c.is_ascii_graphic() || c == ' '), "{s:?}");
         a.send(AgentCmd::Stop);
     }
 

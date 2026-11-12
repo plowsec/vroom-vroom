@@ -693,7 +693,7 @@ pub fn drop_name_ok(n: &str) -> bool {
 }
 
 /// Invisible or text-direction characters: `evil\u{202e}fdp.app` shows as `evilppa.pdf`.
-fn hidden_char(c: char) -> bool {
+pub fn hidden_char(c: char) -> bool {
     matches!(
         c,
         '\u{ad}' | '\u{61c}' | '\u{180e}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}' | '\u{fff9}'..='\u{fffb}'
