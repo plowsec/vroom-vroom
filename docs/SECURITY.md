@@ -612,6 +612,15 @@ Linux, same split:
 - Session helper started with the desktop.
 - Meet on `/run/vroom-agent.sock`; service serves only the user logind reports active on seat0; helper only talks to a root-owned peer.
 
+Both:
+
+- Active user/session checked again before each host message for the helper (clipboard, pointer, drops, windows, apps, layout): user switched away → helper dropped, reconnects, judged again.
+- `guest push` (service, root/SYSTEM): folders walked one by one, file made, renamed, removed relative to the folder's handle (`at.rs`). Never through a planted link.
+  - Linux: a link on the way followed only if it and its folder are root's and the folder isn't group/world-writable (`/var/run`, `/tmp`, `/home`).
+  - Windows: every symlink/junction on the way refused, system ones too.
+- Drops written elevated (agent run as root, old all-in-one installs): same walk under the staging folder; a staging folder that is someone else's link refused.
+- `guest pull` reads by path as root/SYSTEM, links followed.
+
 ### Guest tools updates
 
 Host sends code the guest runs as root/SYSTEM. Intended: the guest asked for host tools by installing the agent, and the host controls the guest anyway. Must hold: only the host can do it; the VMM never runs anything the guest sends.
