@@ -116,7 +116,9 @@ impl DiskSet {
         // Absolute now, while we may still look up the cwd: overlays made
         // later (under the sandbox) record these paths as backing names.
         let dir = std::path::absolute(state_dir.join("disks"))?;
-        std::fs::create_dir_all(&dir)?;
+        std::fs::create_dir_all(state_dir)?;
+        // Not a link the sandboxed VMM left to a folder elsewhere.
+        crate::state::hostile::ensure_dir(&dir, 0o700)?;
         let mut disks = Vec::new();
         #[cfg(feature = "research")]
         let mut fresh = Vec::new();
@@ -140,15 +142,17 @@ impl DiskSet {
                 let top = dir.join(format!("disk{i}-{}.qcow2", stamp()));
                 Qcow2Image::create(&top, lower.size(), Some((layer, lfmt))).map_err(|e| Error::Setup(e.to_string()))?;
                 #[cfg(feature = "research")]
-                fresh.push((top.clone(), ptr_path.clone(), std::fs::read(&ptr_path).ok()));
+                fresh.push((top.clone(), ptr_path.clone(), crate::state::hostile::read_small(&ptr_path, POINTER_MAX).ok()));
                 (top, Format::Qcow2)
             } else {
-                match std::fs::read(&ptr_path).ok().and_then(|b| serde_json::from_slice::<Pointer>(&b).ok()) {
+                match read_pointer(&ptr_path)? {
                     // Only trust pointers into our own disks dir: take the
                     // file name and look for it there (older pointers were
                     // written with paths relative to wherever we ran from).
-                    Some(p) => match p.active.file_name().map(|n| dir.join(n)) {
-                        Some(f) if f.is_file() => (f, Format::Qcow2),
+                    // Only names we make, plain files: the sandboxed VMM
+                    // writes these pointers.
+                    Some(p) => match p.active.file_name().filter(|n| is_layer_name(n, i)).map(|n| dir.join(n)) {
+                        Some(f) if crate::state::hostile::plain_file(&f) => (f, Format::Qcow2),
                         _ if p.active.file_name() == d.path.file_name() => {
                             (std::path::absolute(&d.path)?, fmt_of(d.format).unwrap_or(Format::Raw))
                         }
@@ -339,7 +343,7 @@ impl Drop for DiskSet {
         }
         for (layer, pointer, before) in &self.fresh {
             let restored = match before {
-                Some(bytes) => std::fs::write(pointer, bytes),
+                Some(bytes) => crate::state::hostile::write_atomic(pointer, bytes, 0o600),
                 None => std::fs::remove_file(pointer),
             };
             if let Err(e) = restored.and_then(|()| std::fs::remove_file(layer)) {
@@ -374,14 +378,35 @@ pub(crate) fn found(s: &str, dir: &Path) -> PathBuf {
     }
 }
 
+/// Disk pointers are a line of JSON.
+const POINTER_MAX: u64 = 64 << 10;
+
+/// None when there is none; one that isn't a plain file of JSON is an
+/// error (falling back to the base would write under the layers).
+fn read_pointer(path: &Path) -> Result<Option<Pointer>> {
+    if std::fs::symlink_metadata(path).is_err() {
+        return Ok(None);
+    }
+    let bad = |e: String| Error::Setup(format!("disk pointer {}: {e}", path.display()));
+    let b = crate::state::hostile::read_small(path, POINTER_MAX).map_err(|e| bad(e.to_string()))?;
+    serde_json::from_slice(&b).map(Some).map_err(|e| bad(e.to_string()))
+}
+
+/// A layer file name we make for disk `i`: `disk<i>-<secs>-<nanos>.qcow2`.
+pub(crate) fn is_layer_name(name: &std::ffi::OsStr, i: usize) -> bool {
+    let Some(rest) = name.to_str().and_then(|n| n.strip_prefix(&format!("disk{i}-"))).and_then(|n| n.strip_suffix(".qcow2")) else {
+        return false;
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    rest.split_once('-').is_some_and(|(secs, ns)| digits(secs) && ns.len() == 9 && digits(ns))
+}
+
 /// `path`: `<state>/disks/disk<N>.json`.
 fn write_pointer(path: &Path, active: &Path) -> Result<()> {
-    let tmp = path.with_extension("json.tmp");
     let disks = path.parent().unwrap_or(path);
     let active = PathBuf::from(recorded(active, disks, &vm_dir(disks.parent().unwrap_or(disks))));
     let data = serde_json::to_vec(&Pointer { active }).map_err(|e| Error::Setup(e.to_string()))?;
-    std::fs::write(&tmp, data)?;
-    std::fs::rename(&tmp, path)?;
+    crate::state::hostile::write_atomic(path, &data, 0o600)?;
     Ok(())
 }
 
@@ -396,6 +421,51 @@ mod tests {
         .unwrap();
         c.disks[0].path = disk.to_path_buf();
         c
+    }
+
+    #[test]
+    fn layer_names() {
+        use std::ffi::OsStr;
+        assert!(is_layer_name(OsStr::new("disk0-1700000000-000000123.qcow2"), 0));
+        assert!(!is_layer_name(OsStr::new("disk0-1700000000-000000123.qcow2"), 1));
+        assert!(!is_layer_name(OsStr::new("disk0-$(touch x)-000000123.qcow2"), 0));
+        assert!(!is_layer_name(OsStr::new("disk0-1-12.qcow2"), 0));
+        assert!(!is_layer_name(OsStr::new("evil.qcow2"), 0));
+    }
+
+    #[test]
+    fn planted_pointer_and_layer_links_are_not_followed() {
+        let td = tempfile::tempdir().unwrap();
+        let disk = td.path().join("disk.qcow2");
+        Qcow2Image::create(&disk, 1 << 20, None).unwrap();
+        let c = cfg(&disk);
+        let state = td.path().join("vm.state");
+        let disks = state.join("disks");
+        // The pointer's temp file and the pointer itself: links to a user file.
+        let victim = td.path().join("zshenv");
+        std::fs::write(&victim, b"user").unwrap();
+        std::fs::create_dir_all(&disks).unwrap();
+        std::os::unix::fs::symlink(&victim, disks.join("disk0.json.tmp")).unwrap();
+        std::os::unix::fs::symlink(&victim, disks.join("disk0.json")).unwrap();
+        assert!(DiskSet::open(&c, &state, &BTreeMap::new()).is_err(), "a pointer that is a link");
+        std::fs::remove_file(disks.join("disk0.json")).unwrap();
+        let mut ds = DiskSet::open(&c, &state, &BTreeMap::new()).unwrap();
+        ds.freeze().unwrap();
+        drop(ds);
+        assert_eq!(std::fs::read(&victim).unwrap(), b"user", "wrote through a link");
+        // A pointer naming a link to an image elsewhere, or a name we don't make.
+        let other = td.path().join("other.qcow2");
+        Qcow2Image::create(&other, 1 << 20, None).unwrap();
+        for name in ["disk0-1-000000001.qcow2", "$(touch x).qcow2"] {
+            std::os::unix::fs::symlink(&other, disks.join(name)).unwrap();
+            std::fs::write(disks.join("disk0.json"), format!("{{\"active\":\"{name}\"}}")).unwrap();
+            let e = DiskSet::open(&c, &state, &BTreeMap::new()).err().expect("refused");
+            assert!(e.to_string().contains("missing"), "{e}");
+        }
+        // The disks dir itself a link to a folder elsewhere.
+        std::fs::remove_dir_all(&disks).unwrap();
+        std::os::unix::fs::symlink(td.path(), &disks).unwrap();
+        assert!(DiskSet::open(&c, &state, &BTreeMap::new()).is_err());
     }
 
     #[test]
