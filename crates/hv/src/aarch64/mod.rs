@@ -125,6 +125,13 @@ pub fn decode_sysreg(esr: u64) -> SysRegAccess {
 }
 
 impl SysRegAccess {
+    /// A write to the identification registers (op0 3, op1 0, CRn 0:
+    /// MIDR, MPIDR, REVIDR, ID_*): read-only in hardware, and what the VMM
+    /// sets itself. VPIDR/VMPIDR_EL2 (op1 4) and CSSELR (op1 2) aren't.
+    pub fn writes_id_reg(&self) -> bool {
+        !self.read && (self.op0, self.op1, self.crn) == (3, 0, 0)
+    }
+
     /// Same encoding the ESR uses, handy as a map key / log id.
     pub fn key(&self) -> u32 {
         (self.op0 as u32) << 14
@@ -170,6 +177,28 @@ pub mod psci {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn id_register_writes() {
+        // ESR for MSR/MRS: EC 0x18, op0 bits 21:20, op2 19:17, op1 16:14,
+        // CRn 13:10, Rt 9:5, CRm 4:1, direction bit 0 (1 = read).
+        let esr = |op0: u64, op1: u64, crn: u64, crm: u64, op2: u64, read: bool| {
+            0x18 << 26 | op0 << 20 | op2 << 17 | op1 << 14 | crn << 10 | 3 << 5 | crm << 1 | read as u64
+        };
+        let w = |op0, op1, crn, crm, op2| decode_sysreg(esr(op0, op1, crn, crm, op2, false)).writes_id_reg();
+        assert!(w(3, 0, 0, 0, 0), "MIDR_EL1");
+        assert!(w(3, 0, 0, 0, 5), "MPIDR_EL1");
+        assert!(w(3, 0, 0, 0, 6), "REVIDR_EL1");
+        assert!(w(3, 0, 0, 4, 0), "ID_AA64PFR0_EL1");
+        assert!(w(3, 0, 0, 7, 2), "ID_AA64MMFR2_EL1");
+        assert!(!decode_sysreg(esr(3, 0, 0, 0, 5, true)).writes_id_reg(), "a read");
+        assert!(!w(3, 4, 0, 0, 5), "VMPIDR_EL2");
+        assert!(!w(3, 4, 0, 0, 0), "VPIDR_EL2");
+        assert!(!w(3, 2, 0, 0, 0), "CSSELR_EL1");
+        assert!(!w(3, 3, 9, 12, 0), "PMCR_EL0");
+        assert!(!w(2, 0, 0, 2, 4), "MDSCR_EL1 (debug)");
+        assert!(!w(3, 4, 14, 1, 0), "CNTHCTL_EL2");
+    }
 
     #[test]
     fn stage2_write_faults() {

@@ -693,8 +693,12 @@ impl HvfVcpu {
                 }
                 // Registers HVF can hold but doesn't handle on trap (EL2
                 // state of nested guests, e.g. CNTHCTL_EL2): forward.
-                // Everything else (debug/PMU/OS lock...): RAZ/WI.
-                let forwarded = if s.read {
+                // Everything else (debug/PMU/OS lock...): RAZ/WI. The ID
+                // registers are ours (MIDR, MPIDR, ID_*): writes ignored.
+                let forwarded = if s.writes_id_reg() {
+                    log::debug!("vcpu{}: write to ID register {:#x} ignored", self.index, key);
+                    true
+                } else if s.read {
                     match self.get_sys(key) {
                         Ok(v) => {
                             self.set_x(s.reg, v)?;
