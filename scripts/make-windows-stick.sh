@@ -20,6 +20,9 @@ vw=$(scripts/fetch.sh virtio-win)
 winfsp=$(scripts/fetch.sh winfsp)
 exe=target/aarch64-pc-windows-msvc/release/vroom-agent.exe
 [ -f "$exe" ] || cargo xwin build --release -p vroom-agent --target aarch64-pc-windows-msvc
+# The answer file holds the account password: everything made from here
+# on (scratch, image, out) is owner-only from creation.
+umask 077
 tmp=$(mktemp -d)
 cleanup() {
   for m in "$tmp/iso" "$tmp/vw" "$tmp/usb"; do hdiutil detach -quiet "$m" 2>/dev/null || true; done
