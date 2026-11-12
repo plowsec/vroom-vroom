@@ -31,12 +31,25 @@ VMM drops privileges after building the VM, before the guest runs.
 | | |
 |---|---|
 | macOS (Seatbelt, `sandbox_init`) | deny by default. Allowed: VM's disk images and state dir; outbound sockets only if NAT is used; accept only on configured port-forward sockets; pasteboard only if clipboard sync is on. No exec, no new listeners, no user files (tested: `/etc/passwd`, `~/.ssh`, `exec`, `bind` all fail) |
-| Linux (Landlock + seccomp) | Landlock: same files and dirs. seccomp: only syscalls the VMM uses (no `bind`, `execve`, `ptrace`...); signals only to own threads (`tgkill` with our pid); new sockets IPv4/IPv6 only (no Unix, netlink, packet). Anything else kills the process |
+| Linux (Landlock + seccomp) | Landlock: same files and dirs, on every thread, or the VM doesn't start (no Landlock = error, not a warning). seccomp: only syscalls the VMM uses (no `bind`, `execve`, `ptrace`...); signals only to own threads (`tgkill` with our pid); new sockets IPv4/IPv6 only (no Unix, netlink, packet). Anything else kills the process. Bad arguments get EPERM: tty ioctls (`TIOCSTI`, `TIOCLINUX`, job control, console/VT), `F_SETOWN`/`F_SETSIG`/`FIOASYNC`, `clone` without `CLONE_THREAD` or with `CLONE_NEW*` (no fork), `socketpair` non-Unix, `sendto` with an address, risky `prctl`s. `clone3`: ENOSYS (glibc falls back to `clone`) |
 
 Network reach of the VMM itself:
 
 - macOS: IP only (no Unix sockets: no ssh-agent, no docker.sock); host loopback denied unless `allow_host_loopback` (port 53 stays open if the host resolver is local).
 - Linux: seccomp can't see addresses; loopback refused by the NAT code only.
+
+Linux kernel needed (else `--no-sandbox`):
+
+| Landlock ABI | Kernel | When |
+|---|---|---|
+| 2 (`Refer`) | 5.19 | process single-threaded at lock-down (swtpm child) |
+| 8 (`TSYNC`) | 7.0 | other threads already run: VMM (vCPUs), GPU process, USB helper (libusb's event thread) |
+
+Known gaps (Linux):
+
+- `sendmsg` can carry an address (inside the struct, seccomp can't read it): an existing Unix datagram fd may still reach a pathname socket.
+- `chmod`/`fchmodat` allowed (layer freeze, snapshot dirs); Landlock doesn't cover chmod: any path the user owns can be chmod'ed.
+- `ioctl`, `prctl`: deny-lists, not allow-lists (in-process Vulkan drivers).
 
 `--no-sandbox`: debugging only, prints a warning.
 
@@ -285,7 +298,7 @@ VMM checks the helper:
 Helper sandbox:
 
 - macOS (Seatbelt): system libraries and libusb, IOKit registry, USB device and interface user clients only. No files, network, exec, other drivers. Seatbelt can't tell USB devices apart: a compromised helper could open other USB devices a normal user may open (none held by a macOS driver: not keyboards, mice, disks).
-- Linux: no_new_privs + Landlock (`/dev/bus/usb`, sysfs only). No seccomp filter yet; can open any USB device node your user may (udev rules decide).
+- Linux: no_new_privs + Landlock (`/dev/bus/usb`, sysfs only; not enforced on every thread = helper exits). seccomp deny-list (EPERM): exec, ptrace, modules, kexec, mount, namespaces, `bpf`, `perf_event_open`, io_uring, set*id, new sockets, keyrings, signals to other processes, plus the VMM's argument checks; x86_64: x32 syscalls killed. Can open any USB device node your user may (udev rules decide).
 
 Guest gets full control of a given device (any request, firmware updates included): pass only devices you'd plug into that machine.
 
@@ -355,7 +368,7 @@ Root USB helper:
 - Run via `/usr/bin/sandbox-exec` with its own Seatbelt profile: like the user's helper, but libusb only from the root-owned copy (`/opt/homebrew` is the user's: nothing user-writable loads into a root process); empty environment.
 - Before each start the daemon checks its binary, that libusb, and every parent directory are root-owned and not writable by others.
 - Can do what the user's helper does (USB device user clients, IOKit registry; no files, network, exec) plus what root adds: open and take any USB device. As asked: the user named the device; the helper serves only it.
-- Linux: no_new_privs + Landlock like the user's.
+- Linux: same as the user's helper, still root (keeps reopening the device on replug); the seccomp deny-list is what stops root's extras (modules, mount, set*id, raw sockets).
 - On a device a macOS driver holds (or one left taken by an earlier helper): takes the whole device (libusb "capture": macOS re-enumerates, keeps its drivers off; mounted disk unmounted). Keeps it through guest resets (macOS never mounts the disk in between). Gives it back at the end (one more re-enumeration, drivers return). A device the guest can't use at all: given back at once.
 
 Full Disk Access (needed to pass a USB disk as the device on macOS 15; sharing files / using as a disk needs neither FDA nor vroom-netd):
@@ -384,7 +397,7 @@ Frame sockets: macOS gives Unix datagram sockets 4 KiB (2 frames). Both ends ask
 
 ## vTPM
 
-- `tpm = true`: TPM 2.0. libtpms runs in a separate `swtpm` process, not the VMM. macOS: own Seatbelt profile (its install, system libraries, its state dir; no network).
+- `tpm = true`: TPM 2.0. libtpms runs in a separate `swtpm` process, not the VMM. macOS: own Seatbelt profile (its install, system libraries, its state dir; no network). Linux: no_new_privs + Landlock set up before exec (its binary and install prefix, `/usr`, `/lib*`, Nix/Guix stores read+exec; loader cache, OpenSSL config read; state dir read-write; nothing else) + swtpm's own `--seccomp action=kill`. No Landlock ABI 2 = `tpm = true` fails.
 - VMM only frames commands for it, size-limited.
 - State: `<state>/tpm` (0700). Capture requires successful volatile export and complete permanent/volatile state; export/read errors abort the snapshot. Incomplete state archives are rejected before stopping the current TPM or replacing its files. See the [TPM state contract](../crates/vmm/TPM_STATE.md) for recovery behavior and compatibility limits. Valid-input restore replacement remains nontransactional; this is not a whole-VM atomicity or cross-version portability guarantee.
 
