@@ -117,8 +117,13 @@ impl SharedFb {
         }
         let len = max_len() * heads;
         // A VMM that shrinks the memory under our mapping would crash us
-        // (SIGBUS): Linux memfds must be sealed against that. (macOS POSIX
-        // shm can't be resized once sized.)
+        // (SIGBUS): Linux memfds must be sealed against that. macOS POSIX
+        // shm can't be resized once sized; it is the one kind fstat gives
+        // no file type (a regular file has S_IFREG and can be truncated).
+        #[cfg(target_os = "macos")]
+        if st.st_mode & libc::S_IFMT != 0 {
+            return Err(Error::Proto("framebuffer not shared memory"));
+        }
         #[cfg(target_os = "linux")]
         {
             // SAFETY: valid fd.
@@ -240,6 +245,16 @@ impl Drop for SharedFb {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn only_shared_memory_is_mapped() {
+        let p = std::env::temp_dir().join(format!("vroom-fb-{}", std::process::id()));
+        let f = std::fs::File::create(&p).unwrap();
+        let _ = std::fs::remove_file(&p);
+        f.set_len(max_len() as u64).unwrap();
+        assert!(SharedFb::from_fd(f.into()).is_err(), "a regular file can be truncated under the mapping");
+    }
 
     #[test]
     fn create_share_read() {
