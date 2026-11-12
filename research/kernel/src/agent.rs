@@ -173,6 +173,9 @@ static COMMANDS: &[Command] = &[
     // VM control.
     c("vm.status", "vm", "Run state, CPU count, breakpoints", &[], "read", Target::Op("status")),
     c("vm.pause", "vm", "Stop every CPU", &[], "control", Target::Op("pause")),
+    c("vm.restart", "vm", "Hard-reset the VM from the reset vector; breakpoints, watches, tracepoints and caches are cleared. With paused, stop before the first guest instruction so breakpoints can be armed first", &[
+        p("paused", "boolean", false, "leave the reset VM paused instead of resuming it; default false"),
+    ], "destructive", Target::Op("restart")),
     c("vm.resume", "vm", "Run until a breakpoint, watchpoint or pause; poll events.poll for the stop", &[CPU], "control", Target::Op("resume")),
     c("vm.step", "vm", "Execute one instruction on a CPU", &[CPU], "control", Target::Op("step")),
     c("vm.step_over", "vm", "Step over a call (runs to the next instruction)", &[CPU, VL], "control", Target::Op("step_over")),
@@ -201,9 +204,11 @@ static COMMANDS: &[Command] = &[
         p("host_path", "path", true, "absolute, or under the lab's exports directory"),
         p("guest_path", "string", true, "the guest's path (Windows: C:\\...)"),
     ], "write", Target::Op("guest_upload")),
-    c("guest.download", "guest", "Copy a file out of the running guest; size and SHA-256", &[
+    c("guest.download", "guest", "Read a running guest file as a bounded hex chunk with whole-file SHA-256; requires guest tools", &[
         p("guest_path", "string", true, "the guest's path"),
-        p("host_path", "path", false, "new file: absolute, or under the exports directory (default: exports/guest-<stamp>-<name>)"),
+        p("offset", "integer", false, "byte offset, default 0; without host_path only"),
+        p("length", "integer", false, "maximum returned bytes, default/limit 65536; without host_path only"),
+        p("host_path", "path", false, "ARM64 only: save whole file on host instead of returning hex; cannot combine with offset/length"),
     ], "write", Target::Op("guest_download")),
     c("guest.update_tools", "guest", "Install the lab's guest tools in the running guest (target/guest-tools); the agent restarts", &[], "write", Target::Op("guest_update_tools")),
     // CPU.
@@ -417,6 +422,7 @@ struct Job {
 }
 
 pub struct Shared {
+    ops: Option<&'static [&'static str]>,
     forward: mpsc::Sender<Forward>,
     results: Mutex<HashMap<String, Stored>>,
     jobs: Mutex<HashMap<String, Job>>,
@@ -425,6 +431,9 @@ pub struct Shared {
 }
 
 impl Shared {
+    fn supports(&self, c: &Command) -> bool {
+        self.ops.is_none_or(|ops| matches!(c.target, Target::Op(op) if ops.contains(&op)))
+    }
     fn handle(&self, kind: &str) -> String {
         let n = self.counter.fetch_add(1, Ordering::Relaxed);
         let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
@@ -452,6 +461,7 @@ impl Shared {
     }
 
     fn run(&self, c: &'static Command, args: Map<String, Value>) -> Result<Value, String> {
+        if !self.supports(c) { return Err(format!("{} is not supported by this architecture; see commands.list", c.name)); }
         match c.target {
             Target::Op(op) => {
                 let mut request = Value::Object(args);
@@ -747,14 +757,14 @@ impl Connection {
             "describe" => {
                 allow(&params, &[])?;
                 let status = self.shared.run(find("vm.status")?, Map::new()).unwrap_or_else(|e| json!({"error": e}));
-                let mut categories: Vec<&str> = COMMANDS.iter().map(|c| c.category).collect();
+                let mut categories: Vec<&str> = COMMANDS.iter().filter(|c| self.shared.supports(c)).map(|c| c.category).collect();
                 categories.dedup();
                 Ok(json!({
                     "server": "vroom-lab",
-                    "summary": "vroom VMM: Windows ARM64 kernel debugger on a live VM, plus the snapshot fuzzer and its coverage",
+                    "summary": "vroom VMM: hypervisor-side Windows kernel debugger; commands.list advertises this backend's capabilities",
                     "vm": status,
                     "categories": categories,
-                    "commands": COMMANDS.len(),
+                    "commands": COMMANDS.iter().filter(|c| self.shared.supports(c)).count(),
                     "fuzzer": self.shared.fuzz.as_ref().map(|p| p.display().to_string()),
                     "notes": [
                         "Addresses are integers or \"0x...\" strings; results give integers.",
@@ -772,7 +782,56 @@ impl Connection {
             "commands.list" => {
                 allow(&params, &["category"])?;
                 let category = params.get("category").and_then(Value::as_str).unwrap_or("");
-                Ok(Value::Array(COMMANDS.iter().filter(|c| category.is_empty() || c.category == category).map(describe_command).collect()))
+                Ok(Value::Array(COMMANDS.iter().filter(|c| self.shared.supports(c) && (category.is_empty() || c.category == category)).map(|c| {
+                    let mut description = describe_command(c);
+                    if self.shared.ops.is_some() {
+                        if c.name == "guest.download" {
+                            description["params"].as_array_mut().unwrap().retain(|p| p["name"] != "host_path");
+                            description["risk"] = json!("read");
+                            description["mutates"] = json!(false);
+                        }
+                        if c.name == "cpu.registers" { description["summary"] = json!("AMD64 general, control, segment registers and MSRs"); }
+                        if c.name == "cpu.write_register" { description["summary"] = json!("Write an AMD64 register: rax..r15, rip, rsp, rflags, cr0/cr2/cr3/cr4, efer"); }
+                        if c.name == "debug.breakpoints" { description["summary"] = json!("Replace AMD64 hardware execution breakpoints; four shared execution/data slots, no instruction alignment restriction"); }
+                         if c.name == "debug.watchpoints" { description["summary"] = json!("Replace AMD64 data watchpoints: aligned 1/2/4/8 bytes, w or rw, sharing four slots with execution breakpoints"); }
+                         if matches!(c.name, "vm.step_over" | "vm.step_out" | "kernel.stack") {
+                             description["params"].as_array_mut().unwrap().retain(|p| p["name"] != "vector_length");
+                         }
+                         if c.name == "vm.step_over" { description["summary"] = json!("AMD64 near CALL: run to its return; otherwise single-step. All CPUs/devices run for return steps; CPU/RSP/CR3 must match. vm.pause cancels; no automatic timeout"); }
+                         if c.name == "vm.step_out" { description["summary"] = json!("Run to the caller using bounded native Windows AMD64 unwind metadata; unsupported frames fail closed. All CPUs/devices run; vm.pause cancels; no automatic timeout"); }
+                         if c.name == "debug.tracepoints" {
+                             description["summary"] = json!("AMD64 hardware execution tracepoints with register/memory captures and automatic continuation; four shared execution/data slots. Software traps and actions are unsupported");
+                             for p in description["params"].as_array_mut().unwrap() {
+                                 if p["name"] == "tracepoints" { p["help"] = json!("[{address, kind: hardware (default), pid: integer | any, register: rax..r15 | rip | rsp | rflags | cr3, length: 0..4096, captures: [{name, register, offset, length}], record_if: {register, equals}, max_hits, stop}]; [] clears, omitted reports"); }
+                                 if p["name"] == "capacity" { p["help"] = json!("records kept, oldest dropped first; 1..16384, default 4096"); }
+                             }
+                         }
+                         if c.name == "debug.hwatch" {
+                             description["summary"] = json!("AMD64 hardware data watches: aligned 1/2/4/8 bytes, shared four-slot budget; capture post-instruction registers/bytes and continue or stop. Software/read-only watches are unsupported");
+                             for p in description["params"].as_array_mut().unwrap() {
+                                 if p["name"] == "watches" { p["help"] = json!("[{address, length: 1|2|4|8 (aligned), on: write|access|free, kind: hardware, name, pid, stop}]; free requires an 8-byte poison match; access cannot distinguish reads from writes; [] clears"); }
+                                 if p["name"] == "capacity" { p["help"] = json!("shared record buffer capacity: 1..16384, default 4096"); }
+                             }
+                         }
+                         if c.name == "debug.traces" {
+                             description["summary"] = json!("AMD64 bounded tracepoint/hwatch records, oldest first; host elapsed nanoseconds and raw DR6. No guest CNTVCT or memory rereads; capture bytes at hit time instead");
+                             description["params"].as_array_mut().unwrap().retain(|p| p["name"] != "memory");
+                         }
+                         if c.name == "debug.faults" {
+                             description["summary"] = json!("AMD64 exceptions observed at nt!KiDispatchException using one hardware execution slot and symbol-derived exception/trap frames. No fault stack unwind; restore clears this configuration; pid filters do not match KPTI user-CR3 aliases");
+                             for p in description["params"].as_array_mut().unwrap() {
+                                 if p["name"] == "kind" { p["help"] = json!("hardware only (default); shares the four execution/data slots"); }
+                             }
+                         }
+                         if c.name == "memory.search" { description["summary"] = json!("Search virtual memory with wildcard hex, integer or text patterns; skips/reports holes and supports cross-page matches. A deterministic work budget may require a smaller range or larger alignment"); }
+                         if c.name == "kernel.image" {
+                             description["summary"] = json!("Fetch/validate an exact-build AMD64 static image and write flat PE analysis artifacts under exports (path optionally selects a host source file)");
+                             description["risk"] = json!("write");
+                             description["mutates"] = json!(true);
+                         }
+                    }
+                    description
+                }).collect()))
             }
             "commands.run" => {
                 allow(&params, &["command", "args", "limit"])?;
@@ -831,6 +890,7 @@ impl Connection {
     }
 
     fn start_job(&self, command: &'static Command, args: Map<String, Value>, actor: &str) -> Result<Value, Error> {
+        if !self.shared.supports(command) { return Err(error(INVALID_PARAMS, "command is not supported by this architecture")); }
         let handle = self.shared.handle("job");
         let (child, log) = if matches!(command.target, Target::FuzzRun | Target::FuzzProbe | Target::FuzzTrace | Target::FuzzTriage) {
             let (child, log) = self.shared.spawn_fuzzer(command, &args).map_err(|e| error(INTERNAL_ERROR, e))?;
@@ -994,6 +1054,7 @@ fn serve(stream: UnixStream, shared: Arc<Shared>) {
 }
 
 /// The calling user must own the other end.
+#[cfg(not(target_os = "linux"))]
 fn same_user(stream: &UnixStream) -> bool {
     use std::os::fd::AsRawFd;
     let (mut uid, mut gid) = (0, 0);
@@ -1001,6 +1062,17 @@ fn same_user(stream: &UnixStream) -> bool {
     let rc = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
     // SAFETY: no preconditions.
     rc == 0 && uid == unsafe { libc::geteuid() }
+}
+
+#[cfg(target_os = "linux")]
+fn same_user(stream: &UnixStream) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut size = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: writable ucred and length, valid connected Unix socket.
+    let rc = unsafe { libc::getsockopt(stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED,
+        (&mut credentials as *mut libc::ucred).cast(), &mut size) };
+    rc == 0 && size as usize == std::mem::size_of::<libc::ucred>() && credentials.uid == unsafe { libc::geteuid() }
 }
 
 /// Removes the socket when the lab ends.
@@ -1035,6 +1107,10 @@ fn find_fuzzer() -> Option<PathBuf> {
 
 /// Listen on `path` (owner-only); debugger commands go to `forward`.
 pub fn start(path: &Path, forward: mpsc::Sender<Forward>) -> Result<Endpoint, String> {
+    start_supported(path, forward, None)
+}
+
+pub fn start_supported(path: &Path, forward: mpsc::Sender<Forward>, ops: Option<&'static [&'static str]>) -> Result<Endpoint, String> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
@@ -1057,6 +1133,7 @@ pub fn start(path: &Path, forward: mpsc::Sender<Forward>) -> Result<Endpoint, St
     let listener = UnixListener::bind(path).map_err(|e| format!("{}: {e}", path.display()))?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
     let shared = Arc::new(Shared {
+        ops,
         forward,
         results: Mutex::default(),
         jobs: Mutex::default(),
@@ -1087,7 +1164,7 @@ mod tests {
 
     fn connection() -> (Connection, mpsc::Receiver<Forward>) {
         let (tx, rx) = mpsc::channel();
-        let shared = Arc::new(Shared { forward: tx, results: Mutex::default(), jobs: Mutex::default(), counter: AtomicU64::new(1), fuzz: None });
+        let shared = Arc::new(Shared { ops: None, forward: tx, results: Mutex::default(), jobs: Mutex::default(), counter: AtomicU64::new(1), fuzz: None });
         (Connection { shared, actor: None }, rx)
     }
 
@@ -1107,6 +1184,122 @@ mod tests {
         let list = call(&mut c, r#"{"jsonrpc":"2.0","id":"x","method":"commands.list","params":{"category":"fuzz"}}"#);
         assert!(list["result"].as_array().unwrap().iter().all(|c| c["category"] == "fuzz"));
         assert_eq!(call(&mut c, r#"{"jsonrpc":"2.0","id":4,"method":"nope"}"#)["error"]["code"], METHOD_NOT_FOUND);
+    }
+
+    #[test]
+    fn x64_discovers_guest_file_commands() {
+        let (mut c, _rx) = connection();
+        Arc::get_mut(&mut c.shared).unwrap().ops = Some(crate::x64_lab::OPS);
+        call(&mut c, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"actor":"test"}}"#);
+        let list = call(&mut c, r#"{"jsonrpc":"2.0","id":2,"method":"commands.list","params":{"category":"guest"}}"#);
+        let commands = list["result"].as_array().unwrap();
+        let download = commands.iter().find(|c| c["name"] == "guest.download").unwrap();
+        assert_eq!(download["risk"], "read");
+        let params = download["params"].as_array().unwrap();
+        assert!(params.iter().any(|p| p["name"] == "offset"));
+        assert!(params.iter().any(|p| p["name"] == "length"));
+        assert!(!params.iter().any(|p| p["name"] == "host_path"));
+        let upload = commands.iter().find(|c| c["name"] == "guest.upload").unwrap();
+        assert_eq!(upload["risk"], "write");
+        let params = upload["params"].as_array().unwrap();
+        let host = params.iter().find(|p| p["name"] == "host_path").unwrap();
+        assert_eq!(host["required"], true);
+        assert_eq!(host["help"], "absolute, or under the lab's exports directory");
+        assert!(params.iter().any(|p| p["name"] == "guest_path" && p["required"] == true));
+    }
+
+    #[test]
+    fn x64_discovers_snapshot_commands() {
+        let (mut c, _rx) = connection();
+        Arc::get_mut(&mut c.shared).unwrap().ops = Some(crate::x64_lab::OPS);
+        call(&mut c, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"actor":"test"}}"#);
+        let list = call(&mut c, r#"{"jsonrpc":"2.0","id":2,"method":"commands.list","params":{"category":"vm"}}"#);
+        let names: Vec<_> = list["result"].as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap()).collect();
+        for name in ["vm.snapshot", "vm.snapshots", "vm.restore", "vm.restart"] {
+            assert!(names.contains(&name), "missing {name}");
+        }
+    }
+
+    #[test]
+    fn x64_extended_debugger_commands_are_discovered_and_forwarded() {
+        let (mut c, rx) = connection();
+        Arc::get_mut(&mut c.shared).unwrap().ops = Some(crate::x64_lab::OPS);
+        call(&mut c, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"actor":"test"}}"#);
+        let cases = vec![
+            ("vm.step_over", "step_over", json!({"cpu":0})),
+            ("vm.step_out", "step_out", json!({"cpu":0})),
+            ("memory.dump", "dump", json!({"address":"0x1000","length":64})),
+            ("memory.search", "search", json!({"address":"0x1000","length":64,"text":"MZ"})),
+            ("debug.tracepoints", "tracepoints", json!({"tracepoints":[]})),
+            ("debug.hwatch", "hwatch", json!({"watches":[]})),
+            ("debug.traces", "traces", json!({"limit":1})),
+            ("debug.faults", "faults", json!({"enable":false})),
+            ("kernel.callbacks", "callbacks", json!({})),
+            ("kernel.stack", "stack", json!({"cpu":0})),
+            ("kernel.image", "image", json!({"base":"0x1000"})),
+            ("kernel.export", "export", json!({"base":"0x1000"})),
+            ("kernel.process_event", "process_event", json!({})),
+            ("kernel.cache", "cache", json!({})),
+        ];
+        let list = call(&mut c, r#"{"jsonrpc":"2.0","id":2,"method":"commands.list"}"#);
+        let names: Vec<_> = list["result"].as_array().unwrap().iter().map(|v| v["name"].as_str().unwrap()).collect();
+        for (name, _, _) in &cases {
+            assert!(names.contains(name), "missing x64 command {name}");
+        }
+        let expected: Vec<_> = cases.iter().map(|(_, op, _)| *op).collect();
+        let lab = std::thread::spawn(move || {
+            for op in expected {
+                let f = rx.recv_timeout(Duration::from_secs(5)).expect("command was not forwarded");
+                assert_eq!(f.request["op"], op);
+                f.reply.send(Ok(json!(true))).unwrap();
+            }
+        });
+        for (i, (name, _, params)) in cases.into_iter().enumerate() {
+            let request = json!({"jsonrpc":"2.0","id":i + 3,"method":name,"params":params});
+            let response = call(&mut c, &request.to_string());
+            assert_eq!(response["result"], true, "{name}: {response}");
+        }
+        lab.join().unwrap();
+    }
+
+    #[test]
+    fn x64_discovery_does_not_advertise_arm_only_trace_options() {
+        let (mut c, _rx) = connection();
+        Arc::get_mut(&mut c.shared).unwrap().ops = Some(crate::x64_lab::OPS);
+        call(&mut c, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"actor":"test"}}"#);
+        let list = call(&mut c, r#"{"jsonrpc":"2.0","id":2,"method":"commands.list"}"#);
+        let commands = list["result"].as_array().unwrap();
+        for name in ["vm.step_over", "vm.step_out", "kernel.stack"] {
+            let command = commands.iter().find(|c| c["name"] == name).unwrap();
+            assert!(!command["params"].as_array().unwrap().iter().any(|p| p["name"] == "vector_length"));
+        }
+        let traces = commands.iter().find(|c| c["name"] == "debug.traces").unwrap();
+        assert!(!traces["params"].as_array().unwrap().iter().any(|p| p["name"] == "memory"));
+        for name in ["debug.tracepoints", "debug.hwatch"] {
+            let command = commands.iter().find(|c| c["name"] == name).unwrap();
+            assert!(command["summary"].as_str().unwrap().contains("unsupported"));
+        }
+    }
+
+    #[test]
+    fn architecture_allowlist_covers_aliases_and_jobs() {
+        let (mut c, _rx) = connection();
+        Arc::get_mut(&mut c.shared).unwrap().ops = Some(&["status"]);
+        call(&mut c, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"actor":"test"}}"#);
+        let list=call(&mut c,r#"{"jsonrpc":"2.0","id":2,"method":"commands.list"}"#);
+        assert_eq!(list["result"].as_array().unwrap().len(),1);
+        assert_eq!(list["result"][0]["name"],"vm.status");
+        for request in [
+            r#"{"jsonrpc":"2.0","id":3,"method":"cpu.registers"}"#,
+            r#"{"jsonrpc":"2.0","id":4,"method":"commands.run","params":{"command":"cpu.registers"}}"#,
+            r#"{"jsonrpc":"2.0","id":5,"method":"jobs.start","params":{"command":"cpu.registers"}}"#,
+        ] { assert!(call(&mut c,request).get("error").is_some()); }
+    }
+
+    #[test]
+    fn unix_peer_is_the_calling_user() {
+        let (a,b)=UnixStream::pair().unwrap();
+        assert!(same_user(&a)); assert!(same_user(&b));
     }
 
     #[test]

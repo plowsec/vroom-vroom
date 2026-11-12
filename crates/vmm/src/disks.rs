@@ -121,8 +121,10 @@ impl DiskSet {
         #[cfg(feature = "research")]
         let mut fresh = Vec::new();
         for (i, d) in cfg.disks.iter().enumerate() {
+            let mut allowed_dirs = vec![dir.clone(), d.path.parent().map(Path::to_path_buf).unwrap_or_default()];
+            allowed_dirs.extend(d.backing_dirs.iter().cloned());
             let policy = OpenPolicy {
-                allowed_dirs: vec![dir.clone(), d.path.parent().map(Path::to_path_buf).unwrap_or_default()],
+                allowed_dirs,
                 sync: sync_of(d.sync),
             };
             if d.readonly {
@@ -396,6 +398,35 @@ mod tests {
         .unwrap();
         c.disks[0].path = disk.to_path_buf();
         c
+    }
+
+    #[test]
+    fn external_backing_requires_explicit_directory_and_stays_unchanged() {
+        let source = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let base = source.path().join("base.qcow2");
+        let top = scratch.path().join("overlay.qcow2");
+        Qcow2Image::create(&base, 1 << 20, None).unwrap();
+        {
+            let image = Qcow2Image::open(&base, false).unwrap();
+            image.write_at(b"base", 0).unwrap();
+            image.flush().unwrap();
+        }
+        let before = std::fs::read(&base).unwrap();
+        Qcow2Image::create(&top, 1 << 20, Some((&base, Format::Qcow2))).unwrap();
+        let mut c = cfg(&top);
+        let state = scratch.path().join("vm.state");
+        let err = DiskSet::open(&c, &state, &BTreeMap::new()).unwrap_err();
+        assert!(err.to_string().contains("outside the allowed directories"), "{err}");
+        c.disks[0].backing_dirs.push(source.path().to_path_buf());
+        let ds = DiskSet::open(&c, &state, &BTreeMap::new()).unwrap();
+        let mut bytes = [0; 4];
+        ds.disks[0].image.read_at(&mut bytes, 0).unwrap();
+        assert_eq!(&bytes, b"base");
+        ds.disks[0].image.write_at(b"test", 0).unwrap();
+        ds.disks[0].image.flush().unwrap();
+        drop(ds);
+        assert_eq!(std::fs::read(&base).unwrap(), before);
     }
 
     #[test]

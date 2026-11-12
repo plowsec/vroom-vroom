@@ -790,6 +790,7 @@ impl Vcpu for HvfVcpu {
         use crate::debug::Register::*;
         register.validate(value)?;
         match register {
+            X86(_) => Err(Error::Unsupported("AMD64 register on ARM64")),
             X(n) => self.set_x(n, value),
             Pc => self.set(ffi::HV_REG_PC, value),
             Pstate => self.set(ffi::HV_REG_CPSR, value),

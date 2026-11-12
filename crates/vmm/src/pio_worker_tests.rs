@@ -170,6 +170,8 @@ fn run(
         vm: Arc::new(ScriptVm(script.clone())),
         mmio: Bus::default(),
         pio,
+        pc_pio: None,
+        unmapped_mmio: 0,
         cpus: Mutex::new(CpuTable::new(vec![0])),
         events,
         peers: Default::default(),

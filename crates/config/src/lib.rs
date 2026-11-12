@@ -503,7 +503,7 @@ impl VmConfig {
         match self.virtio_transport {
             Transport::Pci => true,
             Transport::Mmio => false,
-            Transport::Auto => matches!(self.boot, Boot::Uefi { .. }),
+            Transport::Auto => cfg!(target_arch = "x86_64") || matches!(self.boot, Boot::Uefi { .. }),
         }
     }
 }
@@ -594,6 +594,10 @@ pub struct Share {
 #[serde(deny_unknown_fields)]
 pub struct Disk {
     pub path: PathBuf,
+    /// Additional directories from which this image may read backing files.
+    /// Backing images are always opened read-only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backing_dirs: Vec<PathBuf>,
     #[serde(default)]
     pub readonly: bool,
     #[serde(default)]
@@ -1025,6 +1029,9 @@ impl VmConfig {
         }
         for d in &mut self.disks {
             fix(&mut d.path);
+            for dir in &mut d.backing_dirs {
+                fix(dir);
+            }
         }
         for s in &mut self.shares {
             fix(&mut s.path);
@@ -1477,6 +1484,16 @@ guest_to_host = false
         let ids = c("[identity]\nhda_pci_id = \"8086:a0c8:17aa:22d8\"\nhda_codec_id = \"10ec:0287:17aa:22d8\"\n");
         assert_eq!(pci_ids(&ids.identity.hda_codec_id), Some([0x10ec, 0x0287, 0x17aa, 0x22d8]));
         assert!(VmConfig::from_toml(&format!("{base}[identity]\nhda_codec_id = \"0000:0287\"\n")).is_err());
+    }
+
+    #[test]
+    fn disk_backing_directories_are_explicit_and_rebased() {
+        let mut c = VmConfig::from_toml(
+            "name = \"x\"\n[boot]\ntype = \"uefi\"\nvars = \"v.fd\"\n[[disk]]\npath = \"overlay.qcow2\"\nbacking_dirs = [\"images\", \"/external\"]\n",
+        ).unwrap();
+        c.rebase_paths(Path::new("/vm"));
+        assert_eq!(c.disks[0].backing_dirs, [PathBuf::from("/vm/images"), PathBuf::from("/external")]);
+        assert_eq!(VmConfig::from_toml(&c.to_toml().unwrap()).unwrap(), c);
     }
 
     #[test]

@@ -79,6 +79,9 @@ pub enum VmEvent {
 pub struct VcpuShared {
     pub vm: Arc<dyn Vm>,
     pub mmio: Bus,
+    /// Full PC board ports, including repeated string I/O.
+    pub pc_pio: Option<Bus>,
+    pub unmapped_mmio: u8,
     /// Only an explicit PC board opts into absent-port behavior.
     pub pio: Option<crate::pio::PcPioBus>,
     pub cpus: Mutex<CpuTable>,
@@ -438,15 +441,17 @@ impl VcpuLoop {
             }
             VcpuExit::MmioRead { addr, len } => {
                 self.shared.device_exits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let mut buf = [0u8; 8];
+                let mut buf = [self.shared.unmapped_mmio; 8];
                 let len = len.min(8);
                 if !self.shared.mmio.read(addr, &mut buf[..len]) {
                     if self.shared.pio.is_some() { return Err(Error::Setup(format!("unmapped PC MMIO read at {addr:#x}"))); }
                     log::debug!("vcpu{}: read from unmapped {addr:#x}", self.index());
                 }
+                log::trace!(target: "vroom_mmio", "read {addr:#x}: {:x?}", &buf[..len]);
                 self.vcpu.complete_mmio_read(&buf[..len])?;
             }
             VcpuExit::MmioWrite { addr, len, data } => {
+                log::trace!(target: "vroom_mmio", "write {addr:#x}: {:x?}", &data[..len.min(8)]);
                 self.shared.device_exits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if !self.shared.mmio.write(addr, &data[..len.min(8)]) {
                     if self.shared.pio.is_some() { return Err(Error::Setup(format!("unmapped PC MMIO write at {addr:#x}"))); }
@@ -463,23 +468,47 @@ impl VcpuLoop {
                 let _ = self.shared.events.send(VmEvent::Reset);
             }
             VcpuExit::Halted => self.running = false,
-            VcpuExit::PioIn { port, len } => {
-                let bus = self.shared.pio.as_ref().ok_or_else(||
-                    Error::Setup(format!("port I/O {port:#x} on a board without ports")))?;
-                let mut bytes = [0u8; 4];
-                let bytes = bytes.get_mut(..len).ok_or_else(|| Error::Setup("PIO input exceeds a scalar value".into()))?;
-                bus.read(port, bytes)?;
-                self.shared.device_exits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                self.vcpu.complete_pio_in(bytes)?;
-            }
+            VcpuExit::PioIn { port, len } => self.port_in(port, len, 1)?,
             VcpuExit::PioOut { port, len, data } => {
-                let bus = self.shared.pio.as_ref().ok_or_else(||
-                    Error::Setup(format!("port I/O {port:#x} on a board without ports")))?;
                 let bytes = data.get(..len).ok_or_else(|| Error::Setup("PIO output exceeds a scalar value".into()))?;
-                bus.write(port, bytes)?;
-                self.shared.device_exits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.port_out(port, len, bytes)?;
             }
+            VcpuExit::PioInBatch { port, size, count } => self.port_in(port, size, count)?,
+            VcpuExit::PioOutBatch { port, size, data } => self.port_out(port, size, &data)?,
         }
+        Ok(())
+    }
+
+    fn port_in(&mut self, port: u16, size: usize, count: usize) -> Result<()> {
+        let len = size.checked_mul(count).filter(|&n| n <= 65536 && n > 0);
+        if ![1,2,4].contains(&size) || len.is_none() { return Err(Error::Setup("invalid KVM port input length".into())); }
+        let mut data = vec![0xff; len.unwrap_or(0)];
+        if let Some(bus) = &self.shared.pc_pio {
+            for chunk in data.chunks_mut(size) { bus.read(port as u64, chunk); }
+        } else {
+            if count != 1 { return Err(Error::Setup("string I/O on scalar-only board".into())); }
+            self.shared.pio.as_ref().ok_or_else(|| Error::Setup("port I/O on a board without ports".into()))?.read(port, &mut data)?;
+        }
+        log::trace!("pio in {port:#x}: {data:x?}");
+        self.shared.device_exits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.vcpu.complete_pio_in(&data)?; Ok(())
+    }
+
+    fn port_out(&mut self, port: u16, size: usize, data: &[u8]) -> Result<()> {
+        if ![1,2,4].contains(&size) || !data.len().is_multiple_of(size) { return Err(Error::Setup("invalid KVM port output length".into())); }
+        if self.shared.pc_pio.is_none() {
+            if data.len() != size { return Err(Error::Setup("string I/O on scalar-only board".into())); }
+            self.shared.pio.as_ref().ok_or_else(|| Error::Setup("port I/O on a board without ports".into()))?.write(port, data)?;
+            self.shared.device_exits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(());
+        }
+        for chunk in data.chunks(size) {
+            log::trace!("pio out {port:#x}: {chunk:x?}");
+            if port == 0xcf9 && chunk[0] & 4 != 0 { let _ = self.shared.events.send(VmEvent::Reset); }
+            else if port == 0x402 { log::debug!("OVMF: {}", String::from_utf8_lossy(chunk)); }
+            else if let Some(bus) = &self.shared.pc_pio { bus.write(port as u64, chunk); }
+        }
+        self.shared.device_exits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 

@@ -262,7 +262,8 @@ impl Vmm {
     /// Build the machine and start it.
     pub fn start(config: VmConfig, hv: Arc<dyn Hypervisor>, opts: VmmOptions) -> Result<Vmm> {
         let lifecycle = match hv.arch() {
-            vroom_hv::Arch::X86_64 => LifecyclePolicy::ColdBootOnly,
+            vroom_hv::Arch::X86_64 if machine_x86::is_reference(&config) => LifecyclePolicy::ColdBootOnly,
+            vroom_hv::Arch::X86_64 => LifecyclePolicy::Resettable,
             vroom_hv::Arch::Aarch64 => LifecyclePolicy::default(),
         };
         Self::start_with_lifecycle(config, hv, opts, lifecycle)
@@ -272,9 +273,12 @@ impl Vmm {
     fn start_with_lifecycle(config: VmConfig, hv: Arc<dyn Hypervisor>, opts: VmmOptions, lifecycle: LifecyclePolicy) -> Result<Vmm> {
         lifecycle.check_start(&opts.start)?;
         config.validate()?;
+        if hv.arch() == vroom_hv::Arch::X86_64 && matches!(config.boot, vroom_config::Boot::Uefi { secure_boot: true, .. }) {
+            return Err(Error::Unavailable("Secure Boot is unavailable on the experimental PC board"));
+        }
         // Validate and own x64 boot inputs before any viewer, state lock,
         // disk layer, identity file, device, or helper is created.
-        let x86_boot = if hv.arch() == vroom_hv::Arch::X86_64 {
+        let x86_boot = if hv.arch() == vroom_hv::Arch::X86_64 && machine_x86::is_reference(&config) {
             if lifecycle != LifecyclePolicy::ColdBootOnly {
                 return Err(Error::Setup("x64 requires the cold-boot-only lifecycle".into()));
             }

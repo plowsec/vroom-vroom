@@ -6,6 +6,10 @@
 //! implementation. The direct Linux loader and its memory map remain separate.
 
 pub mod firmware;
+/// Experimental full PC board (distinct from the fixed reference profile).
+pub mod acpi;
+pub mod pc_layout;
+pub mod pc_loader;
 pub mod layout;
 pub mod loader;
 

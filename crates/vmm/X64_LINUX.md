@@ -1,5 +1,10 @@
 # Direct x64 Linux reference board
 
+This document describes only the direct-kernel reference profile, selected
+by automatic transport (and requiring the exact command line below).
+Explicit PCI transport selects the separate experimental full PC/Windows board,
+documented in [docs/X86_64.md](../../docs/X86_64.md).
+
 This is a narrow, cold-boot-only VMM integration. Its native `Vmm::start` Linux
 acceptance passed on an AWS x64 nested-KVM host on 2026-11-07. This is separate
 from the earlier `vroom-linux-harness` controller test. The supported profile is
@@ -25,7 +30,7 @@ host clipboard provider are rejected. Firmware and restore starts are rejected.
 The default VMM feature set is required. Unsupported configurations and malformed
 or oversized images fail before VMM state/device/helper side effects.
 
-The ARM path keeps its default resettable lifecycle. X64 selects `ColdBootOnly`:
+The ARM and full PC paths keep their resettable lifecycle. This reference profile selects `ColdBootOnly`:
 no CPU, interrupt-controller or device snapshot is taken. Reset, snapshot,
 suspend and restore fail explicitly. Guest-agent exec/file/update calls and
 control-socket requests fail with the unavailable reason. Host serial input is

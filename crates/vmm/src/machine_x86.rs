@@ -23,6 +23,14 @@ use crate::{Error, Result, VmmOptions};
 
 // The same legacy PIC/PIT profile used by the proven native Linux harness.
 pub(crate) const CMDLINE: &str = "console=ttyS0,115200 earlycon=uart8250,io,0x3f8,115200n8 rdinit=/init panic=-1 nokaslr acpi=off pci=off noapic";
+
+/// Direct boot defaults to the upstream checked reference profile. Explicit
+/// PCI transport selects the full PC board instead. UEFI `other` retains the
+/// isolated firmware-preflight profile, not the Linux/Windows PC board.
+pub(crate) fn is_reference(config: &VmConfig) -> bool {
+    (matches!(config.boot, Boot::Kernel { .. }) && config.virtio_transport != Transport::Pci)
+        || (matches!(config.boot, Boot::Uefi { .. }) && config.os == Some(vroom_config::GuestOs::Other))
+}
 const NO_AGENT: &str = "guest agent is unavailable on the x64 reference board";
 const NO_INPUT: &str = "serial receive is unavailable on the x64 reference board";
 
@@ -144,6 +152,7 @@ pub(crate) fn build(config: &VmConfig, hv: &dyn Hypervisor, output: Box<dyn Writ
     let pio = PcPioBus::new(vec![PioRegion::new(0x3f8, 8, &[1], uart)?])?.with_error_latch(error);
     let shared = Arc::new(VcpuShared {
         vm: vm.clone(), mmio: BusBuilder::new().build(), pio: Some(pio),
+        pc_pio: None, unmapped_mmio: 0,
         cpus: Mutex::new(CpuTable::new(vec![0])), events, peers: OnceLock::new(),
         device_exits: Default::default(), run_calls: Default::default(),
         halt_on_stop: Default::default(), halting: Default::default(),

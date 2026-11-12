@@ -4,6 +4,9 @@
 reference board selects `ColdBootOnly` and validates its configuration and
 owned image bytes before state/device/helper creation. See `X64_LINUX.md` for
 that deliberately narrow profile and its separate native acceptance example.
+The experimental full PC/Windows board uses `Resettable`, including its
+existing x64 CPU/irqchip snapshots and research debugger. See
+[docs/X86_64.md](../../docs/X86_64.md) for profile selection and limits.
 
 Cold-boot workers do not capture or restore pristine CPU state. The VMM also
 skips pristine device and interrupt-controller snapshots. Initial register

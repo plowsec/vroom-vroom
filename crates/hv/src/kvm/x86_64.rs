@@ -1,411 +1,796 @@
-//! x86 KVM backend: one CPU, Linux64 or fresh reset-vector entry, scalar I/O.
-//! Optional static or fixed-Q35 SMRAM is for native prerequisites, not a board.
-//! CPU/irqchip snapshots and guest hypervisors are deliberately unsupported.
-
-use std::sync::{Arc, Mutex};
-
-use kvm_bindings::{kvm_mp_state, kvm_pit_config, kvm_regs, kvm_segment, CpuId,
-    KVM_MAX_CPUID_ENTRIES, KVM_MP_STATE_RUNNABLE, KVM_PIT_SPEAKER_DUMMY,
-    KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN, KVM_RUN_X86_SMM};
-use kvm_ioctls::{Cap, Kvm, VcpuExit as KExit, VcpuFd, VmFd};
-
+//! x86 KVM with in-kernel PIC, IOAPIC, LAPIC and PIT.
 use super::{clear_thread_run, kerr, set_thread_run, Chip, KvmKicker};
 pub(super) use crate::x86_64::check_memory_range;
-use crate::x86_64::{cpuid_registers, initialize_reset_vector, mmio_len, scalar_pio, validate_boot,
-    check_completion, check_smi_ready, check_smm_boot, classify_io, PendingRead, SmramWriteGrant,
-    ResetEntryGuard, ResetSegment, ResetVectorCpu, ResetVectorState, IDENTITY_MAP, TSS_BASE};
-use crate::{BootRegs, Error, IrqChipConfig, IrqChipInfo, Result, Vcpu, VcpuExit, VcpuKicker, VcpuState, VmParams, X86IoExit};
-
-const _: () = assert!(KVM_RUN_X86_SMM == 1); // pure classifier's UAPI bit
+use crate::x86_64::{ResetEntryGuard, initialize_reset_vector, IDENTITY_MAP, TSS_BASE};
+use crate::{
+    BootRegs, Error, IrqChipConfig, IrqChipInfo, Result, Vcpu, VcpuExit, VcpuKicker, VcpuState,
+    VmParams,
+};
+use kvm_bindings::*;
+use kvm_ioctls::{Kvm, VcpuExit as KExit, VcpuFd, VmFd};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 pub(super) fn irqchip_info() -> IrqChipInfo {
-    IrqChipInfo { dist_size: 0, redist_size_per_cpu: 0, msi_size: 0, spi_base: 0, spi_count: 24, msi_frame_in_kernel: true }
+    IrqChipInfo {
+        dist_size: 0,
+        redist_size_per_cpu: 0,
+        msi_size: 0,
+        spi_base: 0,
+        spi_count: 24,
+        msi_frame_in_kernel: true,
+    }
 }
 
-pub(super) fn create_vm(kvm: &Kvm, params: &VmParams) -> Result<(VmFd, Chip)> {
-    if params.irqchip != IrqChipConfig::Ioapic {
-        return Err(Error::Unsupported("x86 KVM requires the Ioapic configuration"));
+pub(super) fn create_vm(kvm: &Kvm, p: &VmParams) -> Result<(VmFd, Chip)> {
+    if p.irqchip != IrqChipConfig::Ioapic || p.vcpus == 0 || p.vcpus > 254 {
+        return Err(Error::Invalid(
+            "x86 requires IOAPIC and 1..=254 vCPUs".into(),
+        ));
     }
-    if params.vcpus != 1 {
-        return Err(Error::Unsupported("initial x86 KVM backend supports one vCPU"));
-    }
-    if params.nested {
-        return Err(Error::Unsupported("exposing virtualization inside the x86 guest"));
+    if p.nested {
+        return Err(Error::Unsupported("nested virtualization on x86"));
     }
     for (cap, name) in [
-        (Cap::UserMemory, "KVM_CAP_USER_MEMORY"),
-        (Cap::Irqchip, "KVM_CAP_IRQCHIP"),
-        (Cap::SetTssAddr, "KVM_CAP_SET_TSS_ADDR"),
-        (Cap::SetIdentityMapAddr, "KVM_CAP_SET_IDENTITY_MAP_ADDR"),
-        (Cap::Pit2, "KVM_CAP_PIT2"),
-        (Cap::ExtCpuid, "KVM_CAP_EXT_CPUID"),
-        (Cap::MpState, "KVM_CAP_MP_STATE"),
-        (Cap::ImmediateExit, "KVM_CAP_IMMEDIATE_EXIT"),
+        (kvm_ioctls::Cap::UserMemory, "KVM_CAP_USER_MEMORY"),
+        (kvm_ioctls::Cap::Irqchip, "KVM_CAP_IRQCHIP"),
+        (kvm_ioctls::Cap::SetTssAddr, "KVM_CAP_SET_TSS_ADDR"),
+        (kvm_ioctls::Cap::SetIdentityMapAddr, "KVM_CAP_SET_IDENTITY_MAP_ADDR"),
+        (kvm_ioctls::Cap::Pit2, "KVM_CAP_PIT2"),
+        (kvm_ioctls::Cap::ExtCpuid, "KVM_CAP_EXT_CPUID"),
+        (kvm_ioctls::Cap::MpState, "KVM_CAP_MP_STATE"),
+        (kvm_ioctls::Cap::ImmediateExit, "KVM_CAP_IMMEDIATE_EXIT"),
     ] {
-        if !kvm.check_extension(cap) {
-            return Err(Error::Unsupported(name));
+        if !kvm.check_extension(cap) { return Err(Error::Unsupported(name)); }
+    }
+    let vm = kvm.create_vm().map_err(kerr("KVM_CREATE_VM"))?;
+    vm.set_tss_address(TSS_BASE as usize)
+        .map_err(kerr("KVM_SET_TSS_ADDR"))?;
+    vm.set_identity_map_address(IDENTITY_MAP)
+        .map_err(kerr("KVM_SET_IDENTITY_MAP_ADDR"))?;
+    vm.create_irq_chip().map_err(kerr("KVM_CREATE_IRQCHIP"))?;
+    let routes = pc_routes();
+    // SAFETY: repr(C) header matches kvm_irq_routing, followed by exactly
+    // nr live routing entries. KVM reads the flexible array during ioctl.
+    let routing = unsafe { &*((&routes as *const PcRoutes).cast::<kvm_irq_routing>()) };
+    vm.set_gsi_routing(routing)
+        .map_err(kerr("KVM_SET_GSI_ROUTING"))?;
+    vm.create_pit2(kvm_pit_config {
+        flags: KVM_PIT_SPEAKER_DUMMY,
+        ..Default::default()
+    })
+    .map_err(kerr("KVM_CREATE_PIT2"))?;
+    Ok((vm, Chip::Ioapic))
+}
+
+#[repr(C)]
+struct PcRoutes {
+    nr: u32,
+    flags: u32,
+    entries: [kvm_irq_routing_entry; 40],
+}
+
+fn pc_routes() -> PcRoutes {
+    let mut table = PcRoutes {
+        nr: 0,
+        flags: 0,
+        entries: [kvm_irq_routing_entry::default(); 40],
+    };
+    let mut add = |gsi, irqchip, pin| {
+        let mut e = kvm_irq_routing_entry {
+            gsi,
+            type_: KVM_IRQ_ROUTING_IRQCHIP,
+            ..Default::default()
+        };
+        e.u.irqchip = kvm_irq_routing_irqchip { irqchip, pin };
+        table.entries[table.nr as usize] = e;
+        table.nr += 1;
+    };
+    for gsi in 0..24 {
+        add(
+            gsi,
+            KVM_IRQCHIP_IOAPIC,
+            match gsi {
+                0 => 2,
+                2 => 0,
+                n => n,
+            },
+        );
+        if gsi < 16 {
+            add(
+                gsi,
+                if gsi < 8 {
+                    KVM_IRQCHIP_PIC_MASTER
+                } else {
+                    KVM_IRQCHIP_PIC_SLAVE
+                },
+                gsi % 8,
+            );
         }
     }
-    let fd = kvm.create_vm().map_err(kerr("KVM_CREATE_VM"))?;
-    fd.set_tss_address(TSS_BASE as usize).map_err(kerr("KVM_SET_TSS_ADDR"))?;
-    fd.set_identity_map_address(IDENTITY_MAP).map_err(kerr("KVM_SET_IDENTITY_MAP_ADDR"))?;
-    fd.create_irq_chip().map_err(kerr("KVM_CREATE_IRQCHIP"))?;
-    // Linux calibrates timers through PIT channel 2 / speaker port 0x61.
-    // Ask KVM to supply that port rather than inventing counter values.
-    fd.create_pit2(kvm_pit_config { flags: KVM_PIT_SPEAKER_DUMMY, ..Default::default() })
-        .map_err(kerr("KVM_CREATE_PIT2"))?;
-    Ok((fd, Chip::Ioapic))
+    table
 }
 
-/// Keep KVM's supported feature set, with one logical CPU and no guest VMX/SVM.
-/// This is host-dependent, not a portable CPU/snapshot compatibility model.
-fn configure_cpuid(cpuid: &mut CpuId) -> Result<()> {
-    let pae = cpuid.as_slice().iter().any(|e| e.function == 1 && e.edx & (1 << 6) != 0);
-    let long_mode = cpuid.as_slice().iter().any(|e| e.function == 0x8000_0001 && e.edx & (1 << 29) != 0);
-    if !pae || !long_mode {
-        return Err(Error::Unsupported("KVM CPU lacks PAE or long mode"));
-    }
-    for e in cpuid.as_mut_slice() {
-        [e.eax, e.ebx, e.ecx, e.edx] = cpuid_registers(e.function, e.index, [e.eax, e.ebx, e.ecx, e.edx]);
-    }
-    Ok(())
+fn state_error(e: impl std::fmt::Display) -> Error {
+    Error::Invalid(format!("x86 state: {e}"))
 }
 
-fn segment(selector: u16, code: bool) -> kvm_segment {
-    kvm_segment {
-        base: 0, limit: 0xffff_ffff, selector, type_: if code { 11 } else { 3 },
-        present: 1, dpl: 0, db: u8::from(!code), s: 1, l: u8::from(code), g: 1,
-        ..Default::default()
-    }
+#[derive(Serialize, Deserialize)]
+struct CpuState {
+    regs: kvm_regs,
+    sregs: kvm_sregs,
+    xsave: kvm_xsave,
+    xcrs: kvm_xcrs,
+    lapic: kvm_lapic_state,
+    mp: kvm_mp_state,
+    events: kvm_vcpu_events,
+    debug: kvm_debugregs,
+    msrs: Vec<kvm_msr_entry>,
 }
 
-fn reset_segment(s: kvm_segment) -> ResetSegment {
-    ResetSegment { base: s.base, limit: s.limit, selector: s.selector, kind: s.type_,
-        attributes: [s.present, s.dpl, s.db, s.s, s.l, s.g, s.avl, s.unusable] }
+#[derive(Serialize, Deserialize)]
+struct ChipState {
+    chips: Vec<kvm_irqchip>,
+    pit: kvm_pit_state2,
+    clock: kvm_clock_data,
 }
 
-impl ResetVectorCpu for VcpuFd {
-    fn read_reset_state(&mut self) -> Result<ResetVectorState> {
-        let r = self.get_regs().map_err(kerr("KVM_GET_REGS for firmware entry"))?;
-        let s = self.get_sregs().map_err(kerr("KVM_GET_SREGS for firmware entry"))?;
-        let mp = self.get_mp_state().map_err(kerr("KVM_GET_MP_STATE for firmware entry"))?;
-        Ok(ResetVectorState {
-            gprs: [r.rax, r.rbx, r.rcx, r.rdx, r.rsi, r.rdi, r.rsp, r.rbp,
-                r.r8, r.r9, r.r10, r.r11, r.r12, r.r13, r.r14, r.r15, r.rip, r.rflags],
-            controls: [s.cr0, s.cr2, s.cr3, s.cr4, s.cr8, s.efer],
-            segments: [s.cs, s.ds, s.es, s.fs, s.gs, s.ss, s.tr, s.ldt].map(reset_segment),
-            tables: [(s.gdt.base, s.gdt.limit), (s.idt.base, s.idt.limit)],
-            interrupt_bitmap: s.interrupt_bitmap,
-            runnable: mp.mp_state == KVM_MP_STATE_RUNNABLE,
-        })
+pub(super) fn save_chip(vm: &VmFd) -> Result<Vec<u8>> {
+    let mut chips = Vec::new();
+    for chip_id in 0..3 {
+        let mut chip = kvm_irqchip {
+            chip_id,
+            ..Default::default()
+        };
+        vm.get_irqchip(&mut chip).map_err(kerr("KVM_GET_IRQCHIP"))?;
+        chips.push(chip);
     }
-
-    fn set_reset_gprs(&mut self, signature: u32) -> Result<()> {
-        self.set_regs(&kvm_regs { rdx: u64::from(signature), rip: 0xfff0, rflags: 2, ..Default::default() })
-            .map_err(kerr("KVM_SET_REGS for firmware entry"))
-    }
-
-    fn set_runnable(&mut self) -> Result<()> {
-        self.set_mp_state(kvm_mp_state { mp_state: KVM_MP_STATE_RUNNABLE })
-            .map_err(kerr("KVM_SET_MP_STATE for firmware entry"))
-    }
+    serde_json::to_vec(&ChipState {
+        chips,
+        pit: vm.get_pit2().map_err(kerr("KVM_GET_PIT2"))?,
+        clock: vm.get_clock().map_err(kerr("KVM_GET_CLOCK"))?,
+    })
+    .map_err(state_error)
 }
 
+pub(super) fn restore_chip(vm: &VmFd, blob: &[u8]) -> Result<()> {
+    let s: ChipState = serde_json::from_slice(blob).map_err(state_error)?;
+    if s.chips.len() != 3
+        || s.chips
+            .iter()
+            .enumerate()
+            .any(|(i, c)| c.chip_id != i as u32)
+    {
+        return Err(state_error("invalid irqchip IDs"));
+    }
+    for c in &s.chips {
+        vm.set_irqchip(c).map_err(kerr("KVM_SET_IRQCHIP"))?;
+    }
+    vm.set_pit2(&s.pit).map_err(kerr("KVM_SET_PIT2"))?;
+    let mut clock = s.clock;
+    clock.flags = 0;
+    vm.set_clock(&clock).map_err(kerr("KVM_SET_CLOCK"))
+}
+
+#[derive(Debug)]
+enum Read {
+    Mmio(usize),
+    Pio { offset: usize, len: usize },
+}
+
+#[derive(Debug)]
 pub struct KvmVcpu {
-    // Close the CPU fd before dropping its last memory backing owners.
     fd: VcpuFd,
-    // Q35 transitions use VM ioctls from the stopped CPU's owning thread.
-    // This VM fd must also close BEFORE the last backing-owner Arc drops.
-    smm_vm: Option<Arc<VmFd>>,
-    smm_owners: Option<Arc<Mutex<super::Slots>>>,
+    index: u32,
     kicker: Arc<KvmKicker>,
-    run_size: usize,
-    pending: Option<PendingRead>,
+    pending: Option<Read>,
+    msr_indices: Vec<u32>,
     reset_entry: ResetEntryGuard,
     cpuid_signature: u32,
-    initialized: bool,
-    last_run_smm: bool,
-    smm_faulted: bool,
-    smram_write: SmramWriteGrant,
-}
-
-impl std::fmt::Debug for KvmVcpu {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("KvmVcpu").field("index", &0).field("pending", &self.pending).finish()
-    }
-}
-
-impl KvmVcpu {
-    pub(super) fn new(vm: &Arc<VmFd>, index: u32, n: u32, smm_owners: Option<Arc<Mutex<super::Slots>>>) -> Result<Self> {
-        if index != 0 || n != 1 {
-            return Err(Error::Unsupported("initial x86 KVM backend supports only vCPU 0"));
-        }
-        let kvm = Kvm::new().map_err(kerr("open KVM capabilities"))?;
-        let mut cpuid = kvm.get_supported_cpuid(KVM_MAX_CPUID_ENTRIES).map_err(kerr("KVM_GET_SUPPORTED_CPUID"))?;
-        configure_cpuid(&mut cpuid)?;
-        let cpuid_signature = cpuid.as_slice().iter().find(|e| e.function == 1)
-            .map(|e| e.eax).ok_or(Error::Unsupported("KVM CPU lacks its version signature"))?;
-        let mut fd = vm.create_vcpu(0).map_err(kerr("KVM_CREATE_VCPU"))?;
-        fd.set_cpuid2(&cpuid).map_err(kerr("KVM_SET_CPUID2"))?;
-        let run_size = kvm.get_vcpu_mmap_size().map_err(kerr("KVM_GET_VCPU_MMAP_SIZE"))?;
-        set_thread_run(fd.get_kvm_run() as *mut _);
-        let smm_vm = smm_owners.as_ref().map(|_| vm.clone());
-        Ok(Self { fd, smm_vm, smm_owners, kicker: KvmKicker::current(), run_size, pending: None,
-            reset_entry: ResetEntryGuard::Fresh, cpuid_signature, initialized: false,
-            last_run_smm: false, smm_faulted: false, smram_write: SmramWriteGrant::default() })
-    }
-
-    /// Called only immediately after an IoIn/IoOut exit.
-    fn pio_location(&mut self, total: usize) -> Result<(usize, usize)> {
-        // SAFETY: the just-returned KVM exit is IO, so this union field is active.
-        let io = unsafe { self.fd.get_kvm_run().__bindgen_anon_1.io };
-        let len = scalar_pio(io.size, io.count, total)?;
-        let offset = usize::try_from(io.data_offset).map_err(|_| Error::GuestFault("PIO offset overflow".into()))?;
-        if offset.checked_add(len).map_or(true, |end| end > self.run_size) {
-            return Err(Error::GuestFault("PIO data outside the KVM mapping".into()));
-        }
-        Ok((len, offset))
-    }
-
-    fn io_exit(&mut self, flags: u16, io: X86IoExit) -> Result<VcpuExit> {
-        let private = if let Some(owners) = &self.smm_owners {
-            let mut slots = owners.lock().unwrap_or_else(|e| e.into_inner());
-            Some(slots.smm_memory()?.private_ranges())
-        } else { None };
-        let result = classify_io(private, flags, io);
-        if let Ok(exit) = &result { self.smram_write.observe(exit); }
-        if result.is_err() { self.smm_faulted = true; }
-        result
-    }
-
-    fn check_smm_fault(&self) -> Result<()> {
-        if self.smm_faulted { return Err(Error::Invalid("failed SMM operation; recreate the vCPU".into())); }
-        if let Some(owners) = &self.smm_owners {
-            owners.lock().unwrap_or_else(|e| e.into_inner()).smm_memory()?.check_cpu()?;
-        }
-        Ok(())
-    }
+    run_size: usize,
 }
 
 impl Drop for KvmVcpu {
     fn drop(&mut self) {
-        // A retained kicker can signal this thread after the vCPU is dropped.
-        // Remove the signal handler's pointer before the fd unmaps kvm_run.
         clear_thread_run(self.fd.get_kvm_run() as *mut _);
     }
 }
 
-impl Vcpu for KvmVcpu {
-    fn apply_x86_smram(&mut self, target: crate::X86SmramState) -> Result<crate::X86SmramState> {
-        self.smram_write.consume(self.initialized, self.pending.is_some())?;
-        self.check_smm_fault()?;
-        let vm = self.smm_vm.as_ref().ok_or(Error::Unsupported("SMRAM transition without isolated configuration"))?;
-        let owners = self.smm_owners.as_ref().ok_or(Error::Unsupported("SMRAM transition without isolated configuration"))?;
-        owners.lock().unwrap_or_else(|e| e.into_inner()).smm_memory()?
-            .apply_q35(target, |mapping| super::install_smm_slot(vm, mapping))
+impl KvmVcpu {
+    pub(super) fn new(vm: &VmFd, index: u32, n: u32) -> Result<Self> {
+        let kvm = Kvm::new().map_err(kerr("open KVM capabilities"))?;
+        let mut cpuid = kvm
+            .get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)
+            .map_err(kerr("KVM_GET_SUPPORTED_CPUID"))?;
+        for e in cpuid.as_mut_slice() {
+            match e.function {
+                1 => {
+                    e.ebx = (e.ebx & 0x0000_ffff) | (n << 16) | (index << 24);
+                    // Conservative baseline: SSE, without nested VMX or XSAVE/AVX.
+                    // This keeps saved extended state within the fixed KVM XSAVE ABI.
+                    e.ecx &= !((1 << 5) | (1 << 12) | (7 << 26) | (1 << 29));
+                    e.ecx |= 1 << 31;
+                    if n > 1 {
+                        e.edx |= 1 << 28;
+                    } else {
+                        e.edx &= !(1 << 28);
+                    }
+                }
+                7 | 0xd => {
+                    e.eax = 0;
+                    e.ebx = 0;
+                    e.ecx = 0;
+                    e.edx = 0;
+                }
+                0xb | 0x1f => {
+                    e.edx = index;
+                    if e.index == 0 {
+                        e.eax = 0;
+                        e.ebx = 1;
+                        e.ecx = 1 << 8;
+                    } else if e.index == 1 {
+                        e.eax = n.next_power_of_two().trailing_zeros();
+                        e.ebx = n;
+                        e.ecx = (2 << 8) | 1;
+                    } else {
+                        e.eax = 0;
+                        e.ebx = 0;
+                    }
+                }
+                0x8000_0001 => e.ecx &= !(1 << 2),
+                0x8000_0008 => {
+                    e.ecx = (e.ecx & !0xffff)
+                        | (n - 1)
+                        | (n.next_power_of_two().trailing_zeros() << 12);
+                }
+                0x8000_001e => {
+                    e.eax = index;
+                    e.ebx = index; // one thread per core
+                    e.ecx = 0; // one node
+                    e.edx = 0;
+                }
+                _ => {}
+            }
+        }
+        let cpuid_signature = cpuid.as_slice().iter().find(|e| e.function == 1)
+            .map(|e| e.eax).ok_or(Error::Unsupported("KVM CPU lacks its version signature"))?;
+        let mut fd = vm
+            .create_vcpu(index as u64)
+            .map_err(kerr("KVM_CREATE_VCPU"))?;
+        fd.set_cpuid2(&cpuid).map_err(kerr("KVM_SET_CPUID2"))?;
+        let entries: Vec<_> = [
+            0x174,
+            0x175,
+            0x176,
+            0xc000_0081,
+            0xc000_0082,
+            0xc000_0083,
+            0xc000_0084,
+            0xc000_0102,
+        ]
+        .into_iter()
+        .map(|index| kvm_msr_entry {
+            index,
+            ..Default::default()
+        })
+        .collect();
+        let msrs = Msrs::from_entries(&entries).map_err(state_error)?;
+        if fd.set_msrs(&msrs).map_err(kerr("KVM_SET_MSRS"))? != entries.len() {
+            return Err(state_error("short MSR initialization"));
+        }
+        fd.set_mp_state(kvm_mp_state {
+            mp_state: if index == 0 {
+                KVM_MP_STATE_RUNNABLE
+            } else {
+                KVM_MP_STATE_UNINITIALIZED
+            },
+        })
+        .map_err(kerr("KVM_SET_MP_STATE"))?;
+        let msr_indices = kvm
+            .get_msr_index_list()
+            .map_err(kerr("KVM_GET_MSR_INDEX_LIST"))?
+            .as_slice()
+            .iter()
+            .copied()
+            // KVM's system list includes VMX capability MSRs even when
+            // this vCPU's CPUID disables VMX. Those cannot be read from
+            // this guest and have no state to restore without nested VMX.
+            .filter(|index| !(0x480..=0x49f).contains(index))
+            .collect();
+        let run_size = kvm.get_vcpu_mmap_size().map_err(kerr("KVM_GET_VCPU_MMAP_SIZE"))?;
+        set_thread_run(fd.get_kvm_run() as *mut _);
+        Ok(Self {
+            fd,
+            index,
+            kicker: KvmKicker::current(),
+            pending: None,
+            msr_indices,
+            reset_entry: ResetEntryGuard::Fresh,
+            cpuid_signature,
+            run_size,
+        })
     }
+}
 
-    fn index(&self) -> u32 { 0 }
-
+impl Vcpu for KvmVcpu {
+    fn debug_write_register(&mut self, register: crate::debug::Register, value: u64) -> Result<()> {
+        use crate::debug::{Register, X86Register as R};
+        let Register::X86(register) = register else {
+            return Err(Error::Invalid("an AMD64 register is required".into()));
+        };
+        let mut r = self.fd.get_regs().map_err(kerr("KVM_GET_REGS"))?;
+        let target = match register {
+            R::Rax => &mut r.rax,
+            R::Rbx => &mut r.rbx,
+            R::Rcx => &mut r.rcx,
+            R::Rdx => &mut r.rdx,
+            R::Rsi => &mut r.rsi,
+            R::Rdi => &mut r.rdi,
+            R::Rbp => &mut r.rbp,
+            R::Rsp => &mut r.rsp,
+            R::R8 => &mut r.r8,
+            R::R9 => &mut r.r9,
+            R::R10 => &mut r.r10,
+            R::R11 => &mut r.r11,
+            R::R12 => &mut r.r12,
+            R::R13 => &mut r.r13,
+            R::R14 => &mut r.r14,
+            R::R15 => &mut r.r15,
+            R::Rip => &mut r.rip,
+            R::Rflags => &mut r.rflags,
+            _ => {
+                let mut s = self.fd.get_sregs().map_err(kerr("KVM_GET_SREGS"))?;
+                match register {
+                    R::Cr0 => s.cr0 = value,
+                    R::Cr2 => s.cr2 = value,
+                    R::Cr3 => s.cr3 = value,
+                    R::Cr4 => s.cr4 = value,
+                    R::Efer => s.efer = value,
+                    _ => unreachable!(),
+                }
+                return self.fd.set_sregs(&s).map_err(kerr("KVM_SET_SREGS"));
+            }
+        };
+        *target = if register == R::Rflags {
+            value | 2
+        } else {
+            value
+        };
+        self.fd.set_regs(&r).map_err(kerr("KVM_SET_REGS"))
+    }
+    fn configure_debug(&mut self, config: &crate::debug::DebugConfig) -> Result<()> {
+        let debug = guest_debug(config)?;
+        self.fd
+            .set_guest_debug(&debug)
+            .map_err(kerr("KVM_SET_GUEST_DEBUG"))
+    }
+    fn index(&self) -> u32 {
+        self.index
+    }
+    fn arch_id(&self) -> u64 {
+        self.index as u64
+    }
+    // AP startup is owned by KVM (INIT/SIPI), as PSCI is on ARM.
+    fn in_kernel_psci(&self) -> bool {
+        true
+    }
+    fn kicker(&self) -> Arc<dyn VcpuKicker> {
+        self.kicker.clone()
+    }
     fn run(&mut self) -> Result<VcpuExit> {
-        self.smram_write.clear();
-        // Even an unsuccessful or kicked attempt ends fresh-reset eligibility.
         self.reset_entry.other_attempt()?;
-        self.check_smm_fault()?;
-        if self.smm_owners.is_some() && !self.initialized {
-            return Err(Error::Invalid("initialize restricted SMM CPU before running".into()));
-        }
-        if self.pending.is_some() {
-            return Err(Error::Invalid("complete the pending guest read before running".into()));
-        }
-        // A thread may own vCPUs from several VMs. Bind the one entering RUN,
-        // not merely whichever vCPU that thread constructed most recently.
+        if self.pending.is_some() { return Err(state_error("complete pending read before RUN")); }
         set_thread_run(self.fd.get_kvm_run() as *mut _);
         loop {
-            // Clear BEFORE testing the atomic flag: a kick arriving between
-            // that test and KVM_RUN must retain immediate_exit=1.
             self.fd.set_kvm_immediate_exit(0);
             if self.kicker.take() {
                 return Ok(VcpuExit::Kicked);
             }
-            let run = self.fd.get_kvm_run() as *mut kvm_bindings::kvm_run;
+            let run = self.fd.get_kvm_run() as *mut kvm_run;
             let result = self.fd.run();
-            // SAFETY: the live fd owns this mapping. flags is disjoint from
-            // the borrowed exit data. Read it from THIS successful RUN, before
-            // any other ioctl or pending-read publication; never GET_EVENTS.
-            let flags = if result.is_ok() { unsafe { (*run).flags } } else { 0 };
-            if result.is_ok() { self.last_run_smm = flags & KVM_RUN_X86_SMM as u16 != 0; }
-            return match result {
-                Ok(KExit::IoOut(port, data)) => {
-                    let len = data.len();
-                    if len > 4 { return Err(Error::Unsupported("multi-element/string x86 port I/O")); }
-                    let mut value = [0; 4];
-                    value[..len].copy_from_slice(data);
-                    self.pio_location(len)?;
-                    self.io_exit(flags, X86IoExit::PioOut { port, len, data: value })
-                }
-                Ok(KExit::IoIn(port, data)) => {
-                    let total = data.len();
-                    let (len, offset) = self.pio_location(total)?;
-                    let exit = self.io_exit(flags, X86IoExit::PioIn { port, len })?;
-                    self.pending = Some(PendingRead::Pio { len, offset });
-                    Ok(exit)
-                }
-                Ok(KExit::MmioWrite(addr, data)) => {
-                    let len = data.len();
-                    mmio_len(len)?;
-                    let mut value = [0; 8];
-                    value[..len].copy_from_slice(data);
-                    self.io_exit(flags, X86IoExit::MmioWrite { addr, len, data: value })
-                }
+            // SAFETY: the live fd owns this mapping; flags is disjoint from exit data.
+            if result.is_ok() && unsafe { (*run).flags } & KVM_RUN_X86_SMM as u16 != 0 {
+                return Err(Error::GuestFault("SMM exit on a non-SMM CPU".into()));
+            }
+            let exit = match result {
                 Ok(KExit::MmioRead(addr, data)) => {
                     let len = data.len();
-                    mmio_len(len)?;
-                    let exit = self.io_exit(flags, X86IoExit::MmioRead { addr, len })?;
-                    self.pending = Some(PendingRead::Mmio(len));
-                    Ok(exit)
+                    self.pending = Some(Read::Mmio(len));
+                    VcpuExit::MmioRead { addr, len }
                 }
-                Ok(KExit::Hlt) => Ok(VcpuExit::Halted),
-                Ok(KExit::Intr) => continue,
-                // On x86 this exit normally means a triple fault, not poweroff.
-                Ok(KExit::Shutdown) => Err(Error::GuestFault("x86 shutdown/triple fault".into())),
-                Ok(KExit::SystemEvent(KVM_SYSTEM_EVENT_SHUTDOWN, _)) => Ok(VcpuExit::SystemOff),
-                Ok(KExit::SystemEvent(KVM_SYSTEM_EVENT_RESET, _)) => Ok(VcpuExit::SystemReset),
-                Ok(other) => Err(Error::GuestFault(format!("unsupported x86 KVM exit {other:?}"))),
-                Err(e) if e.errno() == libc::EINTR || e.errno() == libc::EAGAIN => continue,
-                Err(e) => Err(kerr("KVM_RUN")(e)),
+                Ok(KExit::MmioWrite(addr, bytes)) => {
+                    let mut data = [0; 8];
+                    let len = bytes.len();
+                    data[..len].copy_from_slice(bytes);
+                    VcpuExit::MmioWrite { addr, len, data }
+                }
+                Ok(KExit::IoIn(port, bytes)) => {
+                    let len = bytes.len();
+                    let ptr = bytes.as_mut_ptr() as usize;
+                    let run = self.fd.get_kvm_run();
+                    // SAFETY: the exit was KVM_EXIT_IO.
+                    let io = unsafe { run.__bindgen_anon_1.io };
+                    let offset = ptr.checked_sub(run as *mut _ as usize).ok_or_else(|| state_error("PIO outside KVM mapping"))?;
+                    if ![1, 2, 4].contains(&io.size) || io.count == 0
+                        || usize::from(io.size).checked_mul(io.count as usize) != Some(len)
+                        || len > 65536 || offset.checked_add(len).is_none_or(|end| end > self.run_size) {
+                        return Err(state_error("invalid KVM PIO input span"));
+                    }
+                    self.pending = Some(Read::Pio { offset, len });
+                    if io.count == 1 { VcpuExit::PioIn { port, len } } else { VcpuExit::PioInBatch {
+                        port,
+                        size: io.size as usize,
+                        count: io.count as usize,
+                    } }
+                }
+                Ok(KExit::IoOut(port, bytes)) => {
+                    let data = bytes.to_vec();
+                    // SAFETY: the exit was KVM_EXIT_IO.
+                    let size = unsafe { self.fd.get_kvm_run().__bindgen_anon_1.io.size as usize };
+                    if ![1, 2, 4].contains(&size) || data.is_empty() || data.len() > 65536 || !data.len().is_multiple_of(size) {
+                        return Err(state_error("invalid KVM PIO output span"));
+                    }
+                    if data.len() == size {
+                        let mut value = [0; 4]; value[..size].copy_from_slice(&data);
+                        VcpuExit::PioOut { port, len: size, data: value }
+                    } else { VcpuExit::PioOutBatch { port, size, data } }
+                }
+                Ok(KExit::Shutdown) => return Err(Error::GuestFault("x86 shutdown/triple fault".into())),
+                Ok(KExit::Debug(info)) => {
+                    use crate::debug::{DebugReason, DebugStop};
+                    let watch = (0..4)
+                        .find(|&i| info.dr6 & (1 << i) != 0 && (info.dr7 >> (16 + i * 4)) & 3 != 0);
+                    let reason = if info.exception == 3 {
+                        DebugReason::SoftwareBreakpoint
+                    } else if watch.is_some() {
+                        DebugReason::Watchpoint
+                    } else if info.dr6 & (1 << 14) != 0 {
+                        DebugReason::SingleStep
+                    } else {
+                        DebugReason::Breakpoint
+                    };
+                    VcpuExit::Debug(DebugStop {
+                        cpu: self.index,
+                        pc: info.pc,
+                        syndrome: info.dr6,
+                        reason,
+                        fault_address: None,
+                    })
+                }
+                Ok(KExit::SystemEvent(ty, _)) => {
+                    if ty == KVM_SYSTEM_EVENT_RESET {
+                        VcpuExit::SystemReset
+                    } else {
+                        VcpuExit::SystemOff
+                    }
+                }
+                Ok(KExit::Hlt) | Ok(KExit::Intr) => continue,
+                Ok(KExit::InternalError) => {
+                    let regs = self.fd.get_regs().map_err(kerr("KVM_GET_REGS"))?;
+                    let sregs = self.fd.get_sregs().map_err(kerr("KVM_GET_SREGS"))?;
+                    // SAFETY: KVM_EXIT_INTERNAL_ERROR selects the internal arm.
+                    let internal = unsafe { self.fd.get_kvm_run().__bindgen_anon_1.internal };
+                    return Err(Error::GuestFault(format!("KVM internal error {}: rip={:#x}, cs={:#x}, cr0={:#x}, cr3={:#x}, data={:x?}", internal.suberror, regs.rip, sregs.cs.base, sregs.cr0, sregs.cr3, &internal.data[..(internal.ndata as usize).min(internal.data.len())])));
+                }
+                Ok(other) => {
+                    return Err(Error::GuestFault(format!(
+                        "unexpected x86 KVM exit {other:?}"
+                    )))
+                }
+                Err(e) if e.errno() == libc::EINTR || e.errno() == libc::EAGAIN => {
+                    continue;
+                }
+                Err(e) => return Err(kerr("KVM_RUN")(e)),
             };
+            return Ok(exit);
         }
     }
-
     fn complete_mmio_read(&mut self, data: &[u8]) -> Result<()> {
-        self.smram_write.clear();
-        self.check_smm_fault()?;
-        match check_completion(self.pending, true, data.len())? {
-            PendingRead::Mmio(len) => {
-                // SAFETY: a pending MMIO read owns this exit until completion.
-                unsafe { self.fd.get_kvm_run().__bindgen_anon_1.mmio.data[..len].copy_from_slice(data) };
-                self.pending = None;
-                Ok(())
-            }
-            _ => Err(Error::Invalid("no matching MMIO read or wrong completion length".into())),
+        let Some(Read::Mmio(len)) = self.pending.as_ref() else {
+            return Err(state_error("no MMIO read pending"));
+        };
+        if data.len() != *len {
+            return Err(state_error("wrong MMIO length"));
         }
-    }
-
-    fn complete_pio_in(&mut self, data: &[u8]) -> Result<()> {
-        self.smram_write.clear();
-        self.check_smm_fault()?;
-        match check_completion(self.pending, false, data.len())? {
-            PendingRead::Pio { len, offset } => {
-                let base = self.fd.get_kvm_run() as *mut _ as *mut u8;
-                // SAFETY: pio_location checked offset+len against the mmap
-                // length. Its live fd retains that writable mapping; no RUN
-                // or boot-register change is allowed while the read is pending.
-                unsafe { std::slice::from_raw_parts_mut(base.add(offset), len).copy_from_slice(data) };
-                self.pending = None;
-                Ok(())
-            }
-            _ => Err(Error::Invalid("no matching PIO read or wrong completion length".into())),
+        // SAFETY: last exit was MMIO, data fits the eight-byte field.
+        unsafe {
+            self.fd.get_kvm_run().__bindgen_anon_1.mmio.data[..*len].copy_from_slice(data);
         }
-    }
-
-    fn complete_hypercall(&mut self, _ret: [u64; 4]) -> Result<()> {
-        Err(Error::Unsupported("x86 userspace hypercalls"))
-    }
-
-    fn kicker(&self) -> Arc<dyn VcpuKicker> { self.kicker.clone() }
-
-    fn inject_smi(&mut self) -> Result<()> {
-        self.smram_write.clear();
-        self.check_smm_fault()?;
-        check_smi_ready(self.smm_owners.is_some(), self.initialized, self.pending.is_some(), self.last_run_smm)?;
-        // A failed injection never permits an ambiguous retry or RUN.
-        self.smm_faulted = true;
-        self.fd.smi().map_err(kerr("KVM_SMI"))?;
-        self.smm_faulted = false;
+        self.pending = None;
         Ok(())
     }
-
-    fn set_boot_regs(&mut self, regs: &BootRegs) -> Result<()> {
-        self.smram_write.clear();
-        self.check_smm_fault()?;
-        if self.last_run_smm { return Err(Error::Invalid("cannot replace boot registers while in SMM".into())); }
-        if let Err(error) = check_smm_boot(self.smm_owners.is_some(), regs) {
-            self.reset_entry.other_attempt()?;
-            return Err(error);
+    fn complete_pio_in(&mut self, data: &[u8]) -> Result<()> {
+        let Some(Read::Pio { offset, len }) = self.pending.as_ref() else {
+            return Err(state_error("no port read pending"));
+        };
+        if data.len() != *len {
+            return Err(state_error("wrong port read length"));
         }
+        let run = self.fd.get_kvm_run() as *mut _ as *mut u8;
+        // SAFETY: offset/len came from the IoIn slice of this live run mapping.
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), run.add(*offset), *len);
+        }
+        self.pending = None;
+        Ok(())
+    }
+    fn complete_hypercall(&mut self, _: [u64; 4]) -> Result<()> {
+        Err(Error::Unsupported("x86 hypercalls"))
+    }
+    fn set_boot_regs(&mut self, regs: &BootRegs) -> Result<()> {
         if matches!(regs, BootRegs::X86ResetVector) {
-            // Any previous RUN/boot attempt has already consumed eligibility.
-            // The helper keeps failures latched, including readback failures.
-            let result = initialize_reset_vector(&mut self.reset_entry, &mut self.fd, self.cpuid_signature);
-            if result.is_ok() { self.initialized = true; }
-            return result;
+            return initialize_reset_vector(&mut self.reset_entry, &mut self.fd, self.cpuid_signature);
         }
         self.reset_entry.other_attempt()?;
-        if self.pending.is_some() {
-            return Err(Error::Invalid("complete the pending guest read before changing boot state".into()));
+        if self.pending.is_some() { return Err(state_error("complete pending read before boot")); }
+        if matches!(regs, BootRegs::X86Reset) {
+            return Ok(());
         }
         let BootRegs::X86_64 { rip, rsi, cr3, gdt } = *regs else {
-            return Err(Error::Invalid("ARM boot registers on x86".into()));
+            return Err(state_error("x86 boot registers required"));
         };
-        validate_boot(rip, rsi, cr3, gdt)?;
+        crate::x86_64::validate_boot(rip, rsi, cr3, gdt)?;
         let mut s = self.fd.get_sregs().map_err(kerr("KVM_GET_SREGS"))?;
-        s.cs = segment(0x10, true);
-        s.ds = segment(0x18, false);
-        s.es = s.ds; s.fs = s.ds; s.gs = s.ds; s.ss = s.ds;
-        s.gdt.base = gdt; s.gdt.limit = 31;
-        s.cr0 = 0x8001_0033; // PG, WP, NE, ET, MP, PE
+        s.cr0 = 0x8000_0031;
         s.cr3 = cr3;
-        s.cr4 = 1 << 5; // PAE; no LA57 or guest VMX
-        s.efer = (1 << 8) | (1 << 10); // LME, LMA
+        s.cr4 = 0x20;
+        s.efer = 0x500;
+        s.gdt = kvm_dtable {
+            base: gdt,
+            limit: 31,
+            ..Default::default()
+        };
+        let code = kvm_segment {
+            limit: u32::MAX,
+            selector: 0x10,
+            type_: 11,
+            present: 1,
+            s: 1,
+            l: 1,
+            g: 1,
+            ..Default::default()
+        };
+        let data = kvm_segment {
+            selector: 0x18,
+            type_: 3,
+            l: 0,
+            db: 1,
+            ..code
+        };
+        s.cs = code;
+        s.ds = data;
+        s.es = data;
+        s.fs = data;
+        s.gs = data;
+        s.ss = data;
         self.fd.set_sregs(&s).map_err(kerr("KVM_SET_SREGS"))?;
-        self.fd.set_regs(&kvm_regs { rip, rsi, rflags: 2, ..Default::default() }).map_err(kerr("KVM_SET_REGS"))?;
-        self.fd.set_mp_state(kvm_mp_state { mp_state: KVM_MP_STATE_RUNNABLE }).map_err(kerr("KVM_SET_MP_STATE"))?;
-        self.initialized = true;
+        self.fd
+            .set_regs(&kvm_regs {
+                rip,
+                rsi,
+                rflags: 2,
+                ..Default::default()
+            })
+            .map_err(kerr("KVM_SET_REGS"))
+    }
+    fn save_state(&mut self) -> Result<VcpuState> {
+        let entries: Vec<_> = self
+            .msr_indices
+            .iter()
+            .map(|&index| kvm_msr_entry {
+                index,
+                ..Default::default()
+            })
+            .collect();
+        let mut msrs = Msrs::from_entries(&entries).map_err(state_error)?;
+        let count = self.fd.get_msrs(&mut msrs).map_err(kerr("KVM_GET_MSRS"))?;
+        if count != entries.len() {
+            return Err(state_error(format!(
+                "MSR save stopped at {:#x} ({count}/{})",
+                entries[count].index,
+                entries.len()
+            )));
+        }
+        let mp = self.fd.get_mp_state().map_err(kerr("KVM_GET_MP_STATE"))?;
+        let s = CpuState {
+            regs: self.fd.get_regs().map_err(kerr("KVM_GET_REGS"))?,
+            sregs: self.fd.get_sregs().map_err(kerr("KVM_GET_SREGS"))?,
+            xsave: self.fd.get_xsave().map_err(kerr("KVM_GET_XSAVE"))?,
+            xcrs: self.fd.get_xcrs().map_err(kerr("KVM_GET_XCRS"))?,
+            lapic: self.fd.get_lapic().map_err(kerr("KVM_GET_LAPIC"))?,
+            mp,
+            events: self
+                .fd
+                .get_vcpu_events()
+                .map_err(kerr("KVM_GET_VCPU_EVENTS"))?,
+            debug: self
+                .fd
+                .get_debug_regs()
+                .map_err(kerr("KVM_GET_DEBUGREGS"))?,
+            msrs: msrs.as_slice().to_vec(),
+        };
+        use crate::debug::{x86_state as S, X86Register as R};
+        let r = &s.regs;
+        let sr = &s.sregs;
+        let mut debug_regs = vec![
+            (R::Rax as u32, r.rax),
+            (R::Rbx as u32, r.rbx),
+            (R::Rcx as u32, r.rcx),
+            (R::Rdx as u32, r.rdx),
+            (R::Rsi as u32, r.rsi),
+            (R::Rdi as u32, r.rdi),
+            (R::Rbp as u32, r.rbp),
+            (R::Rsp as u32, r.rsp),
+            (R::R8 as u32, r.r8),
+            (R::R9 as u32, r.r9),
+            (R::R10 as u32, r.r10),
+            (R::R11 as u32, r.r11),
+            (R::R12 as u32, r.r12),
+            (R::R13 as u32, r.r13),
+            (R::R14 as u32, r.r14),
+            (R::R15 as u32, r.r15),
+            (R::Rip as u32, r.rip),
+            (R::Rflags as u32, r.rflags),
+            (R::Cr0 as u32, sr.cr0),
+            (R::Cr2 as u32, sr.cr2),
+            (R::Cr3 as u32, sr.cr3),
+            (R::Cr4 as u32, sr.cr4),
+            (R::Efer as u32, sr.efer),
+            (S::CS_BASE, sr.cs.base),
+            (S::GS_BASE, sr.gs.base),
+            (S::IDT_BASE, sr.idt.base),
+            (S::IDT_LIMIT, sr.idt.limit as u64),
+            (S::CS_SELECTOR, sr.cs.selector as u64),
+            (S::GS_SELECTOR, sr.gs.selector as u64),
+        ];
+        for &(index, id) in &[(0xc000_0082, S::LSTAR), (0xc000_0102, S::KERNEL_GS_BASE)] {
+            if let Some(msr) = s.msrs.iter().find(|m| m.index == index) {
+                debug_regs.push((id, msr.data));
+            }
+        }
+        Ok(VcpuState {
+            backend: "kvm-x86_64-v1".into(),
+            regs: debug_regs,
+            index: self.index,
+            powered_on: mp.mp_state != KVM_MP_STATE_UNINITIALIZED,
+            raw: vec![(0, serde_json::to_vec(&s).map_err(state_error)?)],
+            ..Default::default()
+        })
+    }
+    fn restore_state(&mut self, state: &VcpuState) -> Result<()> {
+        self.reset_entry.other_attempt()?;
+        if state.backend != "kvm-x86_64-v1"
+            || state.index != self.index
+            || state.raw.len() != 1
+            || state.raw[0].0 != 0
+        {
+            return Err(state_error("wrong backend or CPU"));
+        }
+        let s: CpuState = serde_json::from_slice(&state.raw[0].1).map_err(state_error)?;
+        self.fd.set_sregs(&s.sregs).map_err(kerr("KVM_SET_SREGS"))?;
+        let msrs = Msrs::from_entries(&s.msrs).map_err(state_error)?;
+        if self.fd.set_msrs(&msrs).map_err(kerr("KVM_SET_MSRS"))? != s.msrs.len() {
+            return Err(state_error("short MSR restore"));
+        }
+        self.fd.set_xcrs(&s.xcrs).map_err(kerr("KVM_SET_XCRS"))?;
+        self.fd.set_xsave(&s.xsave).map_err(kerr("KVM_SET_XSAVE"))?;
+        self.fd.set_lapic(&s.lapic).map_err(kerr("KVM_SET_LAPIC"))?;
+        self.fd.set_regs(&s.regs).map_err(kerr("KVM_SET_REGS"))?;
+        self.fd
+            .set_debug_regs(&s.debug)
+            .map_err(kerr("KVM_SET_DEBUGREGS"))?;
+        self.fd
+            .set_vcpu_events(&s.events)
+            .map_err(kerr("KVM_SET_VCPU_EVENTS"))?;
+        self.fd
+            .set_mp_state(s.mp)
+            .map_err(kerr("KVM_SET_MP_STATE"))?;
+        self.pending = None;
         Ok(())
     }
+}
 
-    fn arch_id(&self) -> u64 { 0 }
-
-    fn save_state(&mut self) -> Result<VcpuState> {
-        Err(Error::Unsupported("x86 CPU snapshots are not implemented"))
+fn guest_debug(config: &crate::debug::DebugConfig) -> Result<kvm_guest_debug> {
+    let mut d = kvm_guest_debug::default();
+    if !config.enabled {
+        return Ok(d);
     }
-
-    fn restore_state(&mut self, _state: &VcpuState) -> Result<()> {
-        Err(Error::Unsupported("x86 CPU snapshots are not implemented"))
+    if config.trap_brk_immediate.is_some() {
+        return Err(Error::Unsupported("ARM64 BRK immediate on x86"));
     }
+    if config.breakpoints.len() + config.watchpoints.len() > 4 {
+        return Err(Error::Invalid(
+            "x86 has four shared execution/data breakpoint slots".into(),
+        ));
+    }
+    d.control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_HW_BP;
+    if config.single_step {
+        d.control |= KVM_GUESTDBG_SINGLESTEP;
+    }
+    if config.trap_software_breakpoints {
+        d.control |= KVM_GUESTDBG_USE_SW_BP;
+    }
+    let mut dr7 = 0x400u64;
+    for (i, &address) in config.breakpoints.iter().enumerate() {
+        d.arch.debugreg[i] = address;
+        dr7 |= 1 << (i * 2);
+    }
+    for (n, w) in config.watchpoints.iter().enumerate() {
+        let i = config.breakpoints.len() + n;
+        if !matches!(w.size, 1 | 2 | 4 | 8) || w.address % u64::from(w.size) != 0 || !w.write {
+            return Err(Error::Invalid(
+                "x86 watchpoints need aligned 1/2/4/8 bytes and write or read+write (no read-only)"
+                    .into(),
+            ));
+        }
+        let length = match w.size {
+            1 => 0,
+            2 => 1,
+            4 => 3,
+            8 => 2,
+            _ => unreachable!(),
+        };
+        let access = if w.read { 3 } else { 1 };
+        d.arch.debugreg[i] = w.address;
+        dr7 |= 1 << (i * 2);
+        dr7 |= (access | (length << 2)) << (16 + i * 4);
+    }
+    d.arch.debugreg[7] = dr7;
+    Ok(d)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn flat_linux64_segment_cache_matches_the_gdt() {
-        let code = segment(0x10, true);
-        let data = segment(0x18, false);
-        assert_eq!((code.limit, data.limit), (u32::MAX, u32::MAX));
-        assert_eq!((code.selector, code.l, code.db), (0x10, 1, 0));
-        assert_eq!((data.selector, data.l, data.db), (0x18, 0, 1));
+    fn debug_slots_and_watch_encodings() {
+        use crate::debug::{DebugConfig, Watchpoint};
+        let mut c = DebugConfig {
+            enabled: true,
+            breakpoints: vec![0x1001],
+            watchpoints: vec![Watchpoint {
+                address: 0x2000,
+                size: 8,
+                read: true,
+                write: true,
+            }],
+            ..Default::default()
+        };
+        let d = guest_debug(&c).unwrap();
+        assert_eq!(&d.arch.debugreg[..2], &[0x1001, 0x2000]);
+        assert_eq!((d.arch.debugreg[7] >> 20) & 15, 11);
+        c.breakpoints = vec![1, 2, 3, 4];
+        assert!(guest_debug(&c).is_err());
+        c.breakpoints.clear();
+        c.watchpoints[0].write = false;
+        assert!(guest_debug(&c).is_err());
+        c.watchpoints[0].write = true;
+        c.watchpoints[0].address = 0x2001;
+        assert!(guest_debug(&c).is_err());
+        c.enabled = false;
+        assert_eq!(guest_debug(&c).unwrap().control, 0);
     }
-
     #[test]
-    fn cpuid_is_single_cpu_without_guest_virtualization() {
-        use kvm_bindings::kvm_cpuid_entry2 as Entry;
-        let mut cpuid = CpuId::from_entries(&[
-            Entry { function: 1, ebx: u32::MAX, ecx: 1 << 5, edx: (1 << 6) | (1 << 28), ..Default::default() },
-            Entry { function: 0x8000_0001, ecx: 1 << 2, edx: 1 << 29, ..Default::default() },
-            Entry { function: 0xb, index: 0, eax: 5, ebx: 32, edx: 12, ..Default::default() },
-            Entry { function: 0x8000_000a, eax: 1, edx: u32::MAX, ..Default::default() },
-        ]).unwrap();
-        configure_cpuid(&mut cpuid).unwrap();
-        let entries = cpuid.as_slice();
-        assert_eq!(entries[0].ebx >> 16, 1);
-        assert_eq!(entries[0].ecx & (1 << 5), 0);
-        assert_eq!(entries[0].edx & (1 << 28), 0);
-        assert_eq!(entries[1].ecx & (1 << 2), 0);
-        assert_eq!((entries[2].eax, entries[2].ebx, entries[2].edx), (0, 1, 0));
-        assert_eq!((entries[3].eax, entries[3].edx), (0, 0));
-        let mut absent = CpuId::from_entries(&[]).unwrap();
-        assert!(configure_cpuid(&mut absent).is_err());
+    fn pc_irq0_override_matches_routing() {
+        let routes = pc_routes();
+        assert_eq!(routes.nr, 40);
+        for e in &routes.entries {
+            // SAFETY: pc_routes only creates IRQCHIP entries.
+            let chip = unsafe { e.u.irqchip };
+            if chip.irqchip == KVM_IRQCHIP_IOAPIC {
+                assert_eq!(
+                    chip.pin,
+                    match e.gsi {
+                        0 => 2,
+                        2 => 0,
+                        n => n,
+                    }
+                );
+            }
+        }
+        assert_eq!(
+            std::mem::offset_of!(PcRoutes, entries),
+            std::mem::size_of::<kvm_irq_routing>()
+        );
     }
 }

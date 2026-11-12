@@ -1,4 +1,5 @@
-//! Native vroom-hv backend/control smoke. No OS, firmware or snapshots.
+//! Native vroom-hv backend/control smoke with initial CPU state capture.
+//! No OS, firmware or snapshot restore.
 //! Linux x86_64 with /dev/kvm only; deliberately no emulation fallback.
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -57,7 +58,7 @@ fn main() {
     memory.write(GuestAddress(0x10000), &code).expect("code");
     vm.map_memory(&memory).expect("map RAM");
     let mut cpu = vm.create_vcpu(0).expect("vCPU");
-    assert!(matches!(cpu.save_state(), Err(Error::Unsupported(_))));
+    cpu.save_state().expect("PC CPU state is snapshot-capable");
     cpu.set_boot_regs(&BootRegs::X86_64 { rip: 0x10000, rsi: 0, cr3: 0x1000, gdt: 0x5000 }).expect("Linux64 entry");
     vm.finalize().expect("finalize");
 

@@ -1,6 +1,11 @@
 # vroom-vroom
 
-Linux and Windows VMs on Apple Silicon Macs and arm64 Linux. Rust. The VMM sandboxes itself before the guest starts; every device treats the guest as hostile.
+Run Linux and Windows VMs on your Mac (Apple Silicon) or on arm64 Linux.
+
+An experimental x86-64 Linux/KVM board is also available; see
+[x86-64 setup and validation](docs/X86_64.md) for requirements and current limits.
+Written in Rust. The VM process locks itself down before the guest starts,
+and every virtual device treats the guest as hostile.
 
 ![The app](docs/img/app.png)
 
@@ -59,7 +64,10 @@ Linux and Windows VMs on Apple Silicon Macs and arm64 Linux. Rust. The VMM sandb
 - Linux guests, opt-in: hardware video decode (H.264, HEVC, VP9, AV1), encode (H.264, HEVC); Firefox, Chrome, FFmpeg use them
 - disk and network I/O measured against QEMU: [PERFORMANCE.md](docs/PERFORMANCE.md)
 
-Not yet: x86_64 hosts (builds, can't run VMs).
+Linux x86-64/KVM is experimental: Windows 11 x64 installation, desktop,
+USB input and installer-free cold boot have been tested with 2D graphics.
+See [x86-64 limits](docs/X86_64.md); the full Mac feature list above does
+not yet apply to that board. Secure Boot is not yet supported.
 
 ## Build
 

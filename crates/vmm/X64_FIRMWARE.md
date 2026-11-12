@@ -1,10 +1,14 @@
 # Native x64 firmware: owned preflight only
 
-The production `Vmm::start` x64 branch can validate and own inputs for a
+The production `Vmm::start` x64 `os = "other"` branch can validate and own inputs for a
 future first-EFI board. **Even valid inputs return `native x64 firmware
 execution is not enabled`, before creating VM state or a VM.** Invalid
 inputs return their preflight errors. The existing direct-Linux x64 board
 and ARM firmware path are unchanged.
+
+Linux and Windows UEFI configs instead use the separate experimental full
+PC board; see [docs/X86_64.md](../../docs/X86_64.md). That board does not
+enable this restricted SMM firmware profile or claim Secure Boot support.
 
 This preflight requires x64 KVM, the default feature set, one CPU, nominal
 512 MiB RAM, `BootPaused`, sandboxing, explicit `os = "other"`, default

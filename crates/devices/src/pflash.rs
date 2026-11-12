@@ -19,6 +19,9 @@ const MAX_BUF_WORDS: u32 = 256;
 enum Mode {
     ReadArray,
     Status,
+    /// QEMU's byte-wide flash returns zero after CLEAR_STATUS. OVMF
+    /// uses that response to distinguish flash from RAM and ROM.
+    PcClearedStatus,
     Id,
     Cfi,
     /// Next write is the data word.
@@ -43,6 +46,7 @@ struct State {
 
 pub struct PFlash {
     base: u64,
+    pc: bool,
     data: Vec<u8>,
     file: Option<File>,
     st: State,
@@ -106,7 +110,41 @@ impl PFlash {
             return Err("bad flash size".into());
         }
         contents.resize(size as usize, 0xff);
-        Ok(PFlash { base, data: contents, file, st: State { mode: Mode::ReadArray, buf: Vec::new() }, restored: None })
+        Ok(PFlash { base, pc: false, data: contents, file, st: State { mode: Mode::ReadArray, buf: Vec::new() }, restored: None })
+    }
+
+    /// OVMF's byte-wide Intel flash with 4 KiB erase blocks.
+    pub fn new_pc(base: u64, contents: Vec<u8>, file: Option<File>) -> Result<Self, String> {
+        if contents.is_empty() || !contents.len().is_multiple_of(4096) { return Err("bad PC flash size".into()); }
+        Ok(Self { base, pc: true, data: contents, file, st: State { mode: Mode::ReadArray, buf: Vec::new() }, restored: None })
+    }
+
+    fn write_pc(&mut self, offset: u64, data: &[u8]) {
+        let Some(&cmd) = data.first() else { return; };
+        let off = offset as usize;
+        if off.checked_add(data.len()).is_none_or(|end| end > self.data.len()) { return; }
+        self.st.mode = match self.st.mode {
+            Mode::WordProgram => {
+                for (dst, src) in self.data[off..off+data.len()].iter_mut().zip(data) { *dst &= src; }
+                self.persist(offset, data.len()); Mode::Status
+            }
+            Mode::EraseSetup => {
+                if cmd == 0xd0 {
+                    let start = off & !4095;
+                    self.data[start..start+4096].fill(0xff); self.persist(start as u64, 4096);
+                }
+                Mode::Status
+            }
+            Mode::LockSetup => Mode::Status,
+            mode => match cmd {
+                0xff => Mode::ReadArray,
+                0x50 => Mode::PcClearedStatus,
+                0x70 => if mode == Mode::PcClearedStatus { mode } else { Mode::Status },
+                0x90 => Mode::Id,
+                0x10 | 0x40 => Mode::WordProgram, 0x20 => Mode::EraseSetup, 0x60 => Mode::LockSetup,
+                _ => mode,
+            }
+        };
     }
 
     fn persist(&mut self, off: u64, len: usize) {
@@ -137,6 +175,10 @@ impl PFlash {
 
 impl BusDevice for PFlash {
     fn read(&mut self, offset: u64, data: &mut [u8]) {
+        if self.pc && self.st.mode != Mode::ReadArray {
+            put_le(data, if self.st.mode == Mode::Id { if offset == 0 { 0x89 } else { 0x18 } } else if self.st.mode == Mode::PcClearedStatus { 0 } else { 0x80 });
+            return;
+        }
         match self.st.mode {
             Mode::ReadArray => {
                 let o = offset as usize;
@@ -162,6 +204,7 @@ impl BusDevice for PFlash {
     }
 
     fn write(&mut self, offset: u64, data: &[u8]) {
+        if self.pc { self.write_pc(offset, data); return; }
         let v = get_le(data) as u32;
         let cmd = v as u8;
         let mode = self.st.mode;
@@ -319,6 +362,29 @@ impl Snapshottable for PFlash {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pc_flash_program_and_erase_are_byte_wide() {
+        use super::*;
+        let mut f = PFlash::new_pc(0xffc00000, vec![0xff; 8192], None).unwrap();
+        f.write(4097, &[0x10]); f.write(4097, &[0x12]);
+        let mut byte = [0]; f.read(4097, &mut byte); assert_eq!(byte, [0x80]);
+        f.write(0, &[0xff]); f.read(4097, &mut byte); assert_eq!(byte, [0x12]);
+        let saved = f.save().unwrap();
+        f.write(4097, &[0x20]); f.write(4097, &[0xd0]); f.write(0, &[0xff]);
+        f.read(4097, &mut byte); assert_eq!(byte, [0xff]);
+        f.restore(&saved).unwrap(); f.read(4097, &mut byte); assert_eq!(byte, [0x12]);
+    }
+
+    #[test]
+    fn ovmf_flash_detection_restores_array_mode() {
+        use super::*;
+        let mut contents = vec![0xff;8192]; contents[16] = 0x8d;
+        let mut f = PFlash::new_pc(0xffc00000, contents, None).unwrap();
+        let mut byte = [0];
+        f.write(16, &[0x50]); f.read(16, &mut byte); assert_eq!(byte, [0]);
+        f.write(16, &[0x70]); f.read(16, &mut byte); assert_eq!(byte, [0]);
+        f.write(16, &[0xff]); f.read(16, &mut byte); assert_eq!(byte, [0x8d]);
+    }
     use super::*;
 
     fn w(f: &mut PFlash, off: u64, v: u32) {

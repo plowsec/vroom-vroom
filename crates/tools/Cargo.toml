@@ -11,8 +11,6 @@ vroom-proto.workspace = true
 vroom-config.workspace = true
 vroom-block.workspace = true
 sha2 = "0.10"
-
-[dev-dependencies]
 tempfile = "3"
 
 [lints]

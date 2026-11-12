@@ -13,6 +13,8 @@ mod aarch64;
 mod gic;
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
+#[cfg(target_arch = "x86_64")]
+mod x86_64_smm;
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -249,7 +251,11 @@ impl Vm for KvmVm {
                 s.smm_memory()?.seal()?;
                 Some(self.slots.clone())
             } else { None };
-            Ok(Box::new(x86_64::KvmVcpu::new(&self.fd, index, self.vcpus, owners)?))
+            if owners.is_some() {
+                Ok(Box::new(x86_64_smm::KvmVcpu::new(&self.fd, index, self.vcpus, owners)?))
+            } else {
+                Ok(Box::new(x86_64::KvmVcpu::new(&self.fd, index, self.vcpus)?))
+            }
         }
     }
 
@@ -308,13 +314,16 @@ impl Vm for KvmVm {
                 Ok(crate::IrqChipState { backend: "kvm-vgicv3".into(), blob: gic::save(dev, self.vcpus, aarch64::NR_IRQS)? })
             }
             #[cfg(target_arch = "x86_64")]
-            Chip::Ioapic => Err(Error::Unsupported("x86 irqchip save")),
+            Chip::Ioapic => {
+                if self.slots.lock().unwrap_or_else(|e| e.into_inner()).smm_setup.requested {
+                    return Err(Error::Unsupported("restricted SMM irqchip snapshots"));
+                }
+                Ok(crate::IrqChipState { backend: "kvm-x86_64-v1".into(), blob: x86_64::save_chip(&self.fd)? })
+            }
         }
     }
 
     fn restore_irqchip(&self, s: &crate::IrqChipState) -> Result<()> {
-        #[cfg(target_arch = "x86_64")]
-        let _ = s;
         match &self.chip {
             #[cfg(target_arch = "aarch64")]
             Chip::Gic(dev) => {
@@ -324,7 +333,13 @@ impl Vm for KvmVm {
                 gic::restore(dev, &s.blob)
             }
             #[cfg(target_arch = "x86_64")]
-            Chip::Ioapic => Err(Error::Unsupported("x86 irqchip restore")),
+            Chip::Ioapic => {
+                if self.slots.lock().unwrap_or_else(|e| e.into_inner()).smm_setup.requested {
+                    return Err(Error::Unsupported("restricted SMM irqchip restore"));
+                }
+                if s.backend != "kvm-x86_64-v1" { return Err(Error::Invalid("wrong x86 irqchip backend".into())); }
+                x86_64::restore_chip(&self.fd, &s.blob)
+            }
         }
     }
 }

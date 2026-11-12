@@ -176,6 +176,16 @@ pub struct AcpiBlobs {
 /// Lay out tables, build XSDT + RSDP and the loader script.
 /// `dsdt` is pointed to by the FADT (`fadt_dsdt_offset` = X_DSDT field).
 pub fn assemble(ids: &AcpiIds, fadt: Vec<u8>, fadt_dsdt_offset: usize, dsdt: Vec<u8>, others: Vec<Vec<u8>>) -> AcpiBlobs {
+    assemble_inner(ids, fadt, fadt_dsdt_offset, dsdt, others, false)
+}
+
+/// PC ACPI includes the firmware control structure for the global lock
+/// and waking vectors, even though suspend-to-RAM is not advertised.
+pub fn assemble_pc(ids: &AcpiIds, fadt: Vec<u8>, dsdt: Vec<u8>, others: Vec<Vec<u8>>) -> AcpiBlobs {
+    assemble_inner(ids, fadt, 140, dsdt, others, true)
+}
+
+fn assemble_inner(ids: &AcpiIds, fadt: Vec<u8>, fadt_dsdt_offset: usize, dsdt: Vec<u8>, others: Vec<Vec<u8>>, facs: bool) -> AcpiBlobs {
     let mut tables = Vec::new();
     let mut ld = Loader::default();
     ld.allocate(RSDP_FILE, 16, 2);
@@ -194,9 +204,18 @@ pub fn assemble(ids: &AcpiIds, fadt: Vec<u8>, fadt_dsdt_offset: usize, dsdt: Vec
 
     let dsdt_at = place(dsdt, &mut tables);
     let mut fadt = fadt;
+    let facs_at = if facs {
+        while !tables.len().is_multiple_of(64) { tables.push(0); }
+        let off = tables.len() as u32;
+        let mut facs = [0u8;64]; facs[..4].copy_from_slice(b"FACS"); facs[4..8].copy_from_slice(&64u32.to_le_bytes()); facs[32] = 2;
+        tables.extend_from_slice(&facs);
+        fadt[132..140].copy_from_slice(&(off as u64).to_le_bytes());
+        Some(off)
+    } else { None };
     fadt[fadt_dsdt_offset..fadt_dsdt_offset + 8].copy_from_slice(&(dsdt_at.0 as u64).to_le_bytes());
     let fadt_at = place(fadt, &mut tables);
     ld.add_pointer(TABLES_FILE, TABLES_FILE, fadt_at.0 + fadt_dsdt_offset as u32, 8);
+    if facs_at.is_some() { ld.add_pointer(TABLES_FILE, TABLES_FILE, fadt_at.0 + 132, 8); }
 
     let mut placed = vec![fadt_at];
     for t in others {
@@ -235,7 +254,7 @@ pub fn assemble(ids: &AcpiIds, fadt: Vec<u8>, fadt_dsdt_offset: usize, dsdt: Vec
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Run the loader like firmware would, at a fake base address.

@@ -19,6 +19,9 @@
 # offers an update to guests whose agent is older.
 set -e
 cd "$(dirname "$0")/.."
+if [ "$(uname -s)" = Linux ]; then
+  exec sh scripts/make-guest-tools-linux.sh "$@"
+fi
 . scripts/stamp.sh
 out=target/guest-tools
 lin=target/aarch64-unknown-linux-musl/release/vroom-agent

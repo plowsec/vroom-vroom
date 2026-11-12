@@ -545,7 +545,7 @@ fn reset_vector_initialization_is_acknowledged_parked_and_failure_never_runs() {
         let (events, _events_rx) = mpsc::channel();
         let shared = Arc::new(VcpuShared {
             vm: Arc::new(FakeVm { counts: counts.clone(), memory: Mutex::new(None), kernel_psci: false }),
-            mmio: vroom_devices::BusBuilder::new().build(), pio: None,
+            mmio: vroom_devices::BusBuilder::new().build(), pio: None, pc_pio: None, unmapped_mmio: 0,
             cpus: Mutex::new(psci::CpuTable::new(vec![0])), events, peers: Default::default(),
             run_calls: Default::default(), device_exits: Default::default(),
             halt_on_stop: Default::default(), halting: Default::default(),
@@ -598,7 +598,7 @@ fn failed_worker_cold_start_cannot_retry_or_accept_state_commands() {
     let shared = Arc::new(VcpuShared {
         vm,
         mmio: vroom_devices::BusBuilder::new().build(),
-        pio: None,
+        pio: None, pc_pio: None, unmapped_mmio: 0,
         cpus: Mutex::new(psci::CpuTable::new(vec![0])),
         events,
         peers: Default::default(),
@@ -720,7 +720,7 @@ fn startup_shared(counts: &Arc<Counts>) -> Arc<VcpuShared> {
     let (events, _) = mpsc::channel();
     Arc::new(VcpuShared {
         vm: Arc::new(FakeVm { counts: counts.clone(), memory: Mutex::new(None), kernel_psci: false }),
-        mmio: vroom_devices::BusBuilder::new().build(), pio: None,
+        mmio: vroom_devices::BusBuilder::new().build(), pio: None, pc_pio: None, unmapped_mmio: 0,
         cpus: Mutex::new(psci::CpuTable::new(vec![0])), events, peers: Default::default(),
         run_calls: Default::default(), device_exits: Default::default(),
         halt_on_stop: Default::default(), halting: Default::default(),

@@ -109,6 +109,82 @@ fn has_platform_key(store: &[u8]) -> bool {
 }
 
 impl Firmware {
+    /// Standard OVMF CODE/VARS pair, ending at the x86 reset vector.
+    #[allow(clippy::too_many_arguments)]
+    pub fn setup_x86(
+        &self, vm: &Arc<dyn Vm>, mem: &GuestMemory, reg: &mut DeviceRegistry,
+        cpus: u32, ram: u64, tpm: bool, screen: Option<Weak<FbSink>>,
+        smbios: &vroom_arch::smbios::SmbiosConfig, ids: &vroom_arch::acpi::AcpiIds,
+    ) -> Result<()> {
+        use vroom_arch::x86_64::{acpi as pc_acpi, pc_layout as pc};
+        if self.secure_boot { return Err(Error::Unavailable("Secure Boot is unavailable on the experimental PC board")); }
+        // Prefer the current 4 MiB format, matching the vars template.
+        const PAIRS: &[(&str, &str)] = &[
+            ("/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF_VARS_4M.fd"),
+            ("/usr/share/OVMF/x64/OVMF_CODE.4m.fd", "/usr/share/OVMF/x64/OVMF_VARS.4m.fd"),
+            ("/usr/share/edk2/x64/OVMF_CODE.4m.fd", "/usr/share/edk2/x64/OVMF_VARS.4m.fd"),
+            ("/usr/share/edk2/ovmf/OVMF_CODE.fd", "/usr/share/edk2/ovmf/OVMF_VARS.fd"),
+            ("/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/OVMF/OVMF_VARS.fd"),
+        ];
+        let code_path = self.code.clone().or_else(|| PAIRS.iter().map(|p| PathBuf::from(p.0)).find(|p| p.is_file()))
+            .ok_or_else(|| Error::Setup("no OVMF firmware; install ovmf/edk2-ovmf or set boot.firmware".into()))?;
+        let code = std::fs::read(&code_path)?;
+        if code.is_empty() || code.len() > 16 << 20 || !code.len().is_multiple_of(4096) {
+            return Err(Error::Setup("OVMF CODE must be a nonempty page-aligned image <=16 MiB".into()));
+        }
+        if !self.vars.exists() {
+            let template = PAIRS.iter().find(|(c, _)| Path::new(c) == code_path).map(|(_, v)| PathBuf::from(v))
+                .or_else(|| {
+                    let name = code_path.file_name()?.to_str()?.replace("CODE", "VARS");
+                    Some(code_path.with_file_name(name))
+                }).filter(|p| p.is_file())
+                .ok_or_else(|| Error::Setup("OVMF needs a matching initialized VARS template; supply boot.vars or place OVMF_VARS beside CODE".into()))?;
+            let contents = std::fs::read(template)?;
+            if let Some(dir) = self.vars.parent() { std::fs::create_dir_all(dir)?; }
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+            let file = options.open(&self.vars)?;
+            std::io::Write::write_all(&mut &file, &contents)?;
+        }
+        let vars = std::fs::read(&self.vars)?;
+        let total = code.len() + vars.len();
+        if vars.is_empty() || !vars.len().is_multiple_of(4096) || ![2 << 20, 4 << 20].contains(&total) {
+            return Err(Error::Setup("OVMF CODE and VARS must form a matching 2 or 4 MiB flash image".into()));
+        }
+        let code_base = (1u64 << 32) - code.len() as u64;
+        let region = Arc::new(MmapRegion::new(code.len())?); region.load(&code)?;
+        vm.map_readonly(code_base, region)?;
+        let vars_base = (1u64 << 32) - total as u64;
+        let file = std::fs::OpenOptions::new().read(true).write(true).open(&self.vars)?;
+        let flash = PFlash::new_pc(vars_base, vars, Some(file)).map_err(Error::Setup)?;
+        reg.add(vars_base, total as u64 - code.len() as u64, Arc::new(Mutex::new(flash)))?;
+        let mut fw = FwCfg::new_pio(mem.clone(), cpus as u16, ram);
+        fw.skip_boot_menu().map_err(Error::Setup)?;
+        fw.set(0x8000, 0u32.to_le_bytes().to_vec()); // no legacy ACPI tables
+        fw.set(0x8002, 1u32.to_le_bytes().to_vec()); // IRQ0 override
+        let tables = pc_acpi::build(cpus, tpm, ids, ram);
+        fw.add_file(RSDP_FILE, tables.rsdp, None).map_err(Error::Setup)?;
+        fw.add_file(TABLES_FILE, tables.tables, None).map_err(Error::Setup)?;
+        fw.add_file(LOADER_FILE, tables.loader, None).map_err(Error::Setup)?;
+        fw.add_file("etc/e820", pc::firmware_e820(ram)?, None).map_err(Error::Setup)?;
+        // Keep firmware allocation and ACPI's aperture in agreement.
+        fw.add_file("opt/ovmf/X-PciMmio64Mb", b"32768".to_vec(), None).map_err(Error::Setup)?;
+        fw.add_file("etc/boot-fail-wait", 0u32.to_le_bytes().to_vec(), None).map_err(Error::Setup)?;
+        let sm = vroom_arch::smbios::build(smbios);
+        fw.add_file(vroom_arch::smbios::TABLES_FILE, sm.tables, None).map_err(Error::Setup)?;
+        fw.add_file(vroom_arch::smbios::ANCHOR_FILE, sm.anchor, None).map_err(Error::Setup)?;
+        if let Some(fb) = screen {
+            let cfg = Arc::new(Mutex::new(None)); let c2 = cfg.clone(); let m2 = mem.clone();
+            fw.add_file(ramfb::FILE, vec![0; ramfb::CONFIG_LEN], Some(Box::new(move |d| {
+                *c2.lock().unwrap_or_else(|e| e.into_inner()) = ramfb::parse(d, &m2);
+            }))).map_err(Error::Setup)?;
+            ramfb::spawn(mem.clone(), cfg, fb)?;
+        }
+        reg.add_pio(pc::FW_CFG_PORT, 12, Arc::new(Mutex::new(fw)))?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn setup(
         &self,

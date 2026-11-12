@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
 use std::sync::Condvar;
 use vroom_config::{Boot, Disk, GuestOs, Serial};
 use vroom_hv::{Arch, IrqChipConfig, IrqChipInfo, Vcpu, VcpuExit, VcpuKicker, VcpuState, VmParams};
+#[cfg(not(feature = "research"))]
 use vroom_memory::GuestAddress;
 
 #[derive(Debug, Default)]
@@ -104,6 +105,33 @@ fn fixture(root: &Path) -> (VmConfig, VmmOptions, Arc<TestHv>, Arc<Probe>) {
     let p = Arc::new(Probe::default()); (c, o, Arc::new(TestHv(p.clone())), p)
 }
 #[test]
+fn full_pc_and_reference_profiles_have_distinct_selection() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, _, _, _) = fixture(temp.path());
+    assert!(machine_x86::is_reference(&config));
+    config.virtio_transport = vroom_config::Transport::Pci;
+    assert!(!machine_x86::is_reference(&config));
+    config.boot = Boot::Uefi { firmware: None, vars: temp.path().join("vars"), secure_boot: false };
+    config.virtio_transport = vroom_config::Transport::Auto;
+    for os in [GuestOs::Linux, GuestOs::Windows] {
+        config.os = Some(os);
+        assert!(!machine_x86::is_reference(&config));
+    }
+    config.os = Some(GuestOs::Other);
+    assert!(machine_x86::is_reference(&config));
+}
+
+#[test]
+#[cfg(feature = "research")]
+fn reference_profile_rejects_research_before_state_or_vm_creation() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, opts, hv, probe) = fixture(temp.path());
+    assert!(matches!(Vmm::start(config, hv, opts), Err(Error::Setup(reason)) if reason.contains("default VMM feature set")));
+    assert_eq!(probe.creates.load(SeqCst), 0);
+    assert!(!temp.path().join("state").exists());
+}
+
+#[test]
 fn strict_profile_rejections_precede_state_and_vm_creation() {
     let temp = tempfile::tempdir().unwrap();
     let variants: Vec<Box<dyn Fn(&mut VmConfig)>> = vec![
@@ -112,9 +140,9 @@ fn strict_profile_rejections_precede_state_and_vm_creation() {
         Box::new(|c| c.nets.push(serde_json::from_value(serde_json::json!({"mode": "nat"})).unwrap())),
         Box::new(|c| c.audio.output = true), Box::new(|c| c.clipboard.host_to_guest = true),
         Box::new(|c| c.display.gpu = vroom_config::Gpu::Virtio2d), Box::new(|c| c.identity.product = "custom".into()),
-        Box::new(|c| c.virtio_transport = vroom_config::Transport::Pci), Box::new(|c| c.os = Some(GuestOs::Windows)),
+        Box::new(|c| c.os = Some(GuestOs::Windows)),
         Box::new(|c| c.serial = Serial::File { path: "must-not-create".into() }),
-        Box::new(|c| c.disks.push(Disk { path: "must-not-open".into(), readonly: false, format: Default::default(), cdrom: false, bus: Default::default(), sync: Default::default() })),
+        Box::new(|c| c.disks.push(Disk { path: "must-not-open".into(), readonly: false, format: Default::default(), cdrom: false, bus: Default::default(), sync: Default::default(), backing_dirs: Vec::new() })),
         Box::new(|c| c.shares.push(vroom_config::Share { path: "must-not-open".into(), tag: "share".into(), readonly: true })),
         Box::new(|c| c.usb.push(vroom_config::Usb { id: "1234:5678".into(), serial: None, name: None, mode: Default::default(), readonly: true })),
         Box::new(|c| c.boot = Boot::Uefi { firmware: None, vars: "must-not-create".into(), secure_boot: true }),
@@ -150,6 +178,7 @@ fn invalid_or_unbounded_boot_input_fails_before_state_creation() {
     }
 }
 #[test]
+#[cfg(not(feature = "research"))] // The reference board rejects research builds by design.
 fn public_vmm_boot_paused_uses_real_worker_counter_and_cold_only_controls() {
     let temp = tempfile::tempdir().unwrap(); let (c, o, hv, p) = fixture(temp.path());
     let mut vm = Vmm::start(c, hv, o).unwrap(); assert_eq!(vm.state(), RunState::Paused);
@@ -170,6 +199,7 @@ fn public_vmm_boot_paused_uses_real_worker_counter_and_cold_only_controls() {
     vm.shutdown_checked().unwrap(); assert_eq!(vm.state(), RunState::Stopped); assert_eq!(p.drops.load(SeqCst), 1);
 }
 #[test]
+#[cfg(not(feature = "research"))]
 fn initialization_and_finalization_failures_stop_without_run_or_saved_state() {
     for finalize in [false, true] {
         let temp = tempfile::tempdir().unwrap(); let (c, o, hv, p) = fixture(temp.path());
@@ -178,8 +208,10 @@ fn initialization_and_finalization_failures_stop_without_run_or_saved_state() {
         assert_eq!(p.state_calls.load(SeqCst), 0); assert_eq!(p.drops.load(SeqCst), 1);
     }
 }
+#[cfg(not(feature = "research"))]
 fn out(port: u16, byte: u8) -> VcpuExit { VcpuExit::PioOut { port, len: 1, data: [byte, 0, 0, 0] } }
 #[test]
+#[cfg(not(feature = "research"))]
 fn irq_failure_during_pio_read_stops_before_completion_or_another_run() {
     let temp = tempfile::tempdir().unwrap(); let (c, o, hv, p) = fixture(temp.path());
     p.fail_irq_low.store(true, SeqCst);
@@ -190,6 +222,7 @@ fn irq_failure_during_pio_read_stops_before_completion_or_another_run() {
     assert!(p.completions.lock().unwrap().is_empty()); assert_eq!(*p.irqs.lock().unwrap(), vec![(4, true), (4, false)]); vm.shutdown();
 }
 #[test]
+#[cfg(not(feature = "research"))]
 fn serial_output_failure_is_not_silently_discarded() {
     struct Broken;
     impl io::Write for Broken {
@@ -205,6 +238,7 @@ fn serial_output_failure_is_not_silently_discarded() {
 
 
 #[test]
+#[cfg(not(feature = "research"))]
 fn unmapped_pc_mmio_fails_without_completion_or_another_run() {
     for exit in [VcpuExit::MmioRead { addr: 0xf000_0000, len: 4 },
         VcpuExit::MmioWrite { addr: 0xf000_0000, len: 4, data: [0; 8] }] {

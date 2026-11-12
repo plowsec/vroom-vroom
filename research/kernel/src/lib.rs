@@ -8,6 +8,7 @@ pub mod symbolize;
 pub mod symbols;
 pub mod unwind;
 pub mod windows;
+pub mod x86_64;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

@@ -10,6 +10,38 @@ fn err(e: impl std::fmt::Display) -> Error {
     Error::Invalid(format!("symbols: {e}"))
 }
 
+/// Keep this production PDB selection shared with the whitelist regression test.
+fn debugger_type(name: &str) -> bool {
+    matches!(
+        name,
+        "_KLDR_DATA_TABLE_ENTRY"
+            | "_LDR_DATA_TABLE_ENTRY"
+            | "_EPROCESS"
+            | "_KPROCESS"
+            | "_PEB"
+            | "_PEB_LDR_DATA"
+            | "_RTL_USER_PROCESS_PARAMETERS"
+            | "_ETHREAD"
+            | "_KTHREAD"
+            | "_TEB"
+            | "_PS_CREATE_NOTIFY_INFO"
+            | "_EX_CALLBACK_ROUTINE_BLOCK"
+            | "_KTRAP_FRAME"
+            | "_KEXCEPTION_FRAME"
+    )
+}
+
+#[cfg(test)]
+mod type_selection_tests {
+    #[test]
+    fn production_loader_keeps_both_amd64_exception_frames() {
+        assert!(super::debugger_type("_KTRAP_FRAME"));
+        assert!(super::debugger_type("_KEXCEPTION_FRAME"));
+        assert!(super::debugger_type("_EPROCESS"));
+        assert!(!super::debugger_type("_UNRELATED_TYPE"));
+    }
+}
+
 #[derive(Debug)]
 pub struct Symbols {
     pub names: BTreeMap<String, u64>,
@@ -66,7 +98,10 @@ pub fn fetch(cache: &Path, identity: &PdbIdentity) -> Result<PathBuf> {
         .and_then(|m| m.modified())
         .is_ok_and(|at| at.elapsed().is_ok_and(|age| age < MISSING_FOR))
     {
-        return Err(err(format!("{}: not on the symbol server (or no network) at the last try", identity.name)));
+        return Err(err(format!(
+            "{}: not on the symbol server (or no network) at the last try",
+            identity.name
+        )));
     }
     let temporary = directory.join(format!("download-{}.part", std::process::id()));
     let file = std::fs::OpenOptions::new()
@@ -164,24 +199,7 @@ impl Symbols {
                 }
             } else if let Ok(pdb::TypeData::Class(c)) = t.parse() {
                 let name = c.name.to_string().into_owned();
-                if !c.properties.forward_reference()
-                    && matches!(
-                        name.as_str(),
-                        "_KLDR_DATA_TABLE_ENTRY"
-                            | "_LDR_DATA_TABLE_ENTRY"
-                            | "_EPROCESS"
-                            | "_KPROCESS"
-                            | "_PEB"
-                            | "_PEB_LDR_DATA"
-                            | "_RTL_USER_PROCESS_PARAMETERS"
-                            | "_ETHREAD"
-                            | "_KTHREAD"
-                            | "_TEB"
-                            | "_PS_CREATE_NOTIFY_INFO"
-                            | "_EX_CALLBACK_ROUTINE_BLOCK"
-                            | "_KTRAP_FRAME"
-                    )
-                {
+                if !c.properties.forward_reference() && debugger_type(&name) {
                     if let Some(fields) = c.fields {
                         wanted.insert(name, fields);
                     }
@@ -257,16 +275,28 @@ impl Symbols {
     /// The registers a kernel trap frame (`_KTRAP_FRAME` at `frame`) holds:
     /// where the thread was when the exception came. `like` gives what the
     /// frame doesn't (translation registers, x19-x28).
-    pub fn trap_registers(&self, memory: &impl VirtualMemory, frame: u64, like: &Registers) -> Result<Registers> {
+    pub fn trap_registers(
+        &self,
+        memory: &impl VirtualMemory,
+        frame: u64,
+        like: &Registers,
+    ) -> Result<Registers> {
         // `frame` comes from the guest (x2 at KiDispatchException): any value.
-        let at = |offset: u64| frame.checked_add(offset).ok_or_else(|| err(format!("trap frame {frame:#x} wraps")));
+        let at = |offset: u64| {
+            frame
+                .checked_add(offset)
+                .ok_or_else(|| err(format!("trap frame {frame:#x} wraps")))
+        };
         let field = |name: &str| self.field("_KTRAP_FRAME", name).and_then(at);
         let mut r = like.clone();
         r.pc = memory.u64(field("Pc")?)?;
         r.sp = memory.u64(field("Sp")?)?;
         let x0 = field("X0")?;
         for i in 0..19 {
-            r.x[i] = memory.u64(x0.checked_add(8 * i as u64).ok_or_else(|| err("trap frame wraps"))?)?;
+            r.x[i] = memory.u64(
+                x0.checked_add(8 * i as u64)
+                    .ok_or_else(|| err("trap frame wraps"))?,
+            )?;
         }
         r.x[29] = memory.u64(field("Fp")?)?;
         r.x[30] = memory.u64(field("Lr")?)?;

@@ -6,6 +6,7 @@ use vroom_devices::pl011::Pl011;
 
 pub(crate) enum SerialInput {
     Pl011(Arc<Mutex<Pl011>>),
+    Pc(Arc<Mutex<vroom_devices::serial16550::Serial16550>>),
     #[allow(dead_code)] // Boards without a serviced receive path must reject input.
     Unavailable(&'static str),
 }
@@ -13,6 +14,10 @@ pub(crate) enum SerialInput {
 impl SerialInput {
     pub(crate) fn queue_input(&self, bytes: &[u8]) -> crate::Result<()> {
         match self {
+            Self::Pc(uart) => {
+                uart.lock().unwrap_or_else(|e| e.into_inner()).queue_input(bytes);
+                Ok(())
+            }
             Self::Pl011(uart) => {
                 uart.lock().unwrap_or_else(|e| e.into_inner()).queue_input(bytes);
                 Ok(())

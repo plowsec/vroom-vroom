@@ -298,6 +298,9 @@ pub enum VcpuExit {
     /// x86 port I/O.
     PioIn { port: u16, len: usize },
     PioOut { port: u16, len: usize, data: [u8; 4] },
+    /// Repeated string I/O: every element accesses the same port.
+    PioInBatch { port: u16, size: usize, count: usize },
+    PioOutBatch { port: u16, size: usize, data: Vec<u8> },
     /// An x86 I/O exit with KVM_RUN_X86_SMM set in that same successful RUN.
     /// Must never enter ordinary device/GuestMemory routing. Only an explicit
     /// SMM-aware board may handle it; existing VMM profiles reject this exit.
@@ -363,6 +366,8 @@ pub enum BootRegs {
     /// The caller supplies that GDT and maps the entry, parameters and GDT.
     /// Interrupts start disabled; this does not describe a saved CPU state.
     X86_64 { rip: u64, rsi: u64, cr3: u64, gdt: u64 },
+    /// Firmware entry in the architectural x86 reset state.
+    X86Reset,
     /// Enter the x86 firmware reset vector on a fresh, never-run vCPU only.
     /// The backend verifies its power-on state; this is not a runtime reset.
     /// The caller must supply the ROM mapping and board. No SMM, firmware

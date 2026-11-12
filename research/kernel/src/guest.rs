@@ -4,6 +4,8 @@
 
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+use std::io::{self, Write};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use vroom_vmm::agent::{Agent, ExecEnd, ExecReq, Shell};
 use vroom_vmm::{RunState, Vmm};
@@ -38,6 +40,55 @@ pub fn run(vm: &Vmm, exports: &Path, f: Forward) {
 }
 
 type Work = Box<dyn FnOnce() -> Result<Value, String> + Send>;
+
+/// Remote x64 clients may retrieve bytes; guest file uploads use the same
+/// host-path rules as ARM64. Downloads never create host files.
+pub fn run_remote(vm: &Vmm, exports: &Path, f: Forward) {
+    if f.request["op"] == "guest_download" && f.request.get("host_path").is_some() {
+        let _ = f.reply.send(Err("host_path is not available on x64; omit it to receive hex bytes over RPC".into()));
+        return;
+    }
+    run(vm, exports, f);
+}
+
+const CHUNK_LIMIT: u64 = 65536;
+
+fn chunk_range(r: &Value) -> Result<(u64, u64), String> {
+    let integer = |key: &str, default| match r.get(key) {
+        None => Ok(default),
+        Some(v) => v.as_u64().ok_or_else(|| format!("{key} must be an unsigned integer")),
+    };
+    let offset = integer("offset", 0)?;
+    let length = integer("length", CHUNK_LIMIT)?;
+    if length > CHUNK_LIMIT { return Err("length must be at most 65536".into()); }
+    offset.checked_add(length).ok_or("offset + length overflow")?;
+    Ok((offset, length))
+}
+
+/// The installed agent sends a whole file. Discard all but the requested range,
+/// retaining at most 64 KiB; the transport still verifies the whole-file hash.
+struct ChunkSink {
+    position: u64,
+    offset: u64,
+    end: u64,
+    bytes: Arc<Mutex<Vec<u8>>>,
+}
+
+impl Write for ChunkSink {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let next = self.position.checked_add(bytes.len() as u64)
+            .ok_or_else(|| io::Error::other("file size overflow"))?;
+        let start = self.position.max(self.offset);
+        let end = next.min(self.end);
+        if start < end {
+            self.bytes.lock().map_err(|_| io::Error::other("chunk lock poisoned"))?
+                .extend_from_slice(&bytes[(start-self.position) as usize..(end-self.position) as usize]);
+        }
+        self.position = next;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+}
 
 fn exec(agent: Agent, r: &Value) -> Result<Work, String> {
     let req = ExecReq {
@@ -79,6 +130,21 @@ fn upload(agent: Agent, r: &Value, exports: &Path) -> Result<Work, String> {
 
 fn download(agent: Agent, r: &Value, exports: &Path) -> Result<Work, String> {
     let guest = r["guest_path"].as_str().ok_or("missing guest_path")?.to_string();
+    if r.get("host_path").is_none() {
+        let (offset, length) = chunk_range(r)?;
+        return Ok(Box::new(move || {
+            let bytes = Arc::new(Mutex::new(Vec::with_capacity(length as usize)));
+            let sink = ChunkSink { position: 0, offset, end: offset + length, bytes: bytes.clone() };
+            let out = agent.get(guest.clone(), Box::new(sink))?;
+            let bytes = bytes.lock().map_err(|e| e.to_string())?;
+            Ok(json!({"guest_path": guest, "offset": offset, "length": bytes.len(),
+                "file_size": out.size, "eof": offset.saturating_add(bytes.len() as u64) >= out.size,
+                "hex": hex(&bytes), "sha256": hex(&out.sha256)}))
+        }));
+    }
+    if r.get("offset").is_some() || r.get("length").is_some() {
+        return Err("offset/length cannot be combined with host_path".into());
+    }
     let host = match host_path(r, exports) {
         Some(p) => p,
         None => {
@@ -98,6 +164,48 @@ fn download(agent: Agent, r: &Value, exports: &Path) -> Result<Work, String> {
             Err(e)
         }
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_chunks_across_writes_and_eof() {
+        for (offset, length, expected) in [(2, 4, b"cdef".as_slice()), (6, 9, b"gh"), (8, 2, b""), (99, 2, b""), (0, 0, b"")] {
+            let bytes = Arc::new(Mutex::new(Vec::new()));
+            let mut sink = ChunkSink { position: 0, offset, end: offset + length, bytes: bytes.clone() };
+            for part in [b"abc".as_slice(), b"d", b"efgh"] { sink.write_all(part).unwrap(); }
+            assert_eq!(&*bytes.lock().unwrap(), expected);
+            assert_eq!(sink.position, 8);
+        }
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let mut sink = ChunkSink { position: 0, offset: 1, end: 65537, bytes: bytes.clone() };
+        sink.write_all(&vec![7; 1 << 20]).unwrap();
+        assert_eq!(bytes.lock().unwrap().len(), 65536);
+    }
+
+    #[test]
+    fn validate_chunk_ranges() {
+        assert_eq!(chunk_range(&json!({})).unwrap(), (0, 65536));
+        assert_eq!(chunk_range(&json!({"offset":10,"length":0})).unwrap(), (10, 0));
+        for r in [json!({"length":65537}), json!({"offset":-1}), json!({"length":"2"}), json!({"offset":null}), json!({"offset":u64::MAX,"length":1})] {
+            assert!(chunk_range(&r).is_err());
+        }
+    }
+
+    #[test]
+    fn host_paths_are_absolute_or_relative_to_exports() {
+        let exports = Path::new("/var/lib/vroom/exports");
+        assert_eq!(
+            host_path(&json!({"host_path": "/tmp/file.bin"}), exports).unwrap(),
+            PathBuf::from("/tmp/file.bin")
+        );
+        assert_eq!(
+            host_path(&json!({"host_path": "file.bin"}), exports).unwrap(),
+            exports.join("file.bin")
+        );
+    }
 }
 
 fn update_tools(agent: Agent, windows: bool) -> Result<Work, String> {

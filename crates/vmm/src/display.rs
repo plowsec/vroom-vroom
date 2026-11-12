@@ -616,19 +616,37 @@ impl DisplayServer {
         net: Option<Arc<NetPorts>>,
     ) -> std::io::Result<DisplayStop> {
         let closing = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let wake = listener.as_ref().and_then(|l| l.local_addr().ok()).and_then(|a| a.as_pathname().map(std::path::Path::to_path_buf));
+        // Create the wake channel before sandboxing. Connecting back to
+        // the listener at shutdown requires a new AF_UNIX socket, which
+        // the Linux seccomp policy intentionally forbids.
+        let (wake, wake_rx) = if let Some(l) = &listener {
+            l.set_nonblocking(true)?;
+            let (tx, rx) = UnixStream::pair()?;
+            tx.set_nonblocking(true)?;
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
         let stop = DisplayStop { closing: closing.clone(), tx: self.tx.clone(), wake };
         let ctx = Arc::new(Serve { input, agent, events, window, latest: self.clip_latest, tx: self.tx, screens, windows, ptr: Mutex::default(), usb, net });
         let c = ctx.clone();
         let first = self.stream;
         std::thread::Builder::new().name("display".into()).spawn(move || serve(first, &c))?;
         if let Some(l) = listener {
+            let wake_rx = wake_rx.expect("listener has a wake channel");
             std::thread::Builder::new().name("viewer-listen".into()).spawn(move || {
-                for v in l.incoming() {
+                loop {
+                    let v = match accept_viewer(&l, &wake_rx) {
+                        Ok(Some(v)) => v,
+                        Ok(None) => break,
+                        Err(e) => {
+                            log::warn!("display: listener: {e}");
+                            break;
+                        }
+                    };
                     if closing.load(std::sync::atomic::Ordering::Acquire) {
                         break;
                     }
-                    let Ok(v) = v else { continue };
                     if ctx.tx.attached() {
                         // Someone is watching already.
                         let _ = v.shutdown(std::net::Shutdown::Both);
@@ -660,17 +678,42 @@ impl DisplayServer {
 pub(crate) struct DisplayStop {
     closing: Arc<std::sync::atomic::AtomicBool>,
     tx: ViewerTx,
-    /// The socket a later viewer attaches on: a connection wakes its
-    /// listener.
-    wake: Option<std::path::PathBuf>,
+    /// Pre-opened wake channel: no new sockets after sandboxing.
+    wake: Option<UnixStream>,
 }
 
 impl DisplayStop {
     pub fn stop(&self) {
         self.closing.store(true, std::sync::atomic::Ordering::Release);
         self.tx.close();
-        if let Some(p) = &self.wake {
-            let _ = UnixStream::connect(p);
+        if let Some(mut wake) = self.wake.as_ref() {
+            let _ = wake.write_all(&[1]);
+        }
+    }
+}
+
+/// Wait for a viewer or shutdown, using only pre-opened descriptors.
+fn accept_viewer(listener: &UnixListener, wake: &UnixStream) -> std::io::Result<Option<UnixStream>> {
+    let mut fds = [
+        libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+        libc::pollfd { fd: wake.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+    ];
+    loop {
+        // SAFETY: both descriptors are live for this call; fds has two
+        // initialized entries and poll writes only their revents fields.
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+        if n < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted { continue; }
+            return Err(error);
+        }
+        if fds[1].revents != 0 { return Ok(None); }
+        if fds[0].revents != 0 {
+            match listener.accept() {
+                Ok((viewer, _)) => return Ok(Some(viewer)),
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => continue,
+                Err(e) => return Err(e),
+            }
         }
     }
 }
@@ -1029,6 +1072,35 @@ fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listener_shutdown_uses_preopened_wake_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = UnixListener::bind(dir.path().join("viewer.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (mut wake, receiver) = UnixStream::pair().unwrap();
+        let (done, finished) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            done.send(accept_viewer(&listener, &receiver).unwrap().is_none()).unwrap();
+        });
+        // No UnixStream::connect here: shutdown must work after the
+        // seccomp filter forbids creation of new AF_UNIX sockets.
+        wake.write_all(&[1]).unwrap();
+        assert!(finished.recv_timeout(Duration::from_secs(2)).unwrap());
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn listener_accepts_a_viewer_before_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("viewer.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (_wake, receiver) = UnixStream::pair().unwrap();
+        let viewer = UnixStream::connect(path).unwrap();
+        assert!(accept_viewer(&listener, &receiver).unwrap().is_some());
+        drop(viewer);
+    }
     use std::io::Read;
 
     #[test]

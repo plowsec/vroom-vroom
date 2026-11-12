@@ -140,6 +140,7 @@ impl Vcpu for KvmVcpu {
         use crate::debug::Register::*;
         register.validate(value)?;
         let id = match register {
+            X86(_) => return Err(Error::Unsupported("AMD64 register on ARM64")),
             X(n) => x_reg(n as u64), Pc => PC, Pstate => PSTATE,
             Sp => core_reg(if self.get(PSTATE)? & 1 == 0 { 248 } else { 272 }),
             Ttbr0 => sysreg(3,0,2,0,0), Ttbr1 => sysreg(3,0,2,0,1),

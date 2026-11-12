@@ -1,5 +1,6 @@
 //! Input ownership and the actual public early gate. No hypervisor executes.
 use super::*;
+#[cfg(not(feature = "research"))]
 use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use vroom_config::{Disk, DiskSync};
@@ -24,7 +25,7 @@ fn shape(root: &Path) -> (VmConfig, VmmOptions) {
     let mut config = VmConfig::from_toml("name='efi-inputs'\ncpus=1\nmemory_mib=512\nballoon=false\nos='other'\n[clipboard]\nhost_to_guest=false\nguest_to_host=false\n[boot]\ntype='uefi'\nvars='unused'\n").unwrap();
     config.boot = Boot::Uefi { firmware: Some(root.join("code")), vars: root.join("vars"), secure_boot: false };
     config.disks = vec![Disk { path: root.join("disk"), readonly: true, format: DiskFormat::Raw,
-        cdrom: false, bus: DiskBus::Nvme, sync: DiskSync::Fsync }];
+        cdrom: false, bus: DiskBus::Nvme, sync: DiskSync::Fsync, backing_dirs: Vec::new() }];
     let opts = VmmOptions { serial_out: Box::new(io::sink()), start: StartMode::BootPaused,
         clipboard: None, ui: None, state_dir: root.join("state"), sandbox: true };
     (config, opts)
@@ -52,6 +53,7 @@ fn with_pins<T>(pins: Pins, run: impl FnOnce() -> T) -> T {
 fn small_bounds() -> Bounds { Bounds { min: 1, max: 4096, alignment: 1 } }
 
 #[test]
+#[cfg(not(feature = "research"))] // This preflight explicitly requires the default build.
 fn selected_pair_pins_and_exact_geometry_are_fixed() {
     let hex = |b: [u8; 32]| b.iter().map(|v| format!("{v:02x}")).collect::<String>();
     assert_eq!(hex(CODE_SHA256), "32807682a9e5c0e2d192ecb6077941d4be8bcfa6b9cd6e60830c3a9f48c0555a");
@@ -155,6 +157,7 @@ fn short_growing_truncated_or_failed_reads_do_not_produce_owned_input() {
 }
 
 #[test]
+#[cfg(not(feature = "research"))]
 fn firmware_pair_size_digest_and_disk_sector_bounds_are_enforced() {
     let temp = tempfile::tempdir().unwrap(); let (config, opts, pins) = fixture(temp.path());
     let hv = TestHv::kvm();
@@ -181,6 +184,7 @@ fn firmware_pair_size_digest_and_disk_sector_bounds_are_enforced() {
 }
 
 #[test]
+#[cfg(not(feature = "research"))]
 fn owned_descriptors_and_snapshots_survive_path_and_same_inode_changes() {
     let temp = tempfile::tempdir().unwrap(); let (config, opts, pins) = fixture(temp.path());
     let prepared = with_pins(pins, || prepare(&config, TestHv::kvm().as_ref(), &opts).unwrap());
@@ -220,6 +224,7 @@ fn readonly_disk_rejects_mutation_and_checks_full_reads_before_buffer_changes() 
 }
 
 #[test]
+#[cfg(not(feature = "research"))]
 fn valid_owned_inputs_still_fail_public_start_before_all_state_or_vm_effects() {
     let temp = tempfile::tempdir().unwrap(); let (config, opts, pins) = fixture(temp.path());
     let before: Vec<_> = ["code", "vars", "disk"].iter().map(|p| Sha256::digest(std::fs::read(temp.path().join(p)).unwrap())).collect();
