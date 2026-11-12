@@ -107,6 +107,13 @@ fn write_item(r: &mut impl Read, id: u32, name: &str, dir: bool, top: &Path, mad
                     if is_dir {
                         std::fs::create_dir(&at).map_err(|e| format!("{}: {e}", at.display()))?;
                         *made |= path == name;
+                        // A guest-made .app is a folder: Gatekeeper looks at its mark.
+                        OpenOptions::new()
+                            .read(true)
+                            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                            .open(&at)
+                            .and_then(|d| vroom_sandbox::quarantine::mark(&d))
+                            .map_err(|e| format!("{}: quarantine: {e}", at.display()))?;
                     } else {
                         if free_space(dest).is_some_and(|f| f < size.saturating_add(keep_free)) {
                             return Err("not enough free space on the Mac".into());
@@ -118,6 +125,7 @@ fn write_item(r: &mut impl Read, id: u32, name: &str, dir: bool, top: &Path, mad
                             .open(&at)
                             .map_err(|e| format!("{}: {e}", at.display()))?;
                         *made |= path == name;
+                        vroom_sandbox::quarantine::mark(&f).map_err(|e| format!("{}: quarantine: {e}", at.display()))?;
                         p.files.fetch_add(1, Ordering::Relaxed);
                         file = Some(f);
                     }
@@ -174,6 +182,19 @@ mod tests {
         assert_eq!(std::fs::read(got.join("a.txt")).unwrap(), b"hello");
         assert!(got.join("s/empty").is_file());
         assert_eq!((p.sent.load(Ordering::Relaxed), p.total.load(Ordering::Relaxed), p.files.load(Ordering::Relaxed)), (5, 5, 2));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn everything_written_is_quarantined() {
+        let d = tmp("quarantine");
+        let ms = [e("X.app", true, 1), e("X.app/run", false, 1), Message::DropData { id: 3, data: b"x".to_vec() }, Message::DropEnd { id: 3 }];
+        let got = receive(&mut bytes(&ms).as_slice(), 3, "X.app", true, &d, &Progress::default(), 0).unwrap();
+        for p in [got.clone(), got.join("run")] {
+            let o = std::process::Command::new("xattr").args(["-p", "com.apple.quarantine"]).arg(&p).output().unwrap();
+            assert!(String::from_utf8_lossy(&o.stdout).contains(";vroom;"), "{p:?}");
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 

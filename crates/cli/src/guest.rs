@@ -153,14 +153,21 @@ fn push(vm: Vm, host: &Path, guest: String, load: Load, state_dir: StateDir) -> 
 }
 
 fn pull(vm: Vm, guest: String, host: &Path, load: Load, state_dir: StateDir) -> Result<(), String> {
-    use sha2::Digest;
     let to = if host.is_dir() { host.join(guest.rsplit(['/', '\\']).next().filter(|n| !n.is_empty()).unwrap_or("file")) } else { host.to_path_buf() };
     let (mut s, _) = connect(&vm, load, state_dir)?;
     s.write_all(&Message::FileGet { id: 0, path: guest }.encode()).map_err(|e| e.to_string())?;
+    println!("{}: {}", to.display(), receive(&mut s, &to)?);
+    Ok(())
+}
+
+/// A pulled file's data into `to` (via `<to>.vroom-part`), quarantined: it is the guest's.
+fn receive(s: &mut UnixStream, to: &Path) -> Result<String, String> {
+    use sha2::Digest;
     let part = PathBuf::from(format!("{}.vroom-part", to.display()));
     let mut f = std::fs::File::create(&part).map_err(|e| format!("{}: {e}", part.display()))?;
     let r = (|| {
-        let mut frames = Frames::new(&mut s, Duration::from_secs(120))?;
+        vroom_sandbox::quarantine::mark(&f).map_err(|e| format!("{}: quarantine: {e}", part.display()))?;
+        let mut frames = Frames::new(s, Duration::from_secs(120))?;
         let mut h = sha2::Sha256::new();
         let mut size = 0u64;
         loop {
@@ -174,17 +181,11 @@ fn pull(vm: Vm, guest: String, host: &Path, load: Load, state_dir: StateDir) -> 
             }
         }
     })()
-    .and_then(|ok| std::fs::rename(&part, &to).map(|_| ok).map_err(|e| format!("{}: {e}", to.display())));
-    match r {
-        Ok(ok) => {
-            println!("{}: {ok}", to.display());
-            Ok(())
-        }
-        Err(e) => {
-            let _ = std::fs::remove_file(&part);
-            Err(e)
-        }
+    .and_then(|ok| std::fs::rename(&part, to).map(|_| ok).map_err(|e| format!("{}: {e}", to.display())));
+    if r.is_err() {
+        let _ = std::fs::remove_file(&part);
     }
+    r
 }
 
 fn exec(a: ExecArgs, load: Load, state_dir: StateDir) -> Result<(), String> {
@@ -250,4 +251,27 @@ fn find(vm: &str) -> PathBuf {
         None => std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".local/share")).join("vroom"),
     };
     data.join("VMs").join(vm).join(format!("{vm}.toml"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pulled_files_are_quarantined() {
+        use sha2::Digest;
+        let d = std::env::temp_dir().join(format!("vroom-pull-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let (mut a, mut b) = UnixStream::pair().unwrap();
+        let sha: [u8; 32] = sha2::Sha256::digest(b"#!/bin/sh\n").into();
+        b.write_all(&Message::FileData { id: 0, data: b"#!/bin/sh\n".to_vec() }.encode()).unwrap();
+        b.write_all(&Message::FileDone { id: 0, ok: true, size: 10, sha256: sha, why: String::new() }.encode()).unwrap();
+        let to = d.join("run.command");
+        receive(&mut a, &to).unwrap();
+        let o = std::process::Command::new("xattr").args(["-p", "com.apple.quarantine"]).arg(&to).output().unwrap();
+        assert!(String::from_utf8_lossy(&o.stdout).contains(";vroom;"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

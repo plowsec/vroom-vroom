@@ -11,6 +11,7 @@
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+pub mod quarantine;
 
 use std::path::PathBuf;
 

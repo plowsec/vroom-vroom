@@ -75,8 +75,9 @@ Guest → Mac (guest is the one to distrust):
 
 - Guest only answers a question: asked once per mouse-button press, when the mouse leaves the guest screen with the button held; VMM takes one answer per question.
 - A name list alone starts a Mac drag but copies nothing. Data flows only when something on the Mac takes the drop and asks for an item, and only that item.
-- Names and sizes checked twice, VMM and app (vroom-proto `TreeCheck`): `drop_name_ok` names (no `/`, `..`, control characters); asked-for item first; every folder entry announced before it; no more bytes than announced; ≤200,000 entries. Frames of an abandoned item carry an old stream number: dropped. A rule break loses the drag.
+- Names and sizes checked twice, VMM and app (vroom-proto `TreeCheck`): `drop_name_ok` names (no `/`, `..`, control, bidi or invisible characters); asked-for item first; every folder entry announced before it; no more bytes than announced; ≤200,000 entries. Frames of an abandoned item carry an old stream number: dropped. A rule break loses the drag.
 - App (not VMM) writes the files where the Mac drop says: new files/folders only (`O_EXCL`, `O_NOFOLLOW`, `mkdir`), never through a link or over existing (taken name gets a number), removes partial output on failure, stops at <2 GB free.
+- Every file and folder written gets `com.apple.quarantine` (`0081;<hex time>;vroom;`): Gatekeeper checks a guest-made app or script. Same for `vroom guest pull`. Can't set it: that file fails.
 - Agent reads only paths the desktop handed its drop target; skips links inside folders.
 
 ## Coherence
@@ -144,6 +145,7 @@ PCI VMs: 4 PCIe root ports ([ARCHITECTURE.md](ARCHITECTURE.md#pci-hot-plug)). Gu
 - Refused names: `/`, NUL, `.`, `..`. Only regular files and directories opened (no FIFOs, devices, sockets). Guest can't create links or device nodes.
 - Capped: node, handle, directory listing counts; path length 4096 bytes; total memory of all node paths.
 - Sandbox grants only the share's subtree. Read-only shares: read only. Writable: no set-id bits, owner changes, ACLs, file flags, extended attributes.
+- Files the guest writes to a share carry no quarantine (sandbox denies xattr writes): treat them as untrusted downloads.
 - FUSE server fuzzed, as both clients, on both kinds of share.
 - Windows guests (virtio-win virtiofs.exe), same server:
   - Windows-special names (`name:stream`, `CON`, trailing dots) are plain names on Mac/Linux hosts: stay inside the share. Same for Mac `file/..namedfork/rsrc` (a file is never walked through).
