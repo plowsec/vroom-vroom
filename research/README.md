@@ -1,6 +1,7 @@
 # kernel debugger
 
-Windows ARM64 · macOS/HVF · Linux ARM64/KVM · experimental. No KDNET or guest driver.
+Windows ARM64 (macOS/HVF, Linux/KVM) and AMD64 (Linux/KVM), experimental.
+No KDNET or guest kernel driver is required.
 Optional; excluded from normal vroom builds.
 
 ## fuzz lab
@@ -39,6 +40,42 @@ Linux: `/dev/kvm` access. HVF snapshots cannot restore on KVM.
 Use a disposable overlay. Separate state directory. Starts paused.
 
 ## agents
+
+### Linux AMD64 backend
+
+The x64 backend boots the real VM on the **Linux host**, not inside an agent's
+Coop VM. It starts paused and owns that VM exclusively (the GUI/CLI cannot
+run a second copy against the same state directory).
+
+```sh
+cargo build -p vroom-kernel --bin vroom-lab --bin vroom-rpc
+target/debug/vroom-lab /absolute/path/windows11.toml \
+  --agent-socket /run/user/1000/vroom-agent.sock --daemon
+```
+
+`commands.list` is architecture-specific. AMD64 currently implements:
+
+- VM status, all-CPU pause/resume, single-step, screenshot, keyboard and shutdown.
+- General/control registers, physical and virtual memory reads/writes,
+  memory regions, and four-level x64 page translation (4 KiB/2 MiB/1 GiB).
+- Four shared hardware execution/data breakpoint slots. Data watches require
+  aligned 1/2/4/8-byte ranges, write or read+write; read-only is unsupported.
+- Kernel discovery from live CPU contexts, exact-build Microsoft PDBs,
+  symbol lookup, process selection, PEBs, and loaded kernel/user modules.
+
+Capabilities are architecture-specific; unsupported commands are omitted from
+discovery and refused through direct calls, command aliases and jobs.
+Five-level paging and paged-out memory are rejected rather than guessed.
+Use lossless uint64 handling for addresses and response values.
+
+Inspection requires an all-CPU pause. Resume afterwards: while paused, Windows,
+its network and Falcon cannot make progress. `vm.shutdown` ends the VM immediately;
+prefer Windows' normal shutdown when preserving a running installation.
+
+### RPC reference (architecture-dependent capabilities)
+
+The catalog below includes ARM64-only operations. On every connection,
+`commands.list` is the authoritative list for the running backend.
 
 JSON-RPC 2.0, one object per line, owner-only Unix socket. Same protocol as angr_tui's.
 
@@ -87,7 +124,8 @@ fuzz      check run* probe* coverage blocks diff crashes          * jobs.start o
 - Results and jobs belong to the actor that made them.
 - Socket paths: under 104 bytes. A path in a deep temp dir fails: use a relative one.
 - `--daemon`: own session, returns when the socket accepts (prints pid, log `PATH.log`). Use it from agents: their shells often kill what a command started, which leaves a dead socket (`Connection refused`).
-- `target/debug/vroom-lab` is unsigned (cargo tests relink it): run the `target/research/` builds.
+- macOS/HVF: `target/debug/vroom-lab` is unsigned (cargo tests relink it); use
+  the signed `target/research/` builds. Linux/KVM needs no Apple code signature.
 - Snapshots are one format everywhere (app, `vroom`, lab, fuzzer). `vm.snapshot` saves into the VM's own snapshots (the app lists them) or `path`; `vm.restore` restarts the lab's VM from one (`name` or `path`), paused (`resume: true`: running); `--restore` does it at start. Refused when a disk layer under the snapshot changed since. One VM runs once: the lab and the app can't both run it.
 
 Function-calling adapter (one tool):

@@ -158,6 +158,14 @@ impl Image {
     }
 
     pub fn read(memory: &impl VirtualMemory, base: u64) -> Result<Self> {
+        Self::read_machine(memory, base, 0xaa64)
+    }
+
+    pub fn read_amd64(memory: &impl VirtualMemory, base: u64) -> Result<Self> {
+        Self::read_machine(memory, base, 0x8664)
+    }
+
+    fn read_machine(memory: &impl VirtualMemory, base: u64, machine: u16) -> Result<Self> {
         let mut dos = [0; 64];
         memory.read(base, &mut dos)?;
         if &dos[..2] != b"MZ" {
@@ -173,8 +181,8 @@ impl Image {
                 .ok_or_else(|| bad("PE address overflow"))?,
             &mut header,
         )?;
-        if &header[..4] != b"PE\0\0" || u16at(&header, 4) != 0xaa64 || u16at(&header, 24) != 0x20b {
-            return Err(bad("expected ARM64 PE32+ image"));
+        if &header[..4] != b"PE\0\0" || u16at(&header, 4) != machine || u16at(&header, 24) != 0x20b {
+            return Err(bad("PE32+ machine does not match the debugger architecture"));
         }
         if u16at(&header, 20) < 240 || u16at(&header, 6) == 0 || u16at(&header, 6) > 96 {
             return Err(bad("invalid PE optional header or section count"));

@@ -2,6 +2,7 @@
 //! `--agent-socket` also serves agents (JSON-RPC 2.0, see agent.rs).
 mod agent;
 mod guest;
+mod x64_lab;
 
 use clap::Parser;
 use serde_json::{json, Value};
@@ -17,7 +18,7 @@ use vroom_kernel::{process, symbols::Symbols, windows::Image};
 use vroom_vmm::{RunState, StartMode, VmEvent, Vmm, VmmOptions};
 
 #[derive(Debug, Parser)]
-#[command(about = "Windows ARM64 kernel debugger backend (JSON lines on stdio)")]
+#[command(about = "Windows kernel debugger backend: ARM64 and AMD64 (JSON lines on stdio)")]
 struct Args {
     /// A disposable vroom VM config. Boots paused; resume explicitly.
     config: PathBuf,
@@ -3212,6 +3213,9 @@ fn boot(config_path: &std::path::Path, restore: Option<&std::path::Path>) -> Res
 }
 
 fn run(args: Args) -> Result<(), String> {
+    if vroom_hv::default_hypervisor().map_err(|e|e.to_string())?.arch() == vroom_hv::Arch::X86_64 {
+        return x64_lab::run(args);
+    }
     let args_agent_socket = args.agent_socket.clone();
     let mut session = boot(&args.config, args.restore.as_deref())?;
     output(json!({"event":"ready", "state":"Paused", "cpus": session.vm.config().cpus, "note": "paused: vm.resume runs the guest"}))?;
