@@ -55,8 +55,10 @@ target/debug/vroom-lab /absolute/path/windows11.toml \
 
 `commands.list` is architecture-specific. AMD64 currently implements:
 
-- VM status, all-CPU pause/resume, single-step, screenshot, keyboard and shutdown.
-- Hard restart, optionally paused before the first guest instruction.
+- VM status, pause/resume, hard restart (optionally paused at the reset vector),
+  snapshot/restore, single-step, screenshot, keyboard and shutdown.
+- Snapshots save RAM, CPU, device and disk state; restore replaces the live VM,
+  paused by default, on the same KVM host/backend.
 - General/control registers, physical and virtual memory reads/writes,
   memory regions, and four-level x64 page translation (4 KiB/2 MiB/1 GiB).
 - Four shared hardware execution/data breakpoint slots. Data watches require
@@ -128,7 +130,7 @@ fuzz      check run* probe* coverage blocks diff crashes          * jobs.start o
 - `--daemon`: own session, returns when the socket accepts (prints pid, log `PATH.log`). Use it from agents: their shells often kill what a command started, which leaves a dead socket (`Connection refused`).
 - macOS/HVF: `target/debug/vroom-lab` is unsigned (cargo tests relink it); use
   the signed `target/research/` builds. Linux/KVM needs no Apple code signature.
-- Snapshots are one format everywhere (app, `vroom`, lab, fuzzer). `vm.snapshot` saves into the VM's own snapshots (the app lists them) or `path`; `vm.restore` restarts the lab's VM from one (`name` or `path`), paused (`resume: true`: running); `--restore` does it at start. Refused when a disk layer under the snapshot changed since. One VM runs once: the lab and the app can't both run it.
+- Snapshots are one format everywhere (app, `vroom`, lab, fuzzer), but a snapshot is tied to its architecture and hypervisor backend. `vm.snapshot` saves into the VM's own snapshots (the app lists them) or `path`; `vm.restore` restarts the lab's VM from one (`name` or `path`), paused (`resume: true`: running); `--restore` does it at start. Refused when a disk layer under the snapshot changed since, or when the snapshot backend or saved CPU state does not match. One VM runs once: the lab and the app can't both run it.
 
 Function-calling adapter (one tool):
 

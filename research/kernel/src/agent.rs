@@ -1160,12 +1160,15 @@ mod tests {
     }
 
     #[test]
-    fn x64_discovers_restart() {
+    fn x64_discovers_snapshot_commands() {
         let (mut c, _rx) = connection();
         Arc::get_mut(&mut c.shared).unwrap().ops = Some(crate::x64_lab::OPS);
-        call(&mut c, r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"actor":"test"}}"#);
-        let list = call(&mut c, r#"{"jsonrpc":"2.0","id":1,"method":"commands.list"}"#);
-        assert!(list["result"].as_array().unwrap().iter().any(|c| c["name"] == "vm.restart"));
+        call(&mut c, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"actor":"test"}}"#);
+        let list = call(&mut c, r#"{"jsonrpc":"2.0","id":2,"method":"commands.list","params":{"category":"vm"}}"#);
+        let names: Vec<_> = list["result"].as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap()).collect();
+        for name in ["vm.snapshot", "vm.snapshots", "vm.restore", "vm.restart"] {
+            assert!(names.contains(&name), "missing {name}");
+        }
     }
 
     #[test]

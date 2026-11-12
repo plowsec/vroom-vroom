@@ -17,6 +17,9 @@ pub(super) const OPS: &[&str] = &[
     "status",
     "pause",
     "restart",
+    "snapshot",
+    "snapshots",
+    "restore",
     "resume",
     "step",
     "shutdown",
@@ -219,6 +222,120 @@ impl Session {
         }
         Ok(())
     }
+    fn snapshot_dir(&self, q: &Value) -> Result<PathBuf, String> {
+        match (q["path"].as_str(), q["name"].as_str()) {
+            (Some(p), _) => Ok(PathBuf::from(p)),
+            (None, Some(n)) if !n.is_empty() && !n.contains('/') && !n.starts_with('.') => {
+                Ok(self.state.join("snapshots").join(n))
+            }
+            (None, Some(n)) => Err(format!("bad snapshot name {n:?}")),
+            (None, None) => {
+                let t = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                Ok(self.state.join("snapshots").join(format!("snap-{t}")))
+            }
+        }
+    }
+
+    fn snapshot(&mut self, q: &Value) -> Result<Value, String> {
+        let dir = self.snapshot_dir(q)?;
+        if dir.exists() {
+            return Err(format!("{} exists already", dir.display()));
+        }
+        let running = self.vm.state() == RunState::Running;
+        if running {
+            self.vm.pause().map_err(string)?;
+        }
+        if self.pending_step_events()? {
+            return Err("pending VM stops were reported; inspect them and retry snapshot (VM remains paused)".into());
+        }
+        // Saved without the debugger's traps.
+        for cpu in 0..self.vm.config().cpus as usize {
+            self.vm
+                .debug_configure(cpu, DebugConfig::default())
+                .map_err(string)?;
+        }
+        let saved = self
+            .vm
+            .snapshot(&dir, q["description"].as_str().unwrap_or("vroom-lab"))
+            .map_err(string);
+        let rearmed = self.debug(&self.breakpoints, &self.watches);
+        rearmed?;
+        if running {
+            self.vm.resume().map_err(string)?;
+        }
+        saved?;
+        let name = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        Ok(json!({"name":name,"path":dir}))
+    }
+
+    fn snapshots(&self) -> Result<Value, String> {
+        let list = vroom_state::list(&self.state).map_err(string)?;
+        Ok(Value::Array(
+            list.into_iter()
+                .map(|s| {
+                    json!({"name":s.name,"path":s.path,"created_unix":s.created_unix,
+                           "description":s.description,"bytes":s.bytes})
+                })
+                .collect(),
+        ))
+    }
+
+    fn restore_plan(&self, q: &Value) -> Result<(PathBuf, bool), String> {
+        let given = q["name"]
+            .as_str()
+            .or(q["path"].as_str())
+            .ok_or("missing name (or path)")?;
+        let resume = match q.get("resume").filter(|v| !v.is_null()) {
+            Some(v) => v.as_bool().ok_or("resume: expected a boolean")?,
+            None => false,
+        };
+        let dir = super::restore_dir(Path::new(given), &self.state)?;
+        vroom_vmm::check_snapshot(&dir).map_err(string)?;
+        Ok((dir, resume))
+    }
+
+    /// Replace this VM with a fresh one restored from `dir`. On success the
+    /// old VMM is dropped, releasing its state lock, disks and network ports.
+    fn restore(
+        self,
+        config: vroom_config::VmConfig,
+        dir: PathBuf,
+        resume: bool,
+    ) -> Result<(Session, Value), String> {
+        let state = self.state.clone();
+        let mut old = self;
+        old.vm.shutdown();
+        drop(old);
+        let (vm, input) = start_vm(config, &state, StartMode::RestorePaused(dir.clone()))?;
+        let mut session = Session {
+            vm,
+            input,
+            state,
+            breakpoints: vec![],
+            watches: vec![],
+            stopped: BTreeMap::new(),
+            kernel: None,
+            kernel_regs: None,
+            symbols: BTreeMap::new(),
+            selected: None,
+        };
+        session.vm.pause().map_err(string)?;
+        let mut reply = json!({"restored": dir, "state": "Paused",
+            "note": "paused: vm.resume runs the guest (or restore with resume: true)"});
+        if resume {
+            session.command(&json!({"op":"resume"}))?;
+            reply["state"] = json!("Running");
+            reply.as_object_mut().expect("object").remove("note");
+        }
+        Ok((session, reply))
+    }
+
     fn find_kernel(&mut self, cpu: usize) -> Result<(), String> {
         if self.kernel.is_some() {
             return Ok(());
@@ -344,6 +461,8 @@ impl Session {
                 }
                 return Ok(json!({"state":if paused {"Paused"} else {"Running"}}));
             }
+            "snapshot" => return self.snapshot(q),
+            "snapshots" => return self.snapshots(),
             "resume" => {
                 self.vm.pause().map_err(string)?;
                 self.debug(&self.breakpoints, &self.watches)?;
@@ -741,8 +860,27 @@ pub(super) fn run(args: Args) -> Result<(), String> {
         }
         match rx.recv_timeout(Duration::from_millis(10)) {
             Ok(f) => {
-                let result = session.command(&f.request);
-                let _ = f.reply.send(result);
+                let op = f.request["op"].as_str().unwrap_or_default();
+                if op == "restore" {
+                    match session.restore_plan(&f.request) {
+                        Ok((dir, resume)) => match session.restore(config.clone(), dir, resume) {
+                            Ok((new_session, reply)) => {
+                                session = new_session;
+                                let _ = f.reply.send(Ok(reply));
+                            }
+                            Err(e) => {
+                                let _ = f.reply.send(Err(e.clone()));
+                                return Err(e);
+                            }
+                        },
+                        Err(e) => {
+                            let _ = f.reply.send(Err(e));
+                        }
+                    }
+                } else {
+                    let result = session.command(&f.request);
+                    let _ = f.reply.send(result);
+                }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) if endpoint.is_none() => break,
             Err(_) => {}
@@ -750,6 +888,19 @@ pub(super) fn run(args: Args) -> Result<(), String> {
         for _ in 0..64 {
             let Ok(line) = lines.try_recv() else { break };
             let result = match serde_json::from_str::<Value>(&line).map_err(string) {
+                Ok(q) if q["op"] == "restore" => match session.restore_plan(&q) {
+                    Ok((dir, resume)) => match session.restore(config.clone(), dir, resume) {
+                        Ok((new_session, reply)) => {
+                            session = new_session;
+                            Ok(reply)
+                        }
+                        Err(e) => {
+                            super::output(json!({"error":e}))?;
+                            return Err(e);
+                        }
+                    },
+                    Err(e) => Err(e),
+                },
                 Ok(q) => session.command(&q),
                 Err(e) => Err(e),
             };
