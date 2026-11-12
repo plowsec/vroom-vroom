@@ -107,6 +107,12 @@
           <CommandLine>cmd /c for %d in (D E F G H I J K) do if exist %d:\vroom-setup.cmd call %d:\vroom-setup.cmd</CommandLine>
           <Description>Install vroom guest tools</Description>
         </SynchronousCommand>
+        <!-- The copies Windows keeps of this file (the password). -->
+        <SynchronousCommand wcm:action="add">
+          <Order>9</Order>
+          <CommandLine>cmd /c del /f /q %WINDIR%\Panther\unattend.xml %WINDIR%\Panther\unattend-original.xml %WINDIR%\System32\Sysprep\unattend.xml</CommandLine>
+          <Description>Scrub the answer file</Description>
+        </SynchronousCommand>
       </FirstLogonCommands>
     </component>
   </settings>

@@ -46,7 +46,7 @@ pub struct NewArgs {
     /// --ready: the user to make (default: yours).
     #[arg(long)]
     pub user: Option<String>,
-    /// --ready: their password (default: $VROOM_NEW_PASSWORD).
+    /// --ready: their password. Prefer $VROOM_NEW_PASSWORD: arguments show in `ps`.
     #[arg(long)]
     pub password: Option<String>,
     /// --ready: set up SSH for this public key (e.g. ~/.ssh/id_ed25519.pub).

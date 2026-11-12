@@ -170,7 +170,8 @@ VROOM_NEW_PASSWORD=... vroom new win --os windows --ready --iso Win11_ARM64.iso 
 ```
 
 - `--dir`: where. `--user`: another user.
-- Windows answer file holds the password in clear in `install.img`: delete it after.
+- Password: `VROOM_NEW_PASSWORD`, not `--password` (shows in `ps`).
+- `install.img` (Windows) holds it in clear, `seed.iso` (Ubuntu) its hash: owner-only (0400, 0600). Any guest user can read the attached disk: remove it from the VM file once installed, delete the file.
 
 ## Ubuntu 24.04 (cloud image, direct kernel boot)
 

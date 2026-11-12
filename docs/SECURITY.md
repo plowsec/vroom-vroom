@@ -620,6 +620,17 @@ Host sends code the guest runs as root/SYSTEM. Intended: the guest asked for hos
 - App takes tools from its bundle (`Contents/Resources/guest-tools`) or `VROOM_GUEST_TOOLS`. Agent version read from the agent binary there; guest's version from its hello, only compared and shown, cleaned like every status line.
 - Tools stick (guests without an agent): the app's own image, plugged read-only; installing from it is the user's step in the guest.
 
+### Ready-made VMs: where the password stays
+
+| Where | What | Until |
+|---|---|---|
+| `vroom new --password` | clear, in `ps` | use `VROOM_NEW_PASSWORD` |
+| App's New VM sheet | clear, in memory | app quits; not logged, not saved |
+| `install.img` (Windows) | clear (answer file) | you delete it; 0400, made in a 0700 folder |
+| `seed.iso` (Ubuntu) | SHA-512 crypt hash, SSH key | you delete it; 0600, same |
+| Guest, while the disk is attached | readable by any guest user | removed from the VM file |
+| Windows `Panther\unattend*.xml`, Winlogon `DefaultPassword` | Setup's copies | deleted by the last first-logon command |
+
 ## Fuzzing
 
 `fuzz/`: cargo-fuzz targets for what a guest (or downloaded image) controls. Run: `cargo +nightly fuzz run -O <target>`.
