@@ -1086,8 +1086,9 @@ fn ask_vcpus<T>(vcpus: &[vcpu::VcpuHandle], command: impl Fn(mpsc::Sender<Result
 /// dir. Guests key activation and hardware ids on it.
 fn machine_uuid(state_dir: &Path) -> Result<[u8; 16]> {
     let path = state_dir.join("uuid");
-    if let Ok(s) = std::fs::read_to_string(&path) {
-        let hex: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    // The sandboxed VMM can write the state dir: no links, no FIFOs.
+    if let Ok(s) = state::hostile::read_small(&path, 64) {
+        let hex: String = s.iter().map(|&b| b as char).filter(|c| c.is_ascii_hexdigit()).collect();
         if hex.len() == 32 {
             let mut u = [0u8; 16];
             for (i, b) in u.iter_mut().enumerate() {
@@ -1102,13 +1103,28 @@ fn machine_uuid(state_dir: &Path) -> Result<[u8; 16]> {
     u[8] = (u[8] & 0x3f) | 0x80; // variant 1
     std::fs::create_dir_all(state_dir)?;
     let hex: String = u.iter().map(|b| format!("{b:02x}")).collect();
-    std::fs::write(&path, format!("{}-{}-{}-{}-{}\n", &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..]))?;
+    let text = format!("{}-{}-{}-{}-{}\n", &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..]);
+    state::hostile::write_atomic(&path, text.as_bytes(), 0o600)?;
     Ok(u)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_planted_uuid_link_is_not_followed() {
+        let t = tempfile::tempdir().unwrap();
+        let victim = t.path().join("victim");
+        std::fs::write(&victim, "0123456789abcdef0123456789abcdef").unwrap();
+        let state = t.path().join("vm.state");
+        std::fs::create_dir(&state).unwrap();
+        std::os::unix::fs::symlink(&victim, state.join("uuid")).unwrap();
+        let u = machine_uuid(&state).unwrap();
+        assert_ne!(u[..4], [0x01, 0x23, 0x45, 0x67], "read through the link");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "0123456789abcdef0123456789abcdef", "wrote through the link");
+        assert_eq!(machine_uuid(&state).unwrap(), u, "kept in a file of its own");
+    }
 
     #[test]
     fn folders_the_saved_hardware_hasnt() {

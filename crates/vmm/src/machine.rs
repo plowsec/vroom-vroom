@@ -320,20 +320,13 @@ fn viewer_socket(state_dir: &std::path::Path) -> std::io::Result<std::os::unix::
     user_socket(state_dir, "sock", VIEWER_FILE)
 }
 
-/// A socket of this VM's in the user's temp dir (`ext`: what for), and
-/// the file `file` in the state dir that says where it is.
+/// A socket of this VM's in the user's socket dir (`state::hostile::
+/// socket_dir`: checked ours, 0700), and the file `file` in the state dir
+/// that says where it is.
 fn user_socket(state_dir: &std::path::Path, ext: &str, file: &str) -> std::io::Result<std::os::unix::net::UnixListener> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-    let dir = std::env::temp_dir().join("vroom");
-    std::fs::create_dir_all(&dir)?;
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
-    let real = std::fs::canonicalize(state_dir).unwrap_or_else(|_| state_dir.to_path_buf());
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in real.as_os_str().as_bytes() {
-        h = (h ^ *b as u64).wrapping_mul(0x100_0000_01b3);
-    }
-    let p = dir.join(format!("{h:016x}.{ext}"));
+    let p = crate::state::hostile::socket_path(state_dir, ext)?;
     // One left by a VMM that died: we hold the state lock, so it's stale.
     if let Ok(m) = std::fs::symlink_metadata(&p) {
         if !m.file_type().is_socket() {
@@ -343,7 +336,7 @@ fn user_socket(state_dir: &std::path::Path, ext: &str, file: &str) -> std::io::R
     }
     let l = std::os::unix::net::UnixListener::bind(&p)?;
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
-    std::fs::write(state_dir.join(file), p.as_os_str().as_bytes())?;
+    crate::state::hostile::write_atomic(&state_dir.join(file), p.as_os_str().as_bytes(), 0o600)?;
     Ok(l)
 }
 
@@ -407,7 +400,8 @@ fn in_process(vm: &Arc<dyn Vm>, config: &VmConfig) -> Result<Box<dyn Renderer3d>
 fn gpu_process(vm: &Arc<dyn Vm>, config: &VmConfig, mem: &GuestMemory, state_dir: &std::path::Path) -> Result<Box<dyn Renderer3d>> {
     let exe = std::env::current_exe().map_err(|e| Error::Setup(format!("gpu process: {e}")))?;
     let shaders = state_dir.join("shaders");
-    std::fs::create_dir_all(&shaders).map_err(|e| Error::Setup(format!("{}: {e}", shaders.display())))?;
+    // Not a link the sandboxed VMM left to a folder elsewhere.
+    crate::state::hostile::ensure_dir(&shaders, 0o700).map_err(|e| Error::Setup(format!("{}: {e}", shaders.display())))?;
     let gl = config.display.opengl.then_some(match config.display.opengl_host {
         vroom_config::OpenglHost::Angle => "angle",
         vroom_config::OpenglHost::Apple => "apple",
@@ -1087,5 +1081,20 @@ mod tests {
         let ids = vendor_ids("144d:a808:144d:a801").unwrap();
         assert_eq!((ids.device, ids.subsys), (0xa808, 0xa801));
         assert!(vendor_ids("144d").is_err());
+    }
+
+    #[test]
+    fn socket_files_replace_planted_links() {
+        let t = tempfile::tempdir().unwrap();
+        let victim = t.path().join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        let state = t.path().join("vm.state");
+        std::fs::create_dir(&state).unwrap();
+        std::os::unix::fs::symlink(&victim, state.join("control")).unwrap();
+        let l = user_socket(&state, "ctl", "control").unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep", "wrote through the link");
+        let at = crate::state::hostile::running_socket(&state, "control", "ctl").expect("the file names our socket");
+        drop(l);
+        let _ = std::fs::remove_file(at);
     }
 }

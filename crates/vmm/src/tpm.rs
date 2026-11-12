@@ -127,13 +127,33 @@ fn capture_state(
     vroom_snapshot::encode(&state)
 }
 
+/// Files swtpm opens in its state dir (following links; on Linux it has
+/// no sandbox of its own).
+const SWTPM_FILES: [&str; 4] = [STATE_FILES[0], STATE_FILES[1], "swtpm.log", ".lock"];
+
+/// `<state>/tpm` as swtpm needs it: a real directory (not a link the
+/// sandboxed VMM left to a folder elsewhere), mode 0700, and nothing but
+/// plain files where swtpm opens its files.
+fn clean_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    crate::state::hostile::ensure_dir(dir, 0o700)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    for n in SWTPM_FILES {
+        let p = dir.join(n);
+        if std::fs::symlink_metadata(&p).is_ok() && !crate::state::hostile::plain_file(&p) {
+            log::warn!("vtpm: {} is not a plain file; removed", p.display());
+            std::fs::remove_file(&p)?;
+        }
+    }
+    Ok(())
+}
+
 impl Swtpm {
     /// Start swtpm on `dir`. `fresh`: cold boot (drop volatile state) vs
     /// resuming a suspended VM.
     pub fn start(dir: &Path, fresh: bool) -> Result<Swtpm> {
         let exe = find_swtpm().ok_or_else(|| Error::Setup("tpm = true needs swtpm (brew install swtpm)".into()))?;
-        std::fs::create_dir_all(dir)?;
-        let _ = std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700));
+        clean_dir(dir)?;
         // swtpm < 0.8 has no "terminate" (exit when the control channel
         // closes); then only our kill on drop stops it.
         let terminate = Command::new(&exe)
@@ -290,7 +310,10 @@ impl TpmBackend for Swtpm {
             let _ = std::fs::remove_file(self.dir.join(n));
         }
         for (n, b) in &files {
-            if std::fs::write(self.dir.join(n), b).is_err() {
+            // New files only (the old ones are gone): never through a link.
+            let mut o = std::fs::OpenOptions::new();
+            o.write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW);
+            if o.open(self.dir.join(n)).and_then(|mut f| f.write_all(b)).is_err() {
                 return false;
             }
         }
@@ -324,6 +347,27 @@ mod tests {
     fn write_state(dir: &Path) {
         std::fs::write(dir.join(STATE_FILES[0]), b"test permanent state").unwrap();
         std::fs::write(dir.join(STATE_FILES[1]), b"test volatile state").unwrap();
+    }
+
+    #[test]
+    fn planted_links_in_the_tpm_dir_go() {
+        let temp = tempfile::tempdir().unwrap();
+        let victim = temp.path().join("victim");
+        std::fs::write(&victim, b"user file").unwrap();
+        let dir = temp.path().join("tpm");
+        std::os::unix::fs::symlink(temp.path(), &dir).unwrap();
+        assert!(clean_dir(&dir).is_err(), "a link to a folder elsewhere");
+        std::fs::remove_file(&dir).unwrap();
+        clean_dir(&dir).unwrap();
+        write_state(&dir);
+        std::os::unix::fs::symlink(&victim, dir.join("swtpm.log")).unwrap();
+        std::fs::remove_file(dir.join(STATE_FILES[1])).unwrap();
+        std::os::unix::fs::symlink(&victim, dir.join(STATE_FILES[1])).unwrap();
+        clean_dir(&dir).unwrap();
+        assert!(std::fs::symlink_metadata(dir.join("swtpm.log")).is_err());
+        assert!(std::fs::symlink_metadata(dir.join(STATE_FILES[1])).is_err());
+        assert_eq!(std::fs::read(dir.join(STATE_FILES[0])).unwrap(), b"test permanent state", "plain files stay");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"user file");
     }
 
     #[test]

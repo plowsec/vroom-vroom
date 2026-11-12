@@ -28,8 +28,9 @@ pub fn hostname_ok(s: &str) -> bool {
 /// Start on it if this VM's state dir asks for it.
 pub fn start(state_dir: &Path, os: GuestOs, agent: Agent) {
     let note = state_dir.join(FILE);
-    let Ok(text) = std::fs::read_to_string(&note) else { return };
-    let name = text.trim().to_string();
+    // The sandboxed VMM can plant one: no links, no FIFOs, one line.
+    let Ok(text) = crate::state::hostile::read_small(&note, 256) else { return };
+    let name = String::from_utf8_lossy(&text).trim().to_string();
     if !hostname_ok(&name) {
         log::warn!("{}: {name:?} isn't a hostname; ignored", note.display());
         let _ = std::fs::remove_file(&note);
@@ -168,6 +169,18 @@ mod tests {
         let a = crate::agent::spawn(host, Default::default(), None, Default::default()).unwrap();
         start(t.path(), GuestOs::Ubuntu, a.clone());
         assert!(!t.path().join(FILE).exists());
+        a.send(AgentCmd::Stop);
+    }
+
+    #[test]
+    fn a_planted_fifo_does_not_hang_the_start() {
+        let t = tempfile::tempdir().unwrap();
+        let c = std::ffi::CString::new(t.path().join(FILE).as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: valid C string.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (host, _guest) = UnixStream::pair().unwrap();
+        let a = crate::agent::spawn(host, Default::default(), None, Default::default()).unwrap();
+        start(t.path(), GuestOs::Ubuntu, a.clone());
         a.send(AgentCmd::Stop);
     }
 }
