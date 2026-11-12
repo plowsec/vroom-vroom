@@ -208,6 +208,11 @@ impl WindowPlacer for Window {
         if gpa == 0 || !gpa.is_multiple_of(WINDOW) || gpa.checked_add(WINDOW).is_none() {
             return;
         }
+        // Only where device windows go, as the GPU's: a BAR written over RAM
+        // (sizing, or a guest that means to) would unmap what is there.
+        if !crate::machine::in_pci_window(gpa, WINDOW) {
+            return;
+        }
         let mut at = self.at.lock().unwrap_or_else(|e| e.into_inner());
         if *at == Some(gpa) {
             return;

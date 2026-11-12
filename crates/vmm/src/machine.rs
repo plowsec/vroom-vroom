@@ -496,9 +496,13 @@ fn within(gpa: u64, size: u64, base: u64, len: u64) -> bool {
     gpa >= base && gpa.checked_add(size).is_some_and(|e| e <= base.saturating_add(len))
 }
 
-/// Inside a PCI window: never RAM, the flash or the helper page.
-fn in_pci_window(gpa: u64, size: u64) -> bool {
-    within(gpa, size, layout::PCI_MMIO_BASE, layout::PCI_MMIO_SIZE) || within(gpa, size, layout::PCI_MMIO64_BASE, layout::PCI_MMIO64_SIZE)
+/// Where a device's memory window may sit: a PCI window (a BAR), or the
+/// board's shared memory area (virtio-mmio devices, direct kernel boot).
+/// Never RAM, the flash or the helper page.
+pub(crate) fn in_pci_window(gpa: u64, size: u64) -> bool {
+    within(gpa, size, layout::PCI_MMIO_BASE, layout::PCI_MMIO_SIZE)
+        || within(gpa, size, layout::PCI_MMIO64_BASE, layout::PCI_MMIO64_SIZE)
+        || within(gpa, size, layout::SHM_BASE, layout::SHM_SIZE)
 }
 
 impl ShmMapper for VmShm {
@@ -1137,6 +1141,21 @@ pub(crate) fn build(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// virtio-mmio devices (direct kernel boot) get their windows in the
+    /// board's shared memory area, PCI ones in a BAR: both must be placeable,
+    /// RAM, the flash and the helper page never.
+    #[test]
+    fn device_windows_go_in_pci_windows_or_the_shared_memory_area() {
+        assert!(in_pci_window(layout::SHM_BASE, GPU_SHM_SIZE), "3D on virtio-mmio");
+        assert!(in_pci_window(layout::PCI_MMIO64_BASE, GPU_SHM_SIZE));
+        assert!(in_pci_window(layout::PCI_MMIO_BASE, EXTRA_GPU_VRAM));
+        assert!(!in_pci_window(layout::RAM_BASE, 1 << 20));
+        assert!(!in_pci_window(0, 1 << 20), "flash");
+        assert!(!in_pci_window(layout::HELPER_PAGE_BASE, 0x4000));
+        assert!(!in_pci_window(layout::SHM_BASE - 0x1000, 0x2000), "the end of RAM's space");
+        assert!(!in_pci_window(u64::MAX - 0xfff, 0x2000));
+    }
 
     #[test]
     fn macs_and_pci_ids_from_identity() {
