@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
-use vroom_block::qcow2::{OpenPolicy, Qcow2Image};
+use vroom_block::qcow2::{OpenPolicy, Pinned, Qcow2Image};
 #[cfg(feature = "research")]
 use vroom_block::rollback::RollbackDisk;
 use vroom_block::{DiskImage, Format, SwapDisk, SyncMode};
@@ -123,10 +123,14 @@ impl DiskSet {
         #[cfg(feature = "research")]
         let mut fresh = Vec::new();
         for (i, d) in cfg.disks.iter().enumerate() {
-            let policy = OpenPolicy {
-                allowed_dirs: vec![dir.clone(), d.path.parent().map(Path::to_path_buf).unwrap_or_default()],
-                sync: sync_of(d.sync),
-            };
+            // A read-only image: its own backing files, next to it (the
+            // VMM can't change its header). A writable one: the VMM can
+            // rewrite every header in its chain, so only our layers and the
+            // image itself, in the format the VM file says (Auto on a
+            // writable image means raw: `vroom_block::open_with`).
+            let base_fmt = fmt_of(d.format).unwrap_or(Format::Raw);
+            let pinned = (!d.readonly).then(|| Pinned { layers: dir.clone(), bases: vec![(d.path.clone(), Some(base_fmt))] });
+            let policy = OpenPolicy { allowed_dirs: Vec::new(), sync: sync_of(d.sync), pinned };
             if d.readonly {
                 let img = vroom_block::open_with(&d.path, fmt_of(d.format), true, &policy)
                     .map_err(|e| Error::Setup(format!("disk {}: {e}", d.path.display())))?;
@@ -135,10 +139,12 @@ impl DiskSet {
             }
             let ptr_path = dir.join(format!("disk{i}.json"));
             let (active, fmt) = if let Some(layer) = restore.get(&i) {
-                // Revert: new overlay on the frozen layer.
-                let lower = vroom_block::open_with(layer, None, true, &policy)
+                // Revert: new overlay on the frozen layer. Its format is
+                // known, never sniffed: the guest may have written a qcow2
+                // header into a raw base.
+                let lfmt = frozen_format(layer, &dir, &d.path, base_fmt)?;
+                let lower = vroom_block::open_with(layer, Some(lfmt), true, &policy)
                     .map_err(|e| Error::Setup(format!("snapshot layer {}: {e}", layer.display())))?;
-                let lfmt = vroom_block::detect(layer).map_err(|e| Error::Setup(e.to_string()))?;
                 let top = dir.join(format!("disk{i}-{}.qcow2", stamp()));
                 Qcow2Image::create(&top, lower.size(), Some((layer, lfmt))).map_err(|e| Error::Setup(e.to_string()))?;
                 #[cfg(feature = "research")]
@@ -378,6 +384,26 @@ pub(crate) fn found(s: &str, dir: &Path) -> PathBuf {
     }
 }
 
+/// A snapshot's frozen layer of a disk (the save names it, and the
+/// sandboxed VMM writes saves): a plain file of ours in `dir` (qcow2), or
+/// exactly the disk's image (`base`, in `base_fmt`).
+fn frozen_format(layer: &Path, dir: &Path, base: &Path, base_fmt: Format) -> Result<Format> {
+    let real = |p: &Path| std::fs::canonicalize(p).ok();
+    let l = real(layer);
+    if l.is_some() && l == real(base) {
+        return Ok(base_fmt);
+    }
+    // Canonical: no link at its end; one name only (no hard link in).
+    if l.is_some() && l.as_deref().and_then(Path::parent) == real(dir).as_deref() && l.as_deref().is_some_and(crate::state::hostile::plain_file) {
+        return Ok(Format::Qcow2);
+    }
+    Err(Error::Setup(format!(
+        "snapshot layer {} is neither one of this VM's layers nor its disk {}; not restoring it",
+        layer.display(),
+        base.display()
+    )))
+}
+
 /// Disk pointers are a line of JSON.
 const POINTER_MAX: u64 = 64 << 10;
 
@@ -421,6 +447,79 @@ mod tests {
         .unwrap();
         c.disks[0].path = disk.to_path_buf();
         c
+    }
+
+    fn raw_cfg(disk: &Path) -> VmConfig {
+        let mut c = cfg(disk);
+        c.disks[0].format = DiskFormat::Raw;
+        c
+    }
+
+    #[test]
+    fn a_raw_base_with_a_qcow2_header_reverts_as_raw() {
+        let td = tempfile::tempdir().unwrap();
+        let disk = td.path().join("disk.img");
+        std::fs::write(&disk, vec![0u8; 1 << 20]).unwrap();
+        let state = td.path().join("vm.state");
+        let c = raw_cfg(&disk);
+        let mut ds = DiskSet::open(&c, &state, &BTreeMap::new()).unwrap();
+        // The guest writes a qcow2 image (backed by a host file) at LBA 0.
+        let fake = td.path().join("fake.qcow2");
+        let secret = td.path().join("secret");
+        std::fs::write(&secret, b"host secret").unwrap();
+        Qcow2Image::create(&fake, 1 << 20, Some((&secret, Format::Raw))).unwrap();
+        let hdr = std::fs::read(&fake).unwrap();
+        ds.disks[0].image.write_at(&hdr[..4096], 0).unwrap();
+        let layers = ds.freeze().unwrap();
+        assert_eq!(layers[&0], disk);
+        drop(ds);
+        let ds = DiskSet::open(&c, &state, &layers).unwrap();
+        let mut b = [0u8; 4];
+        ds.disks[0].image.read_at(&mut b, 0).unwrap();
+        assert_eq!(b, vroom_block::qcow2::MAGIC.to_be_bytes(), "the guest's bytes, not the file they name");
+        assert_eq!(ds.disks[0].below, [disk.canonicalize().unwrap()]);
+    }
+
+    #[test]
+    fn a_save_names_only_our_layers_or_the_base() {
+        let td = tempfile::tempdir().unwrap();
+        let disk = td.path().join("disk.qcow2");
+        Qcow2Image::create(&disk, 1 << 20, None).unwrap();
+        let other = td.path().join("other-vm.qcow2");
+        Qcow2Image::create(&other, 1 << 20, None).unwrap();
+        let state = td.path().join("vm.state");
+        let c = cfg(&disk);
+        drop(DiskSet::open(&c, &state, &BTreeMap::new()).unwrap());
+        let link = state.join("disks/disk0-1-000000001.qcow2");
+        std::os::unix::fs::symlink(&other, &link).unwrap();
+        for layer in [other.clone(), link] {
+            let e = DiskSet::open(&c, &state, &BTreeMap::from([(0, layer)])).err().expect("refused");
+            assert!(e.to_string().contains("neither"), "{e}");
+        }
+    }
+
+    #[test]
+    fn a_layer_cant_be_repointed_next_to_the_base() {
+        let td = tempfile::tempdir().unwrap();
+        let disk = td.path().join("disk.qcow2");
+        Qcow2Image::create(&disk, 1 << 20, None).unwrap();
+        let other = td.path().join("other-vm.qcow2");
+        Qcow2Image::create(&other, 1 << 20, None).unwrap();
+        let state = td.path().join("vm.state");
+        let c = cfg(&disk);
+        let mut ds = DiskSet::open(&c, &state, &BTreeMap::new()).unwrap();
+        ds.freeze().unwrap();
+        let top = ds.disks[0].active.clone().unwrap();
+        drop(ds);
+        vroom_block::qcow2::set_backing(&top, Some((&other, Format::Qcow2))).unwrap();
+        assert!(DiskSet::open(&c, &state, &BTreeMap::new()).is_err());
+        // A writable base that names a backing file (the VMM can write it).
+        vroom_block::qcow2::set_backing(&top, Some((&disk, Format::Qcow2))).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&disk, std::fs::Permissions::from_mode(0o600)).unwrap();
+        vroom_block::qcow2::set_backing(&disk, Some((&other, Format::Qcow2))).unwrap();
+        let e = DiskSet::open(&c, &state, &BTreeMap::new()).err().expect("refused");
+        assert!(e.to_string().contains("can't trust"), "{e}");
     }
 
     #[test]
