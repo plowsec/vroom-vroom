@@ -13,6 +13,9 @@ use vroom_kernel::x86_64::{canonical, AddressSpace, Registers};
 use vroom_kernel::{process, symbols::Symbols};
 use vroom_vmm::{RunState, StartMode, VmEvent, Vmm, VmmOptions};
 
+#[path = "x64_analysis.rs"]
+pub(super) mod analysis;
+
 #[path = "x64_memory.rs"]
 mod memory_util;
 
@@ -49,6 +52,12 @@ pub(super) const OPS: &[&str] = &[
     "modules",
     "peb",
     "user_modules",
+    "callbacks",
+    "stack",
+    "image",
+    "export",
+    "process_event",
+    "cache",
     "guest_exec",
     "guest_upload",
     "guest_download",
@@ -556,6 +565,9 @@ impl Session {
             }
         }
         match op {
+            "callbacks" | "stack" | "image" | "export" | "process_event" | "cache" => {
+                self.analysis_command(op, cpu, q)
+            }
             "registers" => Ok(json!(self.registers(cpu, false)?)),
             "dump" => self.memory_dump(cpu, q),
             "search" => self.memory_search(cpu, q),

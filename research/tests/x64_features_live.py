@@ -50,9 +50,12 @@ def main():
         if running:
             call("memory.dump", {"address": "0x1000", "length": 64}, error=True)
             call("memory.search", {"address": "0x1000", "length": 64, "text": "MZ"}, error=True)
+            call("kernel.stack", error=True)
         call("vm.pause")
         commands = {c["name"] for c in call("commands.list")}
-        required = {"memory.dump", "memory.search"}
+        required = {"memory.dump", "memory.search",
+                    "kernel.stack", "kernel.callbacks", "kernel.image",
+                    "kernel.export", "kernel.process_event", "kernel.cache"}
         assert required <= commands, sorted(required - commands)
         kernel = call("kernel.info")
         base = kernel["base"]
@@ -70,8 +73,27 @@ def main():
         path = Path(dump["path"])
         artifacts.append(path)
         assert path.read_bytes() == bytes.fromhex(header["hex"]), dump
+        call("kernel.symbols")
+        for method in ("kernel.image", "kernel.export"):
+            image = call(method, {"base": hex(base), "allow_missing": True})
+            assert image, image
+            if "path" in image:
+                image_path = Path(image["path"])
+                artifacts.extend((image_path, image_path.with_suffix(".json")))
+                pe = image_path.read_bytes()
+                assert pe[:2] == b"MZ", image
+                pe_offset = int.from_bytes(pe[0x3C:0x40], "little")
+                assert pe[pe_offset:pe_offset + 4] == b"PE\0\0", image
+                assert int.from_bytes(pe[pe_offset + 4:pe_offset + 6], "little") == 0x8664
+        callbacks = call("kernel.callbacks")
+        assert callbacks is not None
+        stack = call("kernel.stack")
+        assert stack is not None
+        cache = call("kernel.cache")
+        assert isinstance(cache, dict), cache
         print(json.dumps({"ok": True, "kernel": kernel["name"],
-                          "commands": len(commands), "dump_bytes": path.stat().st_size}))
+                          "commands": len(commands), "dump_bytes": path.stat().st_size,
+                          "stack": stack, "cache": cache}))
     finally:
         for path in artifacts:
             path.unlink(missing_ok=True)

@@ -795,6 +795,14 @@ impl Connection {
                         if c.name == "debug.breakpoints" { description["summary"] = json!("Replace AMD64 hardware execution breakpoints; four shared execution/data slots, no instruction alignment restriction"); }
                          if c.name == "debug.watchpoints" { description["summary"] = json!("Replace AMD64 data watchpoints: aligned 1/2/4/8 bytes, w or rw, sharing four slots with execution breakpoints"); }
                          if c.name == "memory.search" { description["summary"] = json!("Search virtual memory with wildcard hex, integer or text patterns; skips/reports holes and supports cross-page matches. A deterministic work budget may require a smaller range or larger alignment"); }
+                         if c.name == "kernel.stack" {
+                             description["params"].as_array_mut().unwrap().retain(|p| p["name"] != "vector_length");
+                         }
+                         if c.name == "kernel.image" {
+                             description["summary"] = json!("Fetch/validate an exact-build AMD64 static image and write flat PE analysis artifacts under exports (path optionally selects a host source file)");
+                             description["risk"] = json!("write");
+                             description["mutates"] = json!(true);
+                         }
                     }
                     description
                 }).collect()))
@@ -1168,6 +1176,19 @@ mod tests {
     }
 
     #[test]
+    fn x64_discovery_does_not_advertise_arm_only_trace_options() {
+        let (mut c, _rx) = connection();
+        Arc::get_mut(&mut c.shared).unwrap().ops = Some(crate::x64_lab::OPS);
+        call(&mut c, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"actor":"test"}}"#);
+        let list = call(&mut c, r#"{"jsonrpc":"2.0","id":2,"method":"commands.list"}"#);
+        let commands = list["result"].as_array().unwrap();
+        for name in ["kernel.stack"] {
+            let command = commands.iter().find(|c| c["name"] == name).unwrap();
+            assert!(!command["params"].as_array().unwrap().iter().any(|p| p["name"] == "vector_length"));
+        }
+    }
+
+    #[test]
     fn x64_extended_debugger_commands_are_discovered_and_forwarded() {
         let (mut c, rx) = connection();
         Arc::get_mut(&mut c.shared).unwrap().ops = Some(crate::x64_lab::OPS);
@@ -1175,6 +1196,12 @@ mod tests {
         let cases = vec![
             ("memory.dump", "dump", json!({"address":"0x1000","length":64})),
             ("memory.search", "search", json!({"address":"0x1000","length":64,"text":"MZ"})),
+            ("kernel.callbacks", "callbacks", json!({})),
+            ("kernel.stack", "stack", json!({"cpu":0})),
+            ("kernel.image", "image", json!({"base":"0x1000"})),
+            ("kernel.export", "export", json!({"base":"0x1000"})),
+            ("kernel.process_event", "process_event", json!({})),
+            ("kernel.cache", "cache", json!({})),
         ];
         let list = call(&mut c, r#"{"jsonrpc":"2.0","id":2,"method":"commands.list"}"#);
         let names: Vec<_> = list["result"].as_array().unwrap().iter().map(|v| v["name"].as_str().unwrap()).collect();

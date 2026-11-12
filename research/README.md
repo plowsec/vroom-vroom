@@ -70,6 +70,16 @@ target/debug/vroom-lab /absolute/path/windows11.toml \
   aligned 1/2/4/8-byte ranges, write or read+write; read-only is unsupported.
 - Kernel discovery from live CPU contexts, exact-build Microsoft PDBs,
   symbol lookup, process selection, PEBs, and loaded kernel/user modules.
+- `kernel.callbacks` lists process-notify callbacks using matching PDB layouts
+  or strictly validated AMD64 instruction evidence when public PDBs omit them;
+  `kernel.process_event` decodes an Ex/Ex2 callback at entry. `kernel.image` and
+  `kernel.export` produce AMD64-validated static/live PE analysis artifacts.
+  `kernel.stack` performs bounded v1/v2 metadata unwinding with partial prologues,
+  epilogues, chained records and machine frames, using the actual CPU's CR3.
+  Version-2 epilog recovery requires canonical mirrored layouts.
+  Unsupported metadata/dynamic code stops explicitly; no guessed frame-pointer
+  chain or automatic KPTI address-space substitution is used. `kernel.cache`
+  reports real sizes (the x64 debugger has no physical-page cache).
 - Guest command execution when guest tools are installed (not needed for
   hypervisor-side memory/kernel access).
 - `guest.upload {host_path, guest_path}` copies a host file into the guest:
@@ -97,6 +107,8 @@ Use lossless uint64 handling for addresses and response values.
 Inspection requires an all-CPU pause. Resume afterwards: while paused, Windows,
 its network and Falcon cannot make progress. `vm.shutdown` ends the VM immediately;
 prefer Windows' normal shutdown when preserving a running installation.
+
+Opt-in live feature checks: `python3 research/tests/x64_features_live.py SOCKET`.
 
 ### RPC reference (architecture-dependent capabilities)
 

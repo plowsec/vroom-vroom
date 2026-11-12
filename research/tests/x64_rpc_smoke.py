@@ -40,6 +40,8 @@ assert 'cpu.registers' in names and 'kernel.processes' in names
 assert 'vm.restart' in names
 assert {'vm.snapshot', 'vm.snapshots', 'vm.restore'} <= names
 assert {'memory.dump', 'memory.search'} <= names
+assert {'kernel.stack', 'kernel.callbacks', 'kernel.image', 'kernel.export',
+        'kernel.process_event', 'kernel.cache'} <= names
 assert 'guest.upload' in names and 'guest.download' in names
 assert 'fuzz.check' not in names
 call('fuzz.check', {'harness': 'unsupported.json'}, error=True)
