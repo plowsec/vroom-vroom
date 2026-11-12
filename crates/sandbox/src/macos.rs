@@ -528,6 +528,65 @@ mod tests {
         assert!(out.connect(("192.0.2.1", 9)).is_ok(), "UDP elsewhere (nothing is sent)");
     }
 
+    /// An ICMP datagram socket as crates/net/src/nat/ping.rs makes it
+    /// (socket2: CLOEXEC, NOSIGPIPE; then nonblocking, TTL, connect).
+    fn icmp_to(ip: [u8; 4], send: bool) -> std::io::Result<()> {
+        let last = || Err(std::io::Error::last_os_error());
+        // SAFETY: plain socket calls on an fd we own and close; the
+        // address and option values live on our stack for each call.
+        unsafe {
+            let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_ICMP);
+            if fd < 0 {
+                return last();
+            }
+            let one: libc::c_int = 1;
+            let ttl: libc::c_int = 63;
+            let sz = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            let mut sa: libc::sockaddr_in = std::mem::zeroed();
+            sa.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
+            sa.sin_family = libc::AF_INET as libc::sa_family_t;
+            sa.sin_addr.s_addr = u32::from_ne_bytes(ip);
+            // Echo request, id 0x1234, seq 1, checksum over the 8 bytes.
+            let echo: [u8; 8] = [8, 0, 0xe5, 0xca, 0x12, 0x34, 0, 1];
+            let r = if libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) < 0
+                || libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_NOSIGPIPE, (&one as *const libc::c_int).cast(), sz) < 0
+                || libc::fcntl(fd, libc::F_SETFL, libc::fcntl(fd, libc::F_GETFL) | libc::O_NONBLOCK) < 0
+                || libc::setsockopt(fd, libc::IPPROTO_IP, libc::IP_TTL, (&ttl as *const libc::c_int).cast(), sz) < 0
+                || libc::connect(fd, (&sa as *const libc::sockaddr_in).cast(), sa.sin_len as libc::socklen_t) < 0
+                || (send && libc::send(fd, echo.as_ptr().cast(), echo.len(), 0) < 0)
+            {
+                last()
+            } else {
+                Ok(())
+            };
+            libc::close(fd);
+            r
+        }
+    }
+
+    /// NAT pings (ICMP datagram sockets) under the TCP/UDP-only rule:
+    /// out to the world yes, host loopback no. In a child, as above.
+    #[test]
+    fn icmp_out_but_not_to_loopback() {
+        const ME: &str = "macos::tests::icmp_out_but_not_to_loopback";
+        if std::env::var_os("VROOM_SB_ICMP_CHILD").is_none() {
+            let st = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", ME, "--nocapture", "--test-threads=1"])
+                .env("VROOM_SB_ICMP_CHILD", "1")
+                .status()
+                .unwrap();
+            assert!(st.success());
+            return;
+        }
+        // Unsandboxed, loopback echo works: a refusal later is the sandbox's.
+        icmp_to([127, 0, 0, 1], true).unwrap();
+        apply(&Policy { network_outbound: true, ..Default::default() }).unwrap();
+        // connect only: nothing leaves the Mac.
+        icmp_to([192, 0, 2, 1], false).unwrap();
+        let e = icmp_to([127, 0, 0, 1], true).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::EPERM), "ICMP to loopback: {e}");
+    }
+
     /// A USB disk's files handed over while the VMM is still setting up
     /// (a VM file's disk): the token must work once the sandbox is on.
     /// Run in a child, as a sandbox is for the whole process.
