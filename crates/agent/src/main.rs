@@ -65,6 +65,9 @@ mod winsvc;
 mod winupdate;
 #[cfg(target_os = "linux")]
 mod linsvc;
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod seat;
 
 #[cfg(windows)]
 use std::fs::OpenOptions;

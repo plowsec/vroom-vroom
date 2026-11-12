@@ -5,7 +5,8 @@
 //! - `/run/vroom-agent.sock`: /run is root's, nobody can squat the name;
 //!   the helper also checks its peer is root.
 //! - The service only serves the user logind says is active on seat0, so
-//!   another local user can't listen in on the clipboard.
+//!   another local user can't listen in on the clipboard. Without logind:
+//!   the owner of the active VT; neither known: root only.
 
 use std::io::Read;
 use std::os::fd::AsRawFd;
@@ -31,12 +32,6 @@ fn peer_uid(s: &UnixStream) -> std::io::Result<u32> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(c.uid)
-}
-
-/// The user on seat0's screen right now (logind's view), if any.
-fn active_uid() -> Option<u32> {
-    let s = std::fs::read_to_string("/run/systemd/seats/seat0").ok()?;
-    s.lines().find_map(|l| l.strip_prefix("ACTIVE_UID=")).and_then(|v| v.trim().parse().ok())
 }
 
 /// Set by SIGTERM (systemd stopping us).
@@ -125,9 +120,8 @@ fn accept_helpers(l: UnixListener, tx: Sender<Ev>) {
     for s in l.incoming() {
         let Ok(s) = s else { continue };
         let uid = peer_uid(&s).ok();
-        let active = active_uid();
-        // No logind (minimal systems): any local user's helper.
-        if active.is_some() && uid != active && uid != Some(0) {
+        let active = crate::seat::active_uid();
+        if !crate::seat::serves(uid, active) {
             log::warn!("service: refusing helper of uid {uid:?} (active user {active:?})");
             continue;
         }
