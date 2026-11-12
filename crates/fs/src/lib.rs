@@ -284,7 +284,10 @@ impl Share {
         if !st.is_file() && !st.is_dir() {
             return Err(os(libc::EPERM));
         }
-        sys::fchmod(fd.as_raw_fd(), mode & 0o7777)
+        // No set-id bits: the Seatbelt rule doesn't cover Linux hosts or --no-sandbox.
+        // Sticky stays on directories (restricts deletion, grants nothing); meaningless on files.
+        let keep = if st.is_dir() { 0o1777 } else { 0o777 };
+        sys::fchmod(fd.as_raw_fd(), mode & keep)
     }
 
     /// Access / modification times; None leaves one alone.
@@ -612,6 +615,20 @@ mod tests {
         ro(s.create(&p(&[]), OsStr::new("n"), 0o644, true).map(|_| ()));
         ro(s.open_file(&p(&["sub", "hello.txt"]), true).map(|_| ()));
         ro(s.rename(&p(&["sub"]), OsStr::new("hello.txt"), &p(&[]), OsStr::new("y"), false));
+    }
+
+    #[test]
+    fn set_mode_drops_set_id_bits() {
+        let (_td, root) = fixture();
+        let s = Share::open(&root, false).unwrap();
+        s.create(&p(&[]), OsStr::new("x"), 0o644, true).unwrap();
+        s.set_mode(&p(&["x"]), 0o6755).unwrap();
+        assert_eq!(s.stat(&p(&["x"])).unwrap().mode & 0o7777, 0o755);
+        s.set_mode(&p(&["x"]), 0o1644).unwrap();
+        assert_eq!(s.stat(&p(&["x"])).unwrap().mode & 0o7777, 0o644);
+        s.mkdir(&p(&[]), OsStr::new("d"), 0o755).unwrap();
+        s.set_mode(&p(&["d"]), 0o7777).unwrap();
+        assert_eq!(s.stat(&p(&["d"])).unwrap().mode & 0o7777, 0o1777, "sticky kept on directories");
     }
 
     #[test]
