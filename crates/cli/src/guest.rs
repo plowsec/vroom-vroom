@@ -166,7 +166,13 @@ fn pull(vm: Vm, guest: String, host: &Path, load: Load, state_dir: StateDir) -> 
 fn receive(s: &mut UnixStream, to: &Path) -> Result<String, String> {
     use sha2::Digest;
     let part = PathBuf::from(format!("{}.vroom-part", to.display()));
-    let mut f = std::fs::File::create(&part).map_err(|e| format!("{}: {e}", part.display()))?;
+    // Ours alone (0600: it may be the guest's secrets), and a new file:
+    // a link someone left at that name is removed, not written through.
+    let _ = std::fs::remove_file(&part);
+    let mut f = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&part).map_err(|e| format!("{}: {e}", part.display()))?
+    };
     let r = (|| {
         vroom_sandbox::quarantine::mark(&f).map_err(|e| format!("{}: quarantine: {e}", part.display()))?;
         let mut frames = Frames::new(s, Duration::from_secs(120))?;
@@ -259,6 +265,28 @@ fn find(vm: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pulled_files_are_owner_only_and_never_written_through_a_link() {
+        use sha2::Digest;
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("vroom-pull-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let victim = d.join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        let to = d.join("shadow");
+        std::os::unix::fs::symlink(&victim, d.join("shadow.vroom-part")).unwrap();
+        let (mut a, mut b) = UnixStream::pair().unwrap();
+        let sha: [u8; 32] = sha2::Sha256::digest(b"secret").into();
+        b.write_all(&Message::FileData { id: 0, data: b"secret".to_vec() }.encode()).unwrap();
+        b.write_all(&Message::FileDone { id: 0, ok: true, size: 6, sha256: sha, why: String::new() }.encode()).unwrap();
+        receive(&mut a, &to).unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), b"secret");
+        assert_eq!(std::fs::metadata(&to).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
