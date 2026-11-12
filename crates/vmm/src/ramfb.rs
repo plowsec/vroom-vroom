@@ -14,6 +14,8 @@ use crate::display::FbSink;
 
 pub const FILE: &str = "etc/ramfb";
 pub const CONFIG_LEN: usize = 28;
+/// One framebuffer slot (`SharedFb`): the largest frame there is.
+const MAX_FRAME: u64 = vroom_display::MAX_WIDTH as u64 * vroom_display::MAX_HEIGHT as u64 * 4;
 const XRGB8888: u32 = 0x3432_5258; // DRM fourcc "XR24"
 const PERIOD: Duration = Duration::from_millis(33);
 /// A screen unchanged for this many periods is looked at less often.
@@ -40,8 +42,15 @@ pub fn parse(b: &[u8], mem: &GuestMemory) -> Option<RamfbConfig> {
     if fourcc != XRGB8888 || !SharedFb::mode_ok(width, height) {
         return None;
     }
+    // Firmware (QemuRamfbDxe) writes width * 4, and Windows' basic
+    // display draws into the frame firmware set up; drivers that pad a
+    // row pad it to well under a page. More is no picture, only memory:
+    // the copier keeps two frames of stride * height.
     let stride = if stride == 0 { width * 4 } else { stride };
-    if stride < width * 4 || stride > width * 16 {
+    if stride < width * 4 || stride > (width * 4).next_multiple_of(4096) {
+        return None;
+    }
+    if stride as u64 * height as u64 > MAX_FRAME {
         return None;
     }
     if !mem.check_range(GuestAddress(addr), stride as u64 * height as u64) {
@@ -139,5 +148,19 @@ mod tests {
         // Frame runs past the end of RAM.
         assert!(parse(&cfg(0x40ff_0000, XRGB8888, 1024, 768, 4096), &mem).is_none());
         assert!(parse(&cfg(u64::MAX - 10, XRGB8888, 16, 16, 64), &mem).is_none());
+    }
+
+    #[test]
+    fn a_frame_is_at_most_one_slot() {
+        let mem = GuestMemory::new(&[(GuestAddress(0x4000_0000), 2 << 30)]).unwrap();
+        // The largest mode, unpadded: fine.
+        assert!(parse(&cfg(0x4000_0000, XRGB8888, 7680, 4320, 0), &mem).is_some());
+        // Rows padded to a page: fine.
+        assert_eq!(parse(&cfg(0x4000_0000, XRGB8888, 1000, 768, 4096), &mem).unwrap().stride, 4096);
+        // Four times the row (about 500 MiB a frame, twice over): refused.
+        assert!(parse(&cfg(0x4000_0000, XRGB8888, 7680, 4320, 7680 * 16), &mem).is_none());
+        assert!(parse(&cfg(0x4000_0000, XRGB8888, 1024, 768, 8192), &mem).is_none());
+        // Padded past one slot at the largest mode.
+        assert!(parse(&cfg(0x4000_0000, XRGB8888, 7680, 4320, 32768), &mem).is_none());
     }
 }
