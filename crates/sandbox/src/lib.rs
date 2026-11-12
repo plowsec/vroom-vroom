@@ -45,6 +45,9 @@ pub struct Policy {
     pub loopback_dns: bool,
     /// Accept on these already-bound local TCP ports (port forwards).
     pub listen_ports: Vec<u16>,
+    /// Accept on listeners opened during setup (viewer/control IPC).
+    /// This does not permit creating, binding or listening on new sockets.
+    pub accept_preopened: bool,
     /// Talk to the system pasteboard (macOS) in-process.
     pub clipboard: bool,
     /// Use the host GPU (virtio-gpu 3D through virglrenderer/Vulkan).

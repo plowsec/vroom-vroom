@@ -56,6 +56,7 @@ fn timestamp() -> u64 {
 fn lock_down(cfg: &VmConfig, state_dir: &Path, clipboard: bool, helpers: Vec<u32>) -> Result<(), String> {
     let mut p = vroom_sandbox::Policy {
         write_dirs: vec![state_dir.to_path_buf()],
+        accept_preopened: true, // viewer/control listeners were bound before lockdown
         clipboard,
         // USB disks the app hands over while the VM runs (nothing else
         // can be reached through these rules).

@@ -81,7 +81,7 @@ fn allowed(p: &Policy) -> Vec<i64> {
         // gets an argument rule in `seccomp` (IP families only).
         v.extend_from_slice(&[SYS_connect]);
     }
-    if !p.listen_ports.is_empty() {
+    if p.accept_preopened || !p.listen_ports.is_empty() {
         v.extend_from_slice(&[SYS_accept4, SYS_accept]);
     }
     v
@@ -163,4 +163,21 @@ pub fn apply(p: &Policy) -> Result<()> {
         log::warn!("landlock unavailable: {e}");
     }
     seccomp(p)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ipc_accept_does_not_allow_new_sockets_or_listeners() {
+        let base = allowed(&Policy::default());
+        assert!(!base.contains(&libc::SYS_accept4));
+        let ipc = allowed(&Policy { accept_preopened: true, ..Default::default() });
+        assert!(ipc.contains(&libc::SYS_accept));
+        assert!(ipc.contains(&libc::SYS_accept4));
+        for syscall in [libc::SYS_socket, libc::SYS_bind, libc::SYS_listen, libc::SYS_connect] {
+            assert!(!ipc.contains(&syscall));
+        }
+    }
 }
