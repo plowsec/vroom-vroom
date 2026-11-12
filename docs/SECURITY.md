@@ -22,7 +22,7 @@ Out of scope: malicious host; CPU side channels (Spectre-class: hypervisor's and
 - Logging capped at 50 lines/s (errors excepted): a guest can't flood the terminal or fill a log disk.
 - Guest serial and `vroom guest exec` output on a terminal: OSC 52 (clipboard), DCS, SOS, PM, APC, ENQ dropped; CSI, other OSC pass (`cli/src/term.rs`).
 - qcow2 backing files: only the image's own dir or allow-listed ones (exact dirs, not below); no protocol prefixes; chain depth capped; format from the backing-format extension, never sniffed (missing: refused, `qemu-img rebase -u -F`).
-- Writable VM disk chains (VMM, prune, app compact): backing = a plain file in `<state>/disks` (qcow2) or exactly the configured image; a writable image with a backing file of its own is refused (the VMM could have rewritten its header).
+- Writable VM disk chains (VMM, prune, app compact): backing = a plain file in `<state>/disks` (qcow2) or exactly the configured image; a writable image with a backing file of its own: only the one its `[[disk]] backing` names (canonical, regular file, no link, recorded format; below it the read-only rules), else refused (the VMM could have rewritten its header). Prune: read-only rules below the image.
 - VMDK import (read-only): headers, grain tables, descriptors range-checked and capped like qcow2; extent files plain names next to their descriptor (no symlinks out); parents must be `.vmdk`, CIDs must match, chains capped, loops refused.
 
 ## Layer 2: sandbox
@@ -412,9 +412,11 @@ Frame sockets: macOS gives Unix datagram sockets 4 KiB (2 frames). Both ends ask
   |---|---|
   | VM file | boot files, disk images, net attachments, share folders + writability, USB devices, identity, clipboard, serial, sandbox |
   | save, only if the file has it too | 3D, OpenGL (Apple driver), video decode/encode, nested, TPM, sound, mic, camera |
-  | save | CPUs, memory, transport, balloon, monitors, sound card |
+  | save, at most the file's | CPUs, memory |
+  | save | transport, balloon, monitors, sound card |
 
-  - Mismatch (disk path/setup, disk count, boot kind, Secure Boot, identity, opt-in off in the file): refused, `--fresh` boots.
+  - Merged config validated like a VM file.
+  - Mismatch (disk path/setup/backing, disk count, boot kind, Secure Boot, identity, opt-in off in the file): refused, `--fresh` boots.
   - Share tag the file dropped: device stays, empty. USB device the file dropped: left out.
   - Adapter the file dropped: kept unplugged, no backend, host-only for the sandbox.
 - Frozen layer named by a snapshot: a plain file in `<state>/disks` (qcow2) or exactly the disk's image (format from the VM file; never sniffed).
@@ -581,6 +583,7 @@ Use 3D only for guests that need it: the GPU process confines the 3D code, but a
 - Socket in the user's temp dir (`$TMPDIR/vroom/`, 0700), itself 0600, bound before the sandbox.
 - Whoever connects gets the guest screen and sends keys and commands: any process of the user can, matching what user processes can already do to the VM's files.
 - One viewer at a time; guest can't reach it.
+- Control socket (`vroom guest exec/push/pull/update-tools`): same place, same reach rule. Any process of the user gets commands run as root/SYSTEM in the guest.
 - Hung VM: app reads the pid from the VMM's state lock, signals it only if that process is a `vroom` executable (the VMM can write that file).
 
 ## Several monitors
@@ -591,7 +594,7 @@ With `[display] monitors`:
 - Viewer messages for other monitors (mode, damage, window size, pointer) name a monitor; outside 1..3 refused; sizes both or neither.
 - virtio-gpu: ≤4 scanouts; every scanout id checked; every rect clipped to its scanout's view; snapshot scanouts checked like commands.
 - Agent gets the layout (sizes, places, bounded) and, on Windows, the pointer on monitors the USB tablet doesn't reach. Host → guest only. Session helper injects the pointer with SendInput: can't reach elevated windows or the secure desktop (UAC), like any user app.
-- Windows' extra GPUs: 32 MiB plain memory in BAR 0 (reserved; only guest-written pages become memory), cleared by the 2D driver as a framebuffer. Windows' 3D GPU: 8 MiB, for the basic display driver while 3D is off. Device never reads it. Memory follows the BAR only inside the PCI windows: a BAR mid-sizing (all ones in its low half) can sit on RAM; once the memory went there and RAM was unmapped when it moved on.
+- Windows' extra GPUs: 32 MiB plain memory in BAR 0 (reserved; only guest-written pages become memory), cleared by the 2D driver as a framebuffer. Windows' 3D GPU: 8 MiB, for the basic display driver while 3D is off. Device never reads it. Memory follows the BAR only inside the PCI windows: a BAR mid-sizing (all ones in its low half) can sit on RAM; once the memory went there and RAM was unmapped when it moved on. Same for the 3D host-visible window: blobs map only inside it as placed (live and from a snapshot); elsewhere the map fails.
 - Windows: agent service picks a display driver per GPU from the driver store (2D on GPUs without 3D; 3D on the first when the host has 3D), like Device Manager; chooses only among installed drivers.
 
 ## Guest agent (Windows and Linux)
