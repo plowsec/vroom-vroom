@@ -68,7 +68,7 @@ mod winsvc;
 mod winupdate;
 #[cfg(target_os = "linux")]
 mod linsvc;
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(test, unix)))]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod seat;
 
