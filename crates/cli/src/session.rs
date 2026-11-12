@@ -94,18 +94,45 @@ fn lock_down(cfg: &VmConfig, later_shares: &[vroom_config::Share], state_dir: &P
     vroom_sandbox::apply(&p).map_err(|e| e.to_string())?;
     log::info!("sandbox applied");
     if std::env::var_os("VROOM_SANDBOX_SELFTEST").is_some() {
-        selftest("vmm", clipboard);
+        probes("vmm", clipboard, p.network_outbound);
     }
     Ok(())
 }
 
 /// Probe what the sandbox should block; `who` names the process.
 pub(crate) fn selftest(who: &str, clipboard: bool) {
-    let probe = |path: &str| match std::fs::read(path) {
-        Ok(_) => eprintln!("{who} sandbox selftest: {path} READABLE (bad)"),
-        Err(e) => eprintln!("{who} sandbox selftest: {path} blocked ({e})"),
+    probes(who, clipboard, false);
+}
+
+/// Probes after the file ones, in order. On Linux seccomp answers each
+/// with a kill (pipe2 for Command, bind, socket(AF_UNIX), and socket()
+/// at all without NAT): there one per run, `VROOM_SELFTEST_FATAL`, last.
+const LATE: [&str; 4] = ["net", "exec", "listen", "unix"];
+
+/// Which `LATE` probes to run, in order, and which are left out. `net`:
+/// the policy allows IP sockets.
+fn plan(linux: bool, net: bool, chosen: Option<&str>) -> (Vec<&'static str>, Vec<&'static str>) {
+    let fatal = |n: &str| linux && (n != "net" || !net);
+    let (mut run, mut skip): (Vec<&'static str>, Vec<&'static str>) = LATE.iter().copied().partition(|n| !fatal(n));
+    if let Some(i) = skip.iter().position(|n| Some(*n) == chosen) {
+        run.push(skip.remove(i));
+    }
+    (run, skip)
+}
+
+/// `net`: see `plan`.
+fn probes(who: &str, clipboard: bool, net: bool) {
+    let say = |m: String| eprintln!("{who} sandbox selftest: {m}");
+    let linux = cfg!(target_os = "linux");
+    let chosen = std::env::var("VROOM_SELFTEST_FATAL").ok();
+    let (late, skipped) = plan(linux, net, chosen.as_deref());
+
+    let read = |path: &str| match std::fs::read(path) {
+        Ok(_) => say(format!("{path} READABLE (bad)")),
+        Err(e) => say(format!("{path} blocked ({e})")),
     };
-    probe("/etc/passwd");
+    read("/etc/passwd");
+    read(&format!("{}/.ssh/known_hosts", std::env::var("HOME").unwrap_or_default()));
     // Another process's shared memory (notifyd's, there on every Mac).
     #[cfg(target_os = "macos")]
     {
@@ -114,53 +141,63 @@ pub(crate) fn selftest(who: &str, clipboard: bool) {
         #[allow(unsafe_code)]
         let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY) };
         if fd >= 0 {
-            eprintln!("{who} sandbox selftest: foreign shared memory OPENED (bad)");
+            say("foreign shared memory OPENED (bad)".into());
             // SAFETY: an fd we just got.
             #[allow(unsafe_code)]
             unsafe {
                 libc::close(fd)
             };
         } else {
-            eprintln!("{who} sandbox selftest: foreign shared memory blocked ({})", std::io::Error::last_os_error());
+            say(format!("foreign shared memory blocked ({})", std::io::Error::last_os_error()));
         }
     }
     if clipboard {
         // Read only: the user's clipboard isn't ours to change, nor to print.
         match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
-            Ok(_) | Err(arboard::Error::ContentNotAvailable) => eprintln!("{who} sandbox selftest: clipboard readable"),
-            Err(e) => eprintln!("{who} sandbox selftest: clipboard FAILED ({e})"),
+            Ok(_) | Err(arboard::Error::ContentNotAvailable) => say("clipboard readable".into()),
+            Err(e) => say(format!("clipboard FAILED ({e})")),
         }
     }
-    probe(&format!("{}/.ssh/known_hosts", std::env::var("HOME").unwrap_or_default()));
-    match std::process::Command::new("/bin/echo").arg("x").output() {
-        Ok(_) => eprintln!("{who} sandbox selftest: exec ALLOWED (bad)"),
-        Err(e) => eprintln!("{who} sandbox selftest: exec blocked ({e})"),
+    if !skipped.is_empty() {
+        say(format!("not run, seccomp kills (one per run: VROOM_SELFTEST_FATAL=<name>): {}", skipped.join(" ")));
     }
-    // On Linux, seccomp kills the process on bind() or an AF_UNIX
-    // socket(): those probes go last there, and dying is the pass.
-    if cfg!(target_os = "macos") {
-        match std::net::TcpListener::bind("127.0.0.1:0") {
-            Ok(_) => eprintln!("{who} sandbox selftest: new listener ALLOWED (bad)"),
-            Err(e) => eprintln!("{who} sandbox selftest: new listener blocked ({e})"),
-        }
-    }
-    // Host services: loopback TCP and Unix sockets (ssh-agent...).
     let t = Duration::from_secs(2);
-    if let Some(port) = std::env::var("VROOM_SELFTEST_LOOPBACK_PORT").ok().and_then(|p| p.parse::<u16>().ok()) {
-        match std::net::TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), t) {
-            Ok(_) => eprintln!("{who} sandbox selftest: host loopback ALLOWED (bad unless allow_host_loopback)"),
-            Err(e) => eprintln!("{who} sandbox selftest: host loopback blocked ({e})"),
+    for probe in late {
+        if linux && chosen.as_deref() == Some(probe) {
+            say(format!("{probe}: expect SIGSYS now (dying = pass)"));
         }
-    }
-    match std::net::TcpStream::connect_timeout(&([1, 1, 1, 1], 53).into(), t) {
-        Ok(_) => eprintln!("{who} sandbox selftest: internet reachable (NAT works)"),
-        Err(e) => eprintln!("{who} sandbox selftest: internet: {e}"),
-    }
-    if let Some(sock) = std::env::var_os("SSH_AUTH_SOCK") {
-        eprintln!("{who} sandbox selftest: unix socket probe (Linux: expect SIGSYS now)");
-        match std::os::unix::net::UnixStream::connect(&sock) {
-            Ok(_) => eprintln!("{who} sandbox selftest: unix socket {} ALLOWED (bad)", sock.to_string_lossy()),
-            Err(e) => eprintln!("{who} sandbox selftest: unix sockets blocked ({e})"),
+        match probe {
+            "net" => {
+                // Host services on loopback TCP, then the internet.
+                if let Some(port) = std::env::var("VROOM_SELFTEST_LOOPBACK_PORT").ok().and_then(|p| p.parse::<u16>().ok()) {
+                    match std::net::TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), t) {
+                        Ok(_) => say("host loopback ALLOWED (bad unless allow_host_loopback)".into()),
+                        Err(e) => say(format!("host loopback blocked ({e})")),
+                    }
+                }
+                match std::net::TcpStream::connect_timeout(&([1, 1, 1, 1], 53).into(), t) {
+                    Ok(_) => say("internet reachable (NAT works)".into()),
+                    Err(e) => say(format!("internet: {e}")),
+                }
+            }
+            "exec" => match std::process::Command::new("/bin/echo").arg("x").output() {
+                Ok(_) => say("exec ALLOWED (bad)".into()),
+                Err(e) => say(format!("exec blocked ({e})")),
+            },
+            "listen" => match std::net::TcpListener::bind("127.0.0.1:0") {
+                Ok(_) => say("new listener ALLOWED (bad)".into()),
+                Err(e) => say(format!("new listener blocked ({e})")),
+            },
+            _ => {
+                // ssh-agent; on Linux any path does (the kill is at socket()).
+                let sock = std::env::var_os("SSH_AUTH_SOCK").or_else(|| linux.then(|| "/run/dbus/system_bus_socket".into()));
+                if let Some(sock) = sock {
+                    match std::os::unix::net::UnixStream::connect(&sock) {
+                        Ok(_) => say(format!("unix socket {} ALLOWED (bad)", sock.to_string_lossy())),
+                        Err(e) => say(format!("unix sockets blocked ({e})")),
+                    }
+                }
+            }
         }
     }
 }
@@ -466,5 +503,20 @@ pub fn run(o: RunOpts) -> Result<(), String> {
                 return Ok(());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::plan;
+
+    #[test]
+    fn selftest_fatal_probes_last_and_one_per_run() {
+        assert_eq!(plan(false, false, None), (vec!["net", "exec", "listen", "unix"], vec![]));
+        assert_eq!(plan(true, true, None), (vec!["net"], vec!["exec", "listen", "unix"]));
+        assert_eq!(plan(true, false, None), (vec![], vec!["net", "exec", "listen", "unix"]));
+        assert_eq!(plan(true, true, Some("listen")), (vec!["net", "listen"], vec!["exec", "unix"]));
+        assert_eq!(plan(true, false, Some("net")), (vec!["net"], vec!["exec", "listen", "unix"]));
+        assert_eq!(plan(true, true, Some("bogus")).0, vec!["net"]);
     }
 }
