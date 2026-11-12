@@ -354,6 +354,32 @@ impl Vmm {
         Self::start_with_lifecycle(config, hv, opts, lifecycle)
     }
 
+    /// `start`, but `confine` (the frontend's sandbox) runs first, with
+    /// every CPU parked: no guest instruction before it. If it fails the
+    /// VM is stopped and never ran.
+    pub fn start_confined<E: From<Error>>(
+        config: VmConfig,
+        hv: Arc<dyn Hypervisor>,
+        mut opts: VmmOptions,
+        confine: impl FnOnce(&Vmm) -> std::result::Result<(), E>,
+    ) -> std::result::Result<Vmm, E> {
+        let run = matches!(opts.start, StartMode::Boot | StartMode::Restore(_));
+        opts.start = match opts.start {
+            StartMode::Boot => StartMode::BootPaused,
+            StartMode::Restore(d) => StartMode::RestorePaused(d),
+            paused => paused,
+        };
+        let mut vmm = Self::start(config, hv, opts)?;
+        if let Err(e) = confine(&vmm) {
+            vmm.shutdown();
+            return Err(e);
+        }
+        if run {
+            vmm.resume()?;
+        }
+        Ok(vmm)
+    }
+
     // Tests can also exercise cold-only lifecycle on the existing ARM board.
     fn start_with_lifecycle(config: VmConfig, hv: Arc<dyn Hypervisor>, opts: VmmOptions, lifecycle: LifecyclePolicy) -> Result<Vmm> {
         lifecycle.check_start(&opts.start)?;

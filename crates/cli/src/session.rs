@@ -344,6 +344,15 @@ fn escape_action(b: u8) -> Option<Action> {
     })
 }
 
+/// `Vmm::start_confined`'s error: the VMM's or the sandbox's, as text.
+struct StartError(String);
+
+impl From<vroom_vmm::Error> for StartError {
+    fn from(e: vroom_vmm::Error) -> Self {
+        StartError(e.to_string())
+    }
+}
+
 pub fn run(o: RunOpts) -> Result<(), String> {
     std::fs::create_dir_all(&o.state_dir).map_err(|e| format!("{}: {e}", o.state_dir.display()))?;
     if o.config.display.gpu == vroom_config::Gpu::Virtio3d {
@@ -376,17 +385,22 @@ pub fn run(o: RunOpts) -> Result<(), String> {
     let has_clip = clipboard.is_some();
     let hv = vroom_hv::default_hypervisor().map_err(|e| e.to_string())?;
     let opts = VmmOptions { serial_out: term::guest_out(), start, clipboard, ui, state_dir: o.state_dir.clone(), sandbox: o.sandbox };
-    let vmm = Vmm::start(o.config, hv, opts).map_err(|e| e.to_string())?;
-    if resumed_suspend {
-        // A suspend image is single use: the disks move on from here.
-        let _ = std::fs::remove_dir_all(&suspend);
-    }
-
-    if o.sandbox && vmm.config().security.sandbox {
-        lock_down(vmm.config(), vmm.later_shares(), &o.state_dir, has_clip, vmm.helper_pids())?;
-    } else {
-        eprintln!("vroom: WARNING: running without sandbox");
-    }
+    // Built with every CPU parked; the guest runs only once we're locked
+    // down (a resumed guest would go on right where it was).
+    let vmm = Vmm::start_confined(o.config, hv, opts, |vmm| {
+        if resumed_suspend {
+            // A suspend image is single use: the disks move on from here.
+            // Before lock-down: seccomp has no unlinkat.
+            let _ = std::fs::remove_dir_all(&suspend);
+        }
+        if o.sandbox && vmm.config().security.sandbox {
+            lock_down(vmm.config(), vmm.later_shares(), &o.state_dir, has_clip, vmm.helper_pids()).map_err(StartError)
+        } else {
+            eprintln!("vroom: WARNING: running without sandbox");
+            Ok(())
+        }
+    })
+    .map_err(|StartError(e)| e)?;
     let mut s = Session { vmm, state_dir: o.state_dir, agent_sessions: 0, viewer_lost: None,
         next_space_check: std::time::Instant::now(),
         low_space: std::env::var("VROOM_LOW_SPACE_MIB").ok().and_then(|v| v.parse::<u64>().ok()).map_or(LOW_SPACE, |m| m << 20),

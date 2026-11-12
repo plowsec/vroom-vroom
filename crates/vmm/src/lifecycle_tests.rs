@@ -833,3 +833,59 @@ fn startup_abandoned_ready_receiver_never_enters_the_command_loop() {
         assert!(weak.upgrade().is_none());
     }
 }
+
+/// The frontend's sandbox goes on before any guest instruction, at boot
+/// and at resume (`vroom run` locks down in `confine`).
+#[test]
+fn confine_runs_before_the_guest_and_its_failure_never_runs_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, opts, hv, counts) = fixture(temp.path(), 2, StartMode::Boot);
+    let mut vm = Vmm::start_confined(config.clone(), hv.clone(), opts, |vm| {
+        // Room for a worker that was let go to call run.
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(vm.state(), RunState::Paused);
+        assert_eq!(vm.vcpu_run_calls(), 0);
+        assert_eq!(counts.runs.load(SeqCst), 0);
+        Ok::<_, Error>(())
+    })
+    .unwrap();
+    assert_eq!(vm.state(), RunState::Running);
+    wait_for_runs(&counts, 0);
+    let snap = temp.path().join("snap");
+    vm.snapshot(&snap, "t").unwrap();
+    drop(vm);
+
+    let opts = VmmOptions {
+        serial_out: Box::new(std::io::sink()),
+        start: StartMode::Restore(snap.clone()),
+        clipboard: None,
+        ui: None,
+        state_dir: temp.path().join("state"),
+        sandbox: false,
+    };
+    let vm = Vmm::start_confined(config.clone(), hv.clone(), opts, |vm| {
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(vm.vcpu_run_calls(), 0);
+        Ok::<_, Error>(())
+    })
+    .unwrap();
+    let after = counts.runs.load(SeqCst);
+    wait_for_runs(&counts, after);
+    drop(vm);
+
+    let runs = counts.runs.load(SeqCst);
+    let drops = counts.drops.load(SeqCst);
+    let opts = VmmOptions {
+        serial_out: Box::new(std::io::sink()),
+        start: StartMode::Restore(snap),
+        clipboard: None,
+        ui: None,
+        state_dir: temp.path().join("state"),
+        sandbox: false,
+    };
+    let e = Vmm::start_confined(config, hv, opts, |_| Err(Error::Setup("no sandbox".into()))).err().unwrap();
+    assert!(e.to_string().contains("no sandbox"));
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(counts.runs.load(SeqCst), runs, "a failed lock-down ran the guest");
+    assert_eq!(counts.drops.load(SeqCst), drops + 2, "workers joined");
+}
