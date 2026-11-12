@@ -81,12 +81,47 @@ impl Files {
     }
 }
 
+/// The file beside `path` a push is written to. We run as root/SYSTEM in
+/// a folder a guest user may write: a part file there already (or a link
+/// planted as one) is removed, never written through; the new one is
+/// made new, without following links, owner-only.
+fn create_part(part: &str) -> io::Result<std::fs::File> {
+    match std::fs::symlink_metadata(part) {
+        Ok(m) if m.is_dir() => return Err(io::Error::other(format!("{part} is a folder"))),
+        Ok(_) => std::fs::remove_file(part)?,
+        Err(_) => {}
+    }
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        o.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let f = o.open(part)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if f.metadata()?.file_attributes() & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::other(format!("{part} is a link")));
+        }
+    }
+    Ok(f)
+}
+
 /// Write `size` bytes from `next` to `path` (through a file beside it,
 /// so a file cut short never replaces one). Their SHA-256.
 fn receive(path: &str, size: u64, next: impl Fn(Duration) -> Result<Vec<u8>, RecvTimeoutError>) -> io::Result<[u8; 32]> {
     let part = format!("{path}.vroom-part");
+    let mut made = false;
     let r = (|| {
-        let mut f = std::fs::File::create(&part)?;
+        let mut f = create_part(&part)?;
+        made = true;
         let mut h = Sha256::new();
         let mut got = 0u64;
         while got < size {
@@ -99,11 +134,18 @@ fn receive(path: &str, size: u64, next: impl Fn(Duration) -> Result<Vec<u8>, Rec
             got += b.len() as u64;
         }
         f.flush()?;
+        // Whole: readable like any file root makes (umask 022).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(0o644))?;
+        }
         drop(f);
         std::fs::rename(&part, path)?;
         Ok(h.finalize().into())
     })();
-    if r.is_err() {
+    // Only ours: one we couldn't make isn't ours to remove.
+    if r.is_err() && made {
         let _ = std::fs::remove_file(&part);
     }
     r
@@ -137,6 +179,7 @@ fn give(id: u32, path: &str, send: &Send) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use std::sync::Mutex;
 
     fn sink() -> (Send, Arc<Mutex<Vec<Message>>>) {
@@ -190,6 +233,36 @@ mod tests {
         f.handle(Message::FilePut { id: 4, size: 0, path: path.clone() }, &send);
         assert!(matches!(wait_done(&got), Message::FileDone { id: 4, ok: true, size: 0, .. }));
         assert!(std::fs::read(&path).unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_part_file_is_never_written_through() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let victim = t.path().join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        let send = |path: &str, data: &[u8]| {
+            let (tx, rx) = sync_channel::<Vec<u8>>(1);
+            tx.send(data.to_vec()).unwrap();
+            receive(path, data.len() as u64, |d| rx.recv_timeout(d))
+        };
+        let links: [fn(&Path, &Path) -> io::Result<()>; 2] = [|a, b| std::os::unix::fs::symlink(a, b), |a, b| std::fs::hard_link(a, b)];
+        for (i, link) in links.into_iter().enumerate() {
+            let path = t.path().join(format!("a{i}.bin")).to_string_lossy().into_owned();
+            link(&victim, Path::new(&format!("{path}.vroom-part"))).unwrap();
+            send(&path, b"new").unwrap();
+            assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+            assert_eq!(std::fs::read(&path).unwrap(), b"new");
+            let m = std::fs::symlink_metadata(&path).unwrap();
+            assert!(m.is_file() && m.permissions().mode() & 0o777 == 0o644);
+            assert!(!Path::new(&format!("{path}.vroom-part")).exists());
+        }
+        // A folder there: refused, left alone.
+        let path = t.path().join("c.bin").to_string_lossy().into_owned();
+        std::fs::create_dir(format!("{path}.vroom-part")).unwrap();
+        assert!(send(&path, b"x").is_err());
+        assert!(Path::new(&format!("{path}.vroom-part")).is_dir() && !Path::new(&path).exists());
     }
 
     #[test]
