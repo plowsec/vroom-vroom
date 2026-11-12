@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::Path;
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering::SeqCst};
 
 use landlock::{
     Access, AccessFs, BitFlags, CompatLevel, Compatible, PathBeneath, PathFd, RestrictSelfAttr, Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr,
@@ -25,11 +26,6 @@ fn kernel_abi() -> i64 {
     const LANDLOCK_CREATE_RULESET_VERSION: libc::c_uint = 1;
     // SAFETY: the VERSION query reads no memory (NULL attr, size 0).
     unsafe { libc::syscall(libc::SYS_landlock_create_ruleset, std::ptr::null::<u8>(), 0usize, LANDLOCK_CREATE_RULESET_VERSION) }
-}
-
-/// Threads of this process now (0: unknown).
-fn threads() -> usize {
-    std::fs::read_dir("/proc/self/task").map(|d| d.count()).unwrap_or(0)
 }
 
 fn no_new_privs() -> Result<()> {
@@ -67,19 +63,199 @@ fn allow_if(rs: RulesetCreated, path: &str, access: BitFlags<AccessFs>) -> Resul
     }
 }
 
-/// Enforce `rs` on the whole process, or fail. Other threads already
-/// running need TSYNC (ABI 8): Landlock otherwise confines only the
-/// calling thread, and its siblings share its memory.
+/// Enforce `rs` on every thread, or fail. Landlock confines only the
+/// calling thread, and its siblings share its memory: ABI 8 (Linux 7.0)
+/// has TSYNC for that; older kernels get `each_thread`.
 fn enforce(rs: RulesetCreated) -> Result<()> {
-    let n = threads();
-    rules::landlock_check(kernel_abi(), n).map_err(Error::Apply)?;
-    let rs = if n == 1 { rs } else { rs.all_threads(true).map_err(err)? };
-    let st = rs.restrict_self().map_err(err)?;
-    if st.ruleset != RulesetStatus::FullyEnforced || (n != 1 && !st.all_threads) {
-        return Err(Error::Apply(format!("landlock not enforced: {:?}, all threads {}", st.ruleset, st.all_threads)));
+    let abi = kernel_abi();
+    rules::landlock_check(abi).map_err(Error::Apply)?;
+    if rules::landlock_tsync(abi) {
+        let st = rs.all_threads(true).map_err(err)?.restrict_self().map_err(err)?;
+        if st.ruleset != RulesetStatus::FullyEnforced || !st.all_threads {
+            return Err(Error::Apply(format!("landlock not enforced: {:?}, all threads {}", st.ruleset, st.all_threads)));
+        }
+        log::info!("landlock: enforced (TSYNC)");
+        return Ok(());
     }
-    log::info!("landlock: enforced ({n} threads)");
-    Ok(())
+    // HardRequirement on ABI 2 rights and an ABI >= 2 kernel: what the
+    // fd holds is enforced in full.
+    let fd: Option<OwnedFd> = rs.into();
+    let fd = fd.ok_or_else(|| Error::Apply("landlock: no ruleset".into()))?;
+    each_thread(ThreadLock { landlock: fd.as_raw_fd() })
+}
+
+// ---- every thread, one by one (no TSYNC) ----
+//
+// libpsx's way: we signal each other thread (tgkill) with a handler
+// doing the raw syscalls on itself, until a fresh /proc/self/task listing
+// shows every thread but us done; then us. Threads made meanwhile by a
+// confined thread inherit; by an unconfined one, they show up in the
+// next listing. All before seccomp: the handler's syscalls, tgkill and
+// the listing need no filter rule.
+//
+// SIGSYS: nothing uses it before seccomp (our filters kill or return
+// errors, never trap), and libraries that block every signal in their
+// workers (Mesa's util_queue) leave it open. A thread blocking it anyway,
+// or not answering within SYNC_TIMEOUT: an error, the VM doesn't start.
+// A thread in a syscall: the signal interrupts it; with SA_RESTART most
+// restart, the rest (epoll/poll/sleeps) see EINTR, as on a vCPU kick.
+
+const SYNC_SIGNAL: libc::c_int = libc::SIGSYS;
+const SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const ACK_SLOTS: usize = 4096;
+
+/// What each thread does to itself. Raw syscalls only: a signal handler.
+#[derive(Debug, Clone, Copy)]
+struct ThreadLock {
+    /// Landlock ruleset fd to enter.
+    landlock: i32,
+}
+
+static LOCK_FD: AtomicI32 = AtomicI32::new(-1);
+static ACKED: [AtomicI32; ACK_SLOTS] = [const { AtomicI32::new(0) }; ACK_SLOTS];
+static N_ACKED: AtomicUsize = AtomicUsize::new(0);
+/// First failure's errno; -1: more threads than ACK_SLOTS.
+static FAILED: AtomicI32 = AtomicI32::new(0);
+
+fn errno() -> i32 {
+    // SAFETY: this thread's errno slot.
+    unsafe { *libc::__errno_location() }
+}
+
+/// prctl(op, arg, 0, 0, 0) succeeded. Async-signal-safe.
+fn prctl(op: libc::c_int, arg: libc::c_ulong) -> bool {
+    let zero: libc::c_ulong = 0;
+    // SAFETY: integer arguments only; the ops we pass read no memory.
+    unsafe { libc::prctl(op, arg, zero, zero, zero) == 0 }
+}
+
+/// Lock the calling thread down as `l` says; 0 or an errno.
+/// Async-signal-safe: raw syscalls on the stack, no allocation, no locks.
+fn lock_this_thread(l: ThreadLock) -> i32 {
+    // Per thread too; Landlock wants it (no CAP_SYS_ADMIN here).
+    if !prctl(libc::PR_SET_NO_NEW_PRIVS, 1) {
+        return errno();
+    }
+    // SAFETY: a ruleset fd the caller keeps open, flags 0; reads no memory.
+    if unsafe { libc::syscall(libc::SYS_landlock_restrict_self, l.landlock, 0u32) } != 0 {
+        return errno();
+    }
+    0
+}
+
+extern "C" fn on_sync_signal(_: libc::c_int, info: *mut libc::siginfo_t, _: *mut libc::c_void) {
+    // Only our own tgkill (SI_TKILL from this process).
+    // SAFETY: the kernel's siginfo for this delivery; getpid has no
+    // preconditions.
+    let ours = !info.is_null() && unsafe { (*info).si_code == libc::SI_TKILL && (*info).si_pid() == libc::getpid() };
+    if !ours {
+        return;
+    }
+    let saved = errno();
+    let l = ThreadLock { landlock: LOCK_FD.load(SeqCst) };
+    let r = lock_this_thread(l);
+    if r != 0 {
+        let _ = FAILED.compare_exchange(0, r, SeqCst, SeqCst);
+    }
+    // SAFETY: gettid has no preconditions.
+    let tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
+    let i = N_ACKED.fetch_add(1, SeqCst);
+    match ACKED.get(i) {
+        Some(slot) => slot.store(tid, SeqCst),
+        None => {
+            let _ = FAILED.compare_exchange(0, -1, SeqCst, SeqCst);
+        }
+    }
+    // SAFETY: this thread's errno slot, as the interrupted code left it.
+    unsafe { *libc::__errno_location() = saved };
+}
+
+fn task_ids() -> Result<Vec<i32>> {
+    let d = std::fs::read_dir("/proc/self/task").map_err(|e| Error::Apply(format!("/proc/self/task: {e}")))?;
+    Ok(d.filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok()).collect())
+}
+
+fn thread_name(tid: i32) -> String {
+    std::fs::read_to_string(format!("/proc/self/task/{tid}/comm")).map(|s| s.trim().to_string()).unwrap_or_default()
+}
+
+/// `l` on every thread of the process.
+fn each_thread(l: ThreadLock) -> Result<()> {
+    N_ACKED.store(0, SeqCst);
+    FAILED.store(0, SeqCst);
+    for a in &ACKED {
+        a.store(0, SeqCst);
+    }
+    LOCK_FD.store(l.landlock, SeqCst);
+    // SAFETY: zeroed sigaction is a valid "no flags, empty mask" value;
+    // the handler only makes raw syscalls and touches atomics.
+    let (mut old, mut sa): (libc::sigaction, libc::sigaction) = unsafe { (std::mem::zeroed(), std::mem::zeroed()) };
+    sa.sa_sigaction = on_sync_signal as *const () as usize;
+    sa.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
+    // SAFETY: valid sigaction structs we own.
+    if unsafe { libc::sigemptyset(&mut sa.sa_mask) | libc::sigaction(SYNC_SIGNAL, &sa, &mut old) } != 0 {
+        return Err(Error::Apply(format!("sigaction: {}", std::io::Error::last_os_error())));
+    }
+    if old.sa_sigaction != libc::SIG_DFL && old.sa_sigaction != libc::SIG_IGN {
+        // SAFETY: putting back what was there.
+        unsafe { libc::sigaction(SYNC_SIGNAL, &old, std::ptr::null_mut()) };
+        return Err(Error::Apply("SIGSYS has a handler already: can't confine the other threads".into()));
+    }
+    sync_threads()?;
+    // Everyone answered: nothing of ours is pending. On failure the
+    // handler stays (a late delivery mustn't kill; we exit anyway).
+    // SAFETY: putting back what was there.
+    unsafe { libc::sigaction(SYNC_SIGNAL, &old, std::ptr::null_mut()) };
+    // Us last: Landlock would hide /proc from us. We make no thread in
+    // between, and the others' new threads inherit from them.
+    match lock_this_thread(l) {
+        0 => Ok(()),
+        r => Err(Error::Apply(format!("lock-down: {}", std::io::Error::from_raw_os_error(r)))),
+    }
+}
+
+fn sync_threads() -> Result<()> {
+    // SAFETY: getpid, gettid have no preconditions.
+    let (pid, me) = unsafe { (libc::getpid(), libc::syscall(libc::SYS_gettid) as i32) };
+    let mut signalled: Vec<i32> = Vec::new();
+    let deadline = std::time::Instant::now() + SYNC_TIMEOUT;
+    loop {
+        let listed = task_ids()?;
+        let n = N_ACKED.load(SeqCst).min(ACK_SLOTS);
+        let acked: Vec<i32> = ACKED[..n].iter().map(|a| a.load(SeqCst)).filter(|&t| t != 0).collect();
+        match FAILED.load(SeqCst) {
+            0 => {}
+            -1 => return Err(Error::Apply(format!("lock-down: more than {ACK_SLOTS} threads"))),
+            e => return Err(Error::Apply(format!("lock-down of a thread: {}", std::io::Error::from_raw_os_error(e)))),
+        }
+        let (todo, done) = rules::sync_pass(&listed, me, &acked, &signalled);
+        if done {
+            log::info!("lock-down: every thread ({})", listed.len());
+            return Ok(());
+        }
+        for t in todo {
+            match std::fs::read_to_string(format!("/proc/self/task/{t}/status")).ok().and_then(|s| rules::sig_blocked(&s, SYNC_SIGNAL)) {
+                Some(true) => return Err(Error::Apply(format!("thread {t} ({}) blocks SIGSYS: can't confine it", thread_name(t)))),
+                Some(false) => {}
+                // Gone, or going: next listing tells.
+                None => continue,
+            }
+            // SAFETY: a signal to a thread of our own process.
+            if unsafe { libc::syscall(libc::SYS_tgkill, pid, t, SYNC_SIGNAL) } == 0 {
+                signalled.push(t);
+            } else {
+                match errno() {
+                    libc::ESRCH | libc::EAGAIN => {}
+                    e => return Err(Error::Apply(format!("tgkill {t}: {}", std::io::Error::from_raw_os_error(e)))),
+                }
+            }
+        }
+        if std::time::Instant::now() > deadline {
+            let late: Vec<String> = listed.iter().filter(|&&t| t != me && !acked.contains(&t)).map(|&t| format!("{t} ({})", thread_name(t))).collect();
+            return Err(Error::Apply(format!("lock-down: no answer from thread(s) {}", late.join(", "))));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
 }
 
 fn landlock(p: &Policy) -> Result<()> {
@@ -131,7 +307,7 @@ impl ExecSandbox {
     /// `exe` and the system's libraries and their config read-only (and
     /// executable: the dynamic loader), `rw_dir` read-write.
     pub fn new(exe: &Path, rw_dir: &Path) -> Result<ExecSandbox> {
-        rules::landlock_check(kernel_abi(), 1).map_err(Error::Apply)?;
+        rules::landlock_check(kernel_abi()).map_err(Error::Apply)?;
         let read = AccessFs::ReadFile | AccessFs::ReadDir;
         let exec = read | AccessFs::Execute;
         let mut rs = ruleset()?;
@@ -362,7 +538,7 @@ pub fn apply_usb_helper() -> Result<()> {
         rs = allow_if(rs, f, AccessFs::ReadFile.into())?;
     }
     rs = allow_if(rs, "/dev/bus/usb", read | AccessFs::WriteFile)?;
-    // libusb_init started its event thread already: TSYNC (ABI 8).
+    // libusb_init started its event thread already.
     enforce(rs)?;
     // SAFETY: getpid has no preconditions.
     let pid = unsafe { libc::getpid() } as u32;

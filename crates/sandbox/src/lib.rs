@@ -144,9 +144,9 @@ pub fn usb_profile_root(exe: &std::path::Path, lib: &std::path::Path) -> Result<
 }
 
 /// Lock down the USB passthrough helper (Linux), once libusb is loaded:
-/// no new privileges, Landlock leaves it the USB device nodes and sysfs
-/// (read-only) only, seccomp refuses what root could escape with. An
-/// error if Landlock can't be enforced on every thread.
+/// no new privileges, Landlock leaves
+/// it the USB device nodes and sysfs (read-only) only, seccomp refuses
+/// what root could escape with. An error if any of it fails on a thread.
 #[cfg(target_os = "linux")]
 pub fn apply_usb_helper() -> Result<()> {
     linux::apply_usb_helper()
@@ -160,8 +160,9 @@ pub fn helper_profile(exe: &std::path::Path, rw_dir: &std::path::Path) -> Result
 }
 
 /// Apply the sandbox to the whole process. Irreversible. Linux: an error
-/// unless Landlock is enforced on every thread (ABI 2, Linux 5.19; ABI 8,
-/// Linux 7.0, once other threads run).
+/// unless Landlock (ABI 2, Linux 5.19) is enforced on every thread: by
+/// the kernel (TSYNC, ABI 8) or one by one (a signal to each; every
+/// thread must leave SIGSYS unblocked and answer within 5 s).
 pub fn apply(p: &Policy) -> Result<()> {
     #[cfg(target_os = "macos")]
     {

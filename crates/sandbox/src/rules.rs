@@ -221,32 +221,41 @@ pub fn prlimit_denied() -> Vec<Rule> {
 
 /// Landlock ABI 2 (Linux 5.19): the rules use `Refer` (renames in shares).
 pub const LANDLOCK_ABI_MIN: i64 = 2;
-/// ABI 8 (Linux 7.0): LANDLOCK_RESTRICT_SELF_TSYNC. Without it only the
-/// calling thread is confined, and the others share its memory: no
-/// boundary at all.
+/// ABI 8 (Linux 7.0): LANDLOCK_RESTRICT_SELF_TSYNC, the kernel confines
+/// every thread. Older: we do it thread by thread (`linux::each_thread`).
 pub const LANDLOCK_ABI_TSYNC: i64 = 8;
 
-/// The ABI needed with `threads` running (0: unknown).
-pub fn landlock_abi_needed(threads: usize) -> i64 {
-    if threads == 1 {
-        LANDLOCK_ABI_MIN
-    } else {
-        LANDLOCK_ABI_TSYNC
-    }
+/// The kernel confines all threads itself.
+pub fn landlock_tsync(kernel: i64) -> bool {
+    kernel >= LANDLOCK_ABI_TSYNC
 }
 
 /// `kernel`: landlock_create_ruleset(VERSION)'s answer (< 0: none).
-pub fn landlock_check(kernel: i64, threads: usize) -> Result<(), String> {
-    let need = landlock_abi_needed(threads);
-    if kernel >= need {
+pub fn landlock_check(kernel: i64) -> Result<(), String> {
+    if kernel >= LANDLOCK_ABI_MIN {
         return Ok(());
     }
     let have = if kernel < 1 { "no Landlock (kernel too old or lsm= lacks landlock)".to_string() } else { format!("Landlock ABI {kernel}") };
-    let why = match need {
-        LANDLOCK_ABI_MIN => "ABI 2 (Linux 5.19)".to_string(),
-        _ => format!("ABI 8 (Linux 7.0) to confine all {} threads", if threads == 0 { "?".to_string() } else { threads.to_string() }),
-    };
-    Err(format!("landlock: {have}; need {why}. --no-sandbox runs the VM unconfined"))
+    Err(format!("landlock: {have}; need ABI 2 (Linux 5.19). --no-sandbox runs the VM unconfined"))
+}
+
+/// One round of confining every thread: whom to signal now (listed, not
+/// us, not signalled yet) and whether we're done (every listed thread but
+/// us answered). Done only on a fresh listing: a thread made after it is
+/// made by a confined one and inherits its domain.
+pub fn sync_pass(listed: &[i32], me: i32, acked: &[i32], signalled: &[i32]) -> (Vec<i32>, bool) {
+    let others = || listed.iter().copied().filter(move |&t| t != me);
+    let todo = others().filter(|t| !signalled.contains(t)).collect();
+    let done = others().all(|t| acked.contains(&t));
+    (todo, done)
+}
+
+/// `/proc/self/task/<tid>/status`: is signal `sig` in SigBlk? None:
+/// no such line.
+pub fn sig_blocked(status: &str, sig: i32) -> Option<bool> {
+    let hex = status.lines().find_map(|l| l.strip_prefix("SigBlk:"))?.trim();
+    let mask = u64::from_str_radix(hex, 16).ok()?;
+    Some((1..=64).contains(&sig) && mask & (1u64 << (sig - 1)) != 0)
 }
 
 /// x86_64 only: kill x32-ABI syscalls (nr | 0x4000_0000) and foreign
@@ -368,13 +377,35 @@ mod tests {
 
     #[test]
     fn landlock_abi() {
-        assert!(landlock_check(2, 1).is_ok());
-        assert!(landlock_check(1, 1).is_err());
-        assert!(landlock_check(-1, 1).is_err());
-        assert!(landlock_check(7, 4).is_err(), "threads need TSYNC");
-        assert!(landlock_check(8, 4).is_ok());
-        assert!(landlock_check(9, 0).is_ok());
-        assert!(landlock_check(7, 0).is_err(), "unknown thread count");
+        assert!(landlock_check(2).is_ok());
+        assert!(landlock_check(1).is_err());
+        assert!(landlock_check(-1).is_err());
+        assert!(!landlock_tsync(7) && landlock_tsync(8) && landlock_tsync(9));
+    }
+
+    #[test]
+    fn every_thread_answers_before_done() {
+        // We (1) are confined already; 2 and 3 run.
+        assert_eq!(sync_pass(&[1, 2, 3], 1, &[], &[]), (vec![2, 3], false));
+        assert_eq!(sync_pass(&[1, 2, 3], 1, &[2], &[2, 3]), (vec![], false));
+        // 3 made 4 before it answered: 4 is new, not done yet.
+        assert_eq!(sync_pass(&[1, 2, 3, 4], 1, &[2, 3], &[2, 3]), (vec![4], false));
+        assert_eq!(sync_pass(&[1, 2, 3, 4], 1, &[2, 3, 4], &[2, 3, 4]), (vec![], true));
+        // 2 exited before answering: not listed, not waited for.
+        assert_eq!(sync_pass(&[1, 3], 1, &[3], &[2, 3]), (vec![], true));
+        assert_eq!(sync_pass(&[1], 1, &[], &[]), (vec![], true));
+    }
+
+    #[test]
+    fn blocked_signal_mask() {
+        let st = "Name:\tusb-events\nSigPnd:\t0000000000000000\nSigBlk:\t0000000000000080\nSigIgn:\t0000000000001000\n";
+        assert_eq!(sig_blocked(st, 8), Some(true));
+        assert_eq!(sig_blocked(st, 31), Some(false), "SIGSYS");
+        // Mesa's worker threads: all but SIGSYS (and glibc's 32, 33).
+        let mesa = "SigBlk:\tfffffffe3fffffff\n";
+        assert_eq!(sig_blocked(mesa, 31), Some(false));
+        assert_eq!(sig_blocked(mesa, 34), Some(true));
+        assert_eq!(sig_blocked("Name:\tx\n", 31), None);
     }
 
     /// A tiny BPF interpreter for the guard's few opcodes.
