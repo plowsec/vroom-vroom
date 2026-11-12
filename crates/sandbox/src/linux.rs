@@ -443,9 +443,9 @@ fn allowed(p: &Policy) -> Vec<i64> {
         SYS_clock_gettime, SYS_clock_nanosleep, SYS_nanosleep, SYS_sched_yield,
         SYS_sched_getaffinity, SYS_rt_sigaction, SYS_rt_sigprocmask, SYS_rt_sigreturn,
         SYS_sigaltstack, SYS_exit, SYS_exit_group, SYS_getrandom, SYS_fcntl, SYS_openat,
-        // fchmod/fchmodat: disks.rs freeze_file (layer files read-only),
+        // fchmod only, no chmod by path: disks.rs freeze_file (layers read-only),
         // snapshot dirs 0700. Landlock doesn't cover chmod.
-        SYS_mkdirat, SYS_renameat, SYS_renameat2, SYS_fchmod, SYS_fchmodat, SYS_fsync, SYS_fdatasync, SYS_ftruncate, SYS_fallocate, SYS_flock,
+        SYS_mkdirat, SYS_renameat, SYS_renameat2, SYS_fchmod, SYS_fsync, SYS_fdatasync, SYS_ftruncate, SYS_fallocate, SYS_flock,
         // clone: threads only (see rules::clone_denied). clone3: ENOSYS
         // from its own filter, glibc then falls back to clone; allowed
         // here so the ENOSYS wins over a kill.
@@ -455,7 +455,7 @@ fn allowed(p: &Policy) -> Vec<i64> {
         SYS_getsockname, SYS_getpeername, SYS_getsockopt, SYS_setsockopt,
     ];
     #[cfg(target_arch = "x86_64")]
-    v.extend_from_slice(&[SYS_epoll_wait, SYS_poll, SYS_rename, SYS_mkdir, SYS_chmod, SYS_arch_prctl]);
+    v.extend_from_slice(&[SYS_epoll_wait, SYS_poll, SYS_rename, SYS_mkdir, SYS_arch_prctl]);
     if p.network_outbound {
         // No bind: UDP flows use implicit binds via connect(). socket()
         // gets an argument rule in `seccomp` (IP families only).
