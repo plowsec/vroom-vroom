@@ -815,6 +815,7 @@ fn hex_string(bytes: &[u8]) -> String {
 fn register_value(regs: &Registers, register: vroom_hv::debug::Register) -> u64 {
     use vroom_hv::debug::Register as R;
     match register {
+        R::X86(_) => unreachable!("ARM64 session only parses ARM64 register names"),
         R::X(n) => regs.x[n as usize],
         R::Pc => regs.pc,
         R::Sp => regs.sp,
@@ -830,6 +831,7 @@ fn register_value(regs: &Registers, register: vroom_hv::debug::Register) -> u64 
 fn set_register_value(regs: &mut Registers, register: vroom_hv::debug::Register, value: u64) {
     use vroom_hv::debug::Register as R;
     *match register {
+        R::X86(_) => unreachable!("ARM64 session only parses ARM64 register names"),
         R::X(n) => &mut regs.x[n as usize],
         R::Pc => &mut regs.pc,
         R::Sp => &mut regs.sp,

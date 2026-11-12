@@ -290,6 +290,57 @@ impl KvmVcpu {
 }
 
 impl Vcpu for KvmVcpu {
+    fn debug_write_register(&mut self, register: crate::debug::Register, value: u64) -> Result<()> {
+        use crate::debug::{Register, X86Register as R};
+        let Register::X86(register) = register else {
+            return Err(Error::Invalid("an AMD64 register is required".into()));
+        };
+        let mut r = self.fd.get_regs().map_err(kerr("KVM_GET_REGS"))?;
+        let target = match register {
+            R::Rax => &mut r.rax,
+            R::Rbx => &mut r.rbx,
+            R::Rcx => &mut r.rcx,
+            R::Rdx => &mut r.rdx,
+            R::Rsi => &mut r.rsi,
+            R::Rdi => &mut r.rdi,
+            R::Rbp => &mut r.rbp,
+            R::Rsp => &mut r.rsp,
+            R::R8 => &mut r.r8,
+            R::R9 => &mut r.r9,
+            R::R10 => &mut r.r10,
+            R::R11 => &mut r.r11,
+            R::R12 => &mut r.r12,
+            R::R13 => &mut r.r13,
+            R::R14 => &mut r.r14,
+            R::R15 => &mut r.r15,
+            R::Rip => &mut r.rip,
+            R::Rflags => &mut r.rflags,
+            _ => {
+                let mut s = self.fd.get_sregs().map_err(kerr("KVM_GET_SREGS"))?;
+                match register {
+                    R::Cr0 => s.cr0 = value,
+                    R::Cr2 => s.cr2 = value,
+                    R::Cr3 => s.cr3 = value,
+                    R::Cr4 => s.cr4 = value,
+                    R::Efer => s.efer = value,
+                    _ => unreachable!(),
+                }
+                return self.fd.set_sregs(&s).map_err(kerr("KVM_SET_SREGS"));
+            }
+        };
+        *target = if register == R::Rflags {
+            value | 2
+        } else {
+            value
+        };
+        self.fd.set_regs(&r).map_err(kerr("KVM_SET_REGS"))
+    }
+    fn configure_debug(&mut self, config: &crate::debug::DebugConfig) -> Result<()> {
+        let debug = guest_debug(config)?;
+        self.fd
+            .set_guest_debug(&debug)
+            .map_err(kerr("KVM_SET_GUEST_DEBUG"))
+    }
     fn index(&self) -> u32 {
         self.index
     }
@@ -342,6 +393,27 @@ impl Vcpu for KvmVcpu {
                     VcpuExit::PioOutBatch { port, size, data }
                 }
                 Ok(KExit::Shutdown) => VcpuExit::SystemReset,
+                Ok(KExit::Debug(info)) => {
+                    use crate::debug::{DebugReason, DebugStop};
+                    let watch = (0..4)
+                        .find(|&i| info.dr6 & (1 << i) != 0 && (info.dr7 >> (16 + i * 4)) & 3 != 0);
+                    let reason = if info.exception == 3 {
+                        DebugReason::SoftwareBreakpoint
+                    } else if watch.is_some() {
+                        DebugReason::Watchpoint
+                    } else if info.dr6 & (1 << 14) != 0 {
+                        DebugReason::SingleStep
+                    } else {
+                        DebugReason::Breakpoint
+                    };
+                    VcpuExit::Debug(DebugStop {
+                        cpu: self.index,
+                        pc: info.pc,
+                        syndrome: info.dr6,
+                        reason,
+                        fault_address: None,
+                    })
+                }
                 Ok(KExit::SystemEvent(ty, _)) => {
                     if ty == KVM_SYSTEM_EVENT_RESET {
                         VcpuExit::SystemReset
@@ -487,8 +559,48 @@ impl Vcpu for KvmVcpu {
                 .map_err(kerr("KVM_GET_DEBUGREGS"))?,
             msrs: msrs.as_slice().to_vec(),
         };
+        use crate::debug::{x86_state as S, X86Register as R};
+        let r = &s.regs;
+        let sr = &s.sregs;
+        let mut debug_regs = vec![
+            (R::Rax as u32, r.rax),
+            (R::Rbx as u32, r.rbx),
+            (R::Rcx as u32, r.rcx),
+            (R::Rdx as u32, r.rdx),
+            (R::Rsi as u32, r.rsi),
+            (R::Rdi as u32, r.rdi),
+            (R::Rbp as u32, r.rbp),
+            (R::Rsp as u32, r.rsp),
+            (R::R8 as u32, r.r8),
+            (R::R9 as u32, r.r9),
+            (R::R10 as u32, r.r10),
+            (R::R11 as u32, r.r11),
+            (R::R12 as u32, r.r12),
+            (R::R13 as u32, r.r13),
+            (R::R14 as u32, r.r14),
+            (R::R15 as u32, r.r15),
+            (R::Rip as u32, r.rip),
+            (R::Rflags as u32, r.rflags),
+            (R::Cr0 as u32, sr.cr0),
+            (R::Cr2 as u32, sr.cr2),
+            (R::Cr3 as u32, sr.cr3),
+            (R::Cr4 as u32, sr.cr4),
+            (R::Efer as u32, sr.efer),
+            (S::CS_BASE, sr.cs.base),
+            (S::GS_BASE, sr.gs.base),
+            (S::IDT_BASE, sr.idt.base),
+            (S::IDT_LIMIT, sr.idt.limit as u64),
+            (S::CS_SELECTOR, sr.cs.selector as u64),
+            (S::GS_SELECTOR, sr.gs.selector as u64),
+        ];
+        for &(index, id) in &[(0xc000_0082, S::LSTAR), (0xc000_0102, S::KERNEL_GS_BASE)] {
+            if let Some(msr) = s.msrs.iter().find(|m| m.index == index) {
+                debug_regs.push((id, msr.data));
+            }
+        }
         Ok(VcpuState {
             backend: "kvm-x86_64-v1".into(),
+            regs: debug_regs,
             index: self.index,
             powered_on: mp.mp_state != KVM_MP_STATE_UNINITIALIZED,
             raw: vec![(0, serde_json::to_vec(&s).map_err(state_error)?)],
@@ -527,9 +639,86 @@ impl Vcpu for KvmVcpu {
     }
 }
 
+fn guest_debug(config: &crate::debug::DebugConfig) -> Result<kvm_guest_debug> {
+    let mut d = kvm_guest_debug::default();
+    if !config.enabled {
+        return Ok(d);
+    }
+    if config.trap_brk_immediate.is_some() {
+        return Err(Error::Unsupported("ARM64 BRK immediate on x86"));
+    }
+    if config.breakpoints.len() + config.watchpoints.len() > 4 {
+        return Err(Error::Invalid(
+            "x86 has four shared execution/data breakpoint slots".into(),
+        ));
+    }
+    d.control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_HW_BP;
+    if config.single_step {
+        d.control |= KVM_GUESTDBG_SINGLESTEP;
+    }
+    if config.trap_software_breakpoints {
+        d.control |= KVM_GUESTDBG_USE_SW_BP;
+    }
+    let mut dr7 = 0x400u64;
+    for (i, &address) in config.breakpoints.iter().enumerate() {
+        d.arch.debugreg[i] = address;
+        dr7 |= 1 << (i * 2);
+    }
+    for (n, w) in config.watchpoints.iter().enumerate() {
+        let i = config.breakpoints.len() + n;
+        if !matches!(w.size, 1 | 2 | 4 | 8) || w.address % u64::from(w.size) != 0 || !w.write {
+            return Err(Error::Invalid(
+                "x86 watchpoints need aligned 1/2/4/8 bytes and write or read+write (no read-only)"
+                    .into(),
+            ));
+        }
+        let length = match w.size {
+            1 => 0,
+            2 => 1,
+            4 => 3,
+            8 => 2,
+            _ => unreachable!(),
+        };
+        let access = if w.read { 3 } else { 1 };
+        d.arch.debugreg[i] = w.address;
+        dr7 |= 1 << (i * 2);
+        dr7 |= (access | (length << 2)) << (16 + i * 4);
+    }
+    d.arch.debugreg[7] = dr7;
+    Ok(d)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn debug_slots_and_watch_encodings() {
+        use crate::debug::{DebugConfig, Watchpoint};
+        let mut c = DebugConfig {
+            enabled: true,
+            breakpoints: vec![0x1001],
+            watchpoints: vec![Watchpoint {
+                address: 0x2000,
+                size: 8,
+                read: true,
+                write: true,
+            }],
+            ..Default::default()
+        };
+        let d = guest_debug(&c).unwrap();
+        assert_eq!(&d.arch.debugreg[..2], &[0x1001, 0x2000]);
+        assert_eq!((d.arch.debugreg[7] >> 20) & 15, 11);
+        c.breakpoints = vec![1, 2, 3, 4];
+        assert!(guest_debug(&c).is_err());
+        c.breakpoints.clear();
+        c.watchpoints[0].write = false;
+        assert!(guest_debug(&c).is_err());
+        c.watchpoints[0].write = true;
+        c.watchpoints[0].address = 0x2001;
+        assert!(guest_debug(&c).is_err());
+        c.enabled = false;
+        assert_eq!(guest_debug(&c).unwrap().control, 0);
+    }
     #[test]
     fn pc_irq0_override_matches_routing() {
         let routes = pc_routes();

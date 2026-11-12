@@ -191,6 +191,7 @@ mod tests {
 /// Architectural scalar registers exposed by the paused debugger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Register {
+    X86(X86Register),
     X(u8),
     Pc,
     Sp,
@@ -222,6 +223,7 @@ impl Register {
     }
     pub fn validate(self, value: u64) -> crate::Result<()> {
         let valid = match self {
+            Self::X86(_) => true,
             Self::X(n) => n <= 30,
             Self::Pc => value & 3 == 0,
             Self::Sp => value & 15 == 0,
@@ -238,5 +240,76 @@ impl Register {
                 "invalid register value/alignment or CPU mode".into(),
             ))
         }
+    }
+}
+
+/// Scalar AMD64 registers; the backend validates architectural constraints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum X86Register {
+    Rax,
+    Rbx,
+    Rcx,
+    Rdx,
+    Rsi,
+    Rdi,
+    Rbp,
+    Rsp,
+    R8,
+    R9,
+    R10,
+    R11,
+    R12,
+    R13,
+    R14,
+    R15,
+    Rip,
+    Rflags,
+    Cr0,
+    Cr2,
+    Cr3,
+    Cr4,
+    Efer,
+}
+/// Additional AMD64 debugger-state IDs in `VcpuState.regs`. Scalar IDs are
+/// `X86Register as u32`; the snapshot's opaque raw KVM state is unchanged.
+pub mod x86_state {
+    pub const CS_BASE: u32 = 0x100;
+    pub const GS_BASE: u32 = 0x101;
+    pub const IDT_BASE: u32 = 0x102;
+    pub const IDT_LIMIT: u32 = 0x103;
+    pub const CS_SELECTOR: u32 = 0x104;
+    pub const GS_SELECTOR: u32 = 0x105;
+    pub const LSTAR: u32 = 0x110;
+    pub const KERNEL_GS_BASE: u32 = 0x111;
+}
+impl X86Register {
+    pub fn parse(name: &str) -> Option<Self> {
+        Some(match name.to_ascii_lowercase().as_str() {
+            "rax" => Self::Rax,
+            "rbx" => Self::Rbx,
+            "rcx" => Self::Rcx,
+            "rdx" => Self::Rdx,
+            "rsi" => Self::Rsi,
+            "rdi" => Self::Rdi,
+            "rbp" => Self::Rbp,
+            "rsp" => Self::Rsp,
+            "r8" => Self::R8,
+            "r9" => Self::R9,
+            "r10" => Self::R10,
+            "r11" => Self::R11,
+            "r12" => Self::R12,
+            "r13" => Self::R13,
+            "r14" => Self::R14,
+            "r15" => Self::R15,
+            "rip" => Self::Rip,
+            "rflags" => Self::Rflags,
+            "cr0" => Self::Cr0,
+            "cr2" => Self::Cr2,
+            "cr3" => Self::Cr3,
+            "cr4" => Self::Cr4,
+            "efer" => Self::Efer,
+            _ => return None,
+        })
     }
 }
