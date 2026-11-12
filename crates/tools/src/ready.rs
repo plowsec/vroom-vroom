@@ -172,7 +172,7 @@ fn ubuntu(spec: &Spec, image: &Path, desktop: bool, tools: &Path, progress: &mut
          name = {}\nos = \"ubuntu\"\ncpus = {}\nmemory_mib = {}\n\
          \n[boot]\ntype = \"uefi\"\nvars = {}\n{}\
          \n# base.img (the cloud image) is never written: changes go here.\n\
-         [[disk]]\npath = \"disk.qcow2\"\nformat = \"qcow2\"\n\
+         [[disk]]\npath = \"disk.qcow2\"\nformat = \"qcow2\"\nbacking = \"base.img\"\n\
          \n# Read at first boot only; can go after that.\n\
          [[disk]]\npath = \"seed.iso\"\nreadonly = true\nformat = \"raw\"\n",
         if desktop { ", the desktop" } else { "" },
