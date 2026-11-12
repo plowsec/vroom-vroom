@@ -843,11 +843,10 @@ pub fn start(path: &Path, cfg: &VmConfig, extra: &[String]) -> Result<String, St
 const ATTACH_WAIT: Duration = Duration::from_secs(5);
 
 /// Where a VM running without a window (its app crashed) can be shown
-/// again: the VMM says in its state dir.
+/// again: the VMM says in its state dir. Only the socket a VM on this
+/// state dir would have, never one the file names elsewhere.
 pub fn viewer_socket(state_dir: &Path) -> Option<PathBuf> {
-    let p = std::fs::read_to_string(state_dir.join("viewer")).ok()?;
-    let p = PathBuf::from(p.trim());
-    std::os::unix::fs::FileTypeExt::is_socket(&std::fs::symlink_metadata(&p).ok()?.file_type()).then_some(p)
+    vroom_state::hostile::running_socket(state_dir, "viewer", "sock")
 }
 
 /// Show a VM that runs without a window again (its app crashed, or was

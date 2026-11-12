@@ -78,8 +78,10 @@ fn connect(vm: &Vm, load: Load, state_dir: StateDir) -> Result<(UnixStream, VmCo
     let cfg = load(&config)?;
     let dir = vm.state_dir.clone().unwrap_or_else(|| state_dir(&config, &cfg));
     let not_running = || format!("{} isn't running", cfg.name);
-    let sock = std::fs::read_to_string(dir.join(vroom_vmm::control::CONTROL_FILE)).map_err(|_| not_running())?;
-    let s = UnixStream::connect(sock.trim()).map_err(|_| not_running())?;
+    // The VMM writes that file: only the socket a VM on this state dir
+    // would have, never one the file names elsewhere.
+    let sock = vroom_vmm::state::hostile::running_socket(&dir, vroom_vmm::control::CONTROL_FILE, "ctl").ok_or_else(not_running)?;
+    let s = UnixStream::connect(sock).map_err(|_| not_running())?;
     Ok((s, cfg))
 }
 
@@ -204,9 +206,10 @@ fn exec(a: ExecArgs, load: Load, state_dir: StateDir) -> Result<(), String> {
     if end == ExecEnd::Failed {
         return Err(String::from_utf8_lossy(&stderr).trim().to_string());
     }
-    let _ = std::io::stdout().write_all(&stdout);
-    let _ = std::io::stdout().flush();
-    let _ = std::io::stderr().write_all(&stderr);
+    let mut out = crate::term::guest_out();
+    let _ = out.write_all(&stdout);
+    let _ = out.flush();
+    let _ = crate::term::guest_err().write_all(&stderr);
     if truncated {
         eprintln!("vroom: output cut at {} bytes", a.max_out);
     }
