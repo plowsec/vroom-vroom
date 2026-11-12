@@ -144,7 +144,8 @@ pub fn usb_profile_root(exe: &std::path::Path, lib: &std::path::Path) -> Result<
 }
 
 /// Lock down the USB passthrough helper (Linux), once libusb is loaded:
-/// no new privileges, Landlock leaves
+/// every thread drops all capabilities (as root: bounding set too,
+/// securebits locked; uid 0 stays), no new privileges, Landlock leaves
 /// it the USB device nodes and sysfs (read-only) only, seccomp refuses
 /// what root could escape with. An error if any of it fails on a thread.
 #[cfg(target_os = "linux")]

@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::Path;
-use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering::SeqCst};
+use std::sync::atomic::{AtomicI32, AtomicU8, AtomicUsize, Ordering::SeqCst};
 
 use landlock::{
     Access, AccessFs, BitFlags, CompatLevel, Compatible, PathBeneath, PathFd, RestrictSelfAttr, Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr,
@@ -65,11 +65,17 @@ fn allow_if(rs: RulesetCreated, path: &str, access: BitFlags<AccessFs>) -> Resul
 
 /// Enforce `rs` on every thread, or fail. Landlock confines only the
 /// calling thread, and its siblings share its memory: ABI 8 (Linux 7.0)
-/// has TSYNC for that; older kernels get `each_thread`.
-fn enforce(rs: RulesetCreated) -> Result<()> {
+/// has TSYNC for that; older kernels get `each_thread`. `drop_caps`:
+/// every thread also drops all capabilities first (see `ThreadLock`).
+fn enforce(rs: RulesetCreated, drop_caps: Option<bool>) -> Result<()> {
     let abi = kernel_abi();
     rules::landlock_check(abi).map_err(Error::Apply)?;
+    let caps = drop_caps.is_some();
+    let setpcap = drop_caps.unwrap_or(false);
     if rules::landlock_tsync(abi) {
+        if caps {
+            each_thread(ThreadLock { landlock: -1, caps, setpcap })?;
+        }
         let st = rs.all_threads(true).map_err(err)?.restrict_self().map_err(err)?;
         if st.ruleset != RulesetStatus::FullyEnforced || !st.all_threads {
             return Err(Error::Apply(format!("landlock not enforced: {:?}, all threads {}", st.ruleset, st.all_threads)));
@@ -81,7 +87,7 @@ fn enforce(rs: RulesetCreated) -> Result<()> {
     // fd holds is enforced in full.
     let fd: Option<OwnedFd> = rs.into();
     let fd = fd.ok_or_else(|| Error::Apply("landlock: no ruleset".into()))?;
-    each_thread(ThreadLock { landlock: fd.as_raw_fd() })
+    each_thread(ThreadLock { landlock: fd.as_raw_fd(), caps, setpcap })
 }
 
 // ---- every thread, one by one (no TSYNC) ----
@@ -107,19 +113,50 @@ const ACK_SLOTS: usize = 4096;
 /// What each thread does to itself. Raw syscalls only: a signal handler.
 #[derive(Debug, Clone, Copy)]
 struct ThreadLock {
-    /// Landlock ruleset fd to enter.
+    /// Landlock ruleset fd to enter, or -1.
     landlock: i32,
+    /// Drop every capability (effective, permitted, inheritable, ambient).
+    caps: bool,
+    /// ... and, holding CAP_SETPCAP (root), the bounding set; securebits
+    /// locked (`rules::SECUREBITS_LOCKED_DOWN`).
+    setpcap: bool,
 }
 
 static LOCK_FD: AtomicI32 = AtomicI32::new(-1);
+static LOCK_CAPS: AtomicU8 = AtomicU8::new(0);
 static ACKED: [AtomicI32; ACK_SLOTS] = [const { AtomicI32::new(0) }; ACK_SLOTS];
 static N_ACKED: AtomicUsize = AtomicUsize::new(0);
 /// First failure's errno; -1: more threads than ACK_SLOTS.
 static FAILED: AtomicI32 = AtomicI32::new(0);
 
+#[repr(C)]
+struct CapHeader {
+    version: u32,
+    pid: libc::c_int,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CapData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
 fn errno() -> i32 {
     // SAFETY: this thread's errno slot.
     unsafe { *libc::__errno_location() }
+}
+
+/// This thread's capability sets (pid 0: the caller).
+fn capget() -> std::result::Result<[CapData; 2], i32> {
+    let mut h = CapHeader { version: rules::LINUX_CAPABILITY_VERSION_3, pid: 0 };
+    let mut d = [CapData::default(); 2];
+    // SAFETY: a v3 header and the two data structs v3 writes.
+    if unsafe { libc::syscall(libc::SYS_capget, &mut h as *mut CapHeader, d.as_mut_ptr()) } != 0 {
+        return Err(errno());
+    }
+    Ok(d)
 }
 
 /// prctl(op, arg, 0, 0, 0) succeeded. Async-signal-safe.
@@ -132,12 +169,46 @@ fn prctl(op: libc::c_int, arg: libc::c_ulong) -> bool {
 /// Lock the calling thread down as `l` says; 0 or an errno.
 /// Async-signal-safe: raw syscalls on the stack, no allocation, no locks.
 fn lock_this_thread(l: ThreadLock) -> i32 {
+    if l.caps {
+        if l.setpcap {
+            if !prctl(libc::PR_SET_SECUREBITS, rules::SECUREBITS_LOCKED_DOWN as libc::c_ulong) {
+                return errno();
+            }
+            for cap in 0..64 as libc::c_ulong {
+                if !prctl(libc::PR_CAPBSET_DROP, cap) {
+                    match errno() {
+                        // Past the kernel's last capability.
+                        libc::EINVAL if cap > 0 => break,
+                        e => return e,
+                    }
+                }
+            }
+            // SAFETY: integer arguments only. 1: still in the bounding set.
+            if unsafe { libc::prctl(libc::PR_CAPBSET_READ, rules::CAP_SETPCAP as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong) } != 0 {
+                return libc::EPERM;
+            }
+        }
+        if !prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_CLEAR_ALL as libc::c_ulong) {
+            return errno();
+        }
+        let mut h = CapHeader { version: rules::LINUX_CAPABILITY_VERSION_3, pid: 0 };
+        let none = [CapData::default(); 2];
+        // SAFETY: a v3 header and the two data structs v3 reads.
+        if unsafe { libc::syscall(libc::SYS_capset, &mut h as *mut CapHeader, none.as_ptr()) } != 0 {
+            return errno();
+        }
+        match capget() {
+            Ok(d) if d.iter().all(|c| c.effective | c.permitted | c.inheritable == 0) => {}
+            Ok(_) => return libc::EPERM,
+            Err(e) => return e,
+        }
+    }
     // Per thread too; Landlock wants it (no CAP_SYS_ADMIN here).
     if !prctl(libc::PR_SET_NO_NEW_PRIVS, 1) {
         return errno();
     }
     // SAFETY: a ruleset fd the caller keeps open, flags 0; reads no memory.
-    if unsafe { libc::syscall(libc::SYS_landlock_restrict_self, l.landlock, 0u32) } != 0 {
+    if l.landlock >= 0 && unsafe { libc::syscall(libc::SYS_landlock_restrict_self, l.landlock, 0u32) } != 0 {
         return errno();
     }
     0
@@ -152,7 +223,8 @@ extern "C" fn on_sync_signal(_: libc::c_int, info: *mut libc::siginfo_t, _: *mut
         return;
     }
     let saved = errno();
-    let l = ThreadLock { landlock: LOCK_FD.load(SeqCst) };
+    let caps = LOCK_CAPS.load(SeqCst);
+    let l = ThreadLock { landlock: LOCK_FD.load(SeqCst), caps: caps & 1 != 0, setpcap: caps & 2 != 0 };
     let r = lock_this_thread(l);
     if r != 0 {
         let _ = FAILED.compare_exchange(0, r, SeqCst, SeqCst);
@@ -187,6 +259,7 @@ fn each_thread(l: ThreadLock) -> Result<()> {
         a.store(0, SeqCst);
     }
     LOCK_FD.store(l.landlock, SeqCst);
+    LOCK_CAPS.store(u8::from(l.caps) | u8::from(l.setpcap) << 1, SeqCst);
     // SAFETY: zeroed sigaction is a valid "no flags, empty mask" value;
     // the handler only makes raw syscalls and touches atomics.
     let (mut old, mut sa): (libc::sigaction, libc::sigaction) = unsafe { (std::mem::zeroed(), std::mem::zeroed()) };
@@ -293,7 +366,7 @@ fn landlock(p: &Policy) -> Result<()> {
     for d in &p.share_rw {
         rs = allow(rs, d, share)?;
     }
-    enforce(rs)
+    enforce(rs, None)
 }
 
 /// Landlock for a program we start (swtpm): built in the parent, entered
@@ -527,8 +600,13 @@ fn usb_refused(pid: u32) -> Result<BTreeMap<i64, Vec<SeccompRule>>> {
 
 /// The USB helper: libusb needs the usbfs nodes (read-write) and sysfs
 /// and udev's database (read) to find devices; nothing else on disk.
+/// As root (vroom-netd's): stays uid 0, which owns the device nodes, but
+/// with no capability left, on every thread: file permissions only.
 pub fn apply_usb_helper() -> Result<()> {
     no_new_privs()?;
+    let setpcap = capget().map_err(|e| Error::Apply(format!("capget: {}", std::io::Error::from_raw_os_error(e))))?[0].effective
+        & (1 << rules::CAP_SETPCAP)
+        != 0;
     let mut rs = ruleset()?;
     let read = AccessFs::ReadFile | AccessFs::ReadDir;
     for d in ["/sys/bus/usb", "/sys/devices", "/sys/class", "/run/udev"] {
@@ -539,7 +617,7 @@ pub fn apply_usb_helper() -> Result<()> {
     }
     rs = allow_if(rs, "/dev/bus/usb", read | AccessFs::WriteFile)?;
     // libusb_init started its event thread already.
-    enforce(rs)?;
+    enforce(rs, Some(setpcap))?;
     // SAFETY: getpid has no preconditions.
     let pid = unsafe { libc::getpid() } as u32;
     #[cfg(target_arch = "x86_64")]

@@ -258,6 +258,29 @@ pub fn sig_blocked(status: &str, sig: i32) -> Option<bool> {
     Some((1..=64).contains(&sig) && mask & (1u64 << (sig - 1)) != 0)
 }
 
+// securebits (include/uapi/linux/securebits.h).
+pub const SECBIT_NOROOT: u64 = 1 << 0;
+pub const SECBIT_NOROOT_LOCKED: u64 = 1 << 1;
+pub const SECBIT_NO_SETUID_FIXUP: u64 = 1 << 2;
+pub const SECBIT_NO_SETUID_FIXUP_LOCKED: u64 = 1 << 3;
+pub const SECBIT_KEEP_CAPS: u64 = 1 << 4;
+pub const SECBIT_KEEP_CAPS_LOCKED: u64 = 1 << 5;
+pub const SECBIT_NO_CAP_AMBIENT_RAISE: u64 = 1 << 6;
+pub const SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED: u64 = 1 << 7;
+
+/// Root without root's powers, for good: uid 0 gets no capabilities from
+/// exec or setuid, KEEP_CAPS off, no ambient raise; all locked.
+pub const SECUREBITS_LOCKED_DOWN: u64 = SECBIT_NOROOT
+    | SECBIT_NOROOT_LOCKED
+    | SECBIT_NO_SETUID_FIXUP
+    | SECBIT_NO_SETUID_FIXUP_LOCKED
+    | SECBIT_KEEP_CAPS_LOCKED
+    | SECBIT_NO_CAP_AMBIENT_RAISE
+    | SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED;
+
+pub const CAP_SETPCAP: u32 = 8;
+pub const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
 /// x86_64 only: kill x32-ABI syscalls (nr | 0x4000_0000) and foreign
 /// arches. A default-allow filter keyed on x86_64 numbers misses them.
 /// Instructions as (code, jt, jf, k).
@@ -406,6 +429,12 @@ mod tests {
         assert_eq!(sig_blocked(mesa, 31), Some(false));
         assert_eq!(sig_blocked(mesa, 34), Some(true));
         assert_eq!(sig_blocked("Name:\tx\n", 31), None);
+    }
+
+    #[test]
+    fn securebits_lock_keep_caps_off() {
+        assert_eq!(SECUREBITS_LOCKED_DOWN, 0xef);
+        assert_eq!(SECUREBITS_LOCKED_DOWN & SECBIT_KEEP_CAPS, 0);
     }
 
     /// A tiny BPF interpreter for the guard's few opcodes.
