@@ -51,7 +51,7 @@ uv run --project research/tui vroom-atui LAB.toml -- ATUI_OPTIONS
 ### Linux AMD64 backend
 
 The x64 backend boots the real VM on the **Linux host**, not inside an agent's
-Coop VM. It starts paused and owns that VM exclusively (the GUI/CLI cannot
+remote VM. It starts paused and owns that VM exclusively (the GUI/CLI cannot
 run a second copy against the same state directory).
 
 ```sh
@@ -135,7 +135,7 @@ Parse response uint64 values losslessly too (for example Python/Rust, or a
 BigInt-aware JSON parser in JavaScript).
 
 Inspection requires an all-CPU pause. Resume afterwards: while paused, Windows,
-its network and Falcon cannot make progress. `vm.shutdown` ends the VM immediately;
+its network and guest services cannot make progress. `vm.shutdown` ends the VM immediately;
 prefer Windows' normal shutdown when preserving a running installation.
 
 Opt-in host-side regression checks (require an idle debugger session and a booted
@@ -146,51 +146,18 @@ python3 research/tests/x64_features_live.py /run/user/1000/vroom-agent.sock
 python3 research/tests/x64_run_control_live.py /run/user/1000/vroom-agent.sock
 ```
 
-#### Exposing only this socket to a Coop VM
+#### Exposing only this socket to a remote VM
 
-For this installed Windows lab, after rebooting the Linux host, run as the normal
-host user (not with sudo):
-
-```sh
-python3 scripts/start-windows-lab.py
-```
-
-This starts the existing `images/windows11-x64.KNZ4j8/windows11.toml` with
-`vroom-lab --daemon`, resumes a newly started VM, waits up to 240 seconds for
-guest tools and an actual Windows command response, verifies `guest.download`
-discovery, applies `scripts/set-windows-isolation.ps1` (routing-only isolation;
-undo with `-Remove` and renew DHCP), and checks/re-establishes the private SSH
-forward to `coop-crowdstrike`. It checks actual RPC responses, not just socket
-existence.
-Both host and Coop checks execute a fresh random challenge inside Windows and
-require its exact echo, successful exit, and no timeout/truncation. Merely
-reporting the agent as connected is insufficient. Local guest-command checks
-retry during the boot timeout; a failed Coop guest-command check exits nonzero
-without replacing a functioning tunnel or resetting Windows.
-An existing running lab is reused; an existing paused debugger session is left
-alone unless `--resume-existing` is specified. No disks are created or reset.
-`--no-coop` checks only the host lab; `--no-isolate` leaves the guest's default
-routes alone; `--config`, `--lab`, `--socket`, `--ssh-host`, `--coop-socket`,
-and `--timeout` override defaults. Requires Python
-3, a built lab binary, host KVM access, and noninteractive SSH access to the
-already-running Coop VM. Rebuild if needed with
-`cargo build -p vroom-kernel --bins`.
-
-Success prints `READY`; failure exits nonzero with a diagnostic. It does not
-install a boot service or continuously monitor/restart the VM. A stale Coop
-socket is removed only if owned by the remote user and connection-refused;
-a live but broken listener is reported, never replaced automatically.
-
-On the host, with the corresponding `coop-<name>` SSH alias configured:
+On the host, replace `research-vm` with your remote VM's SSH alias:
 
 ```sh
 ssh -NT -o ExitOnForwardFailure=yes \
   -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
   -R /home/ubuntu/vroom-agent.sock:/run/user/1000/vroom-agent.sock \
-  coop-crowdstrike
+  research-vm
 ```
 
-Keep this tunnel alive. Inside Coop:
+Keep this tunnel alive. Inside the remote VM:
 
 ```sh
 vroom-rpc --socket /home/ubuntu/vroom-agent.sock describe
@@ -203,7 +170,7 @@ vroom-rpc --socket /home/ubuntu/vroom-agent.sock run kernel.processes
 vroom-rpc --socket /home/ubuntu/vroom-agent.sock run kernel.modules
 ```
 
-Coop needs neither `/dev/kvm` nor a copy of the Windows disk. A listening SSH
+The remote VM needs neither `/dev/kvm` nor a copy of the Windows disk. A listening SSH
 socket alone does not prove the backend is alive: `describe` must succeed.
 Connection reset commonly means the host lab/socket has stopped. The host socket
 is mode 0600 and verifies the peer UID (`SO_PEERCRED` on Linux); SSH must run as
