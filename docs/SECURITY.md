@@ -20,6 +20,7 @@ Out of scope: malicious host; CPU side channels (Spectre-class: hypervisor's and
 - Hard caps on guest-driven allocation: GPU resource memory, pending fences, queue sizes, NAT connections and buffers (~80 MiB max), fragment memory, disk requests in flight.
 - Strict config: unknown keys are errors. `vroom check` (and every start) flags risky valid choices: sandbox off, writable or home-wide shares, LAN-reachable port forwards, host loopback open, bridged networking.
 - Logging capped at 50 lines/s (errors excepted): a guest can't flood the terminal or fill a log disk.
+- Guest serial and `vroom guest exec` output on a terminal: OSC 52 (clipboard), DCS, SOS, PM, APC, ENQ dropped; CSI, other OSC pass (`cli/src/term.rs`).
 - qcow2 backing files: only the image's own dir or allow-listed ones; no protocol prefixes; chain depth capped.
 - VMDK import (read-only): headers, grain tables, descriptors range-checked and capped like qcow2; extent files plain names next to their descriptor (no symlinks out); parents must be `.vmdk`, CIDs must match, chains capped, loops refused.
 
