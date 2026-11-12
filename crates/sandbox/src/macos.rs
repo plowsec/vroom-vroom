@@ -171,7 +171,9 @@ pub fn profile(p: &Policy) -> Result<String> {
     if p.network_outbound {
         // IP only: no Unix sockets (ssh-agent, docker.sock...). netd is
         // connected before we lock down. Later rules win in SBPL.
-        s += "(allow network-outbound (remote ip))\n";
+        // TCP and UDP spelled out: after a bare `(remote ip)` allow, the
+        // localhost deny below does nothing (macOS 27.0.1: loopback open).
+        s += "(allow network-outbound (remote tcp \"*:*\") (remote udp \"*:*\"))\n";
         s += "(allow system-socket)\n";
         if !p.loopback {
             s += "(deny network-outbound (remote ip \"localhost:*\"))\n";
@@ -511,9 +513,19 @@ mod tests {
         let open = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let shut = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let (yes, no) = (open.local_addr().unwrap().port(), shut.local_addr().unwrap().port());
+        // Bound now: the sandbox allows no bind.
+        let udp = || std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let (lo, out, lo6) = (udp(), udp(), std::net::UdpSocket::bind("[::]:0").ok());
         apply(&Policy { network_outbound: true, loopback_ports: vec![yes], ..Default::default() }).unwrap();
         assert!(std::net::TcpStream::connect(("127.0.0.1", yes)).is_ok(), "the listed port");
         assert!(std::net::TcpStream::connect(("127.0.0.1", no)).is_err(), "another port");
+        // UDP and IPv6 loopback are host loopback too.
+        assert!(lo.connect(("127.0.0.1", no)).and_then(|_| lo.send(b"x")).is_err(), "UDP to loopback");
+        if let Some(s) = lo6 {
+            assert!(s.connect(("::1", no)).and_then(|_| s.send(b"x")).is_err(), "UDP to IPv6 loopback");
+            assert!(std::net::TcpStream::connect(("::1", no)).is_err(), "TCP to IPv6 loopback");
+        }
+        assert!(out.connect(("192.0.2.1", 9)).is_ok(), "UDP elsewhere (nothing is sent)");
     }
 
     /// A USB disk's files handed over while the VMM is still setting up
