@@ -51,7 +51,7 @@ One by one (ABI 2..7), fails closed (VM doesn't start) if: a thread blocks SIGSY
 Known gaps (Linux):
 
 - `sendmsg` can carry an address (inside the struct, seccomp can't read it): an existing Unix datagram fd may still reach a pathname socket.
-- `chmod`/`fchmodat` allowed (layer freeze, snapshot dirs); Landlock doesn't cover chmod: any path the user owns can be chmod'ed.
+- No `chmod`/`fchmodat` (Landlock doesn't cover them): modes change only through an open fd (`fchmod`: layer freeze, snapshot dirs).
 - `ioctl`, `prctl`: deny-lists, not allow-lists (in-process Vulkan drivers).
 
 `--no-sandbox`: debugging only, prints a warning.
