@@ -48,6 +48,7 @@ struct State {
 
 pub struct FwCfg {
     base: u64,
+    pio: bool,
     mem: GuestMemory,
     items: BTreeMap<u16, Item>,
     files: Vec<(String, u16)>,
@@ -62,7 +63,7 @@ impl std::fmt::Debug for FwCfg {
 
 impl FwCfg {
     pub fn new(base: u64, mem: GuestMemory, cpus: u16, ram: u64) -> Self {
-        let mut f = FwCfg { base, mem, items: BTreeMap::new(), files: Vec::new(), st: State::default() };
+        let mut f = FwCfg { base, pio: false, mem, items: BTreeMap::new(), files: Vec::new(), st: State::default() };
         f.set(SIGNATURE, b"QEMU".to_vec());
         f.set(ID, FEATURES.to_le_bytes().to_vec());
         f.set(NB_CPUS, cpus.to_le_bytes().to_vec());
@@ -71,8 +72,16 @@ impl FwCfg {
         f
     }
 
-    fn set(&mut self, key: u16, data: Vec<u8>) {
+    pub fn set(&mut self, key: u16, data: Vec<u8>) {
         self.items.insert(key, Item { data, on_write: None });
+    }
+
+    /// PC interface: LE selector at 0, data at 1, BE DMA at 4..12.
+    pub fn new_pio(mem: GuestMemory, cpus: u16, ram: u64) -> Self {
+        let mut f = Self::new(0x510, mem, cpus, ram);
+        f.pio = true;
+        f.set(0x0f, cpus.to_le_bytes().to_vec()); // FW_CFG_MAX_CPUS
+        f
     }
 
     /// Add a named file. `on_write` makes it guest-writable.
@@ -170,6 +179,16 @@ impl FwCfg {
 
 impl BusDevice for FwCfg {
     fn read(&mut self, offset: u64, data: &mut [u8]) {
+        if self.pio {
+            match offset {
+                1 => self.read_bytes(data),
+                4..=11 => {
+                    for (i, b) in data.iter_mut().enumerate() { *b = b"QEMU CFG".get(offset as usize - 4 + i).copied().unwrap_or(0); }
+                }
+                _ => data.fill(0),
+            }
+            return;
+        }
         match offset {
             0..=7 => self.read_bytes(data),
             // DMA signature "QEMU CFG" when probed.
@@ -184,6 +203,18 @@ impl BusDevice for FwCfg {
     }
 
     fn write(&mut self, offset: u64, data: &[u8]) {
+        if self.pio {
+            match (offset, data.len()) {
+                (0, 2) => self.select(u16::from_le_bytes([data[0], data[1]])),
+                (4, 4) => self.st.dma_hi = u32::from_be_bytes([data[0], data[1], data[2], data[3]]),
+                (8, 4) => {
+                    let lo = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+                    let addr = ((self.st.dma_hi as u64) << 32) | lo as u64; self.st.dma_hi = 0; self.dma(addr);
+                }
+                _ => {}
+            }
+            return;
+        }
         match (offset, data.len()) {
             (8, 2) => self.select(u16::from_be_bytes([data[0], data[1]])),
             (0x10, 8) => {
@@ -236,6 +267,20 @@ impl Snapshottable for FwCfg {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn pc_selector_and_dma_endianness() {
+        let mem = GuestMemory::new(&[(GuestAddress(0), 1 << 20)]).unwrap();
+        let mut f = FwCfg::new_pio(mem.clone(), 4, 128 << 20);
+        f.write(0, &NB_CPUS.to_le_bytes()); let mut cpus = [0; 2]; f.read(1, &mut cpus);
+        assert_eq!(cpus, 4u16.to_le_bytes());
+        let mut header = (DMA_SELECT | DMA_READ | ((SIGNATURE as u32) << 16)).to_be_bytes().to_vec();
+        header.extend(4u32.to_be_bytes()); header.extend(0x2000u64.to_be_bytes());
+        mem.write(GuestAddress(0x1000), &header).unwrap();
+        f.write(4, &0u32.to_be_bytes()); f.write(8, &0x1000u32.to_be_bytes());
+        assert_eq!(mem.read_obj::<[u8; 4]>(GuestAddress(0x2000)).unwrap(), *b"QEMU");
+        assert_eq!(mem.read_obj::<[u8; 4]>(GuestAddress(0x1000)).unwrap(), [0;4]);
+    }
 
     fn dev() -> FwCfg {
         let mem = GuestMemory::new(&[(GuestAddress(0), 1 << 20)]).unwrap();

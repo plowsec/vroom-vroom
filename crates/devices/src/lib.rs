@@ -16,6 +16,8 @@ pub mod pflash;
 pub mod tpm;
 pub mod pl011;
 pub mod pl031;
+pub mod serial16550;
+pub mod pc;
 pub mod usb;
 
 pub use bus::{Bus, BusBuilder, BusDevice, BusRange, ConcurrentBusDevice, SharedDevice};

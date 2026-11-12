@@ -70,6 +70,7 @@ struct Mapping {
 
 pub struct PciRoot {
     host: Mutex<ConfigSpace>,
+    pc: bool,
     devices: Vec<(u8, SharedPciDevice)>,
     /// Hot plug root ports (also in `devices`, in their slots).
     ports: Vec<(u8, Arc<Mutex<RootPort>>)>,
@@ -115,7 +116,8 @@ impl PciRoot {
         for (slot, p) in &ports {
             devices.push((*slot, p.clone() as SharedPciDevice));
         }
-        Arc::new(PciRoot { host: Mutex::new(host), devices, ports, map: RwLock::new(Vec::new()), paused: AtomicBool::new(false) })
+        let pc = ids.vendor == 0x8086 && ids.device == 0x1237;
+        Arc::new(PciRoot { host: Mutex::new(host), pc, devices, ports, map: RwLock::new(Vec::new()), paused: AtomicBool::new(false) })
     }
 
     fn device(&self, slot: u8) -> Option<&SharedPciDevice> {
@@ -171,6 +173,20 @@ impl PciRoot {
         let slot = ((off >> 15) & 31) as u8;
         let func = (off >> 12) & 7;
         let reg = (off & 0xfff) as usize;
+        // Fixed PIIX firmware interface at 00:01.0 and 00:01.3. PM I/O
+        // is already enabled at B000; there are no IDE or USB functions.
+        if self.pc && bus == 0 && slot == 1 && (func == 0 || func == 3) {
+            if write.is_none() {
+                let mut cfg = [0u8; 256];
+                cfg[..2].copy_from_slice(&0x8086u16.to_le_bytes());
+                cfg[2..4].copy_from_slice(&(if func == 0 { 0x7000u16 } else { 0x7113u16 }).to_le_bytes());
+                cfg[4] = 1; cfg[0x0b] = 6; cfg[0x0a] = if func == 0 { 1 } else { 0x80 };
+                if func == 0 { cfg[0x0e] = 0x80; cfg[0x60..0x64].copy_from_slice(&[16,17,18,19]); }
+                else { cfg[0x40..0x44].copy_from_slice(&0xb001u32.to_le_bytes()); cfg[0x80] = 1; }
+                for (i, b) in data.iter_mut().enumerate() { *b = cfg.get(reg+i).copied().unwrap_or(0); }
+            }
+            return;
+        }
         if bus == 0 && slot == 0 && func == 0 {
             let mut h = lock(&self.host);
             match write {
@@ -285,6 +301,8 @@ impl PciRoot {
         EcamPort(self.clone())
     }
 
+    pub fn config_port(self: &Arc<Self>) -> ConfigPort { ConfigPort { root: self.clone(), address: 0 } }
+
     /// Bus port for a BAR window starting at `base`.
     pub fn window_port(self: &Arc<Self>, base: u64) -> WindowPort {
         WindowPort { root: self.clone(), base }
@@ -293,6 +311,34 @@ impl PciRoot {
 
 #[derive(Debug)]
 pub struct EcamPort(Arc<PciRoot>);
+
+/// PCI configuration mechanism #1 (CF8 address, CFC data).
+#[derive(Debug)]
+pub struct ConfigPort { root: Arc<PciRoot>, address: u32 }
+impl ConfigPort {
+    fn offset(&self, off: u64, len: usize) -> Option<u64> {
+        if self.address & (1 << 31) == 0 || off < 4 || off + len as u64 > 8 { return None; }
+        Some((((self.address >> 16) & 255) as u64) << 20 |
+            (((self.address >> 11) & 31) as u64) << 15 |
+            (((self.address >> 8) & 7) as u64) << 12 | (self.address & 0xfc) as u64 | (off - 4))
+    }
+}
+impl BusDevice for ConfigPort {
+    fn read(&mut self, off: u64, data: &mut [u8]) {
+        if off == 0 && data.len() == 4 { data.copy_from_slice(&self.address.to_le_bytes()); }
+        else if let Some(addr) = self.offset(off, data.len()) { self.root.ecam(addr, data, None); }
+        else { data.fill(0xff); }
+    }
+    fn write(&mut self, off: u64, data: &[u8]) {
+        if off == 0 && data.len() == 4 { self.address = crate::get_le(data) as u32; }
+        else if let Some(addr) = self.offset(off, data.len()) { self.root.ecam(addr, &mut [0; 8][..data.len().min(8)], Some(data)); }
+    }
+}
+impl Snapshottable for ConfigPort {
+    fn snapshot_id(&self) -> String { "pci-config@cf8".into() }
+    fn save(&mut self) -> vroom_snapshot::Result<Vec<u8>> { encode(&self.address) }
+    fn restore(&mut self, data: &[u8]) -> vroom_snapshot::Result<()> { self.address = decode(data)?; Ok(()) }
+}
 
 impl BusDevice for EcamPort {
     fn read(&mut self, offset: u64, data: &mut [u8]) {
@@ -398,6 +444,19 @@ impl Snapshottable for EcamPort {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pc_config_ports_and_byte_lanes() {
+        use super::*;
+        let root = PciRoot::with_host_ids(vec![], VendorIds { vendor: 0x8086, device: 0x1237, subsys_vendor: 0, subsys: 0 });
+        let mut p = root.config_port(); let mut data = [0;4];
+        p.read(4, &mut data); assert_eq!(data, [0xff;4]);
+        p.write(0, &0x8000_0000u32.to_le_bytes()); p.read(4, &mut data);
+        assert_eq!(data, [0x86,0x80,0x37,0x12]);
+        let mut high = [0;2]; p.read(6, &mut high); assert_eq!(high, [0x37,0x12]);
+        p.write(0, &0x8000_0b40u32.to_le_bytes()); p.read(4, &mut data); assert_eq!(data, 0xb001u32.to_le_bytes());
+        let saved = p.save().unwrap(); p.write(0, &0u32.to_le_bytes()); p.restore(&saved).unwrap();
+        p.read(4, &mut data); assert_eq!(data, 0xb001u32.to_le_bytes());
+    }
     use super::*;
     use crate::pci::{BarSpec, PciDevice};
 
