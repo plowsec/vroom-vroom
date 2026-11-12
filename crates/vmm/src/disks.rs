@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
-use vroom_block::qcow2::{OpenPolicy, Pinned, Qcow2Image};
+use vroom_block::qcow2::{BaseBacking, OpenPolicy, Pinned, Qcow2Image};
 #[cfg(feature = "research")]
 use vroom_block::rollback::RollbackDisk;
 use vroom_block::{DiskImage, Format, SwapDisk, SyncMode};
@@ -130,7 +130,9 @@ impl DiskSet {
             // writable image means raw: `vroom_block::open_with`).
             let base_fmt = fmt_of(d.format).unwrap_or(Format::Raw);
             let pinned = (!d.readonly).then(|| Pinned { layers: dir.clone(), bases: vec![(d.path.clone(), Some(base_fmt))] });
-            let policy = OpenPolicy { allowed_dirs: Vec::new(), sync: sync_of(d.sync), pinned };
+            // The image's own backing file: only the one the VM file names.
+            let base_backing = BaseBacking::Named(d.backing.iter().map(|b| (d.path.clone(), b.clone())).collect());
+            let policy = OpenPolicy { allowed_dirs: Vec::new(), sync: sync_of(d.sync), pinned, base_backing };
             if d.readonly {
                 let img = vroom_block::open_with(&d.path, fmt_of(d.format), true, &policy)
                     .map_err(|e| Error::Setup(format!("disk {}: {e}", d.path.display())))?;
@@ -456,6 +458,26 @@ mod tests {
     }
 
     #[test]
+    fn a_disk_on_a_backing_file_opens_only_with_it_named() {
+        let td = tempfile::tempdir().unwrap();
+        let base = td.path().join("base.qcow2");
+        Qcow2Image::create(&base, 1 << 20, None).unwrap();
+        let disk = td.path().join("disk.qcow2");
+        Qcow2Image::create(&disk, 1 << 20, Some((&base, Format::Qcow2))).unwrap();
+        let state = td.path().join("vm.state");
+        let mut c = cfg(&disk);
+        let e = DiskSet::open(&c, &state, &BTreeMap::new()).unwrap_err().to_string();
+        assert!(e.contains("add backing = "), "{e}");
+        c.disks[0].backing = Some(base.clone());
+        let ds = DiskSet::open(&c, &state, &BTreeMap::new()).unwrap();
+        assert_eq!(ds.disks[0].below, [base.canonicalize().unwrap()]);
+        drop(ds);
+        c.disks[0].backing = Some(td.path().join("other.qcow2"));
+        Qcow2Image::create(&td.path().join("other.qcow2"), 1 << 20, None).unwrap();
+        assert!(DiskSet::open(&c, &state, &BTreeMap::new()).is_err());
+    }
+
+    #[test]
     fn a_raw_base_with_a_qcow2_header_reverts_as_raw() {
         let td = tempfile::tempdir().unwrap();
         let disk = td.path().join("disk.img");
@@ -519,7 +541,7 @@ mod tests {
         std::fs::set_permissions(&disk, std::fs::Permissions::from_mode(0o600)).unwrap();
         vroom_block::qcow2::set_backing(&disk, Some((&other, Format::Qcow2))).unwrap();
         let e = DiskSet::open(&c, &state, &BTreeMap::new()).err().expect("refused");
-        assert!(e.to_string().contains("can't trust"), "{e}");
+        assert!(e.to_string().contains("add backing"), "{e}");
     }
 
     #[test]

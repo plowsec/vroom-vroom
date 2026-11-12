@@ -114,7 +114,7 @@ fn strict_profile_rejections_precede_state_and_vm_creation() {
         Box::new(|c| c.display.gpu = vroom_config::Gpu::Virtio2d), Box::new(|c| c.identity.product = "custom".into()),
         Box::new(|c| c.virtio_transport = vroom_config::Transport::Pci), Box::new(|c| c.os = Some(GuestOs::Windows)),
         Box::new(|c| c.serial = Serial::File { path: "must-not-create".into() }),
-        Box::new(|c| c.disks.push(Disk { path: "must-not-open".into(), readonly: false, format: Default::default(), cdrom: false, bus: Default::default(), sync: Default::default() })),
+        Box::new(|c| c.disks.push(Disk { path: "must-not-open".into(), readonly: false, format: Default::default(), cdrom: false, bus: Default::default(), sync: Default::default(), backing: None })),
         Box::new(|c| c.shares.push(vroom_config::Share { path: "must-not-open".into(), tag: "share".into(), readonly: true })),
         Box::new(|c| c.usb.push(vroom_config::Usb { id: "1234:5678".into(), serial: None, name: None, mode: Default::default(), readonly: true })),
         Box::new(|c| c.boot = Boot::Uefi { firmware: None, vars: "must-not-create".into(), secure_boot: true }),

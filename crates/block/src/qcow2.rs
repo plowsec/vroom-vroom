@@ -105,6 +105,27 @@ pub struct OpenPolicy {
     pub sync: SyncMode,
     /// A VM's writable disk: set, only these backing files count.
     pub pinned: Option<Pinned>,
+    /// With `pinned`: what a base's own backing file may be.
+    pub base_backing: BaseBacking,
+}
+
+/// A pinned base that names a backing file of its own.
+#[derive(Debug, Clone)]
+pub enum BaseBacking {
+    /// Only the file the VM file names for that base (base, backing):
+    /// exactly that one (canonical, regular, not a link), in the format
+    /// the base's header records. Not named: refused.
+    Named(Vec<(PathBuf, PathBuf)>),
+    /// Whatever the base names, under the read-only rules (own
+    /// directory, recorded format). For callers that neither write nor
+    /// hand out what's below the base (prune).
+    ReadOnlyRules,
+}
+
+impl Default for BaseBacking {
+    fn default() -> Self {
+        BaseBacking::Named(Vec::new())
+    }
 }
 
 /// The files a VM's writable disk may be made of. The sandboxed VMM can
@@ -128,16 +149,48 @@ impl Pinned {
     }
 }
 
-/// A pinned chain's base must not name a backing file.
+impl OpenPolicy {
+    /// `image` is a pinned base: the policy for what's below it (its own
+    /// backing chain, which the VMM only reads).
+    fn below_base(&self, image: &Path) -> Option<OpenPolicy> {
+        let pin = self.pinned.as_ref()?;
+        image.canonicalize().ok().filter(|me| pin.base(me).is_some())?;
+        Some(OpenPolicy { allowed_dirs: self.allowed_dirs.clone(), sync: self.sync, pinned: None, base_backing: BaseBacking::default() })
+    }
+}
+
+/// A pinned chain's base may name a backing file only as `base_backing`
+/// allows.
 fn check_base(path: &Path, hdr: &Header, policy: &OpenPolicy) -> Result<()> {
     let (Some(pin), Some(name)) = (&policy.pinned, &hdr.backing_file) else { return Ok(()) };
-    if path.canonicalize().is_ok_and(|me| pin.base(&me).is_some()) {
-        return Err(bad(format!(
-            "{} names a backing file ({name}); vroom writes this image, so it can't trust that name: flatten it (qemu-img convert) or make the disk read-only",
+    let Some(me) = path.canonicalize().ok().filter(|me| pin.base(me).is_some()) else { return Ok(()) };
+    match &policy.base_backing {
+        BaseBacking::ReadOnlyRules => Ok(()),
+        BaseBacking::Named(named) if named.iter().any(|(b, _)| b.canonicalize().is_ok_and(|b| b == me)) => Ok(()),
+        BaseBacking::Named(_) => Err(bad(format!(
+            "{} names a backing file ({name:?}); vroom writes this image, so it trusts that name only if the VM file names it too: add backing = {name:?} to this [[disk]], flatten it (qemu-img convert) or make the disk read-only",
             path.display()
-        )));
+        ))),
     }
-    Ok(())
+}
+
+/// `image` is a pinned base whose own backing the VM file names: check
+/// `p` (the header's name, joined to the image's dir; `real`: resolved)
+/// is exactly that file.
+fn named_backing(image: &Path, want: &Path, p: &Path, real: &Path, recorded: Option<Format>) -> Result<(PathBuf, Format)> {
+    let link = std::fs::symlink_metadata(p).map_or(true, |m| !m.is_file());
+    if link || want.canonicalize().ok().as_deref() != Some(real) {
+        return Err(bad(format!("{} names backing file {}, the VM file says {}", image.display(), p.display(), want.display())));
+    }
+    recorded.map(|f| (real.to_path_buf(), f)).ok_or_else(|| {
+        bad(format!(
+            "{}: no backing format recorded for {}; set it: qemu-img rebase -u -F raw|qcow2 -b {} {}",
+            image.display(),
+            real.display(),
+            real.display(),
+            image.display()
+        ))
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -334,7 +387,16 @@ fn resolve_backing(image: &Path, name: &str, recorded: Option<&str>, policy: &Op
     if !real.is_file() {
         return Err(bad(format!("backing file {} is not a regular file", real.display())));
     }
-    if let Some(pin) = &policy.pinned {
+    let base = policy.pinned.as_ref().and_then(|pin| image.canonicalize().ok().filter(|me| pin.base(me).is_some()));
+    if let Some(me) = &base {
+        // A base's own backing: the one the VM file names, or (prune)
+        // the read-only rules below.
+        if let BaseBacking::Named(named) = &policy.base_backing {
+            let want = named.iter().find(|(b, _)| b.canonicalize().is_ok_and(|b| &b == me)).map(|(_, w)| w);
+            let want = want.ok_or_else(|| bad(format!("{}: the VM file names no backing file for it", image.display())))?;
+            return named_backing(image, want, &p, &real, recorded);
+        }
+    } else if let Some(pin) = &policy.pinned {
         if let Some(f) = pin.base(&real) {
             let f = f.or(recorded).ok_or_else(|| bad(format!("{}: no backing format recorded for {}", image.display(), real.display())))?;
             return Ok((real, f));
@@ -375,14 +437,18 @@ fn resolve_backing(image: &Path, name: &str, recorded: Option<&str>, policy: &Op
 pub fn chain(path: &Path, policy: &OpenPolicy) -> Result<Vec<PathBuf>> {
     let mut out = vec![path.to_path_buf()];
     let mut fmt = Format::Qcow2;
+    let mut policy = policy.clone();
     while fmt == Format::Qcow2 && out.len() <= MAX_CHAIN as usize {
         let cur = out[out.len() - 1].clone();
         let f = File::open(&cur)?;
         let len = f.metadata()?.len();
         let hdr = parse_header(&f, len)?;
-        check_base(&cur, &hdr, policy)?;
+        check_base(&cur, &hdr, &policy)?;
         let Some(name) = &hdr.backing_file else { break };
-        let (bp, bf) = resolve_backing(&cur, name, hdr.backing_format.as_deref(), policy)?;
+        let (bp, bf) = resolve_backing(&cur, name, hdr.backing_format.as_deref(), &policy)?;
+        if let Some(below) = policy.below_base(&cur) {
+            policy = below;
+        }
         out.push(bp);
         fmt = bf;
     }
@@ -499,9 +565,10 @@ impl Qcow2Image {
                 let (bp, fmt) = resolve_backing(path, name, hdr.backing_format.as_deref(), policy)?;
                 backing_path = Some(bp.clone());
                 backing_fmt = Some(fmt);
+                let below = policy.below_base(path);
                 let b: Arc<dyn DiskImage> = match fmt {
                     Format::Raw => Arc::new(crate::raw::RawImage::open(&bp, true)?),
-                    Format::Qcow2 => Arc::new(Qcow2Image::open_with(&bp, true, policy, depth + 1)?),
+                    Format::Qcow2 => Arc::new(Qcow2Image::open_with(&bp, true, below.as_ref().unwrap_or(policy), depth + 1)?),
                 };
                 Some(b)
             }
@@ -1851,9 +1918,64 @@ mod tests {
         Qcow2Image::create(&qbase, 1 << 20, Some((&fake, Format::Qcow2))).unwrap();
         let pol = OpenPolicy { pinned: Some(Pinned { layers: layers.clone(), bases: vec![(qbase.clone(), Some(Format::Qcow2))] }), ..Default::default() };
         let e = Qcow2Image::open_with(&qbase, false, &pol, 0).unwrap_err().to_string();
-        assert!(e.contains("can't trust"), "{e}");
+        assert!(e.contains("add backing"), "{e}");
         set_backing(&l1, Some((&qbase, Format::Qcow2))).unwrap();
         assert!(Qcow2Image::open_with(&l1, true, &pol, 0).is_err());
         assert!(chain(&l1, &pol).is_err());
+    }
+
+    #[test]
+    fn a_pinned_base_names_only_the_backing_the_vm_file_names() {
+        let td = tempfile::tempdir().unwrap();
+        let layers = td.path().join("vm.state/disks");
+        std::fs::create_dir_all(&layers).unwrap();
+        let backing = td.path().join("base.qcow2");
+        Qcow2Image::create(&backing, 1 << 20, None).unwrap();
+        let other = td.path().join("other-vm.qcow2");
+        Qcow2Image::create(&other, 1 << 20, None).unwrap();
+        let disk = td.path().join("disk.qcow2");
+        Qcow2Image::create(&disk, 1 << 20, Some((&backing, Format::Qcow2))).unwrap();
+        let pinned = Some(Pinned { layers: layers.clone(), bases: vec![(disk.clone(), Some(Format::Qcow2))] });
+        let named = OpenPolicy { pinned: pinned.clone(), base_backing: BaseBacking::Named(vec![(disk.clone(), backing.clone())]), ..Default::default() };
+        // Named: accepted, and so is a layer on it.
+        let q = Qcow2Image::open_with(&disk, false, &named, 0).unwrap();
+        assert_eq!(q.backing_path(), Some(backing.canonicalize().unwrap().as_path()));
+        drop(q);
+        let l1 = layers.join("disk0-1-000000001.qcow2");
+        Qcow2Image::create(&l1, 1 << 20, Some((&disk, Format::Qcow2))).unwrap();
+        assert!(Qcow2Image::open_with(&l1, false, &named, 0).is_ok());
+        assert_eq!(chain(&l1, &named).unwrap(), [l1.clone(), disk.canonicalize().unwrap(), backing.canonicalize().unwrap()]);
+        // Unnamed: refused, and the error says what to add.
+        let unnamed = OpenPolicy { pinned: pinned.clone(), ..Default::default() };
+        let e = Qcow2Image::open_with(&disk, false, &unnamed, 0).unwrap_err().to_string();
+        assert!(e.contains("add backing = "), "{e}");
+        assert!(chain(&l1, &unnamed).is_err());
+        // The header names another file: refused.
+        set_backing(&disk, Some((&other, Format::Qcow2))).unwrap();
+        let e = Qcow2Image::open_with(&disk, false, &named, 0).unwrap_err().to_string();
+        assert!(e.contains("the VM file says"), "{e}");
+        assert!(chain(&l1, &named).is_err());
+        // A link to the named file: refused.
+        std::os::unix::fs::symlink(&backing, td.path().join("link.qcow2")).unwrap();
+        set_backing(&disk, Some((&td.path().join("link.qcow2"), Format::Qcow2))).unwrap();
+        assert!(Qcow2Image::open_with(&disk, false, &named, 0).is_err());
+        // No recorded format: refused.
+        set_backing(&disk, Some((&backing, Format::Qcow2))).unwrap();
+        forget_backing_format(&disk);
+        assert!(Qcow2Image::open_with(&disk, false, &named, 0).is_err());
+        set_backing(&disk, Some((&backing, Format::Qcow2))).unwrap();
+        // Below the named file, the read-only rules: its own dir only.
+        let far = tempfile::tempdir().unwrap();
+        let secret = far.path().join("secret");
+        std::fs::write(&secret, b"key").unwrap();
+        set_backing(&backing, Some((&secret, Format::Raw))).unwrap();
+        let e = Qcow2Image::open_with(&disk, false, &named, 0).unwrap_err().to_string();
+        assert!(e.contains("outside the allowed"), "{e}");
+        assert!(chain(&disk, &named).is_err());
+        set_backing(&backing, Some((&other, Format::Qcow2))).unwrap();
+        assert_eq!(chain(&disk, &named).unwrap().len(), 3, "next to it: fine");
+        // Prune's rules: read-only rules below the base.
+        let prune = OpenPolicy { pinned, base_backing: BaseBacking::ReadOnlyRules, ..Default::default() };
+        assert!(Qcow2Image::open_with(&l1, true, &prune, 0).is_ok());
     }
 }

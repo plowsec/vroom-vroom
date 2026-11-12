@@ -63,6 +63,11 @@ pub fn run(cmd: DiskCmd) -> Result<(), String> {
             };
             Qcow2Image::create(&path, size, b.map(|(p, f, _)| (p, f))).map_err(|e| e.to_string())?;
             println!("created {} ({} bytes)", path.display(), size);
+            if let Some(b) = &backing {
+                // A writable VM disk's backing file must be in the VM file too.
+                let b = b.canonicalize().unwrap_or_else(|_| b.clone());
+                println!("as a VM disk: [[disk]] format = \"qcow2\", backing = {:?}", b.display().to_string());
+            }
             Ok(())
         }
         DiskCmd::Compact { path, allow_dirs } => {

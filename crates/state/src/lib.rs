@@ -12,7 +12,7 @@ use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
-use vroom_block::qcow2::{fold_backing, OpenPolicy, Pinned};
+use vroom_block::qcow2::{fold_backing, BaseBacking, OpenPolicy, Pinned};
 use vroom_snapshot::SnapshotDir;
 
 pub mod hostile;
@@ -261,7 +261,8 @@ pub fn prune(state: &Path, bases: &[PathBuf]) -> Result<PruneReport> {
     real_dir(&state.join("disks"))?;
     let disks = canon(&state.join("disks"));
     let pinned = Pinned { layers: disks.clone(), bases: bases.iter().map(|b| (b.clone(), None)).collect() };
-    let policy = OpenPolicy { pinned: Some(pinned), ..Default::default() };
+    // Below a base, nothing is deleted or written: the read-only rules.
+    let policy = OpenPolicy { pinned: Some(pinned), base_backing: BaseBacking::ReadOnlyRules, ..Default::default() };
     let mut report = PruneReport::default();
     loop {
         let (roots, pinned) = roots(state)?;
@@ -430,9 +431,12 @@ mod tests {
         let disks = state.join("disks");
         std::fs::create_dir_all(&disks).unwrap();
         let base = t.path().join("disk.qcow2");
-        Qcow2Image::create(&base, 1 << 20, None).unwrap();
         let other = t.path().join("other-vm.qcow2");
         Qcow2Image::create(&other, 1 << 20, None).unwrap();
+        // The base has a backing file of its own (`backing` in the VM file).
+        let below = t.path().join("below.qcow2");
+        Qcow2Image::create(&below, 1 << 20, None).unwrap();
+        Qcow2Image::create(&base, 1 << 20, Some((&below, Format::Qcow2))).unwrap();
         let (l1, l2) = (disks.join("disk0-1-000000001.qcow2"), disks.join("disk0-1-000000002.qcow2"));
         Qcow2Image::create(&l1, 1 << 20, Some((&base, Format::Qcow2))).unwrap();
         Qcow2Image::create(&l2, 1 << 20, Some((&l1, Format::Qcow2))).unwrap();

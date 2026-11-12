@@ -270,7 +270,8 @@ fn restore_hardware(now: VmConfig, saved: &VmConfig) -> Result<(VmConfig, GoneSh
         return Err(refuse(format!("it has {} disks, the VM file {}", saved.disks.len(), now.disks.len())));
     }
     for (i, (a, b)) in saved.disks.iter().zip(&now.disks).enumerate() {
-        if real(&a.path) != real(&b.path) || (a.readonly, a.format, a.cdrom, a.bus) != (b.readonly, b.format, b.cdrom, b.bus) {
+        let backing = |d: &vroom_config::Disk| d.backing.as_deref().map(real);
+        if real(&a.path) != real(&b.path) || backing(a) != backing(b) || (a.readonly, a.format, a.cdrom, a.bus) != (b.readonly, b.format, b.cdrom, b.bus) {
             return Err(refuse(format!("disk {} is {} in the save, {} in the VM file (or set up differently)", i + 1, a.path.display(), b.path.display())));
         }
     }
@@ -1271,6 +1272,10 @@ mod tests {
         assert!(e.contains("disk 1") && e.contains("--fresh"), "{e}");
         let mut forged = base();
         forged.disks.push(forged.disks[0].clone());
+        assert!(restore_hardware(now.clone(), &forged).is_err());
+        // Another backing file for the image: refused.
+        let mut forged = base();
+        forged.disks[0].backing = Some("/home/me/.ssh/id_ed25519".into());
         assert!(restore_hardware(now.clone(), &forged).is_err());
         // Opt-ins the file doesn't have.
         let opt_ins: [fn(&mut VmConfig); 9] = [

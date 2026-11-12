@@ -609,6 +609,11 @@ pub struct Disk {
     /// "fsync" (default, survives a host crash) or "none" (scratch disks).
     #[serde(default)]
     pub sync: DiskSync,
+    /// A writable qcow2 image's own backing file (`vroom disk create
+    /// --backing`). vroom writes the image, so it believes the name in
+    /// its header only when it is this file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backing: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -1025,6 +1030,9 @@ impl VmConfig {
         }
         for d in &mut self.disks {
             fix(&mut d.path);
+            if let Some(b) = &mut d.backing {
+                fix(b);
+            }
         }
         for s in &mut self.shares {
             fix(&mut s.path);
@@ -1146,6 +1154,9 @@ impl VmConfig {
         for d in &self.disks {
             if d.cdrom && !d.readonly {
                 return bad(format!("{}: cdrom must be readonly", d.path.display()));
+            }
+            if d.backing.is_some() && d.format == DiskFormat::Raw {
+                return bad(format!("{}: backing needs a qcow2 disk", d.path.display()));
             }
         }
         // Adapter N's NAT network is the first one's plus N.
@@ -1515,5 +1526,19 @@ guest_to_host = false
         assert!(VmConfig::from_toml(&fwd).is_err());
         let cd = SAMPLE.replace("readonly = true\ncdrom", "cdrom");
         assert!(VmConfig::from_toml(&cd).is_err());
+    }
+
+    #[test]
+    fn disk_backing_is_a_path_rebased_like_the_disk() {
+        let with = SAMPLE.replace("path = \"/vm/disk.qcow2\"", "path = \"disk.qcow2\"\nbacking = \"base.qcow2\"");
+        let mut c = VmConfig::from_toml(&with).unwrap();
+        c.rebase_paths(Path::new("/vms/a"));
+        assert_eq!(c.disks[0].backing.as_deref(), Some(Path::new("/vms/a/base.qcow2")));
+        assert_eq!(c.disks[1].backing, None);
+        assert!(VmConfig::from_toml(&c.to_toml().unwrap()).unwrap().disks[0].backing.is_some());
+        assert!(!SAMPLE.contains("backing") && !VmConfig::from_toml(SAMPLE).unwrap().to_toml().unwrap().contains("backing"));
+        let raw = with.replace("backing =", "format = \"raw\"\nbacking =");
+        assert!(VmConfig::from_toml(&raw).is_err());
+        assert!(VmConfig::from_toml(&with.replace("backing =", "backing_file =")).is_err(), "unknown key");
     }
 }

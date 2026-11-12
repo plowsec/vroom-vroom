@@ -303,6 +303,7 @@ pub fn add_disk(c: &mut VmConfig, path: &Path, kind: NewDisk) {
             cdrom: true,
             bus: DiskBus::Virtio,
             sync: DiskSync::Fsync,
+            backing: None,
         },
         NewDisk::Image => Disk {
             path: path.to_path_buf(),
@@ -311,6 +312,7 @@ pub fn add_disk(c: &mut VmConfig, path: &Path, kind: NewDisk) {
             cdrom: false,
             bus: if nvme { DiskBus::Nvme } else { DiskBus::Virtio },
             sync: DiskSync::Fsync,
+            backing: None,
         },
     });
 }

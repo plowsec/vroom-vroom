@@ -24,7 +24,7 @@ fn shape(root: &Path) -> (VmConfig, VmmOptions) {
     let mut config = VmConfig::from_toml("name='efi-inputs'\ncpus=1\nmemory_mib=512\nballoon=false\nos='other'\n[clipboard]\nhost_to_guest=false\nguest_to_host=false\n[boot]\ntype='uefi'\nvars='unused'\n").unwrap();
     config.boot = Boot::Uefi { firmware: Some(root.join("code")), vars: root.join("vars"), secure_boot: false };
     config.disks = vec![Disk { path: root.join("disk"), readonly: true, format: DiskFormat::Raw,
-        cdrom: false, bus: DiskBus::Nvme, sync: DiskSync::Fsync }];
+        cdrom: false, bus: DiskBus::Nvme, sync: DiskSync::Fsync, backing: None }];
     let opts = VmmOptions { serial_out: Box::new(io::sink()), start: StartMode::BootPaused,
         clipboard: None, ui: None, state_dir: root.join("state"), sandbox: true };
     (config, opts)

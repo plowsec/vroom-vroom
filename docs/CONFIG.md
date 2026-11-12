@@ -72,6 +72,7 @@ cmdline = "console=ttyAMA0 root=/dev/vda1"
 | `readonly` | false | Guest can't write. Windows doesn't see it on NVMe ([GUIDE](GUIDE.md#read-only-disks)). |
 | `cdrom` | false | Show as a CD (installer ISOs). Needs `readonly = true`. |
 | `sync` | `fsync` | Guest flush = `full` (power-loss safe, slow on macOS), `fsync` (survives host crash), `none` (scratch). |
+| `backing` | none | qcow2 image's own backing file (`vroom disk create --backing`). Required for a writable disk that has one: the VMM can rewrite the header, so only this file is believed. Relative to the VM file. |
 
 ## `[[net]]` (repeat for more adapters, up to 8)
 
