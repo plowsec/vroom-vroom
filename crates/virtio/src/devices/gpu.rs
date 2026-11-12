@@ -2532,8 +2532,10 @@ impl VirtioDevice for Gpu {
             m.place(gpa, *size);
         }
         if let (SHM_HOST_VISIBLE, Some(t)) = (id, &self.three_d) {
-            t.shm_base.store(gpa, Ordering::Release);
-            t.mapper.place(gpa, t.shm_size);
+            // Blobs map only inside the window as placed: elsewhere (the
+            // guest's RAM, the flash) mapping would first unmap what's there.
+            let placed = t.mapper.place(gpa, t.shm_size);
+            t.shm_base.store(if placed { gpa } else { 0 }, Ordering::Release);
         }
     }
     fn activate(&mut self, ctx: ActivateContext) -> Result<()> {
@@ -2853,7 +2855,13 @@ mod tests {
     struct FakeVk {
         log: Arc<Mutex<Vec<String>>>,
         restores: bool,
+        /// Blobs map (to one page).
+        maps: bool,
     }
+
+    #[repr(align(65536))]
+    struct Page([u8; 4096]);
+    static PAGE: Page = Page([0; 4096]);
     impl Renderer3d for FakeVk {
         fn capsets(&self) -> Vec<(u32, u32, u32)> {
             vec![(CAPSET_VENUS, 0, 160)]
@@ -2888,7 +2896,7 @@ mod tests {
             true
         }
         fn map_blob(&mut self, _: u32) -> Option<crate::devices::gpu3d::Mapping> {
-            None
+            self.maps.then(|| crate::devices::gpu3d::Mapping { ptr: PAGE.0.as_ptr().cast_mut(), size: 4096, map_info: 1 })
         }
         fn unmap_blob(&mut self, _: u32) {}
         fn read_mapped(&mut self, _: u32, _: u64, _: &mut [u8]) -> bool {
@@ -2931,7 +2939,7 @@ mod tests {
         for restores in [true, false] {
             let mem = GuestMemory::new(&[(GuestAddress(0), 1 << 20)]).unwrap();
             let log = Arc::new(Mutex::new(vec![]));
-            let vk = || ThreeD::new(Box::new(FakeVk { log: log.clone(), restores }), Arc::new(NoMap), 0);
+            let vk = || ThreeD::new(Box::new(FakeVk { log: log.clone(), restores, maps: false }), Arc::new(NoMap), 0);
             let (gpu, _ctl) = Gpu::new(64, 64, Arc::new(Rec::default()));
             let gpu = gpu.with_3d(vk());
             let mut h = gpu.handler();
@@ -2964,6 +2972,65 @@ mod tests {
             assert_eq!(got, want);
             assert!(h.res3d.contains_key(&4) && h.ctx_info[&2].capset == CAPSET_VENUS);
         }
+    }
+
+    /// Maps what the window lets through: `ok` is where BARs may go.
+    struct RecMap {
+        ok: (u64, u64),
+        maps: Mutex<Vec<u64>>,
+    }
+    impl ShmMapper for RecMap {
+        fn map(&self, gpa: u64, _: &crate::devices::gpu3d::Mapping) -> bool {
+            self.maps.lock().unwrap().push(gpa);
+            true
+        }
+        fn unmap(&self, _: u64, _: u64) {}
+        fn granule(&self) -> u64 {
+            4096
+        }
+        fn place(&self, gpa: u64, size: u64) -> bool {
+            gpa >= self.ok.0 && gpa + size <= self.ok.1
+        }
+    }
+
+    /// A blob maps only inside the window as placed, live and from a
+    /// snapshot: a BAR the guest put over its RAM maps nothing.
+    #[test]
+    fn blobs_map_only_inside_the_placed_window() {
+        use crate::device::VirtioDevice;
+        const RAM: u64 = 0x4000_0000;
+        const BAR: u64 = 0x10_0000_0000;
+        let mem = GuestMemory::new(&[(GuestAddress(0), 1 << 20)]).unwrap();
+        let log = Arc::new(Mutex::new(vec![]));
+        let mapper = Arc::new(RecMap { ok: (BAR, BAR + (1 << 32)), maps: Mutex::new(vec![]) });
+        let vk = || ThreeD::new(Box::new(FakeVk { log: log.clone(), restores: true, maps: true }), mapper.clone(), 1 << 20);
+        let (gpu, _ctl) = Gpu::new(64, 64, Arc::new(Rec::default()));
+        let mut gpu = gpu.with_3d(vk());
+        let mut h = gpu.handler();
+        let mut create = vec![0u32, CAPSET_VENUS];
+        create.extend([0u32; 16]);
+        assert_eq!(run(&mut h, CTX_CREATE, 2, &create), OK_NODATA);
+        assert_eq!(run(&mut h, RESOURCE_CREATE_BLOB, 2, &[3, BLOB_MEM_HOST3D, 1, 0, 9, 0, 4096, 0]), OK_NODATA);
+        // id, padding, offset (2 words)
+        let map = |h: &mut GpuHandler| run(h, RESOURCE_MAP_BLOB, 2, &[3, 0, 0x2000, 0]);
+        assert_eq!(map(&mut h), ERR_INVALID_PARAMETER, "no window yet");
+        gpu.set_shm_base(SHM_HOST_VISIBLE, RAM);
+        assert_eq!(map(&mut h), ERR_INVALID_PARAMETER, "over the guest's RAM");
+        assert!(mapper.maps.lock().unwrap().is_empty());
+        gpu.set_shm_base(SHM_HOST_VISIBLE, BAR);
+        assert_eq!(map(&mut h), OK_MAP_INFO);
+        assert_eq!(*mapper.maps.lock().unwrap(), [BAR + 0x2000]);
+        let data = h.save_3d().unwrap();
+        mapper.maps.lock().unwrap().clear();
+        // Restored where the window isn't placed: refused, nothing mapped.
+        for (base, ok) in [(RAM, false), (BAR + (1 << 20), true)] {
+            let (gpu, _ctl) = Gpu::new(64, 64, Arc::new(Rec::default()));
+            let mut gpu = gpu.with_3d(vk());
+            gpu.set_shm_base(SHM_HOST_VISIBLE, base);
+            let mut h = gpu.handler();
+            assert_eq!(h.restore_3d(&mem, &data).is_ok(), ok);
+        }
+        assert_eq!(*mapper.maps.lock().unwrap(), [BAR + (1 << 20) + 0x2000]);
     }
 
     #[test]

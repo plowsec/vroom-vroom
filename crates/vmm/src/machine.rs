@@ -491,8 +491,25 @@ impl VmShm {
     }
 }
 
+/// `gpa..gpa + size` is inside `base..base + len`.
+fn within(gpa: u64, size: u64, base: u64, len: u64) -> bool {
+    gpa >= base && gpa.checked_add(size).is_some_and(|e| e <= base.saturating_add(len))
+}
+
+/// Inside a PCI window: never RAM, the flash or the helper page.
+fn in_pci_window(gpa: u64, size: u64) -> bool {
+    within(gpa, size, layout::PCI_MMIO_BASE, layout::PCI_MMIO_SIZE) || within(gpa, size, layout::PCI_MMIO64_BASE, layout::PCI_MMIO64_SIZE)
+}
+
 impl ShmMapper for VmShm {
     fn map(&self, gpa: u64, m: &Mapping) -> bool {
+        // Only inside the window as placed: mapping first unmaps what's
+        // there.
+        let placed = *self.filler.lock().unwrap_or_else(|e| e.into_inner());
+        if !placed.is_some_and(|(base, _, len)| within(gpa, m.size, base, len)) {
+            log::warn!("gpu: map {gpa:#x}+{:#x}: outside the window", m.size);
+            return false;
+        }
         // The filler goes first (an unmapped range is fine to unmap).
         let _ = self.vm.unmap_host(gpa, m.size);
         // SAFETY: the renderer keeps the buffer mapped until unmap_blob,
@@ -508,6 +525,9 @@ impl ShmMapper for VmShm {
     }
 
     fn unmap(&self, gpa: u64, size: u64) {
+        if !in_pci_window(gpa, size) {
+            return;
+        }
         if let Err(e) = self.vm.unmap_host(gpa, size) {
             log::warn!("gpu: unmap {gpa:#x}: {e}");
         }
@@ -518,29 +538,28 @@ impl ShmMapper for VmShm {
         self.vm.map_granule()
     }
 
-    fn place(&self, gpa: u64, size: u64) {
+    fn place(&self, gpa: u64, size: u64) -> bool {
         // A BAR sits at a multiple of its size. Anything else is the
         // firmware sizing it (all ones) or halfway through moving it.
         if gpa == 0 || size == 0 || !gpa.is_multiple_of(size) || gpa.checked_add(size).is_none() {
-            return;
+            return false;
         }
         // Halfway through sizing a 64-bit BAR (all ones in its low half
         // only) a small BAR sits just under 4 GiB, which is RAM: the
         // filler went there, and moving it on unmapped the guest's RAM.
-        let inside = |base: u64, len: u64| gpa >= base && gpa + size <= base + len;
-        if !inside(layout::PCI_MMIO_BASE, layout::PCI_MMIO_SIZE) && !inside(layout::PCI_MMIO64_BASE, layout::PCI_MMIO64_SIZE) {
-            return;
+        if !in_pci_window(gpa, size) {
+            return false;
         }
         let mut f = self.filler.lock().unwrap_or_else(|e| e.into_inner());
         let host = match *f {
             Some((old, host, len)) if len == size => {
                 if old == gpa {
-                    return;
+                    return true;
                 }
                 let _ = self.vm.unmap_host(old, len);
                 host
             }
-            Some(_) => return,
+            Some(_) => return false,
             None => {
                 // SAFETY: a fresh private reservation; nothing else uses it.
                 let p = unsafe {
@@ -548,7 +567,7 @@ impl ShmMapper for VmShm {
                 };
                 if p == libc::MAP_FAILED {
                     log::warn!("gpu: can't reserve the window's backing: {}", std::io::Error::last_os_error());
-                    return;
+                    return false;
                 }
                 p as usize
             }
@@ -556,6 +575,7 @@ impl ShmMapper for VmShm {
         *f = Some((gpa, host, size));
         drop(f);
         self.fill(gpa, size);
+        true
     }
 }
 

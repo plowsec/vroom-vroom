@@ -189,6 +189,9 @@ pub trait ShmMapper: Send + Sync {
     /// The window now starts at `gpa` (the guest placed the BAR). Where no
     /// buffer is mapped, the window should read and write like memory,
     /// as on real hardware: a guest still touching a buffer it gave back
-    /// must not stop the VM.
-    fn place(&self, _gpa: u64, _size: u64) {}
+    /// must not stop the VM. False: not placed there (not where BARs go:
+    /// RAM, the flash), and nothing may be mapped until it is.
+    fn place(&self, _gpa: u64, _size: u64) -> bool {
+        true
+    }
 }
