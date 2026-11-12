@@ -6,9 +6,10 @@
 //!   the helper also checks its peer is root.
 //! - The service only serves the user logind says is active on seat0, so
 //!   another local user can't listen in on the clipboard. Without logind:
-//!   the owner of the active VT; neither known: root only.
+//!   the owner of the active VT; neither known: root only. Checked again
+//!   per message (relay.rs): a user switched away from loses its helper.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -115,20 +116,40 @@ fn spawn_reader(mut r: Reader, tx: Sender<Ev>, data: impl Fn(Vec<u8>) -> Ev + Se
     });
 }
 
+/// A helper's link that hangs up when the relay drops it (replaced, or
+/// its user left the screen): the reader's clone alone would keep it
+/// open, and the helper would never reconnect.
+struct Hangup(UnixStream);
+
+impl Write for Hangup {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.write(b)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+impl Drop for Hangup {
+    fn drop(&mut self) {
+        let _ = self.0.shutdown(std::net::Shutdown::Both);
+    }
+}
+
 fn accept_helpers(l: UnixListener, tx: Sender<Ev>) {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     for s in l.incoming() {
         let Ok(s) = s else { continue };
         let uid = peer_uid(&s).ok();
         let active = crate::seat::active_uid();
-        if !crate::seat::serves(uid, active) {
+        let Some(uid) = uid.filter(|_| crate::seat::serves(uid, active)) else {
             log::warn!("service: refusing helper of uid {uid:?} (active user {active:?})");
             continue;
-        }
+        };
         let Ok(r) = s.try_clone() else { continue };
         let id = NEXT.fetch_add(1, Ordering::Relaxed);
-        let w: Writer = Box::new(s);
-        if tx.send(Ev::HelperUp(id, w)).is_err() {
+        let w: Writer = Box::new(Hangup(s));
+        if tx.send(Ev::HelperUp(id, uid, w)).is_err() {
             return;
         }
         spawn_reader(Box::new(r), tx.clone(), move |b| Ev::Helper(id, b), move || Ev::HelperGone(id));

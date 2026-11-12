@@ -20,8 +20,8 @@ pub enum Ev {
     Host(Vec<u8>),
     HostGone,
     /// A helper connected; `id` tells its later events apart from an
-    /// older helper's.
-    HelperUp(u64, Writer),
+    /// older helper's; `who` is its user (Linux: uid; Windows: session).
+    HelperUp(u64, u32, Writer),
     Helper(u64, Vec<u8>),
     HelperGone(u64),
     /// The guest is shutting down: tell the host before we go.
@@ -52,15 +52,25 @@ pub trait System {
     }
     /// Run an `Exec` without blocking; `done` gets its `ExecDone`.
     fn exec(&mut self, m: Message, done: Box<dyn FnOnce(Message) + Send>);
+    /// Whether a helper of `who` (as in `HelperUp`) is still the one on
+    /// screen. Asked per message: cheap.
+    fn on_screen(&mut self, who: u32) -> bool;
 }
 
 pub struct RealSystem {
     updater: crate::update::Updater,
+    /// Linux: the user on screen, and when we looked (a file read; asked
+    /// per message, so looked up at most every `SEAT_TTL`).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    seat: Option<(std::time::Instant, Option<u32>)>,
 }
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const SEAT_TTL: std::time::Duration = std::time::Duration::from_millis(250);
 
 impl Default for RealSystem {
     fn default() -> RealSystem {
-        RealSystem { updater: crate::update::Updater::new(crate::update::root()) }
+        RealSystem { updater: crate::update::Updater::new(crate::update::root()), seat: None }
     }
 }
 
@@ -95,11 +105,34 @@ impl System for RealSystem {
     fn exec(&mut self, m: Message, done: Box<dyn FnOnce(Message) + Send>) {
         crate::exec::spawn(m, done);
     }
+    #[cfg(target_os = "linux")]
+    fn on_screen(&mut self, who: u32) -> bool {
+        let active = match self.seat {
+            Some((at, a)) if at.elapsed() < SEAT_TTL => a,
+            _ => {
+                let a = crate::seat::active_uid();
+                self.seat = Some((std::time::Instant::now(), a));
+                a
+            }
+        };
+        crate::seat::serves(Some(who), active)
+    }
+    #[cfg(windows)]
+    #[allow(unsafe_code)]
+    fn on_screen(&mut self, who: u32) -> bool {
+        // SAFETY: plain call, no arguments.
+        who == unsafe { windows_sys::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId() }
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    fn on_screen(&mut self, _who: u32) -> bool {
+        true
+    }
 }
 
 pub struct Relay<S: System> {
     sys: S,
-    helper: Option<(u64, Writer, Decoder)>,
+    /// The helper: its id, user (`HelperUp`), link, and what it sent.
+    helper: Option<(u64, u32, Writer, Decoder)>,
     max: usize,
     /// The host's last resolution and scale: a helper that starts later
     /// (logon) gets them, so the desktop matches the window right away.
@@ -149,14 +182,14 @@ impl<S: System> Relay<S> {
                         let _ = a.send(());
                     }
                 }
-                Ev::HelperUp(id, w) => {
+                Ev::HelperUp(id, who, w) => {
                     log::info!("session helper {id} connected");
                     // A helper it replaces (started twice in a session)
                     // leaves Coherence, or two would fight over the taskbar.
                     if self.coherence {
                         self.send_helper(&Message::Coherence { on: false });
                     }
-                    self.helper = Some((id, w, Decoder::new(self.max + 64)));
+                    self.helper = Some((id, who, w, Decoder::new(self.max + 64)));
                     for m in [self.display.0.clone(), self.display.1.clone()].into_iter().flatten() {
                         self.send_helper(&m);
                     }
@@ -180,6 +213,27 @@ impl<S: System> Relay<S> {
     }
 
     fn on_host(&mut self, m: Message, host: &mut Writer) -> io::Result<()> {
+        if matches!(
+            m,
+            Message::SetResolution { .. }
+                | Message::SetLayout { .. }
+                | Message::SetScale { .. }
+                | Message::ClipboardText(_)
+                | Message::Mouse { .. }
+                | Message::DragEnter { .. }
+                | Message::DragCancel { .. }
+                | Message::DropEntry { .. }
+                | Message::DropData { .. }
+                | Message::DropEnd { .. }
+                | Message::DragOutQuery { .. }
+                | Message::DragOutGet { .. }
+                | Message::DragOutEnd { .. }
+                | Message::Coherence { .. }
+                | Message::WindowDo { .. }
+                | Message::StartApp(_)
+        ) {
+            self.check_helper(host)?;
+        }
         match m {
             Message::Hello { agent, .. } => {
                 log::info!("host: {agent}");
@@ -261,8 +315,23 @@ impl<S: System> Relay<S> {
         Ok(())
     }
 
+    /// A helper whose user left the screen (user switch) gets nothing
+    /// more: dropped; it reconnects and is judged again.
+    fn check_helper(&mut self, host: &mut Writer) -> io::Result<()> {
+        let Some((id, who, ..)) = self.helper else { return Ok(()) };
+        if self.sys.on_screen(who) {
+            return Ok(());
+        }
+        log::info!("session helper {id}: user {who} is no longer on screen; dropping it");
+        self.helper = None;
+        if self.coherence {
+            host.write_all(&Message::Windows(Vec::new()).encode())?;
+        }
+        Ok(())
+    }
+
     fn send_helper(&mut self, m: &Message) {
-        if let Some((id, w, _)) = self.helper.as_mut() {
+        if let Some((id, _, w, _)) = self.helper.as_mut() {
             if let Err(e) = w.write_all(&m.encode()) {
                 log::info!("session helper {id}: {e}");
                 self.helper = None;
@@ -271,10 +340,11 @@ impl<S: System> Relay<S> {
     }
 
     fn on_helper(&mut self, id: u64, b: &[u8], host: &mut Writer) -> io::Result<()> {
-        let Some((cur, _, dec)) = self.helper.as_mut() else { return Ok(()) };
-        if *cur != id {
+        if self.helper.as_ref().is_none_or(|h| h.0 != id) {
             return Ok(());
         }
+        self.check_helper(host)?;
+        let Some((_, _, _, dec)) = self.helper.as_mut() else { return Ok(()) };
         dec.push(b);
         loop {
             match dec.next() {
@@ -317,6 +387,8 @@ mod tests {
         gpu3d: Vec<bool>,
         usb: Vec<(String, bool)>,
         updates: usize,
+        /// Who is on screen; None: anybody.
+        on_screen: Option<u32>,
     }
     struct Fake(Arc<Mutex<Seen>>);
     impl System for Fake {
@@ -346,6 +418,9 @@ mod tests {
         fn exec(&mut self, m: Message, done: Box<dyn FnOnce(Message) + Send>) {
             let Message::Exec { id, command, .. } = m else { return };
             std::thread::spawn(move || done(Message::ExecDone { id, end: vroom_proto::ExecEnd::Exited(0), truncated: false, stdout: command.into_bytes(), stderr: Vec::new() }));
+        }
+        fn on_screen(&mut self, who: u32) -> bool {
+            self.0.lock().unwrap().on_screen.is_none_or(|a| a == who)
         }
     }
 
@@ -390,7 +465,7 @@ mod tests {
     #[test]
     fn gpu3d_is_switched_by_the_service_and_answered() {
         let helper = Sink::default();
-        let (out, seen) = run(vec![Ev::HelperUp(1, Box::new(helper.clone())), host(Message::Gpu3d { on: false }), host(Message::Gpu3d { on: true })]);
+        let (out, seen) = run(vec![Ev::HelperUp(1, 1000, Box::new(helper.clone())), host(Message::Gpu3d { on: false }), host(Message::Gpu3d { on: true })]);
         assert_eq!(seen.lock().unwrap().gpu3d, vec![false, true]);
         assert_eq!(out[1..], [Message::Gpu3d { on: false }, Message::Gpu3d { on: true }]);
         assert!(helper.msgs().is_empty());
@@ -400,7 +475,7 @@ mod tests {
     fn privileged_messages_stay_in_the_service() {
         let helper = Sink::default();
         let (out, seen) = run(vec![
-            Ev::HelperUp(1, Box::new(helper.clone())),
+            Ev::HelperUp(1, 1000, Box::new(helper.clone())),
             host(Message::TimeSync { unix_secs: 42, nanos: 0 }),
             host(Message::Shutdown { reboot: true }),
             host(Message::Ping(7)),
@@ -417,7 +492,7 @@ mod tests {
         let helper = Sink::default();
         let share = |tag: &str, on| host(Message::UsbShare { tag: tag.into(), label: "STICK".into(), on });
         let (_, seen) = run(vec![
-            Ev::HelperUp(1, Box::new(helper.clone())),
+            Ev::HelperUp(1, 1000, Box::new(helper.clone())),
             share("vroom-usb0", true),
             // A new host forgets the last one's.
             host(Message::Hello { features: 0, agent: "h".into() }),
@@ -437,7 +512,7 @@ mod tests {
             files: vec![vroom_proto::UpdateFile { path: "a".into(), size: 0, sha256: [0; 32] }],
         };
         let (out, seen) = run(vec![
-            Ev::HelperUp(1, Box::new(helper.clone())),
+            Ev::HelperUp(1, 1000, Box::new(helper.clone())),
             // A helper can't send one in.
             Ev::Helper(1, begin.encode()),
             host(begin),
@@ -455,7 +530,7 @@ mod tests {
         let (tx, rx) = channel();
         let mut r = Relay::new(Fake(seen), 1024, tx.clone());
         let exec = Message::Exec { id: 4, shell: vroom_proto::Shell::Default, timeout_ms: 1000, max_out: 64, command: "ver".into() };
-        tx.send(Ev::HelperUp(1, Box::new(helper.clone()))).unwrap();
+        tx.send(Ev::HelperUp(1, 1000, Box::new(helper.clone()))).unwrap();
         // A helper can't ask, nor answer.
         tx.send(Ev::Helper(1, exec.encode())).unwrap();
         tx.send(Ev::Helper(1, Message::ExecDone { id: 4, end: vroom_proto::ExecEnd::Exited(1), truncated: false, stdout: Vec::new(), stderr: Vec::new() }.encode())).unwrap();
@@ -483,7 +558,7 @@ mod tests {
         let out = Sink::default();
         let (tx, rx) = channel();
         let mut r = Relay::new(Fake(Default::default()), 1024, tx.clone());
-        tx.send(Ev::HelperUp(1, Box::new(helper.clone()))).unwrap();
+        tx.send(Ev::HelperUp(1, 1000, Box::new(helper.clone()))).unwrap();
         tx.send(host(Message::FileGet { id: 2, path: path.to_string_lossy().into_owned() })).unwrap();
         let mut hw: Writer = Box::new(out.clone());
         let watch = out.clone();
@@ -504,7 +579,7 @@ mod tests {
     fn desktop_messages_go_to_the_helper() {
         let helper = Sink::default();
         run(vec![
-            Ev::HelperUp(1, Box::new(helper.clone())),
+            Ev::HelperUp(1, 1000, Box::new(helper.clone())),
             host(Message::ClipboardText("hi".into())),
             host(Message::SetResolution { width: 800, height: 600 }),
         ]);
@@ -522,7 +597,7 @@ mod tests {
             host(Message::SetResolution { width: 1600, height: 1200 }),
             host(Message::SetScale { percent: 200 }),
             host(Message::ClipboardText("old".into())),
-            Ev::HelperUp(1, Box::new(helper.clone())),
+            Ev::HelperUp(1, 1000, Box::new(helper.clone())),
         ]);
         assert_eq!(helper.msgs(), vec![Message::SetResolution { width: 1600, height: 1200 }, Message::SetScale { percent: 200 }]);
     }
@@ -530,7 +605,7 @@ mod tests {
     #[test]
     fn helper_may_only_send_clipboard_text() {
         let (out, seen) = run(vec![
-            Ev::HelperUp(1, Box::new(Sink::default())),
+            Ev::HelperUp(1, 1000, Box::new(Sink::default())),
             Ev::Helper(1, Message::ClipboardText("copied".into()).encode()),
             Ev::Helper(1, Message::Shutdown { reboot: false }.encode()),
             Ev::Helper(1, Message::ClipboardText("x".repeat(2000)).encode()),
@@ -546,7 +621,7 @@ mod tests {
         assert!(matches!(&out[1], Message::DropDone { id: 1, ok: false, .. }));
         let helper = Sink::default();
         let (out, _) = run(vec![
-            Ev::HelperUp(1, Box::new(helper.clone())),
+            Ev::HelperUp(1, 1000, Box::new(helper.clone())),
             host(Message::DragEnter { id: 2, items: vec![("a".into(), false)] }),
             host(Message::DropEntry { id: 2, path: "a".into(), dir: false, size: 1 }),
             host(Message::DropData { id: 2, data: vec![9] }),
@@ -567,7 +642,7 @@ mod tests {
         let (h1, h2) = (Sink::default(), Sink::default());
         let (out, _) = run(vec![
             // Not in Coherence: a helper's list goes nowhere.
-            Ev::HelperUp(1, Box::new(h1.clone())),
+            Ev::HelperUp(1, 1000, Box::new(h1.clone())),
             Ev::Helper(1, Message::Windows(vec![w.clone()]).encode()),
             host(Message::Coherence { on: true }),
             host(Message::WindowDo { id: 5, op: vroom_proto::WindowOp::Close }),
@@ -575,7 +650,7 @@ mod tests {
             Ev::Helper(1, Message::WindowIcon { id: 5, w: 0, h: 0, rgba: Vec::new() }.encode()),
             // Logged off: the windows went; the next helper starts in Coherence.
             Ev::HelperGone(1),
-            Ev::HelperUp(2, Box::new(h2.clone())),
+            Ev::HelperUp(2, 1000, Box::new(h2.clone())),
         ]);
         assert_eq!(out[1..], [Message::Windows(vec![w]), Message::WindowIcon { id: 5, w: 0, h: 0, rgba: Vec::new() }, Message::Windows(Vec::new())]);
         assert_eq!(h1.msgs(), vec![Message::Coherence { on: true }, Message::WindowDo { id: 5, op: vroom_proto::WindowOp::Close }]);
@@ -595,7 +670,7 @@ mod tests {
             Message::DragOutFail { stream: 4, why: "x".into() },
         ];
         let mut evs = vec![
-            Ev::HelperUp(1, Box::new(helper.clone())),
+            Ev::HelperUp(1, 1000, Box::new(helper.clone())),
             host(Message::DragOutQuery { id: 2 }),
             host(Message::DragOutGet { id: 2, item: 0, stream: 3 }),
             host(Message::DragOutEnd { id: 2 }),
@@ -609,17 +684,52 @@ mod tests {
     #[test]
     fn a_replaced_helper_leaves_coherence() {
         let (old, new) = (Sink::default(), Sink::default());
-        run(vec![host(Message::Coherence { on: true }), Ev::HelperUp(1, Box::new(old.clone())), Ev::HelperUp(2, Box::new(new.clone()))]);
+        run(vec![host(Message::Coherence { on: true }), Ev::HelperUp(1, 1000, Box::new(old.clone())), Ev::HelperUp(2, 1000, Box::new(new.clone()))]);
         assert_eq!(old.msgs(), vec![Message::Coherence { on: true }, Message::Coherence { on: false }]);
         assert_eq!(new.msgs(), vec![Message::Coherence { on: true }]);
+    }
+
+    #[test]
+    fn a_helper_whose_user_left_the_screen_gets_nothing_more() {
+        let seen = Arc::new(Mutex::new(Seen { on_screen: Some(1000), ..Default::default() }));
+        let (old, new, out) = (Sink::default(), Sink::default(), Sink::default());
+        let (tx, rx) = channel();
+        let mut r = Relay::new(Fake(seen.clone()), 1024, tx.clone());
+        tx.send(host(Message::Coherence { on: true })).unwrap();
+        tx.send(Ev::HelperUp(1, 1000, Box::new(old.clone()))).unwrap();
+        tx.send(host(Message::ClipboardText("a".into()))).unwrap();
+        tx.send(host(Message::Ping(1))).unwrap();
+        let mut hw: Writer = Box::new(out.clone());
+        let (watch, next) = (out.clone(), new.clone());
+        std::thread::spawn(move || {
+            while !watch.msgs().contains(&Message::Pong(1)) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            // Fast user switch: 1001 on screen, 1000's helper still there.
+            seen.lock().unwrap().on_screen = Some(1001);
+            tx.send(host(Message::ClipboardText("b".into()))).unwrap();
+            tx.send(Ev::Helper(1, Message::ClipboardText("from 1000".into()).encode())).unwrap();
+            tx.send(host(Message::DragEnter { id: 7, items: vec![("a".into(), false)] })).unwrap();
+            tx.send(Ev::HelperUp(2, 1001, Box::new(next))).unwrap();
+            tx.send(host(Message::ClipboardText("c".into()))).unwrap();
+            tx.send(Ev::HostGone).unwrap();
+        });
+        assert!(r.run(&mut hw, &rx).is_err());
+        assert_eq!(old.msgs(), vec![Message::Coherence { on: true }, Message::ClipboardText("a".into())]);
+        let out = out.msgs();
+        assert!(!out.contains(&Message::ClipboardText("from 1000".into())));
+        assert!(out.contains(&Message::Windows(Vec::new())), "its windows went with it");
+        assert!(out.iter().any(|m| matches!(m, Message::DropDone { id: 7, ok: false, .. })));
+        // The new user's helper is served.
+        assert_eq!(new.msgs(), vec![Message::Coherence { on: true }, Message::ClipboardText("c".into())]);
     }
 
     #[test]
     fn stale_helper_is_ignored() {
         let (old, new) = (Sink::default(), Sink::default());
         let (out, _) = run(vec![
-            Ev::HelperUp(1, Box::new(old.clone())),
-            Ev::HelperUp(2, Box::new(new.clone())),
+            Ev::HelperUp(1, 1000, Box::new(old.clone())),
+            Ev::HelperUp(2, 1000, Box::new(new.clone())),
             Ev::Helper(1, Message::ClipboardText("old".into()).encode()),
             Ev::HelperGone(1),
             host(Message::ClipboardText("to new".into())),

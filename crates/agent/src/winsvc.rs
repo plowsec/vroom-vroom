@@ -4,11 +4,13 @@
 //! Pipe rules:
 //! - ACL: SYSTEM and Administrators full, interactive users read/write;
 //!   remote clients rejected.
-//! - Server side: only a client in the active console session is served.
+//! - Server side: only a client in the active console session is served,
+//!   checked again per message (relay.rs): after a user switch the old
+//!   session's helper is dropped.
 //! - Client side: only a server process in session 0 (a service) is
 //!   trusted, so a user process squatting the pipe name gets nothing.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::sync::mpsc::{channel, Sender};
@@ -21,7 +23,7 @@ use windows_sys::Win32::Security::Authorization::{ConvertStringSecurityDescripto
 use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX};
 use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientSessionId, GetNamedPipeServerSessionId, PIPE_READMODE_BYTE,
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientSessionId, GetNamedPipeServerSessionId, PIPE_READMODE_BYTE,
     PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
 };
 use windows_sys::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId;
@@ -215,6 +217,32 @@ fn connect(h: HANDLE) -> std::io::Result<()> {
     .map(|_| ())
 }
 
+/// A helper's link that hangs up when the relay drops it (replaced, or
+/// its session left the console): the reader's share of the handle alone
+/// would keep it open, and the helper would never reconnect.
+struct Hangup {
+    w: port::Writer,
+    /// The pipe handle; `w` keeps it open.
+    h: usize,
+}
+
+impl Write for Hangup {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.w.write(b)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.w.flush()
+    }
+}
+
+impl Drop for Hangup {
+    fn drop(&mut self) {
+        // SAFETY: `w` (dropped after this) keeps the handle open; the
+        // reader's pending read fails, and it ends.
+        unsafe { DisconnectNamedPipe(self.h as HANDLE) };
+    }
+}
+
 fn accept_helpers(tx: Sender<Ev>) {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     let mut first = true;
@@ -250,7 +278,8 @@ fn accept_helpers(tx: Sender<Ev>) {
             continue; // dropping r/w closes the instance
         }
         let id = NEXT.fetch_add(1, Ordering::Relaxed);
-        if tx.send(Ev::HelperUp(id, w)).is_err() {
+        let w: port::Writer = Box::new(Hangup { w, h: h as usize });
+        if tx.send(Ev::HelperUp(id, sid, w)).is_err() {
             return;
         }
         spawn_reader(r, tx.clone(), move |b| Ev::Helper(id, b), move || Ev::HelperGone(id));
