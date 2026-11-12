@@ -369,7 +369,7 @@ pub struct HelperArgs<'a> {
 impl Remote {
     /// Start the GPU process and wait until its renderer is up.
     pub fn spawn(a: &HelperArgs, mem: GuestMemory) -> std::io::Result<Remote> {
-        let (fds, _) = mem.shared_fds().ok_or_else(|| std::io::Error::other("guest RAM isn't shared memory"))?;
+        let (fds, _) = mem.shared_fds().ok_or_else(|| std::io::Error::other("guest RAM isn't shared memory"))??;
         let (sock, theirs) = UnixStream::pair()?;
         let (events, their_events) = UnixStream::pair()?;
         let mut cmd = std::process::Command::new(a.exe);
@@ -400,7 +400,7 @@ impl Remote {
         #[cfg(not(target_os = "macos"))]
         let mut child = cmd.spawn()?;
         // Its fence socket, then guest RAM.
-        let sent = std::iter::once(their_events.as_raw_fd()).chain(fds.iter().map(|f| f.0)).try_for_each(|fd| send_fd(&sock, fd));
+        let sent = std::iter::once(their_events.as_raw_fd()).chain(fds.iter().map(|f| f.0.as_raw_fd())).try_for_each(|fd| send_fd(&sock, fd));
         drop(their_events);
         if let Err(e) = sent {
             let _ = child.kill();
@@ -433,7 +433,10 @@ impl Remote {
 
     /// The VMM's end of a GPU process already started: reads its hello.
     pub fn connect(sock: UnixStream, events: UnixStream, mem: GuestMemory, map_granule: u64) -> std::io::Result<Remote> {
-        let (_, gen) = mem.shared_fds().ok_or_else(|| std::io::Error::other("guest RAM isn't shared memory"))?;
+        if mem.regions().any(|r| r.mmap().shared_fd().is_none()) {
+            return Err(std::io::Error::other("guest RAM isn't shared memory"));
+        }
+        let gen = mem.generation();
         let mut r = Remote {
             sock,
             events,
@@ -511,14 +514,22 @@ impl Remote {
     /// After a reset gave the guest new RAM: the GPU process maps the new
     /// objects (the call, then one fd per region, then the answer).
     fn remap(&mut self) -> Option<()> {
-        let (fds, gen) = self.mem.shared_fds()?;
+        // Ours: a reset replacing them meanwhile can't make these name
+        // another file.
+        let (fds, gen) = match self.mem.shared_fds()? {
+            Ok(f) => f,
+            Err(e) => {
+                log::warn!("gpu: guest RAM for the GPU process: {e}");
+                return None;
+            }
+        };
         let mut e = Enc::default();
         e.u8(Op::Remap as u8).u32(fds.len() as u32);
         for (_, size) in &fds {
             e.u64(*size);
         }
         let r = write_frame(&mut self.sock, &e.0)
-            .and_then(|_| fds.iter().try_for_each(|(fd, _)| send_fd(&self.sock, *fd)))
+            .and_then(|_| fds.iter().try_for_each(|(fd, _)| send_fd(&self.sock, fd.as_raw_fd())))
             .and_then(|_| read_frame(&mut self.sock));
         match r {
             Ok(b) if b.first() == Some(&1) => {
@@ -1580,7 +1591,8 @@ mod tests {
         let base = GuestAddress(0x4000_0000);
         let mem = GuestMemory::new_shared(&[(base, 1 << 20)]).unwrap();
         mem.write(GuestAddress(0x4000_1000), b"guest data").unwrap();
-        let (fds, _) = mem.shared_fds().unwrap();
+        let (owned, _) = mem.shared_fds().unwrap().unwrap();
+        let fds: Vec<(RawFd, u64)> = owned.iter().map(|(f, n)| (f.as_raw_fd(), *n)).collect();
         let seen = Arc::new(Mutex::new(Vec::new()));
         let blob = MmapRegion::new_shared(16384).unwrap();
         // SAFETY: our own fresh mapping.

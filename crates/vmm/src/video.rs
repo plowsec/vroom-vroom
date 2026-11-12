@@ -6,7 +6,7 @@
 //! encoder's reads raw frames from there.
 
 use std::collections::VecDeque;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,8 +45,9 @@ impl Helper {
     /// decodes or encodes: the helper and its codecs.
     pub fn spawn(window: &GuestMemory, role: Role) -> Result<(Arc<Helper>, u32)> {
         let exe = std::env::current_exe().map_err(|e| Error::Setup(format!("video: {e}")))?;
-        let (fds, _) = window.shared_fds().ok_or_else(|| Error::Setup("video: the buffer window isn't shared memory".into()))?;
-        let &[(window_fd, _)] = fds.as_slice() else { return Err(Error::Setup("video: buffer window".into())) };
+        let (fds, _) = window.shared_fds().ok_or_else(|| Error::Setup("video: the buffer window isn't shared memory".into()))??;
+        let [(window_fd, _)] = fds.as_slice() else { return Err(Error::Setup("video: buffer window".into())) };
+        let window_fd = window_fd.as_raw_fd();
         let (ours, theirs) = UnixStream::pair()?;
         // Unix sockets on macOS buffer 8 KiB: a 3 MB picture would cross
         // in hundreds of steps.

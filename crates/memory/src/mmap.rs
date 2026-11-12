@@ -92,6 +92,12 @@ impl MmapRegion {
             .map(|f| f.lock().unwrap_or_else(|e| e.into_inner()).as_raw_fd())
     }
 
+    /// A descriptor of its own for the shared object now backing it: a
+    /// reset that replaces the object can't make it name another file.
+    pub fn dup_shared_fd(&self) -> Option<std::io::Result<std::os::fd::OwnedFd>> {
+        self.shared.as_ref().map(|f| f.lock().unwrap_or_else(|e| e.into_inner()).try_clone())
+    }
+
     fn map_shared(&self, fd: &std::os::fd::OwnedFd) -> Result<()> {
         use std::os::fd::AsRawFd;
         // SAFETY: replaces our own mapping in place with the object's pages.

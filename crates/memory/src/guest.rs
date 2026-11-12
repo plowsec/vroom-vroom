@@ -77,15 +77,17 @@ impl GuestMemory {
         Self::build(layout, true)
     }
 
-    /// Each region's shared memory object and size, if RAM is shared, and
-    /// the generation they belong to.
-    pub fn shared_fds(&self) -> Option<(Vec<(std::os::fd::RawFd, u64)>, u64)> {
+    /// Each region's shared memory object (a descriptor of the caller's
+    /// own) and size, if RAM is shared, and the generation they belong to
+    /// (a reset since: a later one).
+    pub fn shared_fds(&self) -> Option<std::io::Result<(Vec<(std::os::fd::OwnedFd, u64)>, u64)>> {
+        let gen = self.generation.load(Ordering::Acquire);
         let fds = self
             .regions
             .iter()
-            .map(|r| r.mmap.shared_fd().map(|f| (f, r.len())))
-            .collect::<Option<Vec<_>>>()?;
-        Some((fds, self.generation.load(Ordering::Acquire)))
+            .map(|r| r.mmap.dup_shared_fd().map(|f| f.map(|f| (f, r.len()))))
+            .collect::<Option<std::io::Result<Vec<_>>>>()?;
+        Some(fds.map(|fds| (fds, gen)))
     }
 
     pub fn generation(&self) -> u64 {
@@ -617,7 +619,7 @@ mod tests {
     fn shared_ram_is_seen_by_another_mapping_and_reset_gets_a_new_object() {
         let ps = page_size() as u64;
         let m = GuestMemory::new_shared(&[(GuestAddress(0x1000_0000), 4 * ps)]).unwrap();
-        let (fds, gen) = m.shared_fds().unwrap();
+        let (fds, gen) = m.shared_fds().unwrap().unwrap();
         assert_eq!((fds.len(), fds[0].1, gen), (1, 4 * ps, 0));
         m.write(GuestAddress(0x1000_0000 + ps), &[7u8; 16]).unwrap();
         // What another process mapping the object sees.
@@ -640,15 +642,20 @@ mod tests {
             unsafe { libc::munmap(p, (4 * ps) as usize) };
             b
         };
-        assert_eq!(other(fds[0].0), 7);
+        use std::os::fd::AsRawFd;
+        assert_eq!(other(fds[0].0.as_raw_fd()), 7);
         m.discard_all().unwrap();
-        let (fds2, gen2) = m.shared_fds().unwrap();
+        // Ours stays the old object, even once the region's is closed and
+        // its number reused.
+        let _reused = tempfile_in_tmp();
+        assert_eq!(other(fds[0].0.as_raw_fd()), 7, "still the object it was");
+        let (fds2, gen2) = m.shared_fds().unwrap().unwrap();
         assert_eq!(gen2, 1);
         let mut b = [1u8; 16];
         m.read(GuestAddress(0x1000_0000 + ps), &mut b).unwrap();
         assert_eq!(b, [0; 16], "zeroed");
         m.write(GuestAddress(0x1000_0000 + ps), &[9u8; 1]).unwrap();
-        assert_eq!(other(fds2[0].0), 9, "the new object is what the guest uses");
+        assert_eq!(other(fds2[0].0.as_raw_fd()), 9, "the new object is what the guest uses");
         // Private RAM has no objects to share.
         assert!(GuestMemory::new(&[(GuestAddress(0), ps)])
             .unwrap()
