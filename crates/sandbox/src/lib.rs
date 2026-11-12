@@ -13,6 +13,11 @@ mod linux;
 mod macos;
 #[cfg(any(target_os = "linux", test))]
 mod rules;
+
+/// Landlock for a program we start (Linux): `ExecSandbox::new` in the
+/// parent, `enter` in `pre_exec`.
+#[cfg(target_os = "linux")]
+pub use linux::ExecSandbox;
 pub mod quarantine;
 
 use std::path::PathBuf;

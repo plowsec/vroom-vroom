@@ -215,7 +215,9 @@ impl Swtpm {
         Ok(t)
     }
 
-    /// macOS: run under its own Seatbelt profile. Linux: swtpm's seccomp.
+    /// macOS: run under its own Seatbelt profile. Linux: no_new_privs,
+    /// Landlock (its state dir read-write, system libraries read-only),
+    /// and swtpm's own seccomp.
     fn command(exe: &Path, dir: &Path, args: &[String]) -> Result<Command> {
         #[cfg(target_os = "macos")]
         {
@@ -224,7 +226,20 @@ impl Swtpm {
             c.arg("-p").arg(prof).arg(exe).args(args);
             Ok(c)
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
+        {
+            // Built here: we are multi-threaded, the child may only make
+            // async-signal-safe calls.
+            let sb = vroom_sandbox::ExecSandbox::new(exe, dir).map_err(|e| Error::Setup(format!("vtpm sandbox: {e}")))?;
+            let mut c = Command::new(exe);
+            c.args(args).args(["--seccomp", "action=kill"]);
+            // SAFETY: `enter` is two raw syscalls (prctl, landlock_restrict_self).
+            unsafe {
+                c.pre_exec(move || sb.enter());
+            }
+            Ok(c)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             let _ = dir;
             let mut c = Command::new(exe);

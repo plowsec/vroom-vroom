@@ -2,6 +2,7 @@
 //! Fails closed: no enforced Landlock, no sandbox (an error, not a warning).
 
 use std::collections::BTreeMap;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::Path;
 
 use landlock::{
@@ -117,6 +118,64 @@ fn landlock(p: &Policy) -> Result<()> {
         rs = allow(rs, d, share)?;
     }
     enforce(rs)
+}
+
+/// Landlock for a program we start (swtpm): built in the parent, entered
+/// in the child between fork and exec with two raw syscalls.
+#[derive(Debug)]
+pub struct ExecSandbox {
+    fd: OwnedFd,
+}
+
+impl ExecSandbox {
+    /// `exe` and the system's libraries and their config read-only (and
+    /// executable: the dynamic loader), `rw_dir` read-write.
+    pub fn new(exe: &Path, rw_dir: &Path) -> Result<ExecSandbox> {
+        rules::landlock_check(kernel_abi(), 1).map_err(Error::Apply)?;
+        let read = AccessFs::ReadFile | AccessFs::ReadDir;
+        let exec = read | AccessFs::Execute;
+        let mut rs = ruleset()?;
+        rs = allow(rs, exe, exec)?;
+        // Libraries: distro paths, Nix/Guix stores, and the prefix the
+        // binary is installed in (Linuxbrew, /opt/...).
+        for d in ["/usr", "/lib", "/lib64", "/lib32", "/nix/store", "/gnu/store"] {
+            rs = allow_if(rs, d, exec)?;
+        }
+        if let Some(prefix) = std::fs::canonicalize(exe).ok().as_deref().and_then(Path::parent).and_then(Path::parent) {
+            if prefix != Path::new("/") {
+                rs = allow(rs, prefix, exec)?;
+            }
+        }
+        // Loader cache, OpenSSL (libtpms) and crypto policies, time zone.
+        for f in ["/etc/ld.so.cache", "/etc/ld.so.preload", "/etc/ssl", "/etc/pki", "/etc/crypto-policies", "/etc/localtime", "/sys/devices/system/cpu"] {
+            rs = allow_if(rs, f, read)?;
+        }
+        for f in ["/dev/urandom", "/dev/random"] {
+            rs = allow_if(rs, f, AccessFs::ReadFile.into())?;
+        }
+        rs = allow_if(rs, "/dev/null", AccessFs::ReadFile | AccessFs::WriteFile)?;
+        // State files, its log and lock: no device nodes, sockets, links.
+        let state = read | AccessFs::WriteFile | AccessFs::RemoveFile | AccessFs::RemoveDir | AccessFs::MakeDir | AccessFs::MakeReg;
+        rs = allow(rs, rw_dir, state)?;
+        let fd: Option<OwnedFd> = rs.into();
+        let fd = fd.ok_or_else(|| Error::Apply("landlock: no ruleset".into()))?;
+        Ok(ExecSandbox { fd })
+    }
+
+    /// no_new_privs + landlock_restrict_self. Async-signal-safe: call it
+    /// from `pre_exec` (the child of a forked multi-threaded parent is
+    /// single-threaded, so no TSYNC).
+    pub fn enter(&self) -> std::io::Result<()> {
+        // SAFETY: prctl with constant arguments; touches no memory.
+        if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: a ruleset fd we own, flags 0; reads no memory.
+        if unsafe { libc::syscall(libc::SYS_landlock_restrict_self, self.fd.as_raw_fd(), 0u32) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
 }
 
 /// Syscalls the VMM needs after setup. Everything else kills the process.
