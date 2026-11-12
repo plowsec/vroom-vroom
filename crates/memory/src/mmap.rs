@@ -36,11 +36,12 @@ impl MmapRegion {
         }
         let guard = ps;
         let total = size.checked_add(2 * guard).ok_or(Error::Overflow)?;
+        let slack = huge_page_align();
         // SAFETY: anonymous private mapping with no address hint.
         let p = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
-                total,
+                total.checked_add(slack).ok_or(Error::Overflow)?,
                 libc::PROT_NONE,
                 libc::MAP_PRIVATE | libc::MAP_ANON | map_noreserve(),
                 -1,
@@ -50,6 +51,21 @@ impl MmapRegion {
         if p == libc::MAP_FAILED {
             return Err(Error::Mmap(errno()));
         }
+        // RAM starts on a huge page boundary, like its guest address, so
+        // the hypervisor can map it in huge blocks. The slack goes again.
+        let start = (p as usize + guard).next_multiple_of(slack.max(1)) - guard;
+        // SAFETY: both pieces are parts of the reservation just made,
+        // outside [start, start + total).
+        unsafe {
+            if start > p as usize {
+                libc::munmap(p, start - p as usize);
+            }
+            let tail = p as usize + slack - start;
+            if tail > 0 {
+                libc::munmap((start + total) as *mut _, tail);
+            }
+        }
+        let p = start as *mut libc::c_void;
         let base = (p as *mut u8).wrapping_add(guard);
         // SAFETY: [base, base+size) lies inside the mapping we just created.
         let rc =
@@ -60,7 +76,7 @@ impl MmapRegion {
             unsafe { libc::munmap(p, total) };
             return Err(Error::Mmap(e));
         }
-        exclude_from_core_dump(base, size);
+        advise(base, size);
         Ok(MmapRegion {
             base,
             size,
@@ -191,6 +207,9 @@ impl MmapRegion {
         if p == libc::MAP_FAILED {
             return Err(Error::Mmap(errno()));
         }
+        // A new mapping: none of the old one's advice.
+        // SAFETY: inside our mapping (checked above).
+        advise(unsafe { self.base.add(off) }, len);
         Ok(())
     }
 
@@ -474,11 +493,42 @@ fn map_noreserve() -> i32 {
     0
 }
 
-/// Guest RAM may hold secrets; keep it out of host core dumps.
-fn exclude_from_core_dump(_base: *mut u8, _size: usize) {
+/// Linux: what a page table's block covers (2 MiB with 4 KiB pages).
+#[cfg(target_os = "linux")]
+fn huge_page_align() -> usize {
+    page_size() / 8 * page_size()
+}
+#[cfg(not(target_os = "linux"))]
+fn huge_page_align() -> usize {
+    0
+}
+
+/// Guest RAM may hold secrets: out of host core dumps. Linux: in
+/// transparent huge pages, which hosts set to "madvise" give only when
+/// asked (with 4 KiB stage-2 mappings a nested guest's kernel booted
+/// 100x slower).
+fn advise(_base: *mut u8, _size: usize) {
     #[cfg(target_os = "linux")]
-    // SAFETY: advisory call on our own mapping.
+    // SAFETY: advisory calls on our own mapping.
     unsafe {
         libc::madvise(_base as *mut _, _size, libc::MADV_DONTDUMP);
+        libc::madvise(_base as *mut _, _size, libc::MADV_HUGEPAGE);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ram_starts_on_a_huge_page_and_discards_to_zeros() {
+        let ps = page_size();
+        let r = MmapRegion::new(4 * ps).unwrap();
+        assert_eq!(r.as_ptr() as usize % huge_page_align().max(ps), 0);
+        r.fill_at(0, 4 * ps, 7);
+        r.discard(ps, ps).unwrap();
+        let mut b = vec![1u8; 2 * ps];
+        r.read_at(0, &mut b);
+        assert!(b[..ps].iter().all(|&x| x == 7) && b[ps..].iter().all(|&x| x == 0));
     }
 }
