@@ -39,6 +39,7 @@ names = {c['name'] for c in call('commands.list')}
 assert 'cpu.registers' in names and 'kernel.processes' in names
 assert 'vm.restart' in names
 assert {'vm.snapshot', 'vm.snapshots', 'vm.restore'} <= names
+assert 'guest.upload' in names and 'guest.download' in names
 assert 'fuzz.check' not in names
 call('fuzz.check', {'harness': 'unsupported.json'}, error=True)
 call('commands.run', {'command': 'fuzz.check', 'args': {'harness': 'unsupported.json'}}, error=True)

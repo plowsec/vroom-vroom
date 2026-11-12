@@ -1,5 +1,5 @@
 //! AMD64 lab driver. Shares the RPC protocol, but advertises only implemented ops.
-use crate::{agent, Args};
+use crate::{agent, guest, Args};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
@@ -44,6 +44,9 @@ pub(super) const OPS: &[&str] = &[
     "modules",
     "peb",
     "user_modules",
+    "guest_exec",
+    "guest_upload",
+    "guest_download",
 ];
 
 fn number(v: &Value) -> Result<u64, String> {
@@ -861,7 +864,9 @@ pub(super) fn run(args: Args) -> Result<(), String> {
         match rx.recv_timeout(Duration::from_millis(10)) {
             Ok(f) => {
                 let op = f.request["op"].as_str().unwrap_or_default();
-                if op == "restore" {
+                if op.starts_with("guest_") {
+                    guest::run_remote(&session.vm, &session.state.join("exports"), f);
+                } else if op == "restore" {
                     match session.restore_plan(&f.request) {
                         Ok((dir, resume)) => match session.restore(config.clone(), dir, resume) {
                             Ok((new_session, reply)) => {

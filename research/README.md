@@ -65,6 +65,24 @@ target/debug/vroom-lab /absolute/path/windows11.toml \
   aligned 1/2/4/8-byte ranges, write or read+write; read-only is unsupported.
 - Kernel discovery from live CPU contexts, exact-build Microsoft PDBs,
   symbol lookup, process selection, PEBs, and loaded kernel/user modules.
+- Guest command execution when guest tools are installed (not needed for
+  hypervisor-side memory/kernel access).
+- `guest.upload {host_path, guest_path}` copies a host file into the guest:
+  `{guest_path, size, sha256}`. `host_path` is absolute or under `exports`, the
+  same as ARM64, and is resolved on the lab host, not on the RPC client.
+- `guest.download {guest_path, offset?, length?}` returns file bytes directly to
+  the RPC client: `{guest_path, offset, length, file_size, eof, hex, sha256}`.
+  Offset defaults to 0; length defaults to and cannot exceed 65536 bytes.
+  Advance offset by the returned length until eof. Offset beyond EOF returns an
+  empty chunk. SHA-256 covers the **whole file**, on every response; compare it
+  between chunks to detect changes during retrieval. No host files are created.
+  Requires a running VM and connected guest tools, not paused/agentless access.
+  For compatibility with installed agents each call streams the full file and
+  retains only the requested range (bounded memory, but repeated transfer cost).
+  Running reads are live views, not atomic filesystem snapshots.
+  `python3 research/guest_download.py --socket SOCKET 'C:\\path\\file' ./file`
+  assembles chunks on the RPC client and verifies size and SHA-256. It refuses
+  existing output files; failures may leave a partial output for diagnosis.
 
 Capabilities are architecture-specific; unsupported commands are omitted from
 discovery and refused through direct calls, command aliases and jobs.
@@ -113,7 +131,8 @@ fuzz      check run* probe* coverage blocks diff crashes          * jobs.start o
 - The lab starts paused: `vm.resume` runs the guest (network, agent, screen). `vm.status` shows `guest_agent`.
 - `vm.restart {paused?}` hard-resets the live VM from the reset vector (devices and RAM reset); breakpoints, watches, tracepoints and caches from the previous boot are cleared. With `paused: true`, it stops before the first guest instruction: arm breakpoints, then `vm.resume`. For an early-boot target, use `vm.restart {paused: true}` -> `debug.breakpoints` -> `vm.resume`, and repeat per boot. Disks and the VM config are kept; use a snapshot restore or a new lab for fresh disks/config.
 - `guest.exec {command, powershell?, timeout?, max_output?}`: the guest agent runs it (cmd.exe as SYSTEM); answers `{exit_code, timed_out, truncated, stdout, stderr}` when it ends. Older agent: `guest.update_tools` first.
-- `guest.upload {host_path, guest_path}`, `guest.download {guest_path, host_path?}`: host paths absolute or under exports/; answer `{size, sha256}`.
+- `guest.upload {host_path, guest_path}`: copy a host file into the guest; answer `{guest_path, size, sha256}`. ARM64 and AMD64 accept an absolute path or one under exports; the path is on the lab host, not the RPC client.
+- `guest.download {guest_path, offset?, length?}`: return at most 65536 bytes as hex over RPC, plus whole-file size and SHA-256; see AMD64 notes above. ARM64 additionally accepts explicit `host_path` to save the whole file on the host instead; cannot combine with offset/length. Omitting `host_path` now returns bytes rather than creating an exports file.
 - `memory.read_virtual`/`memory.dump` `skip_unmapped: true` read what translates and list the holes. `memory.search {address, length, hex (?? wildcards) | int+width | text+utf16, align?, limit?}` finds a pattern in up to 1 GiB, skipping holes; `next` resumes a truncated search.
 - Each command lists params, `mutates` and `risk` (read, control, write, destructive): gate writes on these.
 - Addresses: integers or `"0x..."`. Inspection (`kernel.*`, `memory.*`, `cpu.*`, `debug.*`) needs a paused VM: `vm.pause`, inspect, `vm.resume`. A guest left paused answers nothing, so network probes against it time out with no error.

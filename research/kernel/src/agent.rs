@@ -204,9 +204,11 @@ static COMMANDS: &[Command] = &[
         p("host_path", "path", true, "absolute, or under the lab's exports directory"),
         p("guest_path", "string", true, "the guest's path (Windows: C:\\...)"),
     ], "write", Target::Op("guest_upload")),
-    c("guest.download", "guest", "Copy a file out of the running guest; size and SHA-256", &[
+    c("guest.download", "guest", "Read a running guest file as a bounded hex chunk with whole-file SHA-256; requires guest tools", &[
         p("guest_path", "string", true, "the guest's path"),
-        p("host_path", "path", false, "new file: absolute, or under the exports directory (default: exports/guest-<stamp>-<name>)"),
+        p("offset", "integer", false, "byte offset, default 0; without host_path only"),
+        p("length", "integer", false, "maximum returned bytes, default/limit 65536; without host_path only"),
+        p("host_path", "path", false, "ARM64 only: save whole file on host instead of returning hex; cannot combine with offset/length"),
     ], "write", Target::Op("guest_download")),
     c("guest.update_tools", "guest", "Install the lab's guest tools in the running guest (target/guest-tools); the agent restarts", &[], "write", Target::Op("guest_update_tools")),
     // CPU.
@@ -783,6 +785,11 @@ impl Connection {
                 Ok(Value::Array(COMMANDS.iter().filter(|c| self.shared.supports(c) && (category.is_empty() || c.category == category)).map(|c| {
                     let mut description = describe_command(c);
                     if self.shared.ops.is_some() {
+                        if c.name == "guest.download" {
+                            description["params"].as_array_mut().unwrap().retain(|p| p["name"] != "host_path");
+                            description["risk"] = json!("read");
+                            description["mutates"] = json!(false);
+                        }
                         if c.name == "cpu.registers" { description["summary"] = json!("AMD64 general, control, segment registers and MSRs"); }
                         if c.name == "cpu.write_register" { description["summary"] = json!("Write an AMD64 register: rax..r15, rip, rsp, rflags, cr0/cr2/cr3/cr4, efer"); }
                         if c.name == "debug.breakpoints" { description["summary"] = json!("Replace AMD64 hardware execution breakpoints; four shared execution/data slots, no instruction alignment restriction"); }
@@ -1157,6 +1164,28 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":4,"method":"commands.run","params":{"command":"cpu.registers"}}"#,
             r#"{"jsonrpc":"2.0","id":5,"method":"jobs.start","params":{"command":"cpu.registers"}}"#,
         ] { assert!(call(&mut c,request).get("error").is_some()); }
+    }
+
+    #[test]
+    fn x64_discovers_guest_file_commands() {
+        let (mut c, _rx) = connection();
+        Arc::get_mut(&mut c.shared).unwrap().ops = Some(crate::x64_lab::OPS);
+        call(&mut c, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"actor":"test"}}"#);
+        let list = call(&mut c, r#"{"jsonrpc":"2.0","id":2,"method":"commands.list","params":{"category":"guest"}}"#);
+        let commands = list["result"].as_array().unwrap();
+        let download = commands.iter().find(|c| c["name"] == "guest.download").unwrap();
+        assert_eq!(download["risk"], "read");
+        let params = download["params"].as_array().unwrap();
+        assert!(params.iter().any(|p| p["name"] == "offset"));
+        assert!(params.iter().any(|p| p["name"] == "length"));
+        assert!(!params.iter().any(|p| p["name"] == "host_path"));
+        let upload = commands.iter().find(|c| c["name"] == "guest.upload").unwrap();
+        assert_eq!(upload["risk"], "write");
+        let params = upload["params"].as_array().unwrap();
+        let host = params.iter().find(|p| p["name"] == "host_path").unwrap();
+        assert_eq!(host["required"], true);
+        assert_eq!(host["help"], "absolute, or under the lab's exports directory");
+        assert!(params.iter().any(|p| p["name"] == "guest_path" && p["required"] == true));
     }
 
     #[test]
