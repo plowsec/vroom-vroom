@@ -16,12 +16,19 @@ use vroom_config::template::toml_str;
 use vroom_config::Identity;
 
 /// Who uses the VM.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Account {
     pub user: String,
     pub password: String,
     /// An OpenSSH public key line: SSH is set up for it.
     pub ssh_key: Option<String>,
+}
+
+/// Never prints the password.
+impl std::fmt::Debug for Account {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Account").field("user", &self.user).field("ssh_key", &self.ssh_key).finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -225,6 +232,35 @@ fn windows(spec: &Spec, iso: &Path, tools: &Path, progress: &mut dyn FnMut(&str)
     write_config(dir, &spec.name, &t)
 }
 
+/// A new folder only we can open (0700), to make files holding the
+/// password in. Whatever is at `p` (a folder, a link) is removed first.
+pub(crate) fn private_dir(p: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(p) {
+        Ok(m) if m.is_dir() => std::fs::remove_dir_all(p),
+        Ok(_) => std::fs::remove_file(p),
+        Err(_) => Ok(()),
+    }
+    .map_err(|e| format!("{}: {e}", p.display()))?;
+    let mut b = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        b.mode(0o700);
+    }
+    b.create(p).map_err(|e| format!("{}: {e}", p.display()))
+}
+
+/// Move `from` (made in a `private_dir`) to `to`, owner-only (0600):
+/// never readable by others at either place.
+pub(crate) fn publish_private(from: &Path, to: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(from, std::fs::Permissions::from_mode(0o600)).map_err(|e| format!("{}: {e}", from.display()))?;
+    }
+    std::fs::rename(from, to).map_err(|e| format!("{}: {e}", to.display()))
+}
+
 fn mark_readonly(p: &Path) {
     if let Ok(m) = std::fs::metadata(p) {
         let mut perm = m.permissions();
@@ -325,6 +361,40 @@ mod tests {
         t += &net(Some(2299));
         let c = vroom_config::VmConfig::from_toml(&t).unwrap();
         assert_eq!(c.nets.len(), 1);
+    }
+
+    #[test]
+    fn the_password_is_never_printed() {
+        let s = spec(Path::new("/x"));
+        assert!(!format!("{s:?}").contains("\"pw\""));
+    }
+
+    #[cfg(unix)]
+    fn mode(p: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_files_are_owner_only() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("scratch");
+        // A link planted where the folder goes is removed, not followed.
+        let victim = t.path().join("victim");
+        std::fs::create_dir(&victim).unwrap();
+        std::os::unix::fs::symlink(&victim, &d).unwrap();
+        private_dir(&d).unwrap();
+        assert!(std::fs::symlink_metadata(&d).unwrap().is_dir() && victim.is_dir());
+        assert_eq!(mode(&d), 0o700);
+        // Made in it with the umask's mode, then published owner-only.
+        std::fs::write(d.join("f"), b"secret").unwrap();
+        publish_private(&d.join("f"), &t.path().join("out.img")).unwrap();
+        assert_eq!(mode(&t.path().join("out.img")), 0o600);
+        // Stale contents go.
+        std::fs::write(d.join("old"), b"x").unwrap();
+        private_dir(&d).unwrap();
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 0);
     }
 
     #[test]

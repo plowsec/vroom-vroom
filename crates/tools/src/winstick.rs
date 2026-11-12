@@ -239,9 +239,9 @@ pub fn build(iso: &Path, tools: &Path, acct: &Account, computer: &str, out: &Pat
         return Err("the guest tools have no virtio drivers (build them with the virtio-win ISO)".into());
     }
     let parent = out.parent().ok_or("no folder for the stick")?;
+    // Owner-only: the answer file holds the password, from here to `out`.
     let mut s = Scratch { dir: parent.join(".winstick"), devices: Vec::new() };
-    let _ = std::fs::remove_dir_all(&s.dir);
-    std::fs::create_dir_all(&s.dir).map_err(|e| e.to_string())?;
+    crate::ready::private_dir(&s.dir)?;
     let (isom, usbm) = (s.dir.join("iso"), s.dir.join("usb"));
     std::fs::create_dir_all(&isom).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&usbm).map_err(|e| e.to_string())?;
@@ -293,7 +293,7 @@ pub fn build(iso: &Path, tools: &Path, acct: &Account, computer: &str, out: &Pat
     f.seek(SeekFrom::Start(440)).and_then(|_| f.write_all(b"VRMK")).map_err(|e| e.to_string())?;
     f.seek(SeekFrom::Start(446)).and_then(|_| f.write_all(&[0x80])).map_err(|e| e.to_string())?;
     drop(f);
-    std::fs::rename(&cdr, out).map_err(|e| format!("{}: {e}", out.display()))?;
+    crate::ready::publish_private(&cdr, out)?;
     Ok(())
 }
 
@@ -311,6 +311,9 @@ mod tests {
         assert!(x.contains("vroom-ssh.ps1") && !x.contains('@'), "every placeholder filled");
         let x = unattend(&Account { ssh_key: None, ..a }, "WEB-1", 1);
         assert!(!x.contains("vroom-ssh.ps1"));
+        // Windows' copies of the password go at first logon, last.
+        let last = x.rfind("<SynchronousCommand").unwrap();
+        assert!(x[last..].contains(r"Panther\unattend.xml") && x[last..].contains("/v DefaultPassword"));
         // Well formed enough for Setup: every tag closed.
         assert_eq!(x.matches("<SynchronousCommand").count(), x.matches("</SynchronousCommand>").count());
     }

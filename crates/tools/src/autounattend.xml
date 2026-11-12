@@ -104,7 +104,14 @@
           <CommandLine>cmd /c for %d in (D E F G H I J K) do if exist %d:\vroom-setup.cmd call %d:\vroom-setup.cmd</CommandLine>
           <Description>vroom guest tools</Description>
         </SynchronousCommand>
-@SSH@      </FirstLogonCommands>
+@SSH@        <!-- Last: the copies Windows keeps of this file and of the logon
+             password. The stick keeps its own: remove it from the VM. -->
+        <SynchronousCommand wcm:action="add">
+          <Order>9</Order>
+          <CommandLine>cmd /c del /f /q %WINDIR%\Panther\unattend.xml %WINDIR%\Panther\unattend-original.xml %WINDIR%\System32\Sysprep\unattend.xml &amp; reg delete "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v DefaultPassword /f</CommandLine>
+          <Description>Scrub the password</Description>
+        </SynchronousCommand>
+      </FirstLogonCommands>
     </component>
   </settings>
 </unattend>

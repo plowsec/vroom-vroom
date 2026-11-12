@@ -115,14 +115,18 @@ impl Seed<'_> {
     /// Write the seed ISO to `out`, with the Linux guest tools from `tools`
     /// (the `linux` folder of the guest tools) on it.
     pub fn write(&self, out: &Path, tools: &Path) -> Result<(), String> {
+        // Owner-only, the ISO too: user-data has the password's hash.
         let tmp = out.with_extension("seed-tmp");
-        let _ = std::fs::remove_dir_all(&tmp);
+        crate::ready::private_dir(&tmp)?;
         let r = (|| {
-            std::fs::create_dir_all(tmp.join("vroom")).map_err(|e| e.to_string())?;
-            std::fs::write(tmp.join("user-data"), self.user_data()).map_err(|e| e.to_string())?;
-            std::fs::write(tmp.join("meta-data"), self.meta_data()).map_err(|e| e.to_string())?;
-            copy_tree(tools, &tmp.join("vroom/linux")).map_err(|e| format!("guest tools: {e}"))?;
-            make_iso(&tmp, out, "cidata")
+            let src = tmp.join("src");
+            std::fs::create_dir_all(src.join("vroom")).map_err(|e| e.to_string())?;
+            std::fs::write(src.join("user-data"), self.user_data()).map_err(|e| e.to_string())?;
+            std::fs::write(src.join("meta-data"), self.meta_data()).map_err(|e| e.to_string())?;
+            copy_tree(tools, &src.join("vroom/linux")).map_err(|e| format!("guest tools: {e}"))?;
+            let iso = tmp.join("seed.iso");
+            make_iso(&src, &iso, "cidata")?;
+            crate::ready::publish_private(&iso, out)
         })();
         let _ = std::fs::remove_dir_all(&tmp);
         r
@@ -305,6 +309,22 @@ mod tests {
         let u = s.user_data();
         assert!(u.contains("disable --now ssh") && !u.contains("packages"));
         assert!(s.meta_data().contains("instance-id: iid-vroom-0101010101010101"));
+    }
+
+    /// Needs hdiutil (macOS) or an ISO maker.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_seed_iso_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let tools = t.path().join("linux");
+        std::fs::create_dir(&tools).unwrap();
+        std::fs::write(tools.join("vroom-agent"), b"x").unwrap();
+        let out = t.path().join("seed.iso");
+        let s = Seed { hostname: "h", user: "me", password: "pw", ssh_key: None, desktop: false, instance: [1; 8] };
+        s.write(&out, &tools).unwrap();
+        assert_eq!(std::fs::metadata(&out).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read_dir(t.path()).unwrap().count(), 2, "no scratch left");
     }
 
     #[test]
