@@ -577,12 +577,12 @@ impl WindowOp {
 
 /// A name `drop_name_ok` takes, made from any file name: what Windows or
 /// a shell would read another way becomes `_` (macOS and Linux allow `:`
-/// and `?` in names, Windows doesn't), control characters go, long names
+/// and `?` in names, Windows doesn't), control and hidden characters go, long names
 /// are cut.
 pub fn fix_name(n: &str) -> String {
     let mut s: String = n
         .chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| !c.is_control() && !hidden_char(*c))
         .map(|c| if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { c })
         .collect();
     if s.len() > DROP_NAME_MAX {
@@ -689,7 +689,15 @@ pub fn drop_name_ok(n: &str) -> bool {
         && n.len() <= DROP_NAME_MAX
         && n != "."
         && n != ".."
-        && !n.chars().any(|c| c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+        && !n.chars().any(|c| c.is_control() || hidden_char(c) || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+}
+
+/// Invisible or text-direction characters: `evil\u{202e}fdp.app` shows as `evilppa.pdf`.
+fn hidden_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{ad}' | '\u{61c}' | '\u{180e}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}' | '\u{fff9}'..='\u{fffb}'
+    )
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -1554,6 +1562,12 @@ mod tests {
         for good in ["a", "a b/c.d", "photo (1).JPG", "Ünïcode/日本"] {
             assert!(drop_path_ok(good), "{good:?}");
         }
+        for bad in ["evil\u{202e}fdp.app", "a\u{200b}b", "\u{feff}x", "x\u{2066}y\u{2069}", "\u{61c}a"] {
+            assert!(!drop_name_ok(bad), "{bad:?}");
+            assert!(drop_name_ok(&fix_name(bad)), "{bad:?}");
+        }
+        assert_eq!(fix_name("evil\u{202e}fdp.app"), "evilfdp.app");
+        assert_eq!(fix_name("\u{202e}"), "_");
         let mut f = Message::DropEntry { id: 1, path: "aa/bb".into(), dir: false, size: 1 }.encode();
         let n = f.len();
         // "aa/bb" -> "aa/.."
