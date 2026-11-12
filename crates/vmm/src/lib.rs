@@ -278,6 +278,13 @@ fn restore_hardware(now: VmConfig, saved: &VmConfig) -> Result<(VmConfig, GoneSh
     if saved.identity != now.identity {
         return Err(refuse("its [identity] changed".into()));
     }
+    // Fewer is fine: raised in the file while it was suspended.
+    if saved.cpus > now.cpus || saved.memory_mib > now.memory_mib {
+        return Err(refuse(format!(
+            "it has {} CPUs and {} MiB, the VM file {} and {}",
+            saved.cpus, saved.memory_mib, now.cpus, now.memory_mib
+        )));
+    }
     let three_d = saved.display.gpu == Gpu::Virtio3d;
     if three_d && now.display.gpu != Gpu::Virtio3d {
         return Err(refuse("3D graphics is off in the VM file".into()));
@@ -336,6 +343,8 @@ fn restore_hardware(now: VmConfig, saved: &VmConfig) -> Result<(VmConfig, GoneSh
         usb,
         identity: now.identity,
     };
+    // The save's values were never checked.
+    config.validate().map_err(|e| refuse(format!("the save is not a valid VM ({e})")))?;
     Ok((config, gone))
 }
 
@@ -1277,6 +1286,21 @@ mod tests {
         let mut forged = base();
         forged.disks[0].backing = Some("/home/me/.ssh/id_ed25519".into());
         assert!(restore_hardware(now.clone(), &forged).is_err());
+        // More CPUs or memory than the file: refused; fewer: the save's.
+        for f in [|c: &mut VmConfig| c.cpus = 2, |c: &mut VmConfig| c.memory_mib = 128] {
+            let mut forged = base();
+            f(&mut forged);
+            assert!(restore_hardware(now.clone(), &forged).is_err(), "{forged:?}");
+            let (c, _) = restore_hardware(forged.clone(), &now).unwrap();
+            assert_eq!((c.cpus, c.memory_mib), (1, 64));
+        }
+        // Values the file could never have: refused.
+        let invalid: [fn(&mut VmConfig); 3] = [|c| c.display.monitors = 0, |c| c.display.monitors = 99, |c| c.memory_mib = 1];
+        for f in invalid {
+            let mut forged = base();
+            f(&mut forged);
+            assert!(restore_hardware(now.clone(), &forged).is_err(), "{forged:?}");
+        }
         // Opt-ins the file doesn't have.
         let opt_ins: [fn(&mut VmConfig); 9] = [
             |c| c.audio.input = true,
