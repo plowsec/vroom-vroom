@@ -1780,7 +1780,7 @@ impl App {
             // The suspend image would win over the snapshot next time.
             let r = vroom_state::StateLock::acquire(&state)
                 .map_err(|e| e.to_string())
-                .and_then(|_l| vroom_state::discard_suspend(&state, &v.base_dirs()).map_err(|e| e.to_string()));
+                .and_then(|_l| vroom_state::discard_suspend(&state, &v.bases()).map_err(|e| e.to_string()));
             if let Err(e) = r {
                 return self.toast(format!("Couldn't drop the saved state: {e}"), 3);
             }
@@ -1792,7 +1792,7 @@ impl App {
     /// prune (`None`), in the background.
     fn housekeeping(&mut self, done: &'static str, what: Option<String>) {
         let Some(v) = self.cur() else { return };
-        let (state, bases) = (v.state_dir(), v.base_dirs());
+        let (state, bases) = (v.state_dir(), v.bases());
         std::thread::spawn(move || {
             let r = vroom_state::StateLock::acquire(&state).map_err(|e| match e {
                 vroom_state::Error::Busy(_) => "The VM is running. Stop it first.".to_string(),
@@ -1819,10 +1819,17 @@ impl App {
     }
 
     fn compact(&mut self, i: usize) {
-        let Some(p) = self.cur().and_then(|v| v.resolved()).and_then(|c| c.disks.get(i).map(|d| d.path.clone())) else { return };
+        let Some(v) = self.cur() else { return };
+        let Some((p, readonly)) = v.resolved().and_then(|c| c.disks.get(i).map(|d| (d.path.clone(), d.readonly))) else { return };
+        // A disk the VMM writes: it could have rewritten its header, so its
+        // backing name counts only if it names one of the VM's own layers.
+        let policy = vroom_block::qcow2::OpenPolicy {
+            pinned: (!readonly).then(|| vroom_block::qcow2::Pinned { layers: v.state_dir().join("disks"), bases: vec![(p.clone(), None)] }),
+            ..Default::default()
+        };
         self.toast(format!("Compacting {}...", p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()), 0);
         std::thread::spawn(move || {
-            let r = vroom_block::qcow2::compact(&p, &vroom_block::qcow2::OpenPolicy::default());
+            let r = vroom_block::qcow2::compact(&p, &policy);
             msg::post(move || match r {
                 Ok((before, after)) => Msg::Toast {
                     text: format!("Compacted: {} → {} on disk", fmt::bytes(before), fmt::bytes(after)),

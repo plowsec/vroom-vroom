@@ -47,9 +47,9 @@ fn report(r: &PruneReport) {
     }
 }
 
-/// Directories the configured disks live in: layer chains end there.
-fn base_dirs(cfg: &VmConfig) -> Vec<PathBuf> {
-    cfg.disks.iter().filter_map(|d| d.path.parent().map(Path::to_path_buf)).collect()
+/// The configured disk images: layer chains end there.
+fn bases(cfg: &VmConfig) -> Vec<PathBuf> {
+    cfg.disks.iter().map(|d| d.path.clone()).collect()
 }
 
 pub fn run(cmd: SnapCmd, load: impl Fn(&Path) -> Result<VmConfig, String>, state_of: impl Fn(&Path, &VmConfig) -> PathBuf) -> Result<(), String> {
@@ -74,14 +74,14 @@ pub fn run(cmd: SnapCmd, load: impl Fn(&Path) -> Result<VmConfig, String>, state
         }
         SnapCmd::Delete { name, .. } => {
             let _lock = StateLock::acquire(&state).map_err(|e| format!("{e} (stop the VM first)"))?;
-            let r = state::delete(&state, &name, &base_dirs(&cfg)).map_err(|e| e.to_string())?;
+            let r = state::delete(&state, &name, &bases(&cfg)).map_err(|e| e.to_string())?;
             println!("deleted {name}");
             report(&r);
             Ok(())
         }
         SnapCmd::Prune { .. } => {
             let _lock = StateLock::acquire(&state).map_err(|e| format!("{e} (stop the VM first)"))?;
-            report(&state::prune(&state, &base_dirs(&cfg)).map_err(|e| e.to_string())?);
+            report(&state::prune(&state, &bases(&cfg)).map_err(|e| e.to_string())?);
             Ok(())
         }
     }

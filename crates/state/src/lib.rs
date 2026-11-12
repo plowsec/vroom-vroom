@@ -12,7 +12,7 @@ use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
-use vroom_block::qcow2::{fold_backing, OpenPolicy};
+use vroom_block::qcow2::{fold_backing, OpenPolicy, Pinned};
 use vroom_snapshot::SnapshotDir;
 
 pub mod hostile;
@@ -153,7 +153,8 @@ pub struct PruneReport {
 }
 
 /// Delete snapshot `name`, then prune layers. The caller holds the lock.
-pub fn delete(state: &Path, name: &str, base_dirs: &[PathBuf]) -> Result<PruneReport> {
+/// `bases`: the VM's disk images (see [`prune`]).
+pub fn delete(state: &Path, name: &str, bases: &[PathBuf]) -> Result<PruneReport> {
     if name.is_empty() || name.contains('/') || name.starts_with('.') {
         return Err(Error::Setup(format!("bad snapshot name {name:?}")));
     }
@@ -161,7 +162,7 @@ pub fn delete(state: &Path, name: &str, base_dirs: &[PathBuf]) -> Result<PruneRe
     let dir = snapshots_dir(state).join(name);
     SnapshotDir::open(&dir).map_err(|e| Error::Setup(format!("snapshot {name}: {e}")))?;
     std::fs::remove_dir_all(&dir)?;
-    prune(state, base_dirs)
+    prune(state, bases)
 }
 
 /// Layer paths something points at directly.
@@ -252,13 +253,15 @@ fn parent_of(layer: &Path, policy: &OpenPolicy) -> Result<Option<PathBuf>> {
     Ok(q.backing_path().map(canon))
 }
 
-/// Delete unneeded layers and fold single-child intermediates.
-pub fn prune(state: &Path, base_dirs: &[PathBuf]) -> Result<PruneReport> {
+/// Delete unneeded layers and fold single-child intermediates. `bases`:
+/// the VM's disk images. The sandboxed VMM writes the layers, so their
+/// backing names count only when they name another layer (a plain file in
+/// `disks/`) or one of these exactly.
+pub fn prune(state: &Path, bases: &[PathBuf]) -> Result<PruneReport> {
     real_dir(&state.join("disks"))?;
     let disks = canon(&state.join("disks"));
-    let mut allowed = vec![disks.clone()];
-    allowed.extend(base_dirs.iter().cloned());
-    let policy = OpenPolicy { allowed_dirs: allowed, ..Default::default() };
+    let pinned = Pinned { layers: disks.clone(), bases: bases.iter().map(|b| (b.clone(), None)).collect() };
+    let policy = OpenPolicy { pinned: Some(pinned), ..Default::default() };
     let mut report = PruneReport::default();
     loop {
         let (roots, pinned) = roots(state)?;
@@ -333,12 +336,12 @@ pub fn suspended_config(state: &Path) -> Option<serde_json::Value> {
 
 /// Throw the suspend image away: the next start boots fresh. The caller
 /// holds the lock. Its disk layers go with the next prune.
-pub fn discard_suspend(state: &Path, base_dirs: &[PathBuf]) -> Result<PruneReport> {
+pub fn discard_suspend(state: &Path, bases: &[PathBuf]) -> Result<PruneReport> {
     let d = state.join("suspend");
     if d.exists() {
         std::fs::remove_dir_all(&d)?;
     }
-    prune(state, base_dirs)
+    prune(state, bases)
 }
 
 #[cfg(test)]
@@ -416,5 +419,31 @@ mod tests {
         std::fs::write(snap.join("manifest.json"), r#"{"format": 99}"#).unwrap();
         assert!(prune(&state, &[]).is_err());
         assert!(kept.exists(), "deleted a layer an unreadable snapshot may use");
+    }
+
+    #[test]
+    fn prune_follows_only_layers_and_bases() {
+        use vroom_block::qcow2::{set_backing, Qcow2Image};
+        use vroom_block::Format;
+        let t = tempfile::tempdir().unwrap();
+        let state = t.path().join("vm.state");
+        let disks = state.join("disks");
+        std::fs::create_dir_all(&disks).unwrap();
+        let base = t.path().join("disk.qcow2");
+        Qcow2Image::create(&base, 1 << 20, None).unwrap();
+        let other = t.path().join("other-vm.qcow2");
+        Qcow2Image::create(&other, 1 << 20, None).unwrap();
+        let (l1, l2) = (disks.join("disk0-1-000000001.qcow2"), disks.join("disk0-1-000000002.qcow2"));
+        Qcow2Image::create(&l1, 1 << 20, Some((&base, Format::Qcow2))).unwrap();
+        Qcow2Image::create(&l2, 1 << 20, Some((&l1, Format::Qcow2))).unwrap();
+        std::fs::write(disks.join("disk0.json"), r#"{"active":"disk0-1-000000002.qcow2"}"#).unwrap();
+        // l1 is folded into l2.
+        let r = prune(&state, std::slice::from_ref(&base)).unwrap();
+        assert_eq!(r.folded.len(), 1);
+        // A layer pointed at another VM's disk next to the base: nothing pruned.
+        set_backing(&l2, Some((&other, Format::Qcow2))).unwrap();
+        let e = prune(&state, std::slice::from_ref(&base)).unwrap_err().to_string();
+        assert!(e.contains("neither"), "{e}");
+        assert!(other.exists());
     }
 }

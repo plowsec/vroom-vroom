@@ -119,11 +119,9 @@ impl Vm {
         }
     }
 
-    /// Dirs the VM's disk layer chains may end in (for pruning).
-    pub fn base_dirs(&self) -> Vec<PathBuf> {
-        self.resolved()
-            .map(|c| c.disks.iter().filter_map(|d| d.path.parent().map(Path::to_path_buf)).collect())
-            .unwrap_or_default()
+    /// The VM's disk images: its layer chains end there (for pruning).
+    pub fn bases(&self) -> Vec<PathBuf> {
+        self.resolved().map(|c| c.disks.iter().map(|d| d.path.clone()).collect()).unwrap_or_default()
     }
 }
 

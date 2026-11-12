@@ -392,7 +392,8 @@ impl Clone {
     fn own_layers(&self, state: &Path) -> Result<(), String> {
         let Ok(dir) = std::fs::read_dir(state.join("disks")) else { return Ok(()) };
         for p in dir.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "json")) {
-            let v: serde_json::Value = std::fs::read(&p).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+            // The VMM writes these: no links, no FIFOs.
+            let v: serde_json::Value = vroom_state::hostile::read_small(&p, 64 << 10).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
             let active = v.get("active").and_then(|a| a.as_str()).map(Path::new);
             if active.is_some_and(|a| a.is_absolute() && lexical(a).starts_with(&self.from)) {
                 return Err(format!("{} names its disk by full path, so the clone would write to this VM's. Start and shut it down once, then clone it.", p.file_name().unwrap_or_default().to_string_lossy()));
@@ -447,8 +448,10 @@ fn fresh_state(state: &Path) -> Result<(), String> {
         }
     }
     if state.join("disks").is_dir() {
-        let vm = state.parent().map(Path::to_path_buf).into_iter().collect::<Vec<_>>();
-        vroom_state::prune(state, &vm).map_err(|e| e.to_string())?;
+        // The clone's folder holds only this VM: its files are the bases.
+        let folder = state.parent().and_then(|d| std::fs::read_dir(d).ok());
+        let bases: Vec<PathBuf> = folder.into_iter().flatten().flatten().map(|e| e.path()).filter(|p| vroom_state::hostile::plain_file(p)).collect();
+        vroom_state::prune(state, &bases).map_err(|e| e.to_string())?;
     }
     Ok(())
 }
