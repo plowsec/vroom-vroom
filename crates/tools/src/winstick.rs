@@ -5,11 +5,12 @@
 //! (user, password, OpenSSH). Windows Setup on NVMe can't read the ISO
 //! itself (2 KiB sectors); a GPT disk's EFI partition confuses it.
 //!
-//! macOS only: it mounts the ISO and makes the disk with hdiutil. An
+//! macOS uses hdiutil; Linux uses 7z and mtools without mounting. An
 //! `install.wim` of 4 GiB or more is split (FAT32's file size limit),
 //! which needs wimlib (`brew install wimlib`).
 
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::hash::BuildHasher;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -237,6 +238,7 @@ fn ticker<'a>(copied: &'a mut u64, last: &'a mut u64, total: u64, progress: &'a 
 /// tools' `windows` folder `tools` and this VM's account. `progress` gets
 /// short lines ("Copying Windows: 40%").
 pub fn build(iso: &Path, tools: &Path, acct: &Account, computer: &str, out: &Path, progress: &mut dyn FnMut(&str)) -> Result<(), String> {
+    if cfg!(target_os = "linux") { return build_linux(iso, tools, acct, computer, out, progress); }
     if !cfg!(target_os = "macos") {
         return Err("making a Windows install stick needs macOS (hdiutil)".into());
     }
@@ -303,6 +305,93 @@ pub fn build(iso: &Path, tools: &Path, acct: &Account, computer: &str, out: &Pat
     Ok(())
 }
 
+/// A sparse MBR/FAT32 image populated with mtools. No root or loop mounts.
+pub fn fat_image(tree: &Path, out: &Path, label: &str) -> Result<(), String> {
+    if label.len() > 11 || !label.bytes().all(|b| b.is_ascii_alphanumeric()) { return Err("invalid FAT label".into()); }
+    let size = (files_size(tree) + (256 << 20)).next_multiple_of(1 << 20).max(512 << 20);
+    let sectors = size / 512 - 2048;
+    let sectors = u32::try_from(sectors).map_err(|_| "install disk exceeds MBR capacity")?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600); // answer files may contain a local account password
+    }
+    let mut file = options.open(out).map_err(|e| e.to_string())?;
+    file.set_len(size).map_err(|e| e.to_string())?;
+    let mut mbr = [0u8; 512];
+    // Windows offlines MBR volumes with duplicate signatures. An install
+    // disk and a separate answer/tools disk must not all identify as VRMK.
+    let signature = (std::collections::hash_map::RandomState::new().hash_one(out) as u32).max(1);
+    mbr[440..444].copy_from_slice(&signature.to_le_bytes()); mbr[446] = 0x80; mbr[450] = 0x0c;
+    mbr[447..450].copy_from_slice(&[0xfe, 0xff, 0xff]); mbr[451..454].copy_from_slice(&[0xfe, 0xff, 0xff]);
+    mbr[454..458].copy_from_slice(&2048u32.to_le_bytes()); mbr[458..462].copy_from_slice(&sectors.to_le_bytes());
+    mbr[510..].copy_from_slice(&[0x55, 0xaa]); file.write_all(&mbr).map_err(|e| e.to_string())?; drop(file);
+    let image = format!("{}@@1048576", out.display());
+    run(Command::new("mformat").args(["-i", &image, "-F", "-T", &sectors.to_string(), "-v", label, "::"]))?;
+    for entry in std::fs::read_dir(tree).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        run(Command::new("mcopy").args(["-s", "-i", &image]).arg(entry.path()).arg("::"))?;
+    }
+    Ok(())
+}
+
+fn build_linux(iso: &Path, tools: &Path, acct: &Account, computer: &str, out: &Path, progress: &mut dyn FnMut(&str)) -> Result<(), String> {
+    if !tools.join("NetKVM").is_dir() { return Err("guest tools have no virtio drivers; run scripts/make-guest-tools.sh".into()); }
+    let scratch = tempfile::Builder::new().prefix(".winstick-").tempdir_in(out.parent().unwrap_or(Path::new("."))).map_err(|e| e.to_string())?;
+    let isom = scratch.path().join("iso"); let usbm = scratch.path().join("usb");
+    std::fs::create_dir(&isom).map_err(|e| e.to_string())?;
+    progress("Opening the Windows ISO (needs 7z, mformat and mcopy)");
+    run(Command::new("7z").args(["x", "-y"]).arg(format!("-o{}", isom.display())).arg(iso))?;
+    let efi = if cfg!(target_arch = "x86_64") { "efi/boot/bootx64.efi" } else { "efi/boot/bootaa64.efi" };
+    if !isom.join("sources/boot.wim").is_file() || !isom.join(efi).is_file() { return Err(format!("not a native Windows install ISO (need sources/boot.wim and {efi})")); }
+    let wim = isom.join("sources/install.wim");
+    let image = if wim.is_file() { wim } else { isom.join("sources/install.esd") };
+    let big = std::fs::metadata(&image).map_err(|e| e.to_string())?.len() >= 4 << 30;
+    let index = pro_index(&image).unwrap_or(1);
+    let total = files_size(&isom) + files_size(tools); let (mut copied, mut last) = (0, 0);
+    let skip: &[&str] = if big { &["boot.catalog", "boot.catalogue", "sources/install.wim", "sources/install.esd", "[BOOT]"] } else { &["boot.catalog", "boot.catalogue", "[BOOT]"] };
+    copy_tree(&isom, &usbm, "", skip, &mut ticker(&mut copied, &mut last, total, progress))?;
+    if big {
+        progress("Splitting the install image (needs wimlib-imagex)");
+        run(Command::new("wimlib-imagex").arg("split").arg(&image).arg(usbm.join("sources/install.swm")).arg("3800"))?;
+    }
+    copy_tree(tools, &usbm, "", &[], &mut ticker(&mut copied, &mut last, total, progress))?;
+    std::fs::write(usbm.join("autounattend.xml"), unattend(acct, computer, index)).map_err(|e| e.to_string())?;
+    if let Some(key) = &acct.ssh_key {
+        std::fs::write(usbm.join("vroom-ssh.ps1"), ssh_script()).map_err(|e| e.to_string())?;
+        std::fs::write(usbm.join("vroom-ssh.pub"), format!("{}\r\n", key.trim())).map_err(|e| e.to_string())?;
+    }
+    progress("Configuring unattended WinPE startup (needs wimlib-imagex)");
+    unattended_boot_wim(&usbm.join("sources/boot.wim"), &usbm.join("autounattend.xml"), scratch.path())?;
+    progress("Making the install disk");
+    let image = scratch.path().join("install.img"); fat_image(&usbm, &image, "WININST")?;
+    std::fs::rename(image, out).map_err(|e| e.to_string())
+}
+
+/// New Windows Setup builds do not reliably discover an answer file on
+/// fixed NVMe media. Start Setup with it explicitly, before its GUI opens.
+fn unattended_boot_wim(boot: &Path, answer: &Path, scratch: &Path) -> Result<(), String> {
+    let mut header = [0u8; 128];
+    std::fs::File::open(boot).and_then(|mut f| f.read_exact(&mut header)).map_err(|e| format!("boot.wim header: {e}"))?;
+    let count = u32::from_le_bytes(header[44..48].try_into().unwrap());
+    let index = u32::from_le_bytes(header[120..124].try_into().unwrap());
+    if &header[..5] != b"MSWIM" || index == 0 || index > count {
+        return Err("boot.wim has no valid bootable image".into());
+    }
+    let overlay = scratch.join("boot-overlay");
+    std::fs::create_dir_all(overlay.join("Windows/System32")).map_err(|e| e.to_string())?;
+    std::fs::write(overlay.join("Windows/System32/winpeshl.ini"),
+        "[LaunchApps]\r\n%SYSTEMROOT%\\System32\\wpeinit.exe\r\n%SYSTEMROOT%\\System32\\cmd.exe, /c %SYSTEMDRIVE%\\vroom-start.cmd\r\n").map_err(|e| e.to_string())?;
+    std::fs::write(overlay.join("vroom-start.cmd"),
+        "@echo off\r\n%SYSTEMDRIVE%\\sources\\setup.exe /unattend:%SYSTEMDRIVE%\\vroom-unattend.xml\r\n").map_err(|e| e.to_string())?;
+    std::fs::copy(answer, overlay.join("vroom-unattend.xml")).map_err(|e| e.to_string())?;
+    let boot = boot.canonicalize().map_err(|e| e.to_string())?;
+    run(Command::new("wimlib-imagex").arg("update").arg(boot).arg(index.to_string())
+        .arg("--command=add boot-overlay /").current_dir(scratch))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,6 +406,56 @@ mod tests {
         let arm = unattend_arch(&acct, "ARM", 1, false);
         assert!(arm.contains("processorArchitecture=\"arm64\""));
         assert!(arm.contains("\\w11\\ARM64"));
+    }
+
+    #[test]
+    #[ignore = "requires genisoimage, 7z, mtools and wimlib-imagex"]
+    fn linux_install_stick_end_to_end() {
+        let t = tempfile::tempdir().unwrap(); let root = t.path();
+        let source = root.join("source"); let tools = root.join("tools");
+        std::fs::create_dir_all(source.join("sources")).unwrap();
+        std::fs::create_dir_all(source.join("efi/boot")).unwrap();
+        std::fs::create_dir_all(tools.join("NetKVM")).unwrap();
+        let winpe = root.join("winpe");
+        std::fs::create_dir_all(winpe.join("Windows/System32")).unwrap();
+        std::fs::write(winpe.join("Windows/System32/winpeshl.ini"), b"original startup").unwrap();
+        run(Command::new("wimlib-imagex").arg("capture").arg(winpe).arg(source.join("sources/boot.wim")).arg("--boot")).unwrap();
+        std::fs::write(source.join("sources/install.wim"), b"fake install image").unwrap();
+        let efi = if cfg!(target_arch = "x86_64") { "bootx64.efi" } else { "bootaa64.efi" };
+        std::fs::write(source.join("efi/boot").join(efi), b"fake UEFI loader").unwrap();
+        std::fs::write(tools.join("vroom-setup.cmd"), b"echo test").unwrap();
+        let iso = root.join("windows.iso");
+        run(Command::new("genisoimage").args(["-quiet", "-r", "-J", "-o"]).arg(&iso).arg(&source)).unwrap();
+        let out = root.join("install.img");
+        let acct = Account { user: "test".into(), password: "secret".into(), ssh_key: Some("ssh-ed25519 AAAA test".into()) };
+        build_linux(&iso, &tools, &acct, "TEST", &out, &mut |_| {}).unwrap();
+        let mut file = std::fs::File::open(&out).unwrap(); let mut mbr = [0; 512]; file.read_exact(&mut mbr).unwrap();
+        assert_eq!(&mbr[510..], &[0x55, 0xaa]); assert_eq!(mbr[450], 0x0c);
+        assert_eq!(u32::from_le_bytes(mbr[454..458].try_into().unwrap()), 2048);
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&out).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_ne!(&mbr[440..444], &[0, 0, 0, 0]);
+        // A separately attached answer/tools disk must stay online in
+        // Windows alongside the installer, rather than sharing its ID.
+        let seed = root.join("seed.img");
+        fat_image(&tools, &seed, "SEED").unwrap();
+        let mut seed_mbr = [0u8; 512];
+        std::fs::File::open(seed).unwrap().read_exact(&mut seed_mbr).unwrap();
+        assert_ne!(&mbr[440..444], &seed_mbr[440..444]);
+        let contents = Command::new("mtype").args(["-i", &format!("{}@@1048576", out.display()), "::/autounattend.xml"]).output().unwrap();
+        assert!(contents.status.success());
+        let x = String::from_utf8(contents.stdout).unwrap();
+        assert!(x.contains("<Name>test</Name>")); assert!(x.contains("vroom-ssh.ps1"));
+        assert!(x.contains(if cfg!(target_arch = "x86_64") { "processorArchitecture=\"amd64\"" } else { "processorArchitecture=\"arm64\"" }));
+        let boot = root.join("packed-boot.wim");
+        run(Command::new("mcopy").args(["-i", &format!("{}@@1048576", out.display()), "::/sources/boot.wim"]).arg(&boot)).unwrap();
+        let extracted = root.join("boot-check");
+        run(Command::new("wimlib-imagex").arg("extract").arg(boot).arg("1")
+            .args(["Windows/System32/winpeshl.ini", "vroom-start.cmd", "vroom-unattend.xml"])
+            .arg(format!("--dest-dir={}", extracted.display()))).unwrap();
+        assert!(std::fs::read_to_string(extracted.join("winpeshl.ini")).unwrap().contains("vroom-start.cmd"));
+        assert!(std::fs::read_to_string(extracted.join("vroom-start.cmd")).unwrap().contains("/unattend:"));
+        assert_eq!(std::fs::read_to_string(extracted.join("vroom-unattend.xml")).unwrap(), x);
     }
 
     #[test]
