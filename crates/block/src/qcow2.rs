@@ -98,10 +98,46 @@ const L2_CACHE: usize = 128;
 /// Where backing files may come from.
 #[derive(Debug, Clone, Default)]
 pub struct OpenPolicy {
-    /// Extra directories backing files may live in (besides the image's own).
+    /// Extra directories backing files may sit in (besides the image's
+    /// own): those directories exactly, not below them.
     pub allowed_dirs: Vec<PathBuf>,
     /// Flush behaviour of the opened (writable) image.
     pub sync: SyncMode,
+    /// A VM's writable disk: set, only these backing files count.
+    pub pinned: Option<Pinned>,
+}
+
+/// The files a VM's writable disk may be made of. The sandboxed VMM can
+/// rewrite every header in that chain, so a backing name in it is only
+/// believed when it names one of these: a plain file (regular, no link,
+/// one name) in `layers`, read as qcow2, or exactly one of `bases`. A
+/// base has no backing file of its own. The own-directory rule and
+/// `allowed_dirs` don't apply.
+#[derive(Debug, Clone)]
+pub struct Pinned {
+    /// `<state>/disks`.
+    pub layers: PathBuf,
+    /// The configured images, with the format the VM file gives (None: as
+    /// the overlay records it).
+    pub bases: Vec<(PathBuf, Option<Format>)>,
+}
+
+impl Pinned {
+    fn base(&self, real: &Path) -> Option<Option<Format>> {
+        self.bases.iter().find(|(b, _)| b.canonicalize().is_ok_and(|b| b == real)).map(|(_, f)| *f)
+    }
+}
+
+/// A pinned chain's base must not name a backing file.
+fn check_base(path: &Path, hdr: &Header, policy: &OpenPolicy) -> Result<()> {
+    let (Some(pin), Some(name)) = (&policy.pinned, &hdr.backing_file) else { return Ok(()) };
+    if path.canonicalize().is_ok_and(|me| pin.base(&me).is_some()) {
+        return Err(bad(format!(
+            "{} names a backing file ({name}); vroom writes this image, so it can't trust that name: flatten it (qemu-img convert) or make the disk read-only",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -276,12 +312,21 @@ fn dir_of(p: &Path) -> &Path {
     p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."))
 }
 
-/// Resolve and vet a backing file reference.
-fn resolve_backing(image: &Path, name: &str, policy: &OpenPolicy) -> Result<PathBuf> {
+/// Resolve and vet `image`'s backing file reference `name`, and say its
+/// format: the one `recorded` (the header's backing-format extension), or
+/// what `policy.pinned` gives. Never sniffed: the guest may have written
+/// a qcow2 header into a raw image.
+fn resolve_backing(image: &Path, name: &str, recorded: Option<&str>, policy: &OpenPolicy) -> Result<(PathBuf, Format)> {
     if name.contains('\0') || name.contains(':') && !name.starts_with('/') && name.split(':').next().is_some_and(|p| !p.contains('/')) {
         // "nbd:...", "http:..." style protocol strings: never.
         return Err(bad(format!("backing file {name:?} uses a protocol prefix")));
     }
+    let recorded = match recorded {
+        Some("qcow2") => Some(Format::Qcow2),
+        Some("raw") => Some(Format::Raw),
+        Some(other) => return Err(bad(format!("backing format {other} not supported"))),
+        None => None,
+    };
     let dir = dir_of(image);
     let p = Path::new(name);
     let p = if p.is_absolute() { p.to_path_buf() } else { dir.join(p) };
@@ -289,9 +334,23 @@ fn resolve_backing(image: &Path, name: &str, policy: &OpenPolicy) -> Result<Path
     if !real.is_file() {
         return Err(bad(format!("backing file {} is not a regular file", real.display())));
     }
+    if let Some(pin) = &policy.pinned {
+        if let Some(f) = pin.base(&real) {
+            let f = f.or(recorded).ok_or_else(|| bad(format!("{}: no backing format recorded for {}", image.display(), real.display())))?;
+            return Ok((real, f));
+        }
+        let plain = std::fs::symlink_metadata(&p).is_ok_and(|m| {
+            use std::os::unix::fs::MetadataExt;
+            m.is_file() && m.nlink() == 1
+        });
+        if plain && pin.layers.canonicalize().is_ok_and(|l| real.parent() == Some(l.as_path())) {
+            return Ok((real, Format::Qcow2));
+        }
+        return Err(bad(format!("backing file {} is neither one of the VM's layers nor its disk image", real.display())));
+    }
     let own = dir.canonicalize()?;
     let ok = real.parent().is_some_and(|parent| {
-        parent == own || policy.allowed_dirs.iter().any(|a| a.canonicalize().is_ok_and(|a| parent.starts_with(a)))
+        parent == own || policy.allowed_dirs.iter().any(|a| a.canonicalize().is_ok_and(|a| parent == a))
     });
     if !ok {
         return Err(bad(format!(
@@ -299,22 +358,33 @@ fn resolve_backing(image: &Path, name: &str, policy: &OpenPolicy) -> Result<Path
             real.display()
         )));
     }
-    Ok(real)
+    // Images vroom and current qemu-img make record it.
+    let f = recorded.ok_or_else(|| {
+        bad(format!(
+            "{}: no backing format recorded for {}; set it: qemu-img rebase -u -F raw|qcow2 -b {name} {}",
+            image.display(),
+            real.display(),
+            image.display()
+        ))
+    })?;
+    Ok((real, f))
 }
 
-/// The files `path` reads from: itself, then its backing files down to
-/// the base, vetted as `open_with` does.
+/// The files `path` (a qcow2 image) reads from: itself, then its backing
+/// files down to the base, vetted as `open_with` does.
 pub fn chain(path: &Path, policy: &OpenPolicy) -> Result<Vec<PathBuf>> {
     let mut out = vec![path.to_path_buf()];
-    while out.len() <= MAX_CHAIN as usize {
+    let mut fmt = Format::Qcow2;
+    while fmt == Format::Qcow2 && out.len() <= MAX_CHAIN as usize {
         let cur = out[out.len() - 1].clone();
-        if crate::detect(&cur)? != Format::Qcow2 {
-            break;
-        }
         let f = File::open(&cur)?;
         let len = f.metadata()?.len();
-        let Some(name) = parse_header(&f, len)?.backing_file else { break };
-        out.push(resolve_backing(&cur, &name, policy)?);
+        let hdr = parse_header(&f, len)?;
+        check_base(&cur, &hdr, policy)?;
+        let Some(name) = &hdr.backing_file else { break };
+        let (bp, bf) = resolve_backing(&cur, name, hdr.backing_format.as_deref(), policy)?;
+        out.push(bp);
+        fmt = bf;
     }
     Ok(out)
 }
@@ -343,6 +413,8 @@ pub struct Qcow2Image {
     backing: Option<Arc<dyn DiskImage>>,
     /// Resolved backing file (None for in-process overlays and bases).
     backing_path: Option<PathBuf>,
+    /// Its format.
+    backing_fmt: Option<Format>,
     state: Mutex<State>,
     /// Guest data I/O runs outside `state`, holding this for reading:
     /// whatever frees clusters (discard, write zeroes) takes it for
@@ -418,18 +490,15 @@ impl Qcow2Image {
         }
 
         let mut backing_path = None;
+        let mut backing_fmt = None;
         let backing = match (&hdr.backing_file, backing_override) {
             (_, Some(b)) => Some(b),
             (None, None) => None,
             (Some(name), None) => {
-                let bp = resolve_backing(path, name, policy)?;
+                check_base(path, &hdr, policy)?;
+                let (bp, fmt) = resolve_backing(path, name, hdr.backing_format.as_deref(), policy)?;
                 backing_path = Some(bp.clone());
-                let fmt = match hdr.backing_format.as_deref() {
-                    Some("qcow2") => Format::Qcow2,
-                    Some("raw") => Format::Raw,
-                    Some(other) => return Err(bad(format!("backing format {other} not supported"))),
-                    None => crate::detect(&bp)?,
-                };
+                backing_fmt = Some(fmt);
                 let b: Arc<dyn DiskImage> = match fmt {
                     Format::Raw => Arc::new(crate::raw::RawImage::open(&bp, true)?),
                     Format::Qcow2 => Arc::new(Qcow2Image::open_with(&bp, true, policy, depth + 1)?),
@@ -448,6 +517,7 @@ impl Qcow2Image {
             sync: policy.sync,
             backing,
             backing_path,
+            backing_fmt,
             state: Mutex::new(State { l1, l2_cache: HashMap::new(), refcount_table, next_free, free, zcache: None }),
             io_gate: RwLock::new(()),
             hdr,
@@ -898,9 +968,8 @@ pub fn set_backing(image: &Path, backing: Option<(&Path, Format)>) -> Result<()>
 /// nothing else uses it).
 pub fn fold_backing(child: &Path, policy: &OpenPolicy) -> Result<PathBuf> {
     let c = Qcow2Image::open_with(child, false, policy, 0)?.with_sync(SyncMode::Fsync);
-    let name = c.hdr.backing_file.clone().ok_or_else(|| bad("image has no backing file"))?;
-    let parent = resolve_backing(child, &name, policy)?;
-    if crate::detect(&parent)? != Format::Qcow2 {
+    let (Some(parent), Some(pfmt)) = (c.backing_path.clone(), c.backing_fmt) else { return Err(bad("image has no backing file")) };
+    if pfmt != Format::Qcow2 {
         return Err(bad("backing layer is not qcow2"));
     }
     let p = Qcow2Image::open_with(&parent, true, policy, 0)?;
@@ -946,18 +1015,7 @@ pub fn fold_backing(child: &Path, policy: &OpenPolicy) -> Result<PathBuf> {
     }
     c.flush()?;
     drop(c);
-    let up = match &p.hdr.backing_file {
-        None => None,
-        Some(n) => {
-            let bp = resolve_backing(&parent, n, policy)?;
-            let fmt = match p.hdr.backing_format.as_deref() {
-                Some("raw") => Format::Raw,
-                Some("qcow2") => Format::Qcow2,
-                _ => crate::detect(&bp)?,
-            };
-            Some((bp, fmt))
-        }
-    };
+    let up = p.backing_path.clone().zip(p.backing_fmt);
     set_backing(child, up.as_ref().map(|(b, f)| (b.as_path(), *f)))?;
     Ok(parent)
 }
@@ -970,17 +1028,7 @@ pub fn fold_backing(child: &Path, policy: &OpenPolicy) -> Result<PathBuf> {
 pub fn compact(path: &Path, policy: &OpenPolicy) -> Result<(u64, u64)> {
     let src = Qcow2Image::open_with(path, false, policy, 0)?;
     let before = src.file.metadata()?.len();
-    let up = match (&src.hdr.backing_file, &src.backing_path) {
-        (Some(_), Some(bp)) => {
-            let fmt = match src.hdr.backing_format.as_deref() {
-                Some("raw") => Format::Raw,
-                Some("qcow2") => Format::Qcow2,
-                _ => crate::detect(bp)?,
-            };
-            Some((bp.clone(), fmt))
-        }
-        _ => None,
-    };
+    let up = src.backing_path.clone().zip(src.backing_fmt);
     let tmp = path.with_extension("compacting");
     let _ = std::fs::remove_file(&tmp);
     Qcow2Image::create(&tmp, src.hdr.size, up.as_ref().map(|(p, f)| (p.as_path(), *f)))?;
@@ -1711,7 +1759,101 @@ mod tests {
         assert!(Qcow2Image::open(&p, true).is_err());
         f.write_all_at(&(1u64 << 20).to_be_bytes(), 24).unwrap();
         // protocol-style backing name
-        assert!(resolve_backing(&p, "nbd:evil:1234", &OpenPolicy::default()).is_err());
+        assert!(resolve_backing(&p, "nbd:evil:1234", Some("raw"), &OpenPolicy::default()).is_err());
         assert!(Qcow2Image::open(&p, true).is_ok());
+    }
+
+    #[test]
+    fn allowed_dirs_are_exact_not_below() {
+        let td = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        std::fs::create_dir(other.path().join("sub")).unwrap();
+        let deep = other.path().join("sub/secret");
+        std::fs::write(&deep, b"ssh key").unwrap();
+        let ov = td.path().join("ov.qcow2");
+        Qcow2Image::create(&ov, 1 << 20, Some((&deep, Format::Raw))).unwrap();
+        let pol = OpenPolicy { allowed_dirs: vec![other.path().to_path_buf()], ..Default::default() };
+        let e = Qcow2Image::open_with(&ov, true, &pol, 0).unwrap_err().to_string();
+        assert!(e.contains("outside the allowed"), "{e}");
+        assert!(chain(&ov, &pol).is_err());
+        // A link in the allowed dir to a file below it: resolved, then refused.
+        std::os::unix::fs::symlink(&deep, other.path().join("link")).unwrap();
+        let ov2 = td.path().join("ov2.qcow2");
+        Qcow2Image::create(&ov2, 1 << 20, Some((&other.path().join("link"), Format::Raw))).unwrap();
+        set_backing(&ov2, Some((&other.path().join("link"), Format::Raw))).unwrap();
+        assert!(Qcow2Image::open_with(&ov2, true, &pol, 0).is_err());
+    }
+
+    /// Drop the backing-format extension (as old qemu-img left it).
+    fn forget_backing_format(p: &Path) {
+        let f = std::fs::OpenOptions::new().write(true).open(p).unwrap();
+        f.write_all_at(&[0u8; 8], 104).unwrap();
+    }
+
+    #[test]
+    fn a_backing_format_is_never_guessed() {
+        let td = tempfile::tempdir().unwrap();
+        // A raw base the guest wrote a qcow2 header into.
+        let base = td.path().join("base.img");
+        let fake = td.path().join("fake.qcow2");
+        Qcow2Image::create(&fake, 1 << 20, None).unwrap();
+        std::fs::copy(&fake, &base).unwrap();
+        let ov = td.path().join("ov.qcow2");
+        Qcow2Image::create(&ov, 1 << 20, Some((&base, Format::Raw))).unwrap();
+        let q = Qcow2Image::open(&ov, true).unwrap();
+        assert_eq!(q.backing_fmt, Some(Format::Raw));
+        let mut b = [0u8; 4];
+        q.read_at(&mut b, 0).unwrap();
+        assert_eq!(b, MAGIC.to_be_bytes(), "read as raw bytes");
+        assert_eq!(chain(&ov, &OpenPolicy::default()).unwrap().len(), 2, "raw ends the chain");
+        forget_backing_format(&ov);
+        let e = Qcow2Image::open(&ov, true).unwrap_err().to_string();
+        assert!(e.contains("no backing format"), "{e}");
+        assert!(chain(&ov, &OpenPolicy::default()).is_err());
+        assert!(compact(&ov, &OpenPolicy::default()).is_err());
+    }
+
+    #[test]
+    fn a_pinned_chain_has_only_its_layers_and_base() {
+        let td = tempfile::tempdir().unwrap();
+        let layers = td.path().join("vm.state/disks");
+        std::fs::create_dir_all(&layers).unwrap();
+        let base = td.path().join("disk.img");
+        let fake = td.path().join("other-vm.qcow2");
+        Qcow2Image::create(&fake, 1 << 20, None).unwrap();
+        std::fs::copy(&fake, &base).unwrap();
+        let pol = OpenPolicy { pinned: Some(Pinned { layers: layers.clone(), bases: vec![(base.clone(), Some(Format::Raw))] }), ..Default::default() };
+        // Base: as the VM file says (raw), whatever the overlay recorded.
+        let l1 = layers.join("disk0-1-000000001.qcow2");
+        Qcow2Image::create(&l1, 1 << 20, Some((&base, Format::Qcow2))).unwrap();
+        let q = Qcow2Image::open_with(&l1, true, &pol, 0).unwrap();
+        assert_eq!(q.backing_fmt, Some(Format::Raw));
+        drop(q);
+        let l2 = layers.join("disk0-1-000000002.qcow2");
+        Qcow2Image::create(&l2, 1 << 20, Some((&l1, Format::Qcow2))).unwrap();
+        assert_eq!(chain(&l2, &pol).unwrap(), [l2.clone(), l1.canonicalize().unwrap(), base.canonicalize().unwrap()]);
+        // Another file next to the base (another VM's disk): refused.
+        set_backing(&l1, Some((&fake, Format::Qcow2))).unwrap();
+        assert!(Qcow2Image::open_with(&l2, true, &pol, 0).is_err());
+        assert!(chain(&l2, &pol).is_err());
+        assert!(Qcow2Image::open_with(&l1, true, &OpenPolicy::default(), 0).is_err(), "not in its own dir either");
+        // A link in the layers dir to it.
+        std::os::unix::fs::symlink(&fake, layers.join("disk0-1-000000003.qcow2")).unwrap();
+        set_backing(&l1, Some((&layers.join("disk0-1-000000003.qcow2"), Format::Qcow2))).unwrap();
+        assert!(Qcow2Image::open_with(&l2, true, &pol, 0).is_err());
+        // A hard link in the layers dir.
+        let hard = layers.join("disk0-1-000000004.qcow2");
+        std::fs::hard_link(&fake, &hard).unwrap();
+        set_backing(&l1, Some((&hard, Format::Qcow2))).unwrap();
+        assert!(Qcow2Image::open_with(&l2, true, &pol, 0).is_err());
+        // A base that names a backing file of its own.
+        let qbase = td.path().join("disk.qcow2");
+        Qcow2Image::create(&qbase, 1 << 20, Some((&fake, Format::Qcow2))).unwrap();
+        let pol = OpenPolicy { pinned: Some(Pinned { layers: layers.clone(), bases: vec![(qbase.clone(), Some(Format::Qcow2))] }), ..Default::default() };
+        let e = Qcow2Image::open_with(&qbase, false, &pol, 0).unwrap_err().to_string();
+        assert!(e.contains("can't trust"), "{e}");
+        set_backing(&l1, Some((&qbase, Format::Qcow2))).unwrap();
+        assert!(Qcow2Image::open_with(&l1, true, &pol, 0).is_err());
+        assert!(chain(&l1, &pol).is_err());
     }
 }
