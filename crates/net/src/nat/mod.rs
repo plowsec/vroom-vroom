@@ -67,11 +67,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Whether `dst` is one of this host's own addresses, asked now (they change while a VM runs).
 /// Connecting a UDP socket sends nothing; the kernel picks `dst` itself as source when it is local.
-/// No route: not ours.
+/// No route: not ours. No bind (`connected_udp`): the sandbox refuses it (macOS) or kills us (Linux).
 fn host_owns(dst: Ipv4Addr) -> io::Result<bool> {
-    let s = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
-    match s.connect((dst, 9)) {
-        Ok(()) => Ok(s.local_addr()?.ip() == std::net::IpAddr::V4(dst)),
+    match connected_udp(SocketAddr::V4(SocketAddrV4::new(dst, 9))) {
+        Ok(s) => Ok(s.local_addr()?.ip() == std::net::IpAddr::V4(dst)),
         Err(e) if matches!(e.kind(), io::ErrorKind::NetworkUnreachable | io::ErrorKind::HostUnreachable) => Ok(false),
         Err(e) => Err(e),
     }
@@ -1053,6 +1052,35 @@ mod tests {
         assert!(n.resolve(me, 22).is_none(), "host_ports: gateway alias only");
         n.cfg.policy.allow_host_loopback = true;
         assert_eq!(n.resolve(me, 22), Some(SocketAddr::V4(SocketAddrV4::new(me, 22))));
+    }
+
+    /// The same inside the VMM's sandbox, which allows no bind: the check
+    /// must still tell ours from theirs (an error there refuses every flow).
+    /// In a child, as a sandbox is for the whole process.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn own_address_check_works_in_the_sandbox() {
+        const ME: &str = "nat::tests::own_address_check_works_in_the_sandbox";
+        if std::env::var_os("VROOM_NAT_SB_CHILD").is_none() {
+            let st = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", ME, "--nocapture", "--test-threads=1"])
+                .env("VROOM_NAT_SB_CHILD", "1")
+                .status()
+                .unwrap();
+            assert!(st.success());
+            return;
+        }
+        let me = own_address();
+        let n = nat();
+        vroom_sandbox::apply(&vroom_sandbox::Policy { network_outbound: true, ..Default::default() }).unwrap();
+        assert!(std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).is_err(), "the sandbox allows no bind");
+        assert!(!host_owns(Ipv4Addr::new(1, 1, 1, 1)).unwrap(), "a remote address, no error");
+        assert!(n.resolve(Ipv4Addr::new(1, 1, 1, 1), 443).is_some(), "the internet stays reachable");
+        if let Some(me) = me {
+            // Seatbelt's "localhost" covers our own addresses: the probe itself is refused.
+            assert!(host_owns(me).unwrap_or(true));
+            assert!(n.resolve(me, 22).is_none(), "{me} is this host");
+        }
     }
 
     #[test]
