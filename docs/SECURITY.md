@@ -27,7 +27,7 @@ Out of scope: malicious host; CPU side channels (Spectre-class: hypervisor's and
 
 ## Layer 2: sandbox
 
-VMM drops privileges after building the VM, before the guest runs.
+VMM drops privileges after building the VM, before the guest runs: built with every vCPU parked (boot and resume), locked down, then resumed. Lock-down fails: VM stopped, no guest instruction ran (`Vmm::start_confined`; test: `cargo test -p vroom-vmm confine_runs`).
 
 | | |
 |---|---|
@@ -36,15 +36,17 @@ VMM drops privileges after building the VM, before the guest runs.
 
 Network reach of the VMM itself:
 
-- macOS: TCP and UDP only (no Unix sockets: no ssh-agent, no docker.sock); host loopback denied unless `allow_host_loopback` (port 53 stays open if the host resolver is local). Loopback = 127.0.0.1, ::1 and the Mac's own addresses. Tested: `cargo test -p vroom-sandbox` (a bare `(remote ip)` allow left loopback open on macOS 27).
+- macOS: TCP and UDP only (no Unix sockets: no ssh-agent, no docker.sock); host loopback denied unless `allow_host_loopback` (port 53 stays open if the host resolver is local). Loopback = 127.0.0.1, ::1 and the Mac's own addresses. Tested: `cargo test -p vroom-sandbox` (a bare `(remote ip)` allow left loopback open on macOS 27). NAT ping (ICMP datagram socket): out allowed, loopback EPERM (same test run).
 - Linux: seccomp can't see addresses; loopback refused by the NAT code only.
 
 Linux kernel needed (else `--no-sandbox`):
 
-| Landlock ABI | Kernel | When |
+| Landlock ABI | Kernel | All threads confined by |
 |---|---|---|
-| 2 (`Refer`) | 5.19 | process single-threaded at lock-down (swtpm child) |
-| 8 (`TSYNC`) | 7.0 | other threads already run: VMM (vCPUs), GPU process, USB helper (libusb's event thread) |
+| 2 (`Refer`) | 5.19 | us: SIGSYS to each thread (`tgkill`), its handler runs no_new_privs + `landlock_restrict_self`; repeat until a fresh `/proc/self/task` has nobody left; caller last |
+| 8 (`TSYNC`) | 7.0 | the kernel |
+
+One by one (ABI 2..7), fails closed (VM doesn't start) if: a thread blocks SIGSYS, doesn't answer in 5 s, any syscall fails, or SIGSYS already has a handler. Before seccomp (no filter rule for it).
 
 Known gaps (Linux):
 
@@ -67,9 +69,10 @@ Self-test:
 ```bash
 VROOM_SANDBOX_SELFTEST=1 vroom run vm.toml
 VROOM_SELFTEST_LOOPBACK_PORT=<a port you listen on>   # for the loopback probe
+VROOM_SELFTEST_FATAL=exec|listen|unix|net             # Linux: the one killing probe this run
 ```
 
-Once locked down, the VMM tries: read `/etc/passwd` and `~/.ssh`, exec, open a listener, reach host loopback, connect to `$SSH_AUTH_SOCK`, reach the internet; prints results. Linux: the Unix-socket probe ends the process (seccomp kill) = expected.
+Once locked down, the VMM tries: read `/etc/passwd` and `~/.ssh`, reach host loopback and the internet, exec, open a listener, connect to `$SSH_AUTH_SOCK`; prints results. Linux: exec (`pipe2`), listen (`bind`), unix (`socket(AF_UNIX)`), and net without NAT are seccomp kills: skipped and listed, unless named in `VROOM_SELFTEST_FATAL`; that one runs last, dying (SIGSYS) = pass.
 
 ## Clipboard
 
@@ -377,7 +380,7 @@ Root USB helper:
 - Run via `/usr/bin/sandbox-exec` with its own Seatbelt profile: like the user's helper, but libusb only from the root-owned copy (`/opt/homebrew` is the user's: nothing user-writable loads into a root process); empty environment.
 - Before each start the daemon checks its binary, that libusb, and every parent directory are root-owned and not writable by others.
 - Can do what the user's helper does (USB device user clients, IOKit registry; no files, network, exec) plus what root adds: open and take any USB device. As asked: the user named the device; the helper serves only it.
-- Linux: same as the user's helper, still root (keeps reopening the device on replug); the seccomp deny-list is what stops root's extras (modules, mount, set*id, raw sockets).
+- Linux: same as the user's helper, still uid 0 (owns the device nodes, reopens them on replug) but no capabilities, on every thread: bounding set emptied, `capset` all zero, ambient cleared, securebits `NOROOT`, `NO_SETUID_FIXUP`, `NO_CAP_AMBIENT_RAISE` set, `KEEP_CAPS` off, all locked; no_new_privs. usbfs open/claim/detach/reset need file permissions only (root-owned nodes, owner rw). The seccomp deny-list stops the rest (modules, mount, set*id, raw sockets).
 - On a device a macOS driver holds (or one left taken by an earlier helper): takes the whole device (libusb "capture": macOS re-enumerates, keeps its drivers off; mounted disk unmounted). Keeps it through guest resets (macOS never mounts the disk in between). Gives it back at the end (one more re-enumeration, drivers return). A device the guest can't use at all: given back at once.
 
 Full Disk Access (needed to pass a USB disk as the device on macOS 15; sharing files / using as a disk needs neither FDA nor vroom-netd):
