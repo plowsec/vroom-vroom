@@ -10,7 +10,7 @@ use landlock::{
 };
 use seccompiler::{BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter, SeccompRule, TargetArch};
 
-use crate::rules;
+use crate::rules::{self, Cond, Op, Rule};
 use crate::{Error, Policy, Result};
 
 fn err<E: std::fmt::Display>(e: E) -> Error {
@@ -120,6 +120,8 @@ fn landlock(p: &Policy) -> Result<()> {
 }
 
 /// Syscalls the VMM needs after setup. Everything else kills the process.
+/// Arguments of ioctl, fcntl, clone, socketpair, sendto and prctl are
+/// checked by the EPERM filter (`refused`).
 fn allowed(p: &Policy) -> Vec<i64> {
     use libc::*;
     let mut v: Vec<i64> = vec![
@@ -130,7 +132,12 @@ fn allowed(p: &Policy) -> Vec<i64> {
         SYS_clock_gettime, SYS_clock_nanosleep, SYS_nanosleep, SYS_sched_yield,
         SYS_sched_getaffinity, SYS_rt_sigaction, SYS_rt_sigprocmask, SYS_rt_sigreturn,
         SYS_sigaltstack, SYS_exit, SYS_exit_group, SYS_getrandom, SYS_fcntl, SYS_openat,
+        // fchmod/fchmodat: disks.rs freeze_file (layer files read-only),
+        // snapshot dirs 0700. Landlock doesn't cover chmod.
         SYS_mkdirat, SYS_renameat, SYS_renameat2, SYS_fchmod, SYS_fchmodat, SYS_fsync, SYS_fdatasync, SYS_ftruncate, SYS_fallocate, SYS_flock,
+        // clone: threads only (see rules::clone_denied). clone3: ENOSYS
+        // from its own filter, glibc then falls back to clone; allowed
+        // here so the ENOSYS wins over a kill.
         SYS_getpid, SYS_gettid, SYS_clone, SYS_clone3, SYS_set_robust_list,
         SYS_rseq, SYS_prctl, SYS_getdents64, SYS_restart_syscall, SYS_socketpair,
         SYS_recvfrom, SYS_sendto, SYS_recvmsg, SYS_sendmsg, SYS_shutdown,
@@ -149,8 +156,63 @@ fn allowed(p: &Policy) -> Vec<i64> {
     v
 }
 
+fn arch() -> TargetArch {
+    if cfg!(target_arch = "x86_64") {
+        TargetArch::x86_64
+    } else {
+        TargetArch::aarch64
+    }
+}
+
+fn seccomp_rules(rules: &[Rule]) -> Result<Vec<SeccompRule>> {
+    rules
+        .iter()
+        .map(|r| {
+            let conds = r
+                .iter()
+                .map(|&Cond { arg, wide, op }| {
+                    let len = if wide { SeccompCmpArgLen::Qword } else { SeccompCmpArgLen::Dword };
+                    let (op, v) = match op {
+                        Op::Eq(v) => (SeccompCmpOp::Eq, v),
+                        Op::Ne(v) => (SeccompCmpOp::Ne, v),
+                        Op::MaskedEq(m, v) => (SeccompCmpOp::MaskedEq(m), v),
+                    };
+                    SeccompCondition::new(arg, len, op, v).map_err(err)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            SeccompRule::new(conds).map_err(err)
+        })
+        .collect()
+}
+
+/// Calls refused with EPERM rather than killed (a library probing them
+/// gets an error): bad arguments of allowed syscalls. Shared by the VMM
+/// and the USB helper.
+fn refused() -> Result<BTreeMap<i64, Vec<SeccompRule>>> {
+    let mut m = BTreeMap::new();
+    m.insert(libc::SYS_ioctl, seccomp_rules(&rules::ioctl_denied())?);
+    m.insert(libc::SYS_fcntl, seccomp_rules(&rules::fcntl_denied())?);
+    m.insert(libc::SYS_clone, seccomp_rules(&rules::clone_denied())?);
+    m.insert(libc::SYS_socketpair, seccomp_rules(&rules::socketpair_denied())?);
+    m.insert(libc::SYS_sendto, seccomp_rules(&rules::sendto_denied())?);
+    m.insert(libc::SYS_prctl, seccomp_rules(&rules::prctl_denied())?);
+    Ok(m)
+}
+
+fn install(rules: BTreeMap<i64, Vec<SeccompRule>>, mismatch: SeccompAction, matched: SeccompAction) -> Result<()> {
+    let filter = SeccompFilter::new(rules, mismatch, matched, arch()).map_err(err)?;
+    let prog: BpfProgram = filter.try_into().map_err(err)?;
+    seccompiler::apply_filter_all_threads(&prog).map_err(err)
+}
+
+/// clone3 → ENOSYS. Its flags are behind a pointer seccomp can't read;
+/// glibc's pthread_create (2.34+) and posix_spawn fall back to clone,
+/// whose flags we check. Rust std and musl threads use clone already.
+fn no_clone3() -> Result<()> {
+    install(BTreeMap::from([(libc::SYS_clone3, vec![])]), SeccompAction::Allow, SeccompAction::Errno(libc::ENOSYS as u32))
+}
+
 fn seccomp(p: &Policy) -> Result<()> {
-    let arch = if cfg!(target_arch = "x86_64") { TargetArch::x86_64 } else { TargetArch::aarch64 };
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = allowed(p).into_iter().map(|n| (n, vec![])).collect();
     // Signals only to our own threads (vCPU kicks, abort). No tkill/kill.
     // SAFETY: getpid has no preconditions.
@@ -180,9 +242,10 @@ fn seccomp(p: &Policy) -> Result<()> {
         };
         rules.insert(libc::SYS_socket, vec![fam(libc::AF_INET)?, fam(libc::AF_INET6)?]);
     }
-    let filter = SeccompFilter::new(rules, SeccompAction::KillProcess, SeccompAction::Allow, arch).map_err(err)?;
-    let prog: BpfProgram = filter.try_into().map_err(err)?;
-    seccompiler::apply_filter_all_threads(&prog).map_err(err)
+    // The main filter has no seccomp(2): it goes last.
+    no_clone3()?;
+    install(refused()?, SeccompAction::Allow, SeccompAction::Errno(libc::EPERM as u32))?;
+    install(rules, SeccompAction::KillProcess, SeccompAction::Allow)
 }
 
 /// The USB helper: libusb needs the usbfs nodes (read-write) and sysfs
