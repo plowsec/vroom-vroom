@@ -60,7 +60,9 @@ fn find_secure(name: &str) -> Option<PathBuf> {
 
 /// Create the per-VM variable store from `template` (or blank).
 fn ensure_vars(path: &Path, template: Option<PathBuf>) -> Result<()> {
-    if path.exists() {
+    // A link there (even a dangling one) is not "missing": `open_vars`
+    // refuses it.
+    if std::fs::symlink_metadata(path).is_ok() {
         return Ok(());
     }
     let mut data = match template {
@@ -76,6 +78,17 @@ fn ensure_vars(path: &Path, template: Option<PathBuf>) -> Result<()> {
     std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
     std::io::Write::write_all(&mut o.open(path)?, &data)?;
     Ok(())
+}
+
+/// The NVRAM file, read-write, and what it holds. It is usually in the
+/// state dir, which the sandboxed VMM can write: a link planted there must
+/// not make another file of the user's the guest's flash.
+fn open_vars(path: &Path) -> Result<(std::fs::File, Vec<u8>)> {
+    use std::io::Read;
+    let file = crate::state::hostile::open_rw(path).map_err(|e| Error::Setup(format!("NVRAM {}: {e}", path.display())))?;
+    let mut contents = Vec::new();
+    (&file).take(layout::FLASH_SIZE).read_to_end(&mut contents)?;
+    Ok((file, contents))
 }
 
 const GLOBAL_VARIABLE: [u8; 16] = [0x61, 0xdf, 0xe4, 0x8b, 0xca, 0x93, 0xd2, 0x11, 0xaa, 0x0d, 0x00, 0xe0, 0x98, 0x03, 0x2b, 0x8c];
@@ -148,7 +161,7 @@ impl Firmware {
         let template = if self.secure_boot {
             let t = find_secure(SECURE_VARS)
                 .ok_or_else(|| Error::Setup(format!("no Secure Boot NVRAM template ({SECURE_VARS}): scripts/make-firmware.sh")))?;
-            if !self.resuming && self.vars.exists() && !has_platform_key(&std::fs::read(&self.vars)?) {
+            if !self.resuming && std::fs::symlink_metadata(&self.vars).is_ok() && !has_platform_key(&open_vars(&self.vars)?.1) {
                 let mut bak = self.vars.clone().into_os_string();
                 bak.push(".bak");
                 std::fs::rename(&self.vars, &bak)?;
@@ -159,9 +172,7 @@ impl Firmware {
             find(VARS_SEARCH)
         };
         ensure_vars(&self.vars, template)?;
-        let file = std::fs::OpenOptions::new().read(true).write(true).open(&self.vars)?;
-        let mut contents = std::fs::read(&self.vars)?;
-        contents.truncate(layout::FLASH_SIZE as usize);
+        let (file, contents) = open_vars(&self.vars)?;
         let flash = PFlash::new(layout::FLASH1_BASE, layout::FLASH_SIZE, contents, Some(file)).map_err(Error::Setup)?;
         reg.add(layout::FLASH1_BASE, layout::FLASH_SIZE, Arc::new(Mutex::new(flash)))?;
 
@@ -236,6 +247,25 @@ mod tests {
         }
         s.resize(0x48 + 0x1000, 0xff);
         s
+    }
+
+    #[test]
+    fn a_planted_nvram_link_is_refused() {
+        let t = tempfile::tempdir().unwrap();
+        let victim = t.path().join("victim");
+        std::fs::write(&victim, b"user file").unwrap();
+        let vars = t.path().join("efivars.fd");
+        std::os::unix::fs::symlink(&victim, &vars).unwrap();
+        ensure_vars(&vars, None).unwrap();
+        assert!(open_vars(&vars).is_err(), "opened through the link");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"user file");
+        // A dangling one: nothing created at its target.
+        std::fs::remove_file(&victim).unwrap();
+        ensure_vars(&vars, None).unwrap();
+        assert!(!victim.exists());
+        std::fs::remove_file(&vars).unwrap();
+        ensure_vars(&vars, None).unwrap();
+        assert_eq!(open_vars(&vars).unwrap().1.len() as u64, layout::FLASH_SIZE);
     }
 
     #[test]
