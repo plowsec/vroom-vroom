@@ -223,9 +223,15 @@ fn mark_readonly(p: &Path) {
 }
 
 /// Ubuntu 24.04's cloud image for ARM64.
+#[cfg(target_arch = "aarch64")]
 pub const UBUNTU_URL: &str = "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-arm64.img";
+#[cfg(target_arch = "x86_64")]
+pub const UBUNTU_URL: &str = "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img";
 const UBUNTU_SUMS: &str = "https://cloud-images.ubuntu.com/noble/current/SHA256SUMS";
+#[cfg(target_arch = "aarch64")]
 const UBUNTU_FILE: &str = "noble-server-cloudimg-arm64.img";
+#[cfg(target_arch = "x86_64")]
+const UBUNTU_FILE: &str = "noble-server-cloudimg-amd64.img";
 
 /// The Ubuntu cloud image in `cache`, downloaded (curl, over HTTPS) if it
 /// isn't there or isn't the current one, and checked against Ubuntu's
@@ -245,7 +251,7 @@ pub fn ubuntu_image(cache: &Path, progress: &mut dyn FnMut(&str)) -> Result<Path
     let want = sums
         .lines()
         .find_map(|l| l.split_once(' ').filter(|(_, n)| n.trim_start_matches([' ', '*']) == UBUNTU_FILE).map(|(h, _)| h.to_ascii_lowercase()))
-        .ok_or("Ubuntu's SHA256SUMS doesn't list the ARM64 cloud image")?;
+        .ok_or("Ubuntu's SHA256SUMS doesn't list the native cloud image")?;
     let path = cache.join(UBUNTU_FILE);
     let sum = |p: &Path| -> Option<String> {
         let mut f = std::fs::File::open(p).ok()?;
