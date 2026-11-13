@@ -252,7 +252,9 @@ impl HvfVm {
             }
             check("hv_gic_create", ffi::hv_gic_create(gcfg.0))?;
         }
-        let helper = Arc::new(MmapRegion::new(granule as usize).map_err(|e| Error::Invalid(format!("helper page: {e}")))?);
+        // Host memory comes in host pages; the guest sees one granule of it
+        // (4 KiB with small_pages on a 16 KiB-page host).
+        let helper = Arc::new(MmapRegion::new(host_page as usize).map_err(|e| Error::Invalid(format!("helper page: {e}")))?);
         let code: Vec<u8> = TLB_FLUSH.iter().flat_map(|w| w.to_le_bytes()).collect();
         helper.load(&code).map_err(|e| Error::Invalid(format!("helper page: {e}")))?;
         // SAFETY: the region was just written by this thread; nothing runs it yet.
